@@ -38,6 +38,7 @@ use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
 use crate::physical_plan::commit::IcebergCommitExec;
+use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::scan::IcebergTableScan;
 use crate::physical_plan::write::IcebergWriteExec;
 
@@ -174,28 +175,30 @@ impl TableProvider for IcebergTableProvider {
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if !self
-            .table
-            .metadata()
-            .default_partition_spec()
-            .is_unpartitioned()
-        {
-            // TODO add insert into support for partitioned tables
-            return Err(DataFusionError::NotImplemented(
-                "IcebergTableProvider::insert_into does not support partitioned tables yet"
-                    .to_string(),
-            ));
-        }
-
         let Some(catalog) = self.catalog.clone() else {
             return Err(DataFusionError::Execution(
                 "Catalog cannot be none for insert_into".to_string(),
             ));
         };
 
+        let is_partitioned = !self
+            .table
+            .metadata()
+            .default_partition_spec()
+            .is_unpartitioned();
+
+        let write_input = if is_partitioned {
+            // Add _partition column via project_with_partition.
+            // This adds a struct column containing computed partition values
+            // that the TaskWriter uses to route rows to the correct partitions.
+            project_with_partition(input, &self.table)?
+        } else {
+            input
+        };
+
         let write_plan = Arc::new(IcebergWriteExec::new(
             self.table.clone(),
-            input,
+            write_input,
             self.schema.clone(),
         ));
 
