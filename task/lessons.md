@@ -133,3 +133,67 @@ How to use it (see the manuals' §2):
 - **DO NOT** write a test that calls `.expect_err()` directly on a `commit()` future whose `Ok` type is
   `ActionCommit` — `ActionCommit` is not `Debug`. Insert `.map(drop)` before `.expect_err("…")` (or assert
   on `result.is_err()` + re-extract the error). *Why:* `Result::expect_err` requires `T: Debug`.
+
+### 2026-06-07 (Increment 4 — ManageSnapshots tail + UpdateSchema defaults, BUILDER Opus)
+- **DO** locate `rollbackToTime` in `core/SetSnapshotOperation.java` (`SnapshotManager.rollbackToTime`
+  delegates to `transaction.setBranchSnapshot().rollbackToTime`). The rule is
+  `findLatestAncestorOlderThan(base, ts)`: walk `SnapshotUtil.ancestorIds(currentSnapshot)` (the MAIN
+  parent chain — the existing `is_ancestor_of` walk) and pick the ancestor with the MAX `timestampMillis`
+  that is **strictly `<` ts**; error "Cannot roll back, no valid snapshot older than: {ts}" if none. *Why
+  the strict `<` matters:* ts == current's own timestamp does NOT select current (it picks the next-older
+  ancestor); ts > current selects current (a no-op, suppressed at emit). A `<=` would wrongly keep current
+  on the exact-equal boundary. Non-ancestor siblings are never visited by the parent-chain walk, so they
+  can never be chosen — no extra guard needed.
+- **DO** find the retention positivity checks in `api/SnapshotRef.java` **Builder setters** (lines
+  ~154–177), NOT in the `SnapshotRef` ctor — that is why an earlier grep "of `SnapshotRef.java`" missed
+  them (it likely scanned the ctor/equals region). Each setter has `Preconditions.checkArgument(value ==
+  null || value > 0, "…")` with these EXACT messages: "Min snapshots to keep must be greater than 0",
+  "Max snapshot age must be greater than 0 ms" (note the trailing " ms"), "Max reference age must be
+  greater than 0" (no unit). `null` is allowed (clears the field); our `set_*` API always sets a concrete
+  value, so only the `<= 0` case occurs. *Supersedes the 2026-06-07 "unverified retention `>0`" follow-up
+  — it IS in Java, just in the Builder.*
+- **DO** allow a **required column add WITH a default WITHOUT `allow_incompatible_changes`** —
+  `core/SchemaUpdate.internalAddColumn` gates on `defaultValue != null || isOptional ||
+  allowIncompatibleChanges` (line ~160). The default backfills existing rows, so it is a compatible change.
+  A required add WITHOUT a default to a non-empty schema stays incompatible. *Why it's easy to get wrong:*
+  the obvious guard `required && !flag` rejects the legal defaulted case; the correct guard is `required &&
+  default.is_none() && !flag`.
+- **DO** set BOTH `initial_default` AND `write_default` on an *added* column (Java `addColumn` calls
+  `.withInitialDefault(default).withWriteDefault(default)`), but on `updateColumnDefault` set ONLY
+  `write_default` (Java comment: "write default is always set and initial default is only set if the field
+  requires one"). *Why:* the initial default is the existing-row backfill (fixed at add time); a later
+  default change only affects future writes.
+- **DO** validate a Rust `Literal` default against the column type via
+  `literal.clone().try_into_json(&field_type)` — the Rust `NestedField::with_initial_default` /
+  `with_write_default` setters do NOT validate, but the serde `From<NestedField>` path calls
+  `try_into_json` with a panicking `.expect`. Running `try_into_json` at add/update time is the canonical
+  compatibility check (mirrors Java `castDefault`'s `defaultValue.to(type)`): a non-primitive type rejects
+  with "Invalid default value… (must be null)" and an incompatible primitive rejects with "Cannot cast
+  default value to…". Passing it guarantees no later serialization panic. *Note:* `Type` has `is_primitive`
+  / `is_struct` / `is_nested` but NOT `is_list` / `is_map`; use `!is_primitive()` for "is nested".
+- **DO** reclassify `cherrypick` as **Phase-2-gated**, not a metadata op: Java `SnapshotManager.cherrypick`
+  → `transaction.cherryPick()` whose operation **extends `MergingSnapshotProducer`** and replays data
+  files. It belongs to the write engine (Phase 2), so it is out of scope for the metadata-only
+  `ManageSnapshots` surface even though Java co-locates it on the same API.
+
+### 2026-06-07 (Increment 4 — REVIEWER Opus)
+- **DO** add a test for EVERY conditional relaxation branch, not just its happy/sad headline. *Why:* the
+  Increment-4 builder shipped `add_*_with_default` (defaulted required add) and `update_column_default`
+  (write-default only) but left the *interaction* branch `is_defaulted_add` (an added field's
+  `initial_default.is_some()` lets `require_column` skip the incompatible-change gate) UNTESTED. Java pins it
+  with `testAddColumnWithDefaultToRequiredColumn` (defaulted add → require succeeds) AND
+  `testAddColumnWithUpdateColumnDefaultToRequiredColumn` (add + updateColumnDefault → require FAILS, because
+  updateColumnDefault sets only write_default, not initial_default). The two together are the only thing that
+  distinguishes the two default-setting paths at the require boundary; mutation-verify by swapping
+  `initial_default` → `write_default` (negative test catches it) and by forcing `is_defaulted_add = false`
+  (positive test catches it). When porting a Java API, grep its test file for the *combinations* of the new
+  methods, not just each method alone.
+- **DO** recognize when a same-call validation makes a downstream `.expect` panic-proof, and say so instead
+  of hunting for a stronger check. *Why:* `validate_default` runs `Literal::try_into_json(&field_type)` —
+  the EXACT call the serde `From<NestedField>` path (datatypes.rs:591-592) later runs under a panicking
+  `.expect`. Identical input + identical type ⇒ if validation passes, the serde call returns `Ok`, so the
+  panic is unreachable. That is the load-bearing safety property; the residual Rust-vs-Java parity gaps
+  (the `(_, UInt128|Binary)` wildcard arms accept a UUID/binary literal for any primitive = too lenient; the
+  strict primitive-pair match rejects an int literal on a long column = too strict) only bite a caller who
+  hand-builds a type-mismatched `Literal`, which the strongly-typed Rust `Literal` makes unnatural. Track as
+  a parity note, do not "fix" by diverging from the serde contract.

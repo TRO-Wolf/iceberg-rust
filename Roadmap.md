@@ -62,10 +62,13 @@ layers are removed in Phase 0.
    [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md) → [docs/testing.md](docs/testing.md).
 2. **Phase 0 is complete (2026-06-07); Phase 1 is in progress.** **`main` is the owned 0.9.1 base** (the
    Phase 0 sync landed on it 2026-06-07) — start from `main`, or a short-lived feature branch off it.
-   Within Phase 1, increments 1–3 (`ManageSnapshots`, `UpdatePartitionSpec`, `UpdateSchema`) have landed
-   (all 🟡); **the next move is increment 4 — the `ManageSnapshots` tail (`cherrypick`, `rollbackToTime`)
-   plus the V3 groundwork, then Java interop round-trips to flip the 🟡 rows to ✅**. The live,
-   increment-level plan and checkbox state are in
+   Within Phase 1, increments 1–4 have landed (all 🟡): increments 1–3 (`ManageSnapshots`,
+   `UpdatePartitionSpec`, `UpdateSchema`), and increment 4 (the `ManageSnapshots` tail — `rollbackToTime` +
+   non-positive-retention rejection — plus `UpdateSchema` column initial/write defaults). **`cherrypick` is
+   reclassified as Phase-2-gated** (it extends `MergingSnapshotProducer` / replays data files, so it belongs
+   to the write engine, not this metadata surface). **The next move is the V3 groundwork (row-lineage
+   fields) and the Java interop round-trips to flip the 🟡 rows to ✅.** The live, increment-level plan and
+   checkbox state are in
    [task/todo.md](task/todo.md) — read it (and [task/lessons.md](task/lessons.md) in full) before starting.
 3. Verify the build before and after each change:
    ```bash
@@ -95,9 +98,10 @@ manifest read/write, fast-append, data/equality-delete writers, Parquet→Arrow 
 delete application**, scan planning, the catalog set (REST/Hive/Glue/S3 Tables/SQL/memory), FileIO,
 `timestamp_ns` + column default values are **present**; **snapshot management (`ManageSnapshots`) and
 schema/partition evolution (`UpdateSchema`/`UpdatePartitionSpec`) are partial (🟡)** (Phase 1 increments
-1–3: branch/tag lifecycle + rollback + fast-forward + retention; full `BaseUpdatePartitionSpec`; full
-`SchemaUpdate` incl. `UnionByNameVisitor` and level-order field-id assignment — `cherrypick`/
-`rollbackToTime`, column-default builder overloads, and Java interop tests remain before ✅); the
+1–4: branch/tag lifecycle + rollback + rollback-to-time + fast-forward + retention (non-positive rejected);
+full `BaseUpdatePartitionSpec`; full `SchemaUpdate` incl. `UnionByNameVisitor`, level-order field-id
+assignment, and column initial/write defaults — `cherrypick` is Phase-2-gated and Java interop tests remain
+before ✅); the
 **write engine beyond fast-append, incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
@@ -144,10 +148,12 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 ### Phase 1 — Spec & metadata completeness  ·  **Status: 🟡 in progress**
 - **Goal:** the metadata-evolution surface that writes depend on.
 - **Gates on:** Phase 0.
-- **Key deliverables:** `UpdateSchema` (add/drop/rename/reorder/promote, make-optional/required);
-  `UpdatePartitionSpec` (partition evolution); `ManageSnapshots` (branch/tag CRUD, rollback, cherry-pick,
-  set-current, fast-forward); full snapshot-ref handling; V3 groundwork (row-lineage fields). (Column
-  default values already present in the 0.9.1 base — see GAP_MATRIX.)
+- **Key deliverables:** `UpdateSchema` (add/drop/rename/reorder/promote, make-optional/required, column
+  defaults); `UpdatePartitionSpec` (partition evolution); `ManageSnapshots` (branch/tag CRUD, rollback,
+  rollback-to-time, set-current, fast-forward); full snapshot-ref handling; V3 groundwork (row-lineage
+  fields). (`cherrypick` is **Phase-2-gated** — it extends `MergingSnapshotProducer` / replays data files.
+  Column default *values* already present in the 0.9.1 base as spec types; the *builder API* to set them
+  landed in increment 4 — see GAP_MATRIX.)
 - **Progress:** increment 1 — `ManageSnapshots` (branch/tag lifecycle, rollback, fast-forward, retention)
   landed with unit tests (🟡 — `cherrypick` + `rollbackToTime` deferred; Java interop test pending).
   Increment 2 — `UpdatePartitionSpec` landed at full `BaseUpdatePartitionSpec` parity (🟡), reviewed against
@@ -163,9 +169,18 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   rejects incompatible primitive + complex↔primitive type changes with the Java "Cannot change column
   type" message, recurses list/map), and `Schema::build` now rejects case-insensitive lowercase-name
   collisions (`Cannot build lower case index: a and b collide`, Java `TypeUtil.indexByLowerCaseName`).
-  63 update-schema unit tests + 2 schema-build collision tests; key fixes mutation-verified. **Deferred to
-  ✅:** column initial/write **defaults** through the builder API (Java `addColumn(..,Literal)`/
-  `updateColumnDefault`/`addRequiredColumn(..,default)` overloads — tracked gap); Java interop round-trip.
+  63 update-schema unit tests + 2 schema-build collision tests; key fixes mutation-verified.
+  Increment 4 — the `ManageSnapshots` tail + `UpdateSchema` column defaults (🟡). `ManageSnapshots`:
+  `rollbackToTime` (Java `SetSnapshotOperation.findLatestAncestorOlderThan` — newest ancestor with
+  `timestamp_ms` strictly `<` the arg; errors if none) and non-positive-retention rejection
+  (`SnapshotRef.Builder` `> 0` messages). `UpdateSchema`: column initial/write **defaults** through the
+  builder API (Java `addColumn(..,Literal)` / `addRequiredColumn(..,default)` / `updateColumnDefault`
+  overloads) — add sets both defaults, a required add WITH a default needs no `allow_incompatible_changes`,
+  `update_column_default` sets only the write default; defaults type-validated. `cherrypick` reclassified
+  as **Phase-2-gated** (extends `MergingSnapshotProducer` / replays data files). +22 unit tests
+  (11 manage_snapshots, 11 update_schema — the review added 2 covering the defaulted-add → require
+  interaction, Java `testAddColumnWith[UpdateColumn]DefaultToRequiredColumn`). **Deferred to ✅ (all 🟡
+  rows):** Java interop round-trip.
 - **Exit criteria:** each action matches the Java contract behavior, with unit + interop tests; GAP_MATRIX
   rows flipped to ✅ (interop proven).
 
@@ -247,9 +262,10 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 
 1. **Write engine** — everything beyond fast-append (`OverwriteFiles`, `ReplacePartitions`, `DeleteFiles`,
    `RowDelta`, `RewriteFiles`, `RewriteManifests`, merge append) + finalized position-delete / DV writers.
-2. **Schema/partition evolution + snapshot management** (`UpdateSchema`, `UpdatePartitionSpec`;
-   `ManageSnapshots` is 🟡 — branch/tag lifecycle/rollback/fast-forward landed, `cherrypick`/`rollbackToTime`
-   remain).
+2. **Schema/partition evolution + snapshot management** (`UpdateSchema`, `UpdatePartitionSpec`,
+   `ManageSnapshots` are all 🟡 — branch/tag lifecycle, rollback, rollback-to-time, fast-forward, retention,
+   and column defaults landed; only the Java interop round-trip remains before ✅. `cherrypick` is
+   Phase-2-gated — it extends `MergingSnapshotProducer` / replays data files).
 3. **Format & type breadth** — ORC + Avro data files; remaining V3 types (variant, geo, `unknown`).
    (`timestamp_ns` and column default values already present — see GAP_MATRIX.)
 4. **Views in catalogs** (`ViewCatalog` + view operations).

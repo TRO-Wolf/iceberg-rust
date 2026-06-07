@@ -31,8 +31,8 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::spec::{
-    ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type,
-    ensure_promotion_allowed,
+    ListType, Literal, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType,
+    Type, ensure_promotion_allowed,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
@@ -65,6 +65,9 @@ enum SchemaOp {
         field_type: Type,
         required: bool,
         doc: Option<String>,
+        /// Initial/write default for existing+future rows. A required add WITH a default is allowed
+        /// even without `allow_incompatible_changes` (the default backfills existing rows).
+        default: Option<Literal>,
     },
     /// Rename a column to `new_name`.
     RenameColumn { name: String, new_name: String },
@@ -75,6 +78,8 @@ enum SchemaOp {
     },
     /// Replace a column's doc string.
     UpdateColumnDoc { name: String, doc: Option<String> },
+    /// Set a column's write default (Java `updateColumnDefault`).
+    UpdateColumnDefault { name: String, default: Literal },
     /// Make a column optional (`is_optional == true`) or required (`is_optional == false`).
     UpdateColumnRequirement { name: String, is_optional: bool },
     /// Delete a column (and all its descendants).
@@ -132,7 +137,13 @@ impl UpdateSchemaAction {
     /// Add a new optional top-level column. The name may not contain `.` (Java rejects it here); use
     /// [`add_column_to`](Self::add_column_to) for nested or dotted-leaf columns.
     pub fn add_column(self, name: &str, field_type: Type) -> Self {
-        self.add_column_internal(None, name, field_type, false, None, true)
+        self.add_column_internal(None, name, field_type, false, None, None, true)
+    }
+
+    /// Add a new optional top-level column with an initial/write default value (Java
+    /// `addColumn(name, type, Literal)`). The default is validated against the column type at commit.
+    pub fn add_column_with_default(self, name: &str, field_type: Type, default: Literal) -> Self {
+        self.add_column_internal(None, name, field_type, false, None, Some(default), true)
     }
 
     /// Add a new optional column under `parent` (None = top level). The leaf `name` is taken verbatim
@@ -146,13 +157,39 @@ impl UpdateSchemaAction {
         doc: Option<&str>,
     ) -> Self {
         // Nested form: a `.` in the leaf name is legal, so do not reject it.
-        self.add_column_internal(parent, name, field_type, false, doc, false)
+        self.add_column_internal(parent, name, field_type, false, doc, None, false)
+    }
+
+    /// Add a new optional column under `parent` with an initial/write default value (Java
+    /// `addColumn(parent, name, type, doc, Literal)`).
+    pub fn add_column_to_with_default(
+        self,
+        parent: Option<&str>,
+        name: &str,
+        field_type: Type,
+        doc: Option<&str>,
+        default: Literal,
+    ) -> Self {
+        self.add_column_internal(parent, name, field_type, false, doc, Some(default), false)
     }
 
     /// Add a new required top-level column. Without a default this is an incompatible change and must be
     /// gated by [`allow_incompatible_changes`](Self::allow_incompatible_changes) (validated at commit).
     pub fn add_required_column(self, name: &str, field_type: Type) -> Self {
-        self.add_column_internal(None, name, field_type, true, None, true)
+        self.add_column_internal(None, name, field_type, true, None, None, true)
+    }
+
+    /// Add a new required top-level column with an initial/write default (Java
+    /// `addRequiredColumn(name, type, Literal)`). A required add WITH a default is allowed even without
+    /// [`allow_incompatible_changes`](Self::allow_incompatible_changes), because the default backfills
+    /// the existing rows.
+    pub fn add_required_column_with_default(
+        self,
+        name: &str,
+        field_type: Type,
+        default: Literal,
+    ) -> Self {
+        self.add_column_internal(None, name, field_type, true, None, Some(default), true)
     }
 
     /// Add a new required column under `parent` (None = top level). See
@@ -164,11 +201,26 @@ impl UpdateSchemaAction {
         field_type: Type,
         doc: Option<&str>,
     ) -> Self {
-        self.add_column_internal(parent, name, field_type, true, doc, false)
+        self.add_column_internal(parent, name, field_type, true, doc, None, false)
+    }
+
+    /// Add a new required column under `parent` with an initial/write default (Java
+    /// `addRequiredColumn(parent, name, type, doc, Literal)`). The default relaxes the
+    /// incompatible-change gate, as in [`add_required_column_with_default`](Self::add_required_column_with_default).
+    pub fn add_required_column_to_with_default(
+        self,
+        parent: Option<&str>,
+        name: &str,
+        field_type: Type,
+        doc: Option<&str>,
+        default: Literal,
+    ) -> Self {
+        self.add_column_internal(parent, name, field_type, true, doc, Some(default), false)
     }
 
     /// Shared add-column recorder. `reject_dotted_top_level` mirrors Java's top-level `addColumn`
     /// precondition that a `.`-containing name is ambiguous; the nested form passes `false`.
+    #[allow(clippy::too_many_arguments)]
     fn add_column_internal(
         mut self,
         parent: Option<&str>,
@@ -176,6 +228,7 @@ impl UpdateSchemaAction {
         field_type: Type,
         required: bool,
         doc: Option<&str>,
+        default: Option<Literal>,
         reject_dotted_top_level: bool,
     ) -> Self {
         self.ops.push(SchemaOp::AddColumn {
@@ -190,6 +243,7 @@ impl UpdateSchemaAction {
             field_type,
             required,
             doc: doc.map(str::to_string),
+            default,
         });
         self
     }
@@ -217,6 +271,17 @@ impl UpdateSchemaAction {
         self.ops.push(SchemaOp::UpdateColumnDoc {
             name: name.to_string(),
             doc: doc.map(str::to_string),
+        });
+        self
+    }
+
+    /// Set a column's write default (Java `updateColumnDefault(name, Literal)`). This sets only the
+    /// `write_default` on an existing field; the initial default (which backfills existing rows) is left
+    /// unchanged. The default is validated against the column type at commit.
+    pub fn update_column_default(mut self, name: &str, default: Literal) -> Self {
+        self.ops.push(SchemaOp::UpdateColumnDefault {
+            name: name.to_string(),
+            default,
         });
         self
     }
@@ -510,6 +575,7 @@ impl<'a> SchemaEvolution<'a> {
         field_type: Type,
         required: bool,
         doc: Option<String>,
+        default: Option<Literal>,
     ) -> Result<()> {
         let mut parent_id = TABLE_ROOT_ID;
         let full_name;
@@ -565,10 +631,9 @@ impl<'a> SchemaEvolution<'a> {
             full_name = name.to_string();
         }
 
-        if required && !self.allow_incompatible_changes {
-            // A default value would relax this, but the builder API does not yet plumb defaults, so a
-            // required add is incompatible unless the flag is set (Java's `defaultValue != null ||
-            // isOptional || allowIncompatibleChanges`).
+        // Java `internalAddColumn`: a required add is incompatible UNLESS a default is supplied (it
+        // backfills existing rows), the column is optional, or `allowIncompatibleChanges` is set.
+        if required && default.is_none() && !self.allow_incompatible_changes {
             return Err(data_invalid(format!(
                 "Incompatible change: cannot add required column without a default value: {full_name}"
             )));
@@ -584,6 +649,13 @@ impl<'a> SchemaEvolution<'a> {
         let fresh_type = self.assign_fresh_ids(field_type)?;
         let mut new_field = NestedField::new(new_id, name, fresh_type, required);
         new_field.doc = doc;
+        // Java sets BOTH the initial default (backfills existing rows) and the write default (default for
+        // future writes) on an added column. Validate the default against the (id-assigned) column type.
+        if let Some(default) = default {
+            validate_default(&default, &new_field.field_type)?;
+            new_field.initial_default = Some(default.clone());
+            new_field.write_default = Some(default);
+        }
 
         self.added_fields.insert(new_id, new_field);
         self.parent_to_added_ids
@@ -686,6 +758,31 @@ impl<'a> SchemaEvolution<'a> {
         }
         let mut new_field = field;
         new_field.doc = doc;
+        self.store_update(new_field);
+        Ok(())
+    }
+
+    /// Replay `updateColumnDefault` (Java `updateColumnDefault`): set ONLY the `write_default` on an
+    /// existing field (the initial default backfills existing rows and is never changed here). A no-op
+    /// when the write default already equals the requested value.
+    fn update_column_default(&mut self, name: &str, default: &Literal) -> Result<()> {
+        let field = self
+            .find_for_update(name)
+            .ok_or_else(|| data_invalid(format!("Cannot update missing column: {name}")))?;
+        if self.deletes.contains(&field.id) {
+            return Err(data_invalid(format!(
+                "Cannot update a column that will be deleted: {}",
+                field.name
+            )));
+        }
+        // Validate the default converts to the column type (Java's `newDefault.to(field.type())`); this
+        // also guarantees the value will serialize, avoiding a later panic in the serde path.
+        validate_default(default, &field.field_type)?;
+        if field.write_default.as_ref() == Some(default) {
+            return Ok(());
+        }
+        let mut new_field = field;
+        new_field.write_default = Some(default.clone());
         self.store_update(new_field);
         Ok(())
     }
@@ -1123,6 +1220,7 @@ impl SchemaEvolution<'_> {
                 field_type,
                 required,
                 doc,
+                default,
             } => {
                 let parent = match parent.as_deref() {
                     Some(AMBIGUOUS_TOP_LEVEL_MARKER) => {
@@ -1136,11 +1234,21 @@ impl SchemaEvolution<'_> {
                     }
                     other => other,
                 };
-                self.add_column(parent, name, field_type.clone(), *required, doc.clone())
+                self.add_column(
+                    parent,
+                    name,
+                    field_type.clone(),
+                    *required,
+                    doc.clone(),
+                    default.clone(),
+                )
             }
             SchemaOp::RenameColumn { name, new_name } => self.rename_column(name, new_name),
             SchemaOp::UpdateColumn { name, new_type } => self.update_column(name, new_type.clone()),
             SchemaOp::UpdateColumnDoc { name, doc } => self.update_column_doc(name, doc.clone()),
+            SchemaOp::UpdateColumnDefault { name, default } => {
+                self.update_column_default(name, default)
+            }
             SchemaOp::UpdateColumnRequirement { name, is_optional } => {
                 self.update_column_requirement(name, *is_optional)
             }
@@ -1187,14 +1295,15 @@ impl SchemaEvolution<'_> {
 
             match self.find_for_update(&full_name) {
                 None => {
-                    // New field: add it (optional, mirroring union's compatible-add policy). Its own
-                    // nested fields come along inside `field_type`, so do not also recurse here.
+                    // New field: add it (optional, mirroring union's compatible-add policy, no default).
+                    // Its own nested fields come along inside `field_type`, so do not also recurse here.
                     self.add_column(
                         parent_name.as_deref(),
                         &field.name,
                         (*field.field_type).clone(),
                         false,
                         field.doc.clone(),
+                        None,
                     )?;
                 }
                 Some(existing) => {
@@ -1291,6 +1400,33 @@ impl SchemaEvolution<'_> {
         }
         Ok(())
     }
+}
+
+/// Validate that `default` is a legal default value for a column of type `field_type`, mirroring Java's
+/// `Types.NestedField` `castDefault`: a non-null default for a nested type is rejected, and a default for
+/// a primitive must be convertible to that type.
+///
+/// The Rust `NestedField::with_initial_default` / `with_write_default` setters do not validate, but the
+/// serde path (`Literal::try_into_json`) does — and panics if the value is incompatible. We therefore run
+/// `try_into_json` here as the canonical compatibility check: passing it guarantees the written field can
+/// be serialized without a later panic, and matches the set of `(literal, type)` pairings Java accepts.
+fn validate_default(default: &Literal, field_type: &Type) -> Result<()> {
+    // Java rejects a non-null default on a nested type (`type.isNestedType()`); everything that is not a
+    // primitive (struct/list/map) is nested.
+    if !field_type.is_primitive() {
+        return Err(data_invalid(format!(
+            "Invalid default value for {field_type}: {default:?} (must be null)"
+        )));
+    }
+    default
+        .clone()
+        .try_into_json(field_type)
+        .map_err(|error| {
+            data_invalid(format!(
+                "Cannot cast default value to {field_type}: {default:?} ({error})"
+            ))
+        })
+        .map(|_| ())
 }
 
 /// Java `UnionByNameVisitor.isIgnorableTypeUpdate`: decide whether the change from `existing_type` to
@@ -2844,5 +2980,262 @@ mod tests {
             .map(drop)
             .expect_err("move before itself rejected");
         assert_data_invalid(&error, "Cannot move x before itself");
+    }
+
+    // ----- column defaults (Java addColumn(..,Literal) / updateColumnDefault / addRequiredColumn(..,default)) -----
+
+    // RISK: an OPTIONAL add WITH a default must set BOTH the initial default (backfills existing rows) and
+    // the write default (default for future writes) — Java sets both; setting neither/one silently loses
+    // the backfill or the write default.
+    #[tokio::test]
+    async fn test_add_optional_column_with_default_sets_both_defaults() {
+        let table = v2_table(); // last_column_id 3
+        let updates = run(
+            UpdateSchemaAction::new().add_column_with_default(
+                "w",
+                Type::Primitive(PrimitiveType::Long),
+                Literal::long(7),
+            ),
+            &table,
+        )
+        .await;
+        let schema = added_schema(&updates);
+        let field = schema.field_by_name("w").expect("new column w");
+        assert!(!field.required, "addColumn adds an optional column");
+        assert_eq!(field.initial_default, Some(Literal::long(7)));
+        assert_eq!(field.write_default, Some(Literal::long(7)));
+    }
+
+    // RISK (the headline default rule): a REQUIRED add WITH a default must succeed WITHOUT
+    // allow_incompatible_changes — the default backfills existing rows, so Java treats it as compatible.
+    // The added field must be required and carry the defaults.
+    #[tokio::test]
+    async fn test_add_required_column_with_default_succeeds_without_flag() {
+        let table = v2_table();
+        let updates = run(
+            UpdateSchemaAction::new().add_required_column_with_default(
+                "w",
+                Type::Primitive(PrimitiveType::Long),
+                Literal::long(42),
+            ),
+            &table,
+        )
+        .await;
+        let schema = added_schema(&updates);
+        let field = schema.field_by_name("w").expect("required column w");
+        assert!(field.required, "the added column must be required");
+        assert_eq!(field.initial_default, Some(Literal::long(42)));
+        assert_eq!(field.write_default, Some(Literal::long(42)));
+    }
+
+    // RISK: a required add WITHOUT a default and WITHOUT the flag must STILL be rejected — the default is
+    // what relaxes the gate, not a behavioral regression that now lets all required adds through.
+    #[tokio::test]
+    async fn test_add_required_column_without_default_still_rejected() {
+        let table = v2_table();
+        let error = Arc::new(
+            UpdateSchemaAction::new()
+                .add_required_column("w", Type::Primitive(PrimitiveType::Long)),
+        )
+        .commit(&table)
+        .await
+        .map(drop)
+        .expect_err("required add without default or flag must be rejected");
+        assert_data_invalid(
+            &error,
+            "Incompatible change: cannot add required column without a default value: w",
+        );
+    }
+
+    // RISK: a default whose type does not match the column type must be rejected — a string default on a
+    // long column would otherwise panic later in the serde path. Java rejects it at add time.
+    #[tokio::test]
+    async fn test_add_column_with_type_mismatched_default_rejected() {
+        let table = v2_table();
+        let error = Arc::new(UpdateSchemaAction::new().add_column_with_default(
+            "w",
+            Type::Primitive(PrimitiveType::Long),
+            Literal::string("not-a-long"),
+        ))
+        .commit(&table)
+        .await
+        .map(drop)
+        .expect_err("type-mismatched default must be rejected");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DataInvalid,
+            "mismatched default must be DataInvalid, got {}",
+            error.message()
+        );
+        assert!(
+            error.message().starts_with("Cannot cast default value to"),
+            "message must name the cast failure, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK: a default on a NESTED (non-primitive) column type must be rejected (Java "must be null"). A
+    // struct/list/map default is meaningless and would panic on serialize.
+    #[tokio::test]
+    async fn test_add_column_with_default_on_nested_type_rejected() {
+        let table = v2_table();
+        let struct_type = Type::Struct(StructType::new(vec![
+            NestedField::required(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
+        ]));
+        let error = Arc::new(UpdateSchemaAction::new().add_column_to_with_default(
+            None,
+            "w",
+            struct_type,
+            None,
+            Literal::long(1),
+        ))
+        .commit(&table)
+        .await
+        .map(drop)
+        .expect_err("default on a nested type must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().starts_with("Invalid default value for"),
+            "message must say the nested default must be null, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK: a NESTED (struct child) add WITH a default must place the field inside the struct and set both
+    // defaults on it — the default must follow the field down into the nested struct.
+    #[tokio::test]
+    async fn test_add_nested_struct_child_with_default() {
+        let table = nested_table(); // location struct{lat,long}; last_column_id 10
+        let updates = run(
+            UpdateSchemaAction::new().add_column_to_with_default(
+                Some("location"),
+                "altitude",
+                Type::Primitive(PrimitiveType::Float),
+                Some("meters"),
+                Literal::float(0.0),
+            ),
+            &table,
+        )
+        .await;
+        let schema = added_schema(&updates);
+        let altitude = schema
+            .field_by_name("location.altitude")
+            .expect("nested altitude field");
+        assert_eq!(altitude.id, 11, "nested add gets last_column_id+1");
+        assert_eq!(altitude.initial_default, Some(Literal::float(0.0)));
+        assert_eq!(altitude.write_default, Some(Literal::float(0.0)));
+    }
+
+    // RISK: updateColumnDefault must set ONLY the write default on an existing field, leaving the initial
+    // default unchanged (Java's comment: "write default is always set and initial default is only set if
+    // the field requires one"). It must not touch type/nullability/id.
+    #[tokio::test]
+    async fn test_update_column_default_sets_only_write_default() {
+        let table = v2_table(); // y is required long, id 2, no defaults
+        let updates = run(
+            UpdateSchemaAction::new().update_column_default("y", Literal::long(99)),
+            &table,
+        )
+        .await;
+        let schema = added_schema(&updates);
+        let field = schema.field_by_name("y").expect("y");
+        assert_eq!(field.id, 2, "id unchanged");
+        assert_eq!(field.write_default, Some(Literal::long(99)));
+        assert_eq!(
+            field.initial_default, None,
+            "updateColumnDefault must not set the initial default"
+        );
+    }
+
+    // RISK: updateColumnDefault with a type-mismatched value must be rejected (Java's `newDefault.to(type)`
+    // would be null -> the builder throws).
+    #[tokio::test]
+    async fn test_update_column_default_type_mismatch_rejected() {
+        let table = v2_table(); // y is long
+        let error =
+            Arc::new(UpdateSchemaAction::new().update_column_default("y", Literal::string("nope")))
+                .commit(&table)
+                .await
+                .map(drop)
+                .expect_err("mismatched updateColumnDefault must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.message().starts_with("Cannot cast default value to"));
+    }
+
+    // RISK (the `is_defaulted_add` relaxation, Java testAddColumnWithDefaultToRequiredColumn): an OPTIONAL
+    // add WITH a default, then require_column, must succeed WITHOUT allow_incompatible_changes — the
+    // initial default backfills existing rows, so making it required is compatible. The resulting field
+    // must be required and keep both defaults. This pins the `is_added && initial_default.is_some()` branch
+    // in update_column_requirement; a mutation dropping that branch would reject this legal case.
+    #[tokio::test]
+    async fn test_add_optional_column_with_default_then_require_succeeds_without_flag() {
+        let table = v2_table();
+        let updates = run(
+            UpdateSchemaAction::new()
+                .add_column_with_default(
+                    "w",
+                    Type::Primitive(PrimitiveType::Long),
+                    Literal::long(7),
+                )
+                .require_column("w"),
+            &table,
+        )
+        .await;
+        let schema = added_schema(&updates);
+        let field = schema.field_by_name("w").expect("new column w");
+        assert!(
+            field.required,
+            "a defaulted optional add can be made required without the flag"
+        );
+        assert_eq!(field.initial_default, Some(Literal::long(7)));
+        assert_eq!(field.write_default, Some(Literal::long(7)));
+    }
+
+    // RISK (Java testAddColumnWithUpdateColumnDefaultToRequiredColumn): an add WITHOUT a default, then
+    // update_column_default (which sets ONLY the write default, NOT the initial default), then
+    // require_column, must STILL be rejected — there is no initial default to backfill existing rows, so
+    // `is_defaulted_add` must be false. This is the exact distinction between updateColumnDefault (write
+    // only) and a defaulted add (both); a mutation checking write_default instead of initial_default in
+    // `is_defaulted_add` would wrongly let this through.
+    #[tokio::test]
+    async fn test_add_column_then_update_default_then_require_is_rejected() {
+        let table = v2_table();
+        let error = Arc::new(
+            UpdateSchemaAction::new()
+                .add_column("w", Type::Primitive(PrimitiveType::Long))
+                .update_column_default("w", Literal::long(7))
+                .require_column("w"),
+        )
+        .commit(&table)
+        .await
+        .map(drop)
+        .expect_err("update_column_default sets no initial default, so require must fail");
+        assert_data_invalid(
+            &error,
+            "Cannot change column nullability: w: optional -> required",
+        );
+    }
+
+    // RISK (end-to-end): the emitted schema must actually carry the defaults through to a rebuilt
+    // current schema via TableMetadataBuilder — a default dropped between the action and the metadata
+    // layer would silently lose the backfill.
+    #[tokio::test]
+    async fn test_emitted_schema_round_trips_defaults() {
+        let table = v2_table();
+        let action = Transaction::new(&table)
+            .update_schema()
+            .add_required_column_with_default(
+                "w",
+                Type::Primitive(PrimitiveType::Long),
+                Literal::long(5),
+            );
+        let mut commit = Arc::new(action).commit(&table).await.expect("commit");
+        let metadata = apply_updates(&table, commit.take_updates());
+        let field = metadata
+            .current_schema()
+            .field_by_name("w")
+            .expect("w in new current schema");
+        assert_eq!(field.initial_default, Some(Literal::long(5)));
+        assert_eq!(field.write_default, Some(Literal::long(5)));
     }
 }

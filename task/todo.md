@@ -277,3 +277,102 @@ column defaults) tracked as a scoped-out parity gap. Files touched: `transaction
 `spec/schema/mod.rs`, `transaction/mod.rs` (NOT edited — already wired), GAP_MATRIX, Roadmap, todo,
 lessons. **Verify:** build clean; lib test ×2 = 1298/0 both runs (stable); clippy -D warnings clean; fmt
 clean. update_schema 46 → 63 tests; +2 schema-build tests. Row stays 🟡 (defaults + Java interop deferred).
+
+### Increment 4 — ManageSnapshots tail (rollbackToTime + retention `>0`) + UpdateSchema defaults (IN PROGRESS, 2026-06-07, BUILDER Opus)
+Three Phase-1 metadata items at full Java parity. cherrypick is OUT OF SCOPE (it extends
+`MergingSnapshotProducer` / replays data files → Phase 2; reclassified in docs only). Files touched:
+`transaction/manage_snapshots.rs`, `transaction/update_schema.rs`, `docs/parity/GAP_MATRIX.md`,
+`Roadmap.md`, `task/todo.md`, `task/lessons.md`.
+
+**Java rules verified against `/tmp/iceberg-java-ref` source (not intuition):**
+- **A (rollback_to_time):** `SetSnapshotOperation.rollbackToTime` → `findLatestAncestorOlderThan(base, ts)`
+  walks `SnapshotUtil.ancestorIds(currentSnapshot)` (the parent chain of MAIN's current snapshot — exactly
+  the existing `is_ancestor_of` walk) and picks the snapshot with the MAX `timestampMillis` that is
+  STRICTLY `< ts`; errors "Cannot roll back, no valid snapshot older than: {ts}" if none. Then sets MAIN to
+  it (same emit path as `rollback_to`). Note the STRICT `<`: ts == current's timestamp picks the next-older
+  ancestor; ts > current keeps current (no-op, suppressed at emit).
+- **B (retention >0):** `api/SnapshotRef.java` Builder setters (lines 154-177) DO reject non-positive:
+  `minSnapshotsToKeep` `value == null || value > 0` "Min snapshots to keep must be greater than 0";
+  `maxSnapshotAgeMs` "Max snapshot age must be greater than 0 ms"; `maxRefAgeMs` "Max reference age must be
+  greater than 0". (Resolves the earlier unverified follow-up — the prior grep checked the wrong file.)
+- **C (UpdateSchema defaults):** `core/SchemaUpdate.internalAddColumn` line 160: a required add is allowed
+  when `defaultValue != null || isOptional || allowIncompatibleChanges` (default backfills existing rows).
+  Add sets BOTH `withInitialDefault(default)` AND `withWriteDefault(default)` (lines 181-182).
+  `updateColumnDefault(name, lit)` sets ONLY `writeDefault` on an existing field (no-op if already equal),
+  line 339. Java `Types.NestedField` ctor `castDefault` validates: reject non-null default for a nested
+  type; for a primitive, `defaultValue.to(type)` must succeed. Rust `with_initial_default`/`with_write_default`
+  do NOT validate, so validate via `literal.try_into_json(&field_type)` (the canonical serde compatibility
+  check — passing it guarantees no later serialization panic) before setting.
+
+Plan:
+- [x] **A.** `SnapshotOp::RollbackToTime { timestamp_ms: i64 }` + `pub fn rollback_to_time(self, i64)`;
+      resolver `find_latest_ancestor_older_than` walks MAIN's parent chain, picks newest with
+      `timestamp_ms < arg`, error if none; `set_main` to it. 5 tests (newest-older-ancestor, strict-`<`
+      equal boundary, before-first→error, after-current→noop, sibling-never-chosen).
+- [x] **B.** `validate_retention_positive` at the head of `apply_retention` (the one place all three
+      fields flow through): rejects `<= 0` with exact Java messages; `ErrorKind::DataInvalid`. 6 negatives
+      (zero+negative × 3 fields); existing positive retention tests stay green.
+- [x] **C.** plumbed `Option<Literal>` default through new `add_column_with_default` /
+      `add_required_column_with_default` / `add_column_to_with_default` /
+      `add_required_column_to_with_default` builders + new `update_column_default(name, Literal)` builder +
+      `SchemaOp::AddColumn.default` / `SchemaOp::UpdateColumnDefault`. `add_column` apply: required-without-
+      default guard now relaxed when a default is present (`required && default.is_none() && !flag`); sets
+      BOTH initial+write defaults on the new field; `update_column_default` sets ONLY write_default on an
+      existing field (no-op if equal). `validate_default` rejects non-primitive defaults ("Invalid default
+      value...") and type-mismatched primitives ("Cannot cast default value to...") via `try_into_json`
+      (the canonical serde-compat check — passing it guarantees no later serialization panic). 9 tests.
+- [x] Docs: GAP_MATRIX (ManageSnapshots row — rollbackToTime done, retention >0, cherrypick Phase-2-gated;
+      UpdateSchema row — defaults dropped from "Pending ✅"; headline gaps reconciled); Roadmap Phase 1
+      progress + increment-4 entry + headline gaps + current-state snapshot; this todo; lessons (6 entries).
+- [x] Verify: build clean; lib test ×2 = 1318/0 both runs (stable, was 1298 baseline → +20 new tests);
+      clippy -D warnings clean; fmt clean (one reflow applied via `cargo fmt`).
+
+**Outcome (2026-06-07, Increment 4, BUILDER Opus):** all three items land at Java-source-verified parity.
+**A** `rollback_to_time` (5 tests), **B** retention `>0` rejection (6 tests), **C** UpdateSchema column
+defaults — `add_*_with_default` builders + `update_column_default` (9 tests). `cherrypick` reclassified
+Phase-2-gated in docs (NOT implemented — it extends `MergingSnapshotProducer`). Files touched exactly the
+6 allowed: `transaction/manage_snapshots.rs`, `transaction/update_schema.rs`, GAP_MATRIX, Roadmap, todo,
+lessons. Nothing touched outside the allowed set; no `spec/datatypes.rs` change needed
+(`with_initial_default`/`with_write_default` already exist). Rows stay 🟡 — Java interop round-trip is the
+only remaining gate before ✅. An Opus REVIEWER verifies next.
+
+#### Increment 4 — REVIEW (2026-06-07, Opus REVIEWER)
+Adversarially verified points 1–5 against the Java source (`/tmp/iceberg-java-ref`), not the Rust comments.
+- [x] **Pt 1 (rollback_to_time): CONFIRMED.** `findLatestAncestorOlderThan` (SetSnapshotOperation.java:146)
+      walks `currentAncestors` (main parent chain), strict `<` on `timestampMillis`, picks the MAX. Rust
+      `find_latest_ancestor_older_than` matches exactly. Boundary `ts == ancestor's timestamp` → that
+      ancestor is excluded (strict `<`); `ts == current` → next-older selected; `ts > current` → current
+      (no-op suppressed). Java test `testAttemptToRollbackToCurrentSnapshot` mirrors the Rust no-op test.
+      Benign divergence noted (not a bug): Java seeds `snapshotTimestamp=0` so a snapshot with
+      `timestampMillis <= 0` is never chosen; Rust has no such floor. Real ms timestamps are always > 0,
+      so unreachable in practice — tracked, not fixed.
+- [x] **Pt 2 (retention >0): CONFIRMED.** SnapshotRef.java Builder setters (lines 154-177) enforce
+      `value == null || value > 0` with the three exact messages; Rust reproduces them verbatim in
+      `validate_retention_positive`, called at the head of `apply_retention`. `null`/unset still allowed
+      (the builder API always sets a concrete value, so only `<= 0` occurs). Existing positive-retention
+      tests stay green.
+- [x] **Pt 3 (UpdateSchema add/update defaults): CONFIRMED.** `internalAddColumn` (SchemaUpdate.java:160)
+      gates on `defaultValue != null || isOptional || allowIncompatibleChanges` (Rust De Morgan equivalent
+      `required && default.is_none() && !flag`); add sets BOTH `withInitialDefault`+`withWriteDefault`
+      (lines 181-182); `updateColumnDefault` (line 339) sets ONLY `withWriteDefault`. All three match.
+- [x] **Pt 4 (default type-validation): CONFIRMED (safety) + divergence noted.** The serde `From<NestedField>`
+      path (datatypes.rs:591-592) calls `try_into_json(&field_type).expect(...)`. `validate_default` runs the
+      SAME `try_into_json` at add/update time, so it is a PERFECT predictor of the panic: anything it passes
+      cannot panic later. Parity-precision divergences vs Java `defaultValue.to(type)` exist only on
+      deliberately type-mismatched `Literal`s (e.g. a UUID/binary literal accepted for any primitive via the
+      `(_, UInt128|Binary)` wildcard arms = too lenient; an int literal rejected for a long column = too
+      strict). These require the caller to hand-build a mismatched literal; the Rust `Literal` is already
+      strongly typed so the natural usage matches the column. No corruption, no panic — tracked, not fixed.
+- [x] **Pt 5 (builder naming/arity): CONFIRMED.** Every Java overload semantic
+      ({optional|required}×{top-level|nested}×{doc}×{default}) is reachable via the 8 `add_*` builders +
+      `update_column_default`. Top-level optional-with-doc uses `add_column_to(None, ..)` (doc preserved;
+      bypasses the dotted-name guard — ergonomic, not a lost semantic).
+- [x] **TEST GAP FOUND + FIXED (not a code bug):** the `is_defaulted_add` make-required branch
+      (update_schema.rs:802) was UNTESTED. Java pins it with two tests: `testAddColumnWithDefaultToRequired
+      Column` (optional add WITH default → requireColumn succeeds without the flag) and
+      `testAddColumnWithUpdateColumnDefaultToRequiredColumn` (add + updateColumnDefault sets only write_default
+      → requireColumn FAILS, since initial_default is still null). Added both as Rust tests. Mutation-verified:
+      dropping `&& field.initial_default.is_some()` from `is_defaulted_add` makes the negative test pass-when-
+      it-should-fail (caught); the positive test fails if the defaulted-add relaxation is removed.
+- [x] Verify gate run; rows stay 🟡 (Java interop deferred); cherrypick stays Phase-2-gated. Files touched:
+      `transaction/update_schema.rs` (+2 tests), todo, lessons. Nothing outside the allowed set.
