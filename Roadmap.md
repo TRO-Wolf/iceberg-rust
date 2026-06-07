@@ -66,9 +66,17 @@ layers are removed in Phase 0.
    `UpdatePartitionSpec`, `UpdateSchema`), and increment 4 (the `ManageSnapshots` tail — `rollbackToTime` +
    non-positive-retention rejection — plus `UpdateSchema` column initial/write defaults). **`cherrypick` is
    reclassified as Phase-2-gated** (it extends `MergingSnapshotProducer` / replays data files, so it belongs
-   to the write engine, not this metadata surface). **The next move is the V3 groundwork (row-lineage
-   fields) and the Java interop round-trips to flip the 🟡 rows to ✅.** The live, increment-level plan and
-   checkbox state are in
+   to the write engine, not this metadata surface). **`UpdateSchema` is now a clean ✅** — the increment-5
+   interop pilot (2026-06-07) landed a bidirectional Java round-trip (`dev/java-interop/` oracle +
+   `crates/iceberg/tests/interop_update_schema.rs`, 7 scenarios, both directions green), and increments 6–7
+   (2026-06-07) closed the last holes by enforcing the V3-only initial-default guard AND the V3-only
+   **type** gate (`Schema::check_compatibility` in `TableMetadataBuilder::add_schema`, mirroring Java
+   `Schema.checkCompatibility` in full — both `DEFAULT_VALUES_MIN_FORMAT_VERSION` and `MIN_FORMAT_VERSIONS`).
+   **The next move is the V3 groundwork (row-lineage fields; the remaining `MIN_FORMAT_VERSIONS` types —
+   `variant`/`unknown`/`geometry`/`geography` — each a one-line `min_format_version` arm when the type lands)
+   and applying the same interop harness to flip the remaining 🟡 rows (`UpdatePartitionSpec`,
+   `ManageSnapshots`) to ✅.** The live, increment-level plan and checkbox
+   state are in
    [task/todo.md](task/todo.md) — read it (and [task/lessons.md](task/lessons.md) in full) before starting.
 3. Verify the build before and after each change:
    ```bash
@@ -96,12 +104,15 @@ green and the offline lib/unit suite passes (0 failures); service-bound integrat
 (`make test`) and the `sqllogictest` crate needs `protoc`. Roughly: spec types, partition transforms,
 manifest read/write, fast-append, data/equality-delete writers, Parquet→Arrow read **plus merge-on-read
 delete application**, scan planning, the catalog set (REST/Hive/Glue/S3 Tables/SQL/memory), FileIO,
-`timestamp_ns` + column default values are **present**; **snapshot management (`ManageSnapshots`) and
-schema/partition evolution (`UpdateSchema`/`UpdatePartitionSpec`) are partial (🟡)** (Phase 1 increments
-1–4: branch/tag lifecycle + rollback + rollback-to-time + fast-forward + retention (non-positive rejected);
-full `BaseUpdatePartitionSpec`; full `SchemaUpdate` incl. `UnionByNameVisitor`, level-order field-id
-assignment, and column initial/write defaults — `cherrypick` is Phase-2-gated and Java interop tests remain
-before ✅); the
+`timestamp_ns` + column default values are **present**; **schema evolution (`UpdateSchema`) is ✅**
+(Phase 1 increments 1–7: full `SchemaUpdate` incl. `UnionByNameVisitor`, level-order field-id assignment,
+column initial/write defaults, the V3-only initial-default AND type gates (`Schema::check_compatibility` in
+`TableMetadataBuilder::add_schema`, fully mirroring Java `Schema.checkCompatibility`), AND a bidirectional
+Java interop round-trip via `dev/java-interop/` + `crates/iceberg/tests/interop_update_schema.rs`); **snapshot
+management (`ManageSnapshots`) and partition
+evolution (`UpdatePartitionSpec`) remain partial (🟡)** (branch/tag lifecycle + rollback +
+rollback-to-time + fast-forward + retention (non-positive rejected); full `BaseUpdatePartitionSpec` —
+`cherrypick` is Phase-2-gated and a Java interop round-trip remains before ✅ for each); the
 **write engine beyond fast-append, incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
@@ -181,8 +192,43 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   (11 manage_snapshots, 11 update_schema — the review added 2 covering the defaulted-add → require
   interaction, Java `testAddColumnWith[UpdateColumn]DefaultToRequiredColumn`). **Deferred to ✅ (all 🟡
   rows):** Java interop round-trip.
+  Increment 5 — **`UpdateSchema` interop pilot → row ✅ (2026-06-07).** Built the bidirectional Java
+  interop harness under `dev/java-interop/` (a TEST-ONLY oracle, like `dev/spark/`; not a crate, not in
+  the Cargo graph): a `package org.apache.iceberg` program reaching the package-private
+  `@VisibleForTesting SchemaUpdate(Schema,int)` ctor to (a) `generate` base + Java-evolved metadata JSON
+  and (b) `verify` that Java reads the Rust-evolved metadata. The Rust side is
+  `crates/iceberg/tests/interop_update_schema.rs` over 7 committed scenarios (`add_top_level_columns`,
+  `add_nested_struct_and_map` [the level-order nested-id blocker case], `rename_and_move`,
+  `update_type_promotion`, `make_optional_and_delete`, `set_identifier_fields`,
+  `add_required_with_default_and_update_default`). Direction 1 (Rust reproduces Java's evolution — recursive
+  field-id/name/type/required/doc/default + identifier ids + current-schema-id + last-column-id) runs
+  offline through a real `MemoryCatalog` commit; Direction 2 (`mvn ... verify`) confirms Java reads the
+  Rust output. **7/7 PASS both directions.** The harness is the template for the remaining 🟡 rows.
+  Increment 6 — **V3 initial-default guard → `UpdateSchema` row a clean ✅ (2026-06-07).** Closed the one
+  parity hole the pilot surfaced: Rust had no V3-only guard on column initial defaults, so a defaulted add
+  on a V1/V2 table emitted metadata Java rejects. Added `Schema::check_compatibility(format_version)`
+  (`spec/schema/mod.rs`) mirroring Java `Schema.checkCompatibility` — iterates ALL fields incl. nested (the
+  recursive id→field index = Java's `lazyIdToField()`) and rejects a non-null `initial_default` when
+  `format_version < 3` ("...not supported until v3" / "Invalid schema for v{N}", `ErrorKind::DataInvalid`);
+  gates `initial_default` only, NOT `write_default` (matching Java). Wired into the single choke point
+  `TableMetadataBuilder::add_schema` (Java's `addSchemaInternal`), so it fires for the UpdateSchema action's
+  emitted `AddSchema`, CTAS, and every catalog commit. Reconciled the two tests that pinned the old behavior
+  (V2-default unit test → moved to a V3 base + V2-rejects sibling; the interop divergence test → flipped to
+  assert rejection); +5 `add_schema` guard tests (V2 top-level/nested reject, V3 allow, write-default-only
+  allow, no-default unaffected) + 2 `Schema::check_compatibility` tests, all mutation-verified.
+  Increment 7 — **V3-only TYPE gate → `Schema::check_compatibility` fully mirrors Java (2026-06-07).**
+  Extended the same method with the V3-only type rule (Java `MIN_FORMAT_VERSIONS`): a `min_format_version`
+  helper returns `V3` for `PrimitiveType::{TimestampNs, TimestamptzNs}` (Java `TIMESTAMP_NANO`), and the
+  single field-iteration pass now records a type problem ("Invalid type for {col}: timestamp_ns is not
+  supported until v3") alongside the initial-default problem, accumulated into the one combined "Invalid
+  schema for v{N}:" error ordered by field id (Java's TreeMap). Closes the live `add_column(timestamp_ns)`-
+  on-V2 hole. +5 `check_compatibility` tests (V2 reject `timestamp_ns`/`timestamptz_ns`, V3 allow, nested
+  reject with dotted path, both-problems accumulation), mutation-verified by disabling the type branch.
+  `variant`/`unknown`/`geometry`/`geography` are a one-line `min_format_version` arm each when those types
+  land (tracked in `task/todo.md`).
 - **Exit criteria:** each action matches the Java contract behavior, with unit + interop tests; GAP_MATRIX
-  rows flipped to ✅ (interop proven).
+  rows flipped to ✅ (interop proven). **`UpdateSchema` ✅ (now a clean row — V3 initial-default guard
+  enforced); `UpdatePartitionSpec` + `ManageSnapshots` await the same interop treatment.**
 
 ### Phase 2 — Write engine  ·  **Status: ❌ (largest functional gap)**
 - **Goal:** the full commit/write surface beyond fast-append.

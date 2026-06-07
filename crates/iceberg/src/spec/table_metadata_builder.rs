@@ -641,6 +641,13 @@ impl TableMetadataBuilder {
         // Validate that new schema fields don't conflict with existing partition field names
         self.validate_schema_field_names(&schema)?;
 
+        // Reject schema features not yet allowed at this table's format version: a non-null column
+        // initial default requires v3+, and a V3-only field type (`timestamp_ns` / `timestamptz_ns`)
+        // requires v3+. Mirrors Java `TableMetadata$Builder.addSchemaInternal`'s
+        // `Schema.checkCompatibility(schema, formatVersion)` call — placed here so every add-schema
+        // path (UpdateSchema commits, CTAS, catalog commits) is covered by the single choke point.
+        schema.check_compatibility(self.metadata.format_version)?;
+
         let new_schema_id = self.reuse_or_create_new_schema_id(&schema);
         let schema_found = self.metadata.schemas.contains_key(&new_schema_id);
 
@@ -1468,8 +1475,8 @@ mod tests {
     use crate::TableIdent;
     use crate::io::FileIO;
     use crate::spec::{
-        BlobMetadata, NestedField, NullOrder, Operation, PartitionSpec, PrimitiveType, Schema,
-        SnapshotRetention, SortDirection, SortField, StructType, Summary, TableProperties,
+        BlobMetadata, Literal, NestedField, NullOrder, Operation, PartitionSpec, PrimitiveType,
+        Schema, SnapshotRetention, SortDirection, SortField, StructType, Summary, TableProperties,
         Transform, Type, UnboundPartitionField,
     };
     use crate::table::Table;
@@ -3606,5 +3613,208 @@ mod tests {
         let spec2 = result.metadata.partition_spec_by_id(2).unwrap();
         let field_ids: Vec<i32> = spec2.fields().iter().map(|f| f.field_id).collect();
         assert_eq!(field_ids, vec![1000, 1001, 1002]); // Reused 1000, 1001; new 1002
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // V3-only initial-default guard in `add_schema` (mirrors Java `Schema.checkCompatibility`).
+    //
+    // `add_schema` is the choke point every add-schema path flows through (UpdateSchema commits, CTAS,
+    // catalog commits — `TableUpdate::AddSchema::apply` calls it), so the guard belongs here. It must
+    // fire ONLY when a field carries a non-null `initial_default` AND the table is below v3. The
+    // overwhelming majority of v1/v2 schema additions carry no default and must be unaffected.
+    // -------------------------------------------------------------------------------------------------
+
+    /// Build a schema with a single extra column `w` (long) carrying an initial default, appended after
+    /// the base `x`/`y`/`z` so its id (4) doesn't collide. Used to drive the guard on/off.
+    fn schema_with_initial_default() -> Schema {
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(4, "w", Type::Primitive(PrimitiveType::Long))
+                    .with_initial_default(Literal::long(7))
+                    .with_write_default(Literal::long(7))
+                    .into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    // RISK: a top-level non-null initial default added on a **V2** table must be REJECTED by the guard
+    // (mirrors Java `Schema.checkCompatibility`: "non-null default ... is not supported until v3"). If
+    // the guard did not fire, Rust would emit V2 metadata Java refuses to read.
+    #[test]
+    fn test_add_schema_with_initial_default_rejected_on_v2() {
+        let builder = builder_without_changes(FormatVersion::V2);
+        let error = builder
+            .add_schema(schema_with_initial_default())
+            .expect_err("a V2 table must reject a non-null initial default");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DataInvalid,
+            "guard rejection must be DataInvalid, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("is not supported until v3"),
+            "message must mirror Java's not-supported-until-v3, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("Invalid schema for v2"),
+            "message must carry the Java `Invalid schema for v{{N}}` header, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains('w'),
+            "message must name the offending column `w`, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK: the SAME schema (with a non-null initial default) on a **V3** table must be ACCEPTED — the
+    // guard must not over-fire and block the legal case (defaults are a V3 feature).
+    #[test]
+    fn test_add_schema_with_initial_default_allowed_on_v3() {
+        let builder = builder_without_changes(FormatVersion::V3);
+        let result = builder
+            .add_schema(schema_with_initial_default())
+            .expect("a V3 table must accept a non-null initial default")
+            .build()
+            .expect("build metadata after a V3 defaulted add");
+        let field = result
+            .metadata
+            .schemas
+            .get(&1)
+            .expect("added schema id 1")
+            .field_by_name("w")
+            .expect("field w in the added schema");
+        assert_eq!(
+            field.initial_default,
+            Some(Literal::long(7)),
+            "the V3 add must keep the initial default"
+        );
+    }
+
+    // RISK (the nested-reach contract — Java iterates `lazyIdToField()`, ALL fields): a non-null initial
+    // default buried inside a NESTED struct on a **V2** table must ALSO be rejected. A guard that only
+    // inspected top-level fields would silently let a nested default through.
+    #[test]
+    fn test_add_schema_with_nested_initial_default_rejected_on_v2() {
+        // `payload` is a struct whose child `flag` (id 5) carries a non-null initial default; `payload`
+        // itself (id 4) is a plain struct. The guard must reach the nested child via the recursive
+        // id-to-field index.
+        let nested_default_schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(
+                    4,
+                    "payload",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::required(5, "flag", Type::Primitive(PrimitiveType::Boolean))
+                            .with_initial_default(Literal::bool(true))
+                            .with_write_default(Literal::bool(true))
+                            .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let builder = builder_without_changes(FormatVersion::V2);
+        let error = builder
+            .add_schema(nested_default_schema)
+            .expect_err("a V2 table must reject a default nested inside a struct");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("is not supported until v3"),
+            "message must mirror Java's not-supported-until-v3, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("payload.flag"),
+            "message must name the nested column by its dotted path `payload.flag`, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK (sanity — the guard must NOT touch the common case): a v2 schema add with NO initial default
+    // anywhere (the overwhelming majority of real schema additions) must succeed unchanged.
+    #[test]
+    fn test_add_schema_without_default_unaffected_on_v2() {
+        let no_default_schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(4, "w", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let builder = builder_without_changes(FormatVersion::V2);
+        let result = builder
+            .add_schema(no_default_schema)
+            .expect("a V2 add with no defaults must be unaffected by the guard")
+            .build()
+            .expect("build metadata after a plain V2 add");
+        assert!(
+            result
+                .metadata
+                .schemas
+                .get(&1)
+                .expect("added schema id 1")
+                .field_by_name("w")
+                .is_some(),
+            "the new column must be present"
+        );
+    }
+
+    // RISK (write_default is NOT gated — Java only checks `initialDefault`): a v2 schema add where a
+    // field carries ONLY a `write_default` (no initial default) must succeed. Gating `write_default`
+    // here would wrongly reject a legal v1/v2 write default.
+    #[test]
+    fn test_add_schema_with_write_default_only_allowed_on_v2() {
+        let write_default_only_schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(4, "w", Type::Primitive(PrimitiveType::Long))
+                    .with_write_default(Literal::long(7))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let builder = builder_without_changes(FormatVersion::V2);
+        let result = builder
+            .add_schema(write_default_only_schema)
+            .expect(
+                "a V2 add with only a write default must be allowed (write_default is not gated)",
+            )
+            .build()
+            .expect("build metadata after a V2 write-default-only add");
+        let field = result
+            .metadata
+            .schemas
+            .get(&1)
+            .expect("added schema id 1")
+            .field_by_name("w")
+            .expect("field w");
+        assert_eq!(field.initial_default, None, "no initial default was set");
+        assert_eq!(
+            field.write_default,
+            Some(Literal::long(7)),
+            "the write default must be preserved (it is not gated)"
+        );
     }
 }

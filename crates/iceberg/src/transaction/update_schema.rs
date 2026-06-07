@@ -1471,6 +1471,37 @@ mod tests {
         crate::transaction::tests::make_v2_table()
     }
 
+    /// A from-scratch **V3** table with the same `x`/`y`/`z` (long, required) shape as `v2_table`
+    /// (last_column_id 3). Built at format version 3 so column INITIAL defaults are legal — Java's
+    /// `Schema.checkCompatibility` (mirrored by `Schema::check_compatibility`, enforced in
+    /// `TableMetadataBuilder::add_schema`) rejects a non-null initial default on a v1/v2 table.
+    fn v3_table() -> Table {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("build v3 base schema");
+
+        let metadata = crate::spec::TableMetadataBuilder::new(
+            schema,
+            crate::spec::PartitionSpec::unpartition_spec(),
+            crate::spec::SortOrder::unsorted_order(),
+            "s3://bucket/v3".to_string(),
+            crate::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("build v3 metadata builder")
+        .build()
+        .expect("build v3 metadata")
+        .metadata;
+
+        v2_table().with_metadata(Arc::new(metadata))
+    }
+
     /// Extract the rebuilt schema from the emitted `AddSchema` update.
     fn added_schema(updates: &[TableUpdate]) -> &Schema {
         updates
@@ -3008,24 +3039,82 @@ mod tests {
 
     // RISK (the headline default rule): a REQUIRED add WITH a default must succeed WITHOUT
     // allow_incompatible_changes — the default backfills existing rows, so Java treats it as compatible.
-    // The added field must be required and carry the defaults.
+    // The added field must be required and carry the defaults. Driven on a **V3** base (and applied
+    // through the metadata builder), because the column initial default is only legal at v3+ — Java's
+    // `Schema.checkCompatibility`, mirrored by `Schema::check_compatibility` in
+    // `TableMetadataBuilder::add_schema`, rejects it on v1/v2. The V2 rejection is pinned by
+    // `test_add_required_column_with_default_rejected_on_v2` below.
     #[tokio::test]
-    async fn test_add_required_column_with_default_succeeds_without_flag() {
-        let table = v2_table();
-        let updates = run(
-            UpdateSchemaAction::new().add_required_column_with_default(
+    async fn test_add_required_column_with_default_succeeds_without_flag_on_v3() {
+        let table = v3_table();
+        let action = Transaction::new(&table)
+            .update_schema()
+            .add_required_column_with_default(
                 "w",
                 Type::Primitive(PrimitiveType::Long),
                 Literal::long(42),
-            ),
-            &table,
-        )
-        .await;
-        let schema = added_schema(&updates);
-        let field = schema.field_by_name("w").expect("required column w");
+            );
+        let mut commit = Arc::new(action).commit(&table).await.expect("commit");
+        // Apply the emitted updates through the metadata builder (the path that runs the V3 guard).
+        let metadata = apply_updates(&table, commit.take_updates());
+        let field = metadata
+            .current_schema()
+            .field_by_name("w")
+            .expect("required column w");
         assert!(field.required, "the added column must be required");
         assert_eq!(field.initial_default, Some(Literal::long(42)));
         assert_eq!(field.write_default, Some(Literal::long(42)));
+    }
+
+    // RISK (the V3-only initial-default guard fires): the SAME required-with-default add, applied to a
+    // **V2** table, must be REJECTED when the emitted schema reaches `TableMetadataBuilder::add_schema`
+    // — mirroring Java `Schema.checkCompatibility` ("non-null default ... is not supported until v3").
+    // A guard that only allowed V3 but silently let V2 through would emit Java-unreadable metadata. The
+    // rejection must surface at apply time (the action's `commit` only emits the `AddSchema` update; the
+    // builder enforces the guard).
+    #[tokio::test]
+    async fn test_add_required_column_with_default_rejected_on_v2() {
+        let table = v2_table();
+        let action = Transaction::new(&table)
+            .update_schema()
+            .add_required_column_with_default(
+                "w",
+                Type::Primitive(PrimitiveType::Long),
+                Literal::long(42),
+            );
+        let mut commit = Arc::new(action)
+            .commit(&table)
+            .await
+            .expect("the action itself still commits (it only emits the AddSchema update)");
+        // Driving the emitted AddSchema through the V2 metadata builder must fail the V3 guard.
+        let mut builder = table.metadata().clone().into_builder(None);
+        let mut error = None;
+        for update in commit.take_updates() {
+            match update.apply(builder) {
+                Ok(next) => builder = next,
+                Err(application_error) => {
+                    error = Some(application_error);
+                    break;
+                }
+            }
+        }
+        let error = error.expect("applying a V2 default add must be rejected by the V3 guard");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DataInvalid,
+            "V2 default rejection must be DataInvalid, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("is not supported until v3"),
+            "message must mirror Java's not-supported-until-v3, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains('w'),
+            "message must name the offending column, got: {}",
+            error.message()
+        );
     }
 
     // RISK: a required add WITHOUT a default and WITHOUT the flag must STILL be rejected — the default is
@@ -3218,10 +3307,11 @@ mod tests {
 
     // RISK (end-to-end): the emitted schema must actually carry the defaults through to a rebuilt
     // current schema via TableMetadataBuilder — a default dropped between the action and the metadata
-    // layer would silently lose the backfill.
+    // layer would silently lose the backfill. Uses a **V3** base because applying an initial default
+    // through the builder is only legal at v3+ (the `Schema::check_compatibility` guard).
     #[tokio::test]
     async fn test_emitted_schema_round_trips_defaults() {
-        let table = v2_table();
+        let table = v3_table();
         let action = Transaction::new(&table)
             .update_schema()
             .add_required_column_with_default(
