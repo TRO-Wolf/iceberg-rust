@@ -86,6 +86,67 @@ guards. **Deferred to increment 4:** `cherrypick` (needs snapshot replay), `roll
       min_snapshots_to_keep / max_snapshot_age_ms / max_ref_age_ms). A grep of `SnapshotRef.java` found
       no such `checkArgument` — confirm where (if anywhere) Java enforces it before adding it here.
 
-### Next up — Increment 2: UpdatePartitionSpec
-addField/removeField/renameField → new spec via `TableUpdate::AddSpec`/`SetDefaultSpec`
-(`TableMetadataBuilder::add_partition_spec`/`set_default_partition_spec` already exist).
+### Increment 2 — UpdatePartitionSpec (IN PROGRESS, 2026-06-07)
+New file `crates/iceberg/src/transaction/update_partition_spec.rs`; wired into `transaction/mod.rs`.
+Full Java parity with `BaseUpdatePartitionSpec`. Builder records ops; `commit()` replays Java's
+state machine against `table.metadata()` and emits `AddSpec`/`SetDefaultSpec{-1}` + concurrency guards.
+
+Plan:
+- [x] Read Java `UpdatePartitionSpec` + `BaseUpdatePartitionSpec` contract; Rust partition.rs,
+      transform.rs, table_metadata_builder.rs (`add_partition_spec` recycles equal (src,transform)
+      field ids), catalog/mod.rs (`AddSpec`/`SetDefaultSpec`/`DefaultSpecIdMatch`/
+      `LastAssignedPartitionIdMatch` shapes + their check/apply).
+- [x] `UpdatePartitionSpecAction`: builder methods record `PartitionSpecOp` (case_sensitive flag +
+      add/add_with_transform/remove/remove_by_transform/rename/add_non_default). Names auto-generated
+      to match Java `PartitionNameGenerator` (`generate_partition_name`).
+- [x] `commit()`: `SpecEvolution` state machine replays Java `addField`/`removeField`/`renameField`
+      validation in order, seeded from the current DEFAULT spec; `apply()` builds the new
+      `UnboundPartitionSpec` (keep+rename / void-replace-on-V1 / omit-on-V2; appended adds with
+      `field_id=None` so `TableMetadataBuilder` recycles/assigns). Emits `AddSpec{unbound}` +
+      `SetDefaultSpec{-1}` (unless add_non_default) + `DefaultSpecIdMatch{current}` +
+      `LastAssignedPartitionIdMatch{current}`.
+- [x] 23 unit tests (same change): identity add, add-with-transform auto-name (one per transform incl
+      bucket/truncate/year/month/day/hour/void), explicit name, remove-by-name, remove-by-transform,
+      rename, add-non-default (no SetDefaultSpec), dup-add-name fails, redundant-time-transform fails,
+      remove-newly-added fails, rename+delete-same fails, delete-then-readd un-deletes (+ with rename),
+      V1 void replacement (+ V1 delete-collision rename), field-id recycling across historical specs
+      (forked multi-spec fixture) + new-id assignment, case-insensitive source resolution, unknown
+      column fails, colliding non-void name fails, updates/requirements shape, binds-to-schema.
+- [x] Verify: build green; lib test ×2 = 1207 passed/0 failed both runs; clippy -D warnings clean;
+      fmt clean. Mutation-checked auto-name + V1/V2 void branch (5 tests fail when logic broken).
+      Flipped GAP_MATRIX row + headline gap to 🟡.
+
+**Outcome:** `UpdatePartitionSpec` lands at full `BaseUpdatePartitionSpec` parity (🟡) with optimistic-
+concurrency guards. **Deferred to ✅:** Java interop round-trip (read a Java-evolved spec; prove Java
+reads ours). **Note:** `Transform::Unknown` reject-precondition is N/A — the Rust builder API cannot
+produce an unknown transform (Java's `UnknownTransform` guard has no Rust analogue here).
+
+#### Increment 2 — REVIEW (2026-06-07, adversarial reviewer agent)
+Verified the 10 high-value points against `BaseUpdatePartitionSpec.java` + `TestUpdatePartitionSpec.java`.
+- [x] Pts 1,2,4,5,6,7,8 (un-delete/reject branches; transform `to_string` keys; V1 alwaysNull;
+      void-collision renames; redundant-time guard; case-sensitivity; requirement set): CONFIRMED.
+- [x] **BUG (pt 3): field-id recycling dropped the historical NAME.** Java
+      `recycleOrCreatePartitionField` (V2, base!=null) returns the historical field's *name* too when
+      the add had no explicit name (and only recycles at all when name is null OR matches). Rust
+      delegated id-recycling to `TableMetadataBuilder` (matches on source+transform only) but always
+      used the *generated* default name → a `bucket[8](y)` recycle that was historically named
+      `my_shard` came out `y_bucket_8`, and an explicit-name add recycled an id even when Java would
+      not. FIX: replicate `recycleOrCreatePartitionField` in the action — search historical specs and,
+      on match (respecting the name==null/name-equals rule), set BOTH the recycled field_id and the
+      historical name on the added field. Metadata-builder recycling becomes a harmless no-op.
+- [x] **BUG (pt 8): requirement over-constraint under add_non_default_spec.** Java emits
+      `AssertDefaultSpecID` only for the `SetDefaultPartitionSpec` update; when `addNonDefaultSpec` is
+      set there is no such update, so only `AssertLastAssignedPartitionId` is required. Rust emitted
+      both unconditionally. FIX: gate `DefaultSpecIdMatch` on `set_as_default`.
+- [x] Added tests (pt 9 end-to-end round-trip through builder; pt 10 no-op dedup to existing spec id;
+      V2 remove+re-add-different-transform-same-name; historical-name recycle; add_non_default
+      requirement shape).
+
+**Review outcome:** 28 unit tests (23 → 28; both fixes mutation-verified to fail without the change).
+build green; lib test ×2 = 1212/0 both runs (stable); clippy -D warnings clean; fmt clean. Reconciled
+GAP_MATRIX row + Roadmap Phase 1 progress; appended 3 lessons. Row stays 🟡 (Java interop still deferred).
+**Residual (tracked, intentional):** (a) full interop round-trip; (b) explicit-name recycle when the
+historical name DIFFERS from the requested name — Java assigns a fresh id, Rust's metadata builder would
+still recycle by (source,transform); narrow, spec-favoring, and not separately gated here. Both noted for
+the ✅ flip.
+

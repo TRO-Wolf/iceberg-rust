@@ -58,6 +58,7 @@ mod manage_snapshots;
 mod snapshot;
 mod sort_order;
 mod update_location;
+mod update_partition_spec;
 mod update_properties;
 mod update_statistics;
 mod upgrade_format_version;
@@ -75,6 +76,7 @@ use crate::transaction::append::FastAppendAction;
 use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
+use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
@@ -151,6 +153,11 @@ impl Transaction {
     /// Creates a manage-snapshots action (branch/tag lifecycle, rollback, fast-forward, retention).
     pub fn manage_snapshots(&self) -> ManageSnapshotsAction {
         ManageSnapshotsAction::new()
+    }
+
+    /// Creates an update-partition-spec action (partition evolution: add/remove/rename fields).
+    pub fn update_partition_spec(&self) -> UpdatePartitionSpecAction {
+        UpdatePartitionSpecAction::new()
     }
 
     /// Set the location of table

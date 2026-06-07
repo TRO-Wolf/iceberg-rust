@@ -59,7 +59,7 @@
 | Column default values (initial/write) | ✅ | `Schema`/`Types` | `spec/datatypes.rs` `NestedField` carries `initial_default`/`write_default` |
 | Partition transforms (identity/bucket/truncate/year/month/day/hour/void) | ✅ | `api/.../transforms/` | `spec/transform.rs` |
 | Schema evolution (`UpdateSchema`) | ❌ | `api/UpdateSchema.java` | no transaction action |
-| Partition evolution (`UpdatePartitionSpec`) | ❌ | `api/UpdatePartitionSpec.java` | none |
+| Partition evolution (`UpdatePartitionSpec`) | 🟡 | `api/UpdatePartitionSpec.java`, `core/BaseUpdatePartitionSpec.java` | `transaction/update_partition_spec.rs`: add/add-with-transform (Java `PartitionNameGenerator` auto-naming), remove-by-name/by-transform, rename, `add_non_default_spec`, `case_sensitive`; full `BaseUpdatePartitionSpec` parity — dup-name/redundant-time-transform/remove-newly-added/rename+delete guards, delete-then-readd rewrite, V1 alwaysNull (void) replacement, and `recycleOrCreatePartitionField` (recycles a historical field's id AND name on a `(source,transform)` match). Emits `AddSpec`+`SetDefaultSpec{-1}` with `LastAssignedPartitionIdMatch` always + `DefaultSpecIdMatch` only when the spec is set as default (Java `UpdateRequirements`). Reviewed against `TestUpdatePartitionSpec.java` (28 unit tests incl. end-to-end builder round-trip + no-op dedup). **Pending ✅:** Java interop round-trip. |
 | Sort order (`ReplaceSortOrder`) | ✅ | `api/ReplaceSortOrder.java` | `transaction/sort_order.rs` |
 | Snapshot model + refs (branches/tags) | 🟡 | `api/Snapshot.java`, `SnapshotRef.java` | spec types + ref ops (`transaction/manage_snapshots.rs`) |
 | Snapshot management (`ManageSnapshots`: branch/tag CRUD, rollback, cherrypick, set-current, fast-forward) | 🟡 | `api/ManageSnapshots.java` | `transaction/manage_snapshots.rs`: create/replace/remove branch+tag, rename-branch, set-current, rollback (ancestry-checked), fast-forward, retention — with optimistic-concurrency `RefSnapshotIdMatch` guards + unit tests. **Deferred:** cherrypick, rollbackToTime; Java interop test pending before ✅. |
@@ -115,8 +115,8 @@
 
 1. **Write engine** — everything beyond fast-append (`OverwriteFiles`, `ReplacePartitions`,
    `DeleteFiles`, `RowDelta`, `RewriteFiles`, `RewriteManifests`, merge append).
-2. **Schema/partition evolution + snapshot management** (`UpdateSchema`, `UpdatePartitionSpec`,
-   `ManageSnapshots`).
+2. **Schema/partition evolution + snapshot management** — `UpdatePartitionSpec` and `ManageSnapshots`
+   are 🟡 (landed with unit tests; Java interop pending); `UpdateSchema` is still ❌.
 3. **Format & type breadth** — ORC + Avro data files; remaining V3 types (variant, geo, unknown).
    (`timestamp_ns` and column default values already landed in the 0.8/0.9 base — see the matrix.)
 4. **Views in catalogs** (`ViewCatalog` + view operations).

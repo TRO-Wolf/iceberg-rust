@@ -81,3 +81,26 @@ How to use it (see the manuals' §2):
   the GAP_MATRIX + Roadmap "Headline gaps" kept listing `timestamp_ns`/column-defaults as missing after
   the matrix body flipped them to ✅. When you change a row's status, grep for the capability name and
   reconcile every mention.
+
+### 2026-06-07 (UpdatePartitionSpec review remediation)
+- **DO** replicate Java's `recycleOrCreatePartitionField` in the partition-spec *action*, not just lean
+  on `TableMetadataBuilder.reuse_partition_field_ids`. *Why:* the builder recycles a historical field's
+  *id* (matching on `(source_id, transform)`) but NOT its *name* — so an add with no explicit name came
+  out with the generated default name (`y_bucket_8`) instead of the historical name (`y_bucket`) Java
+  reuses. Java returns the whole historical field when `name == null || field.name().equals(name)`. Fix:
+  the action searches `metadata.partition_specs_iter()` and, on match, sets BOTH the recycled `field_id`
+  and the historical `name` on the `UnboundPartitionField`; the builder's id-recycling then no-ops on the
+  pre-set id. Pin it with a multi-spec fixture whose historical field has a *custom* name (id-only checks
+  pass even when the name is wrong).
+- **DO** derive a transaction action's `TableRequirement`s from the updates it actually emits, the way
+  Java's `UpdateRequirements` visitor does. *Why:* `UpdatePartitionSpec` emitted both
+  `LastAssignedPartitionIdMatch` AND `DefaultSpecIdMatch` unconditionally, but under `add_non_default_spec`
+  there is no `SetDefaultSpec` update, so Java attaches only `AssertLastAssignedPartitionId`. Emitting the
+  default-spec guard anyway over-constrains the commit. Gate each guard on the update that induces it
+  (`AddSpec` ⇒ last-assigned-partition-id; `SetDefaultSpec` ⇒ default-spec-id).
+- **DO** prove a metadata-mutating action end-to-end by driving its emitted `TableUpdate`s through
+  `TableMetadataBuilder` (`update.apply(builder)`), not just by inspecting the unbound `apply()` shape.
+  *Why:* the unbound spec test never exercises the metadata layer's spec dedup, `LAST_ADDED` resolution,
+  or default-spec switch — a no-op evolution (remove-then-re-add the same field) must dedup back to the
+  existing spec id and NOT advance `last_partition_id`; only a round-trip catches a regression there.
+
