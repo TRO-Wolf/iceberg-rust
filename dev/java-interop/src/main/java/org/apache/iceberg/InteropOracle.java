@@ -19,9 +19,11 @@
 
 // IMPORTANT: this file lives in `package org.apache.iceberg` ON PURPOSE — that is the only way to reach
 // the package-private `@VisibleForTesting SchemaUpdate(Schema schema, int lastColumnId)` constructor that
-// drives the UpdateSchema state machine without a live TableOperations / catalog, AND the package-private
-// `BaseUpdatePartitionSpec` / `InMemoryTableOperations` plumbing the partition-spec oracle uses. This class
-// is a TEST-ONLY ORACLE (a dev tool, like dev/spark/); it is not part of the shipped Rust library.
+// drives the UpdateSchema state machine without a live TableOperations / catalog, the package-private
+// `BaseUpdatePartitionSpec` plumbing the partition-spec oracle uses, AND the package-private
+// `new BaseSnapshot(...)` constructor + `TableMetadata.Builder.{addSnapshot,setBranchSnapshot,setRef}`
+// that the manage-snapshots oracle uses to assemble a base with a real snapshot history. This class is a
+// TEST-ONLY ORACLE (a dev tool, like dev/spark/); it is not part of the shipped Rust library.
 package org.apache.iceberg;
 
 import java.io.IOException;
@@ -32,14 +34,16 @@ import java.nio.file.Paths;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.types.Types;
 
 /**
- * Java reference oracle for the UpdateSchema AND UpdatePartitionSpec interop suites.
+ * Java reference oracle for the UpdateSchema, UpdatePartitionSpec, AND ManageSnapshots interop suites.
  *
- * <p>Two modes, selected by the first program argument; each mode runs BOTH capabilities (schema +
- * partition) in one pass so a single {@code generate}/{@code verify} invocation covers the whole surface:
+ * <p>Two modes, selected by the first program argument; each mode runs ALL THREE capabilities (schema +
+ * partition + manage-snapshots) in one pass so a single {@code generate}/{@code verify} invocation covers
+ * the whole surface:
  *
  * <ul>
  *   <li><b>generate</b> — for each named scenario, build a base {@link TableMetadata}, apply the
@@ -48,16 +52,20 @@ import org.apache.iceberg.types.Types;
  *       testdata directory. Schema scenarios drive the package-private {@code @VisibleForTesting
  *       SchemaUpdate(Schema, int)} state machine; partition scenarios drive a real
  *       {@link BaseUpdatePartitionSpec} via {@link BaseTable#updateSpec()} over an in-memory
- *       {@link TableOperations} (so {@code base != null} and historical field-id recycling is exercised).
+ *       {@link TableOperations} (so {@code base != null} and historical field-id recycling is exercised);
+ *       manage-snapshots scenarios drive a real {@link SnapshotManager} via {@link
+ *       BaseTable#manageSnapshots()} over a forked base that carries a real snapshot history + refs.
  *   <li><b>verify</b> — read {@code rust_evolved.metadata.json} from each scenario directory, assert Java
- *       parses it without error AND its current schema (schema scenarios) or default partition spec
- *       (partition scenarios) is structurally equal to Java's own {@code java_evolved}. Prints PASS/FAIL
- *       per scenario; exits non-zero on any FAIL.
+ *       parses it without error AND its current schema (schema scenarios), default partition spec
+ *       (partition scenarios), or refs map + current-snapshot-id (manage-snapshots scenarios) is
+ *       structurally equal to Java's own {@code java_evolved}. Prints PASS/FAIL per scenario; exits
+ *       non-zero on any FAIL.
  * </ul>
  */
 public final class InteropOracle {
   private static final String SCHEMA_LOCATION = "s3://interop-bucket/update_schema";
   private static final String PARTITION_LOCATION = "s3://interop-bucket/update_partition_spec";
+  private static final String SNAPSHOT_LOCATION = "s3://interop-bucket/manage_snapshots";
 
   private InteropOracle() {}
 
@@ -69,17 +77,20 @@ public final class InteropOracle {
     }
     Path schemaFixturesDir = requireFixturesDir("interop.fixtures.dir");
     Path partitionFixturesDir = requireFixturesDir("interop.partition.fixtures.dir");
+    Path snapshotFixturesDir = requireFixturesDir("interop.manage_snapshots.fixtures.dir");
 
     String mode = args[0];
     switch (mode) {
       case "generate":
         SchemaOracle.generate(schemaFixturesDir);
         PartitionOracle.generate(partitionFixturesDir);
+        SnapshotOracle.generate(snapshotFixturesDir);
         break;
       case "verify":
         int failures = 0;
         failures += SchemaOracle.verify(schemaFixturesDir);
         failures += PartitionOracle.verify(partitionFixturesDir);
+        failures += SnapshotOracle.verify(snapshotFixturesDir);
         System.out.println("verify (all capabilities): " + failures + " failures");
         if (failures > 0) {
           System.exit(1);
@@ -686,12 +697,307 @@ public final class InteropOracle {
     }
   }
 
+  // ===========================================================================================
+  // ManageSnapshots oracle — the THIRD capability. Unlike schema/partition, ref operations act on the
+  // snapshot graph + refs, so the base TableMetadata must carry a REAL snapshot history. Each scenario
+  // shares one forked base (snapshots ROOT, CURRENT(child of ROOT), SIBLING(child of ROOT); refs
+  // main->CURRENT, `dev` branch->CURRENT, `stable` tag->ROOT — mirroring the Rust action's
+  // `forked_table()` fixture) and applies a `ManageSnapshots` op-sequence via a REAL `SnapshotManager`
+  // (`new BaseTable(ops, name).manageSnapshots()…commit()`) over the same in-memory `TableOperations`.
+  // The Rust test mirrors EACH op-sequence exactly against the same `base.metadata.json`. We compare the
+  // evolved REFS map (snapshot-id + branch-vs-tag kind + retention) + the current-snapshot-id (main);
+  // the snapshot list itself is unchanged by ref ops.
+  // ===========================================================================================
+
+  /**
+   * The ManageSnapshots half of the oracle. The op-sequence is driven through a real
+   * {@link SnapshotManager} (via {@link BaseTable#manageSnapshots()} over the in-memory
+   * {@link TableOperations}) so the production ref-management + rollback paths are exercised end to end;
+   * the evolved metadata is read back from {@code ops.current()} after {@code commit()}. Ref-only ops
+   * never touch data files, so the no-op {@code io()} on {@link InMemoryTableOperations} is never reached
+   * (the transaction's file-cleanup path returns early for an empty new-snapshot set).
+   */
+  static final class SnapshotOracle {
+    private SnapshotOracle() {}
+
+    // The forked base's snapshot graph. Distinct, increasing timestamps so `rollback_to_time` is
+    // deterministic; increasing sequence numbers so V2 `addSnapshot` validation passes (a child snapshot
+    // must carry a sequence number greater than the last). All three timestamps are far in the past, so
+    // they trivially satisfy `ts <= lastUpdatedMillis` (buildFrom stamps last-updated-ms at build time).
+    static final long ROOT_ID = 3051729675574597004L;
+    static final long CURRENT_ID = 3055729675574597004L;
+    static final long SIBLING_ID = 3060729675574597004L;
+    static final long ROOT_TS_MS = 1515100955770L;
+    static final long CURRENT_TS_MS = 1555100955770L;
+    static final long SIBLING_TS_MS = 1600000000000L;
+
+    private static Map<String, SnapshotScenario> scenarios() {
+      Map<String, SnapshotScenario> scenarios = new LinkedHashMap<>();
+
+      // create_branch_and_tag — create a branch @ROOT and a tag @CURRENT. Pins fresh-ref creation with
+      // default (empty) retention and the branch-vs-tag kind.
+      scenarios.put(
+          "create_branch_and_tag",
+          new SnapshotScenario(
+              manage -> manage.createBranch("audit", ROOT_ID).createTag("release-1", CURRENT_ID)));
+
+      // rollback_to_ancestor — main (CURRENT) -> ROOT, which IS an ancestor. Pins ancestry-checked
+      // rollback (Java `SetSnapshotOperation.rollbackTo`).
+      scenarios.put(
+          "rollback_to_ancestor", new SnapshotScenario(manage -> manage.rollbackTo(ROOT_ID)));
+
+      // rollback_to_time — a timestamp STRICTLY between ROOT and CURRENT resolves to ROOT (the newest
+      // ancestor older than it; CURRENT is too new). Cross-checks the strict-`<` semantics
+      // (`SetSnapshotOperation.findLatestAncestorOlderThan`: `timestampMillis() < timestampMillis`).
+      scenarios.put(
+          "rollback_to_time",
+          new SnapshotScenario(manage -> manage.rollbackToTime(ROOT_TS_MS + 1)));
+
+      // set_current_snapshot — main -> ROOT with NO ancestry requirement (Java `setCurrentSnapshot`).
+      // Here ROOT happens to be an ancestor, but the op path does not check ancestry.
+      scenarios.put(
+          "set_current_snapshot",
+          new SnapshotScenario(manage -> manage.setCurrentSnapshot(ROOT_ID)));
+
+      // fast_forward — a branch @ROOT fast-forwarded to main (@CURRENT). ROOT is an ancestor of CURRENT,
+      // so the branch advances to CURRENT (Java `fastForwardBranch` -> `replaceBranch(from, to, true)`).
+      scenarios.put(
+          "fast_forward",
+          new SnapshotScenario(
+              manage ->
+                  manage
+                      .createBranch("staging", ROOT_ID)
+                      .fastForwardBranch("staging", SnapshotRef.MAIN_BRANCH)));
+
+      // retention — set min_snapshots_to_keep + max_snapshot_age_ms on a BRANCH (`dev`), and
+      // max_ref_age_ms on the `stable` TAG. Pins that branch-only retention fields land on a branch and
+      // tag-legal retention (max_ref_age_ms) lands on a tag — the branch-vs-tag retention distinction.
+      scenarios.put(
+          "retention",
+          new SnapshotScenario(
+              manage ->
+                  manage
+                      .setMinSnapshotsToKeep("dev", 5)
+                      .setMaxSnapshotAgeMs("dev", 86400000L)
+                      .setMaxRefAgeMs("stable", 604800000L)));
+
+      // remove_and_rename — remove the `stable` tag and rename the `dev` branch to `feature`. Pins ref
+      // removal and branch rename (the renamed ref keeps the original snapshot id + retention).
+      scenarios.put(
+          "remove_and_rename",
+          new SnapshotScenario(
+              manage -> manage.removeTag("stable").renameBranch("dev", "feature")));
+
+      return scenarios;
+    }
+
+    /**
+     * Build the shared forked base {@link TableMetadata}: an unpartitioned V2 table with snapshots
+     * {ROOT, CURRENT(child of ROOT), SIBLING(child of ROOT)} and refs {main->CURRENT, `dev`
+     * branch->CURRENT, `stable` tag->ROOT}. SIBLING exists but is NOT in main's ancestry, so the
+     * rollback/fast-forward scenarios have a valid-but-non-ancestor snapshot available (matching the Rust
+     * `forked_table()` shape). The location embeds the scenario name so each fixture is self-describing.
+     */
+    private static TableMetadata buildBase(String name) {
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              SNAPSHOT_LOCATION + "/" + name,
+              props);
+
+      // V2 sequence numbers start at 1 (0 is reserved as INITIAL_SEQUENCE_NUMBER). Using 1/2/3 — rather
+      // than 0/1/2 — means Java's SnapshotParser emits a `sequence-number` for EVERY snapshot (it omits
+      // the field only when the value equals INITIAL_SEQUENCE_NUMBER), which keeps the fixture parseable
+      // by the (spec-`required`) Rust V2 snapshot reader. (A snapshot with sequence-number 0 only arises
+      // as a V1-carryover artifact; see the report for the latent Rust read-strictness note.)
+      Snapshot root = snapshot(ROOT_ID, null, 1L, ROOT_TS_MS, seed.currentSchemaId());
+      Snapshot current = snapshot(CURRENT_ID, ROOT_ID, 2L, CURRENT_TS_MS, seed.currentSchemaId());
+      Snapshot sibling = snapshot(SIBLING_ID, ROOT_ID, 3L, SIBLING_TS_MS, seed.currentSchemaId());
+
+      return TableMetadata.buildFrom(seed)
+          // Add the full snapshot graph first, then attach refs. main is set LAST (and to CURRENT, the
+          // newest snapshot) so the single snapshot-log entry is stamped at CURRENT's timestamp and the
+          // build's last-updated-ms (System.currentTimeMillis) is never behind it.
+          .addSnapshot(root)
+          .addSnapshot(current)
+          .addSnapshot(sibling)
+          .setRef("dev", SnapshotRef.branchBuilder(CURRENT_ID).build())
+          .setRef("stable", SnapshotRef.tagBuilder(ROOT_ID).build())
+          .setBranchSnapshot(CURRENT_ID, SnapshotRef.MAIN_BRANCH)
+          .build();
+    }
+
+    /** Construct a package-private {@link BaseSnapshot} with a fake (never-read) manifest-list path. */
+    private static Snapshot snapshot(
+        long snapshotId, Long parentId, long sequenceNumber, long timestampMs, int schemaId) {
+      Map<String, String> summary = new LinkedHashMap<>();
+      summary.put("operation", DataOperations.APPEND);
+      return new BaseSnapshot(
+          sequenceNumber,
+          snapshotId,
+          parentId,
+          timestampMs,
+          DataOperations.APPEND,
+          summary,
+          schemaId,
+          SNAPSHOT_LOCATION + "/metadata/snap-" + snapshotId + ".avro",
+          null,
+          null,
+          null);
+    }
+
+    private static void generate(Path fixturesDir) throws IOException {
+      Map<String, SnapshotScenario> scenarios = scenarios();
+      for (Map.Entry<String, SnapshotScenario> entry : scenarios.entrySet()) {
+        String name = entry.getKey();
+        SnapshotScenario scenario = entry.getValue();
+
+        Path scenarioDir = fixturesDir.resolve(name);
+        Files.createDirectories(scenarioDir);
+
+        // Write the base FIRST, then re-parse it from disk before evolving. The freshly built
+        // TableMetadata carries pending `AddSnapshot` changes from the history builder; `buildFrom`
+        // copies those, so `isAddedSnapshot` would treat ROOT/CURRENT/SIBLING as just-added and stamp a
+        // rollback's snapshot-log entry with the OLD snapshot timestamp (tripping the "before last
+        // snapshot log entry" guard). A round-tripped TableMetadata has no pending changes — exactly the
+        // clean base the Rust test and the Java `verify` step both load.
+        TableMetadata base = buildBase(name);
+        Path basePath = scenarioDir.resolve("base.metadata.json");
+        writeJson(basePath, TableMetadataParser.toJson(base));
+        TableMetadata cleanBase =
+            TableMetadataParser.fromJson(basePath.toString(), readString(basePath));
+
+        TableMetadata javaEvolved = scenario.evolve(cleanBase);
+        writeJson(
+            scenarioDir.resolve("java_evolved.metadata.json"),
+            TableMetadataParser.toJson(javaEvolved));
+        System.out.println("generated manage_snapshots: " + name);
+      }
+      System.out.println(
+          "generate (manage_snapshots): wrote " + scenarios.size() + " scenarios to " + fixturesDir);
+    }
+
+    /** Returns the number of failed scenarios. */
+    private static int verify(Path fixturesDir) throws IOException {
+      Map<String, SnapshotScenario> scenarios = scenarios();
+      int failures = 0;
+      for (Map.Entry<String, SnapshotScenario> entry : scenarios.entrySet()) {
+        String name = entry.getKey();
+        SnapshotScenario scenario = entry.getValue();
+        Path scenarioDir = fixturesDir.resolve(name);
+        Path rustEvolvedPath = scenarioDir.resolve("rust_evolved.metadata.json");
+
+        if (!Files.exists(rustEvolvedPath)) {
+          System.out.println(
+              "FAIL manage_snapshots/"
+                  + name
+                  + ": missing rust_evolved.metadata.json (run the Rust gen)");
+          failures++;
+          continue;
+        }
+
+        // Recompute Java's evolved metadata from the committed base (same op-sequence as generate).
+        Path basePath = scenarioDir.resolve("base.metadata.json");
+        TableMetadata base = TableMetadataParser.fromJson(basePath.toString(), readString(basePath));
+        TableMetadata javaEvolved = scenario.evolve(base);
+
+        TableMetadata rustEvolved;
+        try {
+          rustEvolved =
+              TableMetadataParser.fromJson(rustEvolvedPath.toString(), readString(rustEvolvedPath));
+        } catch (RuntimeException parseError) {
+          System.out.println(
+              "FAIL manage_snapshots/" + name + ": Java could not parse rust_evolved: " + parseError);
+          failures++;
+          continue;
+        }
+
+        String mismatch = structuralRefsMismatch(javaEvolved, rustEvolved);
+        if (mismatch != null) {
+          System.out.println("FAIL manage_snapshots/" + name + ": " + mismatch);
+          failures++;
+          continue;
+        }
+        System.out.println("PASS manage_snapshots/" + name);
+      }
+      System.out.println(
+          "verify (manage_snapshots): "
+              + (scenarios.size() - failures)
+              + "/"
+              + scenarios.size()
+              + " scenarios passed");
+      return failures;
+    }
+
+    /**
+     * Compare the evolved REFS structurally: the ref names, and for each ref its snapshot-id, kind
+     * (branch vs tag), and retention fields (min_snapshots_to_keep / max_snapshot_age_ms /
+     * max_ref_age_ms) — all covered by {@link SnapshotRef#equals} — plus the current-snapshot-id (main).
+     * Snapshots themselves are unchanged by ref ops, so they are not compared. Returns null when equal.
+     */
+    private static String structuralRefsMismatch(TableMetadata expected, TableMetadata actual) {
+      Map<String, SnapshotRef> expectedRefs = expected.refs();
+      Map<String, SnapshotRef> actualRefs = actual.refs();
+      if (!expectedRefs.keySet().equals(actualRefs.keySet())) {
+        return "ref-name-set mismatch:\n  java= " + expectedRefs.keySet() + "\n  rust= "
+            + actualRefs.keySet();
+      }
+      for (Map.Entry<String, SnapshotRef> javaEntry : expectedRefs.entrySet()) {
+        SnapshotRef javaRef = javaEntry.getValue();
+        SnapshotRef rustRef = actualRefs.get(javaEntry.getKey());
+        // SnapshotRef.equals compares snapshotId, type (branch/tag), and all three retention fields.
+        if (!javaRef.equals(rustRef)) {
+          return "ref `" + javaEntry.getKey() + "` mismatch:\n  java= " + javaRef + "\n  rust= "
+              + rustRef;
+        }
+      }
+      long expectedCurrent =
+          expected.currentSnapshot() == null ? -1 : expected.currentSnapshot().snapshotId();
+      long actualCurrent =
+          actual.currentSnapshot() == null ? -1 : actual.currentSnapshot().snapshotId();
+      if (expectedCurrent != actualCurrent) {
+        return "current-snapshot-id mismatch: java=" + expectedCurrent + " rust=" + actualCurrent;
+      }
+      return null;
+    }
+  }
+
+  /**
+   * A ManageSnapshots scenario: an op-sequence applied through a real {@link SnapshotManager} over an
+   * {@link InMemoryTableOperations} holding the shared forked base. The evolved metadata is read back
+   * from {@code ops.current()} after {@code commit()}.
+   */
+  private static final class SnapshotScenario {
+    final UnaryOperator<ManageSnapshots> ops;
+
+    SnapshotScenario(UnaryOperator<ManageSnapshots> ops) {
+      this.ops = ops;
+    }
+
+    /** Drive the op-sequence through a real SnapshotManager and return the evolved metadata. */
+    TableMetadata evolve(TableMetadata base) {
+      InMemoryTableOperations operations = new InMemoryTableOperations(base);
+      BaseTable table = new BaseTable(operations, "interop");
+      ops.apply(table.manageSnapshots()).commit();
+      return operations.current();
+    }
+  }
+
   /**
    * A minimal in-memory {@link TableOperations} that just holds a {@link TableMetadata} and swaps it on
    * commit. This is the ONLY way to drive {@link BaseUpdatePartitionSpec} with {@code base != null} (so
-   * the historical field-id recycling path is exercised) without a real catalog / object store. A
-   * partition-spec commit never reads or writes data files, so {@code io()} / {@code locationProvider()}
-   * / {@code newSnapshotId()} stay no-op.
+   * the historical field-id recycling path is exercised) without a real catalog / object store; the
+   * manage-snapshots oracle reuses it to drive {@link SnapshotManager} over a base with a real snapshot
+   * history. Neither a partition-spec commit nor a ref-only ManageSnapshots commit reads or writes data
+   * files, so {@code io()} / {@code locationProvider()} / {@code newSnapshotId()} stay no-op.
    */
   private static final class InMemoryTableOperations implements TableOperations {
     private TableMetadata current;

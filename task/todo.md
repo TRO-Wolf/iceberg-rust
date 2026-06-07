@@ -847,3 +847,221 @@ documented in the Increment-7 reviewer lesson.) **Files touched (exactly the all
 production `crates/iceberg/src/spec/{partition.rs,table_metadata_builder.rs}` (the flagged guard fix +
 tests), docs `GAP_MATRIX.md`/`Roadmap.md`/`task/{todo.md,lessons.md}`. No Cargo/lockfile edits. An Opus
 REVIEWER verifies next.
+
+### Increment 9 — ManageSnapshots INTEROP (bidirectional Java round-trip, BUILDER Opus, 2026-06-07)
+The LAST Phase-1 metadata capability to interop-prove. Mirror the proven schema+partition interop harness
+for `ManageSnapshots` ref operations so the two snapshot rows can flip 🟡 → ✅. Java under
+`dev/java-interop/` stays a TEST-ONLY ORACLE (not a Cargo crate, never invoked by `cargo`).
+
+**Plan (inputs/outputs/contract):**
+- **Contract:** for ≥7 identically-named scenarios, Rust loads the Java-written `base.metadata.json`
+  (which already carries a real snapshot HISTORY + refs), applies the SAME `ManageSnapshots` op-sequence
+  via the public `Transaction::manage_snapshots()` + `ApplyTransactionAction::apply` + `commit(&catalog)`,
+  and the evolved REFS map (each ref's snapshot-id + branch-vs-tag kind + retention fields) + the
+  current-snapshot-id (main) must be structurally equal to Java's `java_evolved.metadata.json`.
+- **The wrinkle vs schema/partition:** ref ops act on the snapshot graph, so the base needs a real history.
+  Build it in Java (`package org.apache.iceberg`): `new BaseSnapshot(seq, id, parentId, ts, "append",
+  summary, schemaId, manifestList, null, null, null)` for ROOT/CURRENT/SIBLING (distinct timestamps,
+  increasing seq, ts ≤ last-updated-ms), assemble via `TableMetadata.buildFrom(seed).setBranchSnapshot
+  /setRef(...)`, mirroring the Rust `forked_table()` shape: main→CURRENT, `dev` branch→CURRENT, `stable`
+  tag→ROOT. Drive ops via `new BaseTable(inMemoryOps, name).manageSnapshots().<ops>().commit()` then read
+  `ops.current()`. The `InMemoryTableOperations` (already present) suffices — ref-only ops never call
+  `io()` (`committedFiles` returns early for an empty new-snapshot set; `temp()`/`newSnapshotId()` are
+  interface defaults).
+- **Comparison model:** there is NO public `refs()` accessor on Rust `TableMetadata` returning the typed
+  `SnapshotReference` (only `snapshot_for_ref` → `Snapshot`, which drops kind+retention). So the Rust test
+  serializes the evolved `TableMetadata` to a `serde_json::Value`, extracts the `refs` object, and
+  deserializes each value into the public `SnapshotReference`/`SnapshotRetention` types — typed ref model,
+  no production accessor needed.
+
+**Scenarios (≥7, identical Java + Rust, same names):**
+- [x] `create_branch_and_tag` — create branch @ROOT + tag @CURRENT.
+- [x] `rollback_to_ancestor` — main CURRENT → ROOT (ancestry-valid).
+- [x] `rollback_to_time` — ts strictly between ROOT and CURRENT → resolves to ROOT (cross-checks strict-`<`).
+- [x] `set_current_snapshot` — main → ROOT (no ancestry requirement).
+- [x] `fast_forward` — a branch @ROOT fast-forwarded to main@CURRENT.
+- [x] `retention` — min_snapshots_to_keep + max_snapshot_age_ms on a branch; max_ref_age_ms on `stable` tag.
+- [x] `remove_and_rename` — remove `stable` tag; rename `dev` → `feature`.
+
+**Deliverables:**
+- [x] 1. Extended `InteropOracle.java` with `SnapshotOracle` (+ `buildBase` snapshot-history builder + the
+      `SnapshotScenario` driver) wired into the same `generate`/`verify`; updated
+      `run.sh`/`README.md`/`pom.xml` (new `interop.manage_snapshots.fixtures.dir`). One pass covers all 3.
+- [x] 2. `crates/iceberg/tests/interop_manage_snapshots.rs` (mirrors the others): Dir-1 asserts refs +
+      current-snapshot equal Java's (refs recovered by round-tripping evolved metadata through serde_json
+      — no public `refs()` accessor); writes `rust_evolved.metadata.json` under `ICEBERG_INTEROP_GEN`. 3
+      scenario-specific tests: rollback_to_time→ROOT (strict-`<`), retention-on-branch-vs-tag, remove+rename.
+- [x] 3. Committed fixtures under `crates/iceberg/testdata/interop/manage_snapshots/<scenario>/` (7×3 = 21).
+- [x] 4. Verify (from repo root): `interop_manage_snapshots` 4/4 (1 loops all 7); lib ×2 = 1337/0 both
+      (no production change → unchanged); `interop_update_schema`/`interop_update_partition_spec` stay 4/4;
+      clippy -D warnings clean (clean rebuild); fmt --check clean; mvn compile + run.sh end-to-end =
+      7/7 schema + 7/7 partition + 7/7 manage_snapshots, BOTH directions, 0 failures.
+
+**GAP_MATRIX target:** flipped "Snapshot model + refs" → ✅; "Snapshot management" → ✅ (ref-op surface)
+with the EXPLICIT caveat that `cherrypick` stays Phase-2-gated (status cell reads
+`✅ (ref-op surface; **`cherrypick` Phase-2-gated**)`).
+
+**Outcome (2026-06-07, Increment 9 INTEROP, BUILDER Opus):** bidirectional Java interop for the
+`ManageSnapshots` ref-operation surface landed — the LAST Phase-1 metadata capability to interop-prove.
+Both `"Snapshot model + refs"` and the ref-op surface of `"Snapshot management"` flipped 🟡 → ✅;
+`cherrypick` left Phase-2-gated (NOT interop-proven, explicit caveat in both rows). One `dev/java-interop`
+`generate`/`verify` pass now covers ALL THREE capabilities — `InteropOracle` grew a `SnapshotOracle`
+(nested beside `SchemaOracle` + `PartitionOracle`) with a `buildBase` snapshot-history builder (`new
+BaseSnapshot(...)` ROOT/CURRENT/SIBLING + `TableMetadata.buildFrom().{addSnapshot,setRef,setBranchSnapshot}`,
+mirroring `forked_table()`), driving a REAL `SnapshotManager` via `new BaseTable(ops).manageSnapshots()…
+commit()` over the existing `InMemoryTableOperations`. 7 scenarios × 3 committed fixtures, mirrored by
+`crates/iceberg/tests/interop_manage_snapshots.rs` (refs recovered by round-tripping the evolved
+`TableMetadata` through `serde_json` → typed `SnapshotReference`, since there is no public `refs()`
+accessor). **NO production `.rs` change** (unlike the partition pilot). **Two divergences/wrinkles
+surfaced by interop:**
+  1. **Base-build snapshot-log timestamp ordering — Java oracle wrinkle (test-only).** Building the base
+     with `setBranchSnapshot(currentSnapshot, main)` BEFORE the other refs, then evolving from the
+     IN-MEMORY base (which carries pending `AddSnapshot` changes that `buildFrom` copies), made Java's
+     `isAddedSnapshot(ROOT)` true during a rollback → it stamped the snapshot-log entry with ROOT's OLD
+     timestamp (1515…) and tripped `"Invalid update timestamp …: before last snapshot log entry"`. Fixed
+     two ways in the oracle: (a) add all snapshots first, set `dev`/`stable` refs, then set `main` LAST via
+     the `setBranchSnapshot(long, branch)` overload (clean, monotonic snapshot-log); (b) in `generate`,
+     write the base then RE-PARSE it from disk before evolving so the residual `AddSnapshot` changes are
+     cleared (matching what `verify` and the Rust test both load). No Rust change.
+  2. **V2 snapshot `sequence-number` read-strictness — REAL latent Rust↔Java divergence (FLAGGED, left
+     as-is, orthogonal to ref ops).** Rust's `_serde::SnapshotV2.sequence_number` is a plain required
+     field; Java's `SnapshotParser` OMITS `sequence-number` when it equals `INITIAL_SEQUENCE_NUMBER` (0)
+     and reads a missing one as 0. So a Java-written V2 snapshot with `sequence-number == 0` does NOT parse
+     in Rust (`data did not match any variant of untagged enum TableMetadataEnum`). This is a genuine read
+     gap, BUT: (a) the spec marks snapshot `sequence-number` as **required** in V2/V3 (format/spec.md line
+     949), so making Rust default-0 would DIVERGE from the spec and risk masking malformed metadata; (b) a
+     `sequence-number == 0` V2 snapshot only arises as a V1-carryover artifact — real V2 tables assign
+     seq ≥ 1. **Decision:** did NOT change production (out of scope for a REF-OPERATION increment, and the
+     spec-vs-Java tension needs its own adjudication). Sidestepped by using V2-realistic sequence numbers
+     (ROOT=1/CURRENT=2/SIBLING=3) in the fixture, which keeps Java emitting every `sequence-number` and the
+     fixture spec-faithful. Flagged in GAP_MATRIX (both rows), Roadmap, README, and lessons for the reviewer.
+**Verify:** `interop_manage_snapshots` 4 tests (1 loops all 7) green offline; lib ×2 = 1337/0 both
+(unchanged — no production code); `interop_update_schema`/`interop_update_partition_spec` stay 4/4;
+clippy -D warnings clean (full `cargo clean -p iceberg` + `--all-targets` rebuild, 26.9s); fmt --check
+clean; `mvn compile` + `run.sh` end-to-end = 7/7 × 3 capabilities both directions, 0 failures.
+**Files touched (exactly the allowed set):** `dev/java-interop/{InteropOracle.java,pom.xml,run.sh,
+README.md}`, new `crates/iceberg/tests/interop_manage_snapshots.rs` + `testdata/interop/manage_snapshots/**`
+(21 fixtures), docs `GAP_MATRIX.md`/`Roadmap.md`/`task/{todo.md,lessons.md}`. NO production `.rs`, NO
+Cargo/lockfile edits. Incidental schema/partition fixture churn from `run.sh` (random table-uuid +
+timestamp) was reverted via `git checkout` — those fixtures are byte-identical to committed. An Opus
+REVIEWER verifies next.
+
+**Reviewer verdict (2026-06-07, Increment 9 INTEROP, REVIEWER Opus, DELEGATED/MEDIUM):** CONFIRMED with
+two real findings actioned (tests strengthened; one production fix recommended for a human, not made).
+1. **Bidirectional / not tautological — CONFIRMED.** Per-scenario `base.refs != java.refs` (False) and
+   `java.refs == rust.refs` (True) for all 7; `base`, `java_evolved`, `rust_evolved` are 3 distinct files
+   (Java-written vs Rust-written), and `refs_of()` re-parses kind + retention (retention scenario shows
+   branch fields on `dev`, `max_ref_age_ms`-only on the `stable` tag) — not a snapshot-id-only or
+   file-vs-itself compare.
+2. **Coverage + sharp pins — CONFIRMED (one strengthened).** All 7 scenarios both ways; schema 7/7 +
+   partition 7/7 stay green. Retention pin mutation-verified (misrouting `MaxSnapshotAgeMs`→`max_ref`
+   fails both the dedicated test and the all-scenarios refs-equality). **Gap fixed:** the interop
+   `rollback_to_time` pin did NOT catch a `<`→`<=` regression (`ROOT_TS_MS+1` is far below CURRENT's ts,
+   so ROOT wins either way) — only the unit test did. Added a boundary assertion (roll to EXACTLY
+   `CURRENT_TS_MS` → must fall back to ROOT) and mutation-verified it now FAILs under `<=`.
+3. **V2 `sequence-number` divergence — REAL read bug; RECOMMEND FIX (human), not track.** Probe confirmed:
+   a seq-omitted V2 metadata.json fails Rust parsing (`data did not match any variant of untagged enum
+   TableMetadataEnum`). Java write omits seq≤0 (`SnapshotParser` L60) and defaults absent→0 on read (L128);
+   Rust `_serde::SnapshotV2.sequence_number` is required. The builder's "spec marks it required → defaulting
+   would diverge" rationale is WRONG: `format/spec.md` L1979/L2002 explicitly MANDATE "must default to 0
+   when reading v1 metadata" — the lenient read IS the spec. Blast radius is real (V1→V2-upgraded tables
+   keep seq-0 carryover snapshots; `upgradeFormatVersion` does not rewrite seqs → unreadable by Rust).
+   Fix = one-line `#[serde(default)]` on `SnapshotV2`/`SnapshotV3.sequence_number` (V1 path already
+   hard-codes 0). Left to a human (production-reader edit outside this increment's flagged scope).
+   **→ CLOSED by Increment 10 (2026-06-07): `#[serde(default)]` added to both fields + 4 tests; "Snapshot
+   model + refs" row flipped to a clean ✅. See Increment 10 above.**
+4. **Row states — adjudicated honest, refined.** "Snapshot model + refs" ✅ and "Snapshot management"
+   ✅ (ref-op surface; `cherrypick` Phase-2-gated) kept; the cherrypick caveat is clear (NOT interop-proven).
+   Refined the "Snapshot model + refs" fixture note to (a) correct the spec-vs-Java framing, (b) disclose
+   that the ✅ is scoped to natively-written V2 (seq ≥ 1) refs with a tracked reader gap for the
+   seq-0 V1→V2-upgrade class.
+5. **Scope — CONFIRMED.** Zero production `.rs` changed (only the untracked test + the Java oracle);
+   no Cargo.toml/lockfile; `TransactionAction` trait + `commit` stay `pub(crate)` (action.rs L37/L49);
+   `dev/java-interop/` has no Cargo.toml and is referenced by no `Cargo.toml` — fully out of the Cargo graph.
+   Reviewer edits (all in the allowed set): strengthened `interop_manage_snapshots.rs` (added
+   `CURRENT_TS_MS` + boundary pin), `GAP_MATRIX.md` note correction, `task/{todo.md,lessons.md}`.
+   Throwaway seq-probe written + run + deleted (no residue). NO COMMIT.
+**Reviewer verify (repo root):** interop_manage_snapshots 4/4; interop_update_schema 4/4 +
+interop_update_partition_spec 4/4; lib ×2 = 1337/0 both; clippy -D warnings clean (incl. modified test);
+fmt --check clean; `mvn -f dev/java-interop verify` = schema 7/7 + partition 7/7 + manage_snapshots 7/7,
+0 failures (Direction 2, Java reads committed Rust output); full `run.sh` end-to-end green both directions.
+
+### Increment 10 — V2/V3 snapshot `sequence-number` lenient read (close the seq-0 reader gap, BUILDER Opus, 2026-06-07)
+Close the seq-number follow-up surfaced by Increment 9: Rust's V2/V3 snapshot deserializer required
+`sequence-number`, but the spec MANDATES it default to 0 when absent on read — so Rust cannot parse a
+V1→V2-upgraded table that Java wrote (Java's `SnapshotParser` omits the field when ≤ 0).
+
+**Java + spec rule (verified against source):**
+- `format/spec.md` line 1979 ("Snapshot field `sequence-number` must default to 0" when reading v1 metadata)
+  + line 2002 ("`sequence-number` … is required; default to 0 when reading v1 metadata"). The line-949
+  "required" is a WRITER rule; the read-side rule mandates lenient default-to-0.
+- Java `SnapshotParser`: write omits `sequence-number` when `≤ INITIAL_SEQUENCE_NUMBER (0)` (lines 60-61);
+  read defaults absent → `INITIAL_SEQUENCE_NUMBER (0)` (lines 128-130). Verified in the live ref checkout.
+
+**Exact fields fixed (confirmed by reading the structs + their wiring in `table_metadata.rs`):**
+- `_serde::SnapshotV2.sequence_number` (snapshot.rs ~line 297) — the field used when deserializing a V2
+  snapshot inside `TableMetadataV2` (`table_metadata.rs:801` holds `Option<Vec<SnapshotV2>>`).
+- `_serde::SnapshotV3.sequence_number` (snapshot.rs ~line 274) — same for V3 (`table_metadata.rs:758` holds
+  `Option<Vec<SnapshotV3>>`). The V1 path already hard-codes `sequence_number: 0` (line 405).
+
+Plan:
+- [x] Add `#[serde(default)]` to `SnapshotV2.sequence_number` and `SnapshotV3.sequence_number` (default for
+      `i64` is 0 — exactly Java's `INITIAL_SEQUENCE_NUMBER`). WRITE behavior unchanged (Rust keeps emitting
+      the field; Java tolerates it). No change to the public `Snapshot` API.
+- [x] Tests (same change) in `spec/snapshot.rs`: deserialize a V2 snapshot JSON OMITTING `sequence-number`
+      → succeeds, `sequence_number() == 0` (the Java-written V1→V2-upgrade-carryover snapshot that fails
+      today); negative-control sibling with `sequence-number` present → that value preserved; same pair for
+      V3. Mutation-verify: removing `#[serde(default)]` makes the seq-omitted tests fail to parse.
+- [x] Docs: flip GAP_MATRIX "Snapshot model + refs" to a clean ✅ (remove the seq-0 / "scoped to
+      natively-written V2" caveat; note the spec-mandated lenient read is now honored); close the
+      seq-number follow-up; leave a NEW tracked follow-up for the SIBLING default-to-0 read fields
+      (`last-sequence-number`; manifest-list `sequence-number`/`min-sequence-number`; manifest/manifest-list
+      `content`) NOT verified/fixed here; append a dated lesson (the spec READ-rule). Update Roadmap.
+- [x] Verify gate from repo root.
+
+**Outcome (2026-06-07, Increment 10, BUILDER Opus):** the Increment-9 seq-number follow-up is **CLOSED**.
+Added `#[serde(default)]` to `_serde::SnapshotV2.sequence_number` AND `_serde::SnapshotV3.sequence_number`
+in `crates/iceberg/src/spec/snapshot.rs` — confirmed (by reading the structs + their wiring) these are the
+exact fields used when deserializing a snapshot inside V2/V3 `TableMetadata`: `TableMetadataV2`
+(`table_metadata.rs:801`) holds `Option<Vec<SnapshotV2>>` and `TableMetadataV3` (`:758`) holds
+`Option<Vec<SnapshotV3>>`. An absent `sequence-number` now reads as 0 (i64 default = Java
+`INITIAL_SEQUENCE_NUMBER`), mirroring the spec read rule (`format/spec.md` 1979 & 2002) and Java's
+`SnapshotParser` (write omits ≤ 0; read defaults absent → 0); the V1 path already hard-codes
+`sequence_number: 0`. WRITE behavior unchanged (Rust still emits the field; Java tolerates it); public
+`Snapshot` API unchanged. 4 tests added (V2/V3 seq-omitted → 0; V2/V3 seq-present → preserved);
+mutation-verified — stripping `#[serde(default)]` makes both seq-omitted tests fail with "missing field
+`sequence-number`", the seq-present controls still pass. **Verify:** build clean; lib ×2 = 1341/0 both
+runs (was 1337 → +4); interop `interop_manage_snapshots`/`interop_update_schema`/`interop_update_partition_spec`
+all stay 4/4; clippy -D warnings clean; fmt --check clean (one reflow on the new tests' long `.expect`
+strings, applied via `cargo fmt`). GAP_MATRIX "Snapshot model + refs" flipped to a CLEAN ✅ (seq-0 /
+"scoped to natively-written V2" caveat removed; spec-mandated lenient read noted). Files touched exactly
+the allowed set: `crates/iceberg/src/spec/snapshot.rs` (fix + 4 tests), `docs/parity/GAP_MATRIX.md`,
+`Roadmap.md`, `task/todo.md`, `task/lessons.md`. No Cargo/lockfile/other edits; no fixture file needed
+(inline JSON strings in the tests). An Opus REVIEWER verifies next.
+
+#### Increment 10 — tracked follow-up (NOT built here)
+- [ ] **Sibling spec-mandated default-to-0 read fields (reader-robustness pass).** The spec
+      (`format/spec.md` "Reading v1 metadata for v2", lines ~1979–1986) mandates default-to-0 on read for
+      MORE than the snapshot `sequence-number` fixed in Increment 10. These were **NOT verified or fixed**
+      in that change — a future reader-robustness pass should audit each against Java's parsers and add the
+      analogous lenient read where Rust is currently strict. **Reviewer note (2026-06-07): only the snapshot
+      `sequence-number` was a real _Java-omitted_ field; the rest are spec-robustness, NOT Java-interop
+      blockers** — distinguish them so this is neither over- nor under-stated:
+      - **Table metadata `last-sequence-number`** — spec mandates default-to-0 when reading v1 metadata, BUT
+        **Java ALWAYS writes it for V2+** (`TableMetadataParser.toJson` line 173: `if (formatVersion() > 1)
+        writeNumberField(LAST_SEQUENCE_NUMBER, ...)`, verified in the ref checkout), so Rust's required
+        `last_sequence_number` (`spec/table_metadata.rs::TableMetadataV2V3Shared`, no `#[serde(default)]`)
+        NEVER bites a Java-written V2/V3 table. It is a **spec-robustness gap for non-Java / hand-written
+        metadata only** — confirmed end-to-end by a reviewer probe (a V2 metadata.json with
+        `last-sequence-number` omitted fails Rust parsing with "data did not match any variant of untagged
+        enum TableMetadataEnum"; the same file with it present (=0) parses). Low priority: not on the
+        Java-interop path. Fix shape: `#[serde(default)]` on `last_sequence_number` (i64 → 0), but note the
+        V1→V2 `TryFrom` already validates `last_sequence_number == 0` for V1, so the gate stays correct.
+      - **Manifest list `sequence-number` / `min-sequence-number` / `content`; manifest entry
+        `sequence_number` / `file_sequence_number`; data file `content`** — these are **Avro** fields
+        (Java `V1Metadata`/`V2Metadata` manifest_file Avro schemas; Rust `spec/manifest_list.rs` +
+        `spec/manifest`), a **different read path** from the JSON-serde snapshot fix. Whether each is truly
+        Java-omitted (vs always-written) must be checked per field against the Avro schema's field default
+        before flipping — do not assume the snapshot `sequence-number` omit-when-≤0 pattern carries over.
+        Each fix is an Avro field default, not a `#[serde(default)]`.
+      Out of scope for the snapshot-only Increment 10; each needs its own Java-parser check + test.

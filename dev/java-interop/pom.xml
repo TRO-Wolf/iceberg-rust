@@ -44,6 +44,7 @@
     <!-- The Rust crate's testdata dirs, where fixtures are read/written (one per capability). -->
     <interop.fixtures.dir>${project.basedir}/../../crates/iceberg/testdata/interop/update_schema</interop.fixtures.dir>
     <interop.partition.fixtures.dir>${project.basedir}/../../crates/iceberg/testdata/interop/update_partition_spec</interop.partition.fixtures.dir>
+    <interop.manage_snapshots.fixtures.dir>${project.basedir}/../../crates/iceberg/testdata/interop/manage_snapshots</interop.manage_snapshots.fixtures.dir>
   </properties>
 
   <dependencies>
@@ -78,6 +79,10 @@
             <systemProperty>
               <key>interop.partition.fixtures.dir</key>
               <value>${interop.partition.fixtures.dir}</value>
+            </systemProperty>
+            <systemProperty>
+              <key>interop.manage_snapshots.fixtures.dir</key>
+              <value>${interop.manage_snapshots.fixtures.dir}</value>
             </systemProperty>
           </systemProperties>
         </configuration>

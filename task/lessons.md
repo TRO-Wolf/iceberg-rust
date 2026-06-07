@@ -484,3 +484,135 @@ How to use it (see the manuals' §2):
   partition.rs guard caught it. Added `test_partition_spec_evolution_rejects_void_named_after_a_different_
   source_column` driving the rejection end-to-end through `add_partition_spec`; it pins the source-id gate
   as a whole (the both-layers mutation fails it). Defense-in-depth still needs a test at the public door.
+
+### 2026-06-07 (Increment 9 — ManageSnapshots INTEROP, BUILDER Opus)
+- **DO build a snapshot-history base by adding ALL snapshots first, then refs, with `main` set LAST via
+  `setBranchSnapshot(long snapshotId, branch)` — and RE-PARSE the written base from disk before evolving.**
+  *Why:* two coupled Java traps when assembling a `TableMetadata` with a history for ManageSnapshots. (a)
+  `setBranchSnapshot(Snapshot, main)` stamps a snapshot-log entry; doing it mid-build (before the other
+  refs) plus the `setRef`-for-main ordering can land `lastUpdatedMillis` on an OLD snapshot's timestamp,
+  tripping `"Invalid update timestamp …: before last snapshot log entry"` at `TableMetadata.<init>`. Adding
+  all snapshots, then `dev`/`stable`, then `main` LAST keeps the single snapshot-log entry at CURRENT's ts
+  and `lastUpdatedMillis` monotone. (b) `TableMetadata.buildFrom(base)` COPIES `base.changes`
+  (`AddSnapshot` entries), and `internalApply`/`setRef` use `isAddedSnapshot(id)` to decide a rollback's
+  snapshot-log `timeOfChange` (`snapshot.timestampMillis()` for added, else `lastUpdatedMillis`). Evolving
+  from the freshly-built in-memory base makes ROOT look "just added" → rollback stamps ROOT's old ts →
+  same guard trips. A re-parsed (`TableMetadataParser.fromJson`) base has EMPTY changes — exactly what the
+  Rust test and the Java `verify` step both load. Generate must round-trip the base through disk too.
+- **DO recover the typed ref model by serializing the evolved `TableMetadata` to a `serde_json::Value` and
+  re-parsing its `refs` object into `HashMap<String, SnapshotReference>` — there is NO public `refs()`
+  accessor.** *Why:* `TableMetadata.refs` is `pub(crate)`, and the only public ref accessor
+  (`snapshot_for_ref`) returns a `Snapshot`, which DROPS the branch-vs-tag kind and the three retention
+  fields — the exact things the ManageSnapshots interop must compare. `SnapshotReference`/`SnapshotRetention`
+  are public and serde-round-trippable, so `serde_json::to_value(&meta)["refs"]` → typed map gives the full
+  ref model with zero production change. Compare the refs map (`SnapshotReference: PartialEq` covers
+  snapshot-id + kind + all retention) + `current_snapshot_id()`; do NOT compare the snapshot list (ref ops
+  leave it unchanged) or raw JSON (Jackson vs serde_json key-order/whitespace).
+- **FLAG, DON'T BURY: Rust's `_serde::SnapshotV2.sequence_number` is required; Java's `SnapshotParser`
+  omits `sequence-number` when it equals `INITIAL_SEQUENCE_NUMBER` (0).** *Why it bites:* a Java-written V2
+  metadata whose snapshot has `sequence-number == 0` does NOT parse in Rust (`data did not match any variant
+  of untagged enum TableMetadataEnum`). This is a genuine latent READ divergence — but the spec
+  (`format/spec.md` line 949) marks snapshot `sequence-number` **required** in V2/V3, so adding
+  `#[serde(default)]` would diverge from the spec and could mask malformed metadata; and a seq-0 V2 snapshot
+  only arises as a V1-carryover artifact (real V2 assigns seq ≥ 1). *Decision for a ref-operation
+  increment:* did NOT touch production — out of scope, and the spec-vs-Java tension needs its own
+  adjudication. Sidestepped by giving the fixture V2-realistic sequence numbers (1/2/3, not 0/1/2), which
+  keeps Java emitting every `sequence-number` and the fixture spec-faithful. Pinned the observation in
+  GAP_MATRIX/Roadmap/README so the reviewer (or a future Phase-1-tail increment) can decide whether to relax
+  Rust's reader.
+- **DO revert incidental fixture churn from `run.sh` that lands outside your increment's scope.** *Why:*
+  `run.sh` regenerates ALL THREE capabilities' fixtures, and `base.metadata.json` carries a random
+  `table-uuid` + a wall-clock `last-updated-ms`, so a full run shows the schema/partition fixtures as
+  "modified" even though only the noise changed. They are NOT in this increment's allowed-edit set —
+  `git checkout -- testdata/interop/{update_schema,update_partition_spec}` restored them byte-for-byte. Only
+  the new `manage_snapshots/**` fixtures are mine to add.
+
+### 2026-06-07 (Increment 9 — ManageSnapshots INTEROP, REVIEWER Opus)
+- **DO read the spec's version-compat "Reading vN metadata for vN+1" section, not just the field
+  required/optional table, before calling a reader-leniency a spec divergence.** *Why:* the builder
+  flagged the V2 `sequence-number` read gap (Java omits it when 0; Rust's `_serde::SnapshotV2.sequence_number`
+  is a required `i64` with no `#[serde(default)]`, so a seq-omitted V2 metadata fails with `data did not
+  match any variant of untagged enum TableMetadataEnum`) — VERIFIED by probe, real bug. But the builder's
+  *rationale* for deferring ("adding `#[serde(default)]` would DIVERGE from the spec, which marks
+  `sequence-number` required at `format/spec.md` line 949") is WRONG. The same spec, lines 1979 & 2002,
+  says: "Snapshot field `sequence-number` **must default to 0** when reading v1 metadata [as v2]." The
+  "required" on line 949 is a WRITER rule (write it when non-zero); the READER rule explicitly mandates
+  defaulting absent→0 — exactly what Java's `SnapshotParser` does (write omits ≤0 at line 60; read defaults
+  to `INITIAL_SEQUENCE_NUMBER` at line 128). So Rust's strict reader is a spec-VIOLATION on the read side,
+  not stricter-than-spec. The Rust V1 path already hard-codes `sequence_number: 0` (`snapshot.rs` line 405),
+  so the fix is the directly-analogous one-liner `#[serde(default)]` on `SnapshotV2.sequence_number` (and
+  `SnapshotV3`). RECOMMENDATION: FIX (small spec-mandated reader-leniency, ships with a seq-omitted-V2
+  parse test), not track — the blast radius is real (a V1→V2-upgraded table keeps pre-upgrade snapshots at
+  seq 0, since `upgradeFormatVersion` only bumps the version and does not rewrite snapshot seqs, so its
+  emitted V2 metadata is unreadable by Rust today). Deferred here only because it is a production-reader
+  edit outside this REF-OP increment's flagged scope — a human should action it as a tiny standalone change.
+- **DO mutation-verify that an interop pin catches the regression its doc comment CLAIMS to catch — a
+  near-boundary timestamp does not pin a strict-`<`.** *Why:* the `rollback_to_time` interop scenario uses
+  `ROOT_TS_MS + 1`, whose comment claimed it "cross-checks the strict-`<` semantics." It does NOT: under a
+  `<`→`<=` mutation of `find_latest_ancestor_older_than` the interop pin still PASSED (CURRENT's timestamp
+  is ~40e9 ms above `ROOT_TS_MS+1`, so ROOT is selected either way). Only the pre-existing unit test
+  `test_rollback_to_time_strict_less_than_skips_equal_timestamp` (which sits EXACTLY on CURRENT's timestamp)
+  caught it. Strengthened the interop pin to also roll to a timestamp EQUAL to `CURRENT_TS_MS` and assert it
+  falls back to ROOT (not CURRENT) — mutation-verified it now FAILs under `<=`. The boundary, not a point
+  near it, is what pins a strict inequality.
+
+### 2026-06-07 (Increment 10 — V2/V3 snapshot `sequence-number` lenient read, BUILDER Opus)
+- **DO read the spec's WRITER rule AND its READER rule separately — a field marked "required" on write may
+  be explicitly mandated to DEFAULT on read.** *Why:* the Iceberg spec field table (`format/spec.md` line
+  949) marks snapshot `sequence-number` _required_ in v2/v3, which an earlier increment read as "the reader
+  must reject an absent value." But the same spec's "Reading v1 metadata for v2" section (lines 1979 & 2002)
+  says `sequence-number` **must default to 0** when absent on read — that is the authoritative read rule, and
+  Java's `SnapshotParser` implements exactly it (write omits the field when `<= INITIAL_SEQUENCE_NUMBER` (0),
+  L60-61; read defaults an absent field to `INITIAL_SEQUENCE_NUMBER` (0), L128-130). The "required" is a
+  WRITER obligation (emit it when non-zero), NOT a reader strictness. A strict Rust reader (`_serde::Snapshot
+  V2/V3.sequence_number` with no `#[serde(default)]`) therefore VIOLATED the spec's read side, not exceeded
+  it — it failed to parse a Java-written V1→V2-upgrade table (`upgradeFormatVersion` bumps the version without
+  rewriting pre-upgrade snapshot seqs, so those snapshots stay seq-0 → Java omits the field → Rust errored
+  "missing field `sequence-number`" / "data did not match any variant of untagged enum TableMetadataEnum").
+  Fix = `#[serde(default)]` on both `SnapshotV2.sequence_number` and `SnapshotV3.sequence_number` (i64 default
+  is 0 = `INITIAL_SEQUENCE_NUMBER`), mirroring the V1 `try_from` path that already hard-codes `sequence_number:
+  0`. _Supersedes the Increment-9 builder's "spec marks it required → defaulting would diverge" rationale
+  (lessons entry above + the GAP_MATRIX note), which conflated the writer rule with the reader rule._
+- **DO confirm WHICH serde struct backs the on-disk read before annotating it.** *Why:* a snapshot inside
+  `TableMetadata` deserializes through the version-specific `_serde::SnapshotV{1,2,3}` structs, not the public
+  `Snapshot` — `TableMetadataV2` (`table_metadata.rs:801`) holds `Option<Vec<SnapshotV2>>` and
+  `TableMetadataV3` (`:758`) holds `Option<Vec<SnapshotV3>>`. The `#[serde(default)]` must go on the
+  `sequence_number` field of those `_serde` structs (the ones with the actual `i64`), not on the public
+  `Snapshot` (whose field is populated by the `From`/`TryFrom` conversion, never by serde directly). Read the
+  struct + grep its use in `table_metadata.rs` before guessing.
+- **DO keep WRITE behavior unchanged when relaxing a READ.** *Why:* `#[serde(default)]` only affects
+  deserialization; Rust keeps emitting `sequence-number` on write (Java tolerates a written seq-0 field — its
+  parser reads any present value, and only the WRITER omits ≤ 0). The lenient read is purely additive: every
+  existing seq-present snapshot parses identically; only the previously-erroring seq-absent case now succeeds
+  as 0. Mutation-verify the new tests by STRIPPING the attribute (seq-omitted tests must fail "missing field")
+  while the seq-present negative-control tests still pass — that proves the attribute is load-bearing and not
+  clobbering supplied values.
+- **DO inline the JSON fixture in the test rather than adding a testdata file when the input is a single
+  small record.** *Why:* a kebab-case snapshot JSON literal (`snapshot-id`/`manifest-list`/`summary`/...) in
+  the test body is self-documenting, keeps the risk + the data co-located, and avoids a fixture file that the
+  reader has to go find. Reserve `crates/iceberg/testdata/` for multi-record / cross-test fixtures.
+
+### 2026-06-07 (Increment 10 — V2/V3 snapshot `sequence-number` lenient read, REVIEWER Opus)
+- **DO probe a "this unblocks table-class X" claim END-TO-END through the actual top-level reader, not just
+  the leaf struct, AND mutation-confirm the leaf fix is what unblocks it.** *Why:* the snapshot
+  `#[serde(default)]` fix is on `_serde::SnapshotV{2,3}.sequence_number`, but the claim is that a whole
+  V1→V2-upgrade `TableMetadata` JSON now parses. Verified by feeding a realistic Java-shaped V2 metadata
+  (format-version 2, `last-sequence-number: 0` PRESENT, carryover snapshot with `sequence-number` OMITTED)
+  to `serde_json::from_str::<TableMetadata>` (the production path via `#[serde(try_from =
+  "TableMetadataEnum")]`, untagged enum): it parses (`last_sequence_number=0`, snapshot `sequence_number=0`).
+  Reverting the leaf `#[serde(default)]` makes that SAME top-level parse FAIL ("data did not match any
+  variant of untagged enum TableMetadataEnum") — proving the leaf fix is the load-bearing cause, not an
+  incidental pass. A leaf-only test (`SnapshotV2` in isolation) does NOT prove the end-to-end class is read.
+- **DO distinguish a real _Java-omitted_ field from a _spec-robustness-only_ one when tracking a
+  reader-leniency follow-up — verify the Java WRITER, not just the spec's read table.** *Why:* the spec's
+  "Reading v1 metadata for v2" list (`format/spec.md` 1979–1986) mandates default-to-0 for several fields,
+  which reads like a uniform set of interop gaps. But `TableMetadataParser.toJson` (line 173) ALWAYS writes
+  `last-sequence-number` for `formatVersion > 1`, so Java NEVER emits a V2/V3 file omitting it — Rust's
+  required `last_sequence_number` is therefore a spec-robustness gap for hand-written / non-Java metadata,
+  NOT a Java-interop blocker (probe-confirmed: a `last-sequence-number`-omitted V2 JSON fails Rust parsing,
+  but Java never produces that JSON). Only the snapshot `sequence-number` (Java omits when ≤ 0) was a true
+  Java-omitted field. The manifest-list/manifest/data-file `content`/`sequence-number` siblings are Avro
+  fields on a different read path whose omit-vs-always-write status needs per-field Avro-schema checking —
+  do not assume the snapshot omit-when-≤0 pattern carries over. Sharpened the Increment-10 follow-up to say
+  this so the next agent neither over-prioritizes `last-sequence-number` as interop-critical nor assumes the
+  Avro fields are trivially the same shape.

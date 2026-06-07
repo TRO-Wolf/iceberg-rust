@@ -75,11 +75,23 @@ layers are removed in Phase 0.
    **`UpdatePartitionSpec` is now ✅ too** (bidirectional interop landed 2026-06-07 via the same
    `dev/java-interop/` oracle — one `generate`/`verify` pass now covers both schema + partition; the
    interop surfaced and fixed a real Rust↔Java divergence in the partition-name↔schema collision check —
-   identity-only → identity-OR-void, mirroring Java's bind path). **The next move is the V3 groundwork
+   identity-only → identity-OR-void, mirroring Java's bind path). **`ManageSnapshots` (the ref-operation
+   surface) is now ✅ too** (bidirectional interop landed 2026-06-07 via the same `dev/java-interop/`
+   oracle — one `generate`/`verify` pass now covers all THREE capabilities (schema + partition +
+   manage-snapshots), 7 manage-snapshots scenarios both directions green via
+   `crates/iceberg/tests/interop_manage_snapshots.rs`; both the "Snapshot model + refs" and the
+   ref-operation surface of "Snapshot management" flipped to ✅). **`cherrypick` is NOT interop-proven and
+   stays Phase-2-gated** (it extends `MergingSnapshotProducer` / replays data files). The interop surfaced
+   a Rust read divergence (the V2/V3 snapshot reader required `sequence-number` while the spec and Java
+   default an absent value to 0 on read) — **FIXED 2026-06-07** with `#[serde(default)]` on
+   `_serde::SnapshotV2`/`SnapshotV3.sequence_number`, so Rust now reads the seq-0 V1→V2-upgrade-carryover
+   tables Java emits. (Sibling spec default-to-0 read fields — `last-sequence-number`, manifest-list
+   `sequence-number`/`min-sequence-number`, manifest/manifest-list `content` — remain a future
+   reader-robustness pass.)
+   **With all three Phase-1 evolution capabilities now interop-proven, the next move is the V3 groundwork
    (row-lineage fields; the remaining `MIN_FORMAT_VERSIONS` types — `variant`/`unknown`/`geometry`/
-   `geography` — each a one-line `min_format_version` arm when the type lands) and applying the same
-   interop harness to flip the last 🟡 row (`ManageSnapshots`) to ✅.** The live, increment-level plan
-   and checkbox
+   `geography` — each a one-line `min_format_version` arm when the type lands).** The live, increment-level
+   plan and checkbox
    state are in
    [task/todo.md](task/todo.md) — read it (and [task/lessons.md](task/lessons.md) in full) before starting.
 3. Verify the build before and after each change:
@@ -116,9 +128,12 @@ Java interop round-trip via `dev/java-interop/` + `crates/iceberg/tests/interop_
 **partition evolution (`UpdatePartitionSpec`) is ✅ too** (full `BaseUpdatePartitionSpec` parity + a
 bidirectional Java interop round-trip via the same oracle + `crates/iceberg/tests/interop_update_partition_spec.rs`,
 which surfaced and fixed a real partition-name↔schema collision divergence); **snapshot management
-(`ManageSnapshots`) remains partial (🟡)** (branch/tag lifecycle + rollback + rollback-to-time +
-fast-forward + retention (non-positive rejected); `cherrypick` is Phase-2-gated and a Java interop
-round-trip remains before ✅); the
+(`ManageSnapshots`) — the ref-operation surface — is ✅ now too** (branch/tag lifecycle + rollback +
+rollback-to-time + set-current + fast-forward + retention (non-positive rejected), bidirectionally
+interop-proven via the same oracle + `crates/iceberg/tests/interop_manage_snapshots.rs`, 7 scenarios both
+directions; both "Snapshot model + refs" and the ref-op surface of "Snapshot management" flipped to ✅).
+**`cherrypick` is NOT interop-proven and stays Phase-2-gated** (it extends `MergingSnapshotProducer` /
+replays data files); the
 **write engine beyond fast-append, incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
