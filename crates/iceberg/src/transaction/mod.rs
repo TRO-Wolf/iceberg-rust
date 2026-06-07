@@ -60,6 +60,7 @@ mod sort_order;
 mod update_location;
 mod update_partition_spec;
 mod update_properties;
+mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
 
@@ -78,6 +79,7 @@ use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
+use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
@@ -158,6 +160,12 @@ impl Transaction {
     /// Creates an update-partition-spec action (partition evolution: add/remove/rename fields).
     pub fn update_partition_spec(&self) -> UpdatePartitionSpecAction {
         UpdatePartitionSpecAction::new()
+    }
+
+    /// Creates an update-schema action (schema evolution: add/rename/update/delete/move columns,
+    /// identifier fields, union-by-name).
+    pub fn update_schema(&self) -> UpdateSchemaAction {
+        UpdateSchemaAction::new()
     }
 
     /// Set the location of table

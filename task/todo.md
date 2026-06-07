@@ -150,3 +150,130 @@ historical name DIFFERS from the requested name — Java assigns a fresh id, Rus
 still recycle by (source,transform); narrow, spec-favoring, and not separately gated here. Both noted for
 the ✅ flip.
 
+### Increment 3 (prereq) — Type-promotion helper for UpdateSchema (IN PROGRESS, 2026-06-07, Actor A2)
+New file `crates/iceberg/src/spec/schema/type_promotion.rs`; wired via one `mod` + `pub(crate) use`
+line in `crates/iceberg/src/spec/schema/mod.rs`. Pure, self-contained spec module — no transaction dep.
+
+Contract: mirror Java `TypeUtil.isPromotionAllowed(Type from, Type.PrimitiveType to)`
+(`/tmp/iceberg-java-ref/.../types/TypeUtil.java` lines 440–466), verified against the source (not the
+digest paraphrase). The switch has EXACTLY three branches + an identity short-circuit:
+- `from.equals(to)` (Type-level) ⇒ allowed (no-op / identity).
+- `INTEGER` ⇒ allowed iff `to == LONG`.
+- `FLOAT`  ⇒ allowed iff `to == DOUBLE`.
+- `DECIMAL`⇒ allowed iff `to` is DECIMAL AND `from.scale == to.scale` AND `from.precision <= to.precision`.
+- everything else ⇒ forbidden.
+
+Plan:
+- [x] Implement `ensure_promotion_allowed(from: &Type, to: &PrimitiveType) -> Result<()>` (+ boolean
+      core `is_promotion_allowed`): Ok(()) when allowed; Err(ErrorKind::DataInvalid,
+      "{from} cannot be promoted to {to}") otherwise, mirroring Java `CheckCompatibility.primitive`.
+- [x] Wired into schema/mod.rs as `mod type_promotion;` + `pub use self::type_promotion::{...}` (both
+      fns are `pub` — task asked for a *public* helper, matches Java's `public static`, and avoids the
+      dead-code warning that `pub(crate)` would raise since UpdateSchema does not exist yet).
+- [x] 21 unit tests (6 allowed + 15 rejected; `rejects_struct_from_to_primitive` covers struct/list/map).
+      Each names the risk; rejection tests assert exact ErrorKind::DataInvalid + exact message.
+      Mutation-verified: dropping `from_scale == to_scale` fails `rejects_decimal_scale_change...`.
+
+**Outcome (2026-06-07, Actor A2):** Shipped `crates/iceberg/src/spec/schema/type_promotion.rs` +
+two lines in `schema/mod.rs`. Public API: `is_promotion_allowed(&Type, &PrimitiveType) -> bool` and
+`ensure_promotion_allowed(&Type, &PrimitiveType) -> Result<()>` (re-exported via `spec::*`). Verify:
+build clean; lib suite 1233/0 ×2; clippy -D warnings clean; fmt clean. **DEVIATION:** task brief listed
+`date->timestamp` as allowed — Java's `TypeUtil.isPromotionAllowed` has NO DATE branch, so it is
+implemented as REJECTED (matches Java + digest §6 pt5). Flagged in final report. No interop test (no
+Java-written fixture for a pure type-check helper; the UpdateSchema interop test will exercise it).
+
+**DEVIATION FROM TASK PROMPT (flag in final report):** the task brief said "cover ... date->timestamp"
+as an allowed promotion. The authoritative Java source `TypeUtil.isPromotionAllowed` has NO `DATE` case
+— `date -> timestamp` is FORBIDDEN in Java (confirmed by reading the source + the run's digest §6 pt 5).
+Implementing it would diverge from Java and fail interop. Per the contract ("verify against the Java
+source, not intuition"), I implement the real Java matrix (date→timestamp REJECTED) and surface this.
+
+### Increment 3 — UpdateSchema transaction action (IN PROGRESS, 2026-06-07, Actor A1 Opus)
+New file `crates/iceberg/src/transaction/update_schema.rs`; wired into `transaction/mod.rs`
+(`mod` + `use` + `pub fn update_schema()`). Full Java parity with `SchemaUpdate`. Builder records ops;
+`commit()` replays Java's state machine against `metadata().current_schema()`, builds the new `Schema`
+via a recursive `ApplyChanges` walk (mirrors Java `SchemaUpdate.ApplyChanges` SchemaVisitor), and emits
+`AddSchema` + `SetCurrentSchema{-1}` guarded by `LastAssignedFieldIdMatch` + `CurrentSchemaIdMatch`.
+
+Inputs/outputs/contract: builder methods (add_column/add_required_column/rename_column/update_column/
+update_column_doc/make_column_optional/require_column/delete_column/move_*/set_identifier_fields/
+union_by_name_with/case_sensitive/allow_incompatible_changes) record `SchemaOp`s; `commit(&Table)`
+resolves them in order against the current schema and returns `ActionCommit::new(updates, requirements)`.
+
+Edge cases / risks (Risk-First): fresh field-id assignment for nested adds (reuse `ReassignFieldIds`);
+type-promotion accept+reject (call `ensure_promotion_allowed`); add-required gating on
+`allow_incompatible_changes`; optional→required gating (+ defaulted-add path); identifier-field
+validation (exists/required/primitive/not-deleted/not-nested-in-map-or-list); move self-ref / cross-struct
+/ non-struct-parent rejections; delete vs add/update/rename conflict matrix; map-key immutability;
+case-insensitive resolution. DEVIATION: Rust `TableUpdate::AddSchema` has NO `last_column_id` field
+(only `ViewUpdate::AddSchema` does) — the builder's `add_schema` derives last_column_id from
+`schema.highest_field_id()`. Requirements: Java `UpdateRequirements` attaches BOTH
+`AssertLastAssignedFieldId(base.lastColumnId())` (for AddSchema) AND `AssertCurrentSchemaID`
+(for SetCurrentSchema) — confirmed in `UpdateRequirements.java` lines 131-142. We emit both.
+
+Plan:
+- [x] Builder + `SchemaOp` enum recording all op families; case_sensitive + allow_incompatible flags.
+- [x] `SchemaEvolution` state machine (mirrors `SchemaUpdate` fields: deletes/updates/added-name-to-id/
+      parent-to-added-ids/moves/identifier-field-names/last_column_id) replaying ops with Java's
+      precondition checks; fresh-id assignment via a self-contained `assign_fresh_ids` walk (the schema
+      module's `ReassignFieldIds` is crate-private and unreachable from `transaction/`, and is for
+      whole-schema reassignment; a local walk mirrors Java `TypeUtil.assignFreshIds` for a single add).
+- [x] `apply()` recursive rebuild → new `Schema` (deletes drop, updates replace, adds append to parent
+      struct, moves reorder; map-key immutability + list/map-value rules); identifier-field validation
+      delegated to `Schema::builder` (spec rules) after re-resolving names to fresh ids.
+- [x] `commit()` emits AddSchema + SetCurrentSchema{-1} + LastAssignedFieldIdMatch(last_column_id) +
+      CurrentSchemaIdMatch(current_schema_id) — both guards per Java `UpdateRequirements` (lines 131-142).
+- [x] 46 unit tests (≥1 happy + ≥1 negative per op family); nested fixture built fresh via
+      `TableMetadataBuilder::new` (no stale sort order / identifier set).
+- [x] Verify: build clean; lib test ×2 = 1279/0 both runs (stable); clippy -D warnings clean; fmt clean.
+
+**Outcome (2026-06-07, Actor A1 Opus):** `UpdateSchemaAction` lands at SchemaUpdate parity (builder +
+state machine + recursive apply). Public ctor `Transaction::update_schema()`. **DEVIATIONS (flagged):**
+(1) Rust `TableUpdate::AddSchema` has NO `last_column_id` field (only `ViewUpdate::AddSchema` does) — the
+brief said emit `AddSchema{schema, last_column_id}`; we emit `AddSchema{schema}` and the metadata builder
+derives last_column_id from `schema.highest_field_id()`. (2) Column DEFAULTS are not plumbed through the
+builder API yet (the `addColumn(..., Literal)` / `updateColumnDefault` / `addRequiredColumn(..., default)`
+Java overloads) — `NestedField` supports initial/write defaults but the action's builder methods do not
+take a default, so the "required add WITH default needs no flag" and "defaulted-add can be made required"
+Java paths are present in the state machine (`is_defaulted_add`) but unreachable from the public API. (3)
+`union_by_name_with` is a pragmatic name-driven merge over struct fields (add-new / promote-widening /
+apply-doc / keep-wider-on-narrowing), NOT a port of Java's full `UnionByNameVisitor` (which also handles
+list/map element promotion and required→optional). **Deferred to ✅:** column-default builder overloads;
+full UnionByNameVisitor parity (nested list/map element merge); Java interop round-trip.
+
+#### Increment 3 — REVIEW remediation (2026-06-07, Opus actor, post 3-critic review)
+Three perspective-diverse critics reviewed the UpdateSchema action. Verified each VERIFIED-REAL finding
+against the Java source before acting. Scope: `transaction/update_schema.rs`, `spec/schema/mod.rs`
+(lowercase index), docs. Plan:
+
+- [x] **BLOCKER — nested field-id order (depth-first → level-order).** Rewrote `assign_fresh_ids`:
+      struct assigns ALL immediate ids in pass 1 then recurses in pass 2; map assigns key_id then value_id
+      FIRST then recurses key then value. Confirmed against `AssignFreshIds`/`CustomOrderSchemaVisitor` +
+      `testAddNestedMapOfStructs`. Pinned by 3 exact-id tests (map<struct,struct>, list<struct>,
+      struct{struct,prim}). Mutation-verified: depth-first map arm gives value-id 8 vs Java's 4.
+- [x] **MAJOR — union_by_name full `UnionByNameVisitor` parity** (findings #1,#3,#4,#5,#6,#7,#8). Rewrote
+      `union_struct` into `union_update_existing` + `union_recurse_into` + `union_nested_member` +
+      free fn `is_ignorable_type_update`. Routes existing-field changes through `update_column`/
+      `update_column_requirement`/`update_column_doc`; rejects incompatible primitive + complex↔primitive
+      changes ("Cannot change column type"); relaxes required→optional; recurses struct/list/map. Added
+      9 union tests (nested struct add, list<struct> nested add, required→optional, incompatible-primitive
+      reject, list→primitive reject, mirrored no-op, doc-only). Mutation-verified the reject path.
+- [x] **MAJOR — case-insensitive lowercase-name collision** (`spec/schema/mod.rs`). Added
+      `build_lowercase_name_index` rejecting collisions with the exact Java message (smaller field-id
+      first → `data and DATA collide`). 2 tests (collision rejected + distinct-lowercase accepted).
+      Mutation-verified against the old `.collect()`.
+- [x] **MINOR (test rigor)** — added exact-`ErrorKind::DataInvalid`+message asserts on 3 high-value
+      negatives (ambiguous-name, delete-with-updates, move-before-itself); identifier id-stability tests
+      (rename + move keep the identifier id); list-element struct move; delete+re-add+move.
+- [x] **SKIP/TRACK — column defaults (#10).** Not fixed: plumbing `initial/write` defaults is a
+      signature-changing API expansion beyond the named scope (§6). Tracked as the residual gap for the
+      ✅ flip; row stays 🟡. (Finding #10's own recommendation explicitly allows tracking it as a gap.)
+- [x] Reconciled GAP_MATRIX (UpdateSchema ❌ → 🟡) + headline gaps; Roadmap Phase 1 progress +
+      snapshot/"next move"/current-state lines; appended dated lessons. Verification gate run last.
+
+**Outcome (2026-06-07, Opus remediation):** all 9 VERIFIED-REAL code findings fixed (1 blocker, 4 majors
+collapsed into 2 rewrites — union + lowercase, plus 4 test-coverage/rigor findings); 1 finding (#10
+column defaults) tracked as a scoped-out parity gap. Files touched: `transaction/update_schema.rs`,
+`spec/schema/mod.rs`, `transaction/mod.rs` (NOT edited — already wired), GAP_MATRIX, Roadmap, todo,
+lessons. **Verify:** build clean; lib test ×2 = 1298/0 both runs (stable); clippy -D warnings clean; fmt
+clean. update_schema 46 → 63 tests; +2 schema-build tests. Row stays 🟡 (defaults + Java interop deferred).

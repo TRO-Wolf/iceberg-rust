@@ -28,6 +28,7 @@ pub(super) mod _serde;
 mod id_reassigner;
 mod index;
 mod prune_columns;
+mod type_promotion;
 use bimap::BiHashMap;
 use itertools::{Itertools, zip_eq};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,7 @@ use self::_serde::SchemaEnum;
 use self::id_reassigner::ReassignFieldIds;
 use self::index::{IndexByName, index_by_id, index_parents};
 pub use self::prune_columns::prune_columns;
+pub use self::type_promotion::{ensure_promotion_allowed, is_promotion_allowed};
 use super::NestedField;
 use crate::error::Result;
 use crate::expr::accessor::StructAccessor;
@@ -91,6 +93,49 @@ pub struct SchemaBuilder {
     reassign_field_ids_from: Option<i32>,
 }
 
+/// Build the case-insensitive (lower-cased) name → field-id index, rejecting any two distinct columns
+/// whose names differ only by case — the Rust mirror of Java `TypeUtil.indexByLowerCaseName`, which
+/// throws `IllegalArgumentException` rather than silently dropping a collision into a `HashMap`.
+///
+/// `name_to_id` is the case-sensitive index and `id_to_name` its inverse (used only to render the
+/// offending full names in the error). A collision between two fields that share a field id (impossible
+/// in a well-formed schema, but cheap to allow) is not an error. To keep the message deterministic
+/// despite `HashMap` iteration order, the field with the smaller id is reported first — matching Java,
+/// where the first-visited (lower-id) name lands in the map before the colliding one.
+fn build_lowercase_name_index(
+    name_to_id: &HashMap<String, i32>,
+    id_to_name: &HashMap<i32, String>,
+) -> Result<HashMap<String, i32>> {
+    let mut lowercase_name_to_id: HashMap<String, i32> = HashMap::with_capacity(name_to_id.len());
+    for (name, &field_id) in name_to_id {
+        let key = name.to_lowercase();
+        if let Some(&existing_id) = lowercase_name_to_id.get(&key)
+            && existing_id != field_id
+        {
+            // Report the smaller-id field first so the message is order-independent.
+            let (first_id, second_id) = if existing_id <= field_id {
+                (existing_id, field_id)
+            } else {
+                (field_id, existing_id)
+            };
+            let first = id_to_name
+                .get(&first_id)
+                .map(String::as_str)
+                .unwrap_or(name);
+            let second = id_to_name
+                .get(&second_id)
+                .map(String::as_str)
+                .unwrap_or(name);
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Cannot build lower case index: {first} and {second} collide"),
+            ));
+        }
+        lowercase_name_to_id.insert(key, field_id);
+    }
+    Ok(lowercase_name_to_id)
+}
+
 impl SchemaBuilder {
     /// Add fields to schema builder.
     pub fn with_fields(mut self, fields: impl IntoIterator<Item = NestedFieldRef>) -> Self {
@@ -144,10 +189,7 @@ impl SchemaBuilder {
             index.indexes()
         };
 
-        let lowercase_name_to_id = name_to_id
-            .iter()
-            .map(|(k, v)| (k.to_lowercase(), *v))
-            .collect();
+        let lowercase_name_to_id = build_lowercase_name_index(&name_to_id, &id_to_name)?;
 
         let highest_field_id = id_to_field.keys().max().cloned().unwrap_or(0);
 
@@ -464,6 +506,43 @@ mod tests {
         assert_eq!(Some(&field1), schema.field_by_id(1));
         assert_eq!(Some(&field2), schema.field_by_id(2));
         assert_eq!(None, schema.field_by_id(3));
+    }
+
+    // RISK: two columns whose names differ only by case must be rejected at build time with the exact
+    // Java `TypeUtil.indexByLowerCaseName` message — silently collapsing them into one lowercase index
+    // entry (the old `.collect()` behavior) would let a case-insensitive evolution build an ambiguous
+    // schema where "data" and "DATA" both resolve to the same id.
+    #[test]
+    fn test_build_rejects_case_insensitive_name_collision() {
+        let result = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "DATA", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build();
+        let error = result.expect_err("case-colliding column names must fail to build");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert_eq!(
+            error.message(),
+            "Cannot build lower case index: data and DATA collide",
+            "message must mirror Java TypeUtil.indexByLowerCaseName (smaller field id first)"
+        );
+    }
+
+    // RISK: the collision guard must NOT reject a schema whose names are merely distinct after
+    // lower-casing — a false positive here would block every legal schema with same-prefix columns.
+    #[test]
+    fn test_build_accepts_distinct_lowercase_names() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "Data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "info", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("distinct lowercase names must build");
+        assert!(schema.field_by_name_case_insensitive("DATA").is_some());
+        assert!(schema.field_by_name_case_insensitive("INFO").is_some());
     }
 
     pub fn table_schema_simple<'a>() -> (Schema, &'a str) {

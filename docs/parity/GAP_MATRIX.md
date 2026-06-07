@@ -58,7 +58,7 @@
 | V3 types: unknown | ❌ | `types/Types.java` | none |
 | Column default values (initial/write) | ✅ | `Schema`/`Types` | `spec/datatypes.rs` `NestedField` carries `initial_default`/`write_default` |
 | Partition transforms (identity/bucket/truncate/year/month/day/hour/void) | ✅ | `api/.../transforms/` | `spec/transform.rs` |
-| Schema evolution (`UpdateSchema`) | ❌ | `api/UpdateSchema.java` | no transaction action |
+| Schema evolution (`UpdateSchema`) | 🟡 | `api/UpdateSchema.java`, `core/SchemaUpdate.java`, `schema/UnionByNameVisitor.java` | `transaction/update_schema.rs`: add/add-required (allow-incompatible gated), rename, update-type (promotion-gated), update-doc, make-optional/require, delete, move first/before/after (struct-local, cross-struct rejected), set-identifier-fields (exists/required/primitive/not-deleted rules; id-stable across rename/move), `union_by_name_with` at full `UnionByNameVisitor` parity (add new incl. nested under list/map structs; relax required→optional; legal promotion; reject incompatible primitive + complex↔primitive type changes; doc; mirrored no-op). Fresh nested field-id assignment is **level-order** (Java `AssignFreshIds`/`CustomOrderSchemaVisitor`: struct assigns all immediate ids then descends; map assigns key-id then value-id first) — pinned by `testAddNestedMapOfStructs`/`testAddNestedListOfStructs` exact-id tests. Case-insensitive lowercase-name collisions rejected at `Schema::build` (`Cannot build lower case index: a and b collide`, Java `TypeUtil.indexByLowerCaseName`). Emits `AddSchema`+`SetCurrentSchema{-1}` with `LastAssignedFieldIdMatch`+`CurrentSchemaIdMatch`. 63 unit tests (+ 2 schema-build collision tests). **Pending ✅:** column initial/write **defaults** not plumbed through the builder API (the `addColumn(..,Literal)`/`updateColumnDefault`/`addRequiredColumn(..,default)` Java overloads) — tracked gap; Java interop round-trip. |
 | Partition evolution (`UpdatePartitionSpec`) | 🟡 | `api/UpdatePartitionSpec.java`, `core/BaseUpdatePartitionSpec.java` | `transaction/update_partition_spec.rs`: add/add-with-transform (Java `PartitionNameGenerator` auto-naming), remove-by-name/by-transform, rename, `add_non_default_spec`, `case_sensitive`; full `BaseUpdatePartitionSpec` parity — dup-name/redundant-time-transform/remove-newly-added/rename+delete guards, delete-then-readd rewrite, V1 alwaysNull (void) replacement, and `recycleOrCreatePartitionField` (recycles a historical field's id AND name on a `(source,transform)` match). Emits `AddSpec`+`SetDefaultSpec{-1}` with `LastAssignedPartitionIdMatch` always + `DefaultSpecIdMatch` only when the spec is set as default (Java `UpdateRequirements`). Reviewed against `TestUpdatePartitionSpec.java` (28 unit tests incl. end-to-end builder round-trip + no-op dedup). **Pending ✅:** Java interop round-trip. |
 | Sort order (`ReplaceSortOrder`) | ✅ | `api/ReplaceSortOrder.java` | `transaction/sort_order.rs` |
 | Snapshot model + refs (branches/tags) | 🟡 | `api/Snapshot.java`, `SnapshotRef.java` | spec types + ref ops (`transaction/manage_snapshots.rs`) |
@@ -115,8 +115,9 @@
 
 1. **Write engine** — everything beyond fast-append (`OverwriteFiles`, `ReplacePartitions`,
    `DeleteFiles`, `RowDelta`, `RewriteFiles`, `RewriteManifests`, merge append).
-2. **Schema/partition evolution + snapshot management** — `UpdatePartitionSpec` and `ManageSnapshots`
-   are 🟡 (landed with unit tests; Java interop pending); `UpdateSchema` is still ❌.
+2. **Schema/partition evolution + snapshot management** — `UpdateSchema`, `UpdatePartitionSpec`, and
+   `ManageSnapshots` are all 🟡 (landed with unit tests; Java interop pending). `UpdateSchema` still owes
+   column initial/write **defaults** (builder overloads not plumbed) before ✅.
 3. **Format & type breadth** — ORC + Avro data files; remaining V3 types (variant, geo, unknown).
    (`timestamp_ns` and column default values already landed in the 0.8/0.9 base — see the matrix.)
 4. **Views in catalogs** (`ViewCatalog` + view operations).

@@ -104,3 +104,32 @@ How to use it (see the manuals' §2):
   or default-spec switch — a no-op evolution (remove-then-re-add the same field) must dedup back to the
   existing spec id and NOT advance `last_partition_id`; only a round-trip catches a regression there.
 
+### 2026-06-07 (UpdateSchema review remediation, Opus)
+- **DO** assign fresh nested field ids LEVEL-ORDER (pre-order) when mirroring Java `TypeUtil.assignFreshIds`
+  — it runs as a `CustomOrderSchemaVisitor` whose `struct` assigns ALL immediate field ids before the
+  child futures evaluate, and whose `map` assigns key-id then value-id before either future. A natural
+  depth-first Rust walk (assign this field's id, then immediately recurse its type) diverges the instant a
+  nested field has a following sibling: for `map<struct,struct>` it yields value-id = key-id + (size of key
+  subtree) instead of key-id + 1. *Why:* the ids are observable and Java pins them
+  (`TestSchemaUpdate.testAddNestedMapOfStructs`: key=3, value=4, then 5..8, 9..10); divergent ids break
+  interop and round-trip parity. A `last_column_id`-only assertion CANNOT catch this — assert per-field ids.
+- **DO NOT** gate a union-by-name (or any Java-visitor port) type change on "apply only if it's a legal
+  promotion." *Why:* Java `UnionByNameVisitor.updateColumn` computes `needsTypeUpdate = !isIgnorableType
+  Update` and calls `api.updateColumn` UNCONDITIONALLY for a non-ignorable change, so an *incompatible*
+  change reaches `updateColumn`'s guard and throws "Cannot change column type". Skipping the call (the old
+  Rust behavior) silently drops a change Java rejects. `isIgnorableTypeUpdate` is: existing-primitive →
+  ignorable iff incoming is a primitive that is a *narrowing* (`isPromotionAllowed(incoming, existing)`,
+  reversed); existing-complex → ignorable iff incoming is also complex (the recursion handles inner edits).
+- **DO** recurse a union/partner visitor THROUGH list elements and map key+values, not just structs.
+  *Why:* Java reaches `<path>.element` / `<path>.key` / `<path>.value` via `PartnerIdByNameAccessors`, so a
+  new field nested inside an existing `list<struct>`/`map<.,struct>` is added and an element/value type
+  change is validated. A struct-only recursion silently no-ops those.
+- **DO** reject case-insensitive lowercase-name collisions when building a Rust schema index, mirroring
+  Java `TypeUtil.indexByLowerCaseName` ("Cannot build lower case index: a and b collide"). *Why:* Rust's
+  `lowercase_name_to_id = name_to_id.iter().map(to_lowercase).collect()` silently overwrites colliding keys,
+  so a case-insensitive add of `DATA` after `data` builds a corrupt schema; Java throws. Report the smaller
+  field-id name first so the message is deterministic despite `HashMap` order (matches Java's first-visited
+  ordering for sequential adds).
+- **DO NOT** write a test that calls `.expect_err()` directly on a `commit()` future whose `Ok` type is
+  `ActionCommit` — `ActionCommit` is not `Debug`. Insert `.map(drop)` before `.expect_err("…")` (or assert
+  on `result.is_err()` + re-extract the error). *Why:* `Result::expect_err` requires `T: Debug`.

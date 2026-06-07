@@ -62,8 +62,10 @@ layers are removed in Phase 0.
    [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md) → [docs/testing.md](docs/testing.md).
 2. **Phase 0 is complete (2026-06-07); Phase 1 is in progress.** **`main` is the owned 0.9.1 base** (the
    Phase 0 sync landed on it 2026-06-07) — start from `main`, or a short-lived feature branch off it.
-   Within Phase 1, increment 1 (`ManageSnapshots`) has landed (🟡); **the next move is increment 2 —
-   `UpdatePartitionSpec`**. The live, increment-level plan and checkbox state are in
+   Within Phase 1, increments 1–3 (`ManageSnapshots`, `UpdatePartitionSpec`, `UpdateSchema`) have landed
+   (all 🟡); **the next move is increment 4 — the `ManageSnapshots` tail (`cherrypick`, `rollbackToTime`)
+   plus the V3 groundwork, then Java interop round-trips to flip the 🟡 rows to ✅**. The live,
+   increment-level plan and checkbox state are in
    [task/todo.md](task/todo.md) — read it (and [task/lessons.md](task/lessons.md) in full) before starting.
 3. Verify the build before and after each change:
    ```bash
@@ -91,10 +93,12 @@ green and the offline lib/unit suite passes (0 failures); service-bound integrat
 (`make test`) and the `sqllogictest` crate needs `protoc`. Roughly: spec types, partition transforms,
 manifest read/write, fast-append, data/equality-delete writers, Parquet→Arrow read **plus merge-on-read
 delete application**, scan planning, the catalog set (REST/Hive/Glue/S3 Tables/SQL/memory), FileIO,
-`timestamp_ns` + column default values are **present**; **snapshot management (`ManageSnapshots`) is
-partial** (Phase 1 increment 1: branch/tag lifecycle, rollback, fast-forward, retention — `cherrypick`/
-`rollbackToTime` and a Java interop test remain); the **write engine beyond fast-append, schema/partition
-evolution (`UpdateSchema`/`UpdatePartitionSpec`), incremental scans, ORC/Avro data files,
+`timestamp_ns` + column default values are **present**; **snapshot management (`ManageSnapshots`) and
+schema/partition evolution (`UpdateSchema`/`UpdatePartitionSpec`) are partial (🟡)** (Phase 1 increments
+1–3: branch/tag lifecycle + rollback + fast-forward + retention; full `BaseUpdatePartitionSpec`; full
+`SchemaUpdate` incl. `UnionByNameVisitor` and level-order field-id assignment — `cherrypick`/
+`rollbackToTime`, column-default builder overloads, and Java interop tests remain before ✅); the
+**write engine beyond fast-append, incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
 
@@ -146,7 +150,22 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   default values already present in the 0.9.1 base — see GAP_MATRIX.)
 - **Progress:** increment 1 — `ManageSnapshots` (branch/tag lifecycle, rollback, fast-forward, retention)
   landed with unit tests (🟡 — `cherrypick` + `rollbackToTime` deferred; Java interop test pending).
-  Next: `UpdatePartitionSpec`, then `UpdateSchema`.
+  Increment 2 — `UpdatePartitionSpec` landed at full `BaseUpdatePartitionSpec` parity (🟡), reviewed against
+  `TestUpdatePartitionSpec.java` (two parity bugs fixed in review: `recycleOrCreatePartitionField` name
+  reuse, and the `addNonDefaultSpec` requirement set; Java interop test pending).
+  Increment 3 — `UpdateSchema` landed at `SchemaUpdate` parity (🟡): add/rename/update-type/doc/
+  make-optional/require/delete/move/set-identifier-fields + `union_by_name_with`. Reviewed by three
+  perspective-diverse critics; the remediation fixed one **blocker** (nested fresh field-id assignment was
+  depth-first; Java `AssignFreshIds`/`CustomOrderSchemaVisitor` is level-order — struct assigns all
+  immediate ids before descending, map assigns key-id then value-id first; pinned by `testAddNestedMapOf
+  Structs`/`testAddNestedListOfStructs` exact-id tests) and several **major** gaps: `union_by_name` now
+  mirrors the full `UnionByNameVisitor` (adds nested under list/map structs, relaxes required→optional,
+  rejects incompatible primitive + complex↔primitive type changes with the Java "Cannot change column
+  type" message, recurses list/map), and `Schema::build` now rejects case-insensitive lowercase-name
+  collisions (`Cannot build lower case index: a and b collide`, Java `TypeUtil.indexByLowerCaseName`).
+  63 update-schema unit tests + 2 schema-build collision tests; key fixes mutation-verified. **Deferred to
+  ✅:** column initial/write **defaults** through the builder API (Java `addColumn(..,Literal)`/
+  `updateColumnDefault`/`addRequiredColumn(..,default)` overloads — tracked gap); Java interop round-trip.
 - **Exit criteria:** each action matches the Java contract behavior, with unit + interop tests; GAP_MATRIX
   rows flipped to ✅ (interop proven).
 
