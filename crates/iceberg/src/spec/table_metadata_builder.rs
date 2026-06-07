@@ -771,13 +771,19 @@ impl TableMetadataBuilder {
 
     /// Validate partition field names against schema field names across all historical schemas.
     ///
-    /// Due to Iceberg's multi-version property, partition fields can share names with schema fields
-    /// if they meet specific requirements (identity transform + matching source field ID).
-    /// This validation enforces those rules across all historical schema versions.
+    /// Due to Iceberg's multi-version property, a partition field may share a name with a schema field
+    /// only when it is an `identity` OR `void` transform sourced FROM that same schema field (the
+    /// colliding schema field's id equals the partition field's source id). The `void` case is the V1
+    /// removed-field replacement (`void(name)` re-added under the same name, sourced from its own
+    /// column); it mirrors Java's bind-path `PartitionSpec.Builder.checkAndAddPartitionName(name,
+    /// sourceId)`, which permits a non-identity transform as long as the name↔source-id correspondence
+    /// holds. The earlier identity-only rule wrongly rejected this V1 replacement — surfaced by the
+    /// UpdatePartitionSpec interop suite. This validation runs across all historical schema versions and
+    /// stays in lockstep with `PartitionSpecBuilder::check_name_does_not_collide_with_schema`.
     ///
     /// # Errors
-    /// - Partition field name conflicts with schema field name but doesn't use identity transform.
-    /// - Partition field uses identity transform but references wrong source field ID.
+    /// - Partition field name conflicts with a schema field and is not an identity / void transform.
+    /// - Partition field is identity / void but references a DIFFERENT source field id than the collision.
     fn validate_partition_field_names(&self, unbound_spec: &UnboundPartitionSpec) -> Result<()> {
         if self.metadata.schemas.is_empty() {
             return Ok(());
@@ -796,11 +802,12 @@ impl TableMetadataBuilder {
 
             // If name exists in schemas, validate against current schema rules
             if let Some(schema_field) = current_schema.field_by_name(&partition_field.name) {
-                let is_identity_transform =
-                    partition_field.transform == crate::spec::Transform::Identity;
+                let transform = partition_field.transform;
+                let is_identity_or_void = transform == crate::spec::Transform::Identity
+                    || transform == crate::spec::Transform::Void;
                 let has_matching_source_id = schema_field.id == partition_field.source_id;
 
-                if !is_identity_transform {
+                if !is_identity_or_void {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
@@ -2929,11 +2936,133 @@ mod tests {
         assert!(result.is_err());
         let error = result.unwrap_err();
         let error_message = error.message();
-        // The error comes from our multi-version validation
+        // The error comes from our multi-version validation: `bucket[8]` is neither identity nor void,
+        // and the name collides with a schema field, so it is rejected.
         assert!(error_message.contains(
             "Cannot create partition with name 'existing_field' that conflicts with schema field"
         ));
         assert!(error_message.contains("and is not an identity transform"));
+    }
+
+    // RISK (Java-parity, surfaced by the UpdatePartitionSpec interop suite): a `void` partition field
+    // named after its OWN source column must be ACCEPTED — Java's bind-path
+    // `checkAndAddPartitionName(name, sourceId)` permits a non-identity transform as long as the
+    // colliding schema field's id equals the partition source id. The canonical case is the V1 void
+    // replacement: removing identity(`existing_field`) re-adds `void(existing_field)` under the same name
+    // to keep the field id stable. The earlier identity-only guard wrongly rejected this. (Driven on V2
+    // so the orthogonal V1 sequential-field-id constraint does not mask the name-collision check; the V1
+    // end-to-end path is proven by the `remove_field_v1_void` interop scenario.)
+    #[test]
+    fn test_partition_spec_evolution_allows_void_named_after_its_own_source_column() {
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "existing_field", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        // Base partitioned by identity(existing_field) so the field exists to be void-replaced.
+        let base_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(2, "existing_field", Transform::Identity)
+            .unwrap()
+            .build();
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            base_spec,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let builder = metadata.into_builder(Some(
+            "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+        ));
+
+        // void(existing_field) named "existing_field", sourced from id 2 (== the colliding schema field's
+        // id) — the void replacement. Must be ACCEPTED.
+        let void_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(1)
+            .add_partition_field(2, "existing_field", Transform::Void)
+            .unwrap()
+            .build();
+
+        let result = builder.add_partition_spec(void_spec);
+        assert!(
+            result.is_ok(),
+            "a void partition named after its own source column must be accepted (Java parity), got: {:?}",
+            result.err()
+        );
+    }
+
+    // RISK (Java-parity, source-id gate): the relaxed identity/void collision rule is source-id-GATED —
+    // a void (or identity) partition that COLLIDES with a schema-field name but is sourced from a
+    // DIFFERENT column must still be REJECTED, end-to-end through `add_partition_spec`. Mirrors Java
+    // `checkAndAddPartitionName(name, sourceId)`: when the colliding schema field exists, it requires
+    // `schemaField.fieldId() == sourceId`. Without the source-id gate (enforced on this path by BOTH
+    // `validate_partition_field_names` here AND `check_name_does_not_collide_with_schema` in partition.rs),
+    // Rust would accept a `void("category")` sourced from `data` — a spec Java would reject. Mutation-
+    // verified: forcing the source-id check to pass in BOTH layers makes this rejection disappear.
+    #[test]
+    fn test_partition_spec_evolution_rejects_void_named_after_a_different_source_column() {
+        let initial_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "category", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        // Base partitioned by identity(data) so a partition spec already exists to evolve.
+        let base_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "data", Transform::Identity)
+            .unwrap()
+            .build();
+        let metadata = TableMetadataBuilder::new(
+            initial_schema,
+            base_spec,
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let builder = metadata.into_builder(Some(
+            "s3://bucket/test/location/metadata/metadata1.json".to_string(),
+        ));
+
+        // void named "category" but sourced from id 1 (`data`), NOT the colliding schema field id 2
+        // (`category`). The name↔source-id correspondence is violated → must be REJECTED.
+        let bad_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(1)
+            .add_partition_field(1, "category", Transform::Void)
+            .unwrap()
+            .build();
+
+        let result = builder.add_partition_spec(bad_spec);
+        let error = result.expect_err(
+            "a void partition named after a DIFFERENT schema column must be rejected (source-id gate)",
+        );
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("sourced from different field in schema"),
+            "rejection must cite the source-id mismatch, got: {}",
+            error.message()
+        );
     }
 
     #[test]

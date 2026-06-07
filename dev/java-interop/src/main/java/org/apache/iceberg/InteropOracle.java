@@ -19,8 +19,9 @@
 
 // IMPORTANT: this file lives in `package org.apache.iceberg` ON PURPOSE — that is the only way to reach
 // the package-private `@VisibleForTesting SchemaUpdate(Schema schema, int lastColumnId)` constructor that
-// drives the UpdateSchema state machine without a live TableOperations / catalog. This class is a
-// TEST-ONLY ORACLE (a dev tool, like dev/spark/); it is not part of the shipped Rust library.
+// drives the UpdateSchema state machine without a live TableOperations / catalog, AND the package-private
+// `BaseUpdatePartitionSpec` / `InMemoryTableOperations` plumbing the partition-spec oracle uses. This class
+// is a TEST-ONLY ORACLE (a dev tool, like dev/spark/); it is not part of the shipped Rust library.
 package org.apache.iceberg;
 
 import java.io.IOException;
@@ -35,27 +36,28 @@ import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.types.Types;
 
 /**
- * Java reference oracle for the UpdateSchema interop pilot.
+ * Java reference oracle for the UpdateSchema AND UpdatePartitionSpec interop suites.
  *
- * <p>Two modes, selected by the first program argument:
+ * <p>Two modes, selected by the first program argument; each mode runs BOTH capabilities (schema +
+ * partition) in one pass so a single {@code generate}/{@code verify} invocation covers the whole surface:
  *
  * <ul>
- *   <li><b>generate</b> — for each named scenario, build a base {@link Schema}, wrap it in a
- *       format-version-2 {@link TableMetadata}, apply the scenario's UpdateSchema op-sequence via the
- *       package-private {@code @VisibleForTesting SchemaUpdate(Schema, int)} constructor to get the
- *       evolved {@link Schema}, build the evolved {@link TableMetadata} via
- *       {@code buildFrom(base).setCurrentSchema(evolved, evolvedLastColumnId).build()}, and write
- *       {@code base.metadata.json} + {@code java_evolved.metadata.json} (via {@link
- *       TableMetadataParser#toJson}) into the scenario's testdata directory.
- *   <li><b>verify</b> — read {@code rust_evolved.metadata.json} from each scenario directory via
- *       {@link TableMetadataParser#read}, assert Java parses it without error AND its current schema is
- *       structurally equal (recursive field id / name / type / required / doc / default, plus
- *       current-schema-id and last-column-id) to Java's own {@code java_evolved}. Prints PASS/FAIL per
- *       scenario; exits non-zero on any FAIL.
+ *   <li><b>generate</b> — for each named scenario, build a base {@link TableMetadata}, apply the
+ *       scenario's op-sequence via the Java reference, and write {@code base.metadata.json} +
+ *       {@code java_evolved.metadata.json} (via {@link TableMetadataParser#toJson}) into the scenario's
+ *       testdata directory. Schema scenarios drive the package-private {@code @VisibleForTesting
+ *       SchemaUpdate(Schema, int)} state machine; partition scenarios drive a real
+ *       {@link BaseUpdatePartitionSpec} via {@link BaseTable#updateSpec()} over an in-memory
+ *       {@link TableOperations} (so {@code base != null} and historical field-id recycling is exercised).
+ *   <li><b>verify</b> — read {@code rust_evolved.metadata.json} from each scenario directory, assert Java
+ *       parses it without error AND its current schema (schema scenarios) or default partition spec
+ *       (partition scenarios) is structurally equal to Java's own {@code java_evolved}. Prints PASS/FAIL
+ *       per scenario; exits non-zero on any FAIL.
  * </ul>
  */
 public final class InteropOracle {
-  private static final String LOCATION = "s3://interop-bucket/update_schema";
+  private static final String SCHEMA_LOCATION = "s3://interop-bucket/update_schema";
+  private static final String PARTITION_LOCATION = "s3://interop-bucket/update_partition_spec";
 
   private InteropOracle() {}
 
@@ -65,21 +67,23 @@ public final class InteropOracle {
       System.exit(2);
       return;
     }
-    String fixturesDirProperty = System.getProperty("interop.fixtures.dir");
-    if (fixturesDirProperty == null || fixturesDirProperty.isEmpty()) {
-      System.err.println("system property interop.fixtures.dir must be set");
-      System.exit(2);
-      return;
-    }
-    Path fixturesDir = Paths.get(fixturesDirProperty).toAbsolutePath().normalize();
+    Path schemaFixturesDir = requireFixturesDir("interop.fixtures.dir");
+    Path partitionFixturesDir = requireFixturesDir("interop.partition.fixtures.dir");
 
     String mode = args[0];
     switch (mode) {
       case "generate":
-        generate(fixturesDir);
+        SchemaOracle.generate(schemaFixturesDir);
+        PartitionOracle.generate(partitionFixturesDir);
         break;
       case "verify":
-        verify(fixturesDir);
+        int failures = 0;
+        failures += SchemaOracle.verify(schemaFixturesDir);
+        failures += PartitionOracle.verify(partitionFixturesDir);
+        System.out.println("verify (all capabilities): " + failures + " failures");
+        if (failures > 0) {
+          System.exit(1);
+        }
         break;
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
@@ -87,142 +91,271 @@ public final class InteropOracle {
     }
   }
 
-  // ===========================================================================================
-  // Scenario registry — each entry is (base schema, base lastColumnId, op-sequence). The op-sequence
-  // is applied via `new SchemaUpdate(baseSchema, baseLastColumnId)` (the @VisibleForTesting ctor). The
-  // Rust test mirrors EACH of these op-sequences exactly against the same `base.metadata.json`.
-  // ===========================================================================================
-
-  private static Map<String, Scenario> scenarios() {
-    Map<String, Scenario> scenarios = new LinkedHashMap<>();
-
-    // add_top_level_columns — append two optional and one required-with-default top-level columns.
-    // The required-with-default add needs an initial default, which is V3-only in Java.
-    scenarios.put(
-        "add_top_level_columns",
-        Scenario.v3(
-            new Schema(
-                Types.NestedField.required(1, "id", Types.LongType.get()),
-                Types.NestedField.optional(2, "data", Types.StringType.get())),
-            2,
-            update ->
-                update
-                    .addColumn("count", Types.IntegerType.get())
-                    .addColumn("note", Types.StringType.get(), "a free-text note")
-                    .addRequiredColumn(
-                        "category", Types.StringType.get(), Literal.of("uncategorized"))));
-
-    // add_nested_struct_and_map — THE level-order fresh-field-id case. Adding a map<struct,struct> to a
-    // 1-column schema must assign key=3, value=4, then the key struct's fields 5..8, then the value
-    // struct's fields 9..10 (Java AssignFreshIds / CustomOrderSchemaVisitor level order). Also add a
-    // nested struct to pin the struct path. The incoming ids are deliberately scrambled to prove they
-    // are reassigned.
-    scenarios.put(
-        "add_nested_struct_and_map",
-        Scenario.v2(
-            new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get())),
-            1,
-            update ->
-                update.addColumn(
-                    "locations",
-                    Types.MapType.ofOptional(
-                        11,
-                        12,
-                        Types.StructType.of(
-                            Types.NestedField.required(20, "address", Types.StringType.get()),
-                            Types.NestedField.required(21, "city", Types.StringType.get()),
-                            Types.NestedField.required(22, "state", Types.StringType.get()),
-                            Types.NestedField.required(23, "zip", Types.IntegerType.get())),
-                        Types.StructType.of(
-                            Types.NestedField.required(30, "lat", Types.IntegerType.get()),
-                            Types.NestedField.optional(31, "long", Types.IntegerType.get()))))));
-
-    // rename_and_move — rename a column and reorder columns (move first + move after). Java resolves
-    // move targets by their ORIGINAL name (renames are tracked in `updates`, not in name resolution),
-    // so the moved column is referenced as `email`, not `email_address`. This pins that the rename is
-    // applied to the field-id-stable record while the reorder operates on the original identity.
-    scenarios.put(
-        "rename_and_move",
-        Scenario.v2(
-            new Schema(
-                Types.NestedField.required(1, "id", Types.LongType.get()),
-                Types.NestedField.optional(2, "first_name", Types.StringType.get()),
-                Types.NestedField.optional(3, "last_name", Types.StringType.get()),
-                Types.NestedField.optional(4, "email", Types.StringType.get())),
-            4,
-            update ->
-                update
-                    .renameColumn("email", "email_address")
-                    .moveFirst("email")
-                    .moveAfter("id", "first_name")));
-
-    // update_type_promotion — int->long, float->double, decimal(9,2)->decimal(18,2) widen.
-    scenarios.put(
-        "update_type_promotion",
-        Scenario.v2(
-            new Schema(
-                Types.NestedField.required(1, "id", Types.IntegerType.get()),
-                Types.NestedField.optional(2, "measure", Types.FloatType.get()),
-                Types.NestedField.optional(3, "amount", Types.DecimalType.of(9, 2))),
-            3,
-            update ->
-                update
-                    .updateColumn("id", Types.LongType.get())
-                    .updateColumn("measure", Types.DoubleType.get())
-                    .updateColumn("amount", Types.DecimalType.of(18, 2))));
-
-    // make_optional_and_delete — relax a required column to optional, and delete another column.
-    scenarios.put(
-        "make_optional_and_delete",
-        Scenario.v2(
-            new Schema(
-                Types.NestedField.required(1, "id", Types.LongType.get()),
-                Types.NestedField.required(2, "name", Types.StringType.get()),
-                Types.NestedField.optional(3, "legacy", Types.StringType.get())),
-            3,
-            update -> update.makeColumnOptional("name").deleteColumn("legacy")));
-
-    // set_identifier_fields — promote a required field to the identifier-field set.
-    scenarios.put(
-        "set_identifier_fields",
-        Scenario.v2(
-            new Schema(
-                Types.NestedField.required(1, "id", Types.LongType.get()),
-                Types.NestedField.required(2, "tenant", Types.StringType.get()),
-                Types.NestedField.optional(3, "data", Types.StringType.get())),
-            3,
-            update -> update.setIdentifierFields("id", "tenant")));
-
-    // add_required_with_default_and_update_default — add a required column WITH a default (legal without
-    // allowIncompatibleChanges because the default backfills existing rows), then change its write
-    // default via updateColumnDefault (sets only the write default, leaving the initial default).
-    scenarios.put(
-        "add_required_with_default_and_update_default",
-        Scenario.v3(
-            new Schema(Types.NestedField.required(1, "id", Types.LongType.get())),
-            1,
-            update ->
-                update
-                    .addRequiredColumn("status", Types.StringType.get(), Literal.of("active"))
-                    .updateColumnDefault("status", Literal.of("pending"))));
-
-    return scenarios;
+  /** Read a required system property naming an absolute fixtures directory, or exit non-zero. */
+  private static Path requireFixturesDir(String property) {
+    String value = System.getProperty(property);
+    if (value == null || value.isEmpty()) {
+      System.err.println("system property " + property + " must be set");
+      System.exit(2);
+    }
+    return Paths.get(value).toAbsolutePath().normalize();
   }
 
+  // ===========================================================================================
+  // UpdateSchema oracle — unchanged behavior; the scenario registry + generate/verify moved into a
+  // nested class so the partition oracle can sit beside it in the same exec entrypoint.
+  // ===========================================================================================
+
   /**
-   * A base schema + last column id + the UpdateSchema op-sequence to apply, plus the base format
-   * version. Column initial defaults are a V3-only feature in Java iceberg-core (a non-null initial
-   * default is rejected on V2 metadata), so default-bearing scenarios use format version 3; all others
-   * use format version 2. {@code baseLastColumnId} is informational — the actual value flows through the
-   * built {@link TableMetadata#lastColumnId()}.
+   * The UpdateSchema half of the oracle. Each scenario is a base schema + last column id + an
+   * UpdateSchema op-sequence applied via the {@code @VisibleForTesting SchemaUpdate(Schema, int)}
+   * constructor. The Rust test mirrors EACH op-sequence exactly against the same {@code base.metadata.json}.
    */
-  private static final class Scenario {
+  static final class SchemaOracle {
+    private SchemaOracle() {}
+
+    private static Map<String, SchemaScenario> scenarios() {
+      Map<String, SchemaScenario> scenarios = new LinkedHashMap<>();
+
+      // add_top_level_columns — append two optional and one required-with-default top-level columns.
+      // The required-with-default add needs an initial default, which is V3-only in Java.
+      scenarios.put(
+          "add_top_level_columns",
+          SchemaScenario.v3(
+              new Schema(
+                  Types.NestedField.required(1, "id", Types.LongType.get()),
+                  Types.NestedField.optional(2, "data", Types.StringType.get())),
+              2,
+              update ->
+                  update
+                      .addColumn("count", Types.IntegerType.get())
+                      .addColumn("note", Types.StringType.get(), "a free-text note")
+                      .addRequiredColumn(
+                          "category", Types.StringType.get(), Literal.of("uncategorized"))));
+
+      // add_nested_struct_and_map — THE level-order fresh-field-id case. Adding a map<struct,struct> to a
+      // 1-column schema must assign key=3, value=4, then the key struct's fields 5..8, then the value
+      // struct's fields 9..10 (Java AssignFreshIds / CustomOrderSchemaVisitor level order). The incoming
+      // ids are deliberately scrambled to prove they are reassigned.
+      scenarios.put(
+          "add_nested_struct_and_map",
+          SchemaScenario.v2(
+              new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get())),
+              1,
+              update ->
+                  update.addColumn(
+                      "locations",
+                      Types.MapType.ofOptional(
+                          11,
+                          12,
+                          Types.StructType.of(
+                              Types.NestedField.required(20, "address", Types.StringType.get()),
+                              Types.NestedField.required(21, "city", Types.StringType.get()),
+                              Types.NestedField.required(22, "state", Types.StringType.get()),
+                              Types.NestedField.required(23, "zip", Types.IntegerType.get())),
+                          Types.StructType.of(
+                              Types.NestedField.required(30, "lat", Types.IntegerType.get()),
+                              Types.NestedField.optional(31, "long", Types.IntegerType.get()))))));
+
+      // rename_and_move — rename a column and reorder columns (move first + move after). Java resolves
+      // move targets by their ORIGINAL name.
+      scenarios.put(
+          "rename_and_move",
+          SchemaScenario.v2(
+              new Schema(
+                  Types.NestedField.required(1, "id", Types.LongType.get()),
+                  Types.NestedField.optional(2, "first_name", Types.StringType.get()),
+                  Types.NestedField.optional(3, "last_name", Types.StringType.get()),
+                  Types.NestedField.optional(4, "email", Types.StringType.get())),
+              4,
+              update ->
+                  update
+                      .renameColumn("email", "email_address")
+                      .moveFirst("email")
+                      .moveAfter("id", "first_name")));
+
+      // update_type_promotion — int->long, float->double, decimal(9,2)->decimal(18,2) widen.
+      scenarios.put(
+          "update_type_promotion",
+          SchemaScenario.v2(
+              new Schema(
+                  Types.NestedField.required(1, "id", Types.IntegerType.get()),
+                  Types.NestedField.optional(2, "measure", Types.FloatType.get()),
+                  Types.NestedField.optional(3, "amount", Types.DecimalType.of(9, 2))),
+              3,
+              update ->
+                  update
+                      .updateColumn("id", Types.LongType.get())
+                      .updateColumn("measure", Types.DoubleType.get())
+                      .updateColumn("amount", Types.DecimalType.of(18, 2))));
+
+      // make_optional_and_delete — relax a required column to optional, and delete another column.
+      scenarios.put(
+          "make_optional_and_delete",
+          SchemaScenario.v2(
+              new Schema(
+                  Types.NestedField.required(1, "id", Types.LongType.get()),
+                  Types.NestedField.required(2, "name", Types.StringType.get()),
+                  Types.NestedField.optional(3, "legacy", Types.StringType.get())),
+              3,
+              update -> update.makeColumnOptional("name").deleteColumn("legacy")));
+
+      // set_identifier_fields — promote a required field to the identifier-field set.
+      scenarios.put(
+          "set_identifier_fields",
+          SchemaScenario.v2(
+              new Schema(
+                  Types.NestedField.required(1, "id", Types.LongType.get()),
+                  Types.NestedField.required(2, "tenant", Types.StringType.get()),
+                  Types.NestedField.optional(3, "data", Types.StringType.get())),
+              3,
+              update -> update.setIdentifierFields("id", "tenant")));
+
+      // add_required_with_default_and_update_default — add a required column WITH a default (legal
+      // without allowIncompatibleChanges), then change its write default via updateColumnDefault.
+      scenarios.put(
+          "add_required_with_default_and_update_default",
+          SchemaScenario.v3(
+              new Schema(Types.NestedField.required(1, "id", Types.LongType.get())),
+              1,
+              update ->
+                  update
+                      .addRequiredColumn("status", Types.StringType.get(), Literal.of("active"))
+                      .updateColumnDefault("status", Literal.of("pending"))));
+
+      return scenarios;
+    }
+
+    private static void generate(Path fixturesDir) throws IOException {
+      Map<String, SchemaScenario> scenarios = scenarios();
+      for (Map.Entry<String, SchemaScenario> entry : scenarios.entrySet()) {
+        String name = entry.getKey();
+        SchemaScenario scenario = entry.getValue();
+
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, Integer.toString(scenario.formatVersion));
+        TableMetadata base =
+            TableMetadata.newTableMetadata(
+                scenario.baseSchema,
+                PartitionSpec.unpartitioned(),
+                SortOrder.unsorted(),
+                SCHEMA_LOCATION + "/" + name,
+                props);
+
+        SchemaUpdate update = new SchemaUpdate(base.schema(), base.lastColumnId());
+        Schema evolved = scenario.ops.apply(update).apply();
+
+        // The new last-column-id must never DECREASE below the base's (a delete lowers
+        // highestFieldId() but ids are never reused), so pass max(base.lastColumnId,
+        // evolved.highestFieldId) — exactly what Java's addSchema does internally.
+        int evolvedLastColumnId = Math.max(base.lastColumnId(), evolved.highestFieldId());
+        TableMetadata javaEvolved =
+            TableMetadata.buildFrom(base).setCurrentSchema(evolved, evolvedLastColumnId).build();
+
+        Path scenarioDir = fixturesDir.resolve(name);
+        Files.createDirectories(scenarioDir);
+        writeJson(scenarioDir.resolve("base.metadata.json"), TableMetadataParser.toJson(base));
+        writeJson(
+            scenarioDir.resolve("java_evolved.metadata.json"),
+            TableMetadataParser.toJson(javaEvolved));
+        System.out.println("generated schema: " + name);
+      }
+      System.out.println(
+          "generate (schema): wrote " + scenarios.size() + " scenarios to " + fixturesDir);
+    }
+
+    /** Returns the number of failed scenarios. */
+    private static int verify(Path fixturesDir) throws IOException {
+      Map<String, SchemaScenario> scenarios = scenarios();
+      int failures = 0;
+      for (Map.Entry<String, SchemaScenario> entry : scenarios.entrySet()) {
+        String name = entry.getKey();
+        SchemaScenario scenario = entry.getValue();
+        Path scenarioDir = fixturesDir.resolve(name);
+        Path rustEvolvedPath = scenarioDir.resolve("rust_evolved.metadata.json");
+
+        if (!Files.exists(rustEvolvedPath)) {
+          System.out.println(
+              "FAIL schema/" + name + ": missing rust_evolved.metadata.json (run the Rust gen)");
+          failures++;
+          continue;
+        }
+
+        Path basePath = scenarioDir.resolve("base.metadata.json");
+        TableMetadata base = TableMetadataParser.fromJson(basePath.toString(), readString(basePath));
+        SchemaUpdate update = new SchemaUpdate(base.schema(), base.lastColumnId());
+        Schema javaEvolvedSchema = scenario.ops.apply(update).apply();
+
+        TableMetadata rustEvolved;
+        try {
+          rustEvolved =
+              TableMetadataParser.fromJson(rustEvolvedPath.toString(), readString(rustEvolvedPath));
+        } catch (RuntimeException parseError) {
+          System.out.println(
+              "FAIL schema/" + name + ": Java could not parse rust_evolved: " + parseError);
+          failures++;
+          continue;
+        }
+
+        String mismatch = structuralSchemaMismatch(javaEvolvedSchema, rustEvolved.schema());
+        if (mismatch != null) {
+          System.out.println("FAIL schema/" + name + ": " + mismatch);
+          failures++;
+          continue;
+        }
+        int expectedLastColumnId =
+            Math.max(base.lastColumnId(), javaEvolvedSchema.highestFieldId());
+        if (expectedLastColumnId != rustEvolved.lastColumnId()) {
+          System.out.println(
+              "FAIL schema/"
+                  + name
+                  + ": last-column-id mismatch: java="
+                  + expectedLastColumnId
+                  + " rust="
+                  + rustEvolved.lastColumnId());
+          failures++;
+          continue;
+        }
+        System.out.println("PASS schema/" + name);
+      }
+      System.out.println(
+          "verify (schema): "
+              + (scenarios.size() - failures)
+              + "/"
+              + scenarios.size()
+              + " scenarios passed");
+      return failures;
+    }
+
+    /**
+     * Compare two schemas structurally. {@link Schema#asStruct} includes field id, name, type,
+     * required, doc, and default recursively; identifier-field ids are compared separately.
+     */
+    private static String structuralSchemaMismatch(Schema expected, Schema actual) {
+      if (!expected.asStruct().equals(actual.asStruct())) {
+        return "schema struct mismatch:\n  java= "
+            + expected.asStruct()
+            + "\n  rust= "
+            + actual.asStruct();
+      }
+      if (!expected.identifierFieldIds().equals(actual.identifierFieldIds())) {
+        return "identifier-field-id mismatch: java="
+            + expected.identifierFieldIds()
+            + " rust="
+            + actual.identifierFieldIds();
+      }
+      return null;
+    }
+  }
+
+  /** A base schema + last column id + the UpdateSchema op-sequence + the base format version. */
+  private static final class SchemaScenario {
     final Schema baseSchema;
     final int baseLastColumnId;
     final int formatVersion;
     final Function<UpdateSchema, UpdateSchema> ops;
 
-    Scenario(
+    SchemaScenario(
         Schema baseSchema,
         int baseLastColumnId,
         int formatVersion,
@@ -233,150 +366,371 @@ public final class InteropOracle {
       this.ops = ops;
     }
 
-    /** Convenience for the common format-version-2 case. */
-    static Scenario v2(
+    static SchemaScenario v2(
         Schema baseSchema, int baseLastColumnId, Function<UpdateSchema, UpdateSchema> ops) {
-      return new Scenario(baseSchema, baseLastColumnId, 2, ops);
+      return new SchemaScenario(baseSchema, baseLastColumnId, 2, ops);
     }
 
-    /** Format-version-3 scenario (needed for column initial defaults). */
-    static Scenario v3(
+    static SchemaScenario v3(
         Schema baseSchema, int baseLastColumnId, Function<UpdateSchema, UpdateSchema> ops) {
-      return new Scenario(baseSchema, baseLastColumnId, 3, ops);
+      return new SchemaScenario(baseSchema, baseLastColumnId, 3, ops);
     }
   }
 
   // ===========================================================================================
-  // generate
+  // UpdatePartitionSpec oracle — the new capability. Each scenario supplies a base TableMetadata and
+  // an op-sequence applied through a REAL BaseUpdatePartitionSpec via an in-memory TableOperations, so
+  // `base != null` and the historical field-id recycling path (recycleOrCreatePartitionField) is live.
+  // The Rust test mirrors EACH op-sequence exactly against the same base.metadata.json.
   // ===========================================================================================
 
-  private static void generate(Path fixturesDir) throws IOException {
-    Map<String, Scenario> scenarios = scenarios();
-    for (Map.Entry<String, Scenario> entry : scenarios.entrySet()) {
-      String name = entry.getKey();
-      Scenario scenario = entry.getValue();
+  /**
+   * The UpdatePartitionSpec half of the oracle. We drive {@code BaseTable(ops, name).updateSpec()...} so
+   * the recycling branch (guarded on {@code formatVersion >= 2 && base != null}) is exercised — the
+   * {@code @VisibleForTesting} constructors set {@code base = null} and would silently skip it.
+   */
+  static final class PartitionOracle {
+    private PartitionOracle() {}
 
-      // Base metadata at the scenario's format version (V3 for default-bearing scenarios, else V2).
-      Map<String, String> props = new LinkedHashMap<>();
-      props.put(TableProperties.FORMAT_VERSION, Integer.toString(scenario.formatVersion));
-      TableMetadata base =
-          TableMetadata.newTableMetadata(
-              scenario.baseSchema,
-              PartitionSpec.unpartitioned(),
-              SortOrder.unsorted(),
-              LOCATION + "/" + name,
-              props);
+    private static Map<String, PartitionScenario> scenarios() {
+      Map<String, PartitionScenario> scenarios = new LinkedHashMap<>();
 
-      // Apply the op-sequence via the @VisibleForTesting ctor → evolved schema.
-      SchemaUpdate update = new SchemaUpdate(base.schema(), base.lastColumnId());
-      Schema evolved = scenario.ops.apply(update).apply();
+      // A V2 schema reused by most scenarios: id (long), category (string), event_ts (timestamp).
+      Schema v2Schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "event_ts", Types.TimestampType.withZone()));
 
-      // Evolved metadata: rebuild from base, set the new current schema. The new last-column-id must
-      // never DECREASE below the base's (a delete lowers `highestFieldId()` but ids are never reused),
-      // so pass max(base.lastColumnId, evolved.highestFieldId) — exactly what Java's addSchema does
-      // internally.
-      int evolvedLastColumnId = Math.max(base.lastColumnId(), evolved.highestFieldId());
-      TableMetadata javaEvolved =
-          TableMetadata.buildFrom(base)
-              .setCurrentSchema(evolved, evolvedLastColumnId)
-              .build();
+      // add_identity_field — start unpartitioned, add identity(category). The base case.
+      scenarios.put(
+          "add_identity_field",
+          PartitionScenario.unpartitioned(
+              v2Schema, 2, "add_identity_field", spec -> spec.addField("category")));
 
-      Path scenarioDir = fixturesDir.resolve(name);
-      Files.createDirectories(scenarioDir);
-      writeJson(scenarioDir.resolve("base.metadata.json"), TableMetadataParser.toJson(base));
-      writeJson(
-          scenarioDir.resolve("java_evolved.metadata.json"), TableMetadataParser.toJson(javaEvolved));
-      System.out.println("generated: " + name);
+      // add_transform_fields — start unpartitioned, add bucket[16](id), truncate[8](category),
+      // year(event_ts). Pins the auto-generated names (PartitionNameGenerator) AND the field-ids that
+      // BaseUpdatePartitionSpec assigns sequentially from last-partition-id (999 -> 1000, 1001, 1002).
+      scenarios.put(
+          "add_transform_fields",
+          PartitionScenario.unpartitioned(
+              v2Schema,
+              2,
+              "add_transform_fields",
+              spec ->
+                  spec.addField(org.apache.iceberg.expressions.Expressions.bucket("id", 16))
+                      .addField(org.apache.iceberg.expressions.Expressions.truncate("category", 8))
+                      .addField(org.apache.iceberg.expressions.Expressions.year("event_ts"))));
+
+      // remove_field_v2 — base is partitioned by identity(category); removing it on V2 OMITS the field,
+      // yielding an unpartitioned (empty) default spec.
+      scenarios.put(
+          "remove_field_v2",
+          PartitionScenario.partitioned(
+              v2Schema,
+              2,
+              2,
+              "remove_field_v2",
+              builder -> builder.identity("category"),
+              spec -> spec.removeField("category")));
+
+      // remove_field_v1_void — base (V1) partitioned by identity(category); removing it must RE-ADD it
+      // with the void/alwaysNull transform to preserve the field id (Java V1 apply() branch).
+      scenarios.put(
+          "remove_field_v1_void",
+          PartitionScenario.partitioned(
+              v2Schema,
+              1,
+              2,
+              "remove_field_v1_void",
+              builder -> builder.identity("category"),
+              spec -> spec.removeField("category")));
+
+      // rename_field — base partitioned by identity(category); rename it. Field id preserved.
+      scenarios.put(
+          "rename_field",
+          PartitionScenario.partitioned(
+              v2Schema,
+              2,
+              2,
+              "rename_field",
+              builder -> builder.identity("category"),
+              spec -> spec.renameField("category", "cat")));
+
+      // field_id_recycling — base carries TWO historical specs: spec 0 (default) is identity(category)
+      // @1000, spec 1 is bucket[8](id) under the CUSTOM name "id_shard" @1001. Re-adding bucket[8](id)
+      // with NO explicit name must recycle BOTH the historical field id (1001) AND the historical name
+      // ("id_shard") — not a fresh id or the generated default name "id_bucket_8". Needs base != null.
+      scenarios.put(
+          "field_id_recycling",
+          PartitionScenario.forked(
+              v2Schema,
+              "field_id_recycling",
+              spec ->
+                  spec.addField(org.apache.iceberg.expressions.Expressions.bucket("id", 8))));
+
+      // delete_then_readd — base partitioned by identity(category); remove then re-add the same
+      // (source, transform) → Java's rewrite/un-delete (field restored with its original id, no new
+      // field). The result equals the base spec, so the metadata layer dedups back to it.
+      scenarios.put(
+          "delete_then_readd",
+          PartitionScenario.partitioned(
+              v2Schema,
+              2,
+              2,
+              "delete_then_readd",
+              builder -> builder.identity("category"),
+              spec -> spec.removeField("category").addField("category")));
+
+      return scenarios;
     }
-    System.out.println("generate: wrote " + scenarios.size() + " scenarios to " + fixturesDir);
-  }
 
-  // ===========================================================================================
-  // verify — read rust_evolved.metadata.json, assert Java accepts it and its current schema matches.
-  // ===========================================================================================
+    private static void generate(Path fixturesDir) throws IOException {
+      Map<String, PartitionScenario> scenarios = scenarios();
+      for (Map.Entry<String, PartitionScenario> entry : scenarios.entrySet()) {
+        String name = entry.getKey();
+        PartitionScenario scenario = entry.getValue();
 
-  private static void verify(Path fixturesDir) throws IOException {
-    Map<String, Scenario> scenarios = scenarios();
-    int failures = 0;
-    for (Map.Entry<String, Scenario> entry : scenarios.entrySet()) {
-      String name = entry.getKey();
-      Scenario scenario = entry.getValue();
-      Path scenarioDir = fixturesDir.resolve(name);
-      Path rustEvolvedPath = scenarioDir.resolve("rust_evolved.metadata.json");
+        TableMetadata base = scenario.baseMetadata();
+        TableMetadata javaEvolved = scenario.evolve(base);
 
-      if (!Files.exists(rustEvolvedPath)) {
-        System.out.println("FAIL " + name + ": missing rust_evolved.metadata.json (run the Rust gen)");
-        failures++;
-        continue;
+        Path scenarioDir = fixturesDir.resolve(name);
+        Files.createDirectories(scenarioDir);
+        writeJson(scenarioDir.resolve("base.metadata.json"), TableMetadataParser.toJson(base));
+        writeJson(
+            scenarioDir.resolve("java_evolved.metadata.json"),
+            TableMetadataParser.toJson(javaEvolved));
+        System.out.println("generated partition: " + name);
       }
-
-      // Recompute Java's evolved schema for comparison (the same op-sequence as generate).
-      Path basePath = scenarioDir.resolve("base.metadata.json");
-      TableMetadata base = TableMetadataParser.fromJson(basePath.toString(), readString(basePath));
-      SchemaUpdate update = new SchemaUpdate(base.schema(), base.lastColumnId());
-      Schema javaEvolvedSchema = scenario.ops.apply(update).apply();
-
-      TableMetadata rustEvolved;
-      try {
-        rustEvolved =
-            TableMetadataParser.fromJson(rustEvolvedPath.toString(), readString(rustEvolvedPath));
-      } catch (RuntimeException parseError) {
-        System.out.println("FAIL " + name + ": Java could not parse rust_evolved: " + parseError);
-        failures++;
-        continue;
-      }
-
-      Schema rustSchema = rustEvolved.schema();
-      String mismatch = structuralMismatch(javaEvolvedSchema, rustSchema);
-      if (mismatch != null) {
-        System.out.println("FAIL " + name + ": " + mismatch);
-        failures++;
-        continue;
-      }
-      // Also assert last-column-id agrees. It is max(base lastColumnId, evolved highestFieldId) — a
-      // delete lowers highestFieldId but never lowers lastColumnId (ids are never reused).
-      int expectedLastColumnId =
-          Math.max(base.lastColumnId(), javaEvolvedSchema.highestFieldId());
-      if (expectedLastColumnId != rustEvolved.lastColumnId()) {
-        System.out.println(
-            "FAIL "
-                + name
-                + ": last-column-id mismatch: java="
-                + expectedLastColumnId
-                + " rust="
-                + rustEvolved.lastColumnId());
-        failures++;
-        continue;
-      }
-      System.out.println("PASS " + name);
+      System.out.println(
+          "generate (partition): wrote " + scenarios.size() + " scenarios to " + fixturesDir);
     }
 
-    System.out.println(
-        "verify: " + (scenarios.size() - failures) + "/" + scenarios.size() + " scenarios passed");
-    if (failures > 0) {
-      System.exit(1);
+    /** Returns the number of failed scenarios. */
+    private static int verify(Path fixturesDir) throws IOException {
+      Map<String, PartitionScenario> scenarios = scenarios();
+      int failures = 0;
+      for (Map.Entry<String, PartitionScenario> entry : scenarios.entrySet()) {
+        String name = entry.getKey();
+        PartitionScenario scenario = entry.getValue();
+        Path scenarioDir = fixturesDir.resolve(name);
+        Path rustEvolvedPath = scenarioDir.resolve("rust_evolved.metadata.json");
+
+        if (!Files.exists(rustEvolvedPath)) {
+          System.out.println(
+              "FAIL partition/" + name + ": missing rust_evolved.metadata.json (run the Rust gen)");
+          failures++;
+          continue;
+        }
+
+        // Recompute Java's evolved metadata from the committed base (same op-sequence as generate).
+        Path basePath = scenarioDir.resolve("base.metadata.json");
+        TableMetadata base = TableMetadataParser.fromJson(basePath.toString(), readString(basePath));
+        TableMetadata javaEvolved = scenario.evolve(base);
+
+        TableMetadata rustEvolved;
+        try {
+          rustEvolved =
+              TableMetadataParser.fromJson(rustEvolvedPath.toString(), readString(rustEvolvedPath));
+        } catch (RuntimeException parseError) {
+          System.out.println(
+              "FAIL partition/" + name + ": Java could not parse rust_evolved: " + parseError);
+          failures++;
+          continue;
+        }
+
+        String mismatch = structuralSpecMismatch(javaEvolved, rustEvolved);
+        if (mismatch != null) {
+          System.out.println("FAIL partition/" + name + ": " + mismatch);
+          failures++;
+          continue;
+        }
+        System.out.println("PASS partition/" + name);
+      }
+      System.out.println(
+          "verify (partition): "
+              + (scenarios.size() - failures)
+              + "/"
+              + scenarios.size()
+              + " scenarios passed");
+      return failures;
+    }
+
+    /**
+     * Compare the evolved DEFAULT partition specs structurally: spec id, field count, and each field's
+     * source id / field id / name / transform (via {@link PartitionField#equals}, which covers all
+     * four), plus the table's last-assigned-partition-id. Returns null when equal, else a message.
+     */
+    private static String structuralSpecMismatch(TableMetadata expected, TableMetadata actual) {
+      PartitionSpec expectedSpec = expected.spec();
+      PartitionSpec actualSpec = actual.spec();
+      if (expectedSpec.specId() != actualSpec.specId()) {
+        return "default spec-id mismatch: java="
+            + expectedSpec.specId()
+            + " rust="
+            + actualSpec.specId();
+      }
+      // PartitionField.equals compares sourceId, fieldId, name, and transform — exactly the field-id
+      // level identity we need. List equality compares element-wise in order.
+      if (!expectedSpec.fields().equals(actualSpec.fields())) {
+        return "default spec fields mismatch:\n  java= "
+            + expectedSpec.fields()
+            + "\n  rust= "
+            + actualSpec.fields();
+      }
+      if (expected.lastAssignedPartitionId() != actual.lastAssignedPartitionId()) {
+        return "last-partition-id mismatch: java="
+            + expected.lastAssignedPartitionId()
+            + " rust="
+            + actual.lastAssignedPartitionId();
+      }
+      return null;
     }
   }
 
   /**
-   * Compare two schemas structurally (recursive field id / name / type / required / doc / default plus
-   * identifier-field ids). Returns null when equal, or a human-readable mismatch message.
-   *
-   * <p>{@link Schema#sameSchema} compares {@code asStruct()} (which includes field id, name, type,
-   * required, and doc recursively) plus identifier-field ids — exactly the recursive structural
-   * equality we need. Default values are part of {@code NestedField.equals}, so they are covered too.
+   * A partition-spec scenario: how to build the base {@link TableMetadata} and the UpdatePartitionSpec
+   * op-sequence to apply. The op-sequence is applied through a real {@link BaseUpdatePartitionSpec}
+   * (via {@link BaseTable#updateSpec()} over an {@link InMemoryTableOperations}) so the recycling path
+   * is live; the evolved metadata is read back from {@code ops.current()} after {@code commit()}.
    */
-  private static String structuralMismatch(Schema expected, Schema actual) {
-    if (!expected.asStruct().equals(actual.asStruct())) {
-      return "schema struct mismatch:\n  java= " + expected.asStruct() + "\n  rust= " + actual.asStruct();
+  private static final class PartitionScenario {
+    final Function<Void, TableMetadata> baseSupplier;
+    final Function<UpdatePartitionSpec, UpdatePartitionSpec> ops;
+
+    PartitionScenario(
+        Function<Void, TableMetadata> baseSupplier,
+        Function<UpdatePartitionSpec, UpdatePartitionSpec> ops) {
+      this.baseSupplier = baseSupplier;
+      this.ops = ops;
     }
-    if (!expected.identifierFieldIds().equals(actual.identifierFieldIds())) {
-      return "identifier-field-id mismatch: java="
-          + expected.identifierFieldIds()
-          + " rust="
-          + actual.identifierFieldIds();
+
+    TableMetadata baseMetadata() {
+      return baseSupplier.apply(null);
     }
-    return null;
+
+    /** Drive the op-sequence through a real BaseUpdatePartitionSpec and return the evolved metadata. */
+    TableMetadata evolve(TableMetadata base) {
+      InMemoryTableOperations operations = new InMemoryTableOperations(base);
+      BaseTable table = new BaseTable(operations, "interop");
+      ops.apply(table.updateSpec()).commit();
+      return operations.current();
+    }
+
+    /** An unpartitioned base at the given format version. */
+    static PartitionScenario unpartitioned(
+        Schema schema,
+        int formatVersion,
+        String name,
+        Function<UpdatePartitionSpec, UpdatePartitionSpec> ops) {
+      return new PartitionScenario(
+          ignored -> newBase(schema, PartitionSpec.unpartitioned(), formatVersion, name), ops);
+    }
+
+    /** A base partitioned by a single (built) partition spec at the given format version. */
+    static PartitionScenario partitioned(
+        Schema schema,
+        int formatVersion,
+        int unusedSourceColumns,
+        String name,
+        Function<PartitionSpec.Builder, PartitionSpec.Builder> specBuilder,
+        Function<UpdatePartitionSpec, UpdatePartitionSpec> ops) {
+      return new PartitionScenario(
+          ignored -> {
+            PartitionSpec spec = specBuilder.apply(PartitionSpec.builderFor(schema)).build();
+            return newBase(schema, spec, formatVersion, name);
+          },
+          ops);
+    }
+
+    /**
+     * A V2 base carrying TWO historical specs for the recycling scenario: spec 0 (default) is
+     * identity(category) @1000; spec 1 is bucket[8](id) under the CUSTOM name "id_shard" @1001;
+     * last-partition-id = 1001. Built REALISTICALLY by evolving the identity(category) base through a
+     * real {@link BaseUpdatePartitionSpec} (which assigns the bucket field the next sequential id, 1001,
+     * advancing last-partition-id globally) as a NON-default spec. Driving it this way — rather than
+     * building two independent specs that would BOTH start their field ids at 1000 — is what a real V2
+     * table looks like and is required for recycling: a field id must be unique within a single spec, so
+     * the re-add of bucket[8](id) recycles 1001 (not 1000, which collides with identity(category)).
+     */
+    static PartitionScenario forked(
+        Schema schema,
+        String name,
+        Function<UpdatePartitionSpec, UpdatePartitionSpec> ops) {
+      return new PartitionScenario(
+          ignored -> {
+            PartitionSpec defaultSpec =
+                PartitionSpec.builderFor(schema).identity("category").build();
+            TableMetadata base = newBase(schema, defaultSpec, 2, name);
+            // Evolve in a historical (non-default) spec via the real action so the bucket field gets a
+            // fresh sequential id (1001), exactly as a production V2 evolution would.
+            InMemoryTableOperations operations = new InMemoryTableOperations(base);
+            BaseTable table = new BaseTable(operations, "interop");
+            table
+                .updateSpec()
+                .addNonDefaultSpec()
+                .addField(
+                    "id_shard", org.apache.iceberg.expressions.Expressions.bucket("id", 8))
+                .commit();
+            return operations.current();
+          },
+          ops);
+    }
+
+    private static TableMetadata newBase(
+        Schema schema, PartitionSpec spec, int formatVersion, String name) {
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, Integer.toString(formatVersion));
+      return TableMetadata.newTableMetadata(
+          schema, spec, SortOrder.unsorted(), PARTITION_LOCATION + "/" + name, props);
+    }
+  }
+
+  /**
+   * A minimal in-memory {@link TableOperations} that just holds a {@link TableMetadata} and swaps it on
+   * commit. This is the ONLY way to drive {@link BaseUpdatePartitionSpec} with {@code base != null} (so
+   * the historical field-id recycling path is exercised) without a real catalog / object store. A
+   * partition-spec commit never reads or writes data files, so {@code io()} / {@code locationProvider()}
+   * / {@code newSnapshotId()} stay no-op.
+   */
+  private static final class InMemoryTableOperations implements TableOperations {
+    private TableMetadata current;
+
+    InMemoryTableOperations(TableMetadata initial) {
+      this.current = initial;
+    }
+
+    @Override
+    public TableMetadata current() {
+      return current;
+    }
+
+    @Override
+    public TableMetadata refresh() {
+      return current;
+    }
+
+    @Override
+    public void commit(TableMetadata base, TableMetadata metadata) {
+      // In-memory, single-threaded oracle: trust the optimistic base check that BaseUpdatePartitionSpec
+      // already performed and swap in the new metadata.
+      this.current = metadata;
+    }
+
+    @Override
+    public org.apache.iceberg.io.FileIO io() {
+      throw new UnsupportedOperationException("interop oracle does not perform file IO");
+    }
+
+    @Override
+    public String metadataFileLocation(String fileName) {
+      return current.location() + "/metadata/" + fileName;
+    }
+
+    @Override
+    public org.apache.iceberg.io.LocationProvider locationProvider() {
+      throw new UnsupportedOperationException("interop oracle does not provide data locations");
+    }
   }
 
   // ===========================================================================================

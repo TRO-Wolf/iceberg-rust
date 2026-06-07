@@ -751,3 +751,99 @@ is unaffected. **No existing tests needed reconciling** — a crate-wide audit c
 `check_compatibility`). Files touched exactly the allowed set: `crates/iceberg/src/spec/schema/mod.rs`
 (helper + restructured method + 5 tests), GAP_MATRIX, Roadmap, todo, lessons. No production code outside
 `check_compatibility`/its helper; no Cargo/lockfile edits. An Opus REVIEWER verifies next.
+
+### Increment 8 — UpdatePartitionSpec INTEROP (bidirectional Java round-trip, BUILDER Opus, 2026-06-07)
+Mirror the proven UpdateSchema interop harness for `UpdatePartitionSpec` so its GAP_MATRIX row can flip
+🟡 → ✅. Java under `dev/java-interop/` stays a TEST-ONLY ORACLE (not a Cargo crate, never invoked by
+`cargo`). Durable artifacts = committed JSON fixtures + a Rust test that reads them.
+
+**The wrinkle vs the schema oracle:** Java's `recycleOrCreatePartitionField` only recycles a historical
+field id+name when `formatVersion >= 2 && base != null` (line 124). The `@VisibleForTesting`
+`BaseUpdatePartitionSpec(int, PartitionSpec, ...)` ctors set `base = null` → NO recycling. So to exercise
+recycling I MUST drive through `BaseUpdatePartitionSpec(TableOperations)` (`base = ops.current()`).
+Uniform path for ALL scenarios: a minimal in-memory `org.apache.iceberg.TableOperations` (a sibling class
+in `package org.apache.iceberg`) holding a `TableMetadata`, driven via
+`new BaseTable(ops, name).updateSpec()...commit()`, then read `ops.current()` for the evolved metadata.
+`BaseTable(TableOperations, String)` is public; the in-memory `commit(base, metadata)` just swaps the held
+metadata; `io()/locationProvider()/newSnapshotId()/metadataFileLocation()` are minimal/no-op (the spec
+commit never touches data files).
+
+**Scenarios (≥7, identical + named the same on both sides):**
+- `add_identity_field` (V2) — identity(category) add; base case.
+- `add_transform_fields` (V2) — bucket[16](id), truncate[8](category), year(event_ts) on a multi-col
+  schema; pins auto-generated names (`PartitionNameGenerator`) AND assigned field-ids + last-partition-id.
+- `remove_field_v2` (V2) — base spec has identity(category); remove it → omitted from the new spec.
+- `remove_field_v1_void` (V1) — base spec identity(category); remove → re-added as void/alwaysNull to
+  preserve field-ids (Java V1 `apply()` branch). V1 base.
+- `rename_field` (V2) — rename a base partition field; field-id preserved.
+- `field_id_recycling` (V2) — base metadata carries TWO historical specs sharing a `(source,transform)`
+  with a CUSTOM name; re-adding that field recycles the historical field-id AND name (the Increment-2
+  review bug). Needs `base != null` → the TableOperations path.
+- `delete_then_readd` (V2) — remove + re-add the same `(source,transform)` → Java's rewrite/un-delete
+  (field restored, id stable, no new spec).
+
+Compare the evolved DEFAULT partition spec (spec-id + each field's source-id/field-id/name/transform) +
+`last-partition-id`, embedded in TableMetadata. Compare by PARSING into the Rust model
+(`PartitionSpec`/`PartitionField` `PartialEq`), not raw JSON bytes.
+
+Plan:
+- [ ] 1. Extend `InteropOracle.java`: add a partition-spec scenario registry + an in-memory
+      `TableOperations` sibling; `generate` writes `base`+`java_evolved` for partition scenarios alongside
+      the schema ones; `verify` reads `rust_evolved` and asserts Java parses it + its default spec matches
+      Java's own evolution. Wire BOTH capabilities into one `generate`/`verify` pass; update
+      `run.sh`/`README.md`/`pom.xml` (partition fixtures dir).
+- [ ] 2. `crates/iceberg/tests/interop_update_partition_spec.rs` (mirror the schema test): Dir-1 asserts
+      Rust reproduces Java's evolved default spec (source-id/field-id/name/transform + last-partition-id)
+      for all scenarios via the `MemoryCatalog` + `Transaction::update_partition_spec()` + commit path;
+      writes `rust_evolved.metadata.json` under `ICEBERG_INTEROP_GEN`. Scenario-specific exact-id assert
+      for `field_id_recycling` (recycled id + historical name) — a last-partition-id-only check can't catch
+      a name-recycle drift.
+- [ ] 3. Committed fixtures under `crates/iceberg/testdata/interop/update_partition_spec/<scenario>/`.
+- [ ] 4. Verify: `cargo test -p iceberg --test interop_update_partition_spec`; `cargo test -p iceberg
+      --lib` ×2; `cargo test -p iceberg --test interop_update_schema` (stays green); clippy -D warnings;
+      fmt --check; Java `mvn compile` + generate + verify (PASS/FAIL table for BOTH schema + partition).
+- [x] 5. Flip GAP_MATRIX `UpdatePartitionSpec` row 🟡 → ✅ (both directions pass, no open divergence);
+      reconciled Roadmap headline + summary + Phase-1 exit-criteria lines.
+
+**Outcome (2026-06-07, Increment 8 INTEROP, BUILDER Opus):** bidirectional Java interop for
+`UpdatePartitionSpec` landed; GAP_MATRIX row flipped 🟡 → ✅. One `dev/java-interop` `generate`/`verify`
+pass now covers BOTH capabilities (schema + partition) — `InteropOracle` refactored into `SchemaOracle`
++ `PartitionOracle` nested classes driven from one entrypoint; the partition oracle drives a REAL
+`BaseUpdatePartitionSpec` via `new BaseTable(ops).updateSpec()…commit()` over an in-memory
+`TableOperations` (so `base != null` and `recycleOrCreatePartitionField` is live). 7 partition scenarios
+(`add_identity_field`, `add_transform_fields`, `remove_field_v2`, `remove_field_v1_void`, `rename_field`,
+`field_id_recycling`, `delete_then_readd`) × 3 committed fixtures, mirrored by
+`crates/iceberg/tests/interop_update_partition_spec.rs`. Both directions PASS 7/7 (schema stays 7/7).
+**Two divergences surfaced by interop:**
+  1. **`field_id_recycling` — fixture artifact (test-only fix).** My first base built two independent
+     specs that BOTH started field ids at 1000 → the recycled add collided (`Cannot use field id more
+     than once in one PartitionSpec: 1000`). Real V2 tables don't look like that: a non-default
+     historical spec gets a fresh sequential id (1001) via `BaseUpdatePartitionSpec.assignFieldId`. Fixed
+     by building the recycling base by evolving in the historical spec through the real action (id 1001),
+     which is what production does. No Rust production change.
+  2. **V1 void replacement — REAL Rust↔Java divergence (in-scope production fix, FLAGGED).** Binding the
+     V1-evolved spec was rejected: `Cannot create partition with name: 'category' that conflicts with
+     schema field and is not an identity transform.` The Rust partition-name↔schema collision check
+     (`PartitionSpecBuilder::check_name_does_not_collide_with_schema` + `TableMetadataBuilder::
+     validate_partition_field_names`) was **identity-only**, but Java's bind-path `PartitionSpec.Builder.
+     checkAndAddPartitionName(name, sourceId)` (line 618 → 401) permits ANY transform as long as the
+     colliding schema field's id == the partition's source id — only the public typed builders (`.bucket()`
+     etc., `sourceColumnId=null`) are strict. The V1 void replacement (`void(category)` named `category`,
+     sourced from `category`) satisfies the name↔source-id rule and is legal in Java. **FIX (production,
+     2 files):** relaxed both Rust checks to **identity OR void** (source-id-gated) — the narrowest
+     Java-faithful change that keeps the existing strict-builder bucket-rejection test intact. Pinned with
+     positive + negative tests at both layers (`partition.rs`: void-named-after-own-source OK / different-
+     source rejected; `table_metadata_builder.rs`: void replacement accepted; existing bucket-collision
+     test unchanged). Mutation-verified load-bearing (reverting to identity-only fails all 3 void tests +
+     interop V1). Did NOT broaden to bucket/truncate (Rust collapses Java's two name-check paths into one,
+     and the existing `test_builder_collision` pins bucket-via-builder rejection — out of scope to split).
+**Verify:** `interop_update_partition_spec` 4 tests (1 loops all 7 scenarios) green offline; lib suite
+×2 = 1336/0 both runs (1334 prior + 2 new void tests); `interop_update_schema` stays 4/4; clippy -D
+warnings clean; fmt clean; `mvn compile` + run.sh end-to-end = 7/7 schema + 7/7 partition both directions.
+(5 pre-existing `rt-multi-thread` doctest failures in `lib.rs`/`writer/mod.rs` — unrelated, env artifact,
+documented in the Increment-7 reviewer lesson.) **Files touched (exactly the allowed set):**
+`dev/java-interop/{InteropOracle.java,pom.xml,run.sh,README.md}`, new
+`crates/iceberg/tests/interop_update_partition_spec.rs` + `testdata/interop/update_partition_spec/**`,
+production `crates/iceberg/src/spec/{partition.rs,table_metadata_builder.rs}` (the flagged guard fix +
+tests), docs `GAP_MATRIX.md`/`Roadmap.md`/`task/{todo.md,lessons.md}`. No Cargo/lockfile edits. An Opus
+REVIEWER verifies next.

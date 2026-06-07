@@ -406,3 +406,81 @@ How to use it (see the manuals' §2):
   environment/feature artifact, NOT introduced by the guard. A compile error in an unrelated writer
   doctest is a strong tell that the failure is environmental, since a runtime guard cannot cause a
   doctest not to compile.
+
+### 2026-06-07 (Increment 8 — UpdatePartitionSpec INTEROP, BUILDER Opus)
+- **DO drive the partition-spec interop oracle through a REAL `BaseUpdatePartitionSpec`
+  (`new BaseTable(ops, name).updateSpec()…commit()` over an in-memory `TableOperations`), NOT the
+  `@VisibleForTesting BaseUpdatePartitionSpec(int, PartitionSpec, …)` ctors.** *Why:* those test ctors set
+  `base = null` (line 97), and `recycleOrCreatePartitionField` only recycles when `formatVersion >= 2 &&
+  base != null` (line 124) — so the recycling scenario would silently NOT recycle and the fixture would
+  prove nothing. The in-memory `TableOperations` only needs `current()`/`refresh()`/`commit()` (swap the
+  held metadata) + a no-op `metadataFileLocation`; `io()`/`locationProvider()` can throw (a partition-spec
+  commit never touches data files). `BaseTable(TableOperations, String)` is public.
+- **DO build a multi-spec recycling fixture by EVOLVING a non-default spec through the real action, not by
+  `buildFrom(base).addPartitionSpec(twoIndependentSpecs)`.** *Why:* `PartitionSpec.builderFor(schema)`
+  starts each spec's field ids at 1000 and `freshSpec` PRESERVES the passed `field.fieldId()` — so two
+  independently-built specs BOTH carry field id 1000, and a recycle of the second collides
+  (`Cannot use field id more than once in one PartitionSpec: 1000`) in the Rust metadata builder. A real
+  V2 table never looks like that: a historical non-default spec's field gets the next sequential id (1001)
+  via `BaseUpdatePartitionSpec.assignFieldId`. Drive `updateSpec().addNonDefaultSpec().addField(...)` so
+  the field gets 1001; then the recycle reuses 1001 (distinct from the default spec's 1000) and the
+  realistic-id assertion (1001, not a fresh 1002) is the discriminating check.
+- **DO recognize that Rust's partition-name↔schema collision check is identity-ONLY but Java's BIND path
+  allows any transform sourced from its own column.** *Why:* Java has TWO name-check strictnesses keyed on
+  `PartitionSpec.Builder.checkAndAddPartitionName(name, sourceColumnId)` — the public typed builders
+  (`.bucket()`/`.truncate()`/`.year()`/…) pass `sourceColumnId=null` (STRICT: reject any schema-name
+  collision), while the bind path (`UnboundPartitionSpec.bind` → `add(sourceId, fieldId, name, transform)`,
+  line 618) passes the source id (LENIENT: allow if the colliding schema field's id == the partition's
+  source id, regardless of transform). The Rust `PartitionSpecBuilder` collapses both into one identity-only
+  rule, which wrongly rejects the V1 **void replacement** (`void(category)` named `category`, sourced from
+  `category`) when its emitted spec is bound. Fix: relax `check_name_does_not_collide_with_schema` +
+  `validate_partition_field_names` to **identity OR void** (source-id-gated) — the narrowest Java-faithful
+  change; do NOT broaden to bucket/truncate (Rust can't split the two paths without a `checkConflicts`-style
+  flag, and the existing `test_builder_collision` pins bucket-via-builder rejection — keep it green).
+- **DO let the interop test surface bind-path bugs the unit tests can't.** *Why:* the `update_partition_spec.rs`
+  unit tests inspect the unbound `apply()` shape (`test_remove_v1_replaces_with_void`) — they NEVER bind the
+  emitted spec, so the V1-void name-collision divergence was invisible to them. The interop test goes through
+  the FULL catalog commit (`register_table` → `Transaction::commit` → `add_partition_spec` → `bind`), which is
+  the only path that exercises the bind-time name check. An action whose unbound output is correct can still
+  emit metadata the metadata builder rejects; only an end-to-end commit proves the round-trip.
+- **DO compare evolved partition specs structurally via `PartitionField: PartialEq` (source-id/field-id/
+  name/transform) + `last_partition_id`, on the DEFAULT spec, parsed from the metadata — not raw JSON.**
+  *Why:* same rationale as the schema interop (`StructType: PartialEq`): Jackson and `serde_json` differ in
+  key order/whitespace; field-id-level identity is the contract. Java's `PartitionField.equals` covers the
+  same four fields, so a `List<PartitionField>.equals` on both sides is the exact mirror. Add a
+  scenario-specific exact-id+name assertion for recycling — a field-id-only check can't catch a recycled-id-
+  but-generated-name regression (the Increment-2 review bug).
+
+### 2026-06-07 (Increment 8 — UpdatePartitionSpec INTEROP, REVIEWER Opus)
+- **DECISION (the guard relaxation is HONEST ✅, the residual divergence is Rust-STRICTER): the guard fix
+  is safe in the only direction that matters.** Java's bind-path rule is
+  `PartitionSpec.Builder.checkAndAddPartitionName(name, sourceColumnId)` (api/PartitionSpec.java:401-427,
+  `checkConflicts=true` by default, reached for EVERY field via `UnboundPartitionSpec.bind →
+  copyToBuilder → builder.add(sourceId, [fieldId,] name, transform) → checkAndAddPartitionName(name,
+  sourceId)`): when `sourceColumnId != null` (identity/alwaysNull/`add`), look up `schemaField` by name; if
+  the SOURCE column still exists in the schema, require `schemaField == null || schemaField.fieldId() ==
+  sourceColumnId` — and if the source column was DROPPED, SKIP the name check entirely. The rule is
+  **transform-AGNOSTIC** (any transform passes as long as name↔source-id holds) and has a **source-dropped
+  bypass**. The Rust relaxed guard is narrower: `(identity OR void) AND collision.id == source_id`. Two
+  residual divergences, BOTH Rust-STRICTER (Rust rejects valid-in-Java; never accepts invalid-in-Java):
+  (a) a bucket/truncate/year field explicitly NAMED after its own source column — Java accepts (source-id
+  matches), Rust rejects (not identity/void); (b) a collision where the source column was dropped — Java
+  skips/accepts, Rust still compares ids and rejects. Neither can emit Java-unreadable metadata, so ✅ is
+  honest WITHOUT a caveat: the dangerous direction (Rust accepts a spec Java rejects) does NOT exist here.
+  Verified empirically with a throwaway probe (bucket-named-after-own-source → Rust REJECTS). The
+  `add_partition_spec` path can only get stricter than Java, never looser.
+- **DO confirm a relaxed collision guard still REJECTS the unrelated-source case before trusting ✅.** *Why:*
+  the dangerous regression would be a `void`/identity field named after an UNRELATED schema column slipping
+  through. Mutation-verified the source-id gate is load-bearing: forcing the source-id check past in BOTH
+  layers (`partition.rs` `check_name_does_not_collide_with_schema` AND `table_metadata_builder.rs`
+  `validate_partition_field_names`) makes a void-named-after-a-different-column spec ACCEPTED — caught by the
+  partition.rs negative tests. Tightening the relaxation back to identity-only fails the V1-void unit tests
+  (both layers) AND the `remove_field_v1_void` interop scenario. The guard fires iff
+  `(identity|void) && collision.id == source_id` — the precise narrowed-Java rule.
+- **DO add a public-entry-point negative test even when a downstream layer already catches the bad case.**
+  *Why:* `add_partition_spec` runs `validate_partition_field_names` (builder layer) THEN
+  `PartitionSpecBuilder::build` (partition.rs layer); the builder-layer `has_matching_source_id` rejection
+  branch had NO test — a single-layer mutation (`has_matching_source_id = true`) failed nothing because the
+  partition.rs guard caught it. Added `test_partition_spec_evolution_rejects_void_named_after_a_different_
+  source_column` driving the rejection end-to-end through `add_partition_spec`; it pins the source-id gate
+  as a whole (the both-layers mutation fails it). Defense-in-depth still needs a test at the public door.

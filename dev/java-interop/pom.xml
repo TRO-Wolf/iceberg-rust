@@ -41,8 +41,9 @@
     <maven.compiler.target>11</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <iceberg.version>1.10.0</iceberg.version>
-    <!-- The Rust crate's testdata dir, where fixtures are read/written. -->
+    <!-- The Rust crate's testdata dirs, where fixtures are read/written (one per capability). -->
     <interop.fixtures.dir>${project.basedir}/../../crates/iceberg/testdata/interop/update_schema</interop.fixtures.dir>
+    <interop.partition.fixtures.dir>${project.basedir}/../../crates/iceberg/testdata/interop/update_partition_spec</interop.partition.fixtures.dir>
   </properties>
 
   <dependencies>
@@ -73,6 +74,10 @@
             <systemProperty>
               <key>interop.fixtures.dir</key>
               <value>${interop.fixtures.dir}</value>
+            </systemProperty>
+            <systemProperty>
+              <key>interop.partition.fixtures.dir</key>
+              <value>${interop.partition.fixtures.dir}</value>
             </systemProperty>
           </systemProperties>
         </configuration>

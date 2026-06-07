@@ -72,10 +72,14 @@ layers are removed in Phase 0.
    (2026-06-07) closed the last holes by enforcing the V3-only initial-default guard AND the V3-only
    **type** gate (`Schema::check_compatibility` in `TableMetadataBuilder::add_schema`, mirroring Java
    `Schema.checkCompatibility` in full — both `DEFAULT_VALUES_MIN_FORMAT_VERSION` and `MIN_FORMAT_VERSIONS`).
-   **The next move is the V3 groundwork (row-lineage fields; the remaining `MIN_FORMAT_VERSIONS` types —
-   `variant`/`unknown`/`geometry`/`geography` — each a one-line `min_format_version` arm when the type lands)
-   and applying the same interop harness to flip the remaining 🟡 rows (`UpdatePartitionSpec`,
-   `ManageSnapshots`) to ✅.** The live, increment-level plan and checkbox
+   **`UpdatePartitionSpec` is now ✅ too** (bidirectional interop landed 2026-06-07 via the same
+   `dev/java-interop/` oracle — one `generate`/`verify` pass now covers both schema + partition; the
+   interop surfaced and fixed a real Rust↔Java divergence in the partition-name↔schema collision check —
+   identity-only → identity-OR-void, mirroring Java's bind path). **The next move is the V3 groundwork
+   (row-lineage fields; the remaining `MIN_FORMAT_VERSIONS` types — `variant`/`unknown`/`geometry`/
+   `geography` — each a one-line `min_format_version` arm when the type lands) and applying the same
+   interop harness to flip the last 🟡 row (`ManageSnapshots`) to ✅.** The live, increment-level plan
+   and checkbox
    state are in
    [task/todo.md](task/todo.md) — read it (and [task/lessons.md](task/lessons.md) in full) before starting.
 3. Verify the build before and after each change:
@@ -108,11 +112,13 @@ delete application**, scan planning, the catalog set (REST/Hive/Glue/S3 Tables/S
 (Phase 1 increments 1–7: full `SchemaUpdate` incl. `UnionByNameVisitor`, level-order field-id assignment,
 column initial/write defaults, the V3-only initial-default AND type gates (`Schema::check_compatibility` in
 `TableMetadataBuilder::add_schema`, fully mirroring Java `Schema.checkCompatibility`), AND a bidirectional
-Java interop round-trip via `dev/java-interop/` + `crates/iceberg/tests/interop_update_schema.rs`); **snapshot
-management (`ManageSnapshots`) and partition
-evolution (`UpdatePartitionSpec`) remain partial (🟡)** (branch/tag lifecycle + rollback +
-rollback-to-time + fast-forward + retention (non-positive rejected); full `BaseUpdatePartitionSpec` —
-`cherrypick` is Phase-2-gated and a Java interop round-trip remains before ✅ for each); the
+Java interop round-trip via `dev/java-interop/` + `crates/iceberg/tests/interop_update_schema.rs`);
+**partition evolution (`UpdatePartitionSpec`) is ✅ too** (full `BaseUpdatePartitionSpec` parity + a
+bidirectional Java interop round-trip via the same oracle + `crates/iceberg/tests/interop_update_partition_spec.rs`,
+which surfaced and fixed a real partition-name↔schema collision divergence); **snapshot management
+(`ManageSnapshots`) remains partial (🟡)** (branch/tag lifecycle + rollback + rollback-to-time +
+fast-forward + retention (non-positive rejected); `cherrypick` is Phase-2-gated and a Java interop
+round-trip remains before ✅); the
 **write engine beyond fast-append, incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
@@ -227,8 +233,9 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `variant`/`unknown`/`geometry`/`geography` are a one-line `min_format_version` arm each when those types
   land (tracked in `task/todo.md`).
 - **Exit criteria:** each action matches the Java contract behavior, with unit + interop tests; GAP_MATRIX
-  rows flipped to ✅ (interop proven). **`UpdateSchema` ✅ (now a clean row — V3 initial-default guard
-  enforced); `UpdatePartitionSpec` + `ManageSnapshots` await the same interop treatment.**
+  rows flipped to ✅ (interop proven). **`UpdateSchema` ✅ (V3 initial-default + type gates enforced) and
+  `UpdatePartitionSpec` ✅ (bidirectional interop landed 2026-06-07, surfacing+fixing the identity-only
+  partition-name collision divergence); `ManageSnapshots` awaits the same interop treatment.**
 
 ### Phase 2 — Write engine  ·  **Status: ❌ (largest functional gap)**
 - **Goal:** the full commit/write surface beyond fast-append.
