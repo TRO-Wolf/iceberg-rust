@@ -96,8 +96,11 @@ layers are removed in Phase 0.
    on 2026-06-07 (delete data files by path/reference; `MemoryCatalog` unit tests; data-level Java interop
    deferred); increment 2 — `OverwriteFiles` (explicit add + delete in one `Overwrite` snapshot, composing
    the add + delete paths via the now-shared `SnapshotProducer::{resolve_delete_paths,
-   current_data_manifests}`; summary reflects added + deleted counts) — landed 🟡 the same day. Next Phase-2
-   increments: `ReplacePartitions`, `RewriteFiles`, `RewriteManifests`, merge append, `RowDelta`. (V3
+   current_data_manifests}`; summary reflects added + deleted counts) — landed 🟡 the same day; increment 3
+   — `ReplacePartitions` (dynamic partition overwrite; a by-PARTITION sibling resolver
+   `SnapshotProducer::resolve_partition_deletes` feeds the same rewrite path; replaces every partition an
+   added file belongs to, full replace on an unpartitioned table, `replace-partitions` marker) — landed 🟡
+   the same day. Next Phase-2 increments: `RewriteFiles`, `RewriteManifests`, merge append, `RowDelta`. (V3
    groundwork — row-lineage fields + the remaining `MIN_FORMAT_VERSIONS` types
    `variant`/`unknown`/`geometry`/`geography` — also remains.)** The live,
    increment-level plan and checkbox
@@ -146,8 +149,12 @@ replays data files). **Phase 2 has started: `DeleteFiles` + the manifest-filter 
 (`transaction/delete_files.rs` + `SnapshotProducer::process_deletes`, `MemoryCatalog`-tested; data-level
 Java interop deferred); **`OverwriteFiles` is 🟡** (`transaction/overwrite_files.rs` — explicit add + delete
 in one `Overwrite` snapshot, reusing the shared resolve/list helpers; summary reflects added + deleted
-counts; `overwriteByRowFilter` + conflict validation + interop deferred); the rest of the **write engine
-(merge append, `ReplacePartitions`, `RowDelta`, `RewriteFiles`, `RewriteManifests`), incremental scans, ORC/Avro data files,
+counts; `overwriteByRowFilter` + conflict validation + interop deferred); **`ReplacePartitions` is 🟡**
+(`transaction/replace_partitions.rs` — dynamic partition overwrite via a by-PARTITION sibling resolver
+`SnapshotProducer::resolve_partition_deletes` feeding the same rewrite path; full replace on an
+unpartitioned table; `replace-partitions` marker; static `replaceByRowFilter` + conflict validation +
+interop deferred); the rest of the **write engine
+(merge append, `RowDelta`, `RewriteFiles`, `RewriteManifests`), incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
 
@@ -265,7 +272,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `UpdatePartitionSpec` ✅ (bidirectional interop landed 2026-06-07, surfacing+fixing the identity-only
   partition-name collision divergence); `ManageSnapshots` awaits the same interop treatment.**
 
-### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` landed 2026-06-07)**
+### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` landed 2026-06-07)**
 - **Goal:** the full commit/write surface beyond fast-append.
 - **Gates on:** Phase 1.
 - **Increment sequence (dependency, then value):** **1. `DeleteFiles`** (done 🟡 — delete data files by
@@ -273,7 +280,11 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   rest reuse), **2. `OverwriteFiles`** (done 🟡 — explicit add + delete in one `Overwrite` snapshot,
   composing the fast-append add path with the `DeleteFiles` filter path via the now-shared
   `SnapshotProducer::{resolve_delete_paths, current_data_manifests}`; summary reflects added + deleted
-  counts; `overwriteByRowFilter` + conflict validation + interop deferred), 3. `ReplacePartitions`,
+  counts; `overwriteByRowFilter` + conflict validation + interop deferred), **3. `ReplacePartitions`**
+  (done 🟡 — dynamic partition overwrite; a by-PARTITION sibling resolver
+  `SnapshotProducer::resolve_partition_deletes` feeds the same `process_deletes` rewrite path; replaces
+  every partition an added file belongs to, full replace on an unpartitioned table, `replace-partitions`
+  marker; static `replaceByRowFilter` + conflict validation + interop deferred),
   4. `RewriteFiles`, 5. `RewriteManifests`, 6. merge append, 7. `RowDelta` + position-delete / deletion-vector
   writers, 8. multi-op transaction hardening + optimistic-concurrency retry on the real catalogs.
 - **Key deliverables:** merge append, `OverwriteFiles`, `ReplacePartitions`, `DeleteFiles` (🟡), `RowDelta`,

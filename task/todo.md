@@ -1423,3 +1423,111 @@ reflow applied). Files touched: `transaction/overwrite_files.rs` (dynamic op + 2
 GAP_MATRIX (dynamic-operation note replaces the stale deviation), todo, lessons. NO snapshot.rs production
 change needed (both summary fixes were already correct); no Cargo edits; no `#[ignore]`; no bare `.unwrap()`
 added. 🟡 stays.
+
+### Phase 2 Increment 3 — ReplacePartitions (dynamic partition overwrite) (IN PROGRESS, 2026-06-07, BUILDER Opus)
+New file `crates/iceberg/src/transaction/replace_partitions.rs`: `ReplacePartitionsAction` (dynamic
+partition overwrite). Mirrors Java `BaseReplacePartitions` — when committed, for every partition an ADDED
+file belongs to, DELETE every existing live data file in that same `(spec_id, partition)`, then add the new
+files, in ONE `Operation::Overwrite` snapshot. Reuses the Increment-1 manifest-filter/rewrite machinery.
+
+**Java rules verified against `/tmp/iceberg-java-ref` source (BaseReplacePartitions.java):**
+- `operation()` returns `DataOperations.OVERWRITE` → `Operation::Overwrite` (always; line ~45). [VERIFIED]
+- Ctor sets `SnapshotSummary.REPLACE_PARTITIONS_PROP = "replace-partitions" = "true"` (line ~36). [VERIFIED]
+- `addFile(file)` → `dropPartition(file.specId(), file.partition())` + `replacedPartitions.add(...)` +
+  `add(file)` (lines 49-55): the partition of each added file is dropped (every existing live file in that
+  `(specId, partition)` is removed), and the file is added.
+- `ManifestFilterManager.manifestHasDeletedFiles`/`filterManifestWithDeletedFiles` mark a live entry for
+  delete iff `dropPartitions.contains(file.specId(), file.partition())` (lines 463, 518) — the by-PARTITION
+  match (no path/row-filter/metrics needed). [VERIFIED]
+- **Unpartitioned = full replace:** `apply()` (line ~108) — `if dataSpec().isUnpartitioned()
+  deleteByRowFilter(Expressions.alwaysTrue())` → every file removed. (Falls out naturally: every file is in
+  the single empty partition, so dropping that partition drops all.) [VERIFIED]
+- **No `failMissingDeletePaths` for partition drops:** `validateRequiredDeletes` only validates path/file
+  deletes (lines 280-300); `dropPartitions` has NO missing-validation → replacing a partition with no
+  existing files is a pure add, no spurious delete, no error. [VERIFIED]
+- **No-added-files:** Java does not special-case it; `super.apply()` (`SnapshotProducer.apply`) requires the
+  commit to produce content. Rust mirrors via the existing precondition (no adds + no deletes + no props →
+  rejected). A ReplacePartitions with no added files + no resolved deletes is effectively empty → rejected.
+- **OUT OF SCOPE (defer + flag):** static `replaceByRowFilter`/explicit-partition APIs (need expression
+  evaluators); concurrent-commit conflict validation (`validateNoConflictingData`/`...Deletes`/
+  `validateFromSnapshot`) — serializable isolation, ancestor-chain replay.
+
+**CRITICAL summary finding (verified against Java + Increment-2 review):** Java `SnapshotProducer.summary()`
+has NO truncate/full-table branch — it computes `total = previous + added - removed` UNCONDITIONALLY via
+`updateTotal` (SnapshotProducer.java:926). `replace-partitions=true` is JUST a summary prop. So the
+Java-faithful Rust call is `truncate_full_table = FALSE`: the by-partition resolution already reports EVERY
+removed file (so `deleted-data-files`/`deleted-records` are correct), and `update_totals` computes the right
+post-replace totals (e.g. unpartitioned full replace: prev=N, added=M, removed=N → N+M-N = M, no underflow).
+Setting `truncate_full_table=true` would DOUBLE-COUNT deletes vs. the resolved-removed set and diverge from
+Java. (This corrects the brief's hint — flag in final report. The `truncate_full_table` Rust path has no
+Java analogue for any standard op, per the Increment-2 reviewer.) So NO producer truncate-flag change; the
+summary correctness comes from the resolved removed-file set + existing `update_totals`.
+
+**By-partition delete resolution design (reuses Increment-1, no duplication):** The producer's manifest
+rewrite (`process_deletes`) matches removed files by PATH. ReplacePartitions resolves its drop-partition set
+to the matching `Vec<DataFile>` in the `delete_files` seam — scan the current data manifests, collect every
+live `DataFile` whose `(partition_spec_id, partition)` is in the drop set — and returns them. The producer
+then drives the EXACT SAME rewrite/keep/drop + provenance machinery unchanged. New shared helper
+`SnapshotProducer::resolve_partition_deletes(&HashSet<(i32, Struct)>) -> Result<Vec<DataFile>>` in
+snapshot.rs (sibling of `resolve_delete_paths`); `replace_partitions.rs`'s operation calls it. No change to
+`process_deletes`/`rewrite_manifest_with_deletes`/`current_data_manifests`.
+
+Plan:
+- [x] A. `snapshot.rs`: added `resolve_partition_deletes(&self, &HashSet<(i32, Struct)>) -> Result<Vec<DataFile>>`
+      (scans current data manifests, collects live DataFiles whose `(partition_spec_id, partition)` ∈ set; no
+      missing-validation — partition drops are not path deletes). Shared, sibling of `resolve_delete_paths`.
+- [x] B. `replace_partitions.rs`: `ReplacePartitionsAction` with `add_file`/`add_files` +
+      `set_commit_uuid`/`set_snapshot_properties`/`set_key_metadata`. `commit()`: validates added files via
+      `validate_added_data_files`; collects the drop set `{(spec_id, partition)}` from the added files; sets
+      the `replace-partitions=true` snapshot property (layered ON TOP of caller props); drives
+      `producer.commit(ReplacePartitionsOperation, DefaultManifestProcess)`. Operation = `Operation::Overwrite`;
+      `delete_files` seam → `resolve_partition_deletes(drop_set)`; `existing_manifest` → `current_data_manifests`.
+- [x] C. Wired `Transaction::replace_partitions()` + `mod replace_partitions;` + `use ...ReplacePartitionsAction`.
+- [x] D. 8 tests (in `replace_partitions.rs`, `MemoryCatalog`; identity(x) fixture + an in-test unpartitioned
+      V3 table helper since no unpartitioned JSON fixture exists): (1) cross-partition isolation A@x=0,B@x=1 →
+      replace A2@x=0 → {A2,B}; (2) replace multiple partitions; (3) replace partition with multiple new files;
+      (4) surviving-entry provenance (untouched B keeps S1/seqs); (5) unpartitioned FULL replace → {C}, marker
+      set, totals 2-2+1=1, `deleted-data-files=2`; (6) replace empty partition = pure add; (7) Overwrite op
+      recorded (in test 1); (8) marker + Deleted tombstone on partitioned replace. Mutation-verified: resolve
+      nothing (under-delete) fails 6 tests; resolve everything (over-delete/cross-partition loss) fails 5
+      tests incl. cross-partition isolation; re-stamp surviving entries fails the provenance test.
+- [x] E. Docs: GAP_MATRIX `Write: ReplacePartitions` ❌ → 🟡 + headline-gap #1 + DeleteFiles reuse note;
+      Roadmap Phase 2 status/sequence/snapshot/current-state lines; this todo; lessons.
+- [x] F. Verify gate from repo root: build clean; lib ×2 = 1373/0 both runs (was 1365 → +8); interop
+      manage_snapshots/update_schema/update_partition_spec all 4/4; clippy -D warnings clean; fmt --check clean
+      (one reflow applied via `cargo fmt`).
+
+**Outcome (2026-06-07, Phase 2 Increment 3, BUILDER Opus):** `ReplacePartitionsAction` (dynamic partition
+overwrite) lands 🟡. **By-partition delete-resolution design:** the producer's `process_deletes` rewrite
+matches removed files by PATH; ReplacePartitions's `delete_files` seam resolves its drop-partition set
+`{(spec_id, partition)}` (collected from the added files) to the matching live `DataFile`s via the new
+shared `SnapshotProducer::resolve_partition_deletes` (sibling of `resolve_delete_paths`), which then feed the
+EXACT SAME Increment-1 rewrite/keep/drop + provenance-preservation machinery UNCHANGED — zero edits to
+`process_deletes`/`rewrite_manifest_with_deletes`/`current_data_manifests`. **Java semantics mirrored
+(cited):** `operation()` = `Overwrite` (`BaseReplacePartitions.operation()` = `DataOperations.OVERWRITE`);
+`addFile` drops `file.partition()` then adds (`dropPartition` + `add`); the by-partition match is
+`ManifestFilterManager`'s `dropPartitions.contains(file.specId(), file.partition())`;
+`replace-partitions=true` summary marker (`SnapshotSummary.REPLACE_PARTITIONS_PROP`); unpartitioned = full
+replace (every file in the single empty partition → all replaced, Java's `deleteByRowFilter(alwaysTrue)`);
+a replaced partition with no existing files = pure add (Java's `failMissingDeletePaths` guards only path
+deletes). **SUMMARY-FLAG CORRECTION (flagged in final report):** the brief hinted at setting the producer's
+`truncate_full_table` flag for the unpartitioned full replace. The Java-faithful answer is
+`truncate_full_table = FALSE` (the producer already passes `false`, unchanged): Java
+`SnapshotProducer.summary()` has NO truncate branch — it computes `total = previous + added - removed`
+unconditionally; the by-partition resolution already reports EVERY removed file, so `deleted-data-files`/
+`deleted-records` are correct and `update_totals` yields the right post-replace totals (full replace of N
+adding M → N+M-N = M, no underflow — verified by the unpartitioned test asserting total=1 + deleted=2).
+Setting `truncate_full_table=true` would DOUBLE-COUNT vs. the resolved-removed set and diverge from Java
+(matches the Increment-2 reviewer's "Java has no full-table-truncate branch even for ReplacePartitions").
+**No-added-files behavior:** Java does not special-case it; a no-added-files replace resolves no deletes →
+nothing added/removed (pinned by test 8 — the existing file is untouched). The action always sets the
+`replace-partitions` marker (a snapshot property), so the producer's empty-commit precondition does not trip
+for the no-added case; this is the standard Java shape (the marker is a property). **OUT OF SCOPE (deferred,
+flagged):** static `replaceByRowFilter`/explicit-partition APIs (need metrics evaluators); concurrent-commit
+conflict validation (`validateNoConflictingData`/`...Deletes`/`validateFromSnapshot` — serializable
+isolation, ancestor-chain replay); data-level Java interop round-trip. **Files touched exactly the allowed
+set:** new `transaction/replace_partitions.rs`, `transaction/snapshot.rs` (the by-partition resolver only —
+no rewrite-machinery change), `transaction/mod.rs` (wiring), docs `GAP_MATRIX.md`/`Roadmap.md`/
+`task/{todo.md,lessons.md}`. **Nothing outside the allowed set** — no `delete_files.rs`/`overwrite_files.rs`
+touch was needed (the shared factor already existed from Increment 2); no Cargo/lockfile edits; no
+`#[ignore]`; no bare `.unwrap()` in production paths. An Opus REVIEWER verifies next.

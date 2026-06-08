@@ -291,6 +291,56 @@ impl<'a> SnapshotProducer<'a> {
         Ok(resolved)
     }
 
+    /// Resolve a set of `(partition_spec_id, partition)` tuples against the current snapshot's live data
+    /// entries, returning every matching [`DataFile`] (the ones a partition-scoped replace removes).
+    ///
+    /// This is the by-PARTITION delete-resolution path used by `ReplacePartitions` (dynamic partition
+    /// overwrite), the sibling of the by-PATH [`SnapshotProducer::resolve_delete_paths`]. It scans every
+    /// current data manifest and collects each live entry whose `(partition_spec_id, partition)` is in
+    /// `drop_partitions` — mirroring Java `ManifestFilterManager`'s `dropPartitions.contains(file.specId(),
+    /// file.partition())` test (`filterManifestWithDeletedFiles`). The resolved [`DataFile`]s are then fed
+    /// to the SAME producer rewrite machinery (`process_deletes`, which matches by path), so the
+    /// rewrite/keep/drop + provenance-preservation logic is reused unchanged.
+    ///
+    /// Unlike `resolve_delete_paths`, there is NO missing-target validation: Java's `failMissingDeletePaths`
+    /// guards only path/file deletes (`validateRequiredDeletes`), never partition drops. Replacing a
+    /// partition that has no existing files is therefore a pure add (no spurious delete, no error). Returns
+    /// an empty vector when `drop_partitions` is empty or the table has no current snapshot.
+    pub(crate) async fn resolve_partition_deletes(
+        &self,
+        drop_partitions: &HashSet<(i32, Struct)>,
+    ) -> Result<Vec<DataFile>> {
+        if drop_partitions.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut resolved = Vec::new();
+        if let Some(snapshot) = self.table.metadata().current_snapshot() {
+            let manifest_list = snapshot
+                .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+                .await?;
+
+            for manifest_file in manifest_list.entries() {
+                if manifest_file.content != ManifestContentType::Data {
+                    continue;
+                }
+                let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+                for entry in manifest.entries() {
+                    if !entry.is_alive() {
+                        continue;
+                    }
+                    let data_file = entry.data_file();
+                    let key = (data_file.partition_spec_id, data_file.partition().clone());
+                    if drop_partitions.contains(&key) {
+                        resolved.push(data_file.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(resolved)
+    }
+
     fn generate_unique_snapshot_id(table: &Table) -> i64 {
         let generate_random_id = || -> i64 {
             let (lhs, rhs) = Uuid::new_v4().as_u64_pair();

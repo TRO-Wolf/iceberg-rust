@@ -834,3 +834,47 @@ How to use it (see the manuals' §2):
   `entry.is_alive() && delete_paths.contains(...)` match, same "Missing required files to delete" +
   `ErrorKind::DataInvalid`, same empty-set early return. All 11 DeleteFiles tests stay green — the extraction
   changed call sites, not semantics.
+
+### 2026-06-07 (Phase 2 Increment 3 — ReplacePartitions, BUILDER Opus)
+- **DO resolve a by-PARTITION dynamic overwrite into a `Vec<DataFile>` and feed it to the EXISTING by-path
+  `process_deletes` rewrite, rather than adding a second rewrite path.** *Why:* Java's `ManifestFilterManager`
+  marks a live entry for delete when `dropPartitions.contains(file.specId(), file.partition())` — a
+  by-partition predicate. But the Rust producer's rewrite (`process_deletes`/`rewrite_manifest_with_deletes`)
+  already matches removed files by PATH and already gets the rewrite/keep/drop + provenance-preservation right
+  (Increment 1). So the minimal, no-duplication design is a new RESOLVER
+  `SnapshotProducer::resolve_partition_deletes(&HashSet<(i32, Struct)>)` (sibling of `resolve_delete_paths`)
+  that scans the current data manifests, collects every live `DataFile` whose `(partition_spec_id, partition)`
+  is in the drop set, and returns it — the producer's `delete_files` seam then drives the SAME path unchanged.
+  `Struct` derives `PartialEq + Eq + Hash`, so `(i32, Struct)` is a valid `HashSet` key. Zero edits to the
+  rewrite machinery.
+- **DO use `truncate_full_table = FALSE` for ReplacePartitions' unpartitioned full replace — the brief's
+  truncate hint is WRONG against the Java source.** *Why:* Java `SnapshotProducer.summary()`
+  (`SnapshotProducer.java:926` `updateTotal`) has NO full-table-truncate branch — it computes
+  `total = previous + added - removed` UNCONDITIONALLY; `BaseReplacePartitions` only sets
+  `replace-partitions=true` (a summary property) and reaches a full unpartitioned replace via
+  `deleteByRowFilter(alwaysTrue)`, which makes the filter manager report EVERY file as deleted. The Rust
+  by-partition resolver ALREADY produces the full removed-file set (an unpartitioned table's single empty
+  partition matches all files), so `update_totals` computes the correct post-replace totals (N prev − N
+  removed + M added = M, no underflow) and `remove_file` reports the right `deleted-data-files`/`-records`.
+  Setting `truncate_full_table=true` (the Rust-only `truncate_table_summary` path) would ALSO set
+  `deleted-data-files = previous total`, DOUBLE-COUNTING vs. the resolved-removed set, and has no Java
+  analogue for any standard op (confirmed by the Increment-2 reviewer). Verify against the Java source, not
+  the brief's intuition — pin the totals + deleted count in the unpartitioned test.
+- **DO model the unpartitioned full replace as "drop the single empty partition," not as a special case.**
+  *Why:* on an unpartitioned table every file's partition is `Struct::empty()`, so the drop set collected from
+  any added file is `{(spec_id, empty)}` and the resolver matches ALL existing files — a full replace falls
+  out of the SAME by-partition code with no `is_unpartitioned()` branch (Java reaches the same end via a
+  different mechanism — `deleteByRowFilter(alwaysTrue)` — but the observable result is identical). One code
+  path covers both partitioned and unpartitioned.
+- **DO NOT add a `failMissingDeletePaths`-style validation to a partition-drop resolver.** *Why:* Java's
+  `validateRequiredDeletes` (`ManifestFilterManager.java:280`) fires ONLY for path/file deletes
+  (`deletePaths`/`deleteFiles`), never for `dropPartitions`. So replacing a partition that currently has no
+  files is a legal PURE ADD (no spurious delete, no error) — `resolve_partition_deletes` must return an empty
+  removed-set for an empty partition, unlike `resolve_delete_paths` which errors on a missing path. Pin it
+  with a "replace an empty partition = pure add" test.
+- **DO build an unpartitioned table fixture in-test via `TableCreation` with NO `partition_spec` when no
+  unpartitioned JSON fixture exists and `testdata/` is out of the allowed-edit set.** *Why:*
+  `TableCreation.partition_spec` is `Option<UnboundPartitionSpec>` defaulting to `None` = unpartitioned, so a
+  catalog `create_table` with the minimal schema but no spec yields a real unpartitioned V3 table — no new
+  committed fixture needed (mirrors `make_v3_minimal_table_in_catalog` minus the `.partition_spec(...)` call).
+  Build the data files with `partition_spec_id(0)` + `Struct::empty()`.

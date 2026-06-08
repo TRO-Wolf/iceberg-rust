@@ -57,6 +57,7 @@ mod append;
 mod delete_files;
 mod manage_snapshots;
 mod overwrite_files;
+mod replace_partitions;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -79,6 +80,7 @@ use crate::transaction::append::FastAppendAction;
 use crate::transaction::delete_files::DeleteFilesAction;
 use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 use crate::transaction::overwrite_files::OverwriteFilesAction;
+use crate::transaction::replace_partitions::ReplacePartitionsAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
@@ -163,6 +165,15 @@ impl Transaction {
     /// conflict validation are not yet supported.
     pub fn overwrite_files(&self) -> OverwriteFilesAction {
         OverwriteFilesAction::new()
+    }
+
+    /// Creates a replace-partitions action (dynamic partition overwrite). For every partition an added
+    /// file belongs to, the action replaces all existing live data files in that same partition, then
+    /// adds the new files, in one `Overwrite` snapshot (Java `BaseReplacePartitions`). On an unpartitioned
+    /// table this is a full-table replace. Static `replaceByRowFilter` and concurrent-commit conflict
+    /// validation are not yet supported.
+    pub fn replace_partitions(&self) -> ReplacePartitionsAction {
+        ReplacePartitionsAction::new()
     }
 
     /// Creates replace sort order action.
