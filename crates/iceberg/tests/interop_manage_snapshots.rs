@@ -238,7 +238,7 @@ async fn evolve(scenario: &str, scenario_dir: &Path) -> TableMetadata {
 /// Direction 1: assert the Rust-evolved refs map + current-snapshot-id are structurally equal to Java's.
 ///
 /// RISK: a divergent ref snapshot-id (a missed rollback / fast-forward / set-current), a flipped
-/// branch-vs-tag kind, a dropped or mis-set retention field, a missing created ref, a surviving removed
+/// branch-vs-tag kind, a dropped or wrongly-set retention field, a missing created ref, a surviving removed
 /// ref, or a wrong current-snapshot-id would silently break round-trip interop with Java-written tables.
 /// `SnapshotReference: PartialEq` compares snapshot-id + retention (kind + all three retention fields), so
 /// an equal refs map pins all of those at once; the explicit check pins the current-snapshot-id (`main`).

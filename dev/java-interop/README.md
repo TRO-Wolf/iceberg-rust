@@ -146,7 +146,7 @@ reach the package-private machinery for ALL THREE capabilities.
   ops never touch data files (the transaction's file-cleanup path returns early for an empty new-snapshot
   set; `temp()` / `newSnapshotId()` are `TableOperations` interface defaults), so the no-op `io()` is
   never reached. In `generate`, the base is written, then **re-parsed from disk before evolving** so its
-  pending `AddSnapshot` changes are cleared — otherwise `isAddedSnapshot` would mis-stamp a rollback's
+  pending `AddSnapshot` changes are cleared — otherwise `isAddedSnapshot` would wrongly stamp a rollback's
   snapshot-log entry with the old snapshot timestamp (tripping the "before last snapshot log entry" guard).
 
 The base/evolved `TableMetadata` are serialized via `TableMetadataParser.toJson`.
