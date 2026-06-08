@@ -1143,3 +1143,93 @@ How to use it (see the manuals' §2):
   manifest writer — a consistent, pre-existing producer limitation (non-default-spec writes are a broader
   producer change), NOT a RowDelta regression. Acceptable for this increment; flag if Java-faithful
   multi-spec delete commits are needed later.
+
+### 2026-06-08 (Phase 2 Increment 6 — concurrent-commit conflict-validation foundation + ReplacePartitions, BUILDER Opus)
+- **DO capture the conflict-validation starting snapshot as its OWN `Transaction` field set once in `new()`,
+  NOT by reading `self.table` at validation time.** *Why:* `do_commit` RE-BASES on staleness — when the
+  catalog head moved, it overwrites `self.table` with the refreshed base (line ~286), so the ORIGINAL head
+  (the snapshot the transaction was built against = Java `SnapshotProducer.base.currentSnapshot()`) is LOST
+  the instant the re-base runs. Storing `starting_snapshot_id: Option<i64>` separately, seeded from
+  `table.metadata().current_snapshot_id()` at `Transaction::new`, is the only way it survives. A validation
+  that read the (re-based) `current_table`'s head as its start would compute an EMPTY concurrent-commit set
+  (start == current head) and never detect a conflict — the check would silently always pass.
+- **DO run the `validate` hook AFTER the refresh/re-base and BEFORE the re-apply loop in `do_commit`, with
+  the REFRESHED base as `current`.** *Why:* Java `SnapshotProducer.validate(currentMetadata, parent)` is
+  called against the refreshed metadata so it can enumerate the snapshots that landed concurrently (those
+  `current` has that are newer than `starting_snapshot_id`). Running it before the refresh would validate
+  against the stale base (no concurrent commits visible); running it after re-apply would be too late (the
+  updates are already built). The seam is: refresh → re-base → `for action { validate(...) }` → `for action
+  { commit(...) }`.
+- **DO make a conflict a NON-retryable `DataInvalid` (retryable defaults to false), and a commit-conflict a
+  retryable `CatalogCommitConflicts`.** *Why:* the `backon` retry loop is `.when(|e| e.retryable())` — a
+  retryable error re-runs `do_commit` (re-refresh + re-validate), a non-retryable one STOPS and propagates.
+  A `ValidationException` (Java) is non-retryable: retrying would re-refresh to the SAME concurrent state and
+  re-fail forever (infinite loop / retry exhaustion). `Error::new(ErrorKind::DataInvalid, msg)` is
+  non-retryable by default (no `.with_retryable(true)`), which is exactly right. Pin it with
+  `assert!(!err.retryable())` in the conflict test so a future `.with_retryable(true)` slip is caught — and
+  assert the validation MESSAGE (not just `is_err()`) so a retry-exhausted `CatalogCommitConflicts` can't
+  masquerade as a pass.
+- **DO put the "added data files since a starting snapshot" walk as a SHARED free fn (`added_data_files_after`)
+  reusable by every future conflict check, not inline in one action.** *Why:* Java centralizes it in
+  `MergingSnapshotProducer.addedDataFiles`/`validationHistory`; `OverwriteFiles`/`RowDelta`/`DeleteFiles` all
+  reuse it (plus siblings: deleted-files-since, added-delete-files-since). The walk is: from the current
+  snapshot back via `parent_snapshot_id` to `starting_snapshot_id` (EXCLUSIVE — Java `ancestorsBetween` stops
+  before the starting id), for each APPEND/OVERWRITE snapshot (Java `VALIDATE_ADDED_FILES_OPERATIONS`, NOT
+  Delete/Replace), load its manifest list, keep DATA manifests it ADDED (`manifest.added_snapshot_id ==
+  snapshot.snapshot_id()` = Java `manifest.snapshotId() == currentSnapshot.snapshotId()` — carried-forward
+  manifests belong to older snapshots), collect `Added`-status entries (Java `ignoreDeleted().ignoreExisting()`).
+  The three subtle filters (operation set, manifest-added-by-this-snapshot, Added-only) each prevent a false
+  conflict: without them an OLD file copied forward, or a delete tombstone, would wrongly read as "added since."
+- **DO simulate a REAL concurrent commit in the test (a separate `fast_append` on the SAME catalog between
+  building the action and committing it), not a hand-mutated metadata.** *Why:* the only faithful proof is
+  the actual race: `Transaction::new(&table)` captures S0; build `replace_partitions(...).validate_*()`;
+  then `append_files(&catalog, &table, ...)` lands S1 (advancing the catalog head while the tx still
+  references S0); then `tx.commit(&catalog)` triggers `do_commit`'s refresh→S1→validate. This exercises the
+  capture-survives-rebase property AND the refreshed-base enumeration in one go. Mutation-verified BOTH
+  directions: forcing `validate` to always-`Ok` makes the KEY test (conflict in replaced partition) FAIL
+  (the replace wrongly commits over the concurrent file); forcing the conflict predicate to always-`true`
+  makes the NEGATIVE control (concurrent append to an UNTOUCHED partition) FAIL (a legitimate disjoint
+  concurrent write is wrongly rejected). The OFF control (no opt-in → concurrent append clobbered, commit
+  succeeds) pins that the foundation is OPT-IN and default behavior is unchanged.
+- **DO keep the conflict check OPT-IN (default no-op `validate`).** *Why:* the brief + Java both make it
+  opt-in (`validateNoConflictingData()` must be called). The default `TransactionAction::validate` is a no-op
+  `Ok(())`, so EVERY existing action inherits it with zero change and the default commit is still snapshot
+  isolation. Turning it on by default would change behavior for every `ReplacePartitions` caller and break
+  those relying on snapshot isolation (last-writer-wins). The OFF control test documents the clobber so the
+  semantics are explicit, not accidental.
+
+### 2026-06-08 (Phase 2 Increment 6 — REVIEWER Opus)
+- **DO add a test that exercises the TX-CAPTURED `starting_snapshot_id` (NO `validate_from_snapshot`
+  override) — the override path does NOT pin the survives-rebase property.** *Why:* the builder's 3 conflict
+  tests ALL passed `.validate_from_snapshot(S0)`, so `effective_start = validate_from_snapshot.or(...)` short-
+  circuited on the override and NEVER read the tx field. Mutation-verified the gap was REAL: breaking
+  `Transaction::new`'s capture to `None`, OR rewriting `validate` to fall back to the REFRESHED head
+  (`current.metadata().current_snapshot_id()`) instead of the tx field, failed NOTHING — all 3 stayed green.
+  The brief's #2 highest risk (start re-read at validation time ⇒ empty concurrent set ⇒ silent always-pass)
+  was thus unpinned. Added `test_..._using_tx_captured_starting_snapshot` (validation enabled, NO override):
+  the `effective_start=current-head` mutation now fails EXACTLY this test (1 passed/1 failed: the override
+  KEY test still green, the new one red), proving it is the unique guard for the capture surviving the re-base.
+  LESSON: when a feature has an explicit override AND an implicit default source, a test that always sets the
+  override cannot pin the default source — write one that omits the override.
+- **DO isolate `added_data_files_after`'s carried-forward exclusion in its OWN test, not only end-to-end.**
+  *Why:* the KEY/NEGATIVE conflict tests prove the right END result but cannot distinguish "the walk returned
+  the 1 new file" from "the walk returned 1 new + 2 carried-forward but the predicate happened to filter the
+  carried-forward ones out." Probed the helper directly (S0 has x=0 `a` + x=1 `b`; concurrent S1 adds x=0
+  `a_new`): `added_data_files_after(table, S0)` returns EXACTLY `{a_new}` — the `added_snapshot_id ==
+  snapshot_id` manifest filter + `Added`-status entry filter correctly drop the carried-forward `a`/`b`
+  (re-referenced via their S0 manifest, `Existing` status). Kept as `test_added_data_files_after_excludes_
+  carried_forward_manifests`. A bug counting carried-forward manifests = false-positive rejection of valid
+  commits; this is the only test that would catch it.
+- **DIVERGENCE (Rust-STRICTER, flagged not fixed): a non-ancestor `validate_from_snapshot` over-scans to root
+  instead of Java's fail-loud.** Java `MergingSnapshotProducer.validationHistory` ends with
+  `ValidationException.check(lastSnapshot == null || lastSnapshot.parentId() == startingSnapshotId, "Cannot
+  determine history between starting snapshot %s and the last known ancestor %s")` — if the starting id is
+  NOT an ancestor of the parent, the walk runs off the chain and Java THROWS. Rust `added_data_files_after`
+  has no such post-walk check: it silently walks to the history root and returns ALL added files (verified by
+  probe: a bogus start returns every added file, no panic). Direction is SAFE — over-scanning can only
+  OVER-reject (more files considered ⇒ more likely to flag a conflict), never let a real conflict through —
+  so no data-loss risk; but it diverges from Java's explicit error and could surprise a caller who passes a
+  stale/wrong id. Narrow (only a misused `validate_from_snapshot`), so documented + pinned
+  (`test_added_data_files_after_nonancestor_start_overscans_does_not_panic`) rather than fixed. Tracked as a
+  parity follow-up (add the `lastSnapshot.parentId() == start` guard when the conflict-validation sub-sequence
+  is hardened).

@@ -947,3 +947,90 @@ impl<'a> SnapshotProducer<'a> {
         Ok(ActionCommit::new(updates, requirements))
     }
 }
+
+/// Operations whose snapshots can ADD data files — the only ones a "no conflicting data" validation needs
+/// to inspect (Java `MergingSnapshotProducer.VALIDATE_ADDED_FILES_OPERATIONS = {APPEND, OVERWRITE}`). A
+/// `Delete` / `Replace` snapshot never introduces brand-new conflicting rows.
+fn operation_adds_data_files(operation: &Operation) -> bool {
+    matches!(operation, Operation::Append | Operation::Overwrite)
+}
+
+/// Enumerate the DATA files ADDED to `table` by snapshots committed AFTER `starting_snapshot_id` — the
+/// concurrent commits a serializable-isolation conflict check must inspect.
+///
+/// This is the Rust port of Java `MergingSnapshotProducer.addedDataFiles` + `validationHistory`
+/// (`core/MergingSnapshotProducer.java`): it walks the parent chain of `table`'s current snapshot (the
+/// refreshed base / Java `parent`) back via `parent_snapshot_id`, INCLUSIVE of the current snapshot and
+/// EXCLUSIVE of `starting_snapshot_id` (Java `SnapshotUtil.ancestorsBetween(parent.snapshotId(),
+/// startingSnapshotId)`). For each visited snapshot whose operation can add data
+/// ([`operation_adds_data_files`] = Java `VALIDATE_ADDED_FILES_OPERATIONS`), it loads that snapshot's
+/// manifest list, keeps the DATA manifests it ADDED (`manifest.added_snapshot_id == snapshot.snapshot_id()`,
+/// Java `manifest.snapshotId() == currentSnapshot.snapshotId()`), and collects every `Added`-status entry's
+/// [`DataFile`] (Java `ignoreDeleted().ignoreExisting()` + `entry.snapshotId() ∈ newSnapshots`).
+///
+/// `starting_snapshot_id == None` means "validate from the beginning of history" — every ancestor of the
+/// current snapshot is inspected (Java passes a null starting id to `ancestorsBetween`, which walks to the
+/// root). When the current snapshot already IS `starting_snapshot_id` (no concurrent commit landed), the walk
+/// yields nothing. A table with no current snapshot likewise yields nothing.
+///
+/// This is the shared foundation the per-action conflict validations (`ReplacePartitions`
+/// `validateNoConflictingData`, and the future `OverwriteFiles` / `RowDelta` / `DeleteFiles` checks) build on.
+pub(crate) async fn added_data_files_after(
+    table: &Table,
+    starting_snapshot_id: Option<i64>,
+) -> Result<Vec<DataFile>> {
+    let metadata = table.metadata();
+
+    // The "parent" of the operation in Java terms: the current head of the refreshed base. If there is no
+    // current snapshot, nothing has been added.
+    let Some(mut current) = metadata.current_snapshot().cloned() else {
+        return Ok(vec![]);
+    };
+
+    let mut added = Vec::new();
+
+    loop {
+        // Java `ancestorsBetween` is EXCLUSIVE of the starting snapshot: stop before re-visiting it (and
+        // never inspect the snapshot the operation started from — its files are part of the base, not a
+        // concurrent commit).
+        if Some(current.snapshot_id()) == starting_snapshot_id {
+            break;
+        }
+
+        if operation_adds_data_files(&current.summary().operation) {
+            let manifest_list = current
+                .load_manifest_list(table.file_io(), metadata)
+                .await?;
+            for manifest_file in manifest_list.entries() {
+                // Only DATA manifests that THIS snapshot added (Java `manifest.snapshotId() ==
+                // currentSnapshot.snapshotId()`) — carried-forward manifests belong to older snapshots and
+                // their files are not "added since the starting snapshot".
+                if manifest_file.content != ManifestContentType::Data
+                    || manifest_file.added_snapshot_id != current.snapshot_id()
+                {
+                    continue;
+                }
+                let manifest = manifest_file.load_manifest(table.file_io()).await?;
+                for entry in manifest.entries() {
+                    // Only ADDED entries (Java `ignoreDeleted().ignoreExisting()`) — an `Existing` entry was
+                    // added by an earlier snapshot and copied forward, a `Deleted` tombstone is a removal.
+                    if entry.status() == crate::spec::ManifestStatus::Added {
+                        added.push(entry.data_file().clone());
+                    }
+                }
+            }
+        }
+
+        // Walk to the parent; stop at the root. A missing parent (dangling id) also terminates the walk,
+        // mirroring Java `ancestorsOf` returning when `lookup.apply(parentId)` is null.
+        match current.parent_snapshot_id() {
+            Some(parent_id) => match metadata.snapshot_by_id(parent_id) {
+                Some(parent) => current = parent.clone(),
+                None => break,
+            },
+            None => break,
+        }
+    }
+
+    Ok(added)
+}

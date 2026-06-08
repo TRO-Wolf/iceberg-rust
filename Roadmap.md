@@ -283,7 +283,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `UpdatePartitionSpec` ✅ (bidirectional interop landed 2026-06-07, surfacing+fixing the identity-only
   partition-name collision divergence); `ManageSnapshots` awaits the same interop treatment.**
 
-### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07; `PositionDeleteFileWriter` (RowDelta increment 5a) + `RowDelta` action (5b) landed 2026-06-08 — the merge-on-read write→read chain is now end-to-end)**
+### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07; `PositionDeleteFileWriter` (RowDelta increment 5a) + `RowDelta` action (5b) landed 2026-06-08 — the merge-on-read write→read chain is now end-to-end; the concurrent-commit conflict-validation FOUNDATION + `ReplacePartitions.validateNoConflictingData` (increment 6) landed 2026-06-08 — the serializable-isolation safety layer)**
 - **Goal:** the full commit/write surface beyond fast-append.
 - **Gates on:** Phase 1.
 - **Increment sequence (dependency, then value):** **1. `DeleteFiles`** (done 🟡 — delete data files by
@@ -312,6 +312,18 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   entries inherit the new snapshot's seq so they apply to earlier data; dynamic op (Java
   `BaseRowDelta.operation()`). THE CROWN-JEWEL test proves a scan drops the deleted rows after the row
   delta — the full merge-on-read write→read chain], 5c deletion-vector writer**),
+  **6. concurrent-commit conflict-validation FOUNDATION + `ReplacePartitions.validateNoConflictingData`**
+  (**done 🟡 2026-06-08** — the serializable-isolation safety layer: `Transaction` captures
+  `starting_snapshot_id` (surviving the `do_commit` re-base); a default-no-op `TransactionAction::validate`
+  hook runs in `do_commit` against the refreshed base BEFORE re-apply; a conflict is a non-retryable
+  `DataInvalid` (Java's non-retryable `ValidationException`) so the retry loop stops; shared
+  `added_data_files_after` helper enumerates the concurrent commits' added DATA files (Java
+  `MergingSnapshotProducer.addedDataFiles`/`ancestorsBetween`); `ReplacePartitions` gained the opt-in
+  `validate_no_conflicting_data()`/`validate_from_snapshot(id)` rejecting a concurrent append into a
+  replaced partition. **Conflict-validation sub-sequence:** (6) this; then `OverwriteFiles`
+  `validateNoConflictingData`/`...Deletes`; `RowDelta`/`DeleteFiles` `validateDataFilesExist`; `RewriteFiles`
+  `validateNoNewDeletes`),
+  7. `RewriteManifests`, merge append,
   8. multi-op transaction hardening + optimistic-concurrency retry on the real catalogs.
 - **Key deliverables:** merge append, `OverwriteFiles`, `ReplacePartitions`, `DeleteFiles` (🟡), `RowDelta`,
   `RewriteFiles`, `RewriteManifests`; finalize position-delete + deletion-vector writers; multi-op

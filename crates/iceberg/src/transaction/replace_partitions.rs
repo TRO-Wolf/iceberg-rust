@@ -63,9 +63,10 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation, Struct};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer, added_data_files_after,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::{Error, ErrorKind};
 
 /// The snapshot-summary property Java `BaseReplacePartitions` sets to mark a dynamic partition overwrite
 /// (`SnapshotSummary.REPLACE_PARTITIONS_PROP`).
@@ -90,6 +91,13 @@ pub struct ReplacePartitionsAction {
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
+    /// Whether concurrent-commit conflict validation is enabled (Java `validateNoConflictingData`). OFF by
+    /// default = snapshot isolation (no validation, current behavior). When ON, the commit is rejected if a
+    /// concurrent snapshot added data to any partition this action replaces.
+    validate_no_conflicting_data: bool,
+    /// An explicit starting snapshot for conflict validation (Java `validateFromSnapshot`). When `None`, the
+    /// validation uses the transaction's starting snapshot (the table head when the transaction was created).
+    validate_from_snapshot: Option<i64>,
 }
 
 impl ReplacePartitionsAction {
@@ -99,6 +107,8 @@ impl ReplacePartitionsAction {
             commit_uuid: None,
             key_metadata: None,
             snapshot_properties: HashMap::default(),
+            validate_no_conflicting_data: false,
+            validate_from_snapshot: None,
         }
     }
 
@@ -132,6 +142,28 @@ impl ReplacePartitionsAction {
     /// sets it in the action constructor), so an explicit value here does not clear it.
     pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
+        self
+    }
+
+    /// Override the snapshot from which concurrent-commit conflict validation starts (Java
+    /// `ReplacePartitions.validateFromSnapshot(long)`). By default the validation uses the transaction's
+    /// starting snapshot (the table head when [`crate::transaction::Transaction::new`] was called); this lets
+    /// the caller pin a specific earlier snapshot id (the snapshot it read when building the replacement).
+    ///
+    /// On its own this does NOT enable validation — call [`Self::validate_no_conflicting_data`] for that.
+    pub fn validate_from_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.validate_from_snapshot = Some(snapshot_id);
+        self
+    }
+
+    /// ENABLE concurrent-commit conflict validation (Java `ReplacePartitions.validateNoConflictingData`):
+    /// the commit is rejected with a non-retryable `ValidationException` if any snapshot committed since the
+    /// starting snapshot ADDED data to a partition this action replaces. This is the serializable-isolation
+    /// guard against silently clobbering concurrently-appended data.
+    ///
+    /// Default (this method NOT called) = snapshot isolation = no validation (current behavior unchanged).
+    pub fn validate_no_conflicting_data(mut self) -> Self {
+        self.validate_no_conflicting_data = true;
         self
     }
 
@@ -174,6 +206,61 @@ impl TransactionAction for ReplacePartitionsAction {
                 DefaultManifestProcess,
             )
             .await
+    }
+
+    /// Serializable-isolation conflict validation (Java `BaseReplacePartitions.validate` →
+    /// `MergingSnapshotProducer.validateAddedDataFiles`). Only runs when
+    /// [`Self::validate_no_conflicting_data`] was enabled; otherwise a no-op (snapshot isolation).
+    ///
+    /// When enabled: compute the effective starting snapshot ([`Self::validate_from_snapshot`] if set, else
+    /// the transaction-provided `starting_snapshot_id`), enumerate every DATA file ADDED to the refreshed
+    /// base by snapshots committed since it (the shared [`added_data_files_after`] helper = Java
+    /// `addedDataFiles`), and reject the commit if ANY of those files falls in a partition this action
+    /// replaces (`(spec_id, partition)` ∈ the drop-partition set, Java
+    /// `partitionSet.contains(file.specId(), file.partition())`). The rejection is a NON-retryable
+    /// [`ErrorKind::DataInvalid`] (Java's non-retryable `ValidationException`), so the commit retry loop stops
+    /// and the error propagates rather than looping.
+    async fn validate(
+        self: Arc<Self>,
+        starting_snapshot_id: Option<i64>,
+        current: &Table,
+    ) -> Result<()> {
+        if !self.validate_no_conflicting_data {
+            // Default: snapshot isolation, no conflict check (current behavior unchanged).
+            return Ok(());
+        }
+
+        // Java `BaseReplacePartitions.validate` uses `startingSnapshotId` (the `validateFromSnapshot`
+        // override) when set, else the operation's starting snapshot.
+        let effective_start = self.validate_from_snapshot.or(starting_snapshot_id);
+
+        let drop_partitions = self.drop_partitions();
+        // An empty replace touches no partitions, so nothing can conflict — skip the manifest walk.
+        if drop_partitions.is_empty() {
+            return Ok(());
+        }
+
+        let added = added_data_files_after(current, effective_start).await?;
+
+        // Find the first added file whose partition this action replaces (Java throws on the first conflict
+        // entry). Naming the conflicting partition + file mirrors Java's
+        // "Found conflicting files that can contain records matching partitions %s: %s".
+        if let Some(conflict) = added.iter().find(|file| {
+            drop_partitions.contains(&(file.partition_spec_id, file.partition().clone()))
+        }) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Found conflicting files that can contain records matching replaced partition \
+                     (spec {}, partition {:?}): {}",
+                    conflict.partition_spec_id,
+                    conflict.partition(),
+                    conflict.file_path()
+                ),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -236,7 +323,7 @@ mod tests {
     use crate::table::Table;
     use crate::transaction::tests::make_v3_minimal_table_in_catalog;
     use crate::transaction::{ApplyTransactionAction, Transaction};
-    use crate::{Catalog, TableCreation, TableIdent};
+    use crate::{Catalog, ErrorKind, TableCreation, TableIdent};
 
     /// Build a data file routed to partition `x = part_value` (the V3 minimal table is partitioned by
     /// identity(x), spec id 0) with a unique path.
@@ -725,6 +812,338 @@ mod tests {
             live_file_paths(&table).await,
             HashSet::from(["test/a.parquet".to_string()]),
             "a no-added-files replace must not delete or add anything"
+        );
+    }
+
+    // ============================================================================================
+    // Concurrent-commit conflict validation (Java `validateNoConflictingData` / serializable isolation).
+    //
+    // The race these tests simulate: a `replace_partitions` is BUILT against table head S0, but BEFORE it
+    // commits a SEPARATE `fast_append` lands on the catalog (advancing the head to S1). When the replace then
+    // commits, `do_commit` refreshes to S1 and runs the action's `validate` against that refreshed base. With
+    // `validate_no_conflicting_data()` enabled, a concurrent append into a REPLACED partition must FAIL the
+    // commit (non-retryable) — silently clobbering that concurrently-added data is a serializable-isolation
+    // violation (lost write). A concurrent append into an UNTOUCHED partition must NOT fail. With validation
+    // OFF (the default), neither fails (snapshot isolation, unchanged behavior).
+    // ============================================================================================
+
+    /// THE KEY CONCURRENT-COMMIT CONFLICT TEST. Append S0 (x=0, x=1). Build a `replace_partitions(x=0)` with
+    /// `.validate_from_snapshot(S0).validate_no_conflicting_data()`. Then perform a CONCURRENT `fast_append`
+    /// adding NEW data to partition **x=0** (S1). Committing the replace must FAIL with the validation error,
+    /// and the error must be NON-retryable (the retry loop stops + the validation message propagates — it is
+    /// NOT a retry-exhaustion `CatalogCommitConflicts`).
+    ///
+    /// Risk pinned: silently clobbering concurrently-appended data in a replaced partition = a lost write
+    /// under serializable isolation. Without the conflict check the replace would commit and drop S1's file.
+    #[tokio::test]
+    async fn test_replace_partitions_rejects_concurrent_append_to_replaced_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // S0: x=0 (a), x=1 (b).
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+        ])
+        .await;
+        let s0 = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        // Build the replace on x=0 with conflict validation enabled, pinned to start at S0 (the head we read).
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file("test/a2.parquet", 0))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a separate fast_append adds NEW data to partition x=0.
+        let _table_after_concurrent = append_files(&catalog, &table, vec![data_file(
+            "test/a_concurrent.parquet",
+            0,
+        )])
+        .await;
+
+        // Committing the replace must FAIL: S1 added a file to the replaced partition x=0.
+        let err = tx.commit(&catalog).await.expect_err(
+            "replace must fail: a concurrent append landed in the replaced partition x=0",
+        );
+
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "a conflict is a non-retryable validation failure (DataInvalid), not a commit conflict"
+        );
+        assert!(
+            !err.retryable(),
+            "the validation failure must be NON-retryable so the retry loop stops and it propagates \
+             (it is NOT a retry-exhausted CatalogCommitConflicts)"
+        );
+        assert!(
+            err.message().contains("conflicting files"),
+            "the error must name the conflict, got: {}",
+            err.message()
+        );
+
+        // The catalog head is still S1 (the concurrent append) — the replace did NOT commit over it.
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        let live = live_file_paths(&reloaded).await;
+        assert!(
+            live.contains("test/a_concurrent.parquet"),
+            "the concurrently-added file must survive (the conflicting replace was rejected)"
+        );
+        assert!(
+            !live.contains("test/a2.parquet"),
+            "the rejected replace's file must NOT be in the table"
+        );
+    }
+
+    /// NEGATIVE CONTROL: same setup, but the concurrent append targets the UNTOUCHED partition **x=1**. The
+    /// `replace_partitions(x=0)` validation PASSES and the commit succeeds — a concurrent write to a
+    /// non-replaced partition is not a conflict (it does not race the replaced data).
+    ///
+    /// Risk pinned: an over-eager conflict check that rejects ANY concurrent append (false positive) would
+    /// break legitimate concurrent writes to disjoint partitions.
+    #[tokio::test]
+    async fn test_replace_partitions_allows_concurrent_append_to_other_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // S0: x=0 (a), x=1 (b).
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+        ])
+        .await;
+        let s0 = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file("test/a2.parquet", 0))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a separate fast_append adds data to the UNTOUCHED partition x=1.
+        let _ = append_files(&catalog, &table, vec![data_file(
+            "test/b_concurrent.parquet",
+            1,
+        )])
+        .await;
+
+        // The replace must SUCCEED — x=1 is not replaced, so the concurrent append does not conflict.
+        let table = tx.commit(&catalog).await.expect(
+            "replace must succeed: the concurrent append was in the untouched partition x=1",
+        );
+
+        let live = live_file_paths(&table).await;
+        assert_eq!(
+            live,
+            HashSet::from([
+                // x=0 replaced: a2 replaces a.
+                "test/a2.parquet".to_string(),
+                // x=1 originals + the concurrent append both survive (re-based onto S1).
+                "test/b.parquet".to_string(),
+                "test/b_concurrent.parquet".to_string(),
+            ]),
+            "x=0 replaced (a2), x=1 keeps both b and the concurrent file"
+        );
+    }
+
+    /// OFF CONTROL: with conflict validation NOT enabled (no `validate_no_conflicting_data()` call), a
+    /// concurrent append into the replaced partition x=0 does NOT fail the commit — this is snapshot
+    /// isolation, the DEFAULT behavior, unchanged by this increment. (The concurrent file IS clobbered; that
+    /// is the documented snapshot-isolation semantics the opt-in validation exists to prevent.)
+    ///
+    /// Risk pinned: the conflict-validation foundation must be OPT-IN — turning it on for every replace by
+    /// default would change existing behavior and break callers that rely on snapshot isolation.
+    #[tokio::test]
+    async fn test_replace_partitions_without_validation_allows_concurrent_append_default_behavior()
+    {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // S0: x=0 (a), x=1 (b).
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+        ])
+        .await;
+
+        // Build the replace on x=0 WITHOUT enabling validation (default = snapshot isolation).
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file("test/a2.parquet", 0));
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a separate fast_append adds data to the replaced partition x=0.
+        let _ = append_files(&catalog, &table, vec![data_file(
+            "test/a_concurrent.parquet",
+            0,
+        )])
+        .await;
+
+        // With validation OFF, the replace COMMITS (default behavior unchanged) — it re-bases onto S1 and
+        // replaces partition x=0 entirely, clobbering the concurrent file (documented snapshot isolation).
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("with validation OFF, a concurrent append must not block the commit");
+
+        let live = live_file_paths(&table).await;
+        assert_eq!(
+            live,
+            HashSet::from([
+                // x=0 fully replaced: a2 only (a AND the concurrent file are dropped).
+                "test/a2.parquet".to_string(),
+                // x=1 untouched.
+                "test/b.parquet".to_string(),
+            ]),
+            "default snapshot isolation: the replace re-bases onto S1 and replaces all of x=0"
+        );
+        assert!(
+            !live.contains("test/a_concurrent.parquet"),
+            "without conflict validation, the concurrent x=0 file is clobbered (snapshot isolation)"
+        );
+    }
+
+    /// SURVIVES-REBASE PIN: the conflict check works WITHOUT an explicit `validate_from_snapshot` override,
+    /// relying solely on the transaction-captured starting snapshot id surviving `do_commit`'s re-base.
+    ///
+    /// Same race as the KEY test, but the action calls ONLY `.validate_no_conflicting_data()` (no
+    /// `validate_from_snapshot`). The starting snapshot is therefore the one captured in `Transaction::new`
+    /// (= S0, the head when the tx was built). `do_commit` overwrites `self.table` with the refreshed base
+    /// (S1) during the staleness re-base, but `starting_snapshot_id` is its OWN field and must SURVIVE that
+    /// re-base — so validation still enumerates the concurrent S1 and rejects.
+    ///
+    /// Risk pinned: if the start were (re-)read from the refreshed head at validation time, start == current
+    /// head ⇒ the concurrent set is empty ⇒ the check silently always passes (a serializable-isolation hole
+    /// that lets a real conflict through). The KEY/NEGATIVE/OFF tests all pin `validate_from_snapshot(S0)`,
+    /// so NONE of them exercises the tx-captured field — this test is the only guard that the capture in
+    /// `Transaction::new` survives the re-base. Mutation-verified: capturing `None` (or re-reading the head)
+    /// in `Transaction::new` makes this test fail (the conflict goes undetected, commit wrongly succeeds).
+    #[tokio::test]
+    async fn test_replace_partitions_rejects_concurrent_append_using_tx_captured_starting_snapshot()
+    {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // S0: x=0 (a), x=1 (b). This is the head when the transaction is created below.
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+        ])
+        .await;
+
+        // Build the replace on x=0 with validation enabled but WITHOUT validate_from_snapshot — the
+        // starting snapshot is the tx-captured head (S0).
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file("test/a2.parquet", 0))
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a separate fast_append adds NEW data to partition x=0.
+        let _ = append_files(&catalog, &table, vec![data_file(
+            "test/a_concurrent.parquet",
+            0,
+        )])
+        .await;
+
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("conflict must be detected via the tx-captured starting snapshot");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(err.message().contains("conflicting files"));
+    }
+
+    /// CARRIED-FORWARD EXCLUSION PIN for `added_data_files_after` (Java
+    /// `addedDataFiles`/`validationHistory`: `manifest.snapshotId() == currentSnapshot.snapshotId()` +
+    /// `ignoreExisting().ignoreDeleted()`). S0 already has files in x=0 (a) and x=1 (b). A concurrent append
+    /// S1 adds ONE new file to x=0. `added_data_files_after(table, S0)` must return EXACTLY that one new x=0
+    /// file — NOT the carried-forward old x=0/x=1 files (a fast_append re-references them via their original
+    /// manifests, whose `added_snapshot_id` is S0, not S1, with `Existing` — not `Added` — entries).
+    ///
+    /// Risk pinned: counting carried-forward manifests would return 2-3 files and falsely flag the old x=0
+    /// file as a conflict (false-positive rejection of a valid commit). This isolates the helper directly;
+    /// the end-to-end KEY/NEGATIVE tests cannot distinguish "1 new file" from "1 new + carried-forward old".
+    #[tokio::test]
+    async fn test_added_data_files_after_excludes_carried_forward_manifests() {
+        use crate::transaction::snapshot::added_data_files_after;
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // S0: x=0 (a), x=1 (b).
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+        ])
+        .await;
+        let s0 = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        // S1: concurrent append adds ONE new file to x=0.
+        let table = append_files(&catalog, &table, vec![data_file("test/a_new.parquet", 0)]).await;
+
+        let added = added_data_files_after(&table, Some(s0)).await.unwrap();
+        let paths: HashSet<String> = added.iter().map(|f| f.file_path().to_string()).collect();
+        assert_eq!(
+            paths,
+            HashSet::from(["test/a_new.parquet".to_string()]),
+            "must return ONLY the newly-added file, not carried-forward a/b"
+        );
+    }
+
+    /// EDGE CASE — a non-ancestor `start` does not panic and is Rust-STRICTER than Java. When `start` is a
+    /// snapshot id NOT in the current snapshot's ancestor chain, the walk runs to the root and returns ALL
+    /// added files (an over-scan). Java's `validationHistory` instead fails loud
+    /// ("Cannot determine history between starting snapshot ... and the last known ancestor ...") because
+    /// its post-walk check requires `lastSnapshot.parentId() == startingSnapshotId`. The Rust over-scan
+    /// direction is SAFE (it can only over-reject, never let a real conflict through), but it diverges from
+    /// Java's explicit error. Documented divergence (see lessons/todo follow-up).
+    ///
+    /// Risk pinned: a non-ancestor start must not panic or silently SKIP the check (which would let a
+    /// conflict through); over-scanning to root is the safe fallback.
+    #[tokio::test]
+    async fn test_added_data_files_after_nonancestor_start_overscans_does_not_panic() {
+        use crate::transaction::snapshot::added_data_files_after;
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/b.parquet", 0)]).await;
+        // A snapshot id that is NOT in the ancestor chain (never existed).
+        let bogus: i64 = 999_999_999;
+        let added = added_data_files_after(&table, Some(bogus)).await.unwrap();
+        let paths: HashSet<String> = added.iter().map(|f| f.file_path().to_string()).collect();
+        assert_eq!(
+            paths.len(),
+            2,
+            "over-scans to root when start is a non-ancestor"
+        );
+    }
+
+    /// EDGE CASE — a table with no current snapshot yields an empty added-files set (no panic), whether the
+    /// start is `None` or a stale id. Java `addedDataFiles` returns empty when `parent == null`.
+    ///
+    /// Risk pinned: an empty/just-created table must not panic on the manifest walk (no current snapshot to
+    /// load a manifest list from).
+    #[tokio::test]
+    async fn test_added_data_files_after_empty_table_yields_empty() {
+        use crate::transaction::snapshot::added_data_files_after;
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // No snapshots at all.
+        let added = added_data_files_after(&table, None).await.unwrap();
+        assert!(added.is_empty(), "no current snapshot ⇒ empty");
+        let added2 = added_data_files_after(&table, Some(123)).await.unwrap();
+        assert!(
+            added2.is_empty(),
+            "no current snapshot ⇒ empty even with a start"
         );
     }
 }

@@ -1815,3 +1815,167 @@ Cargo.toml/lockfiles. No commit. **Deferred:** equality-delete WRITER e2e (crown
 `removeRows`/`removeDeletes`; conflict validation (`validateFromSnapshot`/`validateNoConflictingDataFiles`/
 `validateNoConflictingDeleteFiles`/`validateDeletedFiles`/`validateDataFilesExist`); DV path (5c); data-level
 Java interop. An Opus REVIEWER verifies next.
+
+### Phase 2 Increment 6 — Concurrent-commit conflict-validation FOUNDATION + ReplacePartitions `validateNoConflictingData` (BUILDER Opus, 2026-06-08)
+The serializable-isolation safety layer: a `TransactionAction::validate` hook run in `do_commit` AFTER the
+refresh/re-base and BEFORE re-apply, plus its first concrete check (`ReplacePartitions` rejecting a commit
+when a CONCURRENT snapshot added data to a replaced partition). Architecturally significant + correctness-
+critical. EFFORT=MEDIUM, DELEGATED.
+
+**Java rules verified against source** (`/tmp/iceberg-java-ref`):
+- `BaseReplacePartitions.validate(currentMetadata, parent)` (lines 88-110): IF `validateConflictingData`,
+  call `validateAddedDataFiles(currentMetadata, startingSnapshotId, replacedPartitions, parent)` (partitioned)
+  or with `Expressions.alwaysTrue()` (unpartitioned). Opt-in via `validateNoConflictingData()` (sets the flag)
+  + `validateFromSnapshot(long)` (overrides the starting snapshot).
+- `MergingSnapshotProducer.validateAddedDataFiles(base, startingSnapshotId, partitionSet, parent)`
+  (lines 363-381): enumerate `addedDataFiles(...)`; if ANY conflict entry exists, throw `ValidationException`
+  "Found conflicting files that can contain records matching partitions %s: %s".
+- `addedDataFiles` (424-463) → `validationHistory` (913-953): `SnapshotUtil.ancestorsBetween(parent.snapshotId
+  (), startingSnapshotId, base::snapshot)` walks the parent chain from `parent` (INCLUSIVE) back to
+  `startingSnapshotId` (EXCLUSIVE). For each snapshot whose `operation ∈ {APPEND, OVERWRITE}`
+  (`VALIDATE_ADDED_FILES_OPERATIONS`, line 73-74), collect its DATA manifests where `manifest.snapshotId() ==
+  snapshot.snapshotId()` (manifests added BY that snapshot) + add the snapshot id to `newSnapshots`. Then
+  filter entries: `is_added` (`ignoreDeleted().ignoreExisting()`) AND `entry.snapshotId() ∈ newSnapshots` AND
+  (partitionSet.contains(specId, partition)). ⇒ Rust port: walk `current.metadata()` from current-snapshot
+  back via `parent_snapshot_id` until `starting_snapshot_id` (exclusive); for each APPEND/OVERWRITE snapshot,
+  load manifest list → DATA manifests added by that snapshot → entries with `status == Added` → collect
+  `DataFile`s.
+- `ValidationException` is non-retryable → Rust `Error::new(ErrorKind::DataInvalid, ...)` (retryable defaults
+  to FALSE; the `backon` `.when(|e| e.retryable())` loop STOPS on a non-retryable error and propagates it,
+  unlike a `CatalogCommitConflicts` (retryable=true) which retries).
+
+Plan:
+- [x] **A1 — starting-snapshot capture.** `Transaction` gains `starting_snapshot_id: Option<i64>`, set ONCE
+      at `Transaction::new` = `table.metadata().current_snapshot_id()`, NEVER overwritten by the `do_commit`
+      re-base (its own field, so the re-base that overwrites `self.table` does not lose the original head).
+- [x] **A2 — validate hook.** Add a default-no-op `async fn validate(self: Arc<Self>, starting_snapshot_id:
+      Option<i64>, current: &Table) -> Result<()> { Ok(()) }` to `TransactionAction` (existing actions need
+      no change — they inherit the no-op).
+- [x] **A3 — run the hook in do_commit.** AFTER the refresh/re-base, BEFORE the re-apply loop: for each
+      action, `Arc::clone(action).validate(self.starting_snapshot_id, &current_table).await?`. `current_table`
+      is the refreshed base, so `validate` can enumerate the concurrent snapshots (those `current_table` has
+      that are newer than `starting_snapshot_id`). A validation failure returns non-retryable DataInvalid →
+      the retry loop stops + the error propagates (Java's non-retryable `ValidationException`).
+- [x] **A4 — added-files-since helper.** `SnapshotProducer::added_data_files_after(starting_snapshot_id)`
+      (or a free fn in snapshot.rs) walks `table.metadata()` from current-snapshot back via
+      `parent_snapshot_id` to `starting_snapshot_id` (exclusive); for each APPEND/OVERWRITE snapshot, load its
+      manifest list → DATA manifests added BY it → `Added` entries → collect `DataFile`s. Reusable by future
+      validations (OverwriteFiles, etc.). Mirror Java `addedDataFiles`/`validationHistory`/`ancestorsBetween`.
+- [x] **B — ReplacePartitions opt-in.** `ReplacePartitionsAction::{validate_from_snapshot(i64),
+      validate_no_conflicting_data()}` builder methods (store `validate_from_snapshot: Option<i64>` +
+      `validate_no_conflicting_data: bool`). Impl `TransactionAction::validate` for it: IF
+      `validate_no_conflicting_data`, effective-start = `self.validate_from_snapshot` else the tx-provided
+      `starting_snapshot_id`; enumerate added files since it (A4 helper, scoped to the action's helper-need);
+      if ANY added file's `(spec_id, partition)` ∈ the action's replaced-partition set → non-retryable
+      `DataInvalid` ValidationException naming the conflicting partition. Default (no opt-in) = NO validation.
+- [x] **Tests (replace_partitions.rs, MemoryCatalog, REAL concurrent commit):**
+      - KEY: append S0 (x=0,x=1) → build `replace_partitions(x=0).validate_from_snapshot(S0)
+        .validate_no_conflicting_data()` → CONCURRENT `fast_append` adding data to x=0 (S1) → commit the
+        replace → FAILS with the validation error, NON-RETRYABLE (assert `!err.retryable()` + the validation
+        message, not a retry-exhaustion).
+      - NEGATIVE control: concurrent append targets x=1 → replace(x=0) validation PASSES + commits.
+      - OFF control: no opt-in → concurrent x=0 append → commit SUCCEEDS (default behavior unchanged).
+      Each named for the risk (silently clobbering concurrent data = serializable-isolation violation).
+- [x] Docs: GAP_MATRIX (conflict-validation foundation + ReplacePartitions `validateNoConflictingData`
+      landed; the `Multi-op transactions + optimistic-concurrency` row + the `ReplacePartitions` row);
+      Roadmap (Phase 2 increment 6); record the conflict-validation SUB-SEQUENCE in this todo (6 foundation+
+      ReplacePartitions [this]; then OverwriteFiles `validateNoConflictingData`/`...Deletes`; RowDelta/
+      DeleteFiles `validateDataFilesExist`; RewriteFiles `validateNoNewDeletes`); lessons.
+- [x] Verify (repo root): `cargo build -p iceberg`; `cargo test -p iceberg --lib` ×2 (counts); the 3 interop
+      tests; `cargo clippy -p iceberg --all-targets -- -D warnings`; `cargo fmt --all -- --check`.
+
+**Conflict-validation sub-sequence (recorded):** (6) foundation + `ReplacePartitions.validateNoConflictingData`
+[THIS increment]; then `OverwriteFiles` `validateNoConflictingData` / `validateNoConflictingDeletes`;
+`RowDelta` / `DeleteFiles` `validateDataFilesExist`; `RewriteFiles` `validateNoNewDeletes`. Each reuses the
+A4 added-files-since helper (+ siblings: deleted-files-since, added-delete-files-since) and the A2/A3 hook.
+
+**Outcome (2026-06-08, Phase 2 Increment 6, BUILDER Opus):** the concurrent-commit conflict-validation
+FOUNDATION + its first concrete check landed 🟡. **Foundation (3 production files):** (A1) `Transaction`
+gained `starting_snapshot_id: Option<i64>`, captured ONCE in `new()` = `table.metadata().current_snapshot_id()`
+as its OWN field so it SURVIVES the `do_commit` staleness re-base (which overwrites `self.table`). (A2)
+`TransactionAction` gained a default-no-op `async fn validate(self: Arc<Self>, starting_snapshot_id:
+Option<i64>, current: &Table) -> Result<()> { Ok(()) }` — every existing action inherits the no-op, zero
+change. (A3) `do_commit` runs `Arc::clone(action).validate(self.starting_snapshot_id, &current_table)` for
+each action AFTER the refresh/re-base and BEFORE the re-apply loop (so `current_table` is the refreshed base
+= Java `parent`); a validation failure is a non-retryable `DataInvalid` (the `backon` `.when(|e|
+e.retryable())` loop STOPS → it propagates, matching Java's non-retryable `ValidationException`). (A4) shared
+free fn `added_data_files_after(table, starting_snapshot_id)` in `transaction/snapshot.rs` walks the current
+snapshot's parent chain back to `starting_snapshot_id` (EXCLUSIVE), and for each APPEND/OVERWRITE snapshot
+(Java `VALIDATE_ADDED_FILES_OPERATIONS`) collects every `Added`-status entry from the DATA manifests that
+snapshot ADDED (`added_snapshot_id == snapshot_id`) — Java `MergingSnapshotProducer.addedDataFiles` /
+`validationHistory` / `SnapshotUtil.ancestorsBetween`. **ReplacePartitions opt-in (B):**
+`validate_no_conflicting_data()` (enable) + `validate_from_snapshot(id)` (override start) builder methods;
+`impl TransactionAction::validate` for `ReplacePartitionsAction` — when enabled, effective-start =
+`validate_from_snapshot` else the tx-provided id; enumerate added files via the A4 helper; reject (non-retryable
+`DataInvalid` naming the conflicting partition + file) if any added file's `(spec_id, partition)` ∈ the
+replaced-partition set (Java `BaseReplacePartitions.validate` → `validateAddedDataFiles`). Default (no opt-in)
+= snapshot isolation, unchanged. **Tests (3, real concurrent commit via a separate `fast_append` between
+build and commit):** KEY — conflict in the replaced partition x=0 → REJECTED (asserts `!retryable()` + the
+"conflicting files" message + the catalog head is unchanged); NEGATIVE control — concurrent append to the
+untouched x=1 → PASSES; OFF control — no opt-in → concurrent x=0 append → commit SUCCEEDS (default unchanged,
+the concurrent file clobbered per snapshot isolation). Each names the serializable-isolation risk.
+Mutation-verified BOTH directions: `validate`→always-`Ok` fails the KEY test (replace wrongly commits over
+the concurrent file); conflict-predicate→always-`true` fails the NEGATIVE control (disjoint concurrent write
+wrongly rejected). **Verify (repo root, pinned nightly):** `cargo build -p iceberg` clean; `cargo test -p
+iceberg --lib` ×2 = 1404/0 both runs (+3 new tests); `interop_manage_snapshots`/`interop_update_schema`/
+`interop_update_partition_spec` all 4/4; `cargo clippy -p iceberg --all-targets -- -D warnings` clean (fixed
+one `map_clone` → `.cloned()`); `cargo fmt --all -- --check` clean (one reflow applied). Files touched exactly
+the allowed set: `transaction/mod.rs` (field + capture + hook call), `transaction/action.rs` (default validate
+hook), `transaction/replace_partitions.rs` (opt-in API + validate impl + 3 tests), `transaction/snapshot.rs`
+(`added_data_files_after` + `operation_adds_data_files` helpers), GAP_MATRIX, Roadmap, todo, lessons. NO
+Cargo/lockfile edits; no other action's file touched (the inherited no-op `validate` needs none); no
+`#[ignore]`; no bare `.unwrap()` in production paths; no commit. Conflict-validation sub-sequence recorded
+above. An Opus REVIEWER verifies next.
+
+#### Phase 2 Increment 6 — REVIEW (2026-06-08, Opus REVIEWER, DELEGATED)
+Adversarially verified points 1–6 against the Java source (`/tmp/iceberg-java-ref`) + mutation tests.
+- [x] **Pt 1 (NON-retryable, infinite-loop risk): CONFIRMED.** The conflict error is
+      `Error::new(DataInvalid, ...)` (retryable defaults to `false`; only `CatalogCommitConflicts` is
+      `with_retryable(true)`), so `commit()`'s `backon` `.when(|e| e.retryable())` STOPS and propagates it.
+      Mutation: adding `.with_retryable(true)` to the validation error made the KEY test fail at
+      `assert!(!err.retryable())` AND took 1.56s (the loop re-refreshed to the same S1 + re-failed +
+      exhausted 4 retries) — exactly the loop the brief warns about. The `!retryable()` + message asserts
+      catch it cleanly.
+- [x] **Pt 2 (starting_snapshot_id SURVIVES re-base): CONFIRMED + TEST GAP FOUND & FIXED.** Captured once in
+      `Transaction::new` as its own field; `do_commit`'s `self.table = refreshed` does NOT touch it.
+      Mutation (`effective_start = current.metadata().current_snapshot_id()`, the re-based head) makes the
+      check always-pass. **GAP:** the builder's 3 tests all pinned `.validate_from_snapshot(S0)`, which
+      short-circuits the tx field — so capturing `None` / re-reading the head failed NOTHING. Added
+      `test_..._using_tx_captured_starting_snapshot` (no override): the head-mutation now fails EXACTLY it
+      (1 pass override KEY / 1 fail new). This is the #2 highest risk, now pinned.
+- [x] **Pt 3 (added-files walk + carried-forward exclusion): CONFIRMED + isolated test added.** The
+      `added_snapshot_id == snapshot_id` manifest filter + `Added`-status entry filter + APPEND/OVERWRITE
+      operation filter match Java `addedDataFiles`/`validationHistory`/`ancestorsBetween`. Probe (S0 has
+      x=0 a + x=1 b; concurrent S1 adds x=0 a_new): `added_data_files_after(table, S0)` returns EXACTLY
+      `{a_new}` — carried-forward a/b excluded. Kept as
+      `test_added_data_files_after_excludes_carried_forward_manifests`.
+- [x] **Pt 4 (real race + conflict predicate): CONFIRMED.** Tests use a genuine concurrent `fast_append` on
+      the same `MemoryCatalog` between build and commit (refresh→S1→validate), not a faked mismatch.
+      Mutation BOTH directions: predicate→always-`true` fails the NEGATIVE control (disjoint x=1 append
+      wrongly rejected); predicate→always-`false` fails the KEY test (conflict undetected). Default (no
+      opt-in) commits over the concurrent file (OFF control) = snapshot isolation, unchanged.
+- [x] **Pt 5 (edge cases): SANE, one divergence flagged.** `starting_snapshot_id == None` ⇒ walk to root
+      (validate from history start). No parent / missing parent id ⇒ `break` (no panic). Empty table (no
+      current snapshot) ⇒ empty (no panic) — pinned by `test_added_data_files_after_empty_table_yields_empty`.
+      **DIVERGENCE:** a non-ancestor `validate_from_snapshot` OVER-SCANS to root where Java fails loud
+      (`validationHistory`'s `lastSnapshot.parentId() == start` check). Rust-STRICTER (can only over-reject,
+      never miss a conflict) → SAFE; documented + pinned
+      (`test_added_data_files_after_nonancestor_start_overscans_does_not_panic`), tracked as a parity
+      follow-up (add the post-walk ancestor guard), NOT fixed (narrow misuse, errs strict).
+- [x] **Pt 6 (default unchanged + scope): CONFIRMED.** Only `ReplacePartitionsAction` overrides `validate`;
+      every other action inherits the no-op (grep-verified). No bare `.unwrap()` in the new code (all `?`).
+      No Cargo/lockfile edits. Files touched = exactly the named set + this todo/lessons. Full lib suite
+      1408/0 ×2 (was 1404 builder baseline; +4 reviewer tests); 3 interop suites 4/4; clippy `-D warnings`
+      clean; fmt clean.
+
+**Review outcome (2026-06-08, Opus REVIEWER):** all 6 points adjudicated; the two highest risks
+(non-retryable, survives-rebase) hold — survives-rebase had a real TEST GAP (now fixed with a tx-field
+test, mutation-verified as the unique guard). No production bug. +4 tests (tx-captured-start,
+carried-forward isolation, non-ancestor over-scan, empty-table), all mutation-/probe-verified. ONE
+flagged divergence (non-ancestor over-scan vs Java fail-loud, Rust-stricter, tracked). Files touched:
+`transaction/replace_partitions.rs` (+4 tests), todo, lessons. No production `.rs` logic changed, no Cargo
+edits, no commit. Rows stay 🟡.
+
+**Follow-up (tracked):** add Java `validationHistory`'s post-walk `lastSnapshot.parentId() == start` guard
+to `added_data_files_after` so a non-ancestor `validate_from_snapshot` fails loud (parity) rather than
+over-scanning — fold into the conflict-validation sub-sequence hardening.

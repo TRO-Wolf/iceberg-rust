@@ -98,6 +98,14 @@ use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
 #[derive(Clone)]
 pub struct Transaction {
     table: Table,
+    /// The id of the table's current snapshot when this transaction was created (Java
+    /// `SnapshotProducer.base.currentSnapshot()` captured at construction). This is the starting point for
+    /// serializable-isolation conflict validation: an action's [`TransactionAction::validate`] enumerates the
+    /// snapshots the refreshed base has that are NEWER than this id (the concurrent commits). It is captured
+    /// ONCE in [`Transaction::new`] and is its OWN field precisely so it SURVIVES the staleness re-base in
+    /// [`Transaction::do_commit`] (which overwrites `self.table` with the refreshed base, losing the original
+    /// head). `None` means the table had no snapshots yet at transaction start.
+    starting_snapshot_id: Option<i64>,
     actions: Vec<BoxedTransactionAction>,
 }
 
@@ -106,6 +114,7 @@ impl Transaction {
     pub fn new(table: &Table) -> Self {
         Self {
             table: table.clone(),
+            starting_snapshot_id: table.metadata().current_snapshot_id(),
             actions: vec![],
         }
     }
@@ -289,6 +298,18 @@ impl Transaction {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
+
+        // Serializable-isolation conflict validation (Java `SnapshotProducer.validate`): run each action's
+        // `validate` against the REFRESHED base BEFORE re-applying any updates. `current_table` here is the
+        // refreshed base, so an action can enumerate the snapshots it has that are newer than
+        // `starting_snapshot_id` (the concurrent commits) and reject conflicts. A validation failure is
+        // non-retryable, so it propagates out of the retry loop instead of looping (Java's
+        // non-retryable `ValidationException`). The default `validate` is a no-op, so opt-out actions skip it.
+        for action in &self.actions {
+            Arc::clone(action)
+                .validate(self.starting_snapshot_id, &current_table)
+                .await?;
+        }
 
         for action in &self.actions {
             let action_commit = Arc::clone(action).commit(&current_table).await?;
