@@ -21,6 +21,7 @@ mod data_file;
 mod entries;
 mod files;
 mod history;
+mod manifest_source;
 mod manifests;
 mod metadata_log_entries;
 mod metadata_table;

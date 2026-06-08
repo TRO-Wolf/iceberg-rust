@@ -45,6 +45,14 @@ pub enum MetadataTableType {
     DeleteFiles,
     /// [`EntriesTable`] — all manifest entries of the current snapshot (Java `entries`).
     Entries,
+    /// [`FilesTable`] over all data + delete files reachable from ANY snapshot (Java `all_files`).
+    AllFiles,
+    /// [`FilesTable`] over DATA-content files reachable from ANY snapshot (Java `all_data_files`).
+    AllDataFiles,
+    /// [`FilesTable`] over delete-content files reachable from ANY snapshot (Java `all_delete_files`).
+    AllDeleteFiles,
+    /// [`EntriesTable`] over all manifest entries reachable from ANY snapshot (Java `all_entries`).
+    AllEntries,
     /// [`HistoryTable`] — one row per snapshot-log entry (Java `history`).
     History,
     /// [`RefsTable`] — one row per branch/tag reference (Java `refs`).
@@ -66,6 +74,10 @@ impl MetadataTableType {
             MetadataTableType::DataFiles => "data_files",
             MetadataTableType::DeleteFiles => "delete_files",
             MetadataTableType::Entries => "entries",
+            MetadataTableType::AllFiles => "all_files",
+            MetadataTableType::AllDataFiles => "all_data_files",
+            MetadataTableType::AllDeleteFiles => "all_delete_files",
+            MetadataTableType::AllEntries => "all_entries",
             MetadataTableType::History => "history",
             MetadataTableType::Refs => "refs",
             MetadataTableType::MetadataLogEntries => "metadata_log_entries",
@@ -91,6 +103,10 @@ impl TryFrom<&str> for MetadataTableType {
             "data_files" => Ok(Self::DataFiles),
             "delete_files" => Ok(Self::DeleteFiles),
             "entries" => Ok(Self::Entries),
+            "all_files" => Ok(Self::AllFiles),
+            "all_data_files" => Ok(Self::AllDataFiles),
+            "all_delete_files" => Ok(Self::AllDeleteFiles),
+            "all_entries" => Ok(Self::AllEntries),
             "history" => Ok(Self::History),
             "refs" => Ok(Self::Refs),
             "metadata_log_entries" => Ok(Self::MetadataLogEntries),
@@ -135,6 +151,30 @@ impl<'a> MetadataTable<'a> {
     /// current snapshot, with the `data_file` projection nested under one struct column.
     pub fn entries(&self) -> EntriesTable<'_> {
         EntriesTable::new(self.0)
+    }
+
+    /// Get the `all_files` table — all data + delete files reachable from ANY snapshot (the deduplicated
+    /// reachable-manifest union; may return duplicate file rows).
+    pub fn all_files(&self) -> FilesTable<'_> {
+        FilesTable::all_files(self.0)
+    }
+
+    /// Get the `all_data_files` table — only DATA-content files reachable from ANY snapshot (the
+    /// deduplicated reachable-manifest union; may return duplicate file rows).
+    pub fn all_data_files(&self) -> FilesTable<'_> {
+        FilesTable::all_data_files(self.0)
+    }
+
+    /// Get the `all_delete_files` table — only delete-content files reachable from ANY snapshot (the
+    /// deduplicated reachable-manifest union; may return duplicate file rows).
+    pub fn all_delete_files(&self) -> FilesTable<'_> {
+        FilesTable::all_delete_files(self.0)
+    }
+
+    /// Get the `all_entries` table — every manifest entry (data + delete, incl. Deleted tombstones)
+    /// reachable from ANY snapshot. Manifests are deduplicated across snapshots; the entries are not.
+    pub fn all_entries(&self) -> EntriesTable<'_> {
+        EntriesTable::all(self.0)
     }
 
     /// Get the `history` table — one row per snapshot-log entry (the table's current-snapshot history).

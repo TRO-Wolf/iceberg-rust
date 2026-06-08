@@ -169,7 +169,9 @@ validation + interop deferred). **Phase 3 (scan parity) has started on the inspe
 the three pure-metadata tables `history` / `refs` / `metadata_log_entries` (Increment 3,
 `inspect/{history,refs,metadata_log_entries}.rs`), and the first AGGREGATING table `partitions` (Increment 4,
 `inspect/partitions.rs`) are all 🟡** (alongside the pre-existing `snapshots` +
-`manifests`); the `all_*` cross-snapshot variants + inspection interop remain. The rest of the **write engine
+`manifests`); the four cross-snapshot `all_*` file/entry tables (`all_data_files` / `all_delete_files` /
+`all_files` / `all_entries`, Increment 5a, `inspect/{files,entries}.rs` + shared `inspect/manifest_source.rs`)
+are now 🟡 too; only `all_manifests` (5b) + inspection interop remain. The rest of the **write engine
 (merge append, `RowDelta`, `RewriteManifests`), incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
@@ -378,7 +380,19 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      tables (matches the `files` family; documented divergence), and DEFERS cross-spec partition-type
      unification (`Partitioning.partitionType`) as a known divergence (single-spec-correct path). Interop
      deferred (→ ✅).
-  5. **`all_*`** (`all_data_files` / `all_manifests` / `all_entries` …) — across ALL snapshots.
+  5. **`all_*`** (across ALL snapshots) — the four file/entry tables **`all_data_files` / `all_delete_files`
+     / `all_files` / `all_entries` DONE 🟡 (2026-06-08, Increment 5a, `inspect/{files,entries}.rs` + the new
+     shared `inspect/manifest_source.rs`)**: SAME projection/rows/schema as their current-snapshot
+     counterparts, but the manifest source becomes the **deduplicated union of manifests reachable from ALL
+     snapshots** (Java `BaseAllMetadataTableScan.reachableManifests`, dedup by `manifest_path`; files NOT
+     deduped — "may return duplicate rows"). Modeled as a `MetadataScope {CurrentSnapshot, AllSnapshots}`
+     axis orthogonal to `FilesTableKind`, with the manifest source factored into one shared
+     `collect_manifest_files(table, scope)` helper so the two tables can't drift; 12 unit tests
+     (cross-snapshot inclusion + manifest dedup + content filters + tombstones + schema parity + empty +
+     a NON-ANCESTOR forked-sibling file in `all_files`), dedup + all-vs-current + all-vs-ancestry scope +
+     content-filter mutation-pinned (the all-vs-ancestry pin added in REVIEW); interop deferred (→ ✅).
+     The remaining variant
+     **`all_manifests`** (different machinery + a `reference_snapshot_id` column) is still pending (5b).
 - **Exit criteria:** scans match Java planning/results incl. residuals; inspection tables present; reports
   emitted.
 

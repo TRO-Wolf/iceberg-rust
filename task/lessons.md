@@ -1484,3 +1484,46 @@ How to use it (see the manuals' §2):
   `if let Some(id) = entry.snapshot_id() && let Some(snap) = metadata.snapshot_by_id(id) { … }` (let-chains
   are stable on this toolchain). Run clippy `--all-targets -- -D warnings` from the repo root (pinned
   nightly) before declaring done — a plain `cargo build` does NOT surface it.
+
+### 2026-06-08 (Phase 3 Increment 5a — `all_*` cross-snapshot file/entry tables, BUILDER Opus)
+- **DO stamp a SHARED manifest's `sequence_number`/`min_sequence_number` explicitly before referencing it in
+  a SECOND snapshot's manifest list in a multi-snapshot fixture.** *Why:* `ManifestListWriter::assign_sequence
+  _numbers` (`spec/manifest_list.rs:274`) only ASSIGNS a seq to a manifest the list ADDED — i.e. one whose
+  `added_snapshot_id == list.snapshot_id`. A manifest written under the PARENT snapshot but also referenced
+  in the CURRENT snapshot's list (the dedup-test setup: one `ManifestFile` in both lists by the same path)
+  reaches the current list with `added_snapshot_id != current_id` AND an UNASSIGNED seq (-1), so the writer
+  errors `DataInvalid "Found unassigned sequence number for a manifest from snapshot N"`. Fix: after
+  `write_manifest_file()`, set `manifest.sequence_number = parent.sequence_number()` and `.min_sequence_number`
+  likewise (both public fields) — exactly the seq a real commit would have stamped when the parent first
+  wrote it. A manifest carried forward into a later snapshot's list MUST already carry an assigned seq; only
+  the list that ADDED it assigns one. (This is the manifest-list analogue of the entry-level "Existing entry
+  must have a populated seq" rule.)
+- **DO use `TableTestFixture::new()`'s EXISTING parent+current snapshot pair for a multi-snapshot inspection
+  fixture — but WRITE BOTH manifest lists.** *Why:* `example_table_metadata_v2.json` already has two snapshots
+  (parent `3051…`/seq 0 → `manifest_list_1`, current `3055…`/seq 1 → `manifest_list_2`), reachable via
+  `current_snapshot.parent_snapshot(&metadata)` (`pub(crate)`). The current-snapshot tables (`files`/`entries`)
+  only read `current_snapshot.manifest_list()`, so the Increment-1/2 fixtures leave the PARENT list
+  (`manifest_list_1`) UNWRITTEN — but the `all_*` tables read it via `metadata.snapshots()`. The fixture must
+  write BOTH lists (a `write_manifest_list(fixture, snapshot, manifests)` helper at `snapshot.manifest_list()`),
+  or `load_manifest_list` on the parent fails (file absent). No new public accessor needed; everything
+  (`snapshots()`, `parent_snapshot`, `manifest_list()`, the `ManifestFile` fields) is `pub`/`pub(crate)`.
+- **DO preserve FIRST-SEEN order when porting Java's `Sets.newHashSet(reachableManifests)` dedup, even though
+  Java's `HashSet` is unordered.** *Why:* Java `BaseAllMetadataTableScan.reachableManifests` (L80-82) returns a
+  `HashSet<ManifestFile>` (equality by path) — UNORDERED. A faithful port could use any order, but a `HashSet`
+  +`Vec` seen-set that pushes on first sight gives DETERMINISTIC output (a strict superset of Java's contract)
+  and makes the row-order tests reproducible without sorting in production. Dedup the MANIFESTS only; the FILES
+  inside are NOT deduplicated (javadoc "may return duplicate rows") — a shared manifest's file appears once
+  because the manifest is read once, NOT because files are deduped. Return ALL-content manifests from the
+  shared helper and let each table content-filter (`FilesTableKind`): dedup-by-path then filter == filter then
+  dedup (content is intrinsic to a manifest), so one all-content source == Java's per-content
+  `reachableManifests(dataManifests|deleteManifests|allManifests)`.
+- **FLAG (pre-existing, NOT this increment's): `iceberg-datafusion` does not compile against the
+  `MetadataTableType` enum.** *Why:* `crates/integrations/datafusion/src/table/metadata_table.rs` matches
+  `MetadataTableType` for `schema()`/`scan()` but only handles `Snapshots`/`Manifests` — it is already
+  non-exhaustive over the `Files`/`DataFiles`/`DeleteFiles`/`Entries`/`History`/`Refs`/`MetadataLogEntries`/
+  `Partitions` variants prior increments (1-4) added (E0004). Verified by `git stash`-ing the Increment-5a
+  inspect changes and building `-p iceberg-datafusion` at HEAD → SAME errors. The Phase-3 inspection gate is
+  scoped `-p iceberg`, which never builds the datafusion crate, so the regression slipped through every
+  inspection increment. Adding the 4 `all_*` variants extends the already-broken match — it does not CAUSE
+  the breakage. A human should add the missing arms (or a `_ =>` returning `FeatureUnsupported`) in that one
+  datafusion file as a standalone fix, and consider widening the inspection gate to `-p iceberg-datafusion`.

@@ -2432,3 +2432,122 @@ touched ONLY `inspect/partitions.rs` (tests) + `docs/parity/GAP_MATRIX.md` + thi
 Cargo, spec, or arrow edits; no commit/branch. Residual risk: cross-spec partition-evolution unification
 stays a documented DEFERRAL (decision 2); the unpartitioned empty-struct partition column stays a documented
 module-wide DIVERGENCE (decision 1) — both honestly stated, neither overstated as parity.
+
+---
+
+### Phase 3 Increment 5a — `all_data_files` / `all_delete_files` / `all_files` / `all_entries` (SCOPED, 2026-06-08)
+The cross-snapshot file/entry inspection tables: the SAME projection/rows as their current-snapshot
+counterparts (`data_files`/`delete_files`/`files`/`entries`), but the manifest source becomes the
+**deduplicated union of manifests reachable from ALL snapshots** (Java `BaseAllMetadataTableScan
+.reachableManifests`). `all_manifests` is a SEPARATE later increment (5b) — distinct machinery.
+
+**Java authority (CONFIRMED from source):**
+- `BaseAllMetadataTableScan.reachableManifests(toManifests)` (L74-86): union over `table().snapshots()` of
+  `toManifests(snapshot)`, **deduplicated via a HashSet of ManifestFile** (== by manifest path). NOT
+  per-snapshot-tagged (no reference_snapshot_id — that's only `all_manifests`).
+- `AllDataFilesTable` (extends `BaseFilesTable`): `manifests() = reachableManifests(snapshot.dataManifests)`.
+  `AllFilesTable` → `allManifests`; `AllDeleteFilesTable` → `deleteManifests`. Same `BaseFilesTable` schema
+  + LIVE-entry filter (`is_alive`) as the current-snapshot files family. Javadoc: "valid file = readable
+  from ANY snapshot currently tracked"; "may return duplicate rows" (files NOT deduped — only manifests).
+- `AllEntriesTable` (extends `BaseEntriesTable`): `reachableManifests(snapshot.allManifests)`, then the SAME
+  entries rows (ALL entries incl. Deleted tombstones — NO is_alive filter), same schema as `entries`.
+
+**Rust mapping (confirmed):** `metadata.snapshots()` → `impl ExactSizeIterator<&SnapshotRef>` (all snapshots);
+per snapshot `snapshot.load_manifest_list(file_io, metadata)` → entries; dedup the `ManifestFile`s by
+`manifest_path: String` (HashSet/seen-set, preserve first-seen order for determinism); then the EXISTING
+per-manifest read in `files.rs`/`entries.rs` is reused verbatim. The content filter (`FilesTableKind`) and
+`is_alive()` (files) / no-filter (entries) stay exactly as today.
+
+**Design:** add a snapshot-SCOPE axis to `FilesTable` and `EntriesTable` (enum `{CurrentSnapshot, AllSnapshots}`
+or similar), orthogonal to `FilesTableKind`. Factor a shared manifest-source helper (e.g. `pub(super) async fn
+collect_manifests(table, scope, content_filter) -> Result<Vec<ManifestFile>>`, deduped for AllSnapshots) so
+files.rs + entries.rs cannot drift. Wire `MetadataTableType::{AllDataFiles,AllDeleteFiles,AllFiles,AllEntries}`
++ `MetadataTable::{all_data_files,all_delete_files,all_files,all_entries}` accessors + as_str/TryFrom.
+
+Plan:
+- [x] Shared manifest-source helper (deduped reachable-manifest union for AllSnapshots; current-snapshot list
+      for CurrentSnapshot), used by both tables. Keep the existing current-snapshot behavior byte-identical.
+- [x] `FilesTable`: add the scope axis; `FilesTable::all_*` constructors; `scan()` uses the helper.
+- [x] `EntriesTable`: add the scope axis; `EntriesTable::all()` constructor; `scan()` uses the helper.
+- [x] Wire enum variants + accessors + as_str + TryFrom in `metadata_table.rs`.
+- [x] Tests (in-crate): a MULTI-snapshot fixture where an OLD snapshot's manifest holds a file that the
+      current snapshot's manifests do NOT → `all_*` includes it, the current-snapshot table excludes it;
+      manifest DEDUP (a manifest shared by 2 snapshots is not double-read by all_entries); content filters
+      still hold for all_data_files/all_delete_files; all_entries shows Deleted tombstones across snapshots;
+      Arrow schema parity with the non-all counterparts. Mutation-pin the dedup + the all-vs-current scope.
+- [x] Docs: GAP_MATRIX inspection row, Roadmap Phase 3, todo, lessons.
+- [x] Verify from repo root: build; lib ×2; 3 interop suites; clippy -D warnings; fmt --check.
+
+**Outcome (2026-06-08, BUILDER Opus):** Landed the four cross-snapshot file/entry inspection tables
+`all_data_files` / `all_delete_files` / `all_files` / `all_entries` 🟡. **Files modified:**
+`inspect/files.rs` (scope axis + `all_files`/`all_data_files`/`all_delete_files` ctors + 6 tests),
+`inspect/entries.rs` (scope axis + `EntriesTable::all()` + 5 tests), `inspect/metadata_table.rs` (4 enum
+variants + accessors + `as_str` + `TryFrom`), `inspect/mod.rs` (register the new module). **File created:**
+`inspect/manifest_source.rs` — the SHARED single-source-of-truth helper. **Shared-helper design:** a new
+`MetadataScope {CurrentSnapshot, AllSnapshots}` enum (ORTHOGONAL to `FilesTableKind`) drives
+`pub(super) collect_manifest_files(table, scope) -> Result<Vec<ManifestFile>>`: `CurrentSnapshot` returns
+the current snapshot's manifest-list entries (empty when none — old current-snapshot behavior byte-identical);
+`AllSnapshots` walks `metadata.snapshots()`, loads each `load_manifest_list`, and deduplicates `ManifestFile`s
+by `manifest_path` (a `HashSet` seen-set, FIRST-SEEN order preserved for determinism). Both `files.rs` and
+`entries.rs` call it; the content filter (`FilesTableKind::includes_manifest`) + `is_alive()` (files) /
+no-filter (entries) stay UNCHANGED in each table's scan loop, so the row machinery + schema are byte-identical
+across the scope axis. **Java lines verified:** `BaseAllMetadataTableScan.reachableManifests` (L74-86, union
+over `table().snapshots()` deduped via `Sets.newHashSet` = by-path manifest dedup); `AllDataFilesTable` /
+`AllFilesTable` / `AllDeleteFilesTable` / `AllEntriesTable` (each swaps the manifest source to
+`dataManifests` / `allManifests` / `deleteManifests` / `allManifests`, reusing `BaseFilesTable` /
+`BaseEntriesTable` schema + row machinery; javadocs "valid file = readable from ANY snapshot currently
+tracked", "may return duplicate rows" = files NOT deduped). **Tests (11):**
+files.rs — `test_all_files_includes_file_only_in_old_snapshot` (cross-snapshot inclusion: old-only file in
+`all_files` not current `files`), `test_all_data_files_excludes_delete_files_across_snapshots` (content
+filter under AllSnapshots), `test_all_delete_files_excludes_data_files_across_snapshots` (content filter
+under AllSnapshots), `test_all_files_deduplicates_shared_manifest` (shared manifest read once),
+`test_all_files_schema_equals_files_schema` (Arrow schema parity all_files/all_data_files/all_delete_files
+== their non-all counterparts), `test_all_files_empty_table_yields_empty_batch` (no snapshots → 0 rows);
+entries.rs — `test_all_entries_includes_entries_only_in_old_snapshot` (cross-snapshot inclusion),
+`test_all_entries_shows_deleted_tombstone_from_old_snapshot` (tombstones across snapshots, the is_alive
+distinction vs all_files), `test_all_entries_deduplicates_shared_manifest` (shared manifest's entry once),
+`test_all_entries_schema_equals_entries_schema` (Arrow schema parity), `test_all_entries_empty_table_yields_
+empty_batch`. Multi-snapshot fixture built on `TableTestFixture::new()` (which has a parent + current
+snapshot): writes BOTH snapshots' manifest lists (the current-snapshot fixtures leave the parent list
+unwritten); a SHARED manifest is referenced by both lists by the same path (its seq number stamped to the
+parent's explicitly, because a manifest list only ASSIGNS a seq to a manifest it ADDED — a carried-forward
+manifest must already carry one, else "Found unassigned sequence number"). **Mutations run + caught (both):**
+(a) dropped the dedup seen-set (push every manifest) → both `*_deduplicates_shared_manifest` tests FAIL
+(count 2 ≠ 1); (b) `AllSnapshots` reads only the current snapshot → all 3 cross-snapshot-inclusion tests +
+the tombstone test FAIL (old-only file/entry/tombstone absent). Both restored after. **Gate (repo root,
+pinned nightly):** `cargo build -p iceberg` clean; `cargo test -p iceberg --lib` ×2 = **1458 passed / 0
+failed** both runs (was 1447; +11); `cargo test -p iceberg --test interop_manage_snapshots
+--test interop_update_schema --test interop_update_partition_spec` = 4/4 each; `cargo clippy -p iceberg
+--all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean. **`all_manifests` (5b) NOT built**
+
+**REVIEW (2026-06-08, REVIEWER Opus):** PASS 🟡 with ONE test-strength fix landed in scope. Verified Java
+authority myself: `BaseAllMetadataTableScan.reachableManifests` L74-86 (union over `table().snapshots()`,
+`Sets.newHashSet`); the four per-table sources (`AllDataFilesTable`→`dataManifests`,
+`AllFilesTable`/`AllEntriesTable`→`allManifests`, `AllDeleteFilesTable`→`deleteManifests`); and
+`GenericManifestFile.equals`/`hashCode` L405-419 = `manifestPath` ONLY, so the Rust `seen_paths` HashSet is a
+1:1 dedup key. CurrentSnapshot arm confirmed byte-identical (mutation: dropping a manifest from it fails the
+Increment-1/2 tests). Schema-parity confirmed (`schema()` unchanged; the `all_*` schemas equal their non-all
+counterparts via the schema-parity tests). Mutation sweep (all run by injection, restored after): (a) drop
+dedup → both `*_deduplicates_shared_manifest` fail; (b) all→current → 3 inclusion + tombstone fail;
+(d) content-filter swap under AllSnapshots → all- AND current-snapshot content tests fail; CurrentSnapshot
+manifest-drop → Increment-1/2 fail. **(c) all→ANCESTRY-walk SURVIVED the builder's 11 tests** — the base
+`TableTestFixture` metadata has exactly 2 snapshots (current + its parent), so "all `metadata.snapshots()`"
+and "current snapshot's ancestry" are indistinguishable. FIX: added
+`test_all_files_includes_file_from_non_ancestor_snapshot` (files.rs) — grafts a THIRD tracked snapshot that
+is a FORK off the parent (sibling of current, NOT in its ancestry; `main` stays at current) with its own
+manifest list on disk holding `fork-1.parquet`, and asserts `all_files` includes it while current `files`
+does not. Verified it FAILS under the ancestry-walk mutation and PASSES on correct code. No production code
+changed (manifest_source.rs byte-identical to the builder's). Re-ran gate: `cargo test -p iceberg --lib` ×2 =
+**1459 passed / 0 failed** both runs (+1); 3 interop suites 4/4 each; clippy `-D warnings` clean; fmt --check
+clean. Residual risk: low. The fixture now distinguishes all-vs-ancestry; the only remaining residual is the
+absence of a true Java/Spark interop round-trip (deferred → ✅ as planned). The pre-existing
+`iceberg-datafusion` non-exhaustive-match break the builder flagged is the orchestrator's, NOT 5a's, and was
+not touched. **`all_manifests` (5b) NOT built**
+(out of scope: different machinery + a `reference_snapshot_id` column). **Pre-existing issue FLAGGED (not
+mine, not in scope):** `iceberg-datafusion` does NOT compile at the Increment-4 HEAD baseline — its
+`table/metadata_table.rs` match on `MetadataTableType` only handles `Snapshots`/`Manifests` and is already
+non-exhaustive over the `Files`/`DataFiles`/.../`Partitions` variants prior increments added; my 4 new
+variants extend that already-broken match. Verified by `git stash`-ing my inspect changes and building
+`-p iceberg-datafusion` (same E0004 non-exhaustive errors at HEAD). The `-p iceberg` gate never builds the
+datafusion crate, so this slipped through Increments 1-4 — a human should add the missing match arms (or a
+catch-all) in `crates/integrations/datafusion/src/table/metadata_table.rs` as a standalone fix.

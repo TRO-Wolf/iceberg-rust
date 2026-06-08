@@ -15,13 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The `entries` metadata table — the raw manifest-entry view of the table's **current snapshot**.
+//! The `entries` metadata table (and its cross-snapshot sibling `all_entries`) — the raw manifest-entry
+//! view of the table.
 //!
 //! Unlike the `files` family (which lists only LIVE data/delete files), `entries` exposes EVERY manifest
-//! entry of EVERY manifest (data AND delete) of the current snapshot — including the `Deleted` tombstones
-//! (`status == 2`). It is the diagnostic view: Java's `ManifestEntriesTable` javadoc warns it "exposes
-//! internal details, like files that have been deleted." A bug that drops the Deleted entries makes the
-//! `entries` table wrong.
+//! entry of EVERY manifest (data AND delete) — including the `Deleted` tombstones (`status == 2`). It is
+//! the diagnostic view: Java's `ManifestEntriesTable` javadoc warns it "exposes internal details, like
+//! files that have been deleted." A bug that drops the Deleted entries makes the `entries` table wrong.
+//!
+//! The two scopes differ ONLY in the manifest source (Java `ManifestEntriesTable` vs `AllEntriesTable`):
+//! - [`MetadataScope::CurrentSnapshot`] (`entries`) → the current snapshot's `allManifests`.
+//! - [`MetadataScope::AllSnapshots`] (`all_entries`) → the deduplicated union of manifests reachable from
+//!   ALL snapshots (Java `BaseAllMetadataTableScan.reachableManifests(snapshot.allManifests)`). Manifests
+//!   are deduplicated; the entries inside them are NOT (a manifest shared by two snapshots is read once).
+//!
+//! Both use the shared [`crate::inspect::manifest_source`] helper, so `entries` and the `files` family
+//! cannot drift on the cross-snapshot semantics.
 //!
 //! Each row is one [`crate::spec::ManifestEntry`]:
 //! - `status` (id 0, int) — `0`=Existing / `1`=Added / `2`=Deleted (Java `ManifestEntry.Status` ids).
@@ -38,6 +47,7 @@
 //! References:
 //! - <https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/BaseEntriesTable.java>
 //! - <https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/ManifestEntriesTable.java>
+//! - <https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/AllEntriesTable.java>
 //! - <https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/ManifestEntry.java>
 //!
 //! Deferred column: `readable_metrics` (Java `MetricsUtil.readableMetricsStruct`), exactly as the `files`
@@ -51,21 +61,36 @@ use arrow_schema::DataType;
 use futures::{StreamExt, stream};
 
 use super::data_file::{DataFileStructBuilder, data_file_fields};
+use super::manifest_source::{MetadataScope, collect_manifest_files};
 use crate::arrow::schema_to_arrow_schema;
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{NestedField, PrimitiveType, Schema, Type};
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
 
-/// The `entries` metadata table (Java `ManifestEntriesTable` / `BaseEntriesTable`).
+/// The `entries` / `all_entries` metadata table (Java `ManifestEntriesTable` / `AllEntriesTable`,
+/// both `BaseEntriesTable`). The [`MetadataScope`] selects the current-snapshot vs cross-snapshot variant.
 pub struct EntriesTable<'a> {
     table: &'a Table,
+    scope: MetadataScope,
 }
 
 impl<'a> EntriesTable<'a> {
-    /// Create a new `entries` table instance.
+    /// Create a new `entries` table instance (the current snapshot's manifest entries).
     pub fn new(table: &'a Table) -> Self {
-        Self { table }
+        Self {
+            table,
+            scope: MetadataScope::CurrentSnapshot,
+        }
+    }
+
+    /// Create an `all_entries` table instance — every manifest entry reachable from ANY snapshot (Java
+    /// `AllEntriesTable`). Manifests are deduplicated across snapshots; the entries are not.
+    pub fn all(table: &'a Table) -> Self {
+        Self {
+            table,
+            scope: MetadataScope::AllSnapshots,
+        }
     }
 
     /// Returns the iceberg schema of the `entries` metadata table.
@@ -97,9 +122,11 @@ impl<'a> EntriesTable<'a> {
 
     /// Scans the `entries` metadata table.
     ///
-    /// Reads the current snapshot's manifest list, then EVERY manifest (data AND delete — Java
-    /// `snapshot().allManifests`), then EVERY entry (NO `is_alive` filter — the Deleted tombstones are
-    /// rows here). An empty table (no current snapshot) yields a single empty batch.
+    /// Resolves the manifest source for this table's [`MetadataScope`] (the current snapshot's
+    /// `allManifests`, or the deduplicated reachable union over ALL snapshots) via the shared
+    /// [`collect_manifest_files`] helper, then reads EVERY manifest (data AND delete) and EVERY entry
+    /// (NO `is_alive` filter — the Deleted tombstones are rows here). An empty table (no current
+    /// snapshot / no snapshots) yields a single empty batch.
     pub async fn scan(&self) -> Result<ArrowRecordBatchStream> {
         let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema())?);
         let partition_type = self.table.metadata().default_partition_type().clone();
@@ -111,22 +138,18 @@ impl<'a> EntriesTable<'a> {
         let mut file_sequence_number = Int64Builder::new();
         let mut data_file = DataFileStructBuilder::new(&data_file_arrow_fields, &partition_type);
 
-        if let Some(snapshot) = self.table.metadata().current_snapshot() {
-            let manifest_list = snapshot
-                .load_manifest_list(self.table.file_io(), self.table.metadata())
-                .await?;
-            for manifest_file in manifest_list.entries() {
-                let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
-                for entry in manifest.entries() {
-                    // ALL entries — incl. Deleted tombstones (status 2). This is the difference from the
-                    // `files` family, which filters on `entry.is_alive()`.
-                    status.append_value(entry.status() as i32);
-                    snapshot_id.append_option(entry.snapshot_id());
-                    sequence_number.append_option(entry.sequence_number());
-                    // `ManifestEntry` exposes `file_sequence_number` as a public field, not a method.
-                    file_sequence_number.append_option(entry.file_sequence_number);
-                    data_file.append(entry.data_file())?;
-                }
+        let manifest_files = collect_manifest_files(self.table, self.scope).await?;
+        for manifest_file in &manifest_files {
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            for entry in manifest.entries() {
+                // ALL entries — incl. Deleted tombstones (status 2). This is the difference from the
+                // `files` family, which filters on `entry.is_alive()`.
+                status.append_value(entry.status() as i32);
+                snapshot_id.append_option(entry.snapshot_id());
+                sequence_number.append_option(entry.sequence_number());
+                // `ManifestEntry` exposes `file_sequence_number` as a public field, not a method.
+                file_sequence_number.append_option(entry.file_sequence_number);
+                data_file.append(entry.data_file())?;
             }
         }
 
@@ -320,6 +343,152 @@ mod tests {
             .add_manifests(vec![data_manifest, delete_manifest].into_iter())
             .unwrap();
         manifest_list_write.close().await.unwrap();
+    }
+
+    /// Writes a manifest list for `snapshot` referencing the given manifests, at the snapshot's own
+    /// `manifest_list()` location. The `all_entries` table reads BOTH the parent and current lists, so
+    /// the multi-snapshot fixture must write both (the current-snapshot fixtures leave the parent
+    /// list unwritten).
+    async fn write_manifest_list(
+        fixture: &TableTestFixture,
+        snapshot: &crate::spec::Snapshot,
+        manifests: Vec<crate::spec::ManifestFile>,
+    ) {
+        let mut writer = ManifestListWriter::v2(
+            fixture
+                .table
+                .file_io()
+                .new_output(snapshot.manifest_list())
+                .unwrap(),
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+            snapshot.sequence_number(),
+        );
+        writer.add_manifests(manifests.into_iter()).unwrap();
+        writer.close().await.unwrap();
+    }
+
+    /// Builds a MULTI-SNAPSHOT fixture for the `all_entries` (cross-snapshot) semantics.
+    ///
+    /// PARENT snapshot (`3051…`) manifest list:
+    /// - DATA manifest `old_entries` → `old-add.parquet` (Added) + `old-del.parquet` (Deleted tombstone).
+    /// - SHARED DATA manifest `shared_entries` → `shared.parquet` (Added) — referenced by BOTH snapshots.
+    ///
+    /// CURRENT snapshot (`3055…`) manifest list:
+    /// - DATA manifest `cur_entries` → `cur-add.parquet` (Added).
+    /// - the SAME SHARED DATA manifest `shared_entries` (same `manifest_path`).
+    ///
+    /// Pins: cross-snapshot inclusion (`old-add`), tombstones across snapshots (`old-del` from the OLD
+    /// snapshot's manifest), and manifest dedup (`shared.parquet` emitted ONCE).
+    async fn setup_multi_snapshot_entries(fixture: &TableTestFixture) {
+        let metadata = fixture.table.metadata().clone();
+        let current_snapshot = metadata.current_snapshot().unwrap();
+        let parent_snapshot = current_snapshot.parent_snapshot(&metadata).unwrap();
+        let current_schema = current_snapshot.schema(&metadata).unwrap();
+        let current_partition_spec = metadata.default_partition_spec();
+
+        let added = |name: &str, partition: i64| -> ManifestEntry {
+            ManifestEntry::builder()
+                .status(ManifestStatus::Added)
+                .data_file(
+                    DataFileBuilder::default()
+                        .partition_spec_id(0)
+                        .content(DataContentType::Data)
+                        .file_path(format!("{}/{name}", fixture.table_location))
+                        .file_format(DataFileFormat::Parquet)
+                        .file_size_in_bytes(FILE_SIZE)
+                        .record_count(1)
+                        .partition(Struct::from_iter([Some(Literal::long(partition))]))
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+        };
+
+        let new_parent_writer = |file_name: &str| {
+            let output = fixture
+                .table
+                .file_io()
+                .new_output(format!("{}/metadata/{file_name}", fixture.table_location))
+                .unwrap();
+            ManifestWriterBuilder::new(
+                output,
+                Some(parent_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+        };
+
+        // SHARED DATA manifest (written ONCE, referenced by both snapshots by the same path). Committed
+        // by the PARENT snapshot, so stamp its sequence number to the parent's (0): a manifest list only
+        // ASSIGNS a seq to a manifest it ADDED, so a manifest carried forward into the LATER (current)
+        // snapshot's list must already carry an assigned seq (else "Found unassigned sequence number").
+        let mut shared_writer = new_parent_writer("shared_entries.avro").build_v2_data();
+        shared_writer
+            .add_entry(added("shared.parquet", 700))
+            .unwrap();
+        let mut shared_manifest = shared_writer.write_manifest_file().await.unwrap();
+        shared_manifest.sequence_number = parent_snapshot.sequence_number();
+        shared_manifest.min_sequence_number = parent_snapshot.sequence_number();
+
+        // PARENT-only DATA manifest: an Added file AND a Deleted tombstone (the OLD snapshot's manifest).
+        let mut old_writer = new_parent_writer("old_entries.avro").build_v2_data();
+        old_writer.add_entry(added("old-add.parquet", 800)).unwrap();
+        old_writer
+            .add_delete_entry(
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Deleted)
+                    .snapshot_id(parent_snapshot.snapshot_id())
+                    .sequence_number(parent_snapshot.sequence_number())
+                    .file_sequence_number(parent_snapshot.sequence_number())
+                    .data_file(
+                        DataFileBuilder::default()
+                            .partition_spec_id(0)
+                            .content(DataContentType::Data)
+                            .file_path(format!("{}/old-del.parquet", &fixture.table_location))
+                            .file_format(DataFileFormat::Parquet)
+                            .file_size_in_bytes(FILE_SIZE)
+                            .record_count(1)
+                            .partition(Struct::from_iter([Some(Literal::long(900))]))
+                            .build()
+                            .unwrap(),
+                    )
+                    .build(),
+            )
+            .unwrap();
+        let old_manifest = old_writer.write_manifest_file().await.unwrap();
+
+        write_manifest_list(fixture, &parent_snapshot, vec![
+            old_manifest,
+            shared_manifest.clone(),
+        ])
+        .await;
+
+        // CURRENT DATA manifest: one Added file.
+        let mut cur_writer = ManifestWriterBuilder::new(
+            fixture
+                .table
+                .file_io()
+                .new_output(format!(
+                    "{}/metadata/cur_entries.avro",
+                    fixture.table_location
+                ))
+                .unwrap(),
+            Some(current_snapshot.snapshot_id()),
+            None,
+            current_schema.clone(),
+            current_partition_spec.as_ref().clone(),
+        )
+        .build_v2_data();
+        cur_writer.add_entry(added("cur-add.parquet", 100)).unwrap();
+        let cur_manifest = cur_writer.write_manifest_file().await.unwrap();
+
+        write_manifest_list(fixture, current_snapshot, vec![
+            cur_manifest,
+            shared_manifest,
+        ])
+        .await;
     }
 
     /// Concatenates an entries-table scan into a single batch.
@@ -614,6 +783,134 @@ mod tests {
             .table
             .inspect()
             .entries()
+            .scan()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+    }
+
+    /// Collects the sorted `file_path` leaves of every entry row in an entries-table scan (one per
+    /// entry, NOT deduplicated — so duplicates are observable).
+    async fn entry_file_paths(stream: crate::scan::ArrowRecordBatchStream) -> Vec<String> {
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let mut paths = Vec::new();
+        for batch in &batches {
+            // Read the raw file_path column directly (NOT keyed by suffix) so duplicate rows from a
+            // shared manifest read twice would be observable.
+            let data_file = batch
+                .column_by_name("data_file")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let file_path = data_file
+                .column_by_name("file_path")
+                .unwrap()
+                .as_string::<i32>();
+            for i in 0..file_path.len() {
+                paths.push(file_path.value(i).rsplit('/').next().unwrap().to_string());
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test]
+    async fn test_all_entries_includes_entries_only_in_old_snapshot() {
+        // RISK (the core all-vs-current behavior): `all_entries` exposes entries from manifests reachable
+        // from ANY snapshot — so an entry present only in the OLD snapshot's manifest (`old-add.parquet`)
+        // appears in `all_entries` but NOT in the current-snapshot `entries`. Mutation-pin: an
+        // `AllSnapshots` that read only the current snapshot would drop it.
+        let fixture = TableTestFixture::new();
+        setup_multi_snapshot_entries(&fixture).await;
+
+        let current =
+            entry_file_paths(fixture.table.inspect().entries().scan().await.unwrap()).await;
+        let all =
+            entry_file_paths(fixture.table.inspect().all_entries().scan().await.unwrap()).await;
+
+        assert!(
+            !current.contains(&"old-add.parquet".to_string()),
+            "current `entries` must not include the old-only entry"
+        );
+        assert!(
+            all.contains(&"old-add.parquet".to_string()),
+            "`all_entries` must include the entry reachable only from the old snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_entries_shows_deleted_tombstone_from_old_snapshot() {
+        // RISK: `all_entries` must surface Deleted tombstones across snapshots (the is_alive distinction
+        // vs `all_files`). The OLD snapshot's manifest carries `old-del.parquet` as a Deleted (status 2)
+        // entry — it must be a row with status 2.
+        let fixture = TableTestFixture::new();
+        setup_multi_snapshot_entries(&fixture).await;
+
+        let batch =
+            scan_single_batch(fixture.table.inspect().all_entries().scan().await.unwrap()).await;
+        let rows = rows_by_suffix(&batch);
+
+        assert!(
+            rows.contains_key("old-del.parquet"),
+            "the Deleted tombstone from the old snapshot must be an `all_entries` row"
+        );
+        assert_eq!(
+            rows["old-del.parquet"].status, 2,
+            "old-del.parquet must carry status Deleted=2 in all_entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_entries_deduplicates_shared_manifest() {
+        // RISK: a manifest referenced by TWO snapshots must be read ONCE — `all_entries` must NOT emit
+        // the shared manifest's entry twice. Mutation-pin: dropping the dedup seen-set makes
+        // `shared.parquet` appear twice (once per snapshot's list).
+        let fixture = TableTestFixture::new();
+        setup_multi_snapshot_entries(&fixture).await;
+
+        let all =
+            entry_file_paths(fixture.table.inspect().all_entries().scan().await.unwrap()).await;
+        let occurrences = all.iter().filter(|p| **p == "shared.parquet").count();
+        assert_eq!(
+            occurrences, 1,
+            "the entry from the manifest shared by both snapshots must appear exactly once"
+        );
+
+        // The full all_entries set: current add, old add, old delete tombstone, shared — each once.
+        assert_eq!(all, vec![
+            "cur-add.parquet".to_string(),
+            "old-add.parquet".to_string(),
+            "old-del.parquet".to_string(),
+            "shared.parquet".to_string(),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_all_entries_schema_equals_entries_schema() {
+        // RISK: schema drift — `all_entries` must have the IDENTICAL Arrow schema as `entries`.
+        let fixture = TableTestFixture::new();
+        let entries_schema =
+            crate::arrow::schema_to_arrow_schema(&fixture.table.inspect().entries().schema())
+                .unwrap();
+        let all_entries_schema =
+            crate::arrow::schema_to_arrow_schema(&fixture.table.inspect().all_entries().schema())
+                .unwrap();
+        assert_eq!(entries_schema, all_entries_schema);
+    }
+
+    #[tokio::test]
+    async fn test_all_entries_empty_table_yields_empty_batch() {
+        // RISK: panic / non-empty on an empty table — no snapshots must yield zero rows for all_entries.
+        let fixture = TableTestFixture::new_empty();
+        let batches: Vec<_> = fixture
+            .table
+            .inspect()
+            .all_entries()
             .scan()
             .await
             .unwrap()
