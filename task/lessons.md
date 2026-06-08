@@ -878,3 +878,92 @@ How to use it (see the manuals' §2):
   catalog `create_table` with the minimal schema but no spec yields a real unpartitioned V3 table — no new
   committed fixture needed (mirrors `make_v3_minimal_table_in_catalog` minus the `.partition_spec(...)` call).
   Build the data files with `partition_spec_id(0)` + `Struct::empty()`.
+
+### 2026-06-07 (Phase 2 Increment 4 — RewriteFiles, BUILDER Opus)
+- **DO read the Java `validateReplacedAndAddedFiles` preconditions verbatim — RewriteFiles is STRICTER than
+  OverwriteFiles: the DELETE set must be non-empty.** *Why:* Java `BaseRewriteFiles.validateReplacedAndAddedFiles`
+  has THREE `Preconditions.checkArgument`s: (1) `deletesDataFiles() || deletesDeleteFiles()` ("Files to delete
+  cannot be empty"), (2) `deletesDataFiles() || !addsDataFiles()` ("Data files to add must be empty because
+  there's no data file to be rewritten"), (3) the delete-file analogue of (2). So a delete-only rewrite
+  (delete N, add 0) is LEGAL but an add-only rewrite (delete 0, add M) is REJECTED — the OPPOSITE of
+  OverwriteFiles, whose add-only path records an Append. The producer's own empty-commit precondition would
+  WRONGLY allow an add-only rewrite (it only rejects all-empty), so the non-empty-delete check must be added in
+  the action's `commit()` BEFORE the producer runs, with the exact Java message. For a DATA-only rewrite,
+  precondition (2) is SUBSUMED by (1) (with DELETE-file rewrite out of scope, `deletesDataFiles()` is true iff
+  the delete set is non-empty, i.e. exactly when (1) passes), so document it in prose rather than coding an
+  unreachable `if added.is_empty() && deleted.is_empty()` branch that clippy/readers would (rightly) question.
+- **DO add `Operation::Replace` to the `update_snapshot_summaries` op allowlist when landing the first Replace
+  action — the producer's summary path hard-rejects any op outside {Append, Overwrite, Delete}.** *Why:*
+  `spec/snapshot_summary.rs::update_snapshot_summaries` starts with a guard that returns
+  `DataInvalid "Operation is not supported."` for any operation not in that set; `SnapshotProducer::summary`
+  calls it unconditionally, so a `RewriteFilesOperation` recording `Operation::Replace` fails to commit AT ALL
+  until `Replace` is admitted. Java's `SnapshotProducer.summary` is operation-agnostic (totals = prev + added -
+  removed for every op), so admitting `Replace` is the Java-faithful one-liner — directly analogous to the
+  existing Overwrite/Delete entries, no truncate branch. This edit is in `spec/`, technically outside a
+  transaction-action increment's named file set, but it is the minimal + required enabler (flag it). Mutation-
+  verify it is load-bearing: removing the `Replace` entry fails the KEY rewrite test with the exact "Operation
+  is not supported." error.
+- **DO reuse the by-PATH `resolve_delete_paths` for RewriteFiles even though callers pass `DataFile`s.** *Why:*
+  Java's `deleteFile(DataFile)` adds the file to `replacedDataFiles` AND calls `delete(dataFile)`, but the
+  filter manager ultimately matches removed files by PATH (`ManifestFilterManager`). Rust callers hold the
+  to-delete `DataFile`s (after a scan), so the action stores `Vec<DataFile>` and extracts `file_path` into a
+  `HashSet<String>` at commit, then drives the SAME `resolve_delete_paths` + `process_deletes` machinery that
+  DeleteFiles/OverwriteFiles use — which already gets `failMissingDeletePaths`, rewrite/keep/drop, and surviving-
+  entry provenance preservation right (Increments 1-2). Zero new resolution or rewrite logic; RewriteFiles is
+  OverwriteFiles with a fixed `Operation::Replace` and the non-empty-delete precondition. The `delete_files`
+  seam (`SnapshotProduceOperation::delete_files`) was built exactly for this — no machinery change needed.
+- **DO NOT take a mutation-test backup AFTER the mutation — `cp file backup` following an in-place `sed`
+  captures the MUTATION, not the original, and "restoring" re-corrupts the file.** *Why:* a botched mutation
+  loop (`sed -i 's/Replace/Overwrite/'` that matched BOTH the production `operation()` AND a test assertion's
+  expected value, then `cp file /tmp/backup`) baked a wrong assertion into the "backup," which then restored
+  the corruption — the FILTERED test run passed (the mutation matched the test's own expectation too) but the
+  FULL lib suite caught it (`test_rewrite_delete_only_is_allowed` asserted `Operation::Overwrite` while its
+  message said "records Replace"). Always snapshot the file (`cp file /tmp/backup`) BEFORE any in-place edit;
+  mutate; run; restore FROM the pre-mutation copy; and re-run the FULL suite (not just the filtered module)
+  before declaring green — a filtered run can hide a mutation that corrupted a test's own expectation.
+
+### 2026-06-07 (Phase 2 Increment 4 — RewriteFiles, REVIEWER Opus)
+- **DECISION (dataSequenceNumber deferral): ADD A GUARD, don't just document.** A data-file rewrite stamps
+  the added files with a FRESH (higher) data sequence number. Merge-on-read deletes apply only to data with
+  `data_seq <= delete_seq`, so compacting a deleted-from data file into a higher-seq file makes the old
+  delete stop applying → deleted rows RESURRECT (silent data corruption). Java carries the replaced files'
+  max data-seq onto the added files (`setNewDataFilesDataSequenceNumber`); this action defers that.
+  Adjudication: (a) **today** this library cannot itself WRITE delete files — no `RowDelta`, no
+  position/equality-delete commit path, and every add path runs `validate_added_data_files` which rejects
+  non-`Data` content ("Only data content type is allowed for fast append") — so a table THIS library wrote
+  has no outstanding deletes. BUT it can READ + operate on a Java-written table that DOES (a Java `RowDelta`
+  snapshot has `Deletes`-content manifests), and `rewrite_files` on such a table would corrupt it. (b) The
+  original deferral note framed the fresh seq as merely "correct for a pure data rewrite with no outstanding
+  deletes" — true but not a *guard*; a note is not a regression barrier. (c) FIXED: added a HARD precondition
+  in `commit()` — `has_outstanding_delete_files(table)` loads the current snapshot's manifest list and rejects
+  (`ErrorKind::FeatureUnsupported`) if ANY entry is `ManifestContentType::Deletes`. This makes the unsafe case
+  impossible (fail-loud) instead of documented. Test
+  `test_rewrite_rejected_when_table_has_outstanding_delete_files` builds a table with a real position-delete
+  manifest (via the production manifest/list writers + catalog `update_table`, since no public action writes
+  deletes) and asserts rejection + table-unchanged. **Mutation-verified the guard AND the corruption: with the
+  guard disabled the rewrite COMMITS (`expect_err` panics on an `Ok`) — proving the resurrection path is real,
+  not theoretical.** Guard is small + in scope (the action's own file) and lifts cleanly when
+  `dataSequenceNumber` preservation lands (docs say so in three places: module, action struct, `Transaction`
+  ctor).
+- **DO detect "outstanding merge-on-read deletes" by scanning the current snapshot's manifest list for a
+  `ManifestContentType::Deletes` entry — not by reading the `total-delete-files` summary property.** *Why:*
+  the manifest-list content type is the on-disk ground truth (a Java-written delete manifest always carries
+  `content == Deletes`); a summary property can be absent, stale, or omitted by a non-Java writer. Loading the
+  manifest list is one `load_manifest_list` call and is exactly what the producer already does.
+- **DO confirm a producer-level guard does NOT catch the add-only case before trusting the action's
+  precondition.** *Why:* the producer's `manifest_file()` rejects only a TRULY-empty commit (`added.is_empty()
+  && deletes.is_empty() && props.is_empty()`). An add-only rewrite has added files, so the producer passes it —
+  ONLY the action's `deleted_data_files.is_empty()` precondition rejects it. Mutation-verified: disabling the
+  action precondition makes `test_rewrite_add_without_delete_rejected` COMMIT successfully (the `expect_err`
+  panics on a returned `Table`), proving the action precondition — not the producer — is the load-bearing guard
+  for add-only. The brief's worry (producer only rejects all-empty) is exactly right.
+- **FLAG (tracked 🟡, not fixed): Java's REPLACE record-count invariant is unmirrored.** Java
+  `SnapshotProducer` (the `BaseSnapshot`-construction path, lines 347-359) rejects a REPLACE whose summary has
+  `added-records > deleted-records` ("Invalid REPLACE operation: %s added records > %s replaced records") — a
+  compaction must not increase the live row count. Rust's producer commit path has NO such check. NOT added
+  here: the check belongs in the shared `snapshot.rs` producer (Java puts it in `SnapshotProducer`, shared
+  across ops), which is outside this increment's named file set, and it is a logical-consistency guard, not the
+  data-loss trap. The point-2 claim "`SnapshotProducer.summary` is operation-agnostic" is correct for the
+  TOTALS method (`summary(previous)`, all `updateTotal`, no per-op branch) — but the SIBLING REPLACE invariant
+  lives in the snapshot-construction path, not `summary()`, so admitting `Replace` to the
+  `update_snapshot_summaries` allowlist is right AND this separate guard is a distinct missing item.

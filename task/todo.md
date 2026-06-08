@@ -1531,3 +1531,135 @@ no rewrite-machinery change), `transaction/mod.rs` (wiring), docs `GAP_MATRIX.md
 `task/{todo.md,lessons.md}`. **Nothing outside the allowed set** — no `delete_files.rs`/`overwrite_files.rs`
 touch was needed (the shared factor already existed from Increment 2); no Cargo/lockfile edits; no
 `#[ignore]`; no bare `.unwrap()` in production paths. An Opus REVIEWER verifies next.
+
+### Phase 2 Increment 4 — RewriteFiles (compaction-commit primitive) (IN PROGRESS, 2026-06-07, BUILDER Opus)
+New file `crates/iceberg/src/transaction/rewrite_files.rs`: `RewriteFilesAction` — atomically replace a set
+of DATA files with a new set in ONE `Operation::Replace` snapshot (Java `BaseRewriteFiles`). Data-file
+rewrite ONLY (DELETE-file rewrite deferred). Mirrors the OverwriteFiles shape: added files → producer
+(added manifest), to-delete `DataFile`s → resolved BY PATH via the shared `resolve_delete_paths` and removed
+through the Increment-1 `process_deletes` rewrite machinery, in one snapshot.
+
+**Java contract verified against `/tmp/iceberg-java-ref/core/.../BaseRewriteFiles.java` (read the source):**
+- `operation()` returns `DataOperations.REPLACE` → `Operation::Replace` (NOT Overwrite/Delete).
+- ctor calls `failMissingDeletePaths()` → every to-delete file MUST be present in the current snapshot
+  (error if absent). Reuses `resolve_delete_paths` which already enforces this (Java `failMissingDeletePaths`).
+- `validate()` → `validateReplacedAndAddedFiles()`: THREE preconditions:
+  (1) `deletesDataFiles() || deletesDeleteFiles()` → **"Files to delete cannot be empty"** — the delete set
+      MUST be non-empty (data-file rewrite: data-files-to-delete non-empty).
+  (2) `deletesDataFiles() || !addsDataFiles()` → **"Data files to add must be empty because there's no data
+      file to be rewritten"** — adds allowed only if data-files are being deleted (subsumed by (1) for the
+      data-only case, but mirror it for the exact message).
+  (3) delete-file precondition — OUT OF SCOPE (DELETE-file rewrite deferred).
+  So: delete-only rewrite (delete N, add 0) is LEGAL; add-only rewrite (delete 0, add M) is REJECTED.
+- `rewriteFiles(Set<DataFile> filesToDelete, Set<DataFile> filesToAdd)` is the primary entry; each `deleteFile`
+  adds to `replacedDataFiles` + `delete(file)`, each `addFile` → `add(file)`.
+
+**Out of scope (deferred + noted precisely):**
+- (a) DELETE-file (position-delete / DV) rewrite (`deleteFile(DeleteFile)`/`addFile(DeleteFile)`) — needs the
+  delete-file write path (later increment). Data-file rewrite only.
+- (b) `dataSequenceNumber` preservation (`setNewDataFilesDataSequenceNumber` / carrying the replaced files'
+  max seq onto added files to keep merge-on-read deletes applicable) — added files get a FRESH seq via the
+  standard add path, correct for a pure data rewrite with no outstanding deletes. Tracked compaction follow-up.
+- (c) `validateFromSnapshot` / `validateNoNewDeletesForDataFiles` / concurrent-commit conflict validation.
+
+Plan:
+- [x] A. `RewriteFilesAction`: `rewrite_files(files_to_delete, files_to_add)` primary entry +
+      `delete_file(DataFile)`/`delete_files`/`add_file`/`add_files` builders; `set_commit_uuid`/
+      `set_snapshot_properties`/`set_key_metadata`. To-delete files held as `Vec<DataFile>` (callers hold
+      them); paths extracted into a `HashSet<String>` at commit via `delete_paths()` for `resolve_delete_paths`.
+- [x] B. `commit()`: Java `validateReplacedAndAddedFiles` precondition (1) FIRST — reject empty-delete ("Files
+      to delete cannot be empty"). Precondition (2) ("Data files to add must be empty...") is SUBSUMED by (1)
+      for the data-only case (DELETE-file rewrite out of scope → deletesDataFiles() iff delete set non-empty),
+      documented in the source rather than coded as an unreachable branch. Then `validate_added_data_files`;
+      then `producer.commit(RewriteFilesOperation{ delete_paths }, DefaultManifestProcess)`.
+      `RewriteFilesOperation::operation()` = `Operation::Replace`; `delete_files` → `resolve_delete_paths`;
+      `existing_manifest` → `current_data_manifests`.
+- [x] C. Wired `Transaction::rewrite_files(files_to_delete, files_to_add)` + `mod rewrite_files;` +
+      `use ...RewriteFilesAction` in mod.rs.
+- [x] D. **REQUIRED shared change (flagged):** added `Operation::Replace` to the
+      `spec/snapshot_summary.rs::update_snapshot_summaries` op allowlist (was {Append, Overwrite, Delete}) —
+      WITHOUT it the Replace snapshot fails to commit ("Operation is not supported."). One-line addition
+      mirroring the existing entries; Java's `SnapshotProducer.summary` is op-agnostic. Mutation-verified
+      load-bearing (removing it fails the KEY test with that exact error). Outside the named allowed set;
+      minimal + required.
+- [x] E. 10 tests (`MemoryCatalog`; assert post-commit SCAN live set): (1) KEY delete[A,B]+add[D] → live
+      {C,D}, op==Replace, A&B Deleted tombstones, C keeps provenance; (2) rewrite across multiple manifests;
+      (3) compaction-to-fewer-files (3→1); (4) delete-absent errors (table unchanged); (5) empty-delete
+      rejected; (6) add-without-delete rejected (table unchanged); (7) delete-only rewrite legal; (8) summary
+      added+deleted counts; (9) cross-snapshot provenance preservation (C keeps S2, A keeps S1, D gets S3, B
+      tombstone S3 keeps orig seqs); (10) incremental-builder equivalence. Mutation-verified: forcing
+      `operation()` → Overwrite fails the 3 op-asserting tests; disabling the empty-delete precondition fails
+      the 3 precondition tests; removing `Operation::Replace` from the summary allowlist fails the KEY test.
+- [x] F. Docs: GAP_MATRIX `Write: RewriteFiles` ❌ → 🟡 (+ headline-gap #1); Roadmap Phase 2 status/sequence/
+      snapshot/current-state/next-increments lines; this todo; lessons.
+- [x] G. Verify gate from repo root: build clean; lib ×2 = 1383/0 both runs (was 1373 → +10); interop
+      manage_snapshots/update_schema/update_partition_spec all 4/4; clippy -D warnings clean; fmt --check clean
+      (one reflow applied via `cargo fmt`).
+
+**Outcome (2026-06-07, Phase 2 Increment 4, BUILDER Opus):** `RewriteFilesAction` (the compaction-commit
+primitive) lands 🟡. **Design:** mirrors `OverwriteFilesAction` exactly — added files → producer (added
+manifest), to-delete `DataFile`s → resolved BY PATH (paths extracted from the provided `DataFile`s, since
+callers hold them) via the shared `SnapshotProducer::resolve_delete_paths` → the SAME Increment-1
+`process_deletes` rewrite/keep/drop + provenance-preservation machinery, in one snapshot. ZERO edits to the
+rewrite machinery (`process_deletes`/`rewrite_manifest_with_deletes`/`resolve_delete_paths`/
+`current_data_manifests`). **Java semantics mirrored (cited against `core/.../BaseRewriteFiles.java`):**
+`operation()` = `DataOperations.REPLACE` → always `Operation::Replace` (NOT dynamic like OverwriteFiles);
+ctor `failMissingDeletePaths()` → every to-delete file must be present (reused via `resolve_delete_paths`'s
+"Missing required files to delete" error); `validateReplacedAndAddedFiles()` precondition (1)
+`deletesDataFiles() || deletesDeleteFiles()` → "Files to delete cannot be empty" (delete-only legal, add-only
+/ empty rejected); precondition (2) subsumed (DELETE-file rewrite out of scope). **REQUIRED shared change
+(flagged):** `Operation::Replace` added to the `update_snapshot_summaries` op allowlist in
+`spec/snapshot_summary.rs` (the ONE edit outside the named allowed set) — without it `Replace` can't commit;
+it's the direct analogue of the existing Overwrite/Delete entries and Java's summary is op-agnostic.
+**OUT OF SCOPE (deferred, flagged):** (a) DELETE-file (position-delete / DV) rewrite — needs the delete-file
+write path (later increment); DATA-file rewrite only. (b) `dataSequenceNumber` preservation
+(`setNewDataFilesDataSequenceNumber`) — added files get a FRESH seq via the standard add path (correct for a
+pure data rewrite with no outstanding deletes); tracked compaction-correctness follow-up paired with (a).
+(c) `validateFromSnapshot` / `validateNoNewDeletesForDataFiles` / concurrent-commit conflict validation.
+(d) data-level Java interop round-trip. **Files touched:** new `transaction/rewrite_files.rs`,
+`transaction/mod.rs` (wiring), `spec/snapshot_summary.rs` (the one-line allowlist addition — flagged),
+docs `GAP_MATRIX.md`/`Roadmap.md`/`task/{todo.md,lessons.md}`. No `snapshot.rs` change needed (the by-path
+resolver + rewrite machinery already existed). No `overwrite_files.rs`/`delete_files.rs` touch needed. No
+Cargo/lockfile edits; no `#[ignore]`; no bare `.unwrap()` in production paths. An Opus REVIEWER verifies next.
+
+#### Phase 2 Increment 4 — REVIEW (2026-06-07, Opus REVIEWER, DELEGATED)
+Adversarially verified points 1-5 against the Java source (`/tmp/iceberg-java-ref/core/.../BaseRewriteFiles.java`,
+`SnapshotProducer.java`, `MergingSnapshotProducer.java`), with mutation tests for every load-bearing claim.
+- [x] **Pt 1 (operation + precondition): CONFIRMED + mutation-verified.** `BaseRewriteFiles.operation()` →
+      `DataOperations.REPLACE` always; Rust `RewriteFilesOperation::operation()` → `Operation::Replace`
+      (mutation to `Overwrite` fails 4 op-asserting tests). `validateReplacedAndAddedFiles` precondition (1)
+      `deletesDataFiles() || deletesDeleteFiles()` → "Files to delete cannot be empty": delete-only LEGAL,
+      add-only/empty REJECTED. Rust enforces it in the action's `commit()` (the producer's own guard only
+      rejects all-empty — confirmed: disabling the action precondition makes the add-only test COMMIT, so the
+      action precondition is the sole load-bearing guard for add-only).
+- [x] **Pt 2 (snapshot_summary allowlist): CONFIRMED + minimal + mutation-verified.** `update_snapshot_summaries`
+      now admits `Operation::Replace`; mutation (remove it) fails 7 tests with "Operation is not supported."
+      Java's `SnapshotProducer.summary(previous)` totals method is op-agnostic (all `updateTotal`, no per-op
+      branch, no truncate), so admitting Replace is Java-faithful — directly analogous to the Overwrite/Delete
+      entries. The added clause only short-circuits when op IS Replace, so existing ops are unaffected.
+- [x] **Pt 3 (standard correctness): CONFIRMED, assertions real not tautological.** KEY scan test
+      (A,B,C → delete[A,B]+add[D] → {C,D}, Replace, tombstones), compaction-to-fewer (3→1), surviving
+      provenance, absent-file errors, cross-snapshot provenance all assert post-commit SCAN live sets +
+      entry provenance. Mutation-verified the provenance: re-stamping surviving entries in
+      `rewrite_manifest_with_deletes` fails exactly the KEY + cross-snapshot provenance tests.
+- [x] **Pt 4 (dataSequenceNumber data-loss trap): GUARD ADDED + mutation-verified the corruption.** Today this
+      library cannot WRITE delete files (no `RowDelta`; every add path rejects non-`Data` content) — so a table
+      it wrote has no outstanding deletes. BUT it can READ + rewrite a Java-written table that has them →
+      resurrection. The deferral was documented but NOT as a hard precondition. FIXED: `commit()` now rejects a
+      rewrite when the current snapshot has any `Deletes`-content manifest (`has_outstanding_delete_files`,
+      `ErrorKind::FeatureUnsupported`). Test builds a real position-delete manifest + asserts rejection;
+      mutation (disable guard) → the rewrite COMMITS, proving the corruption is real. Docs updated in 3 places.
+- [x] **Pt 5 (no regression + scope): CONFIRMED.** lib ×2 = 1384/0 (was 1383, +1 guard test); interop
+      manage_snapshots/update_schema/update_partition_spec 4/4 each; clippy -D warnings clean; fmt clean. Only
+      `rewrite_files.rs` (guard + test) + `transaction/mod.rs` (doc) touched in this review; no Cargo edits; no
+      bare `.unwrap()` in production (the guard helper uses `?`).
+- [x] **TRACKED 🟡 (not fixed, flagged):** Java's REPLACE record-count invariant (`SnapshotProducer` lines
+      347-359: `added-records <= deleted-records`) is unmirrored — belongs in the shared `snapshot.rs` producer
+      (outside this increment's file set) and is a logical-consistency guard, not a data-loss one. Follow-up.
+
+**Review outcome (2026-06-07, Phase 2 Increment 4, REVIEWER Opus):** ONE data-loss guard ADDED + mutation-
+verified (reject rewrite on a table with outstanding merge-on-read deletes — the dataSequenceNumber-resurrection
+trap), shipping with a test that builds a real delete manifest. All 5 points adjudicated; row stays 🟡 (interop +
+dataSequenceNumber preservation + conflict validation still deferred). Files touched: `transaction/rewrite_files.rs`
+(guard + helper + test + doc), `transaction/mod.rs` (ctor doc), `task/{todo.md,lessons.md}`. One tracked 🟡
+follow-up (REPLACE record-count invariant). No Cargo/lockfile edits.

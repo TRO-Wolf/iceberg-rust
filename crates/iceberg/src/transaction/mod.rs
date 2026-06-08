@@ -58,6 +58,7 @@ mod delete_files;
 mod manage_snapshots;
 mod overwrite_files;
 mod replace_partitions;
+mod rewrite_files;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -81,6 +82,7 @@ use crate::transaction::delete_files::DeleteFilesAction;
 use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 use crate::transaction::overwrite_files::OverwriteFilesAction;
 use crate::transaction::replace_partitions::ReplacePartitionsAction;
+use crate::transaction::rewrite_files::RewriteFilesAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
@@ -174,6 +176,24 @@ impl Transaction {
     /// validation are not yet supported.
     pub fn replace_partitions(&self) -> ReplacePartitionsAction {
         ReplacePartitionsAction::new()
+    }
+
+    /// Creates a rewrite-files action (the compaction-commit primitive): atomically replace a set of
+    /// data files with a new set in one `Replace` snapshot (Java `BaseRewriteFiles`). The files to delete
+    /// must be non-empty and present in the current snapshot. Rewriting DELETE files,
+    /// `dataSequenceNumber` preservation, and concurrent-commit conflict validation are not yet supported.
+    ///
+    /// **Precondition:** the table must NOT carry outstanding row-level (merge-on-read) delete files —
+    /// the commit is rejected if its current snapshot references any delete manifest. Without
+    /// `dataSequenceNumber` preservation, rewriting deleted-from data into fresh higher-sequence files
+    /// would make those deletes stop applying and resurrect deleted rows. This guard is lifted once
+    /// `dataSequenceNumber` preservation lands.
+    pub fn rewrite_files(
+        &self,
+        files_to_delete: impl IntoIterator<Item = crate::spec::DataFile>,
+        files_to_add: impl IntoIterator<Item = crate::spec::DataFile>,
+    ) -> RewriteFilesAction {
+        RewriteFilesAction::new().rewrite_files(files_to_delete, files_to_add)
     }
 
     /// Creates replace sort order action.

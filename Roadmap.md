@@ -100,7 +100,10 @@ layers are removed in Phase 0.
    — `ReplacePartitions` (dynamic partition overwrite; a by-PARTITION sibling resolver
    `SnapshotProducer::resolve_partition_deletes` feeds the same rewrite path; replaces every partition an
    added file belongs to, full replace on an unpartitioned table, `replace-partitions` marker) — landed 🟡
-   the same day. Next Phase-2 increments: `RewriteFiles`, `RewriteManifests`, merge append, `RowDelta`. (V3
+   the same day; increment 4 — `RewriteFiles` (the compaction-commit primitive: atomically replace a set of
+   DATA files with a new set in one `Operation::Replace` snapshot, Java `BaseRewriteFiles`; reuses the
+   by-path `resolve_delete_paths` + `process_deletes` machinery unchanged; delete set must be non-empty) —
+   landed 🟡 the same day. Next Phase-2 increments: `RewriteManifests`, merge append, `RowDelta`. (V3
    groundwork — row-lineage fields + the remaining `MIN_FORMAT_VERSIONS` types
    `variant`/`unknown`/`geometry`/`geography` — also remains.)** The live,
    increment-level plan and checkbox
@@ -153,8 +156,12 @@ counts; `overwriteByRowFilter` + conflict validation + interop deferred); **`Rep
 (`transaction/replace_partitions.rs` — dynamic partition overwrite via a by-PARTITION sibling resolver
 `SnapshotProducer::resolve_partition_deletes` feeding the same rewrite path; full replace on an
 unpartitioned table; `replace-partitions` marker; static `replaceByRowFilter` + conflict validation +
-interop deferred); the rest of the **write engine
-(merge append, `RowDelta`, `RewriteFiles`, `RewriteManifests`), incremental scans, ORC/Avro data files,
+interop deferred); **`RewriteFiles` is 🟡** (`transaction/rewrite_files.rs` — the compaction-commit
+primitive: atomically replace a set of DATA files with a new set in one `Operation::Replace` snapshot,
+reusing the by-path `resolve_delete_paths` + `process_deletes` machinery unchanged; delete set must be
+non-empty (`failMissingDeletePaths`); DELETE-file rewrite + `dataSequenceNumber` preservation + conflict
+validation + interop deferred); the rest of the **write engine
+(merge append, `RowDelta`, `RewriteManifests`), incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
 
@@ -272,7 +279,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `UpdatePartitionSpec` ✅ (bidirectional interop landed 2026-06-07, surfacing+fixing the identity-only
   partition-name collision divergence); `ManageSnapshots` awaits the same interop treatment.**
 
-### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` landed 2026-06-07)**
+### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07)**
 - **Goal:** the full commit/write surface beyond fast-append.
 - **Gates on:** Phase 1.
 - **Increment sequence (dependency, then value):** **1. `DeleteFiles`** (done 🟡 — delete data files by
@@ -284,8 +291,12 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   (done 🟡 — dynamic partition overwrite; a by-PARTITION sibling resolver
   `SnapshotProducer::resolve_partition_deletes` feeds the same `process_deletes` rewrite path; replaces
   every partition an added file belongs to, full replace on an unpartitioned table, `replace-partitions`
-  marker; static `replaceByRowFilter` + conflict validation + interop deferred),
-  4. `RewriteFiles`, 5. `RewriteManifests`, 6. merge append, 7. `RowDelta` + position-delete / deletion-vector
+  marker; static `replaceByRowFilter` + conflict validation + interop deferred), **4. `RewriteFiles`**
+  (done 🟡 — the compaction-commit primitive: atomically replace a set of DATA files with a new set in one
+  `Operation::Replace` snapshot, Java `BaseRewriteFiles`; reuses the by-path `resolve_delete_paths` +
+  `process_deletes` rewrite machinery unchanged; delete set must be non-empty (`failMissingDeletePaths`);
+  DELETE-file rewrite + `dataSequenceNumber` preservation + conflict validation + interop deferred),
+  5. `RewriteManifests`, 6. merge append, 7. `RowDelta` + position-delete / deletion-vector
   writers, 8. multi-op transaction hardening + optimistic-concurrency retry on the real catalogs.
 - **Key deliverables:** merge append, `OverwriteFiles`, `ReplacePartitions`, `DeleteFiles` (🟡), `RowDelta`,
   `RewriteFiles`, `RewriteManifests`; finalize position-delete + deletion-vector writers; multi-op
