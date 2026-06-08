@@ -91,10 +91,13 @@ layers are removed in Phase 0.
    (per-field empirical proof + mutation-verified regression tests — no production change needed; the readers
    were already lenient, the gap was test coverage). The only residual is table-metadata
    `last-sequence-number`, which Java ALWAYS writes for V2+ — a non-Java/hand-written robustness gap only.
-   **With all three Phase-1 evolution capabilities now interop-proven, the next move is the V3 groundwork
-   (row-lineage fields; the remaining `MIN_FORMAT_VERSIONS` types — `variant`/`unknown`/`geometry`/
-   `geography` — each a one-line `min_format_version` arm when the type lands).** The live, increment-level
-   plan and checkbox
+   **With all three Phase-1 evolution capabilities interop-proven, Phase 2 (write engine) has begun: increment 1
+   — `DeleteFiles` + the foundational manifest-filter / rewrite machinery in `SnapshotProducer` — landed 🟡
+   on 2026-06-07 (delete data files by path/reference; `MemoryCatalog` unit tests; data-level Java interop
+   deferred). Next Phase-2 increments: `OverwriteFiles`, `ReplacePartitions`, `RewriteFiles`,
+   `RewriteManifests`, merge append, `RowDelta`. (V3 groundwork — row-lineage fields + the remaining
+   `MIN_FORMAT_VERSIONS` types `variant`/`unknown`/`geometry`/`geography` — also remains.)** The live,
+   increment-level plan and checkbox
    state are in
    [task/todo.md](task/todo.md) — read it (and [task/lessons.md](task/lessons.md) in full) before starting.
 3. Verify the build before and after each change:
@@ -136,8 +139,10 @@ rollback-to-time + set-current + fast-forward + retention (non-positive rejected
 interop-proven via the same oracle + `crates/iceberg/tests/interop_manage_snapshots.rs`, 7 scenarios both
 directions; both "Snapshot model + refs" and the ref-op surface of "Snapshot management" flipped to ✅).
 **`cherrypick` is NOT interop-proven and stays Phase-2-gated** (it extends `MergingSnapshotProducer` /
-replays data files); the
-**write engine beyond fast-append, incremental scans, ORC/Avro data files,
+replays data files). **Phase 2 has started: `DeleteFiles` + the manifest-filter / rewrite machinery is 🟡**
+(`transaction/delete_files.rs` + `SnapshotProducer::process_deletes`, `MemoryCatalog`-tested; data-level
+Java interop deferred); the rest of the **write engine (merge append, `OverwriteFiles`, `ReplacePartitions`,
+`RowDelta`, `RewriteFiles`, `RewriteManifests`), incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
 
@@ -255,10 +260,15 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `UpdatePartitionSpec` ✅ (bidirectional interop landed 2026-06-07, surfacing+fixing the identity-only
   partition-name collision divergence); `ManageSnapshots` awaits the same interop treatment.**
 
-### Phase 2 — Write engine  ·  **Status: ❌ (largest functional gap)**
+### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery landed 2026-06-07)**
 - **Goal:** the full commit/write surface beyond fast-append.
 - **Gates on:** Phase 1.
-- **Key deliverables:** merge append, `OverwriteFiles`, `ReplacePartitions`, `DeleteFiles`, `RowDelta`,
+- **Increment sequence (dependency, then value):** **1. `DeleteFiles`** (done 🟡 — delete data files by
+  path/reference; built the foundational manifest-filter / rewrite machinery in `SnapshotProducer` that the
+  rest reuse), 2. `OverwriteFiles`, 3. `ReplacePartitions`, 4. `RewriteFiles`, 5. `RewriteManifests`,
+  6. merge append, 7. `RowDelta` + position-delete / deletion-vector writers, 8. multi-op transaction
+  hardening + optimistic-concurrency retry on the real catalogs.
+- **Key deliverables:** merge append, `OverwriteFiles`, `ReplacePartitions`, `DeleteFiles` (🟡), `RowDelta`,
   `RewriteFiles`, `RewriteManifests`; finalize position-delete + deletion-vector writers; multi-op
   transactions + optimistic-concurrency retry, **validated against Glue + S3 Tables**.
 - **Exit criteria:** each write action commits correctly through the real catalogs with conflict

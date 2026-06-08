@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod delete_files;
 mod manage_snapshots;
 mod snapshot;
 mod sort_order;
@@ -74,6 +75,7 @@ use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
+use crate::transaction::delete_files::DeleteFilesAction;
 use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -145,6 +147,12 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Creates a delete-files action (remove data files from the table by path / `DataFile`
+    /// reference). Delete-by-row-filter / partition-predicate is not yet supported.
+    pub fn delete_files(&self) -> DeleteFilesAction {
+        DeleteFilesAction::new()
     }
 
     /// Creates replace sort order action.

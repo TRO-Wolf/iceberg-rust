@@ -1153,3 +1153,163 @@ for V2+ so it never bites Java interop — robustness-only). Files touched exact
 (+1 test), `docs/parity/GAP_MATRIX.md`, `Roadmap.md`, `task/todo.md`, `task/lessons.md`. NO production `.rs`
 behavior change; NO Cargo/lockfile edits; no `#[ignore]`; no bare `.unwrap()` in non-test paths. An Opus
 REVIEWER verifies next.
+
+---
+
+## Active: Phase 2 — Write engine (FIRST write increment)
+
+Parity target: Java `iceberg-core` write actions (`MergingSnapshotProducer`, `ManifestFilterManager`,
+`StreamingDelete`/`DeleteFiles`). Authoritative plan: [Roadmap.md](../Roadmap.md) Phase 2; status:
+[docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md).
+
+### Phase-2 increment SEQUENCE (dependency, then value) — recorded 2026-06-07
+1. **DeleteFiles** (this increment) — delete data files by path/reference; builds the foundational
+   manifest-filter / rewrite machinery in `SnapshotProducer` that the rest reuse.
+2. **OverwriteFiles** — delete-by-filter/files + add data files in one snapshot (reuses the filter machinery).
+3. **ReplacePartitions** (dynamic partition overwrite) — replace whole partitions (reuses the machinery).
+4. **RewriteFiles** — atomic replace of a set of files with another set (compaction primitive).
+5. **RewriteManifests** — re-cluster/merge manifests without changing data.
+6. **merge-append** — `MergeAppend` (vs the existing fast-append): merge small new manifests.
+7. **RowDelta + position-delete / deletion-vector writers** — merge-on-read deletes.
+8. **multi-op transaction hardening** — multiple write actions + optimistic-concurrency retry, Glue/S3 Tables.
+
+### Increment 1 — DeleteFiles + manifest-filter machinery (IN PROGRESS, 2026-06-07, BUILDER Opus)
+New file `crates/iceberg/src/transaction/delete_files.rs`; manifest-filter machinery added to
+`crates/iceberg/src/transaction/snapshot.rs`; wired into `transaction/mod.rs`.
+
+**Java rules to mirror (verified against `/tmp/iceberg-java-ref`):**
+- `ManifestFilterManager.filterManifest` (line 368): a manifest that CANNOT contain a to-be-deleted file is
+  carried forward UNCHANGED (`filteredManifests.put(manifest, manifest); return manifest`) — efficiency +
+  fewer files. `canContainDeletedFiles` returns false when the manifest has no live files (here: when it
+  contains none of the target paths).
+- `filterManifestWithDeletedFiles` (line 497): rewrite — for each LIVE entry, if it matches a target,
+  `writer.delete(entry)` (status→Deleted, carries the existing data_file, preserves data/file seq, snapshot_id
+  set to the NEW snapshot); else `writer.existing(entry)` (status→Existing, preserves snapshot_id + both seq
+  numbers — V2/V3 inheritance). Mirror via the Rust `ManifestWriter::add_delete_entry` / `add_existing_entry`
+  (both already preserve exactly these fields; `add_existing_entry` keeps the original snapshot_id, matching
+  Java `writer.existing`).
+- `MergingSnapshotProducer.apply` (lines 1002-1009): after filtering, KEEP a manifest iff
+  `hasAddedFiles() || hasExistingFiles() || snapshotId() == snapshotId()` (the new commit's id). A rewritten
+  manifest where ALL live entries became Deleted has no added/existing files but its `added_snapshot_id` == the
+  new snapshot id → it is KEPT (still written, with the Deleted entries). **DECISION: keep the rewritten manifest
+  even when all-deleted (matches Java's `snapshotId()==snapshotId()` keep), and DROP an originally-empty manifest
+  with no live files.** A manifest with no matching target is carried forward unchanged.
+- `StreamingDelete` + `DeleteFiles.validateFilesExist` (line 91) + `failMissingDeletePaths`
+  (`ManifestFilterManager.validateRequiredDeletes`, line 279): deleting a path not present in the table is an
+  error when validation is on. Java defaults `validateFilesToDeleteExist=false`, but for Increment-1 correctness
+  (and because path-based deletes have no partition pre-filter) we VALIDATE BY DEFAULT that every requested path
+  matched a live entry, erroring otherwise (mirrors `failMissingDeletePaths`'s "Missing required files to
+  delete" with `ErrorKind::DataInvalid`). **delete-by-row-filter / partition-predicate is OUT OF SCOPE** (Java
+  `deleteFromRowFilter`/`dropPartition` — defer to OverwriteFiles/ReplacePartitions increments).
+- Precondition relaxation: `SnapshotProducer::manifest_file` currently rejects a commit with no added files +
+  no snapshot properties. A delete-only commit has deletes but no adds → relax to allow it; reject a
+  truly-empty commit (no adds, no deletes, no properties).
+
+**Seam design:** extend `SnapshotProduceOperation` with `delete_files(&producer) -> Vec<DataFile>` returning the
+data files to delete (resolved from paths against the current snapshot at commit time). `manifest_file()` builds
+a `HashSet<&str>` of target paths and, for each existing manifest, rewrites iff it contains ≥1 matching live
+entry. The operation also supplies `existing_manifest()` (all current manifests, unchanged — the rewrite happens
+in the producer, generic, reused by future ops). `Operation::Delete` recorded in the summary.
+
+Plan:
+- [x] A. `SnapshotProducer`: added `process_deletes` + `rewrite_manifest_with_deletes` +
+      `new_filtering_manifest_writer` into `manifest_file()` — reads each existing manifest, rewrites the ones
+      containing target paths (Deleted/Existing per entry, rewriting with the SOURCE manifest's own partition
+      spec so spec-id/partition-type is preserved), carries the rest forward unchanged, drops no-live-file
+      manifests (all-deleted rewritten manifests are kept — their `added_snapshot_id` is the new snapshot id,
+      Java's `snapshotId()==snapshotId()` keep rule). Relaxed the empty-commit precondition (delete-only OK;
+      truly-empty rejected). Extended `SnapshotProduceOperation` with `delete_files(&producer) -> Vec<DataFile>`
+      (FastAppend returns empty).
+- [x] B. `delete_files.rs`: `DeleteFilesAction` with `delete_file(path)` / `delete_files(paths)` /
+      `delete_data_files(DataFiles)`; `DeleteFilesOperation` (`Operation::Delete`) resolves paths→DataFiles
+      against the current snapshot AND validates that every requested path matched a live entry (the missing-path
+      "failMissingDeletePaths" check must live in the operation, since the producer only sees the resolved
+      `DataFile`s). `Transaction::delete_files()` + `mod` + `use` wiring.
+- [x] C. 8 in-crate unit tests via `MemoryCatalog` + `make_v3_minimal_table_in_catalog`, all asserting the
+      post-commit SCAN live set (the real correctness signal): removes-only-targeted-file → {A,C};
+      marks-entry-deleted-and-counts-correct (Existing/Deleted + manifest counts); carries-untouched-manifest-
+      forward-unchanged (same manifest_path); across-multiple-manifests; delete-all-in-a-manifest → empty;
+      delete-only-commit allowed; absent-file errors; mixed-present-and-absent errors. Mutation-verified:
+      breaking carry-forward fails the carry-forward test; swapping Deleted→Existing fails 6 tests.
+- [x] D. Docs: GAP_MATRIX `Write: DeleteFiles` row 🟡 + headline-gap #1; Roadmap Phase 2 → 🟡 + sequence +
+      current-state + next-move; this todo; lessons.
+- [x] E. Verify gate from repo root: build clean; lib ×2 = 1352/0 both runs (was 1344 → +8); interop
+      manage_snapshots/update_schema/update_partition_spec all 4/4; clippy -D warnings clean; fmt --check clean
+      (one reflow applied via `cargo fmt`).
+
+**Outcome (2026-06-07, Phase 2 Increment 1, BUILDER Opus):** `DeleteFiles` + the foundational manifest-filter /
+rewrite machinery land 🟡 — the FIRST write-engine increment. **Filter machinery** lives in
+`SnapshotProducer::process_deletes` (`transaction/snapshot.rs`), reused by every future write op via the new
+`SnapshotProduceOperation::delete_files` seam (returns the `DataFile`s to remove). Java semantics mirrored
+(each cited): unchanged-manifest carry-forward = `ManifestFilterManager.filterManifest` (a manifest with no
+matching target is returned as-is); per-entry Deleted/Existing = `filterManifestWithDeletedFiles`
+(`writer.delete(entry)` → `add_delete_entry` stamps the new snapshot id + preserves data/file seq;
+`writer.existing(entry)` → `add_existing_entry` preserves snapshot-id + both seq numbers, the V2/V3
+inheritance contract); all-deleted-manifest KEPT + no-live-file dropped = `MergingSnapshotProducer.apply`
+lines 1002-1009 (`hasAddedFiles() || hasExistingFiles() || snapshotId()==snapshotId()`); precondition
+relaxation lets a delete-only commit through (rejects a truly-empty one); absent-path error =
+`failMissingDeletePaths`/`validateRequiredDeletes` ("Missing required files to delete", `DataInvalid`).
+**API:** `Transaction::delete_files()` → `DeleteFilesAction::{delete_file, delete_files, delete_data_files,
+set_commit_uuid, set_key_metadata, set_snapshot_properties}`. **OUT OF SCOPE (deferred, flagged):**
+delete-by-row-filter / partition-predicate (Java `deleteFromRowFilter`/`dropPartition` — needs metrics
+evaluators, lands with OverwriteFiles/ReplacePartitions); data-level Java interop round-trip (Spark/Docker =
+CI-only). Files touched exactly the allowed set: `transaction/snapshot.rs`, new `transaction/delete_files.rs`,
+`transaction/mod.rs` (wiring) + `transaction/append.rs` (the trait gained `delete_files`, so `FastAppendOperation`
+needed the empty impl — flagged below as a necessary touch of an in-scope sibling), docs
+`GAP_MATRIX.md`/`Roadmap.md`/`task/{todo.md,lessons.md}`. No Cargo/lockfile edits; no `#[ignore]`; no bare
+`.unwrap()` in production paths. An Opus REVIEWER verifies next.
+
+**Note on the one extra file (`transaction/append.rs`):** the brief's allowed-set listed `snapshot.rs`,
+`delete_files.rs`, `mod.rs`, and the docs. Extending `SnapshotProduceOperation` with the new `delete_files`
+method forced an empty impl on the EXISTING `FastAppendOperation` in `append.rs` (a 5-line method returning
+`Ok(vec![])`) for the crate to compile — this is the trait's own sibling impl, not unrelated code. Flagged
+per §6 rather than silently expanded; no behavior change to fast-append.
+
+#### Increment 1 — REVIEW (2026-06-07, Opus REVIEWER, DELEGATED)
+Adversarially verified points 1–6 against the Java source (`/tmp/iceberg-java-ref`) + independent
+mutation tests. **No corruption bug in the production code — the rewrite/keep/drop logic is correct.** One
+real TEST-COVERAGE gap found + fixed (the most dangerous bug class was unpinned).
+- **Pt 1 (provenance — the #1 risk): CONFIRMED CORRECT + GAP FIXED.** Rust `add_existing_entry` preserves
+  the entry's original `snapshot_id`/`sequence_number`/`file_sequence_number` (touches only `status`);
+  `add_delete_entry` stamps the NEW snapshot id but keeps both seqs — exactly Java `GenericManifestEntry.
+  wrapExisting`/`wrapDelete`. Entries arrive with populated seqs because `load_manifest` runs `inherit_data`.
+  Proved end-to-end with a new test (append A@S1, append B+C@S2 one-manifest, delete B → C kept as Existing
+  with S2+seq2, A carried fwd keeps S1, B tombstone = S3 + B's original seqs). **GAP: the builder's 8 tests
+  ALL passed under a `snapshot_id` re-stamp mutation** — none pinned surviving-entry provenance. Added
+  `test_delete_preserves_surviving_entry_provenance_across_snapshots` (mutation-verified: the ONLY test that
+  catches the re-stamp).
+- **Pt 2 (deleted entries + keep/drop): CONFIRMED.** Rewritten all-deleted manifest KEPT (its
+  `added_snapshot_id` == new snapshot, Java `snapshotId()==snapshotId()`); unrewritten no-live-file manifest
+  DROPPED (`has_added_files()||has_existing_files()`, mirroring Java `shouldKeep`). Added
+  `test_all_deleted_manifest_kept_by_creating_commit_then_dropped_by_next` pinning the two-commit lifecycle
+  (kept by creating commit, dropped by next) — the builder only covered the single-commit case.
+- **Pt 3 (live-only + source spec): CONFIRMED.** Only `is_alive()` entries are eligible (already-Deleted
+  skipped); rewrite uses `partition_spec_by_id(source_manifest.partition_spec_id)` (Java `reader.spec()`),
+  NOT the table default — correct for partition-evolved tables. A full spec-evolution+data fixture is hard
+  via the public API (`validate_added_data_files` rejects non-default-spec appends); the code path is
+  correct by inspection. (Minor inspected-not-fixed nit: the filtering writer pairs the source spec with the
+  table's CURRENT schema rather than the spec's bound schema — harmless because partition source-column
+  types are stable; matches Java in practice. Tracked, not a bug.)
+- **Pt 4 (mutation tests REAL): CONFIRMED all three.** (a) `add_existing_entry` instead of `add_delete_entry`
+  for the target → 7 delete_files tests FAIL. (b) force every manifest to rewrite (never carry forward) →
+  `test_..._carries_untouched_manifest_forward_unchanged` FAILs (path changes). (c) re-stamp existing
+  snapshot id → only the new provenance test FAILs (see Pt 1). The scan assertions check the real live set,
+  not just emitted updates.
+- **Pt 5 (absent-file + precondition): CONFIRMED + GAP FIXED.** Absent path → `DataInvalid` "Missing
+  required files to delete" (in the operation's resolution, where the requested set is known); mixed
+  present+absent → same error (no silent partial delete); delete-only commit allowed; truly-empty rejected.
+  The truly-empty rejection had NO test — added `test_empty_delete_commit_is_rejected`. (Benign redundancy:
+  the missing-path check exists in BOTH `DeleteFilesOperation::delete_files` and `process_deletes`; the
+  latter can't fire since it sees already-resolved files — defense-in-depth, not a defect.)
+- **Pt 6 (no fast-append regression + scope): CONFIRMED.** `FastAppendOperation::delete_files` returns empty
+  → `process_deletes` early-returns → fast-append unchanged (append.rs tests pass). The trait extension is
+  benign. No Cargo edits; no bare `.unwrap()` added to production.
+
+**Review outcome (2026-06-07, Opus REVIEWER):** all 6 points adjudicated; NO production correctness bug
+(provenance + keep/drop are right). Strengthened tests against the most dangerous unpinned bug class: +3
+tests (provenance across snapshots; all-deleted keep-then-drop lifecycle; empty-commit rejection), each
+mutation-verified. Files touched: `transaction/delete_files.rs` (+3 tests + 2 helpers), todo, lessons. NO
+production `.rs` change, NO Cargo/lockfile edits. **Verify (repo root):** build clean; lib ×2 = 1355/0 both
+runs (was 1352 → +3); interop manage_snapshots/update_schema/update_partition_spec all 4/4; clippy -D
+warnings clean; fmt --check clean. Row stays **🟡** (data-level Java interop deferred, per the increment's
+scope).

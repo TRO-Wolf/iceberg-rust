@@ -74,7 +74,7 @@
 | Write: merge append | ❌ | `AppendFiles` (merge mode) | none |
 | Write: `OverwriteFiles` | ❌ | `api/OverwriteFiles.java` | none |
 | Write: `ReplacePartitions` (dynamic/static overwrite) | ❌ | `api/ReplacePartitions.java` | none |
-| Write: `DeleteFiles` | ❌ | `api/DeleteFiles.java` | none |
+| Write: `DeleteFiles` | 🟡 | `api/DeleteFiles.java`, `core/StreamingDelete.java`, `core/ManifestFilterManager.java` | `transaction/delete_files.rs`: `DeleteFilesAction` (delete by file path / `DataFile` reference) + the foundational **manifest-filter / rewrite** machinery in `transaction/snapshot.rs` (`SnapshotProducer::process_deletes`) that `OverwriteFiles`/`ReplacePartitions`/`RewriteFiles` will reuse. Mirrors Java `ManifestFilterManager.filterManifest`: each existing data manifest containing a to-be-deleted live entry is rewritten (matching entries → `Deleted` carrying their data file + data/file seq, the rest copied forward as `Existing` preserving snapshot-id + both seq numbers — V2/V3 inheritance); a manifest with no matching entry is carried forward UNCHANGED; an all-deleted rewritten manifest is kept (Java `MergingSnapshotProducer.apply` `snapshotId()==snapshotId()` keep rule), a no-live-file manifest dropped. Delete-only commit allowed (precondition relaxed); a truly-empty commit rejected; deleting an absent path errors ("Missing required files to delete", Java `failMissingDeletePaths`). 8 `MemoryCatalog` unit tests assert the post-commit SCAN live set + manifest counts + carry-forward. **Deferred to ✅:** delete-by-row-filter / partition-predicate (Java `deleteFromRowFilter`/`dropPartition` — needs metrics evaluators, OverwriteFiles/ReplacePartitions increments); data-level Java interop round-trip (Spark/Docker = CI-only). |
 | Write: `RowDelta` (merge-on-read) | ❌ | `api/RowDelta.java` | none |
 | Write: `RewriteFiles` (compaction commit) | ❌ | `api/RewriteFiles.java` | none |
 | Transaction action extension seam | 🟡 | `core/.../BaseTransaction` | `transaction/action.rs` — `TransactionAction`/`ApplyTransactionAction` + `ActionCommit` exist (trait is `pub(crate)`; we own it → make `pub` in Phase 2) |
@@ -119,7 +119,10 @@
 ## Headline gaps (ranked by effort × value)
 
 1. **Write engine** — everything beyond fast-append (`OverwriteFiles`, `ReplacePartitions`,
-   `DeleteFiles`, `RowDelta`, `RewriteFiles`, `RewriteManifests`, merge append).
+   `DeleteFiles`, `RowDelta`, `RewriteFiles`, `RewriteManifests`, merge append). **Started 2026-06-07:
+   `DeleteFiles` 🟡** — delete data files by path/reference + the foundational manifest-filter / rewrite
+   machinery in `SnapshotProducer::process_deletes` (which `OverwriteFiles`/`ReplacePartitions`/`RewriteFiles`
+   will reuse); `MemoryCatalog` unit tests; delete-by-row-filter and data-level Java interop deferred.
 2. **Schema/partition evolution + snapshot management** — `UpdateSchema`, `UpdatePartitionSpec`, **and the
    `ManageSnapshots` ref-operation surface** are now **✅** (bidirectional Java interop round-trips landed
    2026-06-07 via the `dev/java-interop/` oracle + the `crates/iceberg/tests/interop_update_schema.rs`,

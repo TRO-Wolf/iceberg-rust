@@ -653,3 +653,83 @@ How to use it (see the manuals' §2):
   `test_v1_shaped_manifest_list_read_as_v2_defaults_absent_fields_to_zero` with real asserts + a risk-named
   doc comment, and mutation-verified it. A probe that ships is an untested assertion; a probe deleted without
   a replacement loses the evidence.
+
+### 2026-06-07 (Phase 2 Increment 1 — DeleteFiles + manifest-filter machinery, BUILDER Opus)
+- **DO put the "missing required delete path" validation (Java `failMissingDeletePaths`) in the OPERATION's
+  path-resolution, NOT in the producer's manifest-rewrite step.** *Why:* the producer's `process_deletes`
+  receives only the RESOLVED `Vec<DataFile>` (the files the operation actually found in live entries) — it
+  has no knowledge of the originally-REQUESTED path set, so it cannot tell that a requested path matched
+  nothing. The first cut validated in the producer and two tests failed: deleting a single absent path
+  resolved to an EMPTY set → `process_deletes` returned early → the precondition fired with
+  `PreconditionFailed` instead of the intended `DataInvalid`; and a mixed present+absent delete SUCCEEDED
+  (the present file was removed, the absent one silently ignored). Fix: the `DeleteFilesOperation::delete_files`
+  resolver builds `found_paths` while scanning the current snapshot's live entries and errors
+  `DataInvalid "Missing required files to delete: {missing}"` if any requested path is absent — because the
+  requested set only lives in the operation. The producer keeps a redundant resolved-set guard as
+  defense-in-depth.
+- **DO rewrite a filtered manifest with the SOURCE manifest's own partition spec, not the table's default
+  spec.** *Why:* Java `ManifestFilterManager.filterManifestWithDeletedFiles` writes with `reader.spec()`
+  (the manifest's own spec). The existing `SnapshotProducer::new_manifest_writer` helper uses
+  `default_partition_spec()` — fine for newly-added data, WRONG for a rewrite, since a manifest written under
+  an older spec must keep its spec-id/partition-type when its `Existing` entries are copied forward. Added a
+  separate `new_filtering_manifest_writer(source_manifest)` that resolves
+  `metadata.partition_spec_by_id(source_manifest.partition_spec_id)`. (For Increment 1 every manifest shares
+  the default spec, so the two coincide — but the seam is correct for the partition-evolution case the later
+  write increments hit.)
+- **DO carry an unchanged manifest forward as-is (same `manifest_path`) when it contains none of the target
+  files, and KEEP an all-deleted rewritten manifest, DROP only a no-live-file unrewritten one.** *Why:* the
+  three Java rules, separately cited: (a) `filterManifest` returns the manifest object unmodified when it
+  cannot contain a deleted file (efficiency + fewer files written); (b) `MergingSnapshotProducer.apply`
+  (lines 1002-1009) keeps a manifest iff `hasAddedFiles() || hasExistingFiles() || snapshotId()==snapshotId()`
+  — a rewritten manifest where every live entry became `Deleted` has no added/existing files but its
+  `added_snapshot_id` IS the new snapshot id (the filter manager writes with the producer's snapshot id), so
+  it is KEPT (the Deleted entries are informational); (c) an UNREWRITTEN carried-forward manifest with no live
+  files is dropped. Pin the carry-forward with a same-`manifest_path` assertion (mutation-verified: forcing
+  every manifest to rewrite changes the path and fails the test) — a live-set-only check can't catch a
+  needless rewrite (which is correct data but wasted IO + a corruption risk surface).
+- **DO assert the post-commit SCAN live set (Added+Existing entry paths across the current snapshot's
+  manifests), not just the emitted `TableUpdate`s, for a write action.** *Why:* the real correctness signal
+  for `DeleteFiles` is "what would a scan read" — {A,C} after deleting B. A test that only inspects the
+  `AddSnapshot` update or the manifest counts can pass while the live set is wrong (e.g. a deleted entry left
+  as `Existing`). Mutation-verified the live-set tests are load-bearing: swapping `add_delete_entry` →
+  `add_existing_entry` (so a "deleted" file stays live) fails 6 of the 8 tests. Build the helper that walks
+  `current_snapshot().load_manifest_list().entries()[*].load_manifest().entries()` filtering `is_alive()`.
+- **DO extend `SnapshotProduceOperation` with `delete_files(&producer) -> Vec<DataFile>` as the generic seam
+  for ALL delete-bearing write ops, and add the empty impl to the existing `FastAppendOperation`.** *Why:*
+  the manifest-rewrite machinery in the producer is operation-agnostic — the operation only supplies WHICH
+  files to remove (resolved against the current snapshot at commit) and WHICH manifests to consider
+  (`existing_manifest`). `OverwriteFiles`/`ReplacePartitions`/`RewriteFiles` will each implement `delete_files`
+  differently (by-filter / by-partition / explicit set) and reuse the same `process_deletes`. Adding a method
+  to the trait forces an impl on every existing implementor — `FastAppendOperation` needs a 5-line
+  `Ok(vec![])`; that touch of `append.rs` is the trait's own sibling, not unrelated scope creep, but flag it.
+
+### 2026-06-07 (Phase 2 Increment 1 — DeleteFiles, REVIEWER Opus)
+- **DO add an explicit cross-snapshot PROVENANCE test for any manifest-rewrite action — a live-PATH-set
+  test does NOT pin it.** *Why:* the #1 corruption risk in a delete/rewrite is re-stamping a SURVIVING
+  entry with the new commit's snapshot id / sequence number instead of preserving its original (Java
+  `writer.existing(entry)` keeps `entry.snapshotId()` + both seqs; `writer.delete(entry)` takes the NEW
+  snapshot id but keeps the removed file's original seqs). The Increment-1 builder's 8 tests asserted only
+  the live PATH set + statuses + manifest counts — ALL 8 PASSED under a mutation that re-stamps
+  `add_existing_entry`'s `snapshot_id = self.snapshot_id` (silent data-sequence corruption that breaks
+  merge-on-read delete application + incremental scans). Added
+  `test_delete_preserves_surviving_entry_provenance_across_snapshots`: append A (snapshot S1), append B+C
+  in one commit (snapshot S2, one manifest), delete B → assert the surviving C keeps S2 + its original
+  data/file seq (NOT S3/new seq), carried-forward A keeps S1, and B's Deleted tombstone gets S3 but keeps
+  B's original seqs. Mutation-verified it is the ONLY test that fails under the re-stamp. The Rust path is
+  correct (provenance preserved end-to-end) — the gap was purely missing test coverage of the most
+  dangerous bug class.
+- **DO verify `inherit_data` runs before a rewrite so Existing/Deleted entries have populated seq numbers.**
+  *Why:* `add_entry_inner` REJECTS an Existing/Deleted entry whose `sequence_number`/`file_sequence_number`
+  is `None`. Entries read via `ManifestFile::load_manifest` are passed through `inherit_data` (inherits the
+  manifest-list entry's `added_snapshot_id` + seq for null fields), so a rewrite of a manifest whose
+  Added entries had null-on-disk seqs/snapshot-id still writes valid Existing/Deleted entries with the
+  inherited (original) provenance. The rewrite path depends on this — a rewrite of un-inherited entries
+  would error.
+- **DO pin the all-deleted-manifest KEEP-then-DROP lifecycle across TWO commits, and the truly-empty-commit
+  rejection.** *Why:* Java `MergingSnapshotProducer.apply` keeps a rewritten all-deleted manifest only in
+  the commit that wrote it (`snapshotId()==snapshotId()`) and the NEXT commit drops it
+  (`hasAddedFiles||hasExistingFiles` false). The builder tested the single-commit all-deleted case but not
+  the two-commit lifecycle; added `test_all_deleted_manifest_kept_by_creating_commit_then_dropped_by_next`.
+  Separately, the precondition relaxation that lets a delete-only commit through must still reject a no-op
+  empty commit — the builder had `test_delete_only_commit_is_allowed` but no rejection test; added
+  `test_empty_delete_commit_is_rejected`.

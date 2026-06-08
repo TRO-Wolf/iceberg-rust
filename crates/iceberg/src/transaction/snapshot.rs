@@ -23,10 +23,10 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
-    TableProperties, update_snapshot_summaries,
+    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, Manifest, ManifestContentType,
+    ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
+    Operation, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
+    StructType, Summary, TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -72,6 +72,17 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
         &self,
         snapshot_produce: &SnapshotProducer,
     ) -> impl Future<Output = Result<Vec<ManifestEntry>>> + Send;
+
+    /// Returns the data files this operation wants to remove from the table.
+    ///
+    /// The producer resolves these against the current snapshot's manifests at commit time: every
+    /// existing manifest that contains a live entry for one of these files is rewritten with the
+    /// matching entries marked `Deleted` (mirroring Java `ManifestFilterManager.filterManifest`).
+    /// Operations that only add files (e.g. fast append) return an empty vector.
+    fn delete_files(
+        &self,
+        snapshot_produce: &SnapshotProducer<'_>,
+    ) -> impl Future<Output = Result<Vec<DataFile>>> + Send;
 
     /// Returns existing manifest files that should be included in the new snapshot.
     ///
@@ -324,20 +335,33 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
-        // Assert current snapshot producer contains new content to add to new snapshot.
+        // Resolve which data files this operation wants to remove, keyed by path.
+        let delete_files = snapshot_produce_operation.delete_files(self).await?;
+
+        // Assert the new snapshot contributes content: added files, deleted files, or added snapshot
+        // properties. A delete-only commit (deletes, no adds) is allowed; a truly-empty commit is not.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files or added snapshot properties found when write a manifest file",
+                "No added data files, deleted data files, or added snapshot properties found when write a manifest file",
             ));
         }
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
-        let mut manifest_files = existing_manifests;
+
+        // Rewrite existing manifests to remove the requested deletes (Java
+        // `ManifestFilterManager.filterManifests`). Manifests that contain none of the target files are
+        // carried forward unchanged.
+        let mut manifest_files = self
+            .process_deletes(existing_manifests, &delete_files)
+            .await?;
 
         // Process added entries.
         if !self.added_data_files.is_empty() {
@@ -345,11 +369,168 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
-
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
+    }
+
+    /// Rewrite the existing manifests to remove `delete_files`, mirroring Java
+    /// `ManifestFilterManager.filterManifests` + `MergingSnapshotProducer.apply`'s keep rule.
+    ///
+    /// For each existing manifest:
+    /// - if it contains at least one live entry whose path is in `delete_files`, it is rewritten:
+    ///   matching live entries are marked `Deleted` (carrying their existing data file and data/file
+    ///   sequence numbers; the new snapshot id is stamped), every other live entry is copied forward as
+    ///   `Existing` (preserving its snapshot id and both sequence numbers — V2/V3 inheritance);
+    /// - otherwise it is carried forward unchanged (efficiency + fewer files).
+    ///
+    /// A rewritten manifest is kept even when every live entry became `Deleted` (its `added_snapshot_id`
+    /// is the new snapshot id — Java's `snapshotId() == snapshotId()` keep rule). An unrewritten manifest
+    /// with no live files is dropped.
+    ///
+    /// Errors if any requested delete path matched no live entry in the table (mirrors Java
+    /// `failMissingDeletePaths` / `validateRequiredDeletes`).
+    async fn process_deletes(
+        &mut self,
+        existing_manifests: Vec<ManifestFile>,
+        delete_files: &[DataFile],
+    ) -> Result<Vec<ManifestFile>> {
+        if delete_files.is_empty() {
+            return Ok(existing_manifests);
+        }
+
+        let delete_paths: HashSet<&str> = delete_files
+            .iter()
+            .map(|df| df.file_path.as_str())
+            .collect();
+
+        // Track which requested paths were actually removed, to validate that none was missing.
+        let mut deleted_paths: HashSet<String> = HashSet::new();
+        let mut result_manifests = Vec::with_capacity(existing_manifests.len());
+
+        for manifest_file in existing_manifests {
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+
+            // Does any live entry in this manifest target one of the files to delete?
+            let has_matching_delete = manifest
+                .entries()
+                .iter()
+                .any(|entry| entry.is_alive() && delete_paths.contains(entry.file_path()));
+
+            if !has_matching_delete {
+                // Carry the manifest forward unchanged unless it has no live files at all.
+                if manifest_file.has_added_files() || manifest_file.has_existing_files() {
+                    result_manifests.push(manifest_file);
+                }
+                continue;
+            }
+
+            let rewritten = self
+                .rewrite_manifest_with_deletes(
+                    &manifest_file,
+                    &manifest,
+                    &delete_paths,
+                    &mut deleted_paths,
+                )
+                .await?;
+            result_manifests.push(rewritten);
+        }
+
+        // Validate that every requested delete path was found in a live entry (Java
+        // `failMissingDeletePaths`).
+        let missing: Vec<&str> = delete_paths
+            .iter()
+            .filter(|path| !deleted_paths.contains(**path))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Missing required files to delete: {}", missing.join(", ")),
+            ));
+        }
+
+        Ok(result_manifests)
+    }
+
+    /// Write a rewritten copy of `manifest` with the entries in `delete_paths` marked `Deleted` and the
+    /// rest copied forward as `Existing`. Records each removed path in `deleted_paths`.
+    async fn rewrite_manifest_with_deletes(
+        &mut self,
+        manifest_file: &ManifestFile,
+        manifest: &Manifest,
+        delete_paths: &HashSet<&str>,
+        deleted_paths: &mut HashSet<String>,
+    ) -> Result<ManifestFile> {
+        // Rewrite with the source manifest's own partition spec so the spec id / partition type of the
+        // copied-forward entries is preserved (Java writes with `reader.spec()`).
+        let mut writer = self.new_filtering_manifest_writer(manifest_file)?;
+
+        for entry in manifest.entries() {
+            // Already-deleted entries are informational only and are not carried forward.
+            if !entry.is_alive() {
+                continue;
+            }
+
+            let entry = entry.as_ref().clone();
+            if delete_paths.contains(entry.file_path()) {
+                deleted_paths.insert(entry.file_path().to_string());
+                writer.add_delete_entry(entry)?;
+            } else {
+                writer.add_existing_entry(entry)?;
+            }
+        }
+
+        writer.write_manifest_file().await
+    }
+
+    /// Build a manifest writer for a rewritten (filtered) manifest, using the partition spec of the
+    /// source manifest so existing entries keep their spec id and partition type.
+    fn new_filtering_manifest_writer(
+        &mut self,
+        source_manifest: &ManifestFile,
+    ) -> Result<ManifestWriter> {
+        let partition_spec = self
+            .table
+            .metadata()
+            .partition_spec_by_id(source_manifest.partition_spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot rewrite manifest: unknown partition spec id {}",
+                        source_manifest.partition_spec_id
+                    ),
+                )
+            })?
+            .as_ref()
+            .clone();
+
+        let new_manifest_path = format!(
+            "{}/{}/{}-m{}.{}",
+            self.table.metadata().location(),
+            META_ROOT_PATH,
+            self.commit_uuid,
+            self.manifest_counter.next().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Exhausted manifest file name counter",
+                )
+            })?,
+            DataFileFormat::Avro
+        );
+        let output_file = self.table.file_io().new_output(new_manifest_path)?;
+        let builder = ManifestWriterBuilder::new(
+            output_file,
+            Some(self.snapshot_id),
+            self.key_metadata.clone(),
+            self.table.metadata().current_schema().clone(),
+            partition_spec,
+        );
+        match self.table.metadata().format_version() {
+            FormatVersion::V1 => Ok(builder.build_v1()),
+            FormatVersion::V2 => Ok(builder.build_v2_data()),
+            FormatVersion::V3 => Ok(builder.build_v3_data()),
+        }
     }
 
     // Returns a `Summary` of the current snapshot
