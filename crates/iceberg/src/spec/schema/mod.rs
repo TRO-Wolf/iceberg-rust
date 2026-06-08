@@ -573,6 +573,28 @@ impl Schema {
             format!("Invalid schema for {format_version}:\n- {joined}"),
         ))
     }
+
+    /// The minimum table format version this schema requires.
+    ///
+    /// Returns the highest format version any field demands: `v3` if a field uses a v3-only type
+    /// (`timestamp_ns`/`timestamptz_ns`) or carries a non-null `initial_default`, otherwise `v1`. A
+    /// table whose `format_version` is below this is rejected by
+    /// [`check_compatibility`](Self::check_compatibility), so a caller building a new table from this
+    /// schema can use it to pick a format version that accommodates the schema's types.
+    pub fn min_format_version(&self) -> FormatVersion {
+        let mut min = FormatVersion::V1;
+        for field in self.field_id_to_fields().values() {
+            if let Some(version) = min_format_version(&field.field_type)
+                && version > min
+            {
+                min = version;
+            }
+            if field.initial_default.is_some() && DEFAULT_VALUES_MIN_FORMAT_VERSION > min {
+                min = DEFAULT_VALUES_MIN_FORMAT_VERSION;
+            }
+        }
+        min
+    }
 }
 
 impl Display for Schema {
@@ -1566,6 +1588,25 @@ table {
             "got: {}",
             error.message()
         );
+    }
+
+    // RISK: `min_format_version` decides the format version a DataFusion-created table gets — if it
+    // under-reported (missed a v3-only type) the table would be created at v2 and then rejected by
+    // `check_compatibility` (the sqllogictest timestamp regression); a plain schema must stay v1 so
+    // it is not needlessly bumped.
+    #[test]
+    fn test_min_format_version() {
+        use crate::spec::table_metadata::FormatVersion;
+
+        let plain = schema_with_top_level_type("x", Type::Primitive(PrimitiveType::Long));
+        assert_eq!(plain.min_format_version(), FormatVersion::V1);
+
+        let ts_ns = schema_with_top_level_type("ts", Type::Primitive(PrimitiveType::TimestampNs));
+        assert_eq!(ts_ns.min_format_version(), FormatVersion::V3);
+
+        let tstz_ns =
+            schema_with_top_level_type("ts", Type::Primitive(PrimitiveType::TimestamptzNs));
+        assert_eq!(tstz_ns.min_format_version(), FormatVersion::V3);
     }
 
     // RISK: the gate must NOT over-fire — a `timestamp_ns` column is legal at v3, where the type was
