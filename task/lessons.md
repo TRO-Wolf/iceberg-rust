@@ -967,3 +967,82 @@ How to use it (see the manuals' §2):
   TOTALS method (`summary(previous)`, all `updateTotal`, no per-op branch) — but the SIBLING REPLACE invariant
   lives in the snapshot-construction path, not `summary()`, so admitting `Replace` to the
   `update_snapshot_summaries` allowlist is right AND this separate guard is a distinct missing item.
+
+### 2026-06-08 (Phase 2 Increment 5a — PositionDeleteWriter, BUILDER Opus)
+- **DO check `metadata_columns.rs` for the reserved position-delete field-id constants BEFORE adding
+  them — they already exist and already match Java.** *Why:* the brief said "ADD them there if missing
+  (use the exact reserved ids)," but `RESERVED_FIELD_ID_DELETE_FILE_PATH = i32::MAX - 101 = 2147483546`
+  and `RESERVED_FIELD_ID_DELETE_FILE_POS = i32::MAX - 102 = 2147483545` (= Java
+  `MetadataColumns.DELETE_FILE_PATH`/`DELETE_FILE_POS`, `Integer.MAX_VALUE - 101/-102`) were already
+  defined, with `delete_file_path_field()` (required string) / `delete_file_pos_field()` (required long)
+  helpers — and the read side (`arrow/delete_filter.rs`) already hard-codes those exact ids in its test.
+  The position-delete writer just reuses the existing helpers via a `pos_delete_schema()` free fn. Adding
+  duplicate constants would have been churn; verify the arithmetic (`i32::MAX - 101` == the spec's
+  `2147483546`) and reuse.
+- **DO build a delete-writer's parquet schema FROM the reserved metadata-column fields, not from a
+  hand-rolled Arrow schema, so the field ids are guaranteed correct.** *Why:* a position-delete file with
+  the wrong field ids is silently unreadable by Java (interop break) and by our own `delete_filter.rs`.
+  Building `Schema::builder().with_fields([delete_file_path_field().clone(),
+  delete_file_pos_field().clone()])` → `schema_to_arrow_schema` → `ParquetWriterBuilder` makes the
+  parquet `PARQUET_FIELD_ID_META_KEY` come out 2147483546/2147483545 by construction. Pin it with a test
+  that reads the written parquet's arrow schema and asserts the exact id strings — a round-trip-of-values
+  test alone does NOT catch a wrong id (the values still round-trip).
+- **DO mirror Java `PositionDeleteWriter`'s write-AS-GIVEN contract and DOC that sorting by
+  (file_path, pos) is the caller's responsibility — do NOT silently reorder.** *Why:* Java's basic
+  `PositionDeleteWriter` "does not keep track of seen deletes and assumes all incoming records are
+  ordered by file and position"; the SORTED ordering is `SortingPositionOnlyDeleteWriter`'s job. The spec
+  (lines 1403-1405) only RECOMMENDS the sort (readers binary-search); an unsorted file is still valid +
+  readable, just sub-optimal. Reordering inside the writer would (a) diverge from Java and (b) require
+  buffering all rows. Mutation-verified the round-trip test asserts ORDER (dropping the last row of each
+  batch fails the round-trip + multi-file + field-id tests) — so a writer that mangles positions is
+  caught.
+- **DO NOT `use crate::Result;` in a writer test module whose tests return `Result<(), anyhow::Error>`.**
+  *Why:* `crate::Result<T>` is a 1-arg alias (`std::result::Result<T, crate::Error>`), so it collides
+  with the 2-arg `Result<(), anyhow::Error>` test signatures → `E0107 type alias takes 1 generic argument
+  but 2 were supplied`. The equality-delete writer test deliberately imports only `ErrorKind` (not
+  `Result`) and relies on the prelude `std::result::Result` for the 2-arg form. Match that.
+- **DO validate a delete-writer's input `RecordBatch` schema against the expected (file_path, pos) Arrow
+  schema in `write()` and reject a mismatch with `ErrorKind::DataInvalid`.** *Why:* unlike the
+  equality-delete writer (which PROJECTS an arbitrary input down to the delete columns via
+  `RecordBatchProjector`), a position-delete writer's input IS already the 2-column schema — so a
+  mismatched batch (wrong column order, missing field ids, wrong types) is a caller bug that would
+  otherwise produce a corrupt/unreadable delete file. Compare `batch.schema().as_ref() ==
+  arrow_schema.as_ref()` up front. Pin it with a negative test (a plain pos-then-path batch with no
+  field-id metadata → rejected).
+
+### 2026-06-08 (Phase 2 Increment 5a — PositionDeleteWriter, REVIEWER Opus)
+- **DO prove a delete-WRITER's read-side consumability END-TO-END with a throwaway in-crate probe that
+  drives the real `CachingDeleteFileLoader`, not just by schema/field-id matching.** *Why:* the brief's
+  item-3 fallback ("at minimum confirm the schema/field-ids match what the reader expects") is weaker than
+  what is actually reachable. `CachingDeleteFileLoader` is `pub(crate)`, so an in-crate test in the writer
+  module CAN: write a pos-delete file via `PositionDeleteFileWriter` pointing at a data-file path, build a
+  `FileScanTaskDeleteFile { file_type: PositionDeletes, .. }`, call
+  `loader.load_deletes(&[entry], schema).await??` (it returns a `futures` oneshot `Receiver<Result<DeleteFilter>>`
+  — `await` then `?` the recv then `?` the inner), and assert `delete_filter.get_delete_vector_for_path(path)`
+  yields a `DeleteVector` whose `.iter().collect::<HashSet<u64>>()` EQUALS the written positions. This is the
+  exact path 5b (RowDelta) will use. Mutation-verified load-bearing: mangling the writer's positions (+1) makes
+  the probe's read-side vector `{1,3,6,1001,1024}` ≠ expected `{0,2,5,1000,1023}` — catching silent
+  wrong-deletion end-to-end. Probe deleted after (rules); the committed value-round-trip + field-id tests are
+  the persistent regression guard, and this probe was the one-time proof the two halves connect.
+- **DO confirm the read side parses pos-delete files BY COLUMN POSITION (col 0 = StringArray file_path, col 1 =
+  Int64Array pos) — not by field-id lookup — so column ORDER is the load-bearing interop contract on the read
+  path, while field-IDS are the interop contract for Java.** *Why:* `caching_delete_file_loader.rs:326-350`
+  downcasts `columns[0]`→`StringArray`, `columns[1]`→`Int64Array` and zips them; it never reads
+  `PARQUET_FIELD_ID_META_KEY`. So the Rust reader would accept a file with wrong field ids as long as the
+  column order/types are right — but Java matches by field id (`2147483546`/`2147483545`), so BOTH must be
+  correct for full interop. The writer gets both right by building its schema from `delete_file_path_field()`
+  / `delete_file_pos_field()` (correct ids) in the canonical order (path, pos). The `delete_filter.rs` test
+  hard-codes the same two ids as `2147483546`/`2147483545` — independent confirmation the read side expects
+  exactly the writer's ids. Verify the reader's matching mechanism (position vs. id) before claiming "wrong id
+  = unreadable by Rust": here a wrong id is unreadable by JAVA but (currently) tolerated by Rust; a wrong
+  column ORDER breaks Rust.
+- **CONFIRMED Java-faithful (no change): write-AS-GIVEN + sort-order-id null.** Java `MetadataColumns.DELETE_FILE_PATH`
+  (`core/.../MetadataColumns.java:64-75`) = `required(MAX-101, "file_path", string)` / `required(MAX-102, "pos",
+  long)` — byte-for-byte the Rust reserved fields. Java's basic `PositionDeleteWriter` writes records as-given
+  (does not reorder; sorting is `SortingPositionOnlyDeleteWriter`'s job), and the spec (`format/spec.md:745,
+  1403`) says position deletes "are required to be sorted by file and position" but "should set sort order id
+  to null" + "Readers must ignore sort order id for position delete files." The Rust writer correctly defers
+  the sort to the caller AND never claims a sort order (it sets no `sort_order_id` on the `DataFile`), so it
+  does not advertise an ordering it doesn't enforce — the dangerous case. The optional `row` column
+  (field-id `MAX-103` / `2147483544`) and `referenced_data_file` are correctly out of scope (documented, not
+  silently wrong).

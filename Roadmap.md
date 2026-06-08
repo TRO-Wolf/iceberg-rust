@@ -103,7 +103,11 @@ layers are removed in Phase 0.
    the same day; increment 4 — `RewriteFiles` (the compaction-commit primitive: atomically replace a set of
    DATA files with a new set in one `Operation::Replace` snapshot, Java `BaseRewriteFiles`; reuses the
    by-path `resolve_delete_paths` + `process_deletes` machinery unchanged; delete set must be non-empty) —
-   landed 🟡 the same day. Next Phase-2 increments: `RewriteManifests`, merge append, `RowDelta`. (V3
+   landed 🟡 the same day. Increment 5a — the `PositionDeleteFileWriter`
+   (`writer/base_writer/position_delete_writer.rs`, first piece of the `RowDelta` merge-on-read write path:
+   writes the Iceberg position-delete file `file_path`/`pos` with `content(PositionDeletes)`, Java-faithful
+   write-as-given) — landed 🟡 on 2026-06-08. Next Phase-2 increments: `RowDelta` action (5b) + producer
+   delete-manifest handling, deletion-vector writer (5c), `RewriteManifests`, merge append. (V3
    groundwork — row-lineage fields + the remaining `MIN_FORMAT_VERSIONS` types
    `variant`/`unknown`/`geometry`/`geography` — also remains.)** The live,
    increment-level plan and checkbox
@@ -279,7 +283,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `UpdatePartitionSpec` ✅ (bidirectional interop landed 2026-06-07, surfacing+fixing the identity-only
   partition-name collision divergence); `ManageSnapshots` awaits the same interop treatment.**
 
-### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07)**
+### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07; `PositionDeleteFileWriter` (RowDelta increment 5a) landed 2026-06-08)**
 - **Goal:** the full commit/write surface beyond fast-append.
 - **Gates on:** Phase 1.
 - **Increment sequence (dependency, then value):** **1. `DeleteFiles`** (done 🟡 — delete data files by
@@ -297,7 +301,12 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `process_deletes` rewrite machinery unchanged; delete set must be non-empty (`failMissingDeletePaths`);
   DELETE-file rewrite + `dataSequenceNumber` preservation + conflict validation + interop deferred),
   5. `RewriteManifests`, 6. merge append, 7. `RowDelta` + position-delete / deletion-vector
-  writers, 8. multi-op transaction hardening + optimistic-concurrency retry on the real catalogs.
+  writers (**increment 5a done 🟡 2026-06-08 — `PositionDeleteFileWriter` in
+  `writer/base_writer/position_delete_writer.rs`: writes the Iceberg position-delete file
+  (`file_path` id 2147483546, `pos` id 2147483545) with `content(PositionDeletes)`, Java-faithful
+  write-as-given; round-trip + field-id tests prove read/Java consumability. Sub-sequence: 5a writer
+  [done], 5b `RowDelta` action + producer delete-manifest handling, 5c deletion-vector writer**),
+  8. multi-op transaction hardening + optimistic-concurrency retry on the real catalogs.
 - **Key deliverables:** merge append, `OverwriteFiles`, `ReplacePartitions`, `DeleteFiles` (🟡), `RowDelta`,
   `RewriteFiles`, `RewriteManifests`; finalize position-delete + deletion-vector writers; multi-op
   transactions + optimistic-concurrency retry, **validated against Glue + S3 Tables**.

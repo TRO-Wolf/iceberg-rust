@@ -1663,3 +1663,90 @@ trap), shipping with a test that builds a real delete manifest. All 5 points adj
 dataSequenceNumber preservation + conflict validation still deferred). Files touched: `transaction/rewrite_files.rs`
 (guard + helper + test + doc), `transaction/mod.rs` (ctor doc), `task/{todo.md,lessons.md}`. One tracked 🟡
 follow-up (REPLACE record-count invariant). No Cargo/lockfile edits.
+
+### Phase 2 Increment 5a — PositionDeleteWriter (RowDelta write-path piece 1, BUILDER Opus, 2026-06-08)
+First piece of the merge-on-read RowDelta write path: a base writer that writes Iceberg position-delete
+files. Correctness-critical — a malformed delete file silently fails to delete rows or deletes the wrong
+rows. Mirrors `EqualityDeleteFileWriter` structurally. New file
+`crates/iceberg/src/writer/base_writer/position_delete_writer.rs`.
+
+**RowDelta subsystem sub-sequence (this increment is 5a):**
+- **5a PositionDeleteWriter** [THIS] — writes a position-delete file (`file_path`,`pos`) with
+  `content(PositionDeletes)`; write-as-given (Java-faithful, caller sorts).
+- **5b RowDelta action** — the `RowDelta` transaction action + producer delete-manifest handling (add the
+  written delete files to a new snapshot via `MergingSnapshotProducer`-equivalent, delete-manifest write).
+- **5c deletion-vector writer** — V3 Puffin DV writer (`delete_vector.rs` + `puffin/`); writers must not add
+  new position-delete files to v3 tables (spec line 1933) — DVs replace them.
+
+**Java rule verified against source** (`core/.../deletes/PositionDeleteWriter.java`, `MetadataColumns.java`,
+`format/spec.md`):
+- Position-delete schema (spec lines 449-451 / 1393-1394): `file_path: string` REQUIRED, field id
+  **2147483546** (= `Integer.MAX_VALUE - 101`, Java `DELETE_FILE_PATH`); `pos: long` REQUIRED, field id
+  **2147483545** (= `Integer.MAX_VALUE - 102`, Java `DELETE_FILE_POS`). Optional `row: struct` field id
+  **2147483544** — OUT OF SCOPE (position-delete-with-row-data, noted).
+- Content type `position deletes` (manifest `content` = 1).
+- **Sorting:** Java basic `PositionDeleteWriter` writes records AS GIVEN (no reorder); the sorted
+  (file_path,pos) ordering is the caller's / `SortingPositionOnlyDeleteWriter`'s job. Spec lines 1403-1405
+  RECOMMEND sorting by file_path then pos (readers binary-search). Mirror Java: write as-given, DOC the
+  recommendation + that sorting is the caller's responsibility. Do NOT silently reorder.
+- Sort-order-id must be null for position deletes (spec line 745) — left null (DataFile default).
+
+**metadata_columns.rs ALREADY has the constants — NOT touched.** `RESERVED_FIELD_ID_DELETE_FILE_PATH =
+i32::MAX - 101 = 2147483546` and `RESERVED_FIELD_ID_DELETE_FILE_POS = i32::MAX - 102 = 2147483545` already
+exist with the exact Java ids, plus `delete_file_path_field()` / `delete_file_pos_field()` helpers
+(required string / required long). The read side (`arrow/delete_filter.rs`) already consumes exactly these
+ids. So the writer just reuses them — no metadata_columns.rs edit needed (flagged: nothing added there).
+
+Plan:
+- [x] `PositionDeleteWriterConfig` — holds the position-delete Iceberg `SchemaRef` (built from
+      `delete_file_path_field()` + `delete_file_pos_field()`) + its projected Arrow schema ref (for input
+      validation). `pos_delete_schema()` free fn builds the canonical 2-field schema.
+- [x] `PositionDeleteFileWriterBuilder<B,L,F>` { inner: RollingFileWriterBuilder, config } +
+      `PositionDeleteFileWriter` mirroring the equality-delete writer; `IcebergWriterBuilder::build` clones
+      the inner rolling builder + config + partition_key.
+- [x] `IcebergWriter::write(RecordBatch)` — VALIDATE the batch's arrow schema equals the position-delete
+      schema (field ids 2147483546/2147483545, types Utf8/Int64, required) before writing; reject otherwise
+      (`ErrorKind::DataInvalid`). Write as-given (no reorder). `close()` stamps
+      `content(DataContentType::PositionDeletes)`, partition/spec from partition_key, returns DataFile(s).
+- [x] Tests (named for the risk): round-trip exact (file_path,pos) pairs (dropped/mangled positions = data
+      not deleted); field ids in written parquet == 2147483546/2147483545 (wrong ids = Java can't read);
+      content==PositionDeletes + record_count==N; multiple data files' positions in one file; reject a
+      batch with the wrong schema; empty-input convention (matches equality-delete: no rows → still produces
+      a closeable writer; assert behavior).
+- [x] Wire `pub mod position_delete_writer;` into `writer/base_writer/mod.rs`.
+- [x] Docs: GAP_MATRIX `Writer: position-delete` row note (writer landed, stays 🟡 pending RowDelta +
+      interop); Roadmap Phase 2 (PositionDeleteWriter landed); this todo; lessons.
+- [x] Verify gate from repo root.
+
+**Deferred (flagged):** the optional `row` column (position-delete-with-row-data, field id 2147483544);
+caller-side sorting by (file_path,pos) — 5b/`SortingPositionOnlyDeleteWriter`; `referenced_data_file`
+single-file optimization (the read side already handles null); the RowDelta action (5b) + DV writer (5c);
+Java interop round-trip (→ ✅). Row stays 🟡.
+
+**Outcome (2026-06-08, Phase 2 Increment 5a, BUILDER Opus):** `PositionDeleteFileWriter` lands as the first
+piece of the `RowDelta` merge-on-read write path (🟡). New file
+`crates/iceberg/src/writer/base_writer/position_delete_writer.rs` mirroring `EqualityDeleteFileWriter`:
+`PositionDeleteWriterConfig` (holds the position-delete `Schema` + Arrow schema; `pos_delete_schema()` free
+fn) + `PositionDeleteFileWriterBuilder<B,L,F>` + `PositionDeleteFileWriter`. Writes a parquet position-delete
+file whose schema is exactly `file_path: string` (field id **2147483546**) + `pos: long` (field id
+**2147483545**) — reserved ids reused from `metadata_columns.rs` (`delete_file_path_field()` /
+`delete_file_pos_field()`); **metadata_columns.rs NOT touched** (the constants already exist and already match
+Java `MetadataColumns.DELETE_FILE_PATH`/`DELETE_FILE_POS`). `close()` stamps
+`content(DataContentType::PositionDeletes)` + partition/spec + correct `record_count`. **Java-faithful
+sorting: writes records AS GIVEN (no reorder); sorting by (file_path,pos) is the caller's / a later
+`SortingPositionOnlyDeleteWriter`'s job — DOC'd in the module header + the spec recommendation.**
+`write()` validates the input batch's Arrow schema against the position-delete schema and rejects a mismatch
+(`ErrorKind::DataInvalid`). **6 tests** (all named for the risk): `pos_delete_schema_has_reserved_field_ids`
+(schema/id contract), `round_trips_exact_positions` (dropped/mangled positions = data not deleted — reads
+parquet back, asserts exact (path,pos) pairs in order), `written_field_ids_match_reserved` (parquet field ids
+== 2147483546/2147483545 — interop), `multiple_data_files_one_delete_file`, `rejects_mismatched_schema`,
+`empty_input_closes`. Mutation-verified: dropping the last row of each batch fails the round-trip + multi-file
++ field-id tests. **Verify (repo root, pinned nightly):** `cargo build -p iceberg` clean; lib ×2 = **1390/0**
+both runs (was 1384 baseline → +6); interop `interop_manage_snapshots` 4/4, `interop_update_schema` 4/4,
+`interop_update_partition_spec` 4/4 (all stay green); clippy -D warnings clean; fmt --check clean (one reflow
+applied via `cargo fmt`). Files touched exactly the allowed set:
+`writer/base_writer/position_delete_writer.rs` (new), `writer/base_writer/mod.rs` (one `pub mod` line),
+`docs/parity/GAP_MATRIX.md`, `Roadmap.md`, `task/todo.md`, `task/lessons.md`. **NOT touched:**
+`metadata_columns.rs` (constants already present — flagged), Cargo.toml/lockfiles. No commit. Row stays 🟡.
+**Deferred:** optional `row` column (id 2147483544); caller-side sorting (5b); the `RowDelta` action (5b) +
+DV writer (5c); Java interop round-trip (→ ✅). An Opus REVIEWER verifies next.

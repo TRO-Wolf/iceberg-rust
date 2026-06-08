@@ -82,7 +82,7 @@
 | Multi-op transactions + optimistic-concurrency retry | 🟡 | `api/Transaction.java` | `catalog.update_table`; needs validation against Glue/S3 Tables |
 | Writer: data file | ✅ | `data/` | `writer/base_writer/data_file_writer.rs` |
 | Writer: equality-delete | ✅ | `data/` | `writer/base_writer/equality_delete_writer.rs` |
-| Writer: position-delete | 🟡 | `data/` | no dedicated `PositionDeleteWriter` in `writer/base_writer/`; read-side apply is done (see below) |
+| Writer: position-delete | 🟡 | `data/`, `core/.../deletes/PositionDeleteWriter.java` | `writer/base_writer/position_delete_writer.rs` — `PositionDeleteFileWriter` (Phase 2 increment 5a). Writes a position-delete file with the exact Iceberg schema (`file_path: string` id 2147483546, `pos: long` id 2147483545; reserved ids reused from `metadata_columns.rs`, no edit needed), `content(PositionDeletes)`, correct `record_count`/partition; round-trip + field-id tests prove the output is consumable by `arrow/delete_filter.rs` and Java. Java-faithful: writes records AS GIVEN (no reorder) — sorting by (file_path,pos) is the caller's job (spec recommendation doc'd). **Stays 🟡 pending:** the `RowDelta` action (5b) that commits these files, the optional `row` column (id 2147483544, out of scope), and a Java interop round-trip (→ ✅). |
 | Writer: deletion-vector (V3 puffin DV) | 🟡 | `core/.../deletes` | `delete_vector.rs` + `puffin/` (read solid; write side partial) |
 | Writer: partitioning (fanout/clustered/unpartitioned) | ✅ | — | `writer/partitioning/` |
 | Read: Parquet → Arrow | ✅ | `parquet/` | `arrow/reader.rs` |
