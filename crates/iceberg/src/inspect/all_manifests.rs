@@ -553,7 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_manifests_key_metadata_present_when_set_null_when_absent() {
-        // RISK: dropping / mis-wiring key_metadata. The DELETE manifest was written with key_metadata
+        // RISK: dropping or wrongly wiring key_metadata. The DELETE manifest was written with key_metadata
         // bytes; the SHARED DATA manifest with none.
         let fixture = TableTestFixture::new();
         setup_all_manifests_fixture(&fixture).await;

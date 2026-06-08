@@ -651,7 +651,7 @@ mod tests {
 
         // Deleted entry: snapshot id STAMPED to the manifest's snapshot (current) by `add_delete_entry`;
         // the data/file sequence numbers are PRESERVED (the parent's). This pins the genuine committed
-        // value — a code that mis-read it (e.g. inherited everything) would fail here.
+        // value — a code that misread it (e.g. inherited everything) would fail here.
         let deleted = rows["2.parquet"];
         assert_eq!(deleted.snapshot_id, Some(current.snapshot_id()));
         assert_eq!(deleted.sequence_number, Some(parent.sequence_number()));

@@ -2011,7 +2011,7 @@ the three tables differ ONLY by the manifest content filter — Rule of Three, f
 - **Content filter is at the MANIFEST level** (Java `FilesTableScan.manifests()`): `files` →
   `snapshot().allManifests()`; `data_files` → `snapshot().dataManifests()` (content == DATA);
   `delete_files` → `snapshot().deleteManifests()` (content == DELETES). Within a manifest, only LIVE
-  entries (Added/Existing, Rust `is_alive()`) are rows. A bug that mis-filters content = wrong table.
+  entries (Added/Existing, Rust `is_alive()`) are rows. A bug that wrongly filters content = wrong table.
   Rust mirror: filter `ManifestFile.content` (`ManifestContentType::{Data,Deletes}`) per table, then
   `entry.is_alive()`.
 - **Schema = `DataFile.getType(partitionType).fields()`** (field-ids from `api/DataFile.java`), order:
@@ -2358,7 +2358,7 @@ Sort output rows deterministically by partition value.
    Rust has only `default_partition_type()` (no cross-spec unifier found). RECOMMENDED: implement the
    single-spec-correct path (key by the file's partition `Struct`, schema = default partition type) and
    DOCUMENT cross-spec unification as a deferral (known divergence) in GAP_MATRIX/todo — do NOT silently
-   mis-aggregate. If a unifier helper does exist, use it.
+   aggregate wrongly. If a unifier helper does exist, use it.
 
 Plan:
 - [x] `inspect/partitions.rs`: `PartitionsTable<'a>` + `schema()` (11 fields; kept empty-struct partition

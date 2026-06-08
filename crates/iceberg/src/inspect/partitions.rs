@@ -44,7 +44,7 @@
 //!    single-spec (no partition-evolution) case. Under partition EVOLUTION (multiple specs with differently
 //!    shaped partition tuples) the rows are not coerced into a unified type — a known divergence deferred
 //!    until a `Partitioning.partitionType` analogue lands (tracked in GAP_MATRIX + `task/todo.md`). The
-//!    per-file `spec_id` is still reported, so no data is silently mis-attributed within a single spec.
+//!    per-file `spec_id` is still reported, so no data is silently misattributed within a single spec.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -779,7 +779,7 @@ mod tests {
         // RISK: the STRICT `>` tie-break in `Partition.update`. Java updates last_updated_*/spec_id only
         // when `commitMicros > lastUpdatedAt` (strict), so on an EXACT commit-time tie the FIRST-seen file
         // keeps ownership and a later equal-time file does NOT overwrite it. A `>=` regression would let the
-        // LAST equal-time file win instead — silently mis-attributing the partition to the wrong snapshot.
+        // LAST equal-time file win instead — silently misattributing the partition to the wrong snapshot.
         //
         // Construction: the parent snapshot's commit time is rewritten to EQUAL the current snapshot's, so
         // the two snapshots tie. Both files live in partition 100; the PARENT's file is iterated FIRST

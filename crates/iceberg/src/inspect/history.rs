@@ -318,15 +318,15 @@ mod tests {
         );
 
         let snapshot_id = batch.column(1).as_primitive::<Int64Type>();
-        let is_anc = batch.column(3).as_boolean();
+        let is_ancestor = batch.column(3).as_boolean();
         // Every row's is_current_ancestor must be consistent for a given snapshot id; collect per id.
         let mut by_id = std::collections::HashMap::new();
         for i in 0..batch.num_rows() {
-            let prev = by_id.insert(snapshot_id.value(i), is_anc.value(i));
+            let prev = by_id.insert(snapshot_id.value(i), is_ancestor.value(i));
             if let Some(prev) = prev {
                 assert_eq!(
                     prev,
-                    is_anc.value(i),
+                    is_ancestor.value(i),
                     "duplicate log rows for one snapshot must agree on is_current_ancestor"
                 );
             }

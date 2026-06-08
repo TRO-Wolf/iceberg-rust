@@ -1467,8 +1467,8 @@ How to use it (see the manuals' §2):
   (schema)` (SINGLE spec) and `TableMetadata::default_partition_type` — no union/coerce. So the
   single-spec-correct path (`Struct` derives `Hash`+`Eq` → direct `HashMap` key; schema = default partition
   type) is the right scope; cross-spec UNIFICATION (partition evolution → differently shaped tuples) is a
-  documented DEFERRAL, not silently mis-aggregated. Still report the per-file `spec_id` so nothing is
-  mis-attributed within a single spec. Do NOT invent a unifier in an inspection-table increment — flag it.
+  documented DEFERRAL, not silently misaggregated. Still report the per-file `spec_id` so nothing is
+  misattributed within a single spec. Do NOT invent a unifier in an inspection-table increment — flag it.
 - **DO reuse the `files`-family unpartitioned-column decision for module consistency: keep the empty-struct
   `partition` column rather than dropping it (Java drops it).** *Why:* `inspect/files.rs` already KEPT an
   empty-struct `partition` column for unpartitioned tables as a documented divergence (Java
