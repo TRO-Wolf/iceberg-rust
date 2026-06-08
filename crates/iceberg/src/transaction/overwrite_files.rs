@@ -39,9 +39,9 @@
 //! concurrent commit since the operation's starting snapshot COULD contain records matching the
 //! conflict-detection filter. This is the serializable-isolation safety layer (Java
 //! `BaseOverwriteFiles.validate` → `validateNewDataFiles` →
-//! `MergingSnapshotProducer.validateAddedDataFiles`). It mirrors the [`SnapshotProducer`]'s shared
-//! [`added_data_files_after`] concurrent-added-files walk and tests each added file against the bound
-//! conflict filter with the existing [`InclusiveMetricsEvaluator`] (file metrics/bounds). Default
+//! `MergingSnapshotProducer.validateAddedDataFiles`). It delegates to the shared
+//! [`validate_no_conflicting_added_data_files`] helper (the concurrent-added-files walk + bind + per-file
+//! inclusive-metrics evaluation), which `RowDelta` also uses so the two checks cannot drift. Default
 //! (this not enabled) = snapshot isolation, behavior unchanged.
 //!
 //! **Out of scope (deferred):**
@@ -61,15 +61,14 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
-use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::expr::Predicate;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer, added_data_files_after,
+    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    validate_no_conflicting_added_data_files,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::{Error, ErrorKind};
 
 /// A transaction action that overwrites files: it adds data files AND removes data files in a single
 /// `Overwrite` snapshot.
@@ -242,15 +241,15 @@ impl TransactionAction for OverwriteFilesAction {
     /// runs when [`Self::validate_no_conflicting_data`] was enabled; otherwise a no-op (snapshot isolation).
     ///
     /// When enabled: compute the effective starting snapshot ([`Self::validate_from_snapshot`] if set, else
-    /// the transaction-provided `starting_snapshot_id`), enumerate every DATA file ADDED to the refreshed
-    /// base by snapshots committed since it (the shared [`added_data_files_after`] helper = Java
-    /// `addedDataFiles`), and reject the commit if ANY of those files COULD contain records matching the
-    /// conflict-detection filter. The per-file test is the existing [`InclusiveMetricsEvaluator`] (Java's
-    /// `ManifestGroup.filterData` = manifest + inclusive-metrics evaluation). The conflict filter is the
-    /// caller's [`Self::conflict_detection_filter`] when set, else `AlwaysTrue` (any concurrently-added data
-    /// file conflicts), mirroring Java `dataConflictDetectionFilter()` (we have no `overwriteByRowFilter`, so
-    /// the row-filter branch never applies). The rejection is a NON-retryable [`ErrorKind::DataInvalid`]
-    /// (Java's non-retryable `ValidationException`), so the commit retry loop stops and the error propagates.
+    /// the transaction-provided `starting_snapshot_id`) and delegate to the shared
+    /// [`validate_no_conflicting_added_data_files`] helper, which enumerates every DATA file ADDED to the
+    /// refreshed base by snapshots committed since it (Java `addedDataFiles`) and rejects the commit if ANY
+    /// of those files COULD contain records matching the conflict-detection filter (the existing
+    /// `InclusiveMetricsEvaluator` over the file's metrics). The conflict filter is the caller's
+    /// [`Self::conflict_detection_filter`] when set, else `AlwaysTrue` (any concurrently-added data file
+    /// conflicts), mirroring Java `dataConflictDetectionFilter()` (we have no `overwriteByRowFilter`, so the
+    /// row-filter branch never applies). The rejection is a NON-retryable `DataInvalid` (Java's non-retryable
+    /// `ValidationException`), so the commit retry loop stops and the error propagates.
     ///
     /// **Case sensitivity:** Java binds the conflict filter with `isCaseSensitive()`. This action has no such
     /// field, so the filter is bound case-sensitive (`true`) — the Iceberg/Java default for column resolution.
@@ -265,45 +264,16 @@ impl TransactionAction for OverwriteFilesAction {
         }
 
         // Java `BaseOverwriteFiles` uses `startingSnapshotId` (the `validateFromSnapshot` override) when set,
-        // else the operation's starting snapshot.
+        // else the operation's starting snapshot. The walk + bind + per-file inclusive-metrics evaluation +
+        // non-retryable-conflict error are the shared helper (also used by `RowDelta`).
         let effective_start = self.validate_from_snapshot.or(starting_snapshot_id);
-
-        let added = added_data_files_after(current, effective_start).await?;
-        if added.is_empty() {
-            // No concurrent commit added data — nothing can conflict.
-            return Ok(());
-        }
-
-        // Build the conflict filter as a `BoundPredicate` against the table's current schema (Java
-        // `dataConflictDetectionFilter()`): the caller's filter when set, else `AlwaysTrue` = any
-        // concurrently-added data file conflicts (the most conservative serializable check).
-        let schema = current.metadata().current_schema().clone();
-        let bound_filter: BoundPredicate = self
-            .conflict_detection_filter
-            .clone()
-            .unwrap_or(Predicate::AlwaysTrue)
-            .bind(schema, true)?;
-
-        // Find the first concurrently-added file that COULD contain records matching the filter (Java throws
-        // on the first conflict entry). `InclusiveMetricsEvaluator::eval` returns whether the file's metrics
-        // permit a match; `include_empty_files = true` keeps a zero-record file's evaluation conservative
-        // (it never excludes on emptiness alone).
-        for file in &added {
-            if InclusiveMetricsEvaluator::eval(&bound_filter, file, true)? {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Found conflicting files that can contain records matching {}: {}",
-                        self.conflict_detection_filter
-                            .as_ref()
-                            .map_or_else(|| "true".to_string(), |filter| format!("{filter}")),
-                        file.file_path()
-                    ),
-                ));
-            }
-        }
-
-        Ok(())
+        validate_no_conflicting_added_data_files(
+            current,
+            effective_start,
+            self.conflict_detection_filter.as_ref(),
+            true,
+        )
+        .await
     }
 }
 

@@ -3156,3 +3156,121 @@ Adversarially verified against the Java source (`/tmp/iceberg-java-ref`) + 7 cod
   nightly):** build -p iceberg ✅; workspace --exclude sqllogictest --all-targets ✅; lib ×2 = 1509/0 both;
   transaction:: 225; 3 interop 4/4 each; clippy -D warnings ✅; fmt ✅. Row stays 🟡 (data-level Java interop
   + `overwriteByRowFilter` + `validateNoConflictingDeletes` still pending).
+
+### Increment 4 — RowDelta validateNoConflictingDataFiles + shared conflict-check helper (DETAIL, 2026-06-08)
+Java `BaseRowDelta.validate` → `validateNewDataFiles` → `validateAddedDataFiles(base, startingSnapshotId,
+conflictDetectionFilter, parent)` — the IDENTICAL filter-based added-data-file conflict check just built for
+OverwriteFiles (Increment 3). SCOPE: RowDelta `validateNoConflictingDataFiles` ONLY. DEFER (need a new
+concurrent-DELETE-file enumeration helper — bigger, separate): `validateNoConflictingDeleteFiles`
+(`validateNoNewDeleteFiles`), `validateDeletedFiles`/`validateDataFilesExist`, `validateAddedDVs`.
+
+Because this is the 2nd use of the exact same load-bearing safety check, FACTOR a shared `pub(crate)` helper
+(next to `added_data_files_after` in `transaction/snapshot.rs`) so OverwriteFiles + RowDelta cannot drift:
+`async fn validate_no_conflicting_added_data_files(current: &Table, effective_start: Option<i64>,
+conflict_filter: Option<&Predicate>, case_sensitive: bool) -> Result<()>` doing the
+`added_data_files_after` walk + bind (None ⇒ AlwaysTrue) + per-file `InclusiveMetricsEvaluator::eval` +
+first-conflict non-retryable `DataInvalid`. Refactor OverwriteFiles.validate to call it (BEHAVIOR-PRESERVING —
+Increment 3's 9 tests stay green, the proof).
+
+Plan:
+- [x] `transaction/snapshot.rs`: add the shared `pub(crate)` helper next to `added_data_files_after`. No
+      behavior change to existing functions.
+- [x] `transaction/overwrite_files.rs`: refactor `validate` to call the helper (keep the flag-guard +
+      `effective_start`); Increment-3 tests unchanged + green = behavior-preserving proof.
+- [x] `transaction/row_delta.rs`: add fields `validate_no_conflicting_data_files: bool`,
+      `conflict_detection_filter: Option<Predicate>`, `validate_from_snapshot: Option<i64>` + builder methods;
+      override `validate` (flag-guard → `effective_start = validate_from_snapshot.or(starting_snapshot_id)` →
+      the shared helper). Update the module doc (drop `validateNoConflictingDataFiles` from deferred; note the
+      delete-file blocks remain).
+- [x] Tests (RowDelta, MemoryCatalog + real concurrent fast_append, mirroring Increment 3): no-concurrent → OK;
+      metrics-match → rejected non-retryable (names file); metrics-exclude → OK; flag OFF → snapshot isolation;
+      None filter → any concurrent add conflicts; `validate_from_snapshot` override. Mutation-pin the
+      include/exclude decision + the non-retryable kind. (OverwriteFiles tests double as the helper's pins.)
+- [x] Docs: GAP_MATRIX (RowDelta validateNoConflictingDataFiles 🟡), Roadmap, todo, lessons.
+- [x] Verify from repo root: build -p iceberg + workspace; lib ×2; transaction::; 3 interop; clippy; fmt.
+
+**Outcome (2026-06-08, Phase 3 Increment 4 — RowDelta `validateNoConflictingDataFiles` + shared conflict-check
+helper, BUILDER Opus):** `RowDelta` gained the SAME filter-based concurrent-commit conflict validation
+`OverwriteFiles` has, and because this was the 2nd use of the load-bearing safety logic it was FACTORED into a
+shared helper so the two checks cannot drift.
+- **Shared helper** (`transaction/snapshot.rs`, right next to `added_data_files_after`, nothing else in that
+  file touched — `added_data_files_after` is BYTE-IDENTICAL): `pub(crate) async fn
+  validate_no_conflicting_added_data_files(current: &Table, effective_start: Option<i64>, conflict_filter:
+  Option<&Predicate>, case_sensitive: bool) -> Result<()>`. It runs `added_data_files_after` → empty ⇒ `Ok`
+  → binds the filter to the table's current schema (`None` ⇒ `Predicate::AlwaysTrue`) → per added file
+  `InclusiveMetricsEvaluator::eval(&bound, file, true)` → first match ⇒ non-retryable
+  `Error::new(ErrorKind::DataInvalid, "Found conflicting files that can contain records matching {filter}:
+  {path}")` (filter rendered as `"true"` for `None`, else `Display`, exactly the Increment-3 wording).
+- **OverwriteFiles refactor (BEHAVIOR-PRESERVING):** `OverwriteFilesAction::validate` keeps its flag-guard +
+  `effective_start` computation and now delegates the walk+bind+eval+error to the shared helper (the inline
+  ~35 lines deleted; `Bind`/`BoundPredicate`/`InclusiveMetricsEvaluator`/`added_data_files_after`/`Error`/
+  `ErrorKind` imports removed from `overwrite_files.rs`). **Proof of behavior-preservation:** Increment 3's
+  9 OverwriteFiles conflict tests (+ the 9 core overwrite tests = 18 total) stayed GREEN unchanged.
+- **RowDelta feature:** added fields `validate_no_conflicting_data_files: bool` (default false),
+  `conflict_detection_filter: Option<Predicate>` (None), `validate_from_snapshot: Option<i64>` (None), all
+  init in `new()`; builder methods `validate_no_conflicting_data_files(self)`, `conflict_detection_filter(self,
+  Predicate)`, `validate_from_snapshot(self, i64)` (named exactly like OverwriteFiles). Overrode `validate` in
+  the `TransactionAction for RowDeltaAction` impl: `if !self.validate_no_conflicting_data_files { return Ok(()) }`
+  → `effective_start = self.validate_from_snapshot.or(starting_snapshot_id)` → the shared helper with
+  `self.conflict_detection_filter.as_ref()` and case-sensitive `true` (Java `isCaseSensitive()`; the action has
+  no such field — defaults to `true`, noted in the doc). Updated the module doc: dropped
+  `validateNoConflictingDataFiles` from the deferred list; the delete-file blocks
+  (`validateNoConflictingDeleteFiles`/`validateDataFilesExist`/`validateAddedDVs`) remain deferred (they need a
+  concurrent-DELETE-file enumeration helper that does not exist yet).
+- **Java lines verified** (`/tmp/iceberg-java-ref`): `BaseRowDelta.validate` L132-174 — the `validateNewDataFiles`
+  branch L155-157 calls `validateAddedDataFiles(base, startingSnapshotId, conflictDetectionFilter, parent)`, the
+  IDENTICAL call OverwriteFiles makes; `MergingSnapshotProducer.validateAddedDataFiles` L391-412 (build the
+  conflict iterable, throw "Found conflicting files that can contain records matching %s: %s" if any). The other
+  blocks I DEFERRED, confirmed against the source: `validateDataFilesExist` (L141-149, referenced-files),
+  `validateNewDeleteFiles`/`validateNoNewDeleteFiles` (L159-168), `validateNoConflictingFileAndPositionDeletes`
+  (L170/L181-193), `validateAddedDVs` (L172) — all need delete-file enumeration that does not exist yet.
+- **RowDelta test list (8 new, each pins a risk):**
+  1. `test_row_delta_validation_no_concurrent_commit_succeeds` — validation enabled, nothing concurrent ⇒ OK
+     (a race-free commit must not be blocked).
+  2. `test_row_delta_rejects_concurrent_added_file_matching_filter` — HEADLINE: concurrent file y bounds [60,70]
+     vs filter `y>=50` ⇒ REJECTED non-retryable, error names the file (lost/incorrect merge-on-read prevention).
+  3. `test_row_delta_allows_concurrent_added_file_excluded_by_filter` — concurrent file y bounds [10,20] below
+     `y>=50` ⇒ inclusive evaluator EXCLUDES ⇒ OK (no false conflict). The mutation-(a) target.
+  4. `test_row_delta_without_validation_allows_conflicting_concurrent_append` — flag OFF ⇒ snapshot isolation
+     unchanged / opt-in.
+  5. `test_row_delta_none_filter_treats_any_concurrent_add_as_conflict` — None filter ⇒ AlwaysTrue ⇒ a no-bounds
+     concurrent add conflicts (the conservative serializable default, opposite of "no check").
+  6. `test_row_delta_validate_from_snapshot_override_changes_concurrent_window` — `validate_from_snapshot(S0)`
+     widens the window to include S1's add ⇒ REJECTED (override genuinely shifts the boundary).
+  7. `test_row_delta_validate_from_snapshot_at_head_finds_no_conflict` — `validate_from_snapshot(S1=head)` ⇒
+     nothing concurrent ⇒ OK (the negative half).
+  8. `test_row_delta_rejects_concurrent_using_tx_captured_starting_snapshot` — NO override; the tx-captured
+     start surviving `do_commit`'s re-base is the only thing that detects the conflict (if the start were
+     re-read from the refreshed head the check would silently always pass).
+  All 8 simulate a REAL concurrent commit (a separate `fast_append` lands between txn-build and txn-commit, so
+  `do_commit` refreshes to the new head and runs `validate` against it). Data files carry y-column bounds via a
+  new `data_file_with_y_bounds(path, part, lo, hi)` helper (schema field id 2).
+- **Mutations run (each caught), incl. the cross-action one:** (a) invert the metrics decision in the SHARED
+  helper (`if !eval(...)`) → the EXCLUDE test fails for BOTH `transaction::overwrite_files` AND
+  `transaction::row_delta` (the cross-action proof the shared helper is load-bearing for both). (b) force
+  RowDelta's `validate` always-`Ok` → exactly its 4 rejection tests (#2/#5/#6/#8) fail, OK tests green. (c) make
+  the helper's conflict error retryable (`.with_retryable(true)`) → the `!err.retryable()` assertion fails AND
+  the retry loop visibly spins (0.06s → 1.57s, a kind/timing failure). All restored byte-identical; verified the
+  OverwriteFiles 9 conflict tests stay green after the refactor (behavior-preservation).
+- **Gate (all from repo root, pinned nightly):** `cargo build -p iceberg` ✅; `cargo build --workspace
+  --exclude iceberg-sqllogictest --all-targets` ✅; `cargo test -p iceberg --lib` ✅ TWICE (run1 1517 passed /
+  0 failed; run2 1517 passed / 0 failed — **new lib total 1517**, was 1509, +8 RowDelta conflict tests);
+  `cargo test -p iceberg --lib transaction::` ✅ (233 passed; `transaction::overwrite_files` 18/18 unchanged,
+  `transaction::row_delta` 19/19); 3 interop binaries ✅ (`interop_manage_snapshots` 4/4,
+  `interop_update_partition_spec` 4/4, `interop_update_schema` 4/4); `cargo clippy --workspace --exclude
+  iceberg-sqllogictest --all-targets -- -D warnings` ✅ (no warnings); `cargo fmt --all -- --check` ✅ (clean
+  after one `cargo fmt`).
+- **Scope:** touched ONLY `transaction/snapshot.rs` (ADDED the shared helper + 2 imports — `added_data_files_after`
+  unchanged), `transaction/overwrite_files.rs` (refactor `validate` to delegate), `transaction/row_delta.rs`
+  (feature + 8 tests), and docs (GAP_MATRIX, Roadmap, todo, lessons). No edits to
+  `inclusive_metrics_evaluator.rs` / `action.rs` / `replace_partitions.rs` / `predicate.rs` / `spec/` / `scan/`
+  / `arrow/` / Cargo / lockfiles. No on-disk format change. No commit, no branch switch, no push — work left on
+  `phase3-residual-eval`.
+- **UNSURE / flagged:** (1) The RowDelta conflict tests assert `add_deletes`-only commits with SYNTHETIC delete
+  files (no real parquet) — same as the existing RowDelta manifest/summary tests; the conflict check is on the
+  concurrently-added DATA files, independent of the delete-file payload, so synthetic delete files are
+  sufficient and faithful. (2) Java `BaseRowDelta`'s `conflictDetectionFilter` DEFAULTS to `Expressions.alwaysTrue()`
+  (not null) and is shared across ALL the validate blocks; our `None ⇒ AlwaysTrue` binding mirrors the default
+  for the data-file block, the only block we implement. (3) The non-ancestor `validate_from_snapshot` over-scan
+  divergence (Rust over-scans to root where Java throws) is inherited UNCHANGED from `added_data_files_after`
+  (Increment-6-flagged, Rust-STRICTER, over-reject-only) — not re-introduced here.

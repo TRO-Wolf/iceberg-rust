@@ -1794,3 +1794,39 @@ How to use it (see the manuals' §2):
   deferred" for OverwriteFiles (an under-claim) and the `mod.rs::overwrite_files()` ctor doc saying conflict
   validation is "not yet supported." Fixed all three (the only changes this review made). Recurring lesson:
   grep the capability name across Roadmap + the public-API ctor doc, not only the matrix.
+
+### 2026-06-08 (Increment 4 — RowDelta validateNoConflictingDataFiles + shared conflict-check helper, BUILDER Opus)
+- **DO extract a shared `pub(crate)` helper on the 2ND use of a load-bearing safety check, and PROVE the
+  refactor behavior-preserving with the EXISTING tests (don't write new pins for the refactor).** *Why:*
+  `RowDelta.validateNoConflictingDataFiles` is the IDENTICAL filter-based added-data-file conflict check as
+  `OverwriteFiles.validateNoConflictingData` (both = Java `MergingSnapshotProducer.validateAddedDataFiles`).
+  Per Rule-of-Three this is exactly the "extract on the 2nd use when the duplication is unmistakably the same
+  concept" case (no plausible divergence — the two leaf checks differ only in the action's flag/filter
+  plumbing, which STAYS in each action). Factored the walk+bind(None⇒AlwaysTrue)+per-file
+  `InclusiveMetricsEvaluator::eval`+first-conflict-non-retryable-`DataInvalid` into
+  `validate_no_conflicting_added_data_files(current, effective_start, conflict_filter, case_sensitive)` next to
+  `added_data_files_after`. The behavior-preservation PROOF is that Increment-3's 9 OverwriteFiles conflict
+  tests stayed GREEN unchanged after `OverwriteFiles::validate` was rewritten to delegate — a refactor that
+  needs new tests to validate it isn't behavior-preserving by definition. Keep the per-action flag-guard +
+  `effective_start = validate_from_snapshot.or(starting_snapshot_id)` in each action; only the shared mechanics
+  move.
+- **DO render the conflict-filter the same way in the shared helper as the inline code did, so the error
+  message + tests are unchanged across the refactor.** *Why:* the Increment-3 message rendered a `None` filter
+  as the literal `"true"` (`conflict_filter.map_or_else(|| "true".to_string(), |f| format!("{f}"))`,
+  `Predicate: Display`). The helper takes `Option<&Predicate>` and renders it identically, so the
+  `err.message().contains("conflicting files")` + file-path assertions in BOTH actions' tests pass verbatim —
+  no test churn, the strongest signal the extraction changed nothing observable.
+- **DO mutation-test a SHARED helper from BOTH consumers (the cross-action mutation).** *Why:* a shared safety
+  helper's load-bearing-ness must be proven for EVERY caller, not just one. Inverting the helper's
+  `InclusiveMetricsEvaluator::eval` decision (`if !eval(...)`) failed the EXCLUDE/no-false-conflict test in
+  BOTH `transaction::overwrite_files` AND `transaction::row_delta` simultaneously — the single mutation, two
+  failures, is the proof neither action's coverage is a gap and the helper can't silently rot for one caller.
+  (The action-local mutations — force RowDelta `validate` always-`Ok` → its 4 rejection tests fail; retryable
+  error kind → `!retryable()` fails + the retry loop spins 0.06s→1.57s — pin the per-action plumbing.)
+- **DO build the discriminating conflict-test data files WITH column bounds (`lower_bounds`/`upper_bounds` on
+  the filtered field id), reusing the OverwriteFiles `data_file_with_y_bounds` shape.** *Why:* the
+  include-vs-exclude decision is the `InclusiveMetricsEvaluator` reading the file's bounds against the
+  predicate; a file with NO bounds is always a (conservative) match, so it can only pin the None/AlwaysTrue
+  default, not the metrics path. A file with `y∈[60,70]` overlaps `y>=50` (match) and `y∈[10,20]` is below it
+  (exclude) — the two halves of the metrics decision. The bounds must be on the schema field id (here `y`=id 2),
+  and they survive the manifest round-trip into `added_data_files_after`.
