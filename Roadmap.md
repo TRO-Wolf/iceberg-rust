@@ -283,7 +283,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `UpdatePartitionSpec` ✅ (bidirectional interop landed 2026-06-07, surfacing+fixing the identity-only
   partition-name collision divergence); `ManageSnapshots` awaits the same interop treatment.**
 
-### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07; `PositionDeleteFileWriter` (RowDelta increment 5a) landed 2026-06-08)**
+### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07; `PositionDeleteFileWriter` (RowDelta increment 5a) + `RowDelta` action (5b) landed 2026-06-08 — the merge-on-read write→read chain is now end-to-end)**
 - **Goal:** the full commit/write surface beyond fast-append.
 - **Gates on:** Phase 1.
 - **Increment sequence (dependency, then value):** **1. `DeleteFiles`** (done 🟡 — delete data files by
@@ -305,7 +305,13 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `writer/base_writer/position_delete_writer.rs`: writes the Iceberg position-delete file
   (`file_path` id 2147483546, `pos` id 2147483545) with `content(PositionDeletes)`, Java-faithful
   write-as-given; round-trip + field-id tests prove read/Java consumability. Sub-sequence: 5a writer
-  [done], 5b `RowDelta` action + producer delete-manifest handling, 5c deletion-vector writer**),
+  [done], 5b `RowDelta` action + producer delete-manifest handling [**done 🟡 2026-06-08** —
+  `transaction/row_delta.rs`: `RowDeltaAction` adds data files + position/equality DELETE files in one
+  snapshot; `SnapshotProducer` gained delete-manifest support (`with_added_delete_files` +
+  `write_added_delete_manifest`, the `Deletes` writer; empty-commit precondition relaxed); added delete
+  entries inherit the new snapshot's seq so they apply to earlier data; dynamic op (Java
+  `BaseRowDelta.operation()`). THE CROWN-JEWEL test proves a scan drops the deleted rows after the row
+  delta — the full merge-on-read write→read chain], 5c deletion-vector writer**),
   8. multi-op transaction hardening + optimistic-concurrency retry on the real catalogs.
 - **Key deliverables:** merge append, `OverwriteFiles`, `ReplacePartitions`, `DeleteFiles` (🟡), `RowDelta`,
   `RewriteFiles`, `RewriteManifests`; finalize position-delete + deletion-vector writers; multi-op

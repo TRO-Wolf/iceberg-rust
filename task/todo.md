@@ -1750,3 +1750,68 @@ applied via `cargo fmt`). Files touched exactly the allowed set:
 `metadata_columns.rs` (constants already present — flagged), Cargo.toml/lockfiles. No commit. Row stays 🟡.
 **Deferred:** optional `row` column (id 2147483544); caller-side sorting (5b); the `RowDelta` action (5b) +
 DV writer (5c); Java interop round-trip (→ ✅). An Opus REVIEWER verifies next.
+
+### Phase 2 Increment 5b — RowDelta action + producer delete-manifest support (IN PROGRESS, 2026-06-08, BUILDER Opus)
+The merge-on-read write-commit core: add data files + add DELETE files (position/equality) in ONE snapshot,
+writing the producer's first DELETE manifest alongside the DATA manifest. New file
+`crates/iceberg/src/transaction/row_delta.rs`; producer delete-manifest support in
+`crates/iceberg/src/transaction/snapshot.rs`; wired into `transaction/mod.rs`.
+
+**Java rules verified against `/tmp/iceberg-java-ref` source:**
+- `BaseRowDelta.operation()` is DYNAMIC: `APPEND` (adds data, no delete files, no data deletes), `DELETE`
+  (adds delete files, no data files), else `OVERWRITE`. The add-deletes-only crown-jewel case → `DELETE`.
+  I mirror Java's dynamic op (the OverwriteFiles reviewer established "align to Java, not the brief's hint";
+  the brief's "it is OVERWRITE" is the both-add-data+add-deletes case). `update_snapshot_summaries` already
+  admits Append/Delete/Overwrite — no summary-allowlist edit needed.
+- `MergingSnapshotProducer.add(DeleteFile)` routes delete files into a DELETE manifest written via the
+  producer's delete-manifest writer; added delete entries inherit the new snapshot's seq at read time
+  (Added entries with no seq → inherited from the manifest-list entry's `added_snapshot_id`/seq), exactly
+  like added data files. So a delete file added now applies to EARLIER data (data_seq <= delete_seq).
+
+Plan:
+- [x] A. Producer: add `added_delete_files: Vec<DataFile>` to `SnapshotProducer`; new ctor param (or a
+      `with_added_delete_files`); `write_added_delete_manifest()` mirroring `write_added_manifest` but using
+      `new_manifest_writer(ManifestContentType::Deletes)`; push it in `manifest_file()` when non-empty.
+      Relax the empty-commit precondition to also count `added_delete_files`. Route added delete files
+      through `summary()`'s `add_file` (delete-content branch already in `SnapshotSummaryCollector`).
+- [x] B. `RowDeltaAction`: `add_data_files`/`add_deletes` + `set_commit_uuid`/`set_snapshot_properties`/
+      `set_key_metadata`. Validate: data files = `Data` content (reuse `validate_added_data_files`); delete
+      files = PositionDeletes/EqualityDeletes content (reject Data) + partition-spec match. Dynamic op via
+      `RowDeltaOperation`. Wire `Transaction::row_delta()` + mod/use.
+- [x] C. Summary: added data + added delete files + pos/eq delete counts via the collector (no
+      snapshot_summary.rs edit — `add_file` already branches on content type). Flagged: NOT touched.
+- [x] CROWN-JEWEL e2e: MemoryCatalog (LocalFsStorageFactory over tempdir) → create table → fast-append a
+      real parquet data file with known rows → `PositionDeleteFileWriter` produces a pos-delete file pointing
+      at specific rows → `row_delta().add_deletes([that file]).commit()` → SCAN → assert deleted rows ABSENT.
+- [x] Plus tests: delete manifest written with content==Deletes + referenced in manifest list; add data +
+      deletes in one RowDelta; add-deletes-only allowed; summary counts; added delete entry seq == new
+      snapshot seq (applies to earlier data); reject Data content in add_deletes; partition-spec mismatch.
+- [x] Docs: GAP_MATRIX RowDelta ❌→🟡 + position-delete writer note (end-to-end); Roadmap; this todo; lessons.
+- [x] Verify gate from repo root.
+
+**OUT OF SCOPE (deferred):** equality-delete WRITER end-to-end (focus crown-jewel on POSITION deletes);
+concurrent-commit conflict validation (`validateFromSnapshot`/`validateNoConflictingDataFiles`/
+`validateDeletedFiles`/`validateDataFilesExist`); the deletion-vector path (5c). RowDelta the COMMIT
+primitive is the deliverable.
+
+**Outcome (2026-06-08, Phase 2 Increment 5b, BUILDER Opus):** `RowDeltaAction` lands 🟡 — the merge-on-read
+write commit. New file `transaction/row_delta.rs`; `SnapshotProducer` (snapshot.rs) gained delete-manifest
+support (`added_delete_files` field + `with_added_delete_files` + `validate_added_delete_files` +
+`write_added_delete_manifest` via the existing `Deletes` writer arm; empty-commit precondition relaxed to
+count added delete files; added delete files routed through `summary()`'s `add_file`); wired
+`Transaction::row_delta()` + mod/use. **Operation dynamic** (Java `BaseRowDelta.operation()`: Append/Delete/
+Overwrite). **Added delete entries inherit the new snapshot's seq** (V2/V3 no-seq Added entries) so they
+apply to earlier data. **THE CROWN-JEWEL** `test_row_delta_position_deletes_drop_deleted_rows_from_scan`:
+real-FS MemoryCatalog → fast-append a real 5-row parquet data file → real position-delete file (5a writer) at
+positions {1,3} → `row_delta().add_deletes(...).commit()` → SCAN returns {10,30,50}, the deleted {20,40}
+ABSENT — the full write→read chain. **9 tests**; mutation-verified the crown jewel three ways (mangled
+positions, skipped delete manifest, seq-0 inheritance → resurrection). **`snapshot_summary.rs` NOT touched**
+(its `add_file` already branches on content type — flagged). **Verify (repo root, pinned nightly):** build
+clean; lib ×2 = **1399/0** both runs (was 1390 → +9); interop manage_snapshots/update_schema/
+update_partition_spec 4/4 each; clippy -D warnings clean; fmt --check clean (one reflow applied). Files
+touched exactly the allowed set: `transaction/row_delta.rs` (new), `transaction/snapshot.rs`,
+`transaction/mod.rs`, GAP_MATRIX, Roadmap, todo, lessons. **NOT touched:** `snapshot_summary.rs`,
+Cargo.toml/lockfiles. No commit. **Deferred:** equality-delete WRITER e2e (crown jewel = POSITION deletes);
+`removeRows`/`removeDeletes`; conflict validation (`validateFromSnapshot`/`validateNoConflictingDataFiles`/
+`validateNoConflictingDeleteFiles`/`validateDeletedFiles`/`validateDataFilesExist`); DV path (5c); data-level
+Java interop. An Opus REVIEWER verifies next.

@@ -125,6 +125,12 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    // DELETE files (position / equality) this snapshot adds, written into a DELETE manifest alongside
+    // the DATA manifest (Java `MergingSnapshotProducer.add(DeleteFile)`). The merge-on-read write path
+    // (`RowDelta`) populates this; add-only data operations (fast append, overwrite-by-files) leave it
+    // empty. Their entries inherit the new snapshot's sequence number at read time, exactly like added
+    // data files (so a delete added now applies to earlier data: `data_seq <= delete_seq`).
+    added_delete_files: Vec<DataFile>,
     // Data files removed by this snapshot, resolved against the current snapshot at commit time. Held
     // so the snapshot summary can reflect the deleted file/record counts (Java overwrite/delete summary).
     // Empty for add-only operations such as fast append.
@@ -150,9 +156,48 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            added_delete_files: vec![],
             removed_data_files: vec![],
             manifest_counter: (0..),
         }
+    }
+
+    /// Attach the DELETE files (position / equality) this snapshot adds. They are written into a
+    /// DELETE manifest alongside the DATA manifest in the same snapshot (Java
+    /// `MergingSnapshotProducer.add(DeleteFile)`). Used by the merge-on-read write path (`RowDelta`).
+    pub(crate) fn with_added_delete_files(mut self, added_delete_files: Vec<DataFile>) -> Self {
+        self.added_delete_files = added_delete_files;
+        self
+    }
+
+    /// Validate the added DELETE files (Java `RowDelta.addDeletes` / `MergingSnapshotProducer.add`):
+    /// each must be a `PositionDeletes` or `EqualityDeletes` content file (a `Data` file is rejected —
+    /// it must be added as a row, not a delete), and its partition spec must match the table default.
+    pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
+        for delete_file in &self.added_delete_files {
+            match delete_file.content_type() {
+                crate::spec::DataContentType::PositionDeletes
+                | crate::spec::DataContentType::EqualityDeletes => {}
+                crate::spec::DataContentType::Data => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Only position-delete or equality-delete content is allowed for added delete files",
+                    ));
+                }
+            }
+            if self.table.metadata().default_partition_spec_id() != delete_file.partition_spec_id {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Delete file partition spec id does not match table default partition spec id",
+                ));
+            }
+            Self::validate_partition_value(
+                delete_file.partition(),
+                self.table.metadata().default_partition_type(),
+            )?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -459,6 +504,43 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    /// Write a DELETE manifest for the added delete files and return its [`ManifestFile`] for the
+    /// manifest list. Mirrors [`write_added_manifest`](Self::write_added_manifest) but uses the
+    /// `Deletes` manifest writer (Java `MergingSnapshotProducer` writes added delete files into a
+    /// delete manifest). The entries are `Added` with no sequence number for V2/V3 so they inherit the
+    /// new snapshot's sequence number at read time — exactly the mechanism added data files use — which
+    /// makes the delete apply to earlier data (`data_seq <= delete_seq`).
+    async fn write_added_delete_manifest(&mut self) -> Result<ManifestFile> {
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        if added_delete_files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added delete files found when writing an added delete manifest file",
+            ));
+        }
+
+        let snapshot_id = self.snapshot_id;
+        let format_version = self.table.metadata().format_version();
+        let manifest_entries = added_delete_files.into_iter().map(|delete_file| {
+            let builder = ManifestEntry::builder()
+                .status(crate::spec::ManifestStatus::Added)
+                .data_file(delete_file);
+            if format_version == FormatVersion::V1 {
+                // Position/equality deletes are V2+ concepts; a V1 table has no delete manifests.
+                builder.snapshot_id(snapshot_id).build()
+            } else {
+                // For format version > 1, set the snapshot id + sequence number at inherited time so the
+                // manifest does not need rewriting on a commit retry (same as added data files).
+                builder.build()
+            }
+        });
+        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
+        for entry in manifest_entries {
+            writer.add_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -469,19 +551,22 @@ impl<'a> SnapshotProducer<'a> {
         // manifest rewrite without re-resolving.
         let delete_files = std::mem::take(&mut self.removed_data_files);
 
-        // Assert the new snapshot contributes content: added files, deleted files, or added snapshot
-        // properties. A delete-only commit (deletes, no adds) is allowed; a truly-empty commit is not.
+        // Assert the new snapshot contributes content: added data files, added DELETE files, removed
+        // (deleted) data files, or added snapshot properties. An add-deletes-only commit (delete files,
+        // no data files) is allowed (the merge-on-read `RowDelta` path); a delete-only data commit
+        // (rewrite data manifests, no adds) is allowed; a truly-empty commit is not.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
         if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
             && delete_files.is_empty()
             && self.snapshot_properties.is_empty()
         {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files, deleted data files, or added snapshot properties found when write a manifest file",
+                "No added data files, added delete files, deleted data files, or added snapshot properties found when write a manifest file",
             ));
         }
 
@@ -494,10 +579,16 @@ impl<'a> SnapshotProducer<'a> {
             .process_deletes(existing_manifests, &delete_files)
             .await?;
 
-        // Process added entries.
+        // Process added data entries (DATA manifest).
         if !self.added_data_files.is_empty() {
             let added_manifest = self.write_added_manifest().await?;
             manifest_files.push(added_manifest);
+        }
+
+        // Process added DELETE entries (DELETE manifest) — merge-on-read deletes added in this snapshot.
+        if !self.added_delete_files.is_empty() {
+            let added_delete_manifest = self.write_added_delete_manifest().await?;
+            manifest_files.push(added_delete_manifest);
         }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
@@ -690,6 +781,18 @@ impl<'a> SnapshotProducer<'a> {
         for data_file in &self.added_data_files {
             summary_collector.add_file(
                 data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        // Reflect added DELETE files (position / equality) in the summary. `add_file` branches on the
+        // file's content type and increments the added-delete-file + added-position/equality-delete
+        // counters (Java `MergingSnapshotProducer.add(DeleteFile)` → the delete-file summary). Empty for
+        // operations that add no delete files.
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );

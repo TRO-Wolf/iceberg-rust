@@ -59,6 +59,7 @@ mod manage_snapshots;
 mod overwrite_files;
 mod replace_partitions;
 mod rewrite_files;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -83,6 +84,7 @@ use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 use crate::transaction::overwrite_files::OverwriteFilesAction;
 use crate::transaction::replace_partitions::ReplacePartitionsAction;
 use crate::transaction::rewrite_files::RewriteFilesAction;
+use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
@@ -194,6 +196,17 @@ impl Transaction {
         files_to_add: impl IntoIterator<Item = crate::spec::DataFile>,
     ) -> RewriteFilesAction {
         RewriteFilesAction::new().rewrite_files(files_to_delete, files_to_add)
+    }
+
+    /// Creates a row-delta action (the merge-on-read write commit): add data files AND add row-level
+    /// DELETE files (position / equality) in ONE snapshot (Java `BaseRowDelta`). The added delete
+    /// files are written into a DELETE manifest alongside the DATA manifest, and inherit the new
+    /// snapshot's sequence number so they apply to data from earlier snapshots. The recorded operation
+    /// is dynamic, matching Java `BaseRowDelta`: adds-data-only → `Append`, adds-deletes-only →
+    /// `Delete`, both → `Overwrite`. Concurrent-commit conflict validation and the deletion-vector
+    /// write path are not yet supported.
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
     }
 
     /// Creates replace sort order action.

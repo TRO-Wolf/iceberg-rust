@@ -1046,3 +1046,100 @@ How to use it (see the manuals' §2):
   does not advertise an ordering it doesn't enforce — the dangerous case. The optional `row` column
   (field-id `MAX-103` / `2147483544`) and `referenced_data_file` are correctly out of scope (documented, not
   silently wrong).
+
+### 2026-06-08 (Phase 2 Increment 5b — RowDelta action + producer delete-manifest support, BUILDER Opus)
+- **DO add producer delete-manifest support as an ADDITIVE second add-path, parallel to
+  `write_added_manifest`, not by overloading the data path.** *Why:* `SnapshotProducer::manifest_file()`
+  already wrote a DATA manifest from `added_data_files`; merge-on-read needs a SECOND manifest with
+  `ManifestContentType::Deletes` from a NEW `added_delete_files: Vec<DataFile>` field. The clean shape is
+  `with_added_delete_files()` (a builder setter, so existing `SnapshotProducer::new` callers are
+  untouched) + `write_added_delete_manifest()` (a byte-for-byte mirror of `write_added_manifest` that calls
+  `new_manifest_writer(ManifestContentType::Deletes)` — the producer ALREADY had the `Deletes` arm wired to
+  `build_v2_deletes`/`build_v3_deletes`) + a `manifest_file()` push when non-empty. The producer was built
+  generic enough that data-only, delete-only, or both fall out of the same `commit()` with no operation
+  branching. Keep the V1 arm (`builder.snapshot_id(id).build()`) for symmetry even though V1 has no delete
+  manifests — it never fires (validation rejects delete content before a V1 table reaches it).
+- **DO relax the empty-commit precondition to count `added_delete_files`, and verify the seq-inheritance
+  path is the SAME as added data files.** *Why:* the producer's `manifest_file()` guard rejected a commit
+  with no added DATA files + no removed files + no props — which would wrongly reject an add-deletes-only
+  `RowDelta` (the crown-jewel case). Add `&& self.added_delete_files.is_empty()` to the guard. The added
+  delete entries are `Added` with NO sequence number for V2/V3 (`builder.build()`, not
+  `.snapshot_id(id).build()`), so the manifest-list reader inherits the new snapshot's seq at read time —
+  IDENTICAL to added data files. This is load-bearing: a delete file's seq MUST exceed the target data's
+  seq for the read side (`delete_file_index.rs`: pos-delete applies iff `delete_seq >= data_seq`) to apply
+  it. Mutation-verified BOTH ways: a seq-0 stamp fails the dedicated seq test AND the crown jewel (the
+  seq-0 delete no longer applies to seq-1 data → the deleted rows RESURRECT in the scan).
+- **DO mirror Java `BaseRowDelta.operation()` DYNAMICALLY (Append / Delete / Overwrite), classified on
+  the REQUESTED add sets, not statically `Overwrite`.** *Why:* the brief said "operation is OVERWRITE" but
+  `core/BaseRowDelta.operation()` returns APPEND (adds data, no delete files, no data deletes), DELETE
+  (adds delete files, no data files), else OVERWRITE — so the crown-jewel add-deletes-only case is DELETE,
+  not Overwrite. The OverwriteFiles reviewer already established "align to the Java source, not the brief's
+  hint" for the dynamic-operation question. `update_snapshot_summaries` already admits Append/Delete/
+  Overwrite, so NO summary-allowlist edit was needed (unlike RewriteFiles, which had to add `Replace`).
+- **DO route added delete files through `SnapshotSummaryCollector::add_file` and DON'T touch
+  `snapshot_summary.rs` — its `add_file` already branches on content type.** *Why:* the brief flagged
+  `snapshot_summary.rs` as edit-only-if-needed. The collector's `add_file`/`remove_file` ALREADY handle
+  `PositionDeletes`/`EqualityDeletes` (incrementing `added_delete_files` + `added_pos_delete_files` +
+  `added_pos_deletes` / the equality siblings) — so wiring a `for delete_file in &self.added_delete_files
+  { summary_collector.add_file(...) }` loop in the producer's `summary()` is the whole change; the summary
+  emits `added-delete-files`/`added-position-delete-files`/`added-position-deletes` for free. Verified by a
+  test asserting those exact properties. Flagged: `snapshot_summary.rs` NOT touched.
+- **DO build the crown-jewel end-to-end test on a REAL-FS `MemoryCatalog`
+  (`MemoryCatalogBuilder::default().with_storage_factory(Arc::new(LocalFsStorageFactory))` over a tempdir
+  warehouse) so the scan's FileIO reads the data + delete parquet files you wrote.** *Why:* the default
+  `MemoryCatalog` storage is in-memory; a position-delete file written to the local FS would be invisible
+  to the scan. Write the data file via the bare `ParquetWriterBuilder` + the table's `FileIO` under
+  `{location}/data/`, finish its `DataFileBuilder` with `content(Data)` + partition; write the delete file
+  via the 5a `PositionDeleteFileWriter` (with a `PartitionKey` so the delete file's partition MATCHES the
+  data file's — the `delete_file_index` keys pos-deletes by `(partition, spec_id)` AND requires
+  `delete_seq >= data_seq`); the delete parquet's `file_path` column rows MUST be the exact data-file path
+  (the loader keys the delete vector by that path). Then `scan().select(["y"]).to_arrow()` and assert the
+  surviving y-values. The crown jewel is the ONLY test that proves the write path produces delete files the
+  read side actually honors — a manifest-shape test alone cannot (it never reads a row).
+- **DO bring `FileWriterBuilder` (not just `FileWriter`) into scope to call `ParquetWriterBuilder::build`.**
+  *Why:* `build()` is on the `FileWriterBuilder` trait; `write()`/`close()` are on `FileWriter`. Importing
+  only `FileWriter` gives `no method named build` + three `type annotations needed` errors (the build call's
+  type can't be inferred without the trait). Import both.
+- **DO assert a row-delta's added-manifest shape by COLLECTING live file paths keyed by manifest content
+  type, not by `manifest_file.has_added_files()`.** *Why:* `existing_manifest` carries EVERY prior manifest
+  forward (a row delta only adds), and the fast-appended data manifest also has `has_added_files() == true`
+  — so counting `Data` manifests with added files gives 2, not 1. Assert instead that the new data file's
+  path appears in a DATA manifest and the delete file's path appears in the (exactly one) DELETE manifest;
+  that is the real signal and is robust to carried-forward manifests.
+
+### 2026-06-08 — RowDelta (increment 5b) REVIEW: seq-inheritance + forward-application verification
+- **The position-delete forward-application negative is protected by TWO independent mechanisms, not
+  just the seq guard — know this before claiming a test "isolates" the sequence number.** A position
+  delete added at seq N must NOT apply to data added LATER (seq > N; spec line 1071: applies only when
+  `data_seq <= delete_seq`). Two things enforce it: (1) the `delete_file_index` seq guard
+  (`delete.sequence_number() >= Some(seq_num)` for pos-deletes, line ~204) decides which delete files
+  are *candidates* for a data file; (2) `arrow/delete_filter.rs` keys the loaded delete VECTOR by the
+  data-file path read from the delete file's `file_path` column (`upsert_delete_vector(data_file_path,
+  ...)`), so a delete naming D1's path produces a vector under D1's path and the scan of D2 looks up
+  D2's path → empty. Mutation-verified: forcibly removing the seq guard (mechanism 1) did NOT fail the
+  end-to-end forward test, because mechanism 2 still spares D2. The e2e test
+  (`test_row_delta_position_delete_does_not_apply_to_later_data`) is a valid behavioral pin (D2 stays
+  intact through the real scan even when it shares D1's partition AND has rows at the deleted positions)
+  but is NOT a clean isolation of the seq guard — the index-level seq semantics are unit-pinned
+  separately in `delete_file_index.rs` (`test_delete_file_index_partitioned`/`unpartitioned`).
+- **The seq-0 inheritance mutation is the decisive corruption probe — it fails BOTH the crown jewel and
+  the forward test.** Forcing `builder.sequence_number(0)` on the added delete entry (instead of leaving
+  it unassigned for V2/V3 inheritance) makes `data_seq(1) <= delete_seq(0)` FALSE → the position delete
+  never applies → the deleted rows RESURRECT (scan returns all 5). This proves the inheritance is
+  genuinely load-bearing: the delete entry MUST be written `Added` with no explicit seq so the
+  manifest-list writer stamps `next_seq_num` (= the new snapshot's seq) via
+  `assign_sequence_numbers` → `inherit_data` at read time — identical to added DATA files.
+- **Java `BaseRowDelta.operation()` APPEND branch has `&& !deletesDataFiles()` that the Rust two-branch
+  form omits — this is SOUND only because removeRows/removeDeletes are deferred.** Java:
+  `addsDataFiles() && !addsDeleteFiles() && !deletesDataFiles() → APPEND`. The Rust RowDelta never
+  removes files (its `delete_files`/`delete_entries` return empty), so `deletesDataFiles()` is always
+  false and the simplified `adds_data && !adds_deletes → Append` is equivalent for this increment's
+  surface. When removeRows/removeDeletes land, the third condition MUST be added or a data-add +
+  data-remove row delta would wrongly record Append instead of Overwrite. Added
+  `test_row_delta_add_data_only_records_append` (the previously-uncovered op branch) — mutation-verified.
+- **The added-delete `validate_added_delete_files` requires the DEFAULT partition spec id, stricter than
+  Java `add(DeleteFile)` (which only checks `spec(file.specId()) != null`, i.e. the spec EXISTS).** This
+  matches the existing `validate_added_data_files` convention and the producer's single-default-spec
+  manifest writer — a consistent, pre-existing producer limitation (non-default-spec writes are a broader
+  producer change), NOT a RowDelta regression. Acceptable for this increment; flag if Java-faithful
+  multi-spec delete commits are needed later.
