@@ -1064,4 +1064,92 @@ the allowed set: `crates/iceberg/src/spec/snapshot.rs` (fix + 4 tests), `docs/pa
         Java-omitted (vs always-written) must be checked per field against the Avro schema's field default
         before flipping — do not assume the snapshot `sequence-number` omit-when-≤0 pattern carries over.
         Each fix is an Avro field default, not a `#[serde(default)]`.
+        **→ CLOSED by Increment 11 (2026-06-07): all six Avro-path fields VERIFIED already-correct + pinned
+        with mutation-verified regression tests; NO production change needed. See Increment 11 below.**
       Out of scope for the snapshot-only Increment 10; each needs its own Java-parser check + test.
+      **Residual after Increment 11 (table-metadata `last-sequence-number`, NOT Avro):** still unfixed; it is
+      a non-Java robustness gap only (Java always writes it for V2+ — see the first bullet above). Low
+      priority; fix shape `#[serde(default)]` on `last_sequence_number` if a non-Java reader case ever needs it.
+
+### Increment 11 — Sibling Avro default-to-0 read fields (manifest / manifest-list), verify-then-fix (BUILDER Opus, 2026-06-07)
+Resolve the Increment-10 sibling follow-up for the Avro-path fields. `last-sequence-number` is OUT OF SCOPE
+(Java always writes it for V2+ — verified by the Increment-10 reviewer; only a non-Java/hand-written
+robustness gap). For EACH spec-mandated default-to-0 field on the manifest-list / manifest-entry / data-file
+READ path, prove empirically whether Rust is strict-and-Java-omits, then fix the real gaps; pin the rest
+with a regression test.
+
+**Spec read rules (`format/spec.md` 1980-1985):** manifest-list `sequence_number`/`min_sequence_number`/
+`content` default-to-0; manifest-entry `sequence_number`/`file_sequence_number` default-to-0; data-file
+`content` default-to-0 (=Data). Java side: `DataFile.CONTENT` is `optional(134)` (absent → null →
+`FileContent.DATA`); `ManifestEntry.SEQUENCE_NUMBER`/`FILE_SEQUENCE_NUMBER` are `optional(3/4)` (absent →
+inherit); the manifest-LIST V1 schema (`V1Metadata`) has no content/seq fields at all.
+
+**Static findings (pre-empirical):**
+- manifest-list `_serde::ManifestFileV2`/`ManifestFileV3` ALREADY carry `#[serde(default = ...)]` on
+  `content` (→0=Data), `sequence_number` (→0), `min_sequence_number` (→0). V1 list → `ManifestFileV1::
+  try_into` hard-codes all three to 0. ⇒ likely already-fine; needs an empirical "absent reads as 0" pin.
+- data-file `_serde::DataFileSerde.content` has `#[serde(default)]` (→0=Data). V1 data-file schema omits
+  `content` entirely; V1 entry → `ManifestEntryV1::try_into` hard-codes seq/file-seq to `Some(0)`.
+- manifest-entry `_serde::ManifestEntryV2.sequence_number`/`file_sequence_number` are `Option<i64>` (absent
+  → `None` → inheritance via `inherit_data`). V2 reader-schema `content` field-id 134 carries
+  `with_initial_default(Int(0))` → Avro reader-schema `default: 0`.
+
+**The load-bearing empirical question:** the manifest read path is Avro (`AvroReader::with_schema(reader,
+bs)`), which resolves the file's WRITER schema against the READER schema BEFORE serde. So a `#[serde(default)]`
+only fires if apache-avro hands serde a record with the field MISSING. Must verify per field whether a
+writer schema that OMITS the field (the way a Java V1 writer emits) actually resolves to the default — vs
+apache-avro erroring on the schema-resolution mismatch. Build hand-constructed minimal Avro inputs and feed
+the real Rust reader.
+
+Plan:
+- [x] 1. Manifest-LIST path probe: wrote a V1-shaped manifest list via `ManifestListWriter::v1` (the V1
+      `manifest_file` Avro schema has NO content/sequence_number/min_sequence_number columns), parsed it with
+      `parse_with_version(.., V2)` and `(.., V3)`. ALL THREE read back as 0 (content=Data). Evidence: the V2/V3
+      manifest-list reader uses `Reader::new(bs)` (embedded writer schema, NO schema resolution), so serde
+      sees the omitted fields and the `#[serde(default = ...)]` on `_serde::ManifestFileV2`/`V3` fires.
+      Mutation-verified: stripping the three defaults from `ManifestFileV2` makes the V2 read fail "missing
+      field `content`". ⇒ ALREADY-FINE, now pinned.
+- [x] 2. Manifest-ENTRY / data-file path probe: wrote a genuine V1 manifest (`build_v1`, format-version=1)
+      with a data file, parsed via `Manifest::parse_avro`. Entry `sequence_number=Some(0)`,
+      `file_sequence_number=Some(0)`, data-file `content=Data`. Evidence: the V1 reader uses
+      `manifest_schema_v1` (no content/seq/file-seq columns) + `ManifestEntryV1::try_into` (hard-codes
+      `Some(0)`/`Some(0)`) and `DataFileSerde.content` `#[serde(default)]` (V1 data-file schema omits
+      `content`, so serde sees it absent). Mutation-verified: stripping `#[serde(default)]` from
+      `DataFileSerde.content` fails this V1-manifest test "missing field `content`" (the EXISTING
+      `test_data_file_serialize_deserialize_v1_data_on_v2_reader` does NOT catch it — it reads via the V2
+      reader schema, whose `content` field-id 134 carries the Avro reader-schema default from
+      `with_initial_default(Int(0))`, which masks the serde default). ⇒ ALREADY-FINE, now pinned.
+      Manifest-entry V2 reader: `sequence_number`/`file_sequence_number` are `Option<i64>` (Java
+      `optional(3/4)`) → absent reads as `None` → inheritance via `inherit_data`; no absent-required case
+      exists at the V2 reader (Java always writes them, as null for inheritance). Matches Java exactly.
+- [x] 3. NO production fix needed — every field was already lenient. Added regression pins only.
+- [x] 4. Tests added (3): `spec/manifest_list.rs::test_v1_shaped_manifest_list_read_as_v2_defaults_absent_
+      fields_to_zero` + `..._as_v3_...` (V1-shaped list → content/seq/min-seq all 0); `spec/manifest/writer.rs::
+      test_v1_manifest_read_defaults_sequence_numbers_and_content_to_zero` (genuine V1 manifest → entry seq/
+      file-seq = Some(0), data-file content = Data). Each names the Java-V1-read risk. Both mutation-verified.
+- [x] 5. Docs: GAP_MATRIX "Manifest + manifest-list read/write" row (default-to-0 reads VERIFIED + pinned) +
+      headline gap #2 reconciled; Roadmap snapshot reconciled; closed the Increment-10 Avro sibling follow-up;
+      left the table-metadata `last-sequence-number` residual (non-Avro, non-Java-blocking); lesson appended.
+- [x] 6. Verify gate (repo root): build clean; lib ×2 = 1344/0 both runs (was 1341 → +3); interop
+      manage_snapshots/update_schema/update_partition_spec all 4/4; clippy -D warnings clean; fmt --check clean.
+
+**Outcome (2026-06-07, Increment 11, BUILDER Opus):** the Increment-10 Avro sibling default-to-0 follow-up is
+**CLOSED** — verify-then-fix found ZERO real gaps: all six Avro-path fields (manifest-list
+`content`/`sequence_number`/`min_sequence_number`; manifest-entry `sequence_number`/`file_sequence_number`;
+data-file `content`) were ALREADY lenient and correctly default to 0 / content=data when a Java V1 (list)
+omits them. Each was proved empirically per field (V1-shaped list read as V2/V3; genuine V1 manifest read via
+`parse_avro`) and the mechanisms identified: manifest-list defaults via `#[serde(default = ...)]` on
+`ManifestFileV2`/`V3` (the V2/V3 list reader is `Reader::new`, no Avro resolution, so serde defaults fire);
+manifest-entry seq/file-seq via `ManifestEntryV1::try_into` hard-coding `Some(0)`; data-file `content` via
+`DataFileSerde.content` `#[serde(default)]` (V1 manifest reads with `manifest_schema_v1`, no content column).
+The gap was purely test coverage of the absent-field-at-read case — added 3 mutation-verified regression
+tests (no production code change). **Key finding:** the EXISTING `test_data_file_serialize_deserialize_v1_
+data_on_v2_reader` did NOT pin the data-file `content` serde default (it reads via the V2 reader schema, whose
+field-id-134 `content` has an Avro reader-schema `default: 0` from `with_initial_default` that masks the serde
+default); the new genuine-V1-manifest test is the one that pins it (mutation-verified). **Residual (tracked):**
+table-metadata `last-sequence-number` (NOT an Avro field; out of this increment's scope; Java always writes it
+for V2+ so it never bites Java interop — robustness-only). Files touched exactly the allowed set:
+`crates/iceberg/src/spec/manifest_list.rs` (+2 tests + a helper), `crates/iceberg/src/spec/manifest/writer.rs`
+(+1 test), `docs/parity/GAP_MATRIX.md`, `Roadmap.md`, `task/todo.md`, `task/lessons.md`. NO production `.rs`
+behavior change; NO Cargo/lockfile edits; no `#[ignore]`; no bare `.unwrap()` in non-test paths. An Opus
+REVIEWER verifies next.

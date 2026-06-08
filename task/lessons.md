@@ -616,3 +616,40 @@ How to use it (see the manuals' §2):
   do not assume the snapshot omit-when-≤0 pattern carries over. Sharpened the Increment-10 follow-up to say
   this so the next agent neither over-prioritizes `last-sequence-number` as interop-critical nor assumes the
   Avro fields are trivially the same shape.
+
+### 2026-06-07 (Increment 11 — Avro manifest default-to-0 reads, verify-then-fix, BUILDER Opus)
+- **DO distinguish the TWO manifest read mechanisms before deciding what a default-to-0 read depends on:**
+  (a) the manifest-LIST V2/V3 reader uses `apache_avro::Reader::new(bs)` — the EMBEDDED writer schema, NO
+  reader-schema resolution — so a field a V1 writer omitted reaches serde MISSING and a `#[serde(default)]`
+  on the `_serde` struct fires; (b) the manifest-ENTRY reader uses `AvroReader::with_schema(reader, bs)` —
+  the writer schema IS resolved against the reader schema, so a field with an Avro reader-schema `default`
+  (produced from `NestedField::with_initial_default`, e.g. data-file `content` field-id 134) is filled by
+  apache-avro BEFORE serde ever sees the record, and the `#[serde(default)]` on that same `_serde` field is
+  never exercised on that path. Knowing which mechanism a given reader uses tells you which test actually
+  pins the leniency. *Why it bites:* the EXISTING `test_data_file_serialize_deserialize_v1_data_on_v2_reader`
+  appears to pin the data-file `content` serde default but does NOT — it reads via the V2 reader schema
+  (Avro default masks the serde default). Stripping `#[serde(default)]` from `DataFileSerde.content` leaves
+  that test GREEN; only a GENUINE V1-manifest read (`build_v1` → `parse_avro`, which uses `manifest_schema_v1`
+  that has no `content` column at all) makes serde see content absent and turns the serde default load-bearing.
+- **DO build the omitted-field input with the REAL V1 writer, not a hand-edited struct, when verifying an
+  absent-field-at-read default.** *Why:* the existing `test_manifest_file_v1_to_v2_projection` /
+  `test_data_file_serde_v1_field_defaults` only exercise the `ManifestFileV1::try_into` / `DataFileSerde::
+  try_into` CONVERSION on an in-memory struct — they never go through the Avro reader, so they cannot catch
+  a reader-side regression (a wrong reader schema, a dropped `#[serde(default)]` reachable on the V1 path,
+  an apache-avro resolution change). Writing a V1-shaped Avro file via `ManifestListWriter::v1` /
+  `ManifestWriterBuilder::build_v1` and reading it back through the production reader
+  (`parse_with_version`/`parse_avro`) is the only test that pins the END-TO-END "read what Java's V1 writer
+  emitted" behavior the spec mandates (`format/spec.md` 1980-1985).
+- **DO honor verify-then-fix: an increment can legitimately land ZERO production changes.** *Why:* the brief
+  said "do NOT assume every field is broken." All six Avro default-to-0 fields were already correct; the real
+  deliverable was per-field EMPIRICAL proof + mutation-verified regression tests, plus an honest "verified
+  already-fine, no production change" doc trail. Resist the pull to "fix" a working reader to feel productive
+  — adding a redundant `.unwrap_or(0)` over an already-defaulted field is dead code that muddies the next
+  audit. Pin the behavior, document the proof, close the follow-up.
+- **DO use a throwaway `println!`-probe test to settle an empirical reader question, then convert it to a
+  named regression test (never leave the probe).** *Why:* the load-bearing unknown was "does apache-avro
+  error on a writer-schema-omits-field, or default it?" A 30-line probe answered it definitively
+  (`Ok(... content: Data, sequence_number: 0 ...)`); I then rewrote it as
+  `test_v1_shaped_manifest_list_read_as_v2_defaults_absent_fields_to_zero` with real asserts + a risk-named
+  doc comment, and mutation-verified it. A probe that ships is an untested assertion; a probe deleted without
+  a replacement loses the evidence.

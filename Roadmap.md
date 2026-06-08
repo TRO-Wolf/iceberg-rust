@@ -85,9 +85,12 @@ layers are removed in Phase 0.
    a Rust read divergence (the V2/V3 snapshot reader required `sequence-number` while the spec and Java
    default an absent value to 0 on read) — **FIXED 2026-06-07** with `#[serde(default)]` on
    `_serde::SnapshotV2`/`SnapshotV3.sequence_number`, so Rust now reads the seq-0 V1→V2-upgrade-carryover
-   tables Java emits. (Sibling spec default-to-0 read fields — `last-sequence-number`, manifest-list
-   `sequence-number`/`min-sequence-number`, manifest/manifest-list `content` — remain a future
-   reader-robustness pass.)
+   tables Java emits. The sibling spec default-to-0 read fields on the **Avro manifest / manifest-list path**
+   (manifest-list `content`/`sequence-number`/`min-sequence-number`; manifest-entry `sequence_number`/
+   `file_sequence_number`; data-file `content`) were **VERIFIED already-correct and pinned 2026-06-07**
+   (per-field empirical proof + mutation-verified regression tests — no production change needed; the readers
+   were already lenient, the gap was test coverage). The only residual is table-metadata
+   `last-sequence-number`, which Java ALWAYS writes for V2+ — a non-Java/hand-written robustness gap only.
    **With all three Phase-1 evolution capabilities now interop-proven, the next move is the V3 groundwork
    (row-lineage fields; the remaining `MIN_FORMAT_VERSIONS` types — `variant`/`unknown`/`geometry`/
    `geography` — each a one-line `min_format_version` arm when the type lands).** The live, increment-level
