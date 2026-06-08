@@ -1517,13 +1517,23 @@ How to use it (see the manuals' §2):
   shared helper and let each table content-filter (`FilesTableKind`): dedup-by-path then filter == filter then
   dedup (content is intrinsic to a manifest), so one all-content source == Java's per-content
   `reachableManifests(dataManifests|deleteManifests|allManifests)`.
-- **FLAG (pre-existing, NOT this increment's): `iceberg-datafusion` does not compile against the
-  `MetadataTableType` enum.** *Why:* `crates/integrations/datafusion/src/table/metadata_table.rs` matches
-  `MetadataTableType` for `schema()`/`scan()` but only handles `Snapshots`/`Manifests` — it is already
-  non-exhaustive over the `Files`/`DataFiles`/`DeleteFiles`/`Entries`/`History`/`Refs`/`MetadataLogEntries`/
-  `Partitions` variants prior increments (1-4) added (E0004). Verified by `git stash`-ing the Increment-5a
-  inspect changes and building `-p iceberg-datafusion` at HEAD → SAME errors. The Phase-3 inspection gate is
-  scoped `-p iceberg`, which never builds the datafusion crate, so the regression slipped through every
-  inspection increment. Adding the 4 `all_*` variants extends the already-broken match — it does not CAUSE
-  the breakage. A human should add the missing arms (or a `_ =>` returning `FeatureUnsupported`) in that one
-  datafusion file as a standalone fix, and consider widening the inspection gate to `-p iceberg-datafusion`.
+- **FIXED (2026-06-08, orchestrator, post-5a): `iceberg-datafusion` non-exhaustive `MetadataTableType` match
+  → workspace build restored + all inspection tables now SQL-queryable.** *Why:* the builder correctly flagged
+  that `crates/integrations/datafusion/src/table/metadata_table.rs` matched `MetadataTableType` for
+  `schema()`/`scan()` but only handled `Snapshots`/`Manifests` — already non-exhaustive (E0004) over the
+  `Files`/`DataFiles`/`DeleteFiles`/`Entries`/`History`/`Refs`/`MetadataLogEntries`/`Partitions` variants
+  Increments 1-4 added; 5a's 4 `all_*` variants extended the already-broken match. *Fix:* wired ALL 14
+  variants into BOTH match blocks (`.schema()` + `.scan().await`) mapping each to its `MetadataTable` accessor
+  — so the crate compiles AND every inspection table is queryable as `tbl$<name>` via DataFusion SQL (real
+  parity value, mirroring Spark's `tbl.metadata_table` surface). Also bumped the `test_provider_list_table_names`
+  `expect_test` block (2 → 14 names, regenerated via `UPDATE_EXPECT=1`, diff inspected — enum order). Verified:
+  `cargo build -p iceberg-datafusion` clean, lib 80/0 + integration 9/0, clippy + fmt clean.
+- **PROCESS: the per-increment gate MUST include the consumers of any enum/trait you extend, not just
+  `-p iceberg`.** *Why:* the `-p iceberg` fast gate never builds `iceberg-datafusion`, so a non-exhaustive-match
+  break sat latent across FOUR committed increments (1-4) before 5a's builder caught it by chance. Adding a
+  public enum variant is a CROSS-CRATE change. The gate now adds `cargo build --workspace --exclude
+  iceberg-sqllogictest --all-targets` (sqllogictest needs `protoc`) — the same build CI runs — to catch
+  downstream non-exhaustiveness before commit. (One residual quirk: `cargo test -p iceberg-datafusion --doc`
+  in ISOLATION fails the pre-existing `table_provider_factory` `#[tokio::main]` doctest because tokio's
+  `rt-multi-thread` feature isn't unified in; at `--workspace` doc scope — how CI runs — it passes. Not a
+  regression; run doctests workspace-wide.)
