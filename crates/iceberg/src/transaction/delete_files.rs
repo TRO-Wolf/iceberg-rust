@@ -38,13 +38,12 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestContentType, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::{Error, ErrorKind};
 
 /// A transaction action that deletes data files from a table by file path.
 ///
@@ -157,52 +156,12 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
     }
 
     async fn delete_files(&self, snapshot_produce: &SnapshotProducer<'_>) -> Result<Vec<DataFile>> {
-        // Resolve the requested paths against the current snapshot's live data entries, and validate
-        // that EVERY requested path matched a live entry (Java `failMissingDeletePaths`). The
-        // requested set is only known here (the producer sees the resolved `DataFile`s), so the
-        // missing-path check must happen during resolution.
-        let snapshot = snapshot_produce.table.metadata().current_snapshot();
-
-        let mut resolved = Vec::new();
-        let mut found_paths: HashSet<String> = HashSet::new();
-        if let Some(snapshot) = snapshot {
-            let manifest_list = snapshot
-                .load_manifest_list(
-                    snapshot_produce.table.file_io(),
-                    &snapshot_produce.table.metadata_ref(),
-                )
-                .await?;
-
-            for manifest_file in manifest_list.entries() {
-                if manifest_file.content != ManifestContentType::Data {
-                    continue;
-                }
-                let manifest = manifest_file
-                    .load_manifest(snapshot_produce.table.file_io())
-                    .await?;
-                for entry in manifest.entries() {
-                    if entry.is_alive() && self.delete_paths.contains(entry.file_path()) {
-                        found_paths.insert(entry.file_path().to_string());
-                        resolved.push(entry.data_file().clone());
-                    }
-                }
-            }
-        }
-
-        let missing: Vec<&str> = self
-            .delete_paths
-            .iter()
-            .map(String::as_str)
-            .filter(|path| !found_paths.contains(*path))
-            .collect();
-        if !missing.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Missing required files to delete: {}", missing.join(", ")),
-            ));
-        }
-
-        Ok(resolved)
+        // Resolve the requested paths against the current snapshot's live data entries, validating that
+        // EVERY requested path matched a live entry (Java `failMissingDeletePaths`). Shared with
+        // `OverwriteFiles` via `SnapshotProducer::resolve_delete_paths`.
+        snapshot_produce
+            .resolve_delete_paths(&self.delete_paths)
+            .await
     }
 
     async fn existing_manifest(
@@ -211,23 +170,7 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
     ) -> Result<Vec<ManifestFile>> {
         // Expose every current data manifest; the producer's `process_deletes` decides per manifest
         // whether to rewrite, carry forward unchanged, or drop it.
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
-            return Ok(vec![]);
-        };
-
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
-            .await?;
-
-        Ok(manifest_list
-            .entries()
-            .iter()
-            .filter(|entry| entry.content == ManifestContentType::Data)
-            .cloned()
-            .collect())
+        snapshot_produce.current_data_manifests().await
     }
 }
 

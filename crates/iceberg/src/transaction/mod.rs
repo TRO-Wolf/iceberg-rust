@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 mod delete_files;
 mod manage_snapshots;
+mod overwrite_files;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -77,6 +78,7 @@ use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::delete_files::DeleteFilesAction;
 use crate::transaction::manage_snapshots::ManageSnapshotsAction;
+use crate::transaction::overwrite_files::OverwriteFilesAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
@@ -153,6 +155,14 @@ impl Transaction {
     /// reference). Delete-by-row-filter / partition-predicate is not yet supported.
     pub fn delete_files(&self) -> DeleteFilesAction {
         DeleteFilesAction::new()
+    }
+
+    /// Creates an overwrite-files action (add data files AND remove data files in one snapshot). The
+    /// recorded operation is dynamic, matching Java `BaseOverwriteFiles`: add-only → `Append`,
+    /// delete-only → `Delete`, both → `Overwrite`. Overwrite-by-row-filter and concurrent-commit
+    /// conflict validation are not yet supported.
+    pub fn overwrite_files(&self) -> OverwriteFilesAction {
+        OverwriteFilesAction::new()
     }
 
     /// Creates replace sort order action.

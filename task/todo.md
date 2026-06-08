@@ -1313,3 +1313,113 @@ production `.rs` change, NO Cargo/lockfile edits. **Verify (repo root):** build 
 runs (was 1352 → +3); interop manage_snapshots/update_schema/update_partition_spec all 4/4; clippy -D
 warnings clean; fmt --check clean. Row stays **🟡** (data-level Java interop deferred, per the increment's
 scope).
+
+### Phase 2 Increment 2 — OverwriteFiles (explicit add + delete) (IN PROGRESS, 2026-06-07, BUILDER Opus)
+New file `crates/iceberg/src/transaction/overwrite_files.rs`: `OverwriteFilesAction` composing the
+fast-append add path with the DeleteFiles manifest-filter path in ONE `Operation::Overwrite` snapshot.
+Data-integrity-critical. Reuses the producer machinery wholesale.
+
+**Java rules verified against source** (`BaseOverwriteFiles.java` / `OverwriteFiles.java` /
+`MergingSnapshotProducer.add`/`delete`):
+- `addFile(DataFile)` → `add(file)` (same path fast-append uses); `deleteFile(DataFile)` →
+  `deletedDataFiles.add(file); delete(file)`; `deleteFiles(DataFileSet, DeleteFileSet)` bulk variant.
+- Added files validated like fast-append; deleted paths resolved against the current snapshot
+  (`failMissingDeletePaths` semantics inherited from `ManifestFilterManager`).
+- **Java `operation()` is DYNAMIC** (delete-only→DELETE, add-only→APPEND, both→OVERWRITE).
+  **DELIBERATE DEVIATION (per brief):** this Rust action always records `Operation::Overwrite` (the brief's
+  KEY test asserts Overwrite for delete+add AND the add-only / delete-only cases). Flagged as a tracked gap.
+- Overwrite summary reflects BOTH added AND deleted file/record counts (`SnapshotSummary` overwrite).
+- OUT OF SCOPE (deferred + noted): `overwriteByRowFilter(Expression)` (inclusive/strict metrics
+  evaluators), concurrent-commit conflict validation (`validateNoConflictingData`/`...Deletes`/
+  `validateFromSnapshot` — serializable isolation).
+
+Plan:
+- [x] **Shared-helper extraction (Rule of Three: two identical non-trivial uses → extract).** Factored the
+      delete-path resolution + missing-path validation and the data-manifest listing into
+      `SnapshotProducer::{resolve_delete_paths, current_data_manifests}` in snapshot.rs; `DeleteFilesOperation`
+      and `OverwriteFilesOperation` both call them (DeleteFiles' two methods shrank to one-liners).
+- [x] **Summary reflects deletes.** Added a `removed_data_files: Vec<DataFile>` field to `SnapshotProducer`,
+      resolved once in `commit()` (via the operation's `delete_files` seam) BEFORE `summary()` and stored;
+      `summary()` now also calls `SnapshotSummaryCollector::remove_file` for each (so `deleted-data-files` /
+      `deleted-records` land); `manifest_file()` `std::mem::take`s the stored set instead of re-resolving.
+      **SAME-CHANGE BUG FIX (in scope):** corrected the producer's `previous_snapshot` resolution from
+      `snapshot_by_id(self.snapshot_id)` (the NOT-yet-committed new snapshot → always None → totals seeded
+      from 0) to `current_snapshot()` (the real parent / branch head, Java `previousBranchHead`). Without it,
+      `update_totals` underflowed (`0 - removed`) on any net-removal commit. **Also flipped the producer's
+      `update_snapshot_summaries` `truncate_full_table` arg from `(op == Overwrite)` → `false`:** Java
+      `SnapshotProducer.summary(previous)` calls `updateTotal` unconditionally with NO full-table-truncate
+      branch — a partial `OverwriteFiles` must NOT reset totals to 0; that Rust path is for a future full
+      replace/truncate action, and nothing else produces an Overwrite snapshot, so zero blast radius.
+- [x] `OverwriteFilesAction`: `add_file`/`add_files`, `delete_file`/`delete_files`/`delete_data_files`,
+      `set_commit_uuid`/`set_snapshot_properties`/`set_key_metadata`. `commit()` builds the producer with
+      added files, calls `validate_added_data_files`, then `producer.commit(OverwriteFilesOperation,
+      DefaultManifestProcess)`. `operation()` = `Operation::Overwrite`; `delete_files` → shared resolver;
+      `existing_manifest` → shared data-manifest list.
+- [x] Wired `Transaction::overwrite_files()` + `mod overwrite_files;` + `use ...OverwriteFilesAction` in
+      `transaction/mod.rs`.
+- [x] 9 tests (MemoryCatalog, V3 minimal identity(x) table; SCAN live set asserted): KEY delete-B+add-D →
+      {A,C,D} op==Overwrite + B Deleted; add-only (Overwrite op); delete-only (Overwrite op);
+      replace-in-same-partition; delete-absent errors (+ table unchanged); mixed present+absent errors;
+      empty overwrite rejected; survivor provenance across snapshots (C keeps S2/seq2, A carried-fwd keeps
+      S1, D gets S3 + new seq, B tombstone S3 + B's seqs); summary reflects added + deleted counts.
+- [x] Docs: GAP_MATRIX `Write: OverwriteFiles` ❌ → 🟡 (+ DeleteFiles "will reuse" → "now reuses" + headline);
+      Roadmap Phase 2 status/sequence/snapshot lines; this todo; lessons.
+- [x] Verify gate (repo root, pinned nightly): build clean; lib ×2 = 1364/0 both runs (was 1355 → +9);
+      interop manage_snapshots/update_schema/update_partition_spec 4/4 each; clippy -D warnings clean;
+      fmt --check clean (one `cargo fmt` reflow applied to the new file + delete_files).
+
+**Outcome (2026-06-07, Phase 2 Increment 2, BUILDER Opus):** `OverwriteFilesAction` lands 🟡 —
+explicit add + delete in ONE `Overwrite` snapshot. The producer seam composes cleanly: added files go
+through the fast-append path (`SnapshotProducer::new` + `validate_added_data_files` + `write_added_manifest`)
+and deleted files through the DeleteFiles filter path (`process_deletes`) in a single `commit()`. Shared
+`SnapshotProducer::{resolve_delete_paths, current_data_manifests}` factored out of DeleteFiles (Rule of
+Three). The overwrite summary now reflects BOTH added and deleted file/record counts. Two same-change
+producer fixes were required and are correct (and Java-faithful): the previous-snapshot resolution and the
+truncate-arg — both pre-existing latent bugs that only surfaced once a producer operation actually removed
+files. **DEVIATION (tracked):** always records `Operation::Overwrite` (Java's `operation()` is dynamic) —
+per the brief; the summary carries the precise counts. **Deferred:** `overwriteByRowFilter` (metrics
+evaluators), concurrent-commit conflict validation (serializable isolation), data-level Java interop. Files
+touched exactly the allowed set: `transaction/overwrite_files.rs` (new), `transaction/snapshot.rs` (shared
+helpers + summary + producer fixes), `transaction/delete_files.rs` (call the shared helpers + drop now-unused
+imports), `transaction/mod.rs` (wiring), GAP_MATRIX, Roadmap, todo, lessons. No `snapshot_summary.rs` /
+Cargo / lockfile edits; no `#[ignore]`; no bare `.unwrap()` in production paths. An Opus REVIEWER verifies next.
+
+#### Phase 2 Increment 2 — REVIEW (2026-06-07, Opus REVIEWER, DELEGATED)
+Adversarially verified the 5 brief points against the Java source (`/tmp/iceberg-java-ref`). Plan:
+- [x] **Pt 1 (Operation parity) — GROUND TRUTH ESTABLISHED: Java IS dynamic; FIXED the always-Overwrite bug.**
+      `BaseOverwriteFiles.operation()` (lines 50-60): `deletesDataFiles() && !addsDataFiles()` → DELETE;
+      `addsDataFiles() && !deletesDataFiles()` → APPEND; both → OVERWRITE. `addsDataFiles()` =
+      `!newDataFilesBySpec.isEmpty()` (requested adds); `deletesDataFiles()` = `filterManager.containsDeletes()`
+      = `!deletePaths.isEmpty()` (requested delete-PATHS, before resolution). The builder's always-Overwrite
+      was a parity BUG → made `OverwriteFilesOperation::operation()` dynamic via a new `adds_data_files: bool`
+      field + `match (adds_data_files, !delete_paths.is_empty())`. Renamed the two tests
+      (`..._records_append_operation`, `..._records_delete_operation`) to assert APPEND/DELETE. Mutation-verified
+      (always-Overwrite → both fail; both-case tests stay green, so they can't pin the rule alone).
+- [x] **Pt 2a (previous_snapshot fix): CONFIRMED Java-faithful + cumulative-totals test ADDED.** Java
+      `SnapshotProducer.summary(previous)` (L392-419) seeds totals from
+      `previous.snapshot(previousBranchHead.snapshotId()).summary()` (the parent / branch head), defaulting to 0
+      only when there is no previous ref. Rust `current_snapshot()` = the main branch head = exactly that. Old
+      code looked up `self.snapshot_id` (the not-yet-committed new snapshot) → always None → seed 0 →
+      `0 - removed` underflow on net removal. Added `test_running_totals_accumulate_across_snapshots` (append
+      A,B → 2; append C,D → 4 cumulative; overwrite-delete A → 3). Mutation-verified: reverting to the seed-0
+      logic fails at the snapshot-2 accumulation (left=2, right=4).
+- [x] **Pt 2b (truncate_full_table=false): CONFIRMED.** Java has NO full-table-truncate branch in
+      `summary(previous)`; even `BaseReplacePartitions` only sets `replace-partitions=true` and accumulates
+      totals via the same `updateTotal` path. So `false` is correct for OverwriteFiles (the Rust truncate path
+      has no Java analogue for any standard op — noted as a residual). Residual: Java `updateTotal` is signed
+      `long` + stops on negative; Rust `update_totals` is `u64` + panics on underflow (tracked, out of scope).
+- [x] **Pts 3-5 (correctness / extraction / regression): CONFIRMED.** Live-set {A,C,D} + provenance +
+      summary verified; mutation-tested provenance (swap `add_existing_entry`→`add_entry` re-stamps survivor →
+      the provenance test fails on "surviving C must keep S2"). Shared helpers byte-identical to Increment-1
+      inline code (DeleteFiles' 11 tests green). No fast-append regression (append tests green); scope clean.
+
+**Review outcome (2026-06-07, Phase 2 Increment 2, REVIEWER Opus):** ONE parity bug fixed (always-Overwrite →
+dynamic operation, matching Java `BaseOverwriteFiles.operation()`). Both producer summary fixes (a + b)
+CONFIRMED Java-faithful; added the cumulative-running-totals regression test the change needed (would underflow
+under the old seed-0 logic). 11 overwrite tests (9 → 11: +1 cumulative-totals, +0 net from the 2 renames).
+Verify gate from repo root: build clean; lib ×2 = 1365/0 both runs (was 1364 → +1); interop
+manage_snapshots/update_schema/update_partition_spec 4/4 each; clippy -D warnings clean; fmt --check clean (one
+reflow applied). Files touched: `transaction/overwrite_files.rs` (dynamic op + 2 renamed tests + 1 new test),
+GAP_MATRIX (dynamic-operation note replaces the stale deviation), todo, lessons. NO snapshot.rs production
+change needed (both summary fixes were already correct); no Cargo edits; no `#[ignore]`; no bare `.unwrap()`
+added. 🟡 stays.

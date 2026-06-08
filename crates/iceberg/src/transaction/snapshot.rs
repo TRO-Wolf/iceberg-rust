@@ -125,6 +125,10 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    // Data files removed by this snapshot, resolved against the current snapshot at commit time. Held
+    // so the snapshot summary can reflect the deleted file/record counts (Java overwrite/delete summary).
+    // Empty for add-only operations such as fast append.
+    removed_data_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -146,6 +150,7 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            removed_data_files: vec![],
             manifest_counter: (0..),
         }
     }
@@ -210,6 +215,80 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         Ok(())
+    }
+
+    /// Return every current data manifest (the candidates the producer's `process_deletes` filters).
+    ///
+    /// Shared by the delete-bearing operations (`DeleteFiles`, `OverwriteFiles`): each exposes every
+    /// current data manifest so `process_deletes` can decide per manifest whether to rewrite, carry
+    /// forward, or drop it. Returns an empty list when the table has no current snapshot.
+    pub(crate) async fn current_data_manifests(&self) -> Result<Vec<ManifestFile>> {
+        let Some(snapshot) = self.table.metadata().current_snapshot() else {
+            return Ok(vec![]);
+        };
+
+        let manifest_list = snapshot
+            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+            .await?;
+
+        Ok(manifest_list
+            .entries()
+            .iter()
+            .filter(|entry| entry.content == ManifestContentType::Data)
+            .cloned()
+            .collect())
+    }
+
+    /// Resolve `delete_paths` against the current snapshot's live data entries, returning the matching
+    /// [`DataFile`]s, and fail if any requested path matched no live entry.
+    ///
+    /// Shared by `DeleteFiles` and `OverwriteFiles` (Rule of Three: two identical non-trivial uses).
+    /// The requested path set is only known to the calling operation (the producer downstream sees just
+    /// the resolved `DataFile`s), so the missing-path check (Java `failMissingDeletePaths`) must happen
+    /// here during resolution: a present-and-absent mix errors rather than silently dropping the present
+    /// file. Returns an empty vector when `delete_paths` is empty.
+    pub(crate) async fn resolve_delete_paths(
+        &self,
+        delete_paths: &HashSet<String>,
+    ) -> Result<Vec<DataFile>> {
+        if delete_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut resolved = Vec::new();
+        let mut found_paths: HashSet<String> = HashSet::new();
+        if let Some(snapshot) = self.table.metadata().current_snapshot() {
+            let manifest_list = snapshot
+                .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+                .await?;
+
+            for manifest_file in manifest_list.entries() {
+                if manifest_file.content != ManifestContentType::Data {
+                    continue;
+                }
+                let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+                for entry in manifest.entries() {
+                    if entry.is_alive() && delete_paths.contains(entry.file_path()) {
+                        found_paths.insert(entry.file_path().to_string());
+                        resolved.push(entry.data_file().clone());
+                    }
+                }
+            }
+        }
+
+        let missing: Vec<&str> = delete_paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !found_paths.contains(*path))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Missing required files to delete: {}", missing.join(", ")),
+            ));
+        }
+
+        Ok(resolved)
     }
 
     fn generate_unique_snapshot_id(table: &Table) -> i64 {
@@ -335,8 +414,10 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
-        // Resolve which data files this operation wants to remove, keyed by path.
-        let delete_files = snapshot_produce_operation.delete_files(self).await?;
+        // The data files to remove were resolved in `commit()` (before `summary()`, so the summary can
+        // reflect the deletes) and stored in `self.removed_data_files`. Take them here to drive the
+        // manifest rewrite without re-resolving.
+        let delete_files = std::mem::take(&mut self.removed_data_files);
 
         // Assert the new snapshot contributes content: added files, deleted files, or added snapshot
         // properties. A delete-only commit (deletes, no adds) is allowed; a truly-empty commit is not.
@@ -564,10 +645,24 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        let previous_snapshot = table_metadata
-            .snapshot_by_id(self.snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id())
-            .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        // Reflect deleted files/records in the summary (Java overwrite/delete summary). `removed_data_files`
+        // is populated in `commit()` (the resolved delete set) before `summary()` is called; it is empty
+        // for add-only operations such as fast append, so this loop is a no-op there.
+        for data_file in &self.removed_data_files {
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
+        // The previous snapshot is the current branch head (the parent of the snapshot being produced):
+        // at summary time the new snapshot is not yet in `table_metadata`, so its totals are seeded from
+        // the current snapshot's summary. Mirrors Java `SnapshotProducer.summary(previous)` which reads
+        // `previous.snapshot(previousBranchHead.snapshotId()).summary()`. (Looking up `self.snapshot_id`
+        // here would always miss — the new snapshot does not exist yet — leaving totals seeded from zero,
+        // which underflows the moment an operation removes more files than it adds.)
+        let previous_snapshot = table_metadata.current_snapshot();
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());
@@ -577,11 +672,13 @@ impl<'a> SnapshotProducer<'a> {
             additional_properties,
         };
 
-        update_snapshot_summaries(
-            summary,
-            previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
-        )
+        // Compute totals as previous + added - removed for ALL operations, mirroring Java
+        // `SnapshotProducer.summary(previous)` (which calls `updateTotal` unconditionally and has NO
+        // full-table-truncate branch). `OverwriteFilesAction` is a PARTIAL overwrite (delete some, add
+        // some), so its totals must NOT be reset to zero. The Rust-specific `truncate_full_table` path
+        // (which zeroes totals + reports every prior file as deleted) is for a future full-table
+        // replace/truncate action, not for a partial overwrite — so pass `false` here.
+        update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
     fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
@@ -602,6 +699,11 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
+        // Resolve the data files this operation removes up front (before `summary()`), so the snapshot
+        // summary can reflect the deleted file/record counts and `manifest_file()` can reuse the result
+        // without re-resolving. Empty for add-only operations (e.g. fast append).
+        self.removed_data_files = snapshot_produce_operation.delete_files(&self).await?;
+
         let manifest_list_path = self.generate_manifest_list_file_path(0);
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();

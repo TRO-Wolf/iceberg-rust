@@ -733,3 +733,104 @@ How to use it (see the manuals' §2):
   Separately, the precondition relaxation that lets a delete-only commit through must still reject a no-op
   empty commit — the builder had `test_delete_only_commit_is_allowed` but no rejection test; added
   `test_empty_delete_commit_is_rejected`.
+
+### 2026-06-07 (Phase 2 Increment 2 — OverwriteFiles, BUILDER Opus)
+- **DO compose a new add+delete write action by reusing the producer's TWO existing paths, not
+  re-implementing either.** *Why:* `SnapshotProducer::manifest_file` already (a) resolves an operation's
+  `delete_files` and runs `process_deletes` (the DeleteFiles filter/rewrite path) AND (b) writes an added
+  manifest from `added_data_files` (the fast-append path), in ONE snapshot. So `OverwriteFiles` is just a
+  `SnapshotProduceOperation` returning `Operation::Overwrite` whose `delete_files`/`existing_manifest` mirror
+  DeleteFiles, with the added files passed to `SnapshotProducer::new` exactly as fast-append does. No new
+  manifest-writing or rewrite logic is needed — the seam was built for this. Validate added files with the
+  existing `validate_added_data_files` (data content type + partition-spec match + partition-value), never a
+  duplicate.
+- **DO extract the delete-path resolution + data-manifest listing into shared `SnapshotProducer` methods on
+  the SECOND identical use, not copy-paste.** *Why:* `DeleteFilesOperation::delete_files`/`existing_manifest`
+  and `OverwriteFilesOperation`'s versions were byte-identical non-trivial logic (load manifest list → filter
+  data manifests → resolve live entries by path → `failMissingDeletePaths`). Two identical uses of non-trivial
+  logic is the Rule-of-Three "extract now" case. Factored `SnapshotProducer::{resolve_delete_paths(&HashSet
+  <String>) -> Vec<DataFile>, current_data_manifests() -> Vec<ManifestFile>}` in snapshot.rs (the existing
+  home of `process_deletes`); both operations' methods became one-liners. Keep `found_paths` as
+  `HashSet<String>` (owned), NOT `HashSet<&str>` — the borrowed `&str` points into a per-iteration `manifest`
+  that drops before the later missing-path filter reads it (E0597).
+- **DO resolve an operation's deleted files BEFORE `summary()` so the snapshot summary can reflect them, and
+  reuse the resolution in `manifest_file()` (don't resolve twice).** *Why:* Java `MergingSnapshotProducer.apply`
+  merges the added-files summary AND the filter-manager's deleted-files summary, so the overwrite/delete
+  summary carries `deleted-data-files`/`deleted-records`. The Rust `summary()` only wired
+  `SnapshotSummaryCollector::add_file`; the collector already has `remove_file` (tracks `removed_data_files` →
+  `deleted-data-files`, `deleted_records` → `deleted-records`). But `summary()` runs BEFORE `manifest_file()`
+  in `commit()`, where deletes used to be resolved — so resolve once at the top of `commit()` (via the
+  operation's `delete_files` seam), store on a `removed_data_files` producer field, call `remove_file` in
+  `summary()`, and `std::mem::take` the field in `manifest_file()`. No double resolution.
+- **DO fix the producer's previous-snapshot resolution to the CURRENT branch head, not a lookup of the
+  not-yet-committed new snapshot id — wiring `remove_file` into the summary EXPOSES this latent bug as an
+  arithmetic underflow.** *Why:* `summary()` computed `previous_snapshot =
+  snapshot_by_id(self.snapshot_id).parent()`, but `self.snapshot_id` is the NEW snapshot, which is not in
+  `table.metadata()` yet → always `None` → `update_totals` seeded all totals from 0. Harmless while every
+  producer op only ADDED files (totals only grew), but the moment an op REMOVES files, `update_totals` does
+  `0 - removed` → `attempt to subtract with overflow` panic. The fix mirrors Java
+  `SnapshotProducer.summary(previous)` (`previous.snapshot(previousBranchHead.snapshotId())`): use
+  `table.metadata().current_snapshot()` (the parent / branch head, which IS in metadata at summary time).
+  Now totals are correct (cumulative) for append, delete, AND overwrite.
+- **DO pass `truncate_full_table = false` from the producer's `update_snapshot_summaries` call — Java's
+  `SnapshotProducer.summary` has NO full-table-truncate branch.** *Why:* the Rust producer keyed the
+  truncate flag on `operation == Overwrite`, and `truncate_table_summary` zeroes all totals and reports the
+  ENTIRE previous `total-data-files` as `deleted-data-files`. That is full-table-replace/INSERT-OVERWRITE
+  semantics, WRONG for a PARTIAL `OverwriteFiles` (delete some, add some) — it would both underflow and
+  over-report deletes. Verified against Java: `SnapshotProducer.summary(previous)` calls `updateTotal`
+  unconditionally (prev + added − removed) for every operation, no truncate. Since nothing else emits an
+  Overwrite snapshot, flipping the arg to `false` has zero blast radius and matches Java. (A future full
+  replace/truncate action can opt into the truncate path explicitly.)
+- **DO honor an explicit increment brief over Java when the brief deliberately diverges — and flag it.**
+  *Why:* Java `BaseOverwriteFiles.operation()` is DYNAMIC (delete-only→`DELETE`, add-only→`APPEND`,
+  both→`OVERWRITE`), but the increment brief's KEY tests assert `Operation::Overwrite` for ALL three cases
+  (delete+add, add-only, delete-only). The brief is the authoritative spec here, so the action always records
+  `Operation::Overwrite`; the divergence is documented in the module doc, the GAP_MATRIX row, and the report
+  as a tracked gap (the summary carries the precise added/deleted counts regardless, so no information is
+  lost). Don't silently "correct" to Java when the brief is explicit — surface the choice.
+  _superseded 2026-06-07 (REVIEWER): the reviewer brief explicitly instructed to establish ground truth from
+  the Java source and ALIGN — Java IS dynamic (`BaseOverwriteFiles.operation()` L50-60, on
+  `addsDataFiles()`/`deletesDataFiles()`), so the always-Overwrite was a PARITY BUG, now fixed. See the
+  REVIEW lesson block below._
+
+### 2026-06-07 (Phase 2 Increment 2 — OverwriteFiles, REVIEWER Opus)
+- **DO make `OverwriteFilesOperation::operation()` DYNAMIC, mirroring Java `BaseOverwriteFiles.operation()`
+  (the always-`Overwrite` was a parity bug).** *Why:* Java (`core/BaseOverwriteFiles.java` L50-60) returns
+  `DELETE` when `deletesDataFiles() && !addsDataFiles()`, `APPEND` when `addsDataFiles() && !deletesDataFiles()`,
+  else `OVERWRITE`. `addsDataFiles()` = `!newDataFilesBySpec.isEmpty()` (`MergingSnapshotProducer` L230) and
+  `deletesDataFiles()` = `filterManager.containsDeletes()` = `!deletePaths.isEmpty()` (`ManifestFilterManager`
+  L198-203) — both keyed on the REQUESTED sets, evaluated at commit time BEFORE the deletes resolve against the
+  table. So in Rust the classification is `match (!added_data_files.is_empty(), !delete_paths.is_empty())`. The
+  recorded operation is read in `SnapshotProducer::summary` (`operation: op.operation()`), so a dynamic
+  `operation()` is all that is needed — `update_snapshot_summaries` already accepts Append/Overwrite/Delete.
+  Pin with three tests (add-only → Append, delete-only → Delete, both → Overwrite); mutation-verify by forcing
+  `operation()` back to always-`Overwrite` (the add-only + delete-only tests fail; the both-tests stay green
+  because they produce Overwrite either way — so they CANNOT pin the dynamic rule alone).
+- **DO add a cumulative-running-totals test (append twice, then delete) for ANY producer-summary change — it
+  is the only test that catches the `previous_snapshot` seed bug.** *Why:* the per-commit added/deleted-count
+  tests pass under BOTH the correct (seed = current branch head) and the broken (seed = 0) logic, because they
+  only assert THIS commit's `added-*`/`deleted-*`. Only a multi-snapshot total assertion (snapshot 1 → 2
+  files, snapshot 2 → 4 files cumulative, snapshot 3 delete → 3) distinguishes them: under the seed-0 bug,
+  snapshot 2's `total-data-files` is 2 (this commit only), not 4, AND snapshot 3 underflows `0 - 1` (u64
+  panic). Mutation-verified: reverting `previous_snapshot` to `snapshot_by_id(self.snapshot_id).parent()`
+  fails this test at the snapshot-2 accumulation assertion. This bug affects EVERY snapshot action
+  (append/delete/overwrite), so the test belongs with the producer-summary contract, not just overwrite.
+- **CONFIRMED Java-faithful (no change): `previous_snapshot = current_snapshot()` and
+  `truncate_full_table = false`.** *Why:* Java `SnapshotProducer.summary(TableMetadata previous)` (L392-419)
+  seeds `previousSummary` from `previous.snapshot(previousBranchHead.snapshotId()).summary()` (the parent /
+  branch head = Rust `current_snapshot()`), defaulting totals to 0 ONLY when there is no previous branch ref —
+  it never zeroes totals for an overwrite. There is NO full-table-truncate branch anywhere in `summary(previous)`;
+  even `BaseReplacePartitions` only `set(REPLACE_PARTITIONS_PROP, "true")` and accumulates via the same
+  `updateTotal` path. So the Rust `truncate_full_table` path (zero totals + report all prior files deleted) has
+  NO Java analogue for any standard op — `false` for OverwriteFiles is unambiguously correct. (Residual note:
+  Java `updateTotal` uses signed `long` and stops accumulating + omits the total once it goes negative;
+  Rust `update_totals` uses `u64` and panics on underflow. With the corrected seed a well-formed sequence
+  never underflows, but the `u64` is strictly less robust than Java against a malformed previous summary —
+  tracked, not in this increment's scope.)
+- **DO confirm a shared-helper extraction is byte-identical to the inline original before trusting "behavior
+  preserving".** *Why:* `DeleteFilesOperation::{delete_files, existing_manifest}` shrank to one-liners calling
+  `SnapshotProducer::{resolve_delete_paths, current_data_manifests}`. Diffed the extracted bodies against the
+  Increment-1 inline code: same `metadata_ref()`, same `ManifestContentType::Data` filter, same
+  `entry.is_alive() && delete_paths.contains(...)` match, same "Missing required files to delete" +
+  `ErrorKind::DataInvalid`, same empty-set early return. All 11 DeleteFiles tests stay green — the extraction
+  changed call sites, not semantics.
