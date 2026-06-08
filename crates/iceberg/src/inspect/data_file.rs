@@ -406,7 +406,10 @@ fn append_i32_list(builder: &mut DynListBuilder, values: Option<&[i32]>) -> Resu
 
 /// Appends one partition tuple to the partition [`StructBuilder`], dispatching each field on its
 /// primitive type. The partition `Struct`'s values are aligned with `partition_type`'s fields.
-fn append_partition(
+///
+/// Shared in-module helper: `files`/`entries` reach it through [`DataFileStructBuilder::append`], and
+/// the `partitions` aggregating table reuses it directly for its `partition` column (Rule of Three).
+pub(super) fn append_partition(
     builder: &mut StructBuilder,
     partition_type: &StructType,
     partition: &crate::spec::Struct,

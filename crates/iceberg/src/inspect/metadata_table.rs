@@ -16,8 +16,8 @@
 // under the License.
 
 use super::{
-    EntriesTable, FilesTable, HistoryTable, ManifestsTable, MetadataLogEntriesTable, RefsTable,
-    SnapshotsTable,
+    EntriesTable, FilesTable, HistoryTable, ManifestsTable, MetadataLogEntriesTable,
+    PartitionsTable, RefsTable, SnapshotsTable,
 };
 use crate::table::Table;
 
@@ -51,6 +51,9 @@ pub enum MetadataTableType {
     Refs,
     /// [`MetadataLogEntriesTable`] — one row per metadata-log entry (Java `metadata_log_entries`).
     MetadataLogEntries,
+    /// [`PartitionsTable`] — one row per partition, aggregated over the current snapshot (Java
+    /// `partitions`).
+    Partitions,
 }
 
 impl MetadataTableType {
@@ -66,6 +69,7 @@ impl MetadataTableType {
             MetadataTableType::History => "history",
             MetadataTableType::Refs => "refs",
             MetadataTableType::MetadataLogEntries => "metadata_log_entries",
+            MetadataTableType::Partitions => "partitions",
         }
     }
 
@@ -90,6 +94,7 @@ impl TryFrom<&str> for MetadataTableType {
             "history" => Ok(Self::History),
             "refs" => Ok(Self::Refs),
             "metadata_log_entries" => Ok(Self::MetadataLogEntries),
+            "partitions" => Ok(Self::Partitions),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -146,5 +151,11 @@ impl<'a> MetadataTable<'a> {
     /// plus the current one), with the snapshot that was current at each entry's timestamp.
     pub fn metadata_log_entries(&self) -> MetadataLogEntriesTable<'_> {
         MetadataLogEntriesTable::new(self.0)
+    }
+
+    /// Get the `partitions` table — one row per partition, aggregated over the current snapshot's live
+    /// manifest entries (data + delete).
+    pub fn partitions(&self) -> PartitionsTable<'_> {
+        PartitionsTable::new(self.0)
     }
 }

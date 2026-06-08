@@ -24,6 +24,7 @@ mod history;
 mod manifests;
 mod metadata_log_entries;
 mod metadata_table;
+mod partitions;
 mod refs;
 mod snapshots;
 
@@ -33,5 +34,6 @@ pub use history::HistoryTable;
 pub use manifests::ManifestsTable;
 pub use metadata_log_entries::MetadataLogEntriesTable;
 pub use metadata_table::*;
+pub use partitions::PartitionsTable;
 pub use refs::RefsTable;
 pub use snapshots::SnapshotsTable;

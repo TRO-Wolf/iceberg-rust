@@ -166,9 +166,10 @@ reusing the by-path `resolve_delete_paths` + `process_deletes` machinery unchang
 non-empty (`failMissingDeletePaths`); DELETE-file rewrite + `dataSequenceNumber` preservation + conflict
 validation + interop deferred). **Phase 3 (scan parity) has started on the inspection-table set: `files` /
 `data_files` / `delete_files` (Increment 1, `inspect/files.rs`), `entries` (Increment 2, `inspect/entries.rs`),
-and the three pure-metadata tables `history` / `refs` / `metadata_log_entries` (Increment 3,
-`inspect/{history,refs,metadata_log_entries}.rs`) are all 🟡** (alongside the pre-existing `snapshots` +
-`manifests`); `partitions` + the `all_*` cross-snapshot variants + inspection interop remain. The rest of the **write engine
+the three pure-metadata tables `history` / `refs` / `metadata_log_entries` (Increment 3,
+`inspect/{history,refs,metadata_log_entries}.rs`), and the first AGGREGATING table `partitions` (Increment 4,
+`inspect/partitions.rs`) are all 🟡** (alongside the pre-existing `snapshots` +
+`manifests`); the `all_*` cross-snapshot variants + inspection interop remain. The rest of the **write engine
 (merge append, `RowDelta`, `RewriteManifests`), incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
@@ -367,7 +368,16 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      current entry, with `latest_*` resolved to the snapshot current at each entry's timestamp (Java
      `snapshotIdAsOfTime`). Field ids verbatim from Java `HistoryTable`/`RefsTable`/`MetadataLogEntriesTable`.
      10 unit tests (incl. a forked/rolled-back `is_current_ancestor==false` case). Interop deferred (→ ✅).
-  4. **`partitions`** — per-partition aggregation over entries.
+  4. **`partitions`** — per-partition aggregation over entries — **DONE 🟡 (2026-06-08, Increment 4,
+     `inspect/partitions.rs`).** The first AGGREGATING table (Java `PartitionsTable`): groups the current
+     snapshot's LIVE manifest entries (data + delete) by partition `Struct` and rolls up record/file/size +
+     pos/eq-delete counts + `last_updated_*`/`spec_id` from the most-recent-commit file (strict `>`
+     tie-break). 11 fields in Java column order with the exact non-sequential field ids
+     (`partition`/1 … `last_updated_snapshot_id`/10). 10 unit tests; content-type / `>` / `is_alive`
+     mutations caught. TWO scoping decisions: keeps the empty-struct partition column for unpartitioned
+     tables (matches the `files` family; documented divergence), and DEFERS cross-spec partition-type
+     unification (`Partitioning.partitionType`) as a known divergence (single-spec-correct path). Interop
+     deferred (→ ✅).
   5. **`all_*`** (`all_data_files` / `all_manifests` / `all_entries` …) — across ALL snapshots.
 - **Exit criteria:** scans match Java planning/results incl. residuals; inspection tables present; reports
   emitted.

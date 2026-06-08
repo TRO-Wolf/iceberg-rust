@@ -1437,3 +1437,50 @@ How to use it (see the manuals' §2):
   with the freshest precedent. When two precedents disagree, follow the one that satisfies the engineering
   floor. (The `is_current_ancestor` always-true mutation and the field-id Arrow probes were already
   correctly pinned by the builder — those needed no change.)
+
+### 2026-06-08 (Phase 3 Increment 4 — `partitions` aggregating table, BUILDER Opus)
+- **DO write a "committed by the OLDER snapshot" test entry via `ManifestWriter::add_existing_entry`, NOT
+  `add_entry` — `add_entry` RESTAMPS `entry.snapshot_id = self.snapshot_id` (the manifest's snapshot) and
+  forces `status = Added`, silently discarding a `.snapshot_id(parent)` you set on the builder.** *Why it
+  un-pins a tie-break test:* the `partitions` `last_updated_*` logic picks the file whose COMMITTING
+  snapshot has the max commit time (Java `Partition.update`, strict `>`). To pin the `>` (vs `<`/min-wins)
+  I needed two files committed by DIFFERENT snapshots in the same partition. My first cut built both via a
+  `write_data_manifest` helper that used `add_entry` for every entry — so BOTH files got stamped with the
+  CURRENT snapshot id, the parent never participated, and mutating `>`→`<` left the test GREEN (only one
+  distinct commit time existed). Fix: write the older file with `add_existing_entry` (status Existing,
+  PRESERVES the parent snapshot id + seqs) and the newer with `add_entry` (Added, inherits current). Then
+  `>`→`<` flips the answer to the parent and the test FAILS. `add_existing_entry`/`add_delete_entry` are
+  `pub(crate)`, reachable from an in-crate `#[cfg(test)]`. *General rule:* before asserting a
+  most-recent/oldest tie-break, verify the writer actually PRESERVES the per-entry snapshot id you depend on
+  — a restamping add path collapses your distinct-commit-time setup to one value and the mutation survives.
+- **DO confirm a strict `>`/`<` comparison test produces a DIFFERENT, asserted result under the mutation —
+  a min-vs-max comparison needs two entries with DISTINCT commit times that genuinely both reach the
+  comparator.** *Why:* same root cause as the snapshot-id restamp above. The `is_none_or(|cur| t > cur)`
+  fold is "max-time-wins, first-writer wins a tie"; `<` makes it "min-time-wins." Only a test where the
+  oldest and newest snapshots BOTH contribute a file to the same partition distinguishes them. Assert both
+  the winning time AND that it is `assert_ne!` the losing snapshot's id, so a min-wins regression can't pass.
+- **DO key an aggregating inspection table by the file's OWN partition `Struct` and use
+  `default_partition_type` for the column schema — there is NO cross-spec partition-type unifier in Rust.**
+  *Why:* Java `PartitionsTable` unifies ALL of a table's specs into one partition type via
+  `Partitioning.partitionType(table)` and coerces each file's partition into it (`PartitionUtil.coerce
+  Partition`). A grep of `spec/`/`transform/` for any analogue found only `PartitionSpec::partition_type
+  (schema)` (SINGLE spec) and `TableMetadata::default_partition_type` — no union/coerce. So the
+  single-spec-correct path (`Struct` derives `Hash`+`Eq` → direct `HashMap` key; schema = default partition
+  type) is the right scope; cross-spec UNIFICATION (partition evolution → differently shaped tuples) is a
+  documented DEFERRAL, not silently mis-aggregated. Still report the per-file `spec_id` so nothing is
+  mis-attributed within a single spec. Do NOT invent a unifier in an inspection-table increment — flag it.
+- **DO reuse the `files`-family unpartitioned-column decision for module consistency: keep the empty-struct
+  `partition` column rather than dropping it (Java drops it).** *Why:* `inspect/files.rs` already KEPT an
+  empty-struct `partition` column for unpartitioned tables as a documented divergence (Java
+  `BaseFilesTable.schema()` drops it). Matching that in `partitions` gives the `inspect` module ONE
+  consistent unpartitioned-column behavior (and one future fix site) instead of two. Pin it with the same
+  `..._unpartitioned_keeps_empty_partition_struct_known_divergence` shape that flips to assert-absent when
+  the module-wide drop-empty rule lands. A new divergence direction in a sibling table is worse than
+  mirroring an existing, tested one.
+- **DO collapse `if let A && let B` with let-chains when clippy's `collapsible_if` fires on the pinned
+  nightly — nested `if let Some(x) { if let Some(y) { … } }` is now a `-D warnings` error.** *Why:* the
+  most-recent-commit lookup naturally reads as `if let Some(id) = entry.snapshot_id() { if let
+  Some(snap) = metadata.snapshot_by_id(id) { … } }`; clippy on `nightly-2025-10-27` rejects it. Rewrite as
+  `if let Some(id) = entry.snapshot_id() && let Some(snap) = metadata.snapshot_by_id(id) { … }` (let-chains
+  are stable on this toolchain). Run clippy `--all-targets -- -D warnings` from the repo root (pinned
+  nightly) before declaring done — a plain `cargo build` does NOT surface it.

@@ -2313,3 +2313,122 @@ One test-strength gap fixed (the as-of-time `<=` boundary, mutation-verified) + 
 `.unwrap()` → `.expect()` ×3). Files touched: `inspect/{history,refs,metadata_log_entries}.rs` (the 3 in-scope
 new files only) + todo + lessons. +1 test (1434 → 1435 lib). build/clippy/fmt clean; 3 interop suites 4/4 each.
 No commit, no branch switch, no Cargo/spec/arrow edits.
+---
+
+### Phase 3 Increment 4 — `partitions` metadata table (SCOPED by orchestrator, 2026-06-08)
+The first AGGREGATING inspection table: per-partition rollup over the current snapshot's LIVE manifest
+entries (data AND delete). New file `inspect/partitions.rs`; wired via `inspect/mod.rs` +
+`metadata_table.rs` (`MetadataTableType::Partitions` + accessor + `as_str` + `TryFrom`).
+
+**Java authority — `core/src/main/java/org/apache/iceberg/PartitionsTable.java` (CONFIRMED from source):**
+- Schema, in COLUMN order (= Java field-id declaration order; ids are NON-sequential):
+  `partition`/1 (struct = `Partitioning.partitionType(table)`, REQUIRED) — DROPPED when unpartitioned
+  (`TypeUtil.select` excludes it); `spec_id`/4 int req; `record_count`/2 long req (DATA records);
+  `file_count`/3 int req (DATA files); `total_data_file_size_in_bytes`/11 long req;
+  `position_delete_record_count`/5 long req; `position_delete_file_count`/6 int req;
+  `equality_delete_record_count`/7 long req; `equality_delete_file_count`/8 int req;
+  `last_updated_at`/9 ts(zone) OPT; `last_updated_snapshot_id`/10 long OPT.
+- Rows = `partitions(table, scan)`: read `scan.snapshot().allManifests()` (DATA + DELETE), `liveEntries()`
+  (Added/Existing == Rust `is_alive()`), group by the partition key (`StructLikeMap`). For each entry
+  `Partition.update(file, snapshot)`:
+  - `snapshot = table.snapshot(entry.snapshotId())`; if non-null and `snapshot.timestampMillis()*1000 >
+    lastUpdatedAt` → set `specId = file.specId()`, `lastUpdatedAt = commitTimeMicros`,
+    `lastUpdatedSnapshotId = snapshot.snapshotId()` (most-recent-commit file wins — `>` not `>=`).
+  - content DATA → dataRecordCount += recordCount; dataFileCount += 1; dataFileSizeInBytes += fileSize.
+  - content POSITION_DELETES → posDeleteRecordCount += recordCount; posDeleteFileCount += 1.
+  - content EQUALITY_DELETES → eqDeleteRecordCount += recordCount; eqDeleteFileCount += 1.
+- Unpartitioned table → single "root" partition row, partition column dropped (see decision below).
+
+**Rust mapping (confirmed reachable):** `metadata.default_partition_type()` for the schema partition
+struct (matches `files.rs`); the partition `Struct` derives `Hash`+`Eq` → use it directly as the
+`HashMap`/`IndexMap` key. Per entry: `entry.is_alive()`, `entry.snapshot_id()` → Option<i64> →
+`metadata.snapshot_by_id(id)` → `.timestamp_ms()`/`.snapshot_id()`; `data_file.content_type()`
+(`DataContentType::{Data,PositionDeletes,EqualityDeletes}`), `.record_count()`, `.file_size_in_bytes()`,
+`.partition()`, `.partition_spec_id`. Reuse the partition-struct Arrow builder primitive
+`inspect::data_file::append_partition` (promote to `pub(super)` if reused — shared in-module helper,
+in scope). Timestamps: micros = `timestamp_ms * 1000`, Arrow `Timestamp(µs, "+00:00")` (like snapshots.rs).
+Sort output rows deterministically by partition value.
+
+**Two scoping DECISIONS the builder must make against the Java source + state rationale:**
+1. **Unpartitioned partition column:** Java DROPS it; `files.rs` KEPT an empty-struct column as a
+   *documented* divergence (`test_files_table_unpartitioned_keeps_empty_partition_struct_known_divergence`).
+   RECOMMENDED: match the `files.rs` precedent for one consistent module-wide divergence (keep empty
+   struct, document + pin with a test), OR match Java exactly (drop). Either way: test it + document it.
+2. **Multi-spec partition evolution:** Java unifies via `Partitioning.partitionType` + `coercePartition`.
+   Rust has only `default_partition_type()` (no cross-spec unifier found). RECOMMENDED: implement the
+   single-spec-correct path (key by the file's partition `Struct`, schema = default partition type) and
+   DOCUMENT cross-spec unification as a deferral (known divergence) in GAP_MATRIX/todo — do NOT silently
+   mis-aggregate. If a unifier helper does exist, use it.
+
+Plan:
+- [x] `inspect/partitions.rs`: `PartitionsTable<'a>` + `schema()` (11 fields; kept empty-struct partition
+      column when unpartitioned per decision 1) + async `scan()` doing the aggregation above into one
+      `RecordBatch`.
+- [x] Wire `MetadataTableType::Partitions` + `partitions()` accessor + `as_str`/`TryFrom`/`all_types` in
+      `metadata_table.rs`; `mod partitions;` + `pub use` in `mod.rs`. Promoted
+      `inspect::data_file::append_partition` to `pub(super)` for reuse (Rule-of-Three 3rd use).
+- [x] Tests (in-crate, `TableTestFixture` + the `files.rs` manifest-builder pattern): two files same
+      partition → summed record/file/size; multiple partitions → row-per + sorted; delete files counted
+      in pos/eq columns (DATA columns unchanged); Deleted-tombstone excluded (`is_alive()`);
+      `last_updated_*` + `spec_id` = most-recent-snapshot file (mutation-pinned the `>` comparison);
+      empty table → 0 rows; unpartitioned → 1 root row + empty-struct column (decision 1); Arrow schema
+      cols + field ids + types; file spec_id reported. 10 tests, each risk-named.
+- [x] Docs: GAP_MATRIX inspection row, Roadmap Phase 3 list + Current state, this todo, lessons.
+- [x] Verify from repo root: build; lib ×2 (1444 ea); 3 interop suites (4/4 ea); clippy -D warnings; fmt
+      --check. All clean.
+
+**Outcome (2026-06-08, BUILDER Opus).** Built `inspect/partitions.rs` (`PartitionsTable<'a>` + `schema()`
++ async `scan()`) — the first AGGREGATING inspection table — plus wiring in `metadata_table.rs`/`mod.rs`
+and the `pub(super)` promotion of `append_partition` in `data_file.rs`. Reads the current snapshot's
+manifest list → ALL manifests (data + delete) → live entries (`is_alive()`), groups by the file's
+partition `Struct` (derives `Hash`+`Eq`), and rolls up per Java `PartitionsTable.Partition.update`. Schema
+is 11 fields in Java column order with the EXACT non-sequential ids verified against
+`PartitionsTable.java`: `partition`/1 (struct=`default_partition_type`, REQUIRED, lines 107-108),
+`spec_id`/4 (44-45), `record_count`/2 (46-48), `file_count`/3 (49-50), `total_data_file_size_in_bytes`/11
+(51-56), `position_delete_record_count`/5 (57-62), `position_delete_file_count`/6 (63-68),
+`equality_delete_record_count`/7 (69-74), `equality_delete_file_count`/8 (75-80), `last_updated_at`/9
+OPT (81-86), `last_updated_snapshot_id`/10 OPT (87-92). The update logic was confirmed against
+`PartitionsTable.java:331-360` (commit time = `snapshot.timestampMillis()*1000`, strict `>`, content
+switch). **Decision 1 (unpartitioned column): KEEP the empty-struct column** to match the `files`-family
+precedent → one consistent module-wide divergence (Java drops it); pinned + documented. **Decision 2
+(multi-spec evolution): DEFER cross-spec unification** — no `Partitioning.partitionType`/`coercePartition`
+analogue exists in Rust (confirmed by grep — only `default_partition_type`), so I key by the file's own
+partition `Struct` (single-spec-correct), report the per-file `spec_id`, and document the multi-spec
+unification gap as a known divergence. 10 risk-named tests. Mutations run + caught: (a) content-type
+switch — counting a position-delete as DATA fails `..._delete_files_counted_separately_from_data`
+(record_count 6≠4); (b) the `>` comparison flipped to `<` (min-wins) makes the OLDEST snapshot win and
+fails `..._last_updated_reflects_most_recent_commit_file` (1515…≠1555…) — note the FIRST cut of this test
+was un-pinning because `write_data_manifest` used `add_entry` (which RESTAMPS the snapshot id to the
+manifest's), so I rewrote it to write the older file via `add_existing_entry` (which PRESERVES the parent
+id); (c) `is_alive()` bypass counts the Deleted tombstone and fails `..._excludes_deleted_tombstones`
+(record_count 3≠1). Gate: build clean; lib 1444 passed ×2; interop_manage_snapshots/update_schema/
+update_partition_spec 4/4 each; clippy -D warnings clean; fmt clean. No commit/branch/Cargo/spec/arrow
+edits.
+
+**REVIEW outcome (2026-06-08, REVIEWER Opus, DELEGATED).** Verdict: CHANGES-MADE (test-strength only; no
+production-code change — the aggregation/tie-break/field-id logic is byte-for-byte correct vs
+`PartitionsTable.java`, re-confirmed all 11 ids/types/nullability against lines 42-118 and the
+`Partition.update` fold against 331-360). Independently ran SEVEN mutations by injection; FIVE were already
+caught by the builder's suite (content-type misroute, `>`→`<`, `is_alive()` bypass, swapped field ids,
+flipped null ordering). TWO SURVIVED — exactly the builder's self-flagged weak spots: (1) `>`→`>=`
+(exact-commit-time tie: `>=` lets a later equal-time file overwrite the first-seen one, diverging from
+Java's strict `>`), and (2) delete-file size leaking into `total_data_file_size_in_bytes` (no test asserted
+the data-size total in the presence of delete files). Both are now PINNED:
+- Added `test_partitions_table_last_updated_exact_commit_time_tie_keeps_first_seen_file` — rebuilds the
+  parent snapshot with a commit time EQUAL to the current snapshot's (splicing it back into the `pub(crate)`
+  `snapshots` map in-test, no new accessor), adds the parent's file FIRST and the current's SECOND, and
+  asserts the FIRST-seen (parent) wins. Verified: passes under `>`, FAILS under `>=`.
+- Strengthened `test_partitions_table_delete_files_counted_separately_from_data` to assert
+  `total_data_file_size_in_bytes == FILE_SIZE` (DATA-only). Verified: FAILS when a delete size is summed in.
+- Added `test_partitions_table_partition_with_only_delete_files_present_with_zero_data` (edge case: a
+  delete-only partition still emits a row, data columns 0, delete columns populated — also asserts the size
+  total stays 0).
+- Added a direct `test_compare_partition_values_multi_field_and_null_first_ordering` unit test for the
+  hand-rolled comparator (builder flag #2): multi-field tiebreak, null-first, and a non-long (String) field
+  type. Verified: FAILS when the null ordering is flipped.
+Gate after changes: build clean; lib **1447** passed ×2 (was 1444; +3 net new tests); interop
+manage_snapshots/update_schema/update_partition_spec 4/4 each; clippy -D warnings clean; fmt clean. Scope:
+touched ONLY `inspect/partitions.rs` (tests) + `docs/parity/GAP_MATRIX.md` + this file. No production-logic,
+Cargo, spec, or arrow edits; no commit/branch. Residual risk: cross-spec partition-evolution unification
+stays a documented DEFERRAL (decision 2); the unpartitioned empty-struct partition column stays a documented
+module-wide DIVERGENCE (decision 1) — both honestly stated, neither overstated as parity.
