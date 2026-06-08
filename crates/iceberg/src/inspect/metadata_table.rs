@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{ManifestsTable, SnapshotsTable};
+use super::{FilesTable, ManifestsTable, SnapshotsTable};
 use crate::table::Table;
 
 /// Metadata table is used to inspect a table's history, snapshots, and other metadata as a table.
@@ -34,6 +34,12 @@ pub enum MetadataTableType {
     Snapshots,
     /// [`ManifestsTable`]
     Manifests,
+    /// [`FilesTable`] over all data + delete files (Java `files`).
+    Files,
+    /// [`FilesTable`] over DATA-content files only (Java `data_files`).
+    DataFiles,
+    /// [`FilesTable`] over delete-content files only (Java `delete_files`).
+    DeleteFiles,
 }
 
 impl MetadataTableType {
@@ -42,6 +48,9 @@ impl MetadataTableType {
         match self {
             MetadataTableType::Snapshots => "snapshots",
             MetadataTableType::Manifests => "manifests",
+            MetadataTableType::Files => "files",
+            MetadataTableType::DataFiles => "data_files",
+            MetadataTableType::DeleteFiles => "delete_files",
         }
     }
 
@@ -59,6 +68,9 @@ impl TryFrom<&str> for MetadataTableType {
         match value {
             "snapshots" => Ok(Self::Snapshots),
             "manifests" => Ok(Self::Manifests),
+            "files" => Ok(Self::Files),
+            "data_files" => Ok(Self::DataFiles),
+            "delete_files" => Ok(Self::DeleteFiles),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -78,5 +90,20 @@ impl<'a> MetadataTable<'a> {
     /// Get the manifests table.
     pub fn manifests(&self) -> ManifestsTable<'_> {
         ManifestsTable::new(self.0)
+    }
+
+    /// Get the `files` table — all data + delete files in the current snapshot.
+    pub fn files(&self) -> FilesTable<'_> {
+        FilesTable::all(self.0)
+    }
+
+    /// Get the `data_files` table — only DATA-content files in the current snapshot.
+    pub fn data_files(&self) -> FilesTable<'_> {
+        FilesTable::data(self.0)
+    }
+
+    /// Get the `delete_files` table — only position/equality delete files in the current snapshot.
+    pub fn delete_files(&self) -> FilesTable<'_> {
+        FilesTable::deletes(self.0)
     }
 }

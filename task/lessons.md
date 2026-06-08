@@ -1233,3 +1233,73 @@ How to use it (see the manuals' §2):
   (`test_added_data_files_after_nonancestor_start_overscans_does_not_panic`) rather than fixed. Tracked as a
   parity follow-up (add the `lastSnapshot.parentId() == start` guard when the conflict-validation sub-sequence
   is hardened).
+
+### 2026-06-08 (Phase 3 Increment 1 — `files`/`data_files`/`delete_files` inspection tables, BUILDER Opus)
+- **DO put the files-table content filter at the MANIFEST level, then `entry.is_alive()` — NOT on the
+  entry's `DataFile.content`.** *Why:* Java `BaseFilesTable` selects which MANIFESTS to read per concrete
+  table (`FilesTable` → `allManifests`, `DataFilesTable` → `dataManifests`/content==DATA, `DeleteFilesTable`
+  → `deleteManifests`/content==DELETES); within a manifest it then takes every LIVE entry. So the Rust mirror
+  filters `ManifestFile.content` (`ManifestContentType::{Data,Deletes}`) per table and within each manifest
+  keeps `entry.is_alive()` (Added/Existing) — it does NOT inspect `DataFile.content_type()` to decide
+  membership. A DATA manifest holds only DATA files and a DELETE manifest only delete files, so the two
+  filters agree on the membership set, but filtering at the manifest level is the Java-faithful structure
+  (and is what `dataManifests()`/`deleteManifests()` do). Both filters are load-bearing and must be
+  mutation-pinned independently: mutating the manifest-content filter makes `data_files` swallow the delete
+  file; mutating `is_alive()` makes `files` surface the Deleted tombstone.
+- **DO build the inspection-table partition column with a `StructBuilder::from_fields(partition_arrow_fields)`
+  and per-field `PrimitiveType` dispatch, NOT `get_arrow_datum`/`Datum::new`.** *Why:* there is NO
+  Iceberg-`Struct`-value → Arrow-array helper in the crate (`arrow/value.rs` only goes Arrow→Iceberg);
+  `get_arrow_datum` returns a single-element `Scalar`, awkward to accumulate into a column. Iterating the
+  default partition type's fields and appending each per-row `Option<&Literal>` (extracting the inner
+  `PrimitiveLiteral` into a typed Arrow builder reached via `StructBuilder::field_builder::<T>(index)`) is
+  the direct, robust path. Align the per-row value by index with `partition_type.fields()` —
+  `Struct::fields()[i]` is the i-th partition value as `Option<Literal>`.
+- **DO return `FeatureUnsupported` for timezone-tagged partition types (`timestamptz`/`timestamptz_ns`) in a
+  `StructBuilder`-based column rather than silently using a plain micro/nano builder.** *Why:*
+  `schema_to_arrow_schema` produces `Timestamp(unit, Some("+00:00"))` for tz-tagged types, but
+  `StructBuilder::from_fields` creates a plain (no-tz) `TimestampMicrosecondBuilder`/…Nanosecond for that
+  child; `StructBuilder::finish` reconciles children against the declared tz-tagged `Fields` and the type
+  mismatch would surface late. A plain partition-on-timestamptz is rare; an explicit `FeatureUnsupported`
+  with the type in the message beats a confusing downstream Arrow error. Flag it as a deferred edge.
+- **DO make the metric-map VALUE field non-nullable (`Field::new("value", ty, false)`) when building a
+  `MapBuilder` to match `schema_to_arrow_schema`.** *Why:* Java `DataFile`'s metric maps use
+  `MapType.ofRequired`, so `schema_to_arrow_schema` emits `value: non-null`. A `MapBuilder` value field built
+  with `nullable=true` makes `RecordBatch::try_new` fail with "column types must match schema types, expected
+  ... non-null Int64 but found ... Int64". Carry the canonical Iceberg key/value field ids
+  (`PARQUET:field_id`) on the map's key/value `Field`s too, or the produced Arrow schema won't match.
+- **DO write a self-contained inspection-table test fixture from the scan `TableTestFixture`'s PUBLIC fields
+  (`table`, `table_location`) + public crate writer APIs, NOT its private helpers.** *Why:* `setup_manifest_
+  files`/`next_manifest_file`/`write_parquet_data_files` are private to `scan::tests` and `scan/mod.rs` was
+  out of this increment's edit scope. The metadata table reads ONLY manifest metadata (never the parquet
+  data), so a test can skip real parquet entirely: use a fixed fake `file_size_in_bytes`, write a DATA
+  manifest (`build_v2_data`) + a DELETE manifest (`build_v2_deletes`) via `ManifestWriterBuilder` over
+  `fixture.table.file_io().new_output(...)`, and stitch them into the current snapshot's manifest list with
+  `ManifestListWriter::v2`. `add_delete_entry`/`add_existing_entry` are `pub(crate)`, reachable from an
+  in-crate `#[cfg(test)]` module.
+
+### 2026-06-08 (Phase 3 Increment 1 — `files`/`data_files`/`delete_files`, REVIEWER Opus)
+- **DO mirror Java `BaseFilesTable.schema()`'s empty-partition special-case when porting a files-table:
+  drop the `partition` column entirely for an UNPARTITIONED table.** *Why:* Java (lines 50-54)
+  `if (partitionType.fields().isEmpty()) schema = TypeUtil.selectNot(schema, PARTITION_ID)` — "avoid
+  returning an empty struct, which is not always supported. instead, drop the partition field." A naive
+  port that always emits the `partition` NestedField produces a `Struct([])` column for unpartitioned
+  tables — non-corrupting (the rows are right, no panic) but a schema-shape divergence that breaks
+  column-set parity for interop. Increment 1 left this unhandled; the REVIEWER pinned it with
+  `test_files_table_unpartitioned_keeps_empty_partition_struct_known_divergence` (asserts the current
+  empty-struct column; flips to assert-absent when fixed) and tracked it as a GAP_MATRIX deferral rather
+  than do the invasive conditional-column fix through the fixed 21-column row builder. *Apply:* when a
+  metadata-table schema embeds the partition struct, branch on `default_partition_type().fields().is_empty()`.
+- **DO mutation-pin BOTH the manifest-content filter AND `is_alive()` independently when reviewing a
+  files-table — they are separately load-bearing.** *Why:* the manifest-content filter (`data_files`=DATA
+  manifests, `delete_files`=DELETE manifests) and the `entry.is_alive()` live-entry filter guard different
+  bugs. Verified by three throwaway mutations (deleted after): `Data => true` leaks the delete file into
+  `data_files` (fails `test_data_files_table_excludes_delete_files`); `Deletes => true` leaks data files
+  into `delete_files`; `if true` instead of `is_alive()` resurrects the Deleted tombstone (fails 4 tests).
+  A green suite after a single mutation = an un-pinned filter.
+- **DO verify inspection-table Arrow field ids by DUMPING them from the produced
+  `schema_to_arrow_schema` output and diffing against the Java `*.getType()` ids one-by-one — don't eyeball
+  the source `NestedField` ids.** *Why:* field ids are the interop contract; a transposed id is invisible in
+  a passing value test. A 6-line probe (`for field in arrow.fields() { field.metadata()["PARQUET:field_id"] }`)
+  confirmed all 21 `files`-table ids equal Java `DataFile.getType` in order, including the nested map
+  key/value (117/118…) and list element (133, 136) ids. Also pin the partition value PER row-key (file_path),
+  not just the multiset — a multiset assertion passes even if partitions are shuffled across rows.

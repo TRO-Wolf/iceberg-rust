@@ -1979,3 +1979,139 @@ edits, no commit. Rows stay 🟡.
 **Follow-up (tracked):** add Java `validationHistory`'s post-walk `lastSnapshot.parentId() == start` guard
 to `added_data_files_after` so a non-ancestor `validate_from_snapshot` fails loud (parity) rather than
 over-scanning — fold into the conflict-validation sub-sequence hardening.
+
+---
+
+## Active: Phase 3 — Scan parity (inspection-table set)
+
+Parity target: Java `iceberg-core` metadata-inspection tables (`core/.../*Table`, ~15 variants).
+Authoritative plan: [Roadmap.md](../Roadmap.md) Phase 3; status: [GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md)
+`Metadata inspection tables` row. The `inspect/` framework already ships `snapshots` + `manifests`
+(`MetadataTable<'a>` + `MetadataTableType` enum + per-table `XTable<'a>` with `schema()` + async `scan()`
+→ `ArrowRecordBatchStream`).
+
+**Inspection-table sub-sequence (dependency, then value):**
+1. **`files` family** (`files` / `data_files` / `delete_files`) — THIS increment. Reads the current
+   snapshot's manifest list → manifests → live entries → `DataFile`; the three differ ONLY by the
+   manifest content filter (Java `BaseFilesTable`).
+2. **`entries`** (+ `all_entries`) — the raw manifest-entry view (status/snapshot-id/seq + the `data_file`
+   struct); supersedes much of the files-family read.
+3. **`history` + `refs` + `metadata_log_entries`** — pure-metadata tables (no manifest IO).
+4. **`partitions`** — per-partition aggregation over entries.
+5. **`all_*`** (`all_data_files` / `all_manifests` / `all_entries` …) — scan across ALL snapshots, not
+   just current.
+
+### Phase 3 Increment 1 — `files` / `data_files` / `delete_files` (BUILDER Opus, 2026-06-08)
+New file `crates/iceberg/src/inspect/files.rs`; wired via `inspect/mod.rs` + `metadata_table.rs`
+(enum variants + accessors). Mirrors Java `BaseFilesTable` (one schema + one read + one projection,
+the three tables differ ONLY by the manifest content filter — Rule of Three, factored as a shared base).
+
+**Java contract verified against source** (`core/.../BaseFilesTable.java`, `FilesTable.java`,
+`DataFilesTable.java`, `DeleteFilesTable.java`, `api/.../DataFile.java`):
+- **Content filter is at the MANIFEST level** (Java `FilesTableScan.manifests()`): `files` →
+  `snapshot().allManifests()`; `data_files` → `snapshot().dataManifests()` (content == DATA);
+  `delete_files` → `snapshot().deleteManifests()` (content == DELETES). Within a manifest, only LIVE
+  entries (Added/Existing, Rust `is_alive()`) are rows. A bug that mis-filters content = wrong table.
+  Rust mirror: filter `ManifestFile.content` (`ManifestContentType::{Data,Deletes}`) per table, then
+  `entry.is_alive()`.
+- **Schema = `DataFile.getType(partitionType).fields()`** (field-ids from `api/DataFile.java`), order:
+  `content`(134), `file_path`(100), `file_format`(101), `spec_id`(141), `partition`(102),
+  `record_count`(103), `file_size_in_bytes`(104), `column_sizes`(108) map<int,long>,
+  `value_counts`(109), `null_value_counts`(110), `nan_value_counts`(137), `lower_bounds`(125)
+  map<int,binary>, `upper_bounds`(128), `key_metadata`(131) binary, `split_offsets`(132) list<long>,
+  `equality_ids`(135) list<int>, `sort_order_id`(140), `first_row_id`(142), `referenced_data_file`(143),
+  `content_offset`(144), `content_size_in_bytes`(145). (`record_count`/`file_size` are LONG in the
+  metadata-table schema even though the Rust `DataFile` holds them as `u64`.)
+
+Plan:
+- [x] `FilesTable<'a>` base struct (holds `&Table` + a `FilesTableKind` filter); `schema()` builds the
+      Iceberg schema above from the table's DEFAULT partition type (partition struct field). `scan()`:
+      current snapshot → `load_manifest_list` → for each `ManifestFile` whose content passes the table's
+      manifest-content filter, `load_manifest` → for each LIVE entry, append a row from its `DataFile`.
+- [x] One struct + a `FilesTableKind` { All, Data, Deletes } enum (the only thing that differs) +
+      ctors `FilesTable::{all,data,deletes}`; `MetadataTable::{files, data_files, delete_files}`
+      accessors + `MetadataTableType::{Files, DataFiles, DeleteFiles}` (+ `as_str`/`TryFrom`).
+- [x] Partition column: `StructBuilder::from_fields(partition_arrow_fields)`; per partition field,
+      dispatch on its `PrimitiveType` and append each per-row `Option<Literal>` (extracting the
+      `PrimitiveLiteral`) — covers bool/int/long/float/double/date/time/timestamp/timestamp_ns/string/
+      binary/decimal. Metrics maps via `MapBuilder<Int32Builder, Int64Builder>` (counts) /
+      `<Int32Builder, LargeBinaryBuilder>` (bounds, RAW `Datum::to_bytes` per Java map<int,binary>);
+      keys sorted for determinism. **DEVIATION:** `get_arrow_datum`/`Datum::new` was NOT used — direct
+      `PrimitiveLiteral` extraction into typed Arrow builders is simpler and avoids scalar-array concat.
+      **Timezone-tagged partition types (`timestamptz`/`timestamptz_ns`) return `FeatureUnsupported`**
+      (the tz-tagged Arrow child can't be produced from a plain micro/nano builder without a panic at
+      `StructBuilder::finish`; flagged as a deferred edge — partition-on-timestamptz is rare).
+- [x] **DEFERRED `readable_metrics`** (Java `MetricsUtil.readableMetricsStruct`). All raw columns incl.
+      the metrics maps + V3 DV fields land. Flagged.
+- [x] 8 tests (`TableTestFixture` + a self-contained DATA + DELETE manifest writer — public crate APIs
+      only, no scan-fixture private helper, no real parquet since the table reads manifest metadata):
+      `files`=live data+delete set, `data_files`=DATA only, `delete_files`=deletes only, content 0-vs-1,
+      record_count/file_size vs committed metadata, partition struct + column_sizes spot-check, Arrow
+      schema column/type set, empty table. Content-filter + `is_alive()` mutation-verified load-bearing.
+- [x] Docs: GAP_MATRIX `Metadata inspection tables` row (files/data_files/delete_files landed;
+      readable_metrics deferred); Roadmap Phase 3 (inspection sub-sequence + this increment); this todo;
+      lessons. Verify gate from repo root.
+
+**Outcome (2026-06-08, Phase 3 Increment 1, BUILDER Opus):** `files` / `data_files` / `delete_files`
+land at Java `BaseFilesTable` schema parity (🟡). One `FilesTable<'a>` + a `FilesTableKind` filter
+(the Rule-of-Three shared base); the three accessors + enum variants wired. Reads the CURRENT snapshot's
+manifest list, selects manifests by content (`All`/`Data`/`Deletes`), emits one row per LIVE entry's
+`DataFile`. Arrow schema mirrors `DataFile.getType(partitionType).fields()` with the canonical field ids;
+ALL raw columns present (metrics maps map<int,long>/map<int,binary>, list columns, V3 DV fields).
+**Deferred:** `readable_metrics`; the other inspection variants (entries/history/refs/partitions/all_*);
+timezone-tagged partition columns (FeatureUnsupported); Java/Spark interop comparison (→ ✅).
+**Verify (repo root):** build clean; lib ×2 = 1417/0 both runs (was 1409 baseline → +8); 3 interop suites
+4/4 each (manage_snapshots/update_schema/update_partition_spec); clippy -D warnings clean; fmt --check
+clean. Content-filter (`data_files` wrongly included the delete file) AND `is_alive()` (Deleted tombstone
+leaked in) mutations each fail the matching test. Files touched exactly the allowed set:
+`inspect/files.rs` (new), `inspect/mod.rs`, `inspect/metadata_table.rs`, GAP_MATRIX, Roadmap, todo,
+lessons. No Cargo/lockfile/`arrow/` edits, no commit. An Opus REVIEWER verifies next.
+
+#### Phase 3 Increment 1 — REVIEW (2026-06-08, Opus REVIEWER, DELEGATED)
+Adversarially verified points 1–5 against the Java source (`/tmp/iceberg-java-ref`) + throwaway probes
+(deleted after). Plan:
+- [x] **Pt 1 (content filter): CONFIRMED + mutation-verified.** Manifest-level filter is correct
+      (`ManifestContentType` is whole-manifest DATA(0)|DELETES(1) — Iceberg never mixes content in one
+      manifest, so manifest-level == file-level, matching Java `dataManifests`/`deleteManifests`).
+      MUTATION A (`Data => true`, include delete manifests) → `test_data_files_table_excludes_delete_files`
+      FAILS. MUTATION B (`Deletes => true`, include data manifests) → `test_delete_files_table_lists_only_
+      delete_files` FAILS. Both restored.
+- [x] **Pt 2 (live-entry filter): CONFIRMED + mutation-verified.** `entry.is_alive()` = Added|Existing;
+      Deleted tombstone dropped. MUTATION C (`if true` instead of `is_alive()`, leak the Deleted
+      2.parquet) → 4 tests FAIL (live-set, data-files-exclude, record-count count=4, partition includes
+      200). Restored.
+- [x] **Pt 3 (column mapping + field ids): CONFIRMED.** A throwaway probe dumped all 21 Arrow field ids;
+      EVERY id + order matches Java `DataFile.getType(partitionType)` exactly (content/134, file_path/100,
+      file_format/101, spec_id/141, partition/102, record_count/103, file_size/104, the 4 count maps
+      108/117-118…137/138-139, the 2 bound maps 125/126-127, 128/129-130, key_metadata/131,
+      split_offsets/132-133, equality_ids/135-136, sort_order_id/140, first_row_id/142,
+      referenced_data_file/143, content_offset/144, content_size/145). Map value fields carry
+      `nullable:false` (Java `MapType.ofRequired`). Values: `content` 0/1 vs committed; `lower_bounds`
+      for `Datum::long(1)` = raw LE `[1,0,0,0,0,0,0,0]` (Iceberg single-value serialization, Java
+      `map<int,binary>`). `content_type() as i32` and `file_format().to_string()` (lowercase) correct.
+- [x] **Pt 4 (partition extraction + tz deferral): CONFIRMED.** A probe pinned partition value PER
+      file_path: `{1.parquet:100, 3.parquet:300, delete-1.parquet:100}` — each row's partition struct
+      matches THAT file (no row misalignment). The `timestamptz`/`timestamptz_ns` → `FeatureUnsupported`
+      deferral is honest (explicit error arm in `append_partition_field`, not a silent wrong value).
+- [x] **Pt 4b (deferrals honestly tracked): CONFIRMED.** `readable_metrics` + tz-partition
+      `FeatureUnsupported` both in GAP_MATRIX/todo; row is 🟡; nothing silently wrong.
+- [x] **Pt 5 (no regression + scope): CONFIRMED.** Build clean; lib ×2 = 1417/0 (→1418 with the new
+      divergence test); 3 interop suites 4/4 each; clippy -D warnings clean; fmt clean. Only the named
+      files. No bare `.unwrap()` in production (one justified `.expect("…statically valid")`). Empty
+      table → 0 rows, no panic.
+- [x] **DIVERGENCE FOUND (untracked) → pinned + tracked, NOT fixed:** Java `BaseFilesTable.schema()`
+      drops the `partition` field for an UNPARTITIONED table (empty partition type); Rust keeps an
+      empty-struct `partition` column. Verified non-corrupting (a probe scanned an unpartitioned table
+      with one file: 1 row, `partition=Struct([])`, NO panic). Decision: the fix (conditionally omit the
+      column through the 21-column builder) is more invasive than the BUILDER's scoped partitioned path
+      and is non-corrupting + narrow, so — matching the Increment-5 V2-default precedent — added a
+      divergence-PINNING test (`test_files_table_unpartitioned_keeps_empty_partition_struct_known_
+      divergence`, asserts the current empty-struct column; flips to assert-absent when fixed) and tracked
+      it as a GAP_MATRIX deferral rather than a silent gap. Row stays 🟡.
+
+**Review outcome (2026-06-08, Opus REVIEWER):** all 5 brief points VERIFIED; content-filter (×2) +
+`is_alive` (×1) mutations each fail the matching test; field-id + partition-value + bound-byte checks pass
+vs Java. One untracked schema-shape divergence (unpartitioned empty-partition column) found → pinned with
+a test + tracked in GAP_MATRIX (not fixed — non-corrupting, narrow, invasive-to-fix; left 🟡). Files
+touched: `inspect/files.rs` (+1 test), GAP_MATRIX, todo, lessons. No production-logic change, no Cargo
+edits, no commit, no branch switch.

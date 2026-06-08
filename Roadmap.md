@@ -338,6 +338,16 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `IncrementalAppendScan`, `IncrementalChangelogScan`, `BatchScan`; split planning;
   `ScanReport` / `MetricsReporter`; the full metadata-inspection table set (files, entries, history, refs,
   partitions, all_* …).
+- **Inspection-table sub-sequence (dependency, then value):**
+  1. **`files` family** (`files` / `data_files` / `delete_files`) — **DONE 🟡 (2026-06-08, Increment 1,
+     `inspect/files.rs`).** Reads the current snapshot's manifest list → manifests → live entries →
+     `DataFile`; the three differ ONLY by the manifest-content filter (Java `BaseFilesTable`). Arrow schema
+     mirrors `DataFile.getType(partitionType)` (all raw columns incl. the metrics maps + V3 DV fields);
+     `readable_metrics` deferred. 8 unit tests (content-filter + `is_alive()` mutation-verified).
+  2. **`entries`** (+ `all_entries`) — the raw manifest-entry view (status/snapshot-id/seq + `data_file`).
+  3. **`history` + `refs` + `metadata_log_entries`** — pure-metadata tables (no manifest IO).
+  4. **`partitions`** — per-partition aggregation over entries.
+  5. **`all_*`** (`all_data_files` / `all_manifests` / `all_entries` …) — across ALL snapshots.
 - **Exit criteria:** scans match Java planning/results incl. residuals; inspection tables present; reports
   emitted.
 
