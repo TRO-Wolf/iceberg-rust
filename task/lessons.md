@@ -1594,3 +1594,70 @@ How to use it (see the manuals' §2):
   pulled it into `inspect/partition_summary.rs` (`pub(super)` free fns) rather than duplicate it; this also
   let me drop the old `manifests.rs` bare `.unwrap()`s (propagate errors / `.expect` only the statically-valid
   schema build) in one place. The shared module means the two tables physically cannot drift.
+
+### 2026-06-08 (Phase 3 Increment 1 — ResidualEvaluator core, BUILDER Opus)
+- **DO mirror Java `ResidualVisitor.not` with a constant-folding `simplifying_not`, NOT the `Predicate` `!`
+  operator.** *Why:* Java `Expressions.not` (`api/.../expressions/Expressions.java` L63-73) folds
+  `not(true)=false`, `not(false)=true`, `not(not x)=x`, else wraps; but Rust's `impl Not for Predicate`
+  (`predicate.rs`) deliberately does NOT simplify — it just wraps in `Predicate::Not`. So a residual
+  `NOT(category==5)` whose inner leaf reduced to `AlwaysTrue` came out as `Not(AlwaysTrue)` instead of
+  `AlwaysFalse`. The bound→unbound reconstruction's `Not` arm has the same trap. Pin it with a test that
+  asserts a `not` over a partition leaf collapses to a bare constant both ways
+  (`test_not_over_partition_leaf_negates_the_reduced_constant`). (Contrast: `Predicate::{and,or}` DO simplify
+  constants, so `and`/`or` can use the operators directly — it's only `not` that needs the helper.)
+- **DO compute a bucket-partition test's partition value with `create_transform_function(&Transform::Bucket(n))
+  .transform_literal(&Datum::int(v))`, not a hand-guessed integer.** *Why:* the bucket-keep test must place the
+  partition value where an `x = v` row actually lands — `bucket(x) == bucket(v)` — so the INCLUSIVE projection
+  evaluates TRUE (does not reduce to false) and, bucket having no strict projection for `eq`, the predicate
+  survives (the residual KEEPs it). A guessed value (e.g. `3`) almost never equals `bucket(5,16)`, so the
+  inclusive projection is false and the residual wrongly collapses to `AlwaysFalse` — the test then fails for
+  the wrong reason. `transform_literal` returns `Option<Datum>` whose `.literal()` is `PrimitiveLiteral::Int`.
+- **DO pass the table `schema` into the residual evaluator's `of` ctor and precompute the partition `Schema`
+  once.** *Why:* Java's `PartitionSpec` carries its schema so `spec.partitionType()` is free; Rust's
+  `PartitionSpec::partition_type(schema)` REQUIRES the schema. The projected (partition-column) predicates from
+  `Transform::{project,strict_project}` are UNBOUND and must be bound to the partition type before evaluating
+  against the partition `Struct` — build a partition `Schema` from `partition_type.fields()` in the ctor (the
+  same shape `expression_evaluator.rs`'s test helper `create_partition_filter` uses) and reuse it for every
+  `residual_for` call. Binding an `AlwaysTrue`/`AlwaysFalse` projection short-circuits to its constant before
+  the `ExpressionEvaluatorVisitor` runs (Java: "if the result is not a predicate it must be a constant").
+- **DO reconstruct the leaf "keep the original predicate" residual from the bound leaf by the source field's
+  NAME, and lean on the existing `BoundReference::field().name`.** *Why:* Java returns the original BOUND
+  `pred`, but the Rust residual is an unbound `Predicate`; there is NO public bound→unbound conversion and no
+  `column_name` accessor on `BoundReference`. Partition-source columns are always TOP-LEVEL schema fields, so
+  `Reference::new(reference.field().name.clone())` is the faithful unbound reference (the nested-path
+  `column_name` distinction never applies to a partition source). A generic `bound_to_unbound` that recurses
+  And/Or/Not and rebuilds Unary/Binary/Set from the field name covers both the leaf-keep and the unpartitioned
+  cases.
+- **DO mutation-check the strict-vs-inclusive DIRECTION, not just "it reduces."** *Why:* swapping
+  `strict_project`↔`project` in `reduce_leaf` still reduces SOME cases, so a single happy-path "reduces to
+  AlwaysTrue" test survives the swap. The discriminating tests are the day-example "equals ONE bound" cases
+  (strict decides the satisfied half ⇒ that half drops; inclusive only gates the false short-circuit) — the
+  swap makes those keep/drop the wrong half. Confirmed: the swap fails exactly the 3 "equals bound" day cases
+  + the bucket-keep (4 total), and the partition-ignore mutation fails the 9 reduction tests while the 7
+  "kept verbatim" tests legitimately survive.
+
+### 2026-06-08 (Phase 3 Increment 1 — ResidualEvaluator core, REVIEWER Opus)
+- **DO test the `bound_to_unbound` logical (And/Or/Not) arms through the UNPARTITIONED path — they are
+  unreachable from the partitioned path.** *Why:* in `residual_for`, the partitioned branch runs the
+  `visit`/`BoundPredicateVisitor`, which decomposes And/Or/Not BEFORE the leaf methods, so `reduce_leaf`
+  only ever hands `bound_to_unbound` a single Unary/Binary/Set leaf. The And/Or/Not arms of
+  `bound_to_unbound` are reached ONLY by the unpartitioned `residual_for` (`bound_to_unbound(&self.filter)`).
+  The Increment-1 builder's unpartitioned tests used only `And` + a single binary, leaving the `Not` arm
+  untested — a mutation that drops the negation there (`simplifying_not(inner)` → `inner`) SURVIVED all 16
+  tests. Added `test_unpartitioned_spec_round_trips_a_not_filter_keeping_the_negation` (a `NOT(id>100)`
+  filter, unpartitioned) which the mutation now fails. Lesson: when a helper has arms reachable by two
+  different callers, enumerate which caller reaches each arm and test from that caller.
+- **DO pin a residual test for transform classes beyond day/identity/bucket — truncate, a temporal
+  (year/month/hour), and void all feed scan correctness.** *Why:* the residual is correct for ALL partition
+  types or it silently drops/over-scans rows. Verified empirically (throwaway probes) that truncate reduces
+  all three ways (straddling→kept, all-above→AlwaysTrue, all-below→AlwaysFalse), year keeps both bounds
+  inside the year + AlwaysFalse outside, and void KEEPS the predicate (Java `VoidTransform.project`/
+  `projectStrict` both return null → no projection → no reduction, no panic on the null partition value).
+  Added pinning tests for all three; the truncate/year tests also fail the strict↔inclusive swap, proving
+  they are not theater.
+- **DO pin the multi-partition-field-per-source loop (`getFieldsBySourceId`) — the single-field tests can't
+  exercise it.** *Why:* Java loops over EVERY partition field whose source id matches the predicate column;
+  a `break`-after-first mutation survives any spec with one field per source. A spec with BOTH
+  bucket(category) (inconclusive for eq) AND identity(category) (conclusive) forces the loop to continue
+  past bucket to let identity decide. Added a test (AlwaysTrue on match / AlwaysFalse on miss); the
+  break-after-first mutation fails it.

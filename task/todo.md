@@ -2705,3 +2705,170 @@ exact panic). Updated the schema doc-comment + GAP_MATRIX to document the diverg
 documented deviation from Java's NOMINAL `required` flag (which Java never enforces); correctness > nominal
 metadata parity. lib total **1467** (was 1466; +1 net regression test, probe removed). Full gate (all 7)
 re-run clean after the fix.
+
+---
+
+## SEQUENCE: ResidualEvaluator + filter-based conflict validation (Phase 3, started 2026-06-08)
+Branch `phase3-residual-eval` (off merged `main` `a31657dd`). The inspection-table set is COMPLETE; this
+sequence builds the residual-evaluation gap + the deferred Phase-2 filter-based conflict validation it unblocks.
+
+**Why:** Java `api/.../expressions/ResidualEvaluator.java` is ABSENT in Rust. It partially-evaluates a row
+filter against a partition's values → the residual predicate. Needed for (a) correct per-task scan residuals
+(`FileScanTask` today carries the FULL bound predicate, not the partition-reduced residual) and (b) the
+DEFERRED `OverwriteFiles`/`RowDelta` `validateNoConflictingData` (filter-based concurrent-commit safety).
+
+Infrastructure that already exists (the build leans on it): `BoundPredicateVisitor` trait
+(`expr/visitors/bound_predicate_visitor.rs`); `Transform::project` (inclusive) + `Transform::strict_project`
+(strict) in `spec/transform.rs`; the `ExpressionEvaluatorVisitor` pattern (`expr/visitors/expression_evaluator.rs`)
+that evaluates a bound predicate against a partition `Struct` → bool; `Predicate::{AlwaysTrue,AlwaysFalse}` +
+`BoundPredicate::{AlwaysTrue,AlwaysFalse}`; `PartitionField.source_id` for the by-source lookup; the scan
+already carries a `partition_bound_predicate` (`scan/mod.rs`).
+
+### Increment 1 — ResidualEvaluator core (THIS increment)
+New `crates/iceberg/src/expr/visitors/residual_evaluator.rs`. Mirror Java `ResidualEvaluator`:
+- `ResidualEvaluator` holding `(partition_spec, filter, case_sensitive)`; constructors `unpartitioned(filter)`
+  (residual is ALWAYS the filter unchanged) and `of(spec, filter, case_sensitive)` (→ unpartitioned when the
+  spec has no fields).
+- `residual_for(&self, partition: &Struct) -> Result<Predicate>` — the residual visitor:
+  - and/or/not → recurse + combine; alwaysTrue/alwaysFalse pass through.
+  - leaf unary/binary/set predicate on a partition-SOURCE column: get the partition fields with
+    `source_id == ref.field_id()`; for each, compute `strict_project` (if its evaluation against the partition
+    struct is TRUE → residual `AlwaysTrue`) and `project` (inclusive; if FALSE → residual `AlwaysFalse`); else
+    keep the original predicate. (Java `predicate()` L227-288.) Evaluate the projected (partition-bound)
+    predicate against the partition struct via the `ExpressionEvaluatorVisitor` pattern.
+  - leaf on a non-partition column → keep the predicate (can't reduce).
+- Tests: the Javadoc `day(ts)` example's 4 residual cases (`d>day(a)&&d<day(b)`→true; `d==day(a)`→`ts>=a`;
+  `d==day(b)`→`ts<=b`; `d==day(a)==day(b)`→both); identity partition (eq reduces to alwaysTrue/false);
+  bucket partition (non-reducible → keeps predicate); unpartitioned (returns filter verbatim); alwaysTrue/
+  alwaysFalse filters; a predicate on a non-partition column (kept). Mutation-pin strict-vs-inclusive.
+
+Plan / checkboxes (Increment 1):
+- [x] New `expr/visitors/residual_evaluator.rs`: `ResidualEvaluator { spec, filter (BoundPredicate),
+      partition_schema, case_sensitive }` + `unpartitioned(filter)` + `of(spec, schema, filter, case_sensitive)`.
+- [x] `residual_for(&self, partition: &Struct) -> Result<Predicate>` via a `ResidualVisitor`
+      (`BoundPredicateVisitor<T = Predicate>`): and/or/not via the simplifying combinators; leaf →
+      strict-true ⇒ `AlwaysTrue`, inclusive-false ⇒ `AlwaysFalse`, else keep the original (bound→unbound).
+- [x] Register `pub(crate) mod residual_evaluator;` in `expr/visitors/mod.rs`.
+- [x] Tests (in-crate): 4 day-example cases + identity + bucket + non-partition + unpartitioned + alwaysTrue/
+      alwaysFalse + and/or/not mixes; mutation-pin strict↔inclusive and partition-ignore.
+- [x] Docs: GAP_MATRIX residual row, Roadmap Phase 3, todo Outcome, lessons.
+- [x] Gate: build -p iceberg / workspace build / lib ×2 / 3 interop / clippy / fmt.
+
+### Increment 2 — wire residuals into scan FileScanTask
+Compute the per-task residual during planning so each `FileScanTask` carries the partition-reduced residual
+(Java parity), connecting to the existing `partition_bound_predicate` machinery in `scan/mod.rs`. Guard
+behavior-equivalence (residual ⊆ original filter; row-level filtering must not change results).
+
+### Increment 3 — OverwriteFiles (+ RowDelta) filter-based validateNoConflictingData
+Consume the residual/metrics evaluators to implement the deferred filter-based conflict validation, building
+on the Phase-2 foundation (`Transaction.starting_snapshot_id` + `TransactionAction::validate` +
+`added_data_files_after`; `ReplacePartitions.validate_no_conflicting_data` already wired). Scope precisely
+against Java `MergingSnapshotProducer.validateAddedDataFiles` / `OverwriteFiles` when reached.
+
+**Outcome (2026-06-08, Phase 3 Increment 1 — ResidualEvaluator core, BUILDER Opus):** `ResidualEvaluator`
+landed 🟡 in the new `crates/iceberg/src/expr/visitors/residual_evaluator.rs`. It partially evaluates a bound
+row filter against a partition's `Struct` and returns the residual — the part of the filter NOT already
+decided by the partition.
+
+**Type decisions (deliberate divergences from Java, documented in the module + GAP_MATRIX):**
+- Java's `ResidualEvaluator` holds one `Expression expr` (the bound/unbound union) and `residualFor` returns
+  an `Expression`. The Rust port holds the filter as a `BoundPredicate` (the scan binds before planning) and
+  returns the residual as an UNBOUND `Predicate`. Signature:
+  `ResidualEvaluator::of(spec: PartitionSpecRef, schema: &Schema, filter: BoundPredicate, case_sensitive: bool)
+  -> Result<Self>`, `ResidualEvaluator::unpartitioned(filter: BoundPredicate) -> Self`,
+  `residual_for(&self, partition: &Struct) -> Result<Predicate>`.
+- `of` takes the table `schema` (Java's `PartitionSpec` carries its schema; the Rust one does not), used once
+  in the ctor to compute `spec.partition_type(schema)` → a partition `Schema` the projected predicates bind to.
+- For the leaf "keep the original predicate" case Java returns the original BOUND `pred`; the Rust port
+  reconstructs the unbound `Predicate` from the bound leaf by the source field's NAME
+  (`bound_to_unbound` + `unbound_reference`) — partition-source columns are top-level schema fields, so the
+  field name is the unbound reference name.
+- Visibility `pub(crate)` (Increments 2/3 are in-crate consumers); `#![allow(dead_code)]` until they land.
+
+**Residual algorithm (mirrors Java `ResidualVisitor`):** a `BoundPredicateVisitor<T = Predicate>`. and/or →
+the simplifying `Predicate::{and,or}` combinators (so AlwaysTrue/AlwaysFalse short-circuit like
+`Expressions.and/or`); not → a Java-`Expressions.not`-faithful `simplifying_not` (`not(true)=false`,
+`not(false)=true`, `not(not x)=x`, else wrap) because the `Predicate` `!` operator does NOT simplify
+constants. Every leaf method routes to `reduce_leaf(reference, predicate)`: find the partition fields with
+`source_id == reference.field().id`; if none, keep the predicate; otherwise for each part compute
+`Transform::strict_project` (bind to the partition schema, evaluate against the partition via
+`ExpressionEvaluatorVisitor` → if TRUE, return `AlwaysTrue`) then `Transform::project` (inclusive; if FALSE,
+return `AlwaysFalse`); if neither is conclusive, keep the original predicate. An `AlwaysTrue`/`AlwaysFalse`
+*projection* short-circuits to its constant (Java's "if the result is not a predicate it must be a constant").
+
+**Reuse:** made `ExpressionEvaluatorVisitor` + its `new` `pub(crate)` in `expression_evaluator.rs` (the ONLY
+edit to that file — the brief's sanctioned small helper) so the residual evaluator reuses the exact
+per-operator bound-predicate-against-partition-`Struct` evaluation rather than duplicating it.
+
+**Java lines verified:** `ResidualEvaluator.unpartitioned` L73-75 + `UnpartitionedResidualEvaluator` L53-65
+(residual is always the whole expr); `of` L84-90 (empty spec → unpartitioned); the leaf methods L146-223
+(each evaluates the bound ref against the partition struct → alwaysTrue/alwaysFalse); the load-bearing
+`predicate(BoundPredicate)` L227-288 (strict-projection-true ⇒ alwaysTrue; inclusive-projection-false ⇒
+alwaysFalse; else keep `pred`); and `Expressions.not` L63-73 (the constant-folding negation).
+
+**Tests (16, each named for its risk):** the 4 Javadoc `day(utc_timestamp)` cases
+(`*_strictly_between_bounds_reduces_to_always_true`, `*_equals_lower_bound_keeps_lower_predicate_only`,
+`*_equals_upper_bound_keeps_upper_predicate_only`, `*_equals_both_bounds_keeps_both_predicates`) — the
+headline reductions; `*_identity_partition_eq_matching_value_reduces_to_always_true` /
+`*_non_matching_value_reduces_to_always_false` (identity eq collapses by the partition value);
+`*_bucket_partition_keeps_predicate_unchanged` (non-invertible transform → predicate survives; the partition
+value is computed as the real `bucket(5,16)` via `transform_literal` so the inclusive projection is true and
+strict is absent); `*_predicate_on_non_partition_column_is_kept`;
+`*_unpartitioned_spec_returns_filter_verbatim` (empty spec via `of`) + `*_unpartitioned_constructor_*`;
+`*_always_true_filter_passes_through` / `*_always_false_*`;
+`*_and_of_reducible_and_non_reducible_keeps_only_the_non_reducible`,
+`*_and_short_circuits_to_false_when_partition_excludes_the_partition_leaf`,
+`*_or_of_reducible_true_and_non_reducible_short_circuits_to_true`,
+`*_not_over_partition_leaf_negates_the_reduced_constant` (and/or/not mixes of a reducible + a non-reducible
+leaf).
+
+**Mutations run (each caught):** (a) swap `strict_project`↔`project` in `reduce_leaf` → 4 reduction tests
+FAIL (the three "equals one bound" day cases + the bucket-keep). (b) make `residual_for` ignore the partition
+(always `bound_to_unbound(filter)`) → 9 reduction tests FAIL (all day reductions + identity + the and/or/not
+combinations); the 7 "kept verbatim" tests legitimately still pass. Both restored after.
+
+**Gate (all clean, from repo root, pinned nightly):** `cargo build -p iceberg` ✅; `cargo build --workspace
+--exclude iceberg-sqllogictest --all-targets` ✅; `cargo test -p iceberg --lib` ×2 = **1483 passed / 0 failed**
+both runs (was 1467 → +16 residual tests); 3 interop suites (`interop_manage_snapshots` /
+`interop_update_schema` / `interop_update_partition_spec`) = 4/4 each ✅; `cargo clippy --workspace --exclude
+iceberg-sqllogictest --all-targets -- -D warnings` clean ✅ (collapsed two `if let { if }` into let-chains);
+`cargo fmt --all -- --check` clean ✅. No commit, no branch switch, no Cargo/spec/scan/transaction edits.
+Files: NEW `expr/visitors/residual_evaluator.rs`; `expr/visitors/mod.rs` (`pub(crate) mod residual_evaluator;`);
+`expr/visitors/expression_evaluator.rs` (`ExpressionEvaluatorVisitor` + `new` → `pub(crate)`); docs
+(GAP_MATRIX/Roadmap/todo/lessons).
+
+#### Phase 3 Increment 1 — REVIEW (2026-06-08, Opus REVIEWER, DELEGATED)
+Adversarially verified the ResidualEvaluator port against the Java source (`/tmp/iceberg-java-ref`) and by
+running 7 code mutations. Findings:
+- **Strict/inclusive direction: CONFIRMED CORRECT (not swapped).** Java `predicate(BoundPredicate)`
+  L248-262: `projectStrict` result `op()==TRUE` ⇒ `alwaysTrue`; L265-283: `project` (inclusive) result
+  `op()==FALSE` ⇒ `alwaysFalse`. Rust `reduce_leaf` uses `strict_project`→AlwaysTrue then `project`
+  (inclusive)→AlwaysFalse — same direction. Swap mutation fails 4-6 tests (the 3 day "equals one bound" +
+  bucket-keep, now also truncate + year).
+- **The 4 day-residual cases: asserted EXACTLY** (strictly-between→`AlwaysTrue`; `==day(a)`→`ts>=a`;
+  `==day(b)`→`ts<=b`; `==both`→`ts>=a AND ts<=b`), not weakened to "not AlwaysTrue".
+- **Untested transform classes: VERIFIED + PINNED.** Exercised truncate / year / void through `residual_for`
+  (throwaway probes): all reduce correctly (truncate all-three-ways; year keeps-both-inside + AlwaysFalse-
+  outside; void KEEPS — Java `VoidTransform` returns null for both projections, no panic). Added permanent
+  pinning tests for all three.
+- **Leaf reconstruction round-trip: VERIFIED + PINNED** for set (`in`/`not_in`) and unary (`is_null`) on a
+  non-partition column (builder only covered binary). `not(in)` correctly round-trips as `Not(In{..})` (the
+  binder keeps the `Not` wrapper, not a `NotIn` operator) — faithful, not a bug.
+- **Combinator simplification: CONFIRMED.** `Predicate::and`/`or` constant-fold (predicate.rs L563-599);
+  `simplifying_not` mirrors Java `Expressions.not` L63-73 EXACTLY (not(true)=false/not(false)=true/
+  not(not x)=x, else wrap). The `!` operator does NOT fold, so `simplifying_not` is load-bearing.
+- **Multi-field-per-source loop: PINNED.** A spec with bucket(category)+identity(category) forces the loop
+  to continue past the inconclusive bucket field; break-after-first mutation now fails.
+- **Mutations run (all caught):** (a) strict↔inclusive swap; (b) ignore-partition; (c) drop inclusive-false;
+  (d) drop strict-true; (e) break `not` folding; (f) drop negation in `bound_to_unbound` `Not` arm
+  [SURVIVED the builder's 16 tests — a real gap, now closed]; (g) break-after-first in the parts loop
+  [closed].
+- **Scope + floor: CLEAN.** Production code byte-identical to the builder's (only test additions);
+  `expression_evaluator.rs` is ONLY the visibility bump; `#![allow(dead_code)]` is module-scoped; no bare
+  `.unwrap()` in production paths; no Cargo/spec/scan/transaction edits; no commit/branch switch.
+
+**Review outcome:** CHANGES-MADE — added 8 tests (16→24); closed two genuine test-strength gaps (the
+unpartitioned-`Not` reconstruction and the multi-field-per-source loop) the builder's suite did not catch.
+**Verify:** build -p iceberg clean; workspace build clean; lib ×2 = 1491/0 (was 1483 → +8); 3 interop
+suites 4/4 each; clippy -D warnings clean; fmt clean. Row stays 🟡 (scan-wiring Inc 2 + conflict-validation
+Inc 3 + Java interop still pending). Files touched: `residual_evaluator.rs` (tests only), todo, lessons.

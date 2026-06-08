@@ -346,6 +346,13 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `IncrementalAppendScan`, `IncrementalChangelogScan`, `BatchScan`; split planning;
   `ScanReport` / `MetricsReporter`; the full metadata-inspection table set (files, entries, history, refs,
   partitions, all_* …).
+- **Residual evaluation (started 2026-06-08):** the `ResidualEvaluator` CORE landed 🟡 (Increment 1,
+  `expr/visitors/residual_evaluator.rs`, Java `ResidualEvaluator`) — partially evaluates a bound row filter
+  against a partition's values → the residual `Predicate` (strict-projection-true ⇒ `AlwaysTrue`,
+  inclusive-projection-false ⇒ `AlwaysFalse`, else keep), reusing `Transform::{project,strict_project}` +
+  the `ExpressionEvaluatorVisitor`; 16 unit tests incl. the Javadoc `day(ts)` 4-case example, both mutations
+  (strict↔inclusive, partition-ignore) caught. **Next:** scan-wiring (Increment 2 — per-`FileScanTask`
+  residuals) + filter-based concurrent-commit conflict validation (Increment 3).
 - **Inspection-table sub-sequence (dependency, then value):**
   1. **`files` family** (`files` / `data_files` / `delete_files`) — **DONE 🟡 (2026-06-08, Increment 1,
      `inspect/files.rs`).** Reads the current snapshot's manifest list → manifests → live entries →
