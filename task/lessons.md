@@ -1684,9 +1684,29 @@ How to use it (see the manuals' §2):
   behavior, but it exposed a pre-existing inconsistency in `TableTestFixture` (partition `x`=100/200/300 vs the
   parquet `x` column `[1; 1024]`) and broke 9 tests asserting `x`==1 as a plain `Int64Array`. A change that
   only "sets a field on a struct" can still alter downstream read behavior — grep the field's consumers
-  (`task.partition_spec`) before assuming "reader unchanged." Fix: make the fixture internally consistent
-  (partition `x`=1, matching the data), and decode the now-run-encoded constant in the read assertions
-  (`arrow_cast::cast::cast` to `Int64` flattens a `RunEndEncoded<Int64>`).
+  (`task.partition_spec`) before assuming "reader unchanged."
+  **REVERTED (2026-06-08, post-push): the constants-map activation was BACKED OUT — `task.partition_spec` is
+  left `None`.** *Why:* CI's INTEGRATION tests (which my `-p iceberg` + workspace-BUILD gate never RAN) exposed
+  two latent bugs in `record_batch_transformer::constants_map`: it emits a `RunEndEncoded` column where the
+  declared scan schema is plain `Utf8` (`test_insert_into_partitioned` — "expected Utf8 but found
+  RunEndEncoded"), and it cannot widen an `Int(i32)` partition literal to an `Int64` column
+  (`test_evolved_schema` — "Unsupported constant type combination: Int64 with Some(Int(19))"). The constants-map
+  is a SEPARATE parity feature with real bugs; activating it was a BUNDLED extra in the residual increment, not
+  the residual goal — the residual works with `partition_spec = None` (the reader reads identity-partition
+  columns from the data file). Reverting kept the residual + the (still-necessary) fixture-consistency fix and
+  removed the blast radius; the constants-map + its fixes are deferred to a dedicated increment gated by the
+  datafusion + integration read tests. Reverting also required removing the now-dead `partition_spec` field
+  threading through `ManifestFileContext`/`ManifestEntryContext` (the local spec that builds the residual
+  evaluator stays) and undoing the RunEndEncoded read assertions (`x` is plain `Int64` again).
+- **PROCESS (2nd gate-widening): the per-increment gate must RUN the downstream crates' TESTS, not just BUILD
+  them.** *Why:* the residual scan-wiring built the workspace clean and passed `-p iceberg`, but
+  `iceberg-datafusion`'s INTEGRATION tests (MemoryCatalog-backed, runnable locally — NO Docker) failed on the
+  constants-map activation, and the Docker-gated `iceberg-integration-tests` failed too. A workspace BUILD
+  compiles datafusion's tests but does not RUN them. Add `cargo test -p iceberg-datafusion` (lib + the
+  MemoryCatalog `integration_datafusion_test`) to the gate for any change that touches the SCAN/READ path
+  (first gate-widening was the non-exhaustive-match → workspace BUILD; this one is read-path → datafusion
+  TESTS). The Docker-only suites (`iceberg-integration-tests` REST/MinIO) still can't run locally, so a
+  read-path change that can't be proven locally is a flag to scope conservatively.
 - **DO make a contrived test fixture INTERNALLY CONSISTENT rather than asserting on inconsistent data.** *Why:*
   the old fixture's partition values were arbitrary distinct constants (100/200/300) for manifest realism,
   never reconciled with the parquet data because `partition_spec` was always `None` (the constant path never

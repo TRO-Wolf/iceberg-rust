@@ -29,8 +29,8 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, PartitionSpec, SchemaRef,
-    SnapshotRef, TableMetadataRef,
+    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, SchemaRef, SnapshotRef,
+    TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -49,10 +49,6 @@ pub(crate) struct ManifestFileContext {
     delete_file_index: DeleteFileIndex,
     case_sensitive: bool,
 
-    /// The partition spec that this manifest's files were written with
-    /// (`table_metadata.partition_spec_by_id(manifest_file.partition_spec_id)`).
-    /// `None` only when the table metadata has no entry for that spec id.
-    partition_spec: Option<Arc<PartitionSpec>>,
     /// The residual evaluator for this manifest's (spec, snapshot filter) pair,
     /// built once per manifest file and shared across its entries. `None` when the
     /// scan has no row filter (every task then carries no per-row predicate).
@@ -72,11 +68,6 @@ pub(crate) struct ManifestEntryContext {
     pub delete_file_index: DeleteFileIndex,
     pub case_sensitive: bool,
 
-    /// The partition spec this file was written with (Java `file.spec()`); carried
-    /// onto the [`FileScanTask`] so the reader can tell identity-partition constants
-    /// from transform partitions. `None` only when the spec id is absent from the
-    /// table metadata.
-    pub partition_spec: Option<Arc<PartitionSpec>>,
     /// The residual evaluator for the scan's (spec, snapshot filter) pair, shared
     /// across the manifest's entries. `None` when the scan has no row filter.
     pub residual_evaluator: Option<Arc<ResidualEvaluator>>,
@@ -95,7 +86,6 @@ impl ManifestFileContext {
             mut sender,
             expression_evaluator_cache,
             delete_file_index,
-            partition_spec,
             residual_evaluator,
             ..
         } = self;
@@ -113,7 +103,6 @@ impl ManifestFileContext {
                 snapshot_schema: snapshot_schema.clone(),
                 delete_file_index: delete_file_index.clone(),
                 case_sensitive: self.case_sensitive,
-                partition_spec: partition_spec.clone(),
                 residual_evaluator: residual_evaluator.clone(),
             };
 
@@ -168,7 +157,12 @@ impl ManifestEntryContext {
 
             // Include partition data and spec from manifest entry
             partition: Some(self.manifest_entry.data_file.partition.clone()),
-            partition_spec: self.partition_spec.clone(),
+            // Left `None` deliberately: setting it activates the reader's identity-partition
+            // constant-materialization path (Java `PartitionUtil.constantsMap`), whose
+            // `record_batch_transformer` has latent type bugs (RunEndEncoded vs the declared
+            // column type; no Int->Int64 widening). That path is a separate parity feature,
+            // deferred to its own increment; the residual above does not need it.
+            partition_spec: None,
             // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
             name_mapping: None,
             case_sensitive: self.case_sensitive,
@@ -328,8 +322,8 @@ impl PlanContext {
             };
 
         // Resolve the spec this manifest's files were written with (Java
-        // `file.spec()`), carried onto each task. All files in one manifest share
-        // this spec id, so it is resolved once per manifest file.
+        // `file.spec()`), used to build the residual evaluator below. All files in one
+        // manifest share this spec id, so it is resolved once per manifest file.
         let partition_spec = self
             .table_metadata
             .partition_spec_by_id(manifest_file.partition_spec_id)
@@ -363,7 +357,6 @@ impl PlanContext {
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
             case_sensitive: self.case_sensitive,
-            partition_spec,
             residual_evaluator,
         })
     }

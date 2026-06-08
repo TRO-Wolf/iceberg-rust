@@ -363,10 +363,12 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `BaseFileScanTask.residual()` = `residuals.residualFor(file.partition())`), not the full snapshot filter —
   the evaluator is built once per manifest file in `PlanContext::create_manifest_file_context` and
   `into_file_scan_task` evaluates it against the file's partition, binds the residual back to the snapshot
-  schema, and stores it as `task.predicate`; the `partition_spec: None` TODO is resolved (the file's spec is
-  threaded onto the task, which also activates the reader's dormant identity-partition constant
-  materialization). The arrow reader is unchanged. Result-equivalence is proven by 11 scan tests on identity
-  AND truncate partitions; both mutations (leave-full-filter, wrong-partition) caught. **Filter-based
+  schema, and stores it as `task.predicate`; the file's spec is used only to build the residual evaluator and
+  the task's `partition_spec` stays `None` (the identity-partition constant-materialization path,
+  `PartitionUtil.constantsMap`, is DEFERRED — its `record_batch_transformer` has latent type bugs that broke
+  integration tests; the residual does not need it). The arrow reader is unchanged. Result-equivalence is
+  proven by 9 scan tests on identity AND truncate partitions; both mutations (leave-full-filter,
+  wrong-partition) caught. **Filter-based
   concurrent-commit conflict validation landed 🟡 (Increment 3, 2026-06-08, `transaction/overwrite_files.rs`):**
   `OverwriteFiles.validateNoConflictingData` — the serializable-isolation write-safety layer. Opt-in
   `validate_no_conflicting_data()` + `conflict_detection_filter(Predicate)` + `validate_from_snapshot(id)`

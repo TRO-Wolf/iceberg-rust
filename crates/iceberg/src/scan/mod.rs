@@ -2002,26 +2002,6 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_partition_spec_is_populated_from_table_metadata() {
-        // The old `partition_spec: None` TODO is resolved: each task carries the
-        // file's `identity(x)` spec (spec id 0), used by the reader to materialize
-        // identity-partition constants.
-        let filter = Reference::new("y").greater_than(Datum::long(0));
-        let tasks = plan_filtered_tasks(filter).await;
-
-        assert_eq!(tasks.len(), 2);
-        for task in &tasks {
-            let spec = task
-                .partition_spec
-                .as_ref()
-                .expect("partition_spec must be populated on the task");
-            assert_eq!(spec.spec_id(), 0);
-            assert_eq!(spec.fields().len(), 1);
-            assert_eq!(spec.fields()[0].name, "x");
-        }
-    }
-
-    #[tokio::test]
     async fn test_residual_uses_files_own_spec_not_the_table_default_spec() {
         // RISK (silent scan-hot-path data bug): after partition evolution, an older
         // manifest's `partition_spec_id` differs from the table's DEFAULT spec. The
@@ -2052,25 +2032,16 @@ pub mod tests {
         assert_eq!(tasks.len(), 1);
         let task = &tasks[0];
 
-        // The residual was reduced by the FILE's identity(x) spec → AlwaysTrue.
+        // The residual was reduced by the FILE's identity(x) spec → AlwaysTrue. Using
+        // the table default (unpartitioned) spec instead would leave the residual as the
+        // full `x == 1` (no reduction), so this predicate assertion pins that the residual
+        // is computed from the FILE's own `partition_spec_id`, not the table default.
         assert_eq!(
             task.predicate,
             Some(BoundPredicate::AlwaysTrue),
             "residual must be reduced by the file's own identity(x) spec (0), not \
              the unpartitioned default spec (1)"
         );
-        // The threaded spec is the file's own spec 0 (identity(x)), not default 1.
-        let spec = task
-            .partition_spec
-            .as_ref()
-            .expect("partition_spec must be populated on the task");
-        assert_eq!(
-            spec.spec_id(),
-            0,
-            "task must carry the file's own spec id (0), not the table default (1)"
-        );
-        assert_eq!(spec.fields().len(), 1);
-        assert_eq!(spec.fields()[0].name, "x");
     }
 
     #[tokio::test]
@@ -2189,8 +2160,6 @@ pub mod tests {
         assert_eq!(tasks.len(), 2);
         for task in &tasks {
             assert_eq!(task.predicate, None);
-            // The spec is still threaded even without a filter (resolving the TODO).
-            assert!(task.partition_spec.is_some());
         }
     }
 
@@ -2240,11 +2209,6 @@ pub mod tests {
             Some(&expected_residual),
             "truncate(x,100)==0 strictly implies x < 100, so the residual is `y > 0`"
         );
-
-        // The threaded spec is the truncate spec (NON-identity), so the reader does
-        // NOT materialize `x` as a constant for a truncate transform.
-        let spec = tasks[0].partition_spec.as_ref().unwrap();
-        assert_eq!(spec.fields()[0].transform, Transform::Truncate(100));
     }
 
     #[tokio::test]
@@ -2738,22 +2702,16 @@ pub mod tests {
             "Column 5 should be y (duplicate)"
         );
 
-        // Verify all columns have correct data types. `x` is an identity-partition
-        // column, materialized by the reader as a run-end-encoded constant (like
-        // `_file`), so it is `RunEndEncoded`, not a plain `Int64`.
+        // Verify all columns have correct data types. `x` is read from the data file as
+        // a plain `Int64` (identity-partition constant materialization is deferred — see
+        // `into_file_scan_task`, where `partition_spec` is left `None`).
         assert!(
-            matches!(
-                schema.field(0).data_type(),
-                arrow_schema::DataType::RunEndEncoded(_, _)
-            ),
-            "Column x should be a RunEndEncoded identity-partition constant"
+            matches!(schema.field(0).data_type(), arrow_schema::DataType::Int64),
+            "Column x should be a plain Int64 read from the data file"
         );
         assert!(
-            matches!(
-                schema.field(2).data_type(),
-                arrow_schema::DataType::RunEndEncoded(_, _)
-            ),
-            "Column x (duplicate) should be a RunEndEncoded identity-partition constant"
+            matches!(schema.field(2).data_type(), arrow_schema::DataType::Int64),
+            "Column x (duplicate) should be a plain Int64 read from the data file"
         );
         assert!(
             matches!(schema.field(3).data_type(), arrow_schema::DataType::Int64),
