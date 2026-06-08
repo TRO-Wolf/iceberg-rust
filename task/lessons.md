@@ -1796,7 +1796,7 @@ How to use it (see the manuals' §2):
   grep the capability name across Roadmap + the public-API ctor doc, not only the matrix.
 
 ### 2026-06-08 (Increment 4 — RowDelta validateNoConflictingDataFiles + shared conflict-check helper, BUILDER Opus)
-- **DO extract a shared `pub(crate)` helper on the 2ND use of a load-bearing safety check, and PROVE the
+- **DO extract a shared `pub(crate)` helper on the second use of a load-bearing safety check, and PROVE the
   refactor behavior-preserving with the EXISTING tests (don't write new pins for the refactor).** *Why:*
   `RowDelta.validateNoConflictingDataFiles` is the IDENTICAL filter-based added-data-file conflict check as
   `OverwriteFiles.validateNoConflictingData` (both = Java `MergingSnapshotProducer.validateAddedDataFiles`).
