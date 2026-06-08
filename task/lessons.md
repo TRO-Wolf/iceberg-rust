@@ -1711,3 +1711,86 @@ How to use it (see the manuals' §2):
   values valid would mean per-file distinct data + rippling every read assertion, for ZERO coverage gain
   (no test filtered on the partition column, and the multi-partition inspect tests build their own inline
   manifests). Collapse-to-consistent is the right call; spend the effort on the spec-evolution pin instead.
+
+### 2026-06-08 (Increment 3 — OverwriteFiles filter-based validateNoConflictingData, BUILDER Opus)
+- **DO reuse `InclusiveMetricsEvaluator::eval(&bound_filter, file, true)` as the per-file conflict TEST when
+  porting Java `MergingSnapshotProducer.validateAddedDataFiles` / `ManifestGroup.filterData`.** *Why:* Java's
+  "could this added file contain records matching the conflict filter?" IS the inclusive-metrics question
+  (bounds/null/nan stats → may-match). The Rust evaluator already answers it (`pub(crate)` in
+  `expr/visitors/inclusive_metrics_evaluator.rs`); the conflict validation differs from ReplacePartitions'
+  `(spec_id, partition) ∈ drop-set` test ONLY in this leaf. NOTE the signature is THREE args
+  (`filter, data_file, include_empty_files: bool`), not the two the brief implied — pass
+  `include_empty_files=true` (conservative: never auto-exclude a 0-record file on emptiness). Build the bound
+  filter once via `Predicate::bind(schema, case_sensitive)` (the `Bind` trait), not per-file.
+- **DO default a `None` conflict-detection filter to `Predicate::AlwaysTrue` (any concurrent add conflicts),
+  NOT to "no conflict".** *Why:* Java `BaseOverwriteFiles.dataConflictDetectionFilter()` returns `alwaysTrue()`
+  when neither a `conflictDetectionFilter` nor a (non-alwaysFalse) `rowFilter` is set — the MOST conservative
+  serializable check. Treating `None` as "skip" would invert the safety property and let every concurrent
+  append through (a serializable-isolation hole). Pin it with a no-bounds concurrent file that MUST still be a
+  conflict under the None default. (Our `overwriteByRowFilter` is deferred, so `rowFilter()` is effectively
+  `alwaysFalse()` and Java's middle branch can never apply → `None ⇒ AlwaysTrue` is the exact mirror.)
+- **DO report a serializable-isolation conflict as a NON-retryable `ErrorKind::DataInvalid` (Java's
+  non-retryable `ValidationException`) and VERIFY the property two ways.** *Why:* a retryable error makes the
+  `do_commit` retry loop spin and re-fail the same check forever, then return a misleading retry-exhausted
+  `CatalogCommitConflicts`. Assert `kind()==DataInvalid` AND `!err.retryable()`; the genuinely-verified proof
+  is a `.with_retryable(true)` mutation that makes the `!retryable()` assertion fail AND visibly inflates the
+  test runtime (the loop actually loops, 0.12s→1.57s here) — kind-equality alone does not prove the loop stops.
+- **DO simulate the concurrent commit with a REAL second `fast_append` through the same `MemoryCatalog`
+  between txn-build and txn-commit (the landed ReplacePartitions pattern), so `do_commit`'s genuine
+  refresh/re-base runs `validate` against the refreshed head.** *Why:* a hand-mocked base would not exercise
+  the `Transaction::new`-captured `starting_snapshot_id` surviving the re-base — the one subtle correctness
+  property. Pin it with a test that calls ONLY `validate_no_conflicting_data()` (no `validate_from_snapshot`):
+  if the start were re-read from the refreshed head, start==head ⇒ empty concurrent set ⇒ the check silently
+  always passes. Build the discriminating data files WITH column bounds (`DataFileBuilder.lower_bounds/
+  upper_bounds`, which survive the manifest round-trip and reach `added_data_files_after`) so the inclusive
+  evaluator can include (overlap) vs exclude (bounds outside the predicate).
+
+### 2026-06-08 (Increment 3 — OverwriteFiles filter-based validateNoConflictingData, REVIEWER Opus)
+- **VERDICT: CHANGES-MADE (docs only) — the production `validate` + 9 tests are correct and well-pinned;
+  no production change needed.** All 6 adversarial-checklist mutations are CAUGHT by the existing suite
+  (verified by running each, then restoring byte-identical): (a) invert the metrics decision → the EXCLUDE
+  no-false-conflict test AND the 4 match/None tests fail (BOTH the false-positive and false-negative guards
+  are load-bearing); (b) `validate` early-`Ok` → exactly the 4 rejection tests fail, OK tests green; (c) kind
+  → `CatalogCommitConflicts` → the 4 `kind()==DataInvalid` assertions fail; (d) drop the
+  `validate_from_snapshot` override → exactly `..override_changes_concurrent_window` fails; (e) re-read the
+  refreshed head instead of the tx-captured start (the silent-always-pass false-negative) → exactly
+  `..tx_captured_starting_snapshot` fails; (f) `.with_retryable(true)` → the `!retryable()` assertions fail
+  AND runtime jumps 0.11s→1.59s (the retry loop demonstrably loops only when retryable). I ALSO mutated the
+  SHARED `added_data_files_after` boundary EXCLUSIVE→INCLUSIVE (snapshot.rs) — 5 tests fail across
+  OverwriteFiles + ReplacePartitions (incl. the dedicated `..excludes_carried_forward_manifests`), proving
+  the exclusive-of-start boundary is pinned. No surviving mutation → no new pinning test required.
+- **The FALSE-NEGATIVE enumeration check (the most important finding): the Rust added-file set MATCHES Java's,
+  no under-reject.** Read `MergingSnapshotProducer.validationHistory` (L913-963) + `addedDataFiles` (L424-462)
+  + `SnapshotUtil.ancestorsBetween`/`ancestorsOf` directly. Java: walk `ancestorsBetween(parent, startingId)`
+  = INCLUSIVE of parent, EXCLUSIVE of starting (the lookup returns null at `oldestSnapshotId`, and
+  `latest==oldest ⇒ empty`); for each snapshot whose op ∈ {APPEND, OVERWRITE} collect `dataManifests` where
+  `manifest.snapshotId() == snapshot.snapshotId()`, then keep entries with `ignoreDeleted().ignoreExisting()`
+  (= Added status). The Rust `added_data_files_after` walk is byte-for-byte the same semantics: same
+  inclusive/exclusive boundary (break at top when `current.snapshot_id()==starting`), same op set
+  (`operation_adds_data_files` = {Append,Overwrite}), same manifest filter (`added_snapshot_id ==
+  snapshot_id`), same Added-only entry filter. Java's extra `newSnapshots.contains(entry.snapshotId())`
+  filter is jointly satisfied by exactly the Added entries in a self-added manifest (an Added entry inherits
+  the manifest's `added_snapshot_id`), so it adds nothing Rust drops. The ONE divergence (Increment-6 reviewer
+  already flagged + pinned): Java throws if `startingId` is not an ancestor of parent; Rust silently
+  over-scans to root — Rust-STRICTER (over-reject only), never an under-reject. **No false-negative vector in
+  the enumeration.**
+- **None-filter = `AlwaysTrue` is the faithful Java mirror.** `BaseOverwriteFiles.dataConflictDetectionFilter()`
+  (L180-188): filter if set; else `rowFilter()` when `!= alwaysFalse && deletedDataFiles.isEmpty()`; else
+  `alwaysTrue()`. `overwriteByRowFilter` is deferred ⇒ `rowFilter()` defaults to `alwaysFalse()` ⇒ the middle
+  branch is unreachable ⇒ `None ⇒ alwaysTrue()` exactly. Pinned by the no-bounds-concurrent-file test.
+- **Non-retryable is REAL and independent of the error KIND.** `Error::new` sets `retryable: false` by
+  default (error.rs:235); `retryable()` returns the field, NOT a kind→bool map. So the conflict
+  `Error::new(DataInvalid, …)` (no `.with_retryable(true)`) is non-retryable, and the `commit` retry loop
+  (`.when(|e| e.retryable())`) stops + propagates. The 0.11→1.59s runtime jump under the `.with_retryable(true)`
+  mutation is the load-bearing proof the loop does NOT spin on the real error.
+- **`validate` IS invoked by the real commit path with the correct starting snapshot.** `do_commit`
+  (mod.rs:308-312) loops every action's `.validate(self.starting_snapshot_id, &current_table)` AFTER the
+  refresh/re-base (line 295) and BEFORE the re-apply (line 314), with `current_table` = the refreshed base.
+  `starting_snapshot_id` is captured once in `Transaction::new` (line 117) as its OWN field and survives the
+  re-base. Not dead code.
+- **DO reconcile the Roadmap NARRATIVE mentions when a status flips, not just the detail/header.** The builder
+  updated the GAP_MATRIX row (accurate + honest: states the over-scan, None-default, case-sensitivity, 🟡
+  rationale) and the Phase 2 status header, but left two Roadmap narrative lines saying "conflict validation …
+  deferred" for OverwriteFiles (an under-claim) and the `mod.rs::overwrite_files()` ctor doc saying conflict
+  validation is "not yet supported." Fixed all three (the only changes this review made). Recurring lesson:
+  grep the capability name across Roadmap + the public-API ctor doc, not only the matrix.

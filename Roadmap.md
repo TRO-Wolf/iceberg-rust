@@ -156,7 +156,8 @@ replays data files). **Phase 2 has started: `DeleteFiles` + the manifest-filter 
 (`transaction/delete_files.rs` + `SnapshotProducer::process_deletes`, `MemoryCatalog`-tested; data-level
 Java interop deferred); **`OverwriteFiles` is 🟡** (`transaction/overwrite_files.rs` — explicit add + delete
 in one `Overwrite` snapshot, reusing the shared resolve/list helpers; summary reflects added + deleted
-counts; `overwriteByRowFilter` + conflict validation + interop deferred); **`ReplacePartitions` is 🟡**
+counts; filter-based `validateNoConflictingData` landed reusing the `InclusiveMetricsEvaluator`;
+`overwriteByRowFilter` + `validateNoConflictingDeletes` + interop deferred); **`ReplacePartitions` is 🟡**
 (`transaction/replace_partitions.rs` — dynamic partition overwrite via a by-PARTITION sibling resolver
 `SnapshotProducer::resolve_partition_deletes` feeding the same rewrite path; full replace on an
 unpartitioned table; `replace-partitions` marker; static `replaceByRowFilter` + conflict validation +
@@ -291,7 +292,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `UpdatePartitionSpec` ✅ (bidirectional interop landed 2026-06-07, surfacing+fixing the identity-only
   partition-name collision divergence); `ManageSnapshots` awaits the same interop treatment.**
 
-### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07; `PositionDeleteFileWriter` (RowDelta increment 5a) + `RowDelta` action (5b) landed 2026-06-08 — the merge-on-read write→read chain is now end-to-end; the concurrent-commit conflict-validation FOUNDATION + `ReplacePartitions.validateNoConflictingData` (increment 6) landed 2026-06-08 — the serializable-isolation safety layer)**
+### Phase 2 — Write engine  ·  **Status: 🟡 (in progress — `DeleteFiles` + manifest-filter machinery + `OverwriteFiles` + `ReplacePartitions` + `RewriteFiles` landed 2026-06-07; `PositionDeleteFileWriter` (RowDelta increment 5a) + `RowDelta` action (5b) landed 2026-06-08 — the merge-on-read write→read chain is now end-to-end; the concurrent-commit conflict-validation FOUNDATION + `ReplacePartitions.validateNoConflictingData` (increment 6) landed 2026-06-08 — the serializable-isolation safety layer; filter-based `OverwriteFiles.validateNoConflictingData` landed 2026-06-08 (Phase 3 Increment 3) reusing the `InclusiveMetricsEvaluator`)**
 - **Goal:** the full commit/write surface beyond fast-append.
 - **Gates on:** Phase 1.
 - **Increment sequence (dependency, then value):** **1. `DeleteFiles`** (done 🟡 — delete data files by
@@ -299,7 +300,9 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   rest reuse), **2. `OverwriteFiles`** (done 🟡 — explicit add + delete in one `Overwrite` snapshot,
   composing the fast-append add path with the `DeleteFiles` filter path via the now-shared
   `SnapshotProducer::{resolve_delete_paths, current_data_manifests}`; summary reflects added + deleted
-  counts; `overwriteByRowFilter` + conflict validation + interop deferred), **3. `ReplacePartitions`**
+  counts; filter-based `validateNoConflictingData` landed (Phase 3 Increment 3, reusing the
+  `InclusiveMetricsEvaluator`); `overwriteByRowFilter` + `validateNoConflictingDeletes` + interop deferred),
+  **3. `ReplacePartitions`**
   (done 🟡 — dynamic partition overwrite; a by-PARTITION sibling resolver
   `SnapshotProducer::resolve_partition_deletes` feeds the same `process_deletes` rewrite path; replaces
   every partition an added file belongs to, full replace on an unpartitioned table, `replace-partitions`
@@ -328,9 +331,13 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `added_data_files_after` helper enumerates the concurrent commits' added DATA files (Java
   `MergingSnapshotProducer.addedDataFiles`/`ancestorsBetween`); `ReplacePartitions` gained the opt-in
   `validate_no_conflicting_data()`/`validate_from_snapshot(id)` rejecting a concurrent append into a
-  replaced partition. **Conflict-validation sub-sequence:** (6) this; then `OverwriteFiles`
-  `validateNoConflictingData`/`...Deletes`; `RowDelta`/`DeleteFiles` `validateDataFilesExist`; `RewriteFiles`
-  `validateNoNewDeletes`),
+  replaced partition. **`OverwriteFiles.validateNoConflictingData` (filter-based) landed 🟡 2026-06-08**
+  (Phase 3 Increment 3, `transaction/overwrite_files.rs`) — the same opt-in shape plus a
+  `conflict_detection_filter(Predicate)`, tested per-file with the existing `InclusiveMetricsEvaluator`
+  (None-filter ⇒ `AlwaysTrue`); see Phase 3. **Conflict-validation sub-sequence:** (6) foundation +
+  `ReplacePartitions` [done 🟡]; `OverwriteFiles.validateNoConflictingData` [done 🟡]; then `OverwriteFiles`
+  `validateAddedFilesMatchOverwriteFilter`/`...Deletes`; `RowDelta`/`DeleteFiles` `validateDataFilesExist`;
+  `RewriteFiles` `validateNoNewDeletes`),
   7. `RewriteManifests`, merge append,
   8. multi-op transaction hardening + optimistic-concurrency retry on the real catalogs.
 - **Key deliverables:** merge append, `OverwriteFiles`, `ReplacePartitions`, `DeleteFiles` (🟡), `RowDelta`,
@@ -359,9 +366,19 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   schema, and stores it as `task.predicate`; the `partition_spec: None` TODO is resolved (the file's spec is
   threaded onto the task, which also activates the reader's dormant identity-partition constant
   materialization). The arrow reader is unchanged. Result-equivalence is proven by 11 scan tests on identity
-  AND truncate partitions; both mutations (leave-full-filter, wrong-partition) caught. **Next:** filter-based
-  concurrent-commit conflict validation (Increment 3 — `OverwriteFiles`/`RowDelta`
-  `validateNoConflictingData`).
+  AND truncate partitions; both mutations (leave-full-filter, wrong-partition) caught. **Filter-based
+  concurrent-commit conflict validation landed 🟡 (Increment 3, 2026-06-08, `transaction/overwrite_files.rs`):**
+  `OverwriteFiles.validateNoConflictingData` — the serializable-isolation write-safety layer. Opt-in
+  `validate_no_conflicting_data()` + `conflict_detection_filter(Predicate)` + `validate_from_snapshot(id)`
+  mirror Java `BaseOverwriteFiles.validate` (L163-165) → `MergingSnapshotProducer.validateAddedDataFiles`
+  (L391-412): when enabled, reject the commit (non-retryable `DataInvalid`) if any DATA file ADDED by a
+  concurrent commit since the starting snapshot COULD contain records matching the conflict filter, tested
+  per-file with the EXISTING `InclusiveMetricsEvaluator` over the shared `added_data_files_after` walk. The
+  None-filter default is `AlwaysTrue` (any concurrent add conflicts); case-sensitivity defaults to `true`.
+  9 conflict tests; the metrics include/exclude decision, the skip-the-check path, and the non-retryable
+  error kind are each mutation-pinned. **Still deferred (separate follow-ups):**
+  `OverwriteFiles.validateAddedFilesMatchOverwriteFilter` (block 1) + `validateNoConflictingDeletes`
+  (block 3); `RowDelta`/`DeleteFiles` `validateDataFilesExist`; `RewriteFiles` `validateNoNewDeletes`.
 - **Inspection-table sub-sequence (dependency, then value):**
   1. **`files` family** (`files` / `data_files` / `delete_files`) — **DONE 🟡 (2026-06-08, Increment 1,
      `inspect/files.rs`).** Reads the current snapshot's manifest list → manifests → live entries →

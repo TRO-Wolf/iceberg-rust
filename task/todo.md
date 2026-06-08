@@ -2999,3 +2999,160 @@ Adversarially verified residual result-equivalence and scope against the Java so
   sqllogictest --all-targets) ✅; lib ×2 = **1501/0** both (was 1500 → +1 spec-evolution pin); 3 interop
   suites 4/4 each ✅; clippy -D warnings clean ✅; fmt clean ✅. Row stays 🟡 (Increment 3 conflict-validation
   + Java interop still pending).
+
+### Increment 3 — OverwriteFiles filter-based validateNoConflictingData (DETAIL, 2026-06-08)
+The headline write-safety unblock. Java `BaseOverwriteFiles.validate` → `validateNewDataFiles` →
+`MergingSnapshotProducer.validateAddedDataFiles(base, startingSnapshotId, conflictDetectionFilter, parent)`:
+enumerate DATA files ADDED by concurrent commits since the starting snapshot, and reject the commit if ANY
+could contain records matching the conflict-detection filter. SCOPE: OverwriteFiles `validateNoConflictingData`
+ONLY (the filter-based added-data-file conflict check). DEFER: `validateAddedFilesMatchOverwriteFilter`
+(block 1, the writer's own files), `validateNoConflictingDeletes` (block 3, delete conflicts), and RowDelta —
+each its own follow-up.
+
+Model (already landed): `transaction/replace_partitions.rs::validate` — flag → `effective_start =
+validate_from_snapshot.or(starting_snapshot_id)` → `added_data_files_after(current, effective_start)` →
+per-file conflict test → non-retryable `ErrorKind::DataInvalid` on the first conflict. OverwriteFiles differs
+ONLY in the conflict test: instead of `(spec_id, partition) ∈ drop-set`, it's "could this added file match the
+conflict filter?" via the EXISTING `InclusiveMetricsEvaluator::eval(&bound_filter, file) -> Result<bool>`
+(file metrics/bounds; `pub(crate)` in `expr/visitors/inclusive_metrics_evaluator.rs`).
+
+Building blocks (all exist): `added_data_files_after(table, Option<i64>) -> Result<Vec<DataFile>>`
+(`transaction/snapshot.rs`); `InclusiveMetricsEvaluator::eval`; `Predicate::bind(schema, case_sensitive) ->
+Result<BoundPredicate>`. The `validate` hook is `async fn validate(self: Arc<Self>, starting_snapshot_id:
+Option<i64>, current: &Table) -> Result<()>` (default no-op; override it, mirroring ReplacePartitions).
+
+Plan:
+- [x] Add fields to `OverwriteFilesAction`: `validate_no_conflicting_data: bool`, `conflict_detection_filter:
+      Option<Predicate>`, `validate_from_snapshot: Option<i64>` (+ builder methods named like ReplacePartitions:
+      `validate_no_conflicting_data()`, `conflict_detection_filter(Predicate)`, `validate_from_snapshot(i64)`).
+- [x] Override `validate`: no-op unless the flag is set; `effective_start`; `added_data_files_after`; bind the
+      conflict filter (if `None`, treat as `AlwaysTrue` = ANY concurrent added data file conflicts — the most
+      conservative serializable check); for each added file `InclusiveMetricsEvaluator::eval(&bound, file, true)?`
+      → first match → non-retryable `DataInvalid` naming the file + filter (Java "Found conflicting files that
+      can contain records matching %s: %s"). Default case-sensitivity true (Java `isCaseSensitive()`; the
+      action has no such field — noted in the `validate` doc-comment).
+- [x] Module doc: drop `validateNoConflictingData` from the deferred list (note block1/block3/RowDelta remain).
+- [x] Tests (MemoryCatalog, the ReplacePartitions conflict-test pattern — commit a CONCURRENT snapshot after
+      the txn's starting point, then validate): (1) no concurrent commit → commit OK; (2) concurrent commit
+      adds a file whose metrics MATCH the filter → validate fails `DataInvalid` (non-retryable, doesn't loop);
+      (3) concurrent commit adds a file whose metrics EXCLUDE the filter (bounds outside) → commit OK; (4) flag
+      OFF → no check (snapshot isolation) even with a conflict; (5) `conflict_detection_filter` None → any
+      concurrent added file conflicts; (6) `validate_from_snapshot` override (+ a negative half + a
+      tx-captured-start survives-rebase pin). Build files WITH bounds so the inclusive evaluator can
+      include/exclude. Mutation-pin: the include-vs-exclude metrics decision + the non-retryable error kind.
+- [x] Docs: GAP_MATRIX (OverwriteFiles validateNoConflictingData landed, row stays 🟡), Roadmap, todo, lessons.
+- [x] Verify from repo root: build -p iceberg + workspace; lib ×2; 3 interop; clippy (workspace); fmt.
+
+**Outcome (2026-06-08, Phase 3 Increment 3 — OverwriteFiles filter-based `validateNoConflictingData`, BUILDER
+Opus):** Added the serializable-isolation write-safety layer to `OverwriteFilesAction` in
+`transaction/overwrite_files.rs` (the ONLY production file touched besides docs). It is the SAME shape as the
+already-landed `ReplacePartitions.validate`; only the per-file conflict TEST differs.
+- **Builder API:** three opt-in fields + builders, named exactly like ReplacePartitions —
+  `validate_no_conflicting_data(self) -> Self` (enable), `validate_from_snapshot(self, i64) -> Self` (override
+  the starting snapshot), and the NEW `conflict_detection_filter(self, Predicate) -> Self` (the data filter
+  OverwriteFiles has but ReplacePartitions doesn't). All default OFF/None in `new()`.
+- **`validate` algorithm** (overrides the `TransactionAction` default no-op): `if
+  !validate_no_conflicting_data { return Ok(()) }` → `effective_start = validate_from_snapshot.or(starting_
+  snapshot_id)` → `added = added_data_files_after(current, effective_start).await?` (empty ⇒ Ok) → bind the
+  conflict filter against `current.metadata().current_schema()` case-sensitive=`true` (the filter is the
+  caller's `conflict_detection_filter` when set, else `Predicate::AlwaysTrue`) → for each added file, if
+  `InclusiveMetricsEvaluator::eval(&bound_filter, file, true)?` is true, return a non-retryable
+  `Error::new(ErrorKind::DataInvalid, "Found conflicting files that can contain records matching {filter}:
+  {path}")` on the FIRST conflict.
+- **Java lines verified against** (`/tmp/iceberg-java-ref`): `BaseOverwriteFiles.validate` L136-179 — the
+  `validateNewDataFiles` branch L163-165 calls `validateAddedDataFiles(base, startingSnapshotId,
+  dataConflictDetectionFilter(), parent)`; `MergingSnapshotProducer.validateAddedDataFiles` L391-412 (build a
+  `ManifestGroup` over the concurrent-added DATA manifests filtered by the conflict filter; throw "Found
+  conflicting files that can contain records matching %s: %s" if any entry survives); `dataConflictDetection
+  Filter()` L181-187 (filter when set, else rowFilter when not alwaysFalse + no deleted files, else
+  `alwaysTrue()`). VERIFIED our `overwriteByRowFilter` is deferred so `rowFilter()` is effectively
+  `alwaysFalse()` and the row-filter branch can never apply → None ⇒ `AlwaysTrue`, matching Java.
+- **None-filter default decision:** a `None` `conflict_detection_filter` binds `Predicate::AlwaysTrue` ⇒ ANY
+  concurrently-added DATA file is a conflict (the most conservative serializable check). This mirrors Java
+  `dataConflictDetectionFilter()` returning `alwaysTrue()` and is pinned by
+  `test_overwrite_none_filter_treats_any_concurrent_add_as_conflict` (a no-bounds concurrent file is still a
+  conflict).
+- **Case-sensitivity default decision:** Java binds with `isCaseSensitive()`. `OverwriteFilesAction` has no
+  case-sensitivity field, so the filter is bound case-sensitive (`true` = the Iceberg/Java default); noted in
+  the `validate` doc-comment. (Adding a `case_sensitive` builder is a trivial future follow-up if needed.)
+- **Test list (9 new conflict tests; each risk pinned):**
+  1. `test_overwrite_validation_no_concurrent_commit_succeeds` — validation enabled but nothing concurrent ⇒
+     commit OK (a race-free commit must not be blocked).
+  2. `test_overwrite_rejects_concurrent_added_file_matching_filter` — HEADLINE: concurrent file with y bounds
+     [60,70] vs filter `y>=50` ⇒ REJECTED, non-retryable, error names the file (silent lost-write prevention).
+  3. `test_overwrite_allows_concurrent_added_file_excluded_by_filter` — concurrent file y bounds [10,20]
+     entirely below `y>=50` ⇒ inclusive evaluator EXCLUDES ⇒ commit OK (no false conflict).
+  4. `test_overwrite_without_validation_allows_conflicting_concurrent_append` — flag OFF (filter present but
+     inert) ⇒ a would-be-conflict concurrent append does NOT block (snapshot isolation unchanged / opt-in).
+  5. `test_overwrite_none_filter_treats_any_concurrent_add_as_conflict` — None filter ⇒ AlwaysTrue ⇒ a
+     no-bounds concurrent add is a conflict (the conservative serializable default; the OPPOSITE of "no check").
+  6. `test_overwrite_validate_from_snapshot_override_changes_concurrent_window` — `validate_from_snapshot(S0)`
+     widens the window to include S1's add ⇒ REJECTED (the override genuinely shifts the boundary).
+  7. `test_overwrite_validate_from_snapshot_at_head_finds_no_conflict` — `validate_from_snapshot(S1=head)` ⇒
+     nothing concurrent ⇒ commit OK (the negative half proving the boundary shift is real).
+  8. `test_overwrite_rejects_concurrent_using_tx_captured_starting_snapshot` — NO `validate_from_snapshot`;
+     relies on the tx-captured start surviving `do_commit`'s re-base ⇒ REJECTED (the only test exercising the
+     capture; if the start were re-read from the refreshed head the check would silently always pass).
+  All 9 use the ReplacePartitions concurrent-commit pattern: a SEPARATE `fast_append` lands between building
+  the txn and committing it, advancing the catalog head; `do_commit` refreshes to that head and runs `validate`
+  against it. Data files carry y-column bounds via the new `data_file_with_y_bounds(path, part, lo, hi)` helper
+  (sets `lower_bounds`/`upper_bounds` on schema field id 2).
+- **Mutations run + each caught:** (a) invert the metrics decision (`if !eval(...)`) → the EXCLUDE test
+  (`..excluded_by_filter`) AND the MATCH/None tests fail; (b) make `validate` early-`return Ok(())` (skip the
+  check) → exactly the 4 rejection tests (#2/#5/#6/#8) fail, the OK tests stay green; (c) change the error kind
+  to `CatalogCommitConflicts` → the 4 rejection tests' `kind()==DataInvalid` assertions fail. Bonus
+  genuinely-non-retryable check: `.with_retryable(true)` on the conflict error → the `!err.retryable()`
+  assertion fails AND the test runtime jumps 0.12s→1.57s (the retry loop demonstrably loops) — confirming the
+  property is verified, not merely asserted.
+- **Gate (all from repo root, pinned nightly):** `cargo build -p iceberg` ✅ (Finished); `cargo build
+  --workspace --exclude iceberg-sqllogictest --all-targets` ✅ (Finished); `cargo test -p iceberg --lib` ✅ TWICE
+  (run1 1509 passed / 0 failed; run2 1509 passed / 0 failed — **new lib total 1509**, was 1500, +9 tests);
+  3 interop binaries ✅ (`interop_manage_snapshots` 4/4, `interop_update_partition_spec` 4/4,
+  `interop_update_schema` 4/4); `cargo clippy --workspace --exclude iceberg-sqllogictest --all-targets -- -D
+  warnings` ✅ (Finished, no warnings); `cargo fmt --all -- --check` ✅ (clean after one `cargo fmt`);
+  `cargo test -p iceberg --lib transaction::` ✅ (225 passed). `transaction::overwrite_files` alone: 18/18.
+- **Scope:** touched ONLY `transaction/overwrite_files.rs` + docs (GAP_MATRIX, Roadmap, todo, lessons). No
+  edits to `snapshot.rs` / `inclusive_metrics_evaluator.rs` / `action.rs` / `predicate.rs` / `replace_partitions.rs`
+  (read-only). No `Cargo.toml`/lockfile/spec/scan/arrow changes. No commit, no branch switch, no push.
+- **UNSURE / flagged:** (1) The Java `addedDataFiles` builds a `ManifestGroup` that pre-filters at the MANIFEST
+  level (manifest partition/metrics summary) BEFORE the per-entry inclusive-metrics test; the Rust port
+  approximates this at the FILE level only (`added_data_files_after` returns every added DATA file, then we run
+  `InclusiveMetricsEvaluator::eval` per file). This is a CONSERVATIVE over-scan — it can only over-reject
+  (inspect a file Java's manifest pre-filter would skip), never under-reject, so it cannot let a real conflict
+  through; it is a performance/precision gap, not a correctness one. (2) `include_empty_files = true` is passed
+  to `eval` so a zero-record concurrent file is evaluated by its bounds rather than auto-excluded on emptiness
+  — conservative (a 0-record file is effectively never a real conflict, but never excluding it is safe). (3)
+  The concurrent commit is simulated EXACTLY as the landed ReplacePartitions tests do it (a real second
+  `fast_append` through the same `MemoryCatalog`, between txn-build and txn-commit), so `do_commit`'s genuine
+  refresh/re-base path runs — not a hand-mocked base. The non-retryable property is verified by BOTH the
+  `!err.retryable()` assertion AND the runtime-doesn't-loop mutation evidence above.
+
+#### Increment 3 — REVIEW (2026-06-08, Opus REVIEWER, DELEGATED). VERDICT: CHANGES-MADE (docs only).
+Adversarially verified against the Java source (`/tmp/iceberg-java-ref`) + 7 code mutations. Production
+`validate` + 9 conflict tests are CORRECT and well-pinned; NO production change made.
+- **`validate` invoked by the real commit path:** `do_commit` (mod.rs:308-312) runs each action's
+  `.validate(self.starting_snapshot_id, &current_table)` AFTER the refresh/re-base (line 295) and BEFORE
+  re-apply (314), against the refreshed base; `starting_snapshot_id` captured once in `Transaction::new`
+  (117), survives the re-base. Not dead code.
+- **THE KEY FINDING — enumeration MATCHES Java, no under-reject:** read `validationHistory` (L913-963) +
+  `addedDataFiles` (L424-462) + `SnapshotUtil.ancestorsBetween`/`ancestorsOf`. Same INCLUSIVE-parent /
+  EXCLUSIVE-start boundary, same op set {APPEND,OVERWRITE}, same `manifest.snapshotId()==snapshot.snapshotId()`
+  manifest filter, same Added-only entry filter. Java's `newSnapshots.contains(entry.snapshotId())` is
+  jointly satisfied by exactly those Added entries. The only divergence (Inc-6, already pinned): non-ancestor
+  start → Java throws, Rust over-scans = Rust-STRICTER. NO false-negative vector.
+- **None-filter=AlwaysTrue:** faithful mirror of `dataConflictDetectionFilter()` (rowFilter branch unreachable
+  while `overwriteByRowFilter` deferred). **Non-retryable:** `Error::new` defaults `retryable:false`
+  (error.rs:235), independent of kind; loop stops (`.when(|e| e.retryable())`).
+- **Mutations run (all CAUGHT):** invert metrics (exclude + match tests fail); skip check (4 rejection fail);
+  kind→CatalogCommitConflicts (4 kind asserts fail); drop validate_from_snapshot (override test fails);
+  re-read refreshed head instead of tx-captured start (tx-captured test fails — the silent-always-pass
+  guard); `.with_retryable(true)` (retryable asserts fail + 0.11→1.59s loop); EXCLUSIVE→INCLUSIVE boundary in
+  shared `added_data_files_after` (5 tests fail across both actions). No surviving mutation.
+- **CHANGES-MADE (docs only):** reconciled two stale Roadmap narrative mentions (lines ~159, ~302 said
+  "conflict validation … deferred" for OverwriteFiles — under-claim) + the `mod.rs::overwrite_files()` ctor
+  doc ("not yet supported"). GAP_MATRIX row 75 was already accurate + honest (over-scan, None-default,
+  case-sensitivity, 🟡 rationale). Production `overwrite_files.rs`/`snapshot.rs` byte-identical to pre-review.
+- **Scope + floor: CLEAN.** No bare `.unwrap()` in the production `validate` path. **Gate (repo root, pinned
+  nightly):** build -p iceberg ✅; workspace --exclude sqllogictest --all-targets ✅; lib ×2 = 1509/0 both;
+  transaction:: 225; 3 interop 4/4 each; clippy -D warnings ✅; fmt ✅. Row stays 🟡 (data-level Java interop
+  + `overwriteByRowFilter` + `validateNoConflictingDeletes` still pending).
