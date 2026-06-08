@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilesTable, ManifestsTable, SnapshotsTable};
+use super::{EntriesTable, FilesTable, ManifestsTable, SnapshotsTable};
 use crate::table::Table;
 
 /// Metadata table is used to inspect a table's history, snapshots, and other metadata as a table.
@@ -40,6 +40,8 @@ pub enum MetadataTableType {
     DataFiles,
     /// [`FilesTable`] over delete-content files only (Java `delete_files`).
     DeleteFiles,
+    /// [`EntriesTable`] — all manifest entries of the current snapshot (Java `entries`).
+    Entries,
 }
 
 impl MetadataTableType {
@@ -51,6 +53,7 @@ impl MetadataTableType {
             MetadataTableType::Files => "files",
             MetadataTableType::DataFiles => "data_files",
             MetadataTableType::DeleteFiles => "delete_files",
+            MetadataTableType::Entries => "entries",
         }
     }
 
@@ -71,6 +74,7 @@ impl TryFrom<&str> for MetadataTableType {
             "files" => Ok(Self::Files),
             "data_files" => Ok(Self::DataFiles),
             "delete_files" => Ok(Self::DeleteFiles),
+            "entries" => Ok(Self::Entries),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -105,5 +109,11 @@ impl<'a> MetadataTable<'a> {
     /// Get the `delete_files` table — only position/equality delete files in the current snapshot.
     pub fn delete_files(&self) -> FilesTable<'_> {
         FilesTable::deletes(self.0)
+    }
+
+    /// Get the `entries` table — every manifest entry (data + delete, incl. Deleted tombstones) of the
+    /// current snapshot, with the `data_file` projection nested under one struct column.
+    pub fn entries(&self) -> EntriesTable<'_> {
+        EntriesTable::new(self.0)
     }
 }

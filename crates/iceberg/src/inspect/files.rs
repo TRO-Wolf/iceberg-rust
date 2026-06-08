@@ -28,6 +28,10 @@
 //!
 //! Within a selected manifest only LIVE entries (Added/Existing, [`ManifestEntry::is_alive`]) are rows.
 //!
+//! The data-file column set (schema + row builder) is the shared [`crate::inspect::data_file`] projection
+//! — the `files` family flattens it to top-level columns, the `entries` table nests it under a `data_file`
+//! struct. See that module (Rule of Three).
+//!
 //! References:
 //! - <https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/BaseFilesTable.java>
 //! - <https://github.com/apache/iceberg/blob/main/api/src/main/java/org/apache/iceberg/DataFile.java>
@@ -35,28 +39,17 @@
 //! Deferred column: `readable_metrics` (Java `MetricsUtil.readableMetricsStruct` — a virtual per-data-column
 //! struct of human-readable min/max/counts). All raw columns, including the metrics maps, are present.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-    Float64Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder, MapBuilder,
-    MapFieldNames, StringBuilder, StructBuilder, Time64MicrosecondBuilder,
-    TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
-};
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Fields};
+use arrow_array::RecordBatch;
 use futures::{StreamExt, stream};
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::arrow::{DEFAULT_MAP_FIELD_NAME, schema_to_arrow_schema};
+use super::data_file::{DataFileStructBuilder, data_file_fields};
+use crate::Result;
+use crate::arrow::schema_to_arrow_schema;
 use crate::scan::ArrowRecordBatchStream;
-use crate::spec::{
-    Datum, ListType, Literal, ManifestContentType, MapType, NestedField, PrimitiveLiteral,
-    PrimitiveType, Schema, StructType, Type,
-};
+use crate::spec::{ManifestContentType, Schema};
 use crate::table::Table;
-use crate::{Error, ErrorKind, Result};
 
 /// Which files a [`FilesTable`] exposes — the only thing that differs across the three tables.
 ///
@@ -112,47 +105,13 @@ impl<'a> FilesTable<'a> {
     /// Returns the iceberg schema of the files metadata table.
     ///
     /// Mirrors Java `DataFile.getType(partitionType).fields()` — the field ids are the canonical
-    /// `DataFile` ids from `api/DataFile.java`. The partition column carries the table's DEFAULT
-    /// partition type. `readable_metrics` is deferred.
+    /// `DataFile` ids from `api/DataFile.java`, built from the shared [`data_file_fields`] projection (the
+    /// `files` family exposes them FLAT as the table's top-level columns). The partition column carries the
+    /// table's DEFAULT partition type. `readable_metrics` is deferred.
     pub fn schema(&self) -> Schema {
-        let partition_type = self.table.metadata().default_partition_type().clone();
-        let fields = vec![
-            NestedField::optional(134, "content", Type::Primitive(PrimitiveType::Int)),
-            NestedField::required(100, "file_path", Type::Primitive(PrimitiveType::String)),
-            NestedField::required(101, "file_format", Type::Primitive(PrimitiveType::String)),
-            NestedField::optional(141, "spec_id", Type::Primitive(PrimitiveType::Int)),
-            NestedField::required(102, "partition", Type::Struct(partition_type)),
-            NestedField::required(103, "record_count", Type::Primitive(PrimitiveType::Long)),
-            NestedField::required(
-                104,
-                "file_size_in_bytes",
-                Type::Primitive(PrimitiveType::Long),
-            ),
-            NestedField::optional(108, "column_sizes", int_long_map(117, 118)),
-            NestedField::optional(109, "value_counts", int_long_map(119, 120)),
-            NestedField::optional(110, "null_value_counts", int_long_map(121, 122)),
-            NestedField::optional(137, "nan_value_counts", int_long_map(138, 139)),
-            NestedField::optional(125, "lower_bounds", int_binary_map(126, 127)),
-            NestedField::optional(128, "upper_bounds", int_binary_map(129, 130)),
-            NestedField::optional(131, "key_metadata", Type::Primitive(PrimitiveType::Binary)),
-            NestedField::optional(132, "split_offsets", long_list(133)),
-            NestedField::optional(135, "equality_ids", int_list(136)),
-            NestedField::optional(140, "sort_order_id", Type::Primitive(PrimitiveType::Int)),
-            NestedField::optional(142, "first_row_id", Type::Primitive(PrimitiveType::Long)),
-            NestedField::optional(
-                143,
-                "referenced_data_file",
-                Type::Primitive(PrimitiveType::String),
-            ),
-            NestedField::optional(144, "content_offset", Type::Primitive(PrimitiveType::Long)),
-            NestedField::optional(
-                145,
-                "content_size_in_bytes",
-                Type::Primitive(PrimitiveType::Long),
-            ),
-        ];
+        let partition_type = self.table.metadata().default_partition_type();
         Schema::builder()
-            .with_fields(fields.into_iter().map(Arc::new))
+            .with_fields(data_file_fields(partition_type))
             .build()
             .expect("files metadata table schema is statically valid")
     }
@@ -163,11 +122,14 @@ impl<'a> FilesTable<'a> {
     /// table's [`FilesTableKind`] filter, and emits one row per LIVE manifest entry built from its
     /// [`crate::spec::DataFile`]. An empty table (no current snapshot) yields a single empty batch.
     pub async fn scan(&self) -> Result<ArrowRecordBatchStream> {
+        // The flattened files-table Arrow schema IS the `data_file` struct's child fields (top-level), so
+        // the same `DataFileStructBuilder` that builds the `entries` nested column builds these rows; we
+        // then split its `StructArray` into the top-level columns.
         let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema())?);
         let partition_type = self.table.metadata().default_partition_type().clone();
-        let partition_arrow_fields = partition_struct_fields(&arrow_schema)?;
+        let data_file_arrow_fields = arrow_schema.fields().clone();
 
-        let mut builder = FilesRowBuilder::new(&partition_arrow_fields, &partition_type)?;
+        let mut builder = DataFileStructBuilder::new(&data_file_arrow_fields, &partition_type);
 
         if let Some(snapshot) = self.table.metadata().current_snapshot() {
             let manifest_list = snapshot
@@ -186,477 +148,9 @@ impl<'a> FilesTable<'a> {
             }
         }
 
-        let batch = builder.finish(arrow_schema)?;
+        let data_file_struct = builder.finish();
+        let batch = RecordBatch::try_new(arrow_schema, data_file_struct.columns().to_vec())?;
         Ok(stream::iter(vec![Ok(batch)]).boxed())
-    }
-}
-
-/// Iceberg `map<int, long>` with the given key/value field ids (the metrics-count maps).
-fn int_long_map(key_id: i32, value_id: i32) -> Type {
-    Type::Map(MapType {
-        key_field: Arc::new(NestedField::map_key_element(
-            key_id,
-            Type::Primitive(PrimitiveType::Int),
-        )),
-        value_field: Arc::new(NestedField::map_value_element(
-            value_id,
-            Type::Primitive(PrimitiveType::Long),
-            true,
-        )),
-    })
-}
-
-/// Iceberg `map<int, binary>` with the given key/value field ids (the lower/upper-bound maps).
-fn int_binary_map(key_id: i32, value_id: i32) -> Type {
-    Type::Map(MapType {
-        key_field: Arc::new(NestedField::map_key_element(
-            key_id,
-            Type::Primitive(PrimitiveType::Int),
-        )),
-        value_field: Arc::new(NestedField::map_value_element(
-            value_id,
-            Type::Primitive(PrimitiveType::Binary),
-            true,
-        )),
-    })
-}
-
-/// Iceberg `list<long>` (required element) with the given element field id (split offsets).
-fn long_list(element_id: i32) -> Type {
-    Type::List(ListType {
-        element_field: Arc::new(NestedField::list_element(
-            element_id,
-            Type::Primitive(PrimitiveType::Long),
-            true,
-        )),
-    })
-}
-
-/// Iceberg `list<int>` (required element) with the given element field id (equality ids).
-fn int_list(element_id: i32) -> Type {
-    Type::List(ListType {
-        element_field: Arc::new(NestedField::list_element(
-            element_id,
-            Type::Primitive(PrimitiveType::Int),
-            true,
-        )),
-    })
-}
-
-/// Extracts the Arrow `partition` struct field list from the converted files-table Arrow schema.
-fn partition_struct_fields(arrow_schema: &arrow_schema::Schema) -> Result<Fields> {
-    match arrow_schema.field_with_name("partition")?.data_type() {
-        DataType::Struct(fields) => Ok(fields.clone()),
-        other => Err(Error::new(
-            ErrorKind::Unexpected,
-            format!("files metadata table partition column must be a struct, got {other:?}"),
-        )),
-    }
-}
-
-/// Builds the metrics map field (`key_value` struct of `key: int`, `value`) for a `MapBuilder`,
-/// carrying the canonical Iceberg field ids so the produced Arrow schema matches `schema_to_arrow_schema`.
-fn metrics_map_fields(
-    key_id: &str,
-    value_id: &str,
-    value_type: DataType,
-) -> (Arc<Field>, Arc<Field>) {
-    let keys_field = Arc::new(Field::new("key", DataType::Int32, false).with_metadata(
-        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), key_id.to_string())]),
-    ));
-    // The `DataFile` metric maps use `MapType.ofRequired`, so the value is non-null.
-    let values_field = Arc::new(Field::new("value", value_type, false).with_metadata(
-        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), value_id.to_string())]),
-    ));
-    (keys_field, values_field)
-}
-
-fn map_field_names() -> MapFieldNames {
-    MapFieldNames {
-        entry: DEFAULT_MAP_FIELD_NAME.to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    }
-}
-
-/// Accumulates files-table rows column-by-column and finishes them into a single [`RecordBatch`].
-///
-/// One builder per output column, mirroring the manifests/snapshots tables' style. The partition
-/// column is a [`StructBuilder`] whose children match the table's DEFAULT partition type.
-struct FilesRowBuilder<'a> {
-    partition_type: &'a StructType,
-
-    content: Int32Builder,
-    file_path: StringBuilder,
-    file_format: StringBuilder,
-    spec_id: Int32Builder,
-    partition: StructBuilder,
-    record_count: Int64Builder,
-    file_size_in_bytes: Int64Builder,
-    column_sizes: MapBuilder<Int32Builder, Int64Builder>,
-    value_counts: MapBuilder<Int32Builder, Int64Builder>,
-    null_value_counts: MapBuilder<Int32Builder, Int64Builder>,
-    nan_value_counts: MapBuilder<Int32Builder, Int64Builder>,
-    lower_bounds: MapBuilder<Int32Builder, LargeBinaryBuilder>,
-    upper_bounds: MapBuilder<Int32Builder, LargeBinaryBuilder>,
-    key_metadata: LargeBinaryBuilder,
-    split_offsets: ListBuilder<Int64Builder>,
-    equality_ids: ListBuilder<Int32Builder>,
-    sort_order_id: Int32Builder,
-    first_row_id: Int64Builder,
-    referenced_data_file: StringBuilder,
-    content_offset: Int64Builder,
-    content_size_in_bytes: Int64Builder,
-}
-
-impl<'a> FilesRowBuilder<'a> {
-    fn new(partition_arrow_fields: &Fields, partition_type: &'a StructType) -> Result<Self> {
-        let count_map = |key_id: &str, value_id: &str| {
-            let (k, v) = metrics_map_fields(key_id, value_id, DataType::Int64);
-            MapBuilder::new(
-                Some(map_field_names()),
-                Int32Builder::new(),
-                Int64Builder::new(),
-            )
-            .with_keys_field(k)
-            .with_values_field(v)
-        };
-        let binary_map = |key_id: &str, value_id: &str| {
-            let (k, v) = metrics_map_fields(key_id, value_id, DataType::LargeBinary);
-            MapBuilder::new(
-                Some(map_field_names()),
-                Int32Builder::new(),
-                LargeBinaryBuilder::new(),
-            )
-            .with_keys_field(k)
-            .with_values_field(v)
-        };
-
-        Ok(Self {
-            partition_type,
-            content: Int32Builder::new(),
-            file_path: StringBuilder::new(),
-            file_format: StringBuilder::new(),
-            spec_id: Int32Builder::new(),
-            partition: StructBuilder::from_fields(partition_arrow_fields.clone(), 0),
-            record_count: Int64Builder::new(),
-            file_size_in_bytes: Int64Builder::new(),
-            column_sizes: count_map("117", "118"),
-            value_counts: count_map("119", "120"),
-            null_value_counts: count_map("121", "122"),
-            nan_value_counts: count_map("138", "139"),
-            lower_bounds: binary_map("126", "127"),
-            upper_bounds: binary_map("129", "130"),
-            key_metadata: LargeBinaryBuilder::new(),
-            split_offsets: list_builder_i64(133),
-            equality_ids: list_builder_i32(136),
-            sort_order_id: Int32Builder::new(),
-            first_row_id: Int64Builder::new(),
-            referenced_data_file: StringBuilder::new(),
-            content_offset: Int64Builder::new(),
-            content_size_in_bytes: Int64Builder::new(),
-        })
-    }
-
-    /// Appends one row from a [`crate::spec::DataFile`].
-    fn append(&mut self, data_file: &crate::spec::DataFile) -> Result<()> {
-        self.content.append_value(data_file.content_type() as i32);
-        self.file_path.append_value(data_file.file_path());
-        self.file_format
-            .append_value(data_file.file_format().to_string());
-        self.spec_id.append_value(data_file.partition_spec_id);
-
-        append_partition(
-            &mut self.partition,
-            self.partition_type,
-            data_file.partition(),
-        )?;
-
-        self.record_count
-            .append_value(data_file.record_count() as i64);
-        self.file_size_in_bytes
-            .append_value(data_file.file_size_in_bytes() as i64);
-
-        append_count_map(&mut self.column_sizes, data_file.column_sizes())?;
-        append_count_map(&mut self.value_counts, data_file.value_counts())?;
-        append_count_map(&mut self.null_value_counts, data_file.null_value_counts())?;
-        append_count_map(&mut self.nan_value_counts, data_file.nan_value_counts())?;
-        append_bound_map(&mut self.lower_bounds, data_file.lower_bounds())?;
-        append_bound_map(&mut self.upper_bounds, data_file.upper_bounds())?;
-
-        self.key_metadata.append_option(data_file.key_metadata());
-
-        append_i64_list(&mut self.split_offsets, data_file.split_offsets());
-        append_i32_list(&mut self.equality_ids, data_file.equality_ids().as_deref());
-
-        self.sort_order_id.append_option(data_file.sort_order_id());
-        self.first_row_id.append_option(data_file.first_row_id());
-        self.referenced_data_file
-            .append_option(data_file.referenced_data_file());
-        self.content_offset
-            .append_option(data_file.content_offset());
-        self.content_size_in_bytes
-            .append_option(data_file.content_size_in_bytes());
-        Ok(())
-    }
-
-    /// Finishes all column builders into a single [`RecordBatch`].
-    fn finish(mut self, arrow_schema: Arc<arrow_schema::Schema>) -> Result<RecordBatch> {
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(self.content.finish()),
-            Arc::new(self.file_path.finish()),
-            Arc::new(self.file_format.finish()),
-            Arc::new(self.spec_id.finish()),
-            Arc::new(self.partition.finish()),
-            Arc::new(self.record_count.finish()),
-            Arc::new(self.file_size_in_bytes.finish()),
-            Arc::new(self.column_sizes.finish()),
-            Arc::new(self.value_counts.finish()),
-            Arc::new(self.null_value_counts.finish()),
-            Arc::new(self.nan_value_counts.finish()),
-            Arc::new(self.lower_bounds.finish()),
-            Arc::new(self.upper_bounds.finish()),
-            Arc::new(self.key_metadata.finish()),
-            Arc::new(self.split_offsets.finish()),
-            Arc::new(self.equality_ids.finish()),
-            Arc::new(self.sort_order_id.finish()),
-            Arc::new(self.first_row_id.finish()),
-            Arc::new(self.referenced_data_file.finish()),
-            Arc::new(self.content_offset.finish()),
-            Arc::new(self.content_size_in_bytes.finish()),
-        ];
-        Ok(RecordBatch::try_new(arrow_schema, columns)?)
-    }
-}
-
-/// Builds a `list<long>` builder whose element field carries the given Iceberg field id.
-fn list_builder_i64(element_id: i32) -> ListBuilder<Int64Builder> {
-    ListBuilder::new(Int64Builder::new())
-        .with_field(list_element_field(element_id, DataType::Int64))
-}
-
-/// Builds a `list<int>` builder whose element field carries the given Iceberg field id.
-fn list_builder_i32(element_id: i32) -> ListBuilder<Int32Builder> {
-    ListBuilder::new(Int32Builder::new())
-        .with_field(list_element_field(element_id, DataType::Int32))
-}
-
-/// The Arrow element field (`element`, required) for a list column, carrying the Iceberg field id so the
-/// produced schema matches `schema_to_arrow_schema` (list elements are required in the `DataFile` schema).
-fn list_element_field(element_id: i32, data_type: DataType) -> Arc<Field> {
-    Arc::new(
-        Field::new("element", data_type, false).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            element_id.to_string(),
-        )])),
-    )
-}
-
-/// Appends a `map<int, long>` value (one of the metrics-count maps), keys sorted for determinism.
-fn append_count_map(
-    builder: &mut MapBuilder<Int32Builder, Int64Builder>,
-    map: &HashMap<i32, u64>,
-) -> Result<()> {
-    let mut keys: Vec<&i32> = map.keys().collect();
-    keys.sort_unstable();
-    for key in keys {
-        builder.keys().append_value(*key);
-        builder.values().append_value(map[key] as i64);
-    }
-    builder.append(true)?;
-    Ok(())
-}
-
-/// Appends a `map<int, binary>` value (lower/upper bounds), keys sorted; values are the raw serialized
-/// single-value bytes (Java map<int, binary>).
-fn append_bound_map(
-    builder: &mut MapBuilder<Int32Builder, LargeBinaryBuilder>,
-    map: &HashMap<i32, Datum>,
-) -> Result<()> {
-    let mut keys: Vec<&i32> = map.keys().collect();
-    keys.sort_unstable();
-    for key in keys {
-        builder.keys().append_value(*key);
-        builder.values().append_value(map[key].to_bytes()?);
-    }
-    builder.append(true)?;
-    Ok(())
-}
-
-/// Appends an optional `list<long>` value (split offsets).
-fn append_i64_list(builder: &mut ListBuilder<Int64Builder>, values: Option<&[i64]>) {
-    match values {
-        Some(values) => {
-            for value in values {
-                builder.values().append_value(*value);
-            }
-            builder.append(true);
-        }
-        None => builder.append(false),
-    }
-}
-
-/// Appends an optional `list<int>` value (equality ids).
-fn append_i32_list(builder: &mut ListBuilder<Int32Builder>, values: Option<&[i32]>) {
-    match values {
-        Some(values) => {
-            for value in values {
-                builder.values().append_value(*value);
-            }
-            builder.append(true);
-        }
-        None => builder.append(false),
-    }
-}
-
-/// Appends one partition tuple to the partition [`StructBuilder`], dispatching each field on its
-/// primitive type. The partition `Struct`'s values are aligned with `partition_type`'s fields.
-fn append_partition(
-    builder: &mut StructBuilder,
-    partition_type: &StructType,
-    partition: &crate::spec::Struct,
-) -> Result<()> {
-    for (index, field) in partition_type.fields().iter().enumerate() {
-        let primitive_type = field.field_type.as_primitive_type().ok_or_else(|| {
-            Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "partition field '{}' has non-primitive type {:?}; not supported in the files metadata table",
-                    field.name, field.field_type
-                ),
-            )
-        })?;
-        let value = partition
-            .fields()
-            .get(index)
-            .and_then(|value| value.as_ref());
-        append_partition_field(builder, index, primitive_type, value)?;
-    }
-    builder.append(true);
-    Ok(())
-}
-
-/// Appends a single partition-field value (or null) to the struct child builder at `index`, dispatching
-/// on the field's primitive type. Mirrors the Arrow types produced by `type_to_arrow_type`.
-fn append_partition_field(
-    builder: &mut StructBuilder,
-    index: usize,
-    primitive_type: &PrimitiveType,
-    value: Option<&Literal>,
-) -> Result<()> {
-    let primitive = match value {
-        Some(Literal::Primitive(primitive)) => Some(primitive),
-        Some(other) => {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!("non-primitive partition literal {other:?} is not supported"),
-            ));
-        }
-        None => None,
-    };
-
-    macro_rules! append_typed {
-        ($builder_ty:ty, $extract:expr) => {{
-            let child = builder.field_builder::<$builder_ty>(index).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("partition child builder at index {index} has an unexpected type"),
-                )
-            })?;
-            match primitive {
-                Some(primitive) => child.append_value($extract(primitive)?),
-                None => child.append_null(),
-            }
-        }};
-    }
-
-    match primitive_type {
-        PrimitiveType::Boolean => append_typed!(BooleanBuilder, extract_bool),
-        PrimitiveType::Int => append_typed!(Int32Builder, extract_i32),
-        PrimitiveType::Long => append_typed!(Int64Builder, extract_i64),
-        PrimitiveType::Float => append_typed!(Float32Builder, extract_f32),
-        PrimitiveType::Double => append_typed!(Float64Builder, extract_f64),
-        PrimitiveType::Date => append_typed!(Date32Builder, extract_i32),
-        PrimitiveType::Time => append_typed!(Time64MicrosecondBuilder, extract_i64),
-        PrimitiveType::Timestamp => append_typed!(TimestampMicrosecondBuilder, extract_i64),
-        PrimitiveType::TimestampNs => {
-            append_typed!(TimestampNanosecondBuilder, extract_i64)
-        }
-        PrimitiveType::String => append_typed!(StringBuilder, extract_string),
-        PrimitiveType::Binary => append_typed!(BinaryBuilder, extract_binary),
-        PrimitiveType::Decimal { .. } => append_typed!(Decimal128Builder, extract_i128),
-        other => {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "partition field type {other:?} is not supported in the files metadata table"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn type_mismatch(primitive: &PrimitiveLiteral) -> Error {
-    Error::new(
-        ErrorKind::DataInvalid,
-        format!("partition literal {primitive:?} does not match its partition field type"),
-    )
-}
-
-fn extract_bool(primitive: &PrimitiveLiteral) -> Result<bool> {
-    match primitive {
-        PrimitiveLiteral::Boolean(value) => Ok(*value),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_i32(primitive: &PrimitiveLiteral) -> Result<i32> {
-    match primitive {
-        PrimitiveLiteral::Int(value) => Ok(*value),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_i64(primitive: &PrimitiveLiteral) -> Result<i64> {
-    match primitive {
-        PrimitiveLiteral::Long(value) => Ok(*value),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_f32(primitive: &PrimitiveLiteral) -> Result<f32> {
-    match primitive {
-        PrimitiveLiteral::Float(value) => Ok(value.into_inner()),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_f64(primitive: &PrimitiveLiteral) -> Result<f64> {
-    match primitive {
-        PrimitiveLiteral::Double(value) => Ok(value.into_inner()),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_string(primitive: &PrimitiveLiteral) -> Result<&str> {
-    match primitive {
-        PrimitiveLiteral::String(value) => Ok(value.as_str()),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_binary(primitive: &PrimitiveLiteral) -> Result<&[u8]> {
-    match primitive {
-        PrimitiveLiteral::Binary(value) => Ok(value.as_slice()),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_i128(primitive: &PrimitiveLiteral) -> Result<i128> {
-    match primitive {
-        PrimitiveLiteral::Int128(value) => Ok(*value),
-        other => Err(type_mismatch(other)),
     }
 }
 

@@ -1303,3 +1303,71 @@ How to use it (see the manuals' §2):
   confirmed all 21 `files`-table ids equal Java `DataFile.getType` in order, including the nested map
   key/value (117/118…) and list element (133, 136) ids. Also pin the partition value PER row-key (file_path),
   not just the multiset — a multiset assertion passes even if partitions are shuffled across rows.
+
+### 2026-06-08 (Phase 3 Increment 2 — `entries` inspection table, BUILDER Opus)
+- **DO trust the Java SOURCE field ids over the brief's paraphrase, and flag the divergence.** *Why:* the
+  brief said `entries` data_file projection ids 0/1/2/3/4; `ManifestEntry.java:51-55` actually assigns
+  `status`=0, `snapshot_id`=1, `sequence_number`=**3**, `file_sequence_number`=**4**, `data_file`=**2**
+  (`DATA_FILE_ID = 2`). CLAUDE.md makes the Java source the spec-by-example; implementing 0/1/2/3/4 would
+  break interop. The Rust `ManifestEntry` doc comments already carry the real ids (1/3/4/2), so they were the
+  cross-check. Read `getSchema`/`wrapFileSchema` for the actual `Schema(...)` field order + ids, never infer.
+- **DO read that Java `entries` reads `snapshot().allManifests` with NO `isLive()` filter — the Deleted
+  tombstones ARE rows.** *Why:* this is the ONE behavioral difference from the `files` family (which filters
+  `is_alive()`). `BaseEntriesTable.planFiles` filters manifests by the row-filter/content evaluator only, and
+  `ManifestReadTask` yields every entry; `ManifestEntriesTable`'s javadoc: "exposes internal details, like
+  files that have been deleted." A port that reuses the files-table `is_alive()` filter silently drops the
+  status-2 tombstone and the entries table is wrong. Pin it with a test that asserts the Deleted file IS a
+  present row with `status == 2` — the headline risk.
+- **GOTCHA: `StructBuilder::from_fields` builds Map/List children as BOXED builders
+  (`MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>` / `ListBuilder<Box<dyn ArrayBuilder>>`), NOT the
+  typed `MapBuilder<Int32Builder, Int64Builder>`.** *Why it bites:* the old flat `FilesRowBuilder`
+  constructed each `MapBuilder<Int32Builder, Int64Builder>` by hand with `.with_keys_field`/`.with_values_field`
+  to carry field ids. When the `data_file` projection became a single `StructBuilder` (so `entries` can nest
+  it AND `files` can flatten its `.columns()`), arrow's `make_builder` produces the BOXED map/list shapes for
+  the `DataType::Map`/`DataType::List` children — so `field_builder::<MapBuilder<Int32Builder, Int64Builder>>(i)`
+  returns `None` → "child builder at index N has an unexpected type" at runtime. Fix: fetch the children as
+  `MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>` / `ListBuilder<Box<dyn ArrayBuilder>>` and
+  `downcast_mut` the inner key/value/element builders. `make_builder` PRESERVES the keys/values/element field
+  metadata (`.with_keys_field`/`.with_field`), so field ids survive automatically — the hand-rolled
+  `metrics_map_fields` helper is then dead and was deleted. The build COMPILES with the wrong typed builder
+  (it's just a `field_builder::<T>` generic) and only fails at the first append — a `RecordBatch::try_new`
+  schema-validation or a `field_builder` `None` is the tell, so run the tests, don't trust a green build.
+- **DO factor a shared Arrow row-builder as a single `StructBuilder` when one consumer needs the nested
+  struct and the other the flat columns.** *Why:* `entries` needs `data_file` as ONE struct column; `files`
+  needs the SAME 21 fields as top-level columns. A single `DataFileStructBuilder` (a `StructBuilder` over the
+  `data_file_fields`) serves BOTH: `entries` appends it as the `data_file` column; `files` calls
+  `.finish()` → `StructArray` and emits `.columns().to_vec()` as the top-level columns (the flattened
+  Arrow schema IS the struct's child fields, so `RecordBatch::try_new(flat_schema, struct.columns())`
+  type-checks). One projection, two shapes, no drift — the Rule-of-Three extraction. The `files` tests
+  (unchanged) staying green after the refactor is the behavior-preservation proof.
+- **DO assert inspection rows against the GENUINELY committed values, including writer-side overrides — not
+  an idealized model.** *Why:* `ManifestWriter::add_delete_entry` STAMPS `entry.snapshot_id = self.snapshot_id`
+  (the manifest's snapshot id) but PRESERVES the data/file sequence numbers; `add_existing_entry` preserves
+  everything; an Added entry with no id/seq INHERITS the manifest-list entry's `added_snapshot_id`/seq at read
+  time. So a Deleted entry written with an explicit `.snapshot_id(parent)` comes back carrying CURRENT's id,
+  seq=parent's. The first cut of the test asserted "Deleted = parent id" and FAILED — the code was right, the
+  expectation was wrong. Read the writer's `add_*_entry` contract before asserting; the test that compares to
+  the real committed shape (incl. the stamp + the inheritance) is the one that pins read correctness.
+
+### 2026-06-08 (Phase 3 Increment 2 — `entries` + shared `DataFileStructBuilder`, REVIEWER Opus)
+- **DO confirm a builder-claimed field-id "correction" against the Java SOURCE line, not the brief.** *Why:*
+  the brief said the entries top-level ids were `0/1/2/3/4`; the BUILDER overrode to `0/1/3/4/2`. Verified
+  against `core/.../ManifestEntry.java:51-56` — `STATUS=0`, `SNAPSHOT_ID=1`, `SEQUENCE_NUMBER=3`,
+  `FILE_SEQUENCE_NUMBER=4`, `DATA_FILE_ID=2` (data_file is **2**, the seq fields are **3/4**). The correction
+  is RIGHT; the brief was wrong. Per CLAUDE.md (Java source is the spec-by-example), the source line wins over
+  the prose brief every time — and the Arrow-schema test pins these exact ids so a regression can't slip.
+- **DO mutation-test a SHARED projection from BOTH consumer shapes, not just one.** *Why:* `DataFileStructBuilder`
+  feeds `files` (flattened `.columns()`) AND `entries` (nested `data_file` struct). Corrupting `record_count`
+  (index 5) failed a test in BOTH (`test_files_table_record_count_...` + `test_entries_table_data_file_struct_...`);
+  corrupting the boxed map VALUE failed BOTH (`test_files_table_partition_struct_and_metrics_map_present` +
+  the entries struct test). A mutation that only broke one shape would mean the other shape's coverage was a
+  gap. Both-shapes mutation is the discipline a Rule-of-Three extraction demands.
+- **DO probe the boxed BINARY map path specifically — a typed-vs-boxed downcast bug hides until the bytes are
+  read.** *Why:* `StructBuilder::from_fields` boxes the `lower_bounds`/`upper_bounds` map's `LargeBinary` value
+  builder; the append path downcasts to `LargeBinaryBuilder`. The existing tests assert the int-value maps
+  (`column_sizes`) and the map TYPE but never read the bound-map BYTES. A throwaway probe confirmed
+  `lower_bounds {1: long(1)}` round-trips to `[1,0,0,0,0,0,0,0]` (LE) and the nested map key/value field ids
+  survive the boxing (column_sizes k117/v118, lower_bounds k126/v127, upper_bounds k129/v130 — exactly Java
+  `DataFile.java`). `PrimitiveType::Binary` maps to Arrow `LargeBinary` (`arrow/schema.rs:691`), so the
+  `LargeBinaryBuilder` downcast for both `key_metadata` and the bound-map values is correct. (Verdict: no bug
+  — the boxed metrics maps are correctly populated in both shapes.)

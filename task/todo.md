@@ -2115,3 +2115,75 @@ vs Java. One untracked schema-shape divergence (unpartitioned empty-partition co
 a test + tracked in GAP_MATRIX (not fixed — non-corrupting, narrow, invasive-to-fix; left 🟡). Files
 touched: `inspect/files.rs` (+1 test), GAP_MATRIX, todo, lessons. No production-logic change, no Cargo
 edits, no commit, no branch switch.
+
+### Phase 3 Increment 2 — `entries` inspection table (BUILDER Opus, 2026-06-08)
+New file `crates/iceberg/src/inspect/entries.rs`; a shared `data_file` projection factored out of
+`inspect/files.rs` into a new `inspect/data_file.rs` submodule (Rule of Three, 2nd use — `files` flattens
+the projection to top-level columns, `entries` nests it under a single `data_file` struct column). Wired
+via `inspect/mod.rs` + `metadata_table.rs` (`MetadataTableType::Entries` + `MetadataTable::entries`).
+Mirrors Java `BaseEntriesTable` / `ManifestEntriesTable`.
+
+**Java contract verified against source** (`core/.../BaseEntriesTable.java`,
+`core/.../ManifestEntriesTable.java`, `core/.../ManifestEntry.java`):
+- **Reads `snapshot().allManifests(io)` = ALL manifests (data AND delete)** of the CURRENT snapshot, and
+  does NOT filter `isLive()` — so it SHOWS the `Deleted` tombstone (`status==2`). This is THE difference
+  from `files` (which excludes Deleted). The `ManifestEntriesTable` javadoc: "exposes internal details,
+  like files that have been deleted."
+- **Schema = `ManifestEntry.getSchema(partitionType)` = `wrapFileSchema(DataFile.getType(partitionType))`:**
+  `status`(0, required int), `snapshot_id`(1, optional long), `sequence_number`(**3**, optional long),
+  `file_sequence_number`(**4**, optional long), `data_file`(**2**, required struct =
+  `DataFile.getType(partitionType)` — the SAME field set the files table projects). **NOTE — the brief said
+  ids 0/1/2/3/4; the authoritative Java source (`ManifestEntry.java:51-55`) uses 0/1/3/4/2** (seq=3,
+  file_seq=4, data_file=2). Per CLAUDE.md (Java source is the spec-by-example, not the paraphrase), I
+  implement the REAL Java ids 0/1/3/4/2 — and these match the Rust `ManifestEntry` doc comments exactly.
+- **Status repr** = Java `Status` enum `EXISTING(0)/ADDED(1)/DELETED(2)` == Rust `ManifestStatus`
+  `Existing=0/Added=1/Deleted=2` (`status() as i32`).
+
+Plan:
+- [x] Extract shared `inspect/data_file.rs`: `data_file_fields(partition_type) -> Vec<NestedFieldRef>`
+      (the 21 `DataFile` columns) + a `DataFileStructBuilder` (a `StructBuilder` of those fields + the
+      partition type) with `append(&DataFile)` / `finish() -> StructArray`. Refactored `files.rs` to wrap
+      it (flatten = build the one `data_file` struct, emit `StructArray::columns()` as the 21 top-level
+      columns). All the per-type partition/metric append helpers + extract helpers moved to the shared
+      module. **KEY GOTCHA (solved):** `StructBuilder::from_fields` builds Map/List children as the BOXED
+      shapes `MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>` / `ListBuilder<Box<dyn ArrayBuilder>>`
+      (via `make_builder`) — NOT the typed `MapBuilder<Int32Builder, Int64Builder>` the old flat
+      `FilesRowBuilder` constructed by hand. So the append helpers now take the `Dyn{Map,List}Builder`
+      aliases and downcast the inner key/value/element builders. The boxed builders PRESERVE the keys/values/
+      element field metadata (so field ids survive), so the explicit `metrics_map_fields`/`map_field_names`
+      helpers were deleted.
+- [x] `EntriesTable<'a>` (holds `&Table`); `schema()` = the 5-field entry schema (data_file =
+      `Type::Struct(StructType::new(data_file_fields))`); `scan()`: current snapshot → `load_manifest_list`
+      → for EVERY manifest (no content filter) → for EVERY entry (no `is_alive` filter) → append a row
+      (status int, nullable snapshot_id/seq/file_seq via `append_option`, data_file struct via the shared
+      builder). `file_sequence_number` is a public FIELD on `ManifestEntry`, not a method.
+- [x] Wired `MetadataTableType::Entries` (+ `as_str` "entries" + `TryFrom`) + `MetadataTable::entries()`.
+- [x] 6 tests (`TableTestFixture` + a DATA manifest Added/Deleted/Existing + a DELETE manifest Added —
+      public crate APIs): (a) ALL 4 entries incl. the Deleted tombstone present (status 2); (b) status per
+      entry (Added=1/Existing=0/Deleted=2); (c) snapshot_id/seq/file_seq vs committed — Existing preserves
+      parent's id+seq, Deleted is snapshot-id-STAMPED to current by `add_delete_entry` but seq PRESERVED,
+      Added inherits current's id+seq at read time; (d) data_file struct carries the right file
+      (record_count/content + the Added file's column_sizes {1:42}) per entry; (e) Arrow schema = 5 cols,
+      ids 0/1/3/4/2, data_file Struct (file_path keeps nested id 100), status non-null + snapshot_id
+      nullable; (f) empty table → 0 rows.
+- [x] Deferred `readable_metrics` (as files did). Docs: GAP_MATRIX inspection row, Roadmap Phase 3, todo,
+      lessons. Verify gate from repo root.
+
+**Outcome (2026-06-08, Phase 3 Increment 2, BUILDER Opus):** the `entries` inspection table lands at Java
+`BaseEntriesTable`/`ManifestEntriesTable` schema parity (🟡). It reads the CURRENT snapshot's
+`allManifests` (data AND delete) and emits EVERY entry — INCLUDING the `Deleted` tombstones (`status==2`)
+that `files` excludes (the diagnostic view). The **shared data_file projection** (`data_file_fields` +
+`DataFileStructBuilder`) was factored out of `files.rs` into `inspect/data_file.rs` (Rule of Three, 2nd
+use): `files` FLATTENS the struct's `.columns()` to top-level columns, `entries` NESTS it under `data_file`
+— one source of truth, the two cannot drift. **DEVIATION FROM BRIEF (flagged): field ids.** The brief said
+data_file ids 0/1/2/3/4; the authoritative Java source `ManifestEntry.java:51-55` uses **0/1/3/4/2**
+(status 0, snapshot_id 1, sequence_number 3, file_sequence_number 4, data_file 2). Per CLAUDE.md (Java
+source is the spec-by-example, not the paraphrase), I implemented the REAL Java ids — which also match the
+Rust `ManifestEntry` doc comments exactly. **Verify (repo root):** build clean; lib ×2 = 1424/0 both runs
+(was 1418 baseline → +6 new entries tests; the files refactor is behavior-preserving — its 9 tests stay
+green); 3 interop suites 4/4 each; clippy -D warnings clean; fmt --check clean. Files touched exactly the
+allowed set: `inspect/data_file.rs` (new shared), `inspect/entries.rs` (new), `inspect/files.rs` (refactor
+to the shared projection ONLY), `inspect/mod.rs`, `inspect/metadata_table.rs`, GAP_MATRIX, Roadmap, todo,
+lessons. No Cargo/lockfile/`arrow/` edits, no commit, no branch switch. **Deferred:** `readable_metrics`;
+`all_entries`/`history`/`refs`/`metadata_log`/`partitions`/`all_*`; Java/Spark interop (→ ✅). An Opus
+REVIEWER verifies next.

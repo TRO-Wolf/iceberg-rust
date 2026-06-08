@@ -344,7 +344,15 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      `DataFile`; the three differ ONLY by the manifest-content filter (Java `BaseFilesTable`). Arrow schema
      mirrors `DataFile.getType(partitionType)` (all raw columns incl. the metrics maps + V3 DV fields);
      `readable_metrics` deferred. 8 unit tests (content-filter + `is_alive()` mutation-verified).
-  2. **`entries`** (+ `all_entries`) — the raw manifest-entry view (status/snapshot-id/seq + `data_file`).
+  2. **`entries`** — the raw manifest-entry diagnostic view — **DONE 🟡 (2026-06-08, Increment 2,
+     `inspect/entries.rs`).** Reads the current snapshot's `allManifests` (data AND delete) and emits EVERY
+     entry — INCLUDING the `Deleted` tombstones (`status==2`) that `files` excludes (Java
+     `ManifestEntriesTable`). Schema = Java `ManifestEntry.getSchema` (5 cols: `status`/0, `snapshot_id`/1,
+     `sequence_number`/3, `file_sequence_number`/4, `data_file`/2 = the SAME data_file projection NESTED).
+     The shared data_file projection (`data_file_fields` + `DataFileStructBuilder`) was factored into
+     `inspect/data_file.rs` (Rule of Three — `files` flattens it, `entries` nests it); `readable_metrics`
+     deferred. 6 unit tests (Deleted-tombstone-present + status + seq/snapshot-id vs committed + nested
+     data_file + schema field ids). (`all_entries` — across ALL snapshots — folds into the `all_*` item.)
   3. **`history` + `refs` + `metadata_log_entries`** — pure-metadata tables (no manifest IO).
   4. **`partitions`** — per-partition aggregation over entries.
   5. **`all_*`** (`all_data_files` / `all_manifests` / `all_entries` …) — across ALL snapshots.
