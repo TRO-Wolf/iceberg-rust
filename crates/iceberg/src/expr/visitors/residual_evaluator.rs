@@ -32,12 +32,10 @@
 //! - if `d == day(a) == day(b)`, the residual is `utc_timestamp >= a AND
 //!   utc_timestamp <= b`.
 //!
-//! The evaluator is fully exercised by this module's tests but has no in-crate
-//! *production* caller yet — Increment 2 wires it into scan planning
-//! (`FileScanTask` residuals) and Increment 3 into filter-based conflict
-//! validation. The `dead_code` allow below is removed when those consumers land.
-
-#![allow(dead_code)]
+//! The evaluator is wired into scan planning (`scan/context.rs` computes each
+//! [`crate::scan::FileScanTask`]'s partition-reduced residual via
+//! [`ResidualEvaluator::residual_for`]); Increment 3 adds a second consumer in
+//! filter-based conflict validation.
 
 use fnv::FnvHashSet;
 

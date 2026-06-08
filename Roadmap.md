@@ -351,8 +351,17 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   against a partition's values → the residual `Predicate` (strict-projection-true ⇒ `AlwaysTrue`,
   inclusive-projection-false ⇒ `AlwaysFalse`, else keep), reusing `Transform::{project,strict_project}` +
   the `ExpressionEvaluatorVisitor`; 16 unit tests incl. the Javadoc `day(ts)` 4-case example, both mutations
-  (strict↔inclusive, partition-ignore) caught. **Next:** scan-wiring (Increment 2 — per-`FileScanTask`
-  residuals) + filter-based concurrent-commit conflict validation (Increment 3).
+  (strict↔inclusive, partition-ignore) caught. **Scan-wiring landed 🟡 (Increment 2, 2026-06-08,
+  `scan/context.rs`):** each `FileScanTask` now carries the PARTITION-REDUCED residual (Java
+  `BaseFileScanTask.residual()` = `residuals.residualFor(file.partition())`), not the full snapshot filter —
+  the evaluator is built once per manifest file in `PlanContext::create_manifest_file_context` and
+  `into_file_scan_task` evaluates it against the file's partition, binds the residual back to the snapshot
+  schema, and stores it as `task.predicate`; the `partition_spec: None` TODO is resolved (the file's spec is
+  threaded onto the task, which also activates the reader's dormant identity-partition constant
+  materialization). The arrow reader is unchanged. Result-equivalence is proven by 11 scan tests on identity
+  AND truncate partitions; both mutations (leave-full-filter, wrong-partition) caught. **Next:** filter-based
+  concurrent-commit conflict validation (Increment 3 — `OverwriteFiles`/`RowDelta`
+  `validateNoConflictingData`).
 - **Inspection-table sub-sequence (dependency, then value):**
   1. **`files` family** (`files` / `data_files` / `delete_files`) — **DONE 🟡 (2026-06-08, Increment 1,
      `inspect/files.rs`).** Reads the current snapshot's manifest list → manifests → live entries →

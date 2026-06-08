@@ -2872,3 +2872,130 @@ unpartitioned-`Not` reconstruction and the multi-field-per-source loop) the buil
 **Verify:** build -p iceberg clean; workspace build clean; lib ×2 = 1491/0 (was 1483 → +8); 3 interop
 suites 4/4 each; clippy -D warnings clean; fmt clean. Row stays 🟡 (scan-wiring Inc 2 + conflict-validation
 Inc 3 + Java interop still pending). Files touched: `residual_evaluator.rs` (tests only), todo, lessons.
+
+### Increment 2 — wire the ResidualEvaluator into scan FileScanTask (DETAIL, 2026-06-08)
+Java `BaseFileScanTask.residual()` = `residuals.residualFor(file.partition())` — each task carries the
+PARTITION-REDUCED residual, and the reader filters rows with it. Today Rust sets `FileScanTask.predicate` to
+the FULL `snapshot_bound_predicate` (`scan/context.rs::into_file_scan_task`), and `partition_spec` is `None`
+(a TODO). The ONLY runtime consumer of `task.predicate` is `arrow/reader.rs` (row filtering); datafusion does
+not read it.
+
+Plan:
+- [x] Thread the file's `Arc<PartitionSpec>` into `ManifestEntryContext` / `into_file_scan_task` (resolve the
+      `partition_spec: None` TODO) — resolved in `PlanContext::create_manifest_file_context` via
+      `table_metadata.partition_spec_by_id(manifest_file.partition_spec_id)`. Set `partition_spec: Some(spec)`
+      on the task too.
+- [x] In `into_file_scan_task`, when there is a filter: compute the residual via the per-manifest
+      `ResidualEvaluator`, BIND the resulting unbound `Predicate` to `snapshot_schema`, and store it as
+      `predicate`. No filter ⇒ `predicate: None`; unpartitioned spec ⇒ residual == the full filter (unchanged
+      behavior). The evaluator is constructed ONCE per manifest file (the spec + snapshot filter are constant
+      within a manifest) and shared across its entries — the per-spec cache pattern, but per-manifest, so no
+      shared mutable cache was needed.
+- [x] Reader UNCHANGED (it already uses `task.predicate` for row filtering; now it's the residual — and
+      `task.partition_spec` for identity-partition constants, which the threading newly activates).
+- [x] Tests (CRITICAL — prove RESULT-EQUIVALENCE + genuine reduction): 11 scan-wiring tests on identity AND
+      truncate transform partitions; reduced-residual (not full filter); fully-implied → `AlwaysTrue`; spec
+      populated; result-equivalence reads; unpartitioned/no-filter unchanged; partition-mismatch pruning.
+      Mutations caught: (a) leave `predicate`=full filter → 3 reduction tests fail; (b) residual against the
+      WRONG (empty) partition → all 5 residual tests fail.
+- [x] Docs: GAP_MATRIX residual/scan row (scan wiring done), Roadmap, todo, lessons.
+
+**Outcome (2026-06-08, Phase 3 Increment 2 — residual scan-wiring, BUILDER Opus):** each `FileScanTask` now
+carries the PARTITION-REDUCED residual of the scan filter, not the full snapshot filter — Java
+`BaseFileScanTask.residual()` parity (`residuals.residualFor(file.partition())`). **What I threaded:** the
+file's `Arc<PartitionSpec>` (`table_metadata.partition_spec_by_id(manifest_file.partition_spec_id)`) and an
+`Arc<ResidualEvaluator>`, both added to `ManifestFileContext` (built in
+`PlanContext::create_manifest_file_context`, which has `table_metadata`) and propagated to each
+`ManifestEntryContext`. **Where the residual is computed:** `ManifestEntryContext::into_file_scan_task` calls a
+new `residual_predicate()` helper — it runs the per-manifest evaluator's `residual_for(file.partition())`,
+binds the unbound residual `Predicate` back to the snapshot schema, and stores the `BoundPredicate` as
+`task.predicate`. The evaluator is built ONCE per manifest file (spec + filter constant within a manifest) and
+shared across entries — the cleaner choice over a shared mutable cache, since each manifest already maps to one
+spec id. `partition_spec: None` → `Some(spec)` resolves the TODO. **Result-equivalence argument:** every row in
+a data file belongs to that file's single partition tuple, so the partition-implied conditions the residual
+drops are TRUE for all rows in the file; filtering with the residual therefore selects exactly the rows the
+full filter would — result-preserving, only cheaper. Stated in an `into_file_scan_task` comment and proven by
+the equivalence read tests (identity + truncate). **Java lines verified:** `BaseFileScanTask.residual()` =
+`residuals.residualFor(file.partition())` (the per-task residual is the partition-reduced one); the
+`ResidualEvaluator` semantics were verified in Increment 1. **The one unforeseen interaction (flagged):**
+threading `task.partition_spec` ALSO activates the arrow reader's identity-partition constant materialization
+(`reader.rs:451-455` → `record_batch_transformer::constants_map`, Java `PartitionUtil.constantsMap`), which was
+dormant while the field was `None`. This is CORRECT Iceberg behavior but exposed a pre-existing inconsistency in
+the shared `TableTestFixture` (partition `x`=100/200/300 vs the parquet `x` column `[1; 1024]`). I made the
+fixture consistent (partition `x`=1, matching the data) — a test-only change in `scan/mod.rs` — which is the
+truthful resolution; no read test prunes on `x`, so nothing else changes. This rippled one expect-snapshot in
+`inspect/manifests.rs` (partition-summary bounds `"100"`/`"300"` → `"1"`/`"1"`, mechanical) — OUTSIDE the
+allowed-edit set, flagged here and in the final report. **Test list (11, each pins a risk):**
+`test_task_predicate_is_partition_reduced_residual_not_full_filter` (residual reduced, not full filter —
+mutation (a) target); `test_task_predicate_residual_is_always_true_when_filter_fully_implied` (filter fully
+implied by partition → `AlwaysTrue`); `test_task_partition_spec_is_populated_from_table_metadata` (TODO
+resolved); `test_residual_scan_result_equivalent_to_full_filter_identity_partition` (RESULT-EQUIVALENCE read,
+identity); `test_unpartitioned_table_keeps_full_filter_as_task_predicate` (no reduction on unpartitioned);
+`test_no_filter_scan_leaves_task_predicate_none` (no-filter unchanged + spec still threaded);
+`test_filter_excluding_the_partition_prunes_the_file_entirely` (partition mismatch → file pruned);
+`test_task_predicate_residual_reduced_on_transform_truncate_partition` (NON-identity transform residual
+reduced); `test_residual_scan_result_equivalent_to_full_filter_truncate_partition` (RESULT-EQUIVALENCE read,
+truncate transform — x read from data, not constant). Plus the 8 pre-existing scan read tests updated to decode
+the now-run-encoded identity-partition `x` constant (new `decode_int64_column` helper), and the
+`test_select_with_repeated_column_names` type assertions (`x` is `RunEndEncoded`, like `_file`).
+**Mutations run (each caught):** (a) `residual_predicate` returns the full `snapshot_bound_predicate` →
+`test_task_predicate_is_partition_reduced_*` + `*_residual_is_always_true_*` +
+`*_residual_reduced_on_transform_truncate_*` all FAIL; (b) `residual_for(&Struct::empty())` (wrong partition) →
+all 5 residual tests FAIL (3 panic in the accessor, 2 wrong-result). Both restored; production byte-identical
+after. **Removed** the module-scoped `#![allow(dead_code)]` from `residual_evaluator.rs` (now consumed in
+production — clippy `-D warnings` confirms every item is reachable). **Gate (all from repo root, pinned
+nightly):** `cargo build -p iceberg` ✅; `cargo build --workspace --exclude iceberg-sqllogictest --all-targets`
+✅; `cargo test -p iceberg --lib` ×2 = **1500 passed / 0 failed** both runs (was 1491 → +9 residual-wiring
+tests, net; the 8 updated read tests + 1 inspect snapshot are edits not adds); 3 interop suites
+(`interop_manage_snapshots`/`interop_update_schema`/`interop_update_partition_spec`) = 4/4 each ✅; `cargo
+clippy --workspace --exclude iceberg-sqllogictest --all-targets -- -D warnings` clean ✅; `cargo fmt --all --
+--check` clean ✅. Existing scan/reader filtered-read tests all still pass. No commit, no branch switch, no
+Cargo/spec/transaction edits; `arrow/reader.rs` behavior unchanged (only the now-active partition-constant path
+it already contained). **Files:** `scan/context.rs` (spec + residual threading, residual computation),
+`scan/mod.rs` (fixture consistency + truncate fixture + 9 new tests + 8 read-test decode updates),
+`expr/visitors/residual_evaluator.rs` (removed `allow(dead_code)` + doc), `inspect/manifests.rs` (forced
+expect-snapshot ripple), docs (GAP_MATRIX/Roadmap/todo/lessons).
+- [x] Verify from repo root: build -p iceberg + workspace; lib ×2; 3 interop; clippy (workspace); fmt.
+
+#### Phase 3 Increment 2 — REVIEW (2026-06-08, Opus REVIEWER, DELEGATED)
+Adversarially verified residual result-equivalence and scope against the Java source + 3 code mutations.
+**VERDICT: CHANGES-MADE.**
+- **Residual result-equivalence: CONFIRMED.** The residual is computed from the FILE's own spec
+  (`partition_spec_by_id(manifest_file.partition_spec_id)`, resolved per manifest), evaluated against the
+  FILE's own `data_file().partition()`, then BOUND BACK to the snapshot schema — exactly Java
+  `BaseFileScanTask.residual()` = `residuals.residualFor(file.partition())`. The data-matches-partition
+  invariant (the original fixture VIOLATED it: data `x`=1, partition `x`=100/200/300) makes the
+  fixture-consistency fix genuinely NECESSARY, not optional — confirmed independently.
+- **Fixture fix DECISION: KEPT the collapse (3→1 partition).** Investigated the multi-partition alternative
+  and REJECTED it: the shared fixture writes BYTE-IDENTICAL parquet data to all three files via one
+  `for n in 1..=3` loop (only 2 are live — 2.parquet is the Deleted entry), so keeping 100/200/300 would
+  require rewriting `write_parquet_data_files` to emit per-file distinct `x` data and rippling ~8 read tests —
+  disproportionate. Crucially, NO coverage is lost: the base `scan/mod.rs` had ZERO tests filtering on the
+  partition column `x` with 100/200/300, and the dedicated multi-partition inspect tests
+  (`all_manifests`/`entries`/`files`/`partitions`) build their OWN inline 3-partition manifests (untouched,
+  60/60 green). The collapse is adequate and the better fix is disproportionately heavy.
+- **Constants-map activation (`partition_spec=Some`) DECISION: KEPT, justified.** Verified by REAL reads:
+  `record_batch_transformer::constants_map` materializes ONLY identity-transform fields (line 60-61); the
+  identity fixture reads `x` as a RunEndEncoded constant from partition metadata (value 1) and the truncate
+  fixture reads `x` from the data file (non-identity) — both confirmed by equivalence read tests. `arrow/reader.rs`
+  is byte-unchanged (not in the diff). Correct Iceberg behavior (Java `PartitionUtil.constantsMap`), resolves a
+  real TODO, fully pinned — KEEP over DEFER.
+- **inspect/manifests.rs ripple: BENIGN.** Mechanical consequence of the (necessary) partition-value change on
+  the SAME manifest the scan reads; the partition-summary bound is genuinely now 1. Not a masked bug.
+- **Mutations run (3):** (a) store full filter instead of residual → CAUGHT (4 tests, incl. the identity
+  equivalence read via its pre-read reduced-residual assertion); (b) residual vs EMPTY partition → CAUGHT
+  (5 tests, incl. BOTH equivalence reads); (c) use the table DEFAULT spec instead of the file's own
+  `partition_spec_id` → **SURVIVED** the builder's suite (fixture had only one spec) — a real test-strength
+  gap (the exact silent partition-evolution data bug). **CLOSED** by a new pinning test.
+- **Test added:** `test_residual_uses_files_own_spec_not_the_table_default_spec` — a 2-spec fixture
+  (`new_with_evolved_default_spec` + `setup_manifest_files_under_spec_zero`) where the live file is written
+  under non-default `identity(x)` spec 0 while the table default is unpartitioned spec 1; pins that the
+  residual reduces to `AlwaysTrue` (file's spec) and `task.partition_spec.spec_id()==0`. Re-running mutation
+  (c) now FAILS it.
+- **Scope + floor: CLEAN.** Production code byte-identical to the builder's after every mutation reverted; my
+  additions are test-only (fixture builder + 1 test) in `scan/mod.rs`; no bare `.unwrap()` added in production;
+  no Cargo/spec/reader-logic/transaction edits; no commit/branch switch.
+- **Gate (all clean, repo root, pinned nightly):** build -p iceberg ✅; workspace build (--exclude
+  sqllogictest --all-targets) ✅; lib ×2 = **1501/0** both (was 1500 → +1 spec-evolution pin); 3 interop
+  suites 4/4 each ✅; clippy -D warnings clean ✅; fmt clean ✅. Row stays 🟡 (Increment 3 conflict-validation
+  + Java interop still pending).

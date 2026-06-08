@@ -1661,3 +1661,53 @@ How to use it (see the manuals' §2):
   bucket(category) (inconclusive for eq) AND identity(category) (conclusive) forces the loop to continue
   past bucket to let identity decide. Added a test (AlwaysTrue on match / AlwaysFalse on miss); the
   break-after-first mutation fails it.
+
+### 2026-06-08 (Phase 3 Increment 2 — residual scan-wiring, BUILDER Opus)
+- **DO state + test the residual-validity invariant as the load-bearing correctness claim.** *Why:* the whole
+  reduction is only result-equivalent because every row in a data file belongs to that file's SINGLE partition
+  tuple, so the partition-implied leaves the residual drops are TRUE for all rows in the file. Wrote it as a
+  comment in `into_file_scan_task` and proved it with read tests that assert the residual-path rows EXACTLY
+  equal the full-filter row set (identity AND truncate partitions). A residual regression silently returns
+  wrong scan results, so this is the one invariant the tests must pin, not just "the predicate is reduced."
+- **DO resolve the `partition_spec: None` TODO via `table_metadata.partition_spec_by_id(manifest_file.
+  partition_spec_id)` in `PlanContext::create_manifest_file_context` (it has `table_metadata`), thread it onto
+  `ManifestFileContext` → `ManifestEntryContext` → the task.** *Why:* all files in one manifest share the
+  manifest's `partition_spec_id`, so the spec (and the `ResidualEvaluator` built from spec+filter) is resolved
+  ONCE per manifest file and shared across its entries — the per-spec cache pattern, but per-manifest, so no
+  shared mutable cache is needed. Per-file rebuild would re-run `spec.partition_type(schema)` + a `Schema`
+  build for every file.
+- **FLAG, DON'T MISS: setting `task.partition_spec = Some(spec)` ACTIVATES the arrow reader's
+  identity-partition constant materialization (`reader.rs:451-455` → `record_batch_transformer::constants_map`,
+  Java `PartitionUtil.constantsMap`), which is dormant while the field is `None`.** *Why it bites:* threading
+  the spec (a required TODO) silently changes how identity-partition columns are READ — they become run-end-
+  encoded constants from the partition METADATA, not values read from the data file. This is correct Iceberg
+  behavior, but it exposed a pre-existing inconsistency in `TableTestFixture` (partition `x`=100/200/300 vs the
+  parquet `x` column `[1; 1024]`) and broke 9 tests asserting `x`==1 as a plain `Int64Array`. A change that
+  only "sets a field on a struct" can still alter downstream read behavior — grep the field's consumers
+  (`task.partition_spec`) before assuming "reader unchanged." Fix: make the fixture internally consistent
+  (partition `x`=1, matching the data), and decode the now-run-encoded constant in the read assertions
+  (`arrow_cast::cast::cast` to `Int64` flattens a `RunEndEncoded<Int64>`).
+- **DO make a contrived test fixture INTERNALLY CONSISTENT rather than asserting on inconsistent data.** *Why:*
+  the old fixture's partition values were arbitrary distinct constants (100/200/300) for manifest realism,
+  never reconciled with the parquet data because `partition_spec` was always `None` (the constant path never
+  ran). Once the spec is threaded, the partition value IS authoritative for an identity column — so the
+  truthful fix is partition `x`=1 (= the data), not "assert `x`==100 (the now-materialized constant)". A
+  consistent fixture is the higher-integrity resolution and keeps the read tests meaningful. The change rippled
+  one `inspect/manifests.rs` expect-snapshot (partition-summary bounds `"100"`/`"300"` → `"1"`); a shared
+  fixture's partition values can reach any test that snapshots partition summaries — grep for the old values.
+
+### 2026-06-08 — Residual scan-wiring REVIEW (spec-evolution mutation gap)
+- **DO mutation-test "use the FILE's own spec vs the table DEFAULT spec" when a scan reads a per-file spec by
+  id.** *Why it bites silently:* `scan/context.rs` resolves the residual's spec via
+  `partition_spec_by_id(manifest_file.partition_spec_id)`. A fixture with only ONE spec CANNOT distinguish this
+  from `default_partition_spec()` — the swap mutation passed all 1500 tests. After partition evolution an older
+  manifest's `partition_spec_id` differs from the current default, so the default-spec bug would compute the
+  residual (and the identity-constant materialization) against the WRONG spec → a silent wrong-rows scan. *Fix:*
+  a 2-spec fixture (`new_with_evolved_default_spec`) writes the live file under the NON-default spec; pin that
+  the residual reduces by the file's spec (`AlwaysTrue`) and `task.partition_spec.spec_id()` is the file's, not
+  the default. A single-spec fixture is structurally blind to this class of bug — add the spec-evolution case.
+- **DO reject a "better" multi-partition fixture fix when the data is shared and no coverage is at stake.** The
+  shared `TableTestFixture` writes byte-identical parquet to all files in one loop; keeping distinct partition
+  values valid would mean per-file distinct data + rippling every read assertion, for ZERO coverage gain
+  (no test filtered on the partition column, and the multi-partition inspect tests build their own inline
+  manifests). Collapse-to-consistent is the right call; spend the effort on the spec-evolution pin instead.
