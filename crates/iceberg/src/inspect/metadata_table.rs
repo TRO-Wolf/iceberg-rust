@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{EntriesTable, FilesTable, ManifestsTable, SnapshotsTable};
+use super::{
+    EntriesTable, FilesTable, HistoryTable, ManifestsTable, MetadataLogEntriesTable, RefsTable,
+    SnapshotsTable,
+};
 use crate::table::Table;
 
 /// Metadata table is used to inspect a table's history, snapshots, and other metadata as a table.
@@ -42,6 +45,12 @@ pub enum MetadataTableType {
     DeleteFiles,
     /// [`EntriesTable`] — all manifest entries of the current snapshot (Java `entries`).
     Entries,
+    /// [`HistoryTable`] — one row per snapshot-log entry (Java `history`).
+    History,
+    /// [`RefsTable`] — one row per branch/tag reference (Java `refs`).
+    Refs,
+    /// [`MetadataLogEntriesTable`] — one row per metadata-log entry (Java `metadata_log_entries`).
+    MetadataLogEntries,
 }
 
 impl MetadataTableType {
@@ -54,6 +63,9 @@ impl MetadataTableType {
             MetadataTableType::DataFiles => "data_files",
             MetadataTableType::DeleteFiles => "delete_files",
             MetadataTableType::Entries => "entries",
+            MetadataTableType::History => "history",
+            MetadataTableType::Refs => "refs",
+            MetadataTableType::MetadataLogEntries => "metadata_log_entries",
         }
     }
 
@@ -75,6 +87,9 @@ impl TryFrom<&str> for MetadataTableType {
             "data_files" => Ok(Self::DataFiles),
             "delete_files" => Ok(Self::DeleteFiles),
             "entries" => Ok(Self::Entries),
+            "history" => Ok(Self::History),
+            "refs" => Ok(Self::Refs),
+            "metadata_log_entries" => Ok(Self::MetadataLogEntries),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -115,5 +130,21 @@ impl<'a> MetadataTable<'a> {
     /// current snapshot, with the `data_file` projection nested under one struct column.
     pub fn entries(&self) -> EntriesTable<'_> {
         EntriesTable::new(self.0)
+    }
+
+    /// Get the `history` table — one row per snapshot-log entry (the table's current-snapshot history).
+    pub fn history(&self) -> HistoryTable<'_> {
+        HistoryTable::new(self.0)
+    }
+
+    /// Get the `refs` table — one row per branch/tag reference, with its retention policy.
+    pub fn refs(&self) -> RefsTable<'_> {
+        RefsTable::new(self.0)
+    }
+
+    /// Get the `metadata_log_entries` table — one row per metadata-log entry (previous metadata files
+    /// plus the current one), with the snapshot that was current at each entry's timestamp.
+    pub fn metadata_log_entries(&self) -> MetadataLogEntriesTable<'_> {
+        MetadataLogEntriesTable::new(self.0)
     }
 }

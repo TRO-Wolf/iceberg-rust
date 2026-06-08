@@ -1371,3 +1371,69 @@ How to use it (see the manuals' §2):
   `DataFile.java`). `PrimitiveType::Binary` maps to Arrow `LargeBinary` (`arrow/schema.rs:691`), so the
   `LargeBinaryBuilder` downcast for both `key_metadata` and the bound-map values is correct. (Verdict: no bug
   — the boxed metrics maps are correctly populated in both shapes.)
+
+### 2026-06-08 (Phase 3 Increment 3 — `history` / `refs` / `metadata_log_entries`, BUILDER Opus)
+- **DO commit a non-current-ancestor history fixture in TWO transactions, not one.** *Why:* a single
+  `into_builder().add_snapshot(SIBLING).set_ref("main", SIBLING).set_ref("main", CURRENT).build()` makes
+  SIBLING an *intermediate* snapshot (made current then superseded WITHIN one changeset) — and
+  `TableMetadataBuilder::update_snapshot_log` (mirroring Java `TableMetadata.Builder`) DROPS intermediate
+  snapshots from the snapshot log, so SIBLING never appears as a `history` row and the only non-trivial
+  column (`is_current_ancestor`) can't be exercised. Split it: commit 1 grafts SIBLING and makes it current
+  (it persists in the log), commit 2 rolls `main` back to CURRENT. SIBLING is now a historical log entry
+  (not intermediate) whose `is_current_ancestor` is correctly false. The final snapshot log is
+  [ROOT, CURRENT, SIBLING, CURRENT] (the rollback re-stamps CURRENT) — assert ≥1 row per id, not a fixed
+  count, and that duplicate rows for the same id agree.
+- **DO read the Java row-builder for `parent_id` semantics: it is the SNAPSHOT's parent, not the previous
+  log entry.** *Why:* `HistoryTable.convertHistoryEntryFunc` looks up `snapshots.get(snapshotId).parentId()`
+  per history entry — so `history.parent_id` = `snapshot_by_id(entry.snapshot_id).parent_snapshot_id()`,
+  nullable, NOT the snapshot id of the preceding snapshot-log row. Easy to get subtly wrong because in a
+  straight-line history they coincide; a forked/rolled-back history is where they diverge.
+- **DO implement `metadata_log_entries.latest_*` fully — it is tractable from Rust metadata, no deferral.**
+  *Why:* Java derives them via `SnapshotUtil.snapshotIdAsOfTime(ts)` = the LAST `table.history()` (snapshot
+  log) entry whose `timestampMillis <= ts`, then that snapshot's `schemaId`/`sequenceNumber`; NULL when no
+  snapshot is at/older than the timestamp (a creation-time metadata file). Rust's `metadata.history()` +
+  `snapshot_by_id().{schema_id,sequence_number}` give exactly this — a 6-line `snapshot_id_as_of_time` walk.
+  Don't reach for the brief's "or NULL with a precise note if unresolvable" escape hatch when the data is
+  right there. The synthetic final log row is `(last_updated_ms, metadata_location)` — Java appends the
+  CURRENT metadata file as the last `MetadataLogEntry`; an empty `metadata_log()` therefore still yields ONE
+  row (the current file), and `metadata_location()` being `Option` → use `unwrap_or("")` defensively.
+- **DO cast an Arrow timestamp column to its `TimestampMicrosecondType`, never `Int64Type`, in tests.** *Why:*
+  `as_primitive::<Int64Type>()` on a `Timestamp(µs, "+00:00")` array PANICS at runtime ("primitive array"
+  type mismatch) even though the physical storage is i64 — `as_primitive` checks the Arrow DataType, not the
+  physical width. Cast to `TimestampMicrosecondType`; `.value(i)` then returns the i64 micros directly
+  (= log millis × 1000), so the millis→micros conversion is still assertable.
+- **DO copy a private cross-module test fixture locally rather than widen its visibility.** *Why:*
+  `transaction::tests::make_v2_table` is `mod tests` (private to `transaction/`), unreachable from
+  `inspect/`'s `#[cfg(test)]`. Re-reading the same committed `TableMetadataV2Valid.json` into a 15-line local
+  `make_v2_table` in each inspect test module is the in-scope path; making `transaction::tests` public to
+  share one helper would touch an out-of-scope file for a test-only convenience. (The `scan::tests` module IS
+  `pub` and is what `snapshots.rs`/`entries.rs` reuse — but its `TableTestFixture` has a different history
+  shape; the JSON-fixture path is cleaner for the pure-metadata tables.)
+- **DO reach `metadata.refs` directly in-crate (`pub(crate)`), no new accessor needed.** *Why:* the brief
+  flagged "if you need to ADD a public accessor, STOP and report." None needed: `TableMetadata.refs` is
+  `pub(crate)` and `inspect/` is in the same crate, and every other field (`history()`, `metadata_log()`,
+  `current_snapshot_id()`, `last_updated_ms()`, `snapshot_by_id()`) plus `Snapshot::{parent_snapshot_id,
+  schema_id, sequence_number, timestamp_ms}` is already public. Confirm visibility before reporting a blocker.
+
+### 2026-06-08 (Phase 3 Increment 3 — `history` / `refs` / `metadata_log_entries`, REVIEWER Opus)
+- **DO pin the `<=` (inclusive) boundary in `snapshot_id_as_of_time` with a metadata-log entry whose
+  timestamp EXACTLY EQUALS a snapshot-log timestamp — offsetting every test entry off the snapshot
+  timestamps leaves the boundary unpinned and a `<`-vs-`<=` mutation SURVIVES.** *Why:* Java
+  `nullableSnapshotIdAsOfTime` keeps the LAST snapshot-log entry with `timestampMillis <= ts`; the only
+  case that distinguishes `<=` from a strict `<` is `ts == a snapshot-log timestamp` (the metadata file
+  written by the very commit that created the snapshot, whose `lastUpdatedMillis == snapshot.timestampMillis`).
+  The builder's `latest_*` test used `ROOT_TS-1000` / `ROOT_TS+1000` / `last_updated_ms` (= `1602…`, well
+  past `CURRENT_TS`) — none landing ON a snapshot timestamp — so I mutation-tested `<=`→`<` and the test
+  still PASSED. Added `test_…_inclusive_of_exact_snapshot_timestamp` (entries at exactly `ROOT_TS` and
+  `CURRENT_TS` → resolve to ROOT and CURRENT, not NULL/ROOT); mutation-verified it now FAILS under `<` (entry
+  at `ROOT_TS` resolved to 0 instead of ROOT). A wrong as-of-time = wrong `latest_snapshot_id`/`schema_id`/
+  `sequence_number` per row, so the boundary is load-bearing, not cosmetic.
+- **DO replace a bare `.unwrap()` on a statically-valid `Schema::builder().build()` with
+  `.expect("<table> metadata table schema is statically valid")`, matching the in-scope sibling
+  precedent.** *Why:* CLAUDE.md Non-Negotiable #3 / Opus §Rust forbid bare `.unwrap()` in production paths.
+  The Increment-3 `schema()` methods copied the bare `.unwrap()` from the OLDER `snapshots.rs` template, but
+  the immediately-preceding Increment-1/2 siblings (`files.rs`/`entries.rs`) had already adopted
+  `.expect("… statically valid")` — so the bare `.unwrap()` was both a non-negotiable miss and inconsistent
+  with the freshest precedent. When two precedents disagree, follow the one that satisfies the engineering
+  floor. (The `is_current_ancestor` always-true mutation and the field-id Arrow probes were already
+  correctly pinned by the builder — those needed no change.)

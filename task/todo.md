@@ -2187,3 +2187,129 @@ to the shared projection ONLY), `inspect/mod.rs`, `inspect/metadata_table.rs`, G
 lessons. No Cargo/lockfile/`arrow/` edits, no commit, no branch switch. **Deferred:** `readable_metrics`;
 `all_entries`/`history`/`refs`/`metadata_log`/`partitions`/`all_*`; Java/Spark interop (→ ✅). An Opus
 REVIEWER verifies next.
+
+### Phase 3 Increment 3 — `history` / `refs` / `metadata_log_entries` (BUILDER Opus, 2026-06-08)
+Three PURE-METADATA inspection tables (no manifest IO) — each reads only `TableMetadata` fields and
+projects to a `RecordBatch`, mirroring `inspect/snapshots.rs` (NOT the manifest-reading `files`/`entries`).
+New files `inspect/{history.rs, refs.rs, metadata_log_entries.rs}`; wired via `inspect/mod.rs` +
+`metadata_table.rs` (`MetadataTableType::{History, Refs, MetadataLogEntries}` + accessors + `as_str` +
+`TryFrom` + `all_types`).
+
+**Java schema authority — CONFIRMED from source (field ids verbatim):**
+- `HistoryTable.java:37-42` — `made_current_at` ts(zone) #1 req, `snapshot_id` long #2 req, `parent_id`
+  long #3 opt, `is_current_ancestor` bool #4 req. Row fn (`convertHistoryEntryFunc`): `madeCurrentAt =
+  historyEntry.timestampMillis()*1000` (millis→micros); `parent_id = snapshots.get(snapshotId).parentId()`
+  (the SNAPSHOT's parent, nullable); `is_current_ancestor = SnapshotUtil.currentAncestorIds(table)
+  .contains(snapshotId)` (the parent-chain of the CURRENT snapshot).
+- `RefsTable.java:33-40` — `name` str #1 req, `type` str #2 req ("BRANCH"/"TAG" via `SnapshotRefType.name()`),
+  `snapshot_id` long #3 req, `max_reference_age_in_ms` long #4 opt, `min_snapshots_to_keep` int #5 opt
+  (branches only), `max_snapshot_age_in_ms` long #6 opt (branches only). Tag carries ONLY max_ref_age.
+- `MetadataLogEntriesTable.java:29-35` — `timestamp` ts(zone) #1 req, `file` str #2 req, `latest_snapshot_id`
+  long #3 opt, `latest_schema_id` int #4 opt, `latest_sequence_number` long #5 opt. The log = `previousFiles`
+  (metadata_log) PLUS a synthetic final entry `(lastUpdatedMillis, metadataFileLocation)` for the CURRENT
+  file. `latest_*` derived from `SnapshotUtil.snapshotIdAsOfTime(ts)` = the LAST snapshot-log entry whose
+  `made_current_at <= ts`; its `schema_id` + `sequence_number`; NULL when no snapshot ≤ ts (creation-time
+  entry). All tractable from Rust metadata — NO deferral needed.
+
+**`is_current_ancestor`**: build a `HashSet<i64>` by walking `current_snapshot_id` via `parent_snapshot_id`
+(mirrors `manage_snapshots::is_ancestor_of` / Java `currentAncestorIds`); a history row is a current-ancestor
+iff its snapshot id ∈ the set. A forked/rolled-back snapshot not on the current parent chain ⇒ false.
+
+**Data sources (all PUBLIC or `pub(crate)`, reachable from in-crate `inspect/`)**: `metadata.history()`
+(`&[SnapshotLog{snapshot_id,timestamp_ms}]`), `metadata.metadata_log()` (`&[MetadataLog{metadata_file,
+timestamp_ms}]`), `metadata.refs` (`pub(crate) HashMap<String,SnapshotReference>` — reachable in-crate),
+`metadata.current_snapshot_id()`, `metadata.last_updated_ms()`, `table.metadata_location()`,
+`snapshot_by_id(id)` → `Snapshot::{parent_snapshot_id, schema_id, sequence_number, timestamp_ms}`.
+Timestamps: spec `Timestamptz` → Arrow `Timestamp(µs, "+00:00")`; multiply `timestamp_ms * 1000` (like
+snapshots.rs). NO new public spec accessor needed.
+
+Plan:
+- [x] `inspect/history.rs`: `HistoryTable` with `schema()` (4 fields) + async `scan()`. Build the
+      current-ancestor id set; one row per `metadata.history()` entry; `parent_id` from the SNAPSHOT's parent.
+- [x] `inspect/refs.rs`: `RefsTable` `schema()` (6 fields) + `scan()`; one row per `metadata.refs` entry;
+      `type` = "BRANCH"/"TAG"; retention fields from `SnapshotRetention::{Branch,Tag}` (tag → only
+      max_reference_age; branch unset → NULL). Sort by name for deterministic output.
+- [x] `inspect/metadata_log_entries.rs`: `MetadataLogEntriesTable` `schema()` (5 fields) + `scan()`; rows =
+      `metadata_log()` + synthetic CURRENT (`last_updated_ms`, `metadata_location`); `latest_*` via a local
+      `snapshot_id_as_of_time` mirroring Java (last history entry ≤ ts), then its schema_id/sequence_number.
+- [x] Wire enum + accessors in `metadata_table.rs`; `mod`+`pub use` in `mod.rs`.
+- [x] Tests (in-crate `#[cfg(test)]`, build tables via `make_v2_table()` + `into_builder`/`add_snapshot`/
+      `set_ref` + `with_metadata` — the `manage_snapshots.rs` forked-table pattern): history 2-snapshot +
+      forked non-ancestor (is_current_ancestor false); refs main+branch+tag w/ retention set/unset; metadata
+      log entries multi-commit; each table's Arrow schema (cols + field ids + types). Name each test for its risk.
+- [x] Docs: GAP_MATRIX inspection row (history/refs/metadata_log_entries landed); Roadmap Phase 3; this todo; lessons.
+- [x] Verify from repo root: build; lib ×2 (counts); 3 interop suites; clippy -D warnings; fmt --check.
+
+**Outcome (2026-06-08, Phase 3 Increment 3, BUILDER Opus):** the three PURE-METADATA inspection tables
+land at Java schema parity (🟡). Each reads only `TableMetadata` fields (no manifest IO), mirroring
+`inspect/snapshots.rs`. **Field ids confirmed verbatim from the Java source** (not the brief paraphrase):
+`HistoryTable` 1/2/3/4 (made_current_at/snapshot_id/parent_id/is_current_ancestor),
+`RefsTable` 1..6 (name/type/snapshot_id/max_reference_age_in_ms/min_snapshots_to_keep/max_snapshot_age_in_ms),
+`MetadataLogEntriesTable` 1..5 (timestamp/file/latest_snapshot_id/latest_schema_id/latest_sequence_number).
+**`is_current_ancestor`** = membership in the set walked from `current_snapshot_id` via `parent_snapshot_id`
+(local `current_ancestor_ids`, mirrors Java `SnapshotUtil.currentAncestorIds`; cycle-guarded). **refs**
+branch/tag handled by matching `SnapshotRetention::{Branch,Tag}` — branch emits all three retention fields
+(NULL where unset), tag emits only `max_reference_age_in_ms` and NULLs the two branch-only fields. **`latest_*`
+FULLY IMPLEMENTED, nothing deferred:** a local `snapshot_id_as_of_time` walks `metadata.history()` for the last
+entry with `timestamp_ms <= ts` (Java `SnapshotUtil.nullableSnapshotIdAsOfTime`), then reads that snapshot's
+`schema_id`/`sequence_number`; NULL when no snapshot is at/older than the timestamp (creation-time file). The log
+rows = `metadata_log()` + a synthetic final entry `(last_updated_ms, metadata_location)` for the CURRENT file,
+exactly as Java appends. Timestamps: `Timestamptz` → Arrow `Timestamp(µs,"+00:00")`, value = log millis × 1000.
+**Tests: 10 (4 history / 3 refs / 3 metadata_log_entries),** each named for its risk; tables built from the
+committed `TableMetadataV2Valid.json` fixture (a local `make_v2_table` per module — `transaction::tests` is
+private to `transaction/`) plus `into_builder`/`set_ref` for refs + branch/tag, a TWO-commit forked rollback for
+the non-ancestor history case, and a directly-set `metadata_log` for the as-of-time resolution. **KEY FINDING
+(forked history):** a single transaction that sets `main`→SIBLING then rolls back to CURRENT drops SIBLING from
+the snapshot log as an *intermediate* snapshot (`TableMetadataBuilder::update_snapshot_log`, mirroring Java) — so
+the forked fixture commits in TWO steps (commit 1 makes SIBLING current; commit 2 rolls main back to CURRENT),
+leaving SIBLING a persisted log row that is correctly `is_current_ancestor == false`. The `is_current_ancestor`
+column is mutation-verified (forcing it true fails the forked test). **Verify (repo root):** build clean; lib ×2
+= 1434/0 both runs (was 1424 baseline → +10); 3 interop suites 4/4 each; clippy -D warnings clean; fmt --check
+clean. Files touched exactly the allowed set: `inspect/{history,refs,metadata_log_entries}.rs` (new),
+`inspect/mod.rs`, `inspect/metadata_table.rs`, GAP_MATRIX, Roadmap, todo, lessons. No Cargo/lockfile/`spec/`/`arrow/`
+edits; NO new public spec accessor needed (`metadata.refs` is `pub(crate)`, reachable in-crate; everything else is
+already public). No commit, no branch switch. **Deferred:** `partitions`/`all_*` variants; Java/Spark interop
+(→ ✅). An Opus REVIEWER verifies next.
+
+#### Phase 3 Increment 3 — REVIEW (2026-06-08, Opus REVIEWER, DELEGATED)
+Adversarially verified points 1–5 against the Java source (`HistoryTable`/`RefsTable`/`MetadataLogEntriesTable`
++ `SnapshotUtil.{currentAncestorIds,ancestorsOf,nullableSnapshotIdAsOfTime}`) and by mutation-testing the
+non-trivial computations.
+- [x] **Pt 1 (field ids + Arrow types): CONFIRMED all three.** Java `HISTORY_SCHEMA` (1 made_current_at
+      timestamptz req / 2 snapshot_id long req / 3 parent_id long opt / 4 is_current_ancestor bool req),
+      `SNAPSHOT_REF_SCHEMA` (1 name / 2 type str req / 3 snapshot_id long req / 4 max_reference_age_in_ms long
+      opt / 5 min_snapshots_to_keep int opt / 6 max_snapshot_age_in_ms long opt), `METADATA_LOG_ENTRIES_SCHEMA`
+      (1 timestamp tstz req / 2 file str req / 3 latest_snapshot_id long opt / 4 latest_schema_id int opt / 5
+      latest_sequence_number long opt) match the Rust `schema()` ids + nullability byte-for-byte. The
+      `arrow_schema_*` expect-tests probe the PRODUCED Arrow field ids + the `Timestamp(µs, "+00:00")` UTC-micros
+      type — all correct. `"BRANCH"`/`"TAG"` == Java `SnapshotRefType.name()`.
+- [x] **Pt 2 (is_current_ancestor): CONFIRMED + mutation-verified.** Rust `current_ancestor_ids` walks
+      `current_snapshot_id` → `parent_snapshot_id` (inclusive), == Java `ancestorsOf(currentSnapshot)`; the
+      forked two-commit fixture makes SIBLING a non-ancestor log row → false; ROOT+CURRENT → true. Mutation
+      (always-true) FAILS the forked test (left Some(true) vs right Some(false)). `parent_id` =
+      `snapshot_by_id(entry.snapshot_id).parent_snapshot_id()` (the SNAPSHOT's parent, nullable) == Java
+      `snap.parentId()`, NOT the previous log row. (Rust adds a benign cycle-guard Java lacks — cannot change
+      correct-input results.)
+- [x] **Pt 3 (refs retention): CONFIRMED.** Branch → all three fields (NULL where the `Option` is unset, e.g.
+      `main`); tag → only `max_reference_age_in_ms`, branch-only fields explicitly NULL. Field-id→accessor map
+      (4←maxRefAge, 5←minKeep, 6←maxSnapAge) matches Java `referencesToRows`.
+- [x] **Pt 4 (latest_* as-of-time): CONFIRMED + TEST-GAP FIXED.** `snapshot_id_as_of_time` (last snapshot-log
+      entry with `timestamp_ms <= ts`, else None) == Java `nullableSnapshotIdAsOfTime`; NULL-before-first / ROOT
+      / CURRENT cases + the synthetic current-file row all correct. **GAP:** the builder's test offset every
+      metadata-log entry OFF the snapshot timestamps, so the `<=`-vs-`<` boundary was UNPINNED — I mutation-tested
+      `<=`→`<` and the test SURVIVED. Added `test_…_inclusive_of_exact_snapshot_timestamp` (entries at exactly
+      `ROOT_TS`/`CURRENT_TS` → ROOT/CURRENT, not NULL/ROOT); mutation-verified it now FAILS under `<`. A wrong
+      as-of-time = wrong latest_* per row, so this is load-bearing.
+- [x] **Pt 5 (no regression + scope): CONFIRMED.** All prior tests green (lib ×2 = 1435/0); only the named
+      files; no `spec/`/`arrow/`/`Cargo` edits; no public spec accessor added (`metadata.refs` is `pub(crate)`,
+      in-crate). **FIXED:** the three `schema()` methods used bare `.unwrap()` (CLAUDE.md NN#3 violation) — copied
+      from the OLDER `snapshots.rs`, but the in-scope Increment-1/2 siblings (`files.rs`/`entries.rs`) already use
+      `.expect("… statically valid")`; replaced all three to match. Empty cases (no refs / no snapshot-log / empty
+      metadata-log) verified panic-free by inspection (the schema-test already exercises the 1-synthetic-row
+      empty-metadata-log path).
+
+**Review outcome (2026-06-08, Opus REVIEWER):** all 5 points adjudicated; row stays 🟡 (interop deferred → ✅).
+One test-strength gap fixed (the as-of-time `<=` boundary, mutation-verified) + one engineering-floor fix (bare
+`.unwrap()` → `.expect()` ×3). Files touched: `inspect/{history,refs,metadata_log_entries}.rs` (the 3 in-scope
+new files only) + todo + lessons. +1 test (1434 → 1435 lib). build/clippy/fmt clean; 3 interop suites 4/4 each.
+No commit, no branch switch, no Cargo/spec/arrow edits.

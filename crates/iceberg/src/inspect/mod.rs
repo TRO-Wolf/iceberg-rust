@@ -20,12 +20,18 @@
 mod data_file;
 mod entries;
 mod files;
+mod history;
 mod manifests;
+mod metadata_log_entries;
 mod metadata_table;
+mod refs;
 mod snapshots;
 
 pub use entries::EntriesTable;
 pub use files::FilesTable;
+pub use history::HistoryTable;
 pub use manifests::ManifestsTable;
+pub use metadata_log_entries::MetadataLogEntriesTable;
 pub use metadata_table::*;
+pub use refs::RefsTable;
 pub use snapshots::SnapshotsTable;
