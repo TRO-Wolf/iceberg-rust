@@ -1537,3 +1537,60 @@ How to use it (see the manuals' §2):
   in ISOLATION fails the pre-existing `table_provider_factory` `#[tokio::main]` doctest because tokio's
   `rt-multi-thread` feature isn't unified in; at `--workspace` doc scope — how CI runs — it passes. Not a
   regression; run doctests workspace-wide.)
+
+### 2026-06-08 (Phase 3 Increment 5b — `all_manifests`, BUILDER Opus)
+- **DO content-gate the manifest count columns in BOTH `all_manifests` AND the regular `manifests` table —
+  Java content-gates in BOTH.** *Why:* `AllManifestsTable.manifestFileToRow` (core L286-303) AND
+  `ManifestsTable.manifestFileToRow` (core L108-113) use the IDENTICAL gate
+  (`manifest.content() == DATA ? count : 0` for the *_data_files_count columns, `== DELETES ? count : 0` for
+  the *_delete_files_count columns). The Rust `inspect/manifests.rs` scan appended each manifest's
+  added/existing/deleted counts to BOTH families unconditionally — a real bug (a DATA manifest reported its
+  data counts in the delete columns too, and vice-versa). The fix is a one-line `is_data` gate shared with
+  `all_manifests`; it ships with the regenerated `manifests` `expect_test` block (the fixture's DATA
+  manifest's delete columns flip 1/1/1 → 0/0/0) and is mutation-pinned. Do NOT let `all_manifests` match the
+  buggy non-gated behavior "for consistency" — fix the buggy one instead.
+- **DO build `all_manifests` by iterating `metadata.snapshots()` DIRECTLY, NOT via the 5a
+  `manifest_source::collect_manifest_files` helper.** *Why:* `all_manifests` is the ONE inspection table that
+  must NOT dedup — Java `AllManifestsTable` javadoc "may return duplicate rows", one row per (manifest ×
+  referencing snapshot). The 5a helper dedups manifests by `manifest_path` AND drops the snapshot identity,
+  so it is fundamentally wrong here (it would collapse a shared manifest to one row and lose the
+  `reference_snapshot_id`). Per-snapshot iteration + `snapshot.snapshot_id()` as `reference_snapshot_id` is
+  the distinct machinery. This is the key distinction from the 5a file/entry `all_*` tables, which DO dedup
+  manifests (but not the files inside them).
+- **DO make the `reference_snapshot_id`-vs-`added_snapshot_id` distinction TESTABLE by giving the shared
+  manifest an `added_snapshot_id` that differs from the referencing snapshot's id.** *Why:* a manifest's
+  `added_snapshot_id` (the snapshot that committed it) and `reference_snapshot_id` (the snapshot whose list
+  this row came from) are EQUAL for the snapshot that added it but DIFFER for any later snapshot that carries
+  it forward. Write the shared manifest with `Some(PARENT)` (→ `added_snapshot_id = PARENT`) and list it in
+  BOTH the parent's and the current's manifest lists; the current-snapshot row then has
+  `reference_snapshot_id = CURRENT != added_snapshot_id = PARENT`, so a mutation that emits
+  `added_snapshot_id` where `reference_snapshot_id` belongs is caught. If both ids were the same the swap
+  mutation would survive.
+- **DO note the schema NULLABILITY differs between `manifests` and `all_manifests` — copy from the Java
+  source, not the sibling Rust table.** *Why:* Java `AllManifestsTable.MANIFEST_FILE_SCHEMA` (L57-81) makes
+  the three `*_delete_files_count` columns (15/16/17) REQUIRED, whereas `ManifestsTable.SNAPSHOT_SCHEMA`
+  (in the Rust port) makes the delete counts nullable. Blindly copying `manifests.rs`'s
+  `NestedField::new(.., false/true)` flags would produce the wrong nullability. The Arrow-schema test pins
+  all 14 columns' ids AND nullability so this can't drift. _(Re: `contains_nan`/11 — superseded 2026-06-08,
+  see next entry: Java marks it `required` but that flag is NOMINAL; the Rust port must make it OPTIONAL.)_
+- **DO NOT copy a Java metadata-table field's `required` flag verbatim into an Arrow builder when the Java
+  ROW VALUE for that field can be null — Arrow enforces non-nullability, Java's `StaticDataTask.Row` does
+  not.** *Why (2026-06-08, `all_manifests` review):* Java `AllManifestsTable.MANIFEST_FILE_SCHEMA` declares
+  `contains_nan`/11 `required`, but `PartitionFieldSummary.containsNaN()` returns a nullable `Boolean` that
+  is `null` for manifests with no NaN info (V1, or V2 without it — `contains_nan`/518 is OPTIONAL in the
+  on-disk manifest-list spec). Java's loosely-typed `Object[]` row emits that null into the nominally-required
+  cell with NO check, so Java "works." Arrow's `StructArray::try_new` REJECTS a null in a non-nullable child
+  → the Rust scan PANICS (`"Found unmasked nulls for non-nullable StructArray field \"contains_nan\""`) on the
+  common `contains_nan == None` case. Fix: mark the field OPTIONAL in the Rust Arrow schema (carries Java's
+  emitted null faithfully). General rule: when porting a Java metadata table, check whether the field's
+  PRODUCER can return null (boxed `Boolean`/`Integer`, `@Nullable`, a default-null getter) independently of
+  the schema's `required` flag; if so, the Arrow field MUST be nullable regardless of the Java schema. Pin it
+  with a test that drives a real null value through `scan()` (not just `Some(false)` from the writer default,
+  which dodges the path entirely).
+- **DO factor a shared Arrow builder into a `pub(super)` module on the SECOND real use (Rule of Three is a
+  ceiling, not a floor, when the duplication is verbatim and the divergence is implausible).** *Why:* the
+  `partition_summaries` list builder + `FieldSummary`→string-bound conversion is byte-identical between
+  `manifests` and `all_manifests` (same element id 9, same struct, same `Datum::try_from_bytes` render). I
+  pulled it into `inspect/partition_summary.rs` (`pub(super)` free fns) rather than duplicate it; this also
+  let me drop the old `manifests.rs` bare `.unwrap()`s (propagate errors / `.expect` only the statically-valid
+  schema build) in one place. The shared module means the two tables physically cannot drift.

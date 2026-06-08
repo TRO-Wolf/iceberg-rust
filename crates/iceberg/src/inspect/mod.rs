@@ -17,6 +17,7 @@
 
 //! Metadata table APIs.
 
+mod all_manifests;
 mod data_file;
 mod entries;
 mod files;
@@ -25,10 +26,12 @@ mod manifest_source;
 mod manifests;
 mod metadata_log_entries;
 mod metadata_table;
+mod partition_summary;
 mod partitions;
 mod refs;
 mod snapshots;
 
+pub use all_manifests::AllManifestsTable;
 pub use entries::EntriesTable;
 pub use files::FilesTable;
 pub use history::HistoryTable;

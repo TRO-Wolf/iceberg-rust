@@ -16,8 +16,8 @@
 // under the License.
 
 use super::{
-    EntriesTable, FilesTable, HistoryTable, ManifestsTable, MetadataLogEntriesTable,
-    PartitionsTable, RefsTable, SnapshotsTable,
+    AllManifestsTable, EntriesTable, FilesTable, HistoryTable, ManifestsTable,
+    MetadataLogEntriesTable, PartitionsTable, RefsTable, SnapshotsTable,
 };
 use crate::table::Table;
 
@@ -62,6 +62,9 @@ pub enum MetadataTableType {
     /// [`PartitionsTable`] — one row per partition, aggregated over the current snapshot (Java
     /// `partitions`).
     Partitions,
+    /// [`AllManifestsTable`] — one row per (manifest × referencing snapshot) across ALL snapshots,
+    /// NOT deduplicated (Java `all_manifests`).
+    AllManifests,
 }
 
 impl MetadataTableType {
@@ -82,6 +85,7 @@ impl MetadataTableType {
             MetadataTableType::Refs => "refs",
             MetadataTableType::MetadataLogEntries => "metadata_log_entries",
             MetadataTableType::Partitions => "partitions",
+            MetadataTableType::AllManifests => "all_manifests",
         }
     }
 
@@ -111,6 +115,7 @@ impl TryFrom<&str> for MetadataTableType {
             "refs" => Ok(Self::Refs),
             "metadata_log_entries" => Ok(Self::MetadataLogEntries),
             "partitions" => Ok(Self::Partitions),
+            "all_manifests" => Ok(Self::AllManifests),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -197,5 +202,11 @@ impl<'a> MetadataTable<'a> {
     /// manifest entries (data + delete).
     pub fn partitions(&self) -> PartitionsTable<'_> {
         PartitionsTable::new(self.0)
+    }
+
+    /// Get the `all_manifests` table — one row per (manifest × referencing snapshot) across ALL
+    /// snapshots, NOT deduplicated; each row tagged with its `reference_snapshot_id`.
+    pub fn all_manifests(&self) -> AllManifestsTable<'_> {
+        AllManifestsTable::new(self.0)
     }
 }

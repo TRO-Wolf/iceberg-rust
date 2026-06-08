@@ -2551,3 +2551,157 @@ variants extend that already-broken match. Verified by `git stash`-ing my inspec
 `-p iceberg-datafusion` (same E0004 non-exhaustive errors at HEAD). The `-p iceberg` gate never builds the
 datafusion crate, so this slipped through Increments 1-4 — a human should add the missing match arms (or a
 catch-all) in `crates/integrations/datafusion/src/table/metadata_table.rs` as a standalone fix.
+
+---
+
+### Phase 3 Increment 5b — `all_manifests` metadata table (SCOPED, 2026-06-08)
+The last inspection table. Distinct machinery from the file/entry `all_*` (5a): it iterates EACH snapshot's
+manifest list (NO dedup — "may return duplicate rows"), one row per (manifest × referencing snapshot), and
+adds a `reference_snapshot_id` column. New file `inspect/all_manifests.rs`; wired via `inspect/mod.rs` +
+`metadata_table.rs` (`MetadataTableType::AllManifests` + accessor + as_str + TryFrom) + the datafusion
+provider match (both `schema()`/`scan()` arms) — datafusion now builds workspace-wide, so 5b MUST add its arm.
+
+**Java authority — `core/.../AllManifestsTable.java` (CONFIRMED from source):**
+- `MANIFEST_FILE_SCHEMA` (L57-81), in COLUMN order with ids + nullability (use VERBATIM — do NOT copy the
+  regular `manifests.rs` schema, which has different nullability for some fields):
+  `content`/14 int REQ, `path`/1 str REQ, `length`/2 long REQ, `partition_spec_id`/3 int OPT,
+  `added_snapshot_id`/4 long OPT, `added_data_files_count`/5 int OPT, `existing_data_files_count`/6 int OPT,
+  `deleted_data_files_count`/7 int OPT, `added_delete_files_count`/15 int REQ, `existing_delete_files_count`/16
+  int REQ, `deleted_delete_files_count`/17 int REQ, `partition_summaries`/8 list OPT (element/9 struct:
+  `contains_null`/10 bool REQ, `contains_nan`/11 bool REQ, `lower_bound`/12 str OPT, `upper_bound`/13 str OPT),
+  `reference_snapshot_id`/18 long REQ, `key_metadata`/19 binary OPT.
+- Row (`manifestFileToRow`, L286-303) — counts are CONTENT-GATED: `added_data_files_count =
+  content==DATA ? addedFilesCount : 0`, ..., `added_delete_files_count = content==DELETES ? addedFilesCount : 0`,
+  etc. `added_snapshot_id = manifest.snapshotId()`. `reference_snapshot_id = the snapshot whose manifest list
+  this row came from`. `partition_summaries` via the same FieldSummary→(contains_null/nan, lower/upper bound as
+  STRING) conversion `manifests.rs` already does. `key_metadata = manifest.keyMetadata()` (raw bytes).
+- Iteration (`doPlanFiles`, L122-158): for EACH snapshot in `table().snapshots()` (no filter ⇒ ALL), read that
+  snapshot's manifest list, emit one row per manifest tagged with that snapshot's id. NOT deduplicated.
+
+**Rust mapping:** iterate `metadata.snapshots()` directly (the 5a `manifest_source::collect_manifest_files`
+helper is NOT reusable here — it dedups AND drops the snapshot identity; all_manifests needs per-snapshot
+(manifest, ref_snapshot_id) pairs WITHOUT dedup). Per snapshot: `snapshot.load_manifest_list(file_io,
+metadata)` → `ManifestFile{ content, manifest_path, manifest_length, partition_spec_id, added_snapshot_id,
+added_files_count/existing_files_count/deleted_files_count (Option<u32>), partitions (Option<Vec<FieldSummary>>),
+key_metadata (Option<Vec<u8>>) }`; `snapshot.snapshot_id()` = reference_snapshot_id. Reuse the
+partition-summary builder/conversion from `manifests.rs` (factor a `pub(super)` shared helper if convenient —
+in scope; else replicate carefully). NEW code follows the engineering floor (no bare `.unwrap()` in production;
+`.expect("…statically valid")` only for the schema build) even though the OLD `manifests.rs` has pre-existing
+`.unwrap()`s.
+
+**FLAG / decide (verify against `ManifestsTable.java` AND `AllManifestsTable.java`):** the existing
+`manifests.rs` scan (L173-183) appends the manifest's added/existing/deleted counts to BOTH the data-count
+columns AND the delete-count columns UNCONDITIONALLY (no content gating). Java content-gates. Determine whether
+the regular `manifests` table is genuinely buggy (Java `ManifestsTable` content-gates too). Implement
+`all_manifests` CORRECTLY (content-gated) regardless. For the regular table: if the fix is a small, confirmed,
+shared-helper change, fixing it (and updating its `expect_test`) is acceptable and preferred for consistency;
+otherwise FLAG it for the orchestrator with the Java evidence — do NOT leave all_manifests matching the buggy
+behavior.
+
+Plan:
+- [x] `inspect/all_manifests.rs`: `AllManifestsTable` + `schema()` (14 cols per Java AllManifestsTable) + async
+      `scan()` (per-snapshot iteration, content-gated counts, reference_snapshot_id, key_metadata).
+- [x] Wire `MetadataTableType::AllManifests` + `all_manifests()` accessor + as_str/TryFrom in
+      `metadata_table.rs`; `mod` + `pub use` in `mod.rs`; the datafusion provider arm in BOTH matches.
+- [x] Tests (in-crate, multi-snapshot fixture): per-snapshot duplication (a manifest in 2 snapshots → 2 rows
+      with different reference_snapshot_id, NOT deduped); content-gated counts (a DELETE manifest has 0 in the
+      data-count columns and vice-versa — mutation-pin the gating); reference_snapshot_id correctness;
+      key_metadata present/null; partition_summaries (lower/upper bound strings); Arrow schema cols+ids+
+      nullability incl. reference_snapshot_id/18 + key_metadata/19; empty table → 0 rows.
+- [x] Docs: GAP_MATRIX inspection row (inspection-table set COMPLETE), Roadmap Phase 3, todo, lessons; note
+      the manifests content-gating finding.
+- [x] Verify from repo root: build `-p iceberg` AND `--workspace --exclude iceberg-sqllogictest`; lib ×2; 3
+      interop suites; datafusion tests; clippy (workspace); fmt --check.
+
+**Outcome (2026-06-08, Phase 3 Increment 5b, BUILDER Opus):** `all_manifests` — the LAST inspection table —
+lands 🟡; the inspection-table SET IS NOW COMPLETE. New file `inspect/all_manifests.rs` (`AllManifestsTable`
++ `schema()` + per-snapshot `scan()`): iterates `metadata.snapshots()` directly (NO dedup — Java javadoc
+"may return duplicate rows"), one row per (manifest × referencing snapshot) tagged with
+`reference_snapshot_id`, CONTENT-GATED counts (a DATA manifest → *_data_files_count columns, delete columns
+0; a DELETE manifest the reverse), `key_metadata` raw bytes, partition summaries via the reused converter.
+Schema is the 14-field Java `AllManifestsTable.MANIFEST_FILE_SCHEMA` verbatim (ids + nullability — note the
+three `*_delete_files_count` columns + `contains_nan` are REQUIRED here, unlike the regular `manifests`
+table). Wired `MetadataTableType::AllManifests` (+ as_str/TryFrom/EnumIter `all_types`) +
+`MetadataTable::all_manifests()` + `mod`/`pub use` in `inspect/mod.rs` + the datafusion provider arm in BOTH
+`schema()`/`scan()` matches.
+
+**CONTENT-GATING DECISION — FIXED the regular `manifests` table (surgical, shared-helper).** Verified against
+BOTH Java files: `AllManifestsTable.manifestFileToRow` (L286-303) AND `ManifestsTable.manifestFileToRow`
+(L108-113) content-gate IDENTICALLY (`manifest.content() == ManifestContent.DATA ? count : 0` for data
+columns, `== DELETES ? count : 0` for delete columns). The Rust `inspect/manifests.rs` scan (old L173-183)
+appended each manifest's added/existing/deleted counts to BOTH the data AND delete column families
+UNCONDITIONALLY — a genuine bug vs Java. The fix is a small, confirmed `is_data` gate (the SAME logic
+`all_manifests` uses), so per the brief's "prefer fixing if surgical" I fixed it and regenerated its
+`expect_test` block via `UPDATE_EXPECT=1` (the fixture's DATA manifest now reports 0/0/0 in the delete
+columns; diff inspected — only those three columns changed). Both tables now content-gate consistently.
+
+**Java lines verified:** schema = `AllManifestsTable.java` L57-81 (`MANIFEST_FILE_SCHEMA` + `REF_SNAPSHOT_ID`
+L53-54); content-gated row logic = `manifestFileToRow` L286-303 (+ `ManifestsTable.java` L108-113 for the
+regular table); per-snapshot iteration = `doPlanFiles` L122-158 (iterate `table().snapshots()`, one row per
+manifest per snapshot, no dedup). Shared partition-summary builder/conversion factored into new
+`inspect/partition_summary.rs` (`pub(super)` fns, Rule of Three) used by both `manifests.rs` and
+`all_manifests.rs`; the new code carries no bare `.unwrap()` (errors propagated; `.expect(...)` only for the
+statically-valid schema build), and I upgraded the touched `manifests.rs` schema `.unwrap()` → `.expect(...)`
+in passing.
+
+**Tests (7, each named for its risk):**
+- `test_all_manifests_does_not_dedup_shared_manifest_across_snapshots` — non-dedup: a manifest in 2 snapshots
+  → 2 rows with different `reference_snapshot_id` (dedup OR current-snapshot-only read collapses it).
+- `test_all_manifests_content_gates_counts_per_manifest_content` — DATA manifest's counts only in data
+  columns (delete 0), DELETE manifest's only in delete columns (data 0).
+- `test_all_manifests_reference_snapshot_id_distinct_from_added_snapshot_id` — the shared manifest's
+  `added_snapshot_id` is PARENT while its current-snapshot row's `reference_snapshot_id` is CURRENT.
+- `test_all_manifests_key_metadata_present_when_set_null_when_absent` — DELETE manifest's bytes present;
+  DATA manifest's null.
+- `test_all_manifests_renders_partition_summary_bounds_as_strings` — lower/upper bounds render to "100"/"300".
+- `test_all_manifests_arrow_schema_columns_ids_and_nullability` — 14 cols in order, exact ids + nullability
+  incl. reference_snapshot_id/18 (req) + key_metadata/19 (opt, LargeBinary).
+- `test_all_manifests_empty_table_yields_no_rows` — 0 rows, 14-col shape, no panic.
+
+**Mutations run (all caught):** (a) un-gate the counts (write into both data+delete families) → content-gating
+test FAILS; (b) read only the current snapshot → non-dedup test FAILS; (b') dedup by `manifest_path`
+(5a-style) → non-dedup test FAILS; (c) emit `added_snapshot_id` for `reference_snapshot_id` → ref-id test
+FAILS; plus un-gating the regular `manifests.rs` scan → its `expect_test` block FAILS. Each restored after.
+
+**Verification gate (all clean, from repo root):** `cargo build -p iceberg` ✅; `cargo build --workspace
+--exclude iceberg-sqllogictest --all-targets` ✅; `cargo test -p iceberg --lib` ×2 = **1466 passed / 0
+failed** both runs (was 1458 baseline → +7 all_manifests tests + 1 net from the shared-helper refactor;
+stable); 3 interop suites (`interop_manage_snapshots` / `interop_update_schema` /
+`interop_update_partition_spec`) = 4/4 each ✅; `cargo test -p iceberg-datafusion` lib+integration ✅ (after
+regenerating the `test_provider_list_table_names` expect block — one additive `all_manifests` line; the only
+datafusion doctest failure is the PRE-EXISTING `table_provider_factory` tokio-flavor one, unrelated);
+`cargo test --doc --workspace --exclude iceberg-sqllogictest` green ✅; `cargo clippy --workspace --exclude
+iceberg-sqllogictest --all-targets -- -D warnings` clean ✅; `cargo fmt --all -- --check` clean ✅. No commit,
+no branch switch, no Cargo/spec/arrow/scan-production edits.
+
+#### Phase 3 Increment 5b — REVIEW (2026-06-08, Opus REVIEWER, DELEGATED) — CHANGES-MADE
+Verdict: **CHANGES-MADE** (one production-panic bug fixed in scope; everything else PASS). Independently
+re-verified all 14 all_manifests field ids+nullability against `AllManifestsTable.MANIFEST_FILE_SCHEMA`
+(L57-81) — all match Java. Confirmed BOTH Java tables content-gate identically (`AllManifestsTable.java`
+L294-299 + `ManifestsTable.java` L108-113, both `content()==DATA ? n : 0` / `==DELETES ? n : 0`), so the
+builder's `manifests.rs` content-gating fix is CORRECT + MINIMAL (schema unchanged, only row values; its
+`expect_test` regen reflects the fix — DATA manifest's delete columns now 0/0/0 — and is mutation-pinned).
+Per-snapshot/non-dedup/ref-id verification all hold; ran mutations (a) un-gate, (b) current-only, (d)
+ref-id=added_snapshot_id, (e) un-gate manifests.rs — every one fails the matching test. Scope clean (git
+modified set == declared scope; no Cargo/spec/arrow/scan-production touched). The pre-existing
+`iceberg-datafusion` `table_provider_factory` doctest failure is environmental (`rt-multi-thread` disabled),
+unrelated, file untouched — confirmed.
+
+**BUG FOUND + FIXED — `contains_nan` production panic.** The builder copied Java's `contains_nan`/11 nullability
+VERBATIM as REQUIRED. But Java's `PartitionFieldSummary.containsNaN()` returns a NULLABLE `Boolean` that is
+`null` when the manifest has no NaN info (V1 manifests, or V2 without it — `contains_nan`/518 is OPTIONAL in
+the on-disk manifest-list spec, `manifest_list.rs:572`), and Java's loosely-typed `StaticDataTask.Row` emits
+that null into the nominally-`required` cell WITHOUT enforcement. Arrow ENFORCES non-nullability at
+array-build time: the shared `append_partition_summaries` does `append_option(summary.contains_nan)`, so when
+`contains_nan == None`, `partition_summaries.finish()` PANICS — `InvalidArgumentError("Found unmasked nulls
+for non-nullable StructArray field \"contains_nan\"")` — crashing `AllManifestsTable::scan()`. The builder's
+7 tests all missed this because the test fixture's `ManifestWriterBuilder` always defaults `contains_nan` to
+`Some(false)`. FIX (in scope, `inspect/all_manifests.rs`): made `contains_nan`/11 OPTIONAL — faithfully
+carries Java's emitted null when unset, and is consistent with the regular `manifests` table (whose Java
+schema `ManifestsTable.java` L51 ALSO marks `contains_nan`/11 optional). Added
+`test_all_manifests_renders_null_contains_nan_without_panicking` (writes a manifest whose summary has
+`contains_nan == None`, scans, asserts a NULL cell; mutation-pinned — reverting to `required` re-triggers the
+exact panic). Updated the schema doc-comment + GAP_MATRIX to document the divergence. This is a deliberate,
+documented deviation from Java's NOMINAL `required` flag (which Java never enforces); correctness > nominal
+metadata parity. lib total **1467** (was 1466; +1 net regression test, probe removed). Full gate (all 7)
+re-run clean after the fix.

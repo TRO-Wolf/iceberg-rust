@@ -66,6 +66,7 @@ impl TableProvider for IcebergMetadataTableProvider {
             MetadataTableType::Refs => metadata_table.refs().schema(),
             MetadataTableType::MetadataLogEntries => metadata_table.metadata_log_entries().schema(),
             MetadataTableType::Partitions => metadata_table.partitions().schema(),
+            MetadataTableType::AllManifests => metadata_table.all_manifests().schema(),
         };
         schema_to_arrow_schema(&schema).unwrap().into()
     }
@@ -105,6 +106,7 @@ impl IcebergMetadataTableProvider {
                 metadata_table.metadata_log_entries().scan().await
             }
             MetadataTableType::Partitions => metadata_table.partitions().scan().await,
+            MetadataTableType::AllManifests => metadata_table.all_manifests().scan().await,
         }
         .map_err(to_datafusion_error)?;
         let stream = stream.map_err(to_datafusion_error);

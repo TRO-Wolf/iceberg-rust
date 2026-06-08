@@ -171,7 +171,8 @@ the three pure-metadata tables `history` / `refs` / `metadata_log_entries` (Incr
 `inspect/partitions.rs`) are all 🟡** (alongside the pre-existing `snapshots` +
 `manifests`); the four cross-snapshot `all_*` file/entry tables (`all_data_files` / `all_delete_files` /
 `all_files` / `all_entries`, Increment 5a, `inspect/{files,entries}.rs` + shared `inspect/manifest_source.rs`)
-are now 🟡 too; only `all_manifests` (5b) + inspection interop remain. The rest of the **write engine
+and the final `all_manifests` table (Increment 5b, `inspect/all_manifests.rs`) are now 🟡 too — the
+inspection-table set is COMPLETE; only inspection interop + `readable_metrics` remain. The rest of the **write engine
 (merge append, `RowDelta`, `RewriteManifests`), incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
@@ -391,8 +392,15 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      (cross-snapshot inclusion + manifest dedup + content filters + tombstones + schema parity + empty +
      a NON-ANCESTOR forked-sibling file in `all_files`), dedup + all-vs-current + all-vs-ancestry scope +
      content-filter mutation-pinned (the all-vs-ancestry pin added in REVIEW); interop deferred (→ ✅).
-     The remaining variant
-     **`all_manifests`** (different machinery + a `reference_snapshot_id` column) is still pending (5b).
+     **`all_manifests` DONE 🟡 (2026-06-08, Increment 5b, `inspect/all_manifests.rs`)** — the LAST
+     inspection table: distinct machinery from the file/entry `all_*` (it iterates EACH snapshot's
+     manifest list with NO dedup, one row per (manifest × referencing snapshot), Java javadoc "may return
+     duplicate rows"), adds a `reference_snapshot_id`/18 column + `key_metadata`/19, and CONTENT-GATES the
+     count columns (Java `AllManifestsTable.manifestFileToRow`). Surfaced + fixed a real content-gating
+     bug in the regular `manifests` table (it appended counts to BOTH the data AND delete column families
+     unconditionally — Java `ManifestsTable.manifestFileToRow` content-gates there too); the shared
+     partition-summary builder/conversion was factored into `inspect/partition_summary.rs`. The
+     inspection-table SET IS NOW COMPLETE; remaining inspection work is `readable_metrics` + interop.
 - **Exit criteria:** scans match Java planning/results incl. residuals; inspection tables present; reports
   emitted.
 
