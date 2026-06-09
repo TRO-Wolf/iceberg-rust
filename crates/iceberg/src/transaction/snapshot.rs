@@ -1161,6 +1161,291 @@ pub(crate) async fn added_delete_files_after(
     .await
 }
 
+/// Enumerate the DELETE files (position / equality deletes) ADDED to `table` by snapshots committed AFTER
+/// `starting_snapshot_id`, PAIRED with each entry's data sequence number — the sequence-preserving sibling
+/// of [`added_delete_files_after`].
+///
+/// [`added_delete_files_after`] deliberately strips the manifest entry's sequence number (returning bare
+/// [`DataFile`]s), which is all the metrics-only conflict checks need. But Java
+/// `MergingSnapshotProducer.validateNoNewDeletesForDataFiles` builds a `DeleteFileIndex` whose
+/// `forDataFile(startingSequenceNumber, dataFile)` compares each delete's DATA sequence number against the
+/// operation's `startingSequenceNumber` (`DeleteFileIndex.PositionDeletes.filter`/`EqualityDeletes.filter`
+/// keep `data_seq >= startingSequenceNumber`). That comparison needs the sequence number, so this variant
+/// preserves it (`entry.sequence_number()`).
+///
+/// Same walk semantics as [`added_delete_files_after`]: the V2 guard (delete files do not exist before
+/// format version 2 — Java `addedDeleteFiles`), the DELETE-manifest walk gated to the operations that can
+/// add delete files ([`operation_adds_delete_files`] = Java `VALIDATE_ADDED_DELETE_FILES_OPERATIONS =
+/// {OVERWRITE, DELETE}`), keeping `ManifestStatus::Added` entries, inclusive of the current snapshot and
+/// exclusive of the starting snapshot. The per-entry `Option<i64>` is the data sequence number a V2/V3
+/// added delete inherits from its committing snapshot (always strictly greater than any pre-start data file's
+/// sequence number, so in practice the partition match is the load-bearing test — but the comparison is
+/// preserved for faithfulness to Java).
+async fn added_delete_files_with_seq_after(
+    table: &Table,
+    starting_snapshot_id: Option<i64>,
+) -> Result<Vec<(DataFile, Option<i64>)>> {
+    let metadata = table.metadata();
+
+    // V2 guard (Java `addedDeleteFiles`: `base.formatVersion() < 2` ⇒ empty `DeleteFileIndex`).
+    if metadata.format_version() < FormatVersion::V2 {
+        return Ok(vec![]);
+    }
+
+    // The "parent" of the operation in Java terms: the current head of the refreshed base.
+    let Some(mut current) = metadata.current_snapshot().cloned() else {
+        return Ok(vec![]);
+    };
+
+    let mut collected = Vec::new();
+
+    loop {
+        // Java `ancestorsBetween` is EXCLUSIVE of the starting snapshot (mirrors [`files_after`]).
+        if Some(current.snapshot_id()) == starting_snapshot_id {
+            break;
+        }
+
+        if operation_adds_delete_files(&current.summary().operation) {
+            let manifest_list = current
+                .load_manifest_list(table.file_io(), metadata)
+                .await?;
+            for manifest_file in manifest_list.entries() {
+                // Only DELETE manifests THIS snapshot wrote (Java `manifest.snapshotId() ==
+                // currentSnapshot.snapshotId()`) — mirrors the manifest filter in [`files_after`].
+                if manifest_file.content != ManifestContentType::Deletes
+                    || manifest_file.added_snapshot_id != current.snapshot_id()
+                {
+                    continue;
+                }
+                let manifest = manifest_file.load_manifest(table.file_io()).await?;
+                for entry in manifest.entries() {
+                    if entry.status() == ManifestStatus::Added {
+                        collected.push((entry.data_file().clone(), entry.sequence_number()));
+                    }
+                }
+            }
+        }
+
+        // Walk to the parent; stop at the root or a dangling parent id (mirrors [`files_after`]).
+        match current.parent_snapshot_id() {
+            Some(parent_id) => match metadata.snapshot_by_id(parent_id) {
+                Some(parent) => current = parent.clone(),
+                None => break,
+            },
+            None => break,
+        }
+    }
+
+    Ok(collected)
+}
+
+/// The sequence number of the snapshot the operation started from, or `0` if there is none — the Rust port
+/// of Java `MergingSnapshotProducer.startingSequenceNumber` (`core/MergingSnapshotProducer.java` L741-748).
+///
+/// Java: when `startingSnapshotId` is non-null AND present in the metadata, return that snapshot's sequence
+/// number; otherwise return `TableMetadata.INITIAL_SEQUENCE_NUMBER` (= 0). The `0` literal here IS
+/// `INITIAL_SEQUENCE_NUMBER` (`spec::table_metadata::INITIAL_SEQUENCE_NUMBER`, a `pub(crate)` constant equal
+/// to 0); it is inlined to avoid widening the spec module's export surface.
+fn starting_sequence_number(table: &Table, starting_snapshot_id: Option<i64>) -> i64 {
+    match starting_snapshot_id {
+        Some(id) => table
+            .metadata()
+            .snapshot_by_id(id)
+            .map_or(0, |snapshot| snapshot.sequence_number()),
+        None => 0,
+    }
+}
+
+/// Reject the commit if any DELETE file ADDED by a concurrent commit since `starting_snapshot_id` APPLIES to
+/// one of the DATA files this operation REMOVES — the serializable-isolation guard that you cannot drop a
+/// data file out from under a concurrent row-level delete (Java
+/// `MergingSnapshotProducer.validateNoNewDeletesForDataFiles`, `core/MergingSnapshotProducer.java`
+/// L519-551). Shared by `OverwriteFiles` (the `!deletedDataFiles.isEmpty()` branch of
+/// `BaseOverwriteFiles.validate`) and, in a later increment, `RowDelta`.
+///
+/// **V2 guard (Java L526-528):** if there is no current snapshot (`parent == null`) or the table is below
+/// format version 2 (`base.formatVersion() < 2`), no delete files can exist, so this is a no-op `Ok(())`.
+///
+/// **Enumerate concurrently-added deletes (Java L530):** the concurrently-added DELETE files are gathered via
+/// [`added_delete_files_with_seq_after`] (the DELETE-manifest walk + the V2 guard), then optionally narrowed
+/// by `conflict_filter` with the existing [`InclusiveMetricsEvaluator`] — mirroring Java passing `dataFilter`
+/// into `addedDeleteFiles` (a delete file whose metrics cannot match the filter cannot conflict). `None` ⇒
+/// no metrics narrowing (every concurrently-added delete is a candidate — the conservative default).
+///
+/// **Starting sequence number (Java L533):** [`starting_sequence_number`] — the sequence number of the
+/// starting snapshot, or 0 when there is none.
+///
+/// **Applicability — mirrors Java `DeleteFileIndex.forDataFile(startingSequenceNumber, dataFile)`
+/// (`core/DeleteFileIndex.java` L151-167):** a concurrently-added delete applies to a removed data file iff
+/// 1. its DATA sequence number is `>= startingSequenceNumber` (Java `PositionDeletes.filter(seq)` /
+///    `EqualityDeletes.filter(seq, file)` keep entries at index `findStartIndex(seqs, seq)`, i.e.
+///    `data_seq >= seq`; `seq == startingSequenceNumber` here). A concurrently-ADDED delete inherits its
+///    snapshot's sequence number, so this is effectively always true — the partition test below is the
+///    load-bearing one — but the comparison is kept for faithfulness; AND
+/// 2. it MATCHES the data file by partition: same `partition_spec_id` AND equal partition tuple
+///    (`posDeletesByPartition.get(specId, partition)` / `eqDeletesByPartition.get(specId, partition)`). A
+///    partition-scoped position delete (no `referenced_data_file`) and an equality delete both match by
+///    partition; a path-scoped position delete (`referenced_data_file == Some(path)`) additionally matches
+///    only the data file at that exact path (Java `findPathDeletes` keyed on `dataFile.location()`).
+///    Global (unpartitioned) equality deletes apply to ANY data file (Java `findGlobalDeletes`).
+///
+/// The applicability test is implemented DIRECTLY here rather than via [`crate::delete_file_index`]'s
+/// `PopulatedDeleteFileIndex`: that index keys on the SCAN-time semantics (it compares against the DATA
+/// file's OWN sequence number and requires `DeleteFileContext`/`ManifestEntry` plumbing the snapshot walk
+/// does not produce), whereas this validation compares against the operation's `startingSequenceNumber`. The
+/// direct test is self-contained and cites the Java `forDataFile` semantics line-for-line above.
+///
+/// **`ignore_equality_deletes` (Java L538-548):** when `true`, only POSITION deletes count as a conflict
+/// (Java keeps the commit unless an applicable delete is a `POSITION_DELETES` — the "found new position
+/// delete for replaced data file" message); when `false`, ANY applicable delete is a conflict (the "found
+/// new delete for replaced data file" message). `OverwriteFiles` passes `false`.
+///
+/// On the FIRST conflicting data file this returns a NON-retryable [`ErrorKind::DataInvalid`] error matching
+/// Java's message ("Cannot commit, found new delete for replaced data file: <path>" /
+/// "...found new position delete..."), so the commit retry loop stops and the error propagates (Java's
+/// non-retryable `ValidationException`).
+pub(crate) async fn validate_no_new_deletes_for_data_files(
+    table: &Table,
+    starting_snapshot_id: Option<i64>,
+    conflict_filter: Option<&Predicate>,
+    data_files: &[DataFile],
+    ignore_equality_deletes: bool,
+) -> Result<()> {
+    // Java L526-528: no current table state (`parent == null`) or a pre-V2 table ⇒ no delete files exist.
+    if table.metadata().current_snapshot().is_none()
+        || table.metadata().format_version() < FormatVersion::V2
+    {
+        return Ok(());
+    }
+
+    // Java L530: the DELETE files concurrently added since the start (with their data sequence numbers).
+    let added_deletes = added_delete_files_with_seq_after(table, starting_snapshot_id).await?;
+    if added_deletes.is_empty() {
+        return Ok(());
+    }
+
+    // Java passes `dataFilter` into `addedDeleteFiles`: a delete whose metrics cannot match the conflict
+    // filter cannot conflict. Bind the filter ONCE (None ⇒ no narrowing — every added delete is a candidate).
+    let bound_filter = match conflict_filter {
+        Some(filter) => Some(
+            filter
+                .clone()
+                .bind(table.metadata().current_schema().clone(), true)?,
+        ),
+        None => None,
+    };
+
+    // Java L533: the sequence number of the starting snapshot (or 0 if none).
+    let starting_sequence_number = starting_sequence_number(table, starting_snapshot_id);
+
+    for data_file in data_files {
+        // Java L536: `deletes.forDataFile(startingSequenceNumber, dataFile)` — the applicable concurrently
+        // -added deletes. We compute applicability inline (see the doc comment) and branch on
+        // `ignore_equality_deletes` per Java L538-548 on the first applicable delete.
+        for (delete_file, delete_seq) in &added_deletes {
+            // Metrics narrowing (Java `addedDeleteFiles(dataFilter)`): skip a delete whose metrics cannot
+            // match the conflict filter.
+            if let Some(bound_filter) = &bound_filter
+                && !InclusiveMetricsEvaluator::eval(bound_filter, delete_file, true)?
+            {
+                continue;
+            }
+
+            if !delete_applies_to_data_file(
+                delete_file,
+                *delete_seq,
+                data_file,
+                starting_sequence_number,
+            ) {
+                continue;
+            }
+
+            let is_position_delete =
+                delete_file.content_type() == crate::spec::DataContentType::PositionDeletes;
+
+            if ignore_equality_deletes {
+                // Java L538-543: only POSITION deletes are a conflict when equality deletes are ignored.
+                if is_position_delete {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot commit, found new position delete for replaced data file: {}",
+                            data_file.file_path()
+                        ),
+                    ));
+                }
+            } else {
+                // Java L544-548: ANY applicable delete is a conflict.
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot commit, found new delete for replaced data file: {}",
+                        data_file.file_path()
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether a single concurrently-added delete file APPLIES to `data_file`, mirroring Java
+/// `DeleteFileIndex.forDataFile(starting_sequence_number, data_file)` (`core/DeleteFileIndex.java`
+/// L151-200). See [`validate_no_new_deletes_for_data_files`] for the full citation; the rules are:
+///
+/// - **Sequence number (Java `*.filter` `findStartIndex`):** the delete's DATA sequence number must be
+///   `>= starting_sequence_number`. An absent entry sequence number is treated conservatively as applicable
+///   (it has not yet been narrowed out).
+/// - **Global (unpartitioned) equality deletes (Java `findGlobalDeletes`):** an EQUALITY delete with an
+///   empty partition applies to ANY data file (subject to the sequence test) — the spec's "equality delete
+///   files stored with an unpartitioned spec are applied as global deletes".
+/// - **Partition match (Java `findPosPartitionDeletes` / `findEqPartitionDeletes`):** otherwise the delete
+///   matches only a data file with the SAME `partition_spec_id` AND an equal partition tuple.
+/// - **Path-scoped position deletes (Java `findPathDeletes`):** a position delete carrying a
+///   `referenced_data_file` additionally requires that path to equal the data file's path.
+fn delete_applies_to_data_file(
+    delete_file: &DataFile,
+    delete_sequence_number: Option<i64>,
+    data_file: &DataFile,
+    starting_sequence_number: i64,
+) -> bool {
+    use crate::spec::DataContentType;
+
+    // Java `*.filter`: keep only deletes whose data sequence number is `>= starting_sequence_number`. An
+    // absent sequence number is treated as applicable (conservative — not yet narrowed out).
+    if let Some(delete_seq) = delete_sequence_number
+        && delete_seq < starting_sequence_number
+    {
+        return false;
+    }
+
+    let is_unpartitioned = delete_file.partition().fields().is_empty();
+
+    match delete_file.content_type() {
+        DataContentType::EqualityDeletes => {
+            // Java `findGlobalDeletes`: an unpartitioned equality delete is a GLOBAL delete (any data file).
+            if is_unpartitioned {
+                return true;
+            }
+            // Java `findEqPartitionDeletes`: same spec id + equal partition tuple.
+            delete_file.partition_spec_id == data_file.partition_spec_id
+                && delete_file.partition() == data_file.partition()
+        }
+        DataContentType::PositionDeletes => {
+            // Java `findPathDeletes`: a path-scoped position delete matches only the referenced data file.
+            if let Some(referenced) = &delete_file.referenced_data_file {
+                return referenced == data_file.file_path();
+            }
+            // Java `findPosPartitionDeletes`: same spec id + equal partition tuple.
+            delete_file.partition_spec_id == data_file.partition_spec_id
+                && delete_file.partition() == data_file.partition()
+        }
+        // A `Data` file is never a delete; it cannot apply as one.
+        DataContentType::Data => false,
+    }
+}
+
 /// Enumerate the DATA files DELETED from `table` by snapshots committed AFTER `starting_snapshot_id` — the
 /// concurrent removals a `validateDataFilesExist` check must inspect to detect that a file this operation
 /// also needs to delete was already removed by a concurrent commit.

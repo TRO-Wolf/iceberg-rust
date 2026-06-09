@@ -2495,3 +2495,26 @@ How to use it (see the manuals' §2):
   covering sequence number — not just the file it "came from". The cat=a delete associated with BOTH F1 and
   F3; Rust matched. Let the bulk per-file delete-set comparison (not a single hand-picked file) prove this, so
   you assert Java's REAL association rather than an assumed one.
+
+### 2026-06-09 (OverwriteFiles.validateNoConflictingDeletes + shared validate_no_new_deletes_for_data_files — ORCHESTRATOR + REVIEWER Opus)
+- **The delete-applies-to-data-file sequence boundary is INCLUSIVE `>=`, not `>`.** Java
+  `DeleteFileIndex.forDataFile` → `*.filter` → `findStartIndex` keeps deletes with `data_seq >=
+  startingSequenceNumber`. My builder PROMPT loosely paraphrased it as `>`; the builder correctly followed the
+  REAL Java source (`delete_seq < starting_sequence_number => not applicable`, i.e. `>=`) — a good instance of
+  the builder trusting the cited source over the orchestrator's loose wording. LESSON (orchestrator): cite the
+  exact Java method + boundary; don't paraphrase comparisons. LESSON (reviewer): re-derive the boundary from
+  the Java source, not the prompt.
+- **A conservative OVER-approximation is a legitimate, safe divergence for a REJECT check.** The equality-delete
+  applicability omits Java `EqualityDeletes.filter`'s per-file `canContainEqDeletesForFile` bounds check, so it
+  may flag MORE conflicts than Java, never fewer. For a serializable-isolation validation that REJECTS on
+  conflict, over-rejecting is safe (never lets a real conflict through); under-rejecting would be the bug.
+  Document it in code as the contract (same shape as the `InclusiveMetricsEvaluator` "file-level only, never
+  under-rejects" note on `validate_no_conflicting_data`).
+- **Add a focused seq-PRESERVING sibling walk rather than refactoring the shared one.** The sequence number
+  lives on `ManifestEntry`; the heavily-documented shared `added_delete_files_after` returns bare
+  `Vec<DataFile>` (drops it). `forDataFile` needs the entry seq, so the builder added
+  `added_delete_files_with_seq_after` (→ `Vec<(DataFile, Option<i64>)>`) alongside it — least churn to the
+  proven shared walk, and the seq is exactly the extra datum this check needs.
+- **The tx-captured-start pin remains the recurring must-have** on EVERY concurrent-commit validation: a test
+  that OMITS `validate_from_snapshot` and still rejects (relying solely on the `Transaction::new` capture),
+  mutation-checked by making the code read the refreshed head and confirming that one test fails.

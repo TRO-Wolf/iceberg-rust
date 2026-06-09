@@ -44,15 +44,24 @@
 //! inclusive-metrics evaluation), which `RowDelta` also uses so the two checks cannot drift. Default
 //! (this not enabled) = snapshot isolation, behavior unchanged.
 //!
+//! **Concurrent-commit conflicting-DELETE validation (`validateNoConflictingDeletes`, OPT-IN):** when
+//! enabled via [`OverwriteFilesAction::validate_no_conflicting_deletes`] AND this overwrite REMOVES data
+//! files supplied with full metadata via [`OverwriteFilesAction::delete_data_files`], the commit is rejected
+//! if a concurrent commit since the starting snapshot added a DELETE file (position / equality delete) that
+//! APPLIES to one of those removed data files — you cannot drop a data file out from under a concurrent
+//! row-level delete (Java `BaseOverwriteFiles.validate` → the `!deletedDataFiles.isEmpty()` branch →
+//! `MergingSnapshotProducer.validateNoNewDeletesForDataFiles`). It delegates to the shared
+//! [`validate_no_new_deletes_for_data_files`] helper. INDEPENDENT of `validateNoConflictingData` — enabling
+//! one does not enable the other. A no-op on a V1 table.
+//!
 //! **Out of scope (deferred):**
 //! - `overwriteByRowFilter(Expression)` (Java) — needs inclusive/strict metrics evaluators to SELECT
 //!   and validate added files by row predicate (Java `validateAddedFilesMatchOverwriteFilter`,
-//!   `BaseOverwriteFiles.validate` block 1).
-//! - `validateNoConflictingDeletes` (Java `BaseOverwriteFiles.validate` block 3) — concurrent delete-file
-//!   conflicts; needs the added-delete-files-since / deleted-data-files-since helpers.
-//! - `RowDelta` filter-based conflict validation — a separate follow-up on the same foundation.
+//!   `BaseOverwriteFiles.validate` block 1), and the `rowFilter()` branch of `validateNewDeletes`
+//!   (`validateNoNewDeleteFiles` / `validateDeletedDataFiles`).
 //!
-//! This increment is the explicit add + delete core plus the filter-based `validateNoConflictingData`.
+//! This increment is the explicit add + delete core plus the filter-based `validateNoConflictingData` and
+//! the `validateNoConflictingDeletes` check on the explicitly-removed (`delete_data_files`) data files.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -66,7 +75,7 @@ use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
-    validate_no_conflicting_added_data_files,
+    validate_no_conflicting_added_data_files, validate_no_new_deletes_for_data_files,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
@@ -85,6 +94,14 @@ pub struct OverwriteFilesAction {
     added_data_files: Vec<DataFile>,
     /// Fully-qualified file paths to remove from the table.
     delete_paths: HashSet<String>,
+    /// The DATA files removed via [`OverwriteFilesAction::delete_data_files`] (the ones supplied with full
+    /// [`DataFile`] metadata), mirroring Java `BaseOverwriteFiles.deletedDataFiles`. These — and ONLY these,
+    /// not the path-only [`OverwriteFilesAction::delete_file`] entries — are validated by
+    /// `validateNoConflictingDeletes`: that check needs each removed file's partition + sequence metadata to
+    /// decide whether a concurrent delete applies, which a bare path does not carry. Their paths are ALSO in
+    /// `delete_paths` (Java's `deleteFile(DataFile)` adds to both `deletedDataFiles` and the filter set), so
+    /// the manifest-rewrite machinery removes them exactly as it removes path-only deletes.
+    deleted_data_files: Vec<DataFile>,
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
@@ -92,6 +109,15 @@ pub struct OverwriteFilesAction {
     /// default = snapshot isolation (no validation, current behavior). When ON, the commit is rejected if a
     /// concurrent snapshot added a DATA file that could contain records matching the conflict filter.
     validate_no_conflicting_data: bool,
+    /// Whether concurrent-commit conflicting-DELETE validation is enabled (Java
+    /// `OverwriteFiles.validateNoConflictingDeletes`). OFF by default = snapshot isolation (no validation,
+    /// current behavior). When ON — AND this overwrite REMOVES data files supplied with full metadata via
+    /// [`OverwriteFilesAction::delete_data_files`] — the commit is rejected if a concurrent snapshot added a
+    /// DELETE file (position / equality delete) that APPLIES to one of those removed data files (you cannot
+    /// drop a data file out from under a concurrent row-level delete). INDEPENDENT of
+    /// [`Self::validate_no_conflicting_data`] — enabling one does NOT enable the other (Java exposes them as
+    /// two separate methods setting two separate flags).
+    validate_no_conflicting_deletes: bool,
     /// The conflict-detection filter (Java `conflictDetectionFilter`). When `Some`, only concurrently-added
     /// files whose metrics COULD match this predicate are conflicts. When `None`, the filter defaults to
     /// `AlwaysTrue` (any concurrently-added DATA file is a conflict — the most conservative serializable
@@ -108,10 +134,12 @@ impl OverwriteFilesAction {
         Self {
             added_data_files: vec![],
             delete_paths: HashSet::default(),
+            deleted_data_files: vec![],
             commit_uuid: None,
             key_metadata: None,
             snapshot_properties: HashMap::default(),
             validate_no_conflicting_data: false,
+            validate_no_conflicting_deletes: false,
             conflict_detection_filter: None,
             validate_from_snapshot: None,
         }
@@ -144,10 +172,19 @@ impl OverwriteFilesAction {
         self
     }
 
-    /// Delete multiple files referenced by [`DataFile`]s (their paths are used).
+    /// Delete multiple files supplied as full [`DataFile`]s (Java `OverwriteFiles.deleteFile(DataFile)`).
+    ///
+    /// Each file's path is added to the delete set that drives the manifest rewrite (exactly like
+    /// [`Self::delete_file`]), AND the full [`DataFile`] is retained in [`Self::deleted_data_files`] so
+    /// `validateNoConflictingDeletes` (when enabled via [`Self::validate_no_conflicting_deletes`]) can test
+    /// it against concurrently-added deletes — a check that needs the file's partition + metrics, which a
+    /// bare path does not carry. Mirrors Java's `deleteFile(DataFile)` populating both `deletedDataFiles` and
+    /// the filter set.
     pub fn delete_data_files(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
-        self.delete_paths
-            .extend(files.into_iter().map(|file| file.file_path));
+        for file in files {
+            self.delete_paths.insert(file.file_path().to_string());
+            self.deleted_data_files.push(file);
+        }
         self
     }
 
@@ -178,6 +215,26 @@ impl OverwriteFilesAction {
     /// Default (this method NOT called) = snapshot isolation = no validation (current behavior unchanged).
     pub fn validate_no_conflicting_data(mut self) -> Self {
         self.validate_no_conflicting_data = true;
+        self
+    }
+
+    /// ENABLE concurrent-commit conflicting-DELETE validation (Java
+    /// `OverwriteFiles.validateNoConflictingDeletes`): the commit is rejected with a non-retryable
+    /// `ValidationException` if a concurrent snapshot since the starting snapshot added a DELETE file
+    /// (position / equality delete) that APPLIES to one of the DATA files this overwrite REMOVES (the data
+    /// files supplied with full metadata via [`Self::delete_data_files`]). Under serializable isolation you
+    /// cannot drop a data file out from under a concurrent row-level delete.
+    ///
+    /// This is INDEPENDENT of [`Self::validate_no_conflicting_data`] — enabling one does NOT enable the other
+    /// (Java's two `validateNoConflicting*` methods set two separate flags). Only the
+    /// [`Self::delete_data_files`] entries are validated; path-only [`Self::delete_file`] /
+    /// [`Self::delete_files`] removals are not (a bare path lacks the partition + metrics the check needs),
+    /// mirroring Java which validates only the `deletedDataFiles` `DataFile` objects. A no-op on a V1 table
+    /// (delete files do not exist before format version 2).
+    ///
+    /// Default (this method NOT called) = snapshot isolation = no validation (current behavior unchanged).
+    pub fn validate_no_conflicting_deletes(mut self) -> Self {
+        self.validate_no_conflicting_deletes = true;
         self
     }
 
@@ -236,20 +293,35 @@ impl TransactionAction for OverwriteFilesAction {
             .await
     }
 
-    /// Serializable-isolation conflict validation (Java `BaseOverwriteFiles.validate` →
-    /// `validateNewDataFiles` → `MergingSnapshotProducer.validateAddedDataFiles`, L163-165 / L391-412). Only
-    /// runs when [`Self::validate_no_conflicting_data`] was enabled; otherwise a no-op (snapshot isolation).
-    ///
-    /// When enabled: compute the effective starting snapshot ([`Self::validate_from_snapshot`] if set, else
-    /// the transaction-provided `starting_snapshot_id`) and delegate to the shared
-    /// [`validate_no_conflicting_added_data_files`] helper, which enumerates every DATA file ADDED to the
-    /// refreshed base by snapshots committed since it (Java `addedDataFiles`) and rejects the commit if ANY
-    /// of those files COULD contain records matching the conflict-detection filter (the existing
-    /// `InclusiveMetricsEvaluator` over the file's metrics). The conflict filter is the caller's
-    /// [`Self::conflict_detection_filter`] when set, else `AlwaysTrue` (any concurrently-added data file
-    /// conflicts), mirroring Java `dataConflictDetectionFilter()` (we have no `overwriteByRowFilter`, so the
-    /// row-filter branch never applies). The rejection is a NON-retryable `DataInvalid` (Java's non-retryable
+    /// Serializable-isolation conflict validation (Java `BaseOverwriteFiles.validate`). Runs two INDEPENDENT
+    /// opt-in checks against the refreshed base; with neither enabled it is a no-op (snapshot isolation,
+    /// current behavior unchanged). Both share the same effective starting snapshot
+    /// ([`Self::validate_from_snapshot`] if set, else the transaction-provided `starting_snapshot_id`) and a
+    /// failure of EITHER rejects the commit with a NON-retryable `DataInvalid` (Java's non-retryable
     /// `ValidationException`), so the commit retry loop stops and the error propagates.
+    ///
+    /// 1. **`validateNoConflictingData`** (Java L167-168 → `validateNewDataFiles` →
+    ///    `MergingSnapshotProducer.validateAddedDataFiles`, when [`Self::validate_no_conflicting_data`] is
+    ///    enabled): enumerate every DATA file ADDED to the refreshed base by snapshots committed since the
+    ///    start (Java `addedDataFiles`) and reject if ANY COULD contain records matching the conflict-detection
+    ///    filter (the existing `InclusiveMetricsEvaluator`). The filter is the caller's
+    ///    [`Self::conflict_detection_filter`] when set, else `AlwaysTrue` (any concurrently-added data file
+    ///    conflicts), mirroring Java `dataConflictDetectionFilter()` (we have no `overwriteByRowFilter`, so the
+    ///    row-filter branch never applies). Delegates to the SHARED
+    ///    [`validate_no_conflicting_added_data_files`] helper (also used by `RowDelta`).
+    /// 2. **`validateNoConflictingDeletes`** (Java L174-177 → `validateNoNewDeletesForDataFiles`, when
+    ///    [`Self::validate_no_conflicting_deletes`] is enabled AND this overwrite removes data files supplied
+    ///    with full metadata via [`Self::delete_data_files`]): enumerate the DELETE files added by concurrent
+    ///    commits since the start and reject if ANY APPLIES to one of those removed data files (you cannot drop
+    ///    a data file out from under a concurrent row-level delete). Delegates to
+    ///    [`validate_no_new_deletes_for_data_files`] with `ignore_equality_deletes = false` (Java passes the
+    ///    full `deletedDataFiles` and does not ignore equality deletes here). Only the
+    ///    [`Self::delete_data_files`] entries (Java's `deletedDataFiles`) are checked — path-only
+    ///    [`Self::delete_file`] / [`Self::delete_files`] removals are not. A no-op on a V1 table.
+    ///
+    /// Out of scope (Java `BaseOverwriteFiles.validate` blocks not ported here): the `validateNewDataFiles`
+    /// row-filter branch and `validateAddedFilesMatchOverwriteFilter` (need `overwriteByRowFilter`), and the
+    /// `validateNoNewDeleteFiles` / `validateDeletedDataFiles` row-filter sub-branch.
     ///
     /// **Case sensitivity:** Java binds the conflict filter with `isCaseSensitive()`. This action has no such
     /// field, so the filter is bound case-sensitive (`true`) — the Iceberg/Java default for column resolution.
@@ -258,22 +330,40 @@ impl TransactionAction for OverwriteFilesAction {
         starting_snapshot_id: Option<i64>,
         current: &Table,
     ) -> Result<()> {
-        if !self.validate_no_conflicting_data {
-            // Default: snapshot isolation, no conflict check (current behavior unchanged).
-            return Ok(());
+        // Java `BaseOverwriteFiles` uses `startingSnapshotId` (the `validateFromSnapshot` override) when set,
+        // else the operation's starting snapshot. CRITICAL: `starting_snapshot_id` is the TRANSACTION-captured
+        // base (the head when `Transaction::new` ran), NOT the refreshed head — re-reading the refreshed head
+        // would make the concurrent set empty and silently pass. Both checks share this start.
+        let effective_start = self.validate_from_snapshot.or(starting_snapshot_id);
+
+        // 1. Concurrent-added DATA-file conflict (Java `validateNewDataFiles` branch). The walk + bind +
+        //    per-file inclusive-metrics evaluation + non-retryable-conflict error are the shared helper.
+        if self.validate_no_conflicting_data {
+            validate_no_conflicting_added_data_files(
+                current,
+                effective_start,
+                self.conflict_detection_filter.as_ref(),
+                true,
+            )
+            .await?;
         }
 
-        // Java `BaseOverwriteFiles` uses `startingSnapshotId` (the `validateFromSnapshot` override) when set,
-        // else the operation's starting snapshot. The walk + bind + per-file inclusive-metrics evaluation +
-        // non-retryable-conflict error are the shared helper (also used by `RowDelta`).
-        let effective_start = self.validate_from_snapshot.or(starting_snapshot_id);
-        validate_no_conflicting_added_data_files(
-            current,
-            effective_start,
-            self.conflict_detection_filter.as_ref(),
-            true,
-        )
-        .await
+        // 2. Concurrent-added DELETE applying to a REMOVED data file (Java `validateNoConflictingDeletes` →
+        //    the `!deletedDataFiles.isEmpty()` branch of `validateNewDeletes`). Only the
+        //    `delete_data_files` (full-metadata) removals are validated — matching Java's `deletedDataFiles`.
+        //    `ignore_equality_deletes = false` (Java passes the full set with equality deletes counted).
+        if self.validate_no_conflicting_deletes && !self.deleted_data_files.is_empty() {
+            validate_no_new_deletes_for_data_files(
+                current,
+                effective_start,
+                self.conflict_detection_filter.as_ref(),
+                &self.deleted_data_files,
+                false,
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1319,5 +1409,393 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(!err.retryable());
         assert!(err.message().contains("test/concurrent.parquet"));
+    }
+
+    // ============================================================================================
+    // Conflicting-DELETE validation (Java `validateNoConflictingDeletes` — serializable isolation).
+    // Java `BaseOverwriteFiles.validate` → the `!deletedDataFiles.isEmpty()` branch →
+    // `MergingSnapshotProducer.validateNoNewDeletesForDataFiles` (L519-551): for the DATA files this
+    // overwrite REMOVES (the `delete_data_files` full-metadata set), reject the commit if a concurrent
+    // commit since the start added a DELETE file that APPLIES to one of them — you cannot drop a data file
+    // out from under a concurrent row-level delete.
+    //
+    // The race: an `overwrite_files` is BUILT against head S0 deleting data file A (via `delete_data_files`,
+    // so A is in the validated `deletedDataFiles` set). BEFORE it commits, a concurrent `row_delta` lands a
+    // POSITION delete (seq > start) in A's partition. With `validate_no_conflicting_deletes()` enabled the
+    // overwrite must FAIL (non-retryable). A delete in a DIFFERENT partition, a delete at seq <= start, the
+    // validation OFF, or A removed only by PATH (not `delete_data_files`) must all COMMIT.
+    // ============================================================================================
+
+    /// A synthetic POSITION-delete file routed to partition `x = part_value` (spec id 0), with a unique
+    /// path — manifest-only (not a real parquet file).
+    fn position_delete_file(path: &str, part_value: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .build()
+            .unwrap()
+    }
+
+    /// A synthetic EQUALITY-delete file routed to partition `x = part_value` (spec id 0), equality on
+    /// field id 1 (`x`), with a unique path — manifest-only.
+    fn equality_delete_file(path: &str, part_value: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .equality_ids(Some(vec![1]))
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .build()
+            .unwrap()
+    }
+
+    /// Concurrently add the given DELETE files in a single `row_delta` commit (records `Operation::Delete`,
+    /// which `validateNoConflictingDeletes` inspects) and return the updated table.
+    async fn add_deletes(catalog: &impl Catalog, table: &Table, deletes: Vec<DataFile>) -> Table {
+        let tx = Transaction::new(table);
+        let action = tx.row_delta().add_deletes(deletes);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog).await.unwrap()
+    }
+
+    /// THE HEADLINE TEST. Append A (delete-data-files target). Build an `overwrite_files` that REMOVES A via
+    /// `delete_data_files` (full metadata) with `.validate_no_conflicting_deletes()`. Then a CONCURRENT
+    /// `row_delta` lands a POSITION delete in A's partition (x=0, seq > start). The overwrite commit must FAIL
+    /// with a NON-retryable `DataInvalid` naming A (Java "Cannot commit, found new delete for replaced data
+    /// file: <path>").
+    ///
+    /// Risk pinned: dropping A out from under a concurrent row-level delete = lost delete under serializable
+    /// isolation. Without the check the overwrite would commit and silently discard the concurrent delete.
+    #[tokio::test]
+    async fn test_overwrite_rejects_concurrent_delete_for_removed_data_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![a.clone()]).await;
+
+        // Build the overwrite removing A via delete_data_files (full metadata ⇒ validated), validation on,
+        // pinned to S0.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .add_file(data_file("test/b.parquet", 0))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a position delete in A's partition (x=0), seq > start.
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "overwrite must fail: a concurrent delete applies to the removed data file A",
+        );
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "a conflict is a non-retryable validation failure (DataInvalid)"
+        );
+        assert!(
+            !err.retryable(),
+            "the validation failure must be NON-retryable so the retry loop stops"
+        );
+        assert!(
+            err.message()
+                .contains("found new delete for replaced data file"),
+            "the error must match Java's message, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/a.parquet"),
+            "the error must name the replaced data file, got: {}",
+            err.message()
+        );
+
+        // The catalog head is still S1 (the concurrent delete) — the overwrite did NOT commit over it.
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        let live = live_file_paths(&reloaded).await;
+        assert!(
+            !live.contains("test/b.parquet"),
+            "the rejected overwrite's added file must NOT be in the table"
+        );
+    }
+
+    /// NO-FALSE-CONFLICT (different partition). Same setup, but the concurrent position delete is in a
+    /// DIFFERENT partition (x=1) than the removed file A (x=0) — it does NOT apply to A. The overwrite must
+    /// COMMIT. Risk pinned: a partition-blind check that rejects ANY concurrent delete (a false positive).
+    #[tokio::test]
+    async fn test_overwrite_allows_concurrent_delete_in_other_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![a.clone()]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .add_file(data_file("test/b.parquet", 0))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a position delete in a DIFFERENT partition (x=1) — cannot apply to A (x=0).
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file(
+            "test/pos-del-other.parquet",
+            1,
+        )])
+        .await;
+
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("overwrite must commit: the concurrent delete is in a different partition");
+        let live = live_file_paths(&table).await;
+        assert!(
+            live.contains("test/b.parquet"),
+            "the overwrite's added file must be in the table (commit succeeded)"
+        );
+        assert!(
+            !live.contains("test/a.parquet"),
+            "A was removed by the overwrite"
+        );
+    }
+
+    /// NO-CONFLICT (delete at/before the start). The concurrent delete lands at seq <= the starting sequence
+    /// number, so it is part of the base, not a concurrent commit. Here we set `validate_from_snapshot` to the
+    /// CURRENT head (after the delete already landed) so the delete is NOT in the concurrent window — the
+    /// overwrite must COMMIT. Risk pinned: a check that ignores the sequence-number / starting-snapshot
+    /// boundary and flags a pre-start delete.
+    #[tokio::test]
+    async fn test_overwrite_allows_delete_at_or_before_start() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let table = append_files(&catalog, &table, vec![a.clone()]).await;
+
+        // A delete lands in A's partition BEFORE the transaction's validation window (it becomes the head S1).
+        let table = add_deletes(&catalog, &table, vec![position_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+        let s1 = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        // Build the overwrite pinned to S1 (the current head) — the pre-existing delete is NOT concurrent.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .add_file(data_file("test/b.parquet", 0))
+            .validate_from_snapshot(s1)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("with start = current head, the pre-existing delete is not concurrent ⇒ commit succeeds");
+        assert!(live_file_paths(&table).await.contains("test/b.parquet"));
+    }
+
+    /// IGNORE-EQUALITY semantics (OverwriteFiles passes `ignore_equality_deletes = false`). An EQUALITY delete
+    /// in A's partition added concurrently IS a conflict for the removed file A (Java's else-branch counts ANY
+    /// applicable delete). Pins that equality deletes are NOT silently ignored by the overwrite check.
+    #[tokio::test]
+    async fn test_overwrite_rejects_concurrent_equality_delete_for_removed_data_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![a.clone()]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): an EQUALITY delete in A's partition (x=0).
+        let _concurrent = add_deletes(&catalog, &table, vec![equality_delete_file(
+            "test/eq-del.parquet",
+            0,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "overwrite must fail: an equality delete applies to the removed data file A",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(
+            err.message()
+                .contains("found new delete for replaced data file"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    /// FLAG-OFF CONTROL. With `validate_no_conflicting_deletes()` NOT called, a concurrent delete applying to
+    /// the removed file does NOT fail the commit — snapshot isolation, the DEFAULT, unchanged. Risk pinned:
+    /// the check must be OPT-IN.
+    #[tokio::test]
+    async fn test_overwrite_without_deletes_validation_allows_conflicting_delete() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let table = append_files(&catalog, &table, vec![a.clone()]).await;
+
+        // Build the overwrite WITHOUT enabling the deletes validation (default = snapshot isolation).
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .add_file(data_file("test/b.parquet", 0));
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a position delete applying to A.
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+
+        let table = tx.commit(&catalog).await.expect(
+            "with the deletes-validation OFF, a conflicting concurrent delete must not block the commit",
+        );
+        assert!(
+            live_file_paths(&table).await.contains("test/b.parquet"),
+            "the overwrite committed (snapshot isolation, no conflicting-delete check)"
+        );
+    }
+
+    /// PATH-ONLY REMOVAL IS NOT VALIDATED. The removed file A is supplied via `delete_file(path)` (path-only,
+    /// NOT `delete_data_files`), so it is NOT in the validated `deletedDataFiles` set. Even with the deletes
+    /// validation enabled and a concurrent delete applying to A, the overwrite COMMITS — matching Java, which
+    /// validates only the `DataFile` objects in `deletedDataFiles`. Risk pinned: validating path-only removals
+    /// (which lack the partition/metrics the check needs) would over-reject beyond Java's contract.
+    #[tokio::test]
+    async fn test_overwrite_path_only_removal_is_not_validated_for_deletes() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        // Remove A by PATH only (not delete_data_files) — so it is not in the validated set.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_file("test/a.parquet")
+            .add_file(data_file("test/b.parquet", 0))
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a position delete in A's partition — would conflict IF A were validated.
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+
+        let table = tx.commit(&catalog).await.expect(
+            "a path-only removal is not in the validated deletedDataFiles set ⇒ no conflict ⇒ commit succeeds",
+        );
+        assert!(live_file_paths(&table).await.contains("test/b.parquet"));
+    }
+
+    /// TX-CAPTURED START PIN (the recurring gap). The conflicting-delete check works WITHOUT an explicit
+    /// `validate_from_snapshot`, relying solely on the transaction-captured starting snapshot surviving
+    /// `do_commit`'s re-base. The action calls ONLY `.validate_no_conflicting_deletes()`. The start is the one
+    /// captured in `Transaction::new` (= S0); `do_commit` overwrites `self.table` with the refreshed base (S1,
+    /// the concurrent delete), but `starting_snapshot_id` must SURVIVE — so the concurrent delete is still
+    /// enumerated and the commit rejected.
+    ///
+    /// Risk pinned: if the start were re-read from the refreshed head at validation time, start == current
+    /// head ⇒ the concurrent set is empty ⇒ the check silently always passes (a serializable-isolation hole).
+    /// All the other enabled deletes-tests pin `validate_from_snapshot`, so this is the only guard that the
+    /// `Transaction::new` capture survives the re-base for the deletes check.
+    #[tokio::test]
+    async fn test_overwrite_rejects_concurrent_delete_using_tx_captured_starting_snapshot() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let table = append_files(&catalog, &table, vec![a.clone()]).await;
+
+        // Build the overwrite with the deletes validation enabled but WITHOUT validate_from_snapshot — the
+        // start is the tx-captured head (S0).
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .add_file(data_file("test/b.parquet", 0))
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a position delete applying to A.
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("conflict must be detected via the tx-captured starting snapshot");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(
+            err.message()
+                .contains("found new delete for replaced data file"),
+            "got: {}",
+            err.message()
+        );
+        assert!(err.message().contains("test/a.parquet"));
+    }
+
+    /// INDEPENDENCE. Enabling ONLY `validate_no_conflicting_deletes()` does NOT enable the DATA-file check:
+    /// a concurrent APPEND of a data file (which the data-file check would flag under AlwaysTrue) does NOT
+    /// fail the commit when only the deletes check is on. Pins that the two flags are independent (enabling
+    /// the deletes check must not silently turn on `validate_no_conflicting_data`).
+    #[tokio::test]
+    async fn test_overwrite_deletes_validation_does_not_enable_data_validation() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![a.clone()]).await;
+
+        // ONLY the deletes check is enabled (no validate_no_conflicting_data).
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .add_file(data_file("test/b.parquet", 0))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a plain data APPEND — a DATA-file conflict under AlwaysTrue, NOT a delete.
+        let _concurrent = append_files(&catalog, &table, vec![data_file(
+            "test/concurrent.parquet",
+            0,
+        )])
+        .await;
+
+        // The deletes check ignores added data files ⇒ the commit succeeds (the data check is OFF).
+        let table = tx.commit(&catalog).await.expect(
+            "only the deletes check is on; a concurrent data APPEND is not a conflicting-delete ⇒ commit",
+        );
+        assert!(live_file_paths(&table).await.contains("test/b.parquet"));
     }
 }

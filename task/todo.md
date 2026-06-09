@@ -4164,3 +4164,31 @@ residual-always-true} match EXACTLY. Purely additive — NO production change.
 
 ### NEXT: squash `phase2-3-remnants` + open PR (awaiting user go-ahead on squash-vs-keep + confirm base = the origin fork, NEVER apache upstream)
 Branch = ~10 commits off main `ccfcb062` (3 Phase-2/3 remnants + 4 pure-metadata/manifest-A1 interop + file_format fix + A2 + A3 + A4). All LOCAL-only, not pushed. Deferred beyond this PR: `readable_metrics` interop; A5 scan EXECUTION (parquet deps + approval); other Phase 2/3 remnants (overwriteByRowFilter, RowDelta validateNoNewDeletesForDataFiles, BatchScan, CDC-merge).
+
+**STATUS (2026-06-09): squashed + merged as `5f32b10d` "Phase2 3 remnants (#8)". Local main fast-forwarded.**
+
+---
+
+## Active (2026-06-09): Phase 2 WRITE-VALIDATION remnants cluster (branch `phase2-write-validation` off main `5f32b10d`)
+
+User chose "write-validation remnants" as next. Sequence (each = builder→reviewer Workflow; orchestrator
+independently re-runs the gate + commits; production, unit-tested via MemoryCatalog concurrent-commit tests,
+NO interop needed):
+
+- [x] **Increment 1: `OverwriteFiles.validateNoConflictingDeletes` + shared `validate_no_new_deletes_for_data_files`**
+  (snapshot.rs) — the genuinely-missing core (per-removed-data-file delete-applicability, Java
+  `MergingSnapshotProducer.validateNoNewDeletesForDataFiles`). NEW seq-preserving walk
+  `added_delete_files_with_seq_after` + `starting_sequence_number` + `delete_applies_to_data_file` (ports Java
+  `DeleteFileIndex.forDataFile`; INCLUSIVE `>=` boundary; one documented conservative equality-delete
+  over-approximation). 8 MemoryCatalog tests incl. the tx-captured-start pin; mutation-verified. Gate green
+  (lib 1603, transaction:: 261, datafusion 80+9, clippy/fmt/typos). `validate_no_conflicting_data`
+  behavior-preserving + independent flag.
+- [ ] **Increment 2: `RowDelta.validateNoNewDeletesForDataFiles` + `validateAddedDVs`** (V3 deletion vectors) —
+  reuse the shared helper over RowDelta's removed data files; add `removed_data_files`; port `validateAddedDVs`.
+- [ ] **Increment 3: `OverwriteFiles.overwriteByRowFilter` + `validateAddedFilesMatchOverwriteFilter`** — the
+  row-filter overwrite mode (delete-by-row-filter) + strict/inclusive/metrics validation of added files
+  (StrictMetricsEvaluator + inclusive/strict partition Projections).
+- [ ] **Increment 4: `ReplacePartitions.validateNoConflictingDeletes`** — wire the shared helper into
+  ReplacePartitions' replaced-partition data files.
+
+Then: PR the cluster to the origin fork (NEVER apache).
