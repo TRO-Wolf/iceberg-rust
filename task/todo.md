@@ -4198,7 +4198,19 @@ FROZEN, 0-diff).
   Reviewer decoded the avro manifests with the production reader + mutated both ways. **Run-script hardening:**
   the D2 scripts now grep the Java verify for `: 0 failures` (mvn exec:java swallows System.exit) — applied to
   BOTH the eq-delete-d2 and the Increment-2 scan-exec-d2 scripts.
-- [ ] **Increment 4: partitioned tables** + the cross-product (position + equality deletes on a partitioned
-  table, both directions); then PR the capstone.
+- [x] **Increment 4: partitioned tables, BOTH directions** — `identity(category)` table (spec id 0), one real
+  parquet data file PER PARTITION (cat=a: 10/20/30, cat=b: 40/50) + a PARTITION-SCOPED position-delete in
+  partition a (position 1 = id=20), committed at seq 2 (data first at seq 1). Live set {10,30,40,50}: only id=20
+  deleted, cat=b untouched (the partition-scoping correctness point — the cat=a delete must NOT reach cat=b).
+  **D1:** Java writes (`GenericAppenderFactory` + `PartitionData`) → Rust `scan().to_arrow()` applies it
+  partition-aware (`delete_file_index` keys by partition + spec id). **D2:** Rust WRITES via the production path
+  (`DataFileWriter` built with a `PartitionKey` that auto-stamps the partition Struct + spec id AND routes the
+  parquet under the partition path; `PositionDeleteFileWriter` with the cat=a `PartitionKey` row_delta'd at seq
+  2) → Java reads. Both = {10,30,40,50}. NO Rust production change, Cargo 0-diff. Reviewer mutation-pinned both
+  directions (poison expected; rm/truncate the Rust-written partition artifacts → Java NotFound/RuntimeIO;
+  confirm cat=a delete does NOT drop cat=b). Gate green (offline no-op `interop_scan_exec` 6 passed + both
+  round-trips exit 0). **Capstone COMPLETE** (position + equality deletes, both directions, unpartitioned +
+  partitioned). PR next. Deferred within partitioning: multi-file-per-partition + non-identity transforms
+  (bucket/truncate); more column types.
 
 Deferred elsewhere: `readable_metrics` interop; ORC/Avro data; V3 types (Phase 4); BatchScan; CDC-merge.

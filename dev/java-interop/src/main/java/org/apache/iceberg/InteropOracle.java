@@ -179,6 +179,39 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-part-scan":
+        // PARTITIONED merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes". The partition-handling
+        // proof: unlike generate-interop-scan-exec (UNPARTITIONED), this writes a V2 table partitioned by
+        // identity(category) with one REAL parquet DATA file PER PARTITION (category=a: ids 10/20/30;
+        // category=b: ids 40/50), each DataFile stamped with its partition value (a PartitionData carrying
+        // the category Struct, spec id 0) via GenericAppenderFactory.newDataWriter(..., partition). It then
+        // writes a PARTITION-SCOPED position-delete in partition a (referencing the partition-a data file,
+        // deleting position 1 = id=20) via newPosDeleteWriter(..., partitionA), committed at sequence 2 via
+        // newRowDelta (the data is appended FIRST at sequence 1). Live merge-on-read rows = {10,30,40,50}
+        // (only id=20 deleted; both partitions otherwise intact). It materializes Java's OWN read into
+        // java_part_scan_rows.json and writes final.metadata.json. The dir is via -Dinterop.part_scan.dir.
+        Path partScanDir = requireFixturesDir("interop.part_scan.dir");
+        PartScanExecOracle.generate(partScanDir);
+        break;
+      case "verify-interop-part-scan":
+        // PARTITIONED merge-on-read, DIRECTION 2 — "Java reads what RUST writes". The Rust GEN path (env
+        // ICEBERG_INTEROP_PART_SCAN_GEN_DIR) wrote a REAL on-disk table partitioned by identity(category) to
+        // <dir>/rust_table via its production write path (MemoryCatalog over LocalFsStorageFactory: one real
+        // parquet DATA file per partition stamped with its partition Struct + spec id 0, fast_appended at
+        // sequence 1, plus a partition-scoped position-delete in partition a written by
+        // PositionDeleteFileWriter with the partition_key set, row_delta'd at sequence 2), landing a
+        // final.metadata.json. Here Java loads that RUST-written metadata, reads with IcebergGenerics (which
+        // APPLIES Rust's partition-scoped position delete), and asserts the merge-on-read rows ==
+        // {(10,a),(30,a),(40,b),(50,b)} (id=20 deleted, both partitions otherwise intact). A failure here is
+        // a REAL partition-aware write-incompatibility finding (Rust wrote a partitioned table / partition-
+        // scoped delete Java cannot read).
+        Path partScanVerifyDir = requireFixturesDir("interop.part_scan.dir");
+        int partScanFailures = PartScanExecOracle.verify(partScanVerifyDir);
+        System.out.println("verify-interop-part-scan: " + partScanFailures + " failures");
+        if (partScanFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-eq-delete":
         // EQUALITY-DELETE merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes". The sibling of
         // generate-interop-scan-exec, but the merge-on-read mechanism is delete-by-VALUE (an equality
@@ -3280,6 +3313,373 @@ public final class InteropOracle {
         System.out.println(
             "verify-interop-eq-delete OK — Java read the RUST-written table (real parquet data + "
                 + "Rust equality-delete), merge-on-read live rows = {10,30,50}");
+      }
+      return failures;
+    }
+  }
+
+  // ===========================================================================================
+  // PARTITIONED scan-execution oracle — the PARTITION-HANDLING proof. The sibling of ScanExecOracle, but
+  // the table is PARTITIONED by identity(category) and the position-delete is PARTITION-SCOPED. Every
+  // earlier scan-exec / eq-delete oracle wrote an UNPARTITIONED table; this one proves that BOTH Java and
+  // Rust agree on partition-aware merge-on-read: the data files carry partition values (category=a /
+  // category=b) and the position-delete is associated with the partition-a data file.
+  //
+  // THE TABLE (under <dir>/table). V2, schema {1 id long required, 2 category string required, 3 data
+  // string optional}, partition spec identity(category) (spec id 0):
+  //   data file 00000-a.parquet (partition category=a): rows (10,a,x) (20,a,y) (30,a,z) at positions 0..2.
+  //   data file 00000-b.parquet (partition category=b): rows (40,b,p) (50,b,q) at positions 0..1.
+  //   position-delete 00000-a-deletes.parquet (partition category=a): deletes position 1 of the cat=a data
+  //     file (row id=20). The delete is PARTITION-SCOPED — it carries the category=a partition Struct and
+  //     references the cat=a data file path.
+  //   live rows after merge-on-read = {10,30,40,50} (only id=20 deleted; both partitions otherwise intact).
+  // Commits: newAppend(dataFileA, dataFileB) at sequence 1, then newRowDelta(deleteFileA) at sequence 2.
+  // Java materializes its OWN merge-on-read read via IcebergGenerics into java_part_scan_rows.json.
+  // ===========================================================================================
+
+  /**
+   * The partitioned scan-execution half of the oracle — the partition-aware merge-on-read interop. Builds a
+   * V2 table partitioned by identity(category) on local disk under {@code <dir>/table}, writes one REAL
+   * parquet data file PER PARTITION (each stamped with its partition value via a {@link PartitionData}) + a
+   * PARTITION-SCOPED position-delete in partition a (deleting position 1 = id=20), commits them
+   * ({@code newAppend} at sequence 1 + {@code newRowDelta} at sequence 2), writes {@code final.metadata.json},
+   * and emits Java's OWN merge-on-read read (via {@link IcebergGenerics}) as {@code java_part_scan_rows.json}.
+   */
+  static final class PartScanExecOracle {
+    private PartScanExecOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the PARTITIONED V2 table on local disk under <dir>/table. The location is the BARE absolute
+      //    path so the manifest/manifest-list/data/delete paths the writers + commits use are bare absolute
+      //    paths the Rust FileIO::new_with_fs() resolves directly (same convention as ScanExecOracle).
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "data", Types.StringType.get()));
+      // Partition by identity(category). The spec gets id 0 (the default spec of a fresh table).
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed); // persist v0 metadata so the BaseTable has a current metadata to evolve.
+      BaseTable table = new BaseTable(ops, "interop_part_scan_exec");
+
+      // 2. The two partition values (category=a / category=b) as PartitionData over the spec's partition
+      //    type. PartitionData is a StructLike the data/pos-delete writers stamp onto the DataFile (and the
+      //    location provider routes the parquet under the partition path data/category=a/...).
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partitionA = new PartitionData(partitionType);
+      partitionA.set(0, "a");
+      PartitionData partitionB = new PartitionData(partitionType);
+      partitionB.set(0, "b");
+
+      // 3. One REAL parquet DATA file PER PARTITION, each carrying its partition value. cat=a holds ids
+      //    10/20/30 at positions 0..2; cat=b holds ids 40/50 at positions 0..1. The DataFile is built from
+      //    the appender's REAL metrics + the partition (the FileHelpers.writeDataFile(partition) template).
+      String dataPathA = new File(dataDir, "category=a/00000-a.parquet").getAbsolutePath();
+      DataFile dataFileA =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionA,
+              dataPathA,
+              new long[] {10L, 20L, 30L},
+              new String[] {"x", "y", "z"});
+
+      String dataPathB = new File(dataDir, "category=b/00000-b.parquet").getAbsolutePath();
+      DataFile dataFileB =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionB,
+              dataPathB,
+              new long[] {40L, 50L},
+              new String[] {"p", "q"});
+
+      // 4. A PARTITION-SCOPED position-delete in partition a, deleting position 1 of the cat=a data file
+      //    (row id=20). It carries the category=a partition Struct (so it is associated with that partition)
+      //    and references the cat=a data file path. cat=b is untouched.
+      String deletePathA = new File(dataDir, "category=a/00000-a-deletes.parquet").getAbsolutePath();
+      DeleteFile deleteFileA =
+          writePartitionedPosDeleteFile(
+              table, schema, spec, partitionA, deletePathA, dataFileA.path());
+
+      // 5. Real commits, IN ORDER: both data files via newAppend (data-sequence-number 1), THEN the
+      //    partition-scoped position-delete via newRowDelta (sequence-number 2). Live rows = {10,30,40,50}.
+      table.newAppend().appendFile(dataFileA).appendFile(dataFileB).commit();
+      table.newRowDelta().addDeletes(deleteFileA).commit();
+
+      // 6. Write the FINAL metadata to a KNOWN path so the Rust test loads it deterministically. (The real
+      //    on-disk manifest-list + manifests + parquet already live under <dir>/table.)
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 7. Java materializes its OWN merge-on-read READ (IcebergGenerics applies the partition-scoped
+      //    position delete) → sort by id, emit java_part_scan_rows.json = [{10,x},{30,z},{40,p},{50,q}]
+      //    (id=20 deleted; both partitions otherwise intact). This is the GROUND TRUTH the Rust scan equals.
+      writeJson(dir.resolve("java_part_scan_rows.json"), readLiveRowsToJson(table));
+      System.out.println("generated partitioned scan-exec table + java_part_scan_rows.json to " + dir);
+    }
+
+    /**
+     * Write a REAL parquet data file for ONE partition via the generic appender and return its
+     * {@link DataFile} built from the appender's REAL metrics + the partition value (the
+     * {@code FileHelpers.writeDataFile(table, out, partition, rows)} template). Each row's {@code category}
+     * field matches the partition's category so the on-disk data is consistent with the partition stamp.
+     */
+    private static DataFile writePartitionedDataFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        long[] ids,
+        String[] dataValues)
+        throws IOException {
+      // The category value is the single partition field's value (identity(category)) — read it back from the
+      // partition struct so the on-disk records carry exactly the partition's category.
+      String category = partition.get(0, String.class);
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("category", category);
+        record.setField("data", dataValues[i]);
+        rows.add(record);
+      }
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      // newDataWriter(file, format, partition) stamps the partition onto the DataFile builder; toDataFile()
+      // reads back the REAL metrics the parquet writer produced AND the partition value.
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * Write a REAL parquet POSITION-DELETE file for ONE partition via the generic position-delete writer,
+     * deleting position 1 of {@code referencedDataPath} (row id=20), and return its {@link DeleteFile} built
+     * from the writer's REAL metrics + the partition value (the {@code FileHelpers.writePosDeleteFile(table,
+     * out, partition, deletes)} template). The delete is PARTITION-SCOPED: it carries {@code partition} (the
+     * category=a Struct) and references the cat=a data file path, so a real merge-on-read reader masks
+     * exactly that one row in that one partition.
+     */
+    private static DeleteFile writePartitionedPosDeleteFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        CharSequence referencedDataPath)
+        throws IOException {
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        // Delete position 1 (the 2nd row of the cat=a data file: id 20). No row data is carried.
+        writer.write(posDelete.set(referencedDataPath, 1L, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    /**
+     * Materialize Java's OWN merge-on-read READ of the partitioned table via {@link IcebergGenerics} (which
+     * plans the scan across both partitions, opens the parquet, AND applies the partition-scoped position
+     * delete), collect the live rows, SORT by id, and serialize them to a JSON array of {@code {id, data}}.
+     * This is the GROUND TRUTH = [{10,x},{30,z},{40,p},{50,q}] (id=20 deleted, both partitions otherwise
+     * intact). Note: the emitted {@code data} column is field 3 (the optional string), NOT category — the
+     * Rust test compares on (id, data) exactly as the unpartitioned oracle does.
+     */
+    private static String readLiveRowsToJson(BaseTable table) {
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+
+      List<Long> ids = new ArrayList<>(dataById.keySet());
+      ids.sort(Long::compareTo);
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (Long id : ids) {
+              gen.writeStartObject();
+              gen.writeNumberField("id", id);
+              String data = dataById.get(id);
+              if (data == null) {
+                gen.writeNullField("data");
+              } else {
+                gen.writeStringField("data", data);
+              }
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * DIRECTION 2 verify — read the RUST-written PARTITIONED table (with a RUST partition-scoped position
+     * delete) and assert the merge-on-read rows. Mirrors {@link ScanExecOracle#verify}, but the table is
+     * partitioned by identity(category) and the applied delete is partition-scoped.
+     *
+     * <p>Loads {@code <dir>/rust_table/metadata/final.metadata.json}, builds a {@link BaseTable} over a
+     * {@link LocalFileIO} (so {@code io()} reads the real on-disk parquet + avro), reads every live row with
+     * {@code IcebergGenerics.read(table).build()} (which APPLIES the Rust-written partition-scoped position
+     * delete), sorts by id, and asserts the rows equal {@code {(10,x),(30,z),(40,p),(50,q)}} (id=20 deleted,
+     * partition a's survivors 10/30 AND partition b's 40/50 all present). A failure here is a REAL partition-
+     * aware write-incompatibility finding: Java could not read the Rust-written partitioned table / partition-
+     * scoped delete, or read the WRONG rows.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL part-scan-d2: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL part-scan-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL part-scan-d2: Java could not READ the Rust-written partitioned table via "
+                + "IcebergGenerics (manifests/parquet/partition-scoped-position-delete incompatibility): "
+                + readError);
+        return 1;
+      }
+
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+
+      // 3a. Exactly 4 live rows survive (5 written across both partitions, position 1 of cat=a deleted).
+      if (liveIds.size() != 4) {
+        System.out.println(
+            "FAIL part-scan-d2: expected 4 live rows after partition-aware merge-on-read, got "
+                + liveIds.size()
+                + " "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS part-scan-d2: 4 live rows survive partition-aware merge-on-read");
+      }
+
+      // 3b. The deleted id (20) must be ABSENT — Rust's partition-scoped position delete must have applied.
+      if (liveIds.contains(20L)) {
+        System.out.println(
+            "FAIL part-scan-d2: deleted id 20 must be ABSENT, but live set is " + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS part-scan-d2: deleted id 20 is absent (Rust's partition-scoped delete applied)");
+      }
+
+      // 3c. Both partitions are otherwise intact: cat=a survivors 10/30 AND cat=b's 40/50 must all be present.
+      if (!liveIds.contains(10L)
+          || !liveIds.contains(30L)
+          || !liveIds.contains(40L)
+          || !liveIds.contains(50L)) {
+        System.out.println(
+            "FAIL part-scan-d2: both partitions must be intact (cat=a 10/30 + cat=b 40/50), live set is "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS part-scan-d2: both partitions intact (cat=a survivors 10/30 + cat=b untouched 40/50)");
+      }
+
+      // 3d. The exact surviving (id, data) set equals {(10,x),(30,z),(40,p),(50,q)}.
+      Map<Long, String> expected = new LinkedHashMap<>();
+      expected.put(10L, "x");
+      expected.put(30L, "z");
+      expected.put(40L, "p");
+      expected.put(50L, "q");
+      boolean valuesMatch = liveIds.equals(new ArrayList<>(expected.keySet()));
+      for (Long id : liveIds) {
+        String actual = dataById.get(id);
+        String want = expected.get(id);
+        if (want == null || !want.equals(actual)) {
+          valuesMatch = false;
+        }
+      }
+      if (!valuesMatch) {
+        System.out.println(
+            "FAIL part-scan-d2: live (id,data) set mismatch: java-read="
+                + dataById
+                + " expected={10=x, 30=z, 40=p, 50=q}");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS part-scan-d2: Java read the Rust-written partitioned table → {(10,x),(30,z),(40,p),(50,q)}");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-part-scan OK — Java read the RUST-written PARTITIONED table (real per-partition "
+                + "parquet data + Rust partition-scoped position-delete), merge-on-read live rows = "
+                + "{10,30,40,50}");
       }
       return failures;
     }

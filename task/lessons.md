@@ -2561,3 +2561,23 @@ How to use it (see the manuals' §2):
   (Java generics like `List<Record>`, or `<->`) can trip the script parser ("Unexpected token … TypeScript
   syntax"). Build long prompts as `[ '...', '...' ].join('\n')` arrays of plain strings to avoid stray `<`/`>`
   and backtick-escaping hazards.
+
+### 2026-06-09 (Partitioned merge-on-read interop, both directions — capstone Increment 4 — ORCHESTRATOR + REVIEWER Opus)
+- **A partition-scoped delete is only correct if it does NOT cross partitions — pin BOTH the deleted row's
+  absence AND a sibling partition's survival.** The fixture partitions by `identity(category)` with a data file
+  PER partition (cat=a: 10/20/30, cat=b: 40/50) and a position-delete in cat=a only (position 1 = id=20). The
+  load-bearing assertions are (1) id=20 ABSENT and (2) cat=b's 40/50 ALL present — a bug that applied the cat=a
+  delete to cat=b, or dropped a whole partition, fails (2), not (1). Rust's `delete_file_index` keys deletes by
+  partition + spec id, so the cat=a delete reaches only the cat=a data file; that's the behavior under test.
+- **Direction-2 partitioned write needs a `PartitionKey`, and it does double duty.** Building the production
+  `DataFileWriter`/`PositionDeleteFileWriter` with a `PartitionKey::new(spec, schema, Struct::from_iter([Some(
+  Literal::string("a"))]))` both (a) auto-stamps the partition `Struct` + spec id onto the written `DataFile`
+  (so the manifest entry's partition matches) AND (b) routes the parquet under the partition path via the
+  location generator. One data file per partition fast_appended at seq 1, then the cat=a partition-scoped
+  position-delete row_delta'd at seq 2 — Java's `IcebergGenerics` reads it back to {10,30,40,50}. Still NO Rust
+  production change, Cargo still 0-diff (the partitioned write + partition-aware read already exist).
+- **The capstone is the cross-product, not a single axis.** Done = {position, equality} deletes × {Java-writes-
+  Rust-reads, Rust-writes-Java-reads} × {unpartitioned, partitioned} — each cell a real-row round-trip with the
+  reviewer mutating the written artifacts. Partitioning was the last axis; with it the data-level interop suite
+  is complete (4 commits). Deferred within partitioning (its own future increment): multi-file-per-partition +
+  non-identity transforms (bucket/truncate) + more column types.

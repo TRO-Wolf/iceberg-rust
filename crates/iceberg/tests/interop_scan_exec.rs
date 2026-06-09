@@ -71,11 +71,13 @@ use futures::TryStreamExt;
 use iceberg::io::{FileIO, LocalFsStorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    DataContentType, DataFile, FormatVersion, NestedField, PrimitiveType, Schema, SortOrder,
-    Struct, TableMetadata, Type, UnboundPartitionSpec,
+    DataContentType, DataFile, FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec,
+    PrimitiveType, Schema, SchemaRef, SortOrder, Struct, TableMetadata, Transform, Type,
+    UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::equality_delete_writer::{
     EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
 };
@@ -142,6 +144,28 @@ fn eq_scan_dir() -> Option<PathBuf> {
 /// for Java to read. `None` when `ICEBERG_INTEROP_EQ_SCAN_GEN_DIR` is unset (then a clean no-op).
 fn eq_scan_gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_EQ_SCAN_GEN_DIR").map(PathBuf::from)
+}
+
+/// The temp dir the Java oracle wrote the PARTITIONED table + JSON rows into (Direction 1, partitioned).
+/// `None` when `ICEBERG_INTEROP_PART_SCAN_DIR` is unset (the partitioned read test is then a clean no-op).
+fn part_scan_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PART_SCAN_DIR").map(PathBuf::from)
+}
+
+/// The temp dir into which the DIRECTION-2 partitioned GEN path writes a Rust-authored partitioned table
+/// (identity(category) + a partition-scoped position-delete) for Java to read. `None` when
+/// `ICEBERG_INTEROP_PART_SCAN_GEN_DIR` is unset (then a clean no-op).
+fn part_scan_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PART_SCAN_GEN_DIR").map(PathBuf::from)
+}
+
+/// Load + parse the Java ground-truth PARTITIONED rows from `<dir>/java_part_scan_rows.json`.
+fn read_java_part_rows(dir: &std::path::Path) -> Vec<ScanRow> {
+    let path = dir.join("java_part_scan_rows.json");
+    let json = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str::<Vec<ScanRow>>(&json)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
 /// Load + parse the Java ground-truth EQUALITY-delete rows from `<dir>/java_eq_scan_rows.json`.
@@ -386,6 +410,111 @@ async fn test_scan_exec_equality_delete_matches_java_read() {
     println!(
         "interop_scan_exec equality-delete OK — Rust scan→Arrow equality merge-on-read = Java read: \
          3 live rows {{10,30,50}}, deleted 20/40 absent"
+    );
+}
+
+// ===========================================================================================
+// PARTITIONED merge-on-read, DIRECTION 1 — Java writes the PARTITIONED table + partition-scoped delete,
+// Rust reads it. The partition-handling proof.
+//
+// The sibling of the position-delete read test above, but the table is PARTITIONED by identity(category)
+// and the position-delete is PARTITION-SCOPED. The Java oracle's `generate-interop-part-scan` mode wrote a
+// V2 table {1 id long required, 2 category string required, 3 data string optional} partitioned by
+// identity(category) with one REAL parquet data file PER PARTITION (category=a: (10,a,x),(20,a,y),(30,a,z)
+// at positions 0..2; category=b: (40,b,p),(50,b,q) at positions 0..1), each DataFile stamped with its
+// partition value (spec id 0). It then wrote a PARTITION-SCOPED position-delete in partition a deleting
+// position 1 (id=20), committed via newRowDelta at sequence 2 (the data appended FIRST at sequence 1). The
+// live merge-on-read set is {10,30,40,50} (only id=20 deleted; both partitions otherwise intact). Java
+// emitted its OWN read into `java_part_scan_rows.json`. This test loads the same table, runs
+// `scan().to_arrow()` — which must apply the partition-scoped position delete — and asserts the rows equal
+// Java's read (id=20 absent; cat=a survivors 10/30 AND cat=b's 40/50 all present).
+//
+// Gated on `ICEBERG_INTEROP_PART_SCAN_DIR`: a clean no-op when unset, so the offline gate stays green. If
+// Rust MISHANDLED partition-scoped merge-on-read (e.g. applied the cat=a delete to cat=b, or dropped a
+// partition) this assertion would FAIL — a real partition-aware read gap. Rust's delete_file_index keys
+// deletes by partition + spec id, so the cat=a delete reaches only the cat=a data file.
+// ===========================================================================================
+
+#[tokio::test]
+async fn test_part_scan_exec_partition_scoped_merge_on_read_matches_java_read() {
+    let Some(dir) = part_scan_dir() else {
+        println!(
+            "skipping interop_scan_exec partitioned — set ICEBERG_INTEROP_PART_SCAN_DIR \
+             (run dev/java-interop/run-interop-part.sh)"
+        );
+        return;
+    };
+
+    let table = load_table(&dir);
+
+    // Rust's scan → Arrow applies the PARTITION-SCOPED position delete (merge-on-read): position 1 of the
+    // category=a data file (id=20) is dropped; category=b is untouched.
+    let batch_stream = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow");
+    let batches: Vec<RecordBatch> = batch_stream
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let java_rows = sorted_by_id(read_java_part_rows(&dir));
+
+    // -- The partition-aware merge-on-read proof. ---------------------------------------------------------
+
+    // Exactly 4 live rows survive (5 written across both partitions, position 1 of cat=a deleted).
+    assert_eq!(
+        rust_rows.len(),
+        4,
+        "exactly 4 rows survive partition-aware merge-on-read (5 written, cat=a position 1 deleted)"
+    );
+
+    // The deleted row (id 20 at position 1 of the cat=a data file) must be ABSENT.
+    assert!(
+        !rust_rows.iter().any(|r| r.id == 20),
+        "id 20 (partition-scoped delete at cat=a position 1) must be ABSENT after merge-on-read"
+    );
+
+    // Both partitions are otherwise intact: cat=a survivors 10/30 AND cat=b's 40/50 must all be present.
+    for id in [10_i64, 30, 40, 50] {
+        assert!(
+            rust_rows.iter().any(|r| r.id == id),
+            "id {id} must be present — both partitions intact except cat=a's deleted id=20"
+        );
+    }
+
+    // The surviving (id, data) values match Java's read exactly: {(10,x),(30,z),(40,p),(50,q)}.
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust scan→Arrow (partition-aware merge-on-read) rows must equal Java's IcebergGenerics read \
+         field-for-field"
+    );
+
+    // Pin the exact live set so it cannot drift unnoticed.
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40, 50],
+        "the live id set after partition-aware merge-on-read is exactly {{10, 30, 40, 50}}"
+    );
+    let live_data: Vec<Option<&str>> = rust_rows.iter().map(|r| r.data.as_deref()).collect();
+    assert_eq!(
+        live_data,
+        vec![Some("x"), Some("z"), Some("p"), Some("q")],
+        "the live data column matches the committed values for ids 10/30 (cat=a) and 40/50 (cat=b)"
+    );
+
+    println!(
+        "interop_scan_exec partitioned OK — Rust scan→Arrow partition-aware merge-on-read = Java read: \
+         4 live rows {{10,30,40,50}}, cat=a's id=20 deleted, cat=b intact"
     );
 }
 
@@ -787,5 +916,327 @@ async fn test_scan_exec_gen_rust_writes_java_readable_equality_delete_table() {
         "interop_scan_exec equality-delete GEN OK — Rust wrote {table_location} (parquet data seq 1 + \
          equality-delete seq 2 + final.metadata.json); Rust scan = {{10,30,50}}. Java verify-interop-eq-delete \
          reads it next."
+    );
+}
+
+// ===========================================================================================
+// PARTITIONED merge-on-read, DIRECTION 2 — the GEN path: Rust WRITES a real on-disk PARTITIONED table
+// (identity(category)) with a PARTITION-SCOPED position delete; Java reads it back. The partition-WRITE
+// proof.
+//
+// The sibling of the position-delete GEN path above, but the table is PARTITIONED. We create a MemoryCatalog
+// table with an identity(category) spec (spec id 0), write one REAL parquet data file PER PARTITION via the
+// production `DataFileWriter` built with a `PartitionKey` (which auto-stamps the partition Struct + spec id
+// onto the DataFile AND routes the parquet under the partition path via the location generator), and
+// fast_append both at SEQUENCE 1. Then we write a PARTITION-SCOPED position-delete in partition a (deleting
+// position 1 = id=20) via `PositionDeleteFileWriter` built with the cat=a `PartitionKey` (so the delete
+// carries the partition Struct + spec id), and row_delta it at SEQUENCE 2. The table lands at
+// `<gen_dir>/rust_table` with a `final.metadata.json`; the Java oracle's `verify-interop-part-scan` mode
+// reads it with `IcebergGenerics` (applying our partition-scoped delete) and asserts {10,30,40,50}.
+//
+// When `ICEBERG_INTEROP_PART_SCAN_GEN_DIR` is UNSET this is a clean no-op — the offline gate stays green.
+// ===========================================================================================
+
+/// The PARTITIONED V2 schema Java expects: {1 id long required, 2 category string required, 3 data string
+/// optional}. The partition column (`category`) is a required top-level field; the spec partitions by
+/// identity(category).
+fn part_gen_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(3, "data", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("build the {id long, category string, data string} schema")
+}
+
+/// Build the identity(category) unbound partition spec (spec id 0) the partitioned table is created with.
+fn part_gen_unbound_spec() -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category".to_string(), Transform::Identity)
+        .expect("add identity(category) partition field")
+        .build()
+}
+
+/// Create the PARTITIONED V2 table at EXACTLY `<gen_dir>/rust_table` in a `MemoryCatalog` over the local FS,
+/// partitioned by identity(category) (spec id 0), so the on-disk layout is the deterministic
+/// `rust_table/{metadata,data/category=.../...}` Java loads.
+async fn create_partitioned_rust_table(catalog: &impl Catalog, table_location: &str) -> Table {
+    let namespace = NamespaceIdent::new("interop".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let creation = TableCreation::builder()
+        .name("rust_table".to_string())
+        .location(table_location.to_string())
+        .schema(part_gen_schema())
+        .partition_spec(part_gen_unbound_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+
+    catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create partitioned rust_table")
+}
+
+/// Build the `PartitionKey` for a single identity(category) partition value (e.g. `"a"`). The bound spec is
+/// the table's default partition spec; the partition `Struct` carries the single string category value.
+fn category_partition_key(schema: SchemaRef, spec: PartitionSpec, category: &str) -> PartitionKey {
+    PartitionKey::new(
+        spec,
+        schema,
+        Struct::from_iter([Some(Literal::string(category))]),
+    )
+}
+
+/// Write a REAL parquet DATA file for ONE partition via the production `DataFileWriter` built with the
+/// partition's `PartitionKey`. The writer auto-stamps the partition `Struct` + spec id onto the returned
+/// `DataFile` and routes the parquet under the partition path (`data/category=.../...`) via the location
+/// generator. Each row's `category` matches the partition so the on-disk data is consistent with the stamp.
+async fn write_partitioned_gen_data_file(
+    table: &Table,
+    partition_key: &PartitionKey,
+    category: &str,
+    ids: Vec<i64>,
+    data_values: Vec<&str>,
+) -> DataFile {
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema → arrow"));
+
+    let row_count = ids.len();
+    let categories: Vec<&str> = std::iter::repeat_n(category, row_count).collect();
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from(ids)) as ArrayRef,
+        Arc::new(StringArray::from(categories)) as ArrayRef,
+        Arc::new(StringArray::from(data_values)) as ArrayRef,
+    ])
+    .expect("build the per-partition data batch");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "rust-data".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        schema.clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+
+    // DataFileWriter built with the PartitionKey: close() stamps `partition` = the key's Struct and
+    // `partition_spec_id` = the key's spec id, and the location generator routes the parquet under the
+    // partition path — exactly how the production partitioning writers stamp partition values.
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(Some(partition_key.clone()))
+        .await
+        .expect("build partitioned data file writer");
+    writer
+        .write(batch)
+        .await
+        .expect("write per-partition batch");
+    writer
+        .close()
+        .await
+        .expect("close partitioned data file writer")
+        .into_iter()
+        .next()
+        .expect("one data file per partition")
+}
+
+/// Write a REAL parquet PARTITION-SCOPED position-delete file (via the production
+/// `PositionDeleteFileWriter` built with the cat=a `PartitionKey`) deleting position 1 of `data_file_path`
+/// (id=20). The writer stamps the partition `Struct` + spec id onto the delete file, so it is associated
+/// with partition a — the delete-file index keys deletes by partition + spec id, reaching only the cat=a
+/// data file.
+async fn write_partitioned_gen_position_delete_file(
+    table: &Table,
+    partition_key: &PartitionKey,
+    data_file_path: &str,
+) -> DataFile {
+    let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "pos-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        config.schema().clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+
+    // Build WITH the cat=a partition key so the delete is partition-scoped (carries the cat=a Struct + spec
+    // id 0). This is the partition-handling proof for the WRITE side.
+    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .build(Some(partition_key.clone()))
+        .await
+        .expect("build partition-scoped position-delete writer");
+
+    let paths = StringArray::from(vec![data_file_path]);
+    let positions = Int64Array::from(vec![1_i64]);
+    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(paths) as ArrayRef,
+        Arc::new(positions) as ArrayRef,
+    ])
+    .expect("build the partition-scoped position-delete batch");
+    writer
+        .write(batch)
+        .await
+        .expect("write partition-scoped position-delete batch");
+    writer
+        .close()
+        .await
+        .expect("close partition-scoped position-delete writer")
+        .into_iter()
+        .next()
+        .expect("one partition-scoped position-delete file")
+}
+
+#[tokio::test]
+async fn test_part_scan_exec_gen_rust_writes_java_readable_partitioned_table() {
+    let Some(gen_dir) = part_scan_gen_dir() else {
+        println!(
+            "skipping interop_scan_exec partitioned GEN — set ICEBERG_INTEROP_PART_SCAN_GEN_DIR \
+             (run dev/java-interop/run-interop-part-d2.sh)"
+        );
+        return;
+    };
+
+    // 1. A MemoryCatalog over the LOCAL FS, warehouse = <gen_dir>, table pinned to <gen_dir>/rust_table,
+    //    partitioned by identity(category) (spec id 0).
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_part_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_partitioned_rust_table(&catalog, &table_location).await;
+
+    // The bound default partition spec + schema the partition keys reference.
+    let schema = table.metadata().current_schema().clone();
+    let spec = table.metadata().default_partition_spec().as_ref().clone();
+    let partition_key_a = category_partition_key(schema.clone(), spec.clone(), "a");
+    let partition_key_b = category_partition_key(schema.clone(), spec.clone(), "b");
+
+    // 2. Write one REAL parquet data file PER PARTITION (each stamped with its partition value), then
+    //    fast_append BOTH at SEQUENCE 1. cat=a: (10,a,x),(20,a,y),(30,a,z); cat=b: (40,b,p),(50,b,q).
+    let data_file_a =
+        write_partitioned_gen_data_file(&table, &partition_key_a, "a", vec![10, 20, 30], vec![
+            "x", "y", "z",
+        ])
+        .await;
+    let data_file_b =
+        write_partitioned_gen_data_file(&table, &partition_key_b, "b", vec![40, 50], vec![
+            "p", "q",
+        ])
+        .await;
+
+    // Sanity: each data file carries the RIGHT partition value (category Struct) + spec id 0.
+    assert_eq!(data_file_a.content_type(), DataContentType::Data);
+    assert_eq!(data_file_b.content_type(), DataContentType::Data);
+    assert_eq!(
+        data_file_a.partition(),
+        &Struct::from_iter([Some(Literal::string("a"))]),
+        "cat=a data file must carry the category=a partition value"
+    );
+    assert_eq!(
+        data_file_b.partition(),
+        &Struct::from_iter([Some(Literal::string("b"))]),
+        "cat=b data file must carry the category=b partition value"
+    );
+
+    let data_file_a_path = data_file_a.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![data_file_a, data_file_b])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // 3. row_delta a PARTITION-SCOPED position-delete in partition a (position 1 of the cat=a data file =
+    //    id=20) at SEQUENCE 2. Because the data (seq 1) was committed FIRST, the delete (seq 2) applies.
+    let delete_file =
+        write_partitioned_gen_position_delete_file(&table, &partition_key_a, &data_file_a_path)
+            .await;
+    assert_eq!(delete_file.content_type(), DataContentType::PositionDeletes);
+    assert_eq!(
+        delete_file.partition(),
+        &Struct::from_iter([Some(Literal::string("a"))]),
+        "the position-delete must be PARTITION-SCOPED to category=a"
+    );
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // 4. Sanity: OUR OWN scan→Arrow already applies the partition-scoped delete → {10,30,40,50} (only id=20
+    //    deleted from cat=a; cat=b untouched). Confirm the table is internally consistent before Java reads.
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40, 50],
+        "Rust's own scan of the written partitioned table must already be {{10,30,40,50}} (cat=a id=20 deleted)"
+    );
+
+    // 5. Write the FINAL metadata to a KNOWN path so Java loads it deterministically. The real on-disk
+    //    manifest-list + manifests + per-partition parquet already live under <gen_dir>/rust_table.
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_scan_exec partitioned GEN OK — Rust wrote {table_location} (per-partition parquet data + \
+         partition-scoped position-delete + final.metadata.json); Rust scan = {{10,30,40,50}}. Java \
+         verify-interop-part-scan reads it next."
     );
 }
