@@ -4089,3 +4089,31 @@ file_format value expectation. Gate + run.sh round-trip green. Own commit (fix(i
 **Deferred next (manifest interop):** A2 `entries`/`manifests`/`partitions` (same harness); A3 `all_*`
 (multi-snapshot table); A4 scan PLANNING (file set + residuals); A5 scan EXECUTION (reads parquet → Arrow —
 needs parquet Maven deps + a separate approval).
+
+---
+
+## Active (2026-06-09): Manifest-reading interop A2 — `entries`/`manifests`/`partitions` (Phase 3)
+
+Increment: 3 more manifest-reading tables over a RICHER multi-snapshot table (`InspectionManifestsA2Oracle`
+→ `<dir>/table_a2`; A1's `<dir>/table` + test untouched). Builder→reviewer; orchestrator independently
+re-ran the offline gate + the run.sh round-trip + verified the production fix + committed.
+
+- [x] **Java oracle** — A2 table: `newAppend` A=a/B=b/C=a/D=b → `newRowDelta` +pos-delete (cat=a) →
+  `newDelete` B → DELETED tombstone + content-gated DATA/DELETE manifests + 2 live partitions. Materializes
+  Java's REAL `EntriesTable`/`ManifestsTable`/`PartitionsTable` rows → java_{entries,manifests,partitions}.json.
+- [x] **Rust tests (3, added to `interop_inspection_manifests.rs`)** — entries/manifests/partitions field-match
+  Java order-independently; entries reuses A1's `FileRow` for the nested data_file via a new `ColumnSource`
+  trait; focused pins: status==2 tombstone, content-gating (data manifest 0 delete-counts / delete manifest 0
+  data-counts), partition delete-counts + DATA-only `total_data_file_size_in_bytes`.
+- [x] **Production parity fix** (`inspect/partition_summary.rs`) — `partition_summaries` STRING bounds were
+  JSON-quoted (`Datum::to_string`) vs Java's bare `Transform.toHumanString`; fixed to `to_human_string` (only
+  string bounds change; int/long unit tests unaffected). Verified both the Rust method semantics (datum.rs:1195)
+  AND the Java call-site (ManifestsTable L134-144).
+- [x] **Gate (orchestrator-rerun, all green):** offline (A2 tests no-op; A1 still green; lib 1595; datafusion
+  80+9; clippy/fmt/typos) + run.sh round-trip (A1 + 3 A2). `git status` = partition_summary.rs +
+  interop_inspection_manifests.rs + InteropOracle.java + run-inspection-manifests.sh.
+- [x] **Docs** — GAP_MATRIX, Roadmap (6e), lessons, todo.
+
+**Deferred next:** A3 `all_*` (all_data_files/all_delete_files/all_files/all_entries/all_manifests —
+multi-snapshot reachability + non-dedup for all_manifests); A4 scan PLANNING (planFiles file set + residuals);
+A5 scan EXECUTION (parquet → Arrow, needs parquet Maven deps + separate approval). Then squash + PR.

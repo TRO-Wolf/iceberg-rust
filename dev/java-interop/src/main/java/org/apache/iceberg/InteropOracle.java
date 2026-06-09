@@ -50,6 +50,7 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.types.Conversions;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.JsonUtil;
 
@@ -128,6 +129,11 @@ public final class InteropOracle {
         // increment never touches any committed fixture.
         Path inspectionManifestsDir = requireFixturesDir("interop.inspection_manifests.dir");
         InspectionManifestsOracle.generate(inspectionManifestsDir);
+        // A2 (the entries / manifests / partitions tables) reuses the SAME exec mode + temp dir: it writes
+        // a SECOND, richer table to <dir>/table_a2 (the A1 table at <dir>/table is untouched) and emits
+        // java_entries.json / java_manifests.json / java_partitions.json. Driven from here so a single
+        // run-inspection-manifests.sh invocation produces both A1's and A2's fixtures in one JVM pass.
+        InspectionManifestsA2Oracle.generate(inspectionManifestsDir);
         break;
       case "verify":
         int failures = 0;
@@ -1950,6 +1956,353 @@ public final class InteropOracle {
         gen.writeNumber(element);
       }
       gen.writeEndArray();
+    }
+
+    /** Lowercase hex of a {@link ByteBuffer}'s remaining bytes (does NOT consume the buffer). */
+    private static String toHex(ByteBuffer buffer) {
+      ByteBuffer dup = buffer.duplicate();
+      StringBuilder hex = new StringBuilder(dup.remaining() * 2);
+      while (dup.hasRemaining()) {
+        hex.append(String.format("%02x", dup.get() & 0xff));
+      }
+      return hex.toString();
+    }
+  }
+
+  // ===========================================================================================
+  // Inspection-MANIFESTS A2 oracle — the SECOND manifest-READING inspection increment, building DIRECTLY
+  // on A1's harness (it reuses A1's LocalTableOperations + LocalFileIO + writeJson + the same
+  // MetadataTableUtils + planFiles() + asDataTask().rows() materializer). A1 proved the content-filtered
+  // FILES / DATA_FILES / DELETE_FILES tables; A2 proves the THREE manifest-reading tables that need a
+  // RICHER table than A1's:
+  //
+  //   * ENTRIES (Java ManifestEntriesTable) — one row per manifest ENTRY of the current snapshot's
+  //     manifests, INCLUDING DELETED tombstones (status 2) that the `files` family excludes. Columns:
+  //     status(int), snapshot_id, sequence_number, file_sequence_number, data_file(NESTED struct = the SAME
+  //     DataFile projection A1 used). REQUIRES a DELETED tombstone in the current snapshot's manifests → the
+  //     A2 table deletes a data file (newDelete) as its last commit.
+  //   * MANIFESTS (Java ManifestsTable) — one row per manifest in the CURRENT snapshot's manifest list:
+  //     content, path, length, partition_spec_id, added_snapshot_id, the six *_data/delete_files_count
+  //     (CONTENT-GATED: a DATA manifest carries data counts + 0 delete counts, a DELETE manifest the
+  //     reverse), partition_summaries (list<struct: contains_null, contains_nan, lower_bound STRING,
+  //     upper_bound STRING>). REQUIRES ≥1 DATA manifest AND ≥1 DELETE manifest, and a PARTITIONED spec so
+  //     the summaries are non-empty.
+  //   * PARTITIONS (Java PartitionsTable) — one row per partition value over the CURRENT snapshot's LIVE
+  //     entries: partition(struct), spec_id, record_count, file_count, total_data_file_size_in_bytes, the
+  //     position/equality delete-count columns, last_updated_at(micros), last_updated_snapshot_id. REQUIRES
+  //     ≥2 partitions, one carrying BOTH data files and a position-delete (so the delete-count columns are
+  //     non-zero).
+  //
+  // THE A2 TABLE (its OWN subdir <dir>/table_a2 + its OWN final.metadata.json — A1's <dir>/table is
+  // untouched). Partition by identity(category), V2:
+  //   snapshot 1 (newAppend): data A(category=a, metrics+bounds), B(category=b), C(category=a), D(category=b)
+  //     -> 2 partitions; cat=a has 2 data files (A, C), cat=b has 2 (B, D).
+  //   snapshot 2 (newRowDelta): add a POSITION-DELETE for category=a
+  //     -> a DELETE manifest in the manifest list; cat=a gets non-zero position_delete_* counts.
+  //   snapshot 3 (newDelete): deleteFile(B) (category=b)
+  //     -> B becomes a DELETED tombstone (status 2) in the rewritten DATA manifest, for `entries`. D KEEPS
+  //        category=b ALIVE in `partitions` (Java's PartitionsTable only lists partitions with live
+  //        entries — deleting the ONLY cat=b file would drop the partition, so D is the live survivor that
+  //        guarantees the required ≥2 partition rows).
+  // The EXACT row values are whatever Java materializes (Java is the oracle; Rust must match) — the table
+  // only needs to HIT these cases, which the design above guarantees.
+  //
+  // The referenced .parquet data/delete paths need NOT exist on disk: the three tables read the MANIFEST
+  // entries (and, for `manifests`, the manifest-list), never the parquet — so PURE-METADATA DataFiles /
+  // FileMetadata builders are enough, exactly as A1.
+  // ===========================================================================================
+
+  /**
+   * The A2 half of the inspection-manifests oracle. Builds the richer partitioned V2 table on local disk
+   * under {@code <dir>/table_a2} via THREE real commits (newAppend + newRowDelta + newDelete), writes
+   * {@code <dir>/table_a2/metadata/final.metadata.json}, and emits the rows of Java's REAL {@link
+   * ManifestEntriesTable} / {@link ManifestsTable} / {@link PartitionsTable} (via {@link
+   * MetadataTableUtils} + {@code asDataTask().rows()} reading those on-disk manifests) as
+   * {@code java_entries.json} / {@code java_manifests.json} / {@code java_partitions.json}.
+   */
+  static final class InspectionManifestsA2Oracle {
+    private InspectionManifestsA2Oracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the richer partitioned V2 table on local disk under <dir>/table_a2 (A1's <dir>/table is
+      //    untouched). The location is the BARE absolute path so the manifest/manifest-list paths the
+      //    commits write are bare absolute paths the Rust FileIO resolves directly (same as A1).
+      File tableDir = dir.resolve("table_a2").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "value", Types.DoubleType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed); // persist v0 metadata so the BaseTable has a current metadata to evolve.
+      BaseTable table = new BaseTable(ops, "interop_inspection_manifests_a2");
+
+      // 2. FOUR DATA files: A + C in category=a, B + D in category=b. Each WITH metrics (column sizes +
+      //    value/null counts for ids 1/2/3 and lower/upper bounds for id (long) and value (double)) so the
+      //    `partitions` size/record rollups and the `manifests` partition_summaries are non-trivial.
+      DataFile dataFileA =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=a/00000-a.parquet")
+              .withFileSizeInBytes(1100L)
+              .withRecordCount(3L)
+              .withPartitionPath("category=a")
+              .withMetrics(metricsFor(3L, 1L, 3L, 10.5d, 30.5d))
+              .build();
+      DataFile dataFileB =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=b/00000-b.parquet")
+              .withFileSizeInBytes(900L)
+              .withRecordCount(2L)
+              .withPartitionPath("category=b")
+              .withMetrics(metricsFor(2L, 4L, 5L, 40.5d, 50.5d))
+              .build();
+      DataFile dataFileC =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=a/00001-c.parquet")
+              .withFileSizeInBytes(1300L)
+              .withRecordCount(4L)
+              .withPartitionPath("category=a")
+              .withMetrics(metricsFor(4L, 6L, 9L, 60.5d, 90.5d))
+              .build();
+      // D — the live cat=b survivor (B is deleted in s3; without D, cat=b would vanish from `partitions`).
+      DataFile dataFileD =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=b/00001-d.parquet")
+              .withFileSizeInBytes(700L)
+              .withRecordCount(1L)
+              .withPartitionPath("category=b")
+              .withMetrics(metricsFor(1L, 7L, 7L, 70.5d, 70.5d))
+              .build();
+
+      // 3. One POSITION-DELETE file in category=a (record_count 2) — so cat=a carries BOTH data files and a
+      //    position-delete, exercising the `partitions` delete-count columns + a DELETE manifest for
+      //    `manifests`.
+      DeleteFile deleteFileA =
+          FileMetadata.deleteFileBuilder(spec)
+              .ofPositionDeletes()
+              .withPath(tableDir.getAbsolutePath() + "/data/category=a/00000-a-deletes.parquet")
+              .withFileSizeInBytes(150L)
+              .withRecordCount(2L)
+              .withPartitionPath("category=a")
+              .build();
+
+      // 4. THREE real commits, each producing a snapshot:
+      //    s1 newAppend(A, B, C, D)  -> a DATA manifest + manifest-list.
+      //    s2 newRowDelta(+deleteFileA) -> a DELETE manifest (the manifest list now has a DATA + a DELETE
+      //       manifest, so `manifests` is content-gated and `partitions` cat=a has position-delete counts).
+      //    s3 newDelete(B) -> rewrites the DATA manifest, marking B as a DELETED tombstone (status 2) in
+      //       the CURRENT snapshot's manifests, which `entries` surfaces (and `files`/`partitions` drop).
+      //       D survives so cat=b is still a live partition.
+      table
+          .newAppend()
+          .appendFile(dataFileA)
+          .appendFile(dataFileB)
+          .appendFile(dataFileC)
+          .appendFile(dataFileD)
+          .commit();
+      table.newRowDelta().addDeletes(deleteFileA).commit();
+      table.newDelete().deleteFile(dataFileB).commit();
+
+      // 5. Write the FINAL metadata to a KNOWN path so the Rust test loads it deterministically. (The real
+      //    on-disk manifest-list + manifests already live under <dir>/table_a2/metadata/.)
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 6. Materialize + emit the rows of Java's REAL ManifestEntriesTable / ManifestsTable /
+      //    PartitionsTable. Same materializer as A1: MetadataTableUtils + planFiles() + asDataTask().rows(),
+      //    columns keyed BY NAME from mt.schema().columns(), eager per-row serialize.
+      writeJson(dir.resolve("java_entries.json"), rowsToJson(table, MetadataTableType.ENTRIES));
+      writeJson(dir.resolve("java_manifests.json"), rowsToJson(table, MetadataTableType.MANIFESTS));
+      writeJson(dir.resolve("java_partitions.json"), rowsToJson(table, MetadataTableType.PARTITIONS));
+      System.out.println("generated inspection-manifests A2 table + fixtures to " + dir);
+    }
+
+    /**
+     * Build a pure-metadata {@link Metrics} for the table schema {1 id long, 2 category string, 3 value
+     * double}: column_sizes + value_counts + null_value_counts for ids 1/2/3, and lower/upper bounds for id
+     * 1 (long) and id 3 (value, double). category (id 2) is excluded from bounds on purpose. Identical to
+     * A1's {@code metricsFor}.
+     */
+    private static Metrics metricsFor(
+        long recordCount, long idLower, long idUpper, double valueLower, double valueUpper) {
+      Map<Integer, Long> columnSizes = new LinkedHashMap<>();
+      columnSizes.put(1, 40L);
+      columnSizes.put(2, 24L);
+      columnSizes.put(3, 32L);
+      Map<Integer, Long> valueCounts = new LinkedHashMap<>();
+      valueCounts.put(1, recordCount);
+      valueCounts.put(2, recordCount);
+      valueCounts.put(3, recordCount);
+      Map<Integer, Long> nullValueCounts = new LinkedHashMap<>();
+      nullValueCounts.put(1, 0L);
+      nullValueCounts.put(2, 0L);
+      nullValueCounts.put(3, 0L);
+      Map<Integer, ByteBuffer> lowerBounds = new LinkedHashMap<>();
+      lowerBounds.put(1, Conversions.toByteBuffer(Types.LongType.get(), idLower));
+      lowerBounds.put(3, Conversions.toByteBuffer(Types.DoubleType.get(), valueLower));
+      Map<Integer, ByteBuffer> upperBounds = new LinkedHashMap<>();
+      upperBounds.put(1, Conversions.toByteBuffer(Types.LongType.get(), idUpper));
+      upperBounds.put(3, Conversions.toByteBuffer(Types.DoubleType.get(), valueUpper));
+      return new Metrics(
+          recordCount,
+          columnSizes,
+          valueCounts,
+          nullValueCounts,
+          null, // nan_value_counts — none (exercises a NULL/absent map column)
+          lowerBounds,
+          upperBounds);
+    }
+
+    /**
+     * Materialize the rows of Java's REAL metadata table of {@code type} (ManifestEntriesTable /
+     * ManifestsTable / PartitionsTable) via {@link MetadataTableUtils#createMetadataTableInstance} +
+     * {@code task.asDataTask().rows()} and serialize each row keyed BY COLUMN NAME (derived from
+     * {@code mt.schema().columns()}; NEVER hardcode positions). Each {@code asDataTask().rows()} for the
+     * entries/manifests/partitions tables reads the ON-DISK AVRO manifests + manifest-list through the
+     * table's LocalFileIO.
+     *
+     * <p>IMPORTANT: each row MUST be serialized EAGERLY inside the iteration — {@code rows()} reuses a
+     * single mutable projection per task, so stashing the {@link StructLike} references would yield the LAST
+     * row repeated. (Same eager-serialize discipline as A1.)
+     */
+    private static String rowsToJson(BaseTable baseTable, MetadataTableType type) {
+      Table mt = MetadataTableUtils.createMetadataTableInstance(baseTable, type);
+      List<Types.NestedField> columns = mt.schema().columns();
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            try (CloseableIterable<FileScanTask> tasks = mt.newScan().planFiles()) {
+              for (FileScanTask task : tasks) {
+                try (CloseableIterable<StructLike> taskRows = task.asDataTask().rows()) {
+                  for (StructLike row : taskRows) {
+                    gen.writeStartObject();
+                    for (int i = 0; i < columns.size(); i++) {
+                      Types.NestedField column = columns.get(i);
+                      writeField(gen, column.name(), column.type(), row.get(i, Object.class));
+                    }
+                    gen.writeEndObject();
+                  }
+                }
+              }
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * Serialize ONE named field of an arbitrary Iceberg type to JSON — the generic counterpart to A1's
+     * {@code fileRowToJson} (which special-cased the files table's flat columns). This walks the column's
+     * Iceberg {@link Type} so it serializes the entries table's NESTED {@code data_file} STRUCT (the SAME
+     * DataFile projection A1's files table flattened) AND the manifests table's
+     * {@code partition_summaries} LIST&lt;STRUCT&gt; AND the partitions table's {@code partition} STRUCT —
+     * all keyed by sub-field NAME, recursively. {@code readable_metrics} is DEFERRED exactly as A1 (its
+     * interior ordering depends on a JVM HashMap iteration order).
+     */
+    private static void writeField(JsonGenerator gen, String name, Type type, Object value)
+        throws IOException {
+      if (MetricsUtil.READABLE_METRICS.equals(name)) {
+        return; // DEFER readable_metrics (the entries table joins it as a top-level struct).
+      }
+      gen.writeFieldName(name);
+      writeValue(gen, name, type, value);
+    }
+
+    /** Serialize a value of the given Iceberg {@link Type}, dispatching struct / list / map / scalar. */
+    @SuppressWarnings("unchecked")
+    private static void writeValue(JsonGenerator gen, String name, Type type, Object value)
+        throws IOException {
+      if (value == null) {
+        gen.writeNull();
+        return;
+      }
+      if (type.isStructType()) {
+        writeStruct(gen, type.asStructType(), (StructLike) value);
+      } else if (type.isListType()) {
+        writeList(gen, type.asListType(), (List<?>) value);
+      } else if (type.isMapType()) {
+        // The metric/bound maps: {field_id: long} for the count maps, {field_id: hex} for the bound maps.
+        // Java keys them by Integer field id; bound VALUES are ByteBuffer (hex), count VALUES are Long.
+        gen.writeStartObject();
+        for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
+          String key = entry.getKey().toString();
+          Object element = entry.getValue();
+          if (element instanceof ByteBuffer) {
+            gen.writeStringField(key, toHex((ByteBuffer) element));
+          } else if (element instanceof Long) {
+            gen.writeNumberField(key, (Long) element);
+          } else if (element instanceof Integer) {
+            gen.writeNumberField(key, (Integer) element);
+          } else {
+            gen.writeStringField(key, element.toString());
+          }
+        }
+        gen.writeEndObject();
+      } else {
+        writeScalarValue(gen, name, value);
+      }
+    }
+
+    /** A STRUCT as a nested object keyed by sub-field NAME (recurses for nested structs/lists). */
+    private static void writeStruct(JsonGenerator gen, Types.StructType type, StructLike struct)
+        throws IOException {
+      gen.writeStartObject();
+      List<Types.NestedField> fields = type.fields();
+      for (int i = 0; i < fields.size(); i++) {
+        Types.NestedField field = fields.get(i);
+        writeField(gen, field.name(), field.type(), struct.get(i, Object.class));
+      }
+      gen.writeEndObject();
+    }
+
+    /** A LIST as a JSON array, each element serialized per the element type (e.g. partition_summaries). */
+    private static void writeList(JsonGenerator gen, Types.ListType type, List<?> list)
+        throws IOException {
+      gen.writeStartArray();
+      Type elementType = type.elementType();
+      for (Object element : list) {
+        writeValue(gen, "element", elementType, element);
+      }
+      gen.writeEndArray();
+    }
+
+    /** A scalar — number / boolean / ByteBuffer(hex) / CharSequence — written verbatim (no field name). */
+    private static void writeScalarValue(JsonGenerator gen, String name, Object value)
+        throws IOException {
+      if (value instanceof Integer) {
+        gen.writeNumber((Integer) value);
+      } else if (value instanceof Long) {
+        gen.writeNumber((Long) value);
+      } else if (value instanceof Float) {
+        gen.writeNumber((Float) value);
+      } else if (value instanceof Double) {
+        gen.writeNumber((Double) value);
+      } else if (value instanceof Boolean) {
+        gen.writeBoolean((Boolean) value);
+      } else if (value instanceof ByteBuffer) {
+        gen.writeString(toHex((ByteBuffer) value));
+      } else {
+        // file_path / file_format / lower_bound / upper_bound are CharSequence-y; toString() yields the
+        // underlying string. (manifests partition_summaries' lower/upper_bound are String in Java.)
+        gen.writeString(value.toString());
+      }
     }
 
     /** Lowercase hex of a {@link ByteBuffer}'s remaining bytes (does NOT consume the buffer). */

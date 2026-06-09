@@ -69,8 +69,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::types::{Int32Type, Int64Type, TimestampMicrosecondType};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, StructArray};
 use futures::TryStreamExt;
 use iceberg::TableIdent;
 use iceberg::io::FileIO;
@@ -276,9 +276,38 @@ fn load_table(dir: &std::path::Path) -> Table {
 // Arrow column extraction — a files-table batch into the comparable [`FileRow`]s.
 // ===========================================================================================
 
-/// Extract a files-table Arrow batch into [`FileRow`]s by COLUMN NAME (never by position), covering every
-/// column except the deferred `readable_metrics`.
-fn extract_rust_rows(batch: &RecordBatch) -> Vec<FileRow> {
+/// A by-name column source: a `files`-family Arrow batch (the A1 `files` scans) OR the nested `data_file`
+/// STRUCT inside an `entries` row (A2). Both `RecordBatch` and `StructArray` expose an identically-typed
+/// `column_by_name`, so the [`FileRow`] extraction below works against either — A1's `files` rows are read
+/// straight from the batch; A2's `entries.data_file` rows are read from the nested struct WITHOUT
+/// duplicating the (large) DataFile-projection extraction.
+trait ColumnSource {
+    fn column(&self, name: &str) -> Option<&ArrayRef>;
+    fn rows(&self) -> usize;
+}
+
+impl ColumnSource for RecordBatch {
+    fn column(&self, name: &str) -> Option<&ArrayRef> {
+        self.column_by_name(name)
+    }
+    fn rows(&self) -> usize {
+        self.num_rows()
+    }
+}
+
+impl ColumnSource for StructArray {
+    fn column(&self, name: &str) -> Option<&ArrayRef> {
+        self.column_by_name(name)
+    }
+    fn rows(&self) -> usize {
+        self.len()
+    }
+}
+
+/// Extract a files-family column source (a `files` batch OR an `entries.data_file` struct) into
+/// [`FileRow`]s by COLUMN NAME (never by position), covering every column except the deferred
+/// `readable_metrics`.
+fn extract_rust_rows(batch: &dyn ColumnSource) -> Vec<FileRow> {
     let content = primitive::<Int32Type>(batch, "content");
     let file_path = string_col(batch, "file_path");
     let file_format = string_col(batch, "file_format");
@@ -292,15 +321,12 @@ fn extract_rust_rows(batch: &RecordBatch) -> Vec<FileRow> {
     let referenced_data_file = string_col(batch, "referenced_data_file");
 
     // The `partition` struct's single `category` (Utf8) sub-field.
-    let partition = batch
-        .column_by_name("partition")
-        .expect("partition")
-        .as_struct();
+    let partition = batch.column("partition").expect("partition").as_struct();
     let partition_category = partition
         .column_by_name("category")
         .map(|c| c.as_string::<i32>());
 
-    (0..batch.num_rows())
+    (0..batch.rows())
         .map(|i| FileRow {
             content: content.value(i),
             file_path: file_path.value(i).to_string(),
@@ -334,18 +360,18 @@ fn extract_rust_rows(batch: &RecordBatch) -> Vec<FileRow> {
 }
 
 fn primitive<'a, T: arrow_array::types::ArrowPrimitiveType>(
-    batch: &'a RecordBatch,
+    batch: &'a dyn ColumnSource,
     name: &str,
 ) -> &'a arrow_array::PrimitiveArray<T> {
     batch
-        .column_by_name(name)
+        .column(name)
         .unwrap_or_else(|| panic!("column {name} present"))
         .as_primitive::<T>()
 }
 
-fn string_col<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
+fn string_col<'a>(batch: &'a dyn ColumnSource, name: &str) -> &'a StringArray {
     batch
-        .column_by_name(name)
+        .column(name)
         .unwrap_or_else(|| panic!("column {name} present"))
         .as_string::<i32>()
 }
@@ -376,9 +402,9 @@ fn opt_str(arr: &StringArray, i: usize) -> Option<String> {
 
 /// A `map<int, long>` metrics column at row `i` → `Some(HashMap)` when present, `None` when the map cell is
 /// NULL (matching Java's `null` for an absent metric map).
-fn long_map(batch: &RecordBatch, name: &str, i: usize) -> Option<HashMap<i32, i64>> {
+fn long_map(batch: &dyn ColumnSource, name: &str, i: usize) -> Option<HashMap<i32, i64>> {
     let map = batch
-        .column_by_name(name)
+        .column(name)
         .unwrap_or_else(|| panic!("column {name} present"))
         .as_map();
     if map.is_null(i) {
@@ -395,9 +421,9 @@ fn long_map(batch: &RecordBatch, name: &str, i: usize) -> Option<HashMap<i32, i6
 }
 
 /// A `map<int, binary>` bound column at row `i` → `Some(HashMap<field_id, raw bytes>)` or `None`.
-fn bytes_map(batch: &RecordBatch, name: &str, i: usize) -> Option<HashMap<i32, Vec<u8>>> {
+fn bytes_map(batch: &dyn ColumnSource, name: &str, i: usize) -> Option<HashMap<i32, Vec<u8>>> {
     let map = batch
-        .column_by_name(name)
+        .column(name)
         .unwrap_or_else(|| panic!("column {name} present"))
         .as_map();
     if map.is_null(i) {
@@ -416,9 +442,9 @@ fn bytes_map(batch: &RecordBatch, name: &str, i: usize) -> Option<HashMap<i32, V
 }
 
 /// A `list<long>` column at row `i` → `Some(Vec)` or `None`.
-fn long_list(batch: &RecordBatch, name: &str, i: usize) -> Option<Vec<i64>> {
+fn long_list(batch: &dyn ColumnSource, name: &str, i: usize) -> Option<Vec<i64>> {
     let list = batch
-        .column_by_name(name)
+        .column(name)
         .unwrap_or_else(|| panic!("column {name} present"))
         .as_list::<i32>();
     if list.is_null(i) {
@@ -430,9 +456,9 @@ fn long_list(batch: &RecordBatch, name: &str, i: usize) -> Option<Vec<i64>> {
 }
 
 /// A `list<int>` column at row `i` → `Some(Vec)` or `None`.
-fn int_list(batch: &RecordBatch, name: &str, i: usize) -> Option<Vec<i32>> {
+fn int_list(batch: &dyn ColumnSource, name: &str, i: usize) -> Option<Vec<i32>> {
     let list = batch
-        .column_by_name(name)
+        .column(name)
         .unwrap_or_else(|| panic!("column {name} present"))
         .as_list::<i32>();
     if list.is_null(i) {
@@ -444,9 +470,9 @@ fn int_list(batch: &RecordBatch, name: &str, i: usize) -> Option<Vec<i32>> {
 }
 
 /// An optional binary column (`key_metadata`) at row `i`. The files table stores it as `LargeBinary`.
-fn opt_binary(batch: &RecordBatch, name: &str, i: usize) -> Option<Vec<u8>> {
+fn opt_binary(batch: &dyn ColumnSource, name: &str, i: usize) -> Option<Vec<u8>> {
     let arr = batch
-        .column_by_name(name)
+        .column(name)
         .unwrap_or_else(|| panic!("column {name} present"))
         .as_binary::<i64>();
     if arr.is_null(i) {
@@ -676,4 +702,641 @@ async fn test_files_tables_match_java_rows_from_real_manifests() {
 /// The trailing path segment (e.g. `00000-a.parquet`) of a file path.
 fn leaf(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+// ===========================================================================================
+// A2 — the `entries` / `manifests` / `partitions` manifest-reading inspection tables.
+//
+// Builds DIRECTLY on the A1 harness above (reusing `manifest_dir()`, the `FileRow` model + its `canonical`
+// representation-divergence collapse, the `ColumnSource`-based DataFile extraction, the hex decode, and
+// `FileIO::new_with_fs()`). The Java oracle's `generate-inspection-manifests` mode now ALSO writes a
+// richer V2 table to `<dir>/table_a2` (A1's `<dir>/table` is untouched) — partition by identity(category)
+// with snapshots {append A,B,C,D; row-delta +pos-delete(cat=a); delete B} — and emits
+// `java_entries.json` / `java_manifests.json` / `java_partitions.json` (the rows of Java's REAL
+// ManifestEntriesTable / ManifestsTable / PartitionsTable). These three tests load
+// `<dir>/table_a2/metadata/final.metadata.json`, run `inspect().entries()/.manifests()/.partitions()`,
+// and assert field-for-field equality vs the Java rows, order-independent.
+//
+// Same env gate as A1 (`ICEBERG_INTEROP_MANIFEST_DIR`): a clean NO-OP when unset. `readable_metrics` (the
+// entries table's trailing top-level virtual struct) is DEFERRED exactly as A1.
+// ===========================================================================================
+
+/// Build a `Table` over the Java-written A2 `final.metadata.json` (under `<dir>/table_a2`), local-fs FileIO.
+fn load_table_a2(dir: &std::path::Path) -> Table {
+    let metadata_path = dir.join("table_a2/metadata/final.metadata.json");
+    let json = fs::read_to_string(&metadata_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", metadata_path.display()));
+    let metadata: TableMetadata = serde_json::from_str(&json)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", metadata_path.display()));
+    Table::builder()
+        .metadata(metadata)
+        .metadata_location(metadata_path.to_string_lossy().to_string())
+        .identifier(
+            TableIdent::from_strs(["interop", "inspection_manifests_a2"])
+                .expect("valid identifier"),
+        )
+        .file_io(FileIO::new_with_fs())
+        .build()
+        .expect("build A2 table from Java-written final.metadata.json")
+}
+
+/// Read + parse one Java JSON fixture into `T` (a typed row vector).
+fn read_java<T: serde::de::DeserializeOwned>(dir: &std::path::Path, file_name: &str) -> Vec<T> {
+    let path = dir.join(file_name);
+    let json = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str::<Vec<T>>(&json)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// `entries` — one row per manifest entry of the current snapshot's manifests, INCLUDING DELETED
+// tombstones (status 2). Columns: status, snapshot_id, sequence_number, file_sequence_number, and the
+// NESTED `data_file` struct (the SAME DataFile projection A1 flattened — reused via `extract_rust_rows`).
+// ---------------------------------------------------------------------------------------------
+
+/// One Java `ManifestEntriesTable` row: the 4 scalar columns + the nested `data_file` (a [`JavaFileRow`]).
+#[derive(Debug, Clone, Deserialize)]
+struct JavaEntryRow {
+    status: i32,
+    snapshot_id: Option<i64>,
+    sequence_number: Option<i64>,
+    file_sequence_number: Option<i64>,
+    data_file: JavaFileRow,
+}
+
+/// A normalized, fully-comparable `entries` row — the 4 scalars + the canonicalized nested [`FileRow`].
+#[derive(Debug, Clone, PartialEq)]
+struct EntryRow {
+    status: i32,
+    snapshot_id: Option<i64>,
+    sequence_number: Option<i64>,
+    file_sequence_number: Option<i64>,
+    data_file: FileRow,
+}
+
+impl JavaEntryRow {
+    fn into_entry_row(self) -> EntryRow {
+        EntryRow {
+            status: self.status,
+            snapshot_id: self.snapshot_id,
+            sequence_number: self.sequence_number,
+            file_sequence_number: self.file_sequence_number,
+            // Same canonicalization A1 applies to the files rows (absent metric/bound map None≡empty).
+            data_file: self.data_file.into_file_row().canonical(),
+        }
+    }
+}
+
+/// Extract the Rust `entries` batch into [`EntryRow`]s: the 4 scalar columns by name, plus the nested
+/// `data_file` STRUCT fed through the A1 [`extract_rust_rows`] (reused via the [`ColumnSource`] trait) and
+/// canonicalized. `readable_metrics` (a trailing TOP-LEVEL struct, not nested in `data_file`) is ignored.
+fn extract_entry_rows(batch: &RecordBatch) -> Vec<EntryRow> {
+    let status = primitive::<Int32Type>(batch, "status");
+    let snapshot_id = primitive::<Int64Type>(batch, "snapshot_id");
+    let sequence_number = primitive::<Int64Type>(batch, "sequence_number");
+    let file_sequence_number = primitive::<Int64Type>(batch, "file_sequence_number");
+    let data_file_struct = batch
+        .column_by_name("data_file")
+        .expect("data_file struct column")
+        .as_struct();
+    let data_file_rows: Vec<FileRow> = extract_rust_rows(data_file_struct)
+        .into_iter()
+        .map(FileRow::canonical)
+        .collect();
+
+    (0..batch.num_rows())
+        .map(|i| EntryRow {
+            status: status.value(i),
+            snapshot_id: opt_i64(snapshot_id, i),
+            sequence_number: opt_i64(sequence_number, i),
+            file_sequence_number: opt_i64(file_sequence_number, i),
+            data_file: data_file_rows[i].clone(),
+        })
+        .collect()
+}
+
+/// Sort `entries` rows order-independently by `(data_file.file_path, status)`.
+fn sorted_entries(mut rows: Vec<EntryRow>) -> Vec<EntryRow> {
+    rows.sort_by(|a, b| {
+        a.data_file
+            .file_path
+            .cmp(&b.data_file.file_path)
+            .then(a.status.cmp(&b.status))
+    });
+    rows
+}
+
+#[tokio::test]
+async fn test_entries_table_matches_java_rows() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_entries_table_matches_java_rows — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a2(&dir);
+    let batches: Vec<RecordBatch> = table
+        .inspect()
+        .entries()
+        .scan()
+        .await
+        .expect("entries scan")
+        .try_collect()
+        .await
+        .expect("collect entries scan");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_entry_rows(batch));
+    }
+    let rust_rows = sorted_entries(rust_rows);
+
+    let java_rows = sorted_entries(
+        read_java::<JavaEntryRow>(&dir, "java_entries.json")
+            .into_iter()
+            .map(JavaEntryRow::into_entry_row)
+            .collect(),
+    );
+
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust `entries` rows must equal Java's ManifestEntriesTable rows field-for-field (status, \
+         snapshot_id, sequence_number, file_sequence_number, and the nested data_file struct) — \
+         readable_metrics deferred, the absent-map-vs-empty divergence canonicalized as in A1"
+    );
+
+    // Focused: the headline difference from `files` — a DELETED tombstone (status 2). The A2 table deletes
+    // data file B in the last commit, so B appears as a status-2 row that `files` would have excluded.
+    let tombstones: Vec<&EntryRow> = rust_rows.iter().filter(|r| r.status == 2).collect();
+    assert!(
+        !tombstones.is_empty(),
+        "the `entries` table MUST surface ≥1 DELETED tombstone (status 2) — the difference from `files`"
+    );
+    assert!(
+        tombstones.iter().all(|r| r.data_file.content == 0),
+        "the deleted tombstone is the data file B (content == 0)"
+    );
+
+    // The position-delete file is the ADDED (status 1) row; its nested data_file reports content == 1.
+    let added_delete: Vec<&EntryRow> = rust_rows
+        .iter()
+        .filter(|r| r.data_file.content == 1)
+        .collect();
+    assert_eq!(
+        added_delete.len(),
+        1,
+        "exactly one position-delete entry in the current snapshot's manifests"
+    );
+    assert_eq!(
+        added_delete[0].status, 1,
+        "the position-delete file was ADDED (status 1) and never rewritten, so it stays status 1"
+    );
+
+    // file_format renders UPPERCASE in the nested struct, matching Java's `FileFormat` enum name.
+    assert!(
+        rust_rows
+            .iter()
+            .all(|r| r.data_file.file_format == "PARQUET"),
+        "the nested data_file.file_format is UPPERCASE (matching Java)"
+    );
+
+    println!(
+        "test_entries_table_matches_java_rows OK — {} entries matched Java (≥1 status-2 tombstone)",
+        rust_rows.len()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// `manifests` — one row per manifest in the CURRENT snapshot's manifest list. Content-gated counts + the
+// partition_summaries list (contains_null / contains_nan / lower_bound STRING / upper_bound STRING).
+// ---------------------------------------------------------------------------------------------
+
+/// One Java `ManifestsTable` partition-summary struct (lower/upper bounds are STRINGS in Java).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct JavaPartitionSummary {
+    contains_null: bool,
+    contains_nan: Option<bool>,
+    lower_bound: Option<String>,
+    upper_bound: Option<String>,
+}
+
+/// One Java `ManifestsTable` row — every column incl. the six content-gated counts + the summaries list.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct JavaManifestRow {
+    content: i32,
+    path: String,
+    length: i64,
+    partition_spec_id: i32,
+    added_snapshot_id: i64,
+    added_data_files_count: i32,
+    existing_data_files_count: i32,
+    deleted_data_files_count: i32,
+    added_delete_files_count: i32,
+    existing_delete_files_count: i32,
+    deleted_delete_files_count: i32,
+    partition_summaries: Vec<JavaPartitionSummary>,
+}
+
+/// A normalized, comparable `manifests` row (Java + Rust both produce one; equality is a single `==`).
+#[derive(Debug, Clone, PartialEq)]
+struct ManifestRow {
+    content: i32,
+    path: String,
+    length: i64,
+    partition_spec_id: i32,
+    added_snapshot_id: i64,
+    added_data_files_count: i32,
+    existing_data_files_count: i32,
+    deleted_data_files_count: i32,
+    added_delete_files_count: i32,
+    existing_delete_files_count: i32,
+    deleted_delete_files_count: i32,
+    partition_summaries: Vec<PartitionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PartitionSummary {
+    contains_null: bool,
+    contains_nan: Option<bool>,
+    lower_bound: Option<String>,
+    upper_bound: Option<String>,
+}
+
+impl JavaManifestRow {
+    fn into_manifest_row(self) -> ManifestRow {
+        ManifestRow {
+            content: self.content,
+            path: self.path,
+            length: self.length,
+            partition_spec_id: self.partition_spec_id,
+            added_snapshot_id: self.added_snapshot_id,
+            added_data_files_count: self.added_data_files_count,
+            existing_data_files_count: self.existing_data_files_count,
+            deleted_data_files_count: self.deleted_data_files_count,
+            added_delete_files_count: self.added_delete_files_count,
+            existing_delete_files_count: self.existing_delete_files_count,
+            deleted_delete_files_count: self.deleted_delete_files_count,
+            partition_summaries: self
+                .partition_summaries
+                .into_iter()
+                .map(|s| PartitionSummary {
+                    contains_null: s.contains_null,
+                    contains_nan: s.contains_nan,
+                    lower_bound: s.lower_bound,
+                    upper_bound: s.upper_bound,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Extract the Rust `manifests` batch into [`ManifestRow`]s by COLUMN NAME, including the nested
+/// `partition_summaries` list<struct>.
+fn extract_manifest_rows(batch: &RecordBatch) -> Vec<ManifestRow> {
+    let content = primitive::<Int32Type>(batch, "content");
+    let path = string_col(batch, "path");
+    let length = primitive::<Int64Type>(batch, "length");
+    let partition_spec_id = primitive::<Int32Type>(batch, "partition_spec_id");
+    let added_snapshot_id = primitive::<Int64Type>(batch, "added_snapshot_id");
+    let added_data = primitive::<Int32Type>(batch, "added_data_files_count");
+    let existing_data = primitive::<Int32Type>(batch, "existing_data_files_count");
+    let deleted_data = primitive::<Int32Type>(batch, "deleted_data_files_count");
+    let added_delete = primitive::<Int32Type>(batch, "added_delete_files_count");
+    let existing_delete = primitive::<Int32Type>(batch, "existing_delete_files_count");
+    let deleted_delete = primitive::<Int32Type>(batch, "deleted_delete_files_count");
+    let summaries = batch
+        .column_by_name("partition_summaries")
+        .expect("partition_summaries")
+        .as_list::<i32>();
+
+    (0..batch.num_rows())
+        .map(|i| ManifestRow {
+            content: content.value(i),
+            path: path.value(i).to_string(),
+            length: length.value(i),
+            partition_spec_id: partition_spec_id.value(i),
+            added_snapshot_id: added_snapshot_id.value(i),
+            added_data_files_count: added_data.value(i),
+            existing_data_files_count: existing_data.value(i),
+            deleted_data_files_count: deleted_data.value(i),
+            added_delete_files_count: added_delete.value(i),
+            existing_delete_files_count: existing_delete.value(i),
+            deleted_delete_files_count: deleted_delete.value(i),
+            partition_summaries: extract_partition_summaries(&summaries.value(i)),
+        })
+        .collect()
+}
+
+/// Extract one row's `partition_summaries` list element (a struct array) into [`PartitionSummary`]s.
+fn extract_partition_summaries(list_values: &ArrayRef) -> Vec<PartitionSummary> {
+    let structs = list_values.as_struct();
+    let contains_null = structs
+        .column_by_name("contains_null")
+        .expect("contains_null")
+        .as_boolean();
+    let contains_nan = structs
+        .column_by_name("contains_nan")
+        .expect("contains_nan")
+        .as_boolean();
+    let lower = structs
+        .column_by_name("lower_bound")
+        .expect("lower_bound")
+        .as_string::<i32>();
+    let upper = structs
+        .column_by_name("upper_bound")
+        .expect("upper_bound")
+        .as_string::<i32>();
+    (0..structs.len())
+        .map(|i| PartitionSummary {
+            contains_null: contains_null.value(i),
+            contains_nan: if contains_nan.is_null(i) {
+                None
+            } else {
+                Some(contains_nan.value(i))
+            },
+            lower_bound: if lower.is_null(i) {
+                None
+            } else {
+                Some(lower.value(i).to_string())
+            },
+            upper_bound: if upper.is_null(i) {
+                None
+            } else {
+                Some(upper.value(i).to_string())
+            },
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_manifests_table_matches_java_rows() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_manifests_table_matches_java_rows — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a2(&dir);
+    let batches: Vec<RecordBatch> = table
+        .inspect()
+        .manifests()
+        .scan()
+        .await
+        .expect("manifests scan")
+        .try_collect()
+        .await
+        .expect("collect manifests scan");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_manifest_rows(batch));
+    }
+    rust_rows.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut java_rows: Vec<ManifestRow> = read_java::<JavaManifestRow>(&dir, "java_manifests.json")
+        .into_iter()
+        .map(JavaManifestRow::into_manifest_row)
+        .collect();
+    java_rows.sort_by(|a, b| a.path.cmp(&b.path));
+
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust `manifests` rows must equal Java's ManifestsTable rows field-for-field (content, path, \
+         length, spec id, added_snapshot_id, the six content-gated counts, and partition_summaries)"
+    );
+
+    // Focused: content gating. A DATA manifest (content == 0) has ZERO delete-file counts; a DELETE
+    // manifest (content == 1) has ZERO data-file counts.
+    let data_manifests: Vec<&ManifestRow> = rust_rows.iter().filter(|r| r.content == 0).collect();
+    let delete_manifests: Vec<&ManifestRow> = rust_rows.iter().filter(|r| r.content == 1).collect();
+    assert!(
+        !data_manifests.is_empty(),
+        "≥1 DATA manifest in the current snapshot's manifest list"
+    );
+    assert!(
+        !delete_manifests.is_empty(),
+        "≥1 DELETE manifest in the current snapshot's manifest list"
+    );
+    for m in &data_manifests {
+        assert_eq!(
+            (
+                m.added_delete_files_count,
+                m.existing_delete_files_count,
+                m.deleted_delete_files_count
+            ),
+            (0, 0, 0),
+            "a DATA manifest carries ZERO delete-file counts (content gating)"
+        );
+    }
+    for m in &delete_manifests {
+        assert_eq!(
+            (
+                m.added_data_files_count,
+                m.existing_data_files_count,
+                m.deleted_data_files_count
+            ),
+            (0, 0, 0),
+            "a DELETE manifest carries ZERO data-file counts (content gating)"
+        );
+    }
+
+    // partition_summaries are non-empty (the spec is partitioned by identity(category)).
+    assert!(
+        rust_rows.iter().all(|m| !m.partition_summaries.is_empty()),
+        "every manifest's partition_summaries is non-empty (partitioned spec)"
+    );
+
+    println!(
+        "test_manifests_table_matches_java_rows OK — {} manifests matched Java (content-gated counts + \
+         non-empty summaries)",
+        rust_rows.len()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// `partitions` — one row per partition value over the current snapshot's LIVE entries. The partition
+// struct + spec_id + record/file/size rollups + the four delete-count columns + last_updated_at (µs) +
+// last_updated_snapshot_id.
+// ---------------------------------------------------------------------------------------------
+
+/// One Java `PartitionsTable` row. The `partition` struct reuses the A1 [`JavaPartition`] (single
+/// `category`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct JavaPartitionRow {
+    partition: JavaPartition,
+    spec_id: i32,
+    record_count: i64,
+    file_count: i32,
+    total_data_file_size_in_bytes: i64,
+    position_delete_record_count: i64,
+    position_delete_file_count: i32,
+    equality_delete_record_count: i64,
+    equality_delete_file_count: i32,
+    last_updated_at: Option<i64>,
+    last_updated_snapshot_id: Option<i64>,
+}
+
+/// A normalized, comparable `partitions` row.
+#[derive(Debug, Clone, PartialEq)]
+struct PartitionRow {
+    partition_category: Option<String>,
+    spec_id: i32,
+    record_count: i64,
+    file_count: i32,
+    total_data_file_size_in_bytes: i64,
+    position_delete_record_count: i64,
+    position_delete_file_count: i32,
+    equality_delete_record_count: i64,
+    equality_delete_file_count: i32,
+    last_updated_at: Option<i64>,
+    last_updated_snapshot_id: Option<i64>,
+}
+
+impl JavaPartitionRow {
+    fn into_partition_row(self) -> PartitionRow {
+        PartitionRow {
+            partition_category: self.partition.category,
+            spec_id: self.spec_id,
+            record_count: self.record_count,
+            file_count: self.file_count,
+            total_data_file_size_in_bytes: self.total_data_file_size_in_bytes,
+            position_delete_record_count: self.position_delete_record_count,
+            position_delete_file_count: self.position_delete_file_count,
+            equality_delete_record_count: self.equality_delete_record_count,
+            equality_delete_file_count: self.equality_delete_file_count,
+            last_updated_at: self.last_updated_at,
+            last_updated_snapshot_id: self.last_updated_snapshot_id,
+        }
+    }
+}
+
+/// Extract the Rust `partitions` batch into [`PartitionRow`]s by COLUMN NAME, incl. the `partition` struct
+/// (`category` sub-field) and `last_updated_at` (timestamptz µs).
+fn extract_partition_rows(batch: &RecordBatch) -> Vec<PartitionRow> {
+    let partition = batch
+        .column_by_name("partition")
+        .expect("partition")
+        .as_struct();
+    let partition_category = partition
+        .column_by_name("category")
+        .map(|c| c.as_string::<i32>());
+    let spec_id = primitive::<Int32Type>(batch, "spec_id");
+    let record_count = primitive::<Int64Type>(batch, "record_count");
+    let file_count = primitive::<Int32Type>(batch, "file_count");
+    let total_size = primitive::<Int64Type>(batch, "total_data_file_size_in_bytes");
+    let pos_del_records = primitive::<Int64Type>(batch, "position_delete_record_count");
+    let pos_del_files = primitive::<Int32Type>(batch, "position_delete_file_count");
+    let eq_del_records = primitive::<Int64Type>(batch, "equality_delete_record_count");
+    let eq_del_files = primitive::<Int32Type>(batch, "equality_delete_file_count");
+    let last_updated_at = primitive::<TimestampMicrosecondType>(batch, "last_updated_at");
+    let last_updated_snapshot_id = primitive::<Int64Type>(batch, "last_updated_snapshot_id");
+
+    (0..batch.num_rows())
+        .map(|i| PartitionRow {
+            partition_category: partition_category.and_then(|c| {
+                if c.is_null(i) {
+                    None
+                } else {
+                    Some(c.value(i).to_string())
+                }
+            }),
+            spec_id: spec_id.value(i),
+            record_count: record_count.value(i),
+            file_count: file_count.value(i),
+            total_data_file_size_in_bytes: total_size.value(i),
+            position_delete_record_count: pos_del_records.value(i),
+            position_delete_file_count: pos_del_files.value(i),
+            equality_delete_record_count: eq_del_records.value(i),
+            equality_delete_file_count: eq_del_files.value(i),
+            last_updated_at: if last_updated_at.is_null(i) {
+                None
+            } else {
+                Some(last_updated_at.value(i))
+            },
+            last_updated_snapshot_id: opt_i64(last_updated_snapshot_id, i),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_partitions_table_matches_java_rows() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_partitions_table_matches_java_rows — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a2(&dir);
+    let batches: Vec<RecordBatch> = table
+        .inspect()
+        .partitions()
+        .scan()
+        .await
+        .expect("partitions scan")
+        .try_collect()
+        .await
+        .expect("collect partitions scan");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_partition_rows(batch));
+    }
+    rust_rows.sort_by(|a, b| a.partition_category.cmp(&b.partition_category));
+
+    let mut java_rows: Vec<PartitionRow> =
+        read_java::<JavaPartitionRow>(&dir, "java_partitions.json")
+            .into_iter()
+            .map(JavaPartitionRow::into_partition_row)
+            .collect();
+    java_rows.sort_by(|a, b| a.partition_category.cmp(&b.partition_category));
+
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust `partitions` rows must equal Java's PartitionsTable rows field-for-field (the partition \
+         struct, spec_id, record/file/size rollups, the four delete-count columns, last_updated_at µs, \
+         last_updated_snapshot_id)"
+    );
+
+    // Focused: ≥2 partition rows; the cat=a partition received a position-delete so its delete counts are
+    // non-zero, and its total_data_file_size_in_bytes counts ONLY the data files (not the delete file).
+    assert!(
+        rust_rows.len() >= 2,
+        "≥2 partition rows (the A2 table partitions cat=a and cat=b)"
+    );
+    let cat_a = rust_rows
+        .iter()
+        .find(|r| r.partition_category.as_deref() == Some("a"))
+        .expect("a cat=a partition row");
+    assert!(
+        cat_a.position_delete_record_count > 0 && cat_a.position_delete_file_count > 0,
+        "the cat=a partition received a position-delete: its position_delete_* counts are non-zero"
+    );
+    // cat=a has data files A (1100) + C (1300) = 2400; the 150-byte delete file is NOT counted here.
+    assert_eq!(
+        cat_a.total_data_file_size_in_bytes, 2400,
+        "total_data_file_size_in_bytes counts ONLY data-file sizes (A 1100 + C 1300), not the delete file"
+    );
+    assert_eq!(
+        cat_a.file_count, 2,
+        "cat=a file_count is the 2 DATA files (A, C); deletes are counted in the delete columns"
+    );
+
+    let cat_b = rust_rows
+        .iter()
+        .find(|r| r.partition_category.as_deref() == Some("b"))
+        .expect("a cat=b partition row");
+    assert_eq!(
+        cat_b.position_delete_record_count, 0,
+        "the cat=b partition received no delete (only the surviving data file D)"
+    );
+
+    println!(
+        "test_partitions_table_matches_java_rows OK — {} partitions matched Java (cat=a delete counts \
+         non-zero)",
+        rust_rows.len()
+    );
 }

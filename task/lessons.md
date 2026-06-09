@@ -2426,3 +2426,31 @@ How to use it (see the manuals' §2):
   documented each — the right move (mirrors the existing GAP_MATRIX "known divergence" pattern for the
   unpartitioned-partition column). The reviewer mutation-probed the comparison (corrupt a `record_count` and a
   single lower-bound hex byte → both FAIL) to prove it's byte/value-level, not a false-pass.
+
+### 2026-06-09 (Manifest-reading interop A2 — `entries`/`manifests`/`partitions` — ORCHESTRATOR + REVIEWER Opus)
+- **Interop surfaced a REAL production parity bug — and the FIX was a verified one-liner.** Rust
+  `inspect/partition_summary.rs::bound_to_string` rendered a STRING partition bound JSON-QUOTED (`"a"`) via
+  `Datum::to_string`, whereas Java `ManifestsTable.partitionSummariesToRows` (core L117–144) renders each
+  bound via `Transform.toHumanString(type, value)` → bare `a` for a string. Fix: `Datum::to_string` →
+  `Datum::to_human_string` (datum.rs:1195 — raw for `PrimitiveLiteral::String`, delegates to `to_string` for
+  EVERY other primitive). Because non-string bounds are byte-identical, no int/long-partition unit test broke;
+  the new A2 `manifests` test pins the bare-string case. **Verify BOTH halves before accepting a parity fix:**
+  (a) the Rust method's exact semantics (here: only strings change), (b) the Java call-site
+  (`grep ManifestsTable` → `toHumanString`). This is the payoff of interop testing on partitioned tables (the
+  pure-metadata + int-partitioned unit fixtures never exercised a string partition bound).
+- **Don't predict the exact metadata-table rows — let Java materialize them and assert Rust==Java.** The A2
+  prompt guessed surviving data files would be status 1 (ADDED); Java's `newDelete` REWRITES the DATA manifest,
+  so survivors are carried as status 0 (EXISTING) and only the position-delete is status 1. The builder
+  asserted against Java's REAL rows (oracle wins) and still hit the required headline (a status==2 tombstone).
+  Build a table RICH enough to hit the cases (tombstone, content-gated manifests, multi-partition + deletes);
+  the values are whatever Java produces.
+- **A `newDelete(file)` removes that partition's only live data → the partition VANISHES from `partitions`.**
+  Keep a SURVIVING data file in a partition you want to remain a row, while still deleting another file to
+  create the `entries` DELETED tombstone (A2 added D=cat=b so cat=b stays a live partition after deleting B).
+- **Reuse the nested-struct extraction across tables via a small trait, not a copy.** `entries.data_file` is
+  the SAME 21-field DataFile projection as `files`; the builder added a `ColumnSource` trait so A1's `FileRow`
+  extraction runs over a `StructArray` (nested) as well as a `RecordBatch` (flat) — no duplicate extractor.
+- **Keep increments isolated by writing a SEPARATE table per increment** (`<dir>/table` for A1,
+  `<dir>/table_a2` for A2) under the same run script + test file, so a richer A2 table (with a tombstone that
+  changes the live-file set) does NOT churn A1's committed-behavior assertions. Both are regenerated; the
+  reviewer confirmed A1 stayed green throughout.

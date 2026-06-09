@@ -17,26 +17,31 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# MANIFEST-READING inspection interop harness — the `files` / `data_files` / `delete_files` tables (A1).
+# MANIFEST-READING inspection interop harness — the `files` / `data_files` / `delete_files` tables (A1)
+# PLUS the `entries` / `manifests` / `partitions` tables (A2).
 #
 # This is a TEST-ONLY ORACLE (a dev tool, like dev/spark/) — it is NOT part of the shipped Rust library, and
 # it is NOT part of the offline `cargo test` gate (it needs Java + Maven). Unlike the pure-metadata
 # inspection interop (committed JSON, offline), these tables read REAL ON-DISK AVRO manifests, so the oracle
-# WRITES A REAL TABLE to a temp dir each run and an ENV-GATED Rust test reads it. Nothing binary is
+# WRITES REAL TABLES to a temp dir each run and ENV-GATED Rust tests read them. Nothing binary is
 # committed — the committed artifacts are the oracle code (InteropOracle.java), the Rust test
 # (interop_inspection_manifests.rs), and this run script.
 #
 # Methodology (regenerate-and-compare):
 #   1. mvn ... -Dexec.args=generate-inspection-manifests -Dinterop.inspection_manifests.dir="$TMP"
-#        -> The Java oracle builds a partitioned V2 table on local disk under "$TMP/table" via REAL commits
-#           (newAppend writes a DATA manifest + manifest-list; newRowDelta writes a DELETE manifest), writes
-#           "$TMP/table/metadata/final.metadata.json", and materializes the rows of Java's REAL FilesTable /
-#           DataFilesTable / DeleteFilesTable into "$TMP/java_{files,data_files,delete_files}.json".
+#        -> The Java oracle builds the A1 partitioned V2 table on local disk under "$TMP/table" via REAL
+#           commits (newAppend writes a DATA manifest + manifest-list; newRowDelta writes a DELETE manifest),
+#           writes "$TMP/table/metadata/final.metadata.json", and materializes the rows of Java's REAL
+#           FilesTable / DataFilesTable / DeleteFilesTable into "$TMP/java_{files,data_files,delete_files}.json".
+#           The SAME invocation ALSO builds a SECOND, richer A2 table under "$TMP/table_a2" (append A,B,C,D;
+#           row-delta a position-delete for cat=a; delete B) and materializes Java's REAL ManifestEntriesTable
+#           / ManifestsTable / PartitionsTable into "$TMP/java_{entries,manifests,partitions}.json".
 #   2. ICEBERG_INTEROP_MANIFEST_DIR="$TMP" cargo test ... interop_inspection_manifests
-#        -> The env-gated Rust test loads "$TMP/table/metadata/final.metadata.json", builds a Table over a
-#           local-filesystem FileIO (resolving the absolute manifest paths), runs
-#           inspect().files()/.data_files()/.delete_files().scan(), and compares EVERY column (except the
-#           deferred readable_metrics) field-for-field, order-independent, against the Java rows.
+#        -> The env-gated Rust tests load "$TMP/table[/_a2]/metadata/final.metadata.json", build a Table over
+#           a local-filesystem FileIO (resolving the absolute manifest paths), run
+#           inspect().files()/.data_files()/.delete_files() (A1) and .entries()/.manifests()/.partitions()
+#           (A2) .scan(), and compare EVERY column (except the deferred readable_metrics) field-for-field,
+#           order-independent, against the Java rows.
 #
 # Without ICEBERG_INTEROP_MANIFEST_DIR the Rust test is a clean no-op (it stays green in the offline gate);
 # this script is what flips it into the REAL comparison.
@@ -58,7 +63,7 @@ echo "==> [1/3] Reset the temp table dir: ${TMP}"
 rm -rf "${TMP}"
 mkdir -p "${TMP}"
 
-echo "==> [2/3] Java oracle: write a REAL partitioned V2 table + emit java_{files,data_files,delete_files}.json"
+echo "==> [2/3] Java oracle: write REAL partitioned V2 tables (A1 table + A2 table_a2) + emit java_*.json"
 (
   cd "${SCRIPT_DIR}"
   JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
@@ -68,11 +73,11 @@ echo "==> [2/3] Java oracle: write a REAL partitioned V2 table + emit java_{file
     -Dinterop.inspection_manifests.dir="${TMP}"
 )
 
-echo "==> [3/3] Rust: load final.metadata.json, scan files/data_files/delete_files, compare vs Java rows"
+echo "==> [3/3] Rust: load final.metadata.json (A1) + table_a2/...(A2), scan all six tables, compare vs Java"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_MANIFEST_DIR="${TMP}" \
     cargo test -p iceberg --test interop_inspection_manifests -- --nocapture
 )
 
-echo "==> DONE — manifest-reading inspection interop (files / data_files / delete_files) passed."
+echo "==> DONE — manifest-reading inspection interop passed (A1 files/data_files/delete_files + A2 entries/manifests/partitions)."

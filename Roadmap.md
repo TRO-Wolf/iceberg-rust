@@ -600,6 +600,17 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      parity gap to follow up; on-disk both write lowercase, verified) + absent metric-map `{}` vs `null`
      (Rust non-optional maps). Deferred: `readable_metrics` in-comparison; A2 `entries`/`manifests`/`partitions`;
      A3 `all_*`; A4/A5 scan planning + execution (A5 needs parquet deps).
+  6e. **Manifest-reading interop A2 — `entries`/`manifests`/`partitions`** — **DONE (2026-06-09, Phase 3
+     manifest-interop Increment A2, same `interop_inspection_manifests.rs` + `InspectionManifestsA2Oracle`).**
+     A RICHER multi-snapshot table (`newAppend` A=a/B=b/C=a/D=b → `newRowDelta` +pos-delete → `newDelete` B)
+     gives a DELETED tombstone (status 2 — `entries`' headline vs `files`), content-gated DATA+DELETE
+     manifests, and 2 live partitions. Java materializes its REAL `EntriesTable`/`ManifestsTable`/
+     `PartitionsTable` rows; Rust field-matches all columns (entries' nested data_file projection reused from
+     A1 via a `ColumnSource` trait). Reviewer mutation-pinned the tombstone / a content-gated count / a
+     partition delete-count. **Surfaced + FIXED a real parity bug** (`inspect/partition_summary.rs`):
+     `partition_summaries` string bounds were JSON-quoted (`Datum::to_string`) vs Java's bare
+     `Transform.toHumanString`; fix = `to_human_string` (only string bounds change; int/long unit tests
+     unaffected). A1 untouched. Deferred: A3 `all_*`; A4 scan planning; A5 scan execution (needs parquet deps).
   7. **`IncrementalAppendScan`** — **DONE 🟡 (2026-06-08, overnight-run Increment 2,
      `scan/incremental.rs`, Java `BaseIncrementalAppendScan` + `BaseIncrementalScan`).** The incremental/CDC
      read primitive: `Table::incremental_append_scan()` plans the data files APPENDED in the range
