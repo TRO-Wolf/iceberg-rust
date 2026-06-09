@@ -475,11 +475,24 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `ScanReportParser`/`ScanMetricsResultParser`/`Counter`/`TimerResultParser` (dashed names, counter/timer
   shapes), with ONE documented divergence — the `filter` field uses the Rust `Predicate`'s own serde, NOT
   Java's `ExpressionParser` JSON (a large separate port, tracked). 7 unit tests; 4 mutations caught (drop a
-  counter / rename a JSON field / InMemory keep-first / drop a `None`-counter's skip-if-none). **DEFERRED:**
-  (1) wiring the model into `TableScan`/`plan_files` to COLLECT + EMIT (the concurrent/lazy-stream
-  instrumentation) — its own supervised increment; (2) Java's `tracing`-based `LoggingMetricsReporter` —
-  needs a logging-facade dependency not yet approved for the `iceberg` crate. **NO dependency change:** the
-  increment is dependency-free (`Cargo.toml`/`Cargo.lock` unchanged from `HEAD`).
+  counter / rename a JSON field / InMemory keep-first / drop a `None`-counter's skip-if-none).
+  **Scan EMISSION wiring landed 2026-06-09 (`scan/{mod,context}.rs` + new `scan/metrics_collector.rs`):**
+  OPT-IN `TableScanBuilder::with_metrics_reporter` installs a `ScanMetricsCollector` (Arc'd `AtomicI64`
+  counters) threaded through `PlanContext`; manifest-list totals + scanned/skipped (at the prune point) +
+  per-task result/size counters (in a stream wrapper) feed a single `MetricsReport::Scan(ScanReport)`
+  reported ONCE on full stream consumption (Java `SnapshotScan.planFiles`' `whenComplete` close hook; timer
+  via `std::time::Instant`). POPULATED: the 8 manifest/file counters + 2 byte sizes + the planning timer;
+  `skipped_data_files`/`skipped_delete_files`/`indexed_delete_files`/`equality_delete_files`/
+  `positional_delete_files`/`dvs` left `None` (no clean accumulation point yet — tracked). **OPT-IN /
+  byte-unchanged:** no reporter ⇒ no collector / timer / wrapper (the existing `plan_files` path is
+  unchanged; the incremental scan threads `None`). 10 new tests (2 collector + 8 scan) incl. a STRUCTURAL
+  no-collector-when-no-reporter guard AND (reviewer-added) a partial-consume-then-drop-emits-NO-report guard;
+  6 mutations caught (scanned-not-skipped on prune, fold delete count into result_data_files, emit per-task,
+  install collector with no reporter, drop the data-file size accumulation, swap data/delete manifest-total
+  counting; the `Drop`-emit divergence is caught only by the new early-drop test). **STILL DEFERRED:** Java's
+  `tracing`-based `LoggingMetricsReporter` — needs a logging-facade dependency not yet approved for the
+  `iceberg` crate. **NO dependency change:** the increment is dependency-free (`std::time` only;
+  `Cargo.toml`/`Cargo.lock` unchanged from `HEAD`).
 - **Inspection-table sub-sequence (dependency, then value):**
   1. **`files` family** (`files` / `data_files` / `delete_files`) — **DONE 🟡 (2026-06-08, Increment 1,
      `inspect/files.rs`).** Reads the current snapshot's manifest list → manifests → live entries →

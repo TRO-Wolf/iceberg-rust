@@ -31,6 +31,29 @@ How to use it (see the manuals' §1):
 
 ---
 
+## Active: Scan metrics emission wiring (TableScan → MetricsReporter) — BUILDER Opus, 2026-06-09
+
+Completes the DEFERRED scan-emission wiring from the metrics data-model increment (GAP_MATRIX row 97).
+OPT-IN: when no reporter is set, the `plan_files` path is BYTE-UNCHANGED. Java authority:
+`SnapshotScan.planFiles` (timer start → `doPlanFiles()` → `whenComplete` report on close) + `ManifestGroup`
+/`ScanMetricsUtil.fileTask` (per-task counters) + `DataTableScan` (manifest-list totals).
+
+- [x] Add `scan/metrics_collector.rs`: `ScanMetricsCollector` (Arc'd `AtomicI64` counters) + `snapshot()`
+      → `ScanMetricsResult`. Only the cleanly-collectable counters + the planning timer are populated;
+      indexed/equality/positional/dvs/skipped-files left `None` (documented not-yet-populated).
+- [x] `TableScanBuilder::with_metrics_reporter(Arc<dyn MetricsReporter>)` (Option, default None) →
+      `TableScan.metrics_reporter`.
+- [x] Thread `Option<Arc<ScanMetricsCollector>>` through `PlanContext` → `ManifestFileContext` /
+      `ManifestEntryContext` (None when no reporter). Manifest-list totals counted in `plan_files`;
+      scanned/skipped at the `context.rs` prune point; per-task result_*/size in the stream wrapper.
+- [x] Emission: wrap the `FileScanTaskStream` so that on FULL consumption (stream returns `None`) the
+      collector is snapshotted, the timer stopped, a `ScanReport` is built (table name / snapshot id /
+      schema id / projected field ids+names / filter), and `reporter.report(Scan(report))` is called ONCE.
+      When `metrics_reporter` is None: no collector, no timer, no wrapper — byte-unchanged.
+- [x] Tests (5) + mutation checks (a–d). Docs: GAP_MATRIX row 97 / Roadmap / lessons / todo.
+
+Outcome: see final report. Stayed on `phase2-3-remnants`; no commit/push; no Cargo edits.
+
 ## Active: Phase 1 — Spec & metadata completeness
 
 Parity target: Java `iceberg-core` evolution APIs. Authoritative plan: [Roadmap.md](../Roadmap.md)

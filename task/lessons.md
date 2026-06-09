@@ -2237,3 +2237,89 @@ How to use it (see the manuals' §2):
   `f`'s `Deleted` tombstone on a DATA manifest the new snapshot owns — in BOTH op sets. `delete_files().delete_
   file(f)` records `Operation::Delete` — only in the non-skip set. Pairing them across the 6 tests exercises both
   op-set branches with REAL concurrent commits through the catalog (no hand-built tombstones).
+
+### 2026-06-09 (Scan metrics EMISSION wiring — TableScan → MetricsReporter, BUILDER Opus)
+- **DO make a lazy/concurrent stream the EMISSION point by counting per-task in `poll_next` and reporting
+  ONCE on the `Ready(None)` exhaustion transition — the faithful analogue of Java
+  `CloseableIterable.whenComplete(doPlanFiles(), closeHook)`.** *Why:* Java `SnapshotScan.planFiles` starts the
+  timer, builds the plan, and on the iterable's CLOSE (after full consumption) builds the `ScanReport` and calls
+  `metricsReporter().report(...)`. A custom `Stream` adapter (`MetricsReportingFileScanTaskStream`) that (a)
+  calls `record_file_task` on each `Ready(Some(Ok(task)))` (mirroring the lazy `createFileScanTasks` transform /
+  `ScanMetricsUtil.fileTask`) and (b) emits the report on the FIRST `Ready(None)` behind a `reported: bool` guard
+  gives "per-task accounting + exactly-once on completion" deterministically. Do NOT emit in `Drop` (fires on
+  early drop with partial counts) and do NOT emit per-task. Pin "exactly once" with a task-by-task drain
+  asserting report count stays 0 mid-stream, ==1 after exhaustion, ==1 after re-polling the exhausted stream —
+  mutation-verified by moving the emit into the `Some(Ok(task))` arm (the mid-stream==0 assertion fails after
+  the 1st task).
+- **DO enforce OPT-IN at the TYPE level: thread `Option<Arc<ScanMetricsCollector>>` and gate every increment on
+  `Some` — when `None` there is no collector, no `Instant`, no stream wrapper, so the un-instrumented
+  `plan_files` is byte-for-byte unchanged.** *Why:* the brief's paramount property. A task-set regression test
+  (no reporter ⇒ same tasks) CANNOT catch a broken opt-in (counting does not change which tasks are planned), so
+  add a STRUCTURAL test that asserts `scan.plan_context.metrics_collector.is_none()` with no reporter and
+  `.is_some()` with one. Mutation-verified: forcing `metrics_collector: Some(...)` unconditionally in `build()`
+  fails EXACTLY the structural test and nothing else. (`scan::tests` is a child module, so it reads the private
+  `TableScan.plan_context` + `pub(crate)` `PlanContext.metrics_collector` directly — no production-visibility
+  widening.)
+- **DO read the Java COUNTER semantics per-metric from the source, not by name-intuition — `result-delete-files`
+  is per-TASK delete REFERENCES, not distinct delete files/manifests.** *Why:* `ScanMetricsUtil.fileTask` runs
+  once per produced `FileScanTask` and does `resultDeleteFiles().increment(deleteFiles.length)` — a delete file
+  applying to N data files counts N times. `total-data-manifests` = the manifest-LIST entries by content
+  (`DataTableScan.doPlanFiles` `dataManifests.size()`), NOT the scanned subset; `scanned`+`skipped` == `total`
+  only WITH a filter (no filter ⇒ all scanned, skipped 0). The delete-manifest fixture test asserts
+  `result_delete_files == Σ task.deletes.len()` (10 here: one position-delete in the shared partition attaches to
+  all 10 data files) and `result_data_files == 10` (excludes the delete file) — mutation-verified by folding the
+  delete count into `result_data_files`.
+- **DO count `scanned`/`skipped` manifests at the partition-filter prune point in `context.rs`
+  (`build_manifest_file_contexts_from_files`), per the manifest's `content`, and the manifest-LIST totals in
+  `plan_files` right after `get_manifest_list` — two different Java sites (`ManifestGroup`'s
+  `CloseableIterable.filter/count` vs `DataTableScan.doPlanFiles`).** *Why:* a pruned manifest
+  (`manifest_evaluator.eval(...) == false` → `continue`) is SKIPPED; a survivor is SCANNED. The prune point is
+  the only place the data-vs-delete content + the prune decision are both in hand. Mutation-verified: swapping
+  the skipped increment to scanned fails the prune test (`skipped >= 1` + `scanned+skipped==total`).
+- **DO capture the `ScanReport` identity (table name / snapshot id / schema id / projected ids+names / filter)
+  ONCE at `build()` time, before the scan's `filter`/`field_ids`/`schema` are moved into `PlanContext`.** *Why:*
+  Java reads exactly these to build `ImmutableScanReport`. In Rust the filter is consumed by
+  `predicate: self.filter.map(Arc::new)` and `field_ids` by `Arc::new(field_ids)`, so the report inputs must be
+  cloned into a `ScanMetricsContext` BEFORE those moves. Projected field NAMES come from
+  `Schema::name_by_field_id(id)` per projected id (Java `schema().findColumnName(id)`), NOT the raw
+  `column_names` (a metadata column has no schema name). The report `filter` defaults to `Predicate::AlwaysTrue`
+  when the scan has no filter (Java `BaseScan.filter()`).
+- **DO leave a metric `None` (not `Some(0)`) when the planner cannot collect it cleanly, and DOCUMENT which +
+  why.** *Why:* Java's `@Nullable` "never incremented ⇒ absent" shape. The Rust planner cleanly collects 8
+  manifest/file counters + 2 byte sizes + the timer; `skipped_data_files`/`skipped_delete_files`/
+  `indexed_delete_files`/`equality_delete_files`/`positional_delete_files`/`dvs` count delete-index internals +
+  per-file metrics pruning the planner doesn't expose at a single accumulation point — left `None`, documented
+  in the collector module. A fabricated 0 would diverge from Java's optionality AND imply fidelity the planner
+  lacks.
+- **DO use `Ordering::Relaxed` for the `AtomicI64` scan counters shared across the spawned manifest/entry
+  tasks.** *Why:* the increments are commutative + order-independent and no counter value gates another thread's
+  control flow; the happens-before barrier that matters is the stream draining to completion (the wrapper's
+  `Ready(None)`) before `snapshot()` reads them, which the await chain provides. `SeqCst` would be unjustified
+  overhead. (`dyn MetricsReporter` is not `Debug`, so `ScanMetricsContext` needs a MANUAL `Debug` eliding the
+  reporter — `TableScan` derives `Debug`; do NOT add `Debug` to the `MetricsReporter` trait, that would touch
+  the out-of-scope `metrics/mod.rs` and change a public trait.)
+
+### 2026-06-09 (Scan metrics EMISSION wiring — REVIEWER Opus)
+- **DO add a test that pins "no report on PARTIAL-consume-then-drop," separately from the "exactly once on
+  full consumption" test — the two are NOT redundant.** *Why:* the exactly-once test fully drains the stream,
+  so a `Drop`-based emit fires AFTER the `Ready(None)` emit and the `reported` guard makes it a silent no-op —
+  the exactly-once test stays GREEN under a `Drop`-emit mutation. The builder correctly *chose* emit-on-
+  `Ready(None)` (not on `Drop`) to avoid partial-count reports, and documented it, but left the property
+  UNPINNED. Added `test_partial_consume_then_drop_emits_no_report` (pull 3 of 10 tasks, `drop(stream)`, assert
+  `last_report().is_none()`); mutation-verified by adding a `Drop` impl that emits — the new test FAILS, the
+  exactly-once test PASSES, proving the new test is the only guard for the early-drop contract. The 60s test
+  timeout also confirms `drop`-before-exhaust does NOT deadlock the spawned producers (the dropped mpsc
+  receiver lets the senders error out, same as the un-instrumented path).
+- **DO verify the default (no-reporter) `plan_files` return is the LITERAL pre-change expression, not just
+  "tests pass."** *Why:* the byte-unchanged guarantee is the #1 regression risk. Confirmed `git show
+  HEAD:scan/mod.rs` ended `plan_files` with `Ok(file_scan_task_rx.boxed())`, and the None-metrics match arm
+  (`_ => Ok(file_scan_task_rx.boxed())`) returns exactly that — same boxed stream, same producers, same
+  channel, same order; `planning_started_at`/the manifest-list fold/the wrapper are all gated on
+  `self.metrics.is_some()`. The `field_ids` hoist (`Arc::new` moved one statement earlier) is behavior-
+  identical (same value, just named before two consumers use it). Mutation-verified the opt-in with a
+  structural test (collector `Some` only with a reporter).
+- **DO confirm the report build never `.unwrap()`s a poisoned lock.** *Why:* brief concern #4. The collector
+  is atomics-only (no `Mutex`); `emit_report` clones captured fields + reads atomics; the only lock is inside
+  `InMemoryMetricsReporter::report`, which uses `unwrap_or_else(|p| p.into_inner())` (poison-safe) and lives in
+  the out-of-scope `metrics/mod.rs` (unchanged). No bare `.unwrap()`/`.expect()`/`println!` in any production
+  region of the three scan files.
