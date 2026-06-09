@@ -2350,3 +2350,42 @@ How to use it (see the manuals' §2):
 - **Cheap fixture richness pays off:** one snapshot with a MULTI-KEY summary + one with an operation-only
   (→ empty-map) summary, and refs covering branch-full-retention / tag-only-max-ref-age / branch-no-retention,
   exercise every non-trivial projection (map column, retention NULL-per-kind) in a 3-row/3-ref fixture.
+
+### 2026-06-09 (Inspection-table interop — `history` + `metadata_log_entries` — ORCHESTRATOR + REVIEWER Opus)
+- **A FORKED snapshot-log (needed for `is_current_ancestor=false`) must be built across SEPARATE commits,
+  re-parsing between each.** *Why:* Java `TableMetadata.Builder.intermediateSnapshotIdSet` (and the Rust
+  `update_snapshot_log` mirror) prunes from the snapshot-LOG any snapshot that, WITHIN ONE build's
+  `changes`, is both AddSnapshot'd AND set-as-main AND no-longer-current. Doing
+  `addSnapshot(A)+setMain(A)+addSnapshot(B)+setMain(B)` in one build drops A as "intermediate" → log=[B]
+  only. Re-parsing (`fromJson(toJson(..))`) clears `changes`, so a prior snapshot counts as
+  already-persisted and survives the next commit's pruning. Recipe: B0 addSnapshot(ROOT)+setMain(ROOT) →
+  reparse → B1 add(SIBLING)+setMain(SIBLING) → reparse → B2 add(CURRENT)+setMain(CURRENT) → log
+  [ROOT,SIBLING,CURRENT]; with CURRENT.parent=ROOT, SIBLING is off the current ancestry.
+- **Because each snapshot is added in the SAME build it becomes main, the snapshot-LOG entry timestamp is
+  the snapshot's OWN `timestampMillis` (Java `isAddedSnapshot ? snapshot.timestampMillis() :
+  lastUpdatedMillis`).** So a no-rollback forked log is FULLY deterministic — and Java `addSnapshot` also
+  sets `lastUpdatedMillis = snapshot.timestampMillis()`, so the `metadata_log_entries` SYNTHETIC current
+  entry (at `lastUpdatedMillis`) lands on EXACTLY the last snapshot's ts — which BONUS-pins the `<=`
+  inclusive boundary of `snapshotIdAsOfTime` (an entry exactly on a snapshot-log ts must resolve TO that
+  snapshot, not the previous one). Keep the three snapshot timestamps ASCENDING (ROOT<SIBLING<CURRENT) or
+  the "before last snapshot-log entry" guard trips and `snapshotIdAsOfTime` (which assumes ascending) misreads.
+- **The `metadata-log` must be INJECTED (not driven by real commits) for deterministic `latest_*`
+  resolution.** *Why:* real commits stamp metadata-log timestamps with `base.lastUpdatedMillis()` (≈ now),
+  which sit far AFTER the 2018–2020 snapshot timestamps, so every entry collapses to the latest snapshot —
+  the NULL/middle cases are never exercised. Inject via `JsonUtil.mapper().readTree(json)` → set a
+  `metadata-log` ArrayNode (keys EXACTLY `timestamp-ms`/`metadata-file`) → re-serialize. This is the Java
+  analog of the Rust unit test's `meta.metadata_log = vec![...]`; Java's REAL `MetadataLogEntriesTable`
+  still computes `latest_*` over it, so it stays a genuine oracle. Straddle the snapshot-log timestamps to
+  hit NULL (before first) / a-middle-snapshot / current.
+- **Pin `metadata_location` to a STABLE LOGICAL URI on BOTH sides.** The `metadata_log_entries` synthetic
+  current entry's `file` column = `metadataFileLocation()` (Java) / `metadata_location()` (Rust). Re-parse
+  the Java base with a fixed logical URI (`fromJson(STABLE_URI, json)`, NOT the on-disk path) and set the
+  Rust test's `.metadata_location(STABLE_URI)` to the same literal, or that one row mismatches
+  non-portably. (Snapshots/refs don't surface the location, so the prior increment didn't need this.)
+- **A log can carry DUPLICATE snapshot ids (rollbacks re-stamp), so sort history rows by the COMPOSITE
+  `(made_current_at, snapshot_id)`, not by snapshot_id alone**, for order-independent comparison.
+- **The validation-first reviewer ran its OWN mutations** (flip SIBLING `is_current_ancestor`; flip the
+  creation row's NULL `latest_snapshot_id`), each failing the matching interop test, then restored
+  byte-clean — confirming the derived columns are load-bearing in the comparison, not just decorative
+  asserts. Good pattern when "validation is key": the critic mutation-probes the FIXTURE/test, not just
+  the prose.

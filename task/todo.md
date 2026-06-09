@@ -4011,3 +4011,39 @@ over ONE mutable projection — serialize each row eagerly, never stash `StructL
 metadata-log fixture so `is_current_ancestor=false` and the `latest_*` as-of-time columns are exercised); then
 the manifest-reading tables `files`/`entries`/`manifests`/`partitions`/`all_*` + scan interop (need real
 on-disk manifests + parquet, a bigger harness step).
+
+---
+
+## Active (2026-06-09): Inspection-table interop — `history` + `metadata_log_entries` (Phase 3 interop Increment 2)
+
+Increment: interop evidence for the two DERIVED-column pure-metadata inspection tables — completes interop
+for ALL FOUR pure-metadata inspection tables. Builder→reviewer (validation-first, per user "validation is
+key"); orchestrator independently re-ran the full gate + committed. **Purely additive — NO production change.**
+
+- [x] **Java oracle** — new `generate-inspection-log` exec mode + `InspectionLogOracle` (reuses the prior
+  increment's `InMemoryInspectionOperations` / `RowWriter` / `rowsToJson`). Builds a FORKED snapshot-log via
+  the 3-commit RE-PARSE recipe (B0 ROOT→main, B1 SIBLING→main, B2 CURRENT→main, re-parse between each to
+  dodge intermediate-snapshot pruning) → log `[ROOT@2018-01, SIBLING@2018-08, CURRENT@2019-04]`,
+  CURRENT.parent=ROOT ⇒ SIBLING off-ancestry. INJECTS a deterministic `metadata-log` (3 straddling entries)
+  via `JsonUtil.mapper()`, re-parses with a stable logical URI, materializes Java's REAL
+  `HistoryTable`/`MetadataLogEntriesTable` rows → `java_history.json` / `java_metadata_log_entries.json`
+  under `testdata/interop/inspection_history/`.
+- [x] **Rust tests (2, added to `interop_inspection.rs`)** — `inspect().history()/.metadata_log_entries()
+  .scan()` asserted field-for-field equal vs the Java rows (all 4 / all 5 columns, order-independent —
+  history by composite `(made_current_at,snapshot_id)`, log by timestamp) + focused pins:
+  `is_current_ancestor` true/FALSE/true (ROOT/SIBLING/CURRENT); `latest_*` NULL/ROOT/SIBLING/CURRENT (with
+  schema_id 0 + seq 1/2/3); synthetic-entry `file` == the stable metadata location.
+- [x] **Gate (orchestrator-rerun, all green):** iceberg lib 1595, interop_inspection 4/4, other 3 interop
+  4/4/4, datafusion 80+9, clippy/fmt/typos clean; `git status` = only `InteropOracle.java` +
+  `interop_inspection.rs` + `inspection_history/` (existing `inspection/` fixtures untouched).
+- [x] **Docs** — GAP_MATRIX, Roadmap (6c), lessons, todo.
+
+**Key recipe (lessons):** forked snapshot-log needs SEPARATE commits + re-parse between (Java
+`intermediateSnapshotIdSet` pruning); deterministic `latest_*` needs an INJECTED metadata-log (real commits
+stamp ≈now); Java `addSnapshot` sets `lastUpdatedMillis = snapshot.ts`, so the synthetic entry lands on
+`CURRENT_TS`, bonus-pinning the `<=` boundary; pin `metadata_location` to a stable URI on both sides.
+Reviewer mutation-probed the fixture (flip SIBLING ancestor; flip creation-row NULL) — each fails the test.
+
+**Deferred (next):** manifest-reading inspection tables (`files`/`entries`/`manifests`/`partitions`/`all_*`)
++ scan interop — need real on-disk manifests + parquet (a bigger harness step: the oracle must write actual
+manifest/data files, or the Rust side must read Java-written ones).

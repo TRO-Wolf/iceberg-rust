@@ -572,6 +572,18 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      `/tmp/iceberg-java-ref` 1.10.0 that Java's on-disk round-trip splits `operation` OUT of the summary map,
      matching Rust's `additional_properties` column. Deferred: `history`/`metadata_log_entries` interop (need a
      multi-entry snapshot-log + metadata-log fixture); manifest-reading tables' interop (need on-disk manifests).
+  6c. **Inspection interop — `history` + `metadata_log_entries`** — **DONE (2026-06-09, Phase 3 interop
+     Increment 2, same `interop_inspection.rs` + `dev/java-interop` `InspectionLogOracle` /
+     `generate-inspection-log` mode, fixtures under `inspection_history/`).** Interop now COMPLETE for all
+     four pure-metadata inspection tables. The two DERIVED columns are genuinely exercised: a FORKED
+     snapshot-log built via a 3-commit RE-PARSE recipe (each commit re-parsed to dodge Java's
+     intermediate-snapshot pruning) makes SIBLING `is_current_ancestor=false`; a deterministic INJECTED
+     `metadata-log` (straddling timestamps) makes `latest_*` resolve to NULL/ROOT/SIBLING/CURRENT. Java's
+     REAL `HistoryTable`/`MetadataLogEntriesTable` rows vs Rust `inspect()` output, all columns,
+     order-independent. Fully deterministic (Java `addSnapshot` stamps `lastUpdatedMillis` = snapshot ts, so
+     the synthetic entry lands on `CURRENT_TS`, also pinning the `<=` boundary). **NO production change**;
+     reviewer mutation-confirmed both derived columns are load-bearing. Deferred: manifest-reading tables'
+     interop (`files`/`entries`/`manifests`/`partitions`/`all_*` — need on-disk manifests + parquet).
   7. **`IncrementalAppendScan`** — **DONE 🟡 (2026-06-08, overnight-run Increment 2,
      `scan/incremental.rs`, Java `BaseIncrementalAppendScan` + `BaseIncrementalScan`).** The incremental/CDC
      read primitive: `Table::incremental_append_scan()` plans the data files APPENDED in the range

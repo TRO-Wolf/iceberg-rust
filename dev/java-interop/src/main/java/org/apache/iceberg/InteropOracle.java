@@ -27,6 +27,8 @@
 package org.apache.iceberg;
 
 import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -100,6 +102,14 @@ public final class InteropOracle {
         // System.getProperty sees it).
         Path inspectionFixturesDir = requireFixturesDir("interop.inspection.fixtures.dir");
         InspectionOracle.generate(inspectionFixturesDir);
+        break;
+      case "generate-inspection-log":
+        // A SEPARATE exec mode (its own fixtures dir) for the two remaining pure-metadata inspection
+        // tables — `history` and `metadata_log_entries`. Like `generate-inspection`, the dir is supplied
+        // via -Dinterop.inspection_log.fixtures.dir on the CLI (same JVM, so System.getProperty sees it),
+        // so this increment never touches the committed `inspection/` fixtures.
+        Path inspectionLogFixturesDir = requireFixturesDir("interop.inspection_log.fixtures.dir");
+        InspectionLogOracle.generate(inspectionLogFixturesDir);
         break;
       case "verify":
         int failures = 0;
@@ -1316,6 +1326,255 @@ public final class InteropOracle {
     @FunctionalInterface
     private interface RowWriter {
       void write(StructLike row, JsonGenerator gen) throws IOException;
+    }
+  }
+
+  // ===========================================================================================
+  // Inspection-LOG oracle — the two REMAINING pure-metadata inspection tables: `history` and
+  // `metadata_log_entries`. Like InspectionOracle these are READ-ONLY projections; this oracle
+  // materializes the rows of Java's REAL HistoryTable / MetadataLogEntriesTable (via MetadataTableUtils +
+  // asDataTask().rows()) and emits them as java_history.json / java_metadata_log_entries.json. The Rust
+  // test asserts `table.inspect().history()/.metadata_log_entries().scan()` is field-for-field equal.
+  //
+  // The two NON-TRIVIAL derived columns drive the whole fixture:
+  //   * history.is_current_ancestor — true iff a snapshot-log entry's snapshot is in the parent chain
+  //     walked from the CURRENT snapshot (Java SnapshotUtil.currentAncestorIds). To make it FALSE for a
+  //     row, the snapshot LOG must contain a snapshot off the current ancestry — a FORKED log entry.
+  //   * metadata_log_entries.latest_{snapshot_id,schema_id,sequence_number} — resolve to the snapshot that
+  //     was current AT each metadata-log entry's timestamp = the last snapshot-log entry with
+  //     made_current_at <= ts (Java SnapshotUtil.snapshotIdAsOfTime); NULL when no snapshot-log entry is
+  //     at/older than the timestamp (Java throws IllegalArgumentException, caught). To exercise
+  //     NULL / a-middle-snapshot / CURRENT the metadata-log timestamps must STRADDLE the snapshot-log
+  //     timestamps.
+  //
+  // FORKED snapshot-log construction. A single build that adds ROOT/SIBLING/CURRENT and points main at
+  // each would treat ROOT/SIBLING as INTERMEDIATE (added AND set-to-main AND no-longer-current within one
+  // build's `changes`) and prune them from the log. So the log is built via THREE SEPARATE builds,
+  // RE-PARSING between each (re-parsing clears `changes`, so a prior snapshot counts as already-persisted
+  // and is not intermediate). Because each snapshot is added in the SAME build that points main at it,
+  // `isAddedSnapshot` is true and the snapshot-LOG entry timestamp is the snapshot's OWN timestampMillis
+  // (deterministic — no rollback, so no System.currentTimeMillis leaks into the log). The snapshot
+  // timestamps are ascending (ROOT 2018-01, SIBLING 2018-08, CURRENT 2019-04) so the log is ascending and
+  // the build's last-entry-is-current invariant holds. Result log =
+  // [(2018-01,ROOT),(2018-08,SIBLING),(2019-04,CURRENT)], current=CURRENT, ancestry={CURRENT,ROOT} =>
+  // is_current_ancestor: ROOT true, SIBLING FALSE, CURRENT true.
+  // ===========================================================================================
+
+  /**
+   * The inspection-log half of the oracle. Builds the shared forked base via the 3-commit re-parse recipe,
+   * INJECTS a deterministic metadata-log that straddles the snapshot timestamps (real commits would stamp
+   * ~now timestamps; injection is the Java analog of the Rust unit test's `meta.metadata_log = vec![...]`,
+   * and Java's REAL MetadataLogEntriesTable still computes latest_* over it), re-parses with a STABLE
+   * LOGICAL LOCATION (so the synthetic current entry's `file` column is portable), and emits the rows of
+   * Java's REAL {@link HistoryTable} / {@link MetadataLogEntriesTable}.
+   */
+  static final class InspectionLogOracle {
+    private InspectionLogOracle() {}
+
+    private static final String LOCATION = "s3://interop-bucket/inspection_history";
+    // The stable LOGICAL metadata location the base is re-parsed with — NOT the on-disk path. The
+    // synthetic metadata-log entry's `file` column = metadataFileLocation(), so it must be portable; the
+    // Rust test builds its Table with exactly this `.metadata_location(...)`.
+    private static final String STABLE_LOCATION = LOCATION + "/metadata/v1.metadata.json";
+
+    // Snapshot graph (reuse the prior ids). NOTE SIBLING's ts sits BETWEEN root and current so the
+    // snapshot log is ascending and the forked SIBLING is genuinely off main's ancestry.
+    static final long ROOT_ID = 3051729675574597004L;
+    static final long CURRENT_ID = 3055729675574597004L;
+    static final long SIBLING_ID = 3060729675574597004L;
+    static final long ROOT_TS_MS = 1515100955770L; // 2018-01
+    static final long SIBLING_TS_MS = 1535000000000L; // 2018-08 (between ROOT and CURRENT)
+    static final long CURRENT_TS_MS = 1555100955770L; // 2019-04
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the FORKED snapshot-log base via THREE separate builds, RE-PARSING between each so a
+      //    prior snapshot is NOT treated as intermediate (which would prune it from the log).
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, PartitionSpec.unpartitioned(), SortOrder.unsorted(), LOCATION, props);
+      int schemaId = seed.currentSchemaId();
+
+      Snapshot root = snapshot(ROOT_ID, null, 1L, ROOT_TS_MS, schemaId);
+      Snapshot sibling = snapshot(SIBLING_ID, ROOT_ID, 2L, SIBLING_TS_MS, schemaId);
+      Snapshot current = snapshot(CURRENT_ID, ROOT_ID, 3L, CURRENT_TS_MS, schemaId);
+
+      // B0: add ROOT, point main at ROOT -> reparse.
+      TableMetadata b0 =
+          reparse(
+              TableMetadata.buildFrom(seed)
+                  .addSnapshot(root)
+                  .setBranchSnapshot(ROOT_ID, SnapshotRef.MAIN_BRANCH)
+                  .build());
+      // B1: add SIBLING, point main at SIBLING -> reparse.
+      TableMetadata b1 =
+          reparse(
+              TableMetadata.buildFrom(b0)
+                  .addSnapshot(sibling)
+                  .setBranchSnapshot(SIBLING_ID, SnapshotRef.MAIN_BRANCH)
+                  .build());
+      // B2: add CURRENT, point main at CURRENT -> reparse. Final log = [ROOT, SIBLING, CURRENT].
+      TableMetadata b2 =
+          reparse(
+              TableMetadata.buildFrom(b1)
+                  .addSnapshot(current)
+                  .setBranchSnapshot(CURRENT_ID, SnapshotRef.MAIN_BRANCH)
+                  .build());
+
+      // 2. INJECT the deterministic metadata-log (three entries that STRADDLE the snapshot timestamps).
+      //    Real commits would stamp ~now timestamps; injecting straight into the metadata JSON is the
+      //    Java analog of the Rust unit test setting `meta.metadata_log` directly.
+      String json = TableMetadataParser.toJson(b2);
+      ObjectNode node = (ObjectNode) JsonUtil.mapper().readTree(json);
+      ArrayNode metadataLog = JsonUtil.mapper().createArrayNode();
+      metadataLog.add(metadataLogEntry(ROOT_TS_MS - 1000, "00000-creation.metadata.json"));
+      metadataLog.add(metadataLogEntry(ROOT_TS_MS + 1000, "00001-after-root.metadata.json"));
+      metadataLog.add(metadataLogEntry(SIBLING_TS_MS + 1000, "00002-after-sibling.metadata.json"));
+      node.set("metadata-log", metadataLog);
+      String injected = JsonUtil.mapper().writerWithDefaultPrettyPrinter().writeValueAsString(node);
+
+      // Write the injected base to disk (this is the byte-for-byte fixture the Rust test loads).
+      Path basePath = dir.resolve("base.metadata.json");
+      writeJson(basePath, injected);
+
+      // 3. RE-PARSE with the STABLE LOGICAL location (NOT basePath) so metadataFileLocation() — the
+      //    synthetic current entry's `file` column — is portable and equals what the Rust test builds.
+      TableMetadata reparsed = TableMetadataParser.fromJson(STABLE_LOCATION, injected);
+
+      // 4. Build a BaseTable over in-memory ops whose io() resolves the STABLE location to the injected
+      //    bytes (HistoryTable.task / MetadataLogEntriesTable.task call io().newInputFile(...) — the file is
+      //    only HELD by StaticDataTask, never read for these pure-metadata tables).
+      InMemoryFileIO io = new InMemoryFileIO();
+      io.addFile(STABLE_LOCATION, injected.getBytes(StandardCharsets.UTF_8));
+      BaseTable baseTable =
+          new BaseTable(new InMemoryInspectionOperations(reparsed, io), "interop_inspection_history");
+
+      // 5. Materialize + emit the rows of Java's REAL HistoryTable and MetadataLogEntriesTable.
+      writeJson(
+          dir.resolve("java_history.json"),
+          rowsToJson(baseTable, MetadataTableType.HISTORY, InspectionLogOracle::historyRowToJson));
+      writeJson(
+          dir.resolve("java_metadata_log_entries.json"),
+          rowsToJson(
+              baseTable,
+              MetadataTableType.METADATA_LOG_ENTRIES,
+              InspectionLogOracle::metadataLogRowToJson));
+      System.out.println("generated inspection-log fixtures to " + dir);
+    }
+
+    /** Round-trip a built {@link TableMetadata} through JSON to clear pending `changes` (re-parse). */
+    private static TableMetadata reparse(TableMetadata metadata) {
+      return TableMetadataParser.fromJson(STABLE_LOCATION, TableMetadataParser.toJson(metadata));
+    }
+
+    /** One injected metadata-log entry — keys EXACTLY `timestamp-ms` + `metadata-file`. */
+    private static ObjectNode metadataLogEntry(long timestampMs, String fileName) {
+      ObjectNode entry = JsonUtil.mapper().createObjectNode();
+      entry.put("timestamp-ms", timestampMs);
+      entry.put("metadata-file", LOCATION + "/metadata/" + fileName);
+      return entry;
+    }
+
+    /** Construct a package-private {@link BaseSnapshot} with a fake (never-read) manifest-list path. */
+    private static Snapshot snapshot(
+        long snapshotId, Long parentId, long sequenceNumber, long timestampMs, int schemaId) {
+      Map<String, String> summary = new LinkedHashMap<>();
+      summary.put("operation", DataOperations.APPEND);
+      return new BaseSnapshot(
+          sequenceNumber,
+          snapshotId,
+          parentId,
+          timestampMs,
+          DataOperations.APPEND,
+          summary,
+          schemaId,
+          LOCATION + "/metadata/snap-" + snapshotId + ".avro",
+          null,
+          null,
+          null);
+    }
+
+    /**
+     * Materialize the rows of Java's REAL metadata table of {@code type} (HistoryTable /
+     * MetadataLogEntriesTable) via {@link MetadataTableUtils#createMetadataTableInstance} +
+     * {@code task.asDataTask().rows()} and serialize each {@link StructLike} row with {@code rowToJson}.
+     * Columns are read BY POSITION per the metadata table's own schema.
+     *
+     * <p>IMPORTANT: each row MUST be serialized EAGERLY inside the iteration — {@code StaticDataTask.rows()}
+     * is a lazy transform over ONE mutable projection, so stashing the {@link StructLike} references would
+     * yield the LAST row repeated N times (this bit the prior increment).
+     */
+    private static String rowsToJson(
+        BaseTable baseTable, MetadataTableType type, InspectionOracle.RowWriter rowToJson) {
+      Table mt = MetadataTableUtils.createMetadataTableInstance(baseTable, type);
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            try (CloseableIterable<FileScanTask> tasks = mt.newScan().planFiles()) {
+              for (FileScanTask task : tasks) {
+                try (CloseableIterable<StructLike> taskRows = task.asDataTask().rows()) {
+                  for (StructLike row : taskRows) {
+                    rowToJson.write(row, gen);
+                  }
+                }
+              }
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * Serialize one HistoryTable row by position (HISTORY_SCHEMA): 0=made_current_at micros Long,
+     * 1=snapshot_id Long, 2=parent_id Long-or-null, 3=is_current_ancestor Boolean.
+     */
+    private static void historyRowToJson(StructLike row, JsonGenerator gen) throws IOException {
+      gen.writeStartObject();
+      gen.writeNumberField("made_current_at", row.get(0, Long.class));
+      gen.writeNumberField("snapshot_id", row.get(1, Long.class));
+      writeLongOrNull(gen, "parent_id", row.get(2, Long.class));
+      gen.writeBooleanField("is_current_ancestor", row.get(3, Boolean.class));
+      gen.writeEndObject();
+    }
+
+    /**
+     * Serialize one MetadataLogEntriesTable row by position (METADATA_LOG_ENTRIES_SCHEMA): 0=timestamp
+     * micros Long, 1=file String, 2=latest_snapshot_id Long-or-null, 3=latest_schema_id Integer-or-null,
+     * 4=latest_sequence_number Long-or-null.
+     */
+    private static void metadataLogRowToJson(StructLike row, JsonGenerator gen) throws IOException {
+      gen.writeStartObject();
+      gen.writeNumberField("timestamp", row.get(0, Long.class));
+      gen.writeStringField("file", row.get(1, String.class));
+      writeLongOrNull(gen, "latest_snapshot_id", row.get(2, Long.class));
+      writeIntOrNull(gen, "latest_schema_id", row.get(3, Integer.class));
+      writeLongOrNull(gen, "latest_sequence_number", row.get(4, Long.class));
+      gen.writeEndObject();
+    }
+
+    private static void writeLongOrNull(JsonGenerator gen, String field, Long value)
+        throws IOException {
+      if (value == null) {
+        gen.writeNullField(field);
+      } else {
+        gen.writeNumberField(field, value);
+      }
+    }
+
+    private static void writeIntOrNull(JsonGenerator gen, String field, Integer value)
+        throws IOException {
+      if (value == null) {
+        gen.writeNullField(field);
+      } else {
+        gen.writeNumberField(field, value.intValue());
+      }
     }
   }
 
