@@ -2518,3 +2518,22 @@ How to use it (see the manuals' §2):
 - **The tx-captured-start pin remains the recurring must-have** on EVERY concurrent-commit validation: a test
   that OMITS `validate_from_snapshot` and still rejects (relying solely on the `Transaction::new` capture),
   mutation-checked by making the code read the refreshed head and confirming that one test fails.
+
+### 2026-06-09 (RowDelta.validateNoNewDeletesForDataFiles — ORCHESTRATOR + REVIEWER Opus)
+- **A VALIDATION-ONLY partial port of a mutating API must be UNMISTAKABLY documented at EVERY surface.**
+  Java `RowDelta.removeRows` both records the file for validation AND removes it from the table in apply; the
+  Rust `RowDeltaOperation` is add-only, so the port lands the safety VALIDATION but defers the apply-side
+  removal. That's a faithful-but-minimal scope — but a public `remove_data_files` that doesn't remove is a
+  footgun unless the deferral is stated in the MODULE doc, the FIELD doc, AND the METHOD doc, each pointing to
+  the real removal path (`overwrite_files().delete_data_files`). Mirror an existing validation-only precedent
+  (`referenced_data_files`) so the pattern is consistent.
+- **When two sub-checks share ONE opt-in flag (Java faithfulness), isolate the one under test by making the
+  OTHER quiet.** RowDelta's `validate_no_conflicting_delete_files()` gates BOTH the new partition-scoped
+  removed-data-file check (2a) AND the pre-existing filter-based check (2b, partition-blind inclusive-metrics).
+  A "should-commit" negative for 2a must give the concurrent deletes metric bounds the conflict filter
+  EXCLUDES, or 2b (which is at least as strict) fires and masks 2a's logic. Document this in the test. Order
+  matters for the asserted message (2a runs first → its message, not 2b's).
+- **Reuse the shared helper UNCHANGED across the second caller.** Increment 2 wired Increment 1's
+  `validate_no_new_deletes_for_data_files` into RowDelta with ZERO edits to the helper — the reviewer confirms
+  the first caller's (OverwriteFiles') tests stay green as the behavior-preservation proof. If the second
+  caller needs a tweak, that's a signal to re-scope, not to fork the logic.

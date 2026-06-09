@@ -4183,8 +4183,15 @@ NO interop needed):
   over-approximation). 8 MemoryCatalog tests incl. the tx-captured-start pin; mutation-verified. Gate green
   (lib 1603, transaction:: 261, datafusion 80+9, clippy/fmt/typos). `validate_no_conflicting_data`
   behavior-preserving + independent flag.
-- [ ] **Increment 2: `RowDelta.validateNoNewDeletesForDataFiles` + `validateAddedDVs`** (V3 deletion vectors) —
-  reuse the shared helper over RowDelta's removed data files; add `removed_data_files`; port `validateAddedDVs`.
+- [x] **Increment 2: `RowDelta.validateNoNewDeletesForDataFiles`** — added `remove_data_files`/`remove_rows`
+  (VALIDATION-ONLY removal — apply-side drop deferred + documented; callers → `overwrite_files().delete_data_files`)
+  + wired the shared helper under the existing `validate_no_conflicting_delete_files()` flag, 2a before 2b
+  (Java order). 9 MemoryCatalog tests incl. the tx-captured-start pin; helper reused UNCHANGED; gate green
+  (lib 1612, transaction:: 270). `validateAddedDVs` SPLIT OUT → Increment 2b below.
+- [ ] **Increment 2b: `RowDelta.validateAddedDVs`** (V3 deletion-vector conflict) — identify added DVs
+  (position-delete files with `referenced_data_file` + content_offset = puffin DV), index by referenced file,
+  reject a concurrently-added DV for the same referenced data file. Java `MergingSnapshotProducer.validateAddedDVs`
+  (L825-895).
 - [ ] **Increment 3: `OverwriteFiles.overwriteByRowFilter` + `validateAddedFilesMatchOverwriteFilter`** — the
   row-filter overwrite mode (delete-by-row-filter) + strict/inclusive/metrics validation of added files
   (StrictMetricsEvaluator + inclusive/strict partition Projections).
