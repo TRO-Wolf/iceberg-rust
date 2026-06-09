@@ -4183,9 +4183,16 @@ FROZEN, 0-diff).
   production change. Reviewer mutation-pinned 2 ways (poison expected; pre-delete snapshot). Gate green (offline
   no-op + run.sh round-trip). **This is the A5 scan-execution proof + the read-side write-action interop.**
 - [ ] **Increment 2: equality deletes** + multi-data-file + schema/type variety.
-- [ ] **Increment 3: Direction-2 — Rust WRITES a real table** (append / rowDelta with a Rust-written parquet
-  data + position-delete) → the Java oracle READS it + verifies the rows (proves Rust's writes are Java-readable
-  — the write-action ✅ flip).
+- [x] **Increment 2: Direction-2 — Rust WRITES a real table → Java reads it** (the write-action ✅ flip) —
+  env-gated GEN path (`ICEBERG_INTEROP_SCAN_GEN_DIR`) writes a real table via the PUBLIC write path
+  (MemoryCatalog+LocalFsStorageFactory, real parquet data + a real PositionDeleteFileWriter delete, fast_append
+  → row_delta, `TableMetadata::write_to` → final.metadata.json); the oracle's `verify-interop-scan-exec` reads
+  it via `IcebergGenerics` + verifies {10,30,50}. **Java reads Rust's output byte-for-byte, NO massaging, NO
+  Rust production change, no new deps (Cargo 0-diff).** Reviewer mutated the WRITTEN artifacts (rm delete
+  parquet → Java NotFoundException; truncate avro manifest → Java RuntimeIOException). Gate green (offline no-op
+  + D2 round-trip). Fixed an abbreviation typos slip in the Increment-1 lesson (+ permanently re-internalized
+  the chain-the-gate-to-the-commit rule).
+- [ ] **Increment 3: equality deletes** + multi-data-file + more column types (Direction 1 and/or 2).
 - [ ] **Increment 4: partitioned tables** + the cross-product; then PR the capstone.
 
 Deferred elsewhere: `readable_metrics` interop; ORC/Avro data; V3 types (Phase 4); BatchScan; CDC-merge.

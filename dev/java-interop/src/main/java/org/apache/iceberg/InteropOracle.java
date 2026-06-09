@@ -162,6 +162,22 @@ public final class InteropOracle {
         Path scanExecDir = requireFixturesDir("interop.scan_exec.dir");
         ScanExecOracle.generate(scanExecDir);
         break;
+      case "verify-interop-scan-exec":
+        // DIRECTION 2 — "Java reads what RUST writes". The Rust GEN path (env
+        // ICEBERG_INTEROP_SCAN_GEN_DIR) wrote a REAL on-disk table to <dir>/rust_table via its production
+        // write path (MemoryCatalog over LocalFsStorageFactory: real parquet data + a real position-delete
+        // written by PositionDeleteFileWriter, committed through fast_append + row_delta), landing a
+        // final.metadata.json at a known path. Here Java loads that RUST-written metadata, builds a BaseTable
+        // over a LocalFileIO (so io() reads the real on-disk parquet/avro), reads with IcebergGenerics (which
+        // APPLIES Rust's position delete), and asserts the merge-on-read rows == {(10,a),(30,c),(50,e)}. A
+        // failure here is a REAL write-incompatibility finding (Rust wrote something Java cannot read).
+        Path scanExecVerifyDir = requireFixturesDir("interop.scan_exec.dir");
+        int scanExecFailures = ScanExecOracle.verify(scanExecVerifyDir);
+        System.out.println("verify-interop-scan-exec: " + scanExecFailures + " failures");
+        if (scanExecFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "verify":
         int failures = 0;
         failures += SchemaOracle.verify(schemaFixturesDir);
@@ -2810,6 +2826,122 @@ public final class InteropOracle {
             gen.writeEndArray();
           },
           true);
+    }
+
+    /**
+     * DIRECTION 2 verify — read the RUST-written table and assert the merge-on-read rows.
+     *
+     * <p>Loads {@code <dir>/rust_table/metadata/final.metadata.json} (the metadata Rust's GEN path wrote),
+     * builds a {@link BaseTable} over a {@link LocalFileIO} (so {@code io()} reads the real on-disk parquet +
+     * avro the Rust commits produced), reads every live row with {@code IcebergGenerics.read(table).build()}
+     * (which APPLIES the Rust-written position delete), sorts by id, and asserts the rows equal the expected
+     * merge-on-read set {@code {(10,a),(30,c),(50,e)}} (ids 20/40 deleted). Prints PASS/FAIL per check and
+     * returns the number of failures so {@code main} can {@code System.exit(1)} on any FAIL.
+     *
+     * <p>A failure here is a REAL write-incompatibility finding: it means Java could not read something Rust
+     * wrote (a manifest, the manifest-list, the parquet data, or the position delete), or read the WRONG
+     * rows. We do NOT massage Rust's output to be "Java-shaped" — the verify must fail loudly so a genuine
+     * divergence surfaces.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      Path finalMetadata = dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL scan-exec-d2: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      // 1. Load the Rust-written metadata. A parse failure is itself a divergence (Java cannot read Rust's
+      //    on-disk TableMetadata JSON).
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL scan-exec-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      // 2. Build a BaseTable over a LocalFileIO so io() resolves the bare absolute manifest/parquet paths the
+      //    Rust commits wrote, then read the live rows via IcebergGenerics (which applies the position delete).
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        // A read failure here is the headline divergence: Java could not read the Rust-written
+        // manifests / parquet / position-delete. Report it precisely.
+        System.out.println(
+            "FAIL scan-exec-d2: Java could not READ the Rust-written table via IcebergGenerics "
+                + "(manifests/parquet/position-delete incompatibility): "
+                + readError);
+        return 1;
+      }
+
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+
+      // 3a. Exactly 3 live rows survive (5 written, positions 1 and 3 deleted).
+      if (liveIds.size() != 3) {
+        System.out.println(
+            "FAIL scan-exec-d2: expected 3 live rows after merge-on-read, got "
+                + liveIds.size()
+                + " "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS scan-exec-d2: 3 live rows survive merge-on-read");
+      }
+
+      // 3b. The deleted ids (20, 40) must be ABSENT — Rust's position delete must have been applied.
+      if (liveIds.contains(20L) || liveIds.contains(40L)) {
+        System.out.println(
+            "FAIL scan-exec-d2: deleted ids 20/40 must be ABSENT, but live set is " + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS scan-exec-d2: deleted ids 20/40 are absent (Rust's delete applied)");
+      }
+
+      // 3c. The exact surviving (id, data) set equals {(10,a),(30,c),(50,e)}.
+      Map<Long, String> expected = new LinkedHashMap<>();
+      expected.put(10L, "a");
+      expected.put(30L, "c");
+      expected.put(50L, "e");
+      boolean valuesMatch = liveIds.equals(new ArrayList<>(expected.keySet()));
+      for (Long id : liveIds) {
+        String actual = dataById.get(id);
+        String want = expected.get(id);
+        if (want == null || !want.equals(actual)) {
+          valuesMatch = false;
+        }
+      }
+      if (!valuesMatch) {
+        System.out.println(
+            "FAIL scan-exec-d2: live (id,data) set mismatch: java-read="
+                + dataById
+                + " expected={10=a, 30=c, 50=e}");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS scan-exec-d2: Java read the Rust-written table → {(10,a),(30,c),(50,e)}");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-scan-exec OK — Java read the RUST-written table (real parquet data + "
+                + "Rust position-delete), merge-on-read live rows = {10,30,50}");
+      }
+      return failures;
     }
   }
 

@@ -2506,7 +2506,7 @@ How to use it (see the manuals' §2):
   the new deps; `-o` works after.
 - **Java emitting its OWN read is the ground truth, not a hand-coded expected set.** `IcebergGenerics.read(table)`
   applies the deletes; emit the rows it returns (`java_scan_rows.json`). Then "Rust scan == Java read" is a true
-  1:1 (Rust's `to_arrow()` MOR vs Java's reader), not "Rust matches my guess".
+  1:1 (Rust's `to_arrow()` merge-on-read vs Java's reader), not "Rust matches my guess".
 - **DATA-LEVEL interop deps go in the TEST-ORACLE pom ONLY; the Rust `Cargo.toml`/`Cargo.lock` stay 0-diff.**
   The reviewer's #1 check is `git diff Cargo.toml Cargo.lock crates/*/Cargo.toml` == EMPTY. The shipped library's
   dependency surface is frozen; only the dev oracle (a tool like `dev/spark/`) gains parquet/hadoop.
@@ -2518,3 +2518,26 @@ How to use it (see the manuals' §2):
   panic instead of skip. Harmless (the offline gate runs the var UNSET; run.sh passes an ABSOLUTE path), but
   treating empty-as-unset is the more robust gate. Also: `cargo test` sets CWD to the crate dir, so the env
   path must be ABSOLUTE (run.sh derives it from `SCRIPT_DIR`).
+- **Direction-2 ("Java reads what RUST writes") is the write-action ✅ flip — and the PUBLIC API suffices.** An
+  integration test can't see the `pub(crate)` row_delta crown-jewel helpers, so it RE-builds the write path from
+  the public surface only: `iceberg::memory::MemoryCatalogBuilder` + `iceberg::io::LocalFsStorageFactory` (real
+  on-disk warehouse), `iceberg::writer::*` (`ParquetWriterBuilder`/`FileWriter` for a real parquet data file,
+  `PositionDeleteFileWriter` for a real position-delete), `tx.fast_append()`/`tx.row_delta()`, and
+  `TableMetadata::write_to(file_io, "<dir>/.../final.metadata.json")` for a deterministic load path. Java's
+  `IcebergGenerics.read` then reads it. **No Rust production change, no new deps** (the write path already
+  exists). That this public-only path produces a Java-readable merge-on-read table is itself a parity result.
+- **Make the cross-impl read NON-VACUOUS by mutating the WRITTEN ARTIFACTS, not just the expected rows.** The
+  reviewer deleted Rust's delete-parquet (→ Java `NotFoundException` on the exact path Rust's manifest
+  references) and truncated Rust's avro manifest (→ Java `RuntimeIOException`) — proving Java genuinely opens
+  Rust's on-disk files, not a re-derivation. A green Direction-2 with these mutations failing = real byte-level
+  write parity.
+
+### 2026-06-09 (COMMIT-HYGIENE — REPEAT OFFENDER, now permanently internalized)
+- **CHAIN the gate to the commit with `&&` on ONE logical line; NEVER put `git commit` on a separate line from
+  the gate.** I hit this TWICE: a separate-line `typos . && echo OK` followed by a newline + `git add && git
+  commit` lets a FAILED gate (no "OK" printed) still commit (the git line is a separate statement). It bit the
+  write-validation fork-org-name typo (caught by CI) AND a capstone Increment-1 abbreviation typo in this very
+  file (caught only by a later local `typos`). THE RULE: `typos . && cargo fmt --all -- --check && git add -A &&
+  git commit …` — all one `&&` chain, output NOT suppressed, so a failure aborts BEFORE the commit. (And short
+  all-caps abbreviations + the fork's org name both trip typos → spell things out; keep org names out of
+  committed docs.)

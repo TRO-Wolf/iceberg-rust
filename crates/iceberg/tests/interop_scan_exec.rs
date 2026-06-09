@@ -48,19 +48,44 @@
 //!
 //! NO PRODUCTION CHANGE is needed: Rust's `to_arrow` already applies position deletes (the row_delta scan
 //! tests in `scan/mod.rs` prove it). This test is the byte-level, Java-written-table proof of that path.
+//!
+//! DIRECTION 2 (the GEN path — "Java reads what WE write"). When `ICEBERG_INTEROP_SCAN_GEN_DIR` is SET,
+//! [`test_scan_exec_gen_rust_writes_java_readable_table`] WRITES a real on-disk table there using the
+//! PRODUCTION write path (mirroring the `row_delta.rs` crown jewel), and the Java oracle's
+//! `verify-interop-scan-exec` mode READS it back with `IcebergGenerics` and asserts the merge-on-read rows.
+//! This is the parity flip for the write actions (append / row_delta): we write REAL parquet data + a REAL
+//! position-delete via `PositionDeleteFileWriter`, commit through a `MemoryCatalog` over the local FS, and
+//! land a `final.metadata.json` at a known path for Java to load. When the GEN var is UNSET this is a clean
+//! NO-OP. The two env vars are independent: Direction-1 (`ICEBERG_INTEROP_SCAN_DIR`) is unchanged.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
-use iceberg::TableIdent;
-use iceberg::io::FileIO;
-use iceberg::spec::TableMetadata;
+use iceberg::io::{FileIO, LocalFsStorageFactory};
+use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use iceberg::spec::{
+    DataContentType, DataFile, FormatVersion, NestedField, PrimitiveType, Schema, SortOrder,
+    Struct, TableMetadata, Type, UnboundPartitionSpec,
+};
 use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::base_writer::position_delete_writer::{
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+};
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use serde::Deserialize;
 
 // ===========================================================================================
@@ -96,6 +121,12 @@ fn cmp_opt(a: &Option<String>, b: &Option<String>) -> Ordering {
 /// The temp dir the Java oracle wrote the table + JSON rows into. `None` when the env var is unset.
 fn scan_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_SCAN_DIR").map(PathBuf::from)
+}
+
+/// The temp dir into which the DIRECTION-2 GEN path writes a Rust-authored table for Java to read.
+/// `None` when `ICEBERG_INTEROP_SCAN_GEN_DIR` is unset (the GEN test is then a clean no-op).
+fn scan_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_SCAN_GEN_DIR").map(PathBuf::from)
 }
 
 /// Load + parse the Java ground-truth rows from `<dir>/java_scan_rows.json`.
@@ -238,5 +269,238 @@ async fn test_scan_exec_merge_on_read_matches_java_read() {
     println!(
         "interop_scan_exec OK — Rust scan→Arrow merge-on-read = Java read: 3 live rows {{10,30,50}}, \
          deleted 20/40 absent"
+    );
+}
+
+// ===========================================================================================
+// DIRECTION 2 — the GEN path: Rust WRITES a real on-disk table; Java reads it back.
+//
+// Mirrors the `row_delta.rs` crown jewel exactly, but commits through a `MemoryCatalog` backed by
+// `LocalFsStorageFactory` (so metadata + manifests + parquet land on the REAL local FS) and writes a
+// `final.metadata.json` at a known path. The Java oracle's `verify-interop-scan-exec` mode loads that
+// metadata, reads with `IcebergGenerics` (applying our position delete), and asserts {10,30,50}.
+//
+// When `ICEBERG_INTEROP_SCAN_GEN_DIR` is UNSET this is a clean no-op — the offline gate stays green.
+// ===========================================================================================
+
+/// The unpartitioned V2 schema Java expects: {1 id long required, 2 data string optional}.
+fn gen_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("build the {id long, data string} schema")
+}
+
+/// Create the unpartitioned V2 table at EXACTLY `<gen_dir>/rust_table` in a `MemoryCatalog` over the
+/// local FS, so the on-disk layout is the deterministic `rust_table/{metadata,data}/...` Java loads.
+async fn create_rust_table(catalog: &impl Catalog, table_location: &str) -> Table {
+    let namespace = NamespaceIdent::new("interop".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let creation = TableCreation::builder()
+        .name("rust_table".to_string())
+        .location(table_location.to_string())
+        .schema(gen_schema())
+        .partition_spec(UnboundPartitionSpec::builder().build())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+
+    catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create rust_table")
+}
+
+/// Write a REAL parquet DATA file of 5 rows (10,"a")…(50,"e") at positions 0..4 into the table's
+/// location via the production `ParquetWriterBuilder` + `FileWriter`, returning the [`DataFile`]
+/// (content `Data`, unpartitioned). Reuses the crown-jewel machinery — no hand-rolled parquet.
+async fn write_gen_data_file(table: &Table) -> DataFile {
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema → arrow"));
+
+    let ids = Int64Array::from(vec![10_i64, 20, 30, 40, 50]);
+    let data = StringArray::from(vec!["a", "b", "c", "d", "e"]);
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(ids) as ArrayRef,
+        Arc::new(data) as ArrayRef,
+    ])
+    .expect("build the 5-row data batch");
+
+    // Write the parquet directly under the table location so Java's FileIO resolves it from the
+    // manifest entry (same convention as the crown jewel's `write_data_file`).
+    let file_path = format!(
+        "{}/data/00000-rust-data.parquet",
+        table.metadata().location()
+    );
+    let output = table
+        .file_io()
+        .new_output(file_path)
+        .expect("new parquet output");
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        schema.clone(),
+    );
+    let mut writer = parquet_builder
+        .build(output)
+        .await
+        .expect("build parquet writer");
+    writer.write(&batch).await.expect("write data batch");
+    let data_file_builders = writer.close().await.expect("close parquet writer");
+
+    // The parquet writer returns builders without content/partition stamped — finish as an
+    // unpartitioned data file (empty partition struct, default spec id 0).
+    let mut builder = data_file_builders
+        .into_iter()
+        .next()
+        .expect("one data file builder");
+    builder
+        .content(DataContentType::Data)
+        .partition_spec_id(0)
+        .partition(Struct::empty())
+        .build()
+        .expect("build unpartitioned data file")
+}
+
+/// Write a REAL parquet POSITION-DELETE file (via the production `PositionDeleteFileWriter`) deleting
+/// positions {1, 3} of `data_file_path` (ids 20 and 40), unpartitioned. Reuses the crown-jewel machinery.
+async fn write_gen_position_delete_file(table: &Table, data_file_path: &str) -> DataFile {
+    let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "pos-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        config.schema().clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+
+    // Unpartitioned table ⇒ no partition key (the delete-file index keys by partition + spec id; an
+    // unpartitioned table has the empty partition for every file).
+    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .build(None)
+        .await
+        .expect("build position-delete writer");
+
+    let paths = StringArray::from(vec![data_file_path, data_file_path]);
+    let positions = Int64Array::from(vec![1_i64, 3]);
+    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(paths) as ArrayRef,
+        Arc::new(positions) as ArrayRef,
+    ])
+    .expect("build the position-delete batch");
+    writer
+        .write(batch)
+        .await
+        .expect("write position-delete batch");
+    writer
+        .close()
+        .await
+        .expect("close position-delete writer")
+        .into_iter()
+        .next()
+        .expect("one position-delete file")
+}
+
+#[tokio::test]
+async fn test_scan_exec_gen_rust_writes_java_readable_table() {
+    let Some(gen_dir) = scan_gen_dir() else {
+        println!(
+            "skipping interop_scan_exec GEN — set ICEBERG_INTEROP_SCAN_GEN_DIR \
+             (run dev/java-interop/run-interop-scan-exec-d2.sh)"
+        );
+        return;
+    };
+
+    // 1. A MemoryCatalog over the LOCAL FS, warehouse = <gen_dir>, table pinned to <gen_dir>/rust_table.
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_rust_table(&catalog, &table_location).await;
+
+    // 2. fast_append a REAL parquet data file of 5 rows (10,a)..(50,e).
+    let data_file = write_gen_data_file(&table).await;
+    let data_file_path = data_file.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![data_file])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // 3. row_delta a REAL position-delete deleting positions {1,3} (ids 20/40).
+    let delete_file = write_gen_position_delete_file(&table, &data_file_path).await;
+    assert_eq!(delete_file.content_type(), DataContentType::PositionDeletes);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // 4. Sanity: OUR OWN scan→Arrow already applies the delete → {10,30,50}. (Direction-1 proves Rust
+    //    reads what Java writes; here we confirm the table is internally consistent before handing to Java.)
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 50],
+        "Rust's own scan of the written table must already be {{10,30,50}} (20/40 deleted)"
+    );
+
+    // 5. Write the FINAL metadata to a KNOWN path so Java loads it deterministically. The real on-disk
+    //    manifest-list + manifests + parquet already live under <gen_dir>/rust_table.
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_scan_exec GEN OK — Rust wrote {table_location} (parquet data + position-delete + \
+         final.metadata.json); Rust scan = {{10,30,50}}. Java verify-interop-scan-exec reads it next."
     );
 }
