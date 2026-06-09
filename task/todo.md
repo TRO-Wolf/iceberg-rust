@@ -3691,3 +3691,68 @@ IncrementalAppendScan UNCHANGED** (the 13 append-scan + the regular scan tests s
 all-targets (excl. sqllogictest) clean; `--lib` ×2 = 1558/0 (1550 prior + 8); `scan::` 64/0; datafusion
 `--lib --tests` 80 + 9; interop manage_snapshots/update_schema/update_partition_spec 4/4/4; clippy `-D warnings`
 clean; fmt clean; typos 0. **NO Cargo edits.**
+
+### Increment 5 — TableScan use_ref (scan a branch/tag by name) (DETAIL)
+Increment 4 (IncrementalChangelogScan) committed `4a772640`. Java `TableScan.useRef(String ref)`
+(`api/.../TableScan.java:48`, impl in `BaseTableScan`/`SnapshotScan.useRef`): select the snapshot a
+branch/tag reference points to. Rust `TableScanBuilder` has `snapshot_id(i64)` but NO ref-based selector;
+`TableMetadata::snapshot_for_ref(name) -> Option<&SnapshotRef>` already exists. Bounded, self-contained,
+low-risk, valuable (branch/tag reads).
+
+Build: add `snapshot_ref: Option<String>` to `TableScanBuilder` + `use_ref(impl Into<String>)`; in `build()`
+resolve the ref via `metadata.snapshot_for_ref(&name)` → its snapshot (error `DataInvalid`/`Unexpected` if the
+ref doesn't exist). Java rejects combining `useRef` with `useSnapshot`/`asOfTime` — reject `use_ref` + 
+`snapshot_id` both set (a clear error). Otherwise scan the resolved snapshot exactly like `snapshot_id`.
+Tests: `use_ref("main")` scans the current snapshot; a tag/branch ref scans its snapshot; unknown ref → error;
+`use_ref` + `snapshot_id` both set → error; default (neither) unchanged. Mutation-pin the ref resolution + the
+both-set rejection. Confirm existing scans unchanged. Widened gate. ONLY `scan/mod.rs` + docs.
+
+Plan (BUILDER Opus, 2026-06-08):
+- [x] Read Java `SnapshotScan.useRef` (L116-128): MAIN_BRANCH ⇒ table default; else reject if snapshot id
+      already set ("Cannot override ref…"); resolve `table().snapshot(name)`; reject null ("Cannot find ref %s").
+- [x] Add `snapshot_ref: Option<String>` field (init `None`) + `pub fn use_ref(impl Into<String>)`.
+- [x] In `build()`: both-set ⇒ `DataInvalid`; ref-set ⇒ `snapshot_for_ref` (unknown ⇒ `DataInvalid` with name);
+      else unchanged `snapshot_id`-or-current logic.
+- [x] Tests against the existing `example_table_metadata_v2.json` fixture: `test` tag → older snapshot
+      `3051729675574597004`; `main` → current; unknown ref → err; both-set → err; default unchanged; plus a
+      result-equivalence read through `use_ref("main")`.
+- [x] Mutations (Edit+revert): ignore `snapshot_ref`; drop both-set rejection; drop unknown-ref error.
+- [x] Docs: GAP_MATRIX, Roadmap, todo Outcome, lessons (if non-obvious).
+
+**Outcome (2026-06-08, Increment 5 — TableScan use_ref, BUILDER Opus):** `TableScanBuilder::use_ref(impl
+Into<String>)` lands in `crates/iceberg/src/scan/mod.rs`, mirroring Java `SnapshotScan.useRef`
+(`core/SnapshotScan.java` L116-128). A new `snapshot_ref: Option<String>` field (init `None`) records the
+intent; `build()` resolves BOTH selectors up front via a `match (self.snapshot_id, self.snapshot_ref)`:
+ref+snapshot-id ⇒ `DataInvalid` ("Cannot scan using both a ref … and a snapshot id", Java "Cannot override
+ref"); ref-only ⇒ `TableMetadata::snapshot_for_ref(name)` (the EXISTING accessor — no `spec/` change), unknown
+⇒ `DataInvalid` ("snapshot ref '…' not found", Java "Cannot find ref %s"); else the ORIGINAL `snapshot_id`-or-
+current logic flows unchanged (including the no-current-snapshot empty-scan early return). `"main"` resolves to
+the current snapshot because the parse path auto-injects a `main` ref at the current snapshot id
+(`table_metadata.rs` `TryFrom`), matching Java `useRef(MAIN_BRANCH)` returning the table default — so no special
+`MAIN_BRANCH` arm is needed. 6 unit tests over the shared `example_table_metadata_v2.json` fixture (which
+already carries two snapshots + a `test` TAG pointing at the OLDER one): `main`→current, `test`→older snapshot
+(asserts ≠ current — the core branch/tag-read behavior), unknown→err+names-ref, ref+id→err (order-independent),
+default-unchanged, and a planning result-equivalence read (`use_ref("main")` plans the same 2 files as a plain
+`.build()`). Mutations (Edit+revert): (a) ignore `snapshot_ref` (always current) → tag test fails 3055…≠3051…;
+(b) drop the both-set rejection (id wins) → both-set test fails; (c) drop the unknown-ref error (fall back to
+current) → unknown-ref test fails — all caught. Existing scans UNCHANGED: the full `scan::` suite stayed green
+(70 tests, 64 prior + 6 new). Gate green on `phase3-overnight`. ONLY `scan/mod.rs` + docs touched; NO Cargo
+edits, NO `spec/` change.
+
+#### Increment 5 — REVIEW (2026-06-08, Opus REVIEWER, DELEGATED) — CHANGES-MADE (PASS 🟡)
+Verdict: PASS 🟡 with one test added. Resolution logic confirmed faithful to Java `SnapshotScan.useRef`
+L116-128 (both-set→reject, unknown→reject, `"main"`/ref→correct snapshot via the auto-injected main ref); the
+default no-`use_ref` path is byte-unchanged (the new pre-resolution `match` only computes a `snapshot_id`, then
+the ORIGINAL `match snapshot_id` block — incl. the empty-table early return — is untouched bar `self.snapshot_id`
+→ `snapshot_id`). Test-strength: the core different-ref test pins the resolved snapshot id (the load-bearing
+logic), and full planning is separately proven via `use_ref("main")` — judged acceptable, and STRENGTHENED with
+`test_plan_files_use_non_main_ref_plans_referenced_snapshot` (adds a non-main tag at the current snapshot via
+`set_ref`, then plans through it = the default file set), guarding against any future special-casing of `"main"`
+in planning. Re-ran all 3 builder mutations + a 4th (swap both-set to silently resolve the ref instead of
+erroring) — all 4 caught. The `use_ref("main")`-on-an-empty-table divergence (Java returns an empty-default;
+Rust errors `DataInvalid` because no `main` ref is injected without a current snapshot) is narrow, documented,
+and a LOUD error (no silent corruption) — judged acceptable. Engineering floor: no bare `.unwrap()` in
+production (resolution uses `.ok_or_else`/`?`); test `.unwrap()` matches the local module convention; error
+kinds/messages name the ref. Scope clean: `scan/mod.rs` + the 4 docs only; no `spec/`/Cargo edits. Lib total now
+1565/0 (×2 stable), `scan::` 71/0, interop 4+4+4, clippy/fmt/typos clean. Stayed on `phase3-overnight`; no
+commit/push.

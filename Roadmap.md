@@ -512,6 +512,18 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      all 4 mutations (reverse ordinals, Deleted→Insert, include Replace, drop the delete-manifest guard)
      caught. Validation + interop deferred → 🟡; `BatchScan` + CDC-merge (`UPDATE_BEFORE`/`UPDATE_AFTER`) still
      pending.
+  9. **`TableScan.useRef` (branch/tag scanning)** — **DONE 2026-06-08 (`scan/mod.rs`, Java
+     `SnapshotScan.useRef` `core/SnapshotScan.java` L116-128).** `TableScanBuilder::use_ref(impl
+     Into<String>)` selects the snapshot a branch/tag reference points to; `build()` resolves it via the
+     existing `TableMetadata::snapshot_for_ref(name)` (`"main"` ⇒ the current snapshot, matching Java
+     `useRef(MAIN_BRANCH)` returning the table default), errors `DataInvalid` on an unknown ref ("snapshot
+     ref '…' not found", Java "Cannot find ref %s") and on `use_ref` + `snapshot_id` set together (Java
+     "Cannot override ref, already set snapshot id"). The default (no `use_ref`) snapshot resolution is
+     byte-unchanged. 7 unit tests (`main`→current, `test` tag→older snapshot ≠ current, unknown→err,
+     both-set→err, default-unchanged, `use_ref("main")` planning result-equivalence, and a NON-main tag at
+     the current snapshot planning the same files — reviewer-added, guarding any "main" special-casing); all
+     4 mutations (ignore the ref, drop the both-set rejection, drop the unknown-ref error, swap both-set to
+     silently use the ref) caught. Scope: `scan/mod.rs` + docs only.
 - **Exit criteria:** scans match Java planning/results incl. residuals; inspection tables present; reports
   emitted.
 

@@ -2057,3 +2057,30 @@ How to use it (see the manuals' §2):
   a typo; wrapping it (`0x…` / "commit hash") clears the gate without an out-of-scope `.typos.toml` edit. Same
   class as an uppercase-plural acronym in a doc comment (e.g. "inserts"/"deletes" written in caps with a
   trailing `s`) — write the lowercase singular-rooted form rather than fight the dictionary.
+
+### 2026-06-08 (Increment 5 — TableScan use_ref, BUILDER Opus)
+- **DO let `TableMetadata::snapshot_for_ref("main")` cover Java's `useRef(MAIN_BRANCH)` default case — no
+  special `MAIN_BRANCH` arm needed.** *Why:* Java early-returns the table default for `MAIN_BRANCH`
+  (`SnapshotScan.useRef` L117-119) BEFORE the ref lookup, because its `table().snapshot(name)` does not resolve
+  `"main"`. But the Rust parse path (`table_metadata.rs` `TryFrom`/`try_normalize`) AUTO-INJECTS a `main` ref at
+  `current_snapshot_id` whenever a current snapshot exists, so `snapshot_for_ref("main")` already returns the
+  current snapshot — identical result. Routing `"main"` through the same `snapshot_for_ref` path as any other
+  ref is simpler and stays faithful. (Narrow divergence: on an EMPTY table with no current snapshot, Java's
+  `useRef("main")` returns the empty table default while Rust's `snapshot_for_ref("main")` is `None` → unknown-
+  ref error; not exercised by the brief's tests, acceptable, flagged here.)
+- **DO reuse the shared `example_table_metadata_v2.json` scan fixture for branch/tag-read tests — it already
+  carries the needed shape.** *Why:* it has two snapshots AND a `refs: {"test": {tag → the OLDER snapshot}}`
+  entry, so `use_ref("test")` resolves to a snapshot that is provably ≠ the current one with ZERO fixture
+  setup. The core "a ref scans a DIFFERENT snapshot" test asserts on `table_scan.snapshot().snapshot_id()` (the
+  pattern of the existing `test_table_scan_with_snapshot_id`), which sidesteps the fact that `setup_manifest_
+  files` only writes the CURRENT snapshot's manifest list (the older snapshot's `manifest_list_1` file is never
+  written, so planning files from it would fail) — the resolved-snapshot-id IS the load-bearing behavior the
+  mutations pin. Prove the full planning pipeline still flows through `use_ref` with a separate result-
+  equivalence read against `use_ref("main")` (= the current snapshot, whose manifest list IS written).
+- **DO resolve BOTH scan selectors in one `match (snapshot_id, snapshot_ref)` up front, then feed the result
+  into the UNCHANGED snapshot-id-or-current logic.** *Why:* it keeps the both-set rejection and the unknown-ref
+  error in one obvious place, reuses the existing snapshot-by-id load + the no-current-snapshot empty-scan early
+  return verbatim (so the default path is byte-unchanged and the existing 64 scan tests stay green), and the
+  ref resolution collapses to producing an `Option<i64>` snapshot id. Mutating any one arm (ignore the ref;
+  let the id win on both-set; swallow the unknown-ref `None`) flips exactly one test — the precise Java
+  contract, not "errors sometimes."
