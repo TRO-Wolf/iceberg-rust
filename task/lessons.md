@@ -2495,3 +2495,26 @@ How to use it (see the manuals' §2):
   covering sequence number — not just the file it "came from". The cat=a delete associated with BOTH F1 and
   F3; Rust matched. Let the bulk per-file delete-set comparison (not a single hand-picked file) prove this, so
   you assert Java's REAL association rather than an assumed one.
+
+### 2026-06-09 (DATA-LEVEL scan-execution interop — real parquet + merge-on-read — ORCHESTRATOR + REVIEWER Opus)
+- **The A1-A4 manifest harness extends to REAL parquet data with `iceberg-data` + `iceberg-parquet`.**
+  `GenericAppenderFactory(schema, spec).newDataWriter(localOutput, PARQUET)` writes a real parquet data file +
+  builds the `DataFile` from its real metrics (the `data/.../FileHelpers.java` template); `newPosDeleteWriter`
+  writes a real position-delete (`PositionDelete.set(path, pos, null)`). It writes to an iceberg `OutputFile`
+  (`Files.localOutput`), so NO Hadoop FileSystem — but the parquet-hadoop classes need a runtime jar, so the
+  oracle pom also needs `org.apache.hadoop:hadoop-client-runtime`. The first `mvn` run must be ONLINE to fetch
+  the new deps; `-o` works after.
+- **Java emitting its OWN read is the ground truth, not a hand-coded expected set.** `IcebergGenerics.read(table)`
+  applies the deletes; emit the rows it returns (`java_scan_rows.json`). Then "Rust scan == Java read" is a true
+  1:1 (Rust's `to_arrow()` MOR vs Java's reader), not "Rust matches my guess".
+- **DATA-LEVEL interop deps go in the TEST-ORACLE pom ONLY; the Rust `Cargo.toml`/`Cargo.lock` stay 0-diff.**
+  The reviewer's #1 check is `git diff Cargo.toml Cargo.lock crates/*/Cargo.toml` == EMPTY. The shipped library's
+  dependency surface is frozen; only the dev oracle (a tool like `dev/spark/`) gains parquet/hadoop.
+- **Mutation-prove a merge-on-read read TWO ways:** (1) poison the expected-rows JSON (resurrect a deleted row)
+  → the value comparison fails; (2) point the env dir at the PRE-delete snapshot (the data-only commit) → Rust
+  scans all rows → fails. Both confirm the delete is genuinely applied + the comparison is non-vacuous, on the
+  gitignored temp dir (restore by re-running the run script).
+- **Env-gate edge case:** `std::env::var_os` treats set-but-EMPTY as present, so `VAR=""` would proceed +
+  panic instead of skip. Harmless (the offline gate runs the var UNSET; run.sh passes an ABSOLUTE path), but
+  treating empty-as-unset is the more robust gate. Also: `cargo test` sets CWD to the crate dir, so the env
+  path must be ABSOLUTE (run.sh derives it from `SCRIPT_DIR`).

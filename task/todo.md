@@ -4164,3 +4164,28 @@ residual-always-true} match EXACTLY. Purely additive — NO production change.
 
 ### NEXT: squash `phase2-3-remnants` + open PR (awaiting user go-ahead on squash-vs-keep + confirm base = the origin fork, NEVER apache upstream)
 Branch = ~10 commits off main `ccfcb062` (3 Phase-2/3 remnants + 4 pure-metadata/manifest-A1 interop + file_format fix + A2 + A3 + A4). All LOCAL-only, not pushed. Deferred beyond this PR: `readable_metrics` interop; A5 scan EXECUTION (parquet deps + approval); other Phase 2/3 remnants (overwriteByRowFilter, RowDelta validateNoNewDeletesForDataFiles, BatchScan, CDC-merge).
+
+**MERGED as `5f32b10d` "Phase2 3 remnants (#8)". Then: write-validation cluster (branch `phase2-write-validation`, in PR — separate). Then: data-level interop capstone (below).**
+
+---
+
+## Active (2026-06-09): DATA-LEVEL write/scan interop capstone (branch `phase3-scan-exec-interop` off main `5f32b10d`)
+
+User chose this as the highest-value next sequence (flips write actions + Phase-3 scan-execution toward ✅ via
+real-row interop). Run.sh-driven, env-gated. The Java oracle now writes REAL parquet data + delete files
+(approved deps in the oracle pom: `iceberg-data` + `iceberg-parquet` + `hadoop-client-runtime`; Rust Cargo
+FROZEN, 0-diff).
+
+- [x] **Increment 1: scan-execution merge-on-read interop (position deletes)** — `ScanExecOracle` /
+  `generate-interop-scan-exec` writes a real table (5-row parquet data file + a real position-delete deleting
+  {1,3}=ids 20/40), commits append→rowDelta, emits Java's OWN `IcebergGenerics` read ({10,30,50}). Rust
+  `interop_scan_exec.rs` loads it, `scan().to_arrow()`, asserts rows == Java's read (20/40 absent). NO Rust
+  production change. Reviewer mutation-pinned 2 ways (poison expected; pre-delete snapshot). Gate green (offline
+  no-op + run.sh round-trip). **This is the A5 scan-execution proof + the read-side write-action interop.**
+- [ ] **Increment 2: equality deletes** + multi-data-file + schema/type variety.
+- [ ] **Increment 3: Direction-2 — Rust WRITES a real table** (append / rowDelta with a Rust-written parquet
+  data + position-delete) → the Java oracle READS it + verifies the rows (proves Rust's writes are Java-readable
+  — the write-action ✅ flip).
+- [ ] **Increment 4: partitioned tables** + the cross-product; then PR the capstone.
+
+Deferred elsewhere: `readable_metrics` interop; ORC/Avro data; V3 types (Phase 4); BatchScan; CDC-merge.

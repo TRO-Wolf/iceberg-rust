@@ -29,6 +29,7 @@ package org.apache.iceberg;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -36,17 +37,25 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
+import org.apache.iceberg.data.GenericAppenderFactory;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.IcebergGenerics;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.deletes.PositionDelete;
+import org.apache.iceberg.deletes.PositionDeleteWriter;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.LocationProvider;
@@ -142,6 +151,16 @@ public final class InteropOracle {
         // and whether each task's residual is fully covered by partitioning — via Java's REAL
         // table.newScan().filter(expr).planFiles(). Driven from here so a single run produces A1/A2/A3/A4.
         InspectionScanA4Oracle.generate(inspectionManifestsDir);
+        break;
+      case "generate-interop-scan-exec":
+        // The FIRST DATA-LEVEL scan-execution interop increment. Unlike every mode above (which reads
+        // MANIFESTS / pure metadata), this writes a REAL PARQUET DATA file + a REAL POSITION-DELETE file
+        // via the generic parquet appender (iceberg-data's GenericAppenderFactory) and materializes Java's
+        // OWN merge-on-read READ (IcebergGenerics) as the ground truth. The Rust test reads the SAME table
+        // and asserts its scan→Arrow (with the position deletes applied) equals Java's live rows. The temp
+        // dir is supplied via -Dinterop.scan_exec.dir on the CLI (same JVM, so System.getProperty sees it).
+        Path scanExecDir = requireFixturesDir("interop.scan_exec.dir");
+        ScanExecOracle.generate(scanExecDir);
         break;
       case "verify":
         int failures = 0;
@@ -2586,6 +2605,207 @@ public final class InteropOracle {
 
                 gen.writeEndObject();
               }
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+  }
+
+  // ===========================================================================================
+  // Scan-EXECUTION oracle — the FIRST DATA-LEVEL scan-execution interop increment (the capstone). Every
+  // mode above reads MANIFESTS or pure metadata; this one proves the DATA path end to end: Rust's
+  // scan→Arrow with MERGE-ON-READ position-delete application must equal Java's OWN read of a JAVA-WRITTEN
+  // table containing REAL parquet data + a REAL position-delete file.
+  //
+  // Unlike A1-A4 (which used PURE-METADATA DataFiles/FileMetadata builders whose referenced .parquet need
+  // not exist), this oracle writes the ACTUAL parquet bytes via the generic parquet appender
+  // (iceberg-data's GenericAppenderFactory, routed to iceberg-parquet's GenericParquetWriter) AND the
+  // ACTUAL position-delete parquet via the generic position-delete writer — then builds the DataFile /
+  // DeleteFile from the writer's real metrics + length + record_count (mirroring iceberg-data's
+  // FileHelpers.writeDataFile / writePosDeleteFile "write records → DataFile" template).
+  //
+  // THE TABLE (under <dir>/table). Unpartitioned V2, schema {1 id long required, 2 data string optional}:
+  //   data file 00000-data.parquet: rows (10,"a") (20,"b") (30,"c") (40,"d") (50,"e") at positions 0..4.
+  //   position-delete 00000-data-deletes.parquet: deletes positions {1,3} of that data file (rows 20, 40).
+  //   live rows after merge-on-read = {10,30,50}.
+  // Commits: newAppend(dataFile) then newRowDelta(deleteFile) — real AVRO manifests + manifest-list land on
+  // disk under <dir>/table/metadata, and final.metadata.json is written to a known path for the Rust test.
+  //
+  // THE GROUND TRUTH. Java materializes its OWN merge-on-read read via IcebergGenerics.read(table).build()
+  // (which plans the scan, opens the parquet, and APPLIES the position deletes), collects the live rows,
+  // sorts by id, and writes them to <dir>/java_scan_rows.json as [{id,data}, ...] = [{10,a},{30,c},{50,e}].
+  // The Rust test reads the SAME table, runs table.scan().build()?.to_arrow(), and asserts equality.
+  // ===========================================================================================
+
+  /**
+   * The scan-execution half of the oracle — the DATA-level merge-on-read interop. Builds an unpartitioned
+   * V2 table on local disk under {@code <dir>/table}, writes a REAL parquet data file (5 rows) + a REAL
+   * position-delete file (deleting positions 1 and 3) via the generic appender / position-delete writer,
+   * commits them ({@code newAppend} + {@code newRowDelta}), writes {@code final.metadata.json}, and emits
+   * Java's OWN merge-on-read read (via {@link IcebergGenerics}) as {@code java_scan_rows.json}.
+   */
+  static final class ScanExecOracle {
+    private ScanExecOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the unpartitioned V2 table on local disk under <dir>/table. The location is the BARE
+      //    absolute path so the manifest/manifest-list/data/delete paths the writers + commits use are bare
+      //    absolute paths the Rust FileIO::new_with_fs() resolves directly (same convention as A1-A4).
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed); // persist v0 metadata so the BaseTable has a current metadata to evolve.
+      BaseTable table = new BaseTable(ops, "interop_scan_exec");
+
+      // 2. Write a REAL parquet DATA file: 5 GenericRecords (10,"a")..(50,"e") at positions 0..4. The
+      //    DataFile is built from the appender's REAL metrics + length + record_count (the FileHelpers
+      //    "write records → DataFile" template), so the on-disk parquet + the manifest entry agree.
+      String dataPath = new File(dataDir, "00000-data.parquet").getAbsolutePath();
+      DataFile dataFile = writeDataFile(table, schema, spec, dataPath);
+
+      // 3. Write a REAL parquet POSITION-DELETE file deleting positions {1,3} of that data file (rows 20 and
+      //    40). Built from the position-delete writer's real metrics, so a real merge-on-read reader applies it.
+      String deletePath = new File(dataDir, "00000-data-deletes.parquet").getAbsolutePath();
+      DeleteFile deleteFile = writePosDeleteFile(table, schema, spec, deletePath, dataFile.path());
+
+      // 4. Real commits: the data file via newAppend (writes a DATA manifest + manifest-list), then the
+      //    position-delete via newRowDelta (writes a DELETE manifest). Live rows are now {10,30,50}.
+      table.newAppend().appendFile(dataFile).commit();
+      table.newRowDelta().addDeletes(deleteFile).commit();
+
+      // 5. Write the FINAL metadata to a KNOWN path so the Rust test loads it deterministically. (The real
+      //    on-disk manifest-list + manifests + parquet already live under <dir>/table.)
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 6. Java materializes its OWN merge-on-read READ (IcebergGenerics plans the scan, opens the parquet,
+      //    and APPLIES the position deletes) → collect live rows, sort by id, emit java_scan_rows.json. This
+      //    is the GROUND TRUTH the Rust scan→Arrow must equal: [{10,a},{30,c},{50,e}] (20 and 40 deleted).
+      writeJson(dir.resolve("java_scan_rows.json"), readLiveRowsToJson(table));
+      System.out.println("generated scan-exec table + java_scan_rows.json to " + dir);
+    }
+
+    /**
+     * Write a REAL parquet data file via the generic appender and return its {@link DataFile} built from
+     * the appender's REAL metrics + length + split offsets (the {@code FileHelpers.writeDataFile} template).
+     * The 5 rows are (10,"a") (20,"b") (30,"c") (40,"d") (50,"e") at positions 0..4.
+     */
+    private static DataFile writeDataFile(
+        BaseTable table, Schema schema, PartitionSpec spec, String path) throws IOException {
+      List<Record> rows = new ArrayList<>();
+      long[] ids = {10L, 20L, 30L, 40L, 50L};
+      String[] values = {"a", "b", "c", "d", "e"};
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("data", values[i]);
+        rows.add(record);
+      }
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      // newDataWriter wires the appender to the DataFile builder: toDataFile() reads back the REAL metrics
+      // (record count, file size, column sizes, bounds, split offsets) the parquet writer produced.
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * Write a REAL parquet POSITION-DELETE file via the generic position-delete writer, deleting positions
+     * {1, 3} of {@code referencedDataPath} (rows 20 and 40), and return its {@link DeleteFile} built from
+     * the writer's REAL metrics (the {@code FileHelpers.writePosDeleteFile} template). The delete references
+     * the data file's path + the two positions, so a real merge-on-read reader masks exactly those rows.
+     */
+    private static DeleteFile writePosDeleteFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        String path,
+        CharSequence referencedDataPath)
+        throws IOException {
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        // Delete positions 1 and 3 (the 2nd and 4th rows: id 20 and id 40). No row data is carried.
+        writer.write(posDelete.set(referencedDataPath, 1L, null));
+        writer.write(posDelete.set(referencedDataPath, 3L, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    /**
+     * Materialize Java's OWN merge-on-read READ of the table via {@link IcebergGenerics} (which plans the
+     * scan, opens the parquet, AND applies the position deletes), collect the live rows, SORT by id, and
+     * serialize them to a JSON array of {@code {id, data}}. This is the GROUND TRUTH = [{10,a},{30,c},{50,e}].
+     */
+    private static String readLiveRowsToJson(BaseTable table) {
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+
+      // Sort by id for a stable, order-independent ground truth.
+      List<Long> ids = new ArrayList<>(dataById.keySet());
+      ids.sort(Long::compareTo);
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (Long id : ids) {
+              gen.writeStartObject();
+              gen.writeNumberField("id", id);
+              String data = dataById.get(id);
+              if (data == null) {
+                gen.writeNullField("data");
+              } else {
+                gen.writeStringField("data", data);
+              }
+              gen.writeEndObject();
             }
             gen.writeEndArray();
           },
