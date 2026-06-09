@@ -4195,7 +4195,17 @@ NO interop needed):
 - [ ] **Increment 3: `OverwriteFiles.overwriteByRowFilter` + `validateAddedFilesMatchOverwriteFilter`** — the
   row-filter overwrite mode (delete-by-row-filter) + strict/inclusive/metrics validation of added files
   (StrictMetricsEvaluator + inclusive/strict partition Projections).
-- [ ] **Increment 4: `ReplacePartitions.validateNoConflictingDeletes`** — wire the shared helper into
-  ReplacePartitions' replaced-partition data files.
+- [x] **Increment 3: `ReplacePartitions.validateNoConflictingDeletes`** (completes the validateNoConflictingDeletes
+  pair) — PARTITION-SET-based (NOT the per-data-file helper): `validateNoNewDeleteFiles(replacedPartitions)` +
+  `validateDeletedDataFiles(replacedPartitions)` reusing `added_delete_files_after` + `deleted_data_files_after`
+  + the SINGLE existing replaced-partition predicate (`file_in_replaced_partition`). op-sets read from the Java
+  constants; skip_deletes=false. 8 MemoryCatalog tests incl. tx-captured pin + non-replaced-partition controls;
+  mutation-verified. Gate green (lib 1620, transaction:: 278). NO snapshot.rs churn.
+
+Remaining in the cluster:
+- [ ] **Increment 4: `OverwriteFiles.overwriteByRowFilter` + `validateAddedFilesMatchOverwriteFilter`** — the
+  row-filter overwrite mode (delete-by-row-filter at commit) + strict/inclusive/metrics validation of added
+  files (StrictMetricsEvaluator + inclusive/strict partition Projections). The meatiest one (a new mode).
+- [ ] **Increment 2b: `RowDelta.validateAddedDVs`** (V3 deletion-vector conflict).
 
 Then: PR the cluster to the origin fork (NEVER apache).
