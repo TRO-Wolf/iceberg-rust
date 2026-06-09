@@ -4078,11 +4078,13 @@ divergence. **Two documented presentation divergences (on-disk MATCHES; not bugs
 (Java row UPPERCASE via the FileFormat enum vs Rust lowercase Display — a small inspection-table-only parity
 gap) + absent metric-map `{}` vs `null` (Rust non-optional maps). readable_metrics deferred from comparison.
 
-### Candidate FOLLOW-UP (small, optional): `file_format` UPPERCASE in inspection tables
-Make `inspect/data_file.rs` (the shared files/entries/all_* projection) emit `file_format` upper-cased to
-match Java's `FilesTable` row (Java round-trips through the `FileFormat` enum NAME). On-disk write is
-UNCHANGED (that's `DataFileFormat::Display`, correct — both write lowercase `parquet`). ~1 line + update the
-files.rs/entries.rs unit-test expectations + check datafusion. Cosmetic but a genuine 1:1 inspection gap.
+### FOLLOW-UP DONE (2026-06-09): `file_format` UPPERCASE in inspection tables
+`inspect/data_file.rs` now emits `file_format` upper-cased (`.to_string().to_uppercase()`) for the shared
+files/entries/all_* projection, matching Java's `FilesTable` enum-NAME rendering. On-disk write UNCHANGED
+(`DataFileFormat::Display`/serde, still lowercase; `git diff crates/iceberg/src/spec` empty). The A1 interop
+test was tightened to EXACT file_format equality (canonicalization dropped). No unit-snapshot churn (the
+inspect unit tests assert only the Arrow schema, never the rendered value); datafusion/sqllogictest had no
+file_format value expectation. Gate + run.sh round-trip green. Own commit (fix(inspect)).
 
 **Deferred next (manifest interop):** A2 `entries`/`manifests`/`partitions` (same harness); A3 `all_*`
 (multi-snapshot table); A4 scan PLANNING (file set + residuals); A5 scan EXECUTION (reads parquet → Arrow —

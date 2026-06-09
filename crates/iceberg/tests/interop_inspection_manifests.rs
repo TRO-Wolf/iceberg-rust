@@ -43,20 +43,22 @@
 //! HashMap iteration order (a documented divergence), so it is OUT OF SCOPE for A1 — the RAW metric MAPS +
 //! bound MAPS this test DOES compare are the load-bearing source those readable values derive from.
 //!
-//! TWO KNOWN, NON-CORRUPTING REPRESENTATION DIVERGENCES (content-identical; surfaced, not hidden). Both
-//! are presentation-only differences in how each library's metadata table RENDERS a column; the underlying
-//! on-disk manifest value is identical, so they are NOT production bugs and NOT in scope to "fix" here (a
-//! fix would be a spec-type change, out of bounds for an interop test). They are collapsed to a canonical
-//! form by [`FileRow::canonical`] for the bulk equality AND pinned RAW by a focused assertion so neither can
-//! drift unnoticed:
-//!   1. `file_format` CASE. Java's `FilesTable` emits the UPPERCASE `FileFormat` enum name (`PARQUET`,
-//!      since `FileFormat` does not override `toString()`); Rust's `inspect` renders `DataFileFormat`'s
-//!      lowercase `Display` (`parquet`). The on-disk AVRO stores `PARQUET` either way (Rust reads it via the
-//!      case-insensitive `from_str`). Canonicalized by ASCII-lowercasing.
-//!   2. ABSENT METRIC/BOUND MAP — empty `{}` vs `null`. Rust's `spec::DataFile` stores the metric/bound maps
-//!      as NON-optional `HashMap`, so an absent map projects to an EMPTY map; Java stores `null` and emits
-//!      JSON `null`. An empty map and a null map carry identical information (no metrics). Canonicalized by
-//!      treating `None` and `Some(empty)` as equal.
+//! `file_format` NOW MATCHES JAVA EXACTLY. Rust's `inspect` projection upper-cases the rendered
+//! `file_format` column (`PARQUET`/`AVRO`/`ORC`) to match Java's `FilesTable`/`ManifestEntriesTable`, which
+//! emit the UPPERCASE `FileFormat` enum NAME via `format.toString()`. The on-disk AVRO stores the lowercase
+//! string on BOTH (the manifest serde is unchanged; Java/Rust read each other's lowercase via the
+//! case-insensitive `from_str`). So the comparison asserts EXACT equality on `file_format` — no canonicalization.
+//!
+//! ONE KNOWN, NON-CORRUPTING REPRESENTATION DIVERGENCE (content-identical; surfaced, not hidden). It is a
+//! presentation-only difference in how each library's metadata table RENDERS a column; the underlying
+//! on-disk manifest value is identical, so it is NOT a production bug and NOT in scope to "fix" here (a fix
+//! would be a spec-type change, out of bounds for an interop test). It is collapsed to a canonical form by
+//! [`FileRow::canonical`] for the bulk equality AND pinned RAW by a focused assertion so it cannot drift
+//! unnoticed:
+//!   - ABSENT METRIC/BOUND MAP — empty `{}` vs `null`. Rust's `spec::DataFile` stores the metric/bound maps
+//!     as NON-optional `HashMap`, so an absent map projects to an EMPTY map; Java stores `null` and emits
+//!     JSON `null`. An empty map and a null map carry identical information (no metrics). Canonicalized by
+//!     treating `None` and `Some(empty)` as equal.
 //!
 //! NO PRODUCTION CHANGE is needed: every OTHER column the Rust `files` family projects matches Java's
 //! `FilesTable` row byte-for-byte when both read the same on-disk manifest. (If a column genuinely diverged
@@ -187,11 +189,11 @@ impl JavaFileRow {
 }
 
 impl FileRow {
-    /// Collapse the two KNOWN, content-identical representation divergences (see the module docs) to a
-    /// canonical form so the bulk equality compares CONTENT: lowercase `file_format`, and an absent
-    /// metric/bound map (`None` on Java, `Some(empty)` on Rust) normalized to `None`.
+    /// Collapse the ONE KNOWN, content-identical representation divergence (see the module docs) to a
+    /// canonical form so the bulk equality compares CONTENT: an absent metric/bound map (`None` on Java,
+    /// `Some(empty)` on Rust) normalized to `None`. `file_format` is NOT canonicalized — Rust now upper-cases
+    /// the rendered value to match Java's enum name exactly, so it is compared verbatim.
     fn canonical(mut self) -> FileRow {
-        self.file_format = self.file_format.to_ascii_lowercase();
         self.column_sizes = none_if_empty_long(self.column_sizes);
         self.value_counts = none_if_empty_long(self.value_counts);
         self.null_value_counts = none_if_empty_long(self.null_value_counts);
@@ -464,8 +466,8 @@ async fn scan_rows(stream: iceberg::scan::ArrowRecordBatchStream) -> Vec<FileRow
     rows
 }
 
-/// Canonicalize (collapse the two known representation divergences) + sort by `file_path` for an
-/// order-independent CONTENT comparison.
+/// Canonicalize (collapse the one known representation divergence — absent map vs empty) + sort by
+/// `file_path` for an order-independent CONTENT comparison.
 fn canonical_sorted(rows: Vec<FileRow>) -> Vec<FileRow> {
     let mut rows: Vec<FileRow> = rows.into_iter().map(FileRow::canonical).collect();
     rows.sort_by(|a, b| a.file_path.cmp(&b.file_path));
@@ -488,8 +490,8 @@ async fn test_files_tables_match_java_rows_from_real_manifests() {
 
     let table = load_table(&dir);
 
-    // RAW (un-canonicalized) Rust `files` rows — kept so the two known representation divergences
-    // (file_format case + empty-map-vs-null) can be PINNED below, not silently masked.
+    // RAW (un-canonicalized) Rust `files` rows — kept so the file_format case (now matching Java) and the
+    // one known representation divergence (empty-map-vs-null) can be PINNED below, not silently masked.
     let rust_files_raw = scan_rows(table.inspect().files().scan().await.expect("files scan")).await;
 
     // -- files: ALL live entries (2 data + 1 delete). -------------------------------------------------
@@ -509,8 +511,8 @@ async fn test_files_tables_match_java_rows_from_real_manifests() {
     assert_eq!(
         rust_files, java_files,
         "Rust `files` rows must equal Java's FilesTable rows field-for-field (content, paths, partition, \
-         counts, the metric + bound maps, the list + V2 delete columns) — readable_metrics excluded, the \
-         two known representation divergences canonicalized"
+         file_format, counts, the metric + bound maps, the list + V2 delete columns) — readable_metrics \
+         excluded, the one known representation divergence (absent map vs empty) canonicalized"
     );
 
     // -- data_files: the 2 DATA files, the delete EXCLUDED. -------------------------------------------
@@ -570,18 +572,19 @@ async fn test_files_tables_match_java_rows_from_real_manifests() {
     );
 
     // ============================================================================================
-    // Pin the TWO known representation divergences on the RAW Rust rows, so neither can drift unnoticed:
-    //   1. file_format renders LOWERCASE in Rust (Java emits the uppercase enum name) — content-identical.
-    //   2. an absent metric map projects to an EMPTY map in Rust (Java emits null) — content-identical.
-    // (These are surfaced + reported, NOT masked; the bulk equality above canonicalizes them.)
+    // Pin the RAW Rust rows so behavior cannot drift unnoticed:
+    //   1. file_format renders UPPERCASE in Rust (matching Java's `FileFormat` enum name) — the inspection
+    //      projection upper-cases the lowercase on-disk string. Compared verbatim in the bulk equality.
+    //   2. an absent metric map projects to an EMPTY map in Rust (Java emits null) — content-identical; the
+    //      ONE remaining divergence, surfaced + reported, NOT masked (the bulk equality canonicalizes it).
     // ============================================================================================
     let raw_data_file = rust_files_raw
         .iter()
         .find(|r| r.content == 0)
         .expect("a raw data-file row");
     assert_eq!(
-        raw_data_file.file_format, "parquet",
-        "KNOWN DIVERGENCE pin: Rust renders file_format lowercase (Java emits PARQUET)"
+        raw_data_file.file_format, "PARQUET",
+        "Rust renders file_format UPPERCASE, matching Java's `FileFormat` enum name"
     );
     let raw_delete_file = rust_files_raw
         .iter()
