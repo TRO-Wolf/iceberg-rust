@@ -2541,3 +2541,23 @@ How to use it (see the manuals' §2):
   git commit …` — all one `&&` chain, output NOT suppressed, so a failure aborts BEFORE the commit. (And short
   all-caps abbreviations + the fork's org name both trip typos → spell things out; keep org names out of
   committed docs.)
+
+### 2026-06-09 (Equality-delete interop + run-script exit-code hardening — ORCHESTRATOR + REVIEWER Opus)
+- **An equality delete only applies to data with a STRICTLY LOWER data-sequence-number.** The interop fixture
+  must commit the DATA first (seq 1) and the equality-delete SECOND (seq 2, a later `rowDelta`/`row_delta`); if
+  they shared one commit the delete would NOT apply and the "deletes work" test would be vacuously green. Pin
+  the ordering. (The delete carries `equality_ids` = the keyed field ids + the delete-value rows; Java
+  `GenericAppenderFactory.newEqDeleteWriter`, Rust `EqualityDeleteFileWriter`.)
+- **`mvn -q exec:java` does NOT propagate the program's `System.exit(1)` to the shell exit code.** A
+  run.sh-driven Java VERIFY step (Java reads what Rust wrote) therefore needs an explicit OUTPUT-SENTINEL
+  check, not reliance on `$?`: capture the mvn output and assert `: 0 failures` is present with no `^FAIL `
+  line, else `exit 1`. Without it, a future write-incompatibility would print FAIL but the script would
+  falsely report DONE (a vacuous gate). Applied to every Direction-2 (Rust-writes→Java-reads) run script.
+- **The reviewer decoded the Rust-written avro MANIFESTS with the production Rust reader to confirm the
+  delete's content-type + `equality_ids` + sequence** — not just "the rows came out right". For a delete-type
+  interop, verify the on-disk delete file is the RIGHT KIND (EqualityDeletes vs PositionDeletes) carrying the
+  right metadata, so a position-delete masquerading as the fixture can't pass.
+- **Workflow scripts are PLAIN JS, not TS:** an inline template-literal prompt containing angle-bracket tokens
+  (Java generics like `List<Record>`, or `<->`) can trip the script parser ("Unexpected token … TypeScript
+  syntax"). Build long prompts as `[ '...', '...' ].join('\n')` arrays of plain strings to avoid stray `<`/`>`
+  and backtick-escaping hazards.

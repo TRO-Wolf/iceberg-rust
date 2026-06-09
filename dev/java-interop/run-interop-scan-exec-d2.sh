@@ -71,13 +71,22 @@ echo "==> [2/3] Rust: WRITE a REAL unpartitioned V2 table (parquet data + positi
 )
 
 echo "==> [3/3] Java: load the RUST-written final.metadata.json, read via IcebergGenerics, verify {10,30,50}"
-(
+# NOTE: `mvn -q exec:java` runs the oracle in Maven's own JVM and does NOT propagate the verify's
+# `System.exit(1)` to the shell exit code. So capture the output and assert the success sentinel
+# ("...: 0 failures") with no per-check FAIL line — otherwise this script would falsely pass on a real
+# Java-read incompatibility.
+VERIFY_OUT="$(
   cd "${SCRIPT_DIR}"
   JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
     PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
     /opt/maven/bin/mvn -o -q compile exec:java \
     -Dexec.args=verify-interop-scan-exec \
-    -Dinterop.scan_exec.dir="${TMP2}"
-)
+    -Dinterop.scan_exec.dir="${TMP2}" 2>&1
+)"
+echo "${VERIFY_OUT}"
+if echo "${VERIFY_OUT}" | grep -q '^FAIL ' || ! echo "${VERIFY_OUT}" | grep -q ': 0 failures'; then
+  echo "==> FAILED — Java could not correctly read the Rust-written table (a real write-incompatibility finding)."
+  exit 1
+fi
 
 echo "==> DONE — Direction-2 round-trip passed (Java read the Rust-written table, live rows {10,30,50}, 20/40 absent)."

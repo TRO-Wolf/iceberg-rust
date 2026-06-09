@@ -76,6 +76,9 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::base_writer::equality_delete_writer::{
+    EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+};
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
 };
@@ -127,6 +130,27 @@ fn scan_dir() -> Option<PathBuf> {
 /// `None` when `ICEBERG_INTEROP_SCAN_GEN_DIR` is unset (the GEN test is then a clean no-op).
 fn scan_gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_SCAN_GEN_DIR").map(PathBuf::from)
+}
+
+/// The temp dir the Java oracle wrote the EQUALITY-delete table + JSON rows into (Direction 1, eq-delete).
+/// `None` when `ICEBERG_INTEROP_EQ_SCAN_DIR` is unset (the eq-delete read test is then a clean no-op).
+fn eq_scan_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_EQ_SCAN_DIR").map(PathBuf::from)
+}
+
+/// The temp dir into which the DIRECTION-2 eq-delete GEN path writes a Rust-authored equality-delete table
+/// for Java to read. `None` when `ICEBERG_INTEROP_EQ_SCAN_GEN_DIR` is unset (then a clean no-op).
+fn eq_scan_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_EQ_SCAN_GEN_DIR").map(PathBuf::from)
+}
+
+/// Load + parse the Java ground-truth EQUALITY-delete rows from `<dir>/java_eq_scan_rows.json`.
+fn read_java_eq_rows(dir: &std::path::Path) -> Vec<ScanRow> {
+    let path = dir.join("java_eq_scan_rows.json");
+    let json = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str::<Vec<ScanRow>>(&json)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
 /// Load + parse the Java ground-truth rows from `<dir>/java_scan_rows.json`.
@@ -269,6 +293,99 @@ async fn test_scan_exec_merge_on_read_matches_java_read() {
     println!(
         "interop_scan_exec OK — Rust scan→Arrow merge-on-read = Java read: 3 live rows {{10,30,50}}, \
          deleted 20/40 absent"
+    );
+}
+
+// ===========================================================================================
+// EQUALITY-DELETE, DIRECTION 1 — Java writes the equality delete, Rust reads it.
+//
+// The sibling of the position-delete read test above, but the merge-on-read mechanism is delete-by-VALUE.
+// The Java oracle's `generate-interop-eq-delete` mode wrote an unpartitioned V2 table with a REAL parquet
+// data file (5 rows, appended at sequence 1) + a REAL parquet EQUALITY-delete file (equality_ids = [1] =
+// the `id` field, deleting rows id=20 and id=40, committed at sequence 2). Because the data (seq 1) precedes
+// the delete (seq 2), the equality delete applies (1 < 2) and the live set is {10,30,50}. Java emitted its
+// OWN read into `java_eq_scan_rows.json`. This test loads the same table, runs `scan().to_arrow()` — which
+// applies the equality delete by VALUE — and asserts the rows equal Java's read (ids 20/40 absent).
+//
+// Gated on `ICEBERG_INTEROP_EQ_SCAN_DIR`: a clean no-op when unset, so the offline gate stays green. If Rust
+// did NOT apply the equality delete this assertion would FAIL (a real read gap) — but Rust's delete_filter +
+// delete_file_index already support equality deletes, so it applies.
+// ===========================================================================================
+
+#[tokio::test]
+async fn test_scan_exec_equality_delete_matches_java_read() {
+    let Some(dir) = eq_scan_dir() else {
+        println!(
+            "skipping interop_scan_exec equality-delete — set ICEBERG_INTEROP_EQ_SCAN_DIR \
+             (run dev/java-interop/run-interop-eq-delete.sh)"
+        );
+        return;
+    };
+
+    let table = load_table(&dir);
+
+    // Rust's scan → Arrow applies the EQUALITY delete (merge-on-read, by VALUE): rows whose `id` equals
+    // a delete value (20 or 40) are dropped from the seq-1 data file by the seq-2 equality delete.
+    let batch_stream = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow");
+    let batches: Vec<RecordBatch> = batch_stream
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let java_rows = sorted_by_id(read_java_eq_rows(&dir));
+
+    // -- The equality-delete merge-on-read proof. ----------------------------------------------------------
+
+    // Exactly 3 live rows survive (5 written - 2 deleted by VALUE).
+    assert_eq!(
+        rust_rows.len(),
+        3,
+        "exactly 3 rows survive merge-on-read (5 written, ids 20 and 40 deleted by VALUE)"
+    );
+
+    // The deleted rows (id 20, id 40) must be ABSENT — the equality delete keyed on field id 1 dropped them.
+    assert!(
+        !rust_rows.iter().any(|r| r.id == 20),
+        "id 20 (equality-deleted by value) must be ABSENT after merge-on-read"
+    );
+    assert!(
+        !rust_rows.iter().any(|r| r.id == 40),
+        "id 40 (equality-deleted by value) must be ABSENT after merge-on-read"
+    );
+
+    // The surviving (id, data) values match Java's read exactly: {(10,a),(30,c),(50,e)}.
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust scan→Arrow (equality merge-on-read) rows must equal Java's IcebergGenerics read field-for-field"
+    );
+
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 50],
+        "the live id set after equality merge-on-read is exactly {{10, 30, 50}}"
+    );
+    let live_data: Vec<Option<&str>> = rust_rows.iter().map(|r| r.data.as_deref()).collect();
+    assert_eq!(
+        live_data,
+        vec![Some("a"), Some("c"), Some("e")],
+        "the live data column matches the committed values for ids 10/30/50"
+    );
+
+    println!(
+        "interop_scan_exec equality-delete OK — Rust scan→Arrow equality merge-on-read = Java read: \
+         3 live rows {{10,30,50}}, deleted 20/40 absent"
     );
 }
 
@@ -502,5 +619,173 @@ async fn test_scan_exec_gen_rust_writes_java_readable_table() {
     println!(
         "interop_scan_exec GEN OK — Rust wrote {table_location} (parquet data + position-delete + \
          final.metadata.json); Rust scan = {{10,30,50}}. Java verify-interop-scan-exec reads it next."
+    );
+}
+
+// ===========================================================================================
+// EQUALITY-DELETE, DIRECTION 2 — the GEN path: Rust WRITES a real on-disk table with an EQUALITY delete;
+// Java reads it back.
+//
+// The sibling of the position-delete GEN path above, but the delete is an EQUALITY delete (delete-by-VALUE,
+// keyed on field id 1 = `id`, deleting rows id=20 and id=40) written via the production
+// `EqualityDeleteFileWriter`. The SEQUENCE ORDERING is the correctness point: the data is `fast_append`ed
+// FIRST (data-sequence-number 1), the equality delete `row_delta`ed SECOND (sequence-number 2), so the
+// delete (seq 2) applies to the data (seq 1) — 1 < 2. The table lands at `<gen_dir>/rust_table` with a
+// `final.metadata.json` at a known path; the Java oracle's `verify-interop-eq-delete` mode reads it with
+// `IcebergGenerics` (applying our equality delete) and asserts {10,30,50}.
+//
+// When `ICEBERG_INTEROP_EQ_SCAN_GEN_DIR` is UNSET this is a clean no-op — the offline gate stays green.
+// ===========================================================================================
+
+/// Write a REAL parquet EQUALITY-delete file (via the production `EqualityDeleteFileWriter`) keyed on field
+/// id 1 (the `id` column), deleting rows id=20 and id=40, unpartitioned. The writer projects the table
+/// schema down to the single `id` column and stamps the delete file with content `EqualityDeletes` +
+/// `equality_ids = [1]`. Reuses the crown-jewel machinery — no hand-rolled parquet.
+async fn write_gen_equality_delete_file(table: &Table) -> DataFile {
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    // equality_ids = [1] (the `id` field). The config builds a projector from the FULL table schema down to
+    // just the `id` column, so we feed it a FULL-schema (id, data) batch and it extracts the `id` values.
+    let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
+        .expect("equality-delete writer config (equality_ids = [1])");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "eq-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    // The parquet writer must use the PROJECTED schema (just `id`), since that is what lands on disk.
+    let projected_iceberg_schema = Arc::new(
+        iceberg::arrow::arrow_schema_to_schema(config.projected_arrow_schema_ref())
+            .expect("projected arrow schema → iceberg schema"),
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        projected_iceberg_schema,
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+
+    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .build(None)
+        .await
+        .expect("build equality-delete writer");
+
+    // A FULL-schema (id, data) batch carrying the two delete keys (id=20, id=40); the writer's projector
+    // keeps only the `id` column. The `data` values are irrelevant (projected away) but the batch must match
+    // the full table schema so the column-index projection resolves.
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema → arrow"));
+    let ids = Int64Array::from(vec![20_i64, 40]);
+    let data = StringArray::from(vec!["b", "d"]);
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(ids) as ArrayRef,
+        Arc::new(data) as ArrayRef,
+    ])
+    .expect("build the equality-delete key batch");
+    writer
+        .write(batch)
+        .await
+        .expect("write equality-delete batch");
+    writer
+        .close()
+        .await
+        .expect("close equality-delete writer")
+        .into_iter()
+        .next()
+        .expect("one equality-delete file")
+}
+
+#[tokio::test]
+async fn test_scan_exec_gen_rust_writes_java_readable_equality_delete_table() {
+    let Some(gen_dir) = eq_scan_gen_dir() else {
+        println!(
+            "skipping interop_scan_exec equality-delete GEN — set ICEBERG_INTEROP_EQ_SCAN_GEN_DIR \
+             (run dev/java-interop/run-interop-eq-delete-d2.sh)"
+        );
+        return;
+    };
+
+    // 1. A MemoryCatalog over the LOCAL FS, warehouse = <gen_dir>, table pinned to <gen_dir>/rust_table.
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_eq_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_rust_table(&catalog, &table_location).await;
+
+    // 2. fast_append a REAL parquet data file of 5 rows (10,a)..(50,e) at SEQUENCE 1.
+    let data_file = write_gen_data_file(&table).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![data_file])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // 3. row_delta a REAL EQUALITY-delete (equality_ids = [1], ids 20/40) at SEQUENCE 2. Because the data
+    //    (seq 1) was committed FIRST, the equality delete (seq 2) applies to it (1 < 2).
+    let delete_file = write_gen_equality_delete_file(&table).await;
+    assert_eq!(delete_file.content_type(), DataContentType::EqualityDeletes);
+    assert_eq!(
+        delete_file.equality_ids(),
+        Some(vec![1]),
+        "the equality delete must carry equality_ids = [1] (field id of `id`)"
+    );
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // 4. Sanity: OUR OWN scan→Arrow already applies the equality delete → {10,30,50} before handing to Java.
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 50],
+        "Rust's own scan of the written table must already be {{10,30,50}} (20/40 equality-deleted)"
+    );
+
+    // 5. Write the FINAL metadata to a KNOWN path so Java loads it deterministically.
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_scan_exec equality-delete GEN OK — Rust wrote {table_location} (parquet data seq 1 + \
+         equality-delete seq 2 + final.metadata.json); Rust scan = {{10,30,50}}. Java verify-interop-eq-delete \
+         reads it next."
     );
 }

@@ -4192,7 +4192,13 @@ FROZEN, 0-diff).
   parquet → Java NotFoundException; truncate avro manifest → Java RuntimeIOException). Gate green (offline no-op
   + D2 round-trip). Fixed an abbreviation typos slip in the Increment-1 lesson (+ permanently re-internalized
   the chain-the-gate-to-the-commit rule).
-- [ ] **Increment 3: equality deletes** + multi-data-file + more column types (Direction 1 and/or 2).
-- [ ] **Increment 4: partitioned tables** + the cross-product; then PR the capstone.
+- [x] **Increment 3: equality deletes, BOTH directions** — D1 (Java writes eq-delete → Rust reads) + D2 (Rust
+  writes eq-delete via `EqualityDeleteFileWriter` → Java reads), `equality_ids=[1]`, delete id ∈ {20,40},
+  sequence-ordered (data seq 1 < eq-delete seq 2). Both = {10,30,50}. NO Rust production change, Cargo 0-diff.
+  Reviewer decoded the avro manifests with the production reader + mutated both ways. **Run-script hardening:**
+  the D2 scripts now grep the Java verify for `: 0 failures` (mvn exec:java swallows System.exit) — applied to
+  BOTH the eq-delete-d2 and the Increment-2 scan-exec-d2 scripts.
+- [ ] **Increment 4: partitioned tables** + the cross-product (position + equality deletes on a partitioned
+  table, both directions); then PR the capstone.
 
 Deferred elsewhere: `readable_metrics` interop; ORC/Avro data; V3 types (Phase 4); BatchScan; CDC-merge.
