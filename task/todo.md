@@ -4117,3 +4117,28 @@ re-ran the offline gate + the run.sh round-trip + verified the production fix + 
 **Deferred next:** A3 `all_*` (all_data_files/all_delete_files/all_files/all_entries/all_manifests —
 multi-snapshot reachability + non-dedup for all_manifests); A4 scan PLANNING (planFiles file set + residuals);
 A5 scan EXECUTION (parquet → Arrow, needs parquet Maven deps + separate approval). Then squash + PR.
+
+---
+
+## Active (2026-06-09): Manifest-reading interop A3 — the five cross-snapshot `all_*` tables (Phase 3)
+
+Increment: `all_data_files`/`all_delete_files`/`all_files`/`all_entries`/`all_manifests` interop, REUSING the
+A2 table read-only. **COMPLETES manifest-reading interop for every inspection table.** Purely additive — NO
+production change. Builder→reviewer; orchestrator re-ran gate + run.sh + fixed the stale run.sh echo + committed.
+
+- [x] **Java oracle** — extended the A2 generate step to ALSO materialize Java's REAL `All*` rows over the
+  same `table_a2` → java_all_{data_files,delete_files,files,entries,manifests}.json (generic `rowsToJson`,
+  `all_manifests`'s `reference_snapshot_id` is just another scalar).
+- [x] **Rust tests (5, added to `interop_inspection_manifests.rs`)** — reuse FileRow/EntryRow/ManifestRow
+  extraction (+ an AllManifestRow wrapper). Order-independent MULTISET comparison (sort full rows by Debug,
+  element-wise, NO dedup — these tables may return duplicates). Focused pins: cross-snapshot reach (B present
+  in all_*, absent in current data_files); duplicates preserved (8 rows / 5 distinct paths); all_manifests
+  non-dedup (shared manifest → 2 rows, reference_snapshot_id distinct + ≠ added_snapshot_id).
+- [x] **Gate (orchestrator-rerun, all green):** offline (A3 no-op; A1+A2 green; lib 1595; datafusion 80+9;
+  clippy/fmt/typos) + run.sh round-trip (9 tests = A1 + 3 A2 + 5 A3). Fixed the stale run.sh header/echo (A3).
+- [x] **Docs** — GAP_MATRIX, Roadmap (6f), lessons, todo.
+
+**Manifest-reading interop COMPLETE for all inspection tables.** Remaining inspection interop: the
+`readable_metrics` virtual column (interior field-id JVM-order residual); SCAN interop — A4 PLANNING (planFiles
+file set + residuals, no parquet needed) + A5 EXECUTION (parquet → Arrow, needs parquet Maven deps + approval).
+Then: squash the `phase2-3-remnants` set (now ~9 commits, LOCAL-only) + open the PR.

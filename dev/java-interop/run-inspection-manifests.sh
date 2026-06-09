@@ -17,8 +17,9 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# MANIFEST-READING inspection interop harness — the `files` / `data_files` / `delete_files` tables (A1)
-# PLUS the `entries` / `manifests` / `partitions` tables (A2).
+# MANIFEST-READING inspection interop harness — the `files` / `data_files` / `delete_files` tables (A1),
+# the `entries` / `manifests` / `partitions` tables (A2), AND the five cross-snapshot `all_*` tables
+# `all_data_files` / `all_delete_files` / `all_files` / `all_entries` / `all_manifests` (A3, over the A2 table).
 #
 # This is a TEST-ONLY ORACLE (a dev tool, like dev/spark/) — it is NOT part of the shipped Rust library, and
 # it is NOT part of the offline `cargo test` gate (it needs Java + Maven). Unlike the pure-metadata
@@ -80,4 +81,4 @@ echo "==> [3/3] Rust: load final.metadata.json (A1) + table_a2/...(A2), scan all
     cargo test -p iceberg --test interop_inspection_manifests -- --nocapture
 )
 
-echo "==> DONE — manifest-reading inspection interop passed (A1 files/data_files/delete_files + A2 entries/manifests/partitions)."
+echo "==> DONE — manifest-reading inspection interop passed (A1 files/data_files/delete_files + A2 entries/manifests/partitions + A3 all_*)."

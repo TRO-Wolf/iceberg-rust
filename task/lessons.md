@@ -2454,3 +2454,22 @@ How to use it (see the manuals' §2):
   `<dir>/table_a2` for A2) under the same run script + test file, so a richer A2 table (with a tombstone that
   changes the live-file set) does NOT churn A1's committed-behavior assertions. Both are regenerated; the
   reviewer confirmed A1 stayed green throughout.
+
+### 2026-06-09 (Manifest-reading interop A3 — the cross-snapshot `all_*` tables — ORCHESTRATOR + REVIEWER Opus)
+- **The `all_*` tables "may return duplicate rows" (Java javadoc) — compare as an order-independent MULTISET,
+  never a set.** A `HashSet`/`dedup` comparison would hide a missing OR extra duplicate. Pattern: sort BOTH
+  sides by a TOTAL key (the row's `Debug` repr works for derive-`PartialEq`+`Debug` rows, since two rows are
+  `==` iff their `Debug` strings match) and `assert_eq!` the equal-length vectors element-by-element — no
+  dedup. (A3's `all_files` = 8 rows / 5 distinct paths: A/C/D carried in both the original and the rewritten
+  manifest appear twice; the comparison must KEEP them.)
+- **Pin the cross-snapshot reach with a present-in-all / absent-in-current pair.** The whole point of `all_*`
+  is the dedup-by-path union of manifests reachable from ALL snapshots (Java `reachableManifests`), so assert a
+  file deleted at the current snapshot (live in an OLDER reachable manifest) IS in `all_data_files` AND is NOT
+  in a fresh `inspect().data_files()` scan over the same table — that assertion FAILS if the impl read only the
+  current snapshot, which a pass-by-coincidence test would miss.
+- **One richer table can serve multiple increments read-only.** A3 reused A2's `table_a2` (3 snapshots, a
+  carried/shared manifest, a rewrite) verbatim — it already exercised cross-snapshot reach + a shared manifest
+  (for `all_manifests`' per-(manifest×snapshot) non-dedup) + content-gating. A3 only ADDED the `all_*`
+  materialization + tests; A2's table/JSONs/tests stayed byte-identical. **With A3, manifest-reading interop is
+  COMPLETE for every inspection table** (pure-metadata done earlier); only the `readable_metrics` virtual
+  column + scan interop (A4/A5) remain.

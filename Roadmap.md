@@ -611,6 +611,16 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      `partition_summaries` string bounds were JSON-quoted (`Datum::to_string`) vs Java's bare
      `Transform.toHumanString`; fix = `to_human_string` (only string bounds change; int/long unit tests
      unaffected). A1 untouched. Deferred: A3 `all_*`; A4 scan planning; A5 scan execution (needs parquet deps).
+  6f. **Manifest-reading interop A3 — the five cross-snapshot `all_*` tables** — **DONE (2026-06-09, Phase 3
+     manifest-interop Increment A3, same `interop_inspection_manifests.rs` + A2 oracle, reusing the A2 table
+     read-only).** `all_data_files`/`all_delete_files`/`all_files`/`all_entries`/`all_manifests` — **completes
+     manifest-reading interop for every inspection table** (only `readable_metrics` + scan interop remain).
+     Java's REAL `All*` rows vs Rust, compared as an order-independent MULTISET (these tables "may return
+     duplicate rows" — no dedup). NO production change. Cross-snapshot semantics pinned: the s3-deleted file is
+     present in `all_*` but absent from current `files`; duplicates preserved (8 rows / 5 distinct paths);
+     `all_manifests` per-(manifest×snapshot) non-dedup with distinct `reference_snapshot_id` ≠
+     `added_snapshot_id`. Reviewer mutation-pinned all three. Deferred: A4 scan planning; A5 scan execution
+     (needs parquet deps).
   7. **`IncrementalAppendScan`** — **DONE 🟡 (2026-06-08, overnight-run Increment 2,
      `scan/incremental.rs`, Java `BaseIncrementalAppendScan` + `BaseIncrementalScan`).** The incremental/CDC
      read primitive: `Table::incremental_append_scan()` plans the data files APPENDED in the range

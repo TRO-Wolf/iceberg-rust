@@ -1340,3 +1340,471 @@ async fn test_partitions_table_matches_java_rows() {
         rust_rows.len()
     );
 }
+
+// ===========================================================================================
+// A3 — the FIVE cross-snapshot `all_*` inspection tables: `all_data_files`, `all_delete_files`,
+// `all_files`, `all_entries`, `all_manifests`.
+//
+// Builds DIRECTLY on the A1/A2 harness above (reusing `manifest_dir()`, `load_table_a2()`, the `FileRow`
+// model + its `canonical` collapse + `extract_rust_rows`, the `EntryRow` model + `extract_entry_rows`, the
+// `ManifestRow` extraction, the hex decode, and `FileIO::new_with_fs()`) over the SAME `<dir>/table_a2`
+// that A2 reads — A2's commits already have the right cross-snapshot shape:
+//   s1 newAppend(A=cat a, B=cat b, C=cat a, D=cat b) -> a DATA manifest M1.
+//   s2 newRowDelta(+pos-delete cat=a)                -> a DELETE manifest MD; M1 is CARRIED into s2's list.
+//   s3 newDelete(B)                                  -> a rewritten DATA manifest M1' where B is a DELETED
+//                                                       tombstone (status 2); D keeps cat=b alive.
+// So the `all_*` semantics ARE exercised:
+//   * all_data_files/all_files: the manifest SOURCE is the dedup-by-PATH union of manifests reachable from
+//     ALL snapshots (Java `BaseAllMetadataTableScan.reachableManifests`), so they INCLUDE B (live in s1's
+//     M1) which the CURRENT `files`/`data_files` table EXCLUDES (current sees only M1' where B is deleted).
+//     Manifests are dedup'd by path but the FILES inside are NOT (Java javadoc "may return duplicate rows")
+//     — a file present in two distinct reachable manifests (e.g. A in M1 and M1') appears MULTIPLE times.
+//   * all_entries: every entry across all reachable manifests, incl. tombstones.
+//   * all_manifests: ONE row per (manifest × referencing snapshot), NOT dedup'd — M1 in s1's AND s2's lists
+//     -> TWO rows with distinct `reference_snapshot_id` (its `added_snapshot_id` stays s1, so for the
+//     s2-referencing carried row reference_snapshot_id != added_snapshot_id). Schema = the regular
+//     `manifests` schema PLUS a `reference_snapshot_id` column.
+//
+// CRITICAL — these tables MAY RETURN DUPLICATE ROWS, so the comparison is an order-independent MULTISET:
+// sort BOTH sides by a TOTAL key (the full row's `Debug` repr — a faithful total order over the plain data
+// rows, since two rows are `==` iff their `Debug` strings match) and compare element-by-element WITHOUT
+// dedup (`assert_eq!` on the equal-length sorted vectors). The same A1/A2 canonical forms apply (absent
+// metric/bound map None≡empty; file_format already uppercase). `readable_metrics` is DEFERRED as in A1/A2.
+// ===========================================================================================
+
+/// Sort plain data rows by a TOTAL key (their `Debug` repr) for an order-independent MULTISET comparison
+/// that PRESERVES duplicates. Two rows compare equal under `==` iff their `Debug` strings are identical for
+/// these derive-`Debug` data structs, so sorting by that string then comparing element-by-element (no
+/// dedup) is a faithful multiset equality.
+fn multiset_sorted<T: std::fmt::Debug>(mut rows: Vec<T>) -> Vec<T> {
+    rows.sort_by_key(|row| format!("{row:?}"));
+    rows
+}
+
+// ---------------------------------------------------------------------------------------------
+// all_data_files / all_delete_files / all_files — the same flat `files` schema as A1, so the A1 `FileRow`
+// extraction is reused verbatim. The only difference is the manifest SOURCE (cross-snapshot reachable union)
+// and that rows may be DUPLICATED — hence the multiset comparison.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_all_data_files_table_matches_java_rows() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_all_data_files_table_matches_java_rows — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a2(&dir);
+
+    let rust_rows: Vec<FileRow> = multiset_sorted(
+        scan_rows(
+            table
+                .inspect()
+                .all_data_files()
+                .scan()
+                .await
+                .expect("all_data_files scan"),
+        )
+        .await
+        .into_iter()
+        .map(FileRow::canonical)
+        .collect(),
+    );
+    let java_rows: Vec<FileRow> = multiset_sorted(
+        read_java_rows(&dir, "java_all_data_files.json")
+            .into_iter()
+            .map(|row| row.into_file_row().canonical())
+            .collect(),
+    );
+
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust `all_data_files` rows must equal Java's AllDataFilesTable rows as an order-independent \
+         MULTISET (duplicates preserved) — readable_metrics deferred, absent-map-vs-empty canonicalized"
+    );
+
+    // Cross-snapshot reach: B (cat=b, deleted at s3) is PRESENT in all_data_files (live in s1's M1) but
+    // ABSENT from a fresh current-snapshot `data_files` scan over the same table.
+    let b_path = rust_rows
+        .iter()
+        .map(|r| r.file_path.clone())
+        .find(|p| leaf(p) == "00000-b.parquet")
+        .expect(
+            "all_data_files CONTAINS B (the cat=b file deleted at s3) via cross-snapshot reach",
+        );
+    let current_data_files = scan_rows(
+        table
+            .inspect()
+            .data_files()
+            .scan()
+            .await
+            .expect("data_files scan"),
+    )
+    .await;
+    assert!(
+        !current_data_files.iter().any(|r| r.file_path == b_path),
+        "the CURRENT data_files table must NOT contain B (it was deleted at s3) — proving all_data_files \
+         reached a non-current snapshot's manifest"
+    );
+
+    // Every all_data_files row is DATA content (the delete file is excluded).
+    assert!(
+        rust_rows.iter().all(|r| r.content == 0),
+        "all_data_files contains only DATA-content files (content == 0)"
+    );
+
+    println!(
+        "test_all_data_files_table_matches_java_rows OK — {} rows matched Java (B present via reach)",
+        rust_rows.len()
+    );
+}
+
+#[tokio::test]
+async fn test_all_delete_files_table_matches_java_rows() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_all_delete_files_table_matches_java_rows — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a2(&dir);
+
+    let rust_rows: Vec<FileRow> = multiset_sorted(
+        scan_rows(
+            table
+                .inspect()
+                .all_delete_files()
+                .scan()
+                .await
+                .expect("all_delete_files scan"),
+        )
+        .await
+        .into_iter()
+        .map(FileRow::canonical)
+        .collect(),
+    );
+    let java_rows: Vec<FileRow> = multiset_sorted(
+        read_java_rows(&dir, "java_all_delete_files.json")
+            .into_iter()
+            .map(|row| row.into_file_row().canonical())
+            .collect(),
+    );
+
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust `all_delete_files` rows must equal Java's AllDeleteFilesTable rows as an order-independent \
+         MULTISET (duplicates preserved)"
+    );
+
+    // Every all_delete_files row is DELETE content (the data files are excluded).
+    assert!(
+        rust_rows.iter().all(|r| r.content == 1),
+        "all_delete_files contains only delete-content files (content == 1)"
+    );
+
+    println!(
+        "test_all_delete_files_table_matches_java_rows OK — {} rows matched Java",
+        rust_rows.len()
+    );
+}
+
+#[tokio::test]
+async fn test_all_files_table_matches_java_rows() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_all_files_table_matches_java_rows — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a2(&dir);
+
+    let rust_raw: Vec<FileRow> = scan_rows(
+        table
+            .inspect()
+            .all_files()
+            .scan()
+            .await
+            .expect("all_files scan"),
+    )
+    .await
+    .into_iter()
+    .map(FileRow::canonical)
+    .collect();
+    let rust_rows = multiset_sorted(rust_raw.clone());
+    let java_rows: Vec<FileRow> = multiset_sorted(
+        read_java_rows(&dir, "java_all_files.json")
+            .into_iter()
+            .map(|row| row.into_file_row().canonical())
+            .collect(),
+    );
+
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust `all_files` rows must equal Java's AllFilesTable rows as an order-independent MULTISET \
+         (data + delete content; duplicates preserved)"
+    );
+
+    // Cross-snapshot reach: B (deleted at s3) is present in all_files but absent from the current `files`.
+    let b_path = rust_rows
+        .iter()
+        .map(|r| r.file_path.clone())
+        .find(|p| leaf(p) == "00000-b.parquet")
+        .expect("all_files CONTAINS B (the cat=b file deleted at s3) via cross-snapshot reach");
+    let current_files = scan_rows(table.inspect().files().scan().await.expect("files scan")).await;
+    assert!(
+        !current_files.iter().any(|r| r.file_path == b_path),
+        "the CURRENT files table must NOT contain B — proving all_files reached a non-current snapshot"
+    );
+
+    // DUPLICATE rows: a file present in ≥2 distinct reachable manifests (e.g. A, present in both s1's M1 and
+    // s3's rewritten M1') appears MORE THAN ONCE. The total row count therefore EXCEEDS the distinct
+    // file-path count, AND at least one specific file_path occurs twice.
+    let distinct_paths: std::collections::HashSet<&String> =
+        rust_rows.iter().map(|r| &r.file_path).collect();
+    assert!(
+        rust_rows.len() > distinct_paths.len(),
+        "all_files MAY RETURN DUPLICATE ROWS: row count ({}) must exceed the distinct file-path count ({})",
+        rust_rows.len(),
+        distinct_paths.len()
+    );
+    let mut path_counts: HashMap<&String, usize> = HashMap::new();
+    for row in &rust_rows {
+        *path_counts.entry(&row.file_path).or_default() += 1;
+    }
+    assert!(
+        path_counts.values().any(|&count| count >= 2),
+        "at least one file_path must appear ≥2 times (a file carried across two reachable manifests)"
+    );
+
+    println!(
+        "test_all_files_table_matches_java_rows OK — {} rows ({} distinct paths) matched Java (B present, \
+         duplicates preserved)",
+        rust_rows.len(),
+        distinct_paths.len()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// all_entries — every manifest entry across ALL reachable manifests (incl. tombstones). Same nested
+// `data_file` schema as A2 `entries`, so `extract_entry_rows` is reused; the multiset comparison preserves
+// the duplicate entries a file carried across two reachable manifests produces.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_all_entries_table_matches_java_rows() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_all_entries_table_matches_java_rows — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a2(&dir);
+    let batches: Vec<RecordBatch> = table
+        .inspect()
+        .all_entries()
+        .scan()
+        .await
+        .expect("all_entries scan")
+        .try_collect()
+        .await
+        .expect("collect all_entries scan");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_entry_rows(batch));
+    }
+    let rust_rows = multiset_sorted(rust_rows);
+
+    let java_rows = multiset_sorted(
+        read_java::<JavaEntryRow>(&dir, "java_all_entries.json")
+            .into_iter()
+            .map(JavaEntryRow::into_entry_row)
+            .collect(),
+    );
+
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust `all_entries` rows must equal Java's AllEntriesTable rows as an order-independent MULTISET \
+         (every entry across all reachable manifests, incl. tombstones; duplicates preserved)"
+    );
+
+    // Cross-snapshot reach + tombstone surfacing: B (deleted at s3) appears both LIVE (status 0 Existing /
+    // 1 Added, from s1's M1) and as a DELETED tombstone (status 2, from s3's M1'). At minimum ≥1 status-2
+    // tombstone is present (as in `entries`), AND B's file_path appears under MORE THAN ONE status.
+    assert!(
+        rust_rows.iter().any(|r| r.status == 2),
+        "all_entries MUST surface ≥1 DELETED tombstone (status 2)"
+    );
+    let b_statuses: std::collections::HashSet<i32> = rust_rows
+        .iter()
+        .filter(|r| leaf(&r.data_file.file_path) == "00000-b.parquet")
+        .map(|r| r.status)
+        .collect();
+    assert!(
+        b_statuses.len() >= 2,
+        "B (deleted at s3) must appear under ≥2 distinct statuses across reachable manifests (live + \
+         tombstone), got {b_statuses:?}"
+    );
+
+    println!(
+        "test_all_entries_table_matches_java_rows OK — {} entries matched Java (B live + tombstone)",
+        rust_rows.len()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// all_manifests — ONE row per (manifest × referencing snapshot), NOT dedup'd. Schema = the regular
+// `manifests` schema (reused via `extract_manifest_rows`) PLUS a `reference_snapshot_id` column.
+// ---------------------------------------------------------------------------------------------
+
+/// One Java `AllManifestsTable` row — the regular [`JavaManifestRow`] columns PLUS `reference_snapshot_id`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct JavaAllManifestRow {
+    content: i32,
+    path: String,
+    length: i64,
+    partition_spec_id: i32,
+    added_snapshot_id: i64,
+    added_data_files_count: i32,
+    existing_data_files_count: i32,
+    deleted_data_files_count: i32,
+    added_delete_files_count: i32,
+    existing_delete_files_count: i32,
+    deleted_delete_files_count: i32,
+    partition_summaries: Vec<JavaPartitionSummary>,
+    reference_snapshot_id: i64,
+}
+
+/// A normalized, comparable `all_manifests` row — the [`ManifestRow`] fields PLUS `reference_snapshot_id`.
+#[derive(Debug, Clone, PartialEq)]
+struct AllManifestRow {
+    manifest: ManifestRow,
+    reference_snapshot_id: i64,
+}
+
+impl JavaAllManifestRow {
+    fn into_all_manifest_row(self) -> AllManifestRow {
+        AllManifestRow {
+            manifest: ManifestRow {
+                content: self.content,
+                path: self.path,
+                length: self.length,
+                partition_spec_id: self.partition_spec_id,
+                added_snapshot_id: self.added_snapshot_id,
+                added_data_files_count: self.added_data_files_count,
+                existing_data_files_count: self.existing_data_files_count,
+                deleted_data_files_count: self.deleted_data_files_count,
+                added_delete_files_count: self.added_delete_files_count,
+                existing_delete_files_count: self.existing_delete_files_count,
+                deleted_delete_files_count: self.deleted_delete_files_count,
+                partition_summaries: self
+                    .partition_summaries
+                    .into_iter()
+                    .map(|s| PartitionSummary {
+                        contains_null: s.contains_null,
+                        contains_nan: s.contains_nan,
+                        lower_bound: s.lower_bound,
+                        upper_bound: s.upper_bound,
+                    })
+                    .collect(),
+            },
+            reference_snapshot_id: self.reference_snapshot_id,
+        }
+    }
+}
+
+/// Extract the Rust `all_manifests` batch into [`AllManifestRow`]s: the regular manifest columns (via the
+/// A2 [`extract_manifest_rows`]) plus the `reference_snapshot_id` column.
+fn extract_all_manifest_rows(batch: &RecordBatch) -> Vec<AllManifestRow> {
+    let manifests = extract_manifest_rows(batch);
+    let reference_snapshot_id = primitive::<Int64Type>(batch, "reference_snapshot_id");
+    manifests
+        .into_iter()
+        .enumerate()
+        .map(|(i, manifest)| AllManifestRow {
+            manifest,
+            reference_snapshot_id: reference_snapshot_id.value(i),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_all_manifests_table_matches_java_rows() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_all_manifests_table_matches_java_rows — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a2(&dir);
+    let batches: Vec<RecordBatch> = table
+        .inspect()
+        .all_manifests()
+        .scan()
+        .await
+        .expect("all_manifests scan")
+        .try_collect()
+        .await
+        .expect("collect all_manifests scan");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_all_manifest_rows(batch));
+    }
+    let rust_rows = multiset_sorted(rust_rows);
+
+    let java_rows = multiset_sorted(
+        read_java::<JavaAllManifestRow>(&dir, "java_all_manifests.json")
+            .into_iter()
+            .map(JavaAllManifestRow::into_all_manifest_row)
+            .collect(),
+    );
+
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust `all_manifests` rows must equal Java's AllManifestsTable rows as an order-independent \
+         MULTISET (one row per manifest × referencing snapshot, NOT dedup'd; the regular manifests columns \
+         PLUS reference_snapshot_id)"
+    );
+
+    // A manifest appears in TWO rows with DIFFERENT reference_snapshot_id (M1 is carried from s1 into s2's
+    // list). For the carried row, reference_snapshot_id != added_snapshot_id (added stays s1).
+    let mut by_path: HashMap<&String, Vec<&AllManifestRow>> = HashMap::new();
+    for row in &rust_rows {
+        by_path.entry(&row.manifest.path).or_default().push(row);
+    }
+    let shared = by_path
+        .values()
+        .find(|rows| {
+            let refs: std::collections::HashSet<i64> =
+                rows.iter().map(|r| r.reference_snapshot_id).collect();
+            refs.len() >= 2
+        })
+        .expect(
+            "≥1 manifest referenced by TWO snapshots (M1 carried from s1 into s2's manifest list)",
+        );
+    let carried = shared
+        .iter()
+        .find(|r| r.reference_snapshot_id != r.manifest.added_snapshot_id)
+        .expect("the carried row has reference_snapshot_id != added_snapshot_id");
+    assert_ne!(
+        carried.reference_snapshot_id, carried.manifest.added_snapshot_id,
+        "the carried manifest row's reference_snapshot_id (the LISTING snapshot) differs from its \
+         added_snapshot_id (the snapshot that first wrote it)"
+    );
+
+    println!(
+        "test_all_manifests_table_matches_java_rows OK — {} rows matched Java (shared manifest has 2 \
+         distinct reference_snapshot_id; carried ref != added)",
+        rust_rows.len()
+    );
+}

@@ -2013,12 +2013,16 @@ public final class InteropOracle {
   // ===========================================================================================
 
   /**
-   * The A2 half of the inspection-manifests oracle. Builds the richer partitioned V2 table on local disk
-   * under {@code <dir>/table_a2} via THREE real commits (newAppend + newRowDelta + newDelete), writes
+   * The A2 (+ A3) half of the inspection-manifests oracle. Builds the richer partitioned V2 table on local
+   * disk under {@code <dir>/table_a2} via THREE real commits (newAppend + newRowDelta + newDelete), writes
    * {@code <dir>/table_a2/metadata/final.metadata.json}, and emits the rows of Java's REAL {@link
-   * ManifestEntriesTable} / {@link ManifestsTable} / {@link PartitionsTable} (via {@link
-   * MetadataTableUtils} + {@code asDataTask().rows()} reading those on-disk manifests) as
-   * {@code java_entries.json} / {@code java_manifests.json} / {@code java_partitions.json}.
+   * ManifestEntriesTable} / {@link ManifestsTable} / {@link PartitionsTable} (A2) as
+   * {@code java_entries.json} / {@code java_manifests.json} / {@code java_partitions.json}, AND — over the
+   * SAME table — Java's REAL {@code AllDataFilesTable} / {@code AllDeleteFilesTable} / {@code AllFilesTable}
+   * / {@code AllEntriesTable} / {@code AllManifestsTable} (A3, the cross-snapshot {@code all_*} tables) as
+   * {@code java_all_data_files.json} / {@code java_all_delete_files.json} / {@code java_all_files.json} /
+   * {@code java_all_entries.json} / {@code java_all_manifests.json}. All materialize via {@link
+   * MetadataTableUtils} + {@code asDataTask().rows()} reading the same on-disk manifests.
    */
   static final class InspectionManifestsA2Oracle {
     private InspectionManifestsA2Oracle() {}
@@ -2131,7 +2135,39 @@ public final class InteropOracle {
       writeJson(dir.resolve("java_entries.json"), rowsToJson(table, MetadataTableType.ENTRIES));
       writeJson(dir.resolve("java_manifests.json"), rowsToJson(table, MetadataTableType.MANIFESTS));
       writeJson(dir.resolve("java_partitions.json"), rowsToJson(table, MetadataTableType.PARTITIONS));
-      System.out.println("generated inspection-manifests A2 table + fixtures to " + dir);
+
+      // 7. A3 — the FIVE cross-snapshot `all_*` inspection tables over the SAME table_a2 (its A2 fixtures
+      //    above are UNTOUCHED). table_a2's three commits (s1 newAppend A,B,C,D -> manifest M1; s2 newRowDelta
+      //    +pos-delete cat=a -> delete manifest MD, M1 CARRIED into s2's list; s3 newDelete B -> rewritten M1'
+      //    where B is a DELETED tombstone) give the cross-snapshot shape these tables read:
+      //      * ALL_DATA_FILES / ALL_FILES — the manifest SOURCE is the dedup-by-PATH union of manifests
+      //        reachable from ALL snapshots (Java BaseAllMetadataTableScan.reachableManifests), so they
+      //        INCLUDE B (live in s1's M1) which the CURRENT files/data_files tables EXCLUDE (current sees
+      //        only M1' where B is deleted). Manifests are dedup'd by path but the FILES inside are NOT — a
+      //        file present in two distinct reachable manifests (A in M1 and M1') appears MULTIPLE times
+      //        (Java javadoc "may return duplicate rows"). Same flat files schema as A1, so the Rust test
+      //        reuses the A1 FileRow extraction; the comparison is an order-independent MULTISET (no dedup).
+      //      * ALL_ENTRIES — every manifest entry across all reachable manifests, incl. tombstones. Same
+      //        nested-data_file schema as A2 `entries`.
+      //      * ALL_MANIFESTS — one row per (manifest × referencing snapshot), NOT dedup'd: M1 referenced by
+      //        BOTH s1 and s2 yields TWO rows with distinct reference_snapshot_id (its added_snapshot_id stays
+      //        s1, so for the s2-referencing carried row reference_snapshot_id != added_snapshot_id). Its
+      //        schema is the regular `manifests` schema PLUS a `reference_snapshot_id` Long column; the
+      //        partition_summaries bounds render via Transform.toHumanString as bare strings, same as A2.
+      //    All five materialize the SAME way (their planFiles tasks are DataTasks) via the shared rowsToJson.
+      writeJson(
+          dir.resolve("java_all_data_files.json"),
+          rowsToJson(table, MetadataTableType.ALL_DATA_FILES));
+      writeJson(
+          dir.resolve("java_all_delete_files.json"),
+          rowsToJson(table, MetadataTableType.ALL_DELETE_FILES));
+      writeJson(dir.resolve("java_all_files.json"), rowsToJson(table, MetadataTableType.ALL_FILES));
+      writeJson(
+          dir.resolve("java_all_entries.json"), rowsToJson(table, MetadataTableType.ALL_ENTRIES));
+      writeJson(
+          dir.resolve("java_all_manifests.json"),
+          rowsToJson(table, MetadataTableType.ALL_MANIFESTS));
+      System.out.println("generated inspection-manifests A2 + A3 table + fixtures to " + dir);
     }
 
     /**
