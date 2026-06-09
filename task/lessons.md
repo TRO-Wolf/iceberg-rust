@@ -1977,3 +1977,45 @@ How to use it (see the manuals' §2):
   Added entries; carried-forward entries are `Existing`/`Deleted`, not `Added`). So `status == Added` ⇒
   `entry.snapshot_id ∈ snapshotIds` already holds — the entry-level id check cannot admit an extra file. The
   omission is a benign simplification, NOT a missing-files / extra-files bug.
+
+### 2026-06-08 (Phase 3 Increment 3 — ScanReport / MetricsReporter data model, BUILDER Opus)
+- **DO model Java's `MetricsReport` marker interface as a closed `#[non_exhaustive] enum`, not a `dyn` trait
+  object.** *Why:* Java's `MetricsReport` is an empty marker and reporters downcast (`instanceof ScanReport`);
+  `InMemoryMetricsReporter.scanReport()` even THROWS on a kind mismatch. A Rust `enum MetricsReport {
+  Scan(ScanReport) }` makes the kind part of the type — `last_scan_report()` matches exhaustively (no wildcard)
+  so a future `Commit(CommitReport)` variant forces every consumer to update, and there is no downcast to get
+  wrong. `#[non_exhaustive]` keeps adding a variant non-breaking. Reporters take `MetricsReport` by value (the
+  trait is `Send + Sync` so reporters can be shared).
+- **DO carry Java's `@Nullable` metric optionality as `Option<_>` per field with `skip_serializing_if =
+  "Option::is_none"` + `default`, NOT a zero default.** *Why:* Java's `ScanMetricsResult` accessors are all
+  `@Nullable` and `ScanMetricsResultParser` OMITS a null counter/timer from the JSON (and `CounterResult.
+  fromCounter` returns null for a no-op counter). A never-incremented counter must be ABSENT, not `{"value":0}`
+  — both for byte-parity with the REST `report-metrics` payload and to distinguish "not measured" from
+  "measured zero". `..Default::default()` on the struct + `Default` on the field gives the absent state for free.
+- **DO hand-write `Serialize`/`Deserialize` for the timer so `total-duration` is expressed in the timer's OWN
+  unit, not nanoseconds.** *Why:* Java `TimerResultParser` writes `total-duration` as `unit.convert(duration.
+  toNanos(), NANOSECONDS)` (a TRUNCATING integer convert into the reported `time-unit`) and reads it back with
+  `Duration.of(val, chronoUnit(unit))`. A naive `#[derive(Serialize)]` over a `Duration` would emit a
+  `{secs,nanos}` struct (wrong shape) — and emitting raw nanos under a `milliseconds` time-unit is wrong by 10^6.
+  The `Duration` is kept exact in memory; convert ONLY at the serde boundary via a `nanos_per_unit()` table.
+  Pin it with a non-nanosecond unit (250ms → `total-duration: 250`, not 250_000_000).
+- **DO pin the JSON shape against a HAND-WRITTEN expected `serde_json::json!` for the top-level field names AND
+  a couple of metric/counter/timer names, not just a serialize→deserialize round-trip.** *Why:* a round-trip
+  (`to_value` → `from_value` → `==`) is TAUTOLOGICAL on field names — rename `table-name`→`tableName` on the
+  struct and the round-trip still passes (both directions use the same rename). Only an explicit
+  `json.get("table-name").is_some()` / `json["metrics"]["result-data-files"] == {"unit":"count","value":5}`
+  assertion catches a drifted wire name. Mutation-verified: the rename mutation fails ONLY the shape assertion,
+  not the round-trip.
+- **DO scope the `filter` serde to the Rust `Predicate`'s own derive and DOCUMENT the divergence from Java's
+  `ExpressionParser` JSON — do not silently imply parity.** *Why:* Java's `ScanReportParser` emits `filter` via
+  `ExpressionParser.toJson` (a structured expression-tree JSON); the Rust `Predicate` serde is a different
+  shape. Porting `ExpressionParser` is a large separate effort; the metric data is the high-value part of the
+  contract. State the gap in the module docs + GAP_MATRIX so a future REST-interop increment knows the `filter`
+  sub-document is the one unfaithful field.
+- **CONSTRAINT HIT: the `iceberg` crate had NO logging facade (`tracing`/`log` are not direct deps), but the
+  brief mandated `tracing`-based logging.** Added `tracing = { workspace = true }` to `crates/iceberg/Cargo.toml`
+  (already a resolved workspace dep, so the `Cargo.lock` delta is a single `tracing` line under the iceberg
+  crate's dep list). This edits a dependency file — an Absolute Prohibition / scope-flag — so it is surfaced for
+  orchestrator sign-off rather than done silently. *Lesson for the next agent:* the core crate logs NOWHERE
+  today; any first `tracing` use forces this same one-line dep add. If sign-off is withheld, the fallback is a
+  caller-injected log sink (over-engineered for one reporter) — the workspace-dep add is the clean path.

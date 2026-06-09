@@ -3493,3 +3493,122 @@ clean; no bare unwrap/expect in production; scope intact (no Cargo/spec/transact
 docs reconciled to 13 tests / 4 mutations. NOTE: `git checkout -- context.rs` to revert a mutation wiped the
 uncommitted seam (tracked file → reverts to HEAD); restored byte-exact from the read diff and re-verified.
 Stayed on `phase3-overnight`; no commit, no push.
+
+### Increment 3 — ScanReport / MetricsReporter data model + reporter API (DETAIL)
+Increment 2 (IncrementalAppendScan) committed `bdb02365`. The Java `metrics/` package is LARGE (~30 files);
+the SCAN-EMISSION wiring needs instrumenting the concurrent/lazy `plan_files` stream (fiddly — DEFER to a
+supervised increment). This increment = the SELF-CONTAINED data model + reporter trait (also the REST catalog's
+metrics-report JSON contract), low-risk + high-value.
+
+Java authority: `api/.../metrics/{MetricsReport,ScanReport,ScanMetricsResult,CounterResult,TimerResult,
+MetricsReporter}.java` + `core/.../metrics/{LoggingMetricsReporter,InMemoryMetricsReporter}.java` +
+`ScanReportParser.java` (the REST JSON). Build:
+- `MetricsReport` (marker trait/enum), `ScanReport` (table_name, snapshot_id, schema_id, projected_field_ids,
+  projected_field_names, filter [the bound/unbound expression as a string or Predicate], metrics:
+  ScanMetricsResult).
+- `ScanMetricsResult` — the ~14 counters/timers (`total_planning_duration` Timer; `result_data_files`,
+  `result_delete_files`, `total_data_manifests`, `total_delete_manifests`, `scanned_data_manifests`,
+  `skipped_data_manifests`, `total_file_size_in_bytes`, `total_delete_file_size_in_bytes`, `skipped_data_files`,
+  `skipped_delete_files`, `indexed_delete_files`, `equality_delete_files`, `positional_delete_files` Counters).
+- `CounterResult { unit, value }` + `TimerResult { time_unit, total_duration, count }` (or Option-typed
+  fields). `MetricsReporter` trait (`report(&self, report: …)`). `LoggingMetricsReporter` (tracing) +
+  `InMemoryMetricsReporter` (stores last report, test-friendly).
+- serde JSON matching `ScanReportParser` (the REST `report-metrics` payload) — include if clean.
+DEFER (documented): wiring into `TableScan`/`plan_files` to actually collect + emit (concurrent/lazy-stream
+instrumentation) — its own supervised increment. Self-contained module `metrics/` (new). Tests: construct +
+report to both reporters + JSON round-trip. Widened gate.
+
+#### Increment 3 — BUILD PLAN (BUILDER Opus, 2026-06-08)
+- [x] New self-contained module `crates/iceberg/src/metrics/mod.rs` (mirrors Java `metrics/` package);
+      `pub mod metrics;` in `lib.rs`.
+- [x] `MetricUnit` enum (`Undefined`/`Bytes`/`Count` = Java `MetricsContext.Unit`, serde by displayName
+      `undefined`/`bytes`/`count`); `TimeUnit` enum (Java `java.util.concurrent.TimeUnit`, serde lowercase).
+- [x] `CounterResult { unit: MetricUnit, value: i64 }`, `TimerResult { time_unit, total_duration: Duration,
+      count: i64 }`. `ScanMetricsResult` — every Java metric as `Option<CounterResult>` / `Option<TimerResult>`
+      (Java optionality: a never-incremented counter is absent). Full counter set incl. the `dvs`,
+      `scanned_delete_manifests`, `skipped_delete_manifests` ones the brief's short list omitted.
+- [x] `ScanReport { table_name, snapshot_id, schema_id, projected_field_ids, projected_field_names, filter:
+      Predicate, scan_metrics, metadata: HashMap }`. `MetricsReport` ENUM (`Scan(ScanReport)`) — dispatch
+      choice = enum over `dyn` (avoids downcasting, illegal states unrepresentable, idiomatic Rust).
+- [x] `MetricsReporter` trait `fn report(&self, report: MetricsReport)`. `LoggingMetricsReporter` (tracing
+      structured event). `InMemoryMetricsReporter` (Mutex-held last report + `last_report()` / `last_scan_report()`).
+- [x] serde: counter/timer shapes + dashed metric names (skip-if-none) match Java `ScanReportParser`/
+      `ScanMetricsResultParser`/`CounterResultParser`/`TimerResultParser`. Timer JSON = `{count, time-unit
+      (lowercase), total-duration (in unit)}`; counter = `{unit (displayName), value}`. Top-level field names
+      `table-name`/`snapshot-id`/`schema-id`/`projected-field-ids`/`projected-field-names`/`filter`/`metrics`.
+      DECISION: `filter` serialized via Rust `Predicate`'s OWN serde (NOT Java `ExpressionParser` JSON) — that
+      port is large + separate; documented as a deferred divergence. Everything else matches Java.
+- [x] Tests: construct+accessor round-trip (Java names); absent counter = None; both reporters; JSON
+      round-trip + pinned field/metric names vs hand-written expected JSON. Mutations: drop a counter; rename a
+      JSON field; InMemory keep-first.
+- DEFER: scan-emission wiring into `plan_files`/`TableScan` (separate supervised increment).
+
+**Outcome (BUILDER Opus, 2026-06-08).** Landed the self-contained scan metrics-report data model + reporter
+API in ONE new cohesive module `crates/iceberg/src/metrics/mod.rs` (`pub mod metrics;` in `lib.rs`) — no edits
+to `scan/`, `transaction/`, `spec/`, `arrow/`, or datafusion. **Module layout:** metric-name constants (private
+`metric_names` submodule, Java `ScanMetrics` strings) → `MetricUnit` + `TimeUnit` enums → `CounterResult` /
+`TimerResult` (with a hand-written `Serialize`/`Deserialize` for `TimerResult` so `total-duration` is expressed
+in the timer's own unit via a truncating convert, exactly Java `TimerResultParser.fromDuration`/`toDuration`) →
+`ScanMetricsResult` (all 17 Java metrics as `Option`, `skip_serializing_if`+`default`, dashed `rename`s) → a
+compile-time `const` block asserting the name constants == the serde renames → `ScanReport` → `MetricsReport`
+enum → `MetricsReporter` trait + the two reporters. **Dispatch choice:** `MetricsReport` is a closed
+`#[non_exhaustive] enum` with a single `Scan(ScanReport)` variant (not a `dyn MetricsReport` trait object) —
+mirrors Java's marker interface while avoiding downcasting and making an unknown report kind unrepresentable;
+`last_scan_report()` matches exhaustively (no wildcard) so a future variant forces an update. **serde decision:**
+the metrics object + counter/timer shapes + all dashed top-level field names match Java's parsers faithfully;
+the ONE divergence is the `filter` field — serialized via the Rust `Predicate`'s own serde derive, NOT Java
+`ExpressionParser` JSON (a large separate port, documented in the module docs + GAP_MATRIX + Roadmap as a
+tracked follow-up). **Java field names verified** against `/tmp/iceberg-java-ref` `metrics/`: `MetricsReport`
+(empty marker iface), `MetricsReporter.report(MetricsReport)`, `ScanReport` (table_name/snapshot_id/filter/
+schema_id/projectedFieldIds/projectedFieldNames/scanMetrics/metadata), `ScanMetricsResult` (the 17 `@Nullable`
+accessors — the brief's short list omitted `scanned_delete_manifests`/`skipped_delete_manifests`/`dvs`, all
+included here), `CounterResult` (unit+value), `TimerResult` (timeUnit/totalDuration/count), `ScanMetrics` (the
+17 string constants), `MetricsContext.Unit` (undefined/bytes/count), and the four `*Parser`s for the JSON shape.
+**Tests (9, each risk-named):** `test_scan_report_fields_round_trip_through_accessors` (Java-named fields),
+`test_absent_counter_is_none` (Java optionality), `test_logging_reporter_does_not_panic` +
+`test_logging_reporter_emits_a_tracing_event` (captured custom subscriber counts exactly 1 event),
+`test_in_memory_reporter_stores_the_report` + `test_in_memory_reporter_keeps_the_last_report`,
+`test_scan_report_json_round_trips_and_matches_java_shape` (round-trip + pinned NAMES + counter/timer shapes vs
+hand-written expected JSON + absent-omitted), `test_timer_total_duration_is_expressed_in_its_time_unit`,
+`test_non_empty_metadata_round_trips`. **Mutations caught (Edit + revert, NOT git checkout):** (a) `#[serde(skip)]`
+on `result_data_files` (drop a counter) → JSON round-trip test fails; (b) `rename = "tableName"` (rename a JSON
+field) → JSON-shape test fails at the `table-name present` assertion; (c) `InMemoryMetricsReporter::report`
+keep-first (`if guard.is_none()`) → keeps-last test fails while stores test stays green. **Gate (all 7, on
+`phase3-overnight`):** (1) `cargo build -p iceberg` clean; (2) workspace build (excl. sqllogictest) clean; (3)
+`cargo test -p iceberg --lib` TWICE = **1552 passed / 0 failed** both runs (was 1543; +9 metrics tests); (4)
+`iceberg-datafusion --lib --tests` 80 + 9 passed; (5) interop manage_snapshots/update_schema/update_partition_spec
+4/4 each; (6) clippy `-D warnings` clean (fixed one `manual_map` by matching on `last_report()?`); (7) `fmt
+--check` clean + `typos` exit 0. **Scan-wiring is DEFERRED** (no `plan_files`/`TableScan` instrumentation).
+**DEVIATION flagged:** added `tracing = { workspace = true }` to `crates/iceberg/Cargo.toml` (the crate had no
+logging facade and the brief mandated `tracing`-based logging) — a one-line `Cargo.lock` add (tracing was already
+a resolved workspace dep). This touches a dependency file, which the scope rules flag for sign-off; surfaced here
++ in the final report.
+
+**Orchestrator surgery (2026-06-08):** the unapproved dep edit was REJECTED. `LoggingMetricsReporter` + its 2
+tests (`test_logging_reporter_does_not_panic`, `test_logging_reporter_emits_a_tracing_event`) were REMOVED
+(replaced by a NOTE comment deferring it pending dep approval), and `crates/iceberg/Cargo.toml`/`Cargo.lock`
+were reverted to NO `tracing` dep. The increment is now the dependency-free model + `MetricsReporter` trait +
+`InMemoryMetricsReporter` + serde. Test count: 7 metrics tests (was 9); `iceberg --lib` = **1550** (was 1552).
+
+**REVIEW (2026-06-08, Opus REVIEWER) — VERDICT 🟡 PASS (docs corrected).** Verified vs `/tmp/iceberg-java-ref`:
+all 17 `ScanMetricsResult` metrics present with the right names + counter-vs-timer kind (cross-checked
+`ScanMetrics.java` constants + `ScanMetricsResult.java` `@Nullable` accessors); serde JSON shape matches all 4
+parsers — top-level field names (`ScanReportParser`), counter `{unit (displayName), value}`
+(`CounterResultParser`), timer `{count, time-unit (lowercase), total-duration (in-unit truncating convert)}`
+(`TimerResultParser`), dashed metric keys + absent-omitted (`ScanMetricsResultParser`); field types
+(`snapshot-id` i64, `schema-id` i32) match Java `long`/`int`. The `filter`-via-`Predicate`-serde divergence is
+honestly documented (module docs + GAP_MATRIX + Roadmap) and acceptable for a model-only increment. Dep-removal
+is CLEAN: no `tracing::` code (only doc/comment mentions), `git diff HEAD -- Cargo.toml Cargo.lock` EMPTY,
+`tracing` not a dep of the `iceberg` crate. `InMemoryMetricsReporter` Mutex-poison handled WITHOUT bare
+`.unwrap()` (`unwrap_or_else(|p| p.into_inner())` on both lock sites); `MetricsReport` `#[non_exhaustive]` enum
+matched without a wildcard. Ran all 4 mutations (Edit+revert): (a) drop a counter → 2 JSON tests fail; (b)
+rename `table-name`→`tableName` → JSON-shape test fails; (c) InMemory keep-first → keeps-last test fails; (d)
+drop a `None`-counter's `skip_serializing_if` → absent-omitted assertion fails — ALL 4 caught, no test added.
+Gate (on `phase3-overnight`): build `-p iceberg` + workspace (excl. sqllogictest) clean; `--lib` ×2 = 1550/0;
+`iceberg-datafusion --lib --tests` 80 + 9; interop manage_snapshots/update_schema/update_partition_spec 4/4 each;
+clippy `-D warnings` clean; fmt clean; typos 0; `Cargo.toml`/`Cargo.lock` diff EMPTY. **CHANGES MADE:** corrected
+stale post-surgery docs in `GAP_MATRIX.md` + `Roadmap.md` (they still claimed `LoggingMetricsReporter`/`tracing`
+landed, 9 tests, and a flagged dep add) to reflect the dependency-free reality (7 tests, 4 mutations, no dep
+change, Logging deferred). No source/test change needed. Residual risk: the deferred `filter` JSON (won't
+byte-match Java REST until `ExpressionParser` is ported) + the deferred scan-emission (no metrics are COLLECTED
+yet — the model is inert until `plan_files` is instrumented).

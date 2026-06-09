@@ -394,6 +394,20 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   follow-ups):** `OverwriteFiles.validateAddedFilesMatchOverwriteFilter` (block 1) + `validateNoConflictingDeletes`
   (block 3); the RowDelta DELETE-file blocks (`validateNoConflictingDeleteFiles`, `validateDataFilesExist`,
   `validateAddedDVs` — need a concurrent-delete-file enumeration helper); `RewriteFiles` `validateNoNewDeletes`.
+- **Scan metrics-report model + `MetricsReporter` API (started 2026-06-08):** the self-contained metrics
+  DATA MODEL + reporter API landed 🟡 (Increment 3, new `metrics/mod.rs`, Java `org.apache.iceberg.metrics`).
+  `MetricsReport` (closed `#[non_exhaustive] enum`, `Scan(ScanReport)` — enum dispatch over `dyn`+downcast);
+  `ScanReport`; `ScanMetricsResult` (all 17 Java metrics as `Option`, names = Java `ScanMetrics` constants);
+  `CounterResult`/`TimerResult` + `MetricUnit`/`TimeUnit`; the `MetricsReporter` trait +
+  `InMemoryMetricsReporter` (last-report, test-friendly). serde JSON matches Java
+  `ScanReportParser`/`ScanMetricsResultParser`/`Counter`/`TimerResultParser` (dashed names, counter/timer
+  shapes), with ONE documented divergence — the `filter` field uses the Rust `Predicate`'s own serde, NOT
+  Java's `ExpressionParser` JSON (a large separate port, tracked). 7 unit tests; 4 mutations caught (drop a
+  counter / rename a JSON field / InMemory keep-first / drop a `None`-counter's skip-if-none). **DEFERRED:**
+  (1) wiring the model into `TableScan`/`plan_files` to COLLECT + EMIT (the concurrent/lazy-stream
+  instrumentation) — its own supervised increment; (2) Java's `tracing`-based `LoggingMetricsReporter` —
+  needs a logging-facade dependency not yet approved for the `iceberg` crate. **NO dependency change:** the
+  increment is dependency-free (`Cargo.toml`/`Cargo.lock` unchanged from `HEAD`).
 - **Inspection-table sub-sequence (dependency, then value):**
   1. **`files` family** (`files` / `data_files` / `delete_files`) — **DONE 🟡 (2026-06-08, Increment 1,
      `inspect/files.rs`).** Reads the current snapshot's manifest list → manifests → live entries →
