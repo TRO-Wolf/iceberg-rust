@@ -4162,5 +4162,5 @@ residual-always-true} match EXACTLY. Purely additive — NO production change.
   clippy/fmt/typos) + run.sh round-trip (10 tests). spec/ untouched (0 lines).
 - [x] **Docs** — GAP_MATRIX (scan-planning row), Roadmap (6g), lessons, todo.
 
-### NEXT: squash `phase2-3-remnants` + open PR (awaiting user go-ahead on squash-vs-keep + confirm base=TRO-Wolf fork, NEVER apache)
+### NEXT: squash `phase2-3-remnants` + open PR (awaiting user go-ahead on squash-vs-keep + confirm base = the origin fork, NEVER apache upstream)
 Branch = ~10 commits off main `ccfcb062` (3 Phase-2/3 remnants + 4 pure-metadata/manifest-A1 interop + file_format fix + A2 + A3 + A4). All LOCAL-only, not pushed. Deferred beyond this PR: `readable_metrics` interop; A5 scan EXECUTION (parquet deps + approval); other Phase 2/3 remnants (overwriteByRowFilter, RowDelta validateNoNewDeletesForDataFiles, BatchScan, CDC-merge).
