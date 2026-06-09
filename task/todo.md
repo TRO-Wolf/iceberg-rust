@@ -51,10 +51,12 @@ sprint (2026-06-09)".
 
 - [x] **Step 0 — stabilize the base.** phase3-scan-exec-interop landed on main as PR #11 (tree
       verified identical; local main fast-forwarded to 7e56fbf7; 1636 lib tests green on this tree).
-- [ ] **A — `map.md` scaffolding (own PR).** Create map + `## Debug` for the hot directories:
+- [x] **A — `map.md` scaffolding.** Created map + `## Debug` for the seven hot directories:
       `crates/iceberg/src/{transaction,inspect,scan,expr/visitors,writer}/`, `dev/java-interop/`,
-      `crates/iceberg/tests/`. Seeded from code as it stands; Debug sections start thin and are
-      populated by B's promotions. Gate: maps accurate vs code; no code touched.
+      `crates/iceberg/tests/`. Seeded from code (module lists verified against `mod.rs`); Debug
+      sections seeded with already-recorded failure modes and left thin for B's promotions.
+      Relative links verified resolving; `typos` clean; no code touched. Rides in the same PR as
+      the sprint-plan record (separate commits) since `gh` is unavailable locally.
 - [ ] **B — lessons.md compaction pass (own PR, interactive).** Run skills/compaction.md verbatim:
       verdict every dated entry (PROMOTE / KEEP / ARCHIVE), promotions land in the same change,
       archive verbatim to `task/lessons-archive/2026-06_phase0-phase3.md`, conservation check
