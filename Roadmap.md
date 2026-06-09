@@ -493,6 +493,25 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      read all manifests, drop the `status == Added` entry filter) caught — the last pinned by a reviewer-added
      mixed-status-own-manifest test (the fast-append fixtures alone could not exercise the `Added` filter).
      Validation + interop deferred → 🟡; `IncrementalChangelogScan`/`BatchScan` still pending.
+  8. **`IncrementalChangelogScan`** — **DONE 🟡 (2026-06-08, `scan/incremental.rs`, Java
+     `BaseIncrementalChangelogScan`).** `Table::incremental_changelog_scan()` plans row-level CHANGE tasks
+     (`ChangelogScanTask`) for the data files ADDED (INSERT) / REMOVED (DELETE) by the snapshots in
+     `(from excl, to incl]`, each tagged with a change ordinal (oldest snapshot → 0, Java
+     `computeSnapshotOrdinals`) and `commit_snapshot_id`. New public types in `scan/task.rs`:
+     `ChangelogOperation { Insert, Delete }` (the CDC-merge `UPDATE_BEFORE`/`UPDATE_AFTER` Java variants are
+     omitted + documented until a merge layer needs them), `ChangelogScanTask` (embeds a `FileScanTask`),
+     `ChangelogScanTaskStream`. Builds DIRECTLY on the increment-7 `IncrementalAppendScan` — the builder
+     delegates range resolution + `PlanContext` to the append-scan builder, and `plan_files` reuses
+     `build_manifest_file_contexts_from_files` (same partition-filter + residual). The changelog-specific
+     logic: `ordered_changelog_snapshots` (oldest-first, EXCLUDING `Operation::Replace`; rejects a range with
+     a row-level DELETE manifest as `FeatureUnsupported`, matching Java's current data-file-changelog limit),
+     and per snapshot emit `Added`→Insert / `Deleted`→Delete (skip `Existing`, Java `ignoreExisting`) from the
+     DATA manifests it itself added — the DELETE tombstones live in the deleting snapshot's OWN rewritten
+     manifest (`added_snapshot_id == snapshot_id`), verified against the producer's `rewrite_manifest_with_
+     deletes` writer stamping. The normal scan AND `IncrementalAppendScan` are byte-unchanged. 8 unit tests;
+     all 4 mutations (reverse ordinals, Deleted→Insert, include Replace, drop the delete-manifest guard)
+     caught. Validation + interop deferred → 🟡; `BatchScan` + CDC-merge (`UPDATE_BEFORE`/`UPDATE_AFTER`) still
+     pending.
 - **Exit criteria:** scans match Java planning/results incl. residuals; inspection tables present; reports
   emitted.
 

@@ -23,7 +23,9 @@ use crate::arrow::ArrowReaderBuilder;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
-use crate::scan::{IncrementalAppendScanBuilder, TableScanBuilder};
+use crate::scan::{
+    IncrementalAppendScanBuilder, IncrementalChangelogScanBuilder, TableScanBuilder,
+};
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
@@ -234,6 +236,21 @@ impl Table {
     /// [`IncrementalAppendScanBuilder`](crate::scan::IncrementalAppendScanBuilder).
     pub fn incremental_append_scan(&self) -> IncrementalAppendScanBuilder<'_> {
         IncrementalAppendScanBuilder::new(self)
+    }
+
+    /// Creates an incremental changelog scan, which plans the row-level CHANGES committed
+    /// between two snapshots — the range `(from_snapshot_id exclusive, to_snapshot_id
+    /// inclusive]`. It emits an INSERT task per data file ADDED and a DELETE task per data
+    /// file REMOVED by the snapshots in the range, each tagged with a change ordinal
+    /// (oldest snapshot → 0) and its commit snapshot id. `Operation::Replace` snapshots
+    /// (e.g. compaction) are excluded; a range whose snapshots carry row-level DELETE
+    /// manifests is rejected (matching Java's current data-file-changelog limitation).
+    ///
+    /// Mirrors Java `Table.newIncrementalChangelogScan()` /
+    /// `BaseIncrementalChangelogScan`. See
+    /// [`IncrementalChangelogScanBuilder`](crate::scan::IncrementalChangelogScanBuilder).
+    pub fn incremental_changelog_scan(&self) -> IncrementalChangelogScanBuilder<'_> {
+        IncrementalChangelogScanBuilder::new(self)
     }
 
     /// Creates a metadata table which provides table-like APIs for inspecting metadata.

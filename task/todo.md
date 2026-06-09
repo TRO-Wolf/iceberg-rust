@@ -3612,3 +3612,82 @@ landed, 9 tests, and a flagged dep add) to reflect the dependency-free reality (
 change, Logging deferred). No source/test change needed. Residual risk: the deferred `filter` JSON (won't
 byte-match Java REST until `ExpressionParser` is ported) + the deferred scan-emission (no metrics are COLLECTED
 yet — the model is inert until `plan_files` is instrumented).
+
+### Increment 4 — IncrementalChangelogScan (DETAIL)
+Increment 3 (ScanReport model) committed (commit hash `0xba590e64`). Java `BaseIncrementalChangelogScan`
+(`core/.../BaseIncrementalChangelogScan.java`, 183 lines) — builds on IncrementalAppendScan (Inc 2):
+- `orderedChangelogSnapshots(from excl, to incl)` (L103-118): the `ancestorsBetween` range snapshots EXCLUDING
+  `Operation::Replace`, oldest-first; **throws UnsupportedOperationException if any has DELETE manifests**
+  (L108-111 — current Java scope is data-file changes only; port as `ErrorKind::FeatureUnsupported`).
+- change ordinals: oldest snapshot = 0, incrementing (L124-134).
+- For each changelog snapshot's DATA manifests IT added (`manifest.snapshotId() ∈ changelogSnapshotIds`),
+  `ignoreExisting()`, filter entries to those snapshots, apply the row filter: ADDED entry →
+  `AddedRowsScanTask` (INSERT), DELETED entry → `DeletedDataFileScanTask` (DELETE), each carrying
+  (changeOrdinal, commitSnapshotId, dataFile, schema, spec, residual) (L136-182).
+
+Rust: new types — `ChangelogOperation { Insert, Delete }` + `ChangelogScanTask { change_ordinal: i32,
+commit_snapshot_id: i64, operation: ChangelogOperation, <the data file + schema + project_field_ids +
+predicate, reusing FileScanTask fields or embedding a FileScanTask> }`. `Table::incremental_changelog_scan()`
+→ builder mirroring `IncrementalAppendScanBuilder` (from excl/incl + to + with_filter + select). Planner mirrors
+`scan/incremental.rs` (the range walk + own-added-data-manifest reading) but: includes BOTH Added (→Insert) and
+Deleted (→Delete) entries (NOT just Added), excludes Replace snapshots, computes ordinals, guards delete
+manifests. Put it in `scan/incremental.rs` (alongside the append scan) — reuse its helpers.
+
+Tests (multi-snapshot fixture): a 2-append range → Insert tasks with correct ordinals (oldest=0); a snapshot
+that DELETED a data file (an overwrite/delete that removes a file, no delete-MANIFEST) → a Delete task; Replace
+snapshot excluded; a range containing a DELETE-manifest snapshot → FeatureUnsupported error; filter prunes;
+from==to empty. Mutation-pin: the ordinal order (oldest=0), the Added→Insert/Deleted→Delete mapping, the
+Replace exclusion, the delete-manifest guard. Confirm normal scan + IncrementalAppendScan unchanged. Widened gate.
+
+
+#### Working plan (BUILDER Opus, 2026-06-08)
+- [x] Verify the load-bearing question against Rust writers: a snapshot's OWN added DATA manifest carries the
+      `Deleted` tombstones for the files it removed. CONFIRMED via `transaction/snapshot.rs`:
+      `rewrite_manifest_with_deletes` writes the rewritten manifest through `new_filtering_manifest_writer`
+      with `Some(self.snapshot_id)` (the NEW snapshot id) -> `ManifestFile.added_snapshot_id == new snapshot id`
+      (writer.rs:477), and `add_delete_entry` stamps `entry.snapshot_id = self.snapshot_id` (writer.rs:305).
+      So `manifest.added_snapshot_id == snapshot.snapshot_id()` selects the deleting snapshot's rewritten
+      manifest, and a `Deleted` entry's `snapshot_id()` == the commit snapshot id. Mirrors Java exactly.
+- [x] New types in `scan/task.rs`: `ChangelogOperation { Insert, Delete }`, `ChangelogScanTask` (embed a
+      `FileScanTask` + change_ordinal/commit_snapshot_id/operation), `ChangelogScanTaskStream` alias.
+- [x] `IncrementalChangelogScanBuilder` + `IncrementalChangelogScan` in `scan/incremental.rs`;
+      `Table::incremental_changelog_scan()` entry point in `table.rs`.
+- [x] Planner: `ordered_changelog_snapshots` (async; Replace-exclusion + delete-manifest guard); ordinals
+      oldest->0; per snapshot, build manifest contexts for its OWN added DATA manifests, tag each task with that
+      snapshot's ordinal + commit_snapshot_id = entry.snapshot_id(); Added->Insert, Deleted->Delete.
+- [x] Tests + 4 mutation checks; confirm normal scan + IncrementalAppendScan unchanged; run the widened gate.
+
+**Outcome (BUILDER Opus, 2026-06-08):** `IncrementalChangelogScan` LANDED 🟡. **Types** (`scan/task.rs`, pub):
+`ChangelogOperation { Insert, Delete }` (ports Java `ChangelogOperation`; the CDC-merge `UPDATE_BEFORE`/
+`UPDATE_AFTER` variants are intentionally OMITTED + documented), `ChangelogScanTask` (embeds a `FileScanTask`
++ `change_ordinal: i32` + `commit_snapshot_id: i64` + `operation`, with accessors), `ChangelogScanTaskStream`.
+**Builder/planner** (`scan/incremental.rs`): `IncrementalChangelogScanBuilder` DELEGATES range resolution +
+`PlanContext` construction to `IncrementalAppendScanBuilder` (so the two scans share, and cannot drift, the
+non-trivial range/projection logic; a small `pub(crate) plan_context()` accessor was opened on
+`IncrementalAppendScan`). `IncrementalChangelogScan::plan_files`: (1) `ordered_changelog_snapshots` walks the
+range parent-chain newest-first, EXCLUDES `Operation::Replace`, REJECTS the range with
+`FeatureUnsupported("Delete files are currently not supported in changelog scans")` if any kept snapshot's
+manifest list carries a `ManifestContentType::Deletes` manifest, then reverses to oldest-first; (2) ordinals
+oldest→0; (3) per snapshot, reads the DATA manifests it itself added (`added_snapshot_id == snapshot_id`) via
+the REUSED `build_manifest_file_contexts_from_files` (same partition-filter pruning + residual, empty delete
+index), and converts `Added`→Insert / `Deleted`→Delete (skip `Existing`), tagging each task with the
+snapshot's ordinal + `commit_snapshot_id = entry.snapshot_id()` (fallback the snapshot id). `Table::
+incremental_changelog_scan()` is the entry point. **Java lines verified** against
+`/tmp/iceberg-java-ref/.../BaseIncrementalChangelogScan.java`: `doPlanFiles` L56-93, `orderedChangelogSnapshots`
+L103-118 (ancestorsBetween range, Replace-exclusion, delete-manifest throw L108-111), `computeSnapshotOrdinals`
+L124-134, `CreateDataFileChangeTasks` L136-182 (Added→AddedRowsScanTask=INSERT, Deleted→DeletedDataFileScanTask
+=DELETE, `commitSnapshotId = entry.snapshotId()`). **Load-bearing question RESOLVED:** a snapshot's OWN added
+DATA manifest DOES carry the `Deleted` tombstones for files it removed — `rewrite_manifest_with_deletes` writes
+the rewritten manifest through a writer stamped with the new snapshot id (`added_snapshot_id == snapshot_id`,
+`writer.rs:477`) and `add_delete_entry` stamps the `Deleted` entry's `snapshot_id` = that snapshot
+(`writer.rs:305`); confirmed by `test_changelog_overwrite_emits_delete_for_removed_file` passing. **Tests (8,
+risk-named):** ordinal scheme oldest=0 + commit-id; overwrite emits DELETE(removed)+INSERT(added); Replace
+excluded; delete-manifest range → FeatureUnsupported; with_filter partition prune; inclusive from==to = only that
+change; exclusive from==to rejected; carried-forward only-own-added. **Mutations (Edit+revert, all caught):**
+(a) newest=0 ordinal → ordinal test fails; (b) Deleted→Insert → delete test fails; (c) include Replace →
+Replace-excluded test fails; (d) drop delete-manifest guard → FeatureUnsupported test fails. **Normal scan +
+IncrementalAppendScan UNCHANGED** (the 13 append-scan + the regular scan tests stay green; only an additive
+`pub(crate)` accessor was added). **Gate (on `phase3-overnight`):** `build -p iceberg` clean; workspace
+all-targets (excl. sqllogictest) clean; `--lib` ×2 = 1558/0 (1550 prior + 8); `scan::` 64/0; datafusion
+`--lib --tests` 80 + 9; interop manage_snapshots/update_schema/update_partition_spec 4/4/4; clippy `-D warnings`
+clean; fmt clean; typos 0. **NO Cargo edits.**

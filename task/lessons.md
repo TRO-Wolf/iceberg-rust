@@ -2019,3 +2019,41 @@ How to use it (see the manuals' §2):
   orchestrator sign-off rather than done silently. *Lesson for the next agent:* the core crate logs NOWHERE
   today; any first `tracing` use forces this same one-line dep add. If sign-off is withheld, the fallback is a
   caller-injected log sink (over-engineered for one reporter) — the workspace-dep add is the clean path.
+### 2026-06-08 (Phase 3 Increment 4 — IncrementalChangelogScan, BUILDER Opus)
+- **DO source a changelog DELETE from the deleting snapshot's OWN rewritten data manifest, not a separate
+  tombstone store.** *Why:* the load-bearing question for the changelog scan was "does a snapshot's own added
+  DATA manifest carry the `Deleted` tombstones for files it removed?" — YES. When an OVERWRITE/DELETE removes a
+  live data file, `transaction/snapshot.rs::rewrite_manifest_with_deletes` writes the rewritten manifest through
+  `new_filtering_manifest_writer`, which stamps the writer's `snapshot_id` = the NEW snapshot id, so the
+  rewritten `ManifestFile.added_snapshot_id == new snapshot id` (`writer.rs:477`) AND `add_delete_entry` stamps
+  the `Deleted` entry's `snapshot_id` = that snapshot (`writer.rs:305`). So the SAME selection rule the append
+  scan uses (DATA manifests where `added_snapshot_id == snapshot_id`) surfaces the `Added` AND `Deleted` entries
+  of a snapshot, and `entry.snapshot_id()` IS the `commit_snapshot_id`. Mirrors Java
+  `BaseIncrementalChangelogScan` exactly (read the file: `CreateDataFileChangeTasks` L136-182 keys off
+  `entry.snapshotId()` and `entry.status()`). Verify the writer stamping against the source before trusting it —
+  a separate-tombstone assumption would have missed every delete.
+- **DO assign change ordinals OLDEST→0 by reversing a newest-first parent-chain walk, mirroring Java
+  `orderedChangelogSnapshots`'s `deque.addFirst`.** *Why:* the natural parent-chain walk visits newest-first;
+  Java prepends each to a deque (→ oldest-first) then `computeSnapshotOrdinals` numbers them 0,1,2… A
+  `last_column_id`-style single-number check can't catch a reversed ordinal — pin it with a 2-append range and
+  assert the OLDER snapshot's file is ordinal 0 AND its `commit_snapshot_id` is the older snapshot. Mutation
+  (skip the reverse → newest=0) flips both and fails.
+- **DO delegate a sibling scan's range-resolution + `PlanContext` to the existing builder instead of copying
+  it.** *Why:* `IncrementalChangelogScanBuilder` shares EVERY field + the (non-trivial) inclusive/exclusive
+  `from` resolution, projection, and bound-filter construction with `IncrementalAppendScanBuilder`. Building an
+  inner `IncrementalAppendScan` and reading its resolved `plan_context()` + range accessors (one additive
+  `pub(crate)` accessor) means the two scans can't drift and the changelog builder is ~15 lines of forwarding,
+  not a 160-line copy. The ONLY changelog-specific code is `plan_files` (Replace-exclusion + delete-manifest
+  guard + Added/Deleted→Insert/Delete + ordinals) — keep the divergence surface minimal.
+- **DO interleave the per-snapshot manifest producer + the task consumer on spawned tasks with a `Result`-
+  carrying output channel.** *Why:* a single manifest can hold more entries than the entry channel's capacity,
+  so a producer's `send` blocks until the consumer drains — fetching all manifests THEN draining deadlocks.
+  Spawn the producers (`try_for_each_concurrent` of `fetch_manifest_and_stream_manifest_entries`) and the
+  consumer, and forward a producer's manifest-fetch error into the same `channel::<Result<ChangelogScanTask>>`
+  so it isn't silently dropped when the producer task ends (a bare `let _ =` on the producer result loses the
+  error). The append scan's `file_scan_task_tx` carries `Result` for the same reason.
+- **DO reword a bare git short-hash in a docs/todo prose line that `typos` flags.** *Why:* the `typos` gate
+  treats a hex hash whose leading two chars are a dictionary-adjacent prefix (e.g. a hash beginning `b`+`a`) as
+  a typo; wrapping it (`0x…` / "commit hash") clears the gate without an out-of-scope `.typos.toml` edit. Same
+  class as an uppercase-plural acronym in a doc comment (e.g. "inserts"/"deletes" written in caps with a
+  trailing `s`) — write the lowercase singular-rooted form rather than fight the dictionary.
