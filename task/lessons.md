@@ -2323,3 +2323,30 @@ How to use it (see the manuals' §2):
   `InMemoryMetricsReporter::report`, which uses `unwrap_or_else(|p| p.into_inner())` (poison-safe) and lives in
   the out-of-scope `metrics/mod.rs` (unchanged). No bare `.unwrap()`/`.expect()`/`println!` in any production
   region of the three scan files.
+
+### 2026-06-09 (Inspection-table interop — `snapshots` + `refs` — ORCHESTRATOR + REVIEWER Opus)
+- **DO verify a suspected parity divergence against the LIVE Java source BEFORE instructing a "fix".** *Why:*
+  Java `SnapshotsTable.snapshotToRow` passes `snap.summary()` (the WHOLE map) into the summary column, which
+  *looked* like Rust diverges (Rust emits only `additional_properties`, dropping `operation`). Reading
+  `/tmp/iceberg-java-ref` `SnapshotParser.fromJson` (1.10.0, ~L153–156) showed the on-disk round-trip SPLITS
+  `operation` OUT of the summary map — so a re-parsed snapshot's `summary()` is `additional_properties`-only,
+  exactly matching Rust. The "divergence" was an artifact of the in-memory-CONSTRUCTED snapshot (our oracle's
+  `snapshot()` helper puts `operation` in the map), NOT the canonical path. Had I trusted the first read and
+  "fixed" Rust to inject `operation`, I'd have BROKEN parity. Captured in memory `reference_java_snapshot_summary_operation.md`.
+- **DO materialize an inspection-table interop oracle from a `TableMetadataParser.fromJson`-RE-PARSED base —
+  the same bytes the Rust reader consumes — not the freshly-built in-memory `TableMetadata`.** *Why:* the two
+  diverge on `summary` (operation-in-map vs split-out) AND the re-parse is what gives a non-null
+  `metadataFileLocation()` that `SnapshotsTable.task`/`RefsTable.task` hand to `io().newInputFile(...)`. Build
+  the base, write it, re-parse from disk, THEN scan.
+- **GOTCHA: Java `StaticDataTask.rows()` is a LAZY `Iterables.transform` over a SINGLE mutable
+  `StructProjection` that re-`wrap`s each row.** Accumulating the `StructLike` references into a `List` and
+  reading them AFTER the loop yields the LAST row N times (the builder's first run emitted three identical
+  snapshot rows). *Fix:* consume each row EAGERLY inside the iteration (serialize to JSON per-row while the
+  projection still points at it). Any metadata-table row reader must not stash `StructLike`s for later.
+- **DO drive inspection-table interop as Direction-1-ONLY.** Metadata tables are READ-ONLY virtual projections
+  of `TableMetadata`; there is nothing of Rust's for Java to read back (no Direction 2). The equality of the
+  projected rows IS the round-trip proof. Compare ALL columns ORDER-INDEPENDENTLY (sort both sides; compare a
+  map column as a `HashMap`, not by key order) so JVM/serde map-ordering never makes the test flaky.
+- **Cheap fixture richness pays off:** one snapshot with a MULTI-KEY summary + one with an operation-only
+  (→ empty-map) summary, and refs covering branch-full-retention / tag-only-max-ref-age / branch-no-retention,
+  exercise every non-trivial projection (map column, retention NULL-per-kind) in a 3-row/3-ref fixture.

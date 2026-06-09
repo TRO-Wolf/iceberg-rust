@@ -3972,3 +3972,42 @@ this — `validate_data_files_exist([paths])` takes the caller's set.
 green (the DeleteFiles increment-1 + data/delete conflict tests behavior-preserving). 4 mutations (a–d)
 caught + the DeleteFiles `skip_deletes=true` mutation caught. Deferred: `validateNoNewDeletesForDataFiles`,
 `validateAddedDVs` (need `removed_data_files`), `OverwriteFiles.validateDataFilesExist`.
+
+---
+
+## Active (2026-06-09): Inspection-table interop — `snapshots` + `refs` (Phase 3 interop Increment 1)
+
+Increment: the FIRST byte/field-level "read a table Java wrote" evidence for the inspection tables — flips the
+`snapshots` + `refs` inspection rows to interop-✅ (the rest of the inspection set stays 🟡). Builder→reviewer
+actor-critic via Workflow; orchestrator independently re-ran the full gate + committed. **Purely additive — NO
+production-code change.**
+
+- [x] **Java oracle** (`dev/java-interop/.../InteropOracle.java`) — new `generate-inspection` exec mode +
+  nested `InspectionOracle` + dedicated `InMemoryInspectionOperations` (its `io()` returns a real
+  `InMemoryFileIO` with the metadata file pre-`addFile`d). Builds a purpose-rich V2 base (3 snapshots
+  ROOT/CURRENT/SIBLING — CURRENT carries a MULTI-KEY summary, ROOT operation-only → empty map; refs main
+  branch-no-retention / dev branch-full-retention / stable tag-only-max-ref-age), writes `base.metadata.json`,
+  RE-PARSES it (`TableMetadataParser.fromJson`), then materializes Java's REAL `SnapshotsTable`/`RefsTable`
+  rows via `MetadataTableUtils.createMetadataTableInstance` + `mt.newScan().planFiles()` +
+  `task.asDataTask().rows()`, serialized by `JsonUtil`/`JsonGenerator` to `java_{snapshots,refs}.json`. No
+  Maven deps added; pom untouched.
+- [x] **Rust test** (`crates/iceberg/tests/interop_inspection.rs`, 2 tests) — loads the same
+  `base.metadata.json`, runs `inspect().snapshots()/.refs().scan()`, extracts every Arrow column, asserts
+  field-for-field equality vs the Java rows ORDER-INDEPENDENTLY (snapshots by id, refs by name; summary as a
+  `HashMap`) + focused named assertions (committed_at micros, empty-vs-multi-key summary, operation-not-in-map,
+  retention NULL-per-kind).
+- [x] **Gate (orchestrator-rerun, all green):** iceberg lib 1595, interop_inspection 2/2, the other 3 interop
+  suites 4/4/4, datafusion 80+9, clippy/fmt/typos clean; `git status` = only InteropOracle.java +
+  testdata/interop/inspection/ + the new test (no existing fixtures changed).
+- [x] **Docs** — GAP_MATRIX (interop note on the inspection row), lessons, todo.
+
+**Key finding (memory `reference_java_snapshot_summary_operation.md`):** Java `SnapshotParser.fromJson` splits
+`operation` OUT of the summary map on the on-disk round-trip ⇒ Rust's `additional_properties`-only summary
+column already matches Java's RE-PARSED `summary()` — NO Rust change. Verified against `/tmp/iceberg-java-ref`
+1.10.0 before any edit (averted a wrong "fix"). **Gotcha:** Java `StaticDataTask.rows()` is a lazy transform
+over ONE mutable projection — serialize each row eagerly, never stash `StructLike`s.
+
+**Deferred (next interop increments):** `history` + `metadata_log_entries` (need a multi-entry snapshot-log +
+metadata-log fixture so `is_current_ancestor=false` and the `latest_*` as-of-time columns are exercised); then
+the manifest-reading tables `files`/`entries`/`manifests`/`partitions`/`all_*` + scan interop (need real
+on-disk manifests + parquet, a bigger harness step).

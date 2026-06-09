@@ -561,6 +561,17 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      unchanged (additive). 12 unit tests; mutations (swap lower↔upper, wrong-field-id count, raw-bytes bound)
      each caught. **The inspection-table COLUMN set is now COMPLETE; only Java/Spark inspection interop
      remains.**
+  6b. **Inspection interop — `snapshots` + `refs`** — **DONE (2026-06-09, Phase 3 interop Increment 1,
+     `crates/iceberg/tests/interop_inspection.rs` + `dev/java-interop` `InspectionOracle` / new
+     `generate-inspection` mode).** The FIRST inspection-table interop evidence: these two rows flip to
+     interop-✅ (rest of the set stays 🟡). The Java oracle materializes the ACTUAL rows of Java's own
+     `SnapshotsTable`/`RefsTable` (`MetadataTableUtils` + `mt.newScan().planFiles()` + `task.asDataTask().rows()`)
+     from a `TableMetadataParser.fromJson`-RE-PARSED base; the Rust `inspect().snapshots()/.refs().scan()`
+     output is asserted field-for-field equal (all 6 columns each, order-independent; summary as a map;
+     retention NULL-per-kind). Read-only tables ⇒ Direction-1 only. **NO production change** — verified against
+     `/tmp/iceberg-java-ref` 1.10.0 that Java's on-disk round-trip splits `operation` OUT of the summary map,
+     matching Rust's `additional_properties` column. Deferred: `history`/`metadata_log_entries` interop (need a
+     multi-entry snapshot-log + metadata-log fixture); manifest-reading tables' interop (need on-disk manifests).
   7. **`IncrementalAppendScan`** — **DONE 🟡 (2026-06-08, overnight-run Increment 2,
      `scan/incremental.rs`, Java `BaseIncrementalAppendScan` + `BaseIncrementalScan`).** The incremental/CDC
      read primitive: `Table::incremental_append_scan()` plans the data files APPENDED in the range

@@ -26,6 +26,7 @@
 // TEST-ONLY ORACLE (a dev tool, like dev/spark/); it is not part of the shipped Rust library.
 package org.apache.iceberg;
 
+import com.fasterxml.jackson.core.JsonGenerator;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -36,7 +37,12 @@ import java.util.Map;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
 import org.apache.iceberg.expressions.Literal;
+import org.apache.iceberg.inmemory.InMemoryFileIO;
+import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.JsonUtil;
 
 /**
  * Java reference oracle for the UpdateSchema, UpdatePartitionSpec, AND ManageSnapshots interop suites.
@@ -66,6 +72,7 @@ public final class InteropOracle {
   private static final String SCHEMA_LOCATION = "s3://interop-bucket/update_schema";
   private static final String PARTITION_LOCATION = "s3://interop-bucket/update_partition_spec";
   private static final String SNAPSHOT_LOCATION = "s3://interop-bucket/manage_snapshots";
+  private static final String INSPECTION_LOCATION = "s3://interop-bucket/inspection";
 
   private InteropOracle() {}
 
@@ -85,6 +92,14 @@ public final class InteropOracle {
         SchemaOracle.generate(schemaFixturesDir);
         PartitionOracle.generate(partitionFixturesDir);
         SnapshotOracle.generate(snapshotFixturesDir);
+        break;
+      case "generate-inspection":
+        // A SEPARATE exec mode (its own fixtures dir) so the inspection increment never touches the
+        // committed update_schema / update_partition_spec / manage_snapshots fixtures. The dir is supplied
+        // via -Dinterop.inspection.fixtures.dir on the CLI (exec:java runs in the same JVM, so
+        // System.getProperty sees it).
+        Path inspectionFixturesDir = requireFixturesDir("interop.inspection.fixtures.dir");
+        InspectionOracle.generate(inspectionFixturesDir);
         break;
       case "verify":
         int failures = 0;
@@ -1036,6 +1051,318 @@ public final class InteropOracle {
     @Override
     public org.apache.iceberg.io.LocationProvider locationProvider() {
       throw new UnsupportedOperationException("interop oracle does not provide data locations");
+    }
+  }
+
+  // ===========================================================================================
+  // Inspection oracle — the FOURTH capability. Unlike schema/partition/manage-snapshots (which evolve
+  // metadata), the inspection metadata tables are READ-ONLY: they project a base TableMetadata into rows.
+  // This oracle materializes the ACTUAL rows of Java's own SnapshotsTable / RefsTable (via
+  // MetadataTableUtils + asDataTask().rows()) from a RE-PARSED base — the same bytes the Rust reader
+  // consumes — and emits them as java_snapshots.json / java_refs.json. The Rust test asserts
+  // `table.inspect().snapshots()/.refs().scan()` is field-for-field equal to those rows. There is only
+  // ONE direction here (Rust reproduces Java's projection); the tables are not writable.
+  //
+  // CORRECTNESS NOTE: SnapshotsTable.snapshotToRow writes snap.summary() into the summary MAP column. On
+  // the on-disk round-trip, SnapshotParser.fromJson splits the `operation` key OUT of the summary map
+  // (operation becomes the typed `operation` column; the map keeps only the OTHER properties). Rust's
+  // spec::Summary likewise hoists `operation` out and inspect/snapshots.rs emits only additional_properties
+  // into the summary column. Materializing from a RE-PARSED base (step 3) is therefore what makes the
+  // summary maps match with NO Rust change.
+  // ===========================================================================================
+
+  /**
+   * The inspection half of the oracle. Builds a purpose-built V2 base that exercises the non-trivial
+   * columns (multi-key summaries, branch/tag retention + NULLs), RE-PARSES it from disk (so the summary
+   * maps are canonical and there is a non-null metadataFileLocation), and emits the rows of Java's REAL
+   * {@link SnapshotsTable} / {@link RefsTable} — obtained via {@link MetadataTableUtils} and
+   * {@code asDataTask().rows()} — as {@code java_snapshots.json} / {@code java_refs.json}.
+   */
+  static final class InspectionOracle {
+    private InspectionOracle() {}
+
+    // The base's snapshot graph. ROOT is the lone-key (operation-only) summary; CURRENT is the MULTI-KEY
+    // summary (added-data-files / added-records / total-records survive the operation split); SIBLING is a
+    // small two-key summary. Sequence numbers 1/2/3 so Java's SnapshotParser emits a sequence-number for
+    // every snapshot (it omits it only for INITIAL_SEQUENCE_NUMBER 0), keeping the fixture parseable by the
+    // spec-`required` Rust V2 snapshot reader.
+    static final long ROOT_ID = 3051729675574597004L;
+    static final long CURRENT_ID = 3055729675574597004L;
+    static final long SIBLING_ID = 3060729675574597004L;
+    static final long ROOT_TS_MS = 1515100955770L;
+    static final long CURRENT_TS_MS = 1555100955770L;
+    static final long SIBLING_TS_MS = 1600000000000L;
+
+    static void generate(Path dir) throws IOException {
+      // 1. Build a purpose-built base TableMetadata that exercises the non-trivial columns.
+      TableMetadata base = buildBase();
+
+      // 2. Write the base, then RE-PARSE it from disk. Re-parsing is what makes the summary maps canonical
+      //    (operation split out by SnapshotParser.fromJson) AND gives a non-null metadataFileLocation that
+      //    SnapshotsTable.task / RefsTable.task hand to io().newInputFile(...).
+      Files.createDirectories(dir);
+      Path basePath = dir.resolve("base.metadata.json");
+      writeJson(basePath, TableMetadataParser.toJson(base));
+      TableMetadata reparsed =
+          TableMetadataParser.fromJson(basePath.toString(), readString(basePath));
+
+      // 3. Build a BaseTable over in-memory ops whose io() is an InMemoryFileIO that has the metadata file
+      //    PRE-ADDED, so SnapshotsTable.task / RefsTable.task's io().newInputFile(metadataFileLocation())
+      //    does not throw. (The InputFile is only HELD by StaticDataTask, never read for these pure-metadata
+      //    tables.)
+      InMemoryFileIO io = new InMemoryFileIO();
+      io.addFile(reparsed.metadataFileLocation(), Files.readAllBytes(basePath));
+      BaseTable baseTable =
+          new BaseTable(new InMemoryInspectionOperations(reparsed, io), "interop_inspection");
+
+      // 4. Materialize + emit the rows of Java's REAL SnapshotsTable and RefsTable.
+      writeJson(
+          dir.resolve("java_snapshots.json"),
+          rowsToJson(baseTable, MetadataTableType.SNAPSHOTS, InspectionOracle::snapshotRowToJson));
+      writeJson(
+          dir.resolve("java_refs.json"),
+          rowsToJson(baseTable, MetadataTableType.REFS, InspectionOracle::refRowToJson));
+      System.out.println("generated inspection fixtures to " + dir);
+    }
+
+    /**
+     * Build the purpose-built base: an unpartitioned V2 table (id long required, data string optional) with
+     * snapshots {ROOT, CURRENT(child of ROOT), SIBLING(child of ROOT)} and refs {main->CURRENT branch,
+     * dev->CURRENT branch with FULL retention, stable->ROOT tag with ONLY maxRefAgeMs}. Mirrors
+     * SnapshotOracle.buildBase, but with the multi-key summaries + the full-retention refs the inspection
+     * columns need. The branch/tag retention shapes exercise every retention column + its NULL pattern.
+     */
+    private static TableMetadata buildBase() {
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              INSPECTION_LOCATION,
+              props);
+
+      // ROOT: lone-key (operation-only) summary.
+      Map<String, String> rootSummary = new LinkedHashMap<>();
+      rootSummary.put("operation", DataOperations.APPEND);
+
+      // CURRENT: MULTI-KEY summary. After the operation split, the summary MAP column retains
+      // added-data-files / added-records / total-records.
+      Map<String, String> currentSummary = new LinkedHashMap<>();
+      currentSummary.put("operation", DataOperations.APPEND);
+      currentSummary.put("added-data-files", "3");
+      currentSummary.put("added-records", "100");
+      currentSummary.put("total-records", "100");
+
+      // SIBLING: a small two-key summary (operation + one surviving property).
+      Map<String, String> siblingSummary = new LinkedHashMap<>();
+      siblingSummary.put("operation", DataOperations.APPEND);
+      siblingSummary.put("added-data-files", "1");
+
+      Snapshot root = snapshot(ROOT_ID, null, 1L, ROOT_TS_MS, rootSummary, seed.currentSchemaId());
+      Snapshot current =
+          snapshot(CURRENT_ID, ROOT_ID, 2L, CURRENT_TS_MS, currentSummary, seed.currentSchemaId());
+      Snapshot sibling =
+          snapshot(SIBLING_ID, ROOT_ID, 3L, SIBLING_TS_MS, siblingSummary, seed.currentSchemaId());
+
+      return TableMetadata.buildFrom(seed)
+          .addSnapshot(root)
+          .addSnapshot(current)
+          .addSnapshot(sibling)
+          // dev branch @CURRENT with FULL retention; stable tag @ROOT with ONLY maxRefAgeMs. main is set
+          // LAST (and to CURRENT, the newest snapshot) so the snapshot-log entry is stamped at CURRENT's
+          // timestamp and last-updated-ms is never behind it.
+          .setRef(
+              "dev",
+              SnapshotRef.branchBuilder(CURRENT_ID)
+                  .minSnapshotsToKeep(2)
+                  .maxSnapshotAgeMs(86400000L)
+                  .maxRefAgeMs(604800000L)
+                  .build())
+          .setRef("stable", SnapshotRef.tagBuilder(ROOT_ID).maxRefAgeMs(259200000L).build())
+          .setBranchSnapshot(CURRENT_ID, SnapshotRef.MAIN_BRANCH)
+          .build();
+    }
+
+    /** Construct a package-private {@link BaseSnapshot} with a fake (never-read) manifest-list path. */
+    private static Snapshot snapshot(
+        long snapshotId,
+        Long parentId,
+        long sequenceNumber,
+        long timestampMs,
+        Map<String, String> summary,
+        int schemaId) {
+      return new BaseSnapshot(
+          sequenceNumber,
+          snapshotId,
+          parentId,
+          timestampMs,
+          DataOperations.APPEND,
+          summary,
+          schemaId,
+          INSPECTION_LOCATION + "/metadata/snap-" + snapshotId + ".avro",
+          null,
+          null,
+          null);
+    }
+
+    /**
+     * Materialize the rows of Java's REAL metadata table of {@code type} (SnapshotsTable / RefsTable) via
+     * {@link MetadataTableUtils#createMetadataTableInstance} + {@code task.asDataTask().rows()} and serialize
+     * each {@link StructLike} row with {@code rowToJson}. Columns are read BY POSITION per the metadata
+     * table's own schema — exactly the rows Java's planner would feed a scan engine.
+     *
+     * <p>IMPORTANT: each row MUST be serialized EAGERLY inside the iteration. {@code StaticDataTask.rows()}
+     * is a lazy {@code Iterables.transform} over a SINGLE mutable {@link org.apache.iceberg.util.StructProjection}
+     * that {@code wrap}s each underlying row in turn — accumulating the {@link StructLike} references into a
+     * list and reading them afterwards would yield the LAST row repeated N times (every reference aliases
+     * the same re-wrapped projection). Writing JSON per row during the loop captures each row's values
+     * while the projection still points at it.
+     */
+    private static String rowsToJson(
+        BaseTable baseTable, MetadataTableType type, RowWriter rowToJson) {
+      Table mt = MetadataTableUtils.createMetadataTableInstance(baseTable, type);
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            try (CloseableIterable<FileScanTask> tasks = mt.newScan().planFiles()) {
+              for (FileScanTask task : tasks) {
+                try (CloseableIterable<StructLike> taskRows = task.asDataTask().rows()) {
+                  for (StructLike row : taskRows) {
+                    rowToJson.write(row, gen);
+                  }
+                }
+              }
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * Serialize one SnapshotsTable row by position: 0=committed_at micros Long, 1=snapshot_id Long,
+     * 2=parent_id Long-or-null, 3=operation String-or-null, 4=manifest_list String-or-null, 5=summary
+     * Map<String,String>. committed_at is emitted as the raw micros long; nulls as JSON null; summary as a
+     * JSON object {string:string}.
+     */
+    @SuppressWarnings("unchecked")
+    private static void snapshotRowToJson(StructLike row, JsonGenerator gen) throws IOException {
+      gen.writeStartObject();
+      gen.writeNumberField("committed_at", row.get(0, Long.class));
+      gen.writeNumberField("snapshot_id", row.get(1, Long.class));
+      writeLongOrNull(gen, "parent_id", row.get(2, Long.class));
+      writeStringOrNull(gen, "operation", row.get(3, String.class));
+      writeStringOrNull(gen, "manifest_list", row.get(4, String.class));
+      Map<String, String> summary = row.get(5, Map.class);
+      gen.writeObjectFieldStart("summary");
+      if (summary != null) {
+        for (Map.Entry<String, String> entry : summary.entrySet()) {
+          gen.writeStringField(entry.getKey(), entry.getValue());
+        }
+      }
+      gen.writeEndObject();
+      gen.writeEndObject();
+    }
+
+    /**
+     * Serialize one RefsTable row by position: 0=name, 1=type, 2=snapshot_id Long,
+     * 3=max_reference_age_in_ms Long-or-null, 4=min_snapshots_to_keep Integer-or-null,
+     * 5=max_snapshot_age_in_ms Long-or-null.
+     */
+    private static void refRowToJson(StructLike row, JsonGenerator gen) throws IOException {
+      gen.writeStartObject();
+      gen.writeStringField("name", row.get(0, String.class));
+      gen.writeStringField("type", row.get(1, String.class));
+      gen.writeNumberField("snapshot_id", row.get(2, Long.class));
+      writeLongOrNull(gen, "max_reference_age_in_ms", row.get(3, Long.class));
+      writeIntOrNull(gen, "min_snapshots_to_keep", row.get(4, Integer.class));
+      writeLongOrNull(gen, "max_snapshot_age_in_ms", row.get(5, Long.class));
+      gen.writeEndObject();
+    }
+
+    private static void writeLongOrNull(JsonGenerator gen, String field, Long value)
+        throws IOException {
+      if (value == null) {
+        gen.writeNullField(field);
+      } else {
+        gen.writeNumberField(field, value);
+      }
+    }
+
+    private static void writeIntOrNull(JsonGenerator gen, String field, Integer value)
+        throws IOException {
+      if (value == null) {
+        gen.writeNullField(field);
+      } else {
+        gen.writeNumberField(field, value.intValue());
+      }
+    }
+
+    private static void writeStringOrNull(JsonGenerator gen, String field, String value)
+        throws IOException {
+      if (value == null) {
+        gen.writeNullField(field);
+      } else {
+        gen.writeStringField(field, value);
+      }
+    }
+
+    /** Serializes one {@link StructLike} metadata-table row to JSON. */
+    @FunctionalInterface
+    private interface RowWriter {
+      void write(StructLike row, JsonGenerator gen) throws IOException;
+    }
+  }
+
+  /**
+   * A minimal in-memory {@link TableOperations} for the inspection oracle. Unlike the manage-snapshots
+   * {@link InMemoryTableOperations}, this one's {@code io()} returns a real {@link InMemoryFileIO} (with the
+   * metadata file pre-added) because {@link SnapshotsTable#task}/{@link RefsTable#task} call
+   * {@code io().newInputFile(metadataFileLocation())} to build the {@link org.apache.iceberg.io.InputFile}
+   * that {@code StaticDataTask} merely HOLDS. The metadata is read-only here (no commit path is exercised).
+   */
+  private static final class InMemoryInspectionOperations implements TableOperations {
+    private final TableMetadata current;
+    private final FileIO io;
+
+    InMemoryInspectionOperations(TableMetadata current, FileIO io) {
+      this.current = current;
+      this.io = io;
+    }
+
+    @Override
+    public TableMetadata current() {
+      return current;
+    }
+
+    @Override
+    public TableMetadata refresh() {
+      return current;
+    }
+
+    @Override
+    public void commit(TableMetadata base, TableMetadata metadata) {
+      throw new UnsupportedOperationException("inspection oracle is read-only");
+    }
+
+    @Override
+    public FileIO io() {
+      return io;
+    }
+
+    @Override
+    public String metadataFileLocation(String fileName) {
+      return current.location() + "/metadata/" + fileName;
+    }
+
+    @Override
+    public LocationProvider locationProvider() {
+      throw new UnsupportedOperationException("inspection oracle does not provide data locations");
     }
   }
 
