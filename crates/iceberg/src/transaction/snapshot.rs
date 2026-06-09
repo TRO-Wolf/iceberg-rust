@@ -23,11 +23,13 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
+use crate::expr::visitors::residual_evaluator::ResidualEvaluator;
+use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, Manifest, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
-    ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention,
+    ManifestWriterBuilder, Operation, Schema, Snapshot, SnapshotReference, SnapshotRetention,
     SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
     update_snapshot_summaries,
 };
@@ -387,6 +389,148 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         Ok(resolved)
+    }
+
+    /// Resolve the LIVE data files this overwrite removes BY ROW PREDICATE, returning every file the
+    /// `predicate` STRICTLY matches (all of its rows match) — the Rust port of Java
+    /// `ManifestFilterManager.manifestHasDeletedFiles` + `PartitionAndMetricsEvaluator`
+    /// (`core/ManifestFilterManager.java` L450-491, L583-627) for the `overwriteByRowFilter` /
+    /// `deleteByRowFilter` mode. The resolved [`DataFile`]s feed the SAME [`process_deletes`] rewrite path
+    /// as [`resolve_partition_deletes`] / [`resolve_delete_paths`], so the matched files drop in the one
+    /// `Operation::Overwrite` snapshot alongside any explicit add/delete.
+    ///
+    /// **`PartitionAndMetricsEvaluator` faithfully (Java L604-626):** for each LIVE data file the predicate is
+    /// reduced to its per-partition RESIDUAL via [`ResidualEvaluator::residual_for`] (Java
+    /// `residualEvaluator.residualFor(partition)` — predicates the partition tuple already decides are folded
+    /// to `true`/`false`), then the strict / inclusive METRICS evaluators run on THAT residual against the
+    /// file's column metrics. This is what makes a partition-column predicate (e.g. `x == 0` on `identity(x)`)
+    /// delete a file with no `x` column bounds: for partition `x = 0` the residual is `alwaysTrue`, which the
+    /// strict-metrics evaluator trivially satisfies. Running the metrics on the FULL predicate instead would
+    /// wrongly classify such a file as a partial match (no bounds ⇒ strict false, inclusive true).
+    ///
+    /// **Decision tree per LIVE data file (mirrors Java `manifestHasDeletedFiles` L458-487, with
+    /// `markedForDelete == false` because the by-path / by-partition deletes are resolved separately):**
+    /// 1. **`rowsMightMatch` (KEEP-fast):** [`InclusiveMetricsEvaluator::eval`] on the residual (Java L470,
+    ///    L592-596). If NO rows can match (residual `alwaysFalse`, or metrics exclude) → **KEEP**.
+    /// 2. **`rowsMustMatch` (DELETE):** [`StrictMetricsEvaluator::eval`] on the residual (Java L471,
+    ///    L598-602). If ALL rows must match (`ROWS_MUST_MATCH`, residual `alwaysTrue` is trivially strict) →
+    ///    **DELETE**.
+    /// 3. **PARTIAL ⇒ ERROR:** might-match but NOT strictly all (Java L472-477:
+    ///    `ValidationException.check(allRowsMatch || isDelete, "Cannot delete file where some, but not all,
+    ///    rows match filter %s: %s", deleteExpression, file.location())` — throws for a DATA manifest where
+    ///    `isDelete == false`) → return a NON-retryable [`ErrorKind::DataInvalid`] with that exact message.
+    ///
+    /// **Unpartitioned `alwaysTrue` ⇒ full replace:** with no partition fields the residual is the whole
+    /// `alwaysTrue` filter, which strictly matches every file ⇒ every live data file is deleted (Java
+    /// `deleteByRowFilter(alwaysTrue)` full-replace).
+    ///
+    /// The predicate is bound case-sensitive (`true`, the Iceberg/Java default; this mode has no
+    /// case-sensitivity field). The residual evaluator is cached per partition-spec id (different manifests
+    /// can carry different spec ids), mirroring Java's per-spec `PartitionAndMetricsEvaluator`.
+    pub(crate) async fn resolve_filter_deletes(
+        &self,
+        predicate: &Predicate,
+    ) -> Result<Vec<DataFile>> {
+        let Some(snapshot) = self.table.metadata().current_snapshot() else {
+            return Ok(vec![]);
+        };
+
+        let schema = self.table.metadata().current_schema().clone();
+        // Bind the row predicate to the table schema once (Java `deleteExpression`). `rewrite_not` first so
+        // the projection / residual visitors never see a `Not` (they reject it).
+        let bound_predicate = predicate.clone().rewrite_not().bind(schema.clone(), true)?;
+
+        // Per-partition-spec cache of the residual evaluator (Java's per-spec `PartitionAndMetricsEvaluator`).
+        let mut residual_evaluators: HashMap<i32, ResidualEvaluator> = HashMap::new();
+
+        let manifest_list = snapshot
+            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+            .await?;
+
+        let mut resolved = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                let data_file = entry.data_file();
+
+                // Reduce the predicate to its residual for this file's partition (Java
+                // `residualEvaluator.residualFor(partition)`), then bind the residual to the table schema for
+                // the metrics evaluators. A new spec id builds (and caches) its residual evaluator.
+                let spec_id = data_file.partition_spec_id;
+                let residual_evaluator = match residual_evaluators.entry(spec_id) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let evaluator = Self::build_residual_evaluator(
+                            self.table,
+                            &bound_predicate,
+                            &schema,
+                            spec_id,
+                        )?;
+                        e.insert(evaluator)
+                    }
+                };
+                let residual = residual_evaluator
+                    .residual_for(data_file.partition())?
+                    .rewrite_not()
+                    .bind(schema.clone(), true)?;
+
+                // 1. `rowsMightMatch` (Java L470, L592-596): no rows can match ⇒ KEEP.
+                if !InclusiveMetricsEvaluator::eval(&residual, data_file, true)? {
+                    continue;
+                }
+
+                // 2. `rowsMustMatch` (Java L471, L598-602): all rows match ⇒ DELETE.
+                if StrictMetricsEvaluator::eval(&residual, data_file)? {
+                    resolved.push(data_file.clone());
+                    continue;
+                }
+
+                // 3. PARTIAL match: might-match but NOT strictly all ⇒ non-retryable error (Java L472-477).
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot delete file where some, but not all, rows match filter {predicate}: {}",
+                        data_file.file_path()
+                    ),
+                ));
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    /// Build the [`ResidualEvaluator`] for `spec_id` from the bound row predicate (Java
+    /// `ResidualEvaluator.of(spec, deleteExpression, caseSensitive)` inside `PartitionAndMetricsEvaluator`).
+    /// An unpartitioned spec degrades to `ResidualEvaluator::unpartitioned` (every residual is the whole
+    /// filter).
+    fn build_residual_evaluator(
+        table: &Table,
+        bound_predicate: &BoundPredicate,
+        schema: &Schema,
+        spec_id: i32,
+    ) -> Result<ResidualEvaluator> {
+        let partition_spec = table
+            .metadata()
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Cannot resolve filter deletes: unknown partition spec id {spec_id}"),
+                )
+            })?;
+
+        ResidualEvaluator::of(
+            partition_spec.clone(),
+            schema,
+            bound_predicate.clone(),
+            true,
+        )
     }
 
     fn generate_unique_snapshot_id(table: &Table) -> i64 {

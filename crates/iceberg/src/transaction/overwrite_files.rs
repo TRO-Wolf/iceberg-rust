@@ -54,14 +54,32 @@
 //! [`validate_no_new_deletes_for_data_files`] helper. INDEPENDENT of `validateNoConflictingData` — enabling
 //! one does not enable the other. A no-op on a V1 table.
 //!
-//! **Out of scope (deferred):**
-//! - `overwriteByRowFilter(Expression)` (Java) — needs inclusive/strict metrics evaluators to SELECT
-//!   and validate added files by row predicate (Java `validateAddedFilesMatchOverwriteFilter`,
-//!   `BaseOverwriteFiles.validate` block 1), and the `rowFilter()` branch of `validateNewDeletes`
-//!   (`validateNoNewDeleteFiles` / `validateDeletedDataFiles`).
+//! **Delete-by-row-filter mode (`overwriteByRowFilter(Expression)`):** [`OverwriteFilesAction::overwrite_by_row_filter`]
+//! stores a row predicate (Java `BaseOverwriteFiles.overwriteByRowFilter` → `deleteByRowFilter`). At apply
+//! time the producer resolves every LIVE data file the predicate STRICTLY matches (all of its rows match)
+//! via [`SnapshotProducer::resolve_filter_deletes`] — the Rust port of Java
+//! `ManifestFilterManager.manifestHasDeletedFiles` + `PartitionAndMetricsEvaluator` (partition pre-filter +
+//! strict/inclusive metrics evaluators). Those files feed the SAME [`process_deletes`] rewrite as the
+//! explicit by-path deletes, so they drop in the one snapshot alongside any explicit add/delete. A file the
+//! predicate matches only PARTIALLY (some-but-not-all rows) is a non-retryable error (Java's "Cannot delete
+//! file where some, but not all, rows match filter"). An unpartitioned `alwaysTrue` row filter deletes every
+//! file (full replace).
 //!
-//! This increment is the explicit add + delete core plus the filter-based `validateNoConflictingData` and
-//! the `validateNoConflictingDeletes` check on the explicitly-removed (`delete_data_files`) data files.
+//! **`validateAddedFilesMatchOverwriteFilter` (OPT-IN, Java `BaseOverwriteFiles.validate` block 1, L137-161):**
+//! when enabled via [`OverwriteFilesAction::validate_added_files_match_overwrite_filter`], each ADDED data
+//! file must have ALL of its rows inside the row filter: `inclusive_partition.eval(partition) &&
+//! (strict_partition.eval(partition) || StrictMetricsEvaluator::eval(rowFilter, file))`. On failure → a
+//! non-retryable `DataInvalid` ("Cannot append file with rows that do not match filter ..."). Only meaningful
+//! WITH `overwrite_by_row_filter` (the filter is `alwaysFalse` when unset).
+//!
+//! **Out of scope (deferred):**
+//! - The `rowFilter()` branch of `validateNewDeletes` (Java `BaseOverwriteFiles.validate` L168-172:
+//!   `validateNoNewDeleteFiles` / `validateDeletedDataFiles`) — the merge-on-read conflicting-delete checks
+//!   keyed on the row filter.
+//!
+//! This increment is the explicit add + delete core, the delete-by-row-filter mode and its added-file
+//! validation, the filter-based `validateNoConflictingData` (with the row-filter conflict-filter default),
+//! and the `validateNoConflictingDeletes` check on the explicitly-removed (`delete_data_files`) data files.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -70,14 +88,19 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::expr::Predicate;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
+use crate::expr::visitors::inclusive_projection::InclusiveProjection;
+use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
+use crate::expr::visitors::strict_projection::StrictProjection;
+use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation, Schema};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
     validate_no_conflicting_added_data_files, validate_no_new_deletes_for_data_files,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::{Error, ErrorKind};
 
 /// A transaction action that overwrites files: it adds data files AND removes data files in a single
 /// `Overwrite` snapshot.
@@ -127,6 +150,17 @@ pub struct OverwriteFilesAction {
     /// An explicit starting snapshot for conflict validation (Java `validateFromSnapshot`). When `None`, the
     /// validation uses the transaction's starting snapshot (the table head when the transaction was created).
     validate_from_snapshot: Option<i64>,
+    /// The row predicate of the delete-by-row-filter mode (Java `BaseOverwriteFiles.overwriteByRowFilter` →
+    /// `deleteByRowFilter`, stored as `deleteExpression`). When `Some`, every LIVE data file the predicate
+    /// STRICTLY matches is removed at apply time via [`SnapshotProducer::resolve_filter_deletes`]. When
+    /// `None`, the row filter is Java `alwaysFalse()` (no by-filter delete) — used as such in the
+    /// conflict-filter default ([`dataConflictDetectionFilter`](Self::validate)) and the added-file
+    /// validation.
+    row_filter: Option<Predicate>,
+    /// Whether to assert that every ADDED data file lies entirely inside the `row_filter` (Java
+    /// `OverwriteFiles.validateAddedFilesMatchOverwriteFilter`). OFF by default. Only meaningful together with
+    /// [`Self::row_filter`].
+    validate_added_files_match_overwrite_filter: bool,
 }
 
 impl OverwriteFilesAction {
@@ -142,6 +176,8 @@ impl OverwriteFilesAction {
             validate_no_conflicting_deletes: false,
             conflict_detection_filter: None,
             validate_from_snapshot: None,
+            row_filter: None,
+            validate_added_files_match_overwrite_filter: false,
         }
     }
 
@@ -185,6 +221,35 @@ impl OverwriteFilesAction {
             self.delete_paths.insert(file.file_path().to_string());
             self.deleted_data_files.push(file);
         }
+        self
+    }
+
+    /// DELETE every current data file the `predicate` STRICTLY matches (Java
+    /// `OverwriteFiles.overwriteByRowFilter(Expression)` → `deleteByRowFilter`). At apply time the producer
+    /// resolves the live data files whose ALL rows match the predicate (via
+    /// [`SnapshotProducer::resolve_filter_deletes`]) and removes them in the SAME `Overwrite` snapshot as any
+    /// explicit [`Self::add_file`] / [`Self::delete_file`]. A file the predicate matches only PARTIALLY
+    /// (some-but-not-all rows) makes the commit fail with a non-retryable error. An unpartitioned
+    /// `Predicate::AlwaysTrue` filter deletes EVERY data file (full replace).
+    ///
+    /// This is independent of the path-based [`Self::delete_file`] / [`Self::delete_data_files`] removals —
+    /// all of them are resolved and dropped in the one snapshot. The recorded operation stays `Overwrite`
+    /// (the row filter requests a delete, so an add+row-filter overwrite is a true overwrite).
+    pub fn overwrite_by_row_filter(mut self, predicate: Predicate) -> Self {
+        self.row_filter = Some(predicate);
+        self
+    }
+
+    /// ENABLE the assertion that every ADDED data file lies entirely inside the [`Self::overwrite_by_row_filter`]
+    /// predicate (Java `OverwriteFiles.validateAddedFilesMatchOverwriteFilter`): at validate time each added
+    /// data file must have ALL of its rows match the row filter, or the commit is rejected with a non-retryable
+    /// `ValidationException` ("Cannot append file with rows that do not match filter"). This guards a
+    /// replace-by-predicate from re-introducing rows outside the predicate it just deleted.
+    ///
+    /// Only meaningful together with [`Self::overwrite_by_row_filter`] — with no row filter the predicate is
+    /// `alwaysFalse` and no added file could match it. Default (this method NOT called) = no assertion.
+    pub fn validate_added_files_match_overwrite_filter(mut self) -> Self {
+        self.validate_added_files_match_overwrite_filter = true;
         self
     }
 
@@ -260,6 +325,129 @@ impl OverwriteFilesAction {
         self.validate_from_snapshot = Some(snapshot_id);
         self
     }
+
+    /// The row filter the validations operate on (Java `MergingSnapshotProducer.rowFilter()` =
+    /// `deleteExpression`): the [`Self::overwrite_by_row_filter`] predicate, or `AlwaysFalse` (Java
+    /// `Expressions.alwaysFalse()`) when unset.
+    fn row_filter(&self) -> Predicate {
+        self.row_filter.clone().unwrap_or(Predicate::AlwaysFalse)
+    }
+
+    /// The conflict-detection filter for `validateNoConflictingData`, mirroring Java
+    /// `BaseOverwriteFiles.dataConflictDetectionFilter()` (L181-188):
+    /// - an explicit [`Self::conflict_detection_filter`] when set; ELSE
+    /// - the [`Self::overwrite_by_row_filter`] row filter when it is set (`rowFilter != alwaysFalse`) AND there
+    ///   are no explicitly-removed data files ([`Self::deleted_data_files`] empty); ELSE
+    /// - `None` (the shared helper binds `None` as `AlwaysTrue` — Java `Expressions.alwaysTrue()`).
+    ///
+    /// Returning `None` for the `alwaysTrue` case keeps the existing explicit-filter + None-default behavior
+    /// for the non-row-filter path byte-for-byte (the helper treats `None` as `AlwaysTrue`), while a
+    /// row-filter overwrite with no explicit deletes now uses the row filter as the conflict filter.
+    fn data_conflict_detection_filter(&self) -> Option<&Predicate> {
+        if self.conflict_detection_filter.is_some() {
+            return self.conflict_detection_filter.as_ref();
+        }
+        match &self.row_filter {
+            Some(row_filter) if self.deleted_data_files.is_empty() => Some(row_filter),
+            // `None` row filter (alwaysFalse) OR explicit deletes present ⇒ Java `alwaysTrue()`; the shared
+            // helper binds `None` as `AlwaysTrue`, so return `None` to preserve the existing default exactly.
+            _ => None,
+        }
+    }
+
+    /// Assert every ADDED data file lies entirely inside the row filter (Java
+    /// `BaseOverwriteFiles.validate` L137-161). For each added file:
+    /// `inclusive_partition.eval(file.partition()) && (strict_partition.eval(file.partition()) ||
+    /// StrictMetricsEvaluator::eval(rowFilter, file))`, where `inclusive_partition` / `strict_partition` are
+    /// the [`InclusiveProjection`] / [`StrictProjection`] of the row filter evaluated on the partition (Java
+    /// `Projections.inclusive/strict(spec).project(rowFilter)` + an `Evaluator`). On failure → non-retryable
+    /// `DataInvalid` (Java L154-159).
+    fn check_added_files_match_overwrite_filter(&self, current: &Table) -> Result<()> {
+        // With no added files there is nothing to assert; with an `alwaysFalse` row filter (none set) the
+        // assertion is vacuous-but-strict — every non-empty added file would fail. Java only reaches this
+        // block when the flag is on, which is only meaningful with a row filter; we still evaluate faithfully.
+        if self.added_data_files.is_empty() {
+            return Ok(());
+        }
+
+        let row_filter = self.row_filter();
+        let schema = current.metadata().current_schema().clone();
+        // Strict METRICS evaluator runs on the full row filter against the table schema (Java
+        // `new StrictMetricsEvaluator(base.schema(), rowFilter, isCaseSensitive())`). `rewrite_not` so the
+        // visitor never sees a `Not`.
+        let bound_row_filter: BoundPredicate = row_filter
+            .clone()
+            .rewrite_not()
+            .bind(schema.clone(), true)?;
+
+        // The added files all share the table default partition spec (validated in `commit` via
+        // `validate_added_data_files`); build the inclusive/strict PARTITION evaluators for that spec.
+        let spec_id = current.metadata().default_partition_spec_id();
+        let inclusive_partition =
+            self.build_partition_evaluator(current, &bound_row_filter, spec_id, true)?;
+        let strict_partition =
+            self.build_partition_evaluator(current, &bound_row_filter, spec_id, false)?;
+
+        for file in &self.added_data_files {
+            // The real test: strict-partition OR strict-metrics proves ALL rows match; inclusive-partition
+            // avoids testing metrics for a file the partition already excludes (Java L151-156).
+            let all_rows_match = inclusive_partition.eval(file)?
+                && (strict_partition.eval(file)?
+                    || StrictMetricsEvaluator::eval(&bound_row_filter, file)?);
+            if !all_rows_match {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot append file with rows that do not match filter {row_filter}: {}",
+                        file.file_path()
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build the partition [`ExpressionEvaluator`] for `spec_id` from the row filter: when `inclusive`,
+    /// project via [`InclusiveProjection`] (Java `Projections.inclusive(spec).project(rowFilter)`), else via
+    /// [`StrictProjection`] (Java `Projections.strict(spec)`), then bind the projected predicate to the
+    /// partition schema. The result evaluates a [`DataFile`]'s partition tuple (Java
+    /// `new Evaluator(spec.partitionType(), expr).eval(file.partition())`).
+    fn build_partition_evaluator(
+        &self,
+        current: &Table,
+        bound_row_filter: &BoundPredicate,
+        spec_id: i32,
+        inclusive: bool,
+    ) -> Result<ExpressionEvaluator> {
+        let schema = current.metadata().current_schema();
+        let partition_spec = current
+            .metadata()
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Cannot validate added files: unknown partition spec id {spec_id}"),
+                )
+            })?;
+
+        let partition_type = partition_spec.partition_type(schema)?;
+        let partition_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(partition_spec.spec_id())
+                .with_fields(partition_type.fields().to_owned())
+                .build()?,
+        );
+
+        let projected = if inclusive {
+            InclusiveProjection::new(partition_spec.clone()).project(bound_row_filter)?
+        } else {
+            StrictProjection::new(partition_spec.clone()).strict_project(bound_row_filter)?
+        };
+
+        let partition_filter = projected.rewrite_not().bind(partition_schema, true)?;
+        Ok(ExpressionEvaluator::new(partition_filter))
+    }
 }
 
 #[async_trait]
@@ -284,6 +472,9 @@ impl TransactionAction for OverwriteFilesAction {
             .commit(
                 OverwriteFilesOperation {
                     delete_paths: self.delete_paths.clone(),
+                    // The delete-by-row-filter predicate (Java `deleteExpression`). When `Some`, the producer
+                    // also resolves the live data files this predicate strictly matches.
+                    row_filter: self.row_filter.clone(),
                     // The recorded operation is classified on the REQUESTED sets (Java `addsDataFiles()` =
                     // requested added files non-empty), evaluated before the deletes are resolved.
                     adds_data_files: !self.added_data_files.is_empty(),
@@ -300,16 +491,23 @@ impl TransactionAction for OverwriteFilesAction {
     /// failure of EITHER rejects the commit with a NON-retryable `DataInvalid` (Java's non-retryable
     /// `ValidationException`), so the commit retry loop stops and the error propagates.
     ///
-    /// 1. **`validateNoConflictingData`** (Java L167-168 → `validateNewDataFiles` →
+    /// 1. **`validateAddedFilesMatchOverwriteFilter`** (Java L137-161, when
+    ///    [`Self::validate_added_files_match_overwrite_filter`] is enabled): assert every ADDED data file lies
+    ///    entirely inside the [`Self::overwrite_by_row_filter`] predicate (`rowFilter`), via
+    ///    [`Self::check_added_files_match_overwrite_filter`] — `inclusive_partition.eval(file.partition()) &&
+    ///    (strict_partition.eval(file.partition()) || StrictMetricsEvaluator::eval(rowFilter, file))`. On
+    ///    failure → non-retryable `DataInvalid` ("Cannot append file with rows that do not match filter ...").
+    /// 2. **`validateNoConflictingData`** (Java L163-165 → `validateNewDataFiles` →
     ///    `MergingSnapshotProducer.validateAddedDataFiles`, when [`Self::validate_no_conflicting_data`] is
     ///    enabled): enumerate every DATA file ADDED to the refreshed base by snapshots committed since the
     ///    start (Java `addedDataFiles`) and reject if ANY COULD contain records matching the conflict-detection
-    ///    filter (the existing `InclusiveMetricsEvaluator`). The filter is the caller's
-    ///    [`Self::conflict_detection_filter`] when set, else `AlwaysTrue` (any concurrently-added data file
-    ///    conflicts), mirroring Java `dataConflictDetectionFilter()` (we have no `overwriteByRowFilter`, so the
-    ///    row-filter branch never applies). Delegates to the SHARED
-    ///    [`validate_no_conflicting_added_data_files`] helper (also used by `RowDelta`).
-    /// 2. **`validateNoConflictingDeletes`** (Java L174-177 → `validateNoNewDeletesForDataFiles`, when
+    ///    filter (the existing `InclusiveMetricsEvaluator`). The filter is the
+    ///    [`Self::data_conflict_detection_filter`] derived per Java `dataConflictDetectionFilter()` (L181-188):
+    ///    the explicit [`Self::conflict_detection_filter`] when set; else the [`Self::overwrite_by_row_filter`]
+    ///    `rowFilter` when it is set (`!= alwaysFalse`) AND there are no explicitly-removed data files; else
+    ///    `AlwaysTrue`. Delegates to the SHARED [`validate_no_conflicting_added_data_files`] helper (also used
+    ///    by `RowDelta`).
+    /// 3. **`validateNoConflictingDeletes`** (Java L174-177 → `validateNoNewDeletesForDataFiles`, when
     ///    [`Self::validate_no_conflicting_deletes`] is enabled AND this overwrite removes data files supplied
     ///    with full metadata via [`Self::delete_data_files`]): enumerate the DELETE files added by concurrent
     ///    commits since the start and reject if ANY APPLIES to one of those removed data files (you cannot drop
@@ -319,9 +517,8 @@ impl TransactionAction for OverwriteFilesAction {
     ///    [`Self::delete_data_files`] entries (Java's `deletedDataFiles`) are checked — path-only
     ///    [`Self::delete_file`] / [`Self::delete_files`] removals are not. A no-op on a V1 table.
     ///
-    /// Out of scope (Java `BaseOverwriteFiles.validate` blocks not ported here): the `validateNewDataFiles`
-    /// row-filter branch and `validateAddedFilesMatchOverwriteFilter` (need `overwriteByRowFilter`), and the
-    /// `validateNoNewDeleteFiles` / `validateDeletedDataFiles` row-filter sub-branch.
+    /// Out of scope (Java `BaseOverwriteFiles.validate` blocks not ported here): the `validateNewDeletes`
+    /// row-filter sub-branch (Java L168-172: `validateNoNewDeleteFiles` / `validateDeletedDataFiles`).
     ///
     /// **Case sensitivity:** Java binds the conflict filter with `isCaseSensitive()`. This action has no such
     /// field, so the filter is bound case-sensitive (`true`) — the Iceberg/Java default for column resolution.
@@ -336,19 +533,27 @@ impl TransactionAction for OverwriteFilesAction {
         // would make the concurrent set empty and silently pass. Both checks share this start.
         let effective_start = self.validate_from_snapshot.or(starting_snapshot_id);
 
-        // 1. Concurrent-added DATA-file conflict (Java `validateNewDataFiles` branch). The walk + bind +
-        //    per-file inclusive-metrics evaluation + non-retryable-conflict error are the shared helper.
+        // 1. validateAddedFilesMatchOverwriteFilter (Java L137-161): every ADDED data file must lie entirely
+        //    inside the row filter. Runs FIRST, matching Java's block order.
+        if self.validate_added_files_match_overwrite_filter {
+            self.check_added_files_match_overwrite_filter(current)?;
+        }
+
+        // 2. Concurrent-added DATA-file conflict (Java `validateNewDataFiles` branch). The walk + bind +
+        //    per-file inclusive-metrics evaluation + non-retryable-conflict error are the shared helper. The
+        //    conflict filter is derived per Java `dataConflictDetectionFilter()` (the row-filter default).
         if self.validate_no_conflicting_data {
+            let conflict_filter = self.data_conflict_detection_filter();
             validate_no_conflicting_added_data_files(
                 current,
                 effective_start,
-                self.conflict_detection_filter.as_ref(),
+                conflict_filter,
                 true,
             )
             .await?;
         }
 
-        // 2. Concurrent-added DELETE applying to a REMOVED data file (Java `validateNoConflictingDeletes` →
+        // 3. Concurrent-added DELETE applying to a REMOVED data file (Java `validateNoConflictingDeletes` →
         //    the `!deletedDataFiles.isEmpty()` branch of `validateNewDeletes`). Only the
         //    `delete_data_files` (full-metadata) removals are validated — matching Java's `deletedDataFiles`.
         //    `ignore_equality_deletes = false` (Java passes the full set with equality deletes counted).
@@ -376,8 +581,13 @@ impl TransactionAction for OverwriteFilesAction {
 /// single snapshot carries both the added manifest and the rewritten (filtered) manifests.
 struct OverwriteFilesOperation {
     delete_paths: HashSet<String>,
-    /// Whether this overwrite requested any added data files. Combined with whether any delete path was
-    /// requested (`delete_paths` non-empty), this classifies the recorded operation the way Java
+    /// The delete-by-row-filter predicate (Java `deleteExpression`). When `Some`, `delete_files` also resolves
+    /// every live data file this predicate STRICTLY matches (via `resolve_filter_deletes`), unioned with the
+    /// path-resolved deletes. `None` ⇒ Java `alwaysFalse` (no by-filter delete).
+    row_filter: Option<Predicate>,
+    /// Whether this overwrite requested any added data files. Combined with whether any delete was requested
+    /// (a non-empty `delete_paths` OR a set `row_filter`, mirroring Java `containsDeletes()` =
+    /// `deleteExpression != alwaysFalse`), this classifies the recorded operation the way Java
     /// `BaseOverwriteFiles.operation()` does.
     adds_data_files: bool,
 }
@@ -388,7 +598,11 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
     /// both → [`Operation::Overwrite`]. An empty overwrite (neither) is rejected before this is read, so
     /// the both-empty case here would fall through to `Overwrite` and never commit.
     fn operation(&self) -> Operation {
-        let deletes_data_files = !self.delete_paths.is_empty();
+        // Java `containsDeletes()` (L198-203): a delete is requested if any path was requested OR the
+        // delete-by-row-filter predicate is set (`deleteExpression != alwaysFalse`). A set row filter
+        // therefore counts as "deletes data files" even before the matched files are resolved — matching
+        // Java's REQUESTED-set classification.
+        let deletes_data_files = !self.delete_paths.is_empty() || self.row_filter.is_some();
         match (self.adds_data_files, deletes_data_files) {
             (false, true) => Operation::Delete,
             (true, false) => Operation::Append,
@@ -407,9 +621,29 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
         // Resolve the requested paths against the current snapshot's live data entries, validating that
         // EVERY requested path matched a live entry (Java `failMissingDeletePaths`). Shared with
         // `DeleteFiles` via `SnapshotProducer::resolve_delete_paths`.
-        snapshot_produce
+        let mut resolved = snapshot_produce
             .resolve_delete_paths(&self.delete_paths)
-            .await
+            .await?;
+
+        // Union the delete-by-row-filter matches (Java `deleteByRowFilter` — every live data file the
+        // predicate strictly matches; a partial match is a non-retryable error inside `resolve_filter_deletes`).
+        // De-dupe by path so a file removed by BOTH an explicit path and the row filter is not deleted twice
+        // (the producer's `process_deletes` matches by path, so a duplicate would be harmless, but the summary
+        // counts must stay accurate — Java's `DataFileSet` likewise dedupes).
+        if let Some(row_filter) = &self.row_filter {
+            let filter_deletes = snapshot_produce.resolve_filter_deletes(row_filter).await?;
+            let mut seen: HashSet<String> = resolved
+                .iter()
+                .map(|df| df.file_path().to_string())
+                .collect();
+            for data_file in filter_deletes {
+                if seen.insert(data_file.file_path().to_string()) {
+                    resolved.push(data_file);
+                }
+            }
+        }
+
+        Ok(resolved)
     }
 
     async fn existing_manifest(
@@ -426,7 +660,7 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use crate::expr::Reference;
+    use crate::expr::{Predicate, Reference};
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestStatus,
@@ -470,6 +704,30 @@ mod tests {
             .record_count(1)
             .partition_spec_id(0)
             .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .lower_bounds(HashMap::from([(2, Datum::long(y_lower))]))
+            .upper_bounds(HashMap::from([(2, Datum::long(y_upper))]))
+            .build()
+            .unwrap()
+    }
+
+    /// Like [`data_file_with_y_bounds`] but with COMPLETE `y` (field id 2) stats: lower/upper bounds plus
+    /// `value_counts`, `null_value_counts = 0`, `nan_value_counts = 0`. The zero null/nan counts let the
+    /// [`StrictMetricsEvaluator`] fully classify the file against a `y` predicate (the strict evaluator
+    /// conservatively returns "might not match" when a column might contain a null/nan — Java
+    /// `StrictMetricsEvaluator`). This is the realistic shape a real Parquet writer produces, and it is what
+    /// the delete-by-row-filter path needs to decide DELETE vs KEEP without a spurious partial-match error.
+    fn data_file_with_y_stats(path: &str, part_value: i64, y_lower: i64, y_upper: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .value_counts(HashMap::from([(2, 1)]))
+            .null_value_counts(HashMap::from([(2, 0)]))
+            .nan_value_counts(HashMap::from([(2, 0)]))
             .lower_bounds(HashMap::from([(2, Datum::long(y_lower))]))
             .upper_bounds(HashMap::from([(2, Datum::long(y_upper))]))
             .build()
@@ -1797,5 +2055,448 @@ mod tests {
             "only the deletes check is on; a concurrent data APPEND is not a conflicting-delete ⇒ commit",
         );
         assert!(live_file_paths(&table).await.contains("test/b.parquet"));
+    }
+
+    // ============================================================================================
+    // Delete-by-row-filter mode (Java `BaseOverwriteFiles.overwriteByRowFilter` → `deleteByRowFilter`).
+    // `resolve_filter_deletes` (`snapshot.rs`) ports Java `ManifestFilterManager.manifestHasDeletedFiles`
+    // + `PartitionAndMetricsEvaluator`: per live data file, reduce the predicate to its per-partition
+    // residual, then DELETE if strict-metrics says all rows match, KEEP if inclusive says none match, and
+    // ERROR ("some, but not all, rows match") on a partial match.
+    // ============================================================================================
+
+    /// THE KEY DELETE-BY-ROW-FILTER TEST. Append files in partitions x=0 (a, b) and x=1 (c). An
+    /// `overwrite_by_row_filter(x == 0)` STRICTLY matches the whole x=0 partition (identity(x) residual is
+    /// `alwaysTrue` there) → a and b are deleted; c (x=1) is kept. An added file d (x=0) lands. Post-commit
+    /// SCAN = {c, d}. Pins the partition-residual delete: a file with NO `x` column bounds must still be
+    /// deleted because the partition value satisfies the predicate.
+    #[tokio::test]
+    async fn test_overwrite_by_row_filter_deletes_strictly_matching_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 0),
+            data_file("test/c.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("x").equal_to(Datum::long(0)))
+            .add_file(data_file("test/d.parquet", 0));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("overwrite_by_row_filter(x == 0) must delete the x=0 files and add d");
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/c.parquet".to_string(), "test/d.parquet".to_string(),]),
+            "x=0 files (a, b) deleted by the row filter; c (x=1) kept; d added"
+        );
+        // Both an add and a (row-filter) delete ⇒ the operation is Overwrite.
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Overwrite
+        );
+    }
+
+    /// FULL REPLACE. `overwrite_by_row_filter(AlwaysTrue)` deletes EVERY live data file (Java
+    /// `deleteByRowFilter(alwaysTrue)`), and the added file is all that remains. Pins the unpartitioned
+    /// `alwaysTrue` full-replace shape (the residual is the whole `alwaysTrue`, strict-matched by every file).
+    #[tokio::test]
+    async fn test_overwrite_by_row_filter_always_true_replaces_all() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Predicate::AlwaysTrue)
+            .add_file(data_file("test/new.parquet", 0));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("overwrite_by_row_filter(AlwaysTrue) must replace every file");
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/new.parquet".to_string()]),
+            "AlwaysTrue deletes every live file; only the added file remains"
+        );
+    }
+
+    /// PARTIAL MATCH ⇒ ERROR. A file whose `y` bounds `[0,10]` STRADDLE the predicate `y == 5` matches only
+    /// SOME rows (inclusive yes, strict no). The commit must ERROR with Java's exact message ("Cannot delete
+    /// file where some, but not all, rows match filter"). Pins that a partial match is a hard non-retryable
+    /// error, never a silent partial delete.
+    #[tokio::test]
+    async fn test_overwrite_by_row_filter_partial_match_errors() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // y bounds [0,10] straddle `y == 5` ⇒ some-but-not-all rows match.
+        let table = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/straddle.parquet",
+            0,
+            0,
+            10,
+        )])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").equal_to(Datum::long(5)));
+        let tx = action.apply(tx).unwrap();
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("a partial (some-but-not-all) row match must error");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable(), "a partial-match delete is non-retryable");
+        assert!(
+            err.message()
+                .contains("Cannot delete file where some, but not all, rows match filter"),
+            "must match Java's message, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/straddle.parquet"),
+            "the error must name the offending file, got: {}",
+            err.message()
+        );
+
+        // The table is unchanged (the failed overwrite committed nothing).
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_file_paths(&reloaded).await,
+            HashSet::from(["test/straddle.parquet".to_string()])
+        );
+    }
+
+    /// NON-MATCHING FILE IS KEPT. The predicate `y == 5` cannot match a file whose `y` bounds `[60,70]` lie
+    /// entirely outside it (inclusive says no rows match). The file survives an `overwrite_by_row_filter`
+    /// (the row filter deletes nothing). Pins that a non-matching file is neither deleted nor an error.
+    #[tokio::test]
+    async fn test_overwrite_by_row_filter_keeps_non_matching_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // y bounds [60,70] are entirely above `y == 5` ⇒ no rows match ⇒ KEEP.
+        let table = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/high.parquet",
+            0,
+            60,
+            70,
+        )])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").equal_to(Datum::long(5)))
+            .add_file(data_file("test/added.parquet", 0));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("a non-matching file is kept; the row filter deletes nothing");
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from([
+                "test/high.parquet".to_string(),
+                "test/added.parquet".to_string(),
+            ]),
+            "the non-matching file survives; the added file lands"
+        );
+    }
+
+    // ============================================================================================
+    // validateAddedFilesMatchOverwriteFilter (Java `BaseOverwriteFiles.validate` L137-161). Every ADDED
+    // data file must lie entirely inside the row filter:
+    //   inclusive_partition.eval(partition) && (strict_partition.eval(partition) || strictMetrics(rowFilter))
+    // ============================================================================================
+
+    /// ADDED FILE INSIDE THE FILTER ⇒ OK. With `validate_added_files_match_overwrite_filter` on and row
+    /// filter `x == 0`, an added file routed to partition x=0 has ALL rows matching (strict-partition on
+    /// identity(x) proves it) ⇒ the commit succeeds.
+    #[tokio::test]
+    async fn test_validate_added_files_match_filter_accepts_in_filter_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("x").equal_to(Datum::long(0)))
+            .add_file(data_file("test/in-filter.parquet", 0))
+            .validate_added_files_match_overwrite_filter();
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("an added file whose rows all match the filter must be accepted");
+
+        assert!(
+            live_file_paths(&table)
+                .await
+                .contains("test/in-filter.parquet"),
+            "the in-filter added file is present (commit succeeded)"
+        );
+    }
+
+    /// ADDED FILE OUTSIDE THE FILTER ⇒ REJECTED. With the validation on and row filter `x == 0`, an added
+    /// file routed to partition x=1 has rows OUTSIDE the filter (strict-partition fails AND strict-metrics
+    /// fails — no `x` bounds). The commit must be rejected with Java's "Cannot append file with rows that do
+    /// not match filter" message.
+    #[tokio::test]
+    async fn test_validate_added_files_match_filter_rejects_out_of_filter_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("x").equal_to(Datum::long(0)))
+            // Added file in partition x=1 — its rows are OUTSIDE `x == 0`.
+            .add_file(data_file("test/out-of-filter.parquet", 1))
+            .validate_added_files_match_overwrite_filter();
+        let tx = action.apply(tx).unwrap();
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("an added file with rows outside the filter must be rejected");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable(), "the validation failure is non-retryable");
+        assert!(
+            err.message()
+                .contains("Cannot append file with rows that do not match filter"),
+            "must match Java's message, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/out-of-filter.parquet"),
+            "the error must name the offending file, got: {}",
+            err.message()
+        );
+    }
+
+    // ============================================================================================
+    // Conflict-filter default with overwrite_by_row_filter (Java `dataConflictDetectionFilter()` L181-188):
+    // with NO explicit conflict filter, NO explicitly-removed data files, and a set row filter, the row
+    // filter becomes the default conflict filter for `validateNoConflictingData`.
+    // ============================================================================================
+
+    /// ROW FILTER BECOMES THE DEFAULT CONFLICT FILTER (MATCH ⇒ REJECT). An `overwrite_by_row_filter(y >= 50)`
+    /// with `validate_no_conflicting_data()` and NO explicit conflict filter (and no explicit deletes). A
+    /// concurrent append of a file whose `y` bounds `[60,70]` MATCH `y >= 50` must conflict — proving the row
+    /// filter (not AlwaysTrue) became the conflict filter.
+    #[tokio::test]
+    async fn test_row_filter_is_default_conflict_filter_matching_add_conflicts() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // Seed lies OUTSIDE the row filter `y >= 50` (bounds [0,10]) so the row filter KEEPS it (no
+        // partial-match ambiguity from possibly-null metrics) — it is only the base; the conflict is about
+        // the concurrent / added files.
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/seed.parquet",
+            0,
+            0,
+            10,
+        )])
+        .await;
+
+        // overwrite_by_row_filter(y >= 50), no explicit deletes, no explicit conflict filter, validation on.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)))
+            .add_file(data_file_with_y_bounds("test/added.parquet", 0, 80, 90))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT add: y bounds [60,70] MATCH `y >= 50` ⇒ a conflict under the row-filter default.
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/concurrent.parquet",
+            0,
+            60,
+            70,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a concurrent add matching the row filter conflicts (row filter is the default conflict filter)",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(
+            err.message().contains("test/concurrent.parquet"),
+            "the conflict must name the concurrent file, got: {}",
+            err.message()
+        );
+    }
+
+    /// ROW FILTER AS DEFAULT CONFLICT FILTER (OUTSIDE ⇒ NO CONFLICT). Same setup, but the concurrent file's
+    /// `y` bounds `[10,20]` lie ENTIRELY BELOW the row filter `y >= 50` — it does NOT match, so it is not a
+    /// conflict and the overwrite COMMITS. This is the discriminating half: under an AlwaysTrue default this
+    /// concurrent add WOULD have conflicted, so a successful commit proves the row filter is the conflict
+    /// filter (not AlwaysTrue).
+    #[tokio::test]
+    async fn test_row_filter_is_default_conflict_filter_outside_add_does_not_conflict() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // Seed lies OUTSIDE the row filter `y >= 50` (bounds [0,10]) so the row filter KEEPS it (no
+        // partial-match ambiguity from possibly-null metrics) — it is only the base; the conflict is about
+        // the concurrent / added files.
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/seed.parquet",
+            0,
+            0,
+            10,
+        )])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)))
+            .add_file(data_file_with_y_bounds("test/added.parquet", 0, 80, 90))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT add: y bounds [10,20] are entirely BELOW `y >= 50` ⇒ NOT a conflict.
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/concurrent.parquet",
+            0,
+            10,
+            20,
+        )])
+        .await;
+
+        let table = tx.commit(&catalog).await.expect(
+            "a concurrent add OUTSIDE the row filter is not a conflict (proves row filter is the default)",
+        );
+        assert!(
+            live_file_paths(&table).await.contains("test/added.parquet"),
+            "the overwrite committed (no conflict under the row-filter default)"
+        );
+        assert!(
+            live_file_paths(&table)
+                .await
+                .contains("test/concurrent.parquet"),
+            "the non-conflicting concurrent add survives the re-based overwrite"
+        );
+    }
+
+    /// EXPLICIT DELETES DISABLE THE ROW-FILTER DEFAULT (Java L184 `&& deletedDataFiles.isEmpty()`). With an
+    /// explicitly-removed data file present, `dataConflictDetectionFilter()` falls through to AlwaysTrue (NOT
+    /// the row filter), so a concurrent add that lies OUTSIDE the row filter STILL conflicts. Pins the
+    /// `deletedDataFiles.isEmpty()` guard on the row-filter default.
+    #[tokio::test]
+    async fn test_row_filter_default_disabled_when_explicit_deletes_present() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // Seed lies OUTSIDE the row filter `y >= 50` (bounds [0,10]) so the row filter KEEPS it; it is
+        // removed by the EXPLICIT delete_data_files below, which is what disables the row-filter default.
+        let seed = data_file_with_y_bounds("test/seed.parquet", 0, 0, 10);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![seed.clone()]).await;
+
+        // overwrite_by_row_filter(y >= 50) BUT ALSO an explicit delete_data_files(seed) ⇒ the row-filter
+        // conflict-default is disabled, so the conflict filter falls back to AlwaysTrue.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)))
+            .delete_data_files(vec![seed])
+            .add_file(data_file_with_y_bounds("test/added.parquet", 0, 80, 90))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT add OUTSIDE the row filter (y bounds [10,20] < 50). Under AlwaysTrue it STILL conflicts.
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/concurrent.parquet",
+            0,
+            10,
+            20,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "with explicit deletes present the conflict filter is AlwaysTrue ⇒ even an outside add conflicts",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(err.message().contains("test/concurrent.parquet"));
+    }
+
+    /// EXPLICIT CONFLICT FILTER STILL WINS (Java L182). When the caller sets BOTH an explicit
+    /// `conflict_detection_filter` and an `overwrite_by_row_filter`, the EXPLICIT filter is used (not the row
+    /// filter). Here the explicit filter `y >= 100` excludes a concurrent add at `[60,70]` that the row filter
+    /// `y >= 50` WOULD have caught — so the commit succeeds, proving the explicit filter takes precedence.
+    #[tokio::test]
+    async fn test_explicit_conflict_filter_takes_precedence_over_row_filter() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // Seed lies OUTSIDE the row filter `y >= 50` (bounds [0,10]) so the row filter KEEPS it (no
+        // partial-match ambiguity from possibly-null metrics) — it is only the base; the conflict is about
+        // the concurrent / added files.
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/seed.parquet",
+            0,
+            0,
+            10,
+        )])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)))
+            .conflict_detection_filter(
+                Reference::new("y").greater_than_or_equal_to(Datum::long(100)),
+            )
+            .add_file(data_file_with_y_bounds("test/added.parquet", 0, 120, 130))
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT add [60,70] with COMPLETE stats: matches the row filter (y >= 50) but NOT the explicit
+        // filter (y >= 100). Full stats (0 nulls/nans) let the re-based row-filter delete cleanly classify it
+        // as a FULL match (deleted), so the test isolates the conflict-filter precedence (no partial-match
+        // noise). Under an AlwaysTrue or row-filter conflict default this add would conflict; the explicit
+        // y >= 100 filter excludes it ⇒ the commit succeeds, proving the explicit filter wins.
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_stats(
+            "test/concurrent.parquet",
+            0,
+            60,
+            70,
+        )])
+        .await;
+
+        let table = tx.commit(&catalog).await.expect(
+            "the explicit conflict filter (y >= 100) excludes the [60,70] add ⇒ commit (explicit wins)",
+        );
+        assert!(live_file_paths(&table).await.contains("test/added.parquet"));
     }
 }

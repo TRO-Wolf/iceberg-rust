@@ -2537,3 +2537,28 @@ How to use it (see the manuals' §2):
   `validate_no_new_deletes_for_data_files` into RowDelta with ZERO edits to the helper — the reviewer confirms
   the first caller's (OverwriteFiles') tests stay green as the behavior-preservation proof. If the second
   caller needs a tweak, that's a signal to re-scope, not to fork the logic.
+
+### 2026-06-09 (OverwriteFiles.overwriteByRowFilter — ORCHESTRATOR + REVIEWER Opus)
+- **Delete-by-row-filter evaluates metrics on the per-file RESIDUAL, NOT the full predicate.** Java
+  `ManifestFilterManager.PartitionAndMetricsEvaluator` does `residual = residualEvaluator.residualFor(partition)`
+  THEN strict/inclusive metrics on the residual. My builder prompt WRONGLY suggested an inclusive-partition
+  pre-filter + metrics on the full predicate — which spuriously partial-errors on a partition-column predicate
+  (`x==0` on a file in partition `x=0` that has no `x` metrics column: strict=false/inclusive=true → false
+  PARTIAL). The residual folds the partition tuple (`x=0` ⇒ residual `alwaysTrue` ⇒ strict-match ⇒ DELETE). The
+  builder caught + corrected this by reading the REAL Java source. LESSON (orchestrator): for predicate-vs-file
+  logic, cite the exact Java evaluator (here `PartitionAndMetricsEvaluator` + `residualFor`) and don't invent a
+  composition; Rust already has `ResidualEvaluator` (it internally does the strict/project + ExpressionEvaluator).
+- **The delete-by-filter decision tree is KEEP / DELETE / PARTIAL-ERROR.** `!Inclusive` ⇒ keep (no rows match);
+  `Strict` ⇒ delete (all rows match); else (might-but-not-all) ⇒ non-retryable error "Cannot delete file where
+  some, but not all, rows match filter". The partial-error is the SUBTLE correctness point — without it a
+  row-filter overwrite silently drops non-matching rows. Pin it with a straddling-bounds test; mutation-check by
+  flipping the DELETE decision strict→inclusive (the partial file then deletes silently → the test must fail).
+- **Implementing a write MODE shifts a downstream DEFAULT.** Adding `overwrite_by_row_filter` made the obsolete
+  GAP_MATRIX note "the row-filter branch never applies" WRONG: Java `dataConflictDetectionFilter()` now routes
+  the row filter as `validate_no_conflicting_data`'s default conflict filter (when set + no explicit deletes).
+  When you land a deferred mode, GREP the docs/code for "deferred"/"never applies" notes that referenced it and
+  fix them — a new capability can silently change a default elsewhere.
+- **Document the non-ported nuances as conservative postures.** `ManifestFilterManager` has delete-manifest-
+  specific branches (`failAnyDelete`, duplicate-path warning, `isDelete`/`isDanglingDV`/`minSequenceNumber`)
+  irrelevant to the data-file row-filter case; not porting them is fine IF named explicitly in the report +
+  module doc so a future reader knows the boundary.

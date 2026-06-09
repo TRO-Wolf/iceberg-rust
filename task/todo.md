@@ -4212,10 +4212,17 @@ Remaining in the cluster:
   Puffin DVs. Behavior-preserving (48 row_delta tests green; non-DV no-op pinned). 6 tests + tx-captured pin;
   mutation-verified. Gate green (lib 1626, transaction:: 284). Cosmetic: dvDesc Option Debug-format (noted).
 
-Remaining in the cluster:
-- [ ] **Increment 5: `OverwriteFiles.overwriteByRowFilter` + `validateAddedFilesMatchOverwriteFilter`** — the
-  meatiest: a new delete-by-row-filter overwrite MODE (scan manifests, evaluate the row filter, delete
-  matching files at commit) + strict/inclusive/metrics validation of added files
-  (`strict_projection.rs`/`inclusive_projection.rs`/`StrictMetricsEvaluator` exist). Then PR the whole cluster.
+- [x] **Increment 5: `OverwriteFiles.overwriteByRowFilter` + `validateAddedFilesMatchOverwriteFilter`** (the
+  meatiest) — NEW delete-by-EXPRESSION overwrite mode via `resolve_filter_deletes` (snapshot.rs) feeding
+  `process_deletes`; ports Java `ManifestFilterManager`/`PartitionAndMetricsEvaluator` by composing the REAL
+  `ResidualEvaluator` + `Strict`/`InclusiveMetricsEvaluator` on the per-file RESIDUAL (the builder CORRECTED my
+  prompt's full-predicate suggestion — residual is what Java does + avoids spurious partial-errors). KEEP /
+  DELETE / PARTIAL-error decision tree. `validate_added_files_match_overwrite_filter()` (block 1) +
+  conflict-filter default now follows the row filter (Java `dataConflictDetectionFilter`). 11 tests incl. the
+  partial-match error + the row-filter-conflict-default pair; mutation-verified. Gate green (lib 1636,
+  transaction:: 294). Conservative postures documented (failAnyDelete / duplicate-path / DV-manifest branches
+  not ported — delete-manifest-specific). Deferred: the rowFilter branch of validateNoConflictingDeletes.
+
+**CLUSTER COMPLETE (5 increments). NEXT: PR `phase2-write-validation` (5 commits) to the origin fork (NEVER apache).**
 
 Then: PR the cluster to the origin fork (NEVER apache).
