@@ -1850,3 +1850,52 @@ How to use it (see the manuals' §2):
   default, not the metrics path. A file with `y∈[60,70]` overlaps `y>=50` (match) and `y∈[10,20]` is below it
   (exclude) — the two halves of the metrics decision. The bounds must be on the schema field id (here `y`=id 2),
   and they survive the manifest round-trip into `added_data_files_after`.
+
+### 2026-06-08 (Increment 1 — readable_metrics inspection column, BUILDER Opus)
+- **DO seed the `readable_metrics` field-id counter at the HOST metadata table's `highest_field_id()`,
+  NOT the data table's, and pre-increment** (Java `MetricsUtil.readableMetricsSchema`,
+  `MetricsUtil.java:356-393`: `AtomicInteger(metadataTableSchema.highestFieldId())` then `incrementAndGet()`
+  per col-struct, then its 6 sub-fields, then the top-level `readable_metrics` field). For the `files`/
+  `entries` tables the host is the data_file projection (highest id 145), so the FIRST id is 146 and the
+  top-level lands at 146 + 7*(num leaf columns) + 1. *Why it's easy to get wrong:* seeding at the DATA
+  schema's highest id (8 here) collides with the data_file projection's ids (100-145); the seed MUST be the
+  metadata table the column is being appended to.
+- **DO assign ids in deterministic ASCENDING data-table-field-id order and document the Java divergence —
+  do NOT try to reproduce Java's `idToName().keySet()` order.** Java's `Schema.idToName()` is backed by
+  `IndexByName.byId()` building an `ImmutableMap` from a `Maps.newHashMap()` (`IndexByName.java:78-80`), so
+  the iteration order is Java-HashMap bucket order: arbitrary, JVM-dependent, NOT portable. Reproducing it
+  byte-for-byte is impossible without replicating HotSpot's HashMap. Pick ascending-field-id (deterministic),
+  sort the EMITTED sub-fields by name (Java sorts by name AFTER id assignment, so the column ORDER matches),
+  and flag full byte-level id parity as a residual Java/Spark-interop concern. Same shape as the `all_*`
+  HashSet-vs-ordered divergence note.
+- **DO decode the readable_metrics lower/upper bound by re-serializing the stored `Datum` and re-decoding it
+  against the COLUMN's primitive type (`Datum::try_from_bytes(stored.to_bytes(), col_type)`), NOT by reading
+  the stored `Datum`'s own type.** Java reads the raw `ByteBuffer` and decodes via
+  `Conversions.fromByteBuffer(field.type(), buffer)` — i.e. the COLUMN type, not the bound's stored type. In
+  Rust the `DataFile`'s `lower_bounds`/`upper_bounds` are already `HashMap<i32, Datum>` (the raw map column
+  re-serializes them with `to_bytes`), so the readable_metrics decode is the exact inverse: `to_bytes` then
+  `try_from_bytes(_, column_primitive)`. This widens an evolved field's bound (e.g. an int-encoded bound on a
+  promoted-to-long column) to the column's CURRENT type — `try_from_bytes` already handles the 4-byte→i64
+  widening. Mutation-pin it with a Binary-typed-bound mutation (the bound must be the column type, not raw
+  binary) so a "just emit the raw bytes" regression fails a type test.
+- **DO build a `readable_metrics`-aware test fixture with DISTINCT lower & upper bounds** (e.g.
+  `lower_bounds {1: long(10)}` + `upper_bounds {1: long(99)}`) so the lower↔upper swap mutation is
+  observable — a fixture that sets only `lower_bounds` (like the existing files/entries fixtures) cannot
+  catch the swap because the missing upper is null in both directions.
+- **Leaf = ANY primitive-typed field id, incl. primitives nested in struct/list/map (keyed by dotted path).**
+  Java `readableMetricsSchema` iterates `idToName().keySet()` (which includes `<col>.element`/`<col>.key`/
+  `<col>.value` ids) filtered by `findField(id).type().isPrimitiveType()`. Rust `Schema::field_id_to_name_map`
+  + `field_by_id` give the identical dotted-name index, so filter on `field.field_type.is_primitive()` — a
+  top-level-only or struct-only filter silently drops `list<int>` elements and nested struct primitives.
+
+### 2026-06-08 (Increment 1 — readable_metrics, REVIEWER Opus)
+- **DO pin EACH of the six metric SOURCES with a DISTINCT non-null value in one builder test — count
+  swaps between two metrics that are both NULL in the fixture survive otherwise.** The builder's
+  files/entries value tests leave `value_count`/`null_value_count`/`nan_value_count` null on the populated
+  column, so swapping the `null_value_count`↔`nan_value_count` (or any two all-null) source maps produced
+  ZERO failures (a silent cross-wiring of a real NaN/null count into the wrong column would ship). Fixed by
+  adding `test_readable_metrics_builder_routes_each_metric_to_its_own_sub_field`: a `DataFile` carrying
+  `column_sizes 11 / value_counts 22 / null_value_counts 33 / nan_value_counts 44 / lower 55 / upper 66`
+  on one long column, asserting each sub-field reports exactly its own source value. Re-verified it catches
+  both the null↔nan swap and the column_size↔value_count swap. General rule: when N sources feed N output
+  slots and the happy-path fixture only populates a couple, one test must give all N distinct values.

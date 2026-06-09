@@ -172,8 +172,10 @@ the three pure-metadata tables `history` / `refs` / `metadata_log_entries` (Incr
 `inspect/partitions.rs`) are all 🟡** (alongside the pre-existing `snapshots` +
 `manifests`); the four cross-snapshot `all_*` file/entry tables (`all_data_files` / `all_delete_files` /
 `all_files` / `all_entries`, Increment 5a, `inspect/{files,entries}.rs` + shared `inspect/manifest_source.rs`)
-and the final `all_manifests` table (Increment 5b, `inspect/all_manifests.rs`) are now 🟡 too — the
-inspection-table set is COMPLETE; only inspection interop + `readable_metrics` remain. The rest of the **write engine
+and the final `all_manifests` table (Increment 5b, `inspect/all_manifests.rs`) are now 🟡 too, and the LAST
+deferred inspection COLUMN `readable_metrics` (overnight Increment 1, `inspect/readable_metrics.rs`, the
+per-leaf-column typed-metrics struct on the `files` family + `entries` + `all_*`) has landed 🟡 — the
+inspection-table set AND its columns are COMPLETE; only inspection interop remains. The rest of the **write engine
 (merge append, `RowDelta`, `RewriteManifests`), incremental scans, ORC/Avro data files,
 variant/geo/unknown types, catalog view ops, and all maintenance actions are missing**. Full row-by-row
 status (re-audited on 0.9.1): [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
@@ -447,6 +449,19 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      unconditionally — Java `ManifestsTable.manifestFileToRow` content-gates there too); the shared
      partition-summary builder/conversion was factored into `inspect/partition_summary.rs`. The
      inspection-table SET IS NOW COMPLETE; remaining inspection work is `readable_metrics` + interop.
+  6. **`readable_metrics` virtual column** — **DONE 🟡 (2026-06-08, overnight-run Increment 1,
+     `inspect/readable_metrics.rs`, Java `MetricsUtil.readableMetricsStruct`).** The LAST deferred
+     inspection-table COLUMN: a virtual STRUCT appended last on the `files` family + `entries` (+ `all_*`
+     automatically) with ONE sub-field per LEAF (primitive) data column (dotted-named), each a struct of the
+     6 metrics — the 4 counts read from the file's metric maps by field id (null when absent), and
+     `lower_bound`/`upper_bound` typed as the COLUMN's own type and DECODED via `Datum::try_from_bytes`
+     (the inverse of the raw map's `to_bytes`; Java `Conversions.fromByteBuffer(field.type(), buffer)`). The
+     field-id scheme ports Java `readableMetricsSchema`'s pre-increment counter seeded at the host table's
+     `highestFieldId()`; ONE documented divergence — Java's `idToName()` HashMap iteration order is replaced
+     by deterministic ascending-field-id order (sub-fields still sorted by name). The raw metrics maps are
+     unchanged (additive). 12 unit tests; mutations (swap lower↔upper, wrong-field-id count, raw-bytes bound)
+     each caught. **The inspection-table COLUMN set is now COMPLETE; only Java/Spark inspection interop
+     remains.**
 - **Exit criteria:** scans match Java planning/results incl. residuals; inspection tables present; reports
   emitted.
 

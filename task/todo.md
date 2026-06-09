@@ -3274,3 +3274,105 @@ shared helper so the two checks cannot drift.
   for the data-file block, the only block we implement. (3) The non-ancestor `validate_from_snapshot` over-scan
   divergence (Rust over-scans to root where Java throws) is inherited UNCHANGED from `added_data_files_after`
   (Increment-6-flagged, Rust-STRICTER, over-reject-only) — not re-introduced here.
+
+---
+
+## OVERNIGHT AUTONOMOUS RUN (2026-06-08/09) — branch `phase3-conflict-and-scan` (off `phase3-rowdelta-delete-conflicts` d327e80d)
+User asleep; run via actor-critic, COMMIT LOCALLY ONLY (no push). User approved "all 5". RECON FOUND 2 of the
+planned items are COUPLED (not clean reuses), so ADAPTED to clean additive items (documented for the morning):
+- OverwriteFiles `validateNoConflictingDeletes` block 3 is GATED on `rowFilter() != alwaysFalse()` → needs
+  `overwriteByRowFilter` (not built). DROPPED.
+- `StreamingDelete` (DeleteFiles) only has `validateFilesExist` → needs a *deleted*-data-file enumeration +
+  resolved removed files, NOT the existing helpers. DEFERRED.
+The clean conflict-validation reuses are ALREADY done (RowDelta data+delete, OverwriteFiles data,
+ReplacePartitions). So the overnight run pivots to clean, additive, locally-verifiable scan/inspection items.
+
+ADAPTED SEQUENCE (each: builder → adversarial reviewer → independent widened gate → local commit):
+1. **`readable_metrics`** inspection column (Java `MetricsUtil.readableMetricsStruct`) — read-only/additive.
+2. **`IncrementalAppendScan`** (Java `BaseIncrementalAppendScan`/`appendsBetween`) — new scan entry, additive.
+3. **`ScanReport` / `MetricsReporter`** (Java `metrics/ScanReport.java`) — self-contained observability.
+4. **DeleteFiles `validateFilesExist` + `deleted_data_files_after`** (verify clean when reached; the deleted-
+   data-file enumeration is parallel to `added_data_files_after`, DeleteFiles has `delete_paths`). Substitute
+   the `position_deletes` metadata table if coupled.
+5. **`position_deletes` metadata table** (Java `PositionDeletesTable`) OR `IncrementalChangelogScan` — pick when
+   reached. (Not yet built; a real inspection/scan gap.)
+Widened gate for ALL: workspace build + iceberg lib ×2 + transaction:: + iceberg-datafusion tests + 3 interop +
+workspace clippy + fmt + typos.
+
+### Increment 1 — readable_metrics (DETAIL)
+Java `MetricsUtil` (`core/.../MetricsUtil.java`): `READABLE_METRIC_COLS` (L140-193) = the 6 per-column metrics
+(`column_size`/`value_count`/`null_value_count`/`nan_value_count` = long, from the file's metric maps by field
+id; `lower_bound`/`upper_bound` = the COLUMN's type, decoded via `Conversions.fromByteBuffer` — NOT raw bytes);
+`readableMetricsSchema(dataTableSchema, metadataTableSchema)` (L356) builds a `readable_metrics` STRUCT with one
+sub-field PER leaf column of the data table (named by column path), each = a struct of the 6; `READABLE_METRICS
+= "readable_metrics"` (L195). `BaseFilesTable`/`BaseEntriesTable` APPEND it (`TypeUtil.join(schema,
+readableMetricsSchema(...))`). Rust: add to the `files` family + `entries` (the shared `inspect/data_file.rs`
+projection, or appended as a top-level/nested column matching Java); the per-column bound decode reuses
+`Datum::try_from_bytes`/typed conversion. Was DEFERRED across the inspection set.
+
+#### Increment 1 — BUILD PLAN (Opus builder, 2026-06-08)
+- [x] New module `inspect/readable_metrics.rs` — ONE source of truth used by `files` + `entries`:
+      builds the `readable_metrics` STRUCT field (one sub-field per LEAF/primitive column of the data
+      table's CURRENT schema, named by dotted path; type = a 6-field struct: column_size/value_count/
+      null_value_count/nan_value_count long opt; lower_bound/upper_bound = the COLUMN's own type, opt).
+      Ports Java `readableMetricsSchema` id scheme (nextId = metadata-table highest id; pre-increment per
+      col-struct then its 6 sub-fields, then the top-level readable_metrics field). ONE documented
+      divergence: Java assigns ids in `idToName.keySet()` = Java-HashMap (arbitrary) order; we use ASCENDING
+      data-table-field-id order (deterministic) then sort emitted sub-fields by name (Java sorts after id
+      assignment). Row builder fills 4 counts from the file's maps by field id (null when absent) and decodes
+      lower/upper bound to the COLUMN's typed value via `Datum::try_from_bytes(stored.to_bytes(), col_type)`
+      (inverse of the raw map's `to_bytes`; mirrors Java `Conversions.fromByteBuffer(field.type(), bytes)`).
+- [x] Append `readable_metrics` to `files` family schema+scan (flat last column) AND `entries` schema+scan
+      (last top-level column after `data_file`), matching Java APPEND order; `all_*` inherit it.
+- [x] Tests: schema present (files/data_files/delete_files/entries + an all_*), one sub-field per leaf each a
+      6-field struct, bound sub-fields carry the COLUMN type, field ids match the ported scheme; values
+      (counts + DECODED typed bounds + nulls); backward-compat (raw maps still present, unchanged).
+- [x] Mutations: (a) swap lower<->upper decode -> value test fails; (b) wrong field id for a count -> value
+      test fails; (c) raw bytes instead of typed bound -> type/value test fails.
+- [x] Docs (GAP_MATRIX, Roadmap, todo Outcome, lessons) + gate (all 8) + new lib total x2.
+
+Outcome (2026-06-08, BUILDER Opus): `readable_metrics` landed on the `files` family + `entries` (+ `all_*`
+inherit it through the shared schema/projection). NEW module `inspect/readable_metrics.rs` is the single
+source of truth: `readable_metrics_field(data_schema, host_highest_field_id)` builds the virtual STRUCT (one
+sub-field per LEAF/primitive data column, dotted-named via `Schema::field_id_to_name_map`, each a 6-field
+struct: `column_size`/`value_count`/`null_value_count`/`nan_value_count` long opt + `lower_bound`/
+`upper_bound` typed as the COLUMN's own type, opt); `ReadableMetricsBuilder` fills the row per `DataFile`.
+**Field-id scheme** (Java `MetricsUtil.readableMetricsSchema`, `MetricsUtil.java:356-393`): pre-increment
+counter seeded at the HOST metadata-table schema's `highest_field_id()` (= the data_file projection's 145 for
+both tables), per leaf column assigns col-struct id then its 6 sub-field ids, then the top-level
+`readable_metrics` id (8-column fixture → readable_metrics = 202). **ONE documented divergence:** Java's
+`idToName()` HashMap iteration order (arbitrary, non-portable — `IndexByName.byId()` over a `HashMap`) is
+replaced by deterministic ASCENDING data-table-field-id assignment; sub-fields still sorted by name (so the
+column ORDER matches Java; exact interior ids match only when Java's HashMap order happens to coincide). Full
+byte-level id parity with a JVM is the residual Java/Spark interop concern. **Typed bound decode:** the stored
+`Datum` is re-serialized (`to_bytes`) and re-decoded against the COLUMN's primitive type
+(`Datum::try_from_bytes`) — the inverse of the raw `lower_bounds`/`upper_bounds` map columns, mirroring Java
+`Conversions.fromByteBuffer(field.type(), buffer)`; widens an evolved field's bound to the column's current
+type. Raw metrics-map columns UNCHANGED (additive). **Java lines verified:** `READABLE_METRIC_COLS` L140-193
+(the 6 metrics; counts by field id nullable; bounds via `Conversions.fromByteBuffer(field.type(), …)`),
+`READABLE_METRICS` L195, `readableMetricsSchema` L356-393 (id scheme + sort-by-name + per-column doc),
+`readableMetricsStruct` L403-429, `IndexByName.byId()` L78-80 (the HashMap-order source). Provider untouched
+(it delegates to `.schema()`/`.scan()` — `test_metadata_table` green). **Files modified:** new
+`crates/iceberg/src/inspect/readable_metrics.rs`; `inspect/mod.rs` (+`mod readable_metrics`); `inspect/files.rs`
+(schema+scan append + 4 tests + 2 existing schema assertions updated); `inspect/entries.rs` (schema+scan
+append + 2 tests + 1 existing schema assertion updated); `inspect/data_file.rs` (module doc — readable_metrics
+no longer "deferred"). **Tests (12 new):** readable_metrics.rs ×6 — one-struct-per-leaf sorted-by-name;
+6-field metric struct; bounds carry the COLUMN type (long/string/double, counts always long); the exact
+pre-increment id scheme (101/108/115 column structs, 102-107 + 116-121 sub-ids, 122 top-level); primitives
+nested in struct/list included by dotted path; complex-only (map) columns excluded. files.rs ×4 — schema
+present with per-column bound type (x→Int64, a→Utf8); counts + DECODED typed bounds + nulls (x.column_size=42,
+x.lower_bound=1 long, absent metrics null, y all null, i32 bound Int32-typed null); distinct lower=10/upper=99
+both typed longs; raw maps unchanged regression guard. entries.rs ×2 — readable_metrics present with decoded
+bound (entries x.column_size=42, x.lower_bound=1); `all_entries` schema inherits readable_metrics.
+**Mutations (all caught, re-run by injection):** (a) swap lower↔upper source maps → distinct-bounds test
+fails (reads 99 where 10 expected); (b) read column_size from `field_id+1` → counts test fails (x.column_size
+null); (c) declare bounds as raw `Binary` → bound-type schema test + the column-type unit test + 4 builder
+dispatch tests fail. **Gate (all 8, pinned nightly):** (1) `cargo build -p iceberg` OK; (2)
+`cargo build --workspace --exclude iceberg-sqllogictest --all-targets` OK; (3) `cargo test -p iceberg --lib`
+×2 = **1528 passed / 0 failed** both runs (was 1516 → +12); (4) `cargo test -p iceberg-datafusion --lib
+--tests` 9/9 integration green incl. `test_metadata_table` (the all-targets DOCTEST run fails ONLY the
+pre-existing `table_provider_factory.rs` `tokio::main`/rt-multi-thread environmental artifact documented in
+lessons 2026-06-07 Increment-7 REVIEWER — a file this change never touched); (5) interop_manage_snapshots /
+interop_update_schema / interop_update_partition_spec = 4/4 each; (6) `cargo clippy --workspace --exclude
+iceberg-sqllogictest --all-targets -- -D warnings` clean; (7) `cargo fmt --all -- --check` clean; (8) `typos`
+repo-wide exit 0. No commit, no branch switch, no edits outside `inspect/` + docs.
