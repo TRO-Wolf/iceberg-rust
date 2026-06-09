@@ -42,6 +42,8 @@ import java.util.Map;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
 import org.apache.iceberg.io.CloseableIterable;
@@ -134,6 +136,12 @@ public final class InteropOracle {
         // java_entries.json / java_manifests.json / java_partitions.json. Driven from here so a single
         // run-inspection-manifests.sh invocation produces both A1's and A2's fixtures in one JVM pass.
         InspectionManifestsA2Oracle.generate(inspectionManifestsDir);
+        // A4 (SCAN PLANNING interop) reuses the SAME exec mode + temp dir: it writes a THIRD, dedicated
+        // table to <dir>/table_a4 (the A1/A2 tables are untouched) and, for each named filter scenario,
+        // emits java_scan_<name>.json — the SET of planned data-file paths, their applicable delete files,
+        // and whether each task's residual is fully covered by partitioning — via Java's REAL
+        // table.newScan().filter(expr).planFiles(). Driven from here so a single run produces A1/A2/A3/A4.
+        InspectionScanA4Oracle.generate(inspectionManifestsDir);
         break;
       case "verify":
         int failures = 0;
@@ -2349,6 +2357,239 @@ public final class InteropOracle {
         hex.append(String.format("%02x", dup.get() & 0xff));
       }
       return hex.toString();
+    }
+  }
+
+  // ===========================================================================================
+  // Inspection-SCAN A4 oracle — the FIRST scan-PLANNING interop increment, building DIRECTLY on A1's
+  // table-writing harness (it reuses A1/A2's LocalTableOperations + LocalFileIO + writeJson + real
+  // newAppend / newRowDelta commits). A1-A3 proved the metadata TABLES (files / entries / manifests /
+  // all_*); A4 proves SCAN PLANNING: for a given filter, does Rust plan the SAME data files Java does?
+  //
+  // Scan planning reads the AVRO manifests + applies the filter to PRUNE files via (a) partition
+  // predicates and (b) column-metric (lower/upper bound) ranges, ASSOCIATES delete files with the surviving
+  // data files, and computes the per-file RESIDUAL (the leftover row filter after the partition-implied
+  // conditions are removed). It does NOT read parquet — so the SAME env-gated, no-parquet methodology as
+  // A1-A3 applies (the referenced .parquet paths need not exist; planning reads manifests only).
+  //
+  // THE A4 TABLE (its OWN subdir <dir>/table_a4 + its OWN final.metadata.json — A1/A2's tables are
+  // untouched). Partition by identity(category), V2, schema {1 id long, 2 category string, 3 value double}.
+  // THREE DATA files with DISTINCT id metric bounds so METRIC pruning (not just partition pruning) is
+  // exercised, then a POSITION-DELETE for F1:
+  //   F1: category=a, id lower=1  upper=10, record_count 3  -> carries the position-delete
+  //   F2: category=b, id lower=11 upper=20, record_count 2
+  //   F3: category=a, id lower=21 upper=30, record_count 4
+  //
+  // THE SCENARIOS (a stable ordered list shared with the Rust test BY NAME). For each, Java plans via the
+  // REAL table.newScan().filter(expr).planFiles() and emits java_scan_<name>.json = a list of
+  // { data_file_path, delete_file_paths:[...], residual_always_true } per planned data file:
+  //   s0 "no_filter"       : no filter            -> plans F1,F2,F3 ; F1 carries the delete ; residual TRUE
+  //   s1 "partition_a"     : category = 'a'        -> plans F1,F3 (partition prune drops the cat=b F2) ;
+  //                                                   residual always-true (the filter IS the partition) ;
+  //                                                   F1 still carries the delete
+  //   s2 "metric_id_gt_15" : id > 15               -> plans F2,F3 (F1 upper=10 < 15 pruned by METRICS) ;
+  //                                                   residual NOT always-true (id is not a partition col)
+  //   s3 "combined"        : category='a' AND id>25 -> plans F3 only (partition drops F2 ; metrics drop F1,
+  //                                                   whose id upper=10 < 25) ; residual NOT always-true on F3
+  //
+  // RESIDUAL SCOPE. A4 compares only a BOOLEAN "residual is fully covered by partitioning" per planned file
+  // (Java: residual().op() == Operation.TRUE; Rust: the task predicate is None or AlwaysTrue) — NOT the full
+  // residual EXPRESSION string (that needs a cross-language expression-normalization design and is DEFERRED;
+  // Rust residuals are already unit-tested). This proves the partition-filter-removal SPLIT matches without a
+  // fragile cross-language expression-string comparison.
+  // ===========================================================================================
+
+  /**
+   * The A4 half of the inspection oracle — SCAN PLANNING. Builds a dedicated partitioned V2 table on local
+   * disk under {@code <dir>/table_a4} via real commits (one {@code newAppend} of F1/F2/F3 with distinct id
+   * metric bounds + one {@code newRowDelta} adding a position-delete for F1), writes
+   * {@code <dir>/table_a4/metadata/final.metadata.json}, and for each named filter scenario emits
+   * {@code java_scan_<name>.json} — the rows of Java's REAL {@code table.newScan().filter(expr).planFiles()}
+   * projected to {@code { data_file_path, delete_file_paths, residual_always_true }}.
+   */
+  static final class InspectionScanA4Oracle {
+    private InspectionScanA4Oracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the dedicated partitioned V2 table on local disk under <dir>/table_a4 (A1/A2 untouched).
+      //    Bare absolute location so the manifest/manifest-list paths the commits write are bare absolute
+      //    paths the Rust FileIO resolves directly (same as A1/A2).
+      File tableDir = dir.resolve("table_a4").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "value", Types.DoubleType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed); // persist v0 metadata so the BaseTable has a current metadata to evolve.
+      BaseTable table = new BaseTable(ops, "interop_inspection_scan_a4");
+
+      // 2. THREE DATA files with DISTINCT id metric bounds so METRIC pruning is exercised (id is NOT a
+      //    partition column, so id-range pruning can only come from the lower/upper bound metrics):
+      //      F1 cat=a id[1,10] rc=3 ; F2 cat=b id[11,20] rc=2 ; F3 cat=a id[21,30] rc=4.
+      DataFile fileF1 =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=a/00000-f1.parquet")
+              .withFileSizeInBytes(1100L)
+              .withRecordCount(3L)
+              .withPartitionPath("category=a")
+              .withMetrics(metricsFor(3L, 1L, 10L, 10.5d, 100.5d))
+              .build();
+      DataFile fileF2 =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=b/00000-f2.parquet")
+              .withFileSizeInBytes(900L)
+              .withRecordCount(2L)
+              .withPartitionPath("category=b")
+              .withMetrics(metricsFor(2L, 11L, 20L, 110.5d, 200.5d))
+              .build();
+      DataFile fileF3 =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=a/00001-f3.parquet")
+              .withFileSizeInBytes(1300L)
+              .withRecordCount(4L)
+              .withPartitionPath("category=a")
+              .withMetrics(metricsFor(4L, 21L, 30L, 210.5d, 300.5d))
+              .build();
+
+      // 3. One POSITION-DELETE file in category=a — it applies to F1 (same partition, sequence number after
+      //    F1's append), so F1 carries the delete in the no-filter and partition=a scans.
+      DeleteFile deleteForF1 =
+          FileMetadata.deleteFileBuilder(spec)
+              .ofPositionDeletes()
+              .withPath(tableDir.getAbsolutePath() + "/data/category=a/00000-f1-deletes.parquet")
+              .withFileSizeInBytes(150L)
+              .withRecordCount(1L)
+              .withPartitionPath("category=a")
+              .build();
+
+      // 4. Real commits: the three data files via newAppend (writes a DATA manifest + manifest-list), then
+      //    the delete via newRowDelta (writes a DELETE manifest).
+      table.newAppend().appendFile(fileF1).appendFile(fileF2).appendFile(fileF3).commit();
+      table.newRowDelta().addDeletes(deleteForF1).commit();
+
+      // 5. Write the FINAL metadata to a KNOWN path so the Rust test loads it deterministically.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 6. The ordered, named scenarios (shared with the Rust test by name). Each plans via the REAL
+      //    table.newScan().filter(expr).planFiles().
+      Map<String, Expression> scenarios = new LinkedHashMap<>();
+      scenarios.put("no_filter", Expressions.alwaysTrue());
+      scenarios.put("partition_a", Expressions.equal("category", "a"));
+      scenarios.put("metric_id_gt_15", Expressions.greaterThan("id", 15L));
+      scenarios.put(
+          "combined",
+          Expressions.and(Expressions.equal("category", "a"), Expressions.greaterThan("id", 25L)));
+
+      for (Map.Entry<String, Expression> entry : scenarios.entrySet()) {
+        String name = entry.getKey();
+        writeJson(
+            dir.resolve("java_scan_" + name + ".json"), planScanToJson(table, entry.getValue()));
+        System.out.println("generated scan plan: " + name);
+      }
+      System.out.println("generated inspection-scan A4 table + fixtures to " + dir);
+    }
+
+    /**
+     * Build a pure-metadata {@link Metrics} for the schema {1 id long, 2 category string, 3 value double}:
+     * column_sizes + value_counts + null_value_counts for ids 1/2/3, and lower/upper bounds for id 1 (long,
+     * the METRIC-pruning column) and id 3 (value, double). category (id 2) is excluded from bounds (it is the
+     * identity-partition column — pruned by the partition predicate, not by metrics). Identical shape to A1/A2.
+     */
+    private static Metrics metricsFor(
+        long recordCount, long idLower, long idUpper, double valueLower, double valueUpper) {
+      Map<Integer, Long> columnSizes = new LinkedHashMap<>();
+      columnSizes.put(1, 40L);
+      columnSizes.put(2, 24L);
+      columnSizes.put(3, 32L);
+      Map<Integer, Long> valueCounts = new LinkedHashMap<>();
+      valueCounts.put(1, recordCount);
+      valueCounts.put(2, recordCount);
+      valueCounts.put(3, recordCount);
+      Map<Integer, Long> nullValueCounts = new LinkedHashMap<>();
+      nullValueCounts.put(1, 0L);
+      nullValueCounts.put(2, 0L);
+      nullValueCounts.put(3, 0L);
+      Map<Integer, ByteBuffer> lowerBounds = new LinkedHashMap<>();
+      lowerBounds.put(1, Conversions.toByteBuffer(Types.LongType.get(), idLower));
+      lowerBounds.put(3, Conversions.toByteBuffer(Types.DoubleType.get(), valueLower));
+      Map<Integer, ByteBuffer> upperBounds = new LinkedHashMap<>();
+      upperBounds.put(1, Conversions.toByteBuffer(Types.LongType.get(), idUpper));
+      upperBounds.put(3, Conversions.toByteBuffer(Types.DoubleType.get(), valueUpper));
+      return new Metrics(
+          recordCount,
+          columnSizes,
+          valueCounts,
+          nullValueCounts,
+          null, // nan_value_counts — none
+          lowerBounds,
+          upperBounds);
+    }
+
+    /**
+     * Plan a scan with {@code filter} via Java's REAL {@link Table#newScan()}.{@code filter(expr)}.{@code
+     * planFiles()} and serialize the planned tasks to a JSON array of
+     * {@code { data_file_path, delete_file_paths:[...], residual_always_true }}. For each {@link
+     * FileScanTask}: {@code file().path()} is the planned data-file path; {@code deletes()} are the applicable
+     * delete files (sorted by path for a stable comparison); {@code residual()} is the per-file leftover row
+     * filter, whose {@code op() == TRUE} means it is FULLY covered by partitioning (no per-row filtering).
+     *
+     * <p>IMPORTANT: serialize EAGERLY inside the {@code try-with-resources} iteration — {@code planFiles()}
+     * returns a lazy {@link CloseableIterable}, and the tasks/files must be read while the iterable is open.
+     */
+    private static String planScanToJson(Table table, Expression filter) {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            try (CloseableIterable<FileScanTask> tasks =
+                table.newScan().filter(filter).planFiles()) {
+              for (FileScanTask task : tasks) {
+                gen.writeStartObject();
+                gen.writeStringField("data_file_path", task.file().path().toString());
+
+                // The applicable delete files, sorted by path for an order-independent comparison.
+                java.util.List<String> deletePaths = new java.util.ArrayList<>();
+                for (DeleteFile delete : task.deletes()) {
+                  deletePaths.add(delete.path().toString());
+                }
+                java.util.Collections.sort(deletePaths);
+                gen.writeArrayFieldStart("delete_file_paths");
+                for (String deletePath : deletePaths) {
+                  gen.writeString(deletePath);
+                }
+                gen.writeEndArray();
+
+                // The residual is fully covered by partitioning iff it reduced to the alwaysTrue() singleton
+                // (Java ResidualEvaluator returns Expressions.alwaysTrue() — op() == Operation.TRUE — when the
+                // filter is entirely partition-implied for this file's partition tuple).
+                boolean residualAlwaysTrue =
+                    task.residual().op() == Expression.Operation.TRUE;
+                gen.writeBooleanField("residual_always_true", residualAlwaysTrue);
+
+                gen.writeEndObject();
+              }
+            }
+            gen.writeEndArray();
+          },
+          true);
     }
   }
 

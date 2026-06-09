@@ -2473,3 +2473,25 @@ How to use it (see the manuals' §2):
   materialization + tests; A2's table/JSONs/tests stayed byte-identical. **With A3, manifest-reading interop is
   COMPLETE for every inspection table** (pure-metadata done earlier); only the `readable_metrics` virtual
   column + scan interop (A4/A5) remain.
+
+### 2026-06-09 (Scan-PLANNING interop A4 — ORCHESTRATOR + REVIEWER Opus)
+- **Scan PLANNING interop needs NO parquet** — `table.newScan().filter(expr).planFiles()` (Java) /
+  `table.scan().with_filter(pred).plan_files()` (Rust) read MANIFESTS + apply partition/metric pruning +
+  associate deletes; they never open the data files. So A4 rides the same run.sh-driven no-parquet harness.
+  (Only scan EXECUTION = reading rows → Arrow needs parquet — that's A5.)
+- **Compare what's robustly comparable cross-language; DEFER what isn't, explicitly.** A4 compares the
+  {planned data-file SET (by path), per-file sorted delete-file paths, a `residual_always_true` boolean}.
+  The full residual EXPRESSION string differs by language syntax (Java `Expression.toString()` vs Rust
+  `Predicate` Display), so string-comparing it would be fragile or vacuous — DEFERRED with a doc note (Rust
+  residuals are unit-tested in `scan/mod.rs`). The boolean `residual fully covered by partitioning` (Java
+  `residual().op()==Expression.Operation.TRUE` ↔ Rust predicate `None`/`AlwaysTrue`) IS a robust, non-vacuous
+  parity signal — it varies across scenarios (true for pure-partition filters, false where a data-column
+  predicate remains) and proves the partition-filter-removal split matches.
+- **Make a fixture that exercises the SUBTLE pruning path: COLUMN-METRIC pruning.** Give the data files
+  DISJOINT `id` bounds ([1,10]/[11,20]/[21,30]) so a filter like `id>15` MUST drop the [1,10] file via its
+  upper bound — partition pruning alone wouldn't catch a regressed metric evaluator. (Partition pruning is the
+  easy case; metric pruning is where planners diverge.)
+- **Java attaches a partition-scoped position-delete to EVERY live data file in that partition** with a
+  covering sequence number — not just the file it "came from". The cat=a delete associated with BOTH F1 and
+  F3; Rust matched. Let the bulk per-file delete-set comparison (not a single hand-picked file) prove this, so
+  you assert Java's REAL association rather than an assumed one.

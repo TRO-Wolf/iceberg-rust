@@ -73,8 +73,10 @@ use arrow_array::types::{Int32Type, Int64Type, TimestampMicrosecondType};
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, StructArray};
 use futures::TryStreamExt;
 use iceberg::TableIdent;
+use iceberg::expr::{BoundPredicate, Predicate, Reference};
 use iceberg::io::FileIO;
-use iceberg::spec::TableMetadata;
+use iceberg::scan::FileScanTask;
+use iceberg::spec::{Datum, TableMetadata};
 use iceberg::table::Table;
 use serde::Deserialize;
 
@@ -1806,5 +1808,288 @@ async fn test_all_manifests_table_matches_java_rows() {
         "test_all_manifests_table_matches_java_rows OK — {} rows matched Java (shared manifest has 2 \
          distinct reference_snapshot_id; carried ref != added)",
         rust_rows.len()
+    );
+}
+
+// ===========================================================================================
+// A4 — SCAN PLANNING interop: does Rust plan the SAME data files Java does for a given filter?
+//
+// Builds on the SAME table-writing harness as A1-A3, but proves the SCAN PLANNER instead of the metadata
+// TABLES. Scan planning reads the AVRO manifests + applies a filter to PRUNE data files via (a) partition
+// predicates and (b) column-metric (lower/upper bound) ranges, ASSOCIATES delete files with the surviving
+// data files, and computes the per-file RESIDUAL. It does NOT read parquet — so the SAME env-gated,
+// no-parquet methodology as A1-A3 (the referenced .parquet paths need not exist; planning reads manifests).
+//
+// The Java oracle's `generate-inspection-manifests` mode now ALSO writes a dedicated V2 table to
+// `<dir>/table_a4` (A1's `<dir>/table` + A2's `<dir>/table_a2` untouched) — partition by identity(category),
+// schema {1 id long, 2 category string, 3 value double}, three DATA files with DISTINCT id metric bounds
+// (F1 cat=a id[1,10], F2 cat=b id[11,20], F3 cat=a id[21,30]) + a position-delete for F1 — and, for each
+// named filter scenario, emits `java_scan_<name>.json` via Java's REAL `table.newScan().filter(expr)
+// .planFiles()`. This test loads `<dir>/table_a4/metadata/final.metadata.json`, runs `table.scan()
+// .with_filter(pred).build()?.plan_files()` with the SAME filter built via the Rust predicate API, and
+// asserts the {data_file_path SET, per-file sorted delete paths, per-file residual_always_true} EXACTLY
+// equals the Java JSON, order-independent by data_file_path.
+//
+// THE SCENARIOS (a stable ordered list shared with Java BY NAME):
+//   s0 "no_filter"       : no filter             -> plans F1,F2,F3 ; F1 carries the delete ; residual TRUE
+//   s1 "partition_a"     : category = 'a'         -> plans F1,F3 (partition prune drops the cat=b F2) ;
+//                                                    residual always-true (the filter IS the partition)
+//   s2 "metric_id_gt_15" : id > 15                -> plans F2,F3 (F1 upper=10 < 15 pruned by METRICS) ;
+//                                                    residual NOT always-true (id is not a partition col)
+//   s3 "combined"        : category='a' AND id>25 -> plans F3 only (partition drops F2 ; metrics drop F1) ;
+//                                                    residual NOT always-true
+//
+// Same env gate as A1-A3 (`ICEBERG_INTEROP_MANIFEST_DIR`): a clean NO-OP when unset.
+//
+// RESIDUAL SCOPE (deferral, mirroring the Java oracle). A4 compares only a BOOLEAN "residual is fully
+// covered by partitioning" per planned file — Java: `residual().op() == Operation.TRUE`; Rust: the task
+// predicate is `None` (no filter / no residual evaluator) OR `Some(BoundPredicate::AlwaysTrue)` (the filter
+// was entirely partition-implied for this file's partition tuple). The full residual-EXPRESSION string
+// comparison is OUT OF SCOPE (it needs a cross-language expression-normalization design; Rust residuals are
+// already unit-tested in `scan/mod.rs`). This proves the partition-filter-removal SPLIT matches WITHOUT a
+// fragile cross-language expression-string comparison.
+// ===========================================================================================
+
+/// One Java scan-plan row from `java_scan_<name>.json`: a planned data file, its applicable (sorted) delete
+/// paths, and whether its residual is fully covered by partitioning.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct JavaScanRow {
+    data_file_path: String,
+    delete_file_paths: Vec<String>,
+    residual_always_true: bool,
+}
+
+/// A normalized, fully-comparable planned-file row — Java + Rust both produce one of these so the
+/// per-scenario comparison is a single sorted-vector `==`. `delete_file_paths` is sorted; the whole vector
+/// is sorted by `data_file_path` for an order-independent (by data file) comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanRow {
+    data_file_path: String,
+    delete_file_paths: Vec<String>,
+    residual_always_true: bool,
+}
+
+impl From<JavaScanRow> for ScanRow {
+    fn from(java: JavaScanRow) -> Self {
+        let mut delete_file_paths = java.delete_file_paths;
+        delete_file_paths.sort();
+        ScanRow {
+            data_file_path: java.data_file_path,
+            delete_file_paths,
+            residual_always_true: java.residual_always_true,
+        }
+    }
+}
+
+/// Whether a planned task's residual is fully covered by partitioning. The Rust planner stores the
+/// partition-reduced residual in `task.predicate`: `None` when the scan has no filter (no residual
+/// evaluator), and `Some(BoundPredicate::AlwaysTrue)` when the filter was entirely partition-implied for
+/// this file's partition tuple — both mean "no per-row filtering needed", i.e. residual ⟺ Java's
+/// `residual().op() == Operation.TRUE`. Any other `Some(predicate)` is a non-trivial residual.
+fn residual_always_true(task: &FileScanTask) -> bool {
+    matches!(task.predicate(), None | Some(BoundPredicate::AlwaysTrue))
+}
+
+/// Project one Rust [`FileScanTask`] into the comparable [`ScanRow`] (delete paths sorted).
+fn task_to_scan_row(task: &FileScanTask) -> ScanRow {
+    let mut delete_file_paths: Vec<String> = task
+        .deletes
+        .iter()
+        .map(|delete| delete.file_path.clone())
+        .collect();
+    delete_file_paths.sort();
+    ScanRow {
+        data_file_path: task.data_file_path().to_string(),
+        delete_file_paths,
+        residual_always_true: residual_always_true(task),
+    }
+}
+
+/// Sort planned rows by `data_file_path` for an order-independent (by data file) comparison.
+fn sorted_scan_rows(mut rows: Vec<ScanRow>) -> Vec<ScanRow> {
+    rows.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path));
+    rows
+}
+
+/// Build a `Table` over the Java-written A4 `final.metadata.json` (under `<dir>/table_a4`), local-fs FileIO.
+fn load_table_a4(dir: &std::path::Path) -> Table {
+    let metadata_path = dir.join("table_a4/metadata/final.metadata.json");
+    let json = fs::read_to_string(&metadata_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", metadata_path.display()));
+    let metadata: TableMetadata = serde_json::from_str(&json)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", metadata_path.display()));
+    Table::builder()
+        .metadata(metadata)
+        .metadata_location(metadata_path.to_string_lossy().to_string())
+        .identifier(
+            TableIdent::from_strs(["interop", "inspection_scan_a4"]).expect("valid identifier"),
+        )
+        .file_io(FileIO::new_with_fs())
+        .build()
+        .expect("build A4 table from Java-written final.metadata.json")
+}
+
+/// Plan a scan with `filter` (or no filter when `None`) via Rust's REAL `table.scan().with_filter(pred)
+/// .build()?.plan_files()` and project the planned tasks into the comparable, sorted [`ScanRow`]s.
+async fn plan_scan_rows(table: &Table, filter: Option<Predicate>) -> Vec<ScanRow> {
+    let mut builder = table.scan();
+    if let Some(predicate) = filter {
+        builder = builder.with_filter(predicate);
+    }
+    let scan = builder.build().expect("build table scan");
+    let tasks: Vec<FileScanTask> = scan
+        .plan_files()
+        .await
+        .expect("plan_files")
+        .try_collect()
+        .await
+        .expect("collect plan_files");
+    sorted_scan_rows(tasks.iter().map(task_to_scan_row).collect())
+}
+
+/// Load + sort the Java scan-plan rows for `<name>` from `java_scan_<name>.json`.
+fn java_scan_rows(dir: &std::path::Path, name: &str) -> Vec<ScanRow> {
+    sorted_scan_rows(
+        read_java::<JavaScanRow>(dir, &format!("java_scan_{name}.json"))
+            .into_iter()
+            .map(ScanRow::from)
+            .collect(),
+    )
+}
+
+/// The leaf (trailing path segment) of every planned data file, sorted — a compact view for focused asserts.
+fn leaf_data_paths(rows: &[ScanRow]) -> Vec<String> {
+    let mut leaves: Vec<String> = rows.iter().map(|r| leaf(&r.data_file_path)).collect();
+    leaves.sort();
+    leaves
+}
+
+#[tokio::test]
+async fn test_scan_planning_matches_java_plans() {
+    let Some(dir) = manifest_dir() else {
+        println!(
+            "skipping test_scan_planning_matches_java_plans — set ICEBERG_INTEROP_MANIFEST_DIR \
+             (run dev/java-interop/run-inspection-manifests.sh)"
+        );
+        return;
+    };
+
+    let table = load_table_a4(&dir);
+
+    // The SAME filters Java built, by name, via the Rust predicate API. `category` is the identity-partition
+    // column (partition pruning); `id` is a non-partition column whose lower/upper bound metrics drive
+    // METRIC pruning.
+    let s1_partition_a = Reference::new("category").equal_to(Datum::string("a"));
+    let s2_metric_id_gt_15 = Reference::new("id").greater_than(Datum::long(15));
+    let s3_combined = Reference::new("category")
+        .equal_to(Datum::string("a"))
+        .and(Reference::new("id").greater_than(Datum::long(25)));
+
+    // -- s0 no_filter: plans F1, F2, F3; F1 carries the delete; residual always-true for every file. -------
+    let rust_s0 = plan_scan_rows(&table, None).await;
+    let java_s0 = java_scan_rows(&dir, "no_filter");
+    assert_eq!(
+        rust_s0, java_s0,
+        "s0 no_filter: Rust plan_files() must equal Java's planFiles() (data-file SET, per-file sorted \
+         delete paths, per-file residual_always_true)"
+    );
+    assert_eq!(
+        leaf_data_paths(&rust_s0),
+        vec![
+            "00000-f1.parquet".to_string(),
+            "00000-f2.parquet".to_string(),
+            "00001-f3.parquet".to_string(),
+        ],
+        "s0 plans all three data files F1, F2, F3"
+    );
+    assert!(
+        rust_s0.iter().all(|r| r.residual_always_true),
+        "s0 has no filter, so every task's residual is trivially always-true"
+    );
+
+    // -- s1 partition_a (category='a'): plans F1, F3 (partition prune drops the cat=b F2). ----------------
+    let rust_s1 = plan_scan_rows(&table, Some(s1_partition_a)).await;
+    let java_s1 = java_scan_rows(&dir, "partition_a");
+    assert_eq!(
+        rust_s1, java_s1,
+        "s1 partition_a: Rust plan_files() must equal Java's planFiles()"
+    );
+    assert_eq!(
+        leaf_data_paths(&rust_s1),
+        vec![
+            "00000-f1.parquet".to_string(),
+            "00001-f3.parquet".to_string()
+        ],
+        "s1 plans exactly {{F1, F3}} — PARTITION pruning drops the cat=b F2"
+    );
+    assert!(
+        rust_s1.iter().all(|r| r.residual_always_true),
+        "s1's filter category='a' IS the identity partition, so the residual reduces to always-true"
+    );
+
+    // -- s2 metric_id_gt_15 (id > 15): plans F2, F3 (F1 upper=10 < 15 pruned by METRICS — the subtle one). -
+    let rust_s2 = plan_scan_rows(&table, Some(s2_metric_id_gt_15)).await;
+    let java_s2 = java_scan_rows(&dir, "metric_id_gt_15");
+    assert_eq!(
+        rust_s2, java_s2,
+        "s2 metric_id_gt_15: Rust plan_files() must equal Java's planFiles()"
+    );
+    assert_eq!(
+        leaf_data_paths(&rust_s2),
+        vec![
+            "00000-f2.parquet".to_string(),
+            "00001-f3.parquet".to_string()
+        ],
+        "s2 plans exactly {{F2, F3}} — METRIC pruning drops F1 (its id upper bound 10 < 15)"
+    );
+    assert!(
+        rust_s2.iter().all(|r| !r.residual_always_true),
+        "s2's filter id>15 is NOT a partition column, so the residual is NOT always-true"
+    );
+
+    // -- s3 combined (category='a' AND id>25): plans F3 only (partition drops F2; metrics drop F1). --------
+    let rust_s3 = plan_scan_rows(&table, Some(s3_combined)).await;
+    let java_s3 = java_scan_rows(&dir, "combined");
+    assert_eq!(
+        rust_s3, java_s3,
+        "s3 combined: Rust plan_files() must equal Java's planFiles()"
+    );
+    assert_eq!(
+        leaf_data_paths(&rust_s3),
+        vec!["00001-f3.parquet".to_string()],
+        "s3 plans exactly {{F3}} — partition drops the cat=b F2, metrics drop F1 (id upper 10 < 25)"
+    );
+    assert!(
+        rust_s3.iter().all(|r| !r.residual_always_true),
+        "s3's filter still carries the non-partition id>25 leaf, so the residual is NOT always-true on F3"
+    );
+
+    // -- Delete association: F1's planned task carries the position-delete in s0 AND s1 (same cat=a partition,
+    //    sequence number after F1's append). Pinned on F1 specifically (unambiguous); the bulk comparisons
+    //    above already proved the FULL per-file delete sets match Java for every scenario. --------------
+    for (label, rows) in [("s0", &rust_s0), ("s1", &rust_s1)] {
+        let f1 = rows
+            .iter()
+            .find(|r| leaf(&r.data_file_path) == "00000-f1.parquet")
+            .unwrap_or_else(|| panic!("{label}: F1 is planned"));
+        assert_eq!(
+            f1.delete_file_paths.len(),
+            1,
+            "{label}: F1 carries exactly one applicable delete file"
+        );
+        assert_eq!(
+            leaf(&f1.delete_file_paths[0]),
+            "00000-f1-deletes.parquet",
+            "{label}: F1's associated delete is the position-delete written for category=a"
+        );
+    }
+
+    println!(
+        "test_scan_planning_matches_java_plans OK — s0={}, s1={}, s2={}, s3={} planned files matched Java \
+         (partition-prune s1 drops F2, metric-prune s2 drops F1, combined s3 = F3, F1 delete associated)",
+        rust_s0.len(),
+        rust_s1.len(),
+        rust_s2.len(),
+        rust_s3.len()
     );
 }

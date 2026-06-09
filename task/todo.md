@@ -4142,3 +4142,25 @@ production change. Builder→reviewer; orchestrator re-ran gate + run.sh + fixed
 `readable_metrics` virtual column (interior field-id JVM-order residual); SCAN interop — A4 PLANNING (planFiles
 file set + residuals, no parquet needed) + A5 EXECUTION (parquet → Arrow, needs parquet Maven deps + approval).
 Then: squash the `phase2-3-remnants` set (now ~9 commits, LOCAL-only) + open the PR.
+
+---
+
+## Active (2026-06-09): Scan-PLANNING interop A4 (Phase 3) — DONE
+
+Increment: scan-planning interop. Java plans 4 filter scenarios via REAL `table.newScan().filter().planFiles()`
+over a dedicated `table_a4` (F1/F2/F3 with distinct `id` bounds + a position-delete on F1, identity(category));
+Rust plans the same via `table.scan().with_filter().plan_files()`; {planned file SET, per-file delete paths,
+residual-always-true} match EXACTLY. Purely additive — NO production change.
+
+- [x] **Java oracle** — `InspectionScanA4Oracle` writes `table_a4` + plans s0 no_filter / s1 partition_a /
+  s2 metric_id_gt_15 / s3 combined → java_scan_*.json.
+- [x] **Rust test** — `test_scan_planning_matches_java_plans` (added to interop_inspection_manifests.rs).
+  Pins partition pruning (s1 drops F2), COLUMN-METRIC pruning (s2 drops F1 via upper bound 10), combined
+  (s3 = F3), residual-covered split, delete association (cat=a delete on BOTH F1+F3). Residual-EXPRESSION
+  string equality DEFERRED (cross-language normalization; Rust residuals unit-tested).
+- [x] **Gate (orchestrator-rerun, all green):** offline (A4 no-op; A1-A3 green; lib 1595; datafusion 80+9;
+  clippy/fmt/typos) + run.sh round-trip (10 tests). spec/ untouched (0 lines).
+- [x] **Docs** — GAP_MATRIX (scan-planning row), Roadmap (6g), lessons, todo.
+
+### NEXT: squash `phase2-3-remnants` + open PR (awaiting user go-ahead on squash-vs-keep + confirm base=TRO-Wolf fork, NEVER apache)
+Branch = ~10 commits off main `ccfcb062` (3 Phase-2/3 remnants + 4 pure-metadata/manifest-A1 interop + file_format fix + A2 + A3 + A4). All LOCAL-only, not pushed. Deferred beyond this PR: `readable_metrics` interop; A5 scan EXECUTION (parquet deps + approval); other Phase 2/3 remnants (overwriteByRowFilter, RowDelta validateNoNewDeletesForDataFiles, BatchScan, CDC-merge).

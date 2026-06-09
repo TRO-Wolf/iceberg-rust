@@ -621,6 +621,16 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      `all_manifests` per-(manifest×snapshot) non-dedup with distinct `reference_snapshot_id` ≠
      `added_snapshot_id`. Reviewer mutation-pinned all three. Deferred: A4 scan planning; A5 scan execution
      (needs parquet deps).
+  6g. **Scan-PLANNING interop A4** — **DONE (2026-06-09, Phase 3 manifest-interop Increment A4, same
+     `interop_inspection_manifests.rs` + `InspectionScanA4Oracle`, run.sh-driven).** Java plans 4 named filter
+     scenarios via its REAL `table.newScan().filter(expr).planFiles()` over a dedicated `table_a4` (F1/F2/F3
+     with distinct `id` bounds [1,10]/[11,20]/[21,30] + a position-delete on F1, identity(category)); Rust
+     plans the same via `table.scan().with_filter(pred).plan_files()` and the {planned file SET, per-file
+     delete paths, residual-always-true} match EXACTLY. Pins partition pruning (drops F2), COLUMN-METRIC
+     pruning (id>15 drops F1 — the subtle one), combined (→F3), the residual-covered split, and delete
+     association (the cat=a delete attaches to BOTH F1+F3). Residual-EXPRESSION string equality deferred. NO
+     production change. **Manifest-interop A1-A4 COMPLETE.** Remaining: `readable_metrics` column interop;
+     A5 scan EXECUTION (parquet → Arrow, needs parquet deps). Next: squash `phase2-3-remnants` + PR.
   7. **`IncrementalAppendScan`** — **DONE 🟡 (2026-06-08, overnight-run Increment 2,
      `scan/incremental.rs`, Java `BaseIncrementalAppendScan` + `BaseIncrementalScan`).** The incremental/CDC
      read primitive: `Table::incremental_append_scan()` plans the data files APPENDED in the range
