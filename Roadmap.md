@@ -409,8 +409,8 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   filters its `DeleteFileIndex` by `startingSequenceNumber`; this port uses the snapshot walk + inclusive-metrics
   filter only (can only over-reject). **Still deferred (separate follow-ups):**
   `OverwriteFiles.validateAddedFilesMatchOverwriteFilter` (block 1) + `validateNoConflictingDeletes` (block 3); the
-  remaining RowDelta DELETE-file blocks (`validateNoNewDeletesForDataFiles`, `validateDataFilesExist`,
-  `validateAddedDVs` — need `referenced_data_files`/`removed_data_files` on the action); `RewriteFiles`
+  remaining RowDelta DELETE-file blocks (`validateNoNewDeletesForDataFiles`, `validateAddedDVs` — need
+  `removed_data_files` on the action; `validateDataFilesExist` landed 2026-06-09, see below); `RewriteFiles`
   `validateNoNewDeletes`.
 - **`DeleteFiles.validateFilesExist` (files-exist) landed 🟡 (2026-06-09, `transaction/delete_files.rs` +
   `transaction/snapshot.rs`):** reject the commit if a data file this delete is removing was already DELETED by a
@@ -436,8 +436,36 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   snapshot to miss). **`StreamingDelete` wiring nuance:** Java `StreamingDelete.validate()` calls
   `failMissingDeletePaths()` (the filter-manager check), NOT `validateDataFilesExist`; this ports the
   `validateDataFilesExist` *contract* (requiredDataFiles = the files being deleted) for the Rust delete path.
-  **Still deferred:** the `skipDeletes` op-set variant (`VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS =
-  {OVERWRITE, REPLACE}`, used by RowDelta/OverwriteFiles); `RowDelta.validateDataFilesExist`.
+  **Still deferred:** `OverwriteFiles`' use of the `skipDeletes` variant (its `validateDataFilesExist` path).
+- **`RowDelta.validateDataFilesExist` (referenced-data-files-exist) + the `skipDeletes` op-set variant landed 🟡
+  (2026-06-09, `transaction/row_delta.rs` + `transaction/snapshot.rs`):** reject the row-delta commit if a DATA
+  file the added position-deletes REFERENCE was DELETED by a concurrent commit since the start (Java
+  `BaseRowDelta.validate` L141-149 → `MergingSnapshotProducer.validateDataFilesExist`). The action gained OPT-IN
+  `validate_data_files_exist(referenced_paths)` (Java `RowDelta.validateDataFilesExist(Iterable<CharSequence>)` —
+  the `referenced_data_files: HashSet<String>` set is CALLER-PROVIDED, NOT derived from the added delete files;
+  non-empty ENABLES the check, mirroring Java's `if (!referencedDataFiles.isEmpty())` guard; repeated calls
+  accumulate) + `validate_deleted_files()` (Java `RowDelta.validateDeletedFiles`, sets `validate_deleted_files:
+  bool`). The `validate` override (mirrors the existing data/delete branches): `effective_start =
+  validate_from_snapshot.or(starting)`; `deleted = deleted_data_files_after(current, effective_start, skip_deletes
+  = !validate_deleted_files)`; if any deleted path ∈ `referenced_data_files` ⇒ non-retryable `DataInvalid` "Cannot
+  commit, missing data files: {path}". **The skip-deletes op-set variant** — `deleted_data_files_after` gained a
+  `skip_deletes: bool` param: `true` ⇒ `operation_removes_data_files_skip_deletes = {Overwrite}` (Java
+  `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}`, `REPLACE` unrepresentable in Rust);
+  `false` ⇒ `{Overwrite, Delete}` (the existing set). RowDelta passes `skip_deletes = !validate_deleted_files`, so
+  Java's `validateDeletes = false` DEFAULT ⇒ `skipDeletes = true` ⇒ a concurrent merge-on-read DELETE-op snapshot
+  is EXCLUDED unless `validate_deleted_files()` is called. The existing `DeleteFiles` caller passes `skip_deletes =
+  false` (BEHAVIOR-PRESERVING — its files-exist tests stay green). 6 tests (real concurrent removal between
+  txn-build and txn-commit: no-concurrent-deletion OK; concurrent OVERWRITE deletion of the referenced file →
+  REJECTED non-retryable naming it; concurrent deletion of a DIFFERENT file → OK [referenced-set intersection is
+  the gate]; empty referenced set → no check; the skip-deletes DEFAULT [concurrent DELETE-op deletion EXCLUDED by
+  default ⇒ OK, INCLUDED with `validate_deleted_files()` ⇒ REJECTED — the only test that distinguishes the two op
+  sets]; tx-captured start survives the re-base). 5 mutations caught (skip-deletes default wrong → the skip-deletes
+  test fails; `validate` always-Ok → the 3 rejection tests fail; refreshed-head fallback → ONLY the tx-captured
+  test fails; retryable kind → `!retryable()` fails + loop spins 0.05s→1.60s; DeleteFiles caller forced to
+  `skip_deletes = true` → 3 DeleteFiles tests fail, proving `false` is load-bearing AND behavior-preserving).
+  **Still deferred:** the remaining RowDelta DELETE-file blocks `validateNoNewDeletesForDataFiles` +
+  `validateAddedDVs` (need `removed_data_files` on the action — `removeRows`/`removeDeletes` not yet ported);
+  `OverwriteFiles.validateDataFilesExist`; `RewriteFiles.validateNoNewDeletes`.
 - **Scan metrics-report model + `MetricsReporter` API (started 2026-06-08):** the self-contained metrics
   DATA MODEL + reporter API landed 🟡 (Increment 3, new `metrics/mod.rs`, Java `org.apache.iceberg.metrics`).
   `MetricsReport` (closed `#[non_exhaustive] enum`, `Scan(ScanReport)` — enum dispatch over `dyn`+downcast);

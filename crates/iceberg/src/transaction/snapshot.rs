@@ -973,11 +973,26 @@ fn operation_adds_delete_files(operation: &Operation) -> bool {
 /// Java's set has THREE members; the Rust [`Operation`] enum has no `Replace` variant (a `ReplacePartitions`
 /// commit records `Operation::Overwrite`, and a rewrite/compaction is not yet a distinct operation here), so
 /// only `{Overwrite, Delete}` are representable. This is faithful to every operation Rust can currently
-/// produce — Rust never records a `REPLACE` snapshot, so there is nothing of that operation to miss. (The
-/// Java `skipDeletes` variant `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}` —
-/// which drops `DELETE` — is deferred: the DeleteFiles path always validates with deletes included.)
+/// produce — Rust never records a `REPLACE` snapshot, so there is nothing of that operation to miss.
+///
+/// This is the `skipDeletes == false` variant; see [`operation_removes_data_files_skip_deletes`] for the
+/// `skipDeletes == true` variant Java's `RowDelta` uses by default.
 fn operation_removes_data_files(operation: &Operation) -> bool {
     matches!(operation, Operation::Overwrite | Operation::Delete)
+}
+
+/// The `skipDeletes == true` variant of [`operation_removes_data_files`] — the operations whose snapshots can
+/// remove data files when DELETE-op snapshots are EXCLUDED (Java
+/// `MergingSnapshotProducer.VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}`).
+///
+/// Java drops `DELETE` from the set so that a concurrent merge-on-read DELETE-op snapshot (which produces
+/// `Deleted` tombstones for the files it removed) does NOT trip the files-exist check — this is what
+/// `BaseRowDelta` uses by DEFAULT (its `validateDeletes` flag is `false` unless `validateDeletedFiles()` is
+/// called, and it passes `skipDeletes = !validateDeletes = true`). With `REPLACE` unrepresentable in the Rust
+/// [`Operation`] enum (a rewrite is not yet a distinct op), only `{Overwrite}` is representable here — faithful
+/// to every operation Rust can produce.
+fn operation_removes_data_files_skip_deletes(operation: &Operation) -> bool {
+    matches!(operation, Operation::Overwrite)
 }
 
 /// Enumerate the files of a given manifest `content` that snapshots committed AFTER `starting_snapshot_id`
@@ -1152,27 +1167,46 @@ pub(crate) async fn added_delete_files_after(
 ///
 /// This is the Rust port of Java `MergingSnapshotProducer.validateDataFilesExist` /  `deletedDataFiles`
 /// (`core/MergingSnapshotProducer.java` L695-735, L773-822): the shared [`files_after`] walk over DATA
-/// manifests, gated to the operations that can remove data ([`operation_removes_data_files`] = Java
-/// `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}`, minus the unrepresentable
-/// `REPLACE`), keeping `ManifestStatus::Deleted` tombstone entries (Java `entry.status() == DELETED` with
+/// manifests, keeping `ManifestStatus::Deleted` tombstone entries (Java `entry.status() == DELETED` with
 /// `ignoreExisting()`). See [`files_after`] for the walk semantics.
+///
+/// The `skip_deletes` flag selects the operation set, mirroring Java's two `validateDataFilesExist` op sets:
+/// - `skip_deletes == false` ⇒ [`operation_removes_data_files`] = Java
+///   `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}` (`{Overwrite, Delete}` in Rust).
+///   `DeleteFiles` uses this (its `validate` always includes DELETE-op snapshots).
+/// - `skip_deletes == true` ⇒ [`operation_removes_data_files_skip_deletes`] = Java
+///   `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}` (`{Overwrite}` in Rust).
+///   `RowDelta` uses this by DEFAULT (Java `BaseRowDelta` passes `skipDeletes = !validateDeletes`, and
+///   `validateDeletes` is `false` unless `validateDeletedFiles()` was called) so that a concurrent
+///   merge-on-read DELETE-op snapshot does not trip the referenced-files check.
+///
+/// In BOTH cases the unrepresentable Java `REPLACE` operation is absent (Rust never records a `REPLACE`
+/// snapshot) — faithful, not a gap.
 ///
 /// A concurrent delete/overwrite writes the file it removes as a `Deleted` tombstone in a manifest IT wrote
 /// (`rewrite_manifest_with_deletes` stamps the committing snapshot id as the manifest's `added_snapshot_id`),
 /// so the `added_snapshot_id == snapshot_id` manifest filter finds those tombstones — exactly the way Java's
 /// `manifest.snapshotId() == currentSnapshot.snapshotId()` filter does.
 ///
-/// The caller intersects these deleted-file paths with the set it is itself deleting to decide whether to
-/// reject the commit (Java `requiredDataFiles.contains(entry.file().location())`).
+/// The caller intersects these deleted-file paths with the set it requires (the files it is deleting, or the
+/// files its added delete files reference) to decide whether to reject the commit (Java
+/// `requiredDataFiles.contains(entry.file().location())`).
 pub(crate) async fn deleted_data_files_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
+    skip_deletes: bool,
 ) -> Result<Vec<DataFile>> {
+    let operation_filter = if skip_deletes {
+        operation_removes_data_files_skip_deletes
+    } else {
+        operation_removes_data_files
+    };
+
     files_after(
         table,
         starting_snapshot_id,
         ManifestContentType::Data,
-        operation_removes_data_files,
+        operation_filter,
         ManifestStatus::Deleted,
     )
     .await

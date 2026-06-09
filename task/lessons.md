@@ -2199,3 +2199,41 @@ How to use it (see the manuals' §2):
   sourcing). One mutation failing both families is the proof the `files_after` generalization kept the
   manifest-sourcing semantics identical for the two `ManifestStatus::Added` callers while extending it to the
   `Deleted` caller — the status axis is the ONLY behavioral change, and it is parameterized, not hard-coded.
+
+### 2026-06-09 (RowDelta validateDataFilesExist + the skip-deletes op-set variant, BUILDER Opus)
+- **DO add the `skipDeletes` op-set axis as a `skip_deletes: bool` PARAM on `deleted_data_files_after`, not a
+  sibling fn, and make the EXISTING DeleteFiles caller pass `false` explicitly.** *Why:* Java's two op sets
+  differ by exactly one member — `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}` vs
+  `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}` (drops DELETE). A bool param selecting
+  between `operation_removes_data_files` (`{Overwrite, Delete}`) and a new
+  `operation_removes_data_files_skip_deletes` (`{Overwrite}`) keeps ONE walk and one call site per caller.
+  Behavior-preservation of the DeleteFiles path is PROVEN by a mutation: forcing the DeleteFiles caller to
+  `skip_deletes = true` fails 3 DeleteFiles files-exist tests (their concurrent deletion is a `Delete`-op
+  `delete_files` snapshot, excluded by `{Overwrite}`) — so `false` is both load-bearing AND the value that keeps
+  the existing tests green. `REPLACE` is unrepresentable in the Rust `Operation` enum in BOTH sets, so it is
+  absent either way — faithful, not a gap.
+- **DO get the skip-deletes DEFAULT right: RowDelta passes `skip_deletes = !validate_deleted_files`, and
+  `validate_deleted_files` is `false` by default ⇒ `skipDeletes = true` ⇒ `{OVERWRITE}` BY DEFAULT.** *Why:* Java
+  `BaseRowDelta.validate` (L146) calls `validateDataFilesExist(..., !validateDeletes, ...)` and `validateDeletes`
+  starts `false` (set only by `validateDeletedFiles()`). The intuitive-but-WRONG default is to include DELETE-op
+  snapshots (`skip_deletes = false`); that would reject a legitimate concurrent merge-on-read DELETE the default
+  is meant to tolerate. The ONLY test that distinguishes the two op sets is a two-half test: a concurrent
+  DELETE-op (`delete_files`) deletion of the referenced file COMMITS by default (excluded) and is REJECTED after
+  `validate_deleted_files()` (included). A concurrent OVERWRITE-op deletion (`overwrite_files().add+delete`) is in
+  BOTH sets, so use it for the headline (rejects WITHOUT needing `validate_deleted_files()`).
+- **DO keep `referenced_data_files` CALLER-PROVIDED, mirroring Java's `CharSequenceSet referencedDataFiles`
+  populated by `validateDataFilesExist(referencedFiles)` — do NOT derive it from the added delete files.** *Why:*
+  Java `BaseRowDelta.referencedDataFiles` is a field the engine fills by passing the position deletes' referenced
+  data-file paths into `validateDataFilesExist(Iterable<CharSequence>)`; the action never inspects the delete
+  files to compute it. The Rust `validate_data_files_exist(impl IntoIterator<Item = impl Into<String>>)` takes the
+  caller's set the same way; non-empty ENABLES the check (Java's `if (!referencedDataFiles.isEmpty())` guard).
+  Deriving it would be a different (and unfaithful) contract — the position-delete `DataFile` in this Rust model
+  does not even carry the referenced data-file path as a first-class field. The different-file negative control
+  (concurrent deletion of a NON-referenced file → OK) is what makes the referenced-set intersection load-bearing
+  rather than "any concurrent deletion rejects."
+- **DO simulate the concurrent deletion that the skip-deletes-DEFAULT check must still see with an OVERWRITE,
+  and the one it must IGNORE with a `delete_files` DELETE.** *Why:* `overwrite_files().add_file(g).delete_file(f)`
+  records `Operation::Overwrite` (Java `BaseOverwriteFiles.operation()` when it both adds and deletes) and writes
+  `f`'s `Deleted` tombstone on a DATA manifest the new snapshot owns — in BOTH op sets. `delete_files().delete_
+  file(f)` records `Operation::Delete` — only in the non-skip set. Pairing them across the 6 tests exercises both
+  op-set branches with REAL concurrent commits through the catalog (no hand-built tombstones).

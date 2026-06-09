@@ -3917,3 +3917,35 @@ tx-captured-fallback); ALL caught after a fix. **Found + fixed 1 SURVIVING mutat
 5 builder tests set the override). Added `test_delete_files_exist_rejects_concurrent_using_tx_captured_starting_snapshot`
 (reviewer); the refreshed-head mutation now fails exactly it. Lib total 1578 → **1579**. Docs reconciled (test
 count 5→6, mutation list 4→8).
+
+---
+
+## Active (2026-06-09): RowDelta validateDataFilesExist + the skip-deletes op-set variant
+
+Increment: Java `BaseRowDelta.validateDataFilesExist(referencedFiles)` — RowDelta gains a builder providing
+the data files its added position-deletes REFERENCE, and at commit rejects if any referenced data file was
+DELETED by a concurrent commit since the start. Reuses `deleted_data_files_after`; ADDS the skip-deletes
+op-set variant (Java `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}`).
+
+- [x] **snapshot.rs `skip_deletes` op-set variant** — `deleted_data_files_after(table, start, skip_deletes:
+  bool)`: `skip_deletes=true` ⇒ `{Overwrite}` (new `operation_removes_data_files_skip_deletes`; Java drops
+  DELETE; REPLACE unrepresentable); `skip_deletes=false` ⇒ `{Overwrite, Delete}`. The existing DeleteFiles
+  caller passes `false` (BEHAVIOR-PRESERVING — proven: forcing it to `true` fails 3 DeleteFiles tests).
+- [x] **row_delta.rs** — added `referenced_data_files: HashSet<String>` + `validate_deleted_files: bool`
+  fields + `validate_data_files_exist(...)` + `validate_deleted_files()` builders + the `validate`-override
+  branch (`skip_deletes = !validate_deleted_files`; intersection of `deleted_data_files_after` paths ∩
+  `referenced_data_files` ⇒ non-retryable `DataInvalid` "Cannot commit, missing data files: <path>").
+- [x] **Tests (6)** + mutation checks (a–d, all caught) + the DeleteFiles behavior-preservation mutation.
+- [x] **Docs** — GAP_MATRIX, Roadmap, lessons updated.
+
+**Faithfulness note:** Java `referencedDataFiles` is CALLER-PROVIDED (`CharSequenceSet`, populated by
+`validateDataFilesExist(referencedFiles)`), NOT derived from the added delete files. The Rust port mirrors
+this — `validate_data_files_exist([paths])` takes the caller's set.
+
+**Outcome (2026-06-09):** Landed. `transaction/snapshot.rs` (skip-deletes op-set axis on
+`deleted_data_files_after` + `operation_removes_data_files_skip_deletes`) +
+`transaction/row_delta.rs` (`validate_data_files_exist` / `validate_deleted_files` + the `validate` branch +
+6 tests) + `transaction/delete_files.rs` (caller passes `skip_deletes = false`). transaction:: 247 → 253
+green (the DeleteFiles increment-1 + data/delete conflict tests behavior-preserving). 4 mutations (a–d)
+caught + the DeleteFiles `skip_deletes=true` mutation caught. Deferred: `validateNoNewDeletesForDataFiles`,
+`validateAddedDVs` (need `removed_data_files`), `OverwriteFiles.validateDataFilesExist`.

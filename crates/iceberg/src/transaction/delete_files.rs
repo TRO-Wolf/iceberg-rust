@@ -201,7 +201,11 @@ impl TransactionAction for DeleteFilesAction {
         // set, else the operation's starting snapshot.
         let effective_start = self.validate_from_snapshot.or(starting_snapshot_id);
 
-        let deleted = deleted_data_files_after(current, effective_start).await?;
+        // `skip_deletes == false`: a `DeleteFiles` commit validates against ALL data-removing operations
+        // INCLUDING concurrent DELETE-op snapshots (Java `validateDataFilesExist` is called with
+        // `skipDeletes = false` here — the files this op needs to delete must still exist regardless of which
+        // operation removed them). `RowDelta` is the variant that skips DELETE-op snapshots by default.
+        let deleted = deleted_data_files_after(current, effective_start, false).await?;
 
         // Reject on the FIRST concurrently-deleted file this action also requires (Java throws on the first
         // matching entry, naming the missing data files).
