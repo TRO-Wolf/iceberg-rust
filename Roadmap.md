@@ -584,6 +584,22 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      the synthetic entry lands on `CURRENT_TS`, also pinning the `<=` boundary). **NO production change**;
      reviewer mutation-confirmed both derived columns are load-bearing. Deferred: manifest-reading tables'
      interop (`files`/`entries`/`manifests`/`partitions`/`all_*` — need on-disk manifests + parquet).
+  6d. **Manifest-reading interop A1 — `files`/`data_files`/`delete_files`** — **DONE (2026-06-09, Phase 3
+     manifest-interop Increment A1, `crates/iceberg/tests/interop_inspection_manifests.rs` +
+     `dev/java-interop` `InspectionManifestsOracle` / `generate-inspection-manifests` +
+     `run-inspection-manifests.sh`).** The FOUNDATION for manifest-reading interop: the oracle WRITES A REAL
+     ON-DISK TABLE (no parquet/hadoop — in-oracle `LocalFileIO` via `Files.localOutput/localInput` + a
+     `LocalTableOperations`; real `newAppend`/`newRowDelta` commits write genuine avro manifest-list + DATA &
+     DELETE manifests with hand-built `DataFile`/`DeleteFile` metrics), Java materializes its REAL `FilesTable`
+     rows, and the Rust test reads the SAME table via `FileIO::new_with_fs()` and field-matches all 21
+     non-derived columns (bounds as raw bytes; content filter pinned). **Methodology (user-chosen):
+     run.sh-driven regenerate-and-compare** — avro bakes absolute paths, so the Rust test is ENV-GATED
+     (`ICEBERG_INTEROP_MANIFEST_DIR`), a clean no-op offline; the real proof runs via the run script.
+     **NO production change.** Two documented presentation divergences (not bugs; on-disk MATCHES): `file_format`
+     case (Java row UPPERCASE via the `FileFormat` enum, Rust lowercase `Display` — a small inspection-table-only
+     parity gap to follow up; on-disk both write lowercase, verified) + absent metric-map `{}` vs `null`
+     (Rust non-optional maps). Deferred: `readable_metrics` in-comparison; A2 `entries`/`manifests`/`partitions`;
+     A3 `all_*`; A4/A5 scan planning + execution (A5 needs parquet deps).
   7. **`IncrementalAppendScan`** — **DONE 🟡 (2026-06-08, overnight-run Increment 2,
      `scan/incremental.rs`, Java `BaseIncrementalAppendScan` + `BaseIncrementalScan`).** The incremental/CDC
      read primitive: `Table::incremental_append_scan()` plans the data files APPENDED in the range

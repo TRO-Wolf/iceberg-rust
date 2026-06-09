@@ -4047,3 +4047,43 @@ Reviewer mutation-probed the fixture (flip SIBLING ancestor; flip creation-row N
 **Deferred (next):** manifest-reading inspection tables (`files`/`entries`/`manifests`/`partitions`/`all_*`)
 + scan interop — need real on-disk manifests + parquet (a bigger harness step: the oracle must write actual
 manifest/data files, or the Rust side must read Java-written ones).
+
+---
+
+## Active (2026-06-09): Manifest-reading interop A1 — `files`/`data_files`/`delete_files` (Phase 3)
+
+Increment: FOUNDATION of the manifest-reading inspection interop. User chose **item (a)** (take on the
+manifest-reading tables) and **run.sh-driven** wiring. Builder→reviewer; orchestrator independently re-ran
+the offline gate AND the run.sh round-trip + committed. **Purely additive — NO production change.**
+
+- [x] **Java oracle** — `generate-inspection-manifests` mode + `InspectionManifestsOracle` + minimal
+  `LocalFileIO` (`Files.localOutput/localInput`) + `LocalTableOperations` (commit writes metadata to disk).
+  Writes a REAL partitioned V2 table (no parquet/hadoop deps): `newAppend` 2 data files (2 partitions, with
+  metrics + id/value bounds) then `newRowDelta` 1 position-delete; materializes Java's REAL `FilesTable`
+  rows (`MetadataTableUtils` + `planFiles` + `ManifestReadTask.asDataTask().rows()`) → java_{files,data_files,
+  delete_files}.json + the table under a gitignored `target/` temp dir.
+- [x] **Rust test** (`interop_inspection_manifests.rs`) — ENV-GATED (`ICEBERG_INTEROP_MANIFEST_DIR`),
+  runtime early-return no-op when unset (offline gate stays green; NOT `#[ignore]`). When set: load
+  `final.metadata.json`, build a Table with `FileIO::new_with_fs()`, scan files/data_files/delete_files,
+  field-match all 21 non-derived columns order-independently (bounds as raw bytes; content filter pinned).
+- [x] **run script** `dev/java-interop/run-inspection-manifests.sh` (mvn generate → env-gated cargo test).
+- [x] **Gate (orchestrator-rerun, all green):** offline (manifests test no-op 1 passed; interop_inspection
+  4/4; workspace build/clippy/fmt/typos clean) + run.sh round-trip (files=3/data_files=2/delete_files=1
+  matched). `git status` = only InteropOracle.java + interop_inspection_manifests.rs + run-inspection-manifests.sh.
+- [x] **Docs** — GAP_MATRIX, Roadmap (6d), lessons, todo.
+
+**Findings (lessons):** Java writes real manifests with NO parquet/hadoop (LocalFileIO + real commits);
+run.sh-driven env-gated test keeps the offline gate green; VERIFY on-disk bytes before calling a render a
+divergence. **Two documented presentation divergences (on-disk MATCHES; not bugs):** `file_format` case
+(Java row UPPERCASE via the FileFormat enum vs Rust lowercase Display — a small inspection-table-only parity
+gap) + absent metric-map `{}` vs `null` (Rust non-optional maps). readable_metrics deferred from comparison.
+
+### Candidate FOLLOW-UP (small, optional): `file_format` UPPERCASE in inspection tables
+Make `inspect/data_file.rs` (the shared files/entries/all_* projection) emit `file_format` upper-cased to
+match Java's `FilesTable` row (Java round-trips through the `FileFormat` enum NAME). On-disk write is
+UNCHANGED (that's `DataFileFormat::Display`, correct — both write lowercase `parquet`). ~1 line + update the
+files.rs/entries.rs unit-test expectations + check datafusion. Cosmetic but a genuine 1:1 inspection gap.
+
+**Deferred next (manifest interop):** A2 `entries`/`manifests`/`partitions` (same harness); A3 `all_*`
+(multi-snapshot table); A4 scan PLANNING (file set + residuals); A5 scan EXECUTION (reads parquet → Arrow —
+needs parquet Maven deps + a separate approval).

@@ -2389,3 +2389,40 @@ How to use it (see the manuals' §2):
   byte-clean — confirming the derived columns are load-bearing in the comparison, not just decorative
   asserts. Good pattern when "validation is key": the critic mutation-probes the FIXTURE/test, not just
   the prose.
+
+### 2026-06-09 (Manifest-reading interop A1 — `files`/`data_files`/`delete_files` — ORCHESTRATOR + REVIEWER Opus)
+- **Java can write a REAL on-disk table (metadata + avro manifest-list + manifests) with NO parquet/hadoop
+  deps.** Replicate Java's own test infra: a `LocalFileIO` (`org.apache.iceberg.Files.localOutput/localInput`
+  for newOutputFile/newInputFile; `java.io` delete) + a minimal `LocalTableOperations` (commit writes
+  `vN.metadata.json` to disk via the FileIO; `metadataFileLocation`=`<dir>/metadata/<name>`;
+  `locationProvider`=`LocationProviders.locationsFor(location,props)`; `newSnapshotId`=counter). Then
+  `new BaseTable(ops,name).newAppend().appendFile(df).commit()` / `.newRowDelta().addDeletes(del).commit()`
+  write genuine avro manifests + manifest-list. The `DataFile`/`DeleteFile` are pure metadata
+  (`DataFiles.builder(spec).withPath/withRecordCount/withFileSizeInBytes/withMetrics/withPartitionPath`,
+  `FileMetadata.deleteFileBuilder(spec).ofPositionDeletes()...`) — their .parquet paths NEED NOT EXIST
+  because the `files`/`entries`/`manifests`/`partitions` tables read only the manifest. The metadata-table
+  rows materialize the SAME way as the pure-metadata tables (`MetadataTableUtils` + `planFiles()` +
+  `asDataTask().rows()`) because `BaseFilesTable.ManifestReadTask implements DataTask`.
+- **Manifest interop is run.sh-driven (regenerate-and-compare), NOT offline-committed.** Avro manifests +
+  manifest-list bake in ABSOLUTE paths, so committed binary fixtures aren't portable. So: a new run script
+  regenerates the table into a gitignored `dev/java-interop/target/` temp dir each run; the Rust test is
+  ENV-GATED (`ICEBERG_INTEROP_MANIFEST_DIR`) and does a runtime EARLY-RETURN (a clean no-op, NOT `#[ignore]`)
+  when the var is unset, so the offline `cargo test` gate stays green. The orchestrator verifies by running
+  BOTH the offline gate AND the run script. (Pure-metadata interop stays offline-committed JSON.)
+- **VERIFY an on-disk representation against the actual bytes before calling it a divergence.** The `files`
+  table's `file_format` looked like a write divergence (Java row `PARQUET`, Rust `parquet`). Reading the
+  Java-written avro manifest DATA BLOCK showed the on-disk value is LOWERCASE `parquet` on BOTH sides — Java
+  reads it via `FileFormat.fromString` (`toUpperCase`→`valueOf`) and its `FilesTable` row re-emits the enum's
+  uppercase NAME, while Rust surfaces the on-disk string via `DataFileFormat`'s lowercase `Display`. So it is
+  a COSMETIC inspection-table-only difference (NO on-disk / Direction-2 divergence). A small follow-up can
+  upper-case the `files`/`entries`/`all_*` `file_format` column to match Java. (Don't "fix" the on-disk
+  `Display`/serde — that's correct.)
+- **Rust `spec::DataFile` models the metric maps (column_sizes/value_counts/null/nan/bounds) as
+  NON-optional `HashMap`**, so an absent map projects to an EMPTY `{}` whereas Java emits `null`. A
+  model-level (not rendering) divergence — to match exactly would need optional maps. Documented; canonicalize
+  `None`≡`Some(empty)` in the interop comparison.
+- **A foundation increment should SURFACE divergences, not hide them.** A1 canonicalized the two presentation
+  divergences for the BULK equality but RAW-pinned both in focused asserts so neither can silently drift, and
+  documented each — the right move (mirrors the existing GAP_MATRIX "known divergence" pattern for the
+  unpartitioned-partition column). The reviewer mutation-probed the comparison (corrupt a `record_count` and a
+  single lower-bound hex byte → both FAIL) to prove it's byte/value-level, not a false-pass.

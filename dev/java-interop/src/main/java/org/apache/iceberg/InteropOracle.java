@@ -29,20 +29,27 @@ package org.apache.iceberg;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
+import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.LocationProvider;
+import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.JsonUtil;
 
@@ -110,6 +117,17 @@ public final class InteropOracle {
         // so this increment never touches the committed `inspection/` fixtures.
         Path inspectionLogFixturesDir = requireFixturesDir("interop.inspection_log.fixtures.dir");
         InspectionLogOracle.generate(inspectionLogFixturesDir);
+        break;
+      case "generate-inspection-manifests":
+        // A SEPARATE exec mode (its own temp dir) for the FIRST manifest-READING inspection increment —
+        // the content-filtered `files` / `data_files` / `delete_files` tables. Unlike the pure-metadata
+        // modes above, this one WRITES A REAL TABLE to local disk (real AVRO manifests + manifest-list +
+        // metadata via org.apache.iceberg.Files.localOutput) so the Rust test reads the same on-disk
+        // manifests Java's FilesTable read. The temp dir is supplied via
+        // -Dinterop.inspection_manifests.dir on the CLI (same JVM, so System.getProperty sees it), so this
+        // increment never touches any committed fixture.
+        Path inspectionManifestsDir = requireFixturesDir("interop.inspection_manifests.dir");
+        InspectionManifestsOracle.generate(inspectionManifestsDir);
         break;
       case "verify":
         int failures = 0;
@@ -1622,6 +1640,426 @@ public final class InteropOracle {
     @Override
     public LocationProvider locationProvider() {
       throw new UnsupportedOperationException("inspection oracle does not provide data locations");
+    }
+  }
+
+  // ===========================================================================================
+  // Inspection-MANIFESTS oracle — the FIRST manifest-READING inspection increment. Unlike the three
+  // pure-metadata oracles above (which read rows out of an InMemoryFileIO holding only the metadata JSON),
+  // this oracle WRITES A REAL TABLE to LOCAL DISK: real commits (newAppend + newRowDelta) write AVRO data /
+  // delete manifests + a manifest-list + a metadata.json under <dir>/table/metadata via
+  // org.apache.iceberg.Files.localOutput. The metadata-table rows are then materialized the SAME way as the
+  // pure-metadata tables — MetadataTableUtils.createMetadataTableInstance(...) + asDataTask().rows() — but
+  // each ManifestReadTask now opens the ON-DISK manifest via the LocalFileIO, so the emitted rows are read
+  // from the real AVRO the Rust test also reads.
+  //
+  // SCOPE (A1): the content-filtered FILES / DATA_FILES / DELETE_FILES tables. Every column is covered
+  // EXCEPT the trailing virtual `readable_metrics` STRUCT — it is DERIVED (per-leaf-column human-readable
+  // min/max/counts) and its interior field ordering depends on a JVM HashMap iteration order, a documented
+  // divergence that is OUT OF SCOPE for A1 (the raw metric MAPS + bound MAPS this oracle emits are the
+  // load-bearing source those readable values are derived from). `entries` / `manifests` / `partitions` /
+  // `all_*` and scan interop are deferred to later increments.
+  //
+  // The referenced .parquet data/delete paths need NOT exist on disk: the files tables read the MANIFEST
+  // entries, never the parquet — so PURE-METADATA DataFiles / FileMetadata builders are enough.
+  // ===========================================================================================
+
+  /**
+   * The inspection-manifests half of the oracle. Builds a partitioned V2 table on local disk via real
+   * commits (so real AVRO manifests + a manifest-list land under {@code <dir>/table/metadata}), writes the
+   * final metadata to a deterministic {@code <dir>/table/metadata/final.metadata.json}, and emits the rows
+   * of Java's REAL {@link FilesTable} / {@link DataFilesTable} / {@link DeleteFilesTable} (via {@link
+   * MetadataTableUtils} + {@code asDataTask().rows()} reading those on-disk manifests) as
+   * {@code java_files.json} / {@code java_data_files.json} / {@code java_delete_files.json}.
+   */
+  static final class InspectionManifestsOracle {
+    private InspectionManifestsOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build a partitioned V2 table on local disk. Location is the BARE absolute path of <dir>/table
+      //    (org.apache.iceberg.Files.localOutput.location() returns a bare path, no `file:` scheme, so the
+      //    manifest/manifest-list paths the commits write are bare absolute paths the Rust FileIO resolves
+      //    directly).
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "value", Types.DoubleType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema,
+              spec,
+              SortOrder.unsorted(),
+              tableDir.getAbsolutePath(),
+              props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed); // persist v0 metadata so the BaseTable has a current metadata to evolve.
+      BaseTable table = new BaseTable(ops, "interop_inspection_manifests");
+
+      // 2. Two DATA files (one per partition), WITH metrics (column sizes + value/null counts for ids 1/2/3
+      //    and lower/upper bounds for id (long) and value (double)). The referenced .parquet paths are pure
+      //    metadata — they need not exist; the files tables read only the manifest entries.
+      DataFile dataFileA =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=a/00000-a.parquet")
+              .withFileSizeInBytes(1100L)
+              .withRecordCount(3L)
+              .withPartitionPath("category=a")
+              .withMetrics(metricsFor(3L, 1L, 3L, 10.5d, 30.5d))
+              .build();
+      DataFile dataFileB =
+          DataFiles.builder(spec)
+              .withPath(tableDir.getAbsolutePath() + "/data/category=b/00000-b.parquet")
+              .withFileSizeInBytes(900L)
+              .withRecordCount(2L)
+              .withPartitionPath("category=b")
+              .withMetrics(metricsFor(2L, 4L, 5L, 40.5d, 50.5d))
+              .build();
+
+      // 3. One POSITION-DELETE file in category=a (record_count 1).
+      DeleteFile deleteFileA =
+          FileMetadata.deleteFileBuilder(spec)
+              .ofPositionDeletes()
+              .withPath(tableDir.getAbsolutePath() + "/data/category=a/00000-a-deletes.parquet")
+              .withFileSizeInBytes(150L)
+              .withRecordCount(1L)
+              .withPartitionPath("category=a")
+              .build();
+
+      // 4. Real commits: the two data files via newAppend (writes a DATA manifest + manifest-list), then the
+      //    delete via newRowDelta (writes a DELETE manifest).
+      table.newAppend().appendFile(dataFileA).appendFile(dataFileB).commit();
+      table.newRowDelta().addDeletes(deleteFileA).commit();
+
+      // 5. Write the FINAL metadata to a KNOWN path so the Rust test loads it deterministically. (The real
+      //    on-disk manifest-list + manifests already live under <dir>/table/metadata/.)
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 6. Materialize + emit the rows of Java's REAL FilesTable / DataFilesTable / DeleteFilesTable.
+      writeJson(dir.resolve("java_files.json"), rowsToJson(table, MetadataTableType.FILES));
+      writeJson(dir.resolve("java_data_files.json"), rowsToJson(table, MetadataTableType.DATA_FILES));
+      writeJson(
+          dir.resolve("java_delete_files.json"), rowsToJson(table, MetadataTableType.DELETE_FILES));
+      System.out.println("generated inspection-manifests table + fixtures to " + dir);
+    }
+
+    /**
+     * Build a pure-metadata {@link Metrics} for the table schema {1 id long, 2 category string, 3 value
+     * double}: column_sizes + value_counts + null_value_counts for ids 1/2/3, and lower/upper bounds for id
+     * 1 (long) and id 3 (value, double). category (id 2) is excluded from bounds on purpose (a string
+     * column with no bound here), so the bound MAPS are non-trivial subsets of the count MAPS.
+     */
+    private static Metrics metricsFor(
+        long recordCount, long idLower, long idUpper, double valueLower, double valueUpper) {
+      Map<Integer, Long> columnSizes = new LinkedHashMap<>();
+      columnSizes.put(1, 40L);
+      columnSizes.put(2, 24L);
+      columnSizes.put(3, 32L);
+      Map<Integer, Long> valueCounts = new LinkedHashMap<>();
+      valueCounts.put(1, recordCount);
+      valueCounts.put(2, recordCount);
+      valueCounts.put(3, recordCount);
+      Map<Integer, Long> nullValueCounts = new LinkedHashMap<>();
+      nullValueCounts.put(1, 0L);
+      nullValueCounts.put(2, 0L);
+      nullValueCounts.put(3, 0L);
+      Map<Integer, ByteBuffer> lowerBounds = new LinkedHashMap<>();
+      lowerBounds.put(1, Conversions.toByteBuffer(Types.LongType.get(), idLower));
+      lowerBounds.put(3, Conversions.toByteBuffer(Types.DoubleType.get(), valueLower));
+      Map<Integer, ByteBuffer> upperBounds = new LinkedHashMap<>();
+      upperBounds.put(1, Conversions.toByteBuffer(Types.LongType.get(), idUpper));
+      upperBounds.put(3, Conversions.toByteBuffer(Types.DoubleType.get(), valueUpper));
+      return new Metrics(
+          recordCount,
+          columnSizes,
+          valueCounts,
+          nullValueCounts,
+          null, // nan_value_counts — none (exercises a NULL/absent map column)
+          lowerBounds,
+          upperBounds);
+    }
+
+    /**
+     * Materialize the rows of Java's REAL files metadata table of {@code type} (FilesTable / DataFilesTable
+     * / DeleteFilesTable) via {@link MetadataTableUtils#createMetadataTableInstance} +
+     * {@code task.asDataTask().rows()} — each {@link BaseFilesTable.ManifestReadTask} opens the ON-DISK
+     * AVRO manifest through the table's LocalFileIO — and serialize each row keyed BY COLUMN NAME (derived
+     * from {@code mt.schema().columns()}; NEVER hardcode positions). EVERY column is emitted EXCEPT the
+     * trailing virtual {@code readable_metrics} struct (deferred for A1).
+     *
+     * <p>IMPORTANT: each row MUST be serialized EAGERLY inside the iteration — {@code StaticDataTask}-style
+     * {@code rows()} reuse a single mutable projection per task, so stashing the {@link StructLike}
+     * references would yield the LAST row repeated. (Here the files tables iterate real manifest entries,
+     * but the eager-serialize discipline is kept identical to the pure-metadata oracles.)
+     */
+    private static String rowsToJson(BaseTable baseTable, MetadataTableType type) {
+      Table mt = MetadataTableUtils.createMetadataTableInstance(baseTable, type);
+      List<Types.NestedField> columns = mt.schema().columns();
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            try (CloseableIterable<FileScanTask> tasks = mt.newScan().planFiles()) {
+              for (FileScanTask task : tasks) {
+                try (CloseableIterable<StructLike> taskRows = task.asDataTask().rows()) {
+                  for (StructLike row : taskRows) {
+                    fileRowToJson(row, columns, gen);
+                  }
+                }
+              }
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * Serialize one files-table row keyed by COLUMN NAME, covering every column EXCEPT
+     * {@code readable_metrics}. Scalars verbatim; {@code partition} as a nested object of its sub-field
+     * values; the count MAPS ({@code column_sizes} / {@code value_counts} / {@code null_value_counts} /
+     * {@code nan_value_counts}) as {field_id: long}; {@code lower_bounds} / {@code upper_bounds} as
+     * {field_id: hex-of-bytes}; list columns ({@code split_offsets} / {@code equality_ids}) as JSON arrays;
+     * nulls as JSON null.
+     */
+    @SuppressWarnings("unchecked")
+    private static void fileRowToJson(
+        StructLike row, List<Types.NestedField> columns, JsonGenerator gen) throws IOException {
+      gen.writeStartObject();
+      for (int i = 0; i < columns.size(); i++) {
+        Types.NestedField column = columns.get(i);
+        String name = column.name();
+        if (MetricsUtil.READABLE_METRICS.equals(name)) {
+          continue; // DEFER readable_metrics for A1 (see class comment).
+        }
+        Object value = row.get(i, Object.class);
+        if (value == null) {
+          gen.writeNullField(name);
+          continue;
+        }
+        switch (name) {
+          case "partition":
+            writePartition(gen, name, (StructLike) value, column.type().asStructType());
+            break;
+          case "column_sizes":
+          case "value_counts":
+          case "null_value_counts":
+          case "nan_value_counts":
+            writeLongMap(gen, name, (Map<Integer, Long>) value);
+            break;
+          case "lower_bounds":
+          case "upper_bounds":
+            writeBytesMap(gen, name, (Map<Integer, ByteBuffer>) value);
+            break;
+          case "split_offsets":
+            writeLongList(gen, name, (List<Long>) value);
+            break;
+          case "equality_ids":
+            writeIntList(gen, name, (List<Integer>) value);
+            break;
+          default:
+            writeScalar(gen, name, value);
+        }
+      }
+      gen.writeEndObject();
+    }
+
+    /** A scalar column — number / boolean / string / CharSequence — written verbatim. */
+    private static void writeScalar(JsonGenerator gen, String name, Object value) throws IOException {
+      if (value instanceof Integer) {
+        gen.writeNumberField(name, (Integer) value);
+      } else if (value instanceof Long) {
+        gen.writeNumberField(name, (Long) value);
+      } else if (value instanceof Boolean) {
+        gen.writeBooleanField(name, (Boolean) value);
+      } else if (value instanceof ByteBuffer) {
+        gen.writeStringField(name, toHex((ByteBuffer) value));
+      } else {
+        // file_path / file_format are CharSequence-y; toString() yields the underlying string.
+        gen.writeStringField(name, value.toString());
+      }
+    }
+
+    /** The {@code partition} struct as a nested object keyed by sub-field name (identity(category)). */
+    private static void writePartition(
+        JsonGenerator gen, String name, StructLike partition, Types.StructType type)
+        throws IOException {
+      gen.writeObjectFieldStart(name);
+      List<Types.NestedField> fields = type.fields();
+      for (int i = 0; i < fields.size(); i++) {
+        Types.NestedField field = fields.get(i);
+        Object value = partition.get(i, Object.class);
+        if (value == null) {
+          gen.writeNullField(field.name());
+        } else {
+          writeScalar(gen, field.name(), value);
+        }
+      }
+      gen.writeEndObject();
+    }
+
+    /** A metric count MAP {field_id: long}. */
+    private static void writeLongMap(JsonGenerator gen, String name, Map<Integer, Long> map)
+        throws IOException {
+      gen.writeObjectFieldStart(name);
+      for (Map.Entry<Integer, Long> entry : map.entrySet()) {
+        gen.writeNumberField(Integer.toString(entry.getKey()), entry.getValue());
+      }
+      gen.writeEndObject();
+    }
+
+    /** A bound MAP {field_id: hex-of-bytes} (lowercase hex of the raw ByteBuffer single-value bytes). */
+    private static void writeBytesMap(JsonGenerator gen, String name, Map<Integer, ByteBuffer> map)
+        throws IOException {
+      gen.writeObjectFieldStart(name);
+      for (Map.Entry<Integer, ByteBuffer> entry : map.entrySet()) {
+        gen.writeStringField(Integer.toString(entry.getKey()), toHex(entry.getValue()));
+      }
+      gen.writeEndObject();
+    }
+
+    /** A {@code split_offsets} list as a JSON array of longs. */
+    private static void writeLongList(JsonGenerator gen, String name, List<Long> list)
+        throws IOException {
+      gen.writeArrayFieldStart(name);
+      for (Long element : list) {
+        gen.writeNumber(element);
+      }
+      gen.writeEndArray();
+    }
+
+    /** An {@code equality_ids} list as a JSON array of ints. */
+    private static void writeIntList(JsonGenerator gen, String name, List<Integer> list)
+        throws IOException {
+      gen.writeArrayFieldStart(name);
+      for (Integer element : list) {
+        gen.writeNumber(element);
+      }
+      gen.writeEndArray();
+    }
+
+    /** Lowercase hex of a {@link ByteBuffer}'s remaining bytes (does NOT consume the buffer). */
+    private static String toHex(ByteBuffer buffer) {
+      ByteBuffer dup = buffer.duplicate();
+      StringBuilder hex = new StringBuilder(dup.remaining() * 2);
+      while (dup.hasRemaining()) {
+        hex.append(String.format("%02x", dup.get() & 0xff));
+      }
+      return hex.toString();
+    }
+  }
+
+  /**
+   * A minimal INSTANCE-based {@link TableOperations} that COMMITS metadata to LOCAL DISK (mirroring the
+   * Java test-only {@code TestTables.TestTableOperations} / {@code LocalTableOperations}). Unlike the
+   * in-memory ops above, a commit here writes the new {@code TableMetadata} to {@code <metadataDir>/vN.
+   * metadata.json} via {@link LocalFileIO}, and {@code io()} returns that {@link LocalFileIO} so a real
+   * {@code newAppend()} / {@code newRowDelta()} writes its AVRO manifests + manifest-list to disk. Single
+   * instance per table, single-threaded — no optimistic-concurrency machinery needed.
+   */
+  private static final class LocalTableOperations implements TableOperations {
+    private final File tableDir;
+    private final File metadataDir;
+    private TableMetadata current;
+    private int version = -1;
+    private long lastSnapshotId = 0;
+
+    LocalTableOperations(File tableDir, File metadataDir) {
+      this.tableDir = tableDir;
+      this.metadataDir = metadataDir;
+    }
+
+    @Override
+    public TableMetadata current() {
+      return current;
+    }
+
+    @Override
+    public TableMetadata refresh() {
+      return current;
+    }
+
+    @Override
+    public void commit(TableMetadata base, TableMetadata metadata) {
+      if (base != current) {
+        throw new CommitFailedException("stale base metadata");
+      }
+      this.version += 1;
+      String fileName = String.format("v%d.metadata.json", version);
+      File metadataFile = new File(metadataDir, fileName);
+      OutputFile out = io().newOutputFile(metadataFile.getAbsolutePath());
+      TableMetadataParser.write(metadata, out);
+      // Strip pending changes and pin the on-disk metadata location, exactly as a real catalog commit does.
+      this.current =
+          TableMetadata.buildFrom(metadata)
+              .discardChanges()
+              .withMetadataLocation(metadataFile.getAbsolutePath())
+              .build();
+      for (Snapshot snapshot : current.snapshots()) {
+        this.lastSnapshotId = Math.max(lastSnapshotId, snapshot.snapshotId());
+      }
+    }
+
+    @Override
+    public FileIO io() {
+      return new LocalFileIO();
+    }
+
+    @Override
+    public String metadataFileLocation(String fileName) {
+      return new File(metadataDir, fileName).getAbsolutePath();
+    }
+
+    @Override
+    public LocationProvider locationProvider() {
+      return LocationProviders.locationsFor(current.location(), current.properties());
+    }
+
+    @Override
+    public long newSnapshotId() {
+      long next = lastSnapshotId + 1;
+      this.lastSnapshotId = next;
+      return next;
+    }
+  }
+
+  /**
+   * A pure-disk {@link FileIO} mirroring {@code TestTables.LocalFileIO}: reads/writes via
+   * {@link org.apache.iceberg.Files#localInput} / {@link org.apache.iceberg.Files#localOutput} (which strip
+   * a leading {@code file:} prefix), so the AVRO manifests + manifest-list + metadata land on the local
+   * filesystem at the BARE absolute paths the Rust {@code FileIO::new_with_fs()} resolves.
+   */
+  private static final class LocalFileIO implements FileIO {
+    @Override
+    public InputFile newInputFile(String path) {
+      return org.apache.iceberg.Files.localInput(path);
+    }
+
+    @Override
+    public OutputFile newOutputFile(String path) {
+      return org.apache.iceberg.Files.localOutput(path);
+    }
+
+    @Override
+    public void deleteFile(String path) {
+      String localPath = path.startsWith("file:") ? path.replaceFirst("file:", "") : path;
+      if (!new File(localPath).delete()) {
+        throw new RuntimeException("failed to delete file: " + path);
+      }
     }
   }
 
