@@ -2133,3 +2133,69 @@ How to use it (see the manuals' §2):
   DATA append (the data check did not run), and data-flag-only must allow a matching concurrent DELETE (the delete
   check did not run). A single "both off / both on" pair cannot catch an accidental coupling where one flag enables
   both checks.
+
+### 2026-06-09 (DeleteFiles validateFilesExist — status axis on the validation walk, BUILDER Opus)
+- **DO add a STATUS AXIS to the shared `files_after` walk (was `added_files_after`) — parameterize
+  `status_to_keep: ManifestStatus` — rather than fork a second near-identical walk.** *Why:* Java's
+  `validationHistory` is one walk; the per-check `ManifestGroup` entry filter differs only in the status it
+  keeps (`Added` for the conflict checks via `ignoreDeleted().ignoreExisting()`; `Deleted` for
+  `validateDataFilesExist`/`deletedDataFiles` via `entry.status() == DELETED` + `ignoreExisting()`). The two
+  existing callers (`added_data_files_after`, `added_delete_files_after`) pass `ManifestStatus::Added` and are
+  BEHAVIOR-PRESERVING — proven by the ReplacePartitions/RowDelta/OverwriteFiles conflict tests staying green.
+  The new `deleted_data_files_after` passes `ManifestStatus::Deleted`. One walk, one axis, no drift.
+- **DO confirm the Deleted-tombstone SOURCING before trusting the `added_snapshot_id == snapshot_id` manifest
+  filter for a concurrent deletion.** *Why:* the load-bearing question is "does a concurrently-deleted file's
+  `Deleted` tombstone live in a manifest the concurrent snapshot ITSELF wrote?" It does:
+  `rewrite_manifest_with_deletes` (snapshot.rs) writes the removed entry via `add_delete_entry` into a NEW
+  manifest whose `added_snapshot_id` is the committing snapshot id. So the SAME `added_snapshot_id ==
+  snapshot.snapshot_id()` filter that finds a snapshot's `Added` entries also finds its `Deleted` tombstones —
+  exactly Java's `manifest.snapshotId() == currentSnapshot.snapshotId()`. Mutation-verified end-to-end (the
+  headline test fails the instant the status axis keeps `Added`), so the sourcing claim is pinned, not assumed.
+- **DO model `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}` as `{Overwrite, Delete}` in
+  Rust and SAY WHY.** *Why:* the Rust `Operation` enum has no `Replace` variant (a `ReplacePartitions` commit
+  records `Operation::Overwrite`; a rewrite is not yet a distinct op). Dropping the unrepresentable `REPLACE` is
+  faithful — Rust never records a `REPLACE` snapshot to miss — NOT a gap. Document it on the predicate so a
+  future agent adding a `Replace` op extends the set.
+- **DO recognize the flag-OFF control yields a DIFFERENT error than the validation path, and assert on the
+  DISTINCTION.** *Why:* with `validate_files_exist()` OFF, the re-based delete still cannot resolve the
+  concurrently-vanished file, so `resolve_delete_paths` fails with the GENERIC "Missing required files to delete"
+  — NOT the validateDataFilesExist "Cannot commit, missing data files". Asserting the OFF test gets the generic
+  message AND does NOT get the validation message proves the validation path is the genuinely OPT-IN one (a
+  weaker `is_err()` assertion would pass even if validation always ran). The two messages must stay textually
+  distinct for this to hold.
+- **DO note the `StreamingDelete.validate()` wiring nuance honestly.** *Why:* Java `StreamingDelete.validate()`
+  calls `failMissingDeletePaths()` (the filter-manager required-deletes mechanism), NOT `validateDataFilesExist`
+  directly — `validateDataFilesExist` is the method the brief targets for the Rust delete path
+  (requiredDataFiles = the files being deleted), modeled on RowDelta/ReplacePartitions' `validate` seam. The
+  Rust port is faithful to `validateDataFilesExist`'s CONTRACT; flag the wiring difference rather than imply
+  `StreamingDelete` calls it.
+
+### 2026-06-09 (Phase 2 — DeleteFiles `validateFilesExist`, REVIEWER Opus)
+- **DO add the no-override tx-captured-start test for EVERY new conflict-validation action — it is the SAME
+  gap the Increment-6 reviewer already caught for OverwriteFiles/RowDelta/ReplacePartitions, and it recurs.**
+  *Why:* the DeleteFiles builder's 5 files-exist tests ALL passed `.validate_from_snapshot(...)`, which
+  short-circuits `effective_start = validate_from_snapshot.or(starting_snapshot_id)` and NEVER reads the
+  tx-captured `starting_snapshot_id` field. Mutation-verified the gap was REAL: rewriting the fallback to read
+  the REFRESHED head (`current.metadata().current_snapshot_id()`) instead of the tx-captured start passed ALL
+  16 delete_files tests — the brief's #1 danger (start re-read at validation time ⇒ start == current head ⇒
+  empty concurrent window ⇒ the files-exist check silently ALWAYS PASSES) was completely unpinned. Added
+  `test_delete_files_exist_rejects_concurrent_using_tx_captured_starting_snapshot` (validate enabled, NO
+  override, concurrent same-file delete): the refreshed-head mutation now fails EXACTLY this one test (16
+  passed / 1 failed), proving it uniquely pins the `Transaction::new` capture surviving `do_commit`'s re-base.
+  When porting a validation that has BOTH an explicit `validate_from_snapshot` override AND an implicit
+  tx-captured default, a test that always sets the override cannot pin the default source — write one that omits it.
+- **DO mutation-test the content-type axis AND the intersection direction separately, not just the status/op
+  axes.** *Why:* beyond the four mutations the builder ran, two more axes are independently load-bearing and
+  were each pinned by a DISTINCT test: (1) `deleted_data_files_after` using `ManifestContentType::Deletes`
+  instead of `Data` misses the data-file tombstone (tombstones live in DATA manifests) → headline fails;
+  (2) the `validate` intersection ignoring `delete_paths` (matching ANY concurrently-deleted file) rejects a
+  disjoint concurrent delete → the different-file negative control fails. The negative control is what makes
+  `requiredDataFiles = delete_paths` load-bearing rather than "any concurrent deletion rejects." A mutation
+  that survives every existing test = an unpinned axis; run the content-type and intersection mutations, not
+  only the status/op/retryable ones.
+- **CONFIRMED behavior-preserving (status-axis generalization): inverting the shared `added_snapshot_id ==
+  snapshot_id` manifest filter fails 17 transaction tests across BOTH axes** — the DeleteFiles headline/override
+  (Deleted-tombstone sourcing) AND the OverwriteFiles/RowDelta/ReplacePartitions conflict tests (Added-entry
+  sourcing). One mutation failing both families is the proof the `files_after` generalization kept the
+  manifest-sourcing semantics identical for the two `ManifestStatus::Added` callers while extending it to the
+  `Deleted` caller — the status axis is the ONLY behavioral change, and it is parameterized, not hard-coded.

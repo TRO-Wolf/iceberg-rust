@@ -337,8 +337,10 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   (Phase 3 Increment 3, `transaction/overwrite_files.rs`) — the same opt-in shape plus a
   `conflict_detection_filter(Predicate)`, tested per-file with the existing `InclusiveMetricsEvaluator`
   (None-filter ⇒ `AlwaysTrue`); see Phase 3. **Conflict-validation sub-sequence:** (6) foundation +
-  `ReplacePartitions` [done 🟡]; `OverwriteFiles.validateNoConflictingData` [done 🟡]; then `OverwriteFiles`
-  `validateAddedFilesMatchOverwriteFilter`/`...Deletes`; `RowDelta`/`DeleteFiles` `validateDataFilesExist`;
+  `ReplacePartitions` [done 🟡]; `OverwriteFiles.validateNoConflictingData` [done 🟡];
+  `RowDelta.validateNoConflictingDataFiles`/`...DeleteFiles` [done 🟡];
+  `DeleteFiles.validateFilesExist` [done 🟡 (2026-06-09), via the walk's status axis]; then `OverwriteFiles`
+  `validateAddedFilesMatchOverwriteFilter`/`...Deletes`; `RowDelta` `validateDataFilesExist`;
   `RewriteFiles` `validateNoNewDeletes`),
   7. `RewriteManifests`, merge append,
   8. multi-op transaction hardening + optimistic-concurrency retry on the real catalogs.
@@ -410,6 +412,32 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   remaining RowDelta DELETE-file blocks (`validateNoNewDeletesForDataFiles`, `validateDataFilesExist`,
   `validateAddedDVs` — need `referenced_data_files`/`removed_data_files` on the action); `RewriteFiles`
   `validateNoNewDeletes`.
+- **`DeleteFiles.validateFilesExist` (files-exist) landed 🟡 (2026-06-09, `transaction/delete_files.rs` +
+  `transaction/snapshot.rs`):** reject the commit if a data file this delete is removing was already DELETED by a
+  concurrent commit since the starting snapshot (Java `StreamingDelete.validateFilesExist` →
+  `MergingSnapshotProducer.validateDataFilesExist` L773-822 / `deletedDataFiles` L695-735). The walk gained a
+  **status axis**: `files_after(table, start, content, op_filter, status_to_keep)` replaces the Added-only
+  `added_files_after` — the two existing callers (`added_data_files_after`, `added_delete_files_after`) pass
+  `ManifestStatus::Added` (BEHAVIOR-PRESERVING, their conflict tests stay green), and the new `pub(crate)
+  deleted_data_files_after` passes `(Data, operation_removes_data_files = {Overwrite, Delete}, ManifestStatus::Deleted)`
+  (Java `VALIDATE_DATA_FILES_EXIST_OPERATIONS` + `entry.status() == DELETED` + `ignoreExisting`). A concurrent
+  delete's rewritten manifest carries the `Deleted` tombstone under its own `added_snapshot_id`, so the existing
+  `added_snapshot_id == snapshot_id` manifest filter finds it. The action gained OPT-IN `validate_files_exist()` +
+  `validate_from_snapshot(id)` and a `validate` override (mirrors ReplacePartitions): non-retryable `DataInvalid`
+  "Cannot commit, missing data files: {path}". 6 tests (real concurrent `delete_files` between txn-build and
+  txn-commit: no-concurrent OK; same-file deletion → REJECTED non-retryable naming the file; different-file
+  deletion → OK; flag OFF → snapshot isolation [generic path-resolution error, not the validation error];
+  `validate_from_snapshot` override; tx-captured start survives the re-base [reviewer-added — the only test that
+  pins the `Transaction::new` capture surviving `do_commit`'s re-base, since every other test sets the override]).
+  8 mutations caught (status axis Added-vs-Deleted; `validate` always-Ok; op set drops `Delete`; content type
+  `Deletes` not `Data`; manifest-sourcing filter inverted [also fails the two `Added` callers]; intersection
+  ignores `delete_paths`; tx-captured fallback reads the refreshed head; retryable kind → loop spins). **Op-set note:** Java's set is `{OVERWRITE, REPLACE, DELETE}`;
+  Rust's `Operation` enum has no `REPLACE`, so `{Overwrite, Delete}` is faithful (Rust never records a `REPLACE`
+  snapshot to miss). **`StreamingDelete` wiring nuance:** Java `StreamingDelete.validate()` calls
+  `failMissingDeletePaths()` (the filter-manager check), NOT `validateDataFilesExist`; this ports the
+  `validateDataFilesExist` *contract* (requiredDataFiles = the files being deleted) for the Rust delete path.
+  **Still deferred:** the `skipDeletes` op-set variant (`VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS =
+  {OVERWRITE, REPLACE}`, used by RowDelta/OverwriteFiles); `RowDelta.validateDataFilesExist`.
 - **Scan metrics-report model + `MetricsReporter` API (started 2026-06-08):** the self-contained metrics
   DATA MODEL + reporter API landed 🟡 (Increment 3, new `metrics/mod.rs`, Java `org.apache.iceberg.metrics`).
   `MetricsReport` (closed `#[non_exhaustive] enum`, `Scan(ScanReport)` — enum dispatch over `dyn`+downcast);

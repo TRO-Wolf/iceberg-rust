@@ -3868,3 +3868,52 @@ Plan:
 `startingSequenceNumber`; this port enumerates concurrent-added delete files by the snapshot walk + inclusive
 metrics only (no seq-number refinement) — a conservative over-scan (can only over-reject, never under-reject),
 same class as Inc-3's manifest-summary pre-filter deferral.
+
+---
+
+## Active (2026-06-09): DeleteFiles validateFilesExist (validateDataFilesExist for the delete path)
+
+Increment: Java `MergingSnapshotProducer.validateDataFilesExist` semantics for the DeleteFiles action —
+reject the commit if any data file this op is deleting was DELETED by a concurrent commit since the start.
+
+- [x] **snapshot.rs status axis** — generalize `added_files_after`'s hard `status() == Added` filter into a
+  `status_to_keep: ManifestStatus` parameter. The two existing callers (`added_data_files_after`,
+  `added_delete_files_after`) pass `ManifestStatus::Added` (BEHAVIOR-PRESERVING — their tests stay green).
+- [x] **snapshot.rs `operation_removes_data_files`** — `{Overwrite, Replace, Delete}` (Java
+  `VALIDATE_DATA_FILES_EXIST_OPERATIONS`). Note: Rust `Operation` has no `Replace` variant → only
+  `{Overwrite, Delete}` are representable; document.
+- [x] **snapshot.rs `deleted_data_files_after(table, start) -> Vec<DataFile>`** — DATA content,
+  `operation_removes_data_files`, `ManifestStatus::Deleted`. The concurrent delete's rewritten manifest
+  carries the Deleted tombstone with `added_snapshot_id == that snapshot` (verified in
+  `rewrite_manifest_with_deletes`), so the existing manifest filter finds it.
+- [x] **delete_files.rs** — add `validate_files_exist: bool` + `validate_from_snapshot: Option<i64>` fields +
+  `validate_files_exist()` / `validate_from_snapshot(i64)` builders + a `validate` override (mirror
+  ReplacePartitions): if OFF ⇒ Ok; effective_start = override.or(start); enumerate
+  `deleted_data_files_after`; if any deleted file's path ∈ self.delete_paths ⇒ non-retryable
+  `Error::new(DataInvalid, "Cannot commit, missing data files: <path>")`.
+- [x] **Tests (5)** + mutation checks (a–d) + behavior-preservation of the two Added callers.
+- [x] **Docs** — GAP_MATRIX, Roadmap, lessons; note skip-deletes op-set variant + RowDelta
+  validateDataFilesExist deferred.
+
+**Java divergence flagged up front:** `StreamingDelete.validate()` actually calls `failMissingDeletePaths()`
+(the filter-manager required-deletes check), NOT `validateDataFilesExist`. The brief directs the
+`validateDataFilesExist`-semantics port for the delete path (requiredDataFiles = the files being deleted),
+modeled on RowDelta/ReplacePartitions. Faithful to `validateDataFilesExist`'s contract; report the
+StreamingDelete wiring nuance.
+
+**Outcome (2026-06-09):** Landed. `transaction/snapshot.rs` (status axis `files_after` +
+`operation_removes_data_files` + `deleted_data_files_after`) + `transaction/delete_files.rs`
+(`validate_files_exist()` / `validate_from_snapshot()` + `validate` override + 5 tests). Lib total
+1573 → 1578. transaction:: 246 green (the two Added callers behavior-preserving). 4 mutations caught.
+Docs updated (GAP_MATRIX, Roadmap, lessons). Deferred: skip-deletes op-set variant + RowDelta
+validateDataFilesExist.
+
+**REVIEW (2026-06-09, Opus):** Verified behavior-preservation (inverting the shared manifest filter fails 17
+tests across BOTH the Deleted and Added axes), the deleted-file enumeration vs Java (content DATA, op
+`{Overwrite, Delete}`, status Deleted — op set PINNED by a real `Delete`-op concurrent deletion), end-to-end
+through `tx.commit` + non-retryable. Ran 8 mutations (the builder's 4 + content-type/manifest-filter/intersection/
+tx-captured-fallback); ALL caught after a fix. **Found + fixed 1 SURVIVING mutation:** the tx-captured
+`starting_snapshot_id` fallback (no `validate_from_snapshot`) was unpinned (the recurring Increment-6 gap — all
+5 builder tests set the override). Added `test_delete_files_exist_rejects_concurrent_using_tx_captured_starting_snapshot`
+(reviewer); the refreshed-head mutation now fails exactly it. Lib total 1578 → **1579**. Docs reconciled (test
+count 5→6, mutation list 4→8).
