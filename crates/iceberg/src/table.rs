@@ -23,7 +23,7 @@ use crate::arrow::ArrowReaderBuilder;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
-use crate::scan::TableScanBuilder;
+use crate::scan::{IncrementalAppendScanBuilder, TableScanBuilder};
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
@@ -222,6 +222,18 @@ impl Table {
     /// Creates a table scan.
     pub fn scan(&self) -> TableScanBuilder<'_> {
         TableScanBuilder::new(self)
+    }
+
+    /// Creates an incremental append scan, which plans the data files APPENDED between
+    /// two snapshots — the range `(from_snapshot_id exclusive, to_snapshot_id inclusive]`,
+    /// considering only `APPEND`-operation snapshots (overwrites and deletes in the range
+    /// are excluded, and no delete files are applied).
+    ///
+    /// Mirrors Java `Table.newIncrementalAppendScan()` /
+    /// `BaseIncrementalAppendScan`. See
+    /// [`IncrementalAppendScanBuilder`](crate::scan::IncrementalAppendScanBuilder).
+    pub fn incremental_append_scan(&self) -> IncrementalAppendScanBuilder<'_> {
+        IncrementalAppendScanBuilder::new(self)
     }
 
     /// Creates a metadata table which provides table-like APIs for inspecting metadata.

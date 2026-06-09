@@ -21,6 +21,8 @@ mod cache;
 use cache::*;
 mod context;
 use context::*;
+mod incremental;
+pub use incremental::*;
 mod task;
 
 use std::sync::Arc;

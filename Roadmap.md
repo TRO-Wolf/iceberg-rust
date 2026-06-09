@@ -462,6 +462,23 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
      unchanged (additive). 12 unit tests; mutations (swap lower↔upper, wrong-field-id count, raw-bytes bound)
      each caught. **The inspection-table COLUMN set is now COMPLETE; only Java/Spark inspection interop
      remains.**
+  7. **`IncrementalAppendScan`** — **DONE 🟡 (2026-06-08, overnight-run Increment 2,
+     `scan/incremental.rs`, Java `BaseIncrementalAppendScan` + `BaseIncrementalScan`).** The incremental/CDC
+     read primitive: `Table::incremental_append_scan()` plans the data files APPENDED in the range
+     `(from_snapshot_id exclusive, to_snapshot_id inclusive]`, considering ONLY `Operation::Append` snapshots
+     (overwrites/deletes in the range excluded; no delete files applied). A SEPARATE planner that does NOT
+     touch the single-snapshot `TableScan::plan_files`: a bounded ancestor walk computes the APPEND snapshots
+     in the range (Java `appendsBetween`), keeps the DATA manifests each snapshot itself ADDED
+     (`added_snapshot_id == snapshot_id`), and streams the `Added`-entry `FileScanTask`s REUSING the existing
+     `PlanContext`/`ManifestEntryContext` + `into_file_scan_task` machinery (same partition-filter pruning +
+     residual evaluator) with an EMPTY delete index. The only seam in `scan/context.rs` is an additive
+     `build_manifest_file_contexts_from_files` that the existing `build_manifest_file_contexts` delegates to —
+     the normal scan is byte-unchanged. Builder mirrors Java's API
+     (`from_snapshot_id_exclusive`/`from_snapshot_id_inclusive`/`to_snapshot_id` defaulting to current +
+     `with_filter`/`select`). 13 unit tests; all four mutations (inclusive boundary, drop append-only filter,
+     read all manifests, drop the `status == Added` entry filter) caught — the last pinned by a reviewer-added
+     mixed-status-own-manifest test (the fast-append fixtures alone could not exercise the `Added` filter).
+     Validation + interop deferred → 🟡; `IncrementalChangelogScan`/`BatchScan` still pending.
 - **Exit criteria:** scans match Java planning/results incl. residuals; inspection tables present; reports
   emitted.
 

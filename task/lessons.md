@@ -1899,3 +1899,81 @@ How to use it (see the manuals' §2):
   on one long column, asserting each sub-field reports exactly its own source value. Re-verified it catches
   both the null↔nan swap and the column_size↔value_count swap. General rule: when N sources feed N output
   slots and the happy-path fixture only populates a couple, one test must give all N distinct values.
+
+### 2026-06-08 (Phase 3 overnight Increment 2 — IncrementalAppendScan, BUILDER Opus)
+- **DO build a SEPARATE incremental planner that REUSES `PlanContext` + `ManifestEntryContext` +
+  `into_file_scan_task`, driving the manifest SELECTION itself rather than calling `PlanContext::
+  get_manifest_list`.** *Why:* the normal scan's `plan_files` reads ONE snapshot's manifest list; the
+  incremental scan must gather manifests across the APPEND snapshots in `(from, to]` and keep only the DATA
+  manifests each snapshot itself added (`added_snapshot_id == snapshot_id`). The clean seam is an additive
+  `PlanContext::build_manifest_file_contexts_from_files(Vec<ManifestFile>, …)` that takes an explicit,
+  pre-filtered manifest set; the existing `build_manifest_file_contexts` delegates to it (behavior-preserving —
+  the normal scan is byte-unchanged), so the incremental planner inherits the partition-filter pruning +
+  residual-evaluator construction for free and only re-implements the `Added`-status entry filter + the
+  append-only snapshot walk. The `PlanContext.snapshot` is set to the `to` snapshot purely as the schema +
+  metadata anchor — the incremental planner never calls `get_manifest_list` on it.
+- **DO take the `_from_files` seam by OWNED `Vec<ManifestFile>`, not `Vec<&ManifestFile>`.** *Why:* the
+  function returns a `Box<impl Iterator + 'static>` (built from an eagerly-collected `Vec`, every `ManifestFile`
+  cloned inside `create_manifest_file_context`). A `Vec<&ManifestFile>` input ties the borrow to the caller's
+  `Arc<ManifestList>` and the borrow checker conservatively requires that `Arc` to outlive the `'static` return
+  (`E0597: manifest_list does not live long enough` in the delegating wrapper, where the list drops at scope
+  end). Owned input sidesteps it; the wrapper clones via `manifest_list.entries().to_vec()` — the entries were
+  cloned per-manifest anyway, so it is not extra cost on the hot path.
+- **DO read the Java `BaseIncrementalScan.fromSnapshotIdExclusive` preconditions — `from == to` EXCLUSIVE is
+  REJECTED, not an empty range.** *Why:* the brief listed "`from == to` (empty range) → zero tasks," but the
+  exclusive path validates `SnapshotUtil.isParentAncestorOf(table, to, from)` FIRST (in `planFiles`), and a
+  snapshot is never a parent ancestor of itself → Java throws "Starting snapshot (exclusive) … is not a parent
+  ancestor of end snapshot …". The `ancestorsBetween` `latestSnapshotId == oldestSnapshotId ⇒ empty`
+  short-circuit is unreachable for the exclusive case (precondition fails before it). The reachable
+  "empty range → zero tasks" case is a non-empty range whose ONLY snapshot is an OVERWRITE — the append-only
+  op filter drops it. Pinned `from==to` as a rejection (Java-faithful) AND the overwrite-only range as empty;
+  do NOT "fix" the brief's wording by returning empty for `from==to` exclusive (it would diverge from Java).
+- **DO keep BOTH the manifest-level `added_snapshot_id == snapshot_id` filter AND the `status == Added` entry
+  filter even though, for fast-append snapshots, the manifest filter already implies Added-only entries.** *Why:*
+  they guard the same invariant from two angles and BOTH mirror Java (`snapshotIds.contains(manifest.snapshotId())`
+  + `manifestEntry.status() == ADDED`). The manifest filter is the load-bearing one (mutation `|| true` →
+  carried-forward manifests re-surface their `Added` entries from an OLDER snapshot's own manifest, double-counting
+  files — caught by the own-added-manifest count test). The `Added`-entry filter is defense-in-depth for this
+  increment (a fast-append snapshot's own data manifest has only `Added` entries), load-bearing if a future
+  merge-append writes `Existing` entries into a snapshot's own added manifest — keep it, it is Java-faithful and
+  free. Verified the manifest mutation fails 6 tests; the entry-status filter has no isolated failure here (noted,
+  not forced into an artificial test).
+- **DO copy the 15-line `make_v3_minimal_table_in_catalog` locally into the scan test module rather than widen
+  `transaction::tests` visibility.** *Why:* `transaction::tests` is a private `mod tests` (NOT `pub(crate)`), so
+  `scan::incremental::tests` cannot `use crate::transaction::tests::…` (E0603 private module) — unlike the
+  replace_partitions tests which sit INSIDE `transaction/` and reach it via `super::tests`. Re-reading the same
+  `TableMetadataV3ValidMinimal.json` into a local helper keeps visibility narrow (same lesson as Increment 3's
+  inspect-module `make_v2_table` copies). A `MemoryCatalog` (default in-memory storage) is fine for `plan_files()`
+  path assertions — it reads manifest metadata, never the parquet data — so no real-FS storage factory is needed
+  unless a test calls `.to_arrow()`.
+
+### 2026-06-08 (Increment 2 — IncrementalAppendScan, REVIEWER Opus)
+- **DO pin a "no isolated failure" filter with a REAL mixed-status fixture rather than leaving it noted.** *Why:*
+  the IncrementalAppendScan builder correctly observed the `status == Added` entry filter had no failing test
+  (the fast-append fixtures produce own-added manifests holding ONLY `Added` entries, so dropping the filter
+  changed nothing — mutation (e) SURVIVED). But "the Rust write engine can't currently produce the violating
+  shape" is a write-engine property that a future `MergeAppend` will break; an unpinned filter is then a silent
+  regression. The fix did NOT need an artificial hand-built manifest: `scan::tests::TableTestFixture::
+  setup_manifest_files` already writes a single manifest — added by the CURRENT (APPEND) snapshot — holding
+  `1.parquet`(Added)/`2.parquet`(Deleted)/`3.parquet`(Existing), and its `example_table_metadata_v2.json`
+  current snapshot is an `append` whose parent is the exclusive `from`. An incremental scan `(parent, current]`
+  over it must return ONLY `1.parquet`; the NORMAL scan over the same fixture returns BOTH `1.parquet` and
+  `3.parquet` (it keeps Existing) — that divergence IS the `Added`-filter contract. Added
+  `test_incremental_append_keeps_only_added_entries_of_own_manifest`; mutation-verified it fails iff the filter
+  is dropped, and NOTHING else fails (precise pin). Reuse an existing mixed-status fixture before hand-rolling one.
+- **DO NOT `git checkout -- <file>` to revert a mutation on a TRACKED file whose increment changes are still
+  UNCOMMITTED — it reverts to HEAD and WIPES the uncommitted work.** *Why:* `scan/context.rs` is git-tracked and
+  the builder's additive seam (`build_manifest_file_contexts_from_files`) was uncommitted; `git checkout --
+  context.rs` to undo a routing mutation silently discarded the entire seam (grep confirmed the fn was gone),
+  which would have broken the build (`incremental.rs` calls it). Restored it by re-applying the exact two edits
+  from the `git diff` I had read. For an in-place mutation+revert on a tracked-but-dirty file, revert with a
+  surgical Edit (or stash-free manual undo), NEVER `git checkout`. (Untracked files like `incremental.rs` can't
+  be `git checkout`-ed at all — `pathspec did not match` — so they already force the manual-revert discipline.)
+- **DO verify the entry-level `snapshotIds.contains(entry.snapshotId())` filter Java applies is REDUNDANT in the
+  Rust port, not missing.** *Why:* Java `appendFilesFromSnapshots` filters entries by BOTH
+  `snapshotIds.contains(entry.snapshotId())` AND `status == ADDED`; Rust only checks `status == Added`. This is
+  safe because a manifest is selected only when `added_snapshot_id == an APPEND-snapshot-id in range`, and within
+  such a manifest every `Added`-status entry carries that snapshot's id (Iceberg stamps the adding snapshot id on
+  Added entries; carried-forward entries are `Existing`/`Deleted`, not `Added`). So `status == Added` ⇒
+  `entry.snapshot_id ∈ snapshotIds` already holds — the entry-level id check cannot admit an extra file. The
+  omission is a benign simplification, NOT a missing-files / extra-files bug.

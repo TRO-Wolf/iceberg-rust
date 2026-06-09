@@ -3376,3 +3376,120 @@ lessons 2026-06-07 Increment-7 REVIEWER — a file this change never touched); (
 interop_update_schema / interop_update_partition_spec = 4/4 each; (6) `cargo clippy --workspace --exclude
 iceberg-sqllogictest --all-targets -- -D warnings` clean; (7) `cargo fmt --all -- --check` clean; (8) `typos`
 repo-wide exit 0. No commit, no branch switch, no edits outside `inspect/` + docs.
+
+### OVERNIGHT branch correction + Increment 2
+NOTE: a stray git op during Increment 1's builder left the tree on `main`; since the overnight scan/inspection
+items are INDEPENDENT of the rowdelta-delete helper, the overnight work is on branch **`phase3-overnight` off
+`main` (063b7153)** — NOT stacked on rowdelta-delete (simpler; no rebase needed). Increment 1 (readable_metrics)
+committed `31595dd4`. After EACH agent: re-verify `git branch --show-current == phase3-overnight`.
+
+### Increment 2 — IncrementalAppendScan (DETAIL)
+Java `BaseIncrementalAppendScan` (`core/.../BaseIncrementalAppendScan.java`): `doPlanFiles(fromExclusive,
+toInclusive)` → `appendsBetween(table, fromExclusive, toInclusive)` = the APPEND-operation snapshots in
+`(from, to]` (via `SnapshotUtil.ancestorsBetween` filtered to `operation == DataOperations.APPEND` — L111),
+then `appendFilesFromSnapshots(snapshots)` plans FileScanTasks for the data files those append snapshots ADDED
+(only Added entries from the manifests each snapshot itself added). Append-only: OVERWRITE/DELETE snapshots in
+the range are EXCLUDED. The API (`IncrementalAppendScan` interface): `fromSnapshotInclusive`/
+`fromSnapshotExclusive` + `toSnapshot` (default to = current).
+
+Rust approach (LOWEST-RISK — additive, do NOT refactor the existing single-snapshot `plan_files`): a SEPARATE
+planner. `Table::incremental_append_scan()` → a builder with `from_snapshot_id` (exclusive) + optional
+`to_snapshot_id` (default current) + `with_filter`/`select` (mirror `TableScanBuilder`). Planning: compute the
+append snapshots in `(from, to]` (mirror the `added_data_files_after` ancestor walk in `transaction/snapshot.rs`,
+but filtered to `Operation::Append` and bounded by both ends); for each, read the DATA manifests it ADDED
+(`added_snapshot_id == snapshot_id`), and for each `Added` entry build a `ManifestEntryContext` (reuse the
+existing `scan/context.rs` struct + `into_file_scan_task`, with an EMPTY delete index — an append scan applies
+no deletes) and stream `FileScanTask`s. Reuse the residual evaluator + the bound-filter machinery exactly as
+the normal scan does. Must NOT change existing `TableScan`/`plan_files` behavior.
+
+Tests (MemoryCatalog/TableTestFixture): multi-snapshot fixture with ≥2 appends; `incremental_append_scan`
+from=S0(excl) to=S2(incl) returns ONLY the files appended in S1+S2 (not S0's); from==to → empty; an OVERWRITE
+snapshot in the range is EXCLUDED; a filter prunes appended files by partition; default to=current. Mutation-
+pin: the exclusive-from boundary, the append-only op filter, the added-manifest filter. Confirm the normal
+`table.scan()` is unchanged. Widened gate (incl. datafusion tests).
+
+#### BUILDER plan (Opus, 2026-06-08)
+- [x] Add `scan/incremental.rs`: `IncrementalAppendScanBuilder` (`from_snapshot_id_exclusive`,
+      `from_snapshot_id_inclusive`, `to_snapshot_id`, `with_filter`, `select`/`select_all`/`select_empty`,
+      concurrency limits) → `build()` → `IncrementalAppendScan`. Validate snapshots exist + `to` descends `from`.
+- [x] `IncrementalAppendScan::plan_files()`: bounded ancestor walk of `(from, to]` filtered to
+      `Operation::Append`; for each, keep DATA manifests it ADDED (`added_snapshot_id == snapshot_id`); stream
+      `Added`-entry `FileScanTask`s reusing `PlanContext`/`ManifestEntryContext`/`into_file_scan_task` + EMPTY
+      delete index + residual evaluator.
+- [x] Seam in `scan/context.rs`: factor `build_manifest_file_contexts` to also accept an explicit
+      `Vec<ManifestFile>` (behavior-preserving for the normal scan) so the incremental planner reuses the
+      partition-pruning + residual machinery; add an `Added`-only entry filter for the incremental path.
+- [x] `Table::incremental_append_scan()` entry point in `table.rs`.
+- [x] Tests in `incremental.rs` (multi-append fixture): core multi-append set; from==to (rejected, Java-faithful);
+      OVERWRITE-in-range excluded; with_filter partition prune; default to=current; exclusive-from boundary.
+      Mutation-pin from-exclusive, append-only op filter, added-manifest filter.
+- [x] Regression: normal `table.scan().plan_files()` unchanged. Docs: GAP_MATRIX row 94 / Roadmap / lessons.
+
+#### Outcome (BUILDER, Opus, 2026-06-08)
+**API.** `Table::incremental_append_scan() -> IncrementalAppendScanBuilder` (mirrors `Table::scan()`). Builder:
+`from_snapshot_id_exclusive(i64)` (Java `fromSnapshotExclusive`), `from_snapshot_id_inclusive(i64)`
+(Java `fromSnapshotInclusive` — resolved to the parent as the exclusive bound at `build()`), `to_snapshot_id(i64)`
+(Java `toSnapshot`, defaults to the current snapshot), `with_filter`/`select`/`select_all`/`select_empty`/
+`with_case_sensitive`/`with_batch_size`/`with_concurrency_limit`. `build()` validates the `to`/`from` snapshots
+exist and the Java preconditions (inclusive `from` is an ancestor of `to`; exclusive `from` is a *parent
+ancestor* of `to`), then resolves schema/field-ids/bound-filter exactly as `TableScanBuilder::build`.
+**Planner design.** `IncrementalAppendScan::plan_files()` is a SEPARATE planner — the single-snapshot
+`TableScan::plan_files` is byte-unchanged. (1) `appends_between` does a bounded parent-chain walk from `to` back,
+stopping BEFORE the exclusive `from`, keeping only `Operation::Append` snapshots (Java `appendsBetween` /
+`SnapshotUtil.ancestorsBetween` filtered to APPEND; `from==to` short-circuits to empty inside the walk, but the
+exclusive `isParentAncestorOf` precondition gates it first). (2) For each append snapshot it loads the manifest
+list and keeps the DATA manifests THAT snapshot itself added (`added_snapshot_id == snapshot_id`, Java
+`manifest.snapshotId() == snapshot.snapshotId()`). (3) Those manifests are driven through the REUSED
+`PlanContext::build_manifest_file_contexts_from_files` (the additive seam) → the SAME partition-filter pruning +
+residual-evaluator construction as the normal scan, with an EMPTY `DeleteFileIndex` (drop the sender so it
+resolves to no-deletes). (4) `process_append_manifest_entry` keeps only `Added`-status entries (Java
+`filterManifestEntries(status==ADDED)`), runs the partition-expression + inclusive-metrics filters, and
+`into_file_scan_task` builds each `FileScanTask` (residual predicate, EMPTY deletes).
+**Range/append-only semantics.** `(from exclusive, to inclusive]`, APPEND-only — overwrites/deletes in the range
+are excluded entirely (snapshot-level op filter); no delete files applied (empty delete index).
+**Java lines verified.** `BaseIncrementalAppendScan.doPlanFiles` L46-57 → `appendsBetween` L105-117 (the
+`operation == DataOperations.APPEND` filter) → `appendFilesFromSnapshots` L68-99 (the
+`snapshotIds.contains(manifest.snapshotId())` manifest filter + `manifestEntry.status() == ADDED` entry filter).
+`BaseIncrementalScan` L159-187 (`fromSnapshotIdExclusive`: inclusive ⇒ `isAncestorOf` + parent bound;
+exclusive ⇒ `isParentAncestorOf`) + L133-157 (`toSnapshotIdInclusive` defaults to current). `SnapshotUtil`
+L211-229 (`ancestorsBetween` equal-from/to ⇒ empty) + L46-86 (`isAncestorOf`/`isParentAncestorOf`).
+**Tests (12, `scan/incremental.rs`).** core range S1+S2-not-S0 (the planner includes both later appends, excludes
+`from`'s files); exclusive-from boundary (S1's own files excluded); inclusive-from includes `from`'s files;
+`from==to` exclusive REJECTED (Java precondition; a snapshot is not its own parent ancestor); range with only an
+OVERWRITE → zero tasks (append-only filter); `with_filter(x==10)` prunes the x=20 appended file; default
+to=current; no-from whole-lineage; empty table → zero; non-ancestor `from` rejected; own-added-manifest-only
+count (carried-forward manifests don't re-surface files).
+**Mutations caught (edit+revert).** (a) inclusive from boundary (process `from` before breaking) → exclusive-from
++ core + 5 others fail; (b) drop the `Operation::Append` filter (`|| true`) → overwrite-excluded + no-append-range
+fail; (c) read all manifests not just the snapshot's own added (`|| true`) → own-added-manifest count + core +
+others fail. Each reverted after; full lib suite re-run green.
+**Gate (all 8, pinned nightly).** (1) `cargo build -p iceberg` OK; (2) `cargo build --workspace --exclude
+iceberg-sqllogictest --all-targets` OK; (3) `cargo test -p iceberg --lib` ×2 = **1542 passed / 0 failed** both
+runs (+12 new, was 1530); (4) `cargo test -p iceberg --lib scan::` = 55 passed (existing scan tests unchanged +
+12 new); (5) `cargo test -p iceberg-datafusion --lib --tests` = 80 + 9 passed; (6) interop_manage_snapshots /
+interop_update_schema / interop_update_partition_spec = 4/4 each; (7) `cargo clippy --workspace --exclude
+iceberg-sqllogictest --all-targets -- -D warnings` clean; (8) `cargo fmt --all -- --check` clean · `typos`
+exit 0. The normal `TableScan`/`plan_files` is UNCHANGED (the only `scan/mod.rs` edit is `mod incremental;` +
+`pub use`; the `context.rs` edit is the additive `_from_files` delegation). Stayed on `phase3-overnight`; no
+commit, no push; edits only in `scan/{mod,context,incremental}.rs` + `table.rs` + docs.
+
+#### REVIEW (2026-06-08, Opus REVIEWER, DELEGATED) — VERDICT: CHANGES-MADE (1 test added), PASS 🟡
+Verified independently: (1) the `context.rs` seam is behavior-preserving — read the delegation line-by-line:
+the loop body is byte-identical, only `manifest_list.entries().iter().collect()`→`.to_vec()` (owned clones,
+no semantic change) and `for x in manifest_files`→`for x in &manifest_files`; inside the loop `x` is
+`&ManifestFile` in BOTH versions, so `get_partition_filter`/`create_manifest_file_context` see identical
+types. (2) Range/append-only/own-manifest semantics match Java line-for-line (`appendsBetween` L105-117,
+`ancestorsBetween`/`isAncestorOf`/`isParentAncestorOf` L46-86/L211-229, the inclusive→parent + exclusive→
+parent-ancestor preconditions L159-187). (3) Java's entry-level `snapshotIds.contains(entry.snapshotId())`
+filter is REDUNDANT in Rust given manifest-selection + `status==Added` (not a missing check) — documented in
+lessons. **MUTATIONS run (edit+revert):** (a) inclusive-from CAUGHT, (b) drop append-only filter CAUGHT,
+(c) read-all-manifests CAUGHT, (d) exclude-`to` (start at to's parent) CAUGHT — all by existing tests; **(e)
+drop the `status==Added` entry filter SURVIVED** (the builder's noted gap — fast-append fixtures hold only
+Added entries). **Closed (e)** by adding `test_incremental_append_keeps_only_added_entries_of_own_manifest`,
+reusing `scan::tests::TableTestFixture::setup_manifest_files` (an APPEND snapshot whose own manifest carries
+Added+Existing+Deleted) — incremental scan returns ONLY the Added file; mutation-verified it fails iff the
+filter is dropped and nothing else. lib 1542→**1543**, scan:: 55→**56**. All 8 gates green; clippy/fmt/typos
+clean; no bare unwrap/expect in production; scope intact (no Cargo/spec/transaction/arrow/datafusion edits);
+docs reconciled to 13 tests / 4 mutations. NOTE: `git checkout -- context.rs` to revert a mutation wiped the
+uncommitted seam (tracked file → reverts to HEAD); restored byte-exact from the read diff and re-verified.
+Stayed on `phase3-overnight`; no commit, no push.
