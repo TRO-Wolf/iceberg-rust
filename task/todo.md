@@ -4206,6 +4206,16 @@ Remaining in the cluster:
 - [ ] **Increment 4: `OverwriteFiles.overwriteByRowFilter` + `validateAddedFilesMatchOverwriteFilter`** — the
   row-filter overwrite mode (delete-by-row-filter at commit) + strict/inclusive/metrics validation of added
   files (StrictMetricsEvaluator + inclusive/strict partition Projections). The meatiest one (a new mode).
-- [ ] **Increment 2b: `RowDelta.validateAddedDVs`** (V3 deletion-vector conflict).
+- [x] **Increment 4: `RowDelta.validateAddedDVs`** (V3 deletion-vector conflict) — ALWAYS-ON (self-skips when
+  no DVs added); DV = Puffin-format delete file (Java `ContentFileUtil.isDV`), indexed by `referenced_data_file`;
+  rejects a concurrently-added DV for the same referenced file. Reuses `added_delete_files_after` filtered to
+  Puffin DVs. Behavior-preserving (48 row_delta tests green; non-DV no-op pinned). 6 tests + tx-captured pin;
+  mutation-verified. Gate green (lib 1626, transaction:: 284). Cosmetic: dvDesc Option Debug-format (noted).
+
+Remaining in the cluster:
+- [ ] **Increment 5: `OverwriteFiles.overwriteByRowFilter` + `validateAddedFilesMatchOverwriteFilter`** — the
+  meatiest: a new delete-by-row-filter overwrite MODE (scan manifests, evaluate the row filter, delete
+  matching files at commit) + strict/inclusive/metrics validation of added files
+  (`strict_projection.rs`/`inclusive_projection.rs`/`StrictMetricsEvaluator` exist). Then PR the whole cluster.
 
 Then: PR the cluster to the origin fork (NEVER apache).
