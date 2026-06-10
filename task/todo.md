@@ -226,11 +226,51 @@ pushed; merge nothing. Gate chained in ONE `&&` chain; Cargo files FROZEN.
       buildManifestCountSummary; the Rust SnapshotProducer.summary does NOT, and MergeManifestProcess
       will NOT inject them either ⇒ merge_append summary == fast_append summary shape (documented
       divergence from Java).
-- [ ] **Increment 4 — interop extension**: extend the E2 chain (`WriteActionsOracle` +
-      `interop_write_actions_meta.rs`) with s6 rewrite_manifests (cluster by partition), s7+
-      merge-append (min-count-to-merge=2 as a TABLE PROPERTY both sides; Java `newAppend`), and a
-      delete-bearing rewrite fixture if Increment 2 landed. Order-insensitive check before
-      semantic bug-hunts; GAP_MATRIX notes stay scoped.
+- [x] **Increment 4 — interop extension** (DONE 2026-06-10 — builder + reviewer VERIFIED + gate.
+      REVIEWER: independent script re-run green; 2 NEW sensitivity mutations both caught (constant
+      cluster key → per-partition vs single-manifest diff; dropped row_delta delete → the view
+      visibly loses the delete manifest — the survives-claim is load-bearing); merging-producer +
+      property-arming verified on both sides (post-s8 view = ONE merged manifest); A' seq==1 pin
+      confirmed in the per-entry view field; the dangling-delete probe wording CORRECTED — the
+      empirical KEEP on 1.10.0 is real but the mechanism is that 1.10.0 prunes only dangling DVs
+      (PUFFIN-gated isDanglingDV) — parquet position-deletes are structurally exempt; BaseRewriteFiles
+      overrides nothing dangling-related. Gate: lib 1692 ×2, all offline interop tests no-op green.):
+      extended the
+      E2 chain (`WriteActionsOracle` + `interop_write_actions_meta.rs`) with s6 rewrite_manifests
+      (cluster by partition), s7 property-set (min-count-to-merge=2, NO snapshot) + s8 merge-append
+      (Java `newAppend`), and a delete-bearing seq-preserving rewrite fixture B. ROUND-TRIP GREEN on
+      the FIRST run (3 directions × 2 fixtures, ZERO production/canonicalization changes); 2 mutations
+      verified the harness non-vacuous. GAP_MATRIX notes scoped, rows stay 🟡. Dangling-delete probe:
+      1.10.0 keeps the dangling delete on a RewriteFiles = PARITY with Rust (documented).
+      BUILDER PLAN (2026-06-10, Increment-4 builder):
+      - [x] **A. Extend the E2 write-actions chain.** Java `WriteActionsOracle.generate` += s6
+            `rewriteManifests().clusterBy(f -> String.valueOf(f.partition()))`, s7
+            `updateProperties().set("commit.manifest.min-count-to-merge","2").commit()`, s8
+            `newAppend().appendFile(G cat=a,60).commit()` (the MERGING producer). Rust GEN test mirrors:
+            `rewrite_manifests().cluster_by(|f| format!("{:?}", f.partition()))`,
+            `update_table_properties().set(min-count-to-merge=2)`, `merge_append().add_data_files([G])`.
+            Document the chosen cluster-key fns on both sides (key string never appears in metadata —
+            only the GROUPING must match). s7 produces NO snapshot — confirm the view is unaffected.
+      - [x] **B. New delete-bearing rewrite fixture (fixture B, E1-family, metadata-only).** Java
+            `RewriteSeqOracle`: fast-append A(a,10)+B(b,20) seq1 → row-delta adding a metadata-only
+            POSITION-delete referencing B (seq2) → `newRewrite().validateFromSnapshot(rowDeltaSnap)
+            .rewriteFiles(Set.of(A), Set.of(A'), 1L)` (dataSequenceNumber=1). Rust mirror: build the
+            rewrite tx AFTER the row-delta commit (tx-captured start ⇒ empty concurrent window =
+            semantic twin of Java's explicit validateFromSnapshot — DOCUMENT in both) with
+            `.data_sequence_number(1)`. Two load-bearing assertions: A' carries data_seq 1 (not the
+            rewrite snap's seq) post-inheritance; the delete manifest survives the rewrite intact.
+            Delete references B (SURVIVOR) ⇒ Java dangling-delete machinery dormant both sides.
+      - [x] **OPTIONAL probe:** a 2nd step rewriting B too (now-dangling delete) — EMPIRICALLY discover
+            1.10.0 behavior vs Rust carry-unchanged. If divergent: do NOT force green; document
+            (GAP_MATRIX + fixture comment) + leave it OUT of the byte-diffed chain. Report either way.
+      - [x] **C. Wire-up:** extend `run-interop-write-actions.sh` to cover BOTH the extended chain AND
+            fixture B in one run; extend the Rust env-gated tests (offline no-op early-return when the
+            env var is unset). New Rust test goes in `interop_write_actions_meta.rs` (shares the view
+            helper) gated on a fixture-B env var.
+      - [x] Offline gate (typos/fmt/clippy/lib ×2/both interop binaries no-op). Round-trip green.
+            Mandatory mutation (poison one Rust GEN value ⇒ comparison fails ⇒ restore ⇒ green).
+            GAP_MATRIX three cells gain scoped "metadata-level interop ✅ 2026-06-10 (chain paths)"
+            notes; rows STAY 🟡. map.md row updates (tests/ + java-interop/).
 - [ ] **Increment 5 (stretch) — `OverwriteFiles.validateDataFilesExist`** wiring (reuse
       `deleted_data_files_after` + skip-deletes variant); reconcile touched GAP_MATRIX cells.
 

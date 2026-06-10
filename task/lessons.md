@@ -927,3 +927,42 @@ How to use it (see the manuals' §2):
   → pack → reverse each bin → reverse bin list; min-count gate is STRICT `<` (== merges).**
   Hand-trace ≥3 cases through BOTH algorithms before trusting unit tests — a test asserting the
   port's own behavior pins nothing about Java.
+
+### 2026-06-10 (Phase-2 completion arc Increment 4 — metadata interop extension, BUILDER Opus)
+- **The three Phase-2 ports (`rewrite_manifests` cluster-by, `merge_append` one-bin merge,
+  `rewrite_files` seq-preservation) were GREEN against Java 1.10.0 on the FIRST round-trip run —
+  zero canonicalization fixes, zero production changes.** Extending the E2 chain (s6 cluster-by-
+  partition → s7 property-set → s8 merge-append) + a sibling delete-bearing fixture B all matched
+  Java byte-for-byte immediately. The unit-level builder+reviewer cycles for Increments 1-3 had
+  already pinned the exact provenance/seq semantics, so the metadata interop confirmed rather than
+  discovered. (When the upstream increments were rigorous, the interop increment is a confirmation
+  step, not a debugging one — but it is still the ONLY 1:1 proof, so it lands regardless.)
+- **A property-set commit (`updateProperties`/`update_table_properties`) produces NO snapshot — the
+  snapshot-level canonical view is unaffected, and the ordinal scheme stays consistent.** s7 set
+  `commit.manifest.min-count-to-merge=2` on both sides; the chain has 7 snapshots (s1-s6 + s8), seq
+  numbers 1-7 with no gap (the property commit consumes no sequence number either). Confirmed both
+  sides agree the merge-arming property is visible to s8's MERGING append within the same chain.
+- **Empirical 1.10.0 dangling-delete probe (the optional one): a `RewriteFiles` that rewrites the
+  data file a position-delete REFERENCES commits and KEEPS the now-dangling delete manifest.**
+  MECHANISM (re-traced against 1.10.0 by the reviewer — the BUILDER's original attribution was
+  WRONG): a `RewriteFiles` commit DOES run `deleteFilterManager.removeDanglingDeletesFor(...)`
+  (`MergingSnapshotProducer` L995) — `deleteFilterManager` is a `DeleteFileFilterManager` that does
+  NOT override it, so the base impl runs fine (it just records the removed data-file paths). The
+  `UnsupportedOperationException` throw at L1220-1222 lives on the SIBLING `DataFileFilterManager`
+  (the DATA-file side) and is NEVER reached for delete pruning. The real reason a dangling
+  POSITION-DELETE PARQUET survives is that the only two delete-drop paths both miss it: (a)
+  `isDanglingDV` is gated on `ContentFileUtil.isDV` == `FileFormat.PUFFIN`, so a parquet position
+  delete (V2, non-DV) is structurally exempt; (b) the `minSequenceNumber` cutoff
+  (`dropDeleteFilesOlderThan`) does not drop it (the carried A'@seq1 holds the min data seq at 1,
+  below the delete's seq 2). NET: only dangling *DVs* are pruned on a `RewriteFiles` in 1.10.0; a
+  dangling parquet position-delete is kept — which CONVERGES with the Rust action's documented
+  carry-unchanged posture (PARITY, not divergence). Lesson: drive the divergence question
+  EMPIRICALLY with a throwaway probe (commit it, emit the canonical view, read it) — and when you
+  cite a source mechanism for WHY, trace which concrete subclass/instance is actually invoked (the
+  data-vs-delete filter-manager pair is a classic misattribution trap). DELETE the probe (it must
+  not enter the byte-diffed chain) and record the finding in prose + the GAP_MATRIX cell.
+- **Cluster keys are GROUPING-only: any key fn producing the same partition of entries is
+  equivalent across languages, because the key string never appears in metadata.** Java
+  `String.valueOf(file.partition())` and Rust `format!("{:?}", data_file.partition())` render
+  differently but both yield one group per distinct partition tuple ⇒ identical manifest grouping.
+  Document the chosen key fns on both sides; the comparison guards the rest.
