@@ -271,8 +271,21 @@ pushed; merge nothing. Gate chained in ONE `&&` chain; Cargo files FROZEN.
             Mandatory mutation (poison one Rust GEN value ⇒ comparison fails ⇒ restore ⇒ green).
             GAP_MATRIX three cells gain scoped "metadata-level interop ✅ 2026-06-10 (chain paths)"
             notes; rows STAY 🟡. map.md row updates (tests/ + java-interop/).
-- [ ] **Increment 5 (stretch) — `OverwriteFiles.validateDataFilesExist`** wiring (reuse
-      `deleted_data_files_after` + skip-deletes variant); reconcile touched GAP_MATRIX cells.
+- [x] **Increment 5 (stretch) — RESCOPED: the deferral was STALE; matrix reconciliation instead**
+      (DONE 2026-06-10, orchestrator, docs-only). The premise (`OverwriteFiles.validateDataFilesExist`
+      wiring) does not exist in Java: `BaseOverwriteFiles.validate` (L135-175) has exactly three
+      blocks, all already ported; `validateDataFilesExist` is RowDelta-only (single caller in core/,
+      already landed 2026-06-09); concurrent-removal protection is `failMissingDeletePaths` ≡
+      `resolve_delete_paths`. Building it would have been anti-parity — decision per the brief's
+      "decide, document, move on".
+      Outcome: (1) the stale deferral corrected in the OverwriteFiles GAP_MATRIX cell; (2) the
+      2b-reviewer-flagged broken cell ROOT-CAUSED and repaired — the de-triplication mover had split
+      the OverwriteFiles narrative MID-EXPRESSION on the `||` inside
+      `(strict.eval(part) || metrics.eval(file))`, stranding 2.7 KB of narrative in the matrix as a
+      phantom column while the archive section ended mid-sentence; strand rejoined VERBATIM in
+      `archive/2026-06_matrix-cell-narratives.md` (conservation preserved), cell now terse + closed;
+      (3) every matrix row pipe-count-audited (all exactly 5 `|`); (4) the three "five-commit chain"
+      citations updated for the 8-step extension; (5) two lessons appended.
 
 ## DONE (2026-06-10): Sprint increment E2 — rewrite-family METADATA-level interop (branch `interop/write-actions-meta`)
 

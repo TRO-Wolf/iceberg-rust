@@ -966,3 +966,20 @@ How to use it (see the manuals' §2):
   `String.valueOf(file.partition())` and Rust `format!("{:?}", data_file.partition())` render
   differently but both yield one group per distinct partition tuple ⇒ identical manifest grouping.
   Document the chosen key fns on both sides; the comparison guards the rest.
+
+### 2026-06-10 (Phase-2 completion arc Increment 5 — stale-deferral audit + matrix repair, ORCHESTRATOR Fable)
+- **DO verify a deferral note against the LIVE Java source before building it.** *Why:* the
+  Increment-5 brief and the GAP_MATRIX OverwriteFiles cell both said "deferred:
+  `validateDataFilesExist` wiring" — but Java's `BaseOverwriteFiles.validate` (L135-175) has
+  exactly three blocks, ALL ported; `validateDataFilesExist` is RowDelta-ONLY (grep of core/
+  confirms the single caller) and already landed in Rust 2026-06-09. OverwriteFiles' concurrent-
+  removal protection is `failMissingDeletePaths` ≡ Rust `resolve_delete_paths`. Building the
+  "missing" block would have been anti-parity. Same family as the 2026-06-09 "verify a suspected
+  parity divergence against the LIVE Java source BEFORE instructing a fix" lesson — it applies to
+  deferral notes too.
+- **DO pipe-count-audit the GAP_MATRIX after any matrix-wide edit: every `^|` row must carry
+  exactly 5 `|` characters.** *Why:* the de-triplication cell mover split the OverwriteFiles
+  narrative MID-EXPRESSION on the logical-OR inside `(strict.eval(part) || metrics.eval(file))` —
+  half the narrative was stranded in the matrix as a phantom column and the archive section ended
+  mid-sentence. Raw pipes inside code spans break naive pipe-delimited cell handling. Repaired
+  2026-06-10 by rejoining the strand verbatim in the archive (conservation preserved).
