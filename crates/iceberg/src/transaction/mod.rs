@@ -59,6 +59,7 @@ mod manage_snapshots;
 mod overwrite_files;
 mod replace_partitions;
 mod rewrite_files;
+mod rewrite_manifests;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -84,6 +85,7 @@ use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 use crate::transaction::overwrite_files::OverwriteFilesAction;
 use crate::transaction::replace_partitions::ReplacePartitionsAction;
 use crate::transaction::rewrite_files::RewriteFilesAction;
+use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -206,6 +208,19 @@ impl Transaction {
         files_to_add: impl IntoIterator<Item = crate::spec::DataFile>,
     ) -> RewriteFilesAction {
         RewriteFilesAction::new().rewrite_files(files_to_delete, files_to_add)
+    }
+
+    /// Creates a rewrite-manifests action: re-organize the table's manifests without changing its
+    /// live data files, producing one `Operation::Replace` snapshot (Java `BaseRewriteManifests`). Use
+    /// [`RewriteManifestsAction::cluster_by`] to re-group matching data manifests' live entries into new
+    /// manifests (provenance preserved), and/or [`RewriteManifestsAction::add_manifest`] +
+    /// [`RewriteManifestsAction::delete_manifest`] for explicit replacement. A no-op rewrite keeps every
+    /// manifest as-is. The live set is identical before and after.
+    ///
+    /// **Deferred:** `add_manifest` on a V1 table (`FeatureUnsupported`), the parallel `scanManifestsWith`
+    /// executor, and metadata-level interop with Java (this is a 🟡 unit-proven action).
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Creates a row-delta action (the merge-on-read write commit): add data files AND add row-level

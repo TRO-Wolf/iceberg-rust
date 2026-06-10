@@ -175,6 +175,82 @@ impl<'a> SnapshotProducer<'a> {
         self
     }
 
+    /// The id of the snapshot this producer is creating. Exposed so an action that pre-computes its
+    /// own manifest list (e.g. `RewriteManifests`) can stamp externally-added manifests with the new
+    /// snapshot id before they reach the manifest-list writer (Java `withSnapshotId`,
+    /// `BaseRewriteManifests.apply` L184-187 — required by
+    /// [`ManifestListWriter::add_manifests`]'s `assign_sequence_numbers` precondition).
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    /// Merge additional snapshot summary properties computed AFTER construction (Java
+    /// `RewriteManifests.summary()` sets `manifests-created` / `-kept` / `-replaced` /
+    /// `entries-processed` only once the rewrite has run). [`SnapshotProducer::new`] takes the
+    /// user-supplied properties up front; this additive setter lets the rewrite inject the counts it
+    /// can only know post-rewrite. These non-empty properties also satisfy the empty-commit
+    /// precondition in [`SnapshotProducer::manifest_file`] for an action that adds no data files.
+    pub(crate) fn extend_snapshot_properties(
+        &mut self,
+        properties: impl IntoIterator<Item = (String, String)>,
+    ) {
+        self.snapshot_properties.extend(properties);
+    }
+
+    /// Build a manifest writer for a brand-new (non-filtered) DATA manifest under `partition_spec_id`
+    /// — the cluster-writer factory for [`crate::transaction::rewrite_manifests`]. Mirrors
+    /// [`SnapshotProducer::new_filtering_manifest_writer`] but is keyed by the partition-spec id
+    /// directly (a cluster writer is created per `(cluster_key, partition_spec_id)`, Java
+    /// `BaseRewriteManifests.getWriter` keyed on `Pair.of(key, partitionSpecId)`) rather than off a
+    /// source [`ManifestFile`]. The entries appended to it are pre-existing data entries copied
+    /// forward via `add_existing_entry` (provenance preserved), so the writer is always a DATA writer.
+    pub(crate) fn new_cluster_manifest_writer(
+        &mut self,
+        partition_spec_id: i32,
+    ) -> Result<ManifestWriter> {
+        let partition_spec = self
+            .table
+            .metadata()
+            .partition_spec_by_id(partition_spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot rewrite manifests: unknown partition spec id {partition_spec_id}"
+                    ),
+                )
+            })?
+            .as_ref()
+            .clone();
+
+        let new_manifest_path = format!(
+            "{}/{}/{}-m{}.{}",
+            self.table.metadata().location(),
+            META_ROOT_PATH,
+            self.commit_uuid,
+            self.manifest_counter.next().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Exhausted manifest file name counter",
+                )
+            })?,
+            DataFileFormat::Avro
+        );
+        let output_file = self.table.file_io().new_output(new_manifest_path)?;
+        let builder = ManifestWriterBuilder::new(
+            output_file,
+            Some(self.snapshot_id),
+            self.key_metadata.clone(),
+            self.table.metadata().current_schema().clone(),
+            partition_spec,
+        );
+        match self.table.metadata().format_version() {
+            FormatVersion::V1 => Ok(builder.build_v1()),
+            FormatVersion::V2 => Ok(builder.build_v2_data()),
+            FormatVersion::V3 => Ok(builder.build_v3_data()),
+        }
+    }
+
     /// Validate the added DELETE files (Java `RowDelta.addDeletes` / `MergingSnapshotProducer.add`):
     /// each must be a `PositionDeletes` or `EqualityDeletes` content file (a `Data` file is rejected —
     /// it must be added as a row, not a delete), and its partition spec must match the table default.

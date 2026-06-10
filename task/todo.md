@@ -34,6 +34,62 @@ How to use it (see the manuals' §1):
 
 > **Archival log.** Last todo-archival pass: 2026-06-09 (size trigger — 4,344 lines) → [todo-archive/](todo-archive/) (phase1/phase2/phase3). Completed-increment narratives moved verbatim; this file keeps the active sprint + open items + archive pointers. Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival. Archives are not read by default.
 
+## ACTIVE (2026-06-10 overnight): Phase-2 write-engine completion arc (branch `phase2/write-engine-completion`)
+
+Session brief: `../FABLE_SESSION_BRIEF_2026-06-10_phase2-completion.md`. Actor-critic per increment
+(Opus builder → Opus reviewer, orchestrator re-runs the gate + commits). One commit per increment,
+pushed; merge nothing. Gate chained in ONE `&&` chain; Cargo files FROZEN.
+
+- [x] **Increment 1 — `RewriteManifests`** (DONE 2026-06-10 — builder + reviewer + gate): new
+      `transaction/rewrite_manifests.rs`, cluster/keep partition of current manifests, provenance-
+      preserving re-group via the existing-entry writer path, `validateDeletedManifests` +
+      `validateFilesCounts`, `Operation::Replace`, live set unchanged. Provenance re-stamp mutation
+      pin mandatory. Done-bar 🟡 (interop in Increment 4).
+      Outcome: 17 MemoryCatalog tests (14 builder + 3 reviewer pins: on-disk explicit seqs via raw
+      avro, multi-spec cluster keying, user-set vs computed-count precedence); REVIEWER verdict NO
+      BUG, zero production changes — the seq-strip RESURRECTION mutation fails the MoR scan test
+      (the builder's weaker re-stamp mutation had only failed the metadata pin), and the builder's
+      changed-partition-count divergence claim was CORRECTED (Java emits =0 too — parity; interop
+      s6 must expect it both sides). Gate: lib 1660 ×2, clippy (workspace, excl. sqllogictest)
+      clean, fmt+typos clean, Cargo FROZEN.
+      BUILDER PLAN (2026-06-10):
+      - [x] Read all required sources + Java `BaseRewriteManifests` (386 lines) fully.
+      - [x] `table_properties.rs`: add 3 consts (target-size 8388608, min-count-to-merge 100,
+            merge-enabled true). Only target-size consumed now.
+      - [x] `snapshot.rs` (additive only): widen `new_filtering_manifest_writer` to `pub(crate)`,
+            add `pub(crate) extend_snapshot_properties`, expose `snapshot_id()`.
+      - [x] `rewrite_manifests.rs`: `RewriteManifestsAction` (cluster_by/rewrite_if/add_manifest/
+            delete_manifest/set/set_commit_uuid/set_key_metadata). Commit: no-current-snapshot →
+            DataInvalid; build producer; load ALL manifests (data+deletes); validateDeletedManifests;
+            performRewrite (cluster) OR keepActiveManifests; validateFilesCounts; stamp added
+            snapshot ids; compose new-first list; feed through SnapshotProduceOperation
+            (Operation::Replace) + DefaultManifestProcess. Estimated-length size rolling.
+      - [x] 13 tests + provenance re-stamp mutation pin (add_entry vs add_existing_entry).
+      - [x] mod.rs wiring + map.md row + GAP_MATRIX cell flip.
+      - Orchestrator design decisions (pre-briefed): the action pre-computes the full new manifest
+        list and feeds it through `SnapshotProduceOperation::existing_manifest` with
+        `DefaultManifestProcess` (no producer-trait change); Java's `writer.length()` size-rolling
+        becomes a documented estimated-length proxy (Rust's `ManifestWriter` buffers entries — no
+        incremental length); `add_manifest` is V2+ only (the V1 `copyManifest` legacy path is
+        deferred, rejected `FeatureUnsupported`); new `TableProperties` consts for
+        `commit.manifest.target-size-bytes` (+ merge siblings for Increment 3).
+- [ ] **Increment 2 — `RewriteFiles` dataSequenceNumber preservation + guard lift +
+      `validateNoNewDeletes`**: crown-jewel resurrection test (MoR table, pos-delete on X,
+      rewrite [X]→[X'] preserving seq ⇒ scan still drops rows; mutation strips preservation ⇒
+      fails). Plus the tx-captured-start pin for the new validation.
+- [ ] **Increment 3 — merge append** (`MergeAppend` / `MergingSnapshotProducer` merge machinery):
+      `merge_append()` action honoring `commit.manifest-merge.enabled` /
+      `commit.manifest.min-count-to-merge` / `commit.manifest.target-size-bytes`; provenance
+      preserved in merged manifests; passthrough pins below threshold / property-disabled. May
+      split 3a/3b; sketch-and-stop fallback.
+- [ ] **Increment 4 — interop extension**: extend the E2 chain (`WriteActionsOracle` +
+      `interop_write_actions_meta.rs`) with s6 rewrite_manifests (cluster by partition), s7+
+      merge-append (min-count-to-merge=2 as a TABLE PROPERTY both sides; Java `newAppend`), and a
+      delete-bearing rewrite fixture if Increment 2 landed. Order-insensitive check before
+      semantic bug-hunts; GAP_MATRIX notes stay scoped.
+- [ ] **Increment 5 (stretch) — `OverwriteFiles.validateDataFilesExist`** wiring (reuse
+      `deleted_data_files_after` + skip-deletes variant); reconcile touched GAP_MATRIX cells.
+
 ## DONE (2026-06-10): Sprint increment E2 — rewrite-family METADATA-level interop (branch `interop/write-actions-meta`)
 
 All four rewrite-family actions proven in ONE five-commit chain (fast-append → DeleteFiles →

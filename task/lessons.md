@@ -848,3 +848,24 @@ How to use it (see the manuals' §2):
   reviewer-corrected: Java does NOT enforce rewrite record-count conservation
   (`validateReplacedAndAddedFiles` checks non-emptiness only) — conservation in the fixture is a
   test-data property, not a Java invariant.
+
+### 2026-06-10 (Phase-2 completion arc Increment 1 — RewriteManifests, BUILDER + REVIEWER Opus)
+- **DO pick the RIGHT corrupting mutation for a provenance suite: `add_entry` (re-stamp) KEEPS an
+  explicit non-negative sequence number, so it only fails metadata assertions — the resurrection
+  mutation is SEQ-STRIPPING (`sequence_number = None` ⇒ V2/V3 re-inheritance of the NEW, higher
+  snapshot seq ⇒ older position deletes stop applying).** *Why:* the builder's re-stamp mutation
+  passed the merge-on-read scan test and looked like a scan-level blind spot; the reviewer's
+  seq-strip mutation made the SAME scan test fail with resurrected rows — the suite was sound, the
+  first mutation was just too weak. Run BOTH mutations on any manifest-rewriting change; pin the
+  on-disk seqs too (read the rewritten manifest's RAW avro via `Manifest::try_from_avro_bytes`,
+  pre-inheritance, and assert explicit original seqs — never null).
+- **DO NOT trust a builder's "Java would not emit key X" divergence claim without re-deriving from
+  `SnapshotSummary.Builder.build()`.** *Why:* the builder flagged `changed-partition-count=0` as a
+  Rust-only key for rewrite snapshots; the source (build() L191-213) shows `trustPartitionMetrics`
+  stays true with no files added and Java emits `changed-partition-count=0` TOO — parity, not
+  divergence. The interop s6 comparison must expect it on both sides.
+- **DO key cluster/fanout manifest writers by `(key, partition_spec_id)` and PIN the multi-spec
+  axis with a partition-evolution fixture** (append spec 0 → evolve → append spec 1 → cluster by a
+  CONSTANT key → one output manifest per spec id). *Why:* a spec-id-less key cross-merges
+  partition tuples from different specs into one manifest (`zip_eq` panic at best, corrupt
+  partition metadata at worst); single-spec fixtures can never catch it.

@@ -39,6 +39,7 @@ engine) parity work.
 | `overwrite_files.rs` | `BaseOverwriteFiles` | Explicit add+delete in one `Overwrite` snapshot; opt-in `validate_no_conflicting_data()` + `conflict_detection_filter` |
 | `replace_partitions.rs` | `BaseReplacePartitions` | Dynamic partition overwrite; opt-in conflict validation |
 | `rewrite_files.rs` | `BaseRewriteFiles` | Compaction-commit primitive (`Operation::Replace`) |
+| `rewrite_manifests.rs` | `BaseRewriteManifests` | Manifest re-organization (NOT data change): cluster live data-manifest entries into new manifests via the provenance-preserving `add_existing_entry` path, and/or explicit add/delete manifest replacement; `Operation::Replace`, live set unchanged. Extends `SnapshotProducer` (NOT `MergingSnapshotProducer`) |
 | `row_delta.rs` | `BaseRowDelta` | Merge-on-read commit: data + position/equality delete files in one snapshot; `validate_no_conflicting_data_files/_delete_files`, `validate_data_files_exist` |
 | `manage_snapshots.rs` | `ManageSnapshots` | Branch/tag CRUD, rollback(-to-time), set-current, fast-forward, retention |
 | `update_schema.rs` | `SchemaUpdate` | Schema evolution incl. `union_by_name`, column defaults (✅ interop-proven) |
