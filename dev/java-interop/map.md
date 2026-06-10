@@ -39,7 +39,7 @@ generate/verify flow; this map only routes.**
 | `run-interop-scan-exec.sh` / `-d2.sh` | data-level scan-execution interop (Java writes parquet + position delete; D2: Java reads Rust) |
 | `run-interop-eq-delete.sh` / `-d2.sh` | equality-delete scan-exec interop, both directions |
 | `run-interop-part.sh` / `-d2.sh` | partitioned merge-on-read scan-exec interop, both directions |
-| `run-interop-dv.sh` | D1 deletion-vector scan-exec interop (Direction 1): Java writes a V3 table + a real `BaseDVFileWriter` DV → Rust scans it; also emits a synthetic high-bits/run-container DV blob for the byte-level decode pin |
+| `run-interop-dv.sh` | deletion-vector interop, BOTH directions. D1 (scan): Java writes a V3 table + a real `BaseDVFileWriter` DV → Rust scans it; also a synthetic high-bits/run-container blob for the byte-level decode pin. D2 (write, blob-level): Rust `DVFileWriter` writes a Puffin DV file → Java's production reader (`Puffin.read` + `PositionDeleteIndex.deserialize`) verifies it (`verify-interop-dv-write`, sentinel-grepped) AND emits its own blobs for the Rust byte-parity pin (`tests/interop_dv_write.rs`) |
 | `run-interop-rowdelta-meta.sh` | E1 metadata-level row-delta interop: canonical snapshot-metadata view over the 3 scan-exec fixtures, 3 comparison directions each |
 | `run-interop-write-actions.sh` | E2 + Increment-4 metadata-level write-actions interop: ONE eight-step chain (`WriteActionsOracle`: delete/overwrite/replace-partitions/rewrite/rewrite-manifests/merge-append) + a delete-bearing seq-preserving `rewrite_files` fixture B (`RewriteSeqOracle`), each judged 3 ways via `SnapshotMetaOracle` |
 | `run-inspection-manifests.sh` | inspection-table expectation generation |

@@ -231,6 +231,27 @@ public final class InteropOracle {
         Path dvDir = requireFixturesDir("interop.dv.dir");
         DvScanOracle.generate(dvDir);
         break;
+      case "verify-interop-dv-write":
+        // DELETION-VECTOR WRITING, DIRECTION 2 — "JAVA reads what RUST writes" (Increment D2).
+        // The Rust GEN test (env ICEBERG_INTEROP_DV_WRITE_DIR, tests/interop_dv_write.rs) wrote
+        // <dir>/rust_dv.puffin via the production DVFileWriter (one deletion-vector-v1 blob per
+        // referenced data file) + rust_dv_expected.json ({path -> positions + blob coordinates}).
+        // Here Java (1) parses the RUST-written Puffin footer with its real Puffin reader and
+        // checks each blob's type/properties/coordinates against the expected JSON, (2) does the
+        // SAME ranged blob read the production scan does (BaseDeleteLoader.readDV) and decodes it
+        // with PositionDeleteIndex.deserialize (framing + magic + CRC + cardinality validations),
+        // asserting the positions match, and (3) serializes Java's OWN BitmapPositionDeleteIndex
+        // over the SAME position sets (via the production BaseDVFileWriter) into
+        // java_dv_blob_<i>.bin so the Rust byte-parity test can pin rust_bytes == java_bytes.
+        // A failure here is a REAL write-incompatibility finding. NOTE: `mvn exec:java` does not
+        // propagate System.exit to the shell — run-interop-dv.sh greps the "0 failures" sentinel.
+        Path dvWriteDir = requireFixturesDir("interop.dv_write.dir");
+        int dvWriteFailures = DvWriteOracle.verify(dvWriteDir);
+        System.out.println("verify-interop-dv-write: " + dvWriteFailures + " failures");
+        if (dvWriteFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-eq-delete":
         // EQUALITY-DELETE merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes". The sibling of
         // generate-interop-scan-exec, but the merge-on-read mechanism is delete-by-VALUE (an equality
@@ -4224,6 +4245,251 @@ public final class InteropOracle {
             gen.writeEndArray();
           },
           true);
+    }
+  }
+
+  // =============================================================================================
+  // DvWriteOracle — DELETION-VECTOR WRITING, Direction 2 (Increment D2): Java verifies a
+  // RUST-written Puffin DV file with its production reader machinery, then emits its OWN
+  // serialization of the same position sets for the Rust byte-parity pin. See the
+  // verify-interop-dv-write dispatch comment for the full flow.
+  // =============================================================================================
+
+  static final class DvWriteOracle {
+    private DvWriteOracle() {}
+
+    /** One expected deletion vector parsed from rust_dv_expected.json. */
+    private static final class ExpectedDv {
+      final String referencedDataFile;
+      final List<Long> positions;
+      final long contentOffset;
+      final long contentSizeInBytes;
+      final long recordCount;
+      final long fileSizeInBytes;
+
+      ExpectedDv(com.fasterxml.jackson.databind.JsonNode node) {
+        this.referencedDataFile = node.get("referenced_data_file").asText();
+        this.positions = new ArrayList<>();
+        for (com.fasterxml.jackson.databind.JsonNode position : node.get("positions")) {
+          this.positions.add(position.asLong());
+        }
+        this.contentOffset = node.get("content_offset").asLong();
+        this.contentSizeInBytes = node.get("content_size_in_bytes").asLong();
+        this.recordCount = node.get("record_count").asLong();
+        this.fileSizeInBytes = node.get("file_size_in_bytes").asLong();
+      }
+    }
+
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      String puffinPath = dir.resolve("rust_dv.puffin").toAbsolutePath().toString();
+
+      String expectedJson =
+          new String(
+              Files.readAllBytes(dir.resolve("rust_dv_expected.json")), StandardCharsets.UTF_8);
+      List<ExpectedDv> expected = new ArrayList<>();
+      for (com.fasterxml.jackson.databind.JsonNode node :
+          JsonUtil.mapper().readTree(expectedJson)) {
+        expected.add(new ExpectedDv(node));
+      }
+
+      // (1) Parse the RUST-written footer with Java's REAL Puffin reader and index the blob
+      // metadata by referenced data file.
+      InputFile inputFile = new LocalFileIO().newInputFile(puffinPath);
+      org.apache.iceberg.puffin.FileMetadata footer;
+      try (org.apache.iceberg.puffin.PuffinReader reader =
+          org.apache.iceberg.puffin.Puffin.read(inputFile).build()) {
+        footer = reader.fileMetadata();
+      }
+      if (footer.blobs().size() != expected.size()) {
+        System.out.println(
+            "FAIL blob count: footer has " + footer.blobs().size() + ", expected "
+                + expected.size());
+        failures++;
+      }
+      Map<String, org.apache.iceberg.puffin.BlobMetadata> blobsByPath = new LinkedHashMap<>();
+      for (org.apache.iceberg.puffin.BlobMetadata blob : footer.blobs()) {
+        blobsByPath.put(blob.properties().get("referenced-data-file"), blob);
+      }
+
+      for (ExpectedDv dv : expected) {
+        failures += verifyOneDv(puffinPath, inputFile, blobsByPath, dv);
+      }
+
+      // On-disk file size must equal the file_size_in_bytes every DeleteFile recorded.
+      long actualFileSize = inputFile.getLength();
+      for (ExpectedDv dv : expected) {
+        if (dv.fileSizeInBytes != actualFileSize) {
+          System.out.println(
+              "FAIL file size for " + dv.referencedDataFile + ": DeleteFile recorded "
+                  + dv.fileSizeInBytes + ", on-disk Puffin is " + actualFileSize);
+          failures++;
+        }
+      }
+
+      // (3) Emit Java's own serialization of the SAME position sets for the byte-parity pin
+      // (java_dv_blob_<i>.bin, index = the entry's position in rust_dv_expected.json).
+      emitJavaBlobs(dir, expected);
+
+      return failures;
+    }
+
+    /** Verify one expected DV: footer metadata, then the production-style ranged read + decode. */
+    private static int verifyOneDv(
+        String puffinPath,
+        InputFile inputFile,
+        Map<String, org.apache.iceberg.puffin.BlobMetadata> blobsByPath,
+        ExpectedDv dv)
+        throws IOException {
+      int failures = 0;
+      org.apache.iceberg.puffin.BlobMetadata blob = blobsByPath.get(dv.referencedDataFile);
+      if (blob == null) {
+        System.out.println("FAIL no footer blob references " + dv.referencedDataFile);
+        return 1;
+      }
+      if (!org.apache.iceberg.puffin.StandardBlobTypes.DV_V1.equals(blob.type())) {
+        System.out.println(
+            "FAIL blob type for " + dv.referencedDataFile + ": " + blob.type());
+        failures++;
+      }
+      if (blob.offset() != dv.contentOffset || blob.length() != dv.contentSizeInBytes) {
+        System.out.println(
+            "FAIL blob coordinates for " + dv.referencedDataFile + ": footer says ("
+                + blob.offset() + ", " + blob.length() + "), DeleteFile metadata recorded ("
+                + dv.contentOffset + ", " + dv.contentSizeInBytes + ")");
+        failures++;
+      }
+      String cardinality = blob.properties().get("cardinality");
+      if (!String.valueOf(dv.positions.size()).equals(cardinality)) {
+        System.out.println(
+            "FAIL cardinality property for " + dv.referencedDataFile + ": " + cardinality
+                + ", expected " + dv.positions.size());
+        failures++;
+      }
+      List<Integer> expectedFields =
+          java.util.Collections.singletonList(MetadataColumns.ROW_POSITION.fieldId());
+      if (!expectedFields.equals(blob.inputFields())) {
+        System.out.println(
+            "FAIL blob fields for " + dv.referencedDataFile + ": " + blob.inputFields()
+                + ", expected " + expectedFields + " (ROW_POSITION)");
+        failures++;
+      }
+      if (blob.snapshotId() != -1L || blob.sequenceNumber() != -1L) {
+        System.out.println(
+            "FAIL blob snapshot-id/sequence-number for " + dv.referencedDataFile
+                + ": (" + blob.snapshotId() + ", " + blob.sequenceNumber()
+                + "), expected (-1, -1) = inherited");
+        failures++;
+      }
+
+      // (2) The SAME ranged read the production scan path does (BaseDeleteLoader.readDV), then
+      // the production deserialization (PositionDeleteIndex.deserialize -> framing + magic +
+      // CRC + cardinality validations) against a DeleteFile shaped like BaseDVFileWriter.createDV.
+      byte[] blobBytes = readBlob(inputFile, dv.contentOffset, (int) dv.contentSizeInBytes);
+      DeleteFile deleteFile =
+          FileMetadata.deleteFileBuilder(PartitionSpec.unpartitioned())
+              .ofPositionDeletes()
+              .withFormat(FileFormat.PUFFIN)
+              .withPath(puffinPath)
+              .withFileSizeInBytes(dv.fileSizeInBytes)
+              .withReferencedDataFile(dv.referencedDataFile)
+              .withContentOffset(dv.contentOffset)
+              .withContentSizeInBytes(dv.contentSizeInBytes)
+              .withRecordCount(dv.recordCount)
+              .build();
+      List<Long> decoded = new ArrayList<>();
+      try {
+        org.apache.iceberg.deletes.PositionDeleteIndex index =
+            org.apache.iceberg.deletes.PositionDeleteIndex.deserialize(blobBytes, deleteFile);
+        index.forEach(decoded::add);
+      } catch (RuntimeException error) {
+        System.out.println(
+            "FAIL Java could not deserialize the Rust-written DV for " + dv.referencedDataFile
+                + ": " + error);
+        return failures + 1;
+      }
+      if (!dv.positions.equals(decoded)) {
+        System.out.println(
+            "FAIL positions for " + dv.referencedDataFile + ": Java decoded " + decoded.size()
+                + " positions, expected " + dv.positions.size()
+                + " (or the sets differ)");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS " + dv.referencedDataFile + ": " + decoded.size()
+                + " positions decoded by Java's production reader");
+      }
+      return failures;
+    }
+
+    private static byte[] readBlob(InputFile inputFile, long offset, int length)
+        throws IOException {
+      byte[] bytes = new byte[length];
+      try (org.apache.iceberg.io.SeekableInputStream in = inputFile.newStream()) {
+        in.seek(offset);
+        org.apache.iceberg.io.IOUtil.readFully(in, bytes, 0, length);
+      }
+      return bytes;
+    }
+
+    /**
+     * Serialize Java's own BitmapPositionDeleteIndex over the SAME position sets through the
+     * production BaseDVFileWriter (1.10.0's only ctor needs an OutputFileFactory, hence the
+     * throwaway table), and dump each framed blob to java_dv_blob_&lt;i&gt;.bin for the Rust
+     * byte-parity test.
+     */
+    private static void emitJavaBlobs(Path dir, List<ExpectedDv> expected) throws IOException {
+      File tableDir = dir.resolve("java_emit_table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      Schema schema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "3");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              tableDir.getAbsolutePath(),
+              props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_dv_write_emit");
+
+      org.apache.iceberg.io.OutputFileFactory fileFactory =
+          org.apache.iceberg.io.OutputFileFactory.builderFor(table, 3, 3L)
+              .format(FileFormat.PUFFIN)
+              .build();
+      org.apache.iceberg.deletes.DVFileWriter dvWriter =
+          new org.apache.iceberg.deletes.BaseDVFileWriter(fileFactory, path -> null);
+      for (ExpectedDv dv : expected) {
+        for (long position : dv.positions) {
+          dvWriter.delete(dv.referencedDataFile, position, PartitionSpec.unpartitioned(), null);
+        }
+      }
+      dvWriter.close();
+
+      Map<String, DeleteFile> javaDvsByPath = new LinkedHashMap<>();
+      for (DeleteFile javaDv : dvWriter.result().deleteFiles()) {
+        javaDvsByPath.put(String.valueOf(javaDv.referencedDataFile()), javaDv);
+      }
+      for (int i = 0; i < expected.size(); i++) {
+        ExpectedDv dv = expected.get(i);
+        DeleteFile javaDv = javaDvsByPath.get(dv.referencedDataFile);
+        if (javaDv == null) {
+          throw new IOException("Java DV writer produced no DV for " + dv.referencedDataFile);
+        }
+        byte[] javaBlob =
+            readBlob(
+                new LocalFileIO().newInputFile(javaDv.location()),
+                javaDv.contentOffset(),
+                javaDv.contentSizeInBytes().intValue());
+        Files.write(dir.resolve("java_dv_blob_" + i + ".bin"), javaBlob);
+      }
+      System.out.println(
+          "emitted " + expected.size() + " java_dv_blob_<i>.bin files for the byte-parity pin");
     }
   }
 

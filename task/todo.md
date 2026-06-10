@@ -158,11 +158,136 @@ The read path is therefore Increment D1, before any writer work.
       fails) all caught. Known pre-existing (NOT D1): a delete-file load error leaves a stale
       `Loading` notify entry in the shared `DeleteFilter` (same class as the parquet pos-del path);
       scan still errors loudly. Test-count breakdown in the builder block corrected above.
-- [ ] **D2 — DV serialization + `DVFileWriter`:** bitmap serialization byte-exact vs Java
+- [x] **D2 — DV serialization + `DVFileWriter`** (DONE 2026-06-10 — Fable builder + Fable
+      reviewer APPROVED + orchestrator gate/commit. Byte parity with Java proven UNCONDITIONALLY
+      incl. run containers — roaring-rs `optimize()` matches Java's criteria incl. ties; 3 interop
+      fixtures byte-identical 69/76/46 B; builder corrected the BRIEF's wrong reserved id
+      (ROW_POSITION = 2147483645, not 2147483545); reviewer confirmed the dense-gap size door
+      (25 GB-by-gaps rejected in 303 µs, gap-term mutation caught), MAX_POSITION bit-exact
+      (0x7FFFFFFE_80000000), added the tie pin + duplicate-position pin, softened the Run-store
+      re-serialization caveat for D3. Gate: lib 1737 ×2, Direction-2 oracle green ×2.):
+      bitmap serialization byte-exact vs Java
       `BitmapPositionDeleteIndex.serialize` (portable 64-bit roaring + index framing), puffin blob
       w/ `referenced-data-file`+`cardinality` properties (BaseDVFileWriter.java L52-53, L173-186),
       DeleteFile metadata (content_offset/content_size_in_bytes/referenced_data_file/record_count
       L145-159); exact-byte fixtures + round-trip through D1's reader.
+      BUILDER PLAN (2026-06-10, D2 builder — FABLE):
+      - [x] `delete_vector.rs`: production `DeleteVector::serialize_deletion_vector_v1(&self) ->
+            Result<Vec<u8>>` — Java-faithful DENSE layout (`RoaringPositionBitmap.serialize`
+            L245-252 writes `bitmaps.length` = max key + 1 entries INCLUDING empty gap bitmaps;
+            `roaring-rs` treemap serialize is SPARSE so the outer layout is hand-rolled per
+            sub-bitmap), per-sub-bitmap run-length encode via `RoaringBitmap::optimize()` on a
+            clone (Java `runLengthEncode` L176-182 → `runOptimize()`; roaring 0.11.3 HAS
+            `optimize()` with the identical run-iff-strictly-smaller criterion — verified in
+            registry source `bitmap/container.rs:243`), framing per
+            `BitmapPositionDeleteIndex.serialize` L124-137 (BE u32 length of magic+bitmap, LE
+            magic D1 D3 39 64, BE zlib CRC-32 of magic+bitmap). Errors: empty vector (never
+            serialized per BaseDVFileWriter flow), key > i32::MAX-1 (unrepresentable in Java's
+            dense array — `validatePosition`/`MAX_POSITION` L342-348), total > 2GB
+            (`computeBitmapDataLength` L158-163). Test encoder `encode_deletion_vector_v1`
+            delegates to the production fn; empty-decode test switches to a raw count=0 frame.
+      - [x] `delete_vector.rs` tests: HAND-COMPUTED golden bytes for {0,5,2^32+1} (66 bytes incl.
+            CRC 0x9ACC8CA4, derived via python struct+zlib independent of the production code) and
+            the DENSE-GAP pin {0,2^33} → count 3 with a literal empty key-1 entry (76 bytes, CRC
+            0xBC98851A); round-trip through D1's decoder (gaps, 0, >2^32, run shape); empty/key-
+            bound/2GB-guard error tests.
+      - [x] `puffin/writer.rs` (minimal write-side extension, FLAGGED): `add()` returns
+            `Result<BlobMetadata>` (Java `PuffinWriter.write(Blob)` returns BlobMetadata —
+            BaseDVFileWriter L164 consumes it for content_offset/content_size); `close()` returns
+            `Result<u64>` file size (Java `fileSize()`, consumed at L134). All existing callers
+            are tests; call sites compile unchanged (`?;` discards the value).
+      - [x] NEW `writer/base_writer/deletion_vector_writer.rs` + `mod.rs` wiring: `DVFileWriter`
+            mirroring `BaseDVFileWriter` — `new(OutputFile)`, `delete(path, pos,
+            Option<&PartitionKey>)` accumulating per path (partition captured at FIRST delete per
+            path, Java `computeIfAbsent` L74-79; pos validated vs MAX_POSITION), async
+            `close() -> Result<Vec<DataFile>>`: no deletes ⇒ NO file (L106-109); else ONE puffin,
+            one uncompressed `deletion-vector-v1` blob per path in SORTED path order (determinism
+            is OUR contract; Java iterates a HashMap — order is not Java's contract), blob fields
+            = [ROW_POSITION id 2147483645 = i32::MAX-2] (BRIEF CORRECTION: the brief said
+            2147483545 which is DELETE_FILE_POS; MetadataColumns.java L39-44 says MAX-2),
+            snapshot_id/sequence_number −1 (L177-178), properties referenced-data-file +
+            cardinality (L181-185); per-path DeleteFile per createDV L145-159. DEFERRED LOUDLY to
+            D3: `loadPreviousDeletes` merge + `rewrittenDeleteFiles` (L117-126, the commit-path
+            concern) — this writer takes only fresh positions.
+      - [x] Writer tests: multi-file blob offsets distinct + full DeleteFile metadata; determinism
+            across two runs (byte-identical puffin); no-deletes ⇒ no file; file_size ==
+            on-disk size; round-trip write → D1 `CachingDeleteFileLoader` → positions match
+            (crate-internal unit test).
+      - [x] Direction-2 oracle: new `crates/iceberg/tests/interop_dv_write.rs` (env
+            `ICEBERG_INTEROP_DV_WRITE_DIR`, offline no-op): GEN writes a real puffin via
+            DVFileWriter (2 referenced files; positions incl. 0, a 5000-run, >2^32, a dense-gap
+            key) + expected JSON {path → positions + blob offset/size}. InteropOracle new mode
+            `verify-interop-dv-write`: Java reads the RUST puffin via Puffin.read footer + ranged
+            blob read + `PositionDeleteIndex.deserialize` (the production scan path,
+            BaseDeleteLoader.readDV L171-183), asserts positions; ALSO emits Java's own
+            serialization of the SAME position sets via BaseDVFileWriter → `java_dv_blob_*.bin`.
+            Rust byte-parity test asserts rust-puffin blob bytes == java blob bytes (incl. the
+            run-shaped set — roaring-rs CAN emit runs, so byte-exactness is pinned for runs too).
+            `run-interop-dv.sh` extended to drive D1 AND D2 phases with the output-sentinel grep.
+      - [x] Mutations (snapshot to /tmp, restore, full-suite re-run): (a) sparse-not-dense ⇒
+            dense-gap golden fails; (b) CRC over bitmap only ⇒ golden + round-trip fail; (c)
+            count = max_key ⇒ golden + decoder fail; (d) blob offset off by footer magic ⇒ writer
+            round-trip fails.
+      - [x] Docs: GAP_MATRIX DV-writer row ❌→🟡; `writer/map.md` row; `dev/java-interop/map.md`
+            run-interop-dv.sh row; this todo outcome.
+      BUILDER OUTCOME (2026-06-10, D2 builder — FABLE; awaiting reviewer): **CROWN JEWEL GREEN ON
+      THE FIRST RUN, BYTE-EXACT INCLUDING RUN CONTAINERS** — Java's production reader
+      (`Puffin.read` footer + the `readDV`-style ranged read + `PositionDeleteIndex.deserialize`)
+      decoded the Rust-written Puffin DVs exactly (5003 positions incl. the 5000-run + 2^32+7;
+      dense-gap set), AND every Rust blob is BYTE-IDENTICAL to Java's own `BaseDVFileWriter`
+      serialization of the same positions — the run-container question is SETTLED: roaring 0.11.3
+      `optimize()` (verified in registry source) makes Java-identical run-iff-strictly-smaller
+      container choices, so byte parity holds for run-shaped inputs too (69-byte run blob
+      matched). BRIEF CORRECTION: blob `fields` = [2147483645] (ROW_POSITION = i32::MAX−2,
+      MetadataColumns.java L39-44), NOT the brief's 2147483545 (that is DELETE_FILE_POS).
+      Implementation: production `serialize_deletion_vector_v1` (dense layout hand-rolled —
+      roaring's treemap serialize is sparse; per-sub-bitmap optimize on clones; errors: empty /
+      key>i32::MAX−1 / >2GB pre-alloc) absorbing the D1 test encoder; `PuffinWriter.add` →
+      `Result<BlobMetadata>` + `close` → `Result<u64>` (file size) mirroring Java's returns (all
+      callers were tests, call sites unchanged); new `DVFileWriter` (sorted-path blob order = our
+      determinism contract, partition captured at first delete per path, MAX_POSITION door incl.
+      the Java low-word quirk 0x80000000). 13 new lib tests (1735 ×2): hand-computed exact-byte
+      goldens ({0,5,2^32+1} 66B CRC 0x9ACC8CA4; dense-gap {0,2^33} 76B with the literal empty
+      key-1 entry), round-trips, run-container cookie pin, 3 error doors, 6 writer tests incl.
+      the D1-loader round-trip. Mutations all caught + restored byte-clean (cmp): (a) sparse ⇒
+      dense-gap golden fails; (b) CRC-sans-magic ⇒ goldens + all round-trips; (c) count=max_key ⇒
+      12 tests incl. decoder trailing-bytes; (d) offset-before-header-magic ⇒ loader round-trip +
+      coordinates + puffin Java-bit-identical tests. KNOWN RESIDUE (flagged): the Puffin FOOTER
+      JSON is not byte-deterministic (HashMap property order, pre-existing `puffin/metadata.rs`,
+      outside the file set) — blob region + structural footer pinned instead; Java reads footers
+      as JSON so interop is unaffected. DEFERRED LOUDLY: previous-deletes merge +
+      `rewrittenDeleteFiles` (BaseDVFileWriter L117-126) → D3 with the commit path.
+      REVIEWER OUTCOME (2026-06-10, D2 reviewer — FABLE): **APPROVED, 2 pins added, 1 doc
+      correction, no production-code bugs.** All seven attack points held: (1) the dense-gap size
+      door INCLUDES gap bytes (probed: one position at key 10_000 ⇒ exactly 120_042-byte blob =
+      12 B/gap entry; key 250M ⇒ 3.0 GB-by-gaps REJECTED in 433 µs; key i32::MAX−2 ⇒ 25.77 GB
+      rejected in 303 µs — O(present keys), pre-allocation; matches Java `serializedSizeInBytes`
+      over the dense array + `computeBitmapDataLength` ≤ Integer.MAX_VALUE, re-derived from
+      1.10.0 BYTECODE); reviewer mutation (drop the absent×empty term) caught by 4 tests incl.
+      the 2GB door test. Write loop for legal gappy blobs is O(dense) like Java's (~418 ns/gap
+      entry debug) — flagged, not fixed. (2) MAX_POSITION re-derived from bytecode:
+      `toPosition(2147483646, Integer.MIN_VALUE)` = 0x7FFFFFFE_80000000 = 9223372030412324864;
+      Rust constant + boundary tests sit exactly on it; positions in (MAX, key-ceiling] rejected
+      by the delete door like Java's `validatePosition` (Java's DESERIALIZER would accept them —
+      the serializer layer matches Java's serialize, the delete door matches set(); layering
+      identical). (3) run-criterion parity verified at SOURCE level both sides (roaring-rs
+      0.11.3 container.rs vs RoaringBitmap 1.3.0 bytecode): Array/Bitmap branches IDENTICAL
+      incl. ties; CAVEAT found+documented — for an already-RUN store (deserialized DVs, D3
+      merge) roaring-rs omits Java's 2-byte array overhead, so at cardinality == 2·runs Java
+      keeps run / Rust would emit array (readable, byte-parity-only; doc softened). PIN ADDED:
+      the exact array/run size tie {0,1,2} (6 == 6 bytes) as lib test + THIRD interop fixture
+      file — Java byte-compare settled it (46-byte blob byte-identical). (4) puffin diff is
+      signature+return only; reviewer mutation (offset captured AFTER blob bytes) caught by 7
+      tests incl. the pre-existing Java-bit-identical pins; all non-DV callers are tests. (5)
+      createDV metadata verified against bytecode (toBlob fields=[2147483645=ROW_POSITION,
+      bytecode-confirmed], −1/−1, two properties; shared fileSize after close like Java's
+      Optional). PIN ADDED: duplicate-position ⇒ record_count 1. NOTE (D3): `delete(path, pos,
+      None)` loses the spec id (DataFileBuilder default) — Java always receives the spec;
+      revisit when the commit path wires real specs. (6)(7) no-deletes ⇒ no file (filesystem
+      probed); interop re-run END-TO-END ×2 (incl. extended fixture) green; oracle
+      CAN-fail proven (tampered expected JSON ⇒ FAIL line ⇒ script grep trips; NOTE the verify
+      step is not re-runnable in place — emit table collides — harmless, script resets dirs).
+      Suite 1737 ×2 (1735 + 2 reviewer pins); gate green; Cargo/pom 0-diff.
 - [ ] **D3 — commit path:** RowDelta DV adds; V2-forbids/V3-requires gating
       (`validateDeleteFileForVersion`, MergingSnapshotProducer L295-316); `validateAddedDVs`
       (L824-870, "Found concurrently added DV for %s: %s") + the no-override tx-captured-start

@@ -1016,6 +1016,34 @@ How to use it (see the manuals' §2):
   unmasked rows. The reviewer ran this against the real harness fixture — make it a standard
   probe for every future storage decoder.
 
+### 2026-06-10 (DV arc D2 — DV serialization + DVFileWriter, BUILDER + REVIEWER Fable)
+- **The orchestrator's brief cited the WRONG reserved field id (2147483545 = DELETE_FILE_POS) for
+  the DV blob's `fields` list — Java writes `MetadataColumns.ROW_POSITION.fieldId()` =
+  Integer.MAX_VALUE − 2 = 2147483645.** The builder caught it by reading MetadataColumns.java and
+  proving against the live oracle (the Java verify asserts the constant). The recurring rule both
+  directions: the brief is never the spec — and reserved-id constants are exactly the kind of
+  off-by-a-digit a paraphrase corrupts.
+- **roaring-rs 0.11.3 CAN emit run containers (`RoaringBitmap::optimize`) with Java-identical
+  array→run/bitmap→run criteria INCLUDING exact ties** — byte parity with Java holds
+  unconditionally for insert()-built vectors (proven: run/dense-gap/tie fixtures byte-identical
+  69/76/46 B). ONE caveat for D3: a store that is ALREADY Run (a deserialized previous DV being
+  re-serialized after merge) ties differently at `cardinality == 2·runs` (Java keeps run, Rust
+  emits array — readable everywhere, byte-only divergence; documented in delete_vector.rs).
+- **A dense-layout size door must count the ABSENT (gap) entries' bytes, not just present
+  bitmaps** — count = max_key+1 means one position at a high key implies gigabytes of empty
+  8-byte entries. Pinned: 3 GB-by-gaps rejected in ~430 µs BEFORE allocation; the
+  drop-the-absent-term mutation ground a 60+ s dense loop. Java's serializedSizeInBytes iterates
+  its dense array (same accounting, slower); the O(present-keys) closed form is strictly better.
+- **Java `MAX_POSITION = toPosition(2^31−2, Integer.MIN_VALUE)` — the LOW WORD IS 0x8000_0000,
+  not 0xFFFF_FFFF** (0x7FFFFFFE_80000000). The writer-side `set()` door rejects above it while
+  the DESERIALIZER accepts up to the key ceiling — mirror the LAYERING (door on delete(), key-only
+  check in serialize), not a single bound.
+- **When the oracle pins a jar version with no matching local source, verify Java behavior from
+  the JAR's bytecode (javap/decompile), not MAIN-source line numbers** — the D2 reviewer
+  re-derived MAX_POSITION, the run criteria (RoaringBitmap 1.3.0 — the version 1.10.0 actually
+  pulls), and the fields constant from bytecode. MAIN line citations are navigation hints, never
+  proof, across versions.
+
 ### 2026-06-10 (post-arc logic + security audit, ORCHESTRATOR Fable — two parity bugs found + fixed)
 - **Java's merge `first` is the unconditional STREAM HEAD (`manifestIter.next()`,
   ManifestMergeManager L85), NOT "this commit's new manifest".** For an empty-data merging append
