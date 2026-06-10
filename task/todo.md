@@ -172,11 +172,60 @@ pushed; merge nothing. Gate chained in ONE `&&` chain; Cargo files FROZEN.
       in `write_added_manifest` ⇒ crown jewel fails with y=20 resurrected; (2) refreshed-head
       `effective_start` ⇒ no-override test fails (commit wrongly succeeds). Done-bar 🟡 (unit-proven;
       interop in Increment 4 with a delete-bearing rewrite fixture).
-- [ ] **Increment 3 — merge append** (`MergeAppend` / `MergingSnapshotProducer` merge machinery):
-      `merge_append()` action honoring `commit.manifest-merge.enabled` /
-      `commit.manifest.min-count-to-merge` / `commit.manifest.target-size-bytes`; provenance
-      preserved in merged manifests; passthrough pins below threshold / property-disabled. May
-      split 3a/3b; sketch-and-stop fallback.
+- [x] **Increment 3 — merge append** (`MergeAppend` / `ManifestMergeManager` merge machinery) — DONE
+      2026-06-10 (builder + reviewer ACCEPT + gate). REVIEWER: bin-packing port hand-traced against
+      Java on 3 adversarial cases (packEnd double-reversal, `<=` weight boundary, lookback-1
+      no-lookahead) — all match; read-back seq chain independently verified; 3 mutations re-run all
+      caught; 1.10.0/manifests-* question RESOLVED for Increment 4 (the canonical view's
+      SUMMARY_COUNT_KEYS allowlist excludes manifests-created/-kept/-replaced ⇒ s7 insensitive,
+      no production/allowlist change needed; the /tmp Java ref is a tagless shallow clone — version-
+      ancestry answers from it are artifacts). Gate: lib 1692 ×2. `merge_append()` action honoring
+      `commit.manifest-merge.enabled` / `commit.manifest.min-count-to-merge` /
+      `commit.manifest.target-size-bytes`; provenance preserved in merged manifests; passthrough
+      below threshold / property-disabled. Done-bar 🟡 (interop in Increment 4).
+      BUILDER PLAN (2026-06-10, Increment-3 builder):
+      - [x] `snapshot.rs` seam: changed `ManifestProcess::process_manifests` → async + `Result` +
+            `&mut SnapshotProducer` (same `impl Future + Send` style as `SnapshotProduceOperation`).
+            `DefaultManifestProcess` stays a passthrough (fast_append byte-identical); single
+            `manifest_file()` call site now `.await?`. NOTHING else changed in snapshot.rs.
+      - [x] New `transaction/merge_append.rs`: `MergeAppendAction` mirroring `FastAppendAction`
+            surface (add_data_files / set_commit_uuid / set_key_metadata / set_snapshot_properties /
+            with_check_duplicate + validate_added_data_files + validate_duplicate_files). Op =
+            `Operation::Append`; `existing_manifest` mirrors append.rs. `MergeManifestProcess`:
+            split DATA vs DELETE; DELETES carried UNCHANGED (deferred); reorder DATA [new added FIRST
+            via added_snapshot_id == producer.snapshot_id, then existing]; group by spec id
+            REVERSE-sorted; packEnd by manifest_length; three bin rules via pure `bin_disposition`;
+            three-way routing (this-snapshot DELETED → add_delete_entry [unreachable]; this-snapshot
+            ADDED → add_entry; else → add_existing_entry); output merged-data then delete manifests.
+      - [x] private `bin_packing` module (ported BinPacking.PackingIterator + ListPacker.packEnd,
+            general lookback/largest-bin-first/max-items) + 7 unit tests.
+      - [x] `mod.rs`: `merge_append()` ctor + docs (3 properties + fast_append/newAppend contrast).
+      - [x] Tests (19, MemoryCatalog, mirror rewrite_manifests fixtures): below-min-count passthrough,
+            at-threshold merge w/ provenance (raw-avro on-disk seqs + summary-shape), property-disabled
+            passthrough, old-tombstone suppression (live+tombstone in one manifest so it reaches the
+            merge), multi-spec separation (higher-spec-first), tiny-target size-1-keep, MoR
+            delete-carry crown jewel, cumulative totals, empty-reject, 3 `bin_disposition` units, 7
+            `pack_end`/`pack` units. Mutations run+restored: provenance re-stamp (→ provenance test
+            fails), tombstone-suppression broaden (→ suppression test fails), bin-gate broaden (→
+            bin_disposition unit fails).
+      - [x] Docs: map.md merge_append row + snapshot.rs ManifestProcess seam note; GAP_MATRIX ❌→🟡.
+      Outcome: 19 merge_append tests green (5x stable — replaced a FLAKY length-arithmetic bin test
+      with a deterministic 1-byte-target size-1 pin + pure `bin_disposition` unit tests; manifest avro
+      length varies a few bytes/commit so `target = 2*one_len` was non-deterministic). Seam change kept
+      fast_append byte-identical (337 transaction tests green). PHYSICS verified: new added manifest
+      reads back with seq=-1, Added entries inherit Some(-1), add_entry strips to None ⇒ re-inherits.
+      SUMMARY-SHAPE finding: Java's MergingSnapshotProducer adds manifests-created/-kept/-replaced;
+      Rust's SnapshotProducer.summary + MergeManifestProcess do NOT ⇒ merge_append == fast_append shape.
+      PHYSICS VERIFIED: the new added manifest read back has ManifestFile.sequence_number == -1;
+      its Added entries inherit seq=Some(-1) via `inherit_data` (status Added branch). `add_entry`
+      then STRIPS Some(-1) (since -1 >= 0 is false) → writes seq=None on disk ⇒ re-inherits the new
+      snapshot's real seq at commit. Carried (committed) entries have real Some(seq) ⇒
+      `add_existing_entry` preserves them explicitly on disk. Merged manifest has
+      added_snapshot_id == new_snapshot_id ⇒ `assign_sequence_numbers` stamps the real new seq.
+      SUMMARY SHAPE: Java's MergingSnapshotProducer.apply adds manifests-created/-kept/-replaced via
+      buildManifestCountSummary; the Rust SnapshotProducer.summary does NOT, and MergeManifestProcess
+      will NOT inject them either ⇒ merge_append summary == fast_append summary shape (documented
+      divergence from Java).
 - [ ] **Increment 4 — interop extension**: extend the E2 chain (`WriteActionsOracle` +
       `interop_write_actions_meta.rs`) with s6 rewrite_manifests (cluster by partition), s7+
       merge-append (min-count-to-merge=2 as a TABLE PROPERTY both sides; Java `newAppend`), and a

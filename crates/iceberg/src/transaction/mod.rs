@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 mod delete_files;
 mod manage_snapshots;
+mod merge_append;
 mod overwrite_files;
 mod replace_partitions;
 mod rewrite_files;
@@ -82,6 +83,7 @@ use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::delete_files::DeleteFilesAction;
 use crate::transaction::manage_snapshots::ManageSnapshotsAction;
+use crate::transaction::merge_append::MergeAppendAction;
 use crate::transaction::overwrite_files::OverwriteFilesAction;
 use crate::transaction::replace_partitions::ReplacePartitionsAction;
 use crate::transaction::rewrite_files::RewriteFilesAction;
@@ -166,6 +168,30 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Creates a merge-append action: append data files in one `Operation::Append` snapshot (exactly like
+    /// [`Self::fast_append`]) and then MERGE the resulting manifest list into a minimal number of
+    /// manifests (Java `MergeAppend`). Java's `Table.newAppend()` returns this MERGING producer, whereas
+    /// `newFastAppend()` returns the non-merging one this fork exposes as [`Self::fast_append`].
+    ///
+    /// The merge honors three table properties (read at commit time, Java `ManifestMergeManager`):
+    /// - `commit.manifest-merge.enabled` (default `true`) — when `false`, the manifest list is left as-is
+    ///   (the action then behaves like a fast append).
+    /// - `commit.manifest.min-count-to-merge` (default `100`) — the bin holding this commit's NEW added
+    ///   manifest is merged only once it accumulates at least this many manifests.
+    /// - `commit.manifest.target-size-bytes` (default 8 MB) — the bin-packing target weight (by manifest
+    ///   length).
+    ///
+    /// Merged manifests preserve every carried-forward entry's provenance (original snapshot id + data /
+    /// file sequence numbers, status `Existing`); this commit's added entries stay `Added` and re-inherit
+    /// the new snapshot's sequence number. The live file set is identical to the equivalent fast append.
+    ///
+    /// **Deferred (vs Java):** delete-manifest merging (delete manifests are carried forward unchanged),
+    /// `appendManifest`, and the retry cache / orphan cleanup. See the
+    /// [`merge_append`](crate::transaction) module for the full Java contract and deviations.
+    pub fn merge_append(&self) -> MergeAppendAction {
+        MergeAppendAction::new()
     }
 
     /// Creates a delete-files action (remove data files from the table by path / `DataFile`

@@ -900,3 +900,30 @@ How to use it (see the manuals' §2):
   `ManifestWriter::add_entry` silently STRIPS a negative explicit seq into `None` ⇒ V2/V3
   re-inheritance of the new (higher) seq ⇒ exactly the resurrection the parameter exists to
   prevent. Java never receives one (compactions pass real seqs); Rust fails loudly.
+
+### 2026-06-10 (Phase-2 completion arc Increment 3 — MergeAppend, BUILDER + REVIEWER Opus)
+- **The uncommitted-new-manifest read-back chain is load-bearing for any merging producer:**
+  `load_manifest` on a manifest whose list entry has `sequence_number == -1` (UNASSIGNED) makes
+  `inherit_data` stamp `Some(-1)` into its Added entries; re-routing them through `add_entry`
+  strips the negative back to `None` on disk ⇒ they correctly re-inherit the REAL snapshot seq at
+  commit. Carried committed entries go through `add_existing_entry` (touches ONLY status; both seq
+  fields + snapshot id preserved verbatim; `add_entry_inner` hard-errors on a missing seq). Pin
+  BOTH halves with a raw-avro on-disk test (new entries None, carried entries Some(original) !=
+  the merged list seq).
+- **A suppression/filter test is VACUOUS if an earlier filter already removes its fixture — route
+  the case through the path under test and ASSERT the routing.** *Why:* the first tombstone-
+  suppression test used a manifest whose only entry was the tombstone; `existing_manifest`'s
+  has-live-files filter dropped it before the merge ever saw it, and the broaden-mutation passed.
+  Fix: co-locate the tombstone with a LIVE entry in one manifest and assert pre-merge that the
+  manifest reaches the merge input.
+- **`manifests-created`/`-kept`/`-replaced` summary keys: Java MAIN's merging producer emits them
+  (`SnapshotProducer.buildManifestCountSummary` L716-733); Rust emits them ONLY from
+  RewriteManifests.** The interop canonical view's `SUMMARY_COUNT_KEYS` allowlist EXCLUDES them,
+  so the s7 merge-append comparison is insensitive either way — no allowlist or production change
+  needed for Increment 4. Proving manifests-* parity later requires a properly-tagged Java
+  checkout (the /tmp ref is a depth-1 TAGLESS shallow clone — `git log -S` / `merge-base
+  --is-ancestor` answers from it about version ancestry are ARTIFACTS, not facts).
+- **Bin-packing port: Java `canAdd` is `<=` on weight, `<` on max-items; `packEnd` = reverse input
+  → pack → reverse each bin → reverse bin list; min-count gate is STRICT `<` (== merges).**
+  Hand-trace ≥3 cases through BOTH algorithms before trusting unit tests — a test asserting the
+  port's own behavior pins nothing about Java.

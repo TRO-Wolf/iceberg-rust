@@ -106,21 +106,33 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
 pub(crate) struct DefaultManifestProcess;
 
 impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifests(
+    async fn process_manifests(
         &self,
-        _snapshot_produce: &SnapshotProducer<'_>,
+        _snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile> {
-        manifests
+    ) -> Result<Vec<ManifestFile>> {
+        // Pass the manifest list through unchanged — the fast-append / single-manifest path. This MUST
+        // stay a no-op so `FastAppend` behavior is byte-identical to the pre-seam-change producer.
+        Ok(manifests)
     }
 }
 
+/// Post-process the manifest list a snapshot is about to commit, after the producer has written the
+/// added DATA/DELETE manifests and rewritten any delete-bearing manifests (Java
+/// `MergingSnapshotProducer.apply`'s `mergeManager.mergeManifests(...)` step). The default
+/// ([`DefaultManifestProcess`]) returns the list untouched (fast append); the merge-append manager
+/// ([`crate::transaction::merge_append::MergeManifestProcess`]) bin-packs and merges them.
+///
+/// Takes `&mut SnapshotProducer` because a manager that MERGES manifests needs the producer's writer
+/// factory ([`SnapshotProducer::new_cluster_manifest_writer`]) — which advances the manifest-name
+/// counter — to write the merged manifests. It is async + `Result` because merging reads the input
+/// manifests back from object storage and writes new ones.
 pub(crate) trait ManifestProcess: Send + Sync {
     fn process_manifests(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile>;
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
 pub(crate) struct SnapshotProducer<'a> {
@@ -865,7 +877,9 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_delete_manifest);
         }
 
-        let manifest_files = manifest_process.process_manifests(self, manifest_files);
+        let manifest_files = manifest_process
+            .process_manifests(self, manifest_files)
+            .await?;
         Ok(manifest_files)
     }
 
