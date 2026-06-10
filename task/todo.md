@@ -34,7 +34,144 @@ How to use it (see the manuals' §1):
 
 > **Archival log.** Last todo-archival pass: 2026-06-09 (size trigger — 4,344 lines) → [todo-archive/](todo-archive/) (phase1/phase2/phase3). Completed-increment narratives moved verbatim; this file keeps the active sprint + open items + archive pointers. Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival. Archives are not read by default.
 
-## ACTIVE (2026-06-10 overnight): Phase-2 write-engine completion arc (branch `phase2/write-engine-completion`)
+## ACTIVE (2026-06-10): Deletion-vector arc (branch `phase2/dv-writer`)
+
+Actor-critic per increment with **FABLE builder + FABLE reviewer** (user-authorized for this
+sequence, naming the tier explicitly — supersedes the Opus default for this arc only).
+Orchestrator re-runs the gate + commits; one commit per increment, pushed; Cargo FROZEN —
+**exception pre-authorized: NONE; if a dep is truly needed, STOP.**
+
+**Scope correction found during orchestrator prep:** the GAP_MATRIX read row claims
+"position-deletes + DVs during scan ✅" but `caching_delete_file_loader.rs` routes ALL
+`PositionDeletes` content to the PARQUET reader (`parquet_to_batch_stream`); the Puffin DV loader
+is a literal TODO (L52). The ✅ came from the 0.7→0.9.1 sync notes and was never scan-verified —
+the scan-exec interop cross-product covered parquet position/equality deletes only, never DVs.
+The read path is therefore Increment D1, before any writer work.
+
+- [x] **D1 — DV scan READ path** (DONE 2026-06-10 — Fable builder + Fable reviewer APPROVED +
+      orchestrator gate/commit): dispatch Puffin-format position deletes in
+      `CachingDeleteFileLoader` to a DV loader (direct ranged read → `deletion-vector-v1` blob →
+      magic/length/CRC framing → `RoaringTreemap` → `DeleteVector` keyed by
+      `referenced_data_file`); DV-vs-position-delete precedence per Java `DeleteFileIndex`;
+      corrected the over-claiming GAP_MATRIX read row. Crown jewel GREEN: Rust scans a JAVA
+      1.10.0-written V3+DV table (incl. >2^32 positions + run containers). Reviewer added 3 pins
+      (hostile-container-count DoS, max-valid-key boundary, two-DVs-in-one-puffin) + proved
+      fail-loud-on-corruption against the real fixture + settled the serde-default blast radius
+      (old serializations fail loudly in the parquet reader — correct posture). Gate: lib 1722 ×2,
+      datafusion 80+9 (known doctest artifact), interop script green ×2 runs.
+      BUILDER PLAN (2026-06-10, D1 builder — FABLE):
+      - [x] `delete_vector.rs`: `DeleteVector::deserialize_deletion_vector_v1(&[u8])` — framing
+            per puffin-spec.md L146-164 + Java `BitmapPositionDeleteIndex.deserialize` (BE u32
+            length prefix over magic+bitmap; LE magic 0x6439D3D1 = bytes D1 D3 39 64; BE CRC-32
+            of magic+bitmap via the existing CRC-32 dependency, checked BEFORE bitmap parse); portable 64-bit
+            roaring decoded MANUALLY mirroring Java `RoaringPositionBitmap.deserialize` L260-307
+            (u64 LE count ≤ i32::MAX + payload bound; u32 LE keys ≥0, ≤ i32::MAX-1, strictly
+            ascending; checked `RoaringBitmap::deserialize_from` per key; exact consumption — no
+            trailing bytes); positions appended as `(key << 32) | low`. Unit tests: round-trip
+            (incl. >2^32), empty, dense run-container, EVERY malformed class (truncations at each
+            boundary, wrong magic, CRC mismatch, length-prefix mismatch both ways, bitmap
+            garbage, count overflow, non-ascending keys, trailing bytes) — all clean `Err`, no
+            panics; env-gated Java-blob byte test (`ICEBERG_INTEROP_DV_DIR`).
+      - [x] **SCOPE ADDITION (flagged):** `scan/task.rs` — extend `FileScanTaskDeleteFile` with
+            `file_format`, `referenced_data_file`, `content_offset`, `content_size_in_bytes`,
+            `record_count` (serde-defaulted) + fill in the `From<&DeleteFileContext>` impl. The
+            DV discriminator Java uses (`ContentFileUtil.isDV` = format == PUFFIN, L142-144) and
+            the direct-ranged-read inputs (`BaseDeleteLoader.readDV` L171-183) can only travel on
+            the task's delete entry; no in-scope alternative exists. Test literals in
+            `arrow/reader.rs` (3 sites, test-only) gain the new fields.
+      - [x] `delete_file_index.rs`: `dv_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>`
+            keyed by `referenced_data_file` (Java `DeleteFileIndex.build` L505-506, `add` L528-535);
+            `get_deletes_for_data_file` mirrors `forDataFile` L151-168: a data file with a DV gets
+            {global eq, partition eq, DV} and NO parquet position deletes. DEFERRED (documented):
+            the two ValidationException paths (duplicate DV → moved to the loader's door;
+            `dv.dataSequenceNumber() >= seq` L209-213 → infallible signature, residue).
+      - [x] `arrow/caching_delete_file_loader.rs` + `arrow/delete_file_loader.rs`: dispatch
+            PositionDeletes+Puffin to a DV load (direct ranged read via new
+            `BasicDeleteFileLoader::read_bytes_range`, per Java `BaseDeleteLoader.readDV` L171-183
+            — deliberately NOT PuffinReader, Java cites ≥3 requests, L144-147); validations per
+            `validateDV` L266-283 (offset/length present, ≤2GB, referenced path present) +
+            cardinality == record_count (Java `deserializeBitmap` L203-209); duplicate-DV reject
+            before load; cache key `{path}@{offset}` (one puffin file holds MANY blobs — the bare
+            path key would mark blob 2 "already loaded"); decoded vector upserted under
+            `referenced_data_file`. Loader tests incl. the sibling-file negative control + an
+            ArrowReader-level scan test (Rust-synthesized DV; deleted positions absent, sibling
+            file intact).
+      - [x] `dev/java-interop/`: `DvScanOracle` (generate-interop-dv) — Java 1.10.0 writes a V3
+            table (2 real parquet data files + a real DV via `BaseDVFileWriter` deleting positions
+            {1,3} of file 1) + `java_dv_scan_rows.json`; ALSO emits a synthetic
+            high-bits/run-container DV blob (`dv_blob.bin` + expected positions JSON) for the
+            byte-level decode pin. `run-interop-dv.sh` drives generate → both env-gated Rust tests.
+            New `crates/iceberg/tests/interop_dv_scan.rs` (env-gated, empty-string-safe, offline
+            no-op).
+      - [x] Docs: GAP_MATRIX merge-on-read read row corrected (pre-change reality: DVs were NOT
+            loadable — routed to the parquet reader; D1 adds the DV scan path + Direction-1
+            interop); todo outcome; scan/map.md only if stale.
+      - [x] Mutations (with /tmp backups + full-suite re-run after restore): (a) skip CRC check;
+            (b) key vector by the DV file's own path; (c) drop the `<<32` high-bits shift.
+      - [x] Gate: typos; fmt; clippy workspace (excl. sqllogictest); `cargo test -p iceberg --lib`
+            ×2; `cargo test -p iceberg-datafusion` (read-path rule); offline no-op of the new
+            interop test; the REAL `run-interop-dv.sh` end-to-end.
+      BUILDER OUTCOME (2026-06-10, D1 builder — FABLE; awaiting reviewer): **CROWN JEWEL GREEN ON
+      THE FIRST RUN** — Rust scanned the Java-1.10.0-written V3 table with a real `BaseDVFileWriter`
+      DV to exactly Java's own read ({10,30,50,60,70,80}; 20/40 deleted, sibling file intact), AND
+      the raw Java-serialized blob (5005 positions incl. 2^32+7 / 2^33+1 + a 5000-position run →
+      RUN containers) decoded to the exact position set — `roaring-rs`'s portable treemap layout is
+      EMPIRICALLY byte-compatible with Java `RoaringPositionBitmap.serialize` (count is non-padded
+      vs Java's dense-with-empty-gap-bitmaps array, but the decoder accepts both; pinned by the
+      empty-gap-bitmap unit test). Implementation: manual outer decode (Java `readBitmapCount`/
+      `readKey` validations + exact-consumption check) + checked `RoaringBitmap::deserialize_from`
+      per key; CRC via the crate's existing gzip dependency (no Cargo change); loader does ONE ranged read per
+      Java `BaseDeleteLoader.readDV` (not PuffinReader), cache-keyed `{path}@{offset}` (one Puffin
+      file holds many blobs — the bare-path key would mark blob 2 already-loaded = silent
+      under-delete); index mirrors `forDataFile` precedence (DV supersedes parquet pos-deletes for
+      its file; eq deletes still apply). 25 new lib tests *(reviewer-corrected count: 14
+      delete_vector incl. 8 malformed-input tests + 4 index + 6 loader incl. ArrowReader-level
+      scan + 1 serde-default; one of the 14 env-gated)* + 1 env-gated integration test
+      (`interop_dv_scan.rs`). Mutations all caught + restored byte-clean + full suite re-run: (a) CRC skip
+      → exactly the CRC test; (b) key-by-DV-path → path-keying + cache + scan tests AND the crown
+      jewel (ids 20/40 resurrect); (c) `<<32` drop → exactly the 3 high-bits tests. Gate: typos/
+      fmt/clippy(workspace excl. sqllogictest) clean; lib 1719 ×2; datafusion 80+9 (doctest
+      failure = the documented pre-existing rt-multi-thread artifact); all interop tests no-op
+      offline; `run-interop-dv.sh` end-to-end green twice. Cargo/pom 0-diff. SCOPE ADDITIONS
+      (flagged): `scan/task.rs` (5 serde-defaulted fields on `FileScanTaskDeleteFile` + the From
+      impl — the only carrier for Java's isDV discriminator + readDV inputs) and `arrow/reader.rs`
+      (3 test literals gained the new fields, test-only). DEFERRED (documented in code + matrix):
+      Java's two index-level ValidationExceptions — duplicate-DV moved to the load door
+      (fail-loud `Err`), `dv_seq >= data_seq` deferred (infallible index signature; invalid-table
+      state only); DV caching beyond one loader instance (Java doesn't cache DVs either);
+      Direction-2 DV interop (needs the D2 writer).
+      REVIEWER OUTCOME (2026-06-10, D1 reviewer — FABLE): APPROVED with 3 added pins (lib 1722 ×2).
+      All 8 review points verified; no correctness bug found. Pins added (each mutation-verified):
+      `test_two_dvs_in_one_puffin_file_both_load_under_own_data_file` (the exact case the
+      `{path}@{offset}` cache key exists for — fails under a bare-path key),
+      `test_dv_blob_hostile_inner_container_count_rejects_fast` (DoS-by-allocation via the INNER
+      roaring container count; roaring 0.11.3 caps containers at 65536 pre-allocation — verified in
+      its source), `test_dv_blob_max_valid_key_boundary_accepted` (the ACCEPT side of Java
+      `readKey`'s `i32::MAX-1` bound — builder pinned only the reject side). Adversarial probes all
+      clean (no panic): hostile inner cookie/count, `read_bytes_range` overflow/past-EOF, declared
+      length 4/8, old-serialized DV task (defaults to Parquet → LOUD "Corrupt footer" error, the
+      pre-D1-equivalent; default confirmed right — no in-repo serializer of `FileScanTask` exists).
+      Fail-loud on REAL corruption proven against the Java fixture: CRC byte-flip → loud
+      `Invalid deletion vector CRC`, truncation → loud error; crown jewel re-verified to catch
+      mutation (b) (ids 20/40 resurrect). Builder mutations (a)/(c) + reviewer mutations (pos
+      deletes alongside DV → supersede pin fails; duplicate-DV door disabled → duplicate test
+      fails) all caught. Known pre-existing (NOT D1): a delete-file load error leaves a stale
+      `Loading` notify entry in the shared `DeleteFilter` (same class as the parquet pos-del path);
+      scan still errors loudly. Test-count breakdown in the builder block corrected above.
+- [ ] **D2 — DV serialization + `DVFileWriter`:** bitmap serialization byte-exact vs Java
+      `BitmapPositionDeleteIndex.serialize` (portable 64-bit roaring + index framing), puffin blob
+      w/ `referenced-data-file`+`cardinality` properties (BaseDVFileWriter.java L52-53, L173-186),
+      DeleteFile metadata (content_offset/content_size_in_bytes/referenced_data_file/record_count
+      L145-159); exact-byte fixtures + round-trip through D1's reader.
+- [ ] **D3 — commit path:** RowDelta DV adds; V2-forbids/V3-requires gating
+      (`validateDeleteFileForVersion`, MergingSnapshotProducer L295-316); `validateAddedDVs`
+      (L824-870, "Found concurrently added DV for %s: %s") + the no-override tx-captured-start
+      pin; write→scan crown jewel on V3.
+- [ ] **D4 — interop:** bidirectional DV round-trips (Java writes V3+DV → Rust scans; Rust writes
+      → Java reads) on the scan-exec harness; metadata-level chain notes; GAP_MATRIX flips with
+      evidence.
+
+## DONE (2026-06-10 overnight): Phase-2 write-engine completion arc (branch `phase2/write-engine-completion`, squash-merged as PR #20)
 
 Session brief: `../FABLE_SESSION_BRIEF_2026-06-10_phase2-completion.md`. Actor-critic per increment
 (Opus builder → Opus reviewer, orchestrator re-runs the gate + commits). One commit per increment,

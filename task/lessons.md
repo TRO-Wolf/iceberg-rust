@@ -984,6 +984,38 @@ How to use it (see the manuals' §2):
   mid-sentence. Raw pipes inside code spans break naive pipe-delimited cell handling. Repaired
   2026-06-10 by rejoining the strand verbatim in the archive (conservation preserved).
 
+### 2026-06-10 (DV arc D1 — deletion-vector scan READ path, BUILDER + REVIEWER Fable)
+- **A GAP_MATRIX ✅ inherited from upstream-sync NOTES is unverified until the OUTERMOST behavior
+  is empirically exercised.** *Why:* the read row claimed "position-deletes + DVs during scan ✅"
+  from the 0.9.1 sync; the `DeleteVector` type and puffin reader existing did NOT mean DVs were
+  scannable — `caching_delete_file_loader` routed every position delete to the PARQUET reader and
+  the DV loader was a literal TODO. A V3+DV scan failed outright. Audit rule: a sync-inherited ✅
+  needs a behavior-level probe (a real scan/commit), not a type-level one. Corrected the row
+  ✅→🟡 with an honesty note.
+- **DV blob facts (settled empirically vs Java 1.10.0):** framing = BE u32 length prefix (magic+
+  bitmap), LE magic `D1 D3 39 64`, BE CRC-32 (the zlib CRC from the existing deflate dependency,
+  identical to `java.util.zip.CRC32`) over magic+bitmap; portable 64-bit roaring DECODE is byte-compatible with `roaring-rs` treemap
+  containers per key — BUT Java's `RoaringPositionBitmap.serialize` writes a DENSE bitmap array
+  including EMPTY gap bitmaps while roaring-rs writes sparse; the decoder tolerates both, the D2
+  WRITER must emit dense + Java's `runLengthEncode()` for byte parity. Read DVs with ONE ranged
+  read via `content_offset`/`content_size_in_bytes` (Java `BaseDeleteLoader.readDV` — the
+  PuffinReader path costs ≥3 requests). Cache/notify key must be `{puffin_path}@{offset}` — one
+  puffin file holds MANY blobs; a bare-path key marks blob 2 "already loaded" = silent
+  under-delete (pinned with a two-DVs-one-file test).
+- **`roaring-rs` 0.11.3 `RoaringBitmap::deserialize_from` is the validating variant and caps the
+  container count (≤65536, ~256KB max pre-read allocation)** — adversarial container-count blobs
+  fail fast without allocation DoS (probed + pinned). Still wrap it per-key with payload-bound
+  checks and an exact-consumption check; reject keys > i32::MAX-1 and non-ascending keys (Java
+  `readKey` L302-308).
+- **Serde-compat defaults on scan-task delete entries: default `file_format` to Parquet.** An old
+  serialization carrying a DV then fails LOUDLY in the parquet reader (pre-D1-equivalent), never
+  silently wrong; rejecting absent fields would break every genuinely-old parquet-delete
+  serialization. Verified no in-repo serializer exists (downstream-API surface only).
+- **Pin fail-loud-on-corruption for any storage-parsed structure:** flip one byte of the
+  Java-written blob → the SCAN must error (CRC named, computed-vs-stored), never silently return
+  unmasked rows. The reviewer ran this against the real harness fixture — make it a standard
+  probe for every future storage decoder.
+
 ### 2026-06-10 (post-arc logic + security audit, ORCHESTRATOR Fable — two parity bugs found + fixed)
 - **Java's merge `first` is the unconditional STREAM HEAD (`manifestIter.next()`,
   ManifestMergeManager L85), NOT "this commit's new manifest".** For an empty-data merging append
