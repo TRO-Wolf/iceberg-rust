@@ -34,6 +34,29 @@ How to use it (see the manuals' §1):
 
 > **Archival log.** Last todo-archival pass: 2026-06-09 (size trigger — 4,344 lines) → [todo-archive/](todo-archive/) (phase1/phase2/phase3). Completed-increment narratives moved verbatim; this file keeps the active sprint + open items + archive pointers. Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival. Archives are not read by default.
 
+## DONE (2026-06-10 overnight): OverwriteFiles validateNewDeletes branch A — Increment 2 of OVERNIGHT_BRIEF
+
+Added the MISSING row-filter sub-branch of Java `BaseOverwriteFiles.validate`'s `validateNewDeletes`
+(L168-172) — Rust previously had only branch B (`!deletedDataFiles.isEmpty()`). Builder→reviewer
+actor-critic; orchestrator independently re-ran the gate + committed.
+
+- [x] `snapshot.rs` — new `validate_deleted_data_files` (filter-based port of Java
+      `MergingSnapshotProducer.validateDeletedDataFiles` L636-654; reuses `deleted_data_files_after(.., false)`
+      + private `first_conflicting_file`; exact Java "Found conflicting deleted files that can contain records
+      matching {filter}: {path}").
+- [x] `overwrite_files.rs` — restructured the `validate_no_conflicting_deletes` block: branch A
+      (`row_filter != AlwaysFalse` ⇒ `filter = conflict_detection_filter ?? row_filter` ⇒
+      `validate_no_conflicting_added_delete_files` + `validate_deleted_data_files`) + branch B unchanged.
+- [x] 7 `MemoryCatalog` tests (2 positives, the no-override tx-captured-start pin, flag-off control, 2
+      row-filter-gate cases incl. the reviewer-added conflict-filter-only gap). Reviewer mutation-pinned each.
+
+**Outcome:** Cargo FROZEN (0 dep changes). Independent gate green — typos/fmt/workspace-clippy clean,
+`cargo test -p iceberg --lib` **1642 passed**, transaction:: 300 ×2. GAP_MATRIX `OverwriteFiles` row note
+updated (stays 🟡 — data-level interop deferred). **2a (`validateAddedFilesMatchOverwriteFilter`) was already
+done in PR #9; 2c (`RewriteFiles.validateNoNewDeletes`) is shadowed by the coarse `has_outstanding_delete_files`
+guard (both `validate` + `commit` run on the refreshed base) so it cannot fire/be tested while that guard
+stands — SKIPPED, see morning report.**
+
 ## Active: Operational hardening & Opus handoff — the meta-sprint (2026-06-09)
 
 **Decided 2026-06-09 (user-approved).** Context: frontier-tier (Fable) sessions are available only
