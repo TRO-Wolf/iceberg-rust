@@ -57,6 +57,32 @@ done in PR #9; 2c (`RewriteFiles.validateNoNewDeletes`) is shadowed by the coars
 guard (both `validate` + `commit` run on the refreshed base) so it cannot fire/be tested while that guard
 stands — SKIPPED, see morning report.**
 
+## DONE (2026-06-10 overnight): readable_metrics inspection interop — Increment 3 of OVERNIGHT_BRIEF
+
+The LAST inspection-table surface without a Java interop round-trip. Extended the existing manifest-reading
+harness (A1/A2 pattern, run.sh-driven, Direction-1, env-gated) with a dedicated `table_rm`. Builder→reviewer
+actor-critic; orchestrator independently re-ran BOTH the offline gate AND the round-trip + committed.
+
+- [x] `dev/java-interop/.../InteropOracle.java` — new `InspectionReadableMetricsRmOracle`: unpartitioned V2
+      `{id long, name string, score double}` table at `<dir>/table_rm` with rich per-column metrics (distinct
+      column_sizes; null counts non-zero on name; nan counts non-zero only on the double; distinct typed
+      lower/upper bounds via `Conversions.toByteBuffer(<column type>, value)`); materializes Java's REAL
+      FilesTable readable_metrics struct → `java_rm_files.json` keyed by leaf-column NAME → 6 metric names.
+      A1/A2/A4 emitters untouched (byte-identical).
+- [x] `crates/iceberg/tests/interop_inspection_manifests.rs` — new env-gated test comparing Rust
+      `inspect().files()` readable_metrics to Java BY NAME (order-independent; counts distinguish absent/None
+      from 0; long+string+double typed bounds, double via `f64::to_bits`; leaf-column SET pinned).
+- [x] `run-inspection-manifests.sh` — header note; same single round-trip (table_rm generated alongside).
+
+**Outcome:** Cargo/pom FROZEN (no new deps). Independent gate green — offline interop suite **11 passed**
+(new test no-ops when `ICEBERG_INTEROP_MANIFEST_DIR` unset), `cargo test -p iceberg --lib` 1642 passed,
+clippy/fmt clean. **Round-trip re-run by orchestrator: 11 passed — readable_metrics matched Java field-for-field
+(3 leaf columns, counts + typed bounds).** Reviewer poison-fixture-pinned every axis (bound/count/drop-column/
+absent↔zero/string-bound/double-bits → matching assertion fails); no production bug. By-NAME comparison
+side-steps the documented interior field-id JVM-HashMap-order divergence. GAP_MATRIX inspection row updated;
+inspection interop now COMPLETE (set + columns + scan A4/A5). DEFERRED: promoted-type bound (needs schema
+evolution); byte-level interior field-id parity (the HashMap-order residual). Row stays 🟡.
+
 ## Active: Operational hardening & Opus handoff — the meta-sprint (2026-06-09)
 
 **Decided 2026-06-09 (user-approved).** Context: frontier-tier (Fable) sessions are available only
