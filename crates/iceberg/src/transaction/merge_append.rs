@@ -379,12 +379,15 @@ impl MergeManifestProcess {
             return Ok(data_manifests);
         }
 
-        // Java extracts `first` (the new added manifest) before grouping; for merge_append it is the
-        // first element after `split_and_reorder` (or absent if this commit added no data files — an
-        // empty-data merge_append, which is still allowed by the producer for a properties-only commit).
-        let first_manifest_path = data_manifests.first().and_then(|manifest| {
-            (manifest.added_snapshot_id == self.snapshot_id).then(|| manifest.manifest_path.clone())
-        });
+        // Java's `first` is the unconditional STREAM HEAD (`ManifestFile first = manifestIter.next()`,
+        // ManifestMergeManager L85) — NOT "the new manifest". After `split_and_reorder` the head is the
+        // new added manifest when one exists; for an empty-data merging append (a properties-only
+        // commit) the head is the first EXISTING manifest, and Java still gives ITS bin the min-count
+        // protection. Gating this on `added_snapshot_id == self.snapshot_id` would drop the protection
+        // for every bin on the empty-data path and merge manifests Java keeps (audit fix 2026-06-10).
+        let first_manifest_path = data_manifests
+            .first()
+            .map(|manifest| manifest.manifest_path.clone());
 
         // Group by partition spec id, REVERSE-sorted (Java `groupBySpec` L129-137: a TreeMap with
         // `Comparator.reverseOrder()` ⇒ higher spec ids first). Preserve the within-group order.
@@ -633,16 +636,22 @@ mod bin_packing {
         for item in items {
             let weight = weight_func(&item);
 
-            // findBin: the first open bin that can still hold this item (Java `findBin`).
+            // findBin: the first open bin that can still hold this item (Java `findBin`,
+            // `bin.weight + weight <= targetWeight`). Saturating add: weights come from the
+            // UNTRUSTED `manifest_length` field of a manifest list read from storage, and a hostile
+            // value near u64::MAX must not panic (debug) or wrap into "fits" (release) — saturation
+            // makes an absurd sum simply never fit, which opens a fresh bin (audit hardening
+            // 2026-06-10; identical to Java for every realistic weight).
             let target_bin = open_bins.iter().position(|(bin_items, bin_weight)| {
-                bin_weight + weight <= target_weight && (bin_items.len() as u64) < max_items_per_bin
+                bin_weight.saturating_add(weight) <= target_weight
+                    && (bin_items.len() as u64) < max_items_per_bin
             });
 
             match target_bin {
                 Some(index) => {
                     let (bin_items, bin_weight) = &mut open_bins[index];
                     bin_items.push(item);
-                    *bin_weight += weight;
+                    *bin_weight = bin_weight.saturating_add(weight);
                 }
                 None => {
                     // Open a new bin for this item.
@@ -1660,5 +1669,49 @@ mod tests {
             }
         }
         values
+    }
+
+    // AUDIT pin (2026-06-10): Java's `first` is the unconditional STREAM HEAD
+    // (`ManifestFile first = manifestIter.next()`, ManifestMergeManager L85) — for a merging append
+    // that adds NO data files (a properties-only commit, allowed by the producer when snapshot
+    // properties are non-empty) the head is the first EXISTING manifest, and ITS bin gets the
+    // min-count protection. With the default min-count (100) a properties-only merge_append must
+    // therefore KEEP the table's small manifests un-merged. Risk pinned: a `first` identification
+    // gated on `added_snapshot_id == this snapshot` yields `None` here, drops the protection for
+    // every bin, and merges manifests Java would keep.
+    #[tokio::test]
+    async fn test_properties_only_merge_append_keeps_first_existing_bin_below_min_count() {
+        use std::collections::HashMap;
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = fast_append(&catalog, &table, vec![data_file("test/audit-a.parquet", 0)]).await;
+        let table = fast_append(&catalog, &table, vec![data_file("test/audit-b.parquet", 0)]).await;
+        assert_eq!(current_manifests(&table).await.len(), 2);
+
+        // Properties-only merging append: no data files, default merge settings (min-count 100).
+        let tx = Transaction::new(&table);
+        let action = tx.merge_append().set_snapshot_properties(HashMap::from([(
+            "audit-pin".to_string(),
+            "true".to_string(),
+        )]));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Java parity: the single bin contains `first` (the first existing manifest) and 2 < 100,
+        // so BOTH manifests are kept — no merge fires.
+        let manifests = current_manifests(&table).await;
+        assert_eq!(
+            manifests.len(),
+            2,
+            "a properties-only merge_append below min-count must keep the existing manifests un-merged (Java stream-head `first`)"
+        );
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from([
+                "test/audit-a.parquet".to_string(),
+                "test/audit-b.parquet".to_string()
+            ])
+        );
     }
 }

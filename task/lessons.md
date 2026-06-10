@@ -983,3 +983,23 @@ How to use it (see the manuals' §2):
   half the narrative was stranded in the matrix as a phantom column and the archive section ended
   mid-sentence. Raw pipes inside code spans break naive pipe-delimited cell handling. Repaired
   2026-06-10 by rejoining the strand verbatim in the archive (conservation preserved).
+
+### 2026-06-10 (post-arc logic + security audit, ORCHESTRATOR Fable — two parity bugs found + fixed)
+- **Java's merge `first` is the unconditional STREAM HEAD (`manifestIter.next()`,
+  ManifestMergeManager L85), NOT "this commit's new manifest".** For an empty-data merging append
+  (properties-only commit) the head is the first EXISTING manifest and ITS bin still gets the
+  min-count protection. Gating `first` on `added_snapshot_id == this snapshot` returned None on
+  that path and silently dropped the protection — Rust merged 2 manifests where Java keeps 2
+  (empirically pinned: the audit test failed 1≠2 pre-fix). When porting a "the first element"
+  concept, port the CODE's selection rule, not the comment's intent.
+- **Java `deletedManifests` is a Set (path equality); a Vec-backed port double-counts a duplicate
+  `delete_manifest` on the replaced side of `validateFilesCounts`** ("0 (new), 2 (old)" vs Java's
+  1 — spurious rejection, fail-loud not corruption, but a divergence). Mirror the COLLECTION
+  semantics of the Java field, not just its uses: Set-backed fields dedupe at insertion.
+- **DO use saturating arithmetic on any accumulator fed by UNTRUSTED on-disk metadata**
+  (`manifest_length` from a manifest list): `bin_weight + weight` and the rolling size estimate
+  could panic in debug builds (overflow check) or wrap in release on a hostile value. Saturation
+  makes an absurd sum "never fits"/"roll now" — strictly safe, identical to Java for every
+  realistic value. Audit greps that pay off: `as u64|as u32` casts on spec-struct fields (clamp
+  negatives first), `+=` on u64 accumulators, `debug_assert` guarding anything reachable in
+  release, `zip_eq` on data derived from storage.

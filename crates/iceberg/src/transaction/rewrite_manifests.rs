@@ -171,7 +171,17 @@ impl RewriteManifestsAction {
     /// `validateDeletedManifests`, L286-298) and its active files must be re-added via a balancing
     /// [`Self::add_manifest`], or the conservation check (`validateFilesCounts`) rejects the commit.
     pub fn delete_manifest(mut self, manifest: ManifestFile) -> Self {
-        self.deleted_manifests.push(manifest);
+        // Java `deletedManifests` is a SET with path-based equality (`Sets.newHashSet` +
+        // `GenericManifestFile` path equality, L55) — a duplicate delete of the same manifest is a
+        // no-op. Deduplicate by path here so the duplicate cannot double-count the replaced side of
+        // `validateFilesCounts` (audit fix 2026-06-10).
+        if !self
+            .deleted_manifests
+            .iter()
+            .any(|existing| existing.manifest_path == manifest.manifest_path)
+        {
+            self.deleted_manifests.push(manifest);
+        }
         self
     }
 
@@ -574,7 +584,12 @@ impl ClusterWriters {
             .get_mut(&key)
             .expect("writer was just inserted for this key");
         writer.add_existing_entry(entry)?;
-        *self.open_estimates.entry(key).or_insert(0) += per_entry_size_estimate;
+        // Saturating add: the per-entry estimate derives from the UNTRUSTED `manifest_length` of a
+        // manifest list read from storage; a hostile value must not panic (debug) or wrap the
+        // estimate back to small (release). Saturation just pins the estimate at the ceiling, which
+        // rolls the writer — harmless (audit hardening 2026-06-10).
+        let estimate = self.open_estimates.entry(key).or_insert(0);
+        *estimate = estimate.saturating_add(per_entry_size_estimate);
 
         Ok(())
     }
@@ -1422,6 +1437,38 @@ mod tests {
         assert_eq!(
             live_file_paths(&reloaded).await,
             HashSet::from(["test/a.parquet".to_string()])
+        );
+    }
+
+    // AUDIT pin (2026-06-10): Java's `deletedManifests` is a SET with path-based equality
+    // (`Sets.newHashSet` + `GenericManifestFile` path equality) — passing the SAME manifest to
+    // `delete_manifest` twice is a no-op and must count it ONCE on the replaced side of the
+    // conservation check. Risk pinned: a Vec-backed deleted set double-counts the duplicate and
+    // spuriously rejects with "0 (new), 2 (old)" where Java reports 1.
+    #[tokio::test]
+    async fn test_duplicate_delete_manifest_counts_once_java_set_semantics() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        let manifests = current_manifests(&table).await;
+        let real_manifest = manifests[0].clone();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_manifests()
+            .delete_manifest(real_manifest.clone())
+            .delete_manifest(real_manifest);
+        let tx = action.apply(tx).unwrap();
+        let error = tx
+            .commit(&catalog)
+            .await
+            .expect_err("still fails conservation (nothing re-added), but with the DEDUPED count");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            error.message(),
+            "Replaced and created manifests must have the same number of active files: 0 (new), 1 (old)",
+            "the duplicate delete_manifest must count once (Java Set semantics), not twice"
         );
     }
 

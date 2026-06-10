@@ -40,6 +40,21 @@ Session brief: `../FABLE_SESSION_BRIEF_2026-06-10_phase2-completion.md`. Actor-c
 (Opus builder → Opus reviewer, orchestrator re-runs the gate + commits). One commit per increment,
 pushed; merge nothing. Gate chained in ONE `&&` chain; Cargo files FROZEN.
 
+**POST-ARC AUDIT (2026-06-10, orchestrator Fable — user-requested logic + security audit of
+everything built):** full manual read of every production region the arc touched. TWO parity bugs
+found, empirically pinned (fail-before), fixed: (1) merge_append's `first` was gated on
+`added_snapshot_id == this snapshot` — Java's `first` is the unconditional stream HEAD
+(ManifestMergeManager L85), so a properties-only merging append dropped the min-count protection
+and over-merged; (2) duplicate `delete_manifest` args double-counted the replaced side of
+`validateFilesCounts` (Java's field is a path-equality Set — now deduped at insertion). THREE
+saturating-arithmetic hardenings on accumulators fed by untrusted `manifest_length` (bin weights
+×2, rolling estimate ×1 — debug-build panic / release wrap on hostile values, now saturate).
+Verified clean: u64 count accumulation (no overflow, stronger than Java's int), division-by-zero
+guards, negative-length clamps, add_manifest None-count rejection == Java's null semantics,
+kept-manifest integrity, no unsafe/no logging surface, eager-vs-commit error placement, retry
+statelessness, release-mode debug_assert acceptable (unreachable via the only constructor).
+Interop round-trip re-run GREEN post-fix. Lib 1694 ×2.
+
 **ARC OUTCOME (2026-06-10, all six increments DONE — 6 commits on
 `phase2/write-engine-completion`, each pushed, nothing merged):** RewriteManifests (8f2fc3a3) →
 RewriteFiles seq-preservation + guard lift + validateNoNewDeletes (e96719e3) → the sibling
