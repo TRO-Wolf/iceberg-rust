@@ -399,24 +399,13 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Expose EVERY current manifest — DATA and DELETE. The producer's `process_deletes` decides per
-        // DATA manifest whether to rewrite (to drop the rewritten files), carry forward unchanged, or drop
-        // it; DELETE manifests carry forward UNCHANGED (their entries are delete-file paths, never in the
-        // data-file `delete_paths`, so `process_deletes` leaves them alone). Carrying delete manifests
-        // forward is REQUIRED for correctness: a rewrite must preserve outstanding merge-on-read deletes
-        // (Java `MergingSnapshotProducer` keeps existing delete manifests for a rewrite), otherwise the
-        // rewrite snapshot would silently drop every delete and resurrect deleted rows — which, combined
-        // with `dataSequenceNumber` preservation, is exactly the corruption this increment prevents.
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
-            return Ok(vec![]);
-        };
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
-            .await?;
-        Ok(manifest_list.entries().to_vec())
+        // Expose EVERY current manifest — DATA and DELETE — via the shared
+        // [`SnapshotProducer::current_manifests`]. DELETE manifests carry forward UNCHANGED: a rewrite must
+        // preserve outstanding merge-on-read deletes, otherwise the rewrite snapshot would silently drop
+        // every delete and resurrect deleted rows — which, combined with `dataSequenceNumber` preservation,
+        // is exactly the corruption this increment prevents. The conservative dangling-delete posture (no
+        // pruning) is documented on the helper.
+        snapshot_produce.current_manifests().await
     }
 }
 
@@ -1205,12 +1194,14 @@ mod tests {
     /// STRUCTURAL CARRY-FORWARD PIN (risk: the rewrite silently DROPS the outstanding delete manifest).
     /// Distinct from the crown jewel's read-side resurrection check: this asserts at the MANIFEST-LIST
     /// level that the DELETE manifest written by the prior `row_delta` is still referenced by the
-    /// post-rewrite snapshot. It fails UNIQUELY under the `existing_manifest -> current_data_manifests()`
-    /// mutation (which drops delete manifests) and is INSENSITIVE to the seq-strip mutation — so it
-    /// disambiguates the carry-forward fix from the seq-preservation fix.
+    /// post-rewrite snapshot. It fails UNIQUELY under a mutation that filters `existing_manifest` down to
+    /// DATA manifests only (the old data-only `current_data_manifests` behavior, which dropped delete
+    /// manifests) and is INSENSITIVE to the seq-strip mutation — so it disambiguates the carry-forward fix
+    /// from the seq-preservation fix.
     ///
-    /// MUTATION (run manually, then restore): revert `RewriteFilesOperation::existing_manifest` to
-    /// `snapshot_produce.current_data_manifests().await` ⇒ this test FAILS (delete manifest count drops to 0).
+    /// MUTATION (run manually, then restore): in `RewriteFilesOperation::existing_manifest`, filter the
+    /// `current_manifests()` result to `content == ManifestContentType::Data` only ⇒ this test FAILS
+    /// (delete manifest count drops to 0).
     #[tokio::test]
     async fn test_rewrite_carries_delete_manifest_forward_structurally() {
         let catalog = new_memory_catalog().await;

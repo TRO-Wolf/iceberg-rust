@@ -85,12 +85,57 @@ pushed; merge nothing. Gate chained in ONE `&&` chain; Cargo files FROZEN.
       cross-consumer mutation (fails rewrite_files+overwrite_files+row_delta together). All-DELETED
       delete-manifest edge: Rust drop == Java drop (shouldKeep rule) — verified. Gate: lib 1670 ×2,
       21 rewrite_files tests, clippy/fmt/typos clean, Cargo FROZEN.
-- [ ] **Increment 2b — fix the SAME delete-manifest-dropping bug in the three sibling actions**
-      (`delete_files.rs` L256 / `overwrite_files.rs` L695 / `replace_partitions.rs` L451 all
+- [x] **Increment 2b — fix the SAME delete-manifest-dropping bug in the three sibling actions**
+      (DONE 2026-06-10 — builder + reviewer + gate. Outcome: shared
+      `SnapshotProducer::current_manifests()` helper, 4 consumers switched, orphaned
+      `current_data_manifests` removed; 3 crown jewels + 3 structural pins; per-action
+      carry-revert mutations prove isolation (each fails ONLY its own action's tests); REVIEWER
+      ACCEPT — add-only overwrite path proven behavior-identical, dangling-delete retention
+      documented conservative-safe. Gate: lib 1673 ×2, clippy/fmt/typos clean, Cargo FROZEN.
+      Reviewer-flagged pre-existing: the OverwriteFiles GAP_MATRIX cell has an old mid-cell `||`
+      breaking the table row — future docs pass.)
+      (`delete_files.rs` L262 / `overwrite_files.rs` L701 / `replace_partitions.rs` L457 all
       return `current_data_manifests()` only — UNGUARDED silent delete loss on any MoR table;
       discovered while reviewing Increment 2; see lessons 2026-06-10). Carry ALL current manifests
       (the Increment-2 fix shape); per-action crown jewel (delete still applies post-commit) + the
       structural delete-manifest-count pin; carry-revert mutation per action.
+      BUILDER PLAN (2026-06-10, Increment-2b builder):
+      - [x] `snapshot.rs`: added `pub(crate) async fn current_manifests(&self) -> Result<Vec<ManifestFile>>`
+            — loads the current snapshot's manifest list, returns ALL entries (data + deletes), empty when
+            no current snapshot. Doc cites `MergingSnapshotProducer.apply` L973-1011 (composes BOTH
+            `filterManager.filterManifests(dataManifests)` AND
+            `deleteFilterManager.filterManifests(deleteManifests)`) + the resurrection corruption it
+            prevents + the conservative dangling-delete posture (Java L982-993 `dropDeleteFilesOlderThan`
+            / `removeDanglingDeletesFor` NOT ported — keeping a stale delete is harmless, dropping a live
+            one resurrects rows).
+      - [x] Switched `rewrite_files.rs`'s inline `existing_manifest` to the helper (behavior-preserving —
+            its structural pin + crown jewel stayed green; merged its inline doc content into the helper;
+            updated the structural-pin test's mutation note since `current_data_manifests` is gone).
+      - [x] Switched `delete_files.rs` / `overwrite_files.rs` / `replace_partitions.rs` `existing_manifest`
+            from `current_data_manifests()` → `current_manifests()` (each keeps a short action-specific
+            comment: delete manifests carry unchanged + conservative dangling-delete posture).
+      - [x] `current_data_manifests` was ORPHANED by the switch (its ONLY three code callers were the
+            three broken actions) → REMOVED it (renamed-by-removal into `current_manifests`; dead-code
+            rule). The two remaining textual refs were doc/comment prose, updated. NOTE: `rewrite_manifests
+            .rs` (out of scope) has its own inline copy of the same "load full manifest list" logic with a
+            LOCAL var named `current_manifests` — a 5th candidate consumer; FLAGGED, not touched.
+      - [x] Tests per action (row_delta crown-jewel fixture: real parquet data + a REAL position-delete
+            via the production writer + a production scan): X (partition a, position-delete masking y=20) +
+            Y (partition b); the action; scan shows X's masked y=20 STILL ABSENT + the action's effect;
+            structural pin (delete-manifest count == 1). All three named
+            `test_*_preserves_outstanding_delete_manifests_no_resurrection`.
+      - [x] Mutations: filtered each action's `existing_manifest` to DATA-only (the old data-only
+            `current_data_manifests` behavior) — three separate, surgical (one block each, restored
+            in-place) ⇒ THAT action's crown jewel fails (y=20 resurrected) + others stay green. Verified
+            each: delete_files {10,20} vs {10}; overwrite_files {10,20,80} vs {10,80}; replace_partitions
+            {10,20,80} vs {10,80}.
+      - [x] Docs: GAP_MATRIX three action cells + the Phase-2 narrative line + map.md `snapshot.rs` row.
+      Outcome: shared `current_manifests` helper carries DATA + DELETE forward; all four delete-bearing
+      actions (rewrite_files + the three fixed) use it; `current_data_manifests` removed (orphaned). 3 new
+      crown-jewel tests (1 per action) + structural pins, all green; three per-action mutations confirm
+      per-action isolation (no accidental coupling). LESSON LEARNED: back up files AFTER tests land, then
+      mutate the ONE production line surgically — restoring a whole-file pre-fix backup wiped the new test
+      (recovered + re-applied). Done-bar 🟡 (unit-proven; interop with a delete-bearing fixture deferred).
       BUILDER PLAN (2026-06-10):
       - [x] `snapshot.rs` (producer, additive only): add field
             `new_data_files_data_sequence_number: Option<i64>` + builder setter

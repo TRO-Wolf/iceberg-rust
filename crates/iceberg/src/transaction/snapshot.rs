@@ -364,12 +364,35 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    /// Return every current data manifest (the candidates the producer's `process_deletes` filters).
+    /// Return EVERY current manifest — DATA **and** DELETE — from the current snapshot's manifest list,
+    /// the complete candidate set a delete-bearing operation's `existing_manifest` hands to the producer.
     ///
-    /// Shared by the delete-bearing operations (`DeleteFiles`, `OverwriteFiles`): each exposes every
-    /// current data manifest so `process_deletes` can decide per manifest whether to rewrite, carry
-    /// forward, or drop it. Returns an empty list when the table has no current snapshot.
-    pub(crate) async fn current_data_manifests(&self) -> Result<Vec<ManifestFile>> {
+    /// Shared by every delete-bearing operation (`DeleteFiles`, `OverwriteFiles`, `ReplacePartitions`,
+    /// `RewriteFiles`): each exposes the FULL manifest list so the producer's `process_deletes` can decide
+    /// per DATA manifest whether to rewrite (drop the removed/replaced files), carry forward unchanged, or
+    /// drop it, while every DELETE manifest is carried forward UNCHANGED — a delete manifest's entries are
+    /// delete-file paths, which can never appear in a DATA `delete_paths` set, so `process_deletes` leaves
+    /// them alone.
+    ///
+    /// Carrying delete manifests forward is REQUIRED FOR CORRECTNESS, not an optimization. This mirrors Java
+    /// `MergingSnapshotProducer.apply` (`core/MergingSnapshotProducer.java` L973-1011), which composes BOTH
+    /// `filterManager.filterManifests(dataManifests)` AND `deleteFilterManager.filterManifests(deleteManifests)`
+    /// into the new manifest list. If an action returned DATA manifests only (the old
+    /// `current_data_manifests`), the new snapshot's manifest list would OMIT every delete manifest the
+    /// current snapshot carried — on a merge-on-read table (Java- or Rust-written) that silently drops all
+    /// outstanding position / equality deletes table-wide, resurrecting every deleted row. This helper exists
+    /// to make that whole bug class unrepresentable: all four delete-bearing actions carry the full set.
+    ///
+    /// **Conservative dangling-delete posture (documented divergence from Java):** Java's `apply` also drops
+    /// delete files older than the surviving data's minimum sequence number and removes DVs orphaned by the
+    /// data files it deleted (L982-993, `dropDeleteFilesOlderThan` / `removeDanglingDeletesFor`). This port
+    /// deliberately does NOT port that pruning — it carries every delete manifest forward UNCHANGED. That is
+    /// the conservative-safe direction: keeping a delete that no longer applies is harmless (it matches no
+    /// live row), whereas dropping one that still applies resurrects deleted rows. Dangling-delete cleanup is
+    /// a maintenance concern for a future `RemoveDanglingDeleteFiles` action, not a commit-path obligation.
+    ///
+    /// Returns an empty list when the table has no current snapshot.
+    pub(crate) async fn current_manifests(&self) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = self.table.metadata().current_snapshot() else {
             return Ok(vec![]);
         };
@@ -378,12 +401,7 @@ impl<'a> SnapshotProducer<'a> {
             .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
             .await?;
 
-        Ok(manifest_list
-            .entries()
-            .iter()
-            .filter(|entry| entry.content == ManifestContentType::Data)
-            .cloned()
-            .collect())
+        Ok(manifest_list.entries().to_vec())
     }
 
     /// Resolve `delete_paths` against the current snapshot's live data entries, returning the matching
