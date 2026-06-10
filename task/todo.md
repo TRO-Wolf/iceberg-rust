@@ -40,6 +40,21 @@ Session brief: `../FABLE_SESSION_BRIEF_2026-06-10_phase2-completion.md`. Actor-c
 (Opus builder → Opus reviewer, orchestrator re-runs the gate + commits). One commit per increment,
 pushed; merge nothing. Gate chained in ONE `&&` chain; Cargo files FROZEN.
 
+**ARC OUTCOME (2026-06-10, all six increments DONE — 6 commits on
+`phase2/write-engine-completion`, each pushed, nothing merged):** RewriteManifests (8f2fc3a3) →
+RewriteFiles seq-preservation + guard lift + validateNoNewDeletes (e96719e3) → the sibling
+delete-manifest-carry corruption fix (fcf8da9d) → MergeAppend + bin-packing port (601eef30) → the
+8-step Java-judged interop extension + delete-bearing rewrite fixture, ALL SIX comparisons green
+with ZERO production changes (b140319a) → the stale-deferral correction + matrix cell-split repair
+(2173feb3) + this Roadmap refresh. Lib suite 1643 → 1692 (+49); every increment
+builder→reviewer→independent-gate; 20+ mutations run, every one caught (after two test fixes the
+reviewers forced). Headline save: the arc surfaced and fixed a FOUR-action silent-corruption class
+(delete manifests dropped from every delete-bearing commit on MoR tables — masked in rewrite_files
+by the old guard, UNGUARDED in the three siblings). **Compaction triggers FIRED, not run (per the
+brief — interactive-approval-only):** lessons.md at 985 lines / 93 KB (trigger ~800 / 50 KB),
+todo.md at ~580 lines (guideline < ~500). Both need a compaction/archival pass next interactive
+session.
+
 - [x] **Increment 1 — `RewriteManifests`** (DONE 2026-06-10 — builder + reviewer + gate): new
       `transaction/rewrite_manifests.rs`, cluster/keep partition of current manifests, provenance-
       preserving re-group via the existing-entry writer path, `validateDeletedManifests` +
