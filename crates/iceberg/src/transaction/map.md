@@ -38,7 +38,7 @@ engine) parity work.
 | `delete_files.rs` | `StreamingDelete` | Delete data files by path/reference; opt-in `validate_files_exist()` |
 | `overwrite_files.rs` | `BaseOverwriteFiles` | Explicit add+delete in one `Overwrite` snapshot; opt-in `validate_no_conflicting_data()` + `conflict_detection_filter` |
 | `replace_partitions.rs` | `BaseReplacePartitions` | Dynamic partition overwrite; opt-in conflict validation |
-| `rewrite_files.rs` | `BaseRewriteFiles` | Compaction-commit primitive (`Operation::Replace`) |
+| `rewrite_files.rs` | `BaseRewriteFiles` | Compaction-commit primitive (`Operation::Replace`); `data_sequence_number` preservation (added files keep the replaced files' data seq so outstanding equality deletes still apply), `validate_from_snapshot` + `validate` (shared `validate_no_new_deletes_for_data_files`, `ignore_equality_deletes = seq preserved`); carries DELETE manifests forward unchanged |
 | `rewrite_manifests.rs` | `BaseRewriteManifests` | Manifest re-organization (NOT data change): cluster live data-manifest entries into new manifests via the provenance-preserving `add_existing_entry` path, and/or explicit add/delete manifest replacement; `Operation::Replace`, live set unchanged. Extends `SnapshotProducer` (NOT `MergingSnapshotProducer`) |
 | `row_delta.rs` | `BaseRowDelta` | Merge-on-read commit: data + position/equality delete files in one snapshot; `validate_no_conflicting_data_files/_delete_files`, `validate_data_files_exist` |
 | `manage_snapshots.rs` | `ManageSnapshots` | Branch/tag CRUD, rollback(-to-time), set-current, fast-forward, retention |

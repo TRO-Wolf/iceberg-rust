@@ -73,10 +73,60 @@ pushed; merge nothing. Gate chained in ONE `&&` chain; Cargo files FROZEN.
         incremental length); `add_manifest` is V2+ only (the V1 `copyManifest` legacy path is
         deferred, rejected `FeatureUnsupported`); new `TableProperties` consts for
         `commit.manifest.target-size-bytes` (+ merge siblings for Increment 3).
-- [ ] **Increment 2 — `RewriteFiles` dataSequenceNumber preservation + guard lift +
-      `validateNoNewDeletes`**: crown-jewel resurrection test (MoR table, pos-delete on X,
-      rewrite [X]→[X'] preserving seq ⇒ scan still drops rows; mutation strips preservation ⇒
-      fails). Plus the tx-captured-start pin for the new validation.
+- [x] **Increment 2 — `RewriteFiles` dataSequenceNumber preservation + guard lift +
+      `validateNoNewDeletes`** (DONE 2026-06-10 — builder + reviewer + gate): crown-jewel
+      resurrection test (MoR table, EQUALITY-delete on X at seq 2, rewrite [X]→[X'] preserving
+      seq 1 ⇒ scan still drops rows; mutation strips preservation ⇒ fails). Plus the
+      tx-captured-start pin for the new validation.
+      Outcome: REVIEWER verdict SHIP IT, zero production fixes needed beyond the builder's; +1
+      reviewer structural pin (delete-manifest count survives the rewrite — fails under the
+      carry-revert mutation, insensitive to seq-strip; disambiguates the two fixes). 6 mutations
+      run, all caught incl. both ignore_equality_deletes directions + the shared-helper
+      cross-consumer mutation (fails rewrite_files+overwrite_files+row_delta together). All-DELETED
+      delete-manifest edge: Rust drop == Java drop (shouldKeep rule) — verified. Gate: lib 1670 ×2,
+      21 rewrite_files tests, clippy/fmt/typos clean, Cargo FROZEN.
+- [ ] **Increment 2b — fix the SAME delete-manifest-dropping bug in the three sibling actions**
+      (`delete_files.rs` L256 / `overwrite_files.rs` L695 / `replace_partitions.rs` L451 all
+      return `current_data_manifests()` only — UNGUARDED silent delete loss on any MoR table;
+      discovered while reviewing Increment 2; see lessons 2026-06-10). Carry ALL current manifests
+      (the Increment-2 fix shape); per-action crown jewel (delete still applies post-commit) + the
+      structural delete-manifest-count pin; carry-revert mutation per action.
+      BUILDER PLAN (2026-06-10):
+      - [x] `snapshot.rs` (producer, additive only): add field
+            `new_data_files_data_sequence_number: Option<i64>` + builder setter
+            `with_new_data_files_data_sequence_number(seq)` (mirror `with_added_delete_files`);
+            consume in `write_added_manifest`: when `Some(seq)` and V2/V3, build each added entry with
+            `.sequence_number(seq)` (writer keeps explicit data seq; file seq still inherits). V1
+            ignored (no seqs). None default ⇒ every existing caller unaffected. NOT the shared helper.
+      - [x] `rewrite_files.rs`: `data_sequence_number(seq: i64)` builder + thread to producer; REJECT
+            `seq < 0` (`DataInvalid`) at commit (Rust-only fail-loud — writer silently strips negatives
+            into re-inheritance). `validate_from_snapshot(snapshot_id)`. Implement `TransactionAction::
+            validate`: when `deleted_data_files` non-empty, call shared
+            `validate_no_new_deletes_for_data_files(current, effective_start, None,
+            &self.deleted_data_files, self.data_sequence_number.is_some())`, `effective_start =
+            validate_from_snapshot.or(tx_captured)`, UNCONDITIONAL. REMOVED the SAFETY GUARD
+            (`has_outstanding_delete_files` + its commit rejection + the guard test). Rewrote the
+            three doc sites (module doc, action-struct doc, mod.rs ctor doc) to the new contract.
+            Ctor stays as-is (no 3-arg overload — builder suffices).
+      - [x] **BUG FOUND + FIXED (latent, exposed by the guard lift):** `RewriteFilesOperation::
+            existing_manifest` returned only DATA manifests, so a rewrite DROPPED every DELETE manifest
+            and lost all outstanding deletes → resurrection regardless of seq. Fixed to carry ALL current
+            manifests forward (data + deletes); `process_deletes` leaves delete manifests untouched
+            (their entries are delete-file paths, never in the data `delete_paths`). The old guard had
+            hidden this — no rewrite ever ran on a delete-bearing table. The crown jewel only goes green
+            with this fix.
+      - [x] Tests (10): crown-jewel eq-delete resurrection (real parquet + eq-delete writer + scan +
+            raw-avro on-disk seq=1 pin + seq-strip mutation); no-preservation Java-faithful hazard;
+            conflict-pair (eq-delete ignored WITH seq / rejected WITHOUT — exact msg + !retryable());
+            new position delete always fatal; no-override tx-captured-start (+ refreshed-head mutation);
+            disjoint negative control; pre-existing deletes not conflicts; no-concurrent-commit clean walk;
+            negative-seq rejected. 20 rewrite_files tests total.
+      - [x] Docs: map.md rewrite_files row, GAP_MATRIX RewriteFiles cell, this bullet outcome.
+      Outcome: 20 rewrite_files lib tests green (8 pre-existing + 12 new/revised; the removed guard test
+      replaced by the crown jewel + hazard pins). BOTH mandatory mutations run + restored: (1) seq-strip
+      in `write_added_manifest` ⇒ crown jewel fails with y=20 resurrected; (2) refreshed-head
+      `effective_start` ⇒ no-override test fails (commit wrongly succeeds). Done-bar 🟡 (unit-proven;
+      interop in Increment 4 with a delete-bearing rewrite fixture).
 - [ ] **Increment 3 — merge append** (`MergeAppend` / `MergingSnapshotProducer` merge machinery):
       `merge_append()` action honoring `commit.manifest-merge.enabled` /
       `commit.manifest.min-count-to-merge` / `commit.manifest.target-size-bytes`; provenance

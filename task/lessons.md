@@ -869,3 +869,34 @@ How to use it (see the manuals' §2):
   CONSTANT key → one output manifest per spec id). *Why:* a spec-id-less key cross-merges
   partition tuples from different specs into one manifest (`zip_eq` panic at best, corrupt
   partition metadata at worst); single-spec fixtures can never catch it.
+
+### 2026-06-10 (Phase-2 completion arc Increment 2 — RewriteFiles seq preservation, BUILDER + REVIEWER Opus)
+- **WHEN LIFTING A COARSE GUARD, AUDIT THE WHOLE PATH IT GUARDED — the guard may be masking a
+  SECOND latent bug.** *Why:* lifting `has_outstanding_delete_files` exposed that
+  `RewriteFilesOperation::existing_manifest` returned `current_data_manifests()` only — a rewrite
+  on a delete-bearing table silently DROPPED every DELETE manifest from the new snapshot (table-
+  wide delete loss, resurrection regardless of seq preservation). The guard had made the broken
+  path unreachable, so no test could ever catch it. Fixed: carry ALL current manifests; a DELETE
+  manifest can never match a data `delete_path` in `process_deletes`, so it flows through the
+  carry branch. Java parity: `MergingSnapshotProducer.apply` (L973-1011) composes BOTH
+  `filterManager.filterManifests(dataManifests)` AND `deleteFilterManager.filterManifests(
+  deleteManifests)`; Rust's carry-unchanged is conservative-safe (Java also drops fully-dangling
+  delete manifests — not ported, harmless retention). Pin BOTH levels: the read-side crown jewel
+  (scan) AND a manifest-LIST structural pin (delete-manifest count survives the commit) — the two
+  fail under DIFFERENT mutations (carry-revert vs seq-strip), so neither subsumes the other.
+- **THE SAME `current_data_manifests()`-only bug exists in `delete_files.rs` (L256), `overwrite_
+  files.rs` (L695), `replace_partitions.rs` (L451) — UNGUARDED.** Any of those actions committed
+  on a merge-on-read table (Java- OR Rust-written) drops all outstanding delete manifests. The E2
+  metadata interop never saw it (its chain had no delete manifests — exactly the scoped-out path).
+  Tracked as the arc's Increment 2b (fix + per-action crown jewels).
+- **DO wire `ignore_equality_deletes = data_sequence_number.is_some()` (Java MergingSnapshot-
+  Producer L475-479) and pin BOTH directions with a concurrent-eq-delete pair.** *Why:* with the
+  seq preserved, a concurrent equality delete still applies to the rewritten data (eq applies iff
+  `data_seq < delete_seq` STRICTLY) — not a conflict; without preservation it IS fatal. A
+  position delete is path-scoped — it dies with the replaced file, so a NEW one is ALWAYS fatal.
+  Corollary: the resurrection crown jewel MUST use an EQUALITY delete — a position delete cannot
+  resurrect rows via sequence numbers (the delete vector is keyed by the data file's path).
+- **DO reject a NEGATIVE explicit data sequence number at the action boundary.** *Why:* the Rust
+  `ManifestWriter::add_entry` silently STRIPS a negative explicit seq into `None` ⇒ V2/V3
+  re-inheritance of the new (higher) seq ⇒ exactly the resurrection the parameter exists to
+  prevent. Java never receives one (compactions pass real seqs); Rust fails loudly.

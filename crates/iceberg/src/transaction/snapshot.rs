@@ -136,6 +136,13 @@ pub(crate) struct SnapshotProducer<'a> {
     // empty. Their entries inherit the new snapshot's sequence number at read time, exactly like added
     // data files (so a delete added now applies to earlier data: `data_seq <= delete_seq`).
     added_delete_files: Vec<DataFile>,
+    // An explicit DATA sequence number to stamp on every ADDED data file (Java
+    // `MergingSnapshotProducer.newDataFilesDataSequenceNumber`). When `Some(seq)`, each added data
+    // entry is written with this explicit data seq instead of inheriting the new snapshot's seq at
+    // read time — the `RewriteFiles.dataSequenceNumber` preservation path that keeps outstanding
+    // equality deletes applying to rewritten data (`data_seq < delete_seq`). `None` (the default for
+    // every other operation) ⇒ the added files inherit the new snapshot's sequence number as usual.
+    new_data_files_data_sequence_number: Option<i64>,
     // Data files removed by this snapshot, resolved against the current snapshot at commit time. Held
     // so the snapshot summary can reflect the deleted file/record counts (Java overwrite/delete summary).
     // Empty for add-only operations such as fast append.
@@ -162,6 +169,7 @@ impl<'a> SnapshotProducer<'a> {
             snapshot_properties,
             added_data_files,
             added_delete_files: vec![],
+            new_data_files_data_sequence_number: None,
             removed_data_files: vec![],
             manifest_counter: (0..),
         }
@@ -172,6 +180,19 @@ impl<'a> SnapshotProducer<'a> {
     /// `MergingSnapshotProducer.add(DeleteFile)`). Used by the merge-on-read write path (`RowDelta`).
     pub(crate) fn with_added_delete_files(mut self, added_delete_files: Vec<DataFile>) -> Self {
         self.added_delete_files = added_delete_files;
+        self
+    }
+
+    /// Stamp every ADDED data file with an explicit DATA sequence number instead of inheriting the new
+    /// snapshot's sequence number (Java `MergingSnapshotProducer.setNewDataFilesDataSequenceNumber` /
+    /// `RewriteFiles.dataSequenceNumber`). Used by the compaction write path (`RewriteFiles`) to preserve
+    /// the replaced files' data sequence number so any outstanding merge-on-read EQUALITY delete still
+    /// applies to the rewritten data (`data_seq < delete_seq`) — without this, the added files would take a
+    /// fresh, higher sequence number and the old deletes would stop applying, resurrecting deleted rows.
+    /// `seq` must be non-negative (the manifest writer silently strips a negative one back into
+    /// re-inheritance — the caller validates this before calling).
+    pub(crate) fn with_new_data_files_data_sequence_number(mut self, sequence_number: i64) -> Self {
+        self.new_data_files_data_sequence_number = Some(sequence_number);
         self
     }
 
@@ -708,12 +729,24 @@ impl<'a> SnapshotProducer<'a> {
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
+        // When set (the `RewriteFiles.dataSequenceNumber` preservation path, Java
+        // `newDataFilesDataSequenceNumber`), every added data entry carries this EXPLICIT data sequence
+        // number so the manifest writer keeps it (mirrors Java `writeDataFileGroup` calling
+        // `writer.add(file, dataSeq)` instead of `writer.add(file)`). V2/V3 only — V1 manifests carry no
+        // sequence numbers, so on V1 this is ignored and the added entry just stamps the snapshot id.
+        let new_data_seq = self.new_data_files_data_sequence_number;
         let manifest_entries = added_data_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
                 .status(crate::spec::ManifestStatus::Added)
                 .data_file(data_file);
             if format_version == FormatVersion::V1 {
                 builder.snapshot_id(snapshot_id).build()
+            } else if let Some(sequence_number) = new_data_seq {
+                // Preserve the explicit data sequence number on the added entry (Java
+                // `writeDataFileGroup` with a non-null `dataSeq`). The writer keeps a non-negative
+                // explicit data seq and lets the FILE sequence number inherit at read time — matching
+                // Java `wrapAppend(snapshotId, dataSeq, file)` with a null file seq.
+                builder.sequence_number(sequence_number).build()
             } else {
                 // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
                 // commit failed.

@@ -194,14 +194,16 @@ impl Transaction {
 
     /// Creates a rewrite-files action (the compaction-commit primitive): atomically replace a set of
     /// data files with a new set in one `Replace` snapshot (Java `BaseRewriteFiles`). The files to delete
-    /// must be non-empty and present in the current snapshot. Rewriting DELETE files,
-    /// `dataSequenceNumber` preservation, and concurrent-commit conflict validation are not yet supported.
+    /// must be non-empty and present in the current snapshot. Rewriting DELETE files is not yet supported.
     ///
-    /// **Precondition:** the table must NOT carry outstanding row-level (merge-on-read) delete files —
-    /// the commit is rejected if its current snapshot references any delete manifest. Without
-    /// `dataSequenceNumber` preservation, rewriting deleted-from data into fresh higher-sequence files
-    /// would make those deletes stop applying and resurrect deleted rows. This guard is lifted once
-    /// `dataSequenceNumber` preservation lands.
+    /// **Preserving outstanding equality deletes:** by default the added files take a fresh, higher data
+    /// sequence number, so an outstanding merge-on-read EQUALITY delete (which applies only to data with a
+    /// strictly lower data seq) stops applying to them and silently resurrects deleted rows. Call
+    /// [`RewriteFilesAction::data_sequence_number`] with the (max) data seq of the replaced files to preserve
+    /// the seq so the deletes still apply (Java `RewriteFiles.dataSequenceNumber`). Without it this is the
+    /// caller's responsibility — exactly as in Java, which has no guard against the hazard.
+    /// [`RewriteFilesAction::validate`] rejects a commit when a concurrent row-level delete conflicts with a
+    /// replaced data file (Java `validateNoNewDeletesForDataFiles`).
     pub fn rewrite_files(
         &self,
         files_to_delete: impl IntoIterator<Item = crate::spec::DataFile>,
