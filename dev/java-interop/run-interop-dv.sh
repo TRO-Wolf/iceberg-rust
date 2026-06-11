@@ -17,7 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# DELETION-VECTOR interop harness, BOTH DIRECTIONS:
+# DELETION-VECTOR interop harness, BOTH DIRECTIONS + TABLE level + METADATA level:
 #
 #   D1 (Direction 1 — "Rust reads what JAVA writes"): proves Rust's scan → Arrow with PUFFIN
 #   DELETION-VECTOR application matches Java's OWN read of a JAVA-WRITTEN **V3** table whose
@@ -25,14 +25,33 @@
 #   BaseDVFileWriter. This is the sibling of run-interop-scan-exec.sh (parquet position deletes);
 #   the DV is the V3 replacement for those.
 #
-#   D2 (Direction 2 — "JAVA reads what RUST writes"): the Rust GEN test writes a REAL Puffin DV
-#   file via the production DVFileWriter (3 referenced data files in one Puffin: position 0, a
-#   5000-long contiguous run, a >2^32 position, a dense-gap key, and the exact array/run
-#   container size tie {0,1,2}); Java verifies it with its
+#   D2 (Direction 2 — "JAVA reads what RUST writes", blob level): the Rust GEN test writes a REAL
+#   Puffin DV file via the production DVFileWriter (3 referenced data files in one Puffin:
+#   position 0, a 5000-long contiguous run, a >2^32 position, a dense-gap key, and the exact
+#   array/run container size tie {0,1,2}); Java verifies it with its
 #   REAL reader machinery (Puffin footer parse + the BaseDeleteLoader.readDV-style ranged read +
 #   PositionDeleteIndex.deserialize) AND emits its own serialization of the SAME position sets;
 #   a final Rust test asserts the blobs are BYTE-IDENTICAL (the exact-byte parity pin, run
 #   containers included).
+#
+#   D4 TABLE level (Direction 2, the headline — "JAVA reads a RUST-COMMITTED V3+DV TABLE"): the
+#   Rust GEN test (tests/interop_dv_table.rs) commits a COMPLETE V3 table through the production
+#   Rust path — two real parquet data files in two identity(category) partitions fast_appended at
+#   sequence 1, ONE Puffin holding TWO DVs (DVFileWriter) committed via row_delta at sequence 2 —
+#   and Java reads it back with its PRODUCTION scan (IcebergGenerics, which loads both DVs via
+#   BaseDeleteLoader.readDV), asserting the live rows {(10,x),(30,z),(50,q)} plus a manifest-API
+#   cross-check of the committed DeleteFile metadata (content/format/referenced-data-file/blob
+#   coordinates/cardinality + the shared-puffin multi-blob pin).
+#
+#   D4 METADATA level (the E1-family extension): BOTH sides perform the SAME logical chain
+#   {fast_append 2 partitioned data files, row_delta adding 2 DVs} on equivalent V3 tables, and
+#   the canonical snapshot-metadata views (SnapshotMetaOracle <-> common/snapshot_meta_view.rs)
+#   are compared the established 3 ways: Java's own view (java_meta.json), Java's view of the
+#   RUST table byte-diffed against it HERE, and Rust's views of both tables asserted in
+#   tests/interop_dv_table.rs. This pins the `added-dvs` summary key, the operation
+#   classification, and the manifest count/sequence-number semantics of a DV commit. (The
+#   canonical view's entry tuple does not carry the DV-specific referenced/offset fields — those
+#   are covered by the table-level manifest cross-check above.)
 #
 # The D1 run ALSO settles the roaring byte-compatibility question EMPIRICALLY: the oracle emits a
 # second, synthetic DV blob (dv_blob.bin) whose positions span the 32-bit key boundary and include
@@ -76,12 +95,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP="${SCRIPT_DIR}/target/interop-dv"
 TMP2="${SCRIPT_DIR}/target/interop-dv-write"
+TMP3="${SCRIPT_DIR}/target/interop-dv-table"
 
-echo "==> [1/6] Reset the temp dirs: ${TMP} + ${TMP2}"
-rm -rf "${TMP}" "${TMP2}"
-mkdir -p "${TMP}" "${TMP2}"
+echo "==> [1/11] Reset the temp dirs: ${TMP} + ${TMP2} + ${TMP3}"
+rm -rf "${TMP}" "${TMP2}" "${TMP3}"
+mkdir -p "${TMP}" "${TMP2}" "${TMP3}"
 
-echo "==> [2/6] (D1) Java oracle: write a REAL V3 table (parquet data + Puffin deletion vector) + emit java_dv_scan_rows.json + dv_blob.bin"
+echo "==> [2/11] (D1) Java oracle: write a REAL V3 table (parquet data + Puffin deletion vector) + emit java_dv_scan_rows.json + dv_blob.bin"
 (
   cd "${SCRIPT_DIR}"
   JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
@@ -91,7 +111,7 @@ echo "==> [2/6] (D1) Java oracle: write a REAL V3 table (parquet data + Puffin d
     -Dinterop.dv.dir="${TMP}"
 )
 
-echo "==> [3/6] (D1) Rust: scan the V3 DV table (merge-on-read) + decode the raw Java DV blob, compare vs Java"
+echo "==> [3/11] (D1) Rust: scan the V3 DV table (merge-on-read) + decode the raw Java DV blob, compare vs Java"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_DV_DIR="${TMP}" \
@@ -100,16 +120,18 @@ echo "==> [3/6] (D1) Rust: scan the V3 DV table (merge-on-read) + decode the raw
     cargo test -p iceberg --lib test_dv_blob_decodes_java_written_blob_when_env_set -- --nocapture
 )
 
-echo "==> [4/6] (D2) Rust: write a REAL Puffin DV file via the production DVFileWriter + rust_dv_expected.json"
+echo "==> [4/11] (D2) Rust: write a REAL Puffin DV file via the production DVFileWriter + rust_dv_expected.json"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_DV_WRITE_DIR="${TMP2}" \
     cargo test -p iceberg --test interop_dv_write test_dv_write_gen -- --exact --nocapture
 )
 
-echo "==> [5/6] (D2) Java: verify the RUST-written Puffin with the production reader + emit java_dv_blob_<i>.bin"
-# NOTE: `mvn -q exec:java` runs the oracle in Maven's own JVM and does NOT propagate the verify's
-# `System.exit(1)` to the shell exit code. So capture the output and assert the success sentinel
+echo "==> [5/11] (D2) Java: verify the RUST-written Puffin with the production reader + emit java_dv_blob_<i>.bin"
+# NOTE: do NOT trust `mvn -q exec:java`'s exit code for the verdict — depending on the
+# exec-maven-plugin/JVM combination the oracle's `System.exit(1)` either vanishes (the D2-era
+# observation) or surfaces as a Maven build failure. So capture the output TOLERANTLY (`|| true`
+# keeps `set -e` from aborting before the diagnostics are echoed) and assert the success sentinel
 # ("...: 0 failures") with no per-check FAIL line — otherwise this script would falsely pass on a
 # real Java-read incompatibility.
 VERIFY_OUT="$(
@@ -119,20 +141,86 @@ VERIFY_OUT="$(
     /opt/maven/bin/mvn -o -q compile exec:java \
     -Dexec.args=verify-interop-dv-write \
     -Dinterop.dv_write.dir="${TMP2}" 2>&1
-)"
+)" || true
 echo "${VERIFY_OUT}"
 if echo "${VERIFY_OUT}" | grep -q '^FAIL ' || ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-dv-write: 0 failures'; then
   echo "==> FAILED — Java could not correctly read the Rust-written deletion vectors (a real write-incompatibility finding)."
   exit 1
 fi
 
-echo "==> [6/6] (D2) Rust: assert the Rust-written blobs are BYTE-IDENTICAL to Java's serialization of the same positions"
+echo "==> [6/11] (D2) Rust: assert the Rust-written blobs are BYTE-IDENTICAL to Java's serialization of the same positions"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_DV_WRITE_DIR="${TMP2}" \
     cargo test -p iceberg --test interop_dv_write test_dv_write_blob_bytes_match_java -- --exact --nocapture
 )
 
-echo "==> DONE — deletion-vector interop passed BOTH directions:"
+echo "==> [7/11] (D4 table) Rust: COMMIT a complete V3 table (2 partitioned parquet data files + ONE puffin with TWO DVs via fast_append + row_delta) + expected_rows.json + expected_dvs.json"
+(
+  cd "${REPO_ROOT}"
+  ICEBERG_INTEROP_DV_TABLE_DIR="${TMP3}" \
+    cargo test -p iceberg --test interop_dv_table test_dv_table_gen_rust_writes_java_readable_v3_dv_table -- --exact --nocapture
+)
+
+echo "==> [8/11] (D4 table) Java: read the RUST-COMMITTED V3+DV table with the PRODUCTION scan (IcebergGenerics) + manifest-API DeleteFile cross-check"
+# Same sentinel rule as step 5: the verdict comes from the OUTPUT (success sentinel present, no
+# per-check FAIL line), never from mvn's unreliable exit code; `|| true` keeps `set -e` from
+# aborting before the diagnostics are echoed.
+TABLE_VERIFY_OUT="$(
+  cd "${SCRIPT_DIR}"
+  JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
+    PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
+    /opt/maven/bin/mvn -o -q compile exec:java \
+    -Dexec.args=verify-interop-dv-table \
+    -Dinterop.dv_table.dir="${TMP3}" 2>&1
+)" || true
+echo "${TABLE_VERIFY_OUT}"
+if echo "${TABLE_VERIFY_OUT}" | grep -q '^FAIL ' || ! echo "${TABLE_VERIFY_OUT}" | grep -q 'verify-interop-dv-table: 0 failures'; then
+  echo "==> FAILED — Java could not correctly read the RUST-COMMITTED V3 deletion-vector table (a real table-level write-incompatibility finding)."
+  exit 1
+fi
+
+echo "==> [9/11] (D4 meta) Java: write the JAVA mirror chain (newFastAppend + BaseDVFileWriter + newRowDelta) on an equivalent V3 table"
+(
+  cd "${SCRIPT_DIR}"
+  JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
+    PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
+    /opt/maven/bin/mvn -o -q compile exec:java \
+    -Dexec.args=generate-interop-dv-table \
+    -Dinterop.dv_table.dir="${TMP3}"
+)
+
+echo "==> [10/11] (D4 meta) Java: emit the canonical snapshot-metadata views + byte-diff Java's view of the RUST table against Java's own"
+(
+  cd "${SCRIPT_DIR}"
+  JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
+    PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
+    /opt/maven/bin/mvn -o -q compile exec:java \
+    -Dexec.args=emit-snapshot-meta \
+    -Dinterop.meta.metadata="${TMP3}/table/metadata/final.metadata.json" \
+    -Dinterop.meta.out="${TMP3}/java_meta.json"
+  JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
+    PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
+    /opt/maven/bin/mvn -o -q compile exec:java \
+    -Dexec.args=emit-snapshot-meta \
+    -Dinterop.meta.metadata="${TMP3}/rust_table/metadata/final.metadata.json" \
+    -Dinterop.meta.out="${TMP3}/java_view_rust_meta.json"
+)
+if ! diff -u "${TMP3}/java_meta.json" "${TMP3}/java_view_rust_meta.json"; then
+  echo "==> FAILED — JAVA's view of the RUST-committed DV chain diverges from Java's own DV-chain semantics (added-dvs / operation / manifest structure)."
+  exit 1
+fi
+echo "    dv_table: Java view of Rust table == Java view of Java table OK"
+
+echo "==> [11/11] (D4 meta) Rust: assert ITS canonical views (of the Java table AND the Rust table) equal java_meta.json"
+(
+  cd "${REPO_ROOT}"
+  ICEBERG_INTEROP_DV_TABLE_DIR="${TMP3}" \
+    cargo test -p iceberg --test interop_dv_table test_dv_meta_views_match_java -- --exact --nocapture
+)
+
+echo "==> DONE — deletion-vector interop passed BOTH directions, table + blob + metadata level:"
 echo "    D1: Rust scan == Java read (live rows {10,30,50,60,70,80}); raw blob decode matched incl. >2^32 positions + run containers."
 echo "    D2: Java's production reader decoded the Rust-written Puffin DVs exactly; blobs byte-identical to Java's own serialization."
+echo "    D4 table: Java's PRODUCTION scan read the RUST-COMMITTED V3 table (one puffin, two DVs, two partitions) -> {(10,x),(30,z),(50,q)}; manifest DeleteFile metadata cross-checked."
+echo "    D4 meta: the canonical snapshot-metadata views of the Rust and Java DV chains are IDENTICAL all 3 ways (added-dvs, operation, manifest/seq semantics)."

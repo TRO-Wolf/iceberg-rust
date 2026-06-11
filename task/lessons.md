@@ -1070,6 +1070,23 @@ How to use it (see the manuals' §2):
   the migration** (56 tests here: subject-preserving fixture swaps to a V2 in-catalog template;
   the migrated suite then doubles as a 60-test regression pin on the V2 gate arm).
 
+### 2026-06-10 (DV arc D4 — table + metadata DV interop, BUILDER + REVIEWER Fable)
+- **`mvn exec:java` exit-code propagation is MACHINE-DEPENDENT — design run-script verdicts to be
+  exit-code-agnostic and FAIL-CLOSED:** capture with `|| true`, then fail when the success
+  sentinel is ABSENT (not only when a `^FAIL` line is present — the absence branch is what makes
+  an early mvn crash/OOM fail the script). The old "-q exec:java does not propagate System.exit"
+  lesson held on the CI-era machine but NOT here (probed: MVN-EXIT=1) — under `set -e` the
+  un-guarded capture aborted before echoing Java's diagnostics. Verdicts from shell VARIABLES
+  (command substitution), never capture files; reset all temp dirs at step 1.
+- **Distinct per-fixture cardinalities (DV A card 1, DV B card 2) keep the canonical entry sort
+  tie-free for free** — design fixture values so no two entries share a sort tuple (the E2
+  tie lesson, applied at fixture-design time instead of comparator-extension time).
+- **DV arc outcome:** all four levels proven vs Java 1.10.0 — blob bytes (D2), scan Direction-1
+  (D1), table-level Direction-2 + metadata-level 3-way incl. `added-dvs` (D4) — with ZERO
+  canonicalization changes and ZERO production fixes in D4 (the D1-D3 surface held). The
+  DV-writer row stays 🟡 SOLELY for the previous-deletes merge + superseded-delete removal
+  (BaseDVFileWriter L117-126) — the next natural increment (needs apply-side delete-file removal).
+
 ### 2026-06-10 (post-arc logic + security audit, ORCHESTRATOR Fable — two parity bugs found + fixed)
 - **Java's merge `first` is the unconditional STREAM HEAD (`manifestIter.next()`,
   ManifestMergeManager L85), NOT "this commit's new manifest".** For an empty-data merging append

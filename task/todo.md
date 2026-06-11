@@ -397,9 +397,111 @@ The read path is therefore Increment D1, before any writer work.
       non-DATA+Puffin (differs only for a pathological Puffin EQUALITY delete, on which Java NPEs
       for a null size — unreachable from real writers); V2/V3 fixture schemas differ by V3 x's
       initial/write-defaults (doc claim softened in mod.rs).
-- [ ] **D4 — interop:** bidirectional DV round-trips (Java writes V3+DV → Rust scans; Rust writes
+- [x] **D4 — interop:** bidirectional DV round-trips (Java writes V3+DV → Rust scans; Rust writes
       → Java reads) on the scan-exec harness; metadata-level chain notes; GAP_MATRIX flips with
       evidence.
+      BUILDER PLAN (2026-06-10, D4 builder — FABLE):
+      - [x] NEW `crates/iceberg/tests/interop_dv_table.rs` (one env var
+            `ICEBERG_INTEROP_DV_TABLE_DIR`, empty-string-safe, offline no-op; phases invoked by
+            test name from the script, like `interop_dv_write.rs`):
+            (1) `test_dv_table_gen_rust_writes_java_readable_v3_dv_table` — the HEADLINE
+            Direction-2 table: V3 identity(category) table at `<dir>/rust_table` on a real-FS
+            MemoryCatalog; TWO real parquet data files (cat=a: (10,a,x)(20,a,y)(30,a,z); cat=b:
+            (40,b,p)(50,b,q)(60,b,r)) `fast_append`ed at seq 1; D2's `DVFileWriter` writes ONE
+            puffin holding TWO DVs (A: pos {1} = id 20; B: pos {0,2} = ids 40/60 — distinct
+            record counts so the canonical entry sort never ties); D3's `row_delta` commits both
+            at seq 2; Rust scan sanity = {10,30,50}; `final.metadata.json` via
+            `TableMetadata::write_to`; emit `expected_rows.json`.
+            (2) `test_dv_meta_views_match_java` — Rust's `snapshot_meta_view` of the JAVA mirror
+            table AND of the Rust table both == `java_meta.json` (the E1 3-way, directions 1+2;
+            direction 3 = the script's byte-diff).
+      - [x] `InteropOracle.java`: new `DvTableOracle` — mode `verify-interop-dv-table` (load the
+            RUST V3 metadata → `IcebergGenerics` PRODUCTION read → rows == expected_rows.json;
+            PLUS the manifest-API cross-check: every delete entry content==POSITION_DELETES,
+            format==PUFFIN, referencedDataFile/contentOffset/contentSizeInBytes set, recordCount
+            == cardinality; sentinel "verify-interop-dv-table: N failures") and mode
+            `generate-interop-dv-table` (the JAVA mirror chain for the metadata fixture:
+            same schema/spec/V3, real parquet via the PartScanExec machinery, `newFastAppend`,
+            `BaseDVFileWriter` two DVs in one puffin, `newRowDelta().addDeletes`,
+            final.metadata.json under `<dir>/table`).
+      - [x] `run-interop-dv.sh`: TMP3 reset in step 1 (idempotency — the D2 reviewer's collision
+            note); new steps: Rust GEN → Java verify (sentinel grep) → Java mirror-table GEN →
+            `emit-snapshot-meta` ×2 + `diff -u` (Java judging Rust's metadata byte-for-byte) →
+            Rust meta test. D1/D2 steps preserved.
+      - [x] Mutations: (a) GEN drops B's DV from the commit → Java table-read step FAILS with
+            resurrected ids 40/60; (b) GEN skips the row_delta → the metadata byte-diff FAILS
+            (missing snapshot). Restore byte-clean + full script green.
+      - [x] Docs: GAP_MATRIX (read row: DV both directions data-level proven; DV-writer row STAYS
+            🟡 — previous-deletes merge + old-delete removal deferred, BaseDVFileWriter L117-126;
+            RowDelta row DV note) + pipe-count audit; tests/map.md + dev/java-interop/map.md rows;
+            this todo outcome.
+      - [x] Gate: typos; fmt; clippy (workspace excl. sqllogictest); `cargo test -p iceberg
+            --lib` ×2; offline no-ops of ALL interop tests (env unset); `run-interop-dv.sh`
+            end-to-end green.
+      BUILDER OUTCOME (2026-06-10, D4 builder — FABLE; awaiting reviewer): **EVERYTHING GREEN ON
+      THE FIRST RUN — both new proofs, zero canonicalization surprises, zero production changes.**
+      (1) TABLE-level Direction-2 (the headline): Java's PRODUCTION scan (`IcebergGenerics` →
+      `BaseDeleteLoader.readDV`) read the Rust-COMMITTED V3 table — 2 identity(category)
+      partitions of real parquet `fast_append`ed at seq 1, ONE puffin holding TWO DVs (cat=a pos
+      {1}, cat=b pos {0,2} — distinct cardinalities 1/2) `row_delta`'d at seq 2 — to exactly
+      {(10,x),(30,z),(50,q)}, AND the manifest-API cross-check matched every committed DeleteFile
+      field (content/format/referencedDataFile/contentOffset/contentSizeInBytes/recordCount +
+      both DVs sharing ONE puffin location). Java 1.10.0 parsed the Rust V3 metadata
+      (`next-row-id`), manifest list, and V3 delete manifests with no issue. (2) METADATA-level
+      (E1-family): Java's canonical snapshot-meta view of the Rust DV chain byte-diffed IDENTICAL
+      to Java's view of its own mirror chain (`newFastAppend` + `BaseDVFileWriter` +
+      `newRowDelta`) on the FIRST diff — `added-dvs: 2` (with NO `added-position-delete-files`,
+      the instead-of branch D3 wired), operation `delete`, `changed-partition-count: 2`, delete
+      manifest split + post-inheritance seq 2 — and Rust's views of BOTH tables equal it
+      (3-way complete). No `snapshot_meta_view.rs` change needed (the E2 lesson's
+      order-insensitive fallback never even fired). SCOPE NOTE stated in the test module: the
+      canonical entry tuple omits referenced_data_file/content_offset — covered instead by the
+      table-level manifest cross-check. New: `interop_dv_table.rs` (2 env-gated tests,
+      `ICEBERG_INTEROP_DV_TABLE_DIR`, offline + empty-string no-op), `DvTableOracle`
+      (verify-interop-dv-table + generate-interop-dv-table), `run-interop-dv.sh` steps 7-11
+      (D1/D2 steps preserved; TMP3 reset in step 1). HARNESS FIX found while mutation-testing:
+      on this machine `mvn exec:java` DOES surface the oracle's `System.exit(1)` (contra the
+      D2-era note), so under `set -e` the `VERIFY_OUT="$(...)"` captures aborted BEFORE echoing
+      Java's diagnostics — both sentinel captures (steps 5 + 8) now `|| true` with the verdict
+      taken ONLY from the output sentinel (success line present, no `^FAIL`), which is robust to
+      either mvn behavior. Mutations (test-only, /tmp backup, restored byte-clean via cmp):
+      (a) drop cat=b's DV from the commit ⇒ step 8 FAILS loudly — Java reads RESURRECTED ids
+      40/60 ({10,30,40,50,60}) + manifest count 1≠2 ⇒ script exit 1; (b) skip the row_delta ⇒
+      the metadata byte-diff FAILS showing the entire missing DV snapshot (added-dvs block) ⇒
+      diff exit 1. Full script re-run END-TO-END GREEN after restore. GAP_MATRIX: DV-writer row
+      gains the D4 table+metadata proofs but STAYS 🟡 (previous-deletes merge + superseded-delete
+      removal, `BaseDVFileWriter` L117-126 — deferred; `removed-dvs` collector-level only);
+      merge-on-read READ row now claims DVs data-level interop ✅ BOTH directions (stays 🟡 for
+      its own residue); RowDelta row gains the D4 DV note; pipe-count audit clean. Gate:
+      typos/fmt/clippy(workspace excl. sqllogictest) clean; lib 1756 ×2 (no lib change in D4);
+      ALL 11 interop test binaries no-op offline; script green ×2 (initial + post-restore).
+      Cargo/pom 0-diff. NO production parity bug found — the D1-D3 surface held under both new
+      proofs.
+      REVIEWER OUTCOME (2026-06-10, D4 reviewer — FABLE): **APPROVED, zero fixes needed — the
+      harness is non-vacuous and fails closed.** Adversarial probes (all different from the
+      builder's two mutations, each restored byte-clean via cmp): (a) EMPTY-OUTPUT probe — step
+      8's capture pointed at /bin/true (mvn dying early with NO output) ⇒ script exit 1 via the
+      success-sentinel-ABSENT branch (the verdict is not merely ^FAIL-present); (b) POISONED
+      GROUND TRUTH — expected_rows.json edited between steps 7 and 8 to claim DV-deleted id 20
+      survives ⇒ step 8 FAILS loudly (java-read {10,30,50} ≠ expected {10,20,30,50}, "1
+      failures", exit 1) WITH Java's diagnostics echoed before the verdict — proving the `||
+      true` change does what it claims; (c) DIRECT mvn exit-code probe — `verify-interop-dv-table`
+      against an empty dir returns MVN-EXIT=1, empirically confirming the builder's claim that
+      `mvn exec:java` DOES surface `System.exit(1)` here (so without `|| true`, `set -e` would
+      abort the capture assignment pre-echo). No capture FILES exist (verdicts from shell vars;
+      TMP/TMP2/TMP3 rm-rf'd in step 1) ⇒ no stale-sentinel leak possible. Mirror-chain
+      equivalence read side-by-side: same schema/spec/V3, same rows, same DV positions/
+      cardinalities (1 vs 2), same commit shape (append seq 1, row_delta seq 2); step 10 emits
+      the two DIFFERENT tables (`table/` vs `rust_table/`) — diff non-vacuous (java_meta.json
+      inspected: operation `delete`, `added-dvs: 2`, no `added-position-delete-files`, delete
+      manifest entries at seq 2). Manifest cross-check is VALUE-level (offsets 4/46, sizes
+      42/44, cardinalities 1/2 compared against expected_dvs.json), not presence-only. Note
+      (accepted, E1-convention precedent): "byte-identical 3 ways" is strictly byte-level only
+      for the script's diff direction; the two Rust-side directions are serde_json::Value
+      structural equality. Independent gate re-run: typos/fmt/clippy clean; lib 1756 ×2; all 11
+      interop binaries no-op with env unset AND the new one with empty-string env; zero src/
+      diff + snapshot_meta_view.rs untouched confirmed; full script green (baseline + final
+      post-probe runs, exit 0).
 
 ## DONE (2026-06-10 overnight): Phase-2 write-engine completion arc (branch `phase2/write-engine-completion`, squash-merged as PR #20)
 
