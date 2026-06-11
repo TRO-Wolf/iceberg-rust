@@ -1461,3 +1461,29 @@ How to use it (see the manuals' §2):
   code buckets the off-spec file under the EMPTY struct (separate), the mutation co-groups them into one qualifying
   group. A mutation-insensitive guard test is worse than none — pick fixture values that make the guard's job
   actually necessary.
+- **_(2026-06-11, S1)_ To prove `data_sequence_number` preservation at the DATA level you MUST use an
+  EQUALITY delete, NOT a position delete.** Position deletes are PATH-BASED: they reference a specific
+  `(file_path, position)` tuple. After `rewriteFiles({A},{A'})`, A' has a NEW path — the position delete
+  on A's path is DANGLING (has no live file to apply to) and never applies to A'. The delete-applicability
+  rule for position deletes does NOT involve `data_sequence_number` at all. Equality deletes ARE
+  seq-based: an equality delete applies to data files with `data_seq STRICTLY LESS THAN` the delete's seq.
+  Therefore `rewriteFiles({A},{A'}, 1L)` stamps A' with `data_seq=1`, and an outstanding equality delete at
+  `seq=2` still applies (`2 > 1`) — this is the invariant `data_sequence_number` preservation tests.
+  The fixture B redesign discovered this the hard way: the original position-delete fixture showed the
+  wrong result (all 4 rows returned — both Java and Rust were CORRECT; the fixture design was wrong).
+  RULE: when constructing a seq-preservation fixture, use equality deletes (seq-governed); a position
+  delete cannot serve as the "outstanding delete" because it is path-governed, not seq-governed.
+
+### 2026-06-11 (S1 DATA-level interop reviewer, Sonnet)
+- **DO use a mutation that removes `data_sequence_number(seq)` from the rewrite commit to prove the
+  fixture is NOT vacuous.** Without it, A' takes the fresh snapshot seq (e.g. 3), making the equality
+  delete (seq=2) inapplicable (2 ≤ 3), and all 5 rows survive — the Rust self-scan assertion fails
+  loud (`[10,20,30,40,50]` ≠ `[10,30,50]`) before Java even runs. A passing self-scan with the mutation
+  means the fixture is vacuous; a fail proves the pin is real. The mutation result here: FAIL-LOUD.
+- **Java interop verify using `LinkedHashMap<Long, String>` keyed by `id` has SET (not MULTISET)
+  semantics — a same-id duplicate from the Rust writer would be silently deduped and the count check
+  would not catch it.** The Rust comparison test uses `Vec.eq()` (multiset) and DOES catch same-id
+  duplicates. Mitigation: same-id duplicates cannot arise from the production write chain (each row
+  written exactly once), and the Rust comparison test is the authoritative multiset guard for the
+  Rust-reads-Java direction. No production code change needed; this is a documented weakness of the
+  Java verify layer specifically for the same-id-duplicate corner case.

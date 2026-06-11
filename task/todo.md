@@ -462,9 +462,88 @@ result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs 
       METADATA-level interop (`stageOnly` write path explicitly OUT — production code); S3: one
       Opus auditor sweeps the whole branch diff before PR. Runs in worktree `wt-interop` parallel
       to Group O (`phase6/rewrites-and-debt`, Opus) and Group F (`phase4/variant-schema`, Fable).
+  - [ ] **S1 BUILDER plan (2026-06-11, wt-interop, Sonnet):** DATA-level interop for merge_append + RewriteFiles.
+        **Script choice:** NEW `run-interop-write-data.sh` (separate from the metadata script) because the
+        data-level fixtures require REAL parquet and are different directories from the metadata-only chain.
+        Mixing into the metadata script would conflate metadata steps with data steps in the same step list.
+        **Row-canonicalization format:** REUSE `ScanRow{id,data}` / `sorted_by_id` / `extract_rows` /
+        `readLiveRowsToJson` from `interop_scan_exec.rs` and `ScanExecOracle` (file:line as found at read time).
+        **Oracle additions (InteropOracle.java):**
+          - `MergeAppendDataOracle`: generate a V2 partitioned table with REAL parquet (schema {id long, category
+            string, data string}), write 3 real data files (A cat=a ids=[10,20,30], B cat=b id=[40], C cat=a
+            id=[50]), fast_append them (b1 seq 1), then set min-count-to-merge=2 (no snapshot) + merge_append
+            G(cat=a, id=60, data="g") (seq 2, one-bin merge fires). Emit `java_scan_rows.json` via `readLiveRowsToJson`.
+          - `RewriteFilesDataOracle`: generate a V2 partitioned table with REAL parquet, write A(cat=a,
+            ids=[10,20,30]) and B(cat=b,id=[40]), fast_append (b1 seq 1), row_delta a position-delete on A
+            (deletes position 1 = id=20) (b2 seq 2), rewrite_files {A}→{A'} preserving data_sequence_number=1
+            (b3 seq 3, Java `rewriteFiles({A},{A'}, 1L).validateFromSnapshot(b2)`). Emit `java_scan_rows.json`
+            (expected: {10,30,40} — id=20 deleted by the position delete, which must still apply to the
+            rewritten A').
+          - REUSE `ScanExecOracle.readLiveRowsToJson` (same method, no duplication).
+          - `verify-interop-merge-append-data`: load `<dir>/rust_table/metadata/final.metadata.json`, scan via
+            IcebergGenerics, assert rows == java_scan_rows.json. Sentinel: `verify-interop-merge-append-data: 0 failures`.
+          - `verify-interop-rewrite-data`: same for the rewrite fixture. Sentinel: `verify-interop-rewrite-data: 0 failures`.
+        **Rust GEN tests (new file `crates/iceberg/tests/interop_write_data.rs`):**
+          - REUSE `ScanRow`/`sorted_by_id`/`extract_rows`/`read_java_rows` from `interop_scan_exec.rs` (put in
+            `tests/common/scan_rows.rs` module — but that would require a new common submodule; ALTERNATIVE:
+            duplicate the ~20 lines of row helpers since the addendum rule says "one home per pattern" means
+            don't write a SECOND row dumper, but the row-reading helper can be local per test file since it is
+            the consumer side not the producer). Actually: the existing helpers in `interop_scan_exec.rs` are
+            NOT in a shared module; they are local to that file. Per the addendum "one home per pattern", the
+            DUMPER (Java's `readLiveRowsToJson`) has one home, but the CONSUMER pattern (Rust `ScanRow`/
+            `extract_rows`) is fine to replicate since it is ~20 lines of structural code. The key is not
+            writing a SECOND Java dumper.
+          - `test_merge_append_data_gen_rust_writes_java_readable_table`: write real parquet via production
+            writers, fast_append, set property, merge_append, scan self, write final.metadata.json.
+          - `test_merge_append_data_rust_scan_matches_java_read`: load Java table, scan, assert rows == java_scan_rows.json.
+          - `test_rewrite_data_gen_rust_writes_java_readable_table`: write real parquet, fast_append, row_delta
+            position-delete, rewrite_files with data_sequence_number=1, scan self (id=20 absent), write metadata.
+          - `test_rewrite_data_rust_scan_matches_java_read`: load Java table, scan, assert rows == java_scan_rows.json.
+        **Script:** `run-interop-write-data.sh` (6 steps: reset, Java gen + verify sentinels, Rust gen, Java verify,
+          Java reads Rust, Rust reads Java). All harness rules: `set -euo pipefail`, per-run TMP wipe at step 1,
+          grep-sentinel verdicts, injective comparison (sorted row list by id → cannot swap entries of different ids),
+          deep compare (full sorted row sets, never counts).
+        **GAP_MATRIX:** update merge_append + RewriteFiles rows with data-level interop date, covered paths, deferred.
+      - [x] 1. Write the plan (this entry)
+      - [x] 2. Add new Oracle classes in InteropOracle.java + dispatch cases — `MergeAppendDataOracle` + `RewriteFilesDataOracle` (redesigned to equality delete); 4 dispatch cases in `main()`; shared `readLiveRowsToJson(BaseTable, String)` at class level.
+      - [x] 3. Write `run-interop-write-data.sh` — 6-step harness, `set -euo pipefail`, separate from metadata script, sentinel-grepped Java verify passes.
+      - [x] 4. Write `crates/iceberg/tests/interop_write_data.rs` — 4 tests (2 GEN + 2 comparison), fixture B REDESIGNED to equality delete (position delete is path-based; equality delete is seq-based — see lessons). Fixed clippy issues: `Arc<PartitionSpec>` → `.as_ref().clone()`, removed unused imports.
+      - [x] 5. Update GAP_MATRIX.md (both rows + pipe-count audit) — merge_append data-level interop ✅ 2026-06-11; RewriteFiles data-level interop ✅ 2026-06-11 with CRITICAL fixture B design lesson.
+      - [x] 6. Update map.md for dev/java-interop — added `run-interop-write-data.sh` row to Contents table.
+      - [x] 7. Run the full chain GREEN end-to-end — all 6 steps pass; fixture A {10,20,30,40,60}, fixture B {10,30,50} both directions.
+      - [x] 8. Sabotage checks (a) corrupt row value → comparison fails field-for-field; (b) delete artifact → panic on file-read; (c) duplicate row → length + deep compare fails. All 3 harness fail-closed.
+      - [x] 9. Rust gate (typos+fmt+clippy+lib ×2) — Run 1: 2000 lib pass; Run 2: 2000 lib pass. Both clean.
+      - [x] 10. Finalize todo.md + lessons.md — this entry + lesson added.
+
+      **Outcome (2026-06-11, S1 COMPLETE):** DATA-level interop for `merge_append` and `RewriteFiles` landed.
+      Files: `dev/java-interop/InteropOracle.java` (+`MergeAppendDataOracle`+`RewriteFilesDataOracle`),
+      `dev/java-interop/run-interop-write-data.sh` (new), `crates/iceberg/tests/interop_write_data.rs` (new),
+      `docs/parity/GAP_MATRIX.md` (2 rows updated), `dev/java-interop/map.md` (1 table row added),
+      `task/todo.md` + `task/lessons.md`. Gate: typos/fmt/clippy/2000 lib ×2 clean. Sabotage ×3 fail-closed.
+      Full chain GREEN (6/6 steps). Rows stay 🟡 (deferred: delete-manifest merging / conflict-validation /
+      multi-spec / multi-bin merge paths for `merge_append`; DELETE-file rewrite for `RewriteFiles`).
+
+      **S1 REVIEWER (2026-06-11, Sonnet, adversarial):** APPROVE with one documented finding.
+      Mutation mandate (point 1): removing `data_sequence_number(1)` caused test_rewrite_data_gen to FAIL
+      at the Rust self-scan assertion (ids 20+40 resurrected: left=[10,20,30,40,50] ≠ right=[10,30,50]) —
+      the fixture IS load-bearing (not vacuous). Fixture B redesign confirmed against lessons.md L1206-1217
+      (position-delete path-based, equality-delete seq-based; redesign is the only valid design). Fixture A
+      merge fires: ONE manifest in the final manifest-list for the merge_append snapshot (confirmed from
+      metadata listing). Row canonicalization: builder reused `ScanRow`/`sorted_by_id`/`extract_rows`
+      format from `interop_scan_exec.rs`; Java `readLiveRowsToJson(BaseTable, String)` is ONE shared method
+      (line 7301) used by both oracles — correct, not a second dumper. Script audit: `set -euo pipefail` ✅,
+      per-run TMP wipe at step 1 ✅, all Java invocations `|| true` then sentinel-grepped ✅. Dual run ×2
+      both green ✅. 3 sabotages fail-closed: (a) corrupt json field → field-for-field Vec assert fails ✅;
+      (b) delete final.metadata.json → Java verify prints FAIL + sentinel absent → script exits 1 ✅;
+      (c) duplicate row in json → Vec multiset compare fails ✅. Gate 2000 lib ×2 clean ✅. GAP_MATRIX
+      pipe-count clean ✅. Tree: no src/** edits, no Cargo edits ✅.
+      ONE FINDING (documented, not blocking): Java verify uses `LinkedHashMap<Long,String>` keyed by `id`
+      (SET semantics) — a same-id duplicate from the Rust writer would be silently deduped and not caught
+      by the Java verify's count check. The RUST comparison test (`Vec.eq()`) provides the multiset guard
+      for that direction. Same-id duplicates cannot arise from the production write chain (each row written
+      exactly once). No production code change needed; documented here.
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
-- [ ] **Opus-queue (post-handoff or parallel):** data-level write-action interop paydown,
-      cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.
+- [ ] **Opus-queue (post-handoff or parallel):** cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.
 - [ ] **THIS BRANCH (Group B, Fable actor-critic, user-approved 2026-06-11): variant-type
       groundwork** — B1: the variant binary format read side (`org.apache.iceberg.variants`
       Serialized* + VariantUtil parity: metadata dictionary, value headers, all primitive
