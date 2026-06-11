@@ -186,6 +186,84 @@ judgment-heavy → frontier window before 2026-06-22; templated breadth → Opus
         **1911 passed ×2** (1903 baseline + 8 reviewer tests). expire_cleanup.rs byte-untouched
         (`git diff --stat` empty); production `delete_orphan_files.rs` matches its pre-review backup
         byte-for-byte (every mutation reverted). No commit.
+- [ ] **THIS BRANCH (Wave 4 Group O, Opus actor-critic, user-approved 2026-06-11):
+      write-engine debt + compaction action** — O1: the FastAppend all-tombstone-manifest carry
+      fix (A3's STOP-grade find: `append.rs:148` filters `has_added || has_existing`; Java 1.10.0
+      `FastAppend.apply` carries `allManifests` unfiltered; sweep merge_append for the same
+      class); O2: `RewriteDataFiles` bin-pack planning (Java core planner classes,
+      1.10.0-bytecode-pinnable) over the existing seq-preserving `RewriteFiles` commit
+      (partial-progress + parallelism deferred); O3 (stretch): `RemoveDanglingDeleteFiles`.
+      Runs in worktree `wt-rewrite` parallel to Group S (`interop/data-level-paydown`, Sonnet)
+      and Group F (`phase4/variant-schema`, Fable).
+## ACTIVE (2026-06-11): Wave-4 Group O increment O1 — FastAppend all-tombstone-manifest carry fix (worktree wt-rewrite, BUILDER Opus)
+
+A3's STOP-grade find. `FastAppendOperation::existing_manifest` (append.rs:148) filters carried
+manifests to `has_added_files() || has_existing_files()`, DROPPING all-tombstone manifests from the
+new snapshot's manifest list. Java 1.10.0 `FastAppend.apply` (`core/FastAppend.java`; bytecode
+offsets 74-99) does `manifests.addAll(snapshot.allManifests(io))` UNFILTERED — every prior manifest
+carries forward, including a manifest left ALL-DELETED by a copy-on-write delete that emptied it.
+
+- [x] **Verify the bytecode (done first):** `FastAppend.apply` carries `snapshot.allManifests(io)`
+      with NO filter (offset 89 `allManifests`, 94 `addAll`); `BaseSnapshot.allManifests` returns the
+      manifest list read verbatim (no content/tombstone filtering). FastAppend filter = real divergence.
+- [x] **#2 merge_append SWEEP — settled NO-FIX from bytecode:** Java's `MergeAppend` (`newAppend`)
+      runs `MergingSnapshotProducer.apply` (L1007-1011) which filters `unmergedManifests` through
+      `shouldKeep = hasAddedFiles OR hasExistingFiles OR snapshotId() == snapshotId()`. So Java's
+      MERGING producer DOES drop all-tombstone prior manifests (the third clause is unreachable for a
+      pure append — no carried manifest was written by the not-yet-committed snapshot). Rust
+      merge_append's `has_added/has_existing` filter MATCHES Java's `shouldKeep` minus the
+      unreachable clause ⇒ NO divergence, NO fix. Pinned with a documented-parity test.
+- [x] **Fix #1:** dropped the filter in `FastAppendOperation::existing_manifest` — carries ALL prior
+      manifest-list entries forward (`entries().to_vec()`, Java `allManifests`). `process_deletes` is a
+      no-op for fast_append (`delete_files` empty ⇒ early return), so append.rs:148 was the sole drop.
+- [x] **Tests (same change):** (a) on-disk fail-before/pass-after reproduction
+      `test_fast_append_carries_all_tombstone_manifest_forward_on_disk` — add → emptying delete →
+      fast_append; RE-PARSES the new snapshot's manifest list FILE; FAILS on HEAD (proved — manifest
+      list omits the tombstone path), PASSES after. (b) scan pin
+      `test_fast_append_carried_tombstone_does_not_resurrect_deleted_rows` (live set = {d2}, d1 stays
+      deleted). (c) merge_append documented-parity pin
+      `test_merge_append_drops_all_tombstone_manifest_unlike_fast_append`.
+- [x] **Knock-on audit:** summaries unaffected (Rust emits no `manifests-*` keys; `total-*`/`added-*`
+      come from file accounting, not manifest-list counts; full suite green unchanged). Expire/orphan
+      universes read all manifests — strictly safer (one fewer dropped-then-relisted manifest). No
+      existing test asserted the old filtered manifest-list length (2000→2003 = +3 new only).
+- [x] **Docs:** GAP_MATRIX fast_append row (A3 divergence → fixed-with-date) + merge_append row
+      (settled-parity note) + ExpireSnapshots STOP-finding tail (→ FIXED pointer); pipe audit CLEAN
+      (every `^|` row exactly 5 pipes — caught + fixed two `||`-broken rows by rephrasing to OR-prose);
+      transaction/map.md append.rs row + lessons.
+
+Deferred: interop re-proof (Group S); O2 (RewriteDataFiles) + O3 are separate runs — NOT started.
+
+**Outcome (2026-06-11): O1 LANDED.** Fix: `FastAppendOperation::existing_manifest` carries all prior
+manifests unfiltered (was `has_added || has_existing`). merge_append swept + settled NO-FIX (Java's
+MERGING `shouldKeep` legitimately drops all-tombstone manifests; Rust matches). Files: append.rs
+(fix + 3 tests + helpers), GAP_MATRIX.md (3 rows), transaction/map.md (append.rs row), todo.md,
+lessons.md. ZERO changes to merge_append.rs/snapshot.rs production (sweep was read-only). Gate CLEAN
+from wt-rewrite root: typos clean, fmt clean, clippy `-D warnings` clean (workspace ex-sqllogictest),
+`cargo test -p iceberg --lib` **2003 passed ×2** (baseline 2000 + 3). Fail-before PROVED (restored
+the filter → the on-disk reproduction FAILS: new snapshot's manifest list omits the tombstone path;
+the scan + merge_append pins correctly still pass under the old filter — they guard against
+over-correction, not the bug). No commit. NOTE: O2 (RewriteDataFiles) NOT started — separate run.
+
+**Reviewer (2026-06-11, Opus, wt-rewrite): O1 VERIFIED — fix + verdicts sound; one test gap closed.**
+#1 merge_append NO-FIX **CONFIRMED from 1.10.0 bytecode** (`lambda$apply$16` = `hasAddedFiles (off 1) ||
+hasExistingFiles (off 10) || snapshotId()==snapshotId() (off 18-32)`; third clause unreachable for the
+carried set because `filterManifest` returns the manifest verbatim with its OLD snapshot id when there are
+no matching deletes; `shouldKeep` applied to DATA off 175 AND DELETE off 191 ⇒ delete-manifest parity too).
+#3 ordering: Java is new-first/carried-last (bytecode off 4-23 then 74-99; MAIN L153/L166), Rust is
+carried-first/new-last (snapshot.rs:1030-1039) — DIVERGES but PRE-EXISTING + spec-non-contractual (the
+canonical oracle SORTS manifests; both readers order-agnostic) ⇒ reported, not fixed (shared-path blast
+radius, out of O1 scope). #4 all three interop chains GREEN (write-actions, expire, dv — exit 0). #2 entry
+fidelity: `to_vec()` clones verbatim, but the reproduction test under-pinned — restamping `added_snapshot_id`
+left the O1 tests green. **Reviewer strengthened** `test_fast_append_carries_all_tombstone_manifest_forward_on_disk`
+to a full `ManifestFile` `==` against the pre-carry entry (helper now returns the full `ManifestFile`);
+mutation-verified it catches the restamp. #5 resurrect-pin + #6 summary (file-accounting only, no
+`manifests-*`) + #7 pipe audit (all 61 rows = 5 pipes, prose-OR matches bytecode) all CONFIRMED. Gate
+re-run: typos/fmt/clippy clean, `cargo test -p iceberg --lib` **2003 ×2** (test strengthened in place, count
+unchanged). REPORTED (not fixed, out of file set): merge_append.rs:282 comment now stale ("Mirrors
+FastAppendOperation::existing_manifest exactly" — they diverge post-O1). Tree clean: 5 allowed files only,
+no Cargo/pom, merge_append.rs + snapshot.rs production byte-untouched. No commit.
+
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** data-level write-action interop paydown,
       cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.

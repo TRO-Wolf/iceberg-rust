@@ -1203,3 +1203,81 @@ How to use it (see the manuals' §2):
   full diff had been captured to a tool-results file and re-applied with `git apply`. RULE for reverting
   probes on uncommitted files: snapshot the file to `/tmp` BEFORE the probe edit and restore from THAT
   (`cp`), or undo the exact textual edit — never `git checkout`/`git restore` a path with uncommitted work.
+
+### 2026-06-11 (Wave-4 Group O / O1 — FastAppend all-tombstone-manifest carry, BUILDER Opus, wt-rewrite)
+- **`FastAppend` (`newFastAppend`) and `MergeAppend` (`newAppend`) carry prior manifests by DIFFERENT
+  rules — the "same-class sweep" answer is NO-FIX for merge_append, settled from bytecode.** *Why:*
+  `FastAppend.apply` (1.10.0 bytecode offsets 89-94 + `core/FastAppend.java`) does
+  `manifests.addAll(snapshot.allManifests(io))` with NO predicate (`BaseSnapshot.allManifests` returns
+  the manifest list verbatim) ⇒ ALL prior manifests carry forward, including a manifest left
+  ALL-DELETED by a copy-on-write delete. But `MergingSnapshotProducer.apply` (the producer `MergeAppend`
+  extends, L1007-1011) filters its carried set through `shouldKeep = hasAddedFiles() OR hasExistingFiles()
+  OR snapshotId() == snapshotId()` — which DROPS all-tombstone prior manifests (the third clause is
+  unreachable for a pure append: no carried manifest was written by the not-yet-committed snapshot). So
+  the Rust `has_added/existing` filter is a DIVERGENCE in fast_append (fix = carry unfiltered) but exact
+  PARITY in merge_append (keep the filter). Lesson: when sweeping a sibling for "the same bug," read the
+  sibling's OWN Java carry path — `newFastAppend` and `newAppend` route through different `apply`s, and
+  the merging one legitimately filters what the non-merging one keeps.
+- **There are THREE places this filter pattern appears in the producer family — only ONE was the bug.**
+  `append.rs` `existing_manifest` (the bug, now `entries().to_vec()`), `merge_append.rs`
+  `existing_manifest` (intentional `shouldKeep` parity — KEPT), and `snapshot.rs` `process_deletes`
+  L1100 (carry-if-no-matching-delete, ALSO correct: a delete-bearing op's `shouldKeep` analogue; the
+  rewritten all-tombstone manifest is pushed unconditionally elsewhere in the loop). For fast_append
+  `process_deletes` returns early (`delete_files` empty), so append.rs:148 was the SOLE drop point.
+  Grep `has_added_files() || has_existing_files()` before assuming one site.
+- **The on-disk reproduction must RE-PARSE the manifest-list FILE, and the producer of the
+  all-tombstone state is an EMPTYING copy-on-write delete (append d1 → delete d1) — not a hand-built
+  fixture.** *Why:* `delete_files(["d1"])` rewrites d1's manifest to {d1: Deleted}, 0 live, which
+  `process_deletes` pushes into the manifest list (added_snapshot_id = delete snapshot,
+  `has_deleted_files` only). The next commit's `existing_manifest` reads that real on-disk list. Fail
+  before / pass after: with the filter the new snapshot's list omits the tombstone manifest path; without
+  it, it is present. Two co-pins keep the fix honest WITHOUT relying on the env-gated interop chain: a
+  scan-unchanged pin (the carry does NOT resurrect the deleted row — the worst regression class) and a
+  merge_append-still-drops pin (the deliberate asymmetry). Both PASS under the OLD filter too, so only
+  the fail-before reproduction proves the fix — the other two guard against over-correcting.
+- **Carrying an extra all-tombstone manifest forward changes NO snapshot summary counter** — Rust does
+  not emit `manifests-created/-kept/-replaced` (only `RewriteManifests` does), and `total-*`/`added-*`
+  counters come from FILE accounting (`added_data_files`/`removed_data_files` seeded from the prior
+  summary), never from counting manifest-list entries. The full lib suite (2000→2003, only the 3 new
+  tests added) passed unchanged — corroborating zero knock-on. Orphan/expire universes read ALL
+  manifests and are strictly SAFER (one fewer dropped-then-relisted manifest).
+
+### 2026-06-11 (Wave-4 Group O / O1 — REVIEWER Opus, wt-rewrite)
+- **The merge_append NO-FIX verdict is CONFIRMED from 1.10.0 bytecode, both sub-questions.** `javap -c
+  MergingSnapshotProducer` → `lambda$apply$16` (the `shouldKeep` Predicate) is exactly `hasAddedFiles()
+  (offset 1, ifne 35) || hasExistingFiles() (offset 10, ifne 35) || manifest.snapshotId().longValue()
+  == this.snapshotId() (offsets 18-32)`. (a) The third clause is UNREACHABLE for a carried manifest in a
+  pure merge_append: `filterManifest` returns the manifest VERBATIM (old snapshot id) when there are no
+  matching deletes (`!canContainDeletedFiles` → `return manifest`, offsets 23-45) — only a REWRITTEN
+  manifest gets the new snapshot id, and merge_append rewrites nothing. So an all-tombstone carried
+  manifest fails all three clauses ⇒ dropped, matching Rust's `has_added || has_existing`. (b) `shouldKeep`
+  (apply local 8) is applied to BOTH the data-manifest iterable (apply offset 175) AND the delete-manifest
+  iterable (offset 191) — so Java drops all-tombstone DELETE manifests in the merge path identically;
+  Rust's content-agnostic filter matches. MAIN `MergingSnapshotProducer.java` L1003-1011 confirms the
+  bytecode (the builder's "L1007-1011" citation is accurate; the third clause is L1007).
+- **Entry-copy fidelity had a TEST GAP — closed by the reviewer.** `to_vec()` clones `ManifestFile`
+  verbatim (Java `allManifests` carries the cached objects with no `copyOf`/`withSnapshotId` — that
+  restamp is only `lambda$apply$1`, the unported `appendManifest()` path). But the original reproduction
+  test only checked the carried entry's PATH + tombstone counts, NOT `added_snapshot_id`. Mutation —
+  restamping `added_snapshot_id` to the new snapshot id — left the O1 tests GREEN and only tripped
+  cross-cutting concurrent-conflict tests in overwrite/row_delta/replace_partitions/cherry_pick
+  (`added_*_files_after` reads `added_snapshot_id`). Reviewer strengthened the reproduction pin to a full
+  `ManifestFile` `==` against the pre-carry entry (covers added_snapshot_id, both seq numbers, all counts,
+  partition summaries); mutation-verified it now fails directly on the `added_snapshot_id` diff. Lesson:
+  a "carried verbatim" pin must field-compare against the SOURCE entry, not just re-assert the entry's own
+  derived predicates — re-inheritance corruption hides in fields the predicate doesn't read.
+- **Manifest-LIST entry ORDER diverges from Java but is NOT a spec/interop contract (REPORT, not fix).**
+  Java `FastAppend.apply` writes NEW manifests FIRST then carried `allManifests` LAST (bytecode offsets
+  4-23 then 74-99; MAIN `FastAppend.java` L153 then L166). Rust `SnapshotProducer::manifest_file`
+  (snapshot.rs:1030-1039) writes CARRIED first (`process_deletes`) then NEW (`write_added_manifests`
+  extend) — the OPPOSITE order. This is PRE-EXISTING (O1 only changed which carried entries survive, not
+  the carried-vs-new order) and the canonical interop oracle (`snapshot_meta_view.rs:107-127`) SORTS
+  manifests by a deterministic tuple precisely because manifest-list file order is "writer-dependent, not
+  a spec contract." Both readers reconcile by sequence number, order-agnostic. So the three interop chains
+  pass and the divergence is cosmetic. Fixing it would touch the shared `manifest_file` path (blast radius:
+  every action) — out of O1 scope.
+- **Comment drift: merge_append.rs:282 now LIES after O1.** It says its `existing_manifest` "Mirrors
+  `FastAppendOperation::existing_manifest` exactly so the carried set is byte-identical" — but O1 made
+  fast_append carry UNFILTERED while merge_append still filters. The two are now DELIBERATELY different.
+  Reported to the orchestrator (merge_append.rs production is outside the reviewer's allowed file set; a
+  one-line comment correction is the only follow-up).
