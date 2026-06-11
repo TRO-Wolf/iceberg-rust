@@ -1106,3 +1106,50 @@ How to use it (see the manuals' §2):
   realistic value. Audit greps that pay off: `as u64|as u32` casts on spec-struct fields (clamp
   negatives first), `+=` on u64 accumulators, `debug_assert` guarding anything reachable in
   release, `zip_eq` on data derived from storage.
+
+### 2026-06-10 (Arc-E Inc 1 — apply-side DELETE-FILE removal `removeDeletes` + door relaxation, BUILDER Opus)
+- **`BaseRowDelta.operation()` is VERSION-SENSITIVE — the 1.10.0 JAR has a TWO-branch form with NO
+  APPEND arm; MAIN's three-branch form is post-1.10.0. The 2026-06-08 lesson's "third condition"
+  was answered by the bytecode, not by adding MAIN's condition.** *Why:* the 2026-06-08 lesson said
+  "when removeRows/removeDeletes land, the third condition (`&& !deletesDataFiles()`) MUST be added or
+  add+remove records Append wrongly." Reading `iceberg-core-1.10.0.jar` BYTECODE
+  (`javap -c BaseRowDelta`) shows 1.10.0 `operation()` is `if (addsDeleteFiles() && !addsDataFiles())
+  return "delete"; return "overwrite";` — NO append branch at all (the MAIN source's leading
+  `addsDataFiles() && !addsDeleteFiles() && !deletesDataFiles() ⇒ APPEND` is a later addition). The
+  interop oracle pins 1.10.0, so the faithful fix is to DROP to the two-branch form (which handles
+  every removal case: add+remove → Overwrite; remove-only → Overwrite; add-deletes-only → Delete),
+  NOT to port MAIN's third condition. This RE-CLASSIFIES add-data-only RowDelta as Overwrite (was
+  Append per the pre-fix MAIN mirror) — unobservable via interop (the oracle data-appends via
+  `newFastAppend`, never an add-data-only `newRowDelta`). LESSON: when a lesson says "port condition
+  X from Java," re-derive X from the PINNED JAR's bytecode first — the source may have moved. Also:
+  `deletesDataFiles()` = the DATA filter manager (`removeRows`), `deletesDeleteFiles()` = the DELETE
+  filter manager (`removeDeletes`) — two separate methods, and 1.10.0 `operation()` consults NEITHER.
+- **The DELETE-manifest filter is the SAME `process_deletes` machinery keyed off the SOURCE manifest's
+  CONTENT — a removed file's path is matched across the FULL manifest list, so a DATA removal lands in
+  a rewritten DATA manifest and a DELETE removal in a rewritten DELETE manifest, no second code path.**
+  *Why:* Java's `DataFileFilterManager`/`DeleteFileFilterManager` are the same abstract
+  `ManifestFilterManager<F>`, differing only in `newManifestWriter` (DATA vs DELETE writer) +
+  `removeDanglingDeletesFor` (the DATA one throws). The Rust port mirrors this by making
+  `new_filtering_manifest_writer` content-keyed off `source_manifest.content` (`build_v2/v3_deletes`
+  for a DELETE source) — ONE `process_deletes`/`rewrite_manifest_with_deletes` serves both. The
+  load-bearing pin: a rewritten DELETE manifest MUST stay a DELETE manifest (`_file_type` 1) or the
+  manifest list misclassifies it and the read path stops applying its surviving deletes
+  (resurrection). Mutation (force always-DATA writer) ⇒ exactly the 7 delete-removal tests fail; the
+  data-side test stays green (proving byte-identical data behavior — it always used the DATA writer).
+- **A door RELAXATION must only ADD an escape hatch, never weaken the original guard — pin BOTH the
+  new positive (with-removal commits) AND keep the original negative (without-removal still rejected)
+  GREEN.** *Why:* the fresh-DV door rejected a DV for a file with a live position-scoped delete. The
+  relaxation: legal IFF the existing delete's path is in this commit's `remove_deletes` set (Java's
+  merge-and-replace contract). Implemented as a single `continue` at the top of the door's per-entry
+  loop (covers both the live-DV and legacy-parquet branches). The D3 door negatives
+  (`second_dv..._rejected`, `legacy_parquet..._still_applies`) stayed green untouched — the escape
+  hatch is purely additive. Mutation (disable the `continue`) ⇒ exactly the 3 removal-commit tests
+  fail, the D3 negatives unaffected — confirming the relaxation is scoped to the removed-set path.
+- **`removed-dvs` became reachable end-to-end via the producer's `remove_file` summary loop — the D3
+  collector-level-only branch is now driven by a real commit.** D3 wired `SnapshotSummaryCollector
+  .remove_file`'s DV branch but had no commit path to feed it (documented "collector-level only"). The
+  producer's new `removed_delete_files` summary loop (mirroring the `removed_data_files` loop) feeds it
+  — a removed DV bumps `removed-dvs`, a removed parquet pos delete `removed-position-delete-files`, eq
+  `removed-equality-delete-files`. NO `snapshot_summary.rs` edit needed (the branch existed) — the
+  "edit only if a counter gap shows" condition was not met. When a prior increment pre-wires a summary
+  branch "for parity, unreachable," the increment that adds the driving path just connects the loop.
