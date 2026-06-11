@@ -1715,10 +1715,13 @@ mod tests {
         );
     }
 
-    /// Pins: a delete file whose partition spec id does not match the table default is rejected. Risk:
-    /// a mismatched-spec delete file that the read side cannot associate to the right partition.
+    /// Pins: a delete file whose partition spec id matches NO table spec (an UNKNOWN id) is rejected with
+    /// Java's exact "Cannot find partition spec %s for delete file: %s" message. Risk: an unknown-spec
+    /// delete file that the read side cannot associate to any partition spec. (A delete under a known
+    /// non-default spec is now ACCEPTED — the multi-spec lift; see
+    /// `snapshot::multispec_tests::test_row_delta_two_specs_produces_per_spec_delete_manifests`.)
     #[tokio::test]
-    async fn test_row_delta_rejects_partition_spec_mismatch() {
+    async fn test_row_delta_rejects_unknown_partition_spec() {
         let catalog = new_memory_catalog().await;
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
         let table = append_files(&catalog, &table, vec![synthetic_data_file(
@@ -1733,7 +1736,7 @@ mod tests {
             .file_format(DataFileFormat::Parquet)
             .file_size_in_bytes(100)
             .record_count(1)
-            // Wrong partition spec id (table default is 0).
+            // Unknown partition spec id (the table has only spec 0).
             .partition_spec_id(999)
             .partition(Struct::from_iter([Some(Literal::long(0))]))
             .build()
@@ -1745,10 +1748,11 @@ mod tests {
         let err = tx
             .commit(&catalog)
             .await
-            .expect_err("a partition-spec-mismatched delete file must be rejected");
+            .expect_err("an unknown-spec delete file must be rejected");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(
-            err.message().contains("partition spec id"),
+            err.message()
+                .contains("Cannot find partition spec 999 for delete file: test/bad-spec.parquet"),
             "unexpected error: {}",
             err.message()
         );

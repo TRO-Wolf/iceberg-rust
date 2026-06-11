@@ -78,6 +78,74 @@ judgment-heavy → frontier window before 2026-06-22; templated breadth → Opus
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** data-level write-action interop paydown,
       cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.
+## DONE (2026-06-11): Multi-spec writes — producer per-spec grouping (BUILDER, Group A, wt-closeout)
+
+Goal: lift the Rust `SnapshotProducer` from DEFAULT-SPEC-ONLY to Java-parity PER-SPEC manifest groups.
+
+- [x] **Producer grouping (snapshot.rs):** `write_added_manifests`/`write_added_delete_manifests` group
+  `added_data_files` / `added_delete_files` by `partition_spec_id` (helper `group_files_by_spec`, spec-id
+  DESCENDING) and write one manifest per (content × spec) via `new_cluster_manifest_writer(spec, content)`
+  (generalized to take content; the two existing callers pass `Data`). The explicit-data-seq (RewriteFiles)
+  + V1 snapshot-id stamping paths preserved. Removed the now-dead default-spec `new_manifest_writer` (which
+  also carried a bare `.unwrap()`).
+- [x] **Validation lift (snapshot.rs):** `validate_added_data_files`/`validate_added_delete_files` now check
+  spec EXISTENCE via `partition_type_for_added_file` with Java's exact "Cannot find partition spec %s for
+  {data,delete} file: %s"; partition-value compat against the FILE's own spec.
+- [x] **Summary ripple:** `summary()` passes each file's own spec via `file_partition_spec(file)` (Java
+  `addedFile(spec(file.specId()), file)`), not the default — the changed-partition-summaries fix.
+- [x] **Cherrypick conversion:** `test_cherrypick_multispec_replay_fails_loud` →
+  `test_cherrypick_multispec_replay_produces_per_spec_manifest` (replay SUCCEEDS, manifest stamped spec 0,
+  scan correct); module-doc note rewritten to the per-spec parity contract.
+- [x] **Tests:** 6 producer tests in `snapshot::multispec_tests` (two-spec data + delete manifests,
+  unknown-spec data + delete rejection, wrong-spec-type, cumulative totals) + the cherrypick conversion.
+  Renamed `row_delta::test_row_delta_rejects_partition_spec_mismatch` →
+  `test_row_delta_rejects_unknown_partition_spec` (stale default-spec assertion fixed).
+- [x] **Mutations:** grouping-revert (default-spec-only) ⇒ all 4 grouping tests fail (`zip_eq` tuple-arity
+  panic = partition corruption); validation-revert (default fallback) ⇒ all 3 unknown-spec tests fail
+  (door message gone). Both restored from /tmp/wtA_snapshot_pre_mutation.rs.
+- [x] **Docs:** GAP_MATRIX (multi-op row + cherrypick cell), transaction/map.md, lessons.
+
+**Outcome:** Producer is Java-parity per-spec. Verification: typos clean, fmt clean, clippy `-D warnings`
+clean (workspace ex-sqllogictest), `cargo test -p iceberg --lib` 1804 passed ×2 (was 1798 baseline +6 new
+−1 renamed... net 1798→1804 = +6 producer +6 unchanged... 1798+6=1804), `iceberg-datafusion` lib+integration
+9/9 + write-path insert tests green. PRE-EXISTING unrelated failure flagged: an `iceberg-datafusion` DOCTEST
+(`table_provider_factory.rs:41`) fails to compile (`#[tokio::main]` multi_thread w/o `rt-multi-thread`) — not
+touched by this increment. Deferred (flagged): WRITER-LAYER spec threading; `OverwriteFiles::validate_added_files`
+default-spec (Java's `dataSpec()` rejects multi-spec there anyway); multi-spec Java↔Rust interop. No commit.
+
+**REVIEWER PASS (Group A, 2026-06-11, wt-closeout).** Verdict: APPROVE with two added pins.
+- **THE MISSING SUMMARY PIN (point 1) — confirmed gap, fixed.** The builder shipped NO test that fails
+  CLEANLY under a summary-collector revert. The summary-revert mutation only crashed the 3 arity-differing
+  manifest tests via a `partition_to_path` index-out-of-bounds PANIC (the "lucky" version) — a same-arity
+  different-NAME multi-spec commit would silently render the WRONG `partitions.{path}` key with NO panic.
+  Added `test_fast_append_multispec_partition_summary_keys_use_file_spec` (spec0=`identity(x)`, spec1=
+  `identity(y)` via a same-arity rename; both files partition value 5): asserts `partitions.x=5` present
+  (NOT `partitions.y=5`-only) AND `changed-partition-count=2` (the default-spec bug collapses both onto
+  `y=5` ⇒ 1). Fails CLEANLY under the summary-revert (asserted, not panic); passes on fixed. Verified Java
+  `SnapshotSummary.Builder.addedFile(spec(file.specId()), file)` → `updatePartitions` → `partitionToPath`
+  uses the FILE's spec (1.10.0 bytecode).
+- **V1 multi-spec (point 4) — probed, WORKS.** Added `test_v1_fast_append_two_specs_produces_per_spec_data_manifests`:
+  a V1 two-spec DATA append produces one V1 manifest per spec (not fail-loud) — Java parity.
+- **Mutations re-run (point 6):** grouping-revert ⇒ 3 manifest tests fail (zip_eq); validation-revert ⇒ 3
+  unknown-spec tests fail (door message gone, deeper failure confirms defense-in-depth); cherrypick
+  default-spec-stamp ⇒ conversion test fails (zip_eq) — pins per-spec, not just success. NEW reviewer
+  mutation: `group_files_by_spec` file-LOSS (truncate to 1 group) ⇒ caught by the two-spec manifest tests
+  (count + per-file presence). NOTE: `test_fast_append_multispec_cumulative_totals` does NOT catch file-loss
+  — `added-data-files`/`total-data-files` come from `added_data_files` BEFORE grouping, so its docstring
+  ("a dropped spec group would under-count") slightly overclaims; the manifest tests are the real loss guard.
+- **Ordering (point 2) — FLAG for future interop (view NOT changed).** `snapshot_meta_view.rs` manifest sort
+  tuple (L113) is `(content_rank, seq, min_seq, 6×counts)` and does NOT include `partition_spec_id`; the
+  emitted manifest JSON also omits it. Two same-content/same-seq/same-counts manifests of DIFFERENT specs
+  TIE on the whole tuple ⇒ array order falls back to manifest-LIST position (Rust spec-descending vs Java
+  HashMap order). NO current interop fixture is multi-spec single-commit, so nothing is broken today; a
+  FUTURE multi-spec interop fixture must either add spec id to the comparator tuple or assert the manifest
+  SET (order-insensitively).
+- **Pre-existing, untouched:** `validate_partition_value` has two near-duplicate messages (L843 "...not
+  compatible WITH partition type" arity branch vs L859 "...not compatible partition type" per-field branch);
+  both present in HEAD, the increment's test asserts the variant it triggers. Cosmetic; out of scope.
+- Stale cherry_pick.rs banner comment (L1442 "fail-loud divergence") corrected to the converted contract.
+  GAP_MATRIX/todo test count 6→8. Gate clean: typos, fmt, clippy -D warnings (workspace ex-sqllogictest),
+  `cargo test -p iceberg --lib` 1806 ×2, `iceberg-datafusion` lib 80 + integration 9. Tree clean, no commit.
 
 ## Carried-forward open items (full context in todo-archive/)
 

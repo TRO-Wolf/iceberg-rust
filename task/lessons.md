@@ -581,3 +581,75 @@ How to use it (see the manuals' §2):
 - **Escalate evidence to a LIVE ORACLE when the jars are present:** the reviewer ran
   `SnapshotRefParser`/`TableMetadataParser` directly on the disputed documents — reject/accept and
   messages matched Rust exactly. Bytecode reasoning is good; an executed oracle is proof.
+
+### 2026-06-11 (Multi-spec writes — producer per-spec grouping, BUILDER Opus, Group A)
+- **DO group added DATA *and* DELETE files by their OWN `partition_spec_id` and write ONE manifest
+  per (content × spec) — the producer was DEFAULT-SPEC-ONLY (validated `spec == default`, wrote the
+  added manifest under `default_partition_spec()`).** *Why:* Java's `MergingSnapshotProducer.add` /
+  `FastAppend.appendFile` (1.10.0 source AND `FastAppend.java` in the jar — VERIFIED, FastAppend does
+  support multi-spec adds) keep each file's own `specId()` in `newDataFilesBySpec` /
+  `newDeleteFilesBySpec` (a `HashMap`) and `forEach`-write `writeDataManifests(files, spec(specId))`
+  per group. Writing a spec-0 file's 1-field partition tuple into a default-spec-1 manifest (2-field
+  type) is partition-tuple CORRUPTION — the mutation made the writer `zip_eq`-panic on the arity
+  mismatch (the exact corruption the grouping prevents). Chose spec-id DESCENDING order (the
+  established Rust convention — `merge_append`/`rewrite_manifests` reverse-sort; Java `groupBySpec` is
+  a `TreeMap(reverseOrder())` for merging; HashMap `forEach` order is non-deterministic and the group
+  order never appears in the spec-canonical metadata view — a manifest list is compared as a SET, the
+  cluster-key GROUPING-only lesson applied to manifest ordering).
+- **DO lift the added-file validation from "spec == default" to "spec EXISTS in `partition_spec_by_id`"
+  with Java's EXACT two messages** ("Cannot find partition spec %s for data file: %s" /
+  "...delete file: %s", spec id + `file.location()`), and check partition-value compatibility against
+  the FILE's OWN spec's partition type, not the default's. *Why:* Java's `Preconditions.checkArgument(
+  spec != null, ...)` accepts any known spec and rejects only an UNKNOWN id. The validation-revert
+  mutation (fall back to the default spec instead of erroring) made the door-level message vanish —
+  the unknown-spec commit still ultimately failed DEEPER (the cluster writer errors "unknown partition
+  spec id", or the partition-value check fails on the default's arity), proving the door is
+  defense-in-depth and the tests must pin the DOOR's exact message, not just "a commit fails".
+- **THE RIPPLE THE BRIEF FLAGGED: `SnapshotSummaryCollector.add_file`/`remove_file` must take the
+  file's OWN spec, not the table default** — Java `SnapshotSummary.Builder.addedFile(spec(file.specId()),
+  file)` → `updatePartitions(spec, file)` computes `spec.partitionToPath(file.partition())` with the
+  file's spec. `summary()` passed `default_partition_spec()` for every file; on a multi-spec commit a
+  spec-0 file's path would be rendered under the wrong spec ⇒ wrong `changed-partition-N=` summary keys
+  (the changed-partition-summaries family). Fixed via a `file_partition_spec(file)` helper (falls back
+  to default only for the unreachable "spec vanished" case, since validation runs first and the summary
+  path is infallible).
+- **VERIFIED-UNAFFECTED ripples (cited, not changed):** the fresh-DV door
+  (`row_delta::validate_fresh_dvs_only`) resolves the REFERENCED file's LIVE manifest entry and keys
+  on ITS `(spec_id, partition)` — never the added file's own fields — so it is independent of the
+  producer's added-file path (the cross-spec DV test stayed green). `rewrite_manifests` /
+  `merge_append` cluster writers are already `(key, spec_id)`-keyed; `replace_partitions` resolves
+  `(spec_id, partition)` tuples (per-spec already). The only producer-side write/validation surface
+  was the default-spec assumption — everything downstream already threaded spec ids.
+- **FLAG (deferred, NOT fixed): `OverwriteFiles::validate_added_files` (the opt-in
+  `validateAddedFilesMatchOverwriteFilter`) builds its partition evaluators from the DEFAULT spec.**
+  Java uses `dataSpec()`, which `checkState(specIds.size() == 1, ...)` — Java itself REJECTS a
+  multi-spec overwrite under that opt-in check. So the Rust path diverges only for a
+  multi-spec-overwrite-with-row-filter-validation combination Java forbids anyway; out of the
+  producer's core scope. The WRITER-LAYER spec threading (`DataFileWriter`/`DeletionVectorWriter` stamp
+  the table default) also stays deferred — a single writer instance produces single-spec files; a
+  multi-spec commit is assembled by the CALLER passing already-spec-stamped files (which is what the
+  producer now groups correctly). Multi-spec Java↔Rust interop is the other deferral.
+
+### 2026-06-11 (Multi-spec writes — REVIEWER pass, Group A, wt-closeout)
+- **A per-file-spec fix needs a SAME-ARITY pin, or the panic is "luck" not coverage.** The summary-collector
+  fix (render each file's `partitions.{path}` under ITS own spec) had no dedicated test. Reverting it only
+  failed the multi-spec MANIFEST tests — and only because those fixtures use DIFFERENT-ARITY specs
+  (`identity(x)` 1-field vs `identity(x)+identity(y)` 2-field), so `partition_to_path` index-out-of-bounds
+  PANICS and aborts the commit before the manifest asserts. A SAME-ARITY different-NAME multi-spec commit
+  (`identity(x)` vs `identity(y)`, both 1-field) renders the WRONG field name with NO panic — silent
+  corruption of `partitions.{path}` keys and `changed-partition-count`. The pin MUST use the same-arity
+  shape (V2 omits a removed-only base field, so `remove(x)+add(y)` gives a clean 1-field `identity(y)`) and
+  pick the SAME partition value on both files so the default-spec bug COLLAPSES two distinct tuples onto one
+  path ⇒ a wrong `changed-partition-count`. General rule: when a fix routes a per-element spec/type, pin it
+  with elements that differ ONLY in the routed attribute, never in arity (arity divergence masks the bug
+  behind an unrelated panic).
+- **`added-/total-data-files` summary counts do NOT guard against manifest-grouping FILE LOSS.** They are
+  computed from `added_data_files` BEFORE `group_files_by_spec`, so a grouping bug that drops a spec group
+  leaves the totals intact while the file vanishes from every manifest. File-loss is caught only by tests
+  that assert manifest COUNT + per-file PRESENCE in a loaded manifest (the two-spec manifest tests do; a
+  cumulative-totals test does not). Pin write-path file-loss at the manifest layer, never via the summary.
+- **The canonical interop view (`snapshot_meta_view.rs`) does NOT encode manifest `partition_spec_id`** (not
+  in the sort tuple, not in the emitted JSON). Same-content/same-seq/same-counts manifests of DIFFERENT
+  specs tie on the whole tuple ⇒ array order is manifest-list position (Rust spec-descending vs Java HashMap
+  `forEach`). Today no interop fixture is multi-spec single-commit, so the view is fine; the FIRST multi-spec
+  interop fixture must add spec id to the comparator tuple (or compare the manifest SET order-insensitively).
