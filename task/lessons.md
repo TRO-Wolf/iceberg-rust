@@ -705,3 +705,44 @@ How to use it (see the manuals' §2):
   only because the mutation's `.mut` artifact held my edits-plus-mutation and I could reverse the mutation
   textually. RULE: snapshot the file AFTER your edits and immediately BEFORE each mutation; that is the only
   correct restore source. (Promoted-rule restatement, but it bit again — keep the post-edit `.bak` namespaced.)
+
+### 2026-06-11 (Multi-spec closeout 3 — `removeRows` apply-side + dv_seq validation, BUILDER Group A)
+- **The scheduled flip arrived: the 2026-06-09 "validation-only must be documented at EVERY surface" lesson's
+  twin is "when the apply side lands, flip EVERY one of those surfaces — they all lied symmetrically."** *Why:*
+  the deferral was deliberately stamped on the module doc, the field doc, BOTH method docs, AND the
+  sibling-field contrast (`removed_delete_files` said "unlike removed_data_files which is validation-only").
+  Landing the apply side means each of those must now say the OPPOSITE, and the symmetric ones (the two
+  "unlike X (validation-only)" contrasts) flip to "like X" — miss one and the docs self-contradict. Grep the
+  EXACT deferral phrase ("validation-only", "deferred", "OverwriteFiles' job") across the file, not just the
+  method you changed; two test-comment instances also carried it.
+- **The cheapest apply-side port is the one where the producer machinery already routes through the seam — you
+  add nothing to snapshot.rs.** *Why:* `SnapshotProducer::commit` already does
+  `self.removed_data_files = operation.delete_files(&self)` and feeds that into `process_deletes` (rewrite) +
+  `summary()` (`remove_file`). `RowDeltaOperation::delete_files` returned `[]` (the validation-only seam). The
+  ENTIRE apply-side port was: resolve the removed paths via the SAME shared `resolve_delete_paths`
+  `OverwriteFiles` uses. Read overwrite_files.rs's `delete_files` FIRST and mirror it — don't invent a parallel
+  removal path.
+- **`operation()` confirmation is a real deliverable, not a formality — and `do_commit` order makes the
+  ordering pin free.** *Why:* the brief asked to CONFIRM the 1.10.0 two-branch `operation()` is unaffected by
+  removals. It is: it consults `addsDeleteFiles`/`addsDataFiles` only, never `deletesDataFiles()` — so
+  remove-only and remove+add-delete are both Overwrite. And because `do_commit` runs `validate()` for ALL
+  actions BEFORE any `commit()`, the removed∩referenced rejection (`validateNoConflictingFileAndPositionDeletes`,
+  in validate) fires strictly before the apply-side removal (in commit) — the ordering test pins this by
+  asserting the table is UNTOUCHED after the rejection, and it PASSES under the routing-sever mutation (proving
+  it's a validate-time gate, independent of the apply path).
+- **Place a fallibility-introducing check where the inputs already live; measure the ripple before rejecting
+  "make it fallible".** *Why:* the dv_seq check needs BOTH the DV's seq and the data file's seq. The caching
+  loader (the duplicate-DV check's home — the tempting "consistent placement") has NEITHER:
+  `FileScanTaskDeleteFile`'s `From<&DeleteFileContext>` DROPS the manifest entry's sequence number, so placing
+  it there means threading two new seqs through a public serialized struct. The index has both in hand
+  (`seq_num` param + the DV's manifest entry) and ONE production caller (`scan/context.rs`, already
+  `Result`-returning). The "infallible signature" that justified D1's deferral was a one-`?` ripple, not a
+  scan-wide fallibility cascade — assess, don't assume. Two sibling checks need NOT share a home if their
+  inputs differ.
+- **A deferred-residue test often INVERTS when the residue lands — split it, don't just `.unwrap()` it.** *Why:*
+  `test_dv_is_not_sequence_filtered` asserted the DV is returned at BOTH `dv_seq==data_seq` AND
+  `dv_seq<data_seq` (the latter being exactly the invalid state the deferral let through). Landing the check
+  makes the second assertion the ERROR case. Split: the valid-boundary half (==, >) keeps "DV applies, not
+  seq-filtered"; the invalid half (<) becomes the new fail-loud test with the bytecode-exact message. Mirror
+  the EXACT Java message from the jar (`javap -c` the `ldc` String constant), not the MAIN source — they can
+  differ; here they matched.

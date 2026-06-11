@@ -143,7 +143,7 @@ impl ManifestEntryContext {
                 self.manifest_entry.data_file(),
                 self.manifest_entry.sequence_number(),
             )
-            .await;
+            .await?;
 
         // Compute the PARTITION-REDUCED residual for this file (Java
         // `BaseFileScanTask.residual()` = `residuals.residualFor(file.partition())`).

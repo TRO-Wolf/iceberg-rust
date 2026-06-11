@@ -505,11 +505,19 @@ impl<'a> SnapshotProducer<'a> {
     /// Resolve `delete_paths` against the current snapshot's live data entries, returning the matching
     /// [`DataFile`]s, and fail if any requested path matched no live entry.
     ///
-    /// Shared by `DeleteFiles` and `OverwriteFiles` (Rule of Three: two identical non-trivial uses).
-    /// The requested path set is only known to the calling operation (the producer downstream sees just
-    /// the resolved `DataFile`s), so the missing-path check (Java `failMissingDeletePaths`) must happen
-    /// here during resolution: a present-and-absent mix errors rather than silently dropping the present
-    /// file. Returns an empty vector when `delete_paths` is empty.
+    /// Shared by `DeleteFiles`, `OverwriteFiles`, and `RowDelta` (`removeRows`). The requested path set
+    /// is only known to the calling operation (the producer downstream sees just the resolved
+    /// `DataFile`s), so the missing-path check (Java `failMissingDeletePaths`) must happen here during
+    /// resolution: a present-and-absent mix errors rather than silently dropping the present file.
+    ///
+    /// **Per-caller faithfulness of the missing-path FAIL:** `StreamingDelete` (DeleteFiles) and
+    /// `BaseOverwriteFiles` both call `failMissingDeletePaths()` (1.10.0 bytecode), so the unconditional
+    /// loud failure is Java-faithful for them. Java's `BaseRowDelta` does NOT set the flag for
+    /// `removeRows` (its sole `failMissingDeletePaths()` sits behind `if (validateDeletes)` in
+    /// `validate()`, gating the unrelated `validateDataFilesExist` walk), so for the `RowDelta.removeRows`
+    /// caller this Rust path is STRICTER than Java's silent best-effort default — the same conservative
+    /// posture documented on [`Self::resolve_delete_file_paths`] (the `removeDeletes` sibling) and on
+    /// `transaction/row_delta.rs`'s apply-side note. Returns an empty vector when `delete_paths` is empty.
     pub(crate) async fn resolve_delete_paths(
         &self,
         delete_paths: &HashSet<String>,

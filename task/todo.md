@@ -181,6 +181,95 @@ materialization (Java `PartitionUtil.constantsMap`), fixing the two transformer 
   `test_evolved_schema`) run EARLY and often.
 - [x] **Docs:** GAP_MATRIX residual/constants-map row, scan/map.md, lessons, this file.
 
+## DONE (2026-06-11): Multi-spec closeout 3 — `removeRows` apply-side + dv_seq validation (BUILDER, Group A, increment 3, wt-closeout)
+
+Goal: land the two residue items left by the merge-on-read arc — `RowDelta::removeRows` apply-side data
+removal (was validation-only) and the `dv_seq >= data_seq` validation (was deferred for the infallible
+index signature).
+
+- [x] **Item 1 — `removeRows` apply-side (row_delta.rs):** `RowDeltaOperation` gained
+  `removed_data_file_paths`; `delete_files()` resolves them via the shared `SnapshotProducer::resolve_delete_paths`
+  EXACTLY as `OverwriteFilesOperation::delete_files` does, so the producer's existing `commit()` routing
+  (`removed_data_files` → `process_deletes` rewrite + summary `remove_file`) drops the file from the scan in
+  the SAME row-delta snapshot. NO snapshot.rs change needed — the producer machinery already routes
+  `delete_files()` through the rewrite + summary; only the operation's seam was empty. `operation()`
+  CONFIRMED unaffected: the 1.10.0 two-branch `addsDeleteFiles && !addsDataFiles ⇒ Delete; else Overwrite`
+  consults neither `deletesDataFiles()` nor the removal set — a remove+add-delete and a remove-only row
+  delta are both Overwrite. The removed∩referenced rejection fires FIRST (in `validate()`, which `do_commit`
+  runs for ALL actions before any `commit()`).
+- [x] **Item 1 docs flipped:** EVERY "validation-only / deferred" surface in row_delta.rs (module doc,
+  "Out of scope", the `removed_data_files` field doc, the `remove_data_files`/`remove_rows` method docs, the
+  `removed_delete_files` contrast, the `remove_deletes` contrast, 2 test comments). NO rename — Java's
+  `removeRows` is already mirrored by `remove_rows`; `remove_data_files` is the bulk primitive (kept).
+- [x] **Item 1 tests (5):** drops-from-scan e2e (remove A + add delete for B ⇒ scan {B}, A tombstoned,
+  DELETE manifest present); remove-only ⇒ Overwrite + drops A; missing-path fail-loud + no partial add;
+  ordering pin (removed∩referenced rejects before apply-side removal, table untouched); summary counters
+  (deleted-data-files/deleted-records appear, cumulative total-data-files/total-records pin). MUTATION:
+  sever `delete_files` → `Ok(vec![])` ⇒ 4 tests fail (scan shows A, remove-only empty-commit, missing-path
+  silent), the ordering test correctly STILL passes (validate-time rejection independent of routing).
+- [x] **Item 2 — dv_seq validation (delete_file_index.rs):** made the index FALLIBLE (`get_deletes_for_data_file`
+  → `Result<Vec<…>>`). PLACEMENT JUSTIFIED: the index is the ONLY place both sequence numbers are in hand
+  (`seq_num` = the data file's, the DV's via its manifest entry); the caching-loader door (the duplicate-DV
+  door's home) receives NEITHER — `FileScanTaskDeleteFile` drops the sequence number in its
+  `From<&DeleteFileContext>` conversion, so candidate (a) would need to thread two new seqs through a public
+  serialized struct + the loader. Ripple of (b) was SMALL: one production caller (`scan/context.rs:144`,
+  already `Result`-returning, just added `?`). The check fires `dv_seq < data_seq` ⇒ the EXACT 1.10.0 message
+  (bytecode-verified against `iceberg-core-1.10.0.jar`): "DV data sequence number (%s) must be greater than
+  or equal to data file sequence number (%s)".
+- [x] **Item 2 tests:** invalid-table (hand-built DV at seq 5 vs data file seq 9 ⇒ loud DataInvalid naming
+  both seqs); the prior `test_dv_is_not_sequence_filtered` SPLIT — the valid boundary half kept
+  (`dv_seq==data_seq` / `dv_seq>data_seq` apply the DV) + the invalid half is the new test. MUTATION: disable
+  the check (`&& false`) ⇒ the invalid-table test sees silent `Ok(vec![dv])` instead of the error.
+- [x] **Docs:** GAP_MATRIX (RowDelta row residue flip + Read row dv_seq residue flip), transaction/map.md,
+  this file, lessons.
+
+**Outcome:** both residue items landed. Verification: typos clean (reworded a parenthesized prefix to dodge a
+false positive), fmt clean, clippy `-D warnings` clean (workspace ex-sqllogictest), `cargo test -p iceberg --lib`
+**1818 passed ×2** (baseline 1812 + 5 row_delta + 1 net delete_file_index split), `iceberg-datafusion` lib
+80 + 9 green. PRE-EXISTING unrelated failure flagged: the `iceberg-datafusion` DOCTEST
+(`table_provider_factory.rs:41`, `#[tokio::main]` multi_thread w/o `rt-multi-thread`) — not touched (no
+datafusion files changed). Files changed: row_delta.rs, delete_file_index.rs, scan/context.rs (the `?` —
+flagged as the item-2 placement consequence), transaction/map.md, GAP_MATRIX.md, todo.md, lessons.md.
+Deferred (flagged): multi-spec delete commits + full conflict-validation interop (RowDelta stays 🟡); the
+manifest-comparator multi-spec tie (from increment 1). No commit.
+
+**REVIEWER PASS (Group A, increment 3, 2026-06-11, wt-closeout). Verdict: APPROVE with one added doc + one added pin.**
+- **Point 1 (fallibility ripple) — VERIFIED.** Grepped every caller: the async `DeleteFileIndex::get_deletes_for_data_file`
+  threads the inner `Result` at BOTH populated call sites (L115/L125); the sole production caller `scan/context.rs:146`
+  adds `?`. Traced the error END-TO-END: `into_file_scan_task`(`?`) → `process_data_manifest_entry`(`?`, mod.rs:706)
+  → `try_for_each_concurrent` short-circuits → `Err` sent into `file_scan_task_rx` (mod.rs:610) ⇒ the scan stream
+  yields the `DataInvalid` as a LOUD item, NOT swallowed into an empty delete set nor a dropped task. Message + arg
+  order BYTECODE-verified (`javap -c DeleteFileIndex.findDV`, 1.10.0): slot-0 `%s` = `dv.dataSequenceNumber()` (DV
+  FIRST), slot-1 = `seq` (data file); comparison `lcmp; iflt` ⇒ check is `dv_seq >= seq` (boundary `==` VALID) —
+  Rust's `dv_seq < data_seq ⇒ Err` is the exact complement.
+- **Point 2 (ordering) — VERIFIED, wording accurate.** Read `transaction/mod.rs::do_commit`: structure is
+  ALL-validates-then-ALL-commits (loop 1 L374-378 runs every action's `validate`; loop 2 L380-389 runs every
+  `commit`). The doc/test/lessons wording ("`do_commit` runs `validate()` for ALL actions before any `commit()`")
+  matches this exactly — no overstatement. The ordering test correctly STILL PASSES under mutation A (validate-time
+  gate, apply-path-independent). Re-ran: green.
+- **Point 3a (failMissingDeletePaths posture) — REAL DOC GAP, FIXED.** Bytecode (`javap -c BaseRowDelta`):
+  `removeRows` = `removedDataFiles.add(file)` + `delete(file)` (no LIVE check beyond delete, matches builder); the
+  ctor does NOT set `failMissingDeletePaths`, and the only `failMissingDeletePaths()` call sits in `validate()` behind
+  `if (validateDeletes)` (gates the UNRELATED `validateDataFilesExist` walk). `StreamingDelete`(1)/`BaseOverwriteFiles`(2)
+  DO call it. ⇒ Rust's `resolve_delete_paths` unconditional fail-loud is Java-faithful for DeleteFiles/OverwriteFiles
+  but STRICTER than Java's `RowDelta` default for the NEW `removeRows` caller — and the docs cited `failMissingDeletePaths`
+  as if it were parity. ADDED the divergence note (module-doc apply-side block in row_delta.rs + the shared
+  `resolve_delete_paths` doc in snapshot.rs, mirroring the Arc-E `removeDeletes` posture note on `resolve_delete_file_paths`).
+- **Point 3b (replace-in-place) — PROBED, sensible, PINNED.** Added `test_row_delta_remove_and_add_same_path_replaces_in_place`:
+  remove X + add a fresh file at the SAME path X ⇒ old entry tombstoned (Deleted), new Added, X stays live, summary
+  counts both (deleted=1, added=1, cumulative total=1). Matches Java's `removeRows(X)`-tombstones + `addRows(X)`-adds.
+  No silent weirdness. Kept as a permanent pin (+1 test; matrix count 5→6).
+- **Point 4 (mutations) — all 3 confirmed.** (A) sever `RowDeltaOperation::delete_files`→`Ok(vec![])` ⇒ exactly 4
+  removeRows tests fail (drops-from-scan, remove-only, missing-path, summary), ordering test correctly STILL passes.
+  (B) disable dv_seq check (`&& false`) ⇒ `test_dv_lower_seq_than_data_file_is_invalid_table` fails (silent Ok),
+  valid-boundary still passes. (C, mine) change `>=`→`>` (`<`→`<=`) ⇒ `test_dv_is_not_sequence_filtered_at_valid_boundary`
+  fails at `dv_seq==data_seq` (boundary pinned from BOTH sides), invalid test still passes. All restored from /tmp/wtA3_rev_*.bak.
+- **Gate:** typos clean, fmt clean, clippy `-D warnings` clean (workspace ex-sqllogictest), `cargo test -p iceberg --lib`
+  **1819 ×2** (1818 + my replace-in-place pin), `iceberg-datafusion` lib 80 + integration 9 green; the
+  `table_provider_factory.rs:41` DOCTEST failure CONFIRMED pre-existing + unrelated (no datafusion files changed).
+  Pipe audit CLEAN. Files added to the changed set by the reviewer: `transaction/snapshot.rs` (the `resolve_delete_paths`
+  posture note). Tree clean, no commit.
+
 ## Carried-forward open items (full context in todo-archive/)
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the
