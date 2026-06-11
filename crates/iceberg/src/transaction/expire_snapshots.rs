@@ -23,9 +23,11 @@
 //! [`TableUpdate::RemoveSnapshots`] / [`TableUpdate::RemoveSnapshotRef`] metadata updates —
 //! nothing else. Physical cleanup of the manifests, manifest lists, data files, delete files,
 //! and statistics files that become unreachable (Java's `cleanExpiredFiles(true)` default,
-//! `IncrementalFileCleanup` / `ReachableFileCleanup`, `deleteWith`, `executeDeleteWith`,
-//! `planWith`) is **Increment B2 and is NOT implemented here**. Until B2 lands, expiring
-//! snapshots only shrinks the metadata; the underlying files stay on storage.
+//! `ReachableFileCleanup`, `deleteWith`) lives in the sibling module
+//! [`expire_cleanup`](super::expire_cleanup) (Increment B2) as an EXPLICIT post-commit step —
+//! [`ExpireSnapshotsCleanup`](crate::transaction::ExpireSnapshotsCleanup) — never run by this
+//! action: committing this action only shrinks the metadata; the files stay on storage until
+//! the caller invokes the cleanup (preferably via `ExpireSnapshotsCleanup::commit_and_clean`).
 //!
 //! The retention computation is a 1:1 port of Java 1.10.0 `RemoveSnapshots.internalApply`
 //! (every branch bytecode-verified against `iceberg-core-1.10.0.jar`):
@@ -71,10 +73,10 @@
 //!   the REST shape: a concurrent rollback (the case where applying a stale removal would destroy
 //!   the new head) is rejected and recomputed on retry.
 //!
-//! **Deferred (loudly):** Increment B2 (all file cleanup + the incremental-cleanup strategy
-//! selection — 1.10.0's `withIncrementalCleanup` / `cleanExpiredSnapshots` surface);
-//! `cleanExpiredMetadata(true)` (unreachable spec/schema removal — needs manifest IO to compute
-//! reachable spec ids); Java interop evidence.
+//! **Deferred (loudly):** the `IncrementalFileCleanup` strategy (see the deferral note in
+//! [`expire_cleanup`](super::expire_cleanup) — B2 ports the general-correct
+//! `ReachableFileCleanup` only); `cleanExpiredMetadata(true)` (unreachable spec/schema removal —
+//! needs manifest IO to compute reachable spec ids); Java interop evidence.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -167,7 +169,9 @@ fn data_invalid(message: String) -> Error {
 
 /// Parse a table property, failing loudly on a malformed value (a silently-defaulted retention
 /// setting could over-expire; Java's `PropertyUtil` throws `NumberFormatException` likewise).
-fn parse_property<T: std::str::FromStr>(
+/// `pub(super)` so the B2 cleanup sibling ([`super::expire_cleanup`]) re-honors the
+/// `gc.enabled` gate with identical parsing.
+pub(super) fn parse_property<T: std::str::FromStr>(
     properties: &HashMap<String, String>,
     key: &str,
     default: T,

@@ -56,7 +56,11 @@ pub use action::*;
 mod append;
 mod cherry_pick;
 mod delete_files;
+mod expire_cleanup;
 mod expire_snapshots;
+pub use expire_cleanup::{
+    CleanupFailure, CleanupFailureKind, CleanupReport, ExpireSnapshotsCleanup,
+};
 mod manage_snapshots;
 mod merge_append;
 mod overwrite_files;
@@ -290,11 +294,14 @@ impl Transaction {
     /// unreferenced-snapshot retention, and explicit [`ExpireSnapshotsAction::expire_snapshot_id`],
     /// honoring the `history.expire.*` table properties.
     ///
-    /// **METADATA-ONLY (Increment B1): this action NEVER deletes files.** It emits
-    /// `RemoveSnapshots` / `RemoveSnapshotRef` updates and nothing else; physical cleanup of
-    /// newly-unreachable manifests/data files (Java's `cleanExpiredFiles(true)` default and its
-    /// incremental/reachable cleanup strategies) is Increment B2 and is NOT implemented. See
-    /// [`expire_snapshots`](crate::transaction::expire_snapshots) for the full contract.
+    /// **THIS ACTION NEVER DELETES FILES.** It emits `RemoveSnapshots` / `RemoveSnapshotRef`
+    /// updates and nothing else. Physical cleanup of newly-unreachable manifest lists /
+    /// manifests / content files / statistics files (Java's `cleanExpiredFiles(true)` default,
+    /// `ReachableFileCleanup`) is the EXPLICIT post-commit step [`ExpireSnapshotsCleanup`] —
+    /// run it via [`ExpireSnapshotsCleanup::commit_and_clean`], which commits the transaction
+    /// and cleans only on success (the Java `RemoveSnapshots.commit()` ordering). See
+    /// [`expire_snapshots`](crate::transaction::expire_snapshots) for the retention contract
+    /// and [`expire_cleanup`](crate::transaction::expire_cleanup) for the cleanup contract.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
     }

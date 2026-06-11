@@ -330,6 +330,101 @@ only overwrites the default). Known acceptable gap (Java's REST posture shares i
 concurrently at a to-be-expired snapshot is not guardable via `RefSnapshotIdMatch`; the apply-side
 sweep then drops it — full-CAS catalogs (Java's primary path) reject it; revisit at B2.
 
+## ACTIVE (2026-06-11): ExpireSnapshots Increment B2 — FILE CLEANUP (worktree wt-expire, BUILDER Fable, Group B)
+
+Port Java 1.10.0 `ReachableFileCleanup` (the general-correct strategy) as a post-commit cleanup
+seam. **THE most dangerous increment: it deletes files. Every choice biases under-deletion; every
+test pins the deletion set BOTH directions.**
+
+- [x] `transaction/expire_cleanup.rs` (new): `ExpireSnapshotsCleanup` (FileIO + injectable
+      delete fn) with `clean_expired_files(before, after) -> CleanupReport` (the two-state core,
+      1.10.0 `ReachableFileCleanup.cleanFiles` bytecode-rederived) and
+      `commit_and_clean(tx, catalog)` (the commit-THEN-clean wrapper; deletion structurally
+      unreachable on a failed commit — Java `RemoveSnapshots.commit()` ordering). GC gate
+      re-honored at the cleanup door (Java's is in the ctor, which also covers cleanup).
+- [x] Set algebra (bytecode-cited): expired = before.snapshots − after.snapshots (by id);
+      manifest-lists of expired snapshots (RUST SAFETY DIVERGENCE: minus retained lists — Java
+      deletes unconditionally, unreachable case for Java-written tables); candidate manifests =
+      ∪ expired lists' entries; retained = ∪ after-snapshots' lists' entries (path equality —
+      `GenericManifestFile.equals` is manifestPath-only); manifests-to-delete = candidates −
+      retained; content files = ∪ LIVE entries (status != DELETED — `isLiveEntry`) of
+      manifests-to-delete, minus ∪ LIVE entries of retained manifests (BOTH data + delete
+      manifests — the 1.10.0 cleanup projection omits `content` and the avro ctor defaults DATA,
+      so Java walks both identically; DV puffin path dedup via path-set semantics); stats =
+      before-locations − after-locations.
+- [x] Failure posture (divergence from Java's log-and-continue, no-logging-dep constraint):
+      manifest-LIST read errors → hard Err BEFORE any deletion (Java throwFailureWhenFinished);
+      candidate-manifest read error → collect + skip its files; retained-manifest read error →
+      collect + CLEAR the whole content-file set (Java catch-Throwable→empty, fail-safe);
+      per-file delete errors → collect + continue. `CleanupReport {deleted_* per funnel,
+      failures: Vec<CleanupFailure {path, kind, error}>}`.
+- [x] Tests (15, each class both directions): grafted shared manifest-list survives (the pinned
+      Rust divergence); carried-forward shared manifest SURVIVES + expired list dies (the #1
+      pin); rewritten-but-live data file survives (rewrite_manifests); expired-only data file
+      dies + retained tombstone does NOT protect (delete_files chain); shared puffin survives
+      via cross-manifest carried-EXISTING DV + replaced puffin dies (NOTE: the planned
+      two-DVs-one-puffin-remove-one shape is unbuildable — delete-file removal is BY PATH in
+      Java too, 1.10.0 `ManifestFilterManager.delete` adds `file.location()` to `deletePaths`,
+      so removing one DV tombstones every same-path entry; fixture reshaped, finding recorded
+      in lessons); expired-only DV puffin dies; stats file dies / retained stats survives;
+      failed-commit ⇒ zero deletes (MockCatalog + recorder); injected failing delete → failure
+      listed, sweep continues; dry-run by injection (storage untouched); unreadable retained
+      manifest → ALL content files spared; unreadable candidate manifest → its files skipped,
+      manifest still dies; unreadable manifest list → Err before any deletion; empty-expiry
+      no-op; GC gate refused with Java's message.
+- [x] Mutations (`wtB2_*`): M1 drop the `!` in the manifest subtraction → 9 tests fail,
+      headlined by the carried-forward pin ("the SHARED manifest must survive: [...m0.avro]" —
+      the data-loss class); M2 `if false` the retained-files subtraction in (c) → 3 fail
+      (rewritten-but-live "the still-live data file must NOT die", shared-puffin,
+      unreadable-retained); M3 cleanup-not-gated-on-commit-success (fabricated post-state on
+      Err) → failed-commit pin fails ("the failed commit must propagate" + recorder
+      non-empty). Snapshot-copied before each, restored surgically, full suite green after.
+- [x] Docs: GAP_MATRIX ExpireSnapshots row (B2 landed; Incremental deferred with the
+      optimization-with-stricter-eligibility rationale; interop deferred), transaction/map.md
+      `expire_cleanup.rs` row, expire_snapshots.rs + mod.rs module-doc pointers, lessons.
+- [x] Gate: typos clean; fmt clean; clippy workspace -D warnings (excl. sqllogictest) clean;
+      `cargo test -p iceberg --lib` ×2 — 1847 passed (baseline 1832 + 15 new).
+
+Outcome (2026-06-11): B2 landed in one increment — `ReachableFileCleanup` semantics ported as
+the explicit post-commit `ExpireSnapshotsCleanup` seam (Java's `cleanExpiredFiles(true)` default
+deliberately NOT mirrored: deletion is opt-in via `commit_and_clean`/`clean_expired_files`,
+documented in-module + GAP_MATRIX). Java-side findings that reshaped the port, all
+bytecode-derived: (1) 1.10.0's cleanup walks DELETE manifests through the DATA reader because
+`MANIFEST_PROJECTION` omits `content` and the avro ctor defaults it to DATA — so delete files /
+DV puffins ARE cleaned, despite `readPaths`' delete-manifest precondition reading as if they
+could not be; (2) `GenericManifestFile` equality is path-only; (3) `findFilesToDelete` returns
+the EMPTY set on any retained-side enumeration failure (catch-Throwable) — ported as
+clear-and-report; (4) delete-file removal is by-path (shared-puffin fixture reshaped). The B1
+concurrently-created-ref gap is unchanged by B2: cleanup computes reachability from the
+COMMITTED post-state (Java refreshes; we use the returned table — equivalence argued in-module),
+so the window is inherited from the metadata commit, not widened. Files touched:
+`transaction/expire_cleanup.rs` (new), `transaction/expire_snapshots.rs` (doc pointer +
+`parse_property` → `pub(super)`), `transaction/mod.rs` (mod + re-export + doc), map.md,
+GAP_MATRIX, todo, lessons.
+
+Review (2026-06-11, REVIEWER Fable): re-derived `cleanFiles` / `readManifests` /
+`pruneReferencedManifests` / `findFilesToDelete` (incl. the lambda exception tables) /
+`FileCleanupStrategy.{MANIFEST_PROJECTION,deleteFiles,statsFileLocations}` /
+`RemoveSnapshots.{commit,cleanExpiredSnapshots}` / `GenericManifestFile.{equals,avro-ctor}` /
+`ManifestReader.{liveEntries,isLiveEntry}` / `ManifestFiles.readPaths` from the 1.10.0
+bytecode — set algebra, three failure tiers (Err / skip / clear-all scopes), sweep order, gate,
+and the MANIFEST_PROJECTION finding all confirmed exactly. Timing verdict: no new concurrency
+window beyond B1's recorded ref gap (post-commit append files can never be candidates;
+double-expire races are double-delete-or-planning-abort, never over-deletion). M1/M2 re-run
+(9 and 3 tests respectively, matching the build record). TWO survivor mutations found and
+pinned (+2 tests, 1 extension; 1849 total ×2 green): the cross-funnel SWEEP ORDER
+(lists-before-content survived everything — pinned structurally via the recorder's invocation
+sequence; the order is the crash-RESUME property: leaves before indexes keeps the expired
+lists plannable until last) and the GC gate SIDE (`after` instead of `before` survived —
+pinned with before=disabled/after=enabled must refuse, Java's ctor reads `base`). Also added
+the re-run pin (second sweep of the same (before, after) aborts at planning with zero delete
+calls — Java's `readManifests` throws identically). Doc corrections: the "staler `before` only
+shrinks" claim was unsound (a concurrent expire GROWS the set — still safe, argued via
+unreachability-from-`after`; module doc + lessons fixed), `BaseSnapshot.equals` citation
+corrected (5 fields, id-diff equivalent by immutability), the inherited B1 window now stated
+in the module docs, and the Rust-stricter retained-list read scope noted (Java's prune
+early-exits; Rust always reads both sides — more pre-deletion `Err` cases only).
+
 ## Carried-forward open items (full context in todo-archive/)
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the

@@ -792,3 +792,55 @@ How to use it (see the manuals' §2):
   ancestor behind the stop. Same pattern for the ref-age `<=` boundary and the refs-first update
   emission order (apply-side sweep self-heals a reorder, so only a shape assertion pins Java's
   REST change order). Mutation-test the SURVIVORS, not just the planned mutations.
+
+### 2026-06-11 (ExpireSnapshots B2 — ReachableFileCleanup file cleanup, BUILDER Fable, wt-expire)
+- **1.10.0's cleanup walks DELETE manifests through the DATA-manifest reader because the
+  PROJECTION masks the content field — a MAIN-source reading concludes the OPPOSITE.**
+  `ManifestFiles.readPaths` → `read(...)` carries `checkArgument(content == DATA, "Cannot read a
+  delete manifest...")`, which reads as "delete manifests crash/leak in cleanup." Bytecode chain:
+  `FileCleanupStrategy.MANIFEST_PROJECTION` selects only {manifest_path, manifest_length,
+  partition_spec_id, added_snapshot_id, deleted_data_files_count} — `content` is NOT projected —
+  and `GenericManifestFile`'s avro-read constructor DEFAULTS `content = ManifestContent.DATA`.
+  Every cleanup-read manifest therefore claims DATA, the precondition never fires, and the
+  data-reader reads delete manifests fine (the entry schemas share `file_path`), so position
+  deletes / eq deletes / DV puffins ARE enumerated and cleaned. Lesson: a guard's reachability
+  depends on how its INPUT was materialized — trace the projection/constructor defaults of the
+  value feeding the guard, not just the guard.
+- **Delete-file removal is BY PATH in Java exactly like the Rust port — so "two DVs in one
+  puffin, remove one" removes BOTH, and the shared-puffin-survives cleanup pin must use the
+  CROSS-MANIFEST share shape.** 1.10.0 `ManifestFilterManager.delete(F)` adds `file.location()`
+  to the `deletePaths` CharSequenceSet (bytecode); the filter drops every same-path entry. The
+  fixture that works: DM1 = {DV-A@P, DV-C@P3}; replacing DV-C rewrites DM1 → DMr carrying DV-A
+  EXISTING (still @P); expiring DM1's snapshots then kills DM1 while P stays live in DMr — P
+  survives, P3 dies, both directions in one fixture. The first fixture draft (sibling DVs, remove
+  one) "failed" the survive pin — correctly: the puffin genuinely became unreachable.
+- **ReachableFileCleanup's three failure tiers have OPPOSITE safety directions — port each tier's
+  direction, not one blanket policy:** manifest-LIST reads `throwFailureWhenFinished` and run
+  BEFORE any deletion (abort-clean ⇒ hard Err); candidate-manifest reads are SUPPRESSED (skip its
+  files = under-delete; the manifest itself still dies — it is retained-by-nobody); a
+  retained-manifest enumeration failure makes `findFilesToDelete` return the EMPTY set
+  (catch-Throwable ⇒ when liveness cannot be proven, NO content file may die) while manifests +
+  lists still get deleted (their subtraction needed no manifest reads). Rust shape:
+  Err / collect-and-skip / collect-and-clear respectively, all surfaced in `CleanupReport`
+  (collect-and-return replaces Java's log-and-continue under the no-logging-dep constraint).
+- **Java deletes expired manifest-LIST locations UNCONDITIONALLY (no retained-shared check,
+  bytecode 1.10.0 `cleanFiles` L80-103) — the Rust retained-shared guard is a deliberate
+  under-deletion divergence and needs its own pin.** Safe in Java only because every Java-written
+  snapshot owns a unique list file; a grafted/cloned-metadata shape breaks that. Pinned with a
+  grafted snapshot whose `manifest_list` aliases a retained snapshot's list (a
+  documented-but-unpinned divergence is indistinguishable from an accidental one).
+- **The post-commit seam: capture `before` from the tx, `commit(catalog).await?`, clean
+  `(before, committed.metadata())` — every staleness direction of that pair is safe, but NOT
+  because a staler `before` "only shrinks" the expired set (REVIEWER correction): a concurrent
+  EXPIRE between tx creation and commit GROWS `before − after` with ITS expirees.** Those are
+  absent from the committed `after` too, so the sweep still touches only files unreachable
+  from the current metadata — Java's `cleanFiles(base, current)` construction-time `base` has
+  the identical property, and the growth is the benign double-delete race (the second sweep
+  sees idempotent `Ok`s / collected failures per file — backend-dependent — or aborts at
+  planning; pinned by the re-run test).
+  Concurrent ADDS do shrink the set; using the commit's returned table instead of Java's
+  `ops.refresh()` only misses later commits whose files are either already protected by the
+  retained-side subtraction or newly added (never candidates). The M3 mutation
+  (cleanup-not-gated-on-commit-success) needs the failing-catalog fixture to be built on a REAL
+  table chain, or the pin passes vacuously — cleanup on a manifest-less fixture errors before
+  the recorder is reached.
