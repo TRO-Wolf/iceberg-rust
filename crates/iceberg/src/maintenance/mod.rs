@@ -33,6 +33,10 @@
 //!   group's live rows (merge-on-read deletes applied), and rewrite them into target-sized files
 //!   committed through the seq-preserving [`RewriteFilesAction`](crate::transaction::rewrite_files).
 //!   The Rust port of Java's `RewriteDataFiles` bin-pack strategy. **This action rewrites data.**
+//! - [`RemoveDanglingDeleteFiles`] — remove delete files that can no longer apply to any live data
+//!   file (per-partition/spec min-data-seq comparison + DV reference check), committed through the
+//!   [`RewriteFilesAction`](crate::transaction::rewrite_files) delete-file-removal surface. The Rust
+//!   port of Java's `RemoveDanglingDeletesSparkAction`. **This action removes delete files.**
 //!
 //! # Relationship to `transaction::expire_cleanup`
 //!
@@ -45,10 +49,14 @@
 //! reusing `expire_cleanup`'s delta machinery).
 
 mod delete_orphan_files;
+mod remove_dangling_delete_files;
 mod rewrite_data_files;
 
 #[cfg(test)]
 mod tests;
 
 pub use delete_orphan_files::{DeleteOrphanFiles, DeleteOrphanFilesResult, PrefixMismatchMode};
+pub use remove_dangling_delete_files::{
+    RemoveDanglingDeleteFiles, RemoveDanglingDeleteFilesResult,
+};
 pub use rewrite_data_files::{FileGroupRewriteResult, RewriteDataFiles, RewriteDataFilesResult};

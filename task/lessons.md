@@ -1377,6 +1377,83 @@ How to use it (see the manuals' §2):
   advanced past the original start). Keep the call (Java-faithful + multi-group-correct) but know a one-group e2e
   can't pin it; the staged conflict tests + the `.execute()` conflict pin cover the single-group path, and the
   bytecode + the `.or()` trace cover the rest.
+
+### 2026-06-11 (Wave-4 Group O / O3 — `RemoveDanglingDeleteFiles` + RewriteFiles delete-removal surface, BUILDER Opus)
+- **The dangling predicate's OFF-BY-ONE (pos `<` min vs eq `<=` min) is the EXACT COMPLEMENT of the read-path
+  applicability rule — derive it from BOTH sides and pin the boundary with a pure-fn test, not an e2e.** Java's
+  `RemoveDanglingDeletesSparkAction.findDanglingDeletes` SQL (lines 152-165): a POSITION delete dangles when `seq <
+  min_data_sequence_number` (STRICT), an EQUALITY delete when `seq <= min` (NON-strict). Why the difference: position
+  deletes APPLY to same-seq data (`delete_file_index.rs` L289 `delete_seq >= data_seq`), equality deletes do NOT
+  (L238 `delete_seq > data_seq` STRICTLY). So a delete applies to the partition's MIN-seq data file iff `delete_seq
+  >= min` (pos) / `delete_seq > min` (eq) ⇒ dangles iff `< min` (pos) / `<= min` (eq). The e2e fixtures (rewrite data
+  to a FRESH higher seq) put the delete strictly below min, so `<` and `<=` BOTH fire there — only a PURE-FN test at
+  the exact boundary (min=5; pos@5 kept, pos@4 removed, eq@5 removed, eq@6 kept) distinguishes the two and catches
+  EITHER flip. The off-by-one IS the resurrection corruption edge; isolate it boundary-exactly.
+- **The vehicle was ALREADY half-built: `RowDelta.remove_deletes` (Arc E) drives the exact delete-filter-manager
+  removal Java's `RewriteFiles.deleteFile(DeleteFile)` does — they differ ONLY in the recorded operation
+  (Overwrite vs Replace) + the 3 RewriteFiles preconditions.** `MergingSnapshotProducer.delete(DeleteFile)`
+  (1.10.0 bytecode: `deleteFile(DeleteFile)` → `invokevirtual delete`) is the same machinery the producer's
+  `with_removed_delete_files` → `resolve_delete_file_paths` → `process_deletes` + summary `remove_file` already
+  drives. Extending `RewriteFiles` with the removal surface was therefore ADDITIVE — a field + 2 builders + the
+  producer routing call + the precondition arithmetic — with ZERO snapshot.rs change (the routing exists). When a
+  new commit-vehicle's machinery overlaps an existing one, the delta is usually just the operation classification +
+  the action-specific preconditions; reuse the producer plumbing, don't fork it.
+- **All THREE `BaseRewriteFiles.validateReplacedAndAddedFiles()` preconditions disassembled (1.10.0 bytecode) —
+  the matrix's "third precondition" is `deletesDeleteFiles() || !addsDeleteFiles()` ("Delete files to add must be
+  empty because there's no delete file to be rewritten").** Preconditions: (1) `deletesDataFiles() ||
+  deletesDeleteFiles()` "Files to delete cannot be empty"; (2) `deletesDataFiles() || !addsDataFiles()` "Data files
+  to add must be empty…"; (3) "Delete files to add must be empty…". With the REMOVAL-only surface (no add-delete),
+  `addsDeleteFiles()` is always false ⇒ (3) always passes (presently unreachable). Kept the check + Java-exact
+  message anyway so the third precondition fires the moment the add-delete builder lands — an unreachable-but-correct
+  guard is cheaper than a missing one, but DOCUMENT the unreachability (clippy would otherwise be right to flag the
+  dead `false`). `operation()` = "replace" UNCONDITIONALLY (bytecode `ldc "replace"; areturn`), even for a
+  delete-file-only rewrite — so a `RemoveDanglingDeleteFiles` commit records Replace, NOT the RowDelta Overwrite.
+- **Severing the producer routing (`with_removed_delete_files` gated on `false`) doesn't silently misroute — it
+  HARD-FAILS the empty-commit guard.** A delete-file-ONLY rewrite has nothing for the producer to do once the
+  removal set is severed (no added data, no removed data, no removed deletes) ⇒ the producer rejects with
+  `PreconditionFailed "No added data files, added delete files, deleted data files, or added snapshot properties
+  found when write a manifest file"`. The routing mutation test catches this as a loud panic, which is even
+  stronger than a silent-stays-live divergence. Good defense-in-depth: the empty-commit guard backstops a severed
+  routing.
+- **MAIN-only impl flag: `RemoveDanglingDeletesSparkAction` is SPARK MAIN-source (no 1.10.0 spark bytecode in
+  ~/.m2 — only the api interface + Result shape are in `iceberg-api-1.10.0.jar`).** The api `RemoveDanglingDeleteFiles`
+  interface (`Result.removedDeleteFiles()`) and the RewriteFiles vehicle (`BaseRewriteFiles`, `deleteFile(DeleteFile)`,
+  the 3 preconditions, `operation()`) ARE 1.10.0-bytecode-verified; the predicate SQL + the per-partition+spec
+  grouping + the unpartitioned-single-spec early return are derived from the Spark v3.5/v4.0/v4.1 MAIN source
+  (identical across the three). Flag the impl-source asymmetry on the GAP_MATRIX cell.
+
+### 2026-06-11 (O3 REVIEWER Opus — `RemoveDanglingDeleteFiles` adversarial review; verdict PASS w/ added pins+docs)
+- **A delete-only `RewriteFiles` has a KNOWN Java-faithful RESURRECTION RACE — confirm it with a staged probe, then
+  DOCUMENT it (don't guard it).** `BaseRewriteFiles.validate` runs `validateNoNewDeletesForDataFiles` only
+  `if (!replacedDataFiles.isEmpty())` (1.10.0 bytecode — disassembled the gated call), and the dangling-removal has
+  an EMPTY replaced-DATA set, so NO concurrent-conflict check runs; Java's `RemoveDanglingDeletesSparkAction` adds no
+  `validateFromSnapshot` either. A concurrent SEQ-PRESERVING compaction (O2's `use_starting_sequence_number`) that
+  lands a data file at a LOWER seq in the dangling delete's partition between plan and commit makes the "dangling"
+  delete APPLICABLE again — and its removal RESURRECTS rows. Reviewer probe staged exactly this (eq@2 dangles vs
+  min=3 → land Z@seq1 carrying the masked row → remove eq@2 → y=20 resurrected, scan went {10,30}→{10,20,30}).
+  IDENTICAL in Java, so pin to Java: documented on the module doc + matrix cell, NOT guarded (a guard would diverge).
+- **The DV simplification (DV → ref-gone check only, never the per-partition min-seq comparison) is BEHAVIORALLY
+  EQUIVALENT to Java's union of `findDanglingDeletes` ∪ `findDanglingDvs` for VALID tables — prove it, don't assume.**
+  Java flows DVs through BOTH (the `findDanglingDeletes` filter is `content != 0`, which includes content==1 PUFFIN
+  DVs) and unions via `DeleteFileSet`. But a DV whose referenced file is LIVE can never additionally trip the seq
+  branch: `dv_seq >= referenced_data_seq` (read-path invariant, `delete_file_index` L263) and `referenced_data_seq >=
+  partition_min` (the ref file is in the min group), so `dv_seq >= partition_min` always ⇒ `dv_seq < min` impossible.
+  So Java's union reduces to just the ref-gone check for live-ref DVs; the Rust simplification matches. Built the
+  missing DV e2e (real Puffin DV → rewrite referenced data away → action removes it, `removed-dvs:1`, scan unchanged).
+- **The global/unpartitioned EQUALITY delete is keyed by `(its-own-spec_id, empty-partition)`, NOT "matches all
+  specs" — so under a multi-spec table it can be flagged dangling while the READER still applies it table-wide. This
+  action↔reader inconsistency is inherited 1:1 from Java.** The reader (`global_equality_deletes` / Java
+  `findGlobalDeletes`) applies a global eq delete to data under ANY spec; the action (and Java's SQL join on `spec_id
+  AND partition`) groups it only against same-unpartitioned-spec data. Reachable after unpartitioned→partitioned spec
+  evolution. Probe confirmed the action flags it dangling; documented as Java-faithful, not a Rust bug.
+- **`RewriteFiles` SETS `failMissingDeletePaths()` in its CONSTRUCTOR (bytecode offset 18-21) — so the action's
+  fail-loud on a missing delete-removal path is Java-faithful for THIS caller** (unlike `RowDelta`, which only sets
+  it conditionally). The missing-path test is correct and matches Java.
+- **Mutation sweep (8 run, all caught, all reverted):** drop spec_id from the group key → cross-spec test; min-IS-NULL
+  as keep → no-live-data test; counter cross-wire pos→eq → dangling-pos test; content-guard removal → data-content
+  rejection test; operation()=Overwrite → 8 tests incl. delete-only-Replace + on-disk changelog; pos `<`→`<=` and eq
+  `<=`→`<` → the off-by-one pure-fn boundary pin; producer-routing sever → both tombstone tests (loud via the
+  empty-commit guard). The builder's pins held under every mutation.
 - **Strengthen an incompatible-spec partition pin by giving the off-spec file the SAME partition struct as a
   current-spec file.** The original pin used DIFFERENT partition values ([7] vs [0]), so the "always key by
   partition" mutation still bucketed them apart (different structs) and the pin passed under mutation. Making both

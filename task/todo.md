@@ -264,6 +264,97 @@ unchanged). REPORTED (not fixed, out of file set): merge_append.rs:282 comment n
 FastAppendOperation::existing_manifest exactly" — they diverge post-O1). Tree clean: 5 allowed files only,
 no Cargo/pom, merge_append.rs + snapshot.rs production byte-untouched. No commit.
 
+## ACTIVE (2026-06-11): Wave-4 Group O increment O3 — `RemoveDanglingDeleteFiles` (worktree wt-rewrite, BUILDER Opus)
+
+Port Java 1.10.0 `RemoveDanglingDeletesSparkAction` (the maintenance action that removes delete files
+that can no longer apply to ANY live data file) + the deferred DELETE-file rewrite surface on
+`RewriteFiles` (the action's commit vehicle). **Corruption surface:** removing a delete that STILL
+applies resurrects deleted rows (GC-of-deletes); a wrong dangling test that never fires is dead code.
+
+**Java authority (1.10.0 bytecode + Spark MAIN, all read):**
+- api `actions/RemoveDanglingDeleteFiles` (interface + `Result.removedDeleteFiles()`): bytecode-confirmed
+  shape. The IMPL `RemoveDanglingDeletesSparkAction` is SPARK MAIN-ONLY (flag). Derived predicates:
+  - DANGLING PREDICATE (verbatim from the Spark SQL `findDanglingDeletes`, lines 152-165):
+    group LIVE DATA entries (`content==0 AND status<2`) by `(partition, spec_id)`, take `min(sequence_number)`;
+    left-join LIVE DELETE entries (`content!=0 AND status<2`) on `(spec_id, partition)`. A delete dangles when:
+    (a) `min_data_sequence_number IS NULL` (no live data file in that partition — ANY content type), OR
+    (b) position delete (content==1) AND `sequence_number < min_data_sequence_number` (STRICT `<`), OR
+    (c) equality delete (content==2) AND `sequence_number <= min_data_sequence_number` (NON-strict `<=`).
+    THE OFF-BY-ONE: pos `<` vs eq `<=` — complement of the read-path applicability (pos applies `delete_seq>=data_seq`
+    so dangling `<min`; eq applies `delete_seq>data_seq` STRICTLY so dangling `<=min`). delete_file_index.rs L289 (`>=`
+    pos) / L238 (`>` eq) confirm.
+  - DV PREDICATE (`findDanglingDvs`): a PUFFIN delete whose `referenced_data_file` is NOT a live DATA-file path → dangling.
+  - SCOPE: the CURRENT snapshot only (Spark loads ENTRIES/DATA_FILES/DELETE_FILES metadata tables = current snapshot).
+  - UNPARTITIONED+single-spec EARLY RETURN: empty result, no commit ("ManifestFilterManager already does this on commit").
+- COMMIT VEHICLE: `table.newRewrite()` (= `RewriteFiles`) + `rewriteFiles.deleteFile(deleteFile)` per dangling
+  delete (the `deleteFile(DeleteFile)` overload — `MergingSnapshotProducer.delete(DeleteFile)`, the delete-filter
+  manager), commit ONLY if non-empty. `operation()` = `"replace"` ALWAYS (bytecode). The THIRD precondition (matrix):
+  `validateReplacedAndAddedFiles()` checks `deletesDeleteFiles() || !addsDeleteFiles()` → "Delete files to add must be
+  empty because there's no delete file to be rewritten" (bytecode-verified, all 3 preconditions disassembled).
+
+**VEHICLE VERDICT: extend `RewriteFiles` with the delete-file-removal surface (Java's exact vehicle).** The underlying
+machinery (delete-filter-manager removal + `removed-*` summary) ALREADY exists in Rust via `RowDelta.remove_deletes`
+(producer's `with_removed_delete_files` → `resolve_delete_file_paths` → `process_deletes` + summary `remove_file`).
+RewriteFiles vs RowDelta differ ONLY in the recorded operation (Replace vs Overwrite) and the 3 Java preconditions.
+Java's action uses RewriteFiles, so for parity the action commits a RewriteFiles delete-file-removal (operation Replace).
+
+- [x] **rewrite_files.rs (FLAGGED): delete-file-removal surface.** Added `deleted_delete_files: Vec<DataFile>`
+      + `delete_delete_file(DataFile)`/`delete_delete_files`; routed via `with_removed_delete_files` to the producer
+      (ZERO snapshot.rs change — the routing existed). Relaxed precondition (1) to data OR delete non-empty; precondition
+      (2) now DISTINCT (was subsumed) — a delete-file-only rewrite that also adds data files is rejected; ADDED
+      precondition (3) `deletesDeleteFiles() || !addsDeleteFiles()` with the Java-exact message (`addsDeleteFiles()`
+      always false ⇒ unreachable, kept + documented for when add-delete lands). Operation stays Replace. `validate()`
+      unchanged (skips when replacedDataFiles empty — matches Java; a delete-only rewrite has empty `deleted_data_files`).
+      Content-type guard rejects a Data file on the removal path. ALL THREE preconditions bytecode-disassembled.
+- [x] **maintenance/remove_dangling_delete_files.rs (new):** `RemoveDanglingDeleteFiles::new(table)
+      .execute(&dyn Catalog) -> Result<RemoveDanglingDeleteFilesResult{removed_delete_files}>` (+ per-type count
+      helpers). CURRENT snapshot only; one manifest-list pass collects per-`(spec_id, partition)` min-data-seq + live
+      data paths + live delete entries; pure `find_dangling_deletes` (pos `<` / eq `<=` / min-IS-NULL / DV ref-not-live).
+      Unpartitioned+single-spec early no-op. Empty plan → no commit. Commits ONE RewriteFiles delete-file removal
+      (`tx.rewrite_files(vec![],vec![]).delete_delete_files(dangling)`).
+- [x] **mod.rs wiring** (mod + 2 re-exports + Contents doc) + module doc relating to the RewriteFiles carry-posture.
+- [x] **Tests (17):** 4 pure-fn (off-by-one boundary, min-IS-NULL, cross-spec, DV-ref-gone) + 8 e2e (crown-jewel
+      still-applicable eq NOT removed + scan correct; pos exact-seq boundary; genuinely-dangling eq removed+counter;
+      dangling pos-parquet removed (converges with carry-posture: plain RewriteFiles KEEPS it); partition isolation;
+      empty no-op no-commit; no-snapshot no-op; producer-routing tombstone) + 5 RewriteFiles delete-removal
+      (delete-only⇒Replace+counter, pos removal restores rows, data-content rejection, missing-path fail-loud,
+      producer-routing tombstone mutation pin). 3 mutations run + restored: pos `<`→`<=` AND eq `<=`→`<` (both caught
+      by the off-by-one pure-fn test), producer-routing sever (3 tests fail loud via the empty-commit guard).
+- [x] **GAP_MATRIX:** RemoveDanglingDeleteFiles ❌→🟡 (row 117); RewriteFiles row (87) deferral updated (delete-file
+      REMOVAL surface lands; only ADD-delete + interop deferred). 5-pipe audit CLEAN.
+- [x] **Verify:** typos clean, fmt clean, clippy `-D warnings` (workspace ex-sqllogictest) clean, `cargo test -p
+      iceberg --lib` **2043 passed ×2** (baseline 2026 + 17 new).
+
+**Outcome (2026-06-11): O3 LANDED.** Vehicle verdict: Java's vehicle IS the RewriteFiles `deleteFile(DeleteFile)`
+surface, so EXTENDED rewrite_files.rs with it (the deferred surface) — operation Replace, all 3 preconditions, content
+guard, producer routing via the EXISTING `with_removed_delete_files` (Arc E machinery; ZERO snapshot.rs change). The
+action computes dangling deletes per `(partition, spec_id)` with the pos-`<`/eq-`<=` off-by-one and the DV-ref-gone
+rule, commits one Replace. Files: `maintenance/remove_dangling_delete_files.rs` (new), `maintenance/mod.rs` (mod +
+re-exports + doc), `transaction/rewrite_files.rs` (FLAGGED — delete-removal surface), `transaction/map.md` (2 rows),
+GAP_MATRIX (2 rows), todo, lessons. NO snapshot.rs/row_delta.rs production edits (their machinery consumed read-only).
+Gate CLEAN from wt-rewrite root. Deferred (named): Java interop; DELETE-file ADD surface (`addFile(DeleteFile)`); an
+e2e DV-dangling fixture (DV ref-gone pinned pure-fn only); CommitManager retry/partial-progress (single commit). No
+commit.
+
+**O3 REVIEWER (2026-06-11, Opus): VERDICT PASS.** Headline #1 (action↔read-path consistency): partition eq/pos
+deletes keyed `(spec_id, partition)` on BOTH sides — agree; DV → ref-gone-only is provably equivalent to Java's
+`findDanglingDeletes ∪ findDanglingDvs` for valid tables; parquet-pos-delete `is_deletion_vector` PUFFIN-gating mirrors
+both Java's `findDanglingDvs` PUFFIN filter AND the reader's PUFFIN `is_deletion_vector`. Two Java-FAITHFUL latent
+inconsistencies surfaced + DOCUMENTED (module doc + matrix), NOT bugs: (a) global/unpartitioned eq delete under a
+multi-spec table is flagged dangling while the reader still applies it table-wide (Java's `spec_id AND partition` join
+does the same); (b) headline #5 — a delete-only RewriteFiles skips conflict validation (bytecode: `validate` gated on
+non-empty replacedDataFiles), so a concurrent SEQ-PRESERVING compaction landing a lower-seq data file races and can
+RESURRECT rows (reviewer probe CONFIRMED the resurrection; identical in Java → pinned, not guarded). #2: removal is
+METADATA-ONLY (tombstone, no physical delete — verified no `file_io.delete` in the path; time travel preserved) —
+doc note added. #3: BUILT THE MISSING DV E2E (real Puffin DV → rewrite referenced data away → action removes it,
+`removed-dvs:1`, tombstoned, scan {10,20,30} unchanged before/after) — +1 test. #4: all 3 preconditions + `operation()`
+re-disassembled from 1.10.0 core jar — boolean forms + messages match EXACTLY; `failMissingDeletePaths` set in the
+ctor (fail-loud is Java-faithful for RewriteFiles). #6: 8 mutations run+reverted, ALL caught. Gate ×2 CLEAN: 2044
+passed (was 2043 + my DV e2e). All 3 interop chains (write-actions/expire/dv) GREEN — rewrite_files commit-path
+changes did not perturb them. Tree = allowed set only; snapshot.rs/row_delta.rs/delete_file_index.rs byte-untouched;
+no Cargo/pom diffs. Reviewer EDITS: module-doc 3 sections (metadata-only/race/global-eq) + matrix posture note + the
+DV e2e test + lessons. No commit.
+
 ## ACTIVE (2026-06-11): Wave-4 Group O increment O2 — `RewriteDataFiles` bin-pack compaction (worktree wt-rewrite, BUILDER Opus)
 
 Port Java 1.10.0 `RewriteDataFiles` bin-pack planning over the existing seq-preserving `RewriteFiles`
