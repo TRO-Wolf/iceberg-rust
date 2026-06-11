@@ -288,10 +288,115 @@ The read path is therefore Increment D1, before any writer work.
       CAN-fail proven (tampered expected JSON ⇒ FAIL line ⇒ script grep trips; NOTE the verify
       step is not re-runnable in place — emit table collides — harmless, script resets dirs).
       Suite 1737 ×2 (1735 + 2 reviewer pins); gate green; Cargo/pom 0-diff.
-- [ ] **D3 — commit path:** RowDelta DV adds; V2-forbids/V3-requires gating
+- [x] **D3 — commit path** (DONE 2026-06-10 — Fable builder + Fable reviewer + orchestrator
+      gate/commit. Builder: gate + fresh-DV door + validateAddedDVs op-set fix [stale "REPLACE
+      unrepresentable" claim — 1.10.0 set is {overwrite, delete, replace}] + the missing
+      validateNoConflictingFileAndPositionDeletes + summary DV counters + 56-test V2-fixture
+      migration. REVIEWER FOUND + FIXED 2 DOOR BUGS with fail-before proof: under-fire (door keyed
+      on the DV's own spec/partition — cross-spec legacy delete shadowed = resurrection class) and
+      over-fire (no seq filter — predating legacy delete froze DV writes); fix resolves the
+      referenced file's LIVE entry and mirrors read-path applicability incl. delete_seq >=
+      data_seq; +5 reviewer pins incl. the concurrent-format-upgrade refreshed-base race. Gate:
+      lib 1756 ×3, datafusion 80+9, interop script green both directions, Cargo/pom frozen.):
+      RowDelta DV adds; V2-forbids/V3-requires gating
       (`validateDeleteFileForVersion`, MergingSnapshotProducer L295-316); `validateAddedDVs`
       (L824-870, "Found concurrently added DV for %s: %s") + the no-override tx-captured-start
       pin; write→scan crown jewel on V3.
+      BUILDER PLAN (2026-06-10, D3 builder — FABLE). Pre-flight findings: `validateAddedDVs` ALREADY
+      landed pre-D1 (commit c1c58f7b) incl. the tx-captured pin + disjoint negative + self-skip +
+      malformed-DV tests — D3 task 3 is verify/fix, not build. Found one REAL bug in it: its walk
+      reuses `added_delete_files_after` (`{Overwrite, Delete}`) but Java 1.10.0
+      `VALIDATE_ADDED_DVS_OPERATIONS` = `{overwrite, delete, replace}` (bytecode-verified) and
+      `Operation::Replace` IS representable in Rust since the rewrite actions landed — the stale
+      "REPLACE unrepresentable" doc claim hid a missed concurrent-REPLACE-adds-DV window. 1.10.0
+      bytecode also shows: NO apply-time re-validation of buffered deletes (that is MAIN-only);
+      the gate fires in `add(DeleteFile)` → `validateNewDeleteFile`; `BaseRowDelta.validate` ALSO
+      calls `validateNoConflictingFileAndPositionDeletes()` (present in 1.10.0 bytecode, missing in
+      Rust). Summary bytecode: a DV increments `added-dvs` INSTEAD of `added-position-delete-files`,
+      but STILL increments `added-delete-files` + `added-position-deletes`; sizes use
+      `ScanTaskUtil.contentSizeInBytes` (DV ⇒ `content_size_in_bytes`, not file size).
+      - [x] `snapshot.rs`: per-file format-version gate in `validate_added_delete_files`
+            (V1 throws / V2 rejects DVs / V3 requires DVs for position deletes, eq exempt; exact
+            Java messages incl. `dvDesc`); `dv_desc` helper; `operation_adds_dvs` op filter
+            (`{Overwrite, Delete, Replace}`) + `added_dv_candidate_delete_files_after` wrapper.
+      - [x] `row_delta.rs`: switch `validate_added_dvs` to the DV op-set walk + Java-exact `dv_desc`
+            message; add always-on `validateNoConflictingFileAndPositionDeletes`; add the
+            fresh-DV-only door (Rust-conservative: reject a DV add when the CURRENT snapshot already
+            has a live DV — or a shadowed parquet position delete — for the referenced file; Java
+            instead merges previous deletes, BaseDVFileWriter L117-126 — deferred).
+      - [x] `spec/snapshot_summary.rs`: `added_dvs`/`removed_dvs` counters + DV content-size
+            accounting, offline unit pins on exact keys.
+      - [x] Tests: gating × versions/content; door 3-way (+ the V2→V3-upgrade parquet-shadow pin);
+            DV-op-set walk (hand-built REPLACE snapshot); manifest round-trip pin (committed DV's
+            referenced_data_file/content_offset/content_size_in_bytes survive Rust manifest
+            write→read — CLEAN, no spec/manifest fix needed); crown jewel (DVFileWriter →
+            row_delta → scan survivors) + resurrection mutation.
+      - [x] TRAP-1 migrations: V3 fixtures that row_delta PARQUET position deletes move to a new
+            `make_v2_minimal_table_in_catalog` (same schema as V3 minimal — verified identical);
+            DV/equality tests stay V3. Affected files (test-only, flagged): row_delta.rs,
+            delete_files.rs, overwrite_files.rs, replace_partitions.rs, rewrite_files.rs,
+            merge_append.rs, rewrite_manifests.rs, scan/incremental.rs (synthetic delete became
+            DV-shaped, stays V3), transaction/mod.rs (the new fixture).
+      - [x] Docs: GAP_MATRIX (DV writer/RowDelta rows), transaction/map.md, this outcome.
+      BUILDER OUTCOME (2026-06-10, D3 builder — FABLE; awaiting reviewer): **CROWN JEWEL GREEN —
+      the all-Rust chain closed** (real parquet → D2 `DVFileWriter` DV {1,3} → D3
+      `row_delta().add_deletes` commit → D1 scan returns exactly {10,30,50}; stripping the delete
+      manifest from the commit resurrects {10,20,30,40,50} — mutation-verified). Format gate
+      Java-byte-exact at all three versions (1.10.0-bytecode-verified; 1.10.0 has NO apply-time
+      re-validation — that is MAIN-only; Rust's commit-time placement vs the refreshed base
+      subsumes both). validateAddedDVs was pre-existing (c1c58f7b) but its walk MISSED Java's
+      REPLACE op (`VALIDATE_ADDED_DVS_OPERATIONS` has 3 members; `Operation::Replace` became
+      representable with the rewrite actions) — fixed + pinned with a hand-built REPLACE-op DV
+      commit whose message assert isolates the walk from the door. Missing 1.10.0 check
+      `validateNoConflictingFileAndPositionDeletes` added (exact message). Fresh-DV-only door
+      (documented Rust-conservative divergence): rejects a DV add when the file already has a live
+      DV (two-DVs = fail-late scan rejection) OR a shadowed legacy parquet position delete
+      (V2→V3-upgrade fixture; DV-supersedes precedence would silently resurrect) — 3-way + upgrade
+      tests, both mutation directions caught. Summary: added-dvs/removed-dvs landed exactly per
+      bytecode (DV counts INSTEAD of added-position-delete-files, still in added-delete-files +
+      added-position-deletes; size = blob content_size_in_bytes per ScanTaskUtil) — collector pins
+      + the commit-level pin inside the crown jewel; removed-dvs reachable only collector-level
+      (no delete-file removal path yet, documented). Manifest round-trip FINDING: CLEAN — the Rust
+      V3 manifest writer already carries fields 143/144/145; raw `Manifest::try_from_avro_bytes`
+      pin added, no spec/manifest change. TRAP-1: 56 tests broke under the gate; 53 migrated to a
+      new V2 in-catalog fixture (subject = parquet position deletes, now the V2-only reality),
+      1 stayed V3 with an equality delete (the DV-check self-skip pin), 1 became a DV-shaped
+      fixture (incremental changelog), + the new fixture itself. 14 new tests (lib 1737 → 1751).
+      Mutations (8, all caught, restored byte-clean, full suite re-run): delete-manifest strip ⇒
+      resurrection; gate off ⇒ exactly the 3 gate pins; V3-eq-exemption drop ⇒ eq tests; V2 arm
+      invert ⇒ 33 (the migrated suite IS the regression pin); door off ⇒ exactly the 2 door pins;
+      door key-blind ⇒ exactly the 2 negative controls; walk op-set revert ⇒ exactly the REPLACE
+      pin; summary DV-branch kill / blob-size kill ⇒ the summary pins + crown jewel.
+      REVIEWER OUTCOME (2026-06-10, D3 reviewer — FABLE): all bytecode claims RE-VERIFIED against
+      the 1.10.0 jars (`VALIDATE_ADDED_DVS_OPERATIONS` = {overwrite, delete, replace};
+      `validateNewDeleteFile` switch incl. exact messages + V4 arm; `validateAddedDVs` walk +
+      message; `validateNoConflictingFileAndPositionDeletes` semantics — intersects
+      `removedDataFiles` locations with the `validateDataFilesExist`-fed `referencedDataFiles`,
+      Java `List` rendering matched; `ContentFileUtil.dvDesc`/`isDV`; `SnapshotSummary
+      .UpdateMetrics.addedFile/removedFile` branch ordering + `ScanTaskUtil.contentSizeInBytes`;
+      `ADDED_DVS_PROP`/`REMOVED_DVS_PROP` keys). Re-ran mutations: walk op-set revert ⇒ exactly
+      the REPLACE pin; shadow-arm disable ⇒ exactly the upgrade-fixture pin; V2-arm invert ⇒ 60
+      fail (the migrated suite is the regression pin); rewrite_files seq-strip ⇒ exactly the eq
+      crown jewel (migration did not weaken it). TWO DOOR BUGS FOUND + FIXED (fail-before/
+      pass-after probes kept as pins, mutation-verified): (1) UNDER-fire — the parquet-shadow arm
+      keyed applicability on the added DV's own (spec id, partition); after a partition evolution
+      the legacy spec-0 delete never matched the spec-1 DV, so the DV COMMITTED and silently
+      superseded a still-applying delete (resurrection class); (2) OVER-fire — no sequence test,
+      so a partition-matched legacy delete PREDATING the referenced data file (delete_seq <
+      data_seq, applies to nothing) froze all DV writes into that partition. Fix: the door now
+      resolves each referenced file's LIVE data-manifest entry and mirrors the read-path test —
+      path/(spec id, partition) scope vs THAT entry + delete_seq >= data_seq; referenced file
+      with no live entry (same-commit add) ⇒ nothing applies. +5 pins (eq-delete door control,
+      path-scoped-other-file door control, cross-spec under-fire, seq over-fire, and the
+      refreshed-base gate race — a parquet delete built on V2 is rejected after a CONCURRENT
+      V2→V3 upgrade, probing the do_commit re-base claim empirically); lib 1751 → 1756 ×2
+      deterministic; fmt/typos/clippy clean; run-interop-dv.sh green both directions; Cargo/pom
+      0-diff. Noted (not fixed): Java skips ALL of `BaseRowDelta.validate` when parent == null —
+      Rust runs the removed∩referenced check on an empty table too (conservative-only divergence);
+      Rust's summary `content_size_in_bytes` keys on PositionDeletes+Puffin where Java keys on
+      non-DATA+Puffin (differs only for a pathological Puffin EQUALITY delete, on which Java NPEs
+      for a null size — unreachable from real writers); V2/V3 fixture schemas differ by V3 x's
+      initial/write-defaults (doc claim softened in mod.rs).
 - [ ] **D4 — interop:** bidirectional DV round-trips (Java writes V3+DV → Rust scans; Rust writes
       → Java reads) on the scan-exec harness; metadata-level chain notes; GAP_MATRIX flips with
       evidence.

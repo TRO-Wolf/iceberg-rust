@@ -1044,6 +1044,32 @@ How to use it (see the manuals' §2):
   pulls), and the fields constant from bytecode. MAIN line citations are navigation hints, never
   proof, across versions.
 
+### 2026-06-10 (DV arc D3 — DV commit path, BUILDER + REVIEWER Fable; 2 reviewer bugs fixed)
+- **A "X is unrepresentable in the Rust enum" claim STALES the day the variant lands — grep for
+  those claims whenever an enum grows.** `validateAddedDVs`' walk had reused the `{Overwrite,
+  Delete}` op set with a comment that REPLACE was unrepresentable; `Operation::Replace` landed
+  with the rewrite actions and the claim silently became a missing-conflict-window bug (1.10.0's
+  `VALIDATE_ADDED_DVS_OPERATIONS` = {overwrite, delete, replace} — bytecode-verified). Fixed +
+  pinned with a Replace-op commit through the production producer.
+- **An applicability door must mirror the READ PATH's resolution exactly: resolve the REFERENCED
+  file's LIVE manifest entry — (spec id, partition, inherited data seq) — never key on the ADDED
+  file's own fields.** The fresh-DV door keyed partition matching on the DV's own (spec,
+  partition): after partition evolution the spec ids never match (UNDER-fire — the DV committed
+  over a still-applying legacy parquet delete = resurrection class), and it had no seq filter
+  (OVER-fire — a predating legacy delete froze all DV writes to that partition). One fix: resolve
+  the live entry, match path-scope OR (spec, partition) against IT, AND `delete_seq >= data_seq`.
+  Both directions pinned (the docs/testing.md mutate-both-directions rule, vindicated again).
+- **`BaseRowDelta.validate` (1.10.0) runs `validateNoConflictingFileAndPositionDeletes`
+  UNCONDITIONALLY** (removed-data-files ∩ new-deletes' referenced files → "Cannot delete data
+  files %s that are referenced by new delete files") — was missing from the Rust validate hook.
+- **Java 1.10.0 summary semantics for DVs (bytecode):** a DV bumps `added-dvs` INSTEAD of
+  `added-position-delete-files`, but BOTH paths bump `added-delete-files` and
+  `added-position-deletes` (+= record_count); size accounting uses `contentSizeInBytes` (the
+  blob), not the shared puffin file size (`ScanTaskUtil.contentSizeInBytes`).
+- **The V3-requires-DV gate breaks every V3 fixture committing parquet position deletes — budget
+  the migration** (56 tests here: subject-preserving fixture swaps to a V2 in-catalog template;
+  the migrated suite then doubles as a 60-test regression pin on the V2 gate arm).
+
 ### 2026-06-10 (post-arc logic + security audit, ORCHESTRATOR Fable — two parity bugs found + fixed)
 - **Java's merge `first` is the unconditional STREAM HEAD (`manifestIter.next()`,
   ManifestMergeManager L85), NOT "this commit's new manifest".** For an empty-data merging append
