@@ -1098,3 +1098,108 @@ How to use it (see the manuals' §2):
   listed entries WITH the scheme, so base and listing agree there. If this needs fixing later, normalize
   `self.location` to the listing's representation BEFORE the hidden filter — but that touches a deleter's
   match surface, so pin it heavily first. Flagged, not fixed (architectural, out of reviewer scope).
+
+### 2026-06-11 (A3 — ExpireSnapshots Java interop, BUILDER Opus, wt-orphan)
+- **DO force Java down `ReachableFileCleanup` (the only ported strategy) with a SURVIVING TAG, and
+  cite the selection condition from bytecode.** *Why:* Java `RemoveSnapshots.cleanExpiredSnapshots`
+  (1.10.0 bytecode) picks INCREMENTAL when `incrementalCleanup==null && !specifiedSnapshotId &&
+  !hasRemovedNonMainAncestors(base,current) && !hasNonMainSnapshots(current)`, else REACHABLE. Rust
+  ports ONLY `ReachableFileCleanup`. A surviving non-main ref (a tag/branch) makes `hasNonMainSnapshots`
+  true ⇒ Java picks Reachable — so both engines run the SAME algorithm. The tag also doubles as the
+  ref-protection judgment-surface element (a tag pinning an otherwise-expirable mid-chain snapshot). The
+  abstract `ReachableFileCleanup.cleanFiles` is 2-arg `(base, current)` = the Rust 2-state
+  `clean_expired_files`; the 3-arg `cleanFiles(base, current, cleanupLevel)` in `cleanExpiredSnapshots`
+  is a newer overload not in 1.10.0's abstract method.
+- **DO compare cross-language DELETED-FILE sets via a path-INDEPENDENT `<funnel>@ord<N>` descriptor
+  multiset, NEVER raw paths.** *Why:* Java and Rust write their tables at DIFFERENT absolute paths
+  (random manifest/list UUIDs, different temp roots), so a `deleteWith`/`CleanupReport` path set is
+  uncomparable. Normalize each deleted file to `<funnel>@ord<N>` (funnel = content/manifest/manifest_list/
+  statistics; ordinal = the owning snapshot's position in the PRE-EXPIRE metadata's sequence-number
+  order): a manifest list → its owning snapshot; a manifest → its `added_snapshot_id`; a content file →
+  its manifest's `added_snapshot_id`; a stats file → its `snapshot_id`. The multiset is identical on
+  both sides because the snapshot GRAPH is logically identical. (Same family as the E1 snapshot-id →
+  ordinal canonicalization, extended to the deleted-file set.) An UNCLASSIFIED token makes a
+  misattribution fail the comparison loudly rather than drop out.
+- **The shared `SnapshotMetaOracle.emit` / `snapshot_meta_view` PANIC on an EXPIRED table — a surviving
+  snapshot's parent was removed, so `ordinals.get(parentId)` is null (Java NPE) / `ordinals[&parent_id]`
+  panics (Rust).** *Why it bit:* the expire fixtures are the FIRST interop fixtures where a retained
+  snapshot's parent is expired out of the table; every prior fixture (write-actions/rowdelta/dv) only
+   APPENDS, so the parent is always present and the branch was dormant. Fix: emit `null` `parent_ordinal`
+  when the parent has no in-table ordinal. The Java emitter (in scope — `InteropOracle.java`) got the
+  fix directly; the Rust shared `common/snapshot_meta_view.rs` is OUT of A3 scope, so `interop_expire.rs`
+  carries a LOCAL `expire_meta_view` copy with the fix (and inlines `SUMMARY_COUNT_KEYS` to avoid pulling
+  the unused shared view builder in as dead code). When an interop increment is the first to feed a
+  shared materializer a new metadata SHAPE, audit the materializer's `null`/absent-key handling for that
+  shape before assuming reuse.
+- **DETERMINISTIC-by-OUTCOME beats re-stamping when the comparison is timestamp-agnostic.** *Why:* the
+  Java oracle re-stamps snapshots to fixed timestamps (`T0 + 1000*ordinal`) so its cut is wall-clock-
+  independent — but re-stamping through the Rust PUBLIC catalog path is impossible (`do_commit` reloads
+  from the catalog, losing an in-memory re-stamp; the action's `commit()` + `Table::with_metadata` are
+  private). It is also UNNECESSARY: the canonical view + the deleted descriptor both key on ORDINALS, never
+  raw timestamps, so the comparison is timestamp-agnostic and only the expiry OUTCOME must match. The Rust
+  side commits real appends, reads the ACTUAL head timestamp, and uses `expire_older_than(head_ts) +
+  retain_last(1)` (the head is the unique newest ⇒ everything strictly older expires) — the same outcome
+  as Java's fixed cut, through the production `ExpireSnapshotsAction` + `ExpireSnapshotsCleanup::
+  commit_and_clean` with a collect-only deleter (so Java can still read the table). Re-stamping is only
+  needed when the comparison itself reads timestamps.
+- **STOP-FINDING (real Rust divergence, separate increment): `FastAppend::existing_manifest`
+  (append.rs:148) DROPS all-tombstone manifests; Java `FastAppend.apply` carries ALL prior manifests
+  forward.** *Why:* Java's `apply` does `manifests.addAll(snapshot.allManifests(io))` with NO filter
+  (1.10.0 MAIN, verified) — every prior manifest, including a manifest left ALL-DELETED by a copy-on-write
+  delete that emptied it. Rust filters to `has_added_files() || has_existing_files()`, so a fast_append
+  AFTER an emptying delete drops the all-tombstone manifest from the manifest LIST. Surfaced by a `rewrite`
+  fixture (append d1 → delete d1 → append): Rust's deleted descriptor carried an extra `manifest@ord2`
+  (the dropped all-tombstone manifest, now unreferenced and GC'd) that Java keeps referenced. Net effect
+  is benign (the dropped manifest holds only a tombstone — no data loss) but it is a real manifest-LIST
+  structure divergence that would also bite general append-after-delete interop. FIXTURED AWAY for A3: the
+  `rewrite` delete now leaves a sibling file EXISTING (1-existing + 1-deleted manifest, carried by both
+  engines), so A3 pins ONLY the expire+cleanup surface. Reported on the GAP_MATRIX row for its own
+  increment. *Rule:* when an interop fixture diverges, trace WHICH production path differs (here:
+  FastAppend, not the expire modules under test) before attributing it to the increment's subject — and if
+  it is outside the increment's scope, fixture it away + report rather than expanding scope.
+
+### 2026-06-11 (A3 — ExpireSnapshots Java interop, REVIEWER Opus, wt-orphan)
+- **A SURVIVING TAG ALONE DOES NOT FORCE `ReachableFileCleanup` — `hasNonMainSnapshots(current)`
+  needs a survivor OFF the POST-EXPIRY main ancestry, and a head-tag leaves every survivor ON it.**
+  *The central A3 claim was cross-strategy, not 1:1.* A reflection probe on Java's private
+  `incrementalCleanup` proved 4/5 fixtures (linear/stats/deletes/rewrite) ran Java's
+  **IncrementalFileCleanup**, not the Reachable strategy the Rust side ports. Bytecode
+  (`RemoveSnapshots.cleanExpiredSnapshots`, 1.10.0): incremental iff `!specifiedSnapshotId &&
+  !hasRemovedNonMainAncestors(base,current) && !hasNonMainSnapshots(current)`. `hasNonMainSnapshots`
+  is true only when a SURVIVING snapshot is not in `mainAncestors(current)` = the head's parent-walk
+  (which STOPS at the first expired parent). A tag on the HEAD (every survivor on main) ⇒ all three
+  false ⇒ Java auto-picks INCREMENTAL; only a tag on a MID-CHAIN survivor (tag_protected) auto-picks
+  Reachable. The sets coincided for these shapes (force-probed both ways), so the comparison passed
+  even cross-strategy — a coincidence of shape, NOT proof of the Reachable port. FIX: force Java's
+  Reachable via the REAL engine selector `((RemoveSnapshots) api).withIncrementalCleanup(false)`
+  (package-private, same package; offset-verified — pre-sets the field so `cleanExpiredSnapshots`
+  skips auto-derivation), against the identical fixture sets. RULE: when an interop harness pins a
+  SPECIFIC algorithm the other side selects among several, ASSERT the selection (probe the strategy
+  field / log), never assume a fixture knob forces it — and prefer a real public/engine selector over
+  reshaping fixtures so coverage is unchanged.
+- **A PATH-INDEPENDENT deleted-file descriptor keyed ONLY on the owning-snapshot ordinal is
+  NON-INJECTIVE over sibling files of one commit — a swap passes set-equality vacuously.** Two
+  DIFFERENT content files in a 2-file append share `added_snapshot_id` ⇒ both `content@ord<N>`, so a
+  Rust-deletes-X / Java-deletes-Y swap is invisible to the multiset compare. FIX: add a
+  cross-language-STABLE per-file discriminator (`#rc<record_count>` for content, `#a<>e<>d<>` file
+  counts for manifests, `#sz<file_size>` for stats; a manifest LIST needs none — one per snapshot).
+  Pin it OFFLINE (fail-before/pass-after on the bare-ordinal scheme), since the env-gated chain
+  passing is not evidence of injectivity. The ordinal itself (sequence-number position) is fine —
+  semantically meaningful + V2-stable; the hole was granularity, not order. GENERAL: a structural
+  cross-language descriptor must be INJECTIVE over the set it compares, or it manufactures false
+  set-equality — discriminate by a content fingerprint, not just the owning container.
+- **A delete/DV-bearing interop fixture does NOT exercise delete-manifest CONTENT cleanup unless a
+  manifest actually DIES — a carried-forward delete manifest is never read by the cleanup walk.**
+  `deletes` (row-delta carried into the head) leaves `manifestsToDelete` EMPTY, so the content-file
+  subtraction block (the only place `load_manifest`/`ManifestFiles.read` runs on a delete manifest) is
+  gated off on BOTH sides; the fixture pins metadata + manifest-LIST GC on a delete-bearing table, not
+  delete-manifest content cleanup (that is the B2 unit tests' job). Corrected the oracle's "the delete
+  manifest is read but spared" overclaim. RULE: for a fixture asserting "feature X traverses path P,"
+  confirm P actually EXECUTES for that input (here: a gate `if !manifests_to_delete.is_empty()` made it
+  inert) — an inert feature is false coverage even when the comparison is green.
+- **DON'T `git checkout --` an UNCOMMITTED file to revert a probe edit — it reverts to HEAD and WIPES
+  the (uncommitted) builder work underneath.** I reverted a Java probe with `git checkout -- InteropOracle.java`
+  and lost the builder's entire uncommitted `ExpireOracle` (HEAD predates it); recovered only because the
+  full diff had been captured to a tool-results file and re-applied with `git apply`. RULE for reverting
+  probes on uncommitted files: snapshot the file to `/tmp` BEFORE the probe edit and restore from THAT
+  (`cp`), or undo the exact textual edit — never `git checkout`/`git restore` a path with uncommitted work.

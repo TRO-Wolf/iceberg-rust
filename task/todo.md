@@ -664,6 +664,128 @@ corrected (5 fields, id-diff equivalent by immutability), the inherited B1 windo
 in the module docs, and the Rust-stricter retained-list read scope noted (Java's prune
 early-exits; Rust always reads both sides — more pre-deletion `Err` cases only).
 
+## ACTIVE (2026-06-11): A3 — ExpireSnapshots Java interop (worktree wt-orphan, BUILDER Opus, Group A)
+
+Close the named interop deferral on the `Maintenance: ExpireSnapshots` GAP_MATRIX row: prove the
+Rust `ExpireSnapshotsAction` (B1 retention) + `ExpireSnapshotsCleanup` (B2 ReachableFileCleanup file
+GC) agree with Java 1.10.0 `RemoveSnapshots` + `cleanExpiredFiles(true)` on the SAME fixtures, judged
+by Java where possible. Modify ONLY: dev/java-interop/** (oracle + new script + map.md),
+crates/iceberg/tests/interop_expire.rs (new), GAP_MATRIX row, task/todo.md, task/lessons.md. NO
+transaction/ production edits — a real Rust bug = STOP + report. No commit.
+
+**Java strategy-selection (bytecode-verified `RemoveSnapshots.cleanExpiredSnapshots`, 1.10.0):** when
+`incrementalCleanup==null` Java picks INCREMENTAL iff `!specifiedSnapshotId && !hasRemovedNonMainAncestors
+&& !hasNonMainSnapshots(current)`, else REACHABLE. Rust ports ReachableFileCleanup ONLY, so EVERY fixture
+must FORCE Java to Reachable: keep a surviving TAG (⇒ `hasNonMainSnapshots(current)` true). This doubles
+as a judgment-surface requirement (a tag protecting an otherwise-expirable snapshot). `ReachableFileCleanup
+.cleanFiles` is the 2-arg `(base, current)` core = the Rust 2-state `clean_expired_files`.
+
+**Outcome (2026-06-11): A3 LANDED. Full chain GREEN both directions, 5 fixtures.** Files:
+`dev/java-interop/src/.../InteropOracle.java` (new `ExpireOracle` + 2 dispatch cases +
+`LocalTableOperations.continueVersioningFrom` + the `SnapshotMetaOracle.emit` null-parent fix),
+`dev/java-interop/run-interop-expire.sh` (new), `dev/java-interop/map.md` (row + 3 Debug entries),
+`crates/iceberg/tests/interop_expire.rs` (new, env-gated, local `expire_meta_view` with the
+expired-parent fix), `GAP_MATRIX.md` (row, 5-pipe audit clean), todo, lessons. NO transaction/
+production edits. Gate CLEAN: typos/fmt/clippy `-D warnings` (workspace ex-sqllogictest) clean,
+`cargo test -p iceberg --lib` 1911 ×2 (no lib code added), interop_expire offline no-op (3 pass).
+Sabotage BOTH fail-closed: (a) resurrect a snapshot id in rust final.metadata.json ⇒ Java byte-diff
+fails (2 snapshots vs 1); (b) drop a token from rust_deleted.json ⇒ Java verify `1 failures` + Rust
+descriptor test FAILED. **STOP-FINDING reported (separate increment):** Rust
+`FastAppend::existing_manifest` (append.rs:148) drops all-tombstone manifests where Java
+`FastAppend.apply` carries ALL prior manifests forward (`snapshot.allManifests()`, no filter) —
+surfaced by an emptying-delete `rewrite` fixture, then fixtured away (delete leaves a file existing).
+Deferred on the row: IncrementalFileCleanup, cleanExpiredMetadata, ref-age (max_ref_age_ms) interop.
+
+- [x] **Oracle (`ExpireOracle` in InteropOracle.java + dispatch cases):**
+  - `generate-interop-expire` (`-Dinterop.expire.dir`): build a REAL on-disk multi-snapshot table via
+    `LocalTableOperations`+`newFastAppend` (metadata-only `DataFiles` — paths need not exist, the cleanup
+    deletes by path via a collector), parameterized timestamps for a deterministic cut; run Java
+    `table.expireSnapshots().expireOlderThan(cut).retainLast(n).cleanExpiredFiles(true).deleteWith(collector)
+    .commit()`; emit `<dir>/<fixture>/java_deleted.json` (SORTED deleted-file list) + leave the expired
+    table at `<dir>/<fixture>/table/metadata/final.metadata.json` (re-located by the LocalTableOps commit).
+    Reuse `emit-snapshot-meta` (SnapshotMetaOracle, re-parsed base) for the canonical view.
+  - `verify-interop-expire` (`-Dinterop.expire.dir`): Java re-reads the RUST-expired table at
+    `<dir>/<fixture>/rust_table/metadata/final.metadata.json` (production read), emits its canonical view
+    of it; the script byte-diffs Java-on-Rust vs Java-on-Java. Sentinel `verify-interop-expire: 0 failures`.
+- [x] **Fixtures (each forces Reachable via a surviving tag):**
+  - `linear`: linear main history s1..s4, a tag at the head; expire prunes a contiguous prefix (retainLast +
+    expireOlderThan cut between s2/s3). Pins prefix retention + manifest-list/manifest/content file GC.
+  - `tag_protected`: linear history + a tag on s2 (an otherwise-expirable mid-chain snapshot); the tag KEEPS
+    s2 and its files (and forces Reachable). Pins ref-protection of the cleanup set.
+  - `stats`: a `linear`-shape table with a statistics file (+ partition-statistics if cheap via
+    `updateStatistics`) attached to an EXPIRED snapshot; pins stats-file cleanup. Tag at head.
+  - `deletes`: a V2 table with a position-delete-bearing snapshot that expires, so a DELETE manifest walks
+    through cleanup. Tag at head. (DV/V3 deferred — the cleanup walks delete manifests identically.)
+  - ALL fixtures fixtured AWAY from shared manifest LISTS (each Java snapshot owns a unique list, so the
+    Rust retained-shared list guard never fires ⇒ byte-equality). Ref aging (`max_ref_age_ms`) NOT exercised
+    (Rust implements it but keep the cut age-only to isolate; flag if Java diverges).
+- [x] **Direction 1 (Rust acts, Java judges):** the Rust GEN test commits the SAME chain on a copy, runs
+  `ExpireSnapshotsCleanup::commit_and_clean` with a COLLECTING deleter (no physical delete — collect-only so
+  Java can still read), lands `rust_table/.../final.metadata.json` + `rust_deleted.json`. Script: Java emits
+  its view of the Rust table, byte-diff vs Java-on-Java; assert the two deleted sets equal as sorted sets.
+- [x] **Direction 2 (Java acts, Rust verifies):** `interop_expire.rs` parses the Java-expired table, asserts
+  its surviving snapshot-id/refs set matches; AND Rust's own cleanup-candidate set (`clean_expired_files` on
+  the SAME pre-expire fixture, collect-only) equals Java's `java_deleted.json`.
+- [x] **`run-interop-expire.sh`:** set -euo pipefail; per-fixture chain mirroring run-interop-write-actions.sh
+  (reset → Java gen+deleted+meta → Rust gen+deleted → Java view-of-Rust + byte-diff + set-diff → Rust assert).
+  Fail-closed: missing artifact fails the chain; mvn verdict from OUTPUT sentinel (`|| true` + grep), not exit
+  code (the run-interop-dv.sh rule).
+- [x] **interop_expire.rs:** env-gated (`ICEBERG_INTEROP_EXPIRE_*`), clean no-op when unset, hard-asserts when
+  the script sets them. Mirrors interop_write_actions_meta.rs structure.
+- [x] **GAP_MATRIX:** ExpireSnapshots row cell — interop deferral RESOLVED for retention + ReachableFileCleanup
+  (both directions, the covered surface); stays 🟡 (IncrementalFileCleanup + cleanExpiredMetadata remain).
+  5-pipe audit.
+- [x] **Verify:** full chain GREEN (paste tail); Rust gate typos+fmt+clippy+`cargo test -p iceberg --lib` ×2
+  (baseline 1911); 2 SABOTAGE checks (resurrect a snapshot id in rust JSON ⇒ byte-diff fails; drop a file from
+  rust_deleted ⇒ set-diff fails); restore green.
+
+- [x] **A3 REVIEWER (2026-06-11, wt-orphan, Opus, adversarial): VERDICT — PASS with TWO harness fixes
+      (cross-strategy + descriptor injectivity) + one fixture-surface correction.** Read the chain, the
+      oracle, both view builders, and re-derived `RemoveSnapshots.cleanExpiredSnapshots` /
+      `hasNonMainSnapshots` / `hasRemovedNonMainAncestors` / `mainAncestors` / `FastAppend.apply` from
+      1.10.0 bytecode. Ran all 3 required sentinel injections + 3 sabotages (D1 byte-diff, D2 descriptor,
+      D2 summary) + the tag_protected flip + a strategy reflection probe.
+  - **VACUITY #1 (headline #3) FOUND + FIXED — the central claim was FALSE.** A reflection probe on
+        Java's `incrementalCleanup` field proved 4 of 5 fixtures (linear/stats/deletes/rewrite) ran Java's
+        **IncrementalFileCleanup**, NOT ReachableFileCleanup (the strategy the Rust side ports): a tag on
+        the HEAD leaves every survivor ON the post-expiry main ancestry ⇒ `hasNonMainSnapshots(current)`
+        is false ⇒ Java auto-selects Incremental. Only `tag_protected` (mid-chain tag) auto-selected
+        Reachable. The comparison passed only because the two strategies coincide on these shapes
+        (measured by force-probe) — a coincidence of shape, NOT 1:1 evidence of the Reachable port. FIX:
+        `((RemoveSnapshots) expireApi).withIncrementalCleanup(false)` (a real engine selector, package-
+        private, bytecode-offset-verified) forces Java's Reachable path for EVERY fixture against the
+        identical deleted sets ⇒ genuine Reachable-vs-Reachable. Surviving tag retained as the
+        ref-protection surface.
+  - **VACUITY #2 (headline #1) FOUND + FIXED — the descriptor was NON-INJECTIVE.** `<funnel>@ord<N>`
+        keyed only on the owning-snapshot ordinal, so two DIFFERENT content files added by the SAME commit
+        (a 2-file append) collapse to ONE token ⇒ a Rust-deletes-X / Java-deletes-Y swap passes set-equality
+        vacuously. FIX: cross-language-stable per-file discriminators on BOTH sides (`#rc<record_count>` for
+        content, `#a<>e<>d<>` file counts for manifests, `#sz<file_size>` for statistics; manifest lists
+        need none — one per snapshot). Offline fail-before/pass-after pin
+        `test_descriptor_token_is_injective_over_sibling_files_of_one_snapshot` (fails under the ordinal-only
+        scheme, passes after). Chain still green; `rewrite` now shows `content@ord0#rc10`/`manifest@ord0#a2e0d0`.
+  - **FIXTURE-SURFACE CORRECTION (headline #7): `deletes` overclaimed.** The delete manifest is carried
+        forward into the head ⇒ `manifestsToDelete` is empty ⇒ NEITHER side's cleanup ever READS the delete
+        manifest body (only manifest LISTS die). Corrected the oracle comment to scope the fixture to
+        metadata+list GC on a delete-bearing table; delete-manifest CONTENT cleanup is covered by the B2
+        unit tests, not here. `stats`/`tag_protected`/`rewrite`/`linear` surfaces all CONFIRMED genuine
+        (stats puffins on disk + in deleted set; tag flip from 2→3 deletions; rewrite fires content+manifest
+        funnels).
+  - **CONFIRMED (no change needed): headline #2** all 3 sentinel injections fail-closed (verify-throw ⇒
+        sentinel absent ⇒ fail; missing artifact ⇒ verify FAIL / diff exit 2 / emit mvn-exit-1 no `||true`;
+        double-run ⇒ `rm -rf TMP` wipes leftovers); **#4** view-copy drift is minimal (ONLY parent_ordinal
+        differs — mechanical diff), and the Java null-parent fix does NOT regress (run-interop-write-actions
+        + run-interop-dv both GREEN); **#5** FastAppend STOP-finding is REAL (1.10.0 bytecode `apply` offset
+        89-94 carries `allManifests` unfiltered vs Rust append.rs:148 `has_added/existing` filter), accurately
+        + findably recorded, correctly fixtured-away, NOT fixed (production read-only); **#6** D2 is a DEEP
+        `assert_eq!` on the full canonical view (summary-corruption sabotage fails it), D1 byte-diff catches a
+        Rust-metadata corruption.
+  - Files touched (harness/test only): `dev/java-interop/src/.../InteropOracle.java` (withIncrementalCleanup,
+        descriptor discriminators, deletes comment), `crates/iceberg/tests/interop_expire.rs` (discriminators
+        + injectivity pin), task/todo + task/lessons. transaction/ + common/snapshot_meta_view.rs +
+        Cargo/pom byte-untouched (`git diff --stat` empty). Gate CLEAN: typos/fmt/clippy `-D warnings` clean,
+        `cargo test -p iceberg --lib` **1911 ×2**, full chain GREEN. No commit.
+
 ## Carried-forward open items (full context in todo-archive/)
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the
