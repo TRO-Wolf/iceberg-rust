@@ -284,6 +284,47 @@ fn string_value(array: &ArrayRef, i: usize) -> Option<String> {
     }
 }
 
+/// Extract the `(id → category)` mapping from a fixture-A scan batch. The `category` column is the
+/// IDENTITY-PARTITION value; the `{id, data}` row compare deliberately drops it (Java's
+/// `readLiveRowsToJson` only emits `{id, data}`), so a partition-routing divergence in
+/// `merge_append` (a row materialized into the wrong partition) is invisible to the row compare.
+/// This map lets the fixture-A tests pin the partition column directly. Risk pinned: a wrong-partition
+/// write — the audit's Mutation 1 (route G to category="b") passed the row compare silently without it.
+fn extract_id_to_category(batch: &RecordBatch) -> Vec<(i64, Option<String>)> {
+    let id = batch
+        .column_by_name("id")
+        .expect("id column present")
+        .as_primitive::<Int64Type>();
+    let category = batch
+        .column_by_name("category")
+        .expect("category column present");
+    (0..batch.num_rows())
+        .map(|i| (id.value(i), string_value(category, i)))
+        .collect()
+}
+
+/// The expected `(id → category)` partition routing for fixture A: A's rows (10,20,30) and G (60)
+/// are `category="a"`; B (40) is `category="b"`. Sorted by id for a stable compare.
+fn expected_merge_append_categories() -> Vec<(i64, Option<String>)> {
+    vec![
+        (10, Some("a".to_string())),
+        (20, Some("a".to_string())),
+        (30, Some("a".to_string())),
+        (40, Some("b".to_string())),
+        (60, Some("a".to_string())),
+    ]
+}
+
+/// Collect + sort the `(id → category)` map from all batches, for the fixture-A partition pin.
+fn id_to_category_sorted(batches: &[RecordBatch]) -> Vec<(i64, Option<String>)> {
+    let mut pairs: Vec<(i64, Option<String>)> = Vec::new();
+    for batch in batches {
+        pairs.extend(extract_id_to_category(batch));
+    }
+    pairs.sort_by_key(|(id, _)| *id);
+    pairs
+}
+
 /// Load + parse a Java ground-truth rows JSON file as `Vec<ScanRow>`.
 fn load_java_rows(path: &Path) -> Vec<ScanRow> {
     let json =
@@ -533,6 +574,16 @@ async fn test_merge_append_data_gen_rust_writes_java_readable_table() {
         "Rust scan of the merge_append table must yield {{10,20,30,40,60}} (all rows, no deletes)"
     );
 
+    // Pin the IDENTITY-PARTITION column too: the `{id, data}` compare drops `category`, so a
+    // partition-routing divergence (a row in the wrong partition) would be invisible to it. Assert
+    // each id materialized into the correct partition before handing the table to Java.
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_merge_append_categories(),
+        "Rust merge_append must route each row to the correct identity(category) partition \
+         (A/G → 'a', B → 'b'); a wrong partition is invisible to the {{id,data}} row compare"
+    );
+
     // Land final metadata at a known path for Java.
     let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
     table
@@ -544,8 +595,8 @@ async fn test_merge_append_data_gen_rust_writes_java_readable_table() {
 
     println!(
         "interop_write_data merge_append GEN OK — Rust wrote {table_location} \
-         (fast_append A+B, merge_append G → merged manifest, Rust scan = {{10,20,30,40,60}}). \
-         Java verify-interop-merge-append-data reads it next."
+         (fast_append A+B, merge_append G → merged manifest, Rust scan = {{10,20,30,40,60}}, \
+         partitions A/G→a B→b pinned). Java verify-interop-merge-append-data reads it next."
     );
 }
 
@@ -746,9 +797,20 @@ async fn test_rust_reads_java_merge_append_data_table() {
         "live id set must be {{10,20,30,40,60}}"
     );
 
+    // Pin the IDENTITY-PARTITION column: Java's `java_merge_append_rows.json` only carries
+    // `{id, data}` (not `category`), so the row compare above cannot see a partition divergence.
+    // Assert Rust reads each Java-written row's partition correctly.
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_merge_append_categories(),
+        "Rust scan of the Java merge_append table must read each row's identity(category) \
+         partition correctly (A/G → 'a', B → 'b')"
+    );
+
     println!(
         "interop_write_data merge_append D1 OK — Rust scan of Java table = Java IcebergGenerics \
-         read: 5 live rows {{10,20,30,40,60}} (merge boundary carried all Existing entries)"
+         read: 5 live rows {{10,20,30,40,60}}, partitions A/G→a B→b (merge boundary carried all \
+         Existing entries)"
     );
 }
 

@@ -394,7 +394,7 @@ public final class InteropOracle {
         // under <dir>/table (identity(category), schema {id long, category string, data string}), adds TWO
         // real parquet data files (A: cat=a, ids 10/20/30; B: cat=b, id 40), fast-appends them, sets
         // commit.manifest.min-count-to-merge=2 to arm the merge, then merge-appends G(cat=a, id=60, "g").
-        // Emits Java's OWN IcebergGenerics read as java_merge_append_rows.json (ground truth = all 6 rows,
+        // Emits Java's OWN IcebergGenerics read as java_merge_append_rows.json (ground truth = all 5 rows,
         // no deletes). The Rust GEN test (ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR) produces the mirror
         // and the verify step proves Java reads the Rust-written table with the SAME live set.
         Path mergeAppendDataDir = requireFixturesDir("interop.merge_append_data.dir");
@@ -405,7 +405,7 @@ public final class InteropOracle {
         // (env ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR) wrote a REAL V2 partitioned table to
         // <dir>/rust_table: fast-append A+B, set min-count=2, merge-append G — landing final.metadata.json
         // + real parquet. Here Java loads that RUST-written metadata, reads with IcebergGenerics (which
-        // applies merge-on-read over the merged manifest), and asserts all 6 rows are present: {(10,a),
+        // applies merge-on-read over the merged manifest), and asserts all 5 rows are present: {(10,a),
         // (20,b),(30,c),(40,d),(60,g)} — no deletes, so the correctness point is the UNION of all files
         // AND the merge fires (carried Existing entries still scan). A failure is a REAL merge_append-level
         // write-incompatibility finding (Rust wrote a merge-appended table Java cannot read correctly).

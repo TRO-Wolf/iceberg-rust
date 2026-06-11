@@ -630,6 +630,60 @@ result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs 
       no Cargo diffs). ONE RETAINED FINDING from builder (documented, not blocking): Java verify's
       `LinkedHashMap<Long,String>` SET semantics silently dedup same-id duplicates — Rust `Vec.eq()` is
       the multiset guard. Cannot arise from production write chain; no code change needed.
+
+      **S3 OPUS EXIT AUDIT (2026-06-11, adversarial sweep of the whole branch before PR) — VERDICT:
+      PASS with one real coverage gap fixed + two harness-hygiene fixes; tier-calibration: SONNET-BUILDER
+      + OPUS-CRITIC for this work class.**
+      - **Cross-chain regression check (headline): CLEAN.** The shared `InteropOracle.java` additions are
+        purely additive (new dispatch arms before the existing ones, no edits to shared methods; clean
+        `mvn -o -q compile`). Re-ran ALL pre-existing `SnapshotMetaOracle` chains — `run-interop-write-actions.sh`,
+        `run-interop-expire.sh`, `run-interop-rowdelta-meta.sh` — plus both new chains (`write-data`,
+        `cherrypick`): all GREEN. No regression from the additions.
+      - **FINDING 1 (real gap, FIXED) — fixture A partition-column projection blind spot.** The S1 fixture A
+        (`merge_append`, V2 partitioned by `identity(category)`, schema `{id,category,data}`) reused the
+        `{id, data}` row dumper from the unpartitioned scan-exec template, so the `category` (partition)
+        column is compared on NEITHER side. Mutation 1 (route G to `category="b"`, id/data unchanged) left
+        the chain fully GREEN — a partition-routing divergence is silently invisible. FIX: pin the partition
+        column in the Rust GEN self-scan AND the Rust comparison (`id_to_category_sorted ==
+        expected_merge_append_categories()`); fail-before (the mutation now panics on the category pin) /
+        pass-after (full chain green) proven. Files: `crates/iceberg/tests/interop_write_data.rs`.
+      - **FINDING 2 (harness hygiene, FIXED) — `^FAIL`-guard inconsistency.** `run-interop-write-data.sh`
+        steps 4/5 checked only the positive `0 failures` sentinel; siblings (expire/cherrypick) ALSO
+        `grep '^FAIL '`. Single check is fail-closed in current code (Mutation 5 confirmed: a broken Rust
+        table flips the sentinel to `: 1 failures`), but diverges from the convention. Added the `^FAIL`
+        belt to both verify steps. Files: `dev/java-interop/run-interop-write-data.sh`.
+      - **FINDING 3 (doc typo, FIXED) — InteropOracle dispatch comments said "all 6 rows" for fixture A
+        (which has 5).** Code asserted 5 correctly; comment only. Fixed both occurrences.
+      - **Mutations run (6, distinct from the pairs'):** (1) wrong-partition route → SURVIVED → fixed;
+        (2) [absorbed-by-design — both sides re-sort, not a gap]; (3) fixture-A→B artifact path-swap →
+        FAILS CLOSED (panics on missing artifact); (4) planted stale poisoned `final.metadata.json` in
+        cherrypick TMP → wiped by step-1 `rm -rf`, hygiene effective; (5) broke a Rust data file → Java
+        verify prints `: 1 failures`, script fail-closed; (6) corrupt replay `java_meta.json`
+        `sequence_number` → cherrypick D2 canonical-view compare FAILS CLOSED. Every probe reverted; test
+        files byte-identical to their /tmp snapshots before fixes.
+      - **Verified-OK (no change):** S2 cherrypick canonical view IS sequence-number/operation/summary-deep
+        (Mutation 6 proof); the dedup substring `"already picked to create ancestor"` IS genuine Java 1.10.0
+        output (observed live: `Cannot cherrypick snapshot %s: already picked to create ancestor %s`);
+        fixture B (`rewrite_files`) is unpartitioned `{id,data}` so its row compare IS full-schema; the
+        S1-builder fixture-B redesign + the recorded position-vs-equality-delete lesson are accurate; the
+        GAP_MATRIX cells are correctly scoped (merge_append "V2 partitioned (identity(category))",
+        RewriteFiles "Unpartitioned 2-field"; multi-spec/multi-bin/partitioned-rewrite deferred — NOT
+        over-broad). Both S-fixtures are unpartitioned-or-single-spec as the brief expected.
+      - **House:** gate CLEAN from worktree root — typos clean, `cargo fmt --all -- --check` clean,
+        `cargo clippy --all-targets --workspace --exclude iceberg-sqllogictest -- -D warnings` clean,
+        `cargo test -p iceberg --lib` **2000 ×2** (no src/** edit ⇒ count unchanged, as expected),
+        both new chains GREEN end-to-end after fixes. GAP_MATRIX pipe audit clean (all `^|` rows = 5).
+        Tree scope: only `interop_write_data.rs` + `run-interop-write-data.sh` + the InteropOracle comment
+        fix — NO `crates/iceberg/src/**`, NO Cargo/pom/lock. No commit.
+      - **TIER CALIBRATION VERDICT — SONNET-BUILDER + OPUS-CRITIC.** The Sonnet pairs handled the
+        load-bearing SEMANTICS well (seq-preservation redesign, byte-deep canonical views, genuine
+        bytecode-pinned dedup message, all sabotages fail-closed). The single miss that mattered was a
+        COVERAGE-GRANULARITY gap — a row compare sound for its columns but silently excluding the
+        partition column — which is invisible to the "does it fail on corruption" mutation mandate Sonnet
+        ran, and surfaces only on the projection-completeness axis ("what field does this compare NOT
+        see?"). That axis is the Opus-critic's distinctive value on templated-interop work. Full-Sonnet
+        risks shipping vacuous-on-the-uncovered-axis evidence; keep-Opus is over-provisioned for work this
+        templated. Sonnet-builder + Opus-critic is the calibrated split.
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** cherrypick `stageOnly` WAP-write path, ORC/Avro breadth, view ops, incremental-scan interop.
 - [ ] **THIS BRANCH (Group B, Fable actor-critic, user-approved 2026-06-11): variant-type

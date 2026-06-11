@@ -1552,3 +1552,48 @@ How to use it (see the manuals' §2):
   sentinel line. The script's `|| true` + `grep "verify-interop-cherrypick: 0 failures"` pattern
   catches this correctly — the absence of the sentinel exits 1. Design rule: the sentinel-presence
   check is the primary guard, not the `^FAIL` check; a crash before any sentinel emission fails closed.
+
+### 2026-06-11 (Wave-4 Group S — S3 Opus EXIT AUDIT of the Sonnet S1/S2 interop branch)
+- **A row-canonicalization that drops a column is a PROJECTION, not a full-schema compare — and a
+  partition column dropped on BOTH sides is a silent partition-routing blind spot.** *Why:* S1's
+  fixture A (`merge_append`) is a V2 table partitioned by `identity(category)` with schema
+  `{id, category, data}`, but the shared `readLiveRowsToJson(table, "data")` + the Rust `ScanRow{id,
+  data}` only carry `{id, data}` — the `category` (partition) column is serialized on NEITHER side.
+  The auditor's Mutation 1 (route G to `category="b"` instead of `"a"`, id/data unchanged) left the
+  ENTIRE chain GREEN: Java's `IcebergGenerics` read still returned `{(10,a)..(60,g)}` and the Rust
+  compare matched. A real `merge_append` partition-routing divergence (identity-constant materialized
+  to the wrong bucket, a partition-field reorder) would slip through. FIX: pin the partition column
+  directly in the Rust GEN self-scan AND the Rust comparison (`id_to_category_sorted ==
+  expected_merge_append_categories()`), fail-before/pass-after proven. RULE: whenever an interop row
+  compare reuses a `{id, data}` dumper on a PARTITIONED fixture, the partition column is uncompared —
+  pin it separately, or the fixture only proves the non-partition columns.
+- **Reusing a row dumper from an UNPARTITIONED template onto a PARTITIONED fixture inherits the
+  template's projection silently.** *Why:* S1 reused `interop_scan_exec`'s `{id, data}` row shape
+  (designed for the unpartitioned scan-exec fixtures) for the partitioned merge_append fixture without
+  widening it. The dumper was correct for its original fixtures; the gap is in the REUSE onto a richer
+  schema. When a templated harness extends a row compare to a new fixture SHAPE, re-derive what columns
+  the fixture adds and confirm each is in the compare.
+- **A `^FAIL`-line guard is the cheap belt to the sentinel-absence suspenders — keep the two
+  fail-closed triggers consistent across sibling scripts.** *Why:* `run-interop-write-data.sh` checked
+  only `! grep '… 0 failures'` while its siblings `run-interop-expire.sh` / `run-interop-cherrypick.sh`
+  ALSO `grep '^FAIL '`. The single check is fail-closed in the current code (a real failure flips the
+  count sentinel to `: 1 failures`), but it diverges from the established convention and would miss a
+  verify that prints a FAIL line while desyncing its count. Added the `^FAIL` guard to both verify
+  steps. RULE: when a new harness script templates from a sibling, copy its fail-closed pattern
+  VERBATIM — a "simpler" sentinel check is a latent inconsistency, not a cleanup.
+- **The shared `InteropOracle.java` is a cross-chain blast surface — re-run EVERY pre-existing chain
+  after additions.** *Why:* S1/S2 added classes + dispatch arms to the one `InteropOracle.java` that
+  all chains compile. The auditor re-ran write-actions, expire, and rowdelta-meta (all `SnapshotMetaOracle`
+  consumers) plus the two new chains: all green, confirming the additions were purely additive (new
+  `case` arms before the existing ones, no edits to shared methods). A clean `mvn -o -q compile` is a
+  fast first signal (one compile error from the additions breaks every chain), but only a per-chain RUN
+  proves no semantic regression.
+- **TIER NOTE (Sonnet-on-templated-interop):** the Sonnet pairs handled the load-bearing semantics
+  WELL — the seq-preservation fixture B redesign (position→equality delete) was correct and matched the
+  cited lesson, the cherrypick dedup message/kind pins are genuine Java 1.10.0 output, the canonical
+  views are byte-deep and catch summary/seq corruption, and all sabotages fail closed. The miss was a
+  COVERAGE-GRANULARITY gap invisible to "does it fail on corruption" mutation testing: the compare was
+  sound for the columns it covered but silently excluded the partition column. Sonnet's mutation
+  mandate broke load-bearing BEHAVIORS one at a time; it did not ask "what column/field does this
+  compare NOT see?" — the projection-completeness axis. That axis is the Opus-critic's distinctive
+  catch on templated-interop work.

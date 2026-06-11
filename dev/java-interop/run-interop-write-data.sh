@@ -82,8 +82,12 @@ echo "==> [4/6] Java: verify-interop-merge-append-data — Java reads the Rust-w
 VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-merge-append-data \
   -Dinterop.merge_append_data.dir="${MERGE_DIR}")" || true
 echo "${VERIFY_OUT}"
-if ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-merge-append-data: 0 failures'; then
-  echo "==> FAILED — verify-interop-merge-append-data did not emit the '0 failures' sentinel."
+# Fail-closed two ways (matching run-interop-expire.sh / run-interop-cherrypick.sh): a per-check
+# `^FAIL ` line OR the absence of the `0 failures` sentinel. The `^FAIL` guard catches a verify that
+# emits a FAIL line but desyncs its count, which the positive-sentinel check alone would miss.
+if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
+  || ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-merge-append-data: 0 failures'; then
+  echo "==> FAILED — verify-interop-merge-append-data emitted a FAIL line or did not emit the '0 failures' sentinel."
   exit 1
 fi
 
@@ -91,8 +95,10 @@ echo "==> [5/6] Java: verify-interop-rewrite-data — Java reads the Rust-writte
 VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-rewrite-data \
   -Dinterop.rewrite_data.dir="${REWRITE_DIR}")" || true
 echo "${VERIFY_OUT}"
-if ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-rewrite-data: 0 failures'; then
-  echo "==> FAILED — verify-interop-rewrite-data did not emit the '0 failures' sentinel."
+# Fail-closed two ways (see the merge-append step above).
+if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
+  || ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-rewrite-data: 0 failures'; then
+  echo "==> FAILED — verify-interop-rewrite-data emitted a FAIL line or did not emit the '0 failures' sentinel."
   exit 1
 fi
 
