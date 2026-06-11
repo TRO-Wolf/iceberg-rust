@@ -118,6 +118,74 @@ judgment-heavy → frontier window before 2026-06-22; templated breadth → Opus
         opendal-memory; left as a noted offline-coverage gap). Gate CLEAN: typos/fmt/clippy `-D warnings`
         clean; `cargo test -p iceberg --lib` **1887 passed ×2** (1882 +5 reviewer tests); opendal --lib
         4 passed. Same file set + task/. No commit.
+  - [x] **A2 BUILDER (2026-06-11, wt-orphan, Opus): the `DeleteOrphanFiles` ACTION.** New module
+        `crates/iceberg/src/maintenance/{mod.rs,delete_orphan_files.rs,tests.rs}`, wired
+        `pub mod maintenance` in lib.rs (1 doc'd line). **This DELETES files.**
+    - [x] **API:** `DeleteOrphanFiles::new(table)` + `.location`, `.older_than` (default now−3d),
+          `.delete_with`, `.prefix_mismatch_mode` (default Error), `.equal_schemes` (defaults
+          `{s3n,s3a→s3}` MERGED with user, comma-flatten), `.equal_authorities` (user-only, flatten),
+          `.execute() -> Result<DeleteOrphanFilesResult{orphan_file_locations, delete_failures}>`.
+          `PrefixMismatchMode {Error,Ignore,Delete}` + `from_string`. `executeDeleteWith` DEFERRED.
+    - [x] **Valid-files universe — RE-DERIVED locally (NOT extracted from expire_cleanup).** The
+          orphan universe spans ALL snapshots WITHOUT the `is_alive()` filter expire_cleanup uses
+          (Java `ManifestFiles.read`); expire_cleanup computes a `before−after` delta — structurally
+          different, no shared helper worth the rule-of-three. NET: ZERO expire_cleanup lines touched,
+          map.md not stale. Universe = all content files (every entry) + all manifests + all manifest
+          lists + current/previous metadata.json (non-recursive) + version-hint + stats/partition-stats.
+    - [x] **Listing + hidden-path filter:** `FileIO::list` + `created_at_millis < older_than` +
+          `PartitionAwareHiddenPathFilter` (segment-wise, named-partition `_<field>=` exception).
+    - [x] **Orphan join + URI normalization:** local Hadoop-`Path`-equivalent `split_uri` →
+          (scheme/authority/path); join on PATH; `uriComponentMatch` (null/empty valid matches any
+          actual ⇒ scheme-less local path matches `file://` actual); PrefixMismatchMode ×3 with Java's
+          verbatim ERROR message.
+    - [x] **Deletion:** sequential via delete_with; per-file failures collected (not abort); full
+          orphan list returned regardless of delete success.
+    - [x] **Tests:** 7 unit (split/normalization/equal-schemes/PrefixMismatchMode×3/any-compatible/
+          hidden-path/version-hint) + 9 e2e (crown-jewel by-category, olderThan grace, hidden-path
+          named-partition, location override, delete_with-exact-set, delete-failure-collected,
+          GC gate, copy-on-write history survival, ERROR-mode-clean). 7 mutations run, all caught
+          except the unconstructible is_alive-on-all-snapshots one (documented coverage limit).
+    - [x] **Docs:** GAP_MATRIX ❌→🟡 (5-pipe audit clean), this file, lessons.
+
+      **Outcome (2026-06-11):** A2 landed. Files: `maintenance/{mod,delete_orphan_files,tests}.rs`
+      (new), `lib.rs` (+1 `pub mod maintenance`), GAP_MATRIX (1 row), todo, lessons. ZERO
+      expire_cleanup.rs / map.md edits (re-derived the universe — no extraction). Gate CLEAN from
+      wt-orphan root: typos clean, fmt clean, clippy `-D warnings` clean (workspace ex-sqllogictest),
+      `cargo test -p iceberg --lib` **1903 passed ×2** (baseline 1887 + 16). expire_cleanup's 17 tests
+      green + untouched. 7 builder mutations: M2 partition-exception-drop, M3 olderThan-flip,
+      M4 full-list→deleted-only, M5 manifest-list-drop, M6 manifest-drop, M7 GC-gate-skip ALL caught;
+      M1 (is_alive filter on the all-snapshots universe) SURVIVED — documented as unconstructible with
+      real commits (the difference is invisible for normally-written tables). No commit. Deferred
+      loudly: executor parallelism, bulk deletes, `compareToFileList`/streaming, Java interop (row 🟡).
+  - [x] **A2 REVIEWER (2026-06-11, wt-orphan, Opus): adversarial review — VERDICT: PASS with one
+        builder claim refuted + two SAFE divergences documented.** Read the module in full, the Java
+        MAIN action + core/api 1.10.0 helpers (FileURI/HiddenPathFilter/FileSystemWalker), and ran a
+        Hadoop-`Path` ground-truth probe (`java -cp hadoop-client-api`). **M1 IS CONSTRUCTIBLE and was
+        KILLED** — the builder's "unconstructible" claim is wrong: commit data_a → copy-on-write-delete
+        it (tombstone) → EXPIRE the adding snapshot via the fork's own ExpireSnapshots (metadata-only,
+        deletes no files) → data_a is now referenced ONLY by a Deleted tombstone, on disk. The
+        no-liveness-filter universe spares it; the `is_alive()` mutation deletes it (history
+        corruption). Added `test_tombstone_only_referenced_file_is_not_orphan_after_expire` (kills M1)
+        and updated the stale "unconstructible" NOTE. Also found the olderThan `<`→`<=` mutation
+        SURVIVED (no boundary test) → added `test_older_than_cut_is_strict_less_than_at_the_exact_boundary`
+        (kills it) + `test_default_older_than_makes_fresh_table_sweep_a_no_op`; partition-stats inclusion
+        was coded-not-tested → added `test_statistics_and_partition_statistics_files_are_not_orphan`
+        (kills the category-drop); list-error propagation, hidden-parent-dir, and the inverse-`file://`
+        / trailing-slash compositions now pinned (8 reviewer tests total). Re-ran the builder's 5
+        in-scope mutations (scheme-detect, ERROR-as-orphan, abort-on-first-delete-fail, M-stats,
+        list-`?`-drop) — ALL killed by the suite. **Two SAFE divergences documented (under-deletion,
+        never corruption):** (a) `split_uri` does NOT collapse `//` nor decode `%xx` like Hadoop —
+        harmless because both metadata + listing sides carry the identical raw string for a Rust-native
+        table; (b) a scheme-qualified table `location` (`file://…`) on the local-fs backend makes the
+        hidden filter's `relative_under` fail to strip the base → every file masked-as-hidden → the
+        sweep is a silent no-op (S3/Glue via OpenDAL re-prefix listed entries WITH the scheme, so they
+        agree and sweep normally). MINOR: the ERROR-message text says `'IGNORE'` where Java MAIN says
+        `'NONE'` (a deliberate correction — `NONE` is not a valid mode — but NOT "verbatim" as the
+        module doc claims; no test pins the text). Gate CLEAN from wt-orphan root: typos clean, fmt
+        clean, clippy `-D warnings` clean (workspace ex-sqllogictest), `cargo test -p iceberg --lib`
+        **1911 passed ×2** (1903 baseline + 8 reviewer tests). expire_cleanup.rs byte-untouched
+        (`git diff --stat` empty); production `delete_orphan_files.rs` matches its pre-review backup
+        byte-for-byte (every mutation reverted). No commit.
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** data-level write-action interop paydown,
       cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.

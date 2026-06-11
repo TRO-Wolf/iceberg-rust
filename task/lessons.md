@@ -1026,3 +1026,75 @@ How to use it (see the manuals' §2):
   un-pinnable on opendal-memory (flat store emits no dir markers); dropping it changed nothing in the
   smoke test. Don't contort a memory test to "catch" it — flag it as needing a live S3/HDFS fixture
   (the same class as the builder's `file_io_s3_test`-needs-MinIO flag) and move on.
+
+### 2026-06-11 (DeleteOrphanFiles A2 — the `DeleteOrphanFiles` action, BUILDER Opus, wt-orphan)
+- **DeleteOrphanFiles' valid-file universe is the OPPOSITE liveness rule from `expire_cleanup`'s, so
+  do NOT extract a "reachability helper" — re-derive it locally.** *Why:* `expire_cleanup`
+  (`ReachableFileCleanup`) computes a `before − after` DELTA and subtracts on `is_alive()` (status !=
+  DELETED). DeleteOrphanFiles' universe is the FULL reachable set across ALL snapshots with NO
+  liveness filter — Java `BaseSparkAction.contentFileDS` flat-maps each manifest through
+  `ManifestFiles.read`/`readDeleteManifest` (the iterators that yield EVERY entry, incl. DELETED
+  tombstones), NOT `liveEntries()`. The two are structurally different set-algebras over the same
+  primitives (`load_manifest_list` → `load_manifest` → entries); sharing code would mean a flag that
+  toggles liveness — the wrong-abstraction trap. Re-deriving cost ~40 lines and touched ZERO
+  expire_cleanup lines (its 17 tests stayed green by CONSTRUCTION, not by re-running an extraction).
+  When two callers want the same DATA primitive but OPPOSITE filtering, that's not a shared helper.
+- **The DELETED-tombstone reachability clause is unconstructible-distinct from a live-only walk on a
+  multi-snapshot table — pin the OBSERVABLE risk (history survival) and NAME the coverage limit.**
+  *Why:* mutation M1 (add `if entry.is_alive()` to the universe collection — the `expire_cleanup`
+  behavior) SURVIVED the whole suite. Reason: a file added by ANY snapshot is ALIVE in that snapshot's
+  manifest, and the universe spans all snapshots, so a file referenced ONLY by a DELETED tombstone
+  (with no live entry anywhere) cannot be produced by real commits. So the no-liveness-filter is
+  Java-faithful but behaviorally identical to live-only for normally-written tables. Kept the
+  Java-faithful no-filter; renamed the test to what it ACTUALLY pins (a copy-on-write-deleted file
+  survives because the PRIOR snapshot references it) and documented the limit in the test + module
+  doc. Same class as A1's opendal-`is_file`-untestable-on-memory gap: name it, don't fake it.
+- **URI normalization's load-bearing asymmetry: a scheme-less VALID path matches an actual of ANY
+  scheme, but a concrete VALID scheme does NOT match an absent actual scheme.** *Why:* Java
+  `FileURI.uriComponentMatch(valid, actual)` = `Strings.isNullOrEmpty(valid) ||
+  valid.equalsIgnoreCase(actual)` (core 1.10.0 bytecode-verified) — the NULL/EMPTY test is on the
+  VALID (metadata) side only. So metadata storing bare `/tmp/.../a.parquet` (scheme None) matches a
+  listing returning `file:///tmp/.../a.parquet` (scheme `file`) — null valid matches any actual; but
+  metadata storing `file://...` vs a bare-path listing is a REAL conflict (`file` != None). Getting
+  the direction backwards makes every local-fs table either report all files as scheme-conflicts
+  (ERROR-fail) or conflate distinct schemes (delete live data). Pinned both directions at the unit
+  level. The local `split_uri` mirrors Hadoop `new Path(s).toUri()` for the writer-produced URI
+  shapes (bare path / `scheme:/p` / `scheme://auth/p` / `scheme:///p`); Windows drive letters are
+  flagged as out-of-parity-scope.
+- **The DeleteOrphanFiles ACTION is MAIN-source (no 1.10.0 Spark bytecode locally), but every
+  load-bearing PRIMITIVE it delegates to IS in core/api 1.10.0 — javap them and flag the residue.**
+  *Why:* `DeleteOrphanFilesSparkAction` lives in `iceberg-spark` (no 1.10.0 spark jar here), so the
+  defaults (3-day `olderThan`, `EQUAL_SCHEMES_DEFAULT`, merge order), the messages, and the
+  universe composition are MAIN-only. But `FileURI`, `DeleteOrphanFiles$PrefixMismatchMode`,
+  `HiddenPathFilter`, and `FileSystemWalker$PartitionAwareHiddenPathFilter` ARE in
+  iceberg-core/iceberg-api 1.10.0 — javap-verified the match rule, the enum, the `_`/`.` hidden
+  rule, and the `_<field>=` partition exception. State the MAIN/bytecode split explicitly in the
+  module doc so the reviewer/next-agent knows which facts are 1.10.0-pinned and which ride MAIN.
+
+### 2026-06-11 (DeleteOrphanFiles A2 — REVIEWER Opus, wt-orphan)
+- **"Unconstructible with real commits" is almost never true — reach for a SECOND maintenance action
+  to construct the missing precondition.** *Why:* the A2 builder declared M1 (an `is_alive()` filter
+  on the all-snapshots universe) unconstructible because a file added by any snapshot is alive in that
+  snapshot's manifest. That's true UNTIL you EXPIRE the adding snapshot. The fork's own ExpireSnapshots
+  is metadata-only (it deletes no files — cleanup is the opt-in B2 sibling), so expiring S1 after a
+  copy-on-write delete leaves the data file on disk referenced ONLY by S2's DELETED tombstone — exactly
+  the tombstone-only state. The orphan sweep must spare it (the no-liveness universe does; an `is_alive`
+  filter deletes it → history corruption). Lesson: when a mutation "can't be triggered," compose two
+  actions (write + expire, append + rewrite, etc.) before believing it. The kill test cost ~70 lines.
+- **For a deleter, prove a URI-normalization divergence is SAFE by checking BOTH representation sides
+  come from the same producer — don't just diff against the Java oracle.** *Why:* Rust `split_uri` does
+  NOT collapse `//` or decode `%xx` the way Hadoop `new Path(s).toUri()` does (ground-truth via
+  `java -cp hadoop-client-api PathProbe`). That LOOKS like a split-the-live-file bug, but it is SAFE
+  because the metadata-writer and the lister both carry the IDENTICAL raw string for a Rust-native
+  table, so they still join on the same key. The split only bites cross-engine (Java-normalized metadata
+  vs Rust-listed paths) — i.e. interop, which is deferred. Verify the no-corruption claim with an e2e
+  trailing-slash-warehouse probe, not just a unit diff.
+- **A scheme-qualified table `location` can silently NO-OP the orphan sweep on a scheme-stripping
+  backend — under-deletion, safe, but a real masking limitation.** *Why:* the hidden-path filter walks
+  `relative_under(base = table.location, listed)`; when `base` is `file://…` but the local-fs lister
+  returns BARE paths (it strips `file://`), `strip_prefix` fails → every file is treated as hidden →
+  zero candidates → the sweep deletes nothing (orphans included). This NEVER deletes live data (the bias
+  is correct), but it means a `file://`-located table is never cleaned. OpenDAL (S3/Glue) re-prefixes
+  listed entries WITH the scheme, so base and listing agree there. If this needs fixing later, normalize
+  `self.location` to the listing's representation BEFORE the hidden filter — but that touches a deleter's
+  match surface, so pin it heavily first. Flagged, not fixed (architectural, out of reviewer scope).
