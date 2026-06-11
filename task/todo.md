@@ -454,6 +454,14 @@ via ignore_equality_deletes; rows stay GONE) + seq-drop mutation resurrects them
 canAdd `<=` inclusive) — all MATCH the Rust. Mutation sweep: 4 builder + partition-default-spec-drop, validate-drop,
 result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs only.
 
+- [ ] **THIS BRANCH (Wave 4 Group S, SONNET actor-critic + Opus exit audit, user-approved
+      2026-06-11): interop paydown** — S0: orchestrator-authored actor-critic addendum to
+      skills/Sonnet.md (mutation mandate, fail-closed harness rules, lowered STOP-and-report
+      threshold); S1: DATA-level interop for `merge_append` + `RewriteFiles` (Java reads back
+      Rust-written rows and vice versa; both cells say "data-level interop open"); S2: cherrypick
+      METADATA-level interop (`stageOnly` write path explicitly OUT — production code); S3: one
+      Opus auditor sweeps the whole branch diff before PR. Runs in worktree `wt-interop` parallel
+      to Group O (`phase6/rewrites-and-debt`, Opus) and Group F (`phase4/variant-schema`, Fable).
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** data-level write-action interop paydown,
       cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.
