@@ -69,12 +69,55 @@ Directive (user, 2026-06-11): table DataFusion/RePark; run this fork's Roadmap t
 full 1:1 Java replacement**. Sequencing in Roadmap.md "Headline gap AREAS" (handoff-aware:
 judgment-heavy → frontier window before 2026-06-22; templated breadth → Opus).
 
-- [ ] **Next arc proposal (awaiting user green-light): Phase-2/3 closeout** — multi-spec writes
-      (producer per-spec manifests; unlocks the documented default-spec-only divergences),
-      the constants-map increment (reverted 2026-06-08; known latent type bugs; gated on
-      datafusion + integration read tests), `removeRows` apply-side, the `dv_seq >= data_seq`
-      index-validation residue.
-- [ ] **Then: maintenance actions** (`ExpireSnapshots` first — the GC-safety judgment increment).
+- [x] **Phase-2/3 closeout** — LANDED (PR #28, 2026-06-11): multi-spec writes, constants-map,
+      `removeRows` apply-side, `dv_seq >= data_seq` index validation.
+- [x] **Maintenance actions: `ExpireSnapshots`** — LANDED (PR #29, 2026-06-11): B1 retention +
+      B2 `ReachableFileCleanup`. Deferred residue on the GAP_MATRIX row.
+- [ ] **THIS BRANCH (Group A, Opus actor-critic, user-approved 2026-06-11):
+      `DeleteOrphanFiles`** — A1: `Storage::list` primitive (trait default + local_fs/memory
+      impls + `FileIO::list`); A2: the action itself (reachable-set vs listed-set, URI
+      normalization + `PrefixMismatchMode`, `olderThan` grace, hidden-path filtering). Runs in
+      worktree `wt-orphan` parallel to Group B (`phase4/variant-groundwork`, Fable).
+  - [x] **A1 BUILDER (2026-06-11, wt-orphan, Opus):** `Storage::list` / `FileIO::list` prefix-listing
+        primitive. `FileInfo { location, size, created_at_millis }` (mirrors Java `FileInfo(String,
+        long, long)`; `created_at_millis` ← last-modified, per Java object-store impls). Trait default
+        body errors `FeatureUnsupported` (naming the op) so external `#[typetag::serde]` implementors
+        keep compiling. RECURSIVE semantics (Java `HadoopFileIO.listPrefix` → `listFiles(prefix,
+        recursive=true)`, files-only). **Prefix-semantics decision: mirror each backend's existing
+        `delete_prefix` so `list`/`delete_prefix` agree on "under the prefix"** — local_fs = DIRECTORY
+        semantics (walk the dir tree; sibling `ab2/` never matches prefix `ab`), memory = STRING-PREFIX
+        semantics (append trailing `/`, then `starts_with`). Documented divergence: returns
+        `Vec<FileInfo>` (eager), not Java's lazy `Iterable`. OpenDAL stretch: IMPLEMENTED via
+        `op.list_with(prefix).recursive(true)` + per-file `stat` for authoritative size/last-modified
+        (timestamp via `From<raw::Timestamp> for SystemTime` — no jiff Cargo dep); 2 memory-service
+        smoke tests (recursive+prefix-bounded, empty-prefix).
+        Outcome: gate CLEAN from wt-orphan root — typos clean, fmt clean, clippy `-D warnings` clean
+        (workspace ex-sqllogictest), `cargo test -p iceberg --lib` **1882 passed ×2** (baseline 1870
+        +12: 1 default-method + 5 local_fs + 4 memory + 2 file_io), `cargo test -p
+        iceberg-storage-opendal --lib` 3 passed (incl. 2 new). Files: io/{mod,file_io}.rs,
+        io/storage/{mod,local_fs,memory}.rs, storage/opendal/src/lib.rs. FLAG: opendal
+        `file_io_s3_test` (4 tests) fail — pre-existing, need a live MinIO at localhost:9000 (not the
+        offline gate; untouched `exists`/`input`/`output` paths). A2 NOT started.
+  - [x] **A1 REVIEWER (2026-06-11, wt-orphan, Opus, adversarial):** Verified all 9 points 3 ways
+        (read+cite / independent probes / mutation-test). 1 BUG FOUND + fixed: memory `list` had an
+        `is_empty()` shortcut absent from `delete_prefix`, so `list("memory://")` reported ALL keys
+        while `delete_prefix("memory://")` removed NONE — broke the builder's stated list/delete_prefix
+        agreement invariant at the empty/root prefix (over-listing = over-delete direction). Fixed to
+        match `delete_prefix` exactly (drop `is_empty()`); fail-before/pass-after test
+        `test_list_set_equals_delete_prefix_set_including_empty_prefix`. CONFIRMED-SAFE: symlinks
+        (cycle terminates, prefix-escape can't leak outside files — `DirEntry::metadata` is lstat-based
+        and agrees with `remove_dir_all`; now documented + 2 tests); walk errors propagate loud
+        (unreadable-subdir → `Unexpected`, matches Java RemoteIterator; +1 test); opendal timestamp math
+        exact ms (epoch→0, pre-epoch clamps 0, round-trips; +1 test); all int casts saturate not wrap;
+        default loud-error pins ErrorKind+msg; `MemoryEntry` pub(crate) no public-API/serde change.
+        DOCUMENTED divergence: file-as-prefix returns empty vs Hadoop `listFiles(file)` returning the
+        file (conservative, can only under-delete; noted in `FileIO::list` doc). Mutations run: memory
+        boundary-guard (caught), local_fs no-descend (caught), default→`Ok(vec![])` (caught), opendal
+        boundary-guard (caught), opendal base-reconstruction (caught), opendal `is_file()` filter (NOT
+        caught — directory markers only appear on object-store/HDFS backends, untestable on
+        opendal-memory; left as a noted offline-coverage gap). Gate CLEAN: typos/fmt/clippy `-D warnings`
+        clean; `cargo test -p iceberg --lib` **1887 passed ×2** (1882 +5 reviewer tests); opendal --lib
+        4 passed. Same file set + task/. No commit.
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** data-level write-action interop paydown,
       cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.

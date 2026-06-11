@@ -958,3 +958,71 @@ How to use it (see the manuals' §2):
   all 7 matched, so the compact in-repo pins stand. A reviewer of a new CRC-pinned fixture
   set should repeat that probe rather than trust CRC32 alone (CRC collisions are trivial to
   miss adversarially).
+### 2026-06-11 (DeleteOrphanFiles A1 — `Storage::list` prefix primitive, BUILDER Opus, wt-orphan)
+- **DO mirror EACH storage backend's existing `delete_prefix` prefix semantics in `list`, not a
+  single global rule.** *Why:* Java's `SupportsPrefixOperations` interface doc explicitly says
+  hierarchical filesystems may require the prefix to NAME A DIRECTORY while key/value object stores
+  allow ARBITRARY STRING PREFIXES. The fork's `delete_prefix` already split exactly this way —
+  `local_fs` uses directory semantics (`path.is_dir()` → `remove_dir_all`), `memory` uses
+  string-prefix semantics (append `/`, `starts_with`). `list` and `delete_prefix` MUST agree per
+  backend on "under the prefix": a disagreement means A2 (the orphan-file GC) lists with one rule
+  and deletes with another, which is a data-loss class. local_fs `list` walks the dir tree
+  (sibling `ab2/` never matches prefix `ab` because they are distinct directory boundaries);
+  memory `list` enforces the trailing-`/` boundary so prefix `dir` excludes sibling key `dir2/...`.
+  Pinned both backends' sibling-boundary case (the over-listing = over-deletion risk).
+- **DO make the trait DEFAULT body for an optional capability ERROR LOUDLY (`FeatureUnsupported`),
+  never return an empty `Vec`.** *Why:* an empty listing reads downstream (A2) as "no orphans /
+  everything orphan" — a silent empty answer from a backend that simply cannot enumerate would
+  corrupt the orphan decision. The defaulted body on the `#[typetag::serde]` `Storage` trait also
+  keeps external implementors compiling (the reason it is defaulted rather than required). Pinned
+  with a stub `Storage` that overrides every method EXCEPT `list` and asserts the error kind +
+  message-names-the-op.
+- **opendal 0.55 `Metadata::last_modified()` returns `opendal::raw::Timestamp` (a newtype over
+  `jiff::Timestamp`), NOT `chrono::DateTime` and NOT a directly-millisecond-able type.** *Why it
+  bites:* the obvious `.as_millisecond()` (a `jiff::Timestamp` inherent method) does NOT exist on
+  the opendal newtype, and naming `jiff::` in a `use` would need `jiff` as a DIRECT dep (Cargo edit
+  — forbidden). The clean escape: opendal provides an infallible `impl From<raw::Timestamp> for
+  std::time::SystemTime`, so convert through `SystemTime` and `duration_since(UNIX_EPOCH)` — pure
+  `std`, zero new deps. (The 0.55 upgrade note saying "metadata APIs now use `jiff::Timestamp`" is
+  about the INNER type; the surfaced public type is `opendal::raw::Timestamp`.)
+- **`Duration::as_millis()` is `u128`; guard the `i64` conversion with `i64::try_from(...).unwrap_or(
+  i64::MAX)`, not `as i64`.** *Why:* a far-future mtime would wrap silently under `as`; `try_from`
+  saturates. Same guard used in all three `*_to_millis` helpers (local_fs mtime, memory write-time,
+  opendal last-modified), and pre-epoch clamps to `0` so `created_at_millis` stays non-negative
+  (the test asserts `>0 && <= now`).
+- **The OpenDAL stretch needed a per-file `stat`, not the lister's inline metadata.** *Why:* some
+  opendal backends do not populate `content_length`/`last_modified` on a `list` entry; `stat`-ing
+  each FILE entry (skipping dir markers via `entry.metadata().is_file()`) guarantees authoritative
+  size + mtime across backends. Cost is one extra request per file — acceptable for a
+  correctness-first GC-input primitive; documented in the method doc. Location reconstruction:
+  entries' `.path()` are operator-relative, so re-prefix with `base = &path[..path.len() -
+  relative_path.len()]` (the scheme-qualified portion `create_operator` stripped).
+
+### 2026-06-11 (DeleteOrphanFiles A1 — REVIEWER Opus, wt-orphan)
+- **DON'T add an `is_empty()` shortcut to a `list` prefix-construction that the matching
+  `delete_prefix` lacks — it silently breaks the list/delete_prefix agreement at the empty/root
+  prefix.** *Bug found & fixed:* `MemoryStorage::list` used `if normalized.is_empty() ||
+  normalized.ends_with('/')` while `delete_prefix` used only `if normalized.ends_with('/')`. For an
+  empty normalized prefix (`memory://`), `list` matched on `""` (every key) but `delete_prefix` built
+  `"/"` and matched nothing (memory keys are stored leading-slash-stripped). So `list` reported all
+  keys while `delete_prefix` removed none — the over-listing direction, the exact data-loss class A2
+  guards against. Fix: make `list`'s prefix construction byte-identical to `delete_prefix`'s. When two
+  methods must "agree," write the boundary logic ONCE and copy it verbatim; any asymmetry is a latent
+  bug. (Note: opendal had the same `is_empty()` branch but is NOT a bug there — opendal-memory treats
+  `list_with("")` and `list_with("/")` identically and `remove_all("/")` removes everything, so they
+  agree regardless; verified by probe before leaving it.)
+- **`std::fs::DirEntry::metadata()` does NOT follow symlinks (it is `lstat`-based) — this is the
+  load-bearing safety property for a filesystem prefix-walk feeding a GC.** *Why it matters:* an
+  explicit-stack dir walk that classifies entries with `DirEntry::metadata()` automatically (a) does
+  not loop on a symlinked-directory cycle (`a/loop -> a`), because the symlink is neither `is_dir()`
+  nor `is_file()` so it's skipped; and (b) cannot pull files from OUTSIDE the prefix into the listing
+  via an escaping symlink (`table/out -> /elsewhere`) — which would otherwise become A2 deleting live
+  data outside the table root. It also agrees with `remove_dir_all` (removes a dir-symlink itself,
+  never follows it). Verified with cycle + escape probes; pinned with permanent tests; documented the
+  "skip symlinks, do not follow" contract in the method doc so nobody "fixes" it to follow links.
+  (If you ever switch to `walkdir` or `fs::metadata`/`stat`, you re-open both holes.)
+- **A mutation that an offline backend can't exercise is a real coverage gap to NAME, not a test to
+  fake.** The opendal `entry.metadata().is_file()` filter (skip directory markers) is correct but
+  un-pinnable on opendal-memory (flat store emits no dir markers); dropping it changed nothing in the
+  smoke test. Don't contort a memory test to "catch" it — flag it as needing a live S3/HDFS fixture
+  (the same class as the builder's `file_io_s3_test`-needs-MinIO flag) and move on.
