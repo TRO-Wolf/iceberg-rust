@@ -1153,3 +1153,72 @@ How to use it (see the manuals' §2):
   `removed-equality-delete-files`. NO `snapshot_summary.rs` edit needed (the branch existed) — the
   "edit only if a counter gap shows" condition was not met. When a prior increment pre-wires a summary
   branch "for parity, unreachable," the increment that adds the driving path just connects the loop.
+
+### 2026-06-10 (Arc-E Inc 2 — DVFileWriter previous-deletes MERGE hook + replacement interop, BUILDER Opus)
+- **`ContentFileUtil.isFileScoped` is the BROADER `referencedDataFile(df) != null`, NOT `isDV`
+  (1.10.0 bytecode-verified).** *Why:* the brief asked "DV OR path-scoped position delete — what
+  exactly?" `javap -c ContentFileUtil` over the 1.10.0 jar shows `isFileScoped` = `referencedDataFile(df)
+  != null`, and `referencedDataFile` is: EQUALITY→null; else the explicit `referencedDataFile()` field;
+  else the `_file_path` (id 2147483546) lower==upper bound (a position delete pinning ONE data file). A
+  DV is file-scoped because it carries `referenced_data_file`, NOT because it is a DV. So `is_file_scoped`
+  must mirror that three-branch predicate (eq→false, explicit field, equal-`_file_path`-bounds fallback)
+  — implemented next to the writer via the public `DataFile` accessors, NOT a fork of `is_deletion_vector`
+  (which is `format==Puffin`, a strictly narrower set). A partition-scoped parquet pos delete (no
+  ref field, unequal/absent path bounds) is NOT file-scoped and must NOT be rewritten (Java L121-124:
+  "only DVs and file-scoped deletes can be discarded") — rewriting it drops a delete still applying to
+  OTHER data files (resurrection on those).
+- **The JAVA oracle's `newRowDelta` defaults `startingSnapshotId = null` = "check ALL history," so
+  `validateAddedDVs` sees the PRIOR DV1 as "concurrently added" and rejects the replacement — set
+  `validateFromSnapshot(currentSnapshotId)` to mirror the engine (and the Rust tx-captured start).**
+  *Why:* the Rust replacement chain committed fine because `Transaction::new` captures the head AFTER
+  DV1, so the Rust `validate_added_dvs` window excludes DV1. Java's default null start checks all
+  versions → DV1 is in-window → "Found concurrently added DV for <path>". The engine
+  (`SparkPositionDeltaWrite`) captures the operation-start snapshot and passes it to
+  `validateFromSnapshot`; the Java oracle must do the same (`newRowDelta().validateFromSnapshot(headId)`)
+  — it is the twin of Rust's tx-captured start, not a hack. Without it the metadata-mirror GEN crashes
+  AFTER the (passing) table-level Direction-2 read, so the failure is the Java MIRROR, not the Rust write.
+- **The Run-store re-serialization byte tie did NOT materialize for the {1}→{1,3} replacement — the
+  merged blob is byte-identical to Java's merge (array container).** *Why:* the D2 caveat fires only when
+  the deserialized previous store is ALREADY a Run container re-serialized at `cardinality == 2·runs`;
+  {1} deserializes to a 1-element array, {1,3} re-serializes to a 2-element array (2 non-contiguous runs
+  ⇒ array strictly smaller), so no Run store sits on the tie. Empirically pinned BOTH the positive (the
+  interop byte-compare passes) and the documented universal caveat (positions identical, bytes may differ
+  at the tie, Java reads our blob either way — proven by the table-level read). Do NOT contort production
+  to chase the tie; the oracle proves Java reads the blob regardless of the byte divergence.
+- **A public API that TAKES a type from a private module is callable but NOT constructible downstream —
+  making the module `pub` is the real cost, and it cascades doc/clippy lints.** *Why:* `PreviousDeletes::
+  new(positions: DeleteVector, …)` is `pub`, but `delete_vector` was `mod` (crate-private), so the
+  `DeleteVector` arg could not be NAMED by a downstream caller — the hook was unusable externally. The fix
+  is `pub mod delete_vector` (the on-disk DV type is genuinely public-worthy), but `#![deny(missing_docs)]`
+  then demands docs on EVERY now-public item (struct + 5 methods + the iterator) AND clippy's
+  `len_without_is_empty` demands a sibling `is_empty()`. Budget the doc/lint tail when promoting a module
+  to satisfy a new public signature; flag the `lib.rs` edit (out of the usual file set) loudly since it is
+  a public-surface change downstream pins must follow.
+- **Keep `close()` returning just the DVs and ADD `close_with_result()` for the richer Java
+  `DeleteWriteResult` shape — zero blast radius beats a breaking signature change.** *Why:* ~10 existing
+  callers (tests + 4 interop files) call `close() -> Vec<DataFile>`. Java's `result()` returns the full
+  `DeleteWriteResult`; callers wanting only the DVs call `.deleteFiles()`. Mirroring that — `close()` a
+  thin wrapper over `close_with_result().delete_files` — keeps every existing caller untouched AND the
+  no-previous path byte-identical (the D2/D4 pins stay green without edits), while the new replacement
+  flow uses `close_with_result()`.
+
+### 2026-06-11 (Arc E orchestrator notes — DV merge + removal complete; DV-writer row ✅)
+- **`ContentFileUtil.isFileScoped` = `referencedDataFile != null`, a THREE-branch chain (1.10.0
+  bytecode): equality → null; the explicit `referenced_data_file` field; ELSE the `_file_path`
+  (reserved id 2147483546) lower==upper bounds fallback** — a parquet position delete pinning
+  exactly one file IS file-scoped even without the explicit field. Port all three branches or the
+  DV-replacement flow diverges (an explicit-only port would make the fresh-DV door reject what
+  Java accepts — fail-loud, but a parity gap). The E2 builder ported all three + the pin.
+- **1.10.0 `BaseRowDelta.operation()` is the TWO-branch form — NO Append arm** (add-data-only row
+  deltas record OVERWRITE); MAIN's three-branch source is post-1.10.0. The 2026-06-08 lesson's
+  "add the third condition when removeDeletes lands" resolved the OPPOSITE way; the E1-family
+  oracle never exercised the branch (audited), which is why the old Append form looked
+  interop-proven.
+- **Prove an oracle knob's NECESSITY by removing it:** the Java replacement chain needs
+  `.validateFromSnapshot(headId)` (the twin of Rust's tx-captured start) or `validateAddedDVs`
+  walks to root and flags the SAME-CHAIN prior DV as concurrent — the E2 reviewer re-ran the
+  oracle without it and got the exact rejection, turning a plausible claim into proof.
+- **A `pub` hook signature drags its parameter types public — choose the minimal surface
+  deliberately and write the breaking-surface callout.** `pub mod delete_vector` exposes exactly
+  `DeleteVector` + its iterator (the `pub use` alternative leaks the same types via `iter()`).
+  `#![deny(missing_docs)]` + clippy `len_without_is_empty` cascade onto newly-public types.

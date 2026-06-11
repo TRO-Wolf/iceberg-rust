@@ -132,6 +132,93 @@ for morning).
         todo. DEFERRED LOUDLY (next increment): the WRITER-side `loadPreviousDeletes` auto-merge (the
         test HAND-merges the super-set DV); apply-side `removeRows` data removal still validation-only;
         interop for the removal path.
+  - [x] **Arc-E Increment 2 — DVFileWriter previous-deletes MERGE hook + DV-replacement interop
+        (BUILDER Opus, 2026-06-10).** DONE — see BUILDER OUTCOME below (DV-writer row flipped ✅).
+        Completes Java's DV write surface — the WRITER-side
+        `BaseDVFileWriter.loadPreviousDeletes` half E1 deferred. After this the GAP_MATRIX DV-writer
+        row is judged for ✅. Plan:
+        1. **The merge hook (`deletion_vector_writer.rs`):** `DVFileWriter::with_previous_deletes(...)`
+           — a Rust-pragmatic mirror of Java's ctor `loadPreviousDeletes: Function<String,
+           PositionDeleteIndex>`. Per referenced data-file path it carries the previous positions
+           (`DeleteVector`) + the SOURCE delete `DataFile`(s) they came from (Java
+           `PositionDeleteIndex.deleteFiles()`). On `close()`: union previous positions into the new
+           DV for that path (record_count/cardinality = MERGED set); previous source files that are
+           FILE-SCOPED (`is_file_scoped` — Java `ContentFileUtil.isFileScoped` = `referencedDataFile
+           != null`, BYTECODE-verified: DV OR path-scoped position delete, NOT equality, NOT
+           partition-scoped) are returned as `rewritten_delete_files` (a `DeleteWriteResult`-shaped
+           return — `DVWriteResult { delete_files, rewritten_delete_files }`, mirroring Java's
+           `DeleteWriteResult(dvs, referencedDataFiles, rewrittenDeleteFiles)`). Files NOT file-scoped
+           are NOT rewritten (Java L121-124). No-previous case BYTE-IDENTICAL to today (D2/D4 pins are
+           the floor). `is_file_scoped`: REUSE `is_deletion_vector` (it lives in `delete_file_index.rs`
+           — NOT in scope; implement a small `is_file_scoped` predicate IN `deletion_vector_writer.rs`
+           via the public `referenced_data_file()` accessor, NOT forking `is_deletion_vector`).
+        2. **Merge support (`delete_vector.rs` if needed):** a positions-out accessor / union helper.
+           `BitOrAssign` already exists; a `clone`/`from_iter` from positions may be needed. The
+           serializer itself does NOT change.
+        3. **Crown jewel (`row_delta.rs` tests):** V3 → data file → DV1 {1} committed → load DV1's
+           positions back via the PRODUCTION read path (`CachingDeleteFileLoader`/decoder, NOT a
+           hand-built vector) → feed as previous-deletes to a new DVFileWriter writing position {3} →
+           writer outputs merged DV {1,3} + rewritten=[dv1] → `row_delta().add_deletes(dv2)
+           .remove_deletes(rewritten...)` commits (E1's escape hatch unlocks) → scan = survivors of
+           {1,3} = {10,30,50}. Mirrors the REAL engine flow (Spark `SparkPositionDeltaWrite`
+           L251+L255-256: `addDeletes(dv)` + `for rewritten: removeDeletes(file)`).
+        4. **The Run-store re-serialization question (the D2 caveat, now LIVE):** the previous DV
+           deserializes into Run containers; after merge we re-serialize. Determine EMPIRICALLY whether
+           the merged blob byte-matches Java's merged blob (extend Direction-2 byte-compare — the
+           oracle does the SAME merge in Java via `BaseDVFileWriter` + a `loadPreviousDeletes` fn). If
+           the tie diverges, document precisely + scope the byte claim (positions identical, bytes may
+           differ at the documented tie); Java reads our blob either way (the oracle proves it). Do NOT
+           contort production code to chase the tie.
+        5. **Interop (`run-interop-dv.sh` + oracle):** (a) table-level Dir-2: the Rust REPLACEMENT
+           chain's final table read by Java's production scan (rows reflect merged DV; old DV absent
+           from manifests — Java manifest cross-check); (b) metadata-level: both sides run {append,
+           row_delta(DV1), row_delta(add DV2 + remove DV1)} → canonical views 3-way (`removed-dvs`
+           allowlist key, first LIVE comparison); fail-closed sentinels per the D4 rule. Mutations: (i)
+           skip the remove in the Rust chain → metadata diff fails (extra live DV + missing
+           removed-dvs); (ii) skip the merge (DV2={3} only) → Java table-read shows position-1 rows
+           RESURRECTED. Restore + green.
+        6. **GAP_MATRIX reckoning:** with merge + removal + replacement interop both directions, judge
+           the DV-writer row against DoD (API matches Java + unit tests + interop both directions). If
+           ✅, flip with dated evidence chain + name residue moving elsewhere (read row keeps its own
+           residue). RowDelta + read rows: terse note updates. transaction/ should need NOTHING — STOP
+           and report if otherwise. Pipe audit.
+        7. **Docs:** writer/map.md, this outcome, lessons entry if a correction lands.
+        BUILDER OUTCOME (2026-06-10, Arc-E Inc 2 — Opus; awaiting reviewer): **DV-WRITER ROW FLIPPED
+        🟡→✅ — the writer surface is now complete vs Java's BaseDVFileWriter.** Hook:
+        `DVFileWriter::with_previous_deletes(HashMap<path, PreviousDeletes>)` (mirrors Java's
+        `loadPreviousDeletes` ctor arg) + `close_with_result() -> DVWriteResult { delete_files,
+        rewritten_delete_files }` (mirrors Java `DeleteWriteResult`; `close()` kept returning just the
+        DVs — ZERO blast radius for ~10 existing callers). Merge unions previous positions
+        (`DeleteVector::merge`) into the new DV; file-scoped source files returned for removal.
+        **isFileScoped finding (1.10.0 BYTECODE-verified):** `ContentFileUtil.isFileScoped(df) ==
+        (referencedDataFile(df) != null)` — NOT just `isDV`; it is eq-delete→false, then non-null
+        `referenced_data_file`, then the `_file_path`-bounds-equal fallback (DV OR path-scoped pos
+        delete). `is_file_scoped` lives in the writer module (NOT a fork of `is_deletion_vector`, which
+        is `format==Puffin`). Engine-caller contract mirrored: Spark `SparkPositionDeltaWrite`
+        L251+L255-256 `addDeletes(dv)` + `for rewritten: removeDeletes(file)` → Rust
+        `add_deletes(result.delete_files).remove_deletes_many(result.rewritten_delete_files)`.
+        **Run-store byte question: ANSWERED.** The merged blob (prev {1} ∪ new {3} = {1,3}, array
+        container) is BYTE-IDENTICAL to Java's same merge (interop `test_dv_replace_merged_blob_bytes`,
+        44 B). The documented universal caveat stands (a previous DV whose store is ALREADY a Run
+        container ties at `card == 2·runs` to array on roaring-rs vs run on Java — positions identical,
+        bytes may differ; Java reads our blob either way — not contorted around). **Tests:** 7 unit
+        (merge cardinality, file-scoped selectivity, eq-delete exclusion, unwritten-path ignore,
+        byte-identical floor, `is_file_scoped` predicate, the crown jewel: DV1{1} → loaded back via the
+        production DECODER → writer merges {1,3} → add+remove → scan {10,30,50}) + 3 interop (table
+        Dir-2 read incl. DV1-absent manifest check, metadata 3-way incl. first LIVE `removed-dvs`, the
+        merged-blob byte-compare). Mutations: merge→no-op (crown jewel + unit fail), `is_file_scoped`→
+        always-true (3 scope tests fail); interop (i) skip remove → Rust commit REJECTED at the fresh-DV
+        door (stronger than the briefed metadata-diff — fail-loud at commit); (ii) skip merge → Rust
+        scan sanity shows id 20 RESURRECTED (stronger than the briefed Java-read — caught at GEN). Both
+        restored byte-clean. **lib 1775 ×2; datafusion 80 lib + 9 integration (the documented
+        rt-multi-thread doctest artifact still fails on the clean tree — unrelated); full
+        `run-interop-dv.sh` GREEN end-to-end (16 steps, both mutations shown failing then restored).**
+        **OUT-OF-SCOPE EDIT FLAGGED:** `lib.rs` `mod delete_vector` → `pub mod delete_vector` (the
+        public `PreviousDeletes::new(DeleteVector, …)` API requires `DeleteVector` to be NAMEABLE
+        downstream — it was a private-module pub type, callable but not constructible externally). Added
+        7 doc comments + `is_empty()` to satisfy `#![deny(missing_docs)]` + clippy on the now-public
+        type. transaction/ took ZERO production change (only the crown-jewel TEST, as expected). Files:
+        ONLY the allowed set + the flagged `lib.rs`.
 - [ ] **Arc F — `cherrypick`** (branch `phase2/cherrypick` off MAIN — no DV dependency): Java
       `SnapshotManager.cherrypick` / cherry-pick operation (WAP semantics: `wap.id`,
       `published-wap-id`, `source-snapshot-id`; fast-forward when the source is directly ahead;

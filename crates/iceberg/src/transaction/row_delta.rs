@@ -1105,9 +1105,12 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use futures::TryStreamExt;
 
+    use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
     use crate::delete_file_index::is_deletion_vector;
+    use crate::delete_vector::DeleteVector;
     use crate::expr::Reference;
     use crate::memory::tests::new_memory_catalog;
+    use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal,
         ManifestContentType, ManifestStatus, Operation, Struct,
@@ -5343,6 +5346,212 @@ mod tests {
             "DV#1 must appear as a tombstone in a rewritten DELETE manifest (it was not dropped \
              silently)"
         );
+    }
+
+    /// Load a committed DV's positions back through the PRODUCTION read path — the D1
+    /// `CachingDeleteFileLoader` (ranged Puffin read → `deletion-vector-v1` decode), NOT a hand-built
+    /// vector. Returns the decoded [`DeleteVector`] keyed by the DV's `referenced_data_file`. This is
+    /// exactly what an engine's `loadPreviousDeletes` does: read the existing DV off disk.
+    async fn load_dv_positions_via_production_loader(
+        table: &Table,
+        dv_file: &DataFile,
+        referenced_data_file: &str,
+    ) -> DeleteVector {
+        let task = FileScanTaskDeleteFile {
+            file_path: dv_file.file_path().to_string(),
+            file_size_in_bytes: dv_file.file_size_in_bytes(),
+            file_type: dv_file.content_type(),
+            partition_spec_id: dv_file.partition_spec_id,
+            equality_ids: None,
+            file_format: dv_file.file_format(),
+            referenced_data_file: dv_file.referenced_data_file(),
+            content_offset: dv_file.content_offset(),
+            content_size_in_bytes: dv_file.content_size_in_bytes(),
+            record_count: Some(dv_file.record_count()),
+        };
+        let loader = CachingDeleteFileLoader::new(table.file_io().clone(), 4);
+        let delete_filter = loader
+            .load_deletes(
+                std::slice::from_ref(&task),
+                Arc::new(
+                    crate::spec::Schema::builder()
+                        .build()
+                        .expect("empty schema"),
+                ),
+            )
+            .await
+            .expect("loader future")
+            .expect("the production loader must load the committed DV");
+        let vector = delete_filter
+            .get_delete_vector_for_path(referenced_data_file)
+            .expect("a delete vector for the referenced data file");
+        let guard = vector.lock().expect("lock delete vector");
+        DeleteVector::new(guard.iter().collect())
+    }
+
+    /// Write a DV via the WRITER-side MERGE hook (`DVFileWriter::with_previous_deletes`): the writer
+    /// unions `previous_positions` (sourced from `previous_dv`) into its new positions and returns
+    /// the merged DV `DeleteFile`s + the file-scoped rewritten (superseded) delete files. The Rust
+    /// mirror of Java `BaseDVFileWriter` driven by a real `loadPreviousDeletes`.
+    async fn write_merged_dv_file(
+        table: &Table,
+        file_name: &str,
+        data_file_path: &str,
+        part_value: i64,
+        new_positions: &[u64],
+        previous_positions: DeleteVector,
+        previous_dv: DataFile,
+    ) -> crate::writer::base_writer::deletion_vector_writer::DVWriteResult {
+        use crate::spec::PartitionKey;
+        use crate::writer::base_writer::deletion_vector_writer::{DVFileWriter, PreviousDeletes};
+
+        let partition_key = PartitionKey::new(
+            table.metadata().default_partition_spec().as_ref().clone(),
+            table.metadata().current_schema().clone(),
+            Struct::from_iter([Some(Literal::long(part_value))]),
+        );
+        let dv_path = format!("{}/data/{}", table.metadata().location(), file_name);
+        let output_file = table.file_io().new_output(&dv_path).unwrap();
+        let previous = PreviousDeletes::new(previous_positions, vec![previous_dv]);
+        let mut dv_writer = DVFileWriter::new(output_file)
+            .with_previous_deletes(HashMap::from([(data_file_path.to_string(), previous)]));
+        for pos in new_positions {
+            dv_writer
+                .delete(data_file_path, *pos, Some(&partition_key))
+                .unwrap();
+        }
+        dv_writer.close_with_result().await.unwrap()
+    }
+
+    /// THE CROWN JEWEL (Arc-E Inc 2): the WRITER-side previous-deletes MERGE closes the loop, all-Rust
+    /// end-to-end — mirroring the REAL engine flow (Spark `SparkPositionDeltaWrite` L234-256:
+    /// `addDeletes(dv)` + `for f in rewrittenDeleteFiles: removeDeletes(f)`).
+    ///   1. V3 real-FS table → real parquet data file (y=[10,20,30,40,50]);
+    ///   2. DV#1 deleting position {1} (y=20) committed via row_delta → scan = {10,30,40,50};
+    ///   3. LOAD DV#1's positions back via the PRODUCTION loader (`CachingDeleteFileLoader`, NOT a
+    ///      hand-built vector), feed them as previous-deletes to a NEW `DVFileWriter` writing only the
+    ///      NEW position {3} → the WRITER merges {1}∪{3} = {1,3} and returns rewritten=[DV#1];
+    ///   4. `row_delta().add_deletes(merged_dv).remove_deletes_many(rewritten)` commits (the escape
+    ///      hatch unlocks); scan = survivors of {1,3} = {10,30,50}, exactly ONE live DV, DV#1 absent.
+    ///
+    /// Risk pinned: the merge is the load-bearing new behavior — the writer (not the test) must
+    /// produce {1,3} from previous {1} + new {3}. A broken merge writes only {3} → y=20 RESURRECTS
+    /// (scan would return {10,20,30,50}). The rewritten-file plumbing must also flow DV#1 into
+    /// `remove_deletes` (else the door rejects the second DV, or two DVs survive). This is the test
+    /// that proves the WRITER-side `loadPreviousDeletes` half (the last deferred piece of the DV
+    /// write surface) works end to end against the real read path.
+    #[tokio::test]
+    async fn test_row_delta_dv_writer_merges_previous_deletes_end_to_end() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // 1. A real parquet data file: 5 rows, partition x=0, y=[10,20,30,40,50].
+        let data_file = write_data_file(&table, "rows.parquet", 0, &[
+            (0, 10, 100),
+            (0, 20, 200),
+            (0, 30, 300),
+            (0, 40, 400),
+            (0, 50, 500),
+        ])
+        .await;
+        let data_file_path = data_file.file_path().to_string();
+        let table = append_files(&catalog, &table, vec![data_file]).await;
+
+        // 2. DV#1 deletes position {1} (y=20). Commit via row_delta.
+        let dv1 = write_real_dv_file(&table, "dv1.puffin", &data_file_path, 0, &[1]).await;
+        let dv1_path = dv1.file_path().to_string();
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![dv1.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10, 30, 40, 50]),
+            "after DV#1 the scan drops y=20"
+        );
+
+        // 3. Load DV#1's positions back through the PRODUCTION loader, then write DV#2 with the WRITER
+        //    MERGE hook supplying those positions + adding the NEW position {3}. The WRITER produces
+        //    the super-set {1,3} (NOT hand-merged) and returns rewritten=[DV#1].
+        let previous_positions =
+            load_dv_positions_via_production_loader(&table, &dv1, &data_file_path).await;
+        assert_eq!(
+            previous_positions.iter().collect::<Vec<_>>(),
+            vec![1],
+            "the production loader must read back DV#1's position {{1}}"
+        );
+
+        let merge_result = write_merged_dv_file(
+            &table,
+            "dv2.puffin",
+            &data_file_path,
+            0,
+            &[3],
+            previous_positions,
+            dv1.clone(),
+        )
+        .await;
+
+        // The writer produced exactly one merged DV with the UNION cardinality, plus rewritten=[DV#1].
+        assert_eq!(merge_result.delete_files.len(), 1);
+        let dv2 = merge_result.delete_files[0].clone();
+        let dv2_path = dv2.file_path().to_string();
+        assert_eq!(
+            dv2.record_count(),
+            2,
+            "the merged DV must carry the UNION {{1,3}} (cardinality 2), proving the WRITER merged"
+        );
+        assert_eq!(
+            merge_result.rewritten_delete_files.len(),
+            1,
+            "DV#1 (file-scoped) must be returned as a rewritten/superseded delete file"
+        );
+        assert_eq!(
+            merge_result.rewritten_delete_files[0].file_path(),
+            dv1_path,
+            "the rewritten file is DV#1"
+        );
+
+        // 4. Commit add(merged DV) + remove(rewritten DV#1) — EXACTLY the engine flow. The fresh-DV
+        //    door's escape hatch unlocks because the live DV#1 is removed in the same commit.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(merge_result.delete_files)
+            .remove_deletes_many(merge_result.rewritten_delete_files);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // 4a. The scan now drops exactly the merged {1,3} (y=20, y=40) → survivors {10,30,50}. A
+        //     broken merge (only {3}) would RESURRECT y=20 here.
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10, 30, 50]),
+            "after the writer-merged DV replace, the scan drops {{1,3}} (y=20 + y=40)"
+        );
+
+        // 4b. Exactly ONE live DV for the data file post-commit (the load-door invariant), and it is
+        //     the merged DV#2 — DV#1 is gone.
+        let live = live_delete_entries(&table).await;
+        let live_dvs_for_file: Vec<&(String, bool, Option<String>)> = live
+            .iter()
+            .filter(|(_, is_dv, referenced)| {
+                *is_dv && referenced.as_deref() == Some(data_file_path.as_str())
+            })
+            .collect();
+        assert_eq!(
+            live_dvs_for_file.len(),
+            1,
+            "exactly ONE live DV for the data file post-commit — got {live:?}"
+        );
+        assert_eq!(
+            live_dvs_for_file[0].0, dv2_path,
+            "the surviving live DV is the writer-merged DV#2, not the removed DV#1"
+        );
+
+        // 4c. The summary carries removed-dvs: 1 + added-dvs: 1 (the merge-and-replace shape).
+        assert_eq!(summary_prop(&table, "added-dvs").as_deref(), Some("1"));
+        assert_eq!(summary_prop(&table, "removed-dvs").as_deref(), Some("1"));
     }
 
     /// MUTATION (a): the door+removal pair protects the post-commit one-DV invariant. With the
