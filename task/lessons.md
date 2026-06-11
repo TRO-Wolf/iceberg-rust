@@ -1474,6 +1474,38 @@ How to use it (see the manuals' §2):
   RULE: when constructing a seq-preservation fixture, use equality deletes (seq-governed); a position
   delete cannot serve as the "outstanding delete" because it is path-governed, not seq-governed.
 
+### 2026-06-11 (S2 — cherrypick METADATA-level interop, BUILDER Sonnet, wt-interop)
+- **DO NOT set `wap.id` on the dedup fixture's staged snapshot — the dedup gate fires via `source-snapshot-id`
+  ANCESTRY, not the WAP-id path.** *Why:* Java `CherryPickOperation` runs two checks before replay:
+  (1) `validateWapPublish` fires when `wap.id` is set — it walks the ancestry looking for any snapshot whose
+  `published-wap-id` equals the staged `wap.id`. If a prior cherrypick published that wap-id, it throws
+  `DuplicateWAPCommitException`. (2) `validateNonAncestor` fires REGARDLESS of `wap.id` — it walks ancestry
+  looking for any snapshot whose summary `source-snapshot-id == staged_id`. If found, it throws
+  `CherrypickAncestorCommitException`. Check (1) fires FIRST. If the dedup staged snapshot has `wap.id`, then
+  after the first cherrypick succeeds (minting `published-wap-id: wap-dedup`), the second attempt triggers
+  `DuplicateWAPCommitException` (WAP path) — not `CherrypickAncestorCommitException` (ancestry path). The
+  interop brief's dedup fixture spec calls for `CherrypickAncestorCommitException`, so the staged snapshot must
+  have NO `wap.id`. Only `validateNonAncestor` then fires, producing the correct exception.
+- **`validate()` fires on `Transaction::commit()`, NOT on `cherry_pick(id).apply(tx)`.** *Why:* `apply()` only
+  records the action into the `Transaction`'s operation list; it does NOT run production validations. A check
+  like `if second_attempt.apply(tx).is_err()` can never detect a cherry-pick conflict. The correct pattern:
+  call `tx.cherry_pick(id).apply(tx)?.commit(&catalog).await` and match on the `commit` result. This mirrors
+  the Java harness where the exception is thrown inside `CherryPickOperation.apply()` which is called from
+  within the `ManageSnapshots.commit()` chain — but the Rust `apply()` is design-different (records, doesn't
+  validate); validation is COMMIT-time. Pin the error at the `commit` await, not at `apply`.
+- **Dedup-fixture verify in Java must use a FRESH temp directory, not the existing `rust_table/` dir.** *Why:*
+  the `LocalTableOperations` version counter starts at -1 and increments to 0 on first commit, writing
+  `v0.metadata.json`. If the dedup verify re-uses the `rust_table/` directory for the second-cherrypick attempt
+  (which already contains a `v0.metadata.json`), the `commit(null, rustMeta)` call fails with "File already
+  exists". The fix: `Files.createTempDirectory(...)` for each verify attempt that needs to commit into a
+  `LocalTableOperations`. A probe table built for verification MUST live in its own directory.
+- **Stage a snapshot via fast_append + set-current rollback, NOT a raw metadata graft, for simple cases.**
+  *Why:* a real fast_append produces real manifest files on disk (`added_snapshot_id == staged_id`), which
+  is required for replay (the cherry-pick sources added/removed files from those manifests). A metadata-only
+  graft skips manifest writes. The rollback (`set_current_snapshot(parent)`) leaves the produced snapshot
+  dangling — `main` points back to the parent while the staged snapshot exists as a dead branch. This is the
+  correct "staged-but-not-published" shape for the WAP pattern in the absence of a real `stageOnly` API.
+
 ### 2026-06-11 (S1 DATA-level interop reviewer, Sonnet)
 - **DO use a mutation that removes `data_sequence_number(seq)` from the rewrite commit to prove the
   fixture is NOT vacuous.** Without it, A' takes the fresh snapshot seq (e.g. 3), making the equality
@@ -1487,3 +1519,36 @@ How to use it (see the manuals' §2):
   written exactly once), and the Rust comparison test is the authoritative multiset guard for the
   Rust-reads-Java direction. No production code change needed; this is a documented weakness of the
   Java verify layer specifically for the same-id-duplicate corner case.
+
+### 2026-06-11 (S2 cherrypick metadata interop reviewer, Sonnet)
+- **A harness that checks `commit.is_err()` without asserting the ERROR KIND and MESSAGE is
+  structurally vacuous for the dedup path.** *Why:* `ErrorKind::DataInvalid` (non-retryable) is the
+  Rust equivalent of Java's `CherrypickAncestorCommitException`; they share the same condition
+  (source-snapshot-id ancestry), but different exception hierarchies. A test that only panics on `Ok`
+  could mask a DIFFERENT error kind (e.g. `Unexpected` or a catalog error) silently "passing" the
+  dedup check. Always assert `err.kind() == DataInvalid`, `!err.retryable()`, and a distinctive
+  substring of the error message (here `"already picked to create ancestor"`) for any dedup/conflict
+  rejection test.
+- **`is_some()` on a summary property is insufficient depth — verify the VALUE refers to a real
+  entity.** *Why:* `source-snapshot-id` is set by Rust's cherrypick replay to the staged snapshot's id.
+  A random garbage value (or a typo in the key) passes `is_some()` but fails the `snapshot_by_id`
+  lookup. The value check is a parse-as-i64 + `metadata.snapshot_by_id(val).is_some()` + `val !=
+  current.snapshot_id()`. The same principle applies to any summary property that records an id:
+  check it resolves to the claimed entity, not just that it is present.
+- **FF-vacuity must be checked by COUNT, not just by canonical-view equality.** *Why:* a fast-forward
+  leaves snapshot count UNCHANGED (the staged snapshot IS published verbatim — no new id minted); a
+  replay adds a new snapshot (count + 1). The count assertion in the GEN test (`snapshot_count_after
+  == snapshot_count_before` for FF) is the primary FF guard — the D2 canonical-view comparison cannot
+  catch a replay-instead-of-FF until three snapshots mismatch the expected two. A production-src
+  mutation was blocked by the READ-ONLY constraint, but the STATIC equivalent (FF predicate:
+  `picked.parent == head`, or both None) is trivially verified by inspecting `is_fast_forward()`, and
+  the count assertion in the GEN test provides the runtime guard. When production src is READ-ONLY,
+  use the count/structure assertion as the behavioral anchor and document why the mutation is infeasible.
+- **Sabotage (c) mechanism — a fake-FF artifact causes the verify Java process to CRASH before
+  printing the sentinel, which the `|| true` + sentinel-absence branch correctly catches.** *Why:* the
+  third sabotage injected a new snapshot id into the FF fixture's Rust-produced `final.metadata.json`,
+  making the artifact claim three snapshots where Java expected two. Java's `LocalTableOperations`
+  raised `CommitFailedException: Current snapshot ID does not match main branch` before printing the
+  sentinel line. The script's `|| true` + `grep "verify-interop-cherrypick: 0 failures"` pattern
+  catches this correctly — the absence of the sentinel exits 1. Design rule: the sentinel-presence
+  check is the primary guard, not the `^FAIL` check; a crash before any sentinel emission fails closed.

@@ -50,6 +50,7 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.deletes.EqualityDeleteWriter;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.deletes.PositionDeleteWriter;
+import org.apache.iceberg.exceptions.CherrypickAncestorCommitException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
@@ -441,6 +442,32 @@ public final class InteropOracle {
         int rewriteDataFailures = RewriteFilesDataOracle.verify(rewriteDataVerifyDir);
         System.out.println("verify-interop-rewrite-data: " + rewriteDataFailures + " failures");
         if (rewriteDataFailures > 0) {
+          System.exit(1);
+        }
+        break;
+      case "generate-interop-cherrypick":
+        // CHERRYPICK metadata-level interop (increment S2). Builds three fixtures (ff / replay / dedup)
+        // on a V2 table (schema {id long, data string}, unpartitioned), stages a snapshot per fixture,
+        // runs Java's production manageSnapshots().cherrypick(id).commit(), emits java_meta.json (via
+        // SnapshotMetaOracle.emit) for each fixture, and emits dedup_expected_rejection.json for the
+        // dedup fixture. The dir is supplied via -Dinterop.cherrypick.dir on the CLI (same JVM).
+        Path cherrypickGenDir = requireFixturesDir("interop.cherrypick.dir");
+        CherryPickOracle.generate(cherrypickGenDir);
+        break;
+      case "verify-interop-cherrypick":
+        // CHERRYPICK metadata-level interop, DIRECTION 2 — "Java verifies what RUST cherry-picked".
+        // The Rust GEN test (env ICEBERG_INTEROP_CHERRYPICK_GEN_DIR, tests/interop_cherrypick.rs)
+        // staged each fixture, ran the production cherry_pick action on a copy at
+        // <fixture>/rust_table, and landed final.metadata.json there. Here Java reads that RUST-produced
+        // table, asserts (a) its canonical view == java_meta.json (canonical snapshot-metadata view
+        // byte-equal) and (b) fixture-specific facts (FF: snapshot count unchanged; replay:
+        // source-snapshot-id present; dedup: second cherrypick attempt raises CherrypickAncestorCommitException).
+        // A failure is a REAL cherrypick write-incompatibility. NOTE: `mvn exec:java` does not
+        // propagate System.exit — run-interop-cherrypick.sh greps the "0 failures" sentinel.
+        Path cherrypickVerifyDir = requireFixturesDir("interop.cherrypick.dir");
+        int cherrypickFailures = CherryPickOracle.verify(cherrypickVerifyDir);
+        System.out.println("verify-interop-cherrypick: " + cherrypickFailures + " failures");
+        if (cherrypickFailures > 0) {
           System.exit(1);
         }
         break;
@@ -7170,6 +7197,337 @@ public final class InteropOracle {
                 + "live rows = {10,30,50}");
       }
       return failures;
+    }
+  }
+
+  // =============================================================================================
+  // CherryPickOracle — the METADATA-LEVEL cherrypick interop oracle (increment S2).
+  // Three fixtures (ff / replay / dedup), both directions, via the canonical snapshot-metadata view
+  // (SnapshotMetaOracle.emit, reused AS-IS). The `stageOnly` WAP WRITE path is deferred; the staged
+  // snapshot is produced by a real fast_append followed by setCurrentSnapshot(parent) so `main`
+  // rolls back, leaving the produced snapshot as a dangling "staged" snapshot with REAL manifests.
+  // =============================================================================================
+
+  /**
+   * The CherryPick half of the oracle. Three fixture shapes, each committed to a real
+   * local-filesystem table (real AVRO manifests + manifest-list), judged by canonical
+   * snapshot-metadata views via {@link SnapshotMetaOracle#emit}.
+   *
+   * <ul>
+   *   <li><b>ff</b> — staged snapshot whose parent IS the current head → cherrypick fast-forwards
+   *       (main moves to the staged snapshot AS-IS, no new snapshot).
+   *   <li><b>replay</b> — staged snapshot whose parent is NOT current (head advanced past it via an
+   *       unrelated commit) → cherrypick REPLAYS: new snapshot with {@code source-snapshot-id} +
+   *       {@code published-wap-id} in the summary.
+   *   <li><b>dedup</b> — same first-publish as replay (succeeds), then a SECOND cherrypick of the
+   *       SAME staged id → Java raises {@link CherrypickAncestorCommitException}. The fixture dir
+   *       holds the table after the first publish plus {@code dedup_expected_rejection.json}.
+   * </ul>
+   */
+  static final class CherryPickOracle {
+    private CherryPickOracle() {}
+
+    private static final List<String> FIXTURES =
+        java.util.Arrays.asList("ff", "replay", "dedup");
+
+    /** Schema: {1 id long required, 2 data string required} — small, unpartitioned (V2). */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "data", Types.StringType.get()));
+    }
+
+    /** A metadata-only DataFile (no parquet on disk — the oracle only reads manifests). */
+    private static DataFile dataFile(BaseTable table, String dataDir, String name, long count) {
+      return DataFiles.builder(table.spec())
+          .withPath(dataDir + "/" + name + ".parquet")
+          .withFileSizeInBytes(count * 100)
+          .withRecordCount(count)
+          .withFormat(FileFormat.PARQUET)
+          .build();
+    }
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      for (String fixture : FIXTURES) {
+        Path fixtureDir = dir.resolve(fixture);
+        Files.createDirectories(fixtureDir);
+        buildFixture(fixture, fixtureDir);
+
+        // Emit java_meta.json from the fixture table (final.metadata.json).
+        Path finalMeta = fixtureDir.resolve("table/metadata/final.metadata.json");
+        Path javaMetaOut = fixtureDir.resolve("java_meta.json");
+        SnapshotMetaOracle.emit(finalMeta, javaMetaOut);
+        System.out.println("generate-interop-cherrypick/" + fixture + ": java_meta.json written");
+      }
+
+      System.out.println(
+          "generate-interop-cherrypick: wrote " + FIXTURES.size() + " fixtures to " + dir);
+    }
+
+    /**
+     * Build one fixture's table to {@code <fixtureDir>/table} with REAL manifests, stage a
+     * snapshot, run {@code manageSnapshots().cherrypick(stagedId).commit()}, land
+     * {@code final.metadata.json}, and emit {@code dedup_expected_rejection.json} for the dedup
+     * fixture.
+     *
+     * <p>HOW STAGING IS SIMULATED WITHOUT stageOnly: commit the staged snapshot via a real
+     * {@code newFastAppend()} so its manifests + manifest-list land on disk (real AVRO, real paths).
+     * Then use {@code manageSnapshots().setCurrentSnapshot(parentId).commit()} to roll {@code main}
+     * back to the parent — leaving the produced snapshot as a dangling "staged" snapshot with its
+     * REAL manifests. Then {@code manageSnapshots().cherrypick(stagedId).commit()} runs the
+     * production Java cherry-pick against a REAL table.
+     */
+    private static void buildFixture(String fixture, Path fixtureDir) throws IOException {
+      File tableDir = fixtureDir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+
+      Schema schema = schema();
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_cherrypick_" + fixture);
+      String dataDir = tableDir.getAbsolutePath() + "/data";
+
+      // S0: the initial snapshot (always committed — it is the parent of the staged snapshot).
+      table.newFastAppend().appendFile(dataFile(table, dataDir, "s0", 10L)).commit();
+      long s0Id = table.currentSnapshot().snapshotId();
+
+      // S1 (staged): commit normally via fast_append (REAL manifests + list on disk).
+      // ff + replay: include wap.id so published-wap-id appears in the replay summary (WAP path).
+      // dedup: NO wap.id — so the second cherrypick dedup fires via source-snapshot-id ancestry
+      //        (CherrypickAncestorCommitException), not via the DuplicateWAPCommitException
+      //        WAP-id path. This tests the production validateNonAncestor dedup surface.
+      AppendFiles stagedAppend =
+          table.newFastAppend().appendFile(dataFile(table, dataDir, "s1", 20L));
+      if (!fixture.equals("dedup")) {
+        stagedAppend = stagedAppend.set("wap.id", "wap-" + fixture);
+      }
+      stagedAppend.commit();
+      long s1StagedId = table.currentSnapshot().snapshotId();
+
+      // Roll main BACK to S0: S1 becomes the "staged" snapshot (exists in metadata, off main).
+      table.manageSnapshots().setCurrentSnapshot(s0Id).commit();
+
+      if (fixture.equals("ff")) {
+        // FF fixture: staged S1's parent == current head (S0) → cherrypick fast-forwards.
+        // main moves to S1 AS-IS; no new snapshot is produced.
+        table.manageSnapshots().cherrypick(s1StagedId).commit();
+
+      } else {
+        // replay / dedup: advance main past S0 with an unrelated commit S2 (now S1.parent != head).
+        table.newFastAppend().appendFile(dataFile(table, dataDir, "s2", 30L)).commit();
+
+        // First cherrypick: replay S1 → produces a NEW snapshot with source-snapshot-id + published-wap-id.
+        table.manageSnapshots().cherrypick(s1StagedId).commit();
+
+        if (fixture.equals("dedup")) {
+          // Emit dedup_expected_rejection.json — both sides assert a second attempt fails.
+          String rejectionJson =
+              JsonUtil.generate(
+                  gen -> {
+                    gen.writeStartObject();
+                    gen.writeBooleanField("second_cherrypick_fails", true);
+                    gen.writeEndObject();
+                  },
+                  false);
+          writeJson(fixtureDir.resolve("dedup_expected_rejection.json"), rejectionJson);
+          System.out.println(
+              "generate-interop-cherrypick/dedup: dedup_expected_rejection.json written");
+
+          // Verify that Java also rejects the second attempt — this must throw.
+          boolean thrown = false;
+          try {
+            table.manageSnapshots().cherrypick(s1StagedId).commit();
+          } catch (CherrypickAncestorCommitException ex) {
+            thrown = true;
+            System.out.println(
+                "generate-interop-cherrypick/dedup: second cherrypick rejected as expected ("
+                    + ex.getMessage()
+                    + ")");
+          }
+          if (!thrown) {
+            throw new RuntimeException(
+                "dedup fixture: second cherrypick of s1StagedId "
+                    + s1StagedId
+                    + " did NOT throw CherrypickAncestorCommitException — fixture is wrong");
+          }
+        }
+      }
+
+      // Land final.metadata.json at the known path for the emitter + comparison.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+    }
+
+    /**
+     * Verify each fixture in DIRECTION 2: Java reads the RUST-produced table (at
+     * {@code <fixture>/rust_table/metadata/final.metadata.json}), asserts the canonical view ==
+     * {@code java_meta.json}, and asserts fixture-specific facts. Returns the failure count.
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+
+      for (String fixture : FIXTURES) {
+        Path fixtureDir = dir.resolve(fixture);
+        Path rustMetadata = fixtureDir.resolve("rust_table/metadata/final.metadata.json");
+
+        if (!Files.exists(rustMetadata)) {
+          System.out.println(
+              "FAIL cherrypick/" + fixture + ": missing rust_table final.metadata.json");
+          failures++;
+          continue;
+        }
+
+        // (a) Canonical view of the RUST-produced table must equal java_meta.json.
+        Path javaMetaPath = fixtureDir.resolve("java_meta.json");
+        if (!Files.exists(javaMetaPath)) {
+          System.out.println(
+              "FAIL cherrypick/" + fixture + ": missing java_meta.json — run generate first");
+          failures++;
+          continue;
+        }
+
+        // Emit the canonical view of the Rust table into a temp file, then compare bytes.
+        Path rustViewPath = fixtureDir.resolve("rust_view_of_rust_meta.json");
+        SnapshotMetaOracle.emit(rustMetadata, rustViewPath);
+        String javaView = readString(javaMetaPath);
+        String rustView = readString(rustViewPath);
+        if (!javaView.equals(rustView)) {
+          System.out.println(
+              "FAIL cherrypick/"
+                  + fixture
+                  + ": Java's canonical view of the RUST table diverges from Java's own view");
+          failures++;
+          continue;
+        }
+
+        // (b) Fixture-specific facts.
+        TableMetadata rustMeta =
+            TableMetadataParser.fromJson(rustMetadata.toString(), readString(rustMetadata));
+        int rustSnapshotCount = countSnapshots(rustMeta);
+
+        switch (fixture) {
+          case "ff":
+            // FF: the cherrypick fast-forwarded — the table has EXACTLY 2 snapshots (S0 + S1,
+            // which is now main; S1 was produced by the staging fast_append, not by cherrypick, so
+            // the count is unchanged relative to the pre-cherrypick state).
+            if (rustSnapshotCount != 2) {
+              System.out.println(
+                  "FAIL cherrypick/ff: expected 2 snapshots after fast-forward, got "
+                      + rustSnapshotCount);
+              failures++;
+              continue;
+            }
+            System.out.println(
+                "PASS cherrypick/ff: snapshot count=2 (fast-forward, no new snapshot) OK");
+            break;
+
+          case "replay":
+          case "dedup":
+            // REPLAY / DEDUP: the cherrypick produced a NEW snapshot carrying source-snapshot-id.
+            // Snapshots present: S0, S1 (staged), S2 (unrelated advance), S3 (the published replay).
+            if (rustSnapshotCount != 4) {
+              System.out.println(
+                  "FAIL cherrypick/"
+                      + fixture
+                      + ": expected 4 snapshots after replay, got "
+                      + rustSnapshotCount);
+              failures++;
+              continue;
+            }
+            // The current snapshot must carry source-snapshot-id in its summary.
+            Snapshot currentSnap = rustMeta.currentSnapshot();
+            if (currentSnap == null) {
+              System.out.println(
+                  "FAIL cherrypick/" + fixture + ": no current snapshot after cherrypick");
+              failures++;
+              continue;
+            }
+            String sourceId = currentSnap.summary().get("source-snapshot-id");
+            if (sourceId == null) {
+              System.out.println(
+                  "FAIL cherrypick/"
+                      + fixture
+                      + ": current snapshot missing source-snapshot-id in summary");
+              failures++;
+              continue;
+            }
+            System.out.println(
+                "PASS cherrypick/"
+                    + fixture
+                    + ": snapshot count=4, source-snapshot-id="
+                    + sourceId
+                    + " OK");
+
+            if (fixture.equals("dedup")) {
+              // Dedup: verify that a second cherrypick attempt on the published staged id would be
+              // rejected. We run the production CherryPickOperation against a COPY of the Rust
+              // table held in a FRESH temp directory (so LocalTableOperations never clobbers the
+              // existing Rust fixtures). The attempt must raise CherrypickAncestorCommitException
+              // (source-snapshot-id ancestry dedup).
+              long stagedId = Long.parseLong(sourceId);
+              java.nio.file.Path tmpDir = Files.createTempDirectory("interop-cherrypick-dedup-verify");
+              File tmpTableDir = tmpDir.resolve("table").toFile();
+              File tmpMetaDir = new File(tmpTableDir, "metadata");
+              if (!tmpMetaDir.mkdirs()) {
+                throw new IOException("failed to create temp metadata dir: " + tmpMetaDir);
+              }
+              LocalTableOperations rustOps = new LocalTableOperations(tmpTableDir, tmpMetaDir);
+              rustOps.commit(null, rustMeta);
+              BaseTable rustTable = new BaseTable(rustOps, "interop_cherrypick_dedup_verify");
+              boolean rejected = false;
+              try {
+                rustTable.manageSnapshots().cherrypick(stagedId).commit();
+              } catch (CherrypickAncestorCommitException ex) {
+                rejected = true;
+                System.out.println(
+                    "PASS cherrypick/dedup: second cherrypick rejected as expected ("
+                        + ex.getMessage()
+                        + ")");
+              }
+              if (!rejected) {
+                System.out.println(
+                    "FAIL cherrypick/dedup: second cherrypick did NOT raise "
+                        + "CherrypickAncestorCommitException — dedup is broken");
+                failures++;
+                continue;
+              }
+            }
+            break;
+
+          default:
+            System.out.println("FAIL cherrypick/" + fixture + ": unknown fixture");
+            failures++;
+            continue;
+        }
+
+        if (!fixture.equals("ff") && !fixture.equals("replay") && !fixture.equals("dedup")) {
+          System.out.println("PASS cherrypick/" + fixture);
+        }
+      }
+
+      return failures;
+    }
+
+    private static int countSnapshots(TableMetadata metadata) {
+      int count = 0;
+      for (Snapshot ignored : metadata.snapshots()) {
+        count++;
+      }
+      return count;
     }
   }
 

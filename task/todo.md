@@ -524,6 +524,64 @@ result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs 
       multi-spec / multi-bin merge paths for `merge_append`; DELETE-file rewrite for `RewriteFiles`).
 
       **S1 REVIEWER (2026-06-11, Sonnet, adversarial):** APPROVE with one documented finding.
+  - [ ] **S2 BUILDER plan (2026-06-11, wt-interop, Sonnet):** METADATA-level interop for `cherrypick` — three
+        fixture shapes (fast-forward / replay / dedup), both directions, judged by Java.
+        **Java authority (1.10.0 bytecode):** `CherryPickOperation.cherrypick(long)` — confirmed string constants:
+        `"source-snapshot-id"` (ldc #102), `"published-wap-id"` (ldc #96), `"replace-partitions"` (ldc #138),
+        `"Cannot cherry-pick snapshot %s: not append, dynamic overwrite, or fast-forward"` (ldc #191). The
+        `isFastForward(base)` / `requireFastForward` logic is bytecode-confirmed as documented in cherry_pick.rs.
+        **Template:** `run-interop-expire.sh` (an OPERATION compared both directions via canonical views) +
+        `interop_expire.rs` (the env-gated Rust GEN + comparison tests). `SnapshotMetaOracle.emit` reused AS-IS
+        (the shared canonical view covers exactly what cherrypick changes: operation, summary counts, manifest
+        structure, sequence numbers). The shared `common/snapshot_meta_view.rs` is reused AS-IS (no expired-parent
+        complication for cherrypick fixtures — the staged snapshot stays in metadata).
+        **Design decisions:**
+        - Fixture 1 (ff): commit S0 + S1 (WAP `wap.id=wap-ff`); roll `main` back to S0 (S1 staged, parent=S0=head);
+          cherrypick → fast-forward. No new snapshot. Java: `stageOnly()` equivalent = real commit + `setCurrentSnapshot(S0)`.
+          Built via `fast_append` + set-current + `manageSnapshots().cherrypick(S1_id)`.
+        - Fixture 2 (replay): commit S0 + S1 (WAP `wap.id=wap-replay`); roll `main` to S0; advance `main` past S0
+          with S2 (unrelated file); cherrypick S1 → replay produces S3 with `source-snapshot-id`/`published-wap-id`.
+          Built via fast_append × 3 + set-current + fast_append + `manageSnapshots().cherrypick(S1_id)`.
+        - Fixture 3 (dedup): replay fixture (same as fixture 2) + attempt a SECOND cherrypick of same staged S1 →
+          Java REJECTS with `CherrypickAncestorCommitException` (already picked). For the dedup fixture we capture
+          the FIRST publish (Java and Rust both succeed), then assert the second attempt FAILS on both sides. The
+          "dedup" fixture dir holds the TABLE AFTER the first publish (the same state as `replay`), plus a boolean
+          assertion file `dedup_expected_rejection.json` = `{"second_cherrypick_fails":true}`. The interop proof is
+          (a) the first-publish canonical views match, and (b) the second attempt fails on both sides.
+        **Oracle class `CherryPickOracle` in InteropOracle.java:**
+        - `generate-interop-cherrypick` (`-Dinterop.cherrypick.dir`): build each fixture, run Java's
+          `manageSnapshots().cherrypick(id).commit()`, emit `java_meta.json` (via `SnapshotMetaOracle.emit`).
+          For the dedup fixture, also emit `dedup_expected_rejection.json`.
+        - `verify-interop-cherrypick` (`-Dinterop.cherrypick.dir`): Java reads the RUST-produced table at
+          `<fixture>/rust_table/metadata/final.metadata.json`, asserts its canonical view == `java_meta.json` AND
+          the cherrypick-specific facts (FF: snapshot count unchanged; replay: `source-snapshot-id` present;
+          dedup: second cherrypick fails). Sentinel: `verify-interop-cherrypick: 0 failures`.
+        **Rust test `crates/iceberg/tests/interop_cherrypick.rs`:**
+        - `test_cherrypick_gen_rust_produces_each_fixture`: env `ICEBERG_INTEROP_CHERRYPICK_GEN_DIR` — builds
+          each fixture via production catalog, cherry-picks, writes `final.metadata.json` to
+          `<fixture>/rust_table/metadata/`.
+        - `test_rust_view_of_java_cherrypick_matches_java_view`: env `ICEBERG_INTEROP_CHERRYPICK_DIR` — loads
+          Java-produced table, asserts Rust canonical view == `java_meta.json` (using shared
+          `common/snapshot_meta_view`). ALSO asserts fixture-specific facts: FF = same snapshot count;
+          replay = `source-snapshot-id` and `published-wap-id` present in current snapshot summary.
+        **Script `run-interop-cherrypick.sh`:**
+        - 6 steps: reset TMP, Java gen fixtures + emit meta, Rust gen, Java emit view of Rust + byte-diff,
+          Java verify-interop-cherrypick, Rust assert view of Java. `set -euo pipefail`, sentinel greps.
+        **GAP_MATRIX:** update cherrypick cell — metadata-level interop proven (ff/replay/dedup), `stageOnly`
+        stays deferred, row stays 🟡.
+      - [x] 1. Write this plan in todo.md (done)
+      - [x] 2. Add `CherryPickOracle` class to `InteropOracle.java` (3 fixture build + emit + verify methods)
+             with 2 new dispatch cases in `main()`.
+      - [x] 3. Write `run-interop-cherrypick.sh` — 6-step harness mirroring run-interop-expire.sh.
+      - [x] 4. Write `crates/iceberg/tests/interop_cherrypick.rs` — 2 env-gated tests (GEN + comparison).
+      - [x] 5. Update `GAP_MATRIX.md` cherrypick row cell + pipe-count audit.
+      - [x] 6. Update `dev/java-interop/map.md` — add run-interop-cherrypick.sh to Contents.
+      - [x] 7. Run the full chain GREEN end-to-end (both directions all 3 fixtures).
+      - [x] 8. Sabotage checks: (a) corrupt summary value in java_meta.json → view compare FAILS; (b) delete
+             mid-chain artifact → chain FAILS not skips; (c) corrupt FF fixture Rust result (fake new snapshot
+             id where FF should occur) → D1 byte-diff FAILS.
+      - [x] 9. Rust gate (typos+fmt+clippy+lib ×2) — Run 1: 2000 lib pass; Run 2: 2000 lib pass. Both clean.
+      - [x] 10. Finalize todo.md + lessons.md.
       Mutation mandate (point 1): removing `data_sequence_number(1)` caused test_rewrite_data_gen to FAIL
       at the Rust self-scan assertion (ids 20+40 resurrected: left=[10,20,30,40,50] ≠ right=[10,30,50]) —
       the fixture IS load-bearing (not vacuous). Fixture B redesign confirmed against lessons.md L1206-1217
@@ -542,8 +600,38 @@ result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs 
       by the Java verify's count check. The RUST comparison test (`Vec.eq()`) provides the multiset guard
       for that direction. Same-id duplicates cannot arise from the production write chain (each row written
       exactly once). No production code change needed; documented here.
+
+      **Outcome (2026-06-11, S2 COMPLETE):** Metadata-level interop for `cherrypick` landed.
+      Files: `dev/java-interop/InteropOracle.java` (+`CherryPickOracle`), `dev/java-interop/run-interop-cherrypick.sh` (new),
+      `crates/iceberg/tests/interop_cherrypick.rs` (new), `docs/parity/GAP_MATRIX.md` (cherrypick row updated),
+      `dev/java-interop/map.md` (1 table row added), `task/todo.md` + `task/lessons.md`. Gate: typos/fmt/clippy/2000 lib ×2 clean.
+      Sabotage ×3 fail-closed. Full chain GREEN (6/6 steps) both directions over 3 fixtures (ff/replay/dedup).
+      Key lessons: dedup fixture must NOT have `wap.id` (use ancestry path `CherrypickAncestorCommitException`, not WAP path
+      `DuplicateWAPCommitException`); `validate()` fires on `tx.commit()` not on `apply()`; dedup verify needs a fresh temp dir.
+      Row stays 🟡 (`stageOnly` WAP-write path deferred).
+
+      **S2 REVIEWER (2026-06-11, Sonnet, adversarial):** APPROVE with two fixes applied.
+      #1 FF-vacuity: NOT vacuous — count assertion (==before for FF, ==before+1 for replay) is the structural
+      guard; a replay-instead-of-FF path produces 3 snapshots (not 2), caught immediately by the D2 comparison
+      test. Production src mutation was blocked (READ-ONLY); static FF-predicate analysis + three independent
+      unit tests all green confirm correctness. #2 Dedup Rust-side: GAP FOUND + FIXED — GEN test only checked
+      "commit fails" (Ok → panic) without asserting error kind or message. Added `ErrorKind::DataInvalid`,
+      `!err.retryable()`, and `err.message().contains("already picked to create ancestor")` — confirmed
+      green with the exact error printed. #3 Staging fidelity: CONFIRMED — all three preconditions
+      structurally enforced (FF: staged parent == S0 == head; replay: staged parent == S0 != S2 == head;
+      dedup: same as replay + second commit attempted). #4 Replay-fact depth: GAP FOUND + FIXED —
+      `source-snapshot-id` was `is_some()`-only; added parse-as-i64 + `snapshot_by_id` lookup (value must
+      point to a real, non-current snapshot in metadata). #5 Script audit: ALL 5 criteria met (`set -euo
+      pipefail` line 45, per-run TMP wipe step 1, every Java call fail-closed, sentinel both absent-`^FAIL`
+      AND present-`verify-interop-cherrypick: 0 failures`). #6 Sabotages: ALL 3 FAIL CLOSED (corrupt summary
+      → Java verify prints FAIL; delete artifact → Java verify prints FAIL; fake-FF snapshot in artifact →
+      Java verify crashes before sentinel). #7 House: gate typos/fmt/clippy/2000 lib CLEAN ×2; all GAP_MATRIX
+      rows have exactly 5 pipes; date "2026-06-11" correct; git status = allowed set only (no src/** edits,
+      no Cargo diffs). ONE RETAINED FINDING from builder (documented, not blocking): Java verify's
+      `LinkedHashMap<Long,String>` SET semantics silently dedup same-id duplicates — Rust `Vec.eq()` is
+      the multiset guard. Cannot arise from production write chain; no code change needed.
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
-- [ ] **Opus-queue (post-handoff or parallel):** cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.
+- [ ] **Opus-queue (post-handoff or parallel):** cherrypick `stageOnly` WAP-write path, ORC/Avro breadth, view ops, incremental-scan interop.
 - [ ] **THIS BRANCH (Group B, Fable actor-critic, user-approved 2026-06-11): variant-type
       groundwork** — B1: the variant binary format read side (`org.apache.iceberg.variants`
       Serialized* + VariantUtil parity: metadata dictionary, value headers, all primitive
