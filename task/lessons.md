@@ -1281,3 +1281,106 @@ How to use it (see the manuals' §2):
   fast_append carry UNFILTERED while merge_append still filters. The two are now DELIBERATELY different.
   Reported to the orchestrator (merge_append.rs production is outside the reviewer's allowed file set; a
   one-line comment correction is the only follow-up).
+
+### 2026-06-11 (Wave-4 Group O / O2 — `RewriteDataFiles` bin-pack compaction, BUILDER Opus)
+- **BIN-PACK COMPACTION READS DELETES-APPLIED, which makes it SAFER than plain `RewriteFiles` for an
+  EXISTING delete — and the "resurrection-without-seq" test premise is WRONG.** *Why:* the Spark
+  runner (`SparkBinPackFileRewriteRunner.doRewrite`, MAIN) reads each group via the normal Iceberg
+  scan, so merge-on-read deletes are APPLIED and the rewritten file contains only LIVE rows. So an
+  EXISTING equality-deleted row is physically gone from the output REGARDLESS of the stamped seq —
+  it cannot resurrect (that is the whole point of `DELETE_FILE_THRESHOLD`: rewrite a delete-laden file
+  to physically drop its deletes). The naive "compact without `use_starting_sequence_number` ⇒ y=20
+  resurrects" test FAILED because y=20 was never written to the new file. The seq flag's REAL
+  load-bearing role is keeping a CONCURRENT equality delete (one added after planning, at a higher
+  seq) still applying to the rewritten data — that is what `RewriteDataFilesCommitManager`'s
+  `dataSequenceNumber(startingSnapshot.sequenceNumber())` preserves. Re-cast the broken test to an
+  ON-DISK seq mechanism pin (raw avro, pre-inheritance, both directions: with-flag ⇒ explicit
+  starting seq; without ⇒ `None`/re-inherit-fresh) — that is mutation-sensitive (the seq-drop mutation
+  fails it) and CORRECT, where the scan-resurrection claim was a category error. Contrast with plain
+  `RewriteFiles` (rewrite_files.rs crown jewel), which rewrites the file's RAW bytes (delete still
+  present), so THAT path genuinely resurrects without seq preservation — the two actions have
+  different read semantics and therefore different resurrection physics.
+- **THE STAMPED SEQ IS THE STARTING SNAPSHOT'S, not the file's own (1.10.0 bytecode-pinned).**
+  `RewriteDataFilesCommitManager.commitFileGroups` (core jar, offsets 81-145): `table.newRewrite()
+  .validateFromSnapshot(startingSnapshotId)`; IF `useStartingSequenceNumber` (default TRUE per api
+  bytecode `USE_STARTING_SEQUENCE_NUMBER_DEFAULT`): `.dataSequenceNumber(table.snapshot(
+  startingSnapshotId).sequenceNumber())`. Maps cleanly onto the fork's
+  `RewriteFilesAction.data_sequence_number(seq)` + `.validate_from_snapshot(id)` — the O2 action
+  threads `starting_snapshot.sequence_number()`, not the input files' seqs.
+- **The 1.10.0 candidate predicate + group filter (MAIN, literal constants bytecode-confirmed):**
+  `filterFiles` = `outsideDesiredFileSizeRange(length<minFileSize || length>maxFileSize) || tooManyDeletes
+  (deletes.size()>=deleteFileThreshold) || tooHighDeleteRatio`; `filterFileGroups` = `enoughInputFiles
+  (size>1 && size>=minInputFiles) || enoughContent(size>1 && inputSize>target) || tooMuchContent(inputSize>
+  maxFileSize) || anyMatch(tooManyDeletes) || anyMatch(tooHighDeleteRatio)`. Defaults: min=0.75·target,
+  max=1.8·target, minInputFiles=5, maxGroupSize=100GiB, deleteFileThreshold=Integer.MAX_VALUE (disabled),
+  target=`write.target-file-size-bytes` (512MiB). The `size>1` guard in `enoughInputFiles`/`enoughContent`
+  is what leaves a LONE undersized file alone — a single-file group only qualifies via `tooMuchContent`
+  (oversized) or the delete clause, never by being merely small (pin the boundary: 2 files < min=3 ⇒ no-op,
+  3 == min ⇒ rewritten).
+- **PER-PARTITION grouping (`groupByPartition`): key by `task.file().partition()` ONLY when the file's spec
+  id == the table's CURRENT default spec id, else the EMPTY struct** ("an incompatible-spec file could span
+  multiple current partitions, so group it un-partitioned"). The pure-fn pin builds an old-spec (id 1) task
+  + a current-spec (id 0) task and asserts they bucket SEPARATELY (never merged into one qualifying group) —
+  the mutation that always-empties the key fails both the unit pin and the e2e partition-isolation pin.
+- **Java's PLANNER does NOT split an oversized INPUT file — it bin-packs whole `FileScanTask`s and lets the
+  WRITE-time rolling writer (`inputSplitSize`/`writeMaxFileSize`) control OUTPUT rolling.** An input file >
+  max is SELECTED (oversized candidate, `tooMuchContent`) and rewritten, but never split before reading.
+  Ported faithfully: bin-pack whole tasks, roll output at the target via `RollingFileWriter`. (The brief
+  flagged oversized-split as a possible deferral — the answer is "Java doesn't do input-split," not "deferred.")
+- **Bin packing = FORWARD `pack` (lookback-1), NOT `packEnd`.** `SizeBasedFileRewritePlanner.planFileGroups`
+  uses `new BinPacking.ListPacker(maxGroupSize, 1, false, maxGroupCount).pack(...)` — the forward greedy
+  first-fit, whereas the fork's MERGE-APPEND manifest packer uses `packEnd` (reversed, so the underfilled bin
+  is first). DIFFERENT entry point, same `PackingIterator` core. The fork's `bin_packing` module is
+  `pub(crate)`-PRIVATE to `transaction/merge_append.rs`; reusing it would require making it visible = a
+  `transaction/` change (out of a maintenance action's scope), so the lookback-1 forward case is reimplemented
+  locally (~15 lines) + algorithm-verified against Java + the fork's `pack`. When a needed helper is private
+  to a read-only module, reimplement-locally beats opening the module if the algorithm is small and pinnable.
+- **A maintenance action that reads + writes + commits is cleanly composable from the existing surface with
+  ZERO transaction/scan/writer edits.** O2 used `table.scan().filter().plan_files()` (tasks carry deletes),
+  `ArrowReaderBuilder::read` (deletes applied), `DataFileWriter`/`RollingFileWriter` (roll at target), and
+  `Transaction::rewrite_files(...).data_sequence_number().validate_from_snapshot()` — every seam already
+  public. The brief's "STOP and report if you need a visibility change in transaction/scan/writer" never
+  fired. The A2 (`DeleteOrphanFiles`) builder idiom (`new(table)` → builder methods → `execute(catalog)`)
+  ported directly; the rewrite_files.rs test fixtures (real parquet write + scan + on-disk-seq raw-avro read)
+  ported directly into the maintenance test module (the transaction `tests` module is private, so the helpers
+  were re-authored, not imported).
+
+### 2026-06-11 (Wave-4 Group O / O2 — `RewriteDataFiles`, REVIEWER Opus)
+- **A COMPACTION/REWRITE READ MUST STRIP THE SCAN RESIDUAL (`FileScanTask.predicate`) BEFORE READING, or
+  `.filter(Predicate)` SILENTLY DROPS LIVE ROWS.** *Found + fixed in O2.* `scan().with_filter(p)` computes a
+  per-file partition-reduced RESIDUAL and stores it on each `FileScanTask.predicate`; `arrow/reader.rs` turns
+  that residual into a row-level `RowFilter` (`final_predicate` → `with_row_filter`, reader.rs ~471/521). A
+  maintenance action that re-feeds the planned tasks into `ArrowReaderBuilder::read` (to read the group's live
+  rows) therefore ALSO applies the filter PER ROW — so a file whose rows only PARTIALLY match the filter has its
+  non-matching LIVE rows DISCARDED from the rewritten output ⇒ permanent data loss (row count fell 10→5 in the
+  repro). Java does NOT do this: `BinPackRewriteFilePlanner.planFileGroups` builds the plan scan with
+  **`.ignoreResiduals()`** (core MAIN ~L291) so tasks carry NO residual, and `SparkBinPackFileRewriteRunner.doRewrite`
+  reads the group by SCAN_TASK_SET_ID with NO row filter (reads ALL rows). FIX (the Rust analogue of
+  `ignoreResiduals`): set `task.predicate = None` on the group tasks before `read`; keep the delete files (deletes
+  still apply) and keep `.with_filter` on the PLANNING scan (file-selection only). RULE: when an action reads a
+  pre-planned `FileScanTask` for a purpose OTHER than answering the filter (rewrite/compact/copy), STRIP
+  `task.predicate` — the residual belongs to query reads, not data-movement reads. Pin: an e2e with rows
+  straddling the filter boundary, asserting the post-rewrite scan still has BOTH sides.
+- **The on-disk-seq mechanism pin is NECESSARY but not SUFFICIENT — add the behavioral concurrent-eq-delete e2e.**
+  The builder pinned `use_starting_sequence_number` only via raw-avro on-disk seq. The REAL behavior is
+  constructible by driving the action's internals: capture starting snapshot S; `write_compacted_files`; commit a
+  CONCURRENT equality delete at seq S+1 (deleting a row in the to-be-rewritten files); then commit the rewrite
+  stamping S — `ignore_equality_deletes = data_sequence_number.is_some()` makes the commit SUCCEED, and the
+  post-rewrite scan shows the row GONE (data at seq S < delete seq S+1). Dropping the seq stamp either resurrects
+  the row OR (more often) flips `ignore_equality_deletes` off ⇒ the delete now CONFLICTS ⇒ commit FAILS — either
+  way the mutation is caught.
+- **`validate_from_snapshot(start)` is REDUNDANT for a single-group first commit but LOAD-BEARING across groups.**
+  `RewriteFilesAction.validate` uses `effective_start = validate_from_snapshot.or(starting_snapshot_id)` where the
+  fallback is the TRANSACTION-captured base. In `rewrite_group`, `Transaction::new(table)` for the FIRST group has
+  base == starting snapshot, so dropping `validate_from_snapshot` is behaviorally identical there (a single-group
+  concurrent-delete e2e through `.execute()` does NOT catch the drop). It diverges only on the 2nd+ group (base has
+  advanced past the original start). Keep the call (Java-faithful + multi-group-correct) but know a one-group e2e
+  can't pin it; the staged conflict tests + the `.execute()` conflict pin cover the single-group path, and the
+  bytecode + the `.or()` trace cover the rest.
+- **Strengthen an incompatible-spec partition pin by giving the off-spec file the SAME partition struct as a
+  current-spec file.** The original pin used DIFFERENT partition values ([7] vs [0]), so the "always key by
+  partition" mutation still bucketed them apart (different structs) and the pin passed under mutation. Making both
+  structs `[0]` (with `min_input_files=2` so a co-grouped pair WOULD qualify) makes the mutation observable: correct
+  code buckets the off-spec file under the EMPTY struct (separate), the mutation co-groups them into one qualifying
+  group. A mutation-insensitive guard test is worse than none — pick fixture values that make the guard's job
+  actually necessary.

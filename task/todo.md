@@ -264,6 +264,105 @@ unchanged). REPORTED (not fixed, out of file set): merge_append.rs:282 comment n
 FastAppendOperation::existing_manifest exactly" — they diverge post-O1). Tree clean: 5 allowed files only,
 no Cargo/pom, merge_append.rs + snapshot.rs production byte-untouched. No commit.
 
+## ACTIVE (2026-06-11): Wave-4 Group O increment O2 — `RewriteDataFiles` bin-pack compaction (worktree wt-rewrite, BUILDER Opus)
+
+Port Java 1.10.0 `RewriteDataFiles` bin-pack planning over the existing seq-preserving `RewriteFiles`
+commit. **Corruption surface:** a compaction that loses rows, resurrects deleted rows (seq mistakes
+break outstanding delete applicability), or commits the wrong replaced-set is silent data corruption.
+Modify ONLY: `crates/iceberg/src/maintenance/**`, `docs/parity/GAP_MATRIX.md` (that row), `task/todo.md`,
+`task/lessons.md`. transaction/ / scan/ / writer/ READ-ONLY (STOP+report if a visibility change is needed).
+
+**Java authority pinned (1.10.0 bytecode + MAIN where flagged):**
+- `api/RewriteDataFiles`: `USE_STARTING_SEQUENCE_NUMBER_DEFAULT = true` (bytecode), `TARGET_FILE_SIZE_BYTES`,
+  `PARTIAL_PROGRESS_ENABLED_DEFAULT = false`, `REWRITE_JOB_ORDER_DEFAULT` (string). Result shape (api
+  bytecode): `addedDataFilesCount`, `rewrittenDataFilesCount`, `rewrittenBytesCount`, `removedDeleteFilesCount`,
+  per-group `FileGroupRewriteResult{info, addedDataFilesCount, rewrittenDataFilesCount, rewrittenBytesCount}`.
+- `core/SizeBasedFileRewritePlanner` (MAIN, defaults bytecode-confirmed): `MIN_FILE_SIZE_DEFAULT_RATIO=0.75`,
+  `MAX_FILE_SIZE_DEFAULT_RATIO=1.8`, `MIN_INPUT_FILES_DEFAULT=5`, `MAX_FILE_GROUP_SIZE_BYTES_DEFAULT=100GB`,
+  `REWRITE_ALL_DEFAULT=false`. Candidate predicate `outsideDesiredFileSizeRange` = `length<minFileSize ||
+  length>maxFileSize`. Group filter = `enoughInputFiles(size>1 && size>=minInputFiles) || enoughContent(size>1 &&
+  inputSize>target) || tooMuchContent(inputSize>maxFileSize)` + the subclass delete clauses. Bin packing =
+  `ListPacker(maxGroupSize, lookback=1, largestBinFirst=false, maxGroupCount).pack` — FORWARD `pack`, NOT packEnd.
+- `core/BinPackRewriteFilePlanner` (MAIN): `DELETE_FILE_THRESHOLD_DEFAULT=Integer.MAX_VALUE` (disabled),
+  `DELETE_RATIO_THRESHOLD_DEFAULT=0.3`. `filterFiles` adds `tooManyDeletes(deletes.size()>=deleteFileThreshold)
+  || tooHighDeleteRatio`. `filterFileGroups` adds `anyMatch(tooManyDeletes) || anyMatch(tooHighDeleteRatio)`.
+  PER-PARTITION grouping (`groupByPartition`: `task.file().partition()` when `specId==table.spec().specId()`,
+  else empty struct). `defaultTargetFileSize` = `write.target-file-size-bytes` (default 512MB).
+- `core/RewriteDataFilesCommitManager.commitFileGroups` (BYTECODE, offsets 81-145): `table.newRewrite()`
+  `.validateFromSnapshot(startingSnapshotId)`; IF `useStartingSequenceNumber` (default TRUE):
+  `.dataSequenceNumber(table.snapshot(startingSnapshotId).sequenceNumber())` — the STARTING snapshot's seq
+  is stamped on all added files; then add added / remove rewritten data / remove rewritten delete; `.commit()`.
+- WHAT THE RUNNER READS (Spark `SparkBinPackFileRewriteRunner.doRewrite`, MAIN — no core/api bytecode):
+  reads the group's files via the normal Iceberg scan (`format("iceberg")`) ⇒ merge-on-read DELETES APPLIED;
+  writes only LIVE rows. That is why `DELETE_FILE_THRESHOLD`/`DELETE_RATIO_THRESHOLD` exist (rewrite a
+  delete-laden file to physically drop its deletes). Position deletes / DVs referencing rewritten files DANGLE
+  (Java keeps them — converges with the existing RewriteFiles dangling-delete probe; carry-unchanged posture).
+
+**Plan:**
+- [x] `maintenance/rewrite_data_files.rs` (new) + mod.rs wiring. `RewriteDataFiles::new(table)` builder with
+      all named knobs (defaults = Java's, bytecode-cited). `.filter(Predicate)` INCLUDED (the scan's
+      `.with_filter` made it cheap). Size thresholds resolved Java-style lazily at execute with all preconditions.
+- [x] Planning (1.10.0 `BinPackRewriteFilePlanner.plan`): plan from `scan().filter().plan_files()` FileScanTasks
+      (each carries size/record_count/partition/spec/deletes) + a path→DataFile map from LIVE manifest entries
+      (for the removal set). Group by partition (current spec else empty), candidate-filter, local forward `pack`
+      (lookback-1), group-filter. The fork's `bin_packing` (merge_append.rs) NOT reused (pub(crate)-private;
+      opening it = transaction/ change) — reimplemented + algorithm-verified, cited in module doc + GAP_MATRIX.
+- [x] Per group: read its tasks' LIVE rows via `ArrowReaderBuilder::read` (deletes APPLIED — each task carries its
+      delete files), write via `DataFileWriter`/`RollingFileWriter` rolling at target size; ONE commit per group
+      via `tx.rewrite_files(deleted, added).validate_from_snapshot(start).data_sequence_number(start_seq)`
+      (when use_starting_sequence_number). Sequential; partial-progress/concurrency/sort+zorder DEFERRED (named).
+- [x] Edge semantics: empty plan ⇒ no-op zero-count result, NO commit (no current snapshot ALSO a no-op).
+      Oversized-file SPLITTING: Java's planner does NOT split input files — bin-packs whole tasks; output rolling
+      only. Stated explicitly in module doc + GAP_MATRIX. **DISCOVERY: the seq flag does NOT prevent resurrection
+      of an EXISTING equality-deleted row** — compaction reads deletes-APPLIED, so the deleted row is physically
+      gone from the output regardless of seq (SAFER than plain RewriteFiles). The seq matters for a CONCURRENT
+      equality delete still applying; the broken-seq test was re-cast to an ON-DISK seq mechanism pin (both
+      directions), which is the correct, mutation-sensitive assertion (the scan-level resurrection claim was wrong).
+- [x] Tests (19, e2e + pure-fn): crown-jewel row conservation (sorted set eq); equality-delete preservation +
+      on-disk-seq mechanism pin (both directions); position-delete-applied + dangle variant; candidate selection
+      (target untouched / undersized rewritten / delete-threshold triggers + under-count negative); partition
+      isolation (e2e + pure-fn incompatible-spec bucket); empty-plan + fresh-table no-op; min_input_files (lone
+      file + 2-vs-3 boundary); result counts; concurrent position-delete fails the commit (inherits RewriteFiles
+      validate); precondition rejection; pure-fn pins for `pack_bins`/`is_candidate`/`group_qualifies`/`plan_file_groups`.
+- [x] GAP_MATRIX `RewriteDataFiles` ❌→🟡 (location, date, defaults cited, deferrals named, bin_packing-not-reused
+      noted) + 5-pipe audit CLEAN.
+- [x] Verify: typos + fmt + clippy `-D warnings` (workspace ex-sqllogictest) + `cargo test -p iceberg --lib` ×2.
+
+**Outcome (2026-06-11): O2 LANDED.** New `maintenance/rewrite_data_files.rs` (action + 19 tests) + mod.rs wiring
+(`pub mod` line already existed). Bin-pack planning ported from 1.10.0 (candidate predicate + per-partition
+grouping + forward pack + group filter), reads deletes-applied, commits per group through the seq-preserving
+`RewriteFiles`. SEQ stamped = STARTING snapshot's seq when `use_starting_sequence_number` (default true,
+bytecode-cited from `RewriteDataFilesCommitManager.commitFileGroups`). Files: `maintenance/{rewrite_data_files.rs
+(new), mod.rs (+1 mod + re-exports)}`, GAP_MATRIX (1 row), todo, lessons. ZERO transaction/scan/writer edits (the
+machinery was sufficient — no visibility change needed). Gate CLEAN from wt-rewrite root: typos clean, fmt clean,
+clippy `-D warnings` clean (workspace ex-sqllogictest), `cargo test -p iceberg --lib` **2022 passed ×2** (baseline
+2003 + 19). 4 mutations run + restored: seq-drop (caught by the on-disk-seq pin), `enoughInputFiles`-false (9
+tests), `outside_desired_size`-false (broad), partition-grouping-always-empty (both partition pins). KEY DISCOVERY:
+bin-pack compaction reading deletes-applied makes it SAFER than plain RewriteFiles for existing deletes (the row
+is physically removed); the seq flag's load-bearing role is keeping CONCURRENT deletes applying — pinned via the
+on-disk seq, not a (wrong) scan resurrection. Deferred (named): partial progress, concurrency, sort/zorder,
+delete_ratio_threshold, output_spec_id/rewrite_all/rewrite_job_order/max_files_to_rewrite, oversized-input SPLIT
+(Java planner doesn't split), interop. No commit. NOTE: O3 (RemoveDanglingDeleteFiles) NOT started — separate run.
+
+**O2 REVIEWER (2026-06-11, Opus, delegated):** Adversarial review. HEADLINE #1 — FILTER-LEAK BUG **FOUND + FIXED.**
+`write_compacted_files` passed the planned `FileScanTask`s straight into `ArrowReaderBuilder::read`; those tasks
+carry a per-file RESIDUAL (`task.predicate`, computed by `scan().with_filter(self.filter)`), which `arrow/reader.rs`
+turns into a row-level `RowFilter` (reader.rs:471/521) ⇒ a file where `.filter` matches only SOME rows had its
+non-matching live rows SILENTLY DROPPED. Java DIVERGES: `BinPackRewriteFilePlanner.planFileGroups` builds the
+plan scan with **`.ignoreResiduals()`** (core MAIN line 291) so tasks carry NO residual, and the Spark runner
+(`SparkBinPackFileRewriteRunner.doRewrite`) reads the group by SCAN_TASK_SET_ID with NO row filter ⇒ reads ALL
+rows. Fix: strip `task.predicate` (set `None`) on the group tasks before the read (the Rust analogue of
+`ignoreResiduals`); planning/file-selection is unchanged (the filter still file-prunes in `plan_files`). Added
+fail-before/pass-after e2e `test_filtered_compaction_keeps_non_matching_live_rows` (a file with rows matching AND
+not-matching the filter; post-compaction scan must keep BOTH). #2 concurrent-eq-delete: constructed the real
+mid-flight injection e2e (delete committed between starting-snapshot capture and the group commit; commit succeeds
+via ignore_equality_deletes; rows stay GONE) + seq-drop mutation resurrects them ⇒ added
+`test_concurrent_equality_delete_still_applies_after_compaction`. #3 boundaries + #4 packing: re-derived from
+1.10.0 BYTECODE (outsideDesiredFileSizeRange strict</-both; enoughInputFiles size>1 && >=min; enoughContent size>1
+&& >target; tooMuchContent inputSize>max with NO size>1 guard; ListPacker(maxGroupSize,1,false,_).pack forward,
+canAdd `<=` inclusive) — all MATCH the Rust. Mutation sweep: 4 builder + partition-default-spec-drop, validate-drop,
+result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs only.
+
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** data-level write-action interop paydown,
       cherrypick interop + `stageOnly`, ORC/Avro breadth, view ops, incremental-scan interop.
