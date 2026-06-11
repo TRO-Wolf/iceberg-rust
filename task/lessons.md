@@ -1597,3 +1597,95 @@ How to use it (see the manuals' §2):
   mandate broke load-bearing BEHAVIORS one at a time; it did not ask "what column/field does this
   compare NOT see?" — the projection-completeness axis. That axis is the Opus-critic's distinctive
   catch on templated-interop work.
+### 2026-06-11 (Wave-4 F1 — `variant` schema-type entry, BUILDER Fable, wt-vschema)
+- **Java's `VariantType` sits in NEITHER hierarchy branch — `Types$VariantType implements Type`
+  directly (1.10.0 bytecode), so the Rust mirror is a new `Type::Variant` enum variant, NOT a
+  `PrimitiveType`.** *Why it pays:* every non-primitive door then fires for free with Java's exact
+  semantics — partition ("Cannot partition by non-primitive source field"), sort ("Cannot sort by
+  non-primitive source field"), identifier ("not a primitive type field"), and promotion (the
+  `let Type::Primitive(..) else return false` up-front rejection). The only Java-side EXPLICIT
+  variant rejection is `Identity.UNSUPPORTED_TYPES = {VARIANT, GEOMETRY, GEOGRAPHY}` — redundant
+  with the non-primitive door for variant, so no Rust-side special case is needed.
+- **`SchemaParser` serializes variant like a primitive — `if (isPrimitiveType() || isVariantType())
+  writeString(toString())` — so the JSON schema serde needs a string-shaped arm in the untagged
+  type enum, placed BEFORE the primitive arm with a marker that accepts ONLY the exact string
+  "variant".** `Types.fromPrimitiveString("variant")` throws a literally HARDCODED message
+  ("Cannot parse type string: variant is not a primitive type" — an ldc constant, because variant
+  is the only non-primitive in the TYPES map); the Rust `PrimitiveType` deserializer must keep
+  rejecting the string.
+- **The visitor-default trick: Java's `TypeUtil.SchemaVisitor.variant` DEFAULT throws
+  ("Unsupported type: variant") and only the structural visitors override it as a leaf — porting
+  that as a DEFAULTED Rust trait method made the crate-wide ripple small and fail-loud.** Every
+  `SchemaVisitor`/`SchemaWithPartnerVisitor` implementor that must not see variant (arrow value
+  conversion, NaN counter, eq-delete projector, parquet writer) inherits the Java-shaped error;
+  only index/prune/reassign (+ avro) override — exactly the set Java overrides (each pinned from
+  bytecode: IndexByName/IndexById/IndexParents/PruneColumns/AssignFreshIds/ApplyChanges return
+  leaf values). The compile-forced direct-match ripple was 7 sites; each took a leaf arm with the
+  Java citation.
+- **Java 1.10.0 HAS an Avro shape for variant (don't assume "no engine shape"):**
+  `TypeToSchema.variant` emits a record `r<fieldId>` (fallback name "variant") with two REQUIRED
+  bytes fields `metadata`,`value` plus logical type "variant" (`VariantLogicalType.NAME`);
+  `AvroSchemaVisitor.visit` routes logicalType-variant records through `isVariantSchema`
+  (record + exactly-2-fields + both bytes, looked up BY NAME) with "Invalid variant record: %s",
+  and `SchemaToType.variant` returns the singleton. apache-avro 0.21 can carry it: unknown
+  logical types pass through to the underlying record and `parse_record` keeps `logicalType` in
+  `RecordSchema.attributes` (only "fields" is excluded), which `Serialize` writes back.
+- **apache-avro `Schema` equality is canonical-form-based with `include_attributes: false` — an
+  `assert_eq!` on schemas can NEVER pin a logical-type attribute.** The variant logicalType (and
+  the existing field-id/element-id attributes) are invisible to schema equality; the avro shape
+  tests must fish the record out and assert `attributes` explicitly, plus pin the serialized JSON
+  string. The drop-the-stamping mutation passed schema equality and was caught only by the
+  explicit attribute pins.
+- **Arrow verdict: loud error IS Java parity.** `ArrowSchemaUtil` (MAIN; no iceberg-arrow 1.10.0
+  jar locally) does not override `variant`, so Java throws the visitor default on the same
+  conversion; arrow-rs 57.1 has no variant extension type. The Rust override keeps Java's message
+  prefix and NAMES the pinned-crate limitation. Eq-delete fields: Java 1.10.0 core has NO explicit
+  eq-delete type door — the Rust rejection happens structurally (`EqualityDeleteWriterConfig::new`
+  converts the FULL table schema through `schema_to_arrow_schema`, which errors on any variant
+  column), pinned at the arrow layer.
+
+### 2026-06-11 (Wave-4 F1 — REVIEWER Fable, wt-vschema)
+- **A bytecode-derived Avro claim is incomplete without the REGISTRATION story: Java only attaches
+  `VariantLogicalType` to PARSED schemas after `org.apache.iceberg.avro.Avro`'s static init runs
+  `LogicalTypes.register("variant", ...)`, and Avro's `fromSchemaIgnoreInvalid` then silently DROPS
+  the logical type when `validate` (= `isVariantSchema`) fails.** *Consequence:* Java's in-code
+  "Invalid variant record: %s" precondition is UNREACHABLE for parsed schemas — live Java reads a
+  malformed claimed-variant record as a plain struct (with a logged warning). The Rust loud
+  rejection is a deliberate fail-loud divergence (B1 house precedent), now documented at `visit()`.
+  A live probe that forgets `Class.forName("org.apache.iceberg.avro.Avro")` measures the
+  UNREGISTERED behavior — probe both.
+- **`isVariantSchema` is by-NAME (`getField`) ⇒ order-insensitive: live Java (registered) accepts
+  `value`-before-`metadata`; Rust's `lookup`-based check matches.** Pinned with a value-first test
+  after the swap-to-positional mutation SURVIVED the builder's suite — shape-check order
+  insensitivity needs its own pin.
+- **The map-value fallback name was a real cross-engine failure, not just a cosmetic divergence:
+  two variant-valued maps in one schema emitted two records both named "variant", and Java's
+  `Schema.Parser` rejects duplicate definitions ("Can't redefine: variant").** Fixed by renaming
+  variant records in `map()` to Java's `r<fieldId>` (live-probed: `r8` for value-id 8); Java now
+  reads the fixed output byte-identically to its own shape. PRE-EXISTING sibling bug left in place
+  and flagged: a STRUCT map value keeps the `"null"` placeholder name (Java emits `r<id>`), so two
+  struct-valued maps still collide — converter-wide naming fix is out of F1 scope.
+- **Java's `Types.fromTypeName` lowercases (`toLowerCase(Locale.ROOT)`) — `SchemaParser` accepts
+  "Variant"/"VARIANT"/"vArIaNt" (and "STRING") where Rust's serde is lowercase-exact for EVERY
+  type name.** Pre-existing whole-parser divergence (read-tolerance of foreign-cased JSON only;
+  both writers emit lowercase). Pinned the uniform case-sensitive posture so a future fix flips
+  all names at once, never just variant.
+- **Read-tolerance verdict (live-probed): Java `TableMetadataParser.fromJson` runs NO
+  `checkCompatibility` — V1/V2 metadata with an existing variant column parses fine on both sides,
+  and `buildFrom(v2-with-variant)` + unrelated edits or `upgradeFormatVersion(3)` commit without
+  re-checking old schemas. The gate is add-schema-only in BOTH languages (creation +
+  `TableUpdate::AddSchema` + evolution all funnel there; views ungated in both).** But the
+  IDENTITY-TRANSFORM door DOES fire on Java's parse: metadata with `identity(variant)` in a
+  partition spec or sort order fails to read ("Unsupported type for identity: variant" —
+  `Identity.UNSUPPORTED_TYPES` is NOT redundant; it is the reachable door on bind paths, firing
+  BEFORE the non-primitive `checkCompatibility` messages, which are unreachable for variant).
+  Rust matches for partition specs (bound on parse → rejected); Rust sort orders are stored
+  unbound and read-tolerated — pre-existing posture difference, flagged not fixed.
+- **The untagged `SerdeType` arm order is NOT load-bearing — the swap-after-Primitive mutation
+  survives because untagged serde tries arms until success and `PrimitiveType` independently
+  rejects "variant".** The real guard is the PrimitiveType-rejection pin; the comment now says so
+  instead of claiming the position matters.
+- **A compile-forced arm unreachable through the public surface still needs a DIRECT unit test:**
+  the `include_leaf_field_id` variant arm survived a full-suite mutation (scans die earlier at the
+  arrow door), so its leaf semantics are pinned by calling the private fn directly — otherwise the
+  arm's behavior is unspecified the day the arrow door opens.

@@ -27,9 +27,12 @@ The Iceberg V3 **variant binary format** — a Rust port of Java 1.10.0
 and bounds-checked as a security boundary — untrusted file bytes; errors, never panics) and
 the WRITE side (`Variants.metadata`/`Variants.of` factories, `PrimitiveWrapper`, `ValueArray`,
 `ShreddedObject`'s plain object-writing core — byte-exact vs Java-1.10.0-generated fixtures).
-Shredding, the `variant` schema-type entry, and file-level interop are deferred. The Java→Rust
-mapping and every deliberate divergence are documented in [mod.rs](mod.rs)'s module doc
-(read-side list) and [write.rs](write.rs)'s module doc (write-side list).
+The `variant` SCHEMA-type entry landed 2026-06-11 (F1) and lives OUTSIDE this module:
+`Type::Variant` + serde in `spec/datatypes.rs`, the V3 gate in `spec/schema/mod.rs`, Avro/Arrow
+conversion in `avro/schema.rs` / `arrow/schema.rs`. Shredding (F2) and file-level variant data
+I/O + interop are deferred. The Java→Rust mapping and every deliberate divergence are documented
+in [mod.rs](mod.rs)'s module doc (read-side list) and [write.rs](write.rs)'s module doc
+(write-side list).
 
 ## Contents
 
@@ -58,7 +61,8 @@ mapping and every deliberate divergence are documented in [mod.rs](mod.rs)'s mod
 ## Pointers
 
 - **Up:** [crates/iceberg/src/](../) — wired as `pub mod variant` in `lib.rs`.
-- **Related:** `spec/datatypes.rs` (where the `variant` SCHEMA type will land — not part of B1);
+- **Related:** `spec/datatypes.rs` (`Type::Variant`, the schema-type entry — landed F1
+  2026-06-11) and `spec/schema/mod.rs` (`min_format_version`, the V3 gate);
   `docs/parity/GAP_MATRIX.md` "V3 types: variant" row (status + deferrals).
 
 ## Debug

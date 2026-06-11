@@ -684,6 +684,17 @@ result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs 
         see?"). That axis is the Opus-critic's distinctive value on templated-interop work. Full-Sonnet
         risks shipping vacuous-on-the-uncovered-axis evidence; keep-Opus is over-provisioned for work this
         templated. Sonnet-builder + Opus-critic is the calibrated split.
+- [ ] **THIS BRANCH (Wave 4 Group F, Fable actor-critic, user-approved 2026-06-11): variant
+      schema integration** — F1: the `variant` schema-type entry (`Type::Variant` in the spec
+      type system, metadata-JSON (de)serialization, `MIN_FORMAT_VERSIONS` V3 gate, not
+      partitionable/sortable/identifier rules, Avro/Arrow schema-conversion visitors; fold in the
+      `unknown` gate if cheap); F2: shredding overlay WRITE side (`ShreddedObject` partial-shred
+      semantics: unshredded backing object, field override/remove, re-wrap) + `VariantVisitor`
+      port — B2's byte-exact Java-fixture bar. BOUNDARY: file-level parquet variant I/O likely
+      blocked by the pinned parquet crate (Cargo FROZEN) — stop at schema/metadata + in-module
+      shredding; surface the dependency question, do not touch Cargo. Runs in worktree
+      `wt-vschema` parallel to Group O (`phase6/rewrites-and-debt`, Opus) and Group S
+      (`interop/data-level-paydown`, Sonnet).
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** cherrypick `stageOnly` WAP-write path, ORC/Avro breadth, view ops, incremental-scan interop.
 - [ ] **THIS BRANCH (Group B, Fable actor-critic, user-approved 2026-06-11): variant-type
@@ -742,6 +753,104 @@ result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs 
         test-pinned. 10-mutation sweep: 2 SURVIVORS found (object/array is-large bit
         transpositions) → killed by new Java-probe tests; 8 tests added, suite 57→65, lib
         **1935 passed ×2**.
+## ACTIVE (2026-06-11): Wave-4 Group F — F1 `variant` schema-type entry (worktree wt-vschema, BUILDER Fable)
+
+Make `variant` a first-class schema TYPE to Java 1.10.0 parity (schema/metadata level only —
+🟡 done-bar; NOT data I/O, NOT interop). Java hierarchy pinned from 1.10.0 bytecode:
+`Types$VariantType implements Type` directly (NOT `Type$PrimitiveType`, NOT `Type$NestedType`;
+`toString()` = "variant"; singleton `get()`), so Rust gets a new `Type::Variant` unit variant.
+
+- [x] **`Type::Variant` in spec/datatypes.rs:** unit variant + Display "variant" + `is_variant()`
+      (mirror Java `Type.isVariantType`); JSON serde — `"variant"` as a bare JSON string exactly
+      like Java `SchemaParser.toJson` (`isPrimitiveType() || isVariantType()` → writeString) /
+      `typeFromJson` (textual → `Types.fromTypeName`, which has "variant" in its TYPES map);
+      `PrimitiveType` parsing must keep REJECTING "variant" (Java `fromPrimitiveString` throws
+      "Cannot parse type string: variant is not a primitive type" — bytecode + MAIN identical).
+- [x] **Visitor dispatch (spec/schema/visitor.rs):** `SchemaVisitor::variant()` +
+      `SchemaWithPartnerVisitor::variant(partner)` DEFAULTED to Err(FeatureUnsupported,
+      "Unsupported type: variant") — the exact 1.10.0 `TypeUtil$SchemaVisitor.variant` default
+      throw — then leaf overrides ONLY where Java overrides: index.rs ×3 (IndexById null /
+      IndexByParent map / IndexByName map — all bytecode-pinned), prune_columns (null),
+      id_reassigner passthrough, update_schema rebuilds (AssignFreshIds.variant returns the type).
+- [x] **Format-version gate (spec/schema/mod.rs):** extend the EXISTING `min_format_version`
+      helper with `Type::Variant => Some(FormatVersion::V3)` — 1.10.0 `Schema.MIN_FORMAT_VERSIONS`
+      = {TIMESTAMP_NANO:3, VARIANT:3, UNKNOWN:3, GEOMETRY:3, GEOGRAPHY:3} (static-init bytecode).
+      One gate, not two: same `check_compatibility` choke point (`TableMetadataBuilder::add_schema`)
+      covers creation AND evolution; message "Invalid type for {col}: variant is not supported
+      until v3" (Java format pinned). `unknown` NOT folded in — it is a new PrimitiveType with a
+      crate-wide ripple, not a one-line gate arm; left deferred.
+- [x] **Legality rules (all via the non-primitive doors, like Java):** partition source rejected
+      ("Cannot partition by non-primitive source field" — `PartitionSpec.checkCompatibility`
+      pinned; `Identity.UNSUPPORTED_TYPES` = {VARIANT, GEOMETRY, GEOGRAPHY} confirms the explicit
+      intent); sort key rejected ("Cannot sort by non-primitive source field"); identifier field
+      rejected ("not a primitive type field" — Java validateIdentifierField); no promotion
+      (1.10.0 `TypeUtil.isPromotionAllowed` switch has no VARIANT branch; the `to` side is
+      `PrimitiveType` so promotion TO variant is unrepresentable in both languages); variant
+      nests freely in struct/list/map (Java visitors all leaf-accept; no map-key restriction
+      found in 1.10.0); `Literal::try_from_json`/`try_into_json` for variant → Err mirroring
+      1.10.0 `SingleValueParser` default "Type: variant is not supported".
+- [x] **Avro conversion (avro/schema.rs):** Java 1.10.0 DOES define the shape
+      (`TypeToSchema.variant`, bytecode): record named `r<fieldId>` (recipe `r`; "variant"
+      fallback), two REQUIRED bytes fields `metadata`, `value` (in that order), logicalType
+      "variant" (`VariantLogicalType.NAME`); reverse: `AvroSchemaVisitor.visit` routes
+      logicalType-variant records through `isVariantSchema` (record + exactly-2-fields +
+      metadata/value both bytes; "Invalid variant record: %s") to `variant()`;
+      `SchemaToType.variant` → `VariantType.get()`. apache-avro 0.21 preserves
+      `"logicalType": "variant"` in `RecordSchema.attributes` both directions (parse_record
+      get_custom_attributes excludes only "fields"; Serialize writes attributes back) — verified
+      in the vendored crate source.
+- [x] **Arrow conversion (arrow/schema.rs):** LOUD error. Java MAIN `ArrowSchemaUtil` has no
+      variant case (inherits the visitor-default throw "Unsupported type: variant"; no
+      iceberg-arrow 1.10.0 jar locally — flagged); pinned arrow-rs 57.1 has no variant canonical
+      extension type → `ToArrowSchemaConverter::variant` overrides the default to NAME the
+      limitation (message still starts with Java's "Unsupported type: variant"). No silent
+      binary/struct fallback. Eq-delete verdict: Java 1.10.0 core has NO explicit eq-delete type
+      door; the Rust `EqualityDeleteWriterConfig` path fails loudly via this same
+      `schema_to_arrow_schema` error (pinned at the arrow layer; writer/ untouched).
+- [x] **Tests (each names its risk):** JSON round-trip (top-level/struct/list/map + map-key);
+      PrimitiveType-"variant" rejection; V2 gate rejection + V3 acceptance at `add_schema`
+      (creation + evolved-schema shapes) + nested-in-struct rejection; timestamp_ns+variant
+      SHARED-gate regression (one gate, not two); partition/sort/identifier/promotion rejections
+      with Java-shaped messages; void-transform + Unknown-transform acceptance parity;
+      try_from_json/try_into_json error pins; Avro shape exact (vs the Java-shaped JSON, both
+      directions, nested placements) + malformed variant-record rejection; Arrow loud-error pin;
+      TableMetadata JSON round-trip with a V3 variant schema (inspect/serde paths work via serde).
+- [x] **Docs:** variant/mod.rs deferral ledger (schema-type entry CLOSED; shredding F2 +
+      file-level parquet I/O remain), variant/map.md, GAP_MATRIX variant row (+ pipe audit),
+      todo, lessons.
+- [x] **Gate:** typos, fmt, clippy `-D warnings` (workspace ex-sqllogictest),
+      `cargo test -p iceberg --lib` ×2 (baseline 2000 per brief — actual baseline verified
+      first), `cargo test -p iceberg-datafusion` (arrow/schema.rs changed = read-path pressure).
+
+Outcome (2026-06-11): LANDED — see the F1 BUILDER final report. Lib **2026 passed ×2** (baseline
+2000, +26 new tests), datafusion 80 lib + 9 integration green (the `table_provider_factory.rs:41`
+DOCTEST failure is the documented PRE-EXISTING `rt-multi-thread` issue — no datafusion files
+changed), typos/fmt/clippy `-D warnings` clean. 5 mutations all caught by their designated pins
+(gate-arm drop → 4 gate tests incl. the shared-gate pin; avro logicalType-stamp drop → 2; avro
+variant-detection disable → 3; arrow silent-Binary fallback → 1; serde wrong-name → serde +
+metadata round-trips). Compile-forced ripple beyond the named file set (flagged, mechanical leaf
+arms only): transaction/update_schema.rs (4 leaf arms), arrow/reader.rs (1 leaf arm),
+spec/values/literal.rs (Java SingleValueParser-default arm). Deferred loudly: `unknown` type
+entry (a new PrimitiveType, crate-wide ripple — NOT folded), shredding overlay (F2), file-level
+parquet variant I/O + interop (pinned parquet 57.1 boundary; Java 1.10.0 `TypeToMessageType
+.variant` defines the parquet group we cannot emit), variant-column readable-metrics rendering
+(needs a real V3 variant table — unreachable until file-level I/O lands).
+
+REVIEWER outcome (2026-06-11, Fable): VERIFIED with one bug fixed + 10 tests added — lib **2036
+passed ×2**. Live-Java probes (1.10.0 jars: `AvroSchemaUtil.convert`/`toIceberg`, `SchemaUpdate`,
+`TableMetadataParser`, `TypeUtil`) byte-compared the Avro shape in all 4 placements: identical
+except the map-value record name — Java emits `r8`, Rust emitted the "variant" fallback, and TWO
+variant-valued maps produced a duplicate definition Java REJECTS ("Can't redefine: variant") →
+FIXED (`rename_variant_record` in `map()`, Java now reads the output). Read-tolerance pinned
+(V1/V2-with-variant parses both sides; gate is add-schema-only in both; identity(variant)
+partition specs rejected on parse in both). Evolution ops (rename/optional/require/doc/move/
+delete/add/retype-reject) probed against live `SchemaUpdate` and pinned. 8 reviewer mutations: 6
+killed, 2 survivors closed (by-name order-insensitivity pin; direct `include_leaf_field_id` unit
+test) — plus 1 genuinely neutral (serde arm order; comment corrected). Divergences flagged not
+fixed (pre-existing/global): case-insensitive Java type-name parse, sort-order read binding,
+message shapes ('variant' quoting, identity-door text), struct-in-map `"null"` record naming.
+Dates normalized 2026-06-12→2026-06-11. Lessons appended. No commit.
+
 ## ACTIVE (2026-06-11): Variant arc B2 — variant binary format WRITE side (worktree wt-variant, BUILDER Fable, Group B)
 
 Port the Java 1.10.0 write surface (`Variants` factory, `PrimitiveWrapper`, `ValueArray`,
