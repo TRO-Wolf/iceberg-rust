@@ -147,6 +147,40 @@ default-spec (Java's `dataSpec()` rejects multi-spec there anyway); multi-spec J
   GAP_MATRIX/todo test count 6→8. Gate clean: typos, fmt, clippy -D warnings (workspace ex-sqllogictest),
   `cargo test -p iceberg --lib` 1806 ×2, `iceberg-datafusion` lib 80 + integration 9. Tree clean, no commit.
 
+## IN PROGRESS (2026-06-11): Identity-partition constants-map ACTIVATION (BUILDER, Group A, increment 2, wt-closeout)
+
+Goal: re-thread `task.partition_spec` and ACTIVATE the arrow reader's identity-partition constant
+materialization (Java `PartitionUtil.constantsMap`), fixing the two transformer bugs that caused the
+2026-06-08 revert. The decisive gate is `cargo test -p iceberg-datafusion` (lib + integration).
+
+- [x] **Bug (a) — REE leak.** Constant identity-partition columns were materialized as `RunEndEncoded`
+  (via `datum_to_arrow_type_with_ree`), so the output batch schema declared REE where the projected scan
+  schema says plain `Utf8`/`Int64` ("expected Utf8 but found RunEndEncoded", `test_insert_into_partitioned`).
+  FIX: materialize identity-partition constants as PLAIN arrays whose Arrow type equals the field's declared
+  scan-schema type — the output batch schema now equals the declared scan schema EXACTLY. (Java's
+  `constantsMap` is type-agnostic about Arrow encoding; REE was a Rust-only storage optimization that broke
+  the schema contract. _file metadata + initial_default still use the existing REE path — unchanged.)
+- [x] **Bug (b) — int->long widening.** A partition literal stored as `Int(i32)` could not materialize into
+  an `Int64`/`Long` column ("Unsupported constant type combination: Int64 with Some(Int(19))",
+  `test_evolved_schema`). FIX: derive the constant's value from the FIELD's iceberg type via
+  `Datum::to(&field.field_type)` — the canonical Iceberg coercion (mirrors Java
+  `IdentityPartitionConverters.convertConstant(partitionType.field(pos).type(), value)`): it widens
+  `Int->Long`, `Int->Date`, `Long->Timestamp/Timestamptz`, passes through equal types, audited matrix.
+- [x] **Threading.** `create_manifest_file_context` already resolves the manifest's spec (Arc) for the
+  residual; thread that Arc onto `ManifestFileContext` -> `ManifestEntryContext` -> `FileScanTask.partition_spec`
+  (once per manifest). Reader activation site (reader.rs:451) already consumes it — was dormant only because
+  the field was `None`.
+- [x] **Multi-spec interaction (sits on increment 1).** Each task's spec comes from ITS manifest's
+  `partition_spec_id`; a multi-spec scan materializes each file's constants under its OWN spec. Tested.
+- [x] **Tests:** transformer unit pins for both bug classes (REE-leak schema-equality + int->long); a
+  metadata-vs-file-value scan test (file value DIFFERS from partition value -> scan returns PARTITION value);
+  multi-spec scan test; bucket/truncate negative control (NOT materialized); null-partition-value case.
+- [x] **Mutations:** disable activation -> metadata-vs-file-value test fails (reads file value); break the
+  widening coercion -> int->long pin fails.
+- [x] **Gate:** `cargo test -p iceberg-datafusion` (lib + integration incl. `test_insert_into_partitioned`,
+  `test_evolved_schema`) run EARLY and often.
+- [x] **Docs:** GAP_MATRIX residual/constants-map row, scan/map.md, lessons, this file.
+
 ## Carried-forward open items (full context in todo-archive/)
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the

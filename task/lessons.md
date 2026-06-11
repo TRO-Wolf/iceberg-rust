@@ -653,3 +653,55 @@ How to use it (see the manuals' §2):
   specs tie on the whole tuple ⇒ array order is manifest-list position (Rust spec-descending vs Java HashMap
   `forEach`). Today no interop fixture is multi-spec single-commit, so the view is fine; the FIRST multi-spec
   interop fixture must add spec id to the comparator tuple (or compare the manifest SET order-insensitively).
+
+### 2026-06-11 (Phase 3 Increment 2 RE-DONE — identity-partition constants-map ACTIVATION, BUILDER Group A)
+- **DO materialize identity-partition constants as PLAIN arrays of the DECLARED scan-schema type, not
+  Run-End-Encoded.** *Why:* the 2026-06-08 revert's first bug ("expected Utf8 but found RunEndEncoded",
+  `test_insert_into_partitioned`) was that `record_batch_transformer` built the target schema field for a
+  constant identity-partition column via `datum_to_arrow_type_with_ree` (a Rust-only storage optimization),
+  so the OUTPUT batch schema declared REE where the projected scan schema (and DataFusion / `RecordBatch::
+  try_new`) require a plain `Utf8`/`Int64`. The fix: for a constant field that EXISTS in the table schema
+  (identity-partition), use the field's declared plain Arrow type + a plain repeated array; REE stays ONLY
+  for metadata-virtual fields (`_file`) that have no schema entry. Java `PartitionUtil.constantsMap` is
+  encoding-agnostic — the column is handed back in its declared physical type. Pin BOTH the field's declared
+  `data_type()` AND the concrete array downcast (`StringArray`/`Int64Array`), because a value-only helper
+  (`get_string_value`) passes under REE too.
+- **DO coerce a partition constant to the COLUMN'S Iceberg type via `Datum::to(&field.field_type)`, not the
+  literal's stored variant.** *Why:* the revert's second bug ("Unsupported constant type combination: Int64
+  with Some(Int(19))", `test_evolved_schema`) was a partition tuple carrying a NARROW `Int(i32)` literal for
+  a column promoted to `Long`; `Datum::new(Long, Int(19))` kept the narrow literal and the array builder's
+  `(Int64, Int(19))` arm did not exist. `Datum::to` is the canonical Iceberg coercion table (`Int->Long`,
+  `Int->Date`, `Long->Timestamp/Timestamptz`, `Int128->Long`, equal-type passthrough) — it mirrors Java
+  `IdentityPartitionConverters.convertConstant(partitionType.field(pos).type(), value)`, where the TYPE comes
+  from the schema-derived partition type (verified against 1.10.0 bytecode: the per-field loop reads
+  `partitionType.fields().get(pos).type()`, and the converter's `default` case is a passthrough — the
+  widening is implicit in Java's boxing/coercion).
+- **DO force the constant to OVERRIDE a file-present column — the `PassThrough`/`ModifySchema` fast paths
+  silently return the FILE value.** *Why:* the revert's two known bugs were the loud failures, but a SILENT
+  third one lurked: `compare_schemas` is constant-unaware, so when an identity-partition column is ALSO
+  physically in the data file with a matching type (the test fixtures — the partition column is in the
+  parquet), the transformer took `PassThrough` and returned the FILE value, never applying the constant. The
+  existing scan read tests NEVER caught this because the fixture made the file value == the partition value
+  (both 1) — indistinguishable. The metadata-vs-file test (partition `x==999`, file `x==[1;1024]`) is the
+  one that exposed it; the fix forces the column-rebuilding `Modify` path whenever a constant field id is
+  also in the source file (Java: partition metadata wins over file data). LESSON: a "constant overrides
+  file" feature is structurally untestable on a fixture where the two sources AGREE — make them DIFFER.
+- **DO thread the spec the same once-per-manifest way the residual already does.** `create_manifest_file_
+  context` already resolves `partition_spec_by_id(manifest.partition_spec_id)` (an `Arc`) to build the
+  residual evaluator; thread THAT same Arc onto `ManifestFileContext` -> `ManifestEntryContext` -> `FileScan
+  Task.partition_spec` — no new resolution, no per-file rebuild, and multi-spec falls out for free (each
+  manifest's files get their own spec). Multi-spec test: two identity specs over different columns, one file
+  each in its own manifest, partition values differing from the data — each file's constant materializes
+  under ITS spec (mutation: disable activation ⇒ both the metadata-vs-file AND multi-spec tests fail).
+- **PROCESS WIN: the gate that killed the first attempt now PASSES BY CONSTRUCTION.** Ran `cargo test -p
+  iceberg-datafusion` (lib 80 + MemoryCatalog integration 9 incl. `test_insert_into_partitioned`) EARLY and
+  after every transformer edit, not just at the end. The REE-mutation reproduced the ORIGINAL revert error
+  byte-for-byte ("expected Utf8 but found RunEndEncoded at column index 1") in the datafusion integration
+  test — proof the offline pin and the gate catch the same regression. (The pre-existing
+  `table_provider_factory.rs` DOCTEST failure — `#[tokio::main]` without `rt-multi-thread`, present in HEAD,
+  Cargo edits prohibited — is the only datafusion red and is unrelated.)
+- **MUTATION-MECHANICS near-miss (re-learned): restore from the POST-EDIT snapshot, never a pre-edit one.**
+  I mutated the file in place, then restored from a backup taken BEFORE my edits — wiping my own work. Recovered
+  only because the mutation's `.mut` artifact held my edits-plus-mutation and I could reverse the mutation
+  textually. RULE: snapshot the file AFTER your edits and immediately BEFORE each mutation; that is the only
+  correct restore source. (Promoted-rule restatement, but it bit again — keep the post-edit `.bak` namespaced.)
