@@ -110,7 +110,7 @@
 | Encryption (`EncryptionManager`, KMS, encrypted FileIO/manifests) | ❌ | `api/encryption/`, `core/.../encryption` | V3 `spec/encrypted_key.rs` stub only |
 | FileIO (S3/GCS/Azure/OSS/fs/memory) | ✅ | `core/.../io`, cloud modules | `io/` + extracted `crates/storage/opendal` (OpenDAL) |
 | Puffin read/write + blob types (theta NDV, DV) | 🟡 | `core/.../puffin`, `api/.../puffin` | `puffin/` (blob coverage partial) |
-| Maintenance: `ExpireSnapshots` | ❌ | `api/actions/ExpireSnapshots.java` | none |
+| Maintenance: `ExpireSnapshots` | 🟡 | `api/ExpireSnapshots.java`, `core/RemoveSnapshots.java` | `transaction/expire_snapshots.rs` (2026-06-11, B1) — METADATA retention semantics (the `cleanExpiredFiles(false)` posture, 1.10.0 bytecode-verified): per-branch age+count retention, ref expiry (`main` exempt), unreferenced retention, `expire_snapshot_id`, `history.expire.*` + `gc.enabled` gate; apply-side `remove_snapshots` completed (statistics pruning + dangling-ref removal). **No file deletion** — cleanup is Increment B2; `cleanExpiredMetadata` + interop deferred. |
 | Maintenance: `DeleteOrphanFiles` | ❌ | `api/actions/DeleteOrphanFiles.java` | none |
 | Maintenance: `RewriteDataFiles` (compaction) | ❌ | `api/actions/RewriteDataFiles.java` | none |
 | Maintenance: `RewritePositionDeleteFiles` | ❌ | `api/actions/RewritePositionDeleteFiles.java` | none |

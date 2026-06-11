@@ -746,3 +746,49 @@ How to use it (see the manuals' §2):
   seq-filtered"; the invalid half (<) becomes the new fail-loud test with the bytecode-exact message. Mirror
   the EXACT Java message from the jar (`javap -c` the `ldc` String constant), not the MAIN source — they can
   differ; here they matched.
+### 2026-06-11 (ExpireSnapshots B1 — metadata retention semantics, BUILDER Fable, wt-expire)
+- **Java 1.10.0 `RemoveSnapshots` retention facts (all bytecode-verified; MAIN source matches for
+  every ported method, EXCEPT `cleanupLevel`, which is post-1.10.0):** retain a branch ancestor
+  while `kept < minToKeep || ts >= cutoff` with an EARLY RETURN at the first failing ancestor (the
+  retained set is a contiguous chain prefix — an out-of-order recent ancestor BEHIND the stop point
+  is NOT kept); ref expiry retains on `now − ts <= maxRefAgeMs` (`main` exempt via a string compare
+  BEFORE the snapshot lookup, so even an invalid main ref survives); unreferenced snapshots retain
+  on `ts >= defaultExpireOlderThan` — the DEFAULT cutoff, never a per-ref one; `expireSnapshotId`
+  ids form a SEED SET applied unconditionally after the only guard (retained-ref HEADS) — an
+  explicit id that ancestry/age retention would keep is still removed; a pure
+  `expireSnapshotId()` call STILL runs age-based expiry with the 5-day default (defaults always
+  apply). Defaults: 432000000 / 1 / `Long.MAX_VALUE`; `gc.enabled` gate in the CONSTRUCTOR (fires
+  even for metadata-only expiry).
+- **The Rust `TableMetadataBuilder::remove_snapshots` was INCOMPLETE vs Java 1.10.0
+  `rewriteSnapshotsInternal` in two ways, one of them a hard apply-path bug:** (1) no
+  statistics/partition-statistics pruning for removed ids (Java records `RemoveStatistics` +
+  `RemovePartitionStatistics` changes per id); (2) dangling refs swept with a SILENT `refs.retain`
+  instead of Java's `removeRef` — no `RemoveSnapshotRef` change, and `current_snapshot_id` left
+  pointing at the removed snapshot, so `build()` ERRORED ("Cannot set invalid snapshot log") on
+  exactly the input Java handles (removing main's snapshot via the raw update). The snapshot-log
+  pruning itself was already a faithful port. Lesson: when an action EMITS an update, audit the
+  full Java apply-side sibling (`rewriteSnapshotsInternal`, not just `removeSnapshots`'s
+  signature) — the emit half can be perfect while the apply half corrupts/errs on every catalog
+  path.
+- **`tracing` is NOT a dependency of the `iceberg` crate** (workspace-root only; the metrics
+  module's `LoggingMetricsReporter` deferral note says a logging-facade dep needs approval). A
+  Java `LOG.warn` port therefore becomes a documented silent branch — do not add the dep without
+  approval, and grep the CRATE manifest (not the workspace root) before writing `tracing::`.
+- **Requirements posture for snapshot removal:** Java derives NO `UpdateRequirement` for
+  `RemoveSnapshots`/`RemoveSnapshotRef` (REST `UpdateRequirements` handles only `SetSnapshotRef`);
+  its real safety is the `ops.commit(base, updated)` full-metadata CAS. The Rust action emits
+  `RefSnapshotIdMatch` for EVERY ref consulted — between the two Java postures, and the only one
+  that rejects the concurrent-rollback window (stale expiry destroying the new head) in a
+  requirements-based catalog protocol. Pinned with a stale-guard-vs-rolled-back-base test.
+- **Fixture trick for snapshot-log tests: build chains ONE `TableMetadataBuilder` pass per
+  snapshot.** A single-pass `add_snapshot`+`set_ref` chain gets collapsed by the
+  intermediate-snapshot suppression in `build()` (only the final head is logged); per-snapshot
+  passes give the multi-entry log the prune tests need.
+- **(Reviewer) A faithful port's COUNTERINTUITIVE branches are the unpinned ones — pin the
+  early stop, not just the comparison.** The branch-walk early stop (contiguous-prefix retention)
+  was perfectly ported but removable with the whole suite green: every fixture used monotonic
+  timestamps, so the stop point never had a recent ancestor BEHIND it. Out-of-order timestamps are
+  legal (`add_snapshot` tolerates 60s of clock skew), and Java EXPIRES a newer-than-cutoff
+  ancestor behind the stop. Same pattern for the ref-age `<=` boundary and the refs-first update
+  emission order (apply-side sweep self-heals a reorder, so only a shape assertion pins Java's
+  REST change order). Mutation-test the SURVIVORS, not just the planned mutations.

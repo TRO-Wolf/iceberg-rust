@@ -269,6 +269,66 @@ manifest-comparator multi-spec tie (from increment 1). No commit.
   `table_provider_factory.rs:41` DOCTEST failure CONFIRMED pre-existing + unrelated (no datafusion files changed).
   Pipe audit CLEAN. Files added to the changed set by the reviewer: `transaction/snapshot.rs` (the `resolve_delete_paths`
   posture note). Tree clean, no commit.
+## ACTIVE (2026-06-11): ExpireSnapshots Increment B1 — METADATA retention semantics (worktree wt-expire, BUILDER Fable, Group B)
+
+Java `RemoveSnapshots` retention computation, metadata-only (`cleanExpiredFiles(false)` semantics).
+**B1 is METADATA-ONLY: no file deletion of any kind — file cleanup is Increment B2, not this one.**
+
+- [x] `transaction/expire_snapshots.rs` (new): `ExpireSnapshotsAction` — `expire_older_than(ts)`,
+      `retain_last(n)` (deferred-to-commit validation, Java's exact message), `expire_snapshot_id(id)`
+      repeatable; commit-time retention computation against the refreshed table (1.10.0
+      `internalApply`, bytecode-verified): retained refs (main never ref-expired; `now − ts <=
+      maxRefAgeMs` retains; missing-snapshot refs dropped) → explicit-id-vs-retained-ref precondition
+      ("Cannot expire %s. Still referenced by refs: %s") → per-branch contiguous-prefix retention
+      (`kept < minToKeep || ts >= cutoff`, EARLY STOP) → unreferenced retention (`ts >=
+      defaultExpireOlderThan`) → emit `RemoveSnapshotRef` (expired refs, sorted) +
+      `RemoveSnapshots` (sorted ids) + `RefSnapshotIdMatch` guards for every ref consulted.
+      GC gate (`gc.enabled`, Java ctor message verbatim) at commit. No-op emits nothing.
+- [x] `spec/table_properties.rs`: `history.expire.max-snapshot-age-ms` (default 432000000),
+      `history.expire.min-snapshots-to-keep` (default 1), `history.expire.max-ref-age-ms`
+      (default i64::MAX) — all three bytecode-verified vs 1.10.0; plus `gc.enabled` (default true,
+      needed by the GC gate — flagged as the 4th const).
+- [x] `spec/table_metadata_builder.rs` — complete `remove_snapshots` vs Java 1.10.0
+      `rewriteSnapshotsInternal`: prune statistics + partition statistics per removed id (with
+      changes), and remove dangling refs via `remove_ref` semantics (pushes `RemoveSnapshotRef`,
+      resets `current_snapshot_id` for main) instead of the silent `refs.retain`. (catalog/mod.rs
+      apply routing already correct — no edit needed there.)
+- [x] Wire `Transaction::expire_snapshots()` in `transaction/mod.rs` + `transaction/map.md` row.
+- [x] Tests both directions of every boundary (age boundary ON the cutoff, retain_last n/1/n>len,
+      per-ref overrides both ways, tag expiry removed/kept, main never expired, explicit-id error +
+      seed-set semantics, ancestors survive, unreferenced boundary, no-op, idempotent re-run,
+      snapshot-log prune, stats prune, dangling-main, GC gate, ref guards + stale-guard conflict,
+      end-to-end memory-catalog commit). Then the 4 mutations (age-boundary flip, min-floor drop,
+      ancestor-retention drop, tag-expiry invert) + restore + full suite ×2.
+- [x] Docs: GAP_MATRIX `ExpireSnapshots` ❌→🟡 (metadata semantics landed; file cleanup = B2;
+      interop deferred), map.md row, lessons.
+
+Deferred loudly: B2 file cleanup (`cleanExpiredFiles`, delete callbacks, incremental-cleanup
+strategy selection), `cleanExpiredMetadata` (spec/schema GC — needs manifest IO), interop.
+
+Outcome (2026-06-11): landed in one increment. 32 action tests + 2 builder tests (1832 lib total,
+×2 green). 5 builder mutations all caught (branch-walk `>=`→`>`; unreferenced `>=`→`>`; min-floor
+drop; ancestor-retention drop; ref-age-expiry invert + the M5 builder revert proving the apply-side
+tests fail pre-fix). `catalog/mod.rs` needed NO edit (apply routing was already correct — the
+completeness gap was in the builder). One extra const beyond the planned three: `gc.enabled`
+(needed by the GC gate; same file, flagged). `tracing` is NOT an iceberg-crate dep, so the
+invalid-ref drop is silent with a comment (Java WARN-logs) — no Cargo edit made.
+
+Review (2026-06-11, REVIEWER Fable): re-derived `internalApply` / `computeRetainedRefs` /
+`computeBranchSnapshotsToRetain` / `unreferencedSnapshotsToRetain` / `rewriteSnapshotsInternal` /
+`removeRef` / `removeStatistics` from 1.10.0 bytecode — semantics, messages, defaults, and change
+recording all confirmed; M5 revert re-run (exactly the 2 builder tests catch it);
+requirements-drop mutation caught by the stale-guard + requirements-shape tests. THREE survivor
+mutations found and pinned (+5 tests, 1 extension): the branch-walk EARLY STOP under clock-skewed
+timestamps (a newer-than-cutoff ancestor behind the stop point IS expired — previously removable
+with the whole suite green), the ref-age `<=` boundary (age == maxRefAgeMs retained), and the
+refs-first update emission order (Java's change order; the apply-side dangling sweep self-heals,
+so only a shape pin catches a reorder). Also pinned: explicit id == main's head errors with
+`[main]`; a mid-ancestry explicit-id hole clears the snapshot log at the hole on apply; a branch's
+own `max_snapshot_age_ms` beats even the EXPLICIT `expire_older_than` (Java: `expireOlderThan`
+only overwrites the default). Known acceptable gap (Java's REST posture shares it): a ref CREATED
+concurrently at a to-be-expired snapshot is not guardable via `RefSnapshotIdMatch`; the apply-side
+sweep then drops it — full-CAS catalogs (Java's primary path) reject it; revisit at B2.
 
 ## Carried-forward open items (full context in todo-archive/)
 
