@@ -1392,6 +1392,98 @@ Deferred on the row: IncrementalFileCleanup, cleanExpiredMetadata, ref-age (max_
         Cargo/pom byte-untouched (`git diff --stat` empty). Gate CLEAN: typos/fmt/clippy `-D warnings` clean,
         `cargo test -p iceberg --lib` **1911 ×2**, full chain GREEN. No commit.
 
+## ACTIVE (2026-06-11): Wave-4 Group F — F2 variant shredding overlay WRITE side + VariantVisitor (worktree wt-vschema, BUILDER Fable)
+
+Port the parts of Java 1.10.0 `ShreddedObject` that B2 deferred (the partial-shred overlay over
+an unshredded backing: `Variants.object(metadata, object)`, `put`/`remove`/`removedFields`,
+`SerializedObject.sliceValue` VERBATIM buffer reuse for untouched fields) plus the `VariantVisitor`
+port (trait + drivers, Java traversal order). Byte-exact vs Java-1.10.0-generated fixtures is the
+bar. Bytecode pass DONE: `ShreddedObject` + `$SerializationState` + `VariantVisitor` (core 1.10.0)
+and `SerializedObject.fields()/sliceValue` + `Variants.object` ×3 (api/core 1.10.0) all match MAIN
+EXCEPT one: **1.10.0 `ShreddedObject.remove()` does NOT reset `serializationState` (MAIN does)** —
+a stale-cache bug; the Rust port is stateless (computes layout fresh), matching MAIN's intent and
+1.10.0's fresh-state behavior. Brief-vs-bytecode flag: the visitor drivers are
+`visit(Variant, VariantVisitor)` + `visit(VariantValue, VariantVisitor)` — there is NO
+`visit(VariantMetadata, VariantValue, VariantVisitor)` overload in 1.10.0.
+
+- [x] **value.rs seam:** `parse_object` optionally records each field's value byte range
+      (the `sliceValue(index)` span — same sorted-distinct-offsets length scheme); new
+      `pub(super) parse_object_with_value_ranges(metadata, bytes)` for the overlay door. One
+      parser, no duplication. — Done: `record_value_ranges: Option<&mut Vec<Range<usize>>>`
+      threaded through `parse_object` only (arrays untouched).
+- [x] **write.rs:** `pub(super)` the shared helpers the overlay reuses (`size_of_unsigned`,
+      `object_header`, `write_u8`/`write_bytes`/`write_le_unsigned`, `door_value_span`,
+      `value_size`, `write_value`, `JAVA_INT_MAX`, `checked_data_size`). No behavior change.
+- [x] **shredded.rs (new):** `ShreddedObject<'a>` — `new(metadata)` (Java `Variants.object(md)`),
+      `over_serialized_object(metadata, value_bytes)` (the `SerializedObject` branch: parses +
+      keeps the bytes + per-field ranges; untouched fields serialize VERBATIM),
+      `over_object(metadata, object)` (the non-serialized branch: materializes via `get(name)`
+      at serialization — canonicalizing, like Java), `put` (Java's exact precondition; does NOT
+      clear `removed` — Java doesn't), `remove` (no-op-tolerant; removed wins in `get`),
+      `get`/`num_fields`/`field_names` (TreeSet = UTF-16-sorted dedup, removed excluded),
+      `size_in_bytes`/`write_to`/`to_bytes` (SerializationState math: `fieldIdSize =
+      sizeOf(dictionarySize)`, merged `dataSize`, `offsetSize = sizeOf(dataSize)`, `isLarge =
+      n > 0xFF`, SortedMerge order = one UTF-16 sort over disjoint key sets, ids re-resolved by
+      name, "Invalid metadata, missing: %s"). Duplicate unshredded names → Err at serialization
+      (Java ImmutableMap throws) unless replaced/removed (then legal, like Java).
+- [x] **visitor.rs (new):** `VariantVisitor` trait (`type Output`; `object`/`array`/`primitive`
+      default `None` = Java's `null`; before/after hooks default no-op) + `visit_variant`/
+      `visit_value` drivers with Java's exact traversal order (object: fieldNames order +
+      `get(name)` lookup; array: index order; after-hooks run on the error path = Java
+      `finally`), depth-guarded by `MAX_NESTING_DEPTH` (parse-equivalent accepted set).
+- [x] **Fixture generator:** /tmp/variant-fixture-gen/VariantShredFixtureGen.java (same CPW
+      classpath recipe — avro + caffeine needed for ShreddedObject statics) — override/add/
+      remove over a sorted dict; unsorted/duplicate-name metadata; NON-CANONICAL backing
+      preserved verbatim (the divergence-class pin); add-only; remove-only; remove-then-put;
+      empty overlay over canonical (byte-identical?) and non-canonical (re-headered?) backings;
+      offsetSize escalation 255→2-byte and 65536→3-byte (CRC pin); shredded-wins; 256-name-dict
+      fieldIdSize 2; dup-field-name backing replaced; visitor event log; negative probes
+      (put-unknown message, remove-nonexistent no-op, get-after-remove-then-put null,
+      dup-name-unreplaced throw).
+- [x] **tests.rs:** byte-exact pins for every fixture (B1 parse round-trip + Java byte
+      equality), the negatives (put unknown name, remove nonexistent, non-object bytes,
+      lying-sorted-dict write miss, dup-name backing), the view-vs-serialization disagreement
+      pin (remove-then-put), visitor traversal-order/defaults/finally/depth pins. Mutations:
+      verbatim→re-encode, removed-filter drop, shredded-wins flip, visitor order swap.
+- [x] **Docs:** mod.rs mapping table + divergence ledger (B2 canonicalization note updated:
+      the overlay is the verbatim path for untouched fields; the 1.10.0 stale-cache bug),
+      map.md, GAP_MATRIX variant row (+ pipe audit), todo, lessons.
+- [x] **Gate:** typos, fmt, clippy `-D warnings` (workspace ex-sqllogictest),
+      `cargo test -p iceberg --lib` ×2 (baseline 2036).
+
+Outcome (2026-06-11): LANDED — lib **2062 passed ×2** (baseline 2036 + 26: 21 overlay + 5
+visitor tests). 17 Java-1.10.0 byte fixtures (15 full-hex incl. 4 base reconstructions, 2 CRC
+straddles at 65535/65536) + a 19-line Java visitor event log + 5 negative probes, all from
+/tmp/variant-fixture-gen/VariantShredFixtureGen.java (CPW classpath; quoted in tests.rs).
+TWO probe-verified 1.10.0 bugs deliberately not mirrored (documented shredded.rs + map.md):
+`remove()` does not reset the cached SerializationState (stale-state serialization), and the
+constructed-backing first serialization is CORRUPT (ctor parameter shadowing, fixed on MAIN) —
+the Rust port is stateless and MAIN-consistent, pinned against Java's self-healed output.
+4 mutations all killed by their designated pins (verbatim→re-encode ⇒ the 2 non-canonical
+pins; removed-filter drop ⇒ 2 remove pins; collision flip ⇒ 6 pins; visitor hook-order swap ⇒
+the event-log pin) + a fixture-honesty corruption check. Brief-vs-bytecode flag: there is no
+`visit(VariantMetadata, VariantValue, VariantVisitor)` overload in 1.10.0 — the drivers are
+`visit(Variant, ...)` / `visit(VariantValue, ...)`. Deferred: shredded-parquet FILE I/O +
+file-level interop (parquet 57.1 pin), `unknown` type, `Variants.object(object)` (the parsed
+Rust object carries no metadata reference).
+
+REVIEWER outcome (2026-06-11, Fable): APPROVED with additions, no production bugs found. Both
+1.10.0-bug claims independently re-verified (javap `remove`-no-reset + `$SerializationState`
+aload_3 param mutation vs `getfield` copy in writeTo; live ShredProbe re-run; MAIN diff confirms
+both fixes + that MAIN retains the remove-then-put inconsistency). HEADLINE GAP CLOSED: the
+adjacent-offset-subtraction slice mutation SURVIVED all 17 builder fixtures (every backing was
+data-order==field-order) — added the disordered-backing pin (ReviewerShredProbe r1, Java-probed)
+that alone kills it, plus 4 more Java-probed pins (nested non-canonical subtree r2, 4-byte-offset
+backing r3, malformed-untouched-field divergence r4 — Java writeTo succeeds BLIND, Rust rejects
+at the door, ledger updated with the replaced-twin case — and dup-name-removed + dup views r5).
+7 mutations run, all killed (M1 off-by-one start ⇒ 17 pins; M2 adjacent subtraction ⇒ the new r1
+pin ONLY; M4 verbatim→re-encode ⇒ now 5 pins; M5 result-drop + M6 finally-removal ⇒ visitor
+pins; M7 garbage ranges ⇒ 17 overlay pins, ZERO non-overlay failures = seam neutrality proven on
+the full 2066-test lib). Visitor drivers + finally semantics bytecode-confirmed (exception
+tables 71-90→99 / 193-214→223; exactly two static `visit` overloads). Gate ×2 CLEAN: typos /
+fmt / clippy `-D warnings`, `cargo test -p iceberg --lib` **2066 ×2** (2062 + 4 reviewer tests;
+one builder test extended). Probes/mutations reverted from /tmp snapshots; tree = allowed set.
+
 ## Carried-forward open items (full context in todo-archive/)
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the

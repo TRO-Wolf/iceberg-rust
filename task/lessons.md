@@ -1689,3 +1689,80 @@ How to use it (see the manuals' §2):
   the `include_leaf_field_id` variant arm survived a full-suite mutation (scans die earlier at the
   arrow door), so its leaf semantics are pinned by calling the private fn directly — otherwise the
   arm's behavior is unspecified the day the arrow door opens.
+
+### 2026-06-11 (Wave-4 F2 — variant shredding overlay + VariantVisitor, BUILDER Fable, wt-vschema)
+- **1.10.0 `ShreddedObject` DIVERGES from MAIN twice — both found in bytecode and confirmed by live
+  probe (`/tmp/variant-probe/ShredProbe.java`), and both are BUGS the port must not mirror:** (1)
+  `remove()` lacks MAIN's `this.serializationState = null`, so `sizeInBytes()` → `remove(x)` →
+  `writeTo` serializes the STALE cached state with x still present; (2) the `SerializationState`
+  ctor's non-`SerializedObject` branch compiles to `aload_3` (the PARAMETER map = the overlay's
+  LIVE `shreddedFields`) for the materializing merge while `this.shreddedFields` keeps the
+  pre-merge COPY that `writeTo` iterates — the FIRST serialization over a constructed backing
+  writes count/dataSize for the merged set but only the copy's fields ⇒ CORRUPT bytes (probe:
+  re-read throws IndexOutOfBoundsException); a later state rebuild self-heals because the live map
+  was polluted. MAIN fixed both (the param was renamed). The Rust port is STATELESS (plan computed
+  fresh per call) and MAIN-consistent; the constructed-backing oracle is Java's SELF-HEALED second
+  serialization (puts → sizeInBytes → re-put to reset the cache → serialize). LESSON: a
+  source-vs-bytecode diff can hide in PARAMETER NAMING — `javap` shows `aload_<n>` vs `getfield`,
+  which no source read reveals; for any stateful Java class, probe the mutate-after-size sequence.
+- **The verbatim-slice contract is what makes the overlay safe over third-party data:**
+  `SerializedObject.sliceValue(index)` spans are exactly B1's sorted-distinct-offsets field
+  ranges, so `parse_object` grew an optional range recorder (one parser, no duplication) and the
+  overlay copies untouched fields' ORIGINAL bytes — only ids/offsets/header recompute (ids
+  re-resolve BY NAME at write time even for verbatim fields, Java `metadata.id` + "Invalid
+  metadata, missing: %s"). The designated mutation (verbatim → canonical re-encode) is killed
+  ONLY by the non-canonical fixtures (long-form string that fits short form; oversized offset
+  width) — canonical-input fixtures pass under the mutation, so a fixture set without a
+  non-canonical backing would NOT pin the contract at all.
+- **Java's remove-then-put contract is deliberately inconsistent — mirror BOTH sides:** `put`
+  does not clear `removedFields`, so after `remove(x)` + `put(x, v)` the views (`get` → null,
+  `numFields`/`fieldNames` exclude x — removedFields filters them) DISAGREE with serialization
+  (which includes x=v: the SerializationState's shredded map still carries it). Probe-pinned
+  (`probe_remove_then_put_view numFields=2 get_b=null` + bytes containing b=9). Fixing either
+  side to be "consistent" diverges from Java.
+- **Duplicate backing-field names: the rejection is REPLACEMENT-SENSITIVE, so door at
+  serialization time, not construction.** Java's ImmutableMap throws only when the duplicate
+  SURVIVES the replaced/removed filter; putting or removing the duplicated name skips both
+  occurrences and serializes fine (fixture-pinned both ways). An eager constructor-time door
+  would over-reject vs Java. Constructed-backing duplicates collapse SILENTLY instead (HashMap
+  put semantics) — two different dup behaviors in one class.
+- **`VariantVisitor` facts (1.10.0 == MAIN, bytecode-verified):** drivers are `visit(Variant,
+  visitor)` + `visit(VariantValue, visitor)` — the brief's `visit(VariantMetadata, VariantValue,
+  VariantVisitor)` signature DOES NOT EXIST in 1.10.0 (brief ≠ spec, again); object traversal
+  iterates `fieldNames()` (stored order) but recurses into `object.get(name)` — the NAME LOOKUP —
+  so a non-name-sorted object NPEs in Java (Rust: named Err, after-hook still fired); after-hooks
+  run in `finally` (pinned by asserting the hook fired on the error path); all defaults return
+  null (Rust `Option::None`) and the result lists carry nulls. A Java-generated event log (the
+  generator's LoggingVisitor) is a cheap, exact traversal-order oracle — pin the SEQUENCE, not
+  properties of it.
+
+### 2026-06-11 (Wave-4 F2 — REVIEWER Fable, wt-vschema)
+- **A verbatim-slice fixture set whose backings ALL have data-order == field-order cannot pin the
+  sorted-distinct-offsets length scheme — the adjacent-offset-subtraction mutation survived the
+  builder's entire 17-fixture suite.** Every Java-WRITTEN base is canonical (name-sorted fields,
+  ascending data), so adjacent subtraction == sorted-distinct on all of them; only a HAND-BUILT
+  backing with data placed out of field order at distinct widths (fields a/b/c stored in name
+  order, data c-first/a-second/b-third, widths 2/7/5) distinguishes the schemes — and Java
+  happily overlays such a backing (ReviewerShredProbe r1, output pinned). RULE: when a port's
+  correctness claim is "lengths from sorted-distinct offsets, NOT adjacent subtraction," the
+  fixture set MUST include a disordered-data backing, because every writer-generated fixture is
+  structurally incapable of catching the swap. Same family as B1's "positive decode test per
+  header-flag branch": generator-produced fixtures inherit the generator's canonical shape.
+- **Lazy Java `ShreddedObject.writeTo` serializes a MALFORMED untouched backing field BLIND —
+  probe-verified, not just reasoned:** r4 shows `writeTo` succeeds and copies the bad bytes
+  (undefined primitive type id 63) verbatim into the output; only a later `get()` on the field
+  throws (`UnsupportedOperationException: Unknown primitive physical type: 63`), and Java even
+  re-reads the corrupt output as an object (the re-read is lazy too). When documenting a
+  lazy-vs-eager accepted-set divergence on a WRITE path, probe whether the lazy side actually
+  SUCCEEDS end-to-end (here it does — the divergence is real and the ledger must say "Java
+  serializes blind," not "Java fails later"). The malformed-REPLACED-field twin also serializes
+  fine in Java (skipped before slicing) while Rust still rejects at the door (the door parses
+  the whole backing before puts exist) — both directions now in shredded.rs's module doc.
+- **Both builder-claimed 1.10.0 ShreddedObject bugs CONFIRMED independently** (javap: `remove`
+  has no `serializationState` reset while `put` does; the `$SerializationState` ctor's
+  constructed branch does `aload_3.put(...)` into the live parameter map while `writeTo`
+  iterates the `getfield` pre-merge copy; live ShredProbe re-run reproduces stale-state and
+  corrupt-first-serialization outputs; MAIN has both fixes — param renamed `shredded`, reset
+  added). MAIN also RETAINS the remove-then-put view/serialization inconsistency (put never
+  clears removedFields), so the Rust pins follow 1.10.0 AND MAIN alike — noted in the module doc
+  so nobody "fixes" one side.
