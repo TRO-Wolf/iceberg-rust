@@ -182,6 +182,38 @@ impl PhysicalType {
         }
     }
 
+    /// Returns the 6-bit primitive type id this physical type encodes as, or `None` for the
+    /// container types ([`PhysicalType::Array`] / [`PhysicalType::Object`], which have no
+    /// primitive type id) — the inverse of [`PhysicalType::from_type_info`]. Java has no
+    /// single method for this; `PrimitiveWrapper` bakes the `Primitives.TYPE_*` constants
+    /// into its per-type headers (1.10.0).
+    pub fn to_type_info(self) -> Option<u8> {
+        match self {
+            PhysicalType::Null => Some(0),
+            PhysicalType::BooleanTrue => Some(1),
+            PhysicalType::BooleanFalse => Some(2),
+            PhysicalType::Int8 => Some(3),
+            PhysicalType::Int16 => Some(4),
+            PhysicalType::Int32 => Some(5),
+            PhysicalType::Int64 => Some(6),
+            PhysicalType::Double => Some(7),
+            PhysicalType::Decimal4 => Some(8),
+            PhysicalType::Decimal8 => Some(9),
+            PhysicalType::Decimal16 => Some(10),
+            PhysicalType::Date => Some(11),
+            PhysicalType::Timestamptz => Some(12),
+            PhysicalType::Timestampntz => Some(13),
+            PhysicalType::Float => Some(14),
+            PhysicalType::Binary => Some(15),
+            PhysicalType::String => Some(16),
+            PhysicalType::Time => Some(17),
+            PhysicalType::TimestamptzNanos => Some(18),
+            PhysicalType::TimestampntzNanos => Some(19),
+            PhysicalType::Uuid => Some(20),
+            PhysicalType::Array | PhysicalType::Object => None,
+        }
+    }
+
     /// Returns the logical type this physical encoding represents (Java
     /// `PhysicalType.toLogicalType`).
     pub fn to_logical_type(self) -> LogicalType {
@@ -283,6 +315,24 @@ mod tests {
         // High bits set (a 63-length short string, a large object) leave the tag intact.
         assert_eq!(BasicType::from_header(0b1111_1101), BasicType::ShortString);
         assert_eq!(BasicType::from_header(0b0100_0010), BasicType::Object);
+    }
+
+    /// Risk pinned: a transposed entry in the WRITE-side id table would emit every value of
+    /// that type under the wrong header — `to_type_info` must be the exact inverse of the
+    /// Java-pinned `from_type_info` for all 21 primitive ids, and `None` for containers.
+    #[test]
+    fn test_to_type_info_is_inverse_of_from_type_info() {
+        for type_info in 0..=20u8 {
+            let physical_type =
+                PhysicalType::from_type_info(type_info).expect("known type id must decode");
+            assert_eq!(
+                physical_type.to_type_info(),
+                Some(type_info),
+                "{physical_type:?} must encode back to type id {type_info}"
+            );
+        }
+        assert_eq!(PhysicalType::Array.to_type_info(), None);
+        assert_eq!(PhysicalType::Object.to_type_info(), None);
     }
 
     /// Risk pinned: the physical→logical grouping must match Java 1.10.0's enum declarations

@@ -902,3 +902,59 @@ How to use it (see the manuals' §2):
   preserves insertion order, setting the sorted flag only when the input already IS
   compareTo-sorted. A hand-built "sorted" fixture written in Rust byte order would pin the
   WRONG order and the comparator bug would pass.
+
+### 2026-06-11 (Variant arc B2 — variant binary format WRITE side, BUILDER Fable, wt-variant)
+- **Java 1.10.0 write-side width rules (bytecode-pinned, all matched MAIN):** every width is
+  `VariantUtil.sizeOf(maxValue)` with UNSIGNED thresholds 0xFF/0xFFFF/0xFFFFFF — but the INPUT
+  differs per site: array/object offsets use `sizeOf(dataSize)`, metadata offsets use
+  `sizeOf(dataSize)` (and the dictionary COUNT is written at that same width), and object field
+  ids use `sizeOf(metadata.dictionarySize())` — the dictionary SIZE, not the largest id used, so
+  a 256-name dictionary writes 2-byte ids even though max id 255 fits one byte (fixture-pinned
+  at both 255 and 256). A "minimal width" optimization would be byte-divergent.
+- **`Variants.metadata` writes the dictionary in INSERTION order, never dedups, and sets the
+  sorted flag only for STRICTLY `compareTo`-ascending input** (`last.compareTo(name) >= 0`
+  clears it ⇒ duplicates clear it; single-name input IS sorted; the EMPTY metadata is NOT —
+  Java returns the `01 00 00` EMPTY_V1 buffer whose flag bit is unset, a special case the
+  windows()-based recompute must mirror). compareTo = UTF-16 code units: [U+10000, U+FFFF] is
+  ASCENDING in Java order, DESCENDING in byte order — flag fixture-pinned.
+- **`VariantUtil.writeLittleEndianUnsigned` MASKS oversized values — Java 1.10.0 silently emits
+  CORRUPT metadata for >255 names whose data size still picks a 1-byte width (only reachable
+  via empty names): probe-verified, 256 empty names serialize to `01 00 00`, losing every
+  name.** The Rust door errors by name instead (divergence documented + pinned). When porting a
+  writer, grep for the masking writes — each is a potential silent-corruption door to convert.
+- **`ShreddedObject.writeTo` re-resolves field ids BY NAME at write time (`metadata.id(field)` +
+  `checkState(id >= 0, "Invalid metadata, missing: %s")`) and emits fields via `SortedMerge` of
+  `stream().sorted()` = String natural order = UTF-16.** The Rust split: the BUILDER sorts at
+  `build()` (so serialization emits stored order), and the writer re-resolves ids against the
+  passed metadata — wrong-metadata writes fail with Java's message instead of emitting dangling
+  ids. Re-serializing a PARSED value canonicalizes (Java's SerializedValue copies its buffer
+  verbatim); for everything Java's writer produced the bytes are identical (pinned per fixture).
+- **The short-string spill decision is writeTo-time, by UTF-8 BYTE length ≤ 63
+  (`PrimitiveWrapper.MAX_SHORT_STRING_LENGTH`)** — `Variants.of(String)` always constructs
+  PhysicalType.STRING; the encoding form is not a constructor property. Decimal16 writing
+  (reverse `BigInteger.toByteArray()` + sign-pad to 16) is exactly `i128::to_le_bytes` —
+  pinned incl. i128::MIN (constructible only via the width-explicit factory; the precision
+  factory rejects 39 digits with "Unsupported decimal precision: %s", boundaries 9/10 and
+  18/19 fixture-pinned).
+- **Big write fixtures don't need full hex pins: pin (java.util.zip.CRC32, length, first-64-bytes
+  hex) — the existing deflate dependency's `Crc` computes the identical CRC-32** (the DV-arc
+  discovery reused for byte evidence). Used for the 7 fixtures ≥ 513 bytes incl. the 65535/65536
+  offset-width boundary arrays; everything ≤ ~530 bytes stays full-hex.
+- **B1's classpath lesson extended: `ShreddedObject.writeTo` ALSO needs avro AND caffeine jars**
+  (SortedMerge's `MergeIterator` init touches CloseableGroup/util statics) — slf4j alone gets
+  you primitives/arrays/metadata but the FIRST object write throws NoClassDefFoundError.
+
+### 2026-06-11 (Variant arc B2 — REVIEWER Fable, wt-variant)
+- **An `is_err()` assertion does not pin a fail-fast guard.** Removing the write side's
+  up-front whole-span door (`door_value_span`) survived every undersized-buffer test: the
+  per-write bounds checks still returned Err, but only AFTER partially mutating the caller's
+  buffer. When a guard exists for ATOMICITY (no side effects before the error), the pin must
+  assert the no-side-effect property itself (buffer still all-zero on failure), not just that
+  an error came back. DO byte-compare the untouched buffer in door tests; DO NOT trust
+  mutation-killed status of neighboring `is_err` pins.
+- **CRC+length+prefix pins are acceptable ONLY after a one-time out-of-band full-byte diff.**
+  Review closed B2's CRC gap by having Java dump the COMPLETE bytes of every CRC-pinned
+  fixture to /tmp and end-to-end byte-diffing Rust's output (first-divergence index reported);
+  all 7 matched, so the compact in-repo pins stand. A reviewer of a new CRC-pinned fixture
+  set should repeat that probe rather than trust CRC32 alone (CRC collisions are trivial to
+  miss adversarially).

@@ -24,16 +24,19 @@ use crate::{Error, ErrorKind, Result};
 
 /// Bit mask of the version in the metadata header byte (Java `SerializedMetadata.VERSION_MASK`).
 const VERSION_MASK: u8 = 0b1111;
-/// The only supported metadata version (Java `SerializedMetadata.SUPPORTED_VERSION`).
-const SUPPORTED_VERSION: u8 = 1;
-/// Header bit signalling the dictionary strings are sorted (Java `SORTED_STRINGS`).
-const SORTED_STRINGS: u8 = 0b10000;
+/// The only supported metadata version (Java `SerializedMetadata.SUPPORTED_VERSION`); shared
+/// with the write side (`VariantUtil.metadataHeader`'s `| 0b0001`).
+pub(super) const SUPPORTED_VERSION: u8 = 1;
+/// Header bit signalling the dictionary strings are sorted (Java `SORTED_STRINGS`); shared
+/// with the write side (`VariantUtil.metadataHeader`).
+pub(super) const SORTED_STRINGS: u8 = 0b10000;
 /// Bit mask of the offset-size field in the header (Java `OFFSET_SIZE_MASK`).
 const OFFSET_SIZE_MASK: u8 = 0b1100_0000;
-/// Right shift of the offset-size field (Java `OFFSET_SIZE_SHIFT`).
-const OFFSET_SIZE_SHIFT: u8 = 6;
-/// Size in bytes of the metadata header (Java `SerializedMetadata.HEADER_SIZE`).
-const HEADER_SIZE: usize = 1;
+/// Right shift of the offset-size field (Java `OFFSET_SIZE_SHIFT`); shared with the write side.
+pub(super) const OFFSET_SIZE_SHIFT: u8 = 6;
+/// Size in bytes of the metadata header (Java `SerializedMetadata.HEADER_SIZE`); shared with
+/// the write side.
+pub(super) const HEADER_SIZE: usize = 1;
 
 /// The parsed variant metadata: a dictionary of field-name strings addressed by id, plus the
 /// sorted flag that governs name→id lookup. The Rust analogue of Java's `VariantMetadata` /
@@ -151,6 +154,27 @@ impl VariantMetadata {
             dictionary,
             size_in_bytes: end_offset,
         })
+    }
+
+    /// Assembles an already-validated metadata (the write side's constructor seam —
+    /// [`VariantMetadata::from_field_names`] in `write.rs` builds the parts per Java
+    /// `Variants.metadata` and constructs through here; parse keeps its own path above).
+    pub(super) fn from_parts(
+        is_sorted: bool,
+        dictionary: Vec<String>,
+        size_in_bytes: usize,
+    ) -> VariantMetadata {
+        VariantMetadata {
+            is_sorted,
+            dictionary,
+            size_in_bytes,
+        }
+    }
+
+    /// Returns the dictionary strings in id order (the write side iterates them; external
+    /// callers use [`Self::get`] / [`Self::id`]).
+    pub(super) fn dictionary(&self) -> &[String] {
+        &self.dictionary
     }
 
     /// Returns the number of strings in the dictionary (Java `dictionarySize()`).

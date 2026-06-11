@@ -34,28 +34,32 @@ use crate::variant::util;
 pub const MAX_NESTING_DEPTH: usize = 128;
 
 /// Right shift to extract a primitive header's 6-bit type id (Java
-/// `Primitives.PRIMITIVE_TYPE_SHIFT`; also the short-string length shift).
-const PRIMITIVE_TYPE_SHIFT: u8 = 2;
+/// `Primitives.PRIMITIVE_TYPE_SHIFT`; also the short-string length shift). Shared with the
+/// write side (`VariantUtil.primitiveHeader` / `shortStringHeader` shift left by the same 2).
+pub(super) const PRIMITIVE_TYPE_SHIFT: u8 = 2;
 /// Offset of a primitive's payload, right after the header (Java
 /// `SerializedPrimitive.PRIMITIVE_OFFSET` / `SerializedShortString.HEADER_SIZE`).
 const PRIMITIVE_OFFSET: usize = 1;
 /// Mask of an object header's offset-size field (Java `SerializedObject.OFFSET_SIZE_MASK`;
 /// the array header uses the same bits, Java `SerializedArray.OFFSET_SIZE_MASK`).
 const OFFSET_SIZE_MASK: u8 = 0b1100;
-/// Right shift of the offset-size field (Java `OFFSET_SIZE_SHIFT`, object and array alike).
-const OFFSET_SIZE_SHIFT: u8 = 2;
+/// Right shift of the offset-size field (Java `OFFSET_SIZE_SHIFT`, object and array alike);
+/// shared with the write side (`VariantUtil.objectHeader` / `arrayHeader`).
+pub(super) const OFFSET_SIZE_SHIFT: u8 = 2;
 /// Mask of an object header's field-id-size field (Java `SerializedObject.FIELD_ID_SIZE_MASK`).
 const FIELD_ID_SIZE_MASK: u8 = 0b110000;
-/// Right shift of the field-id-size field (Java `SerializedObject.FIELD_ID_SIZE_SHIFT`).
-const FIELD_ID_SIZE_SHIFT: u8 = 4;
+/// Right shift of the field-id-size field (Java `SerializedObject.FIELD_ID_SIZE_SHIFT`);
+/// shared with the write side (`VariantUtil.objectHeader`).
+pub(super) const FIELD_ID_SIZE_SHIFT: u8 = 4;
 /// An object header's is-large bit: a 4-byte instead of 1-byte field count (Java
-/// `SerializedObject.IS_LARGE`).
-const OBJECT_IS_LARGE: u8 = 0b100_0000;
+/// `SerializedObject.IS_LARGE`). Shared with the write side (`VariantUtil.objectHeader`).
+pub(super) const OBJECT_IS_LARGE: u8 = 0b100_0000;
 /// An array header's is-large bit (Java `SerializedArray.IS_LARGE` — note it differs from the
-/// object's bit position).
-const ARRAY_IS_LARGE: u8 = 0b1_0000;
-/// Size of the value header byte (Java `HEADER_SIZE` on the serialized classes).
-const HEADER_SIZE: usize = 1;
+/// object's bit position). Shared with the write side (`VariantUtil.arrayHeader`).
+pub(super) const ARRAY_IS_LARGE: u8 = 0b1_0000;
+/// Size of the value header byte (Java `HEADER_SIZE` on the serialized classes); shared with
+/// the write side.
+pub(super) const HEADER_SIZE: usize = 1;
 
 /// A decoded variant primitive — the Rust analogue of Java's `VariantPrimitive<T>` (covering
 /// both `SerializedPrimitive` and `SerializedShortString`, which also reports
@@ -175,6 +179,13 @@ pub struct VariantObject {
 }
 
 impl VariantObject {
+    /// Assembles an object from already-resolved fields — the write side's constructor seam
+    /// (`VariantObjectBuilder::build` in `write.rs` sorts the fields by name in Java
+    /// `String.compareTo` order and resolves ids before constructing through here).
+    pub(super) fn from_fields(fields: Vec<VariantObjectField>) -> VariantObject {
+        VariantObject { fields }
+    }
+
     /// Returns the number of fields (Java `numFields()`).
     pub fn num_fields(&self) -> usize {
         self.fields.len()
@@ -211,7 +222,27 @@ pub struct VariantArray {
     elements: Vec<VariantValue>,
 }
 
+impl Default for VariantArray {
+    fn default() -> VariantArray {
+        VariantArray::new()
+    }
+}
+
 impl VariantArray {
+    /// Creates an empty, writable array — the Rust analogue of Java `Variants.array()`
+    /// returning a fresh `ValueArray`. Fill it with [`VariantArray::push`], then serialize
+    /// via [`VariantValue::to_bytes`](crate::variant::VariantValue::to_bytes).
+    pub fn new() -> VariantArray {
+        VariantArray {
+            elements: Vec::new(),
+        }
+    }
+
+    /// Appends an element (Java `ValueArray.add`).
+    pub fn push(&mut self, value: VariantValue) {
+        self.elements.push(value);
+    }
+
     /// Returns the number of elements (Java `numElements()`).
     pub fn num_elements(&self) -> usize {
         self.elements.len()
