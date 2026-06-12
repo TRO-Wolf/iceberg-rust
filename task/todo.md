@@ -61,6 +61,64 @@ data-level interop fixtures A–G, cherrypick interop). Statuses live ONLY in th
       F1 pre-existing global flags (Java lowercases ALL type names on parse, Rust exact-lowercase;
       Rust sort orders unbound/unvalidated on metadata parse; struct map-value Avro record naming
       shares the duplicate-name hazard variant's fix closed).
+- [ ] **THIS BRANCH (Wave 5 Group U, Opus actor-critic, user-approved 2026-06-12): views in
+      catalogs.** U1: view-metadata + view-ops completeness vs Java 1.10.0 (`ViewMetadata`
+      builder parity, `ReplaceViewVersion`/`UpdateViewProperties` ops, version-log semantics,
+      the `replace` dialect rules — bytecode-pinned); U2: catalog view CRUD parity (the `Catalog`
+      view surface across MemoryCatalog + the SQL catalog; REST view shapes verified against the
+      existing REST machinery; Glue/S3Tables deferred to the credentialed sprint). Worktree
+      `wt-views`, parallel to Group Y (`phase6/compute-table-stats`) and Group Z
+      (`interop/wave5`).
+### Wave-5 Group U / U1 — view metadata + view ops + in-tree catalog CRUD (BUILDER, wt-views)
+
+**Survey verdict (read before assuming a gap):** the SPEC side is already a faithful 1:1 port of
+Java's `ViewMetadata.Builder` — `spec/view_metadata.rs` + `view_version.rs` +
+`view_metadata_builder.rs` (58 KB) carry version-id assignment, the identical-version REUSE
+(`reuse_or_create_new_view_version_id` == Java `reuseOrCreateNewViewVersionId`/`sameViewVersion`),
+schema interning by id, version-log append + expiry (`version.history.num-entries`, default 10),
+dialect rules (unique-per-version, replace-must-not-drop unless `replace.drop-dialect.allowed`),
+parser via serde `_serde::ViewMetadataV1`. **What is MISSING:** (a) no `View` type, (b) no
+view methods on the `Catalog` trait, (c) no view CRUD in any catalog, (d) no `ViewCommit` /
+`ViewRequirement` / view-ops seam, (e) no `ViewMetadata::read_from`/`write_to`.
+
+- [x] **U1a — spec IO + wire-format pin:** added `ViewMetadata::read_from`/`write_to` (gzip-aware,
+      mirrors `TableMetadata`); pinned the Java `ViewMetadataParser`/`ViewVersionParser` FIELD SET
+      round-trip + read/write FileIO round-trip. (Field order DOES differ Rust↔Java — see lesson.)
+- [x] **U1b — `ViewRequirement` + `ViewUpdate::apply`:** `ViewRequirement::{NotExist, UuidMatch}`
+      with `check(Option<&ViewMetadata>)` (case-insensitive uuid per `AssertViewUUID`) + serde tags
+      `assert-create`/`assert-view-uuid`; `ViewUpdate::apply(ViewMetadataBuilder)`. Requirement set
+      = `[AssertViewUUID]` ALONE, bytecode-confirmed (`forReplaceView`: null base ⇒ AddSchema arm
+      no-ops, no AddViewVersion arm).
+- [x] **U1c — `View` type + `ViewCommit`:** `crates/iceberg/src/view.rs` — `View` + `ViewBuilder`,
+      `ViewCommit{ident, requirements, updates}` with `apply(View)->View` (check reqs, apply updates,
+      bump metadata-file version via `MetadataLocation::with_next_version`).
+- [x] **U1d — view ops seam:** `ReplaceViewVersionAction` (Java `ViewVersionReplace.internalApply`
+      — requires query/schema/namespace, version-id `max+1` then builder REUSE) +
+      `UpdateViewPropertiesAction` (set/remove + can't-set-and-remove guard), both emit `ViewCommit`.
+- [x] **U1e — `Catalog` trait view surface + MemoryCatalog:** seven default-erroring view methods
+      on the trait + full MemoryCatalog impl (new `view_metadata_locations` namespace state +
+      `ViewNotFound`/`ViewAlreadyExists` ErrorKinds). REST view shapes + SQL catalog views deferred
+      to U2/Task-3 (NOT this increment).
+- [x] **U1f — tests (18, each risk-named) + GAP_MATRIX row 107 + gate ×2 (2168→2186, both green).**
+
+Outcome: U1 landed. Spec builder was already a 1:1 Java port (the survey's key finding); the gap was
+the entire catalog-facing view surface. Pre-existing flag: SQL catalog `lib.rs` doctest fails to
+compile (tokio `rt-multi-thread` feature gate) — unrelated, SQL crate untouched, its 52 unit tests
+pass. Deferred per scope: SQL/REST/Glue/S3Tables view CRUD, view interop (next wave).
+
+U1 REVIEWER (2026-06-12, adversarial vs 1.10.0 bytecode): forReplaceView=`[AssertViewUUID]` ALONE
+re-derived from bytecode (null base ⇒ AddSchema no-ops, no AddViewVersion arm) — CONFIRMED, pinned at
+the commit object. Replace dialect-drop guard + escape, identical-version reuse, the missing-required-
+field serde pin, and Java-parser tolerance of Rust's wire format all VERIFIED (Java reads Rust's JSON
+today — order-insensitive + tolerates always-present empty `properties`; cosmetic divergence only).
+FIXED one real divergence: table↔view name collisions were silently allowed (Java rejects both
+directions) — added symmetric cross-guards to `insert_new_table`/`insert_new_view` + 2 tests
+(fail-before/pass-after). REPORTED, not fixed (pre-existing, shared with `update_table`): the in-tree
+`update_view` has no base-location CAS, so a stale concurrent commit lands last-write-win (Java's
+`doCommit` throws CommitFailedException) — belongs in a dedicated concurrency-parity increment.
+Gate green ×2 (2186→2188 with the 2 collision tests). Verdict: APPROVE with the concurrency-CAS gap
+flagged for the orchestrator.
+
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** ORC/Avro breadth, view ops + SessionCatalog +
       LockManager (Sonnet-builder + Opus-critic per the calibrated split), incremental-scan interop,

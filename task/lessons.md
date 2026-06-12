@@ -594,3 +594,82 @@ How to use it (see the manuals' §2):
   the spec field id.** *Why:* a write-side type mismatch (building an Int32 array for a Date32 schema field)
   would either panic at `StructArray::from` or silently produce the wrong on-disk physical type; asserting
   the raw Arrow child DataType == `Date32` pins the on-disk contract other engines read.
+
+### 2026-06-12 (Wave-5 Group U / U1 — view metadata + view ops + catalog CRUD, BUILDER Opus, wt-views)
+- **The view SPEC builder was ALREADY a 1:1 Java port — the V2 "read before assuming unbuilt" lesson
+  paid off; the actual gap was the entire CATALOG-facing surface.** `spec/view_metadata_builder.rs`
+  (58 KB) is a faithful port of Java `ViewMetadata.Builder`: `reuse_or_create_new_view_version_id` ==
+  `reuseOrCreateNewViewVersionId`/`sameViewVersion`, schema interning, version-log append + expiry
+  (`version.history.num-entries`, default 10), the dialect-drop rules. What was MISSING and had to be
+  built: `ViewMetadata::read_from`/`write_to`, a `View` type, `ViewCommit`/`ViewRequirement`, the
+  `replace_version`/`update_properties` ops, and the `Catalog` trait view methods + a catalog impl.
+  DO survey the spec layer in full before scoping a "views" increment — most of the hard metadata
+  logic may already be ported from upstream.
+- **The view REPLACE requirement set is `[AssertViewUUID]` ALONE — bytecode-pinned from
+  `UpdateRequirements.forReplaceView`, the V1-lesson view sibling.** 1.10.0 bytecode: `forReplaceView`
+  seeds ONE `AssertViewUUID(metadata.uuid())` then forEach-applies `Builder.update`. The `Builder` is
+  constructed with `base = null` (offset 34 `aconst_null`), and the `update(AddSchema)` arm only adds
+  `AssertLastAssignedFieldId` when `base != null` (offset 11 `ifnull 33`) — so it NO-OPS for views.
+  There is NO `AddViewVersion`/`SetCurrentViewVersion` arm at all. So a view replace commit carries
+  `[AssertViewUUID]` regardless of the update list. Pin it at the ActionCommit source (`take_requirements`
+  == `[UuidMatch]`), not via concurrency — the retry machinery masks over-strict requirements (V1 lesson).
+- **`ViewVersionReplace.internalApply` assigns `versionId = max(versionId)+1` then defers REUSE to the
+  builder — the op's `+1` is a hint, not the final id.** 1.10.0 bytecode matches the /tmp source exactly:
+  `Preconditions.checkState` on representations/schema/defaultNamespace, build version with
+  `versionId(maxVersionId+1)` + `timestampMillis(now)` + `putAllSummary(EnvironmentContext.get())`, then
+  `ViewMetadata.buildFrom(base).setCurrentVersion(newVersion, schema).build()` — and `setCurrentVersion`
+  runs `reuseOrCreateNewViewVersionId`, so committing identical representations REUSES the existing id
+  (version count unchanged). The Rust `ReplaceViewVersionAction::to_commit` mirrors this: feed the
+  `max+1` candidate through `into_builder().set_current_version(...)` and let the builder dedup.
+- **The view JSON wire format DIVERGES from Rust serde in FIELD ORDER but not field SET — round-trip is
+  field-set-exact, NOT byte-exact.** Java `ViewMetadataParser.toJson` writes `view-uuid, format-version,
+  location, [properties only if non-empty], schemas, current-version-id, versions, version-log`; Java
+  `ViewVersionParser` writes `version-id, timestamp-ms, schema-id, summary, [default-catalog only if
+  non-null], default-namespace, representations`. Rust's `_serde::ViewMetadataV1` orders
+  `format-version` FIRST and `schemas` LAST, and always emits `properties` (Java omits when empty). Both
+  parse each other's field set (serde is order-insensitive). DO pin the field SET (parse a Java-ordered
+  doc + round-trip), and flag the order/empty-properties divergence — byte-level view interop is a
+  next-wave item, not a U1 claim.
+- **Mirror the table CRUD idiom EXACTLY for views in MemoryCatalog: a SEPARATE `view_metadata_locations`
+  map in `NamespaceState`, so a view and a table of the same name in one namespace do not collide.** Java
+  keeps views and tables in distinct catalog spaces; the Rust MemoryCatalog already keyed tables by name
+  in `table_metadata_locations`, so views need their own parallel map (+ `insert_new_view`/
+  `remove_existing_view`/`commit_view_update`/`get_existing_view_location` + `ViewNotFound`/
+  `ViewAlreadyExists` ErrorKinds for Java `NoSuchViewException`/`AlreadyExistsException` parity).
+
+#### U1 REVIEWER corrections (2026-06-12, wt-views) — adversarial pass against 1.10.0 bytecode
+- **CORRECTS the "separate map ⇒ do not collide" lesson above: separate maps are right, but Java
+  ENFORCES a shared name space across them — a view CANNOT be created/renamed onto a TABLE's name,
+  and vice versa.** The builder shipped views+tables coexisting silently (probe: `create_view` over a
+  table AND `create_table` over a view both SUCCEEDED). Java 1.10.0 `InMemoryViewOperations.doCommit`
+  (offset 85-117) throws `AlreadyExistsException("Table with same name already exists")` when
+  `tables.containsKey(ident)`; the view-catalog's table builder throws `"View with same name already
+  exists"` (`viewExists` check); `renameView`/`renameTable` both cross-check the OTHER map at the
+  destination. FIX (this pass): added a `tables.contains_key`/`views.contains_key` cross-guard to
+  `insert_new_table` + `insert_new_view` in `namespace_state.rs` (symmetric — both helpers live in the
+  modified file; the table-direction guard only rejects a previously-silent corruption, no legit test
+  hits it). DO add the cross-type collision guard to BOTH `insert_new_*` helpers whenever a new
+  catalog object class shares the table name space.
+- **The in-tree MemoryCatalog `update_view` (and the pre-existing `update_table` it mirrors) has NO
+  base-location CAS — a stale concurrent commit silently lands (last-write-win), diverging from Java
+  `InMemoryViewOperations.doCommit`'s `views.compute` location-equality check.** Probe: two
+  `ReplaceViewVersionAction` commits built from the SAME base, applied sequentially — the second
+  (stale) one SUCCEEDED (versions 1→2→3, location 00001→00002) instead of failing. Java's `doCommit`
+  lambda throws `CommitFailedException("...because it has been concurrently modified to %s")` when the
+  stored location ≠ the expected base location. ROOT CAUSE: `ViewCommit::apply` re-loads the CURRENT
+  view inside the lock and the only requirement is `AssertViewUUID` — but the UUID is INVARIANT across
+  replaces, so it never detects staleness. This is consistent with the pre-existing `update_table`
+  path (same gap), so it is NOT a view-specific regression and was NOT fixed here (fixing only the view
+  side would diverge from the table side; belongs in a dedicated optimistic-concurrency-parity
+  increment touching both). DO NOT claim "catalog view CRUD at parity" without the concurrency
+  dimension — `[AssertViewUUID]` alone is correct for the REST commit protocol (server does the CAS)
+  but insufficient for an in-process catalog with no location CAS.
+- **VERIFIED interop-readiness (escalation NOT needed): Java `ViewMetadataParser.fromJson` reads
+  Rust's emitted wire format TODAY.** 1.10.0 bytecode: all reads are by-key (`JsonUtil.getString`/
+  `getInt`/`get` → order-insensitive Jackson), and `properties` is read under `if (node.has(...))`
+  (offset 46-67) — so Rust always-emitting `"properties":{}` is tolerated, and field ORDER is
+  irrelevant. The reverse holds too: Rust `_serde::ViewMetadataV1.properties` is `Option<..>` +
+  `unwrap_or_default()`, so Rust tolerates Java's omit-when-empty. The wire divergence is COSMETIC
+  (field order + always-emit-empty-properties), not blocking — byte-level view interop stays a
+  next-wave item but bidirectional field-set reads work now. Mutation pinned: dropping the required
+  `default-namespace` field makes the parse fail (`ViewVersionV1.default_namespace` is non-Option).
