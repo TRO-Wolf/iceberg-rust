@@ -52,6 +52,7 @@ import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.deletes.PositionDeleteWriter;
 import org.apache.iceberg.exceptions.CherrypickAncestorCommitException;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.DuplicateWAPCommitException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.Literal;
@@ -619,6 +620,35 @@ public final class InteropOracle {
         failures += SnapshotOracle.verify(snapshotFixturesDir);
         System.out.println("verify (all capabilities): " + failures + " failures");
         if (failures > 0) {
+          System.exit(1);
+        }
+        break;
+      case "generate-interop-staged-wap":
+        // STAGED-WAP metadata-level interop (increment Z1). Builds three fixtures (S-ff / S-replay /
+        // S-dedup) on a V2 table using REAL Java `stageOnly()` (the production API), stages each
+        // snapshot, emits TWO canonical snapshot-metadata views per fixture:
+        //   java_staged_meta.json — staged-but-unpublished state (the new coverage: a metadata view
+        //                           containing a staged ref-less snapshot, compared cross-language).
+        //   java_final_meta.json  — post-publish state (mirrors the existing cherrypick interop).
+        // Also emits wap_dedup_expected_rejection.json for the S-dedup fixture.
+        // The dir is supplied via -Dinterop.staged_wap.dir on the CLI.
+        Path stagedWapGenDir = requireFixturesDir("interop.staged_wap.dir");
+        StagedWapOracle.generate(stagedWapGenDir);
+        break;
+      case "verify-interop-staged-wap":
+        // STAGED-WAP interop, DIRECTION 2 — "Java verifies what RUST staged and cherry-picked".
+        // The Rust GEN test (env ICEBERG_INTEROP_STAGED_WAP_GEN_DIR, tests/interop_staged_wap.rs)
+        // staged each fixture via REAL stage_only(), then cherry-picked, landing
+        // rust_staged_table/metadata/final.metadata.json (staged state) and
+        // rust_final_table/metadata/final.metadata.json (post-publish). Here Java reads BOTH
+        // Rust-produced tables, asserts (a) canonical views == java_{staged,final}_meta.json
+        // byte-equal, and (b) fixture-specific facts (staged state: current-snapshot-id unchanged,
+        // staged snapshot in snapshots list with wap.id; published state: published-wap-id present
+        // for ff/replay; S-dedup: second cherrypick raises DuplicateWAPCommitException).
+        Path stagedWapVerifyDir = requireFixturesDir("interop.staged_wap.dir");
+        int stagedWapFailures = StagedWapOracle.verify(stagedWapVerifyDir);
+        System.out.println("verify-interop-staged-wap: " + stagedWapFailures + " failures");
+        if (stagedWapFailures > 0) {
           System.exit(1);
         }
         break;
@@ -9473,6 +9503,650 @@ public final class InteropOracle {
 
         if (!fixture.equals("ff") && !fixture.equals("replay") && !fixture.equals("dedup")) {
           System.out.println("PASS cherrypick/" + fixture);
+        }
+      }
+
+      return failures;
+    }
+
+    private static int countSnapshots(TableMetadata metadata) {
+      int count = 0;
+      for (Snapshot ignored : metadata.snapshots()) {
+        count++;
+      }
+      return count;
+    }
+  }
+
+  // StagedWapOracle — the STAGED-WAP WRITE + CHERRYPICK interop oracle (increment Z1).
+  // Three fixtures (S-ff / S-replay / S-dedup), BOTH sides using REAL staging APIs.
+  // Java uses the production `stageOnly()` method; Rust uses `stage_only()` on `FastAppendAction`.
+  // TWO metadata views are compared per fixture: the staged-but-unpublished state (NEW COVERAGE)
+  // and the post-publish state. The staged view confirms a staged ref-less snapshot appears
+  // identically in `metadata.snapshots()` on both sides without moving `main`.
+  //
+  // PRE-DECIDED CAVEAT (exit-audit ruling, 2026-06-12): `SnapshotMetaOracle.emit()` iterates
+  // `metadata.snapshots()` — the FULL metadata snapshot list — so a staged ref-less snapshot IS
+  // enumerated and gets an ordinal like any other. This matches the Rust canonical view exactly.
+  // =============================================================================================
+
+  /**
+   * The StagedWAP oracle. Three fixture shapes, committed to real local-filesystem tables with
+   * REAL AVRO manifests + manifest-lists, judged by canonical snapshot-metadata views via
+   * {@link SnapshotMetaOracle#emit}.
+   *
+   * <ul>
+   *   <li><b>S-ff</b> — Java: {@code newFastAppend().set("wap.id","w1").stageOnly().commit()} with
+   *       parent == current head → cherry-pick fast-forwards. Staged state: current-snapshot-id
+   *       unchanged, staged snapshot in {@code snapshots} list, {@code wap.id} present. Published
+   *       state: main moved to the staged snapshot AS-IS (FF: no new snapshot, no
+   *       {@code published-wap-id}).
+   *   <li><b>S-replay</b> — stage w2, advance main with an unrelated append, cherry-pick → replay;
+   *       staged state view + post-publish view both compared; {@code published-wap-id} present
+   *       post-replay.
+   *   <li><b>S-dedup</b> — publish w3 via cherry-pick (succeeds), then stage ANOTHER snapshot with
+   *       {@code wap.id=w3} and cherry-pick → BOTH sides reject
+   *       ({@link DuplicateWAPCommitException} on Java; Rust {@code DataInvalid} + verbatim message
+   *       substring). Table unchanged after rejection (re-parse). The staged view before the second
+   *       attempt is also compared.
+   * </ul>
+   */
+  static final class StagedWapOracle {
+    private StagedWapOracle() {}
+
+    private static final List<String> FIXTURES =
+        java.util.Arrays.asList("S-ff", "S-replay", "S-dedup");
+
+    /** Schema: {1 id long required, 2 data string required} — small, unpartitioned (V2). */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "data", Types.StringType.get()));
+    }
+
+    /** A metadata-only DataFile (no parquet on disk — the oracle only reads manifests). */
+    private static DataFile dataFile(BaseTable table, String dataDir, String name, long count) {
+      return DataFiles.builder(table.spec())
+          .withPath(dataDir + "/" + name + ".parquet")
+          .withFileSizeInBytes(count * 100)
+          .withRecordCount(count)
+          .withFormat(FileFormat.PARQUET)
+          .build();
+    }
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      for (String fixture : FIXTURES) {
+        Path fixtureDir = dir.resolve(fixture);
+        Files.createDirectories(fixtureDir);
+        buildFixture(fixture, fixtureDir);
+        System.out.println("generate-interop-staged-wap/" + fixture + ": written to " + fixtureDir);
+      }
+
+      System.out.println(
+          "generate-interop-staged-wap: wrote " + FIXTURES.size() + " fixtures to " + dir);
+    }
+
+    /**
+     * Build one fixture's tables using REAL {@code stageOnly()} staging on both the staged and
+     * published states. Emits:
+     * <ul>
+     *   <li>{@code java_staged_meta.json} — canonical view of the table AFTER staging but BEFORE
+     *       cherry-pick (new coverage: a metadata view containing a staged ref-less snapshot).
+     *   <li>{@code java_final_meta.json} — canonical view of the table AFTER cherry-pick.
+     *   <li>{@code wap_dedup_expected_rejection.json} — for the S-dedup fixture only.
+     * </ul>
+     *
+     * <p><b>HOW STAGING WORKS (REAL stageOnly()):</b> {@code newFastAppend().set("wap.id", wapId).
+     * stageOnly().commit()} calls the production {@link SnapshotProducer#stageOnly()} which gates
+     * the metadata-builder update: {@code stageOnly ? builder.addSnapshot(snapshot) :
+     * builder.setBranchSnapshot(snapshot, branch)} — so only {@code AddSnapshot} fires, leaving
+     * {@code current-snapshot-id}, {@code main} ref, and {@code snapshot-log} untouched. The staged
+     * snapshot consumes a sequence number exactly like a normal commit (1.10.0 bytecode: {@code apply()}
+     * at offsets 18-24 reads {@code base.nextSequenceNumber()} unconditionally, independent of
+     * {@code stageOnly}).
+     */
+    private static void buildFixture(String fixture, Path fixtureDir) throws IOException {
+      File tableDir = fixtureDir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+
+      Schema schema = schema();
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_staged_wap_" + fixture);
+      String dataDir = tableDir.getAbsolutePath() + "/data";
+
+      // S0: the initial snapshot (always committed — it is the parent of the staged snapshot).
+      table.newFastAppend().appendFile(dataFile(table, dataDir, "s0", 10L)).commit();
+      long s0Id = table.currentSnapshot().snapshotId();
+
+      switch (fixture) {
+        case "S-ff": {
+          // Stage w1 (parent == current head S0) via REAL stageOnly() — the production API.
+          // After this: current-snapshot-id is STILL s0 (unchanged), staged snapshot in
+          // metadata.snapshots() with wap.id=w1, main ref unchanged.
+          table.newFastAppend()
+              .appendFile(dataFile(table, dataDir, "s1", 20L))
+              .set("wap.id", "w1")
+              .stageOnly()
+              .commit();
+          long stagedId = findStagedSnapshotId(table, s0Id, "w1");
+
+          // Emit the STAGED state (new coverage: canonical view of the table with a staged
+          // ref-less snapshot — current-snapshot-id unchanged, staged snapshot in snapshots list).
+          Path stagedMeta = writeFinalMetadata(ops, fixtureDir.resolve("java_staged_table"));
+          SnapshotMetaOracle.emit(stagedMeta, fixtureDir.resolve("java_staged_meta.json"));
+          System.out.println(
+              "generate-interop-staged-wap/S-ff: java_staged_meta.json written");
+
+          // Cherry-pick: FF (parent == head) → main moves to staged snapshot AS-IS.
+          table.manageSnapshots().cherrypick(stagedId).commit();
+
+          // Emit the FINAL state (post-publish).
+          Path finalMeta = writeFinalMetadata(ops, fixtureDir.resolve("java_final_table"));
+          SnapshotMetaOracle.emit(finalMeta, fixtureDir.resolve("java_final_meta.json"));
+          System.out.println(
+              "generate-interop-staged-wap/S-ff: java_final_meta.json written");
+          break;
+        }
+
+        case "S-replay": {
+          // Stage w2 (parent == S0, NOT yet head after S2 below).
+          table.newFastAppend()
+              .appendFile(dataFile(table, dataDir, "s1", 20L))
+              .set("wap.id", "w2")
+              .stageOnly()
+              .commit();
+          long stagedId = findStagedSnapshotId(table, s0Id, "w2");
+
+          // Advance main past S0 with an unrelated append S2 (now S1.parent != head).
+          table.newFastAppend().appendFile(dataFile(table, dataDir, "s2", 30L)).commit();
+
+          // Emit the STAGED state: S0 + S1-staged + S2 all in snapshots, main at S2.
+          Path stagedMeta = writeFinalMetadata(ops, fixtureDir.resolve("java_staged_table"));
+          SnapshotMetaOracle.emit(stagedMeta, fixtureDir.resolve("java_staged_meta.json"));
+          System.out.println(
+              "generate-interop-staged-wap/S-replay: java_staged_meta.json written");
+
+          // Cherry-pick: REPLAY (parent S0 != head S2) → new snapshot with source-snapshot-id +
+          // published-wap-id.
+          table.manageSnapshots().cherrypick(stagedId).commit();
+
+          // Emit the FINAL state.
+          Path finalMeta = writeFinalMetadata(ops, fixtureDir.resolve("java_final_table"));
+          SnapshotMetaOracle.emit(finalMeta, fixtureDir.resolve("java_final_meta.json"));
+          System.out.println(
+              "generate-interop-staged-wap/S-replay: java_final_meta.json written");
+          break;
+        }
+
+        case "S-dedup": {
+          // Stage BOTH w3 snapshots off S0 (same parent = S0 = current head) BEFORE any
+          // cherry-pick. This mirrors TestWapWorkflow.testDuplicateCherrypick.
+          //
+          // Pattern:
+          //   S0 (main)
+          //   ├── stage w3-first  (parent=S0, seq=2)
+          //   └── stage w3-second (parent=S0, seq=3)
+          //
+          // Cherry-pick w3-first → FF (parent==head S0) → main = w3-first.
+          // Cherry-pick w3-second → REPLAY (parent=S0 != head w3-first)
+          //   → validateWapPublish fires → finds wap.id=w3 on ancestor w3-first
+          //   → DuplicateWAPCommitException ✓
+          //
+          // Staged state (before any cherry-pick): S0 + w3-first + w3-second = 3 snapshots.
+          // Final state (after rejection): still S0 + w3-first (main) + w3-second (staged) = 3.
+
+          // Stage w3-first off S0 (parent = S0 = current head).
+          table.newFastAppend()
+              .appendFile(dataFile(table, dataDir, "s1", 20L))
+              .set("wap.id", "w3")
+              .stageOnly()
+              .commit();
+          long firstStagedId = findStagedSnapshotId(table, s0Id, "w3");
+
+          // Stage w3-second ALSO off S0 (still the current head — no cherry-pick yet).
+          table.newFastAppend()
+              .appendFile(dataFile(table, dataDir, "s2", 30L))
+              .set("wap.id", "w3")
+              .stageOnly()
+              .commit();
+          // secondStagedId: the staged snapshot that is NOT firstStagedId.
+          long secondStagedId = -1L;
+          for (Snapshot snap : table.snapshots()) {
+            if ("w3".equals(snap.summary().get("wap.id"))
+                && snap.snapshotId() != table.currentSnapshot().snapshotId()
+                && snap.snapshotId() != firstStagedId) {
+              secondStagedId = snap.snapshotId();
+            }
+          }
+          if (secondStagedId == -1L) {
+            throw new RuntimeException(
+                "S-dedup fixture: could not find secondStagedId after second stageOnly()");
+          }
+
+          // Emit the STAGED state: S0 (main) + w3-first (staged) + w3-second (staged) = 3.
+          Path stagedMeta = writeFinalMetadata(ops, fixtureDir.resolve("java_staged_table"));
+          SnapshotMetaOracle.emit(stagedMeta, fixtureDir.resolve("java_staged_meta.json"));
+          System.out.println(
+              "generate-interop-staged-wap/S-dedup: java_staged_meta.json written");
+
+          // FIRST cherry-pick: FF (parent=S0=head) → main moves to w3-first verbatim.
+          table.manageSnapshots().cherrypick(firstStagedId).commit();
+
+          // SECOND cherry-pick: REPLAY (parent=S0 != head=w3-first) → validateWapPublish fires
+          // → finds wap.id=w3 on ancestor w3-first → DuplicateWAPCommitException.
+          boolean thrown = false;
+          try {
+            table.manageSnapshots().cherrypick(secondStagedId).commit();
+          } catch (DuplicateWAPCommitException ex) {
+            thrown = true;
+            System.out.println(
+                "generate-interop-staged-wap/S-dedup: second cherry-pick rejected as expected "
+                    + "DuplicateWAPCommitException: "
+                    + ex.getMessage());
+          }
+          if (!thrown) {
+            throw new RuntimeException(
+                "S-dedup fixture: second cherry-pick of secondStagedId "
+                    + secondStagedId
+                    + " did NOT throw DuplicateWAPCommitException — fixture is wrong");
+          }
+
+          // Emit the FINAL state (unchanged after the rejection — main still at w3-first).
+          // Snapshots: S0 + w3-first (main via FF) + w3-second (still staged) = 3.
+          Path finalMeta = writeFinalMetadata(ops, fixtureDir.resolve("java_final_table"));
+          SnapshotMetaOracle.emit(finalMeta, fixtureDir.resolve("java_final_meta.json"));
+          System.out.println(
+              "generate-interop-staged-wap/S-dedup: java_final_meta.json written");
+
+          // Emit wap_dedup_expected_rejection.json.
+          String rejectionJson =
+              JsonUtil.generate(
+                  gen -> {
+                    gen.writeStartObject();
+                    gen.writeBooleanField("second_cherrypick_fails", true);
+                    gen.writeStringField("exception_type", "DuplicateWAPCommitException");
+                    gen.writeStringField(
+                        "message_substring",
+                        "Duplicate request to cherry pick wap id that was published already");
+                    gen.writeEndObject();
+                  },
+                  false);
+          writeJson(fixtureDir.resolve("wap_dedup_expected_rejection.json"), rejectionJson);
+          System.out.println(
+              "generate-interop-staged-wap/S-dedup: wap_dedup_expected_rejection.json written");
+          break;
+        }
+
+        default:
+          throw new IllegalArgumentException("unknown fixture: " + fixture);
+      }
+    }
+
+    /**
+     * Find the staged snapshot id — the snapshot in {@code table.metadata().snapshots()} that is
+     * NOT the current snapshot AND carries {@code wap.id == wapId}. When {@code parentId >= 0},
+     * also asserts the staged snapshot's parent is {@code parentId}.
+     */
+    private static long findStagedSnapshotId(BaseTable table, long parentId, String wapId) {
+      for (Snapshot snap : table.snapshots()) {
+        Map<String, String> props = snap.summary();
+        if (wapId.equals(props.get("wap.id")) && snap.snapshotId() != table.currentSnapshot().snapshotId()) {
+          // When parentId >= 0 verify parent.
+          if (parentId >= 0 && snap.parentId() != null && snap.parentId() != parentId) {
+            throw new RuntimeException(
+                "findStagedSnapshotId: staged snapshot "
+                    + snap.snapshotId()
+                    + " has parent "
+                    + snap.parentId()
+                    + " but expected "
+                    + parentId);
+          }
+          return snap.snapshotId();
+        }
+      }
+      throw new RuntimeException(
+          "findStagedSnapshotId: no staged snapshot with wap.id="
+              + wapId
+              + " found in table (current="
+              + table.currentSnapshot().snapshotId()
+              + ")");
+    }
+
+    /**
+     * Write the table's CURRENT metadata as {@code final.metadata.json} under
+     * {@code <tableDir>/metadata/} and return the path to the written file. The {@code tableDir}
+     * directory is created if it does not exist.
+     */
+    private static Path writeFinalMetadata(LocalTableOperations ops, Path tableDir)
+        throws IOException {
+      Files.createDirectories(tableDir.resolve("metadata"));
+      Path out = tableDir.resolve("metadata/final.metadata.json");
+      OutputFile outputFile = new LocalFileIO().newOutputFile(out.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), outputFile);
+      return out;
+    }
+
+    /**
+     * Verify each fixture in DIRECTION 2: Java reads the RUST-produced staged + final tables,
+     * asserts canonical views byte-equal, and asserts fixture-specific facts. Returns the failure
+     * count.
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+
+      for (String fixture : FIXTURES) {
+        Path fixtureDir = dir.resolve(fixture);
+
+        // Both states must be present.
+        Path rustStagedMeta =
+            fixtureDir.resolve("rust_staged_table/metadata/final.metadata.json");
+        Path rustFinalMeta =
+            fixtureDir.resolve("rust_final_table/metadata/final.metadata.json");
+
+        if (!Files.exists(rustStagedMeta)) {
+          System.out.println(
+              "FAIL staged-wap/" + fixture + ": missing rust_staged_table final.metadata.json");
+          failures++;
+          continue;
+        }
+        if (!Files.exists(rustFinalMeta)) {
+          System.out.println(
+              "FAIL staged-wap/" + fixture + ": missing rust_final_table final.metadata.json");
+          failures++;
+          continue;
+        }
+
+        // (a) Canonical view of the RUST staged state must equal java_staged_meta.json.
+        Path javaStagedPath = fixtureDir.resolve("java_staged_meta.json");
+        if (!Files.exists(javaStagedPath)) {
+          System.out.println(
+              "FAIL staged-wap/" + fixture + ": missing java_staged_meta.json — run generate first");
+          failures++;
+          continue;
+        }
+        Path rustStagedViewPath = fixtureDir.resolve("rust_view_of_rust_staged_meta.json");
+        SnapshotMetaOracle.emit(rustStagedMeta, rustStagedViewPath);
+        String javaStagedView = readString(javaStagedPath);
+        String rustStagedView = readString(rustStagedViewPath);
+        if (!javaStagedView.equals(rustStagedView)) {
+          System.out.println(
+              "FAIL staged-wap/"
+                  + fixture
+                  + ": Java's canonical view of the RUST STAGED table diverges from Java's own "
+                  + "staged view");
+          failures++;
+          continue;
+        }
+        System.out.println(
+            "PASS staged-wap/" + fixture + "/staged: canonical view byte-equal OK");
+
+        // (b) Canonical view of the RUST final state must equal java_final_meta.json.
+        Path javaFinalPath = fixtureDir.resolve("java_final_meta.json");
+        if (!Files.exists(javaFinalPath)) {
+          System.out.println(
+              "FAIL staged-wap/" + fixture + ": missing java_final_meta.json — run generate first");
+          failures++;
+          continue;
+        }
+        Path rustFinalViewPath = fixtureDir.resolve("rust_view_of_rust_final_meta.json");
+        SnapshotMetaOracle.emit(rustFinalMeta, rustFinalViewPath);
+        String javaFinalView = readString(javaFinalPath);
+        String rustFinalView = readString(rustFinalViewPath);
+        if (!javaFinalView.equals(rustFinalView)) {
+          System.out.println(
+              "FAIL staged-wap/"
+                  + fixture
+                  + ": Java's canonical view of the RUST FINAL table diverges from Java's own "
+                  + "final view");
+          failures++;
+          continue;
+        }
+        System.out.println(
+            "PASS staged-wap/" + fixture + "/final: canonical view byte-equal OK");
+
+        // (c) Fixture-specific facts on the Rust STAGED table.
+        TableMetadata rustStagedMeta2 =
+            TableMetadataParser.fromJson(
+                rustStagedMeta.toString(), readString(rustStagedMeta));
+        int rustStagedSnapshotCount = countSnapshots(rustStagedMeta2);
+
+        // The staged state must contain S0 + the staged snapshot (at minimum 2 for S-ff and S-replay
+        // where no advance has happened yet; 3 for S-dedup which stages TWO w3 snapshots off S0).
+        int expectedStagedCount = fixture.equals("S-dedup") ? 3 : 2;
+        if (rustStagedSnapshotCount < expectedStagedCount) {
+          System.out.println(
+              "FAIL staged-wap/"
+                  + fixture
+                  + "/staged: expected at least "
+                  + expectedStagedCount
+                  + " snapshots in staged metadata, got "
+                  + rustStagedSnapshotCount);
+          failures++;
+          continue;
+        }
+
+        // Current-snapshot-id in the staged state must be the S0 id (unchanged by staging).
+        // For S-dedup the current is the published S3 (after first cherry-pick + S2 advance).
+        // We simply verify the staged snapshot is NOT the current snapshot — i.e. staging
+        // did not move main.
+        long rustStagedCurrent =
+            rustStagedMeta2.currentSnapshot() == null
+                ? -1L
+                : rustStagedMeta2.currentSnapshot().snapshotId();
+        // HAND-DECLARED wap.id VALUE pin (anti-circular, Z1 reviewer 2026-06-12): the canonical
+        // SnapshotMetaOracle view EXCLUDES wap.id from its summary allowlist, so a corrupted
+        // staged wap.id VALUE rides PAST the byte-equal view diff (step 4). The earlier check here
+        // only required SOME non-empty wap.id — a corruption of the staged wap.id (e.g. "w1" →
+        // "CORRUPTED") passed silently in the D1 direction. Pin the EXACT value the fixture staged:
+        // S-ff → w1, S-replay → w2, S-dedup → w3. (D2 already pins the value via the Rust test's
+        // `.find(wap.id == "w1")`.)
+        String expectedStagedWapId =
+            fixture.equals("S-ff") ? "w1" : (fixture.equals("S-replay") ? "w2" : "w3");
+        // Find the staged snapshot: has the EXPECTED wap.id in summary but is not the current.
+        long stagedSnapId = -1L;
+        for (Snapshot snap : rustStagedMeta2.snapshots()) {
+          String wapId = snap.summary().get("wap.id");
+          if (expectedStagedWapId.equals(wapId) && snap.snapshotId() != rustStagedCurrent) {
+            // Pick the LAST one added — the one we just staged (the dedup fixture also has w3
+            // from the first publish chain, but that one IS on main via cherry-pick, so it IS
+            // the current or an ancestor; the newly staged one is not current).
+            stagedSnapId = snap.snapshotId();
+          }
+        }
+        if (stagedSnapId == -1L) {
+          System.out.println(
+              "FAIL staged-wap/"
+                  + fixture
+                  + "/staged: no staged snapshot with wap.id="
+                  + expectedStagedWapId
+                  + " found in Rust staged metadata (a corrupted wap.id value would land here)");
+          failures++;
+          continue;
+        }
+        System.out.println(
+            "PASS staged-wap/"
+                + fixture
+                + "/staged: staged snapshot "
+                + stagedSnapId
+                + " present with wap.id="
+                + expectedStagedWapId
+                + ", current="
+                + rustStagedCurrent
+                + " (unchanged) OK");
+
+        // (d) Fixture-specific facts on the Rust FINAL table.
+        TableMetadata rustFinalMeta2 =
+            TableMetadataParser.fromJson(
+                rustFinalMeta.toString(), readString(rustFinalMeta));
+        int rustFinalSnapshotCount = countSnapshots(rustFinalMeta2);
+
+        switch (fixture) {
+          case "S-ff":
+            // FF: cherry-pick fast-forwarded — main moved to the staged snapshot AS-IS.
+            // Snapshots: S0 + the staged snapshot (now main). Count == 2.
+            if (rustFinalSnapshotCount != 2) {
+              System.out.println(
+                  "FAIL staged-wap/S-ff/final: expected 2 snapshots after FF, got "
+                      + rustFinalSnapshotCount);
+              failures++;
+              continue;
+            }
+            // The current snapshot must be the staged one (FF moves main to it verbatim).
+            Snapshot ffCurrent = rustFinalMeta2.currentSnapshot();
+            if (ffCurrent == null) {
+              System.out.println("FAIL staged-wap/S-ff/final: no current snapshot after FF");
+              failures++;
+              continue;
+            }
+            // No source-snapshot-id / published-wap-id — FF does NOT tag the published snapshot.
+            String ffSourceId = ffCurrent.summary().get("source-snapshot-id");
+            if (ffSourceId != null) {
+              System.out.println(
+                  "FAIL staged-wap/S-ff/final: FF cherry-pick must NOT set source-snapshot-id, "
+                      + "got: "
+                      + ffSourceId);
+              failures++;
+              continue;
+            }
+            // HAND-DECLARED current==staged-id pin (anti-circular, Z1 reviewer 2026-06-12): FF moves
+            // main to the staged snapshot VERBATIM, so the current snapshot must carry the staged
+            // wap.id=w1. This pins "main == the staged snapshot" via the wap.id proxy (only the
+            // staged snapshot carries w1), matching the D2 Rust test's `wap.id=w1 on current` check.
+            // Without it the canonical view (which excludes wap.id) and the count/source-id checks
+            // would not catch a FF that moved main to the WRONG snapshot of the right shape.
+            String ffCurrentWapId = ffCurrent.summary().get("wap.id");
+            if (!"w1".equals(ffCurrentWapId)) {
+              System.out.println(
+                  "FAIL staged-wap/S-ff/final: FF current must carry the staged wap.id=w1 "
+                      + "(main moved to the staged snapshot verbatim), got: "
+                      + ffCurrentWapId);
+              failures++;
+              continue;
+            }
+            System.out.println(
+                "PASS staged-wap/S-ff/final: snapshot count=2, wap.id=w1 on current (FF verbatim), "
+                    + "no source-snapshot-id OK");
+            break;
+
+          case "S-replay":
+            // REPLAY: S0 + S1-staged + S2-advance + S3-published = 4 snapshots.
+            if (rustFinalSnapshotCount != 4) {
+              System.out.println(
+                  "FAIL staged-wap/S-replay/final: expected 4 snapshots after replay, got "
+                      + rustFinalSnapshotCount);
+              failures++;
+              continue;
+            }
+            Snapshot replayCurrent = rustFinalMeta2.currentSnapshot();
+            if (replayCurrent == null) {
+              System.out.println(
+                  "FAIL staged-wap/S-replay/final: no current snapshot after replay");
+              failures++;
+              continue;
+            }
+            String replaySourceId = replayCurrent.summary().get("source-snapshot-id");
+            String replayPublishedWap = replayCurrent.summary().get("published-wap-id");
+            if (replaySourceId == null) {
+              System.out.println(
+                  "FAIL staged-wap/S-replay/final: current snapshot missing source-snapshot-id");
+              failures++;
+              continue;
+            }
+            if (!"w2".equals(replayPublishedWap)) {
+              System.out.println(
+                  "FAIL staged-wap/S-replay/final: published-wap-id must be 'w2', got: "
+                      + replayPublishedWap);
+              failures++;
+              continue;
+            }
+            System.out.println(
+                "PASS staged-wap/S-replay/final: snapshot count=4, source-snapshot-id="
+                    + replaySourceId
+                    + ", published-wap-id=w2 OK");
+            break;
+
+          case "S-dedup":
+            // S-dedup final: S0 + w3-first (main via FF) + w3-second (still staged) = 3 snapshots.
+            // The second cherry-pick was REJECTED (DuplicateWAPCommitException), so table is
+            // unchanged after the rejection. The first cherry-pick was FF (parent=S0=head), so:
+            //   - current snapshot = w3-first (carries wap.id=w3, NO source-snapshot-id — FF path)
+            //   - w3-second is still in snapshots but NOT current
+            // We verify count==3, current is non-null, NO source-snapshot-id (FF not REPLAY),
+            // and the Rust GEN rejection artifact confirms the second cherry-pick failed.
+            if (rustFinalSnapshotCount != 3) {
+              System.out.println(
+                  "FAIL staged-wap/S-dedup/final: expected exactly 3 snapshots "
+                      + "(S0 + w3-first-FF-main + w3-second-still-staged), got "
+                      + rustFinalSnapshotCount);
+              failures++;
+              continue;
+            }
+            Snapshot dedupCurrent = rustFinalMeta2.currentSnapshot();
+            if (dedupCurrent == null) {
+              System.out.println("FAIL staged-wap/S-dedup/final: no current snapshot");
+              failures++;
+              continue;
+            }
+            // FF cherry-pick must NOT set source-snapshot-id (that is the REPLAY path only).
+            String dedupSourceId = dedupCurrent.summary().get("source-snapshot-id");
+            if (dedupSourceId != null) {
+              System.out.println(
+                  "FAIL staged-wap/S-dedup/final: FF cherry-pick must NOT set source-snapshot-id, "
+                      + "got: " + dedupSourceId);
+              failures++;
+              continue;
+            }
+            // The current snapshot must carry wap.id=w3 (the FF published it verbatim).
+            String dedupWapId = dedupCurrent.summary().get("wap.id");
+            if (!"w3".equals(dedupWapId)) {
+              System.out.println(
+                  "FAIL staged-wap/S-dedup/final: current snapshot must carry wap.id=w3 (FF), "
+                      + "got: " + dedupWapId);
+              failures++;
+              continue;
+            }
+            // Read the dedup rejection confirmation from the Rust-emitted artifact.
+            Path dedupRejectionPath =
+                fixtureDir.resolve("rust_wap_dedup_rejection.json");
+            if (!Files.exists(dedupRejectionPath)) {
+              System.out.println(
+                  "FAIL staged-wap/S-dedup/final: missing rust_wap_dedup_rejection.json — "
+                      + "Rust GEN must emit this after the rejected second cherry-pick");
+              failures++;
+              continue;
+            }
+            String dedupRejectionRaw = readString(dedupRejectionPath);
+            com.fasterxml.jackson.databind.JsonNode dedupNode =
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree(dedupRejectionRaw);
+            if (!dedupNode.path("second_cherrypick_fails").asBoolean(false)) {
+              System.out.println(
+                  "FAIL staged-wap/S-dedup/final: rust_wap_dedup_rejection.json must have "
+                      + "second_cherrypick_fails=true");
+              failures++;
+              continue;
+            }
+            System.out.println(
+                "PASS staged-wap/S-dedup/final: count=3, wap.id=w3 on current (FF), "
+                    + "no source-snapshot-id, rust rejection confirmed OK");
+            break;
+
+          default:
+            System.out.println("FAIL staged-wap/" + fixture + "/final: unknown fixture");
+            failures++;
+            continue;
         }
       }
 

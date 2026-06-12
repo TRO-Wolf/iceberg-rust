@@ -799,3 +799,61 @@ How to use it (see the manuals' §2):
   (mutation: remove `ViewRepresentations::new` ⇒ the SQL test target fails E0599).** The probe couldn't
   name `uuid::Uuid` (not a SQL-crate dep) — used `ViewRequirement::NotExist` (unit variant) + pattern
   matches instead. Result: SQL 62→64, REST 51→52, iceberg 2188 unchanged; gate ×2 green.
+### 2026-06-12 (Z1 — staged-WAP interop fixture, BUILDER Sonnet, wt-interop3)
+
+- **The WAP-dedup `testDuplicateCherrypick` pattern REQUIRES both staged snapshots to share the SAME
+  parent (S0) — if the second staged snapshot is committed AFTER the first cherry-pick, the second
+  snapshot's parent becomes the current head (= w3-first after FF), the second cherry-pick FAST-FORWARDS
+  (parent == head), and `validate_wap_publish` is NEVER reached.** *Why:* `CherryPickAction.validate`
+  early-returns `Ok(())` for the fast-forward plan (Java `if (!isFastForward(base))` gates the whole
+  validate block). The ONLY way to force the REPLAY path (which runs `validate_wap_publish`) is to ensure
+  the second staged snapshot's parent IS NOT the current head — i.e., the first cherry-pick must have
+  advanced `main` past S0 BEFORE the second staged snapshot inherits S0 as parent. Concretely: stage w3-first
+  off S0, stage w3-second ALSO off S0 (still head, no cherry-pick yet), THEN cherry-pick w3-first (FF →
+  main = w3-first), THEN cherry-pick w3-second (parent=S0 ≠ w3-first=head → REPLAY → dedup fires). Any
+  design that commits the second staged snapshot AFTER the first cherry-pick stages it off the NEW head and
+  silently skips the dedup check. Verified against 1.10.0 bytecode of `CherryPickOperation.apply` and
+  `TestWapWorkflow.testDuplicateCherrypick` in the m2 jar — this is the exact pattern Java's own test uses.
+
+- **The canonical `SnapshotMetaOracle.emit()` view does NOT include `current-snapshot-id` or `refs` — it
+  covers ONLY `metadata.snapshots()` ordinals, sequence numbers, operations, summary counts, and manifest
+  tuples.** *Why it matters:* sabotage 7d was originally designed to inject a `main` ref pointing at the
+  staged snapshot AND advance `current-snapshot-id` to the staged id. The view produced by the injected
+  metadata was IDENTICAL to `java_staged_meta.json` because neither refs nor current-snapshot-id appear in
+  the output. The correct staged-state-specific sabotage is to REMOVE the staged snapshot from
+  `metadata.snapshots()` entirely — the canonical view then has 1 ordinal instead of 2, diverges from
+  `java_staged_meta.json`, and proves the view IS testing `metadata.snapshots()` coverage. Rule: when
+  designing a sabotage for a metadata-view-based interop test, first read what the view ACTUALLY emits (the
+  oracle's JSON keys); then design the corruption around a field that IS in the view.
+
+- **`cargo fmt` reformats method chains that exceed line-width limits — always run `cargo fmt --all` BEFORE
+  `cargo fmt --all -- --check` at the gate, not instead of it.** *Why:* after writing multi-line assertion
+  bodies, the formatter may split a one-line `.expect("msg")` call into a two-line chain. `cargo fmt` fixes
+  this automatically; running `-- --check` first without running `cargo fmt` causes a spurious gate failure
+  that requires a separate fix commit. Pattern: always `cargo fmt --all && cargo fmt --all -- --check`
+  (or just `cargo fmt --all` and rely on `-- --check` in the gate chain).
+
+### 2026-06-12 (Z1 — staged-WAP interop, OPUS REVIEWER, wt-interop3)
+
+- **A field the canonical view EXCLUDES must be VALUE-pinned (not just presence-pinned) in the per-fixture
+  verify, on BOTH directions — and the pin must be HAND-DECLARED (anti-circular).** *Found in review:* the
+  `SnapshotMetaOracle`/`snapshot_meta_view` summary allowlist excludes `wap.id`, so a corrupted staged
+  `wap.id` value rides PAST the byte-equal view diff. The Java `verify()` (D1, Java-judges-Rust) only required
+  SOME non-empty `wap.id` on the staged snapshot — corrupting `"w1" → "CORRUPTED"` in the Rust artifact
+  passed silently (0 failures). The D2 (Rust-verifies-Java) side already hand-declared `wap.id == "w1"`.
+  Mutation proof: corrupt the staged `wap.id` value → D1 must `FAIL`. *Fix:* added an `expectedStagedWapId`
+  (S-ff→w1 / S-replay→w2 / S-dedup→w3) value pin to the Java staged-state verify, plus a FF `current` wap.id
+  pin (S-ff final must carry wap.id=w1 — the verbatim-publish proxy for `current == staged-id`). Rule: for any
+  fact the shared view omits (refs, current-snapshot-id, wap.id, source/published-wap-id values), run the
+  corruption mutation on BOTH the producer-side artifact (D1) AND the oracle-side artifact (D2); a pin that
+  only exists on one side is half-closed.
+
+- **Ref-state (current-snapshot-id) is invisible to the canonical view, so a "published when it should be
+  staged" corruption is caught ONLY by the per-fixture `staged != current` check — and that check is loose
+  when >2 snapshots exist.** *Verified by mutation:* moving `current-snapshot-id` onto the staged snapshot in
+  an S-ff artifact left the canonical view BYTE-IDENTICAL (view omits refs) yet the per-fixture verify caught
+  it (the `staged != current` filter found no qualifying staged snapshot). But for S-replay (3 snapshots: S0,
+  staged-w2, S2-advance) `staged != current` allowed `current ∈ {S0, S2}` — it did NOT hand-declare
+  `current == S2`. *Fix:* added a hand-declared ref-state pin to the D2 S-replay staged check (current is the
+  S2 advance: no `wap.id` AND non-root). Rule (W1 lesson, re-confirmed): when the view can't see ref state,
+  the per-fixture verify must HAND-DECLARE the expected current-snapshot-id identity, not just "≠ staged".

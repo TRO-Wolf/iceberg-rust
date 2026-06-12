@@ -40,6 +40,60 @@ How to use it (see the manuals' §1):
 > phase files). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 > Archives are not read by default.
 
+## ACTIVE (2026-06-12): Z1 — staged-WAP interop fixture (BUILDER Sonnet, wt-interop3)
+
+**Structure choice:** a SIBLING script `dev/java-interop/run-interop-staged-wap.sh` (separate from
+`run-interop-cherrypick.sh`) so the new staged-state-comparison steps do not disturb the existing
+3-fixture chain that is already green.
+
+**Java-emitter enumeration verdict (PRE-DECIDED CAVEAT):** `SnapshotMetaOracle.emit()` at line
+6479 iterates `metadata.snapshots()` — the FULL metadata snapshot list, NOT `currentAncestors` or
+`history`. A staged ref-less snapshot IS included. Confirmed all-snapshots — no STOP needed.
+
+**Plan:**
+
+- [x] Record plan (this section).
+- [x] **Step 1: Java `StagedWapOracle` (new inner class in InteropOracle.java).** Three fixtures
+  (S-ff / S-replay / S-dedup). Java uses REAL `stageOnly()`. S-dedup redesigned to the
+  `testDuplicateCherrypick` same-parent pattern (stage BOTH w3 off S0 before any cherry-pick;
+  first cherry-pick FF, second cherry-pick REPLAY → validate_wap_publish → DuplicateWAPCommitException).
+  Both views per fixture + `wap_dedup_expected_rejection.json`. `generate-interop-staged-wap` +
+  `verify-interop-staged-wap` modes landed.
+- [x] **Step 2: Rust interop test `crates/iceberg/tests/interop_staged_wap.rs`.** Both directions,
+  both views. S-dedup redesigned to match Java's same-parent pattern. Direction 2 assertions updated
+  (staged count=3, final count=3, no source-snapshot-id on FF current, wap.id=w3 on current).
+- [x] **Step 3: Shell script `dev/java-interop/run-interop-staged-wap.sh`.** 7 steps landed.
+  Sabotage 7d redesigned from "inject main ref" (ineffective — canonical view omits refs) to
+  "remove staged snapshot from metadata" (canonical view loses 1 ordinal → diverges → PASS).
+- [x] **Step 4: map.md updates** (dev/java-interop/map.md, crates/iceberg/tests/map.md).
+- [x] **Step 5: GAP_MATRIX.md update** (cherrypick row — staged-WAP interop ✅ 2026-06-12 landed).
+- [x] **Step 6: Run full chain ×2, paste output; run verbatim gate ×2.**
+  Full chain ×2 green (0 failures, all 4 sabotages closed). Verbatim gate ×2: 2168 lib tests.
+- [x] **Step 7: task/lessons.md update.** Three lessons added: S-dedup same-parent pattern,
+  canonical view does not include refs/current-snapshot-id (sabotage redesign), `cargo fmt` order.
+
+**Outcome:** Z1 staged-WAP interop fixture landed 2026-06-12. Three fixtures × two views × two
+directions green. The S-dedup same-parent correction was the key insight; the sabotage redesign
+was secondary.
+
+**Z1 OPUS REVIEWER (2 of 2), 2026-06-12 — cold-start verification:**
+
+- [x] Cold-start required reading (CLAUDE.md, Opus.md + Sonnet addendum, lessons, git diff full,
+      the three new/changed pieces, the canonical view, cherry_pick.rs + stage_only surface).
+- [x] RUN the chain ×2 + 4-sabotage battery (both green; 7a/7b/7c/7d closed). Ref-state on BOTH
+      sides: D1 verify + D2 test both assert it; FOUND S-replay D2 staged current loose → tightened.
+- [x] S-dedup rejection arm: verbatim "Duplicate request to cherry pick wap id..." + DataInvalid +
+      non-retryable on BOTH sides; FF-first (count unchanged) → REPLAY-second fires dedup. Confirmed.
+- [x] wap.id coverage: canonical view excludes it; FOUND D1 value-pin missing (corruption passed) →
+      added expectedStagedWapId pin + FF current-wap pin; mutation now fails closed BOTH directions.
+- [x] ROW-STATUS JUDGMENT (headline): verdict = ✅-scoping HONEST (surface-scoped, row stays 🟡,
+      data-level residue named); made airtight by the D1 wap.id-value pin I added.
+- [x] 5 mutations beyond the battery: wap.id-value (D1+D2), ordinal/seq perturbation, current-id move
+      (ref-state), cross-fixture swap — all fail closed.
+- [x] Verbatim gate ×2 (2168 lib tests ×2, typos/fmt/clippy clean). Cross-chain: cherrypick + expire
+      green; write-data running.
+- [x] GAP_MATRIX pipe audit clean (5 pipes/row). Tier-ledger data point recorded in final report.
+
 ## ACTIVE (2026-06-12): Near-full-parity direction — open queue (planning record)
 
 Directive (user, 2026-06-11): run this fork's Roadmap to **almost the full 1:1 Java replacement**;
@@ -48,10 +102,15 @@ constants-map, ExpireSnapshots + interop, DeleteOrphanFiles, RewriteDataFiles,
 RemoveDanglingDeleteFiles, the variant arc end-to-end, stage_only + WAP dedup, ComputePartitionStats,
 data-level interop fixtures A–G, cherrypick interop). Statuses live ONLY in the GAP_MATRIX.
 
-- [ ] **Named next-wave interop items:** the staged-WAP fixture (V1's machinery + the harness; the
-      Java oracle must enumerate ALL metadata snapshots, not ancestry, when it lands — exit-audit
-      caveat); the multi-spec fixture (comparator groundwork RESOLVED in W3 — spec_id is the final
-      tiebreaker on all three view copies); Java-reads-our-partition-stats-file.
+- [ ] **THIS BRANCH (Wave 5 Group Z, SONNET-builder + OPUS-critic per the calibrated split,
+      user-approved 2026-06-12): the named interop items.** Z1: the staged-WAP fixture (V1's
+      `stage_only()` + the cherrypick chain; THE EXIT-AUDIT CAVEAT IS BINDING — the Java
+      `SnapshotMetaOracle` enumerates ALL metadata snapshots, NOT ancestry/history, and a staged
+      ref-less snapshot must appear identically on both sides); Z2: the multi-spec fixture
+      (comparator groundwork RESOLVED in W3 — spec_id is already the final tiebreaker on all
+      three view copies); Z3: Java-reads-our-partition-stats-file (PartitionStatsHandler
+      .readPartitionStatsFile as the Direction-2 oracle). Worktree `wt-interop3`, parallel to
+      Group Y (`phase6/compute-table-stats`, Opus) and Group U (`phase5/view-ops`, Opus).
 - [ ] **Partition-stats residue:** the INCREMENTAL compute path; time/uuid/fixed/binary partition
       values in stats files (loud errors today).
 - [ ] **`ComputeTableStats` (NDV/theta sketches) — DEPENDENCY-GATED, user decision:** needs a
