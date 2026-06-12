@@ -362,6 +362,31 @@ public final class InteropOracle {
         Path rewriteSeqDir = requireFixturesDir("interop.rewrite_seq.dir");
         RewriteSeqOracle.generate(rewriteSeqDir);
         break;
+      case "generate-interop-multi-spec":
+        // MULTI-SPEC metadata-level interop fixture (Z2). Creates a V2 table partitioned by
+        // identity(a) (spec 0), appends F1 under spec 0, evolves the partition spec to add
+        // identity(b) (spec 1), appends F2 under spec 1, then commits ONE multi-spec fast-append
+        // carrying both a spec-0-stamped AND a spec-1-stamped DataFile. The snapshot containing the
+        // multi-spec commit has TWO manifests with DIFFERENT partition_spec_id values, exercising
+        // the W3 spec-id tiebreaker. Emits java_meta.json (via SnapshotMetaOracle.emit). The dir
+        // is supplied via -Dinterop.multi_spec.dir.
+        Path multiSpecGenDir = requireFixturesDir("interop.multi_spec.dir");
+        MultiSpecOracle.generate(multiSpecGenDir);
+        break;
+      case "verify-interop-multi-spec":
+        // MULTI-SPEC interop, DIRECTION 2 — "Java verifies what RUST wrote". The Rust GEN test
+        // (env ICEBERG_INTEROP_MULTI_SPEC_GEN_DIR, tests/interop_multi_spec.rs) performed the SAME
+        // chain, writing the table to <dir>/rust_table. Here Java reads that RUST-produced table
+        // and emits its canonical snapshot-metadata view, which the run script byte-diffs against
+        // java_meta.json. NOTE: `mvn exec:java` does not propagate System.exit — the run script
+        // greps the "0 failures" sentinel.
+        Path multiSpecVerifyDir = requireFixturesDir("interop.multi_spec.dir");
+        int multiSpecFailures = MultiSpecOracle.verify(multiSpecVerifyDir);
+        System.out.println("verify-interop-multi-spec: " + multiSpecFailures + " failures");
+        if (multiSpecFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-expire":
         // EXPIRE-SNAPSHOTS interop (increment A3). Builds four fixtures (linear / tag_protected /
         // stats / deletes), each a real-manifest table with deterministically re-stamped snapshot
@@ -6426,6 +6451,181 @@ public final class InteropOracle {
     private static DataFile fakeDataFile(
         BaseTable table, String path, String partitionPath, long recordCount) {
       return DataFiles.builder(table.spec())
+          .withPath(path)
+          .withFileSizeInBytes(recordCount * 100)
+          .withRecordCount(recordCount)
+          .withPartitionPath(partitionPath)
+          .withFormat(FileFormat.PARQUET)
+          .build();
+    }
+  }
+
+  // =============================================================================================
+  // MultiSpecOracle — MULTI-SPEC metadata-level interop fixture (Z2).
+  //
+  // THE CHAIN (V2 table; NO parquet — the fixture only reads/writes MANIFESTS):
+  //
+  //   ms1: fast_append   F1(a="x", record_count=10)   spec 0 [identity(a)]    seq 1, op append
+  //   ms2: update_spec   add identity(b)               NO snapshot             → spec 1 becomes default
+  //   ms3: fast_append   F2(a="y",b="z", record_count=10)  spec 1            seq 2, op append
+  //   ms4: fast_append   F0(a="q", rc=10) spec 0 + F3(a="r",b="s", rc=10) spec 1
+  //                                                                             seq 3, op append
+  //        ↑ THE MULTI-SPEC COMMIT: TWO manifests in ONE snapshot, spec_id=0 AND spec_id=1.
+  //          TIE-SHAPING: F0 and F3 have IDENTICAL record_count=10, so the two manifests produced
+  //          by this commit tie on ALL 9 prior sort-tuple keys (content=data, seq=3, min_seq=3,
+  //          added_files_count=1, existing_files_count=0, deleted_files_count=0, added_rows=10,
+  //          existing_rows=0, deleted_rows=0) and differ ONLY on partition_spec_id (0 vs 1).
+  //          The W3 spec-id tiebreaker (position 10) is the ONLY disambiguator. This exercises
+  //          the same-arity masking lesson: without the spec-id tiebreaker the two manifests
+  //          would tie completely and produce indeterminate ordering.
+  //
+  // SINGLE-COMMIT CONSTRUCTIBILITY (BOTH sides):
+  //   Java: newFastAppend().appendFile(f0).appendFile(f3).commit() — MergingSnapshotProducer.add()
+  //         routes each file by spec id into newDataFilesBySpec (Map<Integer, DataFileSet>), and
+  //         newDataFilesAsManifests iterates that map to produce one manifest per spec bucket.
+  //         Bytecode: field newDataFilesBySpec:Ljava/util/Map; with lambda$newDataFilesAsManifests$19.
+  //   Rust: fast_append().add_data_files(vec![f0, f3]) — group_files_by_spec routes by
+  //         file.partition_spec_id and write_added_manifests produces one writer per spec group.
+  //
+  // COMPARISON (via the SnapshotMetaOracle canonical view):
+  //   java_meta.json = Java's canonical view of the Java-written chain.
+  //   Rust test D1: Rust's view of the Java chain == java_meta.json.
+  //   Script step: Java's view of the Rust chain byte-diffed against java_meta.json.
+  //   Rust test D2: Rust's view of the Rust chain == java_meta.json.
+  //
+  // Sabotage battery (in the run script):
+  //   SB1: truncate one manifest file → the load fails (structural corruption).
+  //   SB2: replace the final.metadata.json with a copy that omits the ms4 snapshot entirely
+  //        (drop the multi-spec commit snapshot) → the view has 2 instead of 3 ordinals → FAIL.
+  //   SB3: control — run D1 on the clean java chain → must pass → SB1/SB2 proved non-trivial.
+  //   SB4: spec-id swap mutation — in the rust_table's manifest list, swap the partition_spec_id
+  //        values of the two ms4 manifests (0↔1) → the view's ms4 manifests now carry spec_id=1
+  //        and spec_id=0 in the wrong order, diverging from java_meta.json's ms4 → FAIL.
+  //        This proves the emitted spec_id field is load-bearing, not decorative.
+  // =============================================================================================
+
+  static final class MultiSpecOracle {
+    private MultiSpecOracle() {}
+
+    /**
+     * Perform the four-commit multi-spec chain on a V2 table (NO parquet — metadata-only DataFiles)
+     * and emit {@code java_meta.json} (the canonical snapshot-metadata view) into {@code dir}.
+     *
+     * <p>Schema: {@code {1 a string required, 2 b string optional}} — b is optional so a spec-0
+     * partition tuple (which has only "a") round-trips without a null-fill error.
+     *
+     * <p>Spec 0: {@code identity(a)} built directly with {@code PartitionSpec.builderFor(schema).
+     * identity("a")} (partition field id 1000, name "a"). Spec 1: produced by
+     * {@code table.updateSpec().addField("b")} — adds {@code identity(b)} (field id 1001, name
+     * "b"). The default spec after ms2 is spec 1. This mirrors the {@link WriteActionsOracle}
+     * pattern of building spec 0 directly and then driving updateSpec() for the evolution.
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+
+      // Schema: {a string required, b string optional}.
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "a", Types.StringType.get()),
+              Types.NestedField.optional(2, "b", Types.StringType.get()));
+
+      // Spec 0: identity(a) built directly — the table is CREATED with spec 0, exactly like
+      // WriteActionsOracle.generate() which builds spec 0 with PartitionSpec.builderFor(schema).
+      // The partition field name for identity(a) is "a" (Java PartitionNameGenerator convention).
+      // Field id assigned by PartitionSpec.builderFor is 1000 (the first sequential id starting
+      // from lastPartitionId=999, the default for a new table).
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      PartitionSpec spec0seed = PartitionSpec.builderFor(schema).identity("a").build();
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec0seed, SortOrder.unsorted(),
+              tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_multi_spec");
+
+      // Spec 0 (identity(a)) is the initial default spec.
+      PartitionSpec spec0 = table.spec();
+      String dataDir = tableDir.getAbsolutePath() + "/data";
+
+      // ms1: fast_append F1 under spec 0.
+      DataFile fileF1 = fakeDataFile(spec0, dataDir + "/s0_f1.parquet", "a=x", 10L);
+      table.newFastAppend().appendFile(fileF1).commit();
+
+      // ms2: updateSpec() adds identity(b) via addField("b") — auto-names the partition field "b"
+      // (Java PartitionNameGenerator: identity → column name). Assigns field id 1001 (next after
+      // spec 0's 1000). This is a NO-SNAPSHOT metadata commit; the new spec 1 becomes default.
+      table.updateSpec().addField("b").commit();
+      PartitionSpec spec1 = table.spec();
+      // Snapshot ms3: append F2 under spec 1. Partition fields named "a" and "b".
+      DataFile fileF2 = fakeDataFile(spec1, dataDir + "/s1_f2.parquet", "a=y/b=z", 10L);
+      table.newFastAppend().appendFile(fileF2).commit();
+
+      // Snapshot ms4: the MULTI-SPEC commit — ONE fast-append carrying BOTH a spec-0-stamped file
+      // (F0, built under spec0) AND a spec-1-stamped file (F3, built under spec1). Java's
+      // MergingSnapshotProducer.add() routes by spec id into newDataFilesBySpec so one manifest
+      // per spec group is produced: two manifests with partition_spec_id=0 and partition_spec_id=1
+      // respectively. TIE-SHAPED: both record_count=10 so the two manifests tie on all 9 prior
+      // sort-tuple keys, exercising the spec-id tiebreaker (W3, position 10) as the ONLY
+      // disambiguator.
+      DataFile fileF0 = fakeDataFile(spec0, dataDir + "/s0_f0.parquet", "a=q", 10L);
+      DataFile fileF3 = fakeDataFile(spec1, dataDir + "/s1_f3.parquet", "a=r/b=s", 10L);
+      table.newFastAppend().appendFile(fileF0).appendFile(fileF3).commit();
+
+      // The FINAL metadata at a known path for the emitter + the Rust test.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // Emit java_meta.json (the canonical snapshot-metadata view).
+      SnapshotMetaOracle.emit(finalMetadata, dir.resolve("java_meta.json"));
+      System.out.println("generated multi-spec table to " + dir);
+    }
+
+    /**
+     * Direction 2 — "Java judges what RUST wrote." Reads the Rust-produced
+     * {@code rust_table/metadata/final.metadata.json}, emits its canonical view, and byte-diffs
+     * it against {@code java_meta.json}. Returns the failure count (0 = pass).
+     */
+    static int verify(Path dir) throws IOException {
+      Path javaMetaPath = dir.resolve("java_meta.json");
+      Path rustMetadataPath = dir.resolve("rust_table/metadata/final.metadata.json");
+      if (!Files.exists(rustMetadataPath)) {
+        System.out.println("FAIL verify-interop-multi-spec: missing " + rustMetadataPath);
+        return 1;
+      }
+
+      // Emit the canonical view of the Rust-written table.
+      Path rustViewPath = dir.resolve("java_view_rust_meta.json");
+      SnapshotMetaOracle.emit(rustMetadataPath, rustViewPath);
+
+      String javaView = readString(javaMetaPath);
+      String rustView = readString(rustViewPath);
+      if (javaView.equals(rustView)) {
+        System.out.println("verify-interop-multi-spec: Rust chain == Java semantics OK");
+        return 0;
+      } else {
+        System.out.println("FAIL verify-interop-multi-spec: Rust canonical view diverges:");
+        System.out.println("  expected: " + javaMetaPath);
+        System.out.println("  actual:   " + rustViewPath);
+        return 1;
+      }
+    }
+
+    /**
+     * A metadata-only {@link DataFile} built under a SPECIFIC {@link PartitionSpec} (not the
+     * table's current default). The path need not exist — the fixture only reads manifests.
+     */
+    private static DataFile fakeDataFile(
+        PartitionSpec spec, String path, String partitionPath, long recordCount) {
+      return DataFiles.builder(spec)
           .withPath(path)
           .withFileSizeInBytes(recordCount * 100)
           .withRecordCount(recordCount)

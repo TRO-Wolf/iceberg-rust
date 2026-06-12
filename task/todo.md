@@ -40,6 +40,75 @@ How to use it (see the manuals' §1):
 > phase files). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 > Archives are not read by default.
 
+## ACTIVE (2026-06-12): Z2 — multi-spec metadata-level interop fixture (BUILDER Sonnet, wt-interop3)
+
+**Structure choice:** SIBLING script `dev/java-interop/run-interop-multi-spec.sh` (separate from
+`run-interop-write-actions.sh`) so the new multi-spec steps do not disturb the existing metadata
+chains. New Rust test `crates/iceberg/tests/interop_multi_spec.rs`.
+
+**Single multi-spec commit constructibility verdict:**
+CONSTRUCTIBLE on BOTH sides. Java `newFastAppend().appendFile(f0).appendFile(f1).commit()` where
+f0 carries spec_id=0 partition and f1 carries spec_id=1 partition routes to `newDataFilesBySpec`
+(a `Map<Integer, DataFileSet>`) in `MergingSnapshotProducer.add()` which `newDataFilesAsManifests`
+iterates to produce one manifest per spec group — bytecode-verified. Rust `fast_append().
+add_data_files(vec![f0, f1])` routes through `group_files_by_spec` → one writer per spec group
+→ two manifests with different `partition_spec_id` values. Both sides produce TWO manifests in the
+single multi-spec commit snapshot.
+
+**Tie-shaping proof:** F0 and F1 have IDENTICAL record count (10), so the two manifests produced
+in the multi-spec commit tie on ALL 9 prior sort keys (content=data, seq=same, min_seq=same,
+added_files_count=1, existing_files_count=0, deleted_files_count=0, added_rows=10, existing_rows=0,
+deleted_rows=0) and differ ONLY on `partition_spec_id` (0 vs 1). The spec-id tiebreaker (position
+10, W3 ruling) is the ONLY disambiguator — assert this property explicitly in the fixture.
+
+**Plan:**
+
+- [x] Record plan (this section).
+- [x] **Step 1: Java `MultiSpecOracle` (new inner class in InteropOracle.java).** Operations:
+  create table partitioned by identity(a) → append F1(spec 0) → evolve spec: add identity(b)
+  (spec 1) → append F2(spec 1) → ONE multi-spec fast_append carrying both F0-spec0 and F1-spec1
+  stamped files. Emit `java_meta.json` (canonical view). Add `generate-interop-multi-spec` and
+  `verify-interop-multi-spec` dispatch cases to `main()`. Key fix: Java oracle builds spec 0
+  directly (not from unpartitioned default) so spec_ids align with Rust (0=identity(a),
+  1=identity(a)+identity(b)).
+- [x] **Step 2: Rust interop test `crates/iceberg/tests/interop_multi_spec.rs`.** GEN test (performs
+  the same chain via Rust production write paths), READ parity test (Rust view of Java chain ==
+  java_meta.json), WRITE parity test (Rust view of Rust chain == java_meta.json). Tie-shaping
+  assertion: F0.record_count == F3.record_count == 10; different partition tuple arities prove
+  different spec ids (1 vs 2 fields).
+- [x] **Step 3: Shell script `dev/java-interop/run-interop-multi-spec.sh`.** 5-step chain + sabotage
+  battery (structural corruption + control + spec-id-swap mutation). SB2 refs-aware snapshot
+  stripping (update current-snapshot-id AND refs["main"]["snapshot-id"] to ms3). SB4 Python-driven
+  subprocess spec-id swap in the canonical view JSON; fixed cwd path depth (fixture_dir + 3 levels
+  up to reach pom.xml, not 2).
+- [x] **Step 4: map.md updates** (dev/java-interop/map.md, crates/iceberg/tests/map.md).
+- [x] **Step 5: GAP_MATRIX.md update** (multi-spec interop cells — landed, scoped).
+- [x] **Step 6: Run full chain ×2, paste output; run verbatim gate ×2.**
+  Full chain ×2 green (5 steps + SB1/SB2/SB3/SB4 all PASS). Gate: typos clean, fmt clean,
+  clippy clean (fixed doc_overindented_list_items), 2168 lib tests ×2.
+- [x] **Step 7: task/lessons.md update.**
+
+**Outcome:** Z2 multi-spec interop fixture landed 2026-06-12. Single multi-spec fast-append
+commit constructible on both sides (CONFIRMED). Spec-id tiebreaker is the sole disambiguator for
+tie-shaped ms4 manifests. 4-sabotage battery all closed. Verbatim gate ×2 green (2168 lib tests).
+
+- [x] **REVIEWER (Opus 2-of-2, 2026-06-12):** Cold-start verified. Chain ×2 green incl. genuine D1
+  (step 4/5: Java judges the Rust-written table via emit+diff). Tie decoded from the emitted JSON:
+  the two ms4 manifests are byte-identical on all 9 prior sort keys (content/seq=3/min_seq=3/added=1/
+  existing=0/deleted=0/added_rows=10/existing_rows=0/deleted_rows=0), differ ONLY on
+  partition_spec_id 0 vs 1; their entries render `{1000:q}` (spec-0, 1-field) vs `{1000:r,1001:s}`
+  (spec-1, 2-field) per the file's-own-spec rule (Rust + Java both render under the manifest's own
+  spec). **STRENGTHENED SB4:** the builder's original SB4 only post-edited the spec_id INTEGER in the
+  emitted view JSON (proved the field is in the comparison key, but NOT the per-own-spec rendering it
+  claimed). Rewrote SB4 to swap the spec-0/spec-1 FIELD DEFINITIONS in the SOURCE metadata and
+  RE-EMIT → the partition tuples re-render under the wrong-arity spec (`1001:s` drops) and the view
+  diverges — now a true artifact-level, re-derived fail-closed proof. Updated dev map.md + GAP_MATRIX
+  SB4 wording to match. Cell scoping HONEST (both ✅ cells scoped to multi-spec FAST-APPEND metadata
+  interop; merge_append/deletes/replay-cherrypick interop correctly stay open in their own rows).
+  Cross-chain ×1 green (write-actions, staged-wap, cherrypick — shared oracle untouched by Z2). Gate
+  ×2 green (2168). Tree clean. Flagged: dead `verify-interop-multi-spec` Java dispatch (unused;
+  builder-owned, left in place).
+
 ## ACTIVE (2026-06-12): Z1 — staged-WAP interop fixture (BUILDER Sonnet, wt-interop3)
 
 **Structure choice:** a SIBLING script `dev/java-interop/run-interop-staged-wap.sh` (separate from

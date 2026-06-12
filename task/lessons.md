@@ -857,3 +857,83 @@ How to use it (see the manuals' §2):
   `current == S2`. *Fix:* added a hand-declared ref-state pin to the D2 S-replay staged check (current is the
   S2 advance: no `wap.id` AND non-root). Rule (W1 lesson, re-confirmed): when the view can't see ref state,
   the per-fixture verify must HAND-DECLARE the expected current-snapshot-id identity, not just "≠ staged".
+
+### 2026-06-12 (Z2 — multi-spec metadata-level interop fixture, BUILDER Sonnet, wt-interop3)
+
+- **Spec-id alignment across languages requires BOTH sides to start from the SAME initial spec.**
+  *Why:* Java's `TableMetadata.newTableMetadata` with `PartitionSpec.unpartitioned()` as the seed
+  assigns spec_id=0 to unpartitioned, so `updateSpec().addField("a")` creates spec_id=1 for
+  identity(a) and a further `addField("b")` creates spec_id=2. Rust's seed-from-spec-0 approach
+  (`with_spec_id(0)` + identity(a) directly) assigns spec_id=0 to identity(a) and spec_id=1 to
+  identity(a)+identity(b). FIX: build Java's seed spec DIRECTLY (not from unpartitioned default):
+  `PartitionSpec.builderFor(schema).identity("a").build()` then ONLY use `updateSpec().addField("b")`
+  for evolution. This makes both sides produce spec_id=0=identity(a), spec_id=1=identity(a)+identity(b).
+  Rule: when a cross-language fixture involves spec evolution, BUILD the initial spec explicitly on
+  BOTH sides so the first `updateSpec()` call creates spec_id=1, not spec_id=0.
+
+- **SB2 snapshot-stripping must also update `refs["main"]["snapshot-id"]` — Java's metadata parser
+  rejects a ref pointing at a non-existent snapshot ID.** *Why:* the Python script stripped ms4 from
+  `metadata.snapshots` but left `refs["main"]["snapshot-id"]` = ms4_id, causing Java to error:
+  "Snapshot for reference SnapshotRef{snapshotId=…} does not exist in the existing snapshots list."
+  FIX: after stripping, also set `refs["main"]["snapshot-id"] = ms3_id` AND
+  `current-snapshot-id = ms3_id`. Rule: when stripping a snapshot from metadata JSON for a
+  sabotage test, update ALL three ref points (snapshots array, current-snapshot-id, AND any branch
+  refs) atomically or the Java parser rejects the file before the interop check can run.
+
+- **SB4 subprocess `cwd` must point to the Maven project directory — not to the fixture sub-path.**
+  *Why:* the Python subprocess in SB4 called `mvn` with `cwd = fixture_dir + "/../.."` but
+  `fixture_dir` = `.../dev/java-interop/target/interop-multi-spec/fixture`, making `"../.."` =
+  `.../dev/java-interop/target/interop-multi-spec/` (no pom.xml). The correct depth is `"../../.."` =
+  `.../dev/java-interop/`. Rule: when a shell helper script embeds a Python subprocess that calls
+  `mvn`, compute the Maven cwd by counting directory levels from the shell variable — use `realpath`
+  or count levels manually against the known fixture path structure.
+
+- **The `clippy::doc_overindented_list_items` lint fires on multi-line `//!` list continuations
+  indented beyond 2 spaces.** *Why:* a `//!` bullet continuation of the form `//!        text`
+  (8-space indent) was flagged by clippy as over-indented (wants 2 spaces). Fix: rewrite the
+  multi-line bullet as a single line, or use exactly `//!   ` (2-space continuation indent).
+  Rule: after writing `//!` doc blocks with multi-line bullets, run `cargo clippy --all-targets
+  --workspace -- -D warnings` to catch this lint before the gate.
+
+- **Tie-shaping proof belongs in the GEN test, not only in the shell script comment.** *Why:* the
+  spec-id tiebreaker's effectiveness (the ONLY disambiguator for the two ms4 manifests) is only
+  meaningful if the fixture data actually satisfies the tie condition (identical record counts).
+  Asserting `file_f0.record_count() == file_f3.record_count()` AND different partition-tuple arities
+  (1 vs 2 fields as the proxy for different spec ids, since `partition_spec_id()` is `pub(crate)`)
+  IN THE TEST makes the tie-shaping property machine-checked, not just documented. Rule: whenever
+  a fixture depends on a tie-shaping invariant (X == Y across two artifacts), assert it in the code,
+  not only in prose.
+
+### 2026-06-12 (Z2 — multi-spec interop fixture, REVIEWER Opus 2-of-2, wt-interop3)
+
+- **A sabotage step that POST-EDITS the emitted view JSON does NOT prove the property it claims to
+  re-derive — mutate the ARTIFACT and RE-EMIT.** *Why:* the builder's original SB4 emitted the Rust
+  table's canonical view normally, then in Python swapped the `partition_spec_id` INTEGER on the two
+  ms4 manifests IN THE OUTPUT JSON and diffed. Its comment claimed this was the "wrong-spec-rendering
+  corruption — partition tuples rendered under the WRONG spec," but the partition TUPLES were never
+  touched (they were carried through from the clean emit); only the integer moved. That proved the
+  spec_id field is in the comparison KEY (a valid injectivity check) but NOT that partition tuples are
+  rendered under each manifest's OWN spec (the file's-own-spec rule — the multi-spec arc's whole
+  point). FIX: SB4 now swaps the spec-0/spec-1 FIELD DEFINITIONS in the SOURCE `final.metadata.json`
+  (ids unchanged) and RE-EMITS via Java — the ms4 spec-0 manifest's 1-field tuple is then projected
+  under the 2-field spec (and vice versa: spec-1's `{1000:r,1001:s}` renders as `{1000:r}`, the
+  `1001:s` field DROPS), so the re-derived view genuinely diverges. Rule (reviewer mutation mandate):
+  a fail-closed sabotage must mutate the on-disk artifact and re-run the production view builder, never
+  post-edit the builder's output — the latter can pass while the property under test is broken.
+
+- **The per-own-spec partition rendering IS exercised by the multi-spec fixture's POSITIVE
+  comparisons, independent of SB4.** *Why:* `snapshot_meta_view.rs` (Rust) renders each entry's
+  partition under `manifest_meta.partition_spec.partition_type(&schema)` and Java's `entryView` under
+  `metadata.specsById().get(file.specId()).partitionType()` — both the file's OWN spec. The clean ms4
+  manifests render spec-0 → `{1000:q}` (1-field) and spec-1 → `{1000:r,1001:s}` (2-field), and those
+  exact tuples must byte-match Java in D1 + D2. So the own-spec rule is load-bearing in the positive
+  path; SB4 (re-derived) is the explicit fail-closed pin. Verified by an independent reviewer probe
+  (swap spec field-defs in metadata, re-emit → view diverges with `1001:s` dropped).
+
+- **A genuine D1 step exists for multi-spec (Java judges the Rust-written chain) — the 'both
+  directions' claim holds.** Script step [4/5] runs `emit-snapshot-meta` on the Rust-produced
+  `rust_table/.../final.metadata.json` → `java_view_rust_meta.json` and `diff`s it against
+  `java_meta.json` (Java-on-Java). This matches the cherrypick/staged-WAP house D1 pattern. Note: the
+  Java `MultiSpecOracle.verify()` method + its `verify-interop-multi-spec` dispatch case are written
+  but NEVER invoked by the run script (D1 is done inline via emit+diff instead) — harmless redundancy,
+  flagged not removed (builder-owned code, no correctness impact).
