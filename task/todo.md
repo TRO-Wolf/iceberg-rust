@@ -228,6 +228,93 @@ was secondary.
       green; write-data running.
 - [x] GAP_MATRIX pipe audit clean (5 pipes/row). Tier-ledger data point recorded in final report.
 ## IN-FLIGHT (2026-06-12): Wave-5 Group Y / Y1 — theta-sketch foundation (BUILDER Opus, wt-tstats)
+## IN-FLIGHT (2026-06-12): Wave-5 Group Y / Y2 — ComputeTableStats action (BUILDER Opus, wt-tstats)
+
+**Goal:** wire the Y1 `iceberg-sketches` crate into the `ComputeTableStats` maintenance action — per-column
+NDV via theta sketches into one Puffin `apache-datasketches-theta-v1` blob per column, written into a single
+puffin StatisticsFile, registered via the existing `UpdateStatisticsAction`. Cross-engine byte contract: the
+value→bytes feeding MUST match Java `Conversions.toByteBuffer` (single-value serialization), else every NDV
+diverges silently.
+
+**Java oracle facts (cited, derived this session):**
+- **VALUE→bytes = Iceberg single-value serialization** (puffin spec: "feeding it with individual distinct
+  values converted to bytes using Iceberg's single-value serialization"). Rust port = `Datum::to_bytes()`,
+  which I verified byte-identical to `Conversions.toByteBuffer` (iceberg-api-1.10.0 bytecode `javap`):
+  bool=1B(0/1); int/date=4B LE; long/time/timestamp/timestamptz/tsNs/tstzNs=8B LE; float=4B LE; double=8B LE;
+  string=UTF-8 unprefixed; uuid=16B BE; fixed/binary=raw; decimal=big-endian two's-complement minimal of the
+  unscaled value. Fed via `sketch.update_bytes(&bytes)` (Java `update(byte[])`); longs MAY use the Y1-proven
+  `update_u64` equivalence (`hash(long[]{v}) == hash(LE8(v))`) — I use `update_bytes` uniformly for one path.
+- **Default columns** = `schema.columns().filter(type.isPrimitiveType())` — top-level primitive fields only
+  (skips struct/list/map), names (`ComputeTableStatsSparkAction`); ComputeTableStats javadoc: "by default all
+  columns are chosen". **Validation**: non-existent → "Can't find column %s"; non-primitive → "Can't compute
+  stats on non-primitive type column".
+- **Default snapshot** = current snapshot (javadoc).
+- **ndv property** = `String.valueOf((long) sketch.getEstimate())` (`NDVSketchUtil`) — `f64 as i64`
+  TRUNCATION toward zero, decimal digits, key `"ndv"` (`APACHE_DATASKETCHES_THETA_V1_NDV_PROPERTY`). Spec:
+  "stored as non-negative integer value represented using decimal digits with no leading/trailing spaces."
+- **Blob** (`apache-datasketches-theta-v1`): fields=[field_id], snapshot-id + sequence-number from the
+  computed snapshot, payload = `serialize_compact()`. **File** = `<snapshotId>-<uuid>.stats` at
+  `operations.metadataFileLocation` (honors `write.metadata.path` else `<location>/metadata/`). StatisticsFile:
+  `file_size_in_bytes = writer.fileSize()`, `file_footer_size_in_bytes = writer.footerSize()`,
+  blob_metadata from written blobs.
+- **MAIN-only flag:** `NDVSketchUtil` / `ThetaSketchAgg` live in `iceberg-spark` (NOT in m2 jars) — the
+  spark-agg feeding behavior is MAIN-only; pinned here against the spec text + `Conversions` bytecode, not the
+  agg bytecode. Spec says "Alpha family"; Y1 ports `HeapQuickSelectSketch` (QuickSelect) and proved its bytes
+  round-trip Java — kept (Y1-verified).
+
+**Plan:**
+- [ ] Sanctioned Cargo dep: add `iceberg-sketches = { workspace = true }` (or path) to `crates/iceberg/Cargo.toml`
+      `[dependencies]`; regen Cargo.lock. FLAG the exact diff. (Only sanctioned Cargo edit.)
+- [ ] Puffin seam (flag): `PuffinWriter` exposes `footer_size()` (computed from blob metadata + properties,
+      deterministic) for `file_footer_size_in_bytes` — `close()` returns only total size. Non-breaking add.
+- [ ] `maintenance/compute_table_stats.rs`: `ComputeTableStats::new(table)` → `.columns([...])` (default all
+      top-level primitive cols) → `.snapshot_id(...)` (default current) → `.execute(catalog)`:
+      scan snapshot (deletes APPLIED via `Table::scan().snapshot_id().select(cols).to_arrow()`) → per column
+      feed non-null values (`arrow_primitive_to_literal` → `Datum::to_bytes()` → `update_bytes`) into a
+      per-column `ThetaSketch` → write ONE puffin file (one blob/column, ndv property = `(estimate as i64)`
+      string) → build `StatisticsFile` → register via `tx.update_statistics().set_statistics(file)`.
+- [ ] Read-back: parse the written puffin, deserialize each blob via `CompactThetaSketch`, estimates match.
+- [ ] Tests (crown jewel + per-type byte pins + nulls-excluded + deletes-applied + col-selection/error +
+      multi-snapshot + 2 mutation-baits) in `maintenance/tests.rs` or the new module.
+- [ ] `maintenance/mod.rs` pub-export; update `maintenance` map.md if present; GAP_MATRIX ComputeTableStats
+      row (Y2 landed, still 🟡 — interop next-wave); pipe-audit; lessons entry.
+- [x] Gate: typos + taplo + fmt + clippy + `cargo test -p iceberg --lib` ×2 + `cargo test -p iceberg-sketches`.
+
+**Outcome (Y2 DONE, 🟡):** `maintenance/compute_table_stats.rs` (385+ LOC + 15 tests) — builder
+(`new`/`columns`/`snapshot_id`/`execute`), scan-fed per-column theta sketches via `Datum::to_bytes()`
+(= `Conversions.toByteBuffer`, byte-verified per type), one `apache-datasketches-theta-v1` blob/column,
+`<snapshotId>-<uuid>.stats` puffin file, `ndv` = `(estimate as i64)` string, registered via the REUSED
+`UpdateStatisticsAction`. REUSED: `UpdateStatisticsAction` (SetStatistics), `arrow_primitive_to_literal`,
+`Datum::to_bytes`, `PuffinWriter`/`PuffinReader`/`Blob`, the X2 local-fs test harness pattern. BUILT:
+the action + `PuffinWriter::footer_size()` seam (non-breaking, flagged). CARGO DIFF (sanctioned, one line):
+`crates/iceberg/Cargo.toml [dependencies]` +`iceberg-sketches = { workspace = true }` (workspace entry +
+member already existed from Y1); Cargo.lock +1 line (`iceberg-sketches` added to the `iceberg` crate's
+dependency list, auto-regenerated by the build — no version bumps). GATE GREEN: typos /
+taplo / fmt / clippy(`-D warnings`, exit 0) all clean; `iceberg --lib` 2183 ×2 (baseline 2168 + 15);
+`iceberg-sketches` 41 + 1 doctest. Mutation-bait verified: replacing `to_bytes()` with the display form
+makes both byte-form pins FAIL (crown jewel's NDV count alone does NOT — proving the byte-form pins are
+load-bearing). DEFERRED (named): Java-reads-our-theta-blob interop (NEXT-WAVE, Group W/Z owns
+dev/java-interop, kept READ-ONLY); the spark `theta_sketch_agg`/`NDVSketchUtil` feeding is MAIN-only
+(not in m2 jars) — pinned vs the puffin SPEC + `Conversions` bytecode instead.
+
+- [x] **Y2 REVIEWER (Opus, wt-tstats):** HEADLINE — refuted the builder's "Alpha is a doc nit" flag. Java's
+  NDV pipeline builds an **ALPHA** family sketch (`ThetaSketchAgg.createAggregationBuffer` MAIN source
+  `setFamily(Family.ALPHA)`, all spark v3.5/4.0/4.1 + puffin-spec.md + datasketches bytecode showing the
+  builder default IS QuickSelect so `.setFamily(ALPHA)` is load-bearing); the Y1 port is QuickSelect.
+  STOP-grade estimation-mode divergence (Java probe: exact mode byte-identical, but n=1M → Alpha 1004032
+  vs QuickSelect/Rust 1002714). Documented in the module doc + matrix cell + lessons + a new estimation-mode
+  value pin; Y1 crate left UNCHANGED (committed byte surface — flagged for an Alpha port next wave).
+  FIXED in scope: tightened the crown-jewel footer invariant `<=`→`<` (a `footer_size==total` mutation
+  SURVIVED `<=`; now killed). ADDED 6 tests (+5 edge byte pins: negative/zero decimal, uuid BE, float
+  NaN/-0.0, double NaN, boolean — all vs Java probe bytes; +1 estimation-mode QuickSelect-vs-Alpha pin).
+  VERIFIED: footer_size seam == Java `footerSize()` byte-for-byte; blob/StatisticsFile shape == Java
+  Generic*; lgK 12 / seed 9001 / p 1.0 / RF X8 all match the builder; ndv `f64 as i64` == Java `(long)`.
+  Mutations killed: footer=total, null-fed-as-value, JSON-form (builder's), field-id swap (builder's).
+  Gate ×2 green: `iceberg --lib` 2189, `iceberg-sketches` unchanged. NO Cargo/Y1/interop edits.
+
+---
+
+## DONE (2026-06-12): Wave-5 Group Y / Y1 — theta-sketch foundation (BUILDER Opus, wt-tstats)
 
 **Goal:** new workspace crate `iceberg-sketches` implementing the DataSketches theta CompactSketch
 v1/v3 serialized format (the `apache-datasketches-theta-v1` puffin blob payload), byte-compatible

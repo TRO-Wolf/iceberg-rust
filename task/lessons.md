@@ -1074,3 +1074,66 @@ How to use it (see the manuals' §2):
   `HeapifyProbe.java`, compiled against the m2 jar) — `cargo test --nocapture` interleaves stdout when
   multiple `println!` race, so run each probe test with `--exact` individually for clean capture, or it
   silently drops lines and looks like a divergence.
+
+### 2026-06-12 (Wave-5 Group Y / Y2 — ComputeTableStats action, BUILDER Opus, wt-tstats)
+- **The theta-sketch VALUE→bytes contract IS `Datum::to_bytes()` — verify it byte-for-byte against
+  `Conversions.toByteBuffer` bytecode before trusting it, then feed via `update_bytes`.** *Why:* the
+  puffin spec says "values converted to bytes using Iceberg's single-value serialization"; `javap -c`
+  on `iceberg-api-1.10.0` `Conversions.toByteBuffer` confirms per type — int/date=`allocate(4).order(LE)
+  .putInt`, long/time/timestamp(tz)(Ns)=`allocate(8).order(LE).putLong`, float/double=LE, string=
+  `CharBuffer.wrap → UTF-8 encoder` (unprefixed), uuid=16B BE, fixed/binary=raw, decimal=
+  `unscaledValue().toByteArray()` (BE two's-complement minimal). `Datum::to_bytes()` matches all of
+  these. A per-type byte-form unit pin (hand-declared bytes) is mandatory: the crown-jewel NDV-count
+  test alone does NOT catch a wrong byte form (the display/JSON form yields the SAME distinct count) —
+  only the byte pins fail when `to_bytes()` is swapped for `to_string()`. Proven by mutation.
+- **The `ndv` blob property is `String.valueOf((long) sketch.getEstimate())` — `f64 as i64` TRUNCATION
+  toward zero, NOT `round()`.** *Why:* `NDVSketchUtil` (spark, MAIN-only) + the puffin spec ("non-negative
+  integer ... decimal digits, no leading/trailing spaces"). Rust `estimate() as i64` is the identical
+  truncation. Don't reach for `.round()`.
+- **Java `ComputeTableStats` defaults: columns = all TOP-LEVEL PRIMITIVE columns (skip nested), snapshot
+  = current.** *Why:* `ComputeTableStatsSparkAction` filters `schema.columns().filter(type.isPrimitiveType())`
+  and `validateColumns` rejects non-existent ("Can't find column %s") + non-primitive ("Can't compute stats
+  on non-primitive type column"); the `ComputeTableStats` javadoc says "by default all columns are chosen".
+- **The spark `theta_sketch_agg` / `NDVSketchUtil` feeding behavior is MAIN-only (lives in `iceberg-spark`,
+  NOT in the m2 `iceberg-{api,core,data}` jars) — pin the action against the puffin SPEC + `Conversions`
+  bytecode, and flag the agg as MAIN-only.** *Why:* the cross-engine contract is the BYTES + the blob/
+  property shape, all derivable from core + the spec; the spark UDAF only orchestrates `update(byte[])`.
+- **`PuffinWriter::close()` returns total size only — Java's `StatisticsFile` also needs `footerSize()`.**
+  *Why:* `ComputeTableStatsSparkAction` builds `GenericStatisticsFile(..., writer.fileSize(),
+  writer.footerSize(), ...)`. Add a non-breaking `footer_size()` accessor (MAGIC + footer_payload +
+  FOOTER_STRUCT) rather than changing `close()`'s signature (3 in-crate callers). The existing
+  `UpdateStatisticsAction` already covers `SetStatistics` — reuse it (do NOT rebuild a registration path
+  like X2 had to for partition stats, which has no transaction action).
+
+### 2026-06-12 (Wave-5 Group Y / Y2 — ComputeTableStats action, REVIEWER Opus, wt-tstats)
+- **STOP-GRADE: Java's NDV pipeline builds an ALPHA-family sketch; the Y1 port is QUICKSELECT — do NOT
+  dismiss the puffin spec's "Alpha" as a doc nit.** *Why:* three independent sources agree —
+  `format/puffin-spec.md` ("constructing **Alpha family sketch**"), Spark `ThetaSketchAgg
+  .createAggregationBuffer` MAIN source (`UpdateSketch.builder.setFamily(Family.ALPHA).build()`, all of
+  spark v3.5/4.0/4.1 + the class doc), and `datasketches-java-3.3.0` bytecode (`UpdateSketchBuilder`'s
+  DEFAULT family is QuickSelect, so the explicit `.setFamily(ALPHA)` is load-bearing — it overrides the
+  default the Y1 port matches). Consequence (Java probe, lgK12/seed9001): **exact mode (≲ a few thousand
+  distinct, theta==MAX) Alpha and QuickSelect are byte-identical + same ndv; estimation mode (≳7k) they
+  DIVERGE** (n=1M → Alpha 1004032 vs QS 1002714, different retained set + bytes — Alpha switches to a
+  sampling estimate `nominal*MAX/theta`). A test suite that feeds only ≤6 distinct values per column
+  CANNOT see this — the divergence is SILENT. Lesson: when the headline is a sketch-FAMILY question, the
+  crown-jewel hand-count test is necessary but NOT sufficient — add an explicit estimation-mode value pin
+  (large distinct input) that documents the QuickSelect↔Alpha gap, so the next agent porting Alpha has a
+  visible, citable pin (flip it to assert-equal-with-Alpha when the family lands). DON'T fix Y1's crate
+  from Y2 (committed byte surface) — STOP-report the family verdict in the module doc + matrix cell.
+- **The `footer_size <= file_size` invariant is too weak — a `footer_size == total` mutation SURVIVES it.**
+  *Why:* a real Puffin stats file always has the leading MAGIC + the blob payloads BEFORE the footer, so
+  `footer < total` STRICTLY; Java readers locate the blob region as `fileSize - footerSize`, so a footer
+  that equals/exceeds the data is corrupt. Pin `<` not `<=`. (Verified the seam IS correct otherwise:
+  Rust `footer_size()` == Java `PuffinWriter.footerSize()` byte-for-byte = MAGIC(4) + payload +
+  FOOTER_STRUCT(12) = payload+16, the exact bytes `write_footer` appends.)
+- **The 4 byte-form pins (long/date/string/decimal) skip the dangerous edges — add them.** *Why:*
+  negative/zero decimals (Java `BigInteger.toByteArray` minimal two's-complement: -1→`ff`, 0→`00`,
+  -300→`fe d4`), uuid (16B BE), float/double NaN + -0.0 (Java `putFloat`/`putDouble` write RAW bits, no
+  NaN canonicalization — Rust `to_le_bytes` matches), and boolean (1 byte) all have distinct failure modes
+  a long/string pin can't catch. `Datum::to_bytes` matches Java for ALL of them (verified vs a Java probe).
+- **Spark agg/UDAF source IS available at `/tmp/iceberg-java-ref/spark/v{3.5,4.0,4.1}` even though no
+  iceberg-spark JAR is in `~/.m2`.** *Why:* the orchestrator believed datasketches came in via a spark jar
+  in m2 — it did NOT (only `datasketches-java`/`-memory` jars are there). For spark-action provenance read
+  the MAIN source tree, not m2 bytecode; for the FAMILY question that source (`setFamily(ALPHA)`) is the
+  authoritative oracle, cross-checked against the datasketches jar's builder-default bytecode.

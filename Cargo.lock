@@ -3286,6 +3286,7 @@ dependencies = [
  "flate2",
  "fnv",
  "futures",
+ "iceberg-sketches",
  "iceberg_test_utils",
  "itertools 0.13.0",
  "minijinja",
