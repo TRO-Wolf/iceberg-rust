@@ -312,6 +312,20 @@ impl<'de> Deserialize<'de> for Type {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where D: Deserializer<'de> {
         let type_serde = _serde::SerdeType::deserialize(deserializer)?;
+        // Java `SchemaParser.typeFromJson` matches the object WRAPPER names with `String.equals`
+        // (1.10.0 bytecode, offsets 41/55/69) — CASE-SENSITIVE: `{"type":"STRUCT"/"LIST"/"MAP"}`
+        // falls through to `IllegalArgumentException("Cannot parse type from json: ...")`. The
+        // untagged [`_serde::SerdeType`] matches a wrapper STRUCTURALLY (by its `fields` /
+        // `element` / `key`+`value` shape) and ignores the `type` string, so without this guard
+        // Rust would ACCEPT a wrong-cased or wrong wrapper name that Java rejects (a read-leniency
+        // divergence found by the O3 REVIEWER). Re-assert Java's exact `String.equals` here so the
+        // accepted set matches; Rust's own writer always emits the lowercase name, so this never
+        // rejects a self-round-trip.
+        if let Some((actual, expected)) = type_serde.wrapper_type_mismatch() {
+            return Err(serde::de::Error::custom(format!(
+                "Cannot parse type from json: expected wrapper type '{expected}', got '{actual}'"
+            )));
+        }
         Ok(Type::from(type_serde))
     }
 }
@@ -319,7 +333,19 @@ impl<'de> Deserialize<'de> for Type {
 impl<'de> Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where D: Deserializer<'de> {
-        let s = String::deserialize(deserializer)?;
+        // Case-fold the type NAME before matching, exactly like Java 1.10.0
+        // `Types.fromTypeName(name)` does `name.toLowerCase(Locale.ROOT)` before consulting the
+        // primitive-name map and the `fixed[..]` / `decimal(..)` regexes (1.10.0 bytecode:
+        // `fromTypeName` offsets 0-7 lowercase, then the TYPES map / FIXED / DECIMAL all match the
+        // lowercased string). So `"BOOLEAN"`, `"Decimal(9,2)"`, `"FIXED[16]"` all parse. The object
+        // WRAPPER names (`struct`/`list`/`map`) are NOT folded by Java (`SchemaParser.typeFromJson`
+        // matches them with `String.equals`) and are handled structurally by the untagged
+        // [`_serde::SerdeType`], so this lowercasing is scoped to primitive names only.
+        //
+        // `to_lowercase` here is `char::to_lowercase` (Unicode), a superset of Java's
+        // `Locale.ROOT` ASCII fold for the only inputs that can collide with a type name (ASCII
+        // letters); every real type name is ASCII, so the two agree on every accepted input.
+        let s = String::deserialize(deserializer)?.to_lowercase();
         if s.starts_with("decimal") {
             deserialize_decimal(s.into_deserializer())
         } else if s.starts_with("fixed") {
@@ -345,17 +371,46 @@ impl Serialize for PrimitiveType {
 
 fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<PrimitiveType, D::Error>
 where D: Deserializer<'de> {
+    // Java 1.10.0 `Types.fromTypeName` matches `decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)` against the
+    // lowercased name (the caller has already lowercased). The regex REQUIRES the literal `decimal(`
+    // prefix and the closing `)`, and `\s*` allows whitespace around the precision/scale and the
+    // comma. We mirror that: require the wrapping `decimal(` … `)` exactly, then `trim()` the inner
+    // operands. A missing close paren (`decimal(38,2`) or trailing junk (`decimal(38,2)x`) is
+    // rejected here just as Java's anchored `matches()` rejects it.
     let s = String::deserialize(deserializer)?;
-    let (precision, scale) = s
-        .trim_start_matches(r"decimal(")
-        .trim_end_matches(')')
+    let inner = s
+        .strip_prefix("decimal(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .ok_or_else(|| D::Error::custom(format!("Cannot parse type string to primitive: {s}")))?;
+    let (precision, scale) = inner
         .split_once(',')
-        .ok_or_else(|| D::Error::custom("Decimal requires precision and scale: {s}"))?;
+        .ok_or_else(|| D::Error::custom(format!("Decimal requires precision and scale: {s}")))?;
 
     Ok(PrimitiveType::Decimal {
-        precision: precision.trim().parse().map_err(D::Error::custom)?,
-        scale: scale.trim().parse().map_err(D::Error::custom)?,
+        precision: parse_unsigned_digits(precision, &s)?,
+        scale: parse_unsigned_digits(scale, &s)?,
     })
+}
+
+/// Parses the `\d+` capture of Java's `fixed`/`decimal` regex: ASCII digits only after a `trim()`.
+///
+/// Rust's `FromStr for u32`/`u64` accept a leading `+` (`"+16"` parses), but Java's `\d+` does not,
+/// so we reject any non-digit (the `+`/`-`/hex prefixes Java's regex never matches) before parsing.
+/// `original` is the full type string, carried only for the error message.
+fn parse_unsigned_digits<T, E>(digits: &str, original: &str) -> std::result::Result<T, E>
+where
+    T: std::str::FromStr,
+    E: serde::de::Error,
+{
+    let trimmed = digits.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(E::custom(format!(
+            "Cannot parse type string to primitive: {original}"
+        )));
+    }
+    trimmed
+        .parse()
+        .map_err(|_| E::custom(format!("Cannot parse type string to primitive: {original}")))
 }
 
 fn serialize_decimal<S>(
@@ -371,15 +426,18 @@ where
 
 fn deserialize_fixed<'de, D>(deserializer: D) -> std::result::Result<PrimitiveType, D::Error>
 where D: Deserializer<'de> {
-    let fixed = String::deserialize(deserializer)?
-        .trim_start_matches(r"fixed[")
-        .trim_end_matches(']')
-        .to_owned();
+    // Java 1.10.0 `Types.fromTypeName` matches `fixed\[\s*(\d+)\s*\]` against the lowercased name.
+    // The regex REQUIRES the literal `fixed[` prefix and the closing `]`, and `\s*` allows
+    // whitespace around the length. We mirror that: require the wrapping `fixed[` … `]` exactly,
+    // then `trim()` the inner length. A missing close bracket (`fixed[16`) is rejected just as
+    // Java's anchored `matches()` rejects it, and inner whitespace (`fixed[ 16 ]`) is accepted.
+    let s = String::deserialize(deserializer)?;
+    let inner = s
+        .strip_prefix("fixed[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .ok_or_else(|| D::Error::custom(format!("Cannot parse type string to primitive: {s}")))?;
 
-    fixed
-        .parse()
-        .map(PrimitiveType::Fixed)
-        .map_err(D::Error::custom)
+    parse_unsigned_digits(inner, &s).map(PrimitiveType::Fixed)
 }
 
 fn serialize_fixed<S>(value: &u64, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -740,13 +798,17 @@ pub(super) mod _serde {
         ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, StructType, Type,
     };
 
-    /// Marker that (de)serializes exactly the JSON string `"variant"`.
+    /// Marker that deserializes the JSON string `"variant"` (case-insensitively) and serializes
+    /// the lowercase `"variant"`.
     ///
     /// Java `SchemaParser.toJson` writes variant the same way it writes primitives — as the bare
     /// string `type.toString()` (`"variant"`) — and `typeFromJson` parses any textual node through
-    /// `Types.fromTypeName`, whose TYPES map contains `"variant" -> VariantType` (1.10.0
-    /// bytecode). The marker rejects every other string so the untagged [`SerdeType`] falls
-    /// through to [`SerdeType::Primitive`] for real primitive names.
+    /// `Types.fromTypeName`, which LOWERCASES its input (`toLowerCase(Locale.ROOT)`, 1.10.0
+    /// bytecode) before consulting the TYPES map whose key is `"variant" -> VariantType`. So Java
+    /// reads `"Variant"`/`"VARIANT"` as the variant type too; this marker matches case-insensitively
+    /// to stay at parity with the primitive-name case fold (see [`PrimitiveType`]'s deserializer).
+    /// It rejects every non-`variant` string so the untagged [`SerdeType`] falls through to
+    /// [`SerdeType::Primitive`] for real primitive names.
     pub(super) struct VariantTypeName;
 
     impl serde::Serialize for VariantTypeName {
@@ -765,12 +827,13 @@ pub(super) mod _serde {
                 type Value = VariantTypeName;
 
                 fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                    formatter.write_str("the string 'variant'")
+                    formatter.write_str("the string 'variant' (case-insensitive)")
                 }
 
                 fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
                 where E: serde::de::Error {
-                    if value == "variant" {
+                    // Case-insensitive to mirror Java `Types.fromTypeName`'s `toLowerCase`.
+                    if value.eq_ignore_ascii_case("variant") {
                         Ok(VariantTypeName)
                     } else {
                         Err(E::custom(format!("expected 'variant', got '{value}'")))
@@ -814,6 +877,27 @@ pub(super) mod _serde {
         // (mutation-verified by the reviewer).
         Variant(VariantTypeName),
         Primitive(PrimitiveType),
+    }
+
+    impl SerdeType<'_> {
+        /// Returns `Some((actual, expected))` when a wrapper arm's `type` string is not Java's
+        /// exact lowercase wrapper name, else `None`.
+        ///
+        /// Java `SchemaParser.typeFromJson` selects the wrapper handler with
+        /// `String.equals("struct"/"list"/"map")` (1.10.0 bytecode) — case-sensitive — so a
+        /// wrong-cased name (`"STRUCT"`) is rejected. The untagged enum here matches a wrapper by its
+        /// field shape and never inspects the `type` string, so [`Type`]'s deserializer calls this
+        /// to re-impose Java's check. Primitive/variant arms carry no wrapper `type` and return
+        /// `None` (they are validated by their own deserializers).
+        pub(super) fn wrapper_type_mismatch(&self) -> Option<(&str, &'static str)> {
+            let (actual, expected) = match self {
+                SerdeType::List { r#type, .. } => (r#type.as_str(), "list"),
+                SerdeType::Struct { r#type, .. } => (r#type.as_str(), "struct"),
+                SerdeType::Map { r#type, .. } => (r#type.as_str(), "map"),
+                SerdeType::Variant(_) | SerdeType::Primitive(_) => return None,
+            };
+            (actual != expected).then_some((actual, expected))
+        }
     }
 
     impl From<SerdeType<'_>> for Type {
@@ -1396,30 +1480,96 @@ mod tests {
         );
     }
 
-    // RISK (case posture, live-Java-probed by the reviewer): this parser is CASE-SENSITIVE for
-    // every type name — `"Variant"`/`"VARIANT"` are rejected exactly like `"STRING"` is. Java
-    // 1.10.0 `Types.fromTypeName` lowercases its input (`toLowerCase(Locale.ROOT)`), so Java's
-    // `SchemaParser` accepts `"Variant"`; Rust's pre-existing posture is uniformly
-    // case-sensitive (its `PrimitiveType` serde is lowercase-exact), and the variant arm follows
-    // that posture rather than becoming the single case-insensitive name. In practice both
-    // writers only ever emit lowercase (`Type.toString()` / `Display`), so the divergence is
-    // read-tolerance of foreign-cased JSON only — pinned here so a future global
-    // case-insensitivity fix flips ALL names at once, never just one.
+    // RISK (case posture, 1.10.0-bytecode-derived): Java `Types.fromTypeName(name)` does
+    // `name.toLowerCase(Locale.ROOT)` BEFORE consulting the primitive-name map and the
+    // `fixed[..]` / `decimal(..)` regexes, so `SchemaParser` reads `"BOOLEAN"`/`"Decimal(9,2)"`/
+    // `"FIXED[16]"`/`"Variant"` exactly as their lowercase forms. Rust used to be lowercase-exact
+    // and REJECTED every mixed-case name Java accepts — a read-tolerance divergence. The fix folds
+    // the primitive name (incl. the parameterized forms) and the variant marker; this pins the
+    // accepted set. Self-mutation: removing the `.to_lowercase()` in `PrimitiveType::deserialize`
+    // (and the variant marker's `eq_ignore_ascii_case`) makes every assertion below fail.
     #[test]
-    fn variant_type_name_parsing_is_case_sensitive_like_every_other_name() {
-        for cased in ["Variant", "VARIANT", "vArIaNt", " variant", "variant2"] {
-            let json = format!(r#""{cased}""#);
-            assert!(
-                serde_json::from_str::<Type>(&json).is_err(),
-                "'{cased}' must not parse as a type (case-sensitive posture)"
+    fn primitive_type_names_parse_case_insensitively_like_java_from_type_name() {
+        // Plain primitive names — upper, mixed, and lowercase all reach the same type.
+        for cased in ["BOOLEAN", "Boolean", "boolean"] {
+            assert_eq!(
+                serde_json::from_str::<Type>(&format!(r#""{cased}""#))
+                    .unwrap_or_else(|error| panic!("'{cased}' must parse: {error}")),
+                Type::Primitive(PrimitiveType::Boolean),
+                "'{cased}' must fold to boolean"
             );
         }
-        // The same posture for a primitive name, proving variant is not special-cased.
-        assert!(serde_json::from_str::<Type>(r#""STRING""#).is_err());
-        // Exact lowercase parses.
         assert_eq!(
-            serde_json::from_str::<Type>(r#""variant""#).expect("lowercase variant parses"),
-            Type::Variant
+            serde_json::from_str::<Type>(r#""STRING""#).expect("STRING folds to string"),
+            Type::Primitive(PrimitiveType::String)
+        );
+        assert_eq!(
+            serde_json::from_str::<Type>(r#""TimestampTZ""#).expect("mixed-case timestamptz folds"),
+            Type::Primitive(PrimitiveType::Timestamptz)
+        );
+        // Parameterized forms: Java lowercases the WHOLE string before the FIXED / DECIMAL regex.
+        assert_eq!(
+            serde_json::from_str::<Type>(r#""Decimal(9,2)""#).expect("Decimal(9,2) folds"),
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 9,
+                scale: 2
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<Type>(r#""FIXED[16]""#).expect("FIXED[16] folds"),
+            Type::Primitive(PrimitiveType::Fixed(16))
+        );
+        // The variant name folds too (Java's TYPES map key is `"variant"`, matched against the
+        // lowercased input — so `"Variant"`/`"VARIANT"` read as the variant type).
+        for cased in ["Variant", "VARIANT", "vArIaNt", "variant"] {
+            assert_eq!(
+                serde_json::from_str::<Type>(&format!(r#""{cased}""#))
+                    .unwrap_or_else(|error| panic!("'{cased}' must parse as variant: {error}")),
+                Type::Variant,
+                "'{cased}' must fold to variant"
+            );
+        }
+    }
+
+    // RISK (negative pin, 1.10.0-bytecode-derived): the case fold is SCOPED to type NAMES. Java
+    // `fromTypeName` does NOT recognize trailing junk or whitespace-padded names ( leading space,
+    // `variant2`) — they fall through to its `IllegalArgumentException`. Rust must reject the same.
+    #[test]
+    fn case_fold_does_not_admit_non_type_name_strings() {
+        for bad in [
+            " variant", "variant2", "boolean_", "decimal", "fixed", "notatype", "VARIANTX",
+        ] {
+            assert!(
+                serde_json::from_str::<Type>(&format!(r#""{bad}""#)).is_err(),
+                "'{bad}' must not parse as a type"
+            );
+        }
+    }
+
+    // RISK (scope pin, 1.10.0-bytecode-derived): Java folds case ONLY for primitive names.
+    // `SchemaParser.typeFromJson` matches the object WRAPPER names `struct`/`list`/`map` with
+    // `String.equals` (CASE-SENSITIVE), so `{"type":"STRUCT", ...}` FAILS in Java
+    // (`IllegalArgumentException`). The dedicated `StructType` deserializer already enforced this;
+    // the production `Type` route did NOT until the O3 REVIEWER added `wrapper_type_mismatch`
+    // (pinned end-to-end in `wrapper_type_names_are_case_sensitive_via_the_type_path_like_java_schema_parser`).
+    // This pin documents that the primitive case fold did not leak into the wrappers (a lowercased
+    // `struct` is still required) AND that the `StructType` deserializer stays case-sensitive.
+    #[test]
+    fn wrapper_type_names_are_not_folded_by_the_primitive_case_fix() {
+        // The lowercase wrapper parses (baseline, unchanged).
+        let struct_json =
+            r#"{"type":"struct","fields":[{"id":1,"name":"x","required":true,"type":"long"}]}"#;
+        let parsed = serde_json::from_str::<Type>(struct_json).expect("lowercase struct parses");
+        assert!(
+            parsed.is_struct(),
+            "lowercase struct must parse as a struct"
+        );
+        // The dedicated StructType deserializer is case-SENSITIVE on the wrapper name, matching
+        // Java's `String.equals("struct")` (it is NOT routed through the primitive case fold).
+        let upper_struct = r#"{"type":"STRUCT","fields":[]}"#;
+        assert!(
+            serde_json::from_str::<StructType>(upper_struct).is_err(),
+            "StructType deserializer must reject an upper-case wrapper name (Java String.equals)"
         );
     }
 
@@ -1492,5 +1642,110 @@ mod tests {
                 .to_string()
                 .contains("expected type 'struct'")
         );
+    }
+
+    // RISK (item O3(a) parameterized parse fidelity, 1.10.0-bytecode + live-Java-probed by the
+    // O3 REVIEWER): Java `Types.fromTypeName` matches `fixed\[\s*(\d+)\s*\]` and
+    // `decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)` (anchored `matches()`) against the lowercased name.
+    // `\s*` allows whitespace INSIDE the brackets/parens, and the anchors REQUIRE the close
+    // bracket/paren. The Rust helpers previously used `trim_end_matches` (a no-op when the close
+    // char is absent) and never trimmed the inner content, so they DIVERGED from Java two ways:
+    //   - too LENIENT: `fixed[16` / `decimal(38,2` (no close) parsed in Rust, Java rejects;
+    //   - too STRICT: `fixed[ 16 ]` (inner whitespace) was rejected in Rust, Java accepts.
+    // The REVIEWER fix (strip-prefix-and-suffix + trim) restores 1:1. This pins BOTH arms against
+    // a live `Types.fromTypeName` oracle (every case below was probed in Java 1.10.0).
+    #[test]
+    fn parameterized_type_parse_matches_java_fixed_and_decimal_regex() {
+        // Inner whitespace ACCEPTED (Java `\s*`), folding case too.
+        for (cased, expected) in [
+            ("fixed[ 16 ]", PrimitiveType::Fixed(16)),
+            ("fixed[16 ]", PrimitiveType::Fixed(16)),
+            ("fixed[ 16]", PrimitiveType::Fixed(16)),
+            ("FIXED[ 16 ]", PrimitiveType::Fixed(16)),
+            ("decimal( 38 , 2 )", PrimitiveType::Decimal {
+                precision: 38,
+                scale: 2,
+            }),
+            ("Decimal( 38, 2 )", PrimitiveType::Decimal {
+                precision: 38,
+                scale: 2,
+            }),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Type>(&format!(r#""{cased}""#))
+                    .unwrap_or_else(|error| panic!("'{cased}' must parse like Java: {error}")),
+                Type::Primitive(expected),
+                "'{cased}' must parse with inner whitespace, like Java's `\\s*`"
+            );
+        }
+        // Missing close bracket/paren REJECTED (Java anchored `matches()`), trailing junk too, and
+        // the `\d+` capture rejects a SIGN/extra-arg/hex Rust's `FromStr` would otherwise accept
+        // (`fixed[+16]`/`decimal( +38 , 2 )` parse in raw Rust but NOT in Java — live-probed).
+        // Self-mutation: reverting `deserialize_fixed`/`deserialize_decimal` to `trim_end_matches`
+        // makes `fixed[16`/`decimal(38,2` parse, and dropping the `parse_unsigned_digits` digit
+        // guard makes `fixed[+16]` parse (too lenient both ways) — these assertions catch it.
+        for bad in [
+            "fixed[16",
+            "fixed[16]x",
+            "fixed16]",
+            "xfixed[16]",
+            "fixed[]",
+            "fixed[+16]",
+            "fixed[-16]",
+            "fixed[0x10]",
+            "decimal(38,2",
+            "decimal(38,2)x",
+            "decimal38,2)",
+            "xdecimal(38,2)",
+            "decimal()",
+            "decimal(38,2,3)",
+            "decimal( +38 , 2 )",
+            "decimal(-38,2)",
+        ] {
+            assert!(
+                serde_json::from_str::<Type>(&format!(r#""{bad}""#)).is_err(),
+                "'{bad}' must be rejected like Java's anchored regex"
+            );
+        }
+    }
+
+    // RISK (item O3(a) wrapper read-leniency, 1.10.0-bytecode + live-Java-probed by the O3
+    // REVIEWER): Java `SchemaParser.typeFromJson` selects the wrapper handler with
+    // `String.equals("struct"/"list"/"map")` (1.10.0 bytecode offsets 41/55/69) — CASE-SENSITIVE —
+    // so `{"type":"STRUCT"/"LIST"/"MAP"}` raises `IllegalArgumentException` (live-probed: lowercase
+    // `struct` OK, `STRUCT`/`LIST`/`MAP` all ERR). The untagged `_serde::SerdeType` matches a
+    // wrapper by its field SHAPE and ignores the `type` string, so the `Type` deserializer USED TO
+    // accept a wrong-cased wrapper Java rejects — a read-leniency divergence the builder documented
+    // but did not close (its scope test exercised the `StructType` deserializer, a path the `Type`
+    // route never takes). The REVIEWER added `SerdeType::wrapper_type_mismatch` re-imposing Java's
+    // `String.equals`. This pins BOTH arms via the production `Type` path. Self-mutation: removing
+    // the `wrapper_type_mismatch` guard in `Type::deserialize` makes every upper-case case parse.
+    #[test]
+    fn wrapper_type_names_are_case_sensitive_via_the_type_path_like_java_schema_parser() {
+        // Lowercase wrapper names parse (baseline) through the production `Type` route.
+        for good in [
+            r#"{"type":"struct","fields":[{"id":1,"name":"x","required":true,"type":"long"}]}"#,
+            r#"{"type":"list","element-id":1,"element-required":true,"element":"long"}"#,
+            r#"{"type":"map","key-id":1,"key":"long","value-id":2,"value-required":true,"value":"long"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Type>(good).is_ok(),
+                "lowercase wrapper must parse via the Type path: {good}"
+            );
+        }
+        // Wrong-cased wrapper names are REJECTED, matching Java's `String.equals` (live-probed
+        // `IllegalArgumentException`). This is the production read path (a `Schema`/`Type` doc),
+        // NOT the dedicated `StructType` deserializer the builder's scope test used.
+        for bad in [
+            r#"{"type":"STRUCT","fields":[{"id":1,"name":"x","required":true,"type":"long"}]}"#,
+            r#"{"type":"Struct","fields":[{"id":1,"name":"x","required":true,"type":"long"}]}"#,
+            r#"{"type":"LIST","element-id":1,"element-required":true,"element":"long"}"#,
+            r#"{"type":"MAP","key-id":1,"key":"long","value-id":2,"value-required":true,"value":"long"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Type>(bad).is_err(),
+                "wrong-cased wrapper must be rejected via the Type path (Java String.equals): {bad}"
+            );
+        }
     }
 }

@@ -34,8 +34,8 @@ use super::snapshot::SnapshotReference;
 pub use super::table_metadata_builder::{TableMetadataBuildResult, TableMetadataBuilder};
 use super::{
     DEFAULT_PARTITION_SPEC_ID, PartitionSpecRef, PartitionStatisticsFile, SchemaId, SchemaRef,
-    SnapshotRef, SnapshotRetention, SortOrder, SortOrderRef, StatisticsFile, StructType,
-    TableProperties,
+    SnapshotRef, SnapshotRetention, SortOrder, SortOrderBuilder, SortOrderRef, StatisticsFile,
+    StructType, TableProperties,
 };
 use crate::compression::CompressionCodec;
 use crate::error::{Result, timestamp_ms_to_utc};
@@ -526,7 +526,20 @@ impl TableMetadata {
             ));
         }
 
-        if self.sort_order_by_id(self.default_sort_order_id).is_some() {
+        if let Some(default_sort_order) = self.sort_order_by_id(self.default_sort_order_id) {
+            // Bind-time validation of the DEFAULT sort order against the current schema, matching
+            // Java 1.10.0: `TableMetadataParser.fromJson` → `SortOrderParser.fromJson(schema, node,
+            // defaultId)` binds the unbound order via `bind` (→ `SortOrder.Builder.build()` →
+            // `SortOrder.checkCompatibility`) ONLY when its order id equals the default sort order
+            // id; every OTHER order is bound with `bindUnchecked` (no compatibility check). So a
+            // metadata doc whose DEFAULT sort field references a missing/non-primitive/wrongly
+            // transformed source column fails to parse, while a non-default order is read
+            // leniently. The schema is the current schema (Java binds against `schema` = the
+            // current-schema-id schema; `validate_current_schema` already ran in `try_normalize`).
+            SortOrderBuilder::check_compatibility(
+                default_sort_order.as_ref().clone(),
+                self.current_schema(),
+            )?;
             return Ok(());
         }
 
@@ -4272,5 +4285,122 @@ mod tests {
             deserialized_snapshot.row_range().unwrap();
         assert_eq!(deserialized_first_row_id, 100);
         assert_eq!(deserialized_added_rows, 50);
+    }
+
+    /// Builds a minimal V2 metadata JSON whose schema has a primitive `id` (long, id 1) and a
+    /// non-primitive `nested` struct (id 2). `sort_orders_json` and `default_sort_order_id` are
+    /// substituted so each sort-order parse test drives a different shape.
+    fn sort_order_metadata_json(sort_orders_json: &str, default_sort_order_id: i64) -> String {
+        format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+                "location": "s3://b/wh/data.db/table",
+                "last-sequence-number": 1,
+                "last-updated-ms": 1515100955770,
+                "last-column-id": 3,
+                "schemas": [{{
+                    "schema-id": 0,
+                    "type": "struct",
+                    "fields": [
+                        {{"id": 1, "name": "id", "required": true, "type": "long"}},
+                        {{"id": 2, "name": "nested", "required": true, "type": {{
+                            "type": "struct",
+                            "fields": [{{"id": 3, "name": "inner", "required": true, "type": "long"}}]
+                        }}}}
+                    ]
+                }}],
+                "current-schema-id": 0,
+                "partition-specs": [{{"spec-id": 0, "fields": []}}],
+                "default-spec-id": 0,
+                "last-partition-id": 999,
+                "properties": {{}},
+                "refs": {{}},
+                "sort-orders": {sort_orders_json},
+                "default-sort-order-id": {default_sort_order_id}
+            }}"#
+        )
+    }
+
+    // RISK (item O3(b), 1.10.0-bytecode-derived): Java `TableMetadataParser.fromJson` binds the
+    // DEFAULT sort order against the current schema with `SortOrderParser.fromJson(schema, node,
+    // defaultId)` → `bind` → `SortOrder.checkCompatibility`. A default sort order whose source
+    // column EXISTS, is PRIMITIVE, and accepts its transform must parse. Pins the happy arm.
+    #[test]
+    fn metadata_with_valid_default_sort_order_binds_and_parses() {
+        let json = sort_order_metadata_json(
+            r#"[{"order-id": 1, "fields": [
+                {"transform": "identity", "source-id": 1, "direction": "asc", "null-order": "nulls-first"}
+            ]}]"#,
+            1,
+        );
+        let metadata: TableMetadata =
+            serde_json::from_str(&json).expect("valid default sort order must parse");
+        assert_eq!(metadata.default_sort_order_id, 1);
+        assert_eq!(metadata.default_sort_order().fields.len(), 1);
+    }
+
+    // RISK (item O3(b)): the DEFAULT sort order is bound with `checkCompatibility`, so a default
+    // sort field referencing a MISSING source column id fails at parse — Java's "Cannot find
+    // source column for sort field: %s" (`ValidationException`). Self-mutation: dropping the
+    // `SortOrderBuilder::check_compatibility` call in `try_normalize_sort_order` makes this parse.
+    #[test]
+    fn metadata_with_default_sort_order_on_missing_source_id_fails_at_parse() {
+        let json = sort_order_metadata_json(
+            r#"[{"order-id": 1, "fields": [
+                {"transform": "identity", "source-id": 999, "direction": "asc", "null-order": "nulls-first"}
+            ]}]"#,
+            1,
+        );
+        let error = serde_json::from_str::<TableMetadata>(&json)
+            .expect_err("default sort order on a missing source id must fail to parse");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot find source column for sort field"),
+            "expected the Java checkCompatibility message, got: {error}"
+        );
+    }
+
+    // RISK (item O3(b)): the DEFAULT sort order must reject a NON-PRIMITIVE source — Java "Cannot
+    // sort by non-primitive source field: %s". `nested` (id 2) is a struct.
+    #[test]
+    fn metadata_with_default_sort_order_on_non_primitive_source_fails_at_parse() {
+        let json = sort_order_metadata_json(
+            r#"[{"order-id": 1, "fields": [
+                {"transform": "identity", "source-id": 2, "direction": "asc", "null-order": "nulls-first"}
+            ]}]"#,
+            1,
+        );
+        let error = serde_json::from_str::<TableMetadata>(&json)
+            .expect_err("default sort order on a struct source must fail to parse");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot sort by non-primitive source field"),
+            "expected the non-primitive message, got: {error}"
+        );
+    }
+
+    // RISK (item O3(b)): a NON-DEFAULT sort order is bound with `bindUnchecked` (no
+    // checkCompatibility) — so even a NON-DEFAULT order referencing a missing source id parses,
+    // exactly like Java. The default (id 0, unsorted) is the only one validated. This is the
+    // "no stricter than Java" half — over-validating every order would diverge.
+    #[test]
+    fn metadata_with_non_default_sort_order_on_missing_source_id_still_parses() {
+        let json = sort_order_metadata_json(
+            r#"[
+                {"order-id": 0, "fields": []},
+                {"order-id": 5, "fields": [
+                    {"transform": "identity", "source-id": 999, "direction": "asc", "null-order": "nulls-first"}
+                ]}
+            ]"#,
+            0,
+        );
+        let metadata: TableMetadata = serde_json::from_str(&json)
+            .expect("a non-default incompatible sort order must parse (Java bindUnchecked)");
+        assert_eq!(metadata.default_sort_order_id, 0);
+        // The incompatible non-default order is retained, unvalidated.
+        assert!(metadata.sort_order_by_id(5).is_some());
     }
 }

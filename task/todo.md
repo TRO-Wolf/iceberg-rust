@@ -127,6 +127,100 @@ pinned as cosmetic-only; byte-exact view round-trip is next-wave.
 parquet, 8-row fixture (base 4 + bump 1 + staged 3), chain ×2, sabotage 4 closed. Key lessons:
 S-replay order (stage before bump); updateProperties does not create a snapshot; LocalTableOperations
 v0.metadata.json collision fixed with Files.createTempDirectory.
+## INCREMENT O3 (2026-06-12): divergence burn-down — type-name case / sort-order bind / manifest-list order / map-value avro naming (BUILDER Opus, wt-core6)
+
+Charter: brief O3. Four reported Java↔Rust divergences; bounded cleanup. Per item: derive Java 1.10.0
+behavior from bytecode (`/tmp/o3-bytecode`, jars in ~/.m2), then FIX if real bounded parity or DOCUMENT
+in the matrix if cosmetic/out-of-scope.
+
+Java 1.10.0 bytecode findings (all from `javap -p -c`, iceberg-api/core-1.10.0.jar):
+- (a) `Types.fromTypeName(name)` does `name.toLowerCase(Locale.ROOT)` then matches the TYPES map (all
+  primitive names) + the FIXED (`fixed\[\s*(\d+)\s*\]`) and DECIMAL (`decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)`)
+  regexes against the LOWERCASED string. `SchemaParser.typeFromJson` matches the WRAPPER names
+  `struct`/`list`/`map` with `String.equals` (CASE-SENSITIVE — NOT lowercased). So Java folds case for
+  primitives + fixed/decimal ONLY, not the object wrappers. Rust `PrimitiveType` custom deserializer is
+  lowercase-exact → reject `BOOLEAN`/`Decimal(..)`/`FIXED[5]` Java accepts. FIX: lowercase the primitive
+  name before dispatch; leave wrappers untouched (Rust matches them structurally anyway).
+- (b) `TableMetadataParser.fromJson` → `SortOrderParser.fromJson(Schema, JsonNode, defaultId)`: builds
+  an `UnboundSortOrder`, then if `orderId == defaultSortOrderId` calls `bind` (→ `build()` →
+  `SortOrder.checkCompatibility` = 3 checks: source col exists / source primitive / transform
+  applicable), ELSE `bindUnchecked` (no checkCompatibility). So ONLY the default sort order is
+  validated at parse time. Rust `try_normalize_sort_order` runs NEITHER — it only checks order-id-0
+  has no fields + the default id exists. FIX: run `check_compatibility` on the DEFAULT sort order at
+  normalize time (Rust already has the 1:1 `check_compatibility`); non-default orders stay lenient.
+- (c) `FastAppend.apply` = new-then-carried; `MergingSnapshotProducer.apply` = `concat(prepareNew, carried)`
+  for data then delete (new-then-carried, all-data-before-all-delete). Rust shared `manifest_file<OP,MP>`
+  = carried(process_deletes, data+delete mixed) THEN new-data THEN new-delete — OPPOSITE order, in the
+  ONE shared path every action uses. Interop oracle SORTS manifests, both readers reconcile by seq →
+  cosmetic. DOCUMENT (shared-path blast radius), no fix.
+- (d) `TypeToSchema.struct` names a struct record `namesFunction(fieldIds.peek, struct)` else `"r"+id`
+  (recipe `r`); for a map value the deque top is the value-id → `r<value_id>`. Rust `map()`
+  visitor leaves a struct value record at the `"null"` placeholder (only `rename_variant_record` runs);
+  two struct-valued maps in one schema → two `"null"` records → Java `Schema.Parser` "Can't redefine".
+  REAL + bounded. FIX: rename ANY map key/value record (struct incl.) to `r<field_id>`, matching what
+  `field()`/`list()` already do for non-map placements.
+
+- [x] (a) FIXED. datatypes.rs `PrimitiveType` deserialize `.to_lowercase()` before decimal/fixed/exact
+      dispatch + variant marker `eq_ignore_ascii_case` (Java `fromTypeName` Locale.ROOT). Replaced the
+      case-sensitive pin with 3 tests: mixed-case primitives + `Decimal(..)`/`FIXED[..]`/`Variant` fold;
+      non-type-name negatives; wrapper-not-folded scope pin (`{"type":"STRUCT"}` rejected by the
+      `StructType` deserializer, Java `String.equals`). Self-mutation (drop `.to_lowercase()`) → BOOLEAN fails.
+- [x] (b) FIXED. table_metadata.rs `try_normalize_sort_order` runs `SortOrderBuilder::check_compatibility`
+      on the DEFAULT sort order vs the current schema (made `pub(crate)`); non-default unchanged. 4 tests:
+      valid default parses; default on missing source / non-primitive source fails with Java's messages;
+      non-default on missing source STILL parses (Java bindUnchecked). Self-mutation (drop the call) → both
+      reject-tests parse.
+- [x] (c) DOCUMENTED in matrix (manifest-list row): Java new-then-carried all-data-before-delete
+      (`FastAppend.apply` / `MergingSnapshotProducer.apply` bytecode) vs Rust shared `manifest_file`
+      carried-then-new; cosmetic (oracle sorts at `snapshot_meta_view.rs:127`, readers reconcile by seq);
+      exact-match needs a content-type-separated restructure of the shared path (ripples into
+      `manifests[0]` tests) — out of scope. No fix.
+- [x] (d) FIXED. avro/schema.rs `rename_variant_record`→`rename_map_record` renames ANY map key/value
+      record (struct incl.) to `r<field_id>` (Java `TypeToSchema.struct` = `"r"+fieldIds.peek()`). 2 tests:
+      two string-key struct maps → distinct `r3`/`r7`; array-form struct-key → inner `r<keyId>`/`r<valueId>`
+      (explicit names, not just round-trip — round-trip alone is weak here). Self-mutation (variant-only) →
+      both tests fail (`"null"`).
+- [ ] Gate chain (typos + fmt + clippy + lib test) + taplo + matrix pipe-audit; interop chain if needed;
+      report to /tmp/wave6/O3-builder.md.
+
+Outcome: (a)/(b)/(d) FIXED with bytecode-derived parity + mutation-pinned tests; (c) DOCUMENTED
+(cosmetic, shared-path blast radius). No interop surface touched by the fixes (avro map-value naming
+only affects struct/variant-valued maps, none in the interop fixtures; sort-order/type-case are
+parse-time read-tolerance). 9 new tests; matrix updated (4 cells, 5-pipe audit clean).
+
+### O3 REVIEWER (CRITIC) plan (2026-06-12, wt-core6) — adversarial pass vs 1.10.0 bytecode + live probe
+- [x] (a) re-derive `Types.fromTypeName` bytecode + live Java probe; build a Rust-vs-Java acceptance
+      table over the flagged edge spellings. FOUND 5 fixed/decimal parse mismatches (Rust too-lenient
+      on missing-close `decimal(38,2` / `fixed[16`; too-strict on inner-whitespace `fixed[ 16 ]`).
+- [x] (b) re-derive `SortOrderParser.fromJson` + `bind`/`bindUnchecked` + var-10=current-schema:
+      CONFIRMED exactly. Mutation: knockout `check_compatibility` → 2 reject tests fail. Reverted.
+- [x] (c) confirm new-then-carried (FastAppend) + data-before-delete (MergingSnapshotProducer) +
+      Rust carried-then-new; confirm oracle sorts (snapshot_meta_view:127) + `current_manifests`
+      returns RAW order (so `manifests[0]` tests ARE coupled) → DOCUMENT verdict CONFIRMED not lazy.
+- [x] (d) revert to variant-only → reproduce both struct-map failures; restore. Confirmed KEY+VALUE
+      + array-form explicit-name pins; manifest schema has no struct-valued maps → byte-invisible.
+- [x] FIX vector 1: killed the 5 fixed/decimal parse mismatches via `strip_prefix`+`strip_suffix`+`trim`
+      in `deserialize_fixed`/`deserialize_decimal` (Java anchored-regex parity). Pinned both arms in
+      `parameterized_type_parse_matches_java_fixed_and_decimal_regex`; mutation (revert to `trim_end_matches`)
+      fails it.
+- [x] FIX vector 5: the wrapper read-leniency was REAL via the `Type` path (`{"type":"STRUCT"/"LIST"/"MAP"}`
+      all parsed where Java's `String.equals` rejects — the builder's scope test used the WRONG deserializer).
+      Cheap contained fix: `SerdeType::wrapper_type_mismatch()` + guard in `Type::deserialize` (≤30 lines, no
+      untagged-machinery fight). Pinned both arms via the production `Type` path; mutation (guard knockout)
+      fails it. Live-Java-confirmed (`SchemaParser.fromJson`: lowercase OK, upper ERR).
+- [x] Mutation battery (all 5 fixes, for real, reverted): (a) drop `.to_lowercase()` → case-fold test fails;
+      (b) drop `check_compatibility` → 2 reject tests fail; (d) variant-only rename → both struct-map tests
+      fail; vector-1 `trim_end_matches` revert → parameterized test fails; vector-5 guard knockout → wrapper
+      test fails. Every fix pinned.
+- [x] Gate GREEN AFTER fixes: typos + fmt + clippy + `cargo test -p iceberg --lib` (2236 passed, 0 failed;
+      +2 net over the builder's 2234) + taplo + matrix pipe-audit (all `^|` rows 5 pipes). Interop write-data
+      chain re-run GREEN (exit 0, 22 steps). Matrix cell refreshed; lessons (O3 REVIEWER) recorded.
+
+Outcome (REVIEWER): (b)/(c)/(d) CONFIRMED by independent bytecode re-derivation + mutation battery — no
+defect. (a) CONFIRMED but INCOMPLETE — found + FIXED 5 fixed/decimal parse-fidelity mismatches the case-fold
+missed. The documented "open risk" (wrapper read-leniency) was REAL + worse than framed (builder's scope test
+checked the wrong deserializer path) — FIXED with a contained ≤30-line guard. VERDICT: SHIP.
+
 ## INCREMENT O2 (2026-06-12): partition-stats residue — incremental compute + exotic value types (BUILDER Opus, wt-core6)
 
 Charter: brief O2. Two halves on `maintenance/partition_stats.rs`. (a) the INCREMENTAL compute path

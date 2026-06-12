@@ -672,3 +672,91 @@ How to use it (see the manuals' §2):
   deferral text in the same cell/bullet, not just adding the landing note. (A pre-existing
   `Java-reads-our-stats-file interop is NEXT-WAVE` contradiction predates this branch and is left for
   the next phase re-audit — out of this branch's scope.)
+### 2026-06-12 (Wave-6 O3 — divergence burn-down: type-case / sort-bind / manifest-order / avro-map-name, BUILDER Opus, wt-core6)
+- **Java's type-name case fold is SCOPED to primitive names — `Types.fromTypeName` lowercases
+  (`toLowerCase(Locale.ROOT)`) but `SchemaParser.typeFromJson` matches the WRAPPER names
+  `struct`/`list`/`map` with `String.equals` (case-SENSITIVE). Fold primitives + `fixed[..]`/`decimal(..)`
+  ONLY; do NOT fold wrappers.** *Why (bytecode):* `fromTypeName` offsets 0-7 lowercase, then the TYPES
+  map / FIXED / DECIMAL regexes all consume `aload_1` (the lowercased var); `typeFromJson` offsets 41/55/69
+  are `String.equals("struct"/"list"/"map")` on the ORIGINAL. So a one-line `.to_lowercase()` in Rust's
+  `PrimitiveType::deserialize` (+ the variant marker `eq_ignore_ascii_case`) is the WHOLE fix — wrappers are
+  matched structurally by the untagged `SerdeType` and need no change. NOTE the residual asymmetry: Rust's
+  untagged matcher IGNORES the wrapper `type` string for List/Map (accepts `{"type":"STRUCT"}` where Java
+  rejects) — a PRE-EXISTING separate posture (Rust too LENIENT on wrappers), NOT the reported divergence
+  (Rust too STRICT on primitives); pin it as a scope test, don't fix it in a primitive-case increment.
+- **Sort orders: Java binds+`checkCompatibility`-validates ONLY the DEFAULT order at metadata parse; all
+  others are `bindUnchecked` (lenient). Mirror exactly — validating every order would be STRICTER than
+  Java.** *Why (bytecode):* `TableMetadataParser.fromJson` → `SortOrderParser.fromJson(Schema, node,
+  defaultId)`: `if unbound.orderId()==defaultId → bind` (→ `Builder.build()` → `SortOrder.checkCompatibility`
+  = source-exists/primitive/transform-applies) `else → bindUnchecked` (no check). Binding itself NEVER throws
+  on a missing source id (it keeps the unbound transform string); only `checkCompatibility` does. Rust already
+  had a 1:1 `SortOrderBuilder::check_compatibility` — the only gap was `try_normalize_sort_order` never
+  CALLING it. Schema bound against is the CURRENT schema (var 10 = current-schema-id). The fix is one
+  `check_compatibility(default_order, current_schema)?` call; non-default orders stay untouched.
+- **Manifest-list entry order: Java is new-then-carried, all-DATA-before-all-DELETE (`FastAppend.apply` =
+  `writeNewManifests()` then `snapshot.allManifests`; `MergingSnapshotProducer.apply` =
+  `concat(prepareNewData, carriedData)` then `concat(prepareNewDelete, carriedDelete)`). Rust's SHARED
+  `manifest_file` is carried(mixed)-then-new — opposite, in the ONE path every action uses.** *Verdict:*
+  DOCUMENT not fix — the oracle SORTS manifests (`snapshot_meta_view.rs:127`), both readers reconcile by
+  seq, so it's byte-invisible after the canonical sort; matching Java needs a content-type-separated
+  restructure of the shared path that ripples into `manifests[0]`-indexed tests. A "cosmetic, readers
+  reconcile" order divergence in a SHARED producer path is a DOCUMENT, not a bounded-cleanup fix.
+- **The avro map key/value record rename must cover ANY record (struct included), not just variant —
+  Java `TypeToSchema.struct` names EVERY record `"r"+fieldIds.peek()` (the enclosing key/value-id).** *Why:*
+  the F1 variant fix renamed only variant map records; a struct map value kept the `"null"` placeholder, so
+  two struct-valued maps in one schema emitted duplicate `"null"` records Java's `Schema.Parser` rejects.
+  Generalizing `rename_variant_record`→`rename_map_record` (drop the logical-type guard) is the fix.
+  TEST-RIGOR TRAP: the array-form (non-string-key) map's ROUND-TRIP test PASSES even under the variant-only
+  mutation because apache-avro tolerates duplicate `"null"` records in that array nesting — the round-trip
+  is a WEAK pin there; assert the explicit inner record NAMES (`r<keyId>`/`r<valueId>`) to make it
+  load-bearing. The string-key Map form's explicit-name assertion catches the mutation directly.
+- **`git checkout <file>` to undo a self-mutation WIPES uncommitted work — use a `/tmp` backup `cp`, never
+  `git checkout`, when the file has un-committed changes you need to keep.** *Why:* mid-increment a
+  `git checkout crates/.../avro/schema.rs` reverted to the O2 commit and erased the (d) fix + tests (the
+  worktree changes weren't committed). Restored from the `/tmp/avro.bak` I'd made before mutating. For
+  mutation-testing an uncommitted file: `cp file /tmp/x.bak` → mutate → test → `cp /tmp/x.bak file`.
+
+#### O3 REVIEWER corrections (2026-06-12, wt-core6) — adversarial pass vs 1.10.0 bytecode + live Java probe
+- **The (a) case-fold fix was correct BUT incomplete — building a Java-vs-Rust acceptance table over the
+  parameterized edge spellings exposed FIVE `fixed[..]`/`decimal(..)` parse mismatches the case-fold alone
+  did not touch. FIXED.** *Why:* a live `Types.fromTypeName` probe (compiled against the api jar +
+  `iceberg-bundled-guava` + caffeine — the static initializer needs the relocated guava `ImmutableMap`)
+  vs a Rust acceptance-probe test showed Java's anchored regexes `fixed\[\s*(\d+)\s*\]` /
+  `decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)` ACCEPT inner whitespace (`fixed[ 16 ]`, `decimal( 38 , 2 )`) and
+  REQUIRE the close bracket/paren, whereas Rust's `deserialize_fixed`/`deserialize_decimal` used
+  `trim_end_matches(']'/')')` (a NO-OP when the close char is absent — so `fixed[16`/`decimal(38,2` parsed,
+  too LENIENT) and never trimmed the inner content (so `fixed[ 16 ]` was rejected, too STRICT). Fix:
+  `strip_prefix` + `strip_suffix` (require the wrapper) + `.trim()` the inner operands. LESSON: when a fix
+  is "case-fold the name", the PARAMETERIZED forms have a SECOND parse layer (the bracket/paren structure)
+  the fold doesn't reach — build the full accept/reject acceptance table against the live oracle, both
+  directions, before declaring parity. The bytecode also reveals GEOMETRY/GEOGRAPHY use `aload_0` (the
+  ORIGINAL, case-INSENSITIVE-flag regex) while FIXED/DECIMAL use `aload_1` (the lowercased) — a scope
+  detail invisible in source.
+- **The builder's documented "open risk" (Rust accepts `{"type":"STRUCT"}` where Java rejects) was REAL,
+  WORSE than framed, and the builder's own scope test gave FALSE comfort. FIXED.** *Why:* the test
+  `wrapper_type_names_are_not_folded_by_the_primitive_case_fix` asserted rejection via the dedicated
+  `StructType` deserializer — a path the production `Type`/`Schema` read NEVER takes. The real read path
+  routes through the untagged `_serde::SerdeType`, which matches a wrapper by its FIELD SHAPE and IGNORES
+  the `type` string: a probe via `serde_json::from_str::<Type>` accepted `{"type":"STRUCT"}`,
+  `{"type":"LIST"}`, `{"type":"MAP"}` ALL. Java `SchemaParser.typeFromJson` (1.10.0 bytecode offsets
+  41/55/69 + live `SchemaParser.fromJson` probe) matches with `String.equals` → `IllegalArgumentException`.
+  RULING: cheap contained fix (≤30 lines, no untagged-machinery fight) over documentation — added
+  `SerdeType::wrapper_type_mismatch()` and a guard in `Type::deserialize` re-imposing Java's exact
+  `String.equals`; Rust's writer always emits lowercase, so it never rejects a self-round-trip. LESSON: a
+  read-leniency "open risk" must be probed on the PRODUCTION deserialization path, not a sibling
+  deserializer — an untagged-enum arm that captures-but-ignores a discriminator field is a silent
+  over-acceptance, and a scope test on the wrong path is no pin at all.
+- **CONFIRMED (b)/(c)/(d) by independent re-derivation + mutation battery — no defect.** (b)
+  `SortOrderParser.fromJson(Schema,node,int)` offsets 5-24: `if orderId==defaultId → bind` (→`build()`→
+  `checkCompatibility`) `else → bindUnchecked`; var-10 = current-schema-id schema (bytecode-confirmed);
+  knockout of `check_compatibility` fails exactly the 2 reject tests. (c) `FastAppend.apply` new-then-carried
+  (addAll at 18 then 94) + `MergingSnapshotProducer.apply` `concat(prepareNew*, filtered*)` data-before-delete
+  (offsets 166-272); Rust shared `manifest_file` is carried-then-new; the `current_manifests` test helper
+  returns RAW manifest-list order (NOT the oracle's canonical sort), so the `data_manifests[0]`/`manifests[0]`
+  spec-order assertions in merge_append/rewrite_manifests ARE writer-order-coupled — the DOCUMENT-not-fix
+  defer is justified, the ripple is real. (d) `TypeToSchema.struct` names EVERY struct record `"r"+fieldIds.peek()`
+  (offset 4-35); variant-only revert reproduces the two-`"null"` collision on BOTH the string-key and array
+  forms, and the array-form caught it ONLY via the explicit `r2`/`r4` name assertion (round-trip alone is a
+  weak pin — apache-avro tolerates duplicate `"null"` in that nesting), exactly as the builder warned. The
+  manifest schema has only PRIMITIVE-valued maps, so `rename_map_record` never fires on the manifest write
+  path — (d) is byte-invisible to interop (write-data chain re-run GREEN, exit 0).

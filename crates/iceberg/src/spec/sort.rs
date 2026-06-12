@@ -173,8 +173,13 @@ impl SortOrderBuilder {
         SortOrderBuilder::check_compatibility(unbound_sort_order, schema)
     }
 
-    /// Returns the given sort order if it is compatible with the given schema
-    fn check_compatibility(sort_order: SortOrder, schema: &Schema) -> Result<SortOrder> {
+    /// Returns the given sort order if it is compatible with the given schema, mirroring Java
+    /// `SortOrder.checkCompatibility`: every sort field's source column must exist, be primitive,
+    /// and accept its transform. `pub(crate)` so [`TableMetadata`](crate::spec::TableMetadata)
+    /// normalization can run it on the DEFAULT sort order at parse time (Java
+    /// `TableMetadataParser`/`SortOrderParser.fromJson` binds the default order with `bind` →
+    /// `build()` → `checkCompatibility`, leaving non-default orders unchecked via `bindUnchecked`).
+    pub(crate) fn check_compatibility(sort_order: SortOrder, schema: &Schema) -> Result<SortOrder> {
         let sort_fields = &sort_order.fields;
         for sort_field in sort_fields {
             match schema.field_by_id(sort_field.source_id) {
