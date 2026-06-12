@@ -1964,6 +1964,100 @@ documenting the escape hatch (both rollback + ref-orphan consequences; cherry-pi
 production-logic change (no divergence found). Gate ×2 CLEAN: typos/fmt/clippy `-D warnings` clean,
 `cargo test -p iceberg --lib` **2064 ×2** (baseline 2063 + my 1 escape-hatch test). Tree = allowed set; no
 Cargo/pom diffs. NO COMMIT.
+## DONE (2026-06-11): W3 — Overnight Group W, increment W3 (multi-bin merge_append data fixture + multi-spec comparator groundwork, worktree wt-interop2, BUILDER Sonnet)
+
+Close two open items from the W-series data-level wave:
+
+**Part 1 — Fixture G: multi-bin `merge_append` data-level.** The metadata chain covers the
+one-bin merge path (s8 in write-actions chain). The GAP_MATRIX names multi-bin open. Build a
+fixture where the merge produces TWO OR MORE merged manifests in a single merge_append commit.
+Approach: 4 separate fast_appends → 4 separate manifests, then set
+`commit.manifest.min-count-to-merge=2` + a dynamic `commit.manifest.target-size-bytes =
+max_manifest_len * 2 + 1` so `pack_end` produces 2 bins of 2 → both bins satisfy
+min-count=2 → both merge. Verify: count manifests with `existing_files_count > 0` ≥ 2 in the
+final manifest list. Live set: A(cat=a,10/20/30) + B(cat=b,40) + C1(cat=a,50) + C2(cat=b,55) +
+G(cat=a,60) = all 7 rows survive. Both directions (Java writes/Rust reads + Rust writes/Java reads).
+Sabotage battery (truncate + bogus-path). Wired into `run-interop-write-data.sh` extending the 18
+steps to 22 steps, map.md updated. Env-var gates: `ICEBERG_INTEROP_MULTI_BIN_MERGE_DATA_GEN_DIR`
+/ `ICEBERG_INTEROP_MULTI_BIN_MERGE_DATA_DIR`.
+
+**Part 2 — Multi-spec comparator GROUNDWORK (ESCALATION raised).** Added `partition_spec_id` to
+the emitted JSON on both sides (Rust `snapshot_meta_view.rs` + local `expire_meta_view` copy in
+`interop_expire.rs` + Java `SnapshotMetaOracle`) — SYMMETRICALLY — constant 0 for all existing
+single-spec fixtures. ALL 5 metadata chains re-run green after the change (byte-unaffected).
+ESCALATION raised: sort-tuple POSITION for `partition_spec_id` — see final W3 report.
+
+**Allowed files:** `dev/java-interop/**`, `crates/iceberg/tests/**` (incl.
+`common/snapshot_meta_view.rs`), `docs/parity/GAP_MATRIX.md`, `task/todo.md`, `task/lessons.md`.
+ZERO production src edits. No commits/pushes/branch switches. Never edit Cargo/pom files.
+
+**Baseline:** `cargo test -p iceberg --lib` = 2044 ×2.
+
+### Plan
+
+- [x] **Java oracle: `MultiBinMergeAppendDataOracle`** in `InteropOracle.java`:
+  - `generate(Path dir)`: build V2 partitioned table (identity(category), 3-field schema);
+    fast_append A(cat=a,10/20/30) → fast_append B(cat=b,40) → fast_append C1(cat=a,50) →
+    fast_append C2(cat=b,55) [4 commits → 4 manifests]; then set min-count=2 and
+    dynamic target-size-bytes; merge_append G(cat=a,60) — produces ≥2 merged manifests.
+    Emit `java_multi_bin_merge_append_rows.json` + dump bin count to stdout.
+  - `verify(Path dir)`: load `rust_table/metadata/final.metadata.json`, read with IcebergGenerics,
+    assert 7 rows `{10,20,30,40,50,55,60}` with partition pins. Assert ≥2 manifests with
+    `existing_files_count > 0`.
+  - dispatch cases in main() wired.
+- [x] **Rust GEN test + comparison test** in `interop_write_data.rs`: env-var gates, 4 fast_appends,
+  dynamic target-size measurement, merge_append G, ≥2 bin-count assert, 7-row + partition-pin asserts.
+- [x] **Shell harness `run-interop-write-data.sh`**: extended to 22 steps; all fixture G steps wired.
+- [x] **Part 2 ESCALATION**: `partition_spec_id` added to emitted JSON on both sides (sort tuple
+  unchanged); ALL 5 metadata chains re-run green; sort position ESCALATED (see W3 report).
+- [x] **GAP_MATRIX.md**: merge_append cell multi-bin note + manifest row comparator spec-id groundwork note.
+- [x] **map.md** (`dev/java-interop/map.md`): updated `run-interop-write-data.sh` row with fixture G, 22 steps.
+- [x] **Verbatim gate ×2**, full chain GREEN ×2, sabotage evidence — ALL CLEAN.
+
+**Outcome (2026-06-11): W3 LANDED.** Fixture G: multi-bin merge_append data-level interop proven both
+directions; sabotage battery passes; bin-count assert ≥2 verified. Part 2: `partition_spec_id` in
+emitted JSON both sides, byte-unaffected on all existing chains; sort-position ESCALATED. Gate CLEAN:
+typos clean, fmt clean, clippy `-D warnings` clean, `cargo test -p iceberg --lib` **2044 passed ×2**.
+Full 22-step chain GREEN ×2. No commit (per task brief). ESCALATION pending Opus decision (see W3
+final report below).
+
+### W3 REVIEWER (2026-06-12, Opus 2-of-2, adversarial, delegated overnight)
+
+**Plan:**
+- [x] Implement the orchestrator's ruling — Option B: `partition_spec_id` as the FINAL
+      tiebreaker (sort position 10) on ALL THREE sides (Rust `snapshot_meta_view.rs` 9→10-tuple,
+      Rust `interop_expire.rs` 9→10-tuple, Java `SnapshotMetaOracle` comparator `.thenComparingInt
+      (ManifestFile::partitionSpecId)`), with the cross-language-determinism rationale comment.
+- [x] Re-run ALL FIVE metadata chains (write-actions, rowdelta-meta, expire, dv, cherrypick) —
+      every one must stay green (the field is constant-0 in single-spec fixtures ⇒ the tiebreaker
+      is byte-invisible; any diff = a pre-existing instability the old tuple left, investigate).
+- [x] Cold-start verify Fixture G: dump the final manifest LIST (≥2 MERGED manifests each carrying
+      Existing entries); rows = hand-declared union both directions; partition pins both sides.
+- [x] Judge the dynamic target-size trick (`max_manifest_len * 2 + 1`) for determinism; verify the
+      ≥2-bin assert fails LOUDLY (not skip) when bins collapse to 1.
+- [x] Sabotage (truncate + bogus-path + control) + ≥3 mutations.
+- [x] Verbatim gate ×2 (baseline 2044). Offline interop_write_data tests (clean no-ops).
+- [x] House: GAP_MATRIX cells + pipe audit; tree = allowed set; no Cargo/pom diffs; tier ledger.
+
+**Outcome (2026-06-12): W3 REVIEWER COMPLETE — VERDICT: APPROVE; ruling implemented; all claims TRUE.**
+Ruling (Option B) implemented symmetrically: `partition_spec_id` is the FINAL sort tiebreaker
+(position 10) in `snapshot_meta_view.rs` (9→10-tuple + rationale comment), `interop_expire.rs`
+(9→10-tuple + rationale comment), and Java `SnapshotMetaOracle` (`.thenComparingInt(ManifestFile::
+partitionSpecId)` + rationale comment). All FIVE metadata chains GREEN post-change (write-actions 6
+passed, rowdelta-meta 2, expire 1+D2, dv all-3-ways, cherrypick 3 fixtures) — the tiebreaker is
+byte-invisible (spec_id=0 constant); NO pre-existing ordering instability surfaced. Fixture-G bin
+honesty CONFIRMED via own manifest-list dump: 3 manifests = [m0 new G ADDED] + [m1 MERGED, 2 Existing:
+A(rc=3,cat=a)+B(rc=1,cat=b)] + [m2 MERGED, 2 Existing: C1(rc=1,cat=a)+C2(rc=1,cat=b)] — TWO merged
+manifests each carrying 2 Existing entries (packing split the carried set into 2 bins of 2; NOT
+one-merged-plus-leftover), 7 live rows. Target-size trick ROBUST (derived from measured max; verified
+loud assert via huge-target probe → "got 1" panic). 3 mutations (corrupt-row→field-compare fails;
+wrong-partition→partition-pin fails; merge_append→fast_append→bin-count assert "got 0" panics) all
+caught. Sabotage (truncate+bogus-path+control) all fail-closed. 22-step chain GREEN ×2. Verbatim gate
+×2 CLEAN (2044 lib). Tree = allowed set only; no Cargo/pom/src diffs. GAP_MATRIX comparator line
+updated to RESOLVED; pipe audit clean. Builder's escalation recorded as a discipline IMPROVEMENT (see
+lessons 2026-06-12). One nuance flagged: min-count-to-merge protects only the new-manifest bin (so
+the brief's proposed mutation-3 lever didn't fire — used the correct fast_append lever instead). No
+commit.
 
 ## Carried-forward open items (full context in todo-archive/)
 

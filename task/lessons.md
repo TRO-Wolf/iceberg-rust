@@ -2074,3 +2074,70 @@ How to use it (see the manuals' §2):
   clean" claim was FALSE as committed. Reworded the entry to describe the token instead of pasting it;
   `typos .` then clean. RULE: after any typos-related edit, run `typos .` over the WHOLE tree (docs
   included), and never paste the raw flagged spelling into prose.
+
+### 2026-06-11 (W3 — multi-bin merge_append data fixture + multi-spec comparator groundwork, BUILDER Sonnet)
+- **DO measure actual manifest sizes at runtime when setting `target-size-bytes` for a multi-bin
+  merge test — never guess.** *Why:* manifest avro sizes depend on schema complexity and record counts
+  in unpredictable ways. After 4 fast_appends, load the manifest list, find `max_manifest_len =
+  entries().iter().map(|m| m.manifest_length).max()`, then set `target_size_bytes = max_manifest_len
+  * 2 + 1`. This guarantees `pack_end` sees two manifests fit per bin but not three — regardless of
+  machine or avro encoder version.
+- **DO place `partition_spec_id` in the emitted manifest JSON (sort-tuple position left open = ESCALATE).** *Why:*
+  the field must go into the emitted view BEFORE the sort-tuple position is decided, so the JSON
+  output evolves in one atomic change when the Opus reviewer makes the sort decision. Adding to the
+  JSON without adding to the sort key is safe — constant 0 for all existing single-spec fixtures
+  means the new field is byte-invisible. The sort-position is an Opus-level semantic judgment
+  (Option A: position 2 after content_rank; Option B: position 10 as final tiebreaker — see W3
+  escalation report). NEVER unilaterally resolve a named escalation question.
+- **When a Java helper method needs to be reused by a sibling class in the same package, change
+  `private static` to `static` (package-visible) rather than duplicating the code.** *Why:*
+  the `MergeAppendDataOracle.writePartitionedDataFile` method was `private static` and needed by
+  `MultiBinMergeAppendDataOracle`. Removing `private` (Java package-visibility default) is the
+  minimal, safe change; the method stays inside the package and does not become part of any public
+  API. Verify `mvn -o -q compile` is clean after the change.
+- **The `cargo fmt` auto-fix sometimes reformats multi-line closure filter predicates to a single
+  line.** *Why:* a two-line `m.content == ManifestContentType::Data\n    && m.existing_files_count...`
+  filter was reformatted to one line by `cargo fmt`. Always run `cargo fmt --all` before the
+  `-- --check` gate step to let the formatter fix style issues, then re-run `-- --check` to confirm
+  clean. The gate itself (`typos && fmt -- --check && clippy && test`) will fail on any unfixed
+  formatting.
+
+### 2026-06-12 (W3 — multi-bin merge_append + comparator groundwork, Opus REVIEWER 2-of-2)
+- **TIER-LEDGER / DISCIPLINE IMPROVEMENT: the W3 Sonnet builder correctly ESCALATED the one
+  semantic question (the `partition_spec_id` sort-tuple position) instead of guessing it — a clean
+  application of the addendum's lowered-escalation rule ("NEVER decide a semantic parity question
+  yourself … an escalation is a success of the process, not a failure of yours").** *Why it
+  matters:* this is the FIRST W-series increment where the builder split a change cleanly along the
+  "I can verify this locally" line — it landed the emitted-field half (byte-invisible, fully
+  verifiable: spec_id=0 everywhere, all chains green) and STOPPED at the sort-position half (a
+  cross-language-determinism judgment with no local oracle). Contrast W1 (shipped behind a false
+  "JVM blocker", chain never run) and W2 (a sabotage step that could never fire). The escalation
+  was actionable: it named both options (A: position 2 after content_rank; B: position 10 final
+  tiebreaker) with the tradeoff, so the reviewer's job was a RULING + verification, not a redesign.
+  Record this as the discipline win it is; the builder's claims-vs-reality below were all TRUE.
+- **THE RULING (Option B, implemented): `partition_spec_id` is the FINAL sort tiebreaker (position
+  10), symmetrically on all three sides** (Rust `snapshot_meta_view.rs` + `interop_expire.rs`
+  10-tuples, Java `SnapshotMetaOracle` `.thenComparingInt(ManifestFile::partitionSpecId)`).
+  *Rationale:* the canonical view's sort exists to ERASE writer-dependent manifest-list ordering;
+  its only contract is cross-language determinism, which the final-tiebreaker position provides for
+  future multi-spec fixtures with zero risk to existing single-spec ordering (spec_id is constant 0,
+  so the key is byte-invisible). Verified byte-invisible: all FIVE metadata chains (write-actions,
+  rowdelta-meta, expire, dv, cherrypick) stayed green after the change — no pre-existing ordering
+  instability surfaced (any diff would have meant the old 9-tuple left an ordering unstable).
+- **`commit.manifest.min-count-to-merge` protects ONLY the bin containing the NEW (first) manifest,
+  not the carried-existing bins** (Rust `bin_disposition`: `bin_contains_first && bin_len <
+  min_count ⇒ Keep`; Java `MergingSnapshotProducer` parity). *Why it bit the review:* a natural
+  mutation ("set min-count high so the merge never fires") did NOT fire the fixture-G bin-count
+  assert — the carried bins of 2 merged anyway (correct Iceberg behavior). The genuine levers that
+  make the multi-bin merge collapse to a no-merge/one-bin shape (and DO fire the `>= 2` assert
+  loudly) are: (a) a too-large `target-size-bytes` (all manifests in one bin ⇒ 1 merged manifest)
+  and (b) replacing `merge_append` with a plain `fast_append` for G (no merge ⇒ 0 Existing-carry
+  manifests). Both proved the assert panics, not skips. When designing a "the guard never fires"
+  mutation, confirm WHICH bin the guard actually scopes to first.
+- **The dynamic `target-size-bytes = max_manifest_len * 2 + 1` is robust across runs/paths because
+  it is DERIVED FROM the measured max, not hardcoded.** A longer tmp path inflates every manifest
+  roughly uniformly (they embed the same parquet dir), so `max` grows and the target grows
+  proportionally — the "2 fit, 3 don't" invariant (and "4 never fit in one bin") is preserved
+  regardless of absolute path length. Verified: max=3863 → target=7727 → 2 bins of 2; the bin-count
+  assert is a real `assert!` (fail-loud), proven by forcing target=max*1000 (collapses to 1 merged
+  manifest, assert panics "got 1"). No fragility found — the measurement is the right design.

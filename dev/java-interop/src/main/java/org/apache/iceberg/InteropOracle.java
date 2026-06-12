@@ -546,6 +546,35 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-multi-bin-merge-append-data":
+        // DATA-LEVEL multi-bin merge_append interop (increment W3, fixture G). Writes a V2 partitioned
+        // table (identity(category), schema {id, category, data}) under <dir>/table, performs FOUR separate
+        // fast-appends (A:cat=a,10/20/30; B:cat=b,40; C1:cat=a,50; C2:cat=b,55) each in its own commit
+        // → four separate manifests m1..m4. Measures actual manifest sizes, sets target-size-bytes to
+        // max_size*2+1 + min-count-to-merge=2, then merge-appends G(cat=a,60). pack_end yields ≥2 bins
+        // of 2 manifests each → both merge → ≥2 merged manifests with Existing entries. All 7 rows survive.
+        // Emits java_multi_bin_merge_append_rows.json (ground truth = 7 rows).
+        Path multiBinMergeAppendDataDir =
+            requireFixturesDir("interop.multi_bin_merge_append_data.dir");
+        MultiBinMergeAppendDataOracle.generate(multiBinMergeAppendDataDir);
+        break;
+      case "verify-interop-multi-bin-merge-append-data":
+        // DATA-LEVEL multi-bin merge_append interop, DIRECTION 2 — "Java reads what RUST writes". The Rust
+        // GEN test (env ICEBERG_INTEROP_MULTI_BIN_MERGE_DATA_GEN_DIR) wrote a V2 partitioned table to
+        // <dir>/rust_table: 4 fast-appends + set multi-bin merge properties + merge-append G. Java reads
+        // via IcebergGenerics and asserts all 7 rows present AND ≥2 merged manifests in the manifest list.
+        Path multiBinMergeAppendDataVerifyDir =
+            requireFixturesDir("interop.multi_bin_merge_append_data.dir");
+        int multiBinMergeAppendDataFailures =
+            MultiBinMergeAppendDataOracle.verify(multiBinMergeAppendDataVerifyDir);
+        System.out.println(
+            "verify-interop-multi-bin-merge-append-data: "
+                + multiBinMergeAppendDataFailures
+                + " failures");
+        if (multiBinMergeAppendDataFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-cherrypick":
         // CHERRYPICK metadata-level interop (increment S2). Builds three fixtures (ff / replay / dedup)
         // on a V2 table (schema {id long, data string}, unpartitioned), stages a snapshot per fixture,
@@ -6495,6 +6524,13 @@ public final class InteropOracle {
                   // min_seq), and a tie would fall back to each table's manifest-LIST file order —
                   // writer-dependent, not a spec contract. The counts disambiguate
                   // deterministically (mirrored by the Rust common/snapshot_meta_view.rs sort).
+                  //
+                  // W3 (2026-06-11): partition_spec_id is the FINAL tiebreaker (position 10,
+                  // Option B). The canonical view's sort exists to ERASE writer-dependent
+                  // manifest-list ordering; its only contract is cross-language determinism, which
+                  // the final-tiebreaker position provides for future multi-spec fixtures with zero
+                  // risk to existing ordering (spec_id is constant 0 in every single-spec fixture,
+                  // so the key is byte-invisible there). Kept identical to the Rust sort tuple.
                   manifests.sort(
                       java.util.Comparator.comparingInt(
                               (ManifestFile m) -> m.content().id())
@@ -6505,7 +6541,8 @@ public final class InteropOracle {
                           .thenComparingLong(m -> nullToMinusOne(m.deletedFilesCount()))
                           .thenComparingLong(m -> nullToMinusOne(m.addedRowsCount()))
                           .thenComparingLong(m -> nullToMinusOne(m.existingRowsCount()))
-                          .thenComparingLong(m -> nullToMinusOne(m.deletedRowsCount())));
+                          .thenComparingLong(m -> nullToMinusOne(m.deletedRowsCount()))
+                          .thenComparingInt(ManifestFile::partitionSpecId));
                   gen.writeArrayFieldStart("manifests");
                   for (ManifestFile manifest : manifests) {
                     gen.writeStartObject();
@@ -6513,6 +6550,7 @@ public final class InteropOracle {
                         "content", manifest.content() == ManifestContent.DATA ? "data" : "deletes");
                     gen.writeNumberField("sequence_number", manifest.sequenceNumber());
                     gen.writeNumberField("min_sequence_number", manifest.minSequenceNumber());
+                    gen.writeNumberField("partition_spec_id", manifest.partitionSpecId());
                     Integer addedOrdinal = ordinals.get(manifest.snapshotId());
                     if (addedOrdinal == null) {
                       gen.writeNullField("added_snapshot_ordinal");
@@ -6847,8 +6885,10 @@ public final class InteropOracle {
      * Write a REAL parquet data file for ONE partition via the generic appender. The same pattern as
      * {@link PartScanExecOracle}'s {@code writePartitionedDataFile}: the writer stamps the partition
      * Struct onto the DataFile and routes the parquet under the partition path.
+     *
+     * <p>Package-visible (not private) so {@link MultiBinMergeAppendDataOracle} can reuse it.
      */
-    private static DataFile writePartitionedDataFile(
+    static DataFile writePartitionedDataFile(
         BaseTable table,
         Schema schema,
         PartitionSpec spec,
@@ -6996,6 +7036,405 @@ public final class InteropOracle {
         System.out.println(
             "verify-interop-merge-append-data OK — Java read the RUST-written merge-append table "
                 + "(real parquet + merged manifest Existing-carry), live rows = {10,20,30,40,60}");
+      }
+      return failures;
+    }
+  }
+
+  // =============================================================================================
+  // MultiBinMergeAppendDataOracle — DATA-LEVEL multi-bin merge_append interop (increment W3,
+  // fixture G).
+  //
+  // THE TABLE (under <dir>/table). V2 partitioned by identity(category), schema
+  //   {1 id long required, 2 category string required, 3 data string optional}
+  //
+  //   Four fast-appends build up four small manifests:
+  //     fast-append A(cat=a, 10/20/30)  → manifest m1 (seq 1)
+  //     fast-append B(cat=b, 40)        → manifest m2 (seq 2)
+  //     fast-append C1(cat=a, 50)       → manifest m3 (seq 3)
+  //     fast-append C2(cat=b, 55)       → manifest m4 (seq 4)
+  //
+  //   After the four appends, the actual manifest sizes are measured from the manifest-list.
+  //   The target-size-bytes is then set to max_manifest_size * 2 + 1 (so at most 2 manifests
+  //   fit per bin, forcing ≥2 bins over 4 existing manifests) together with min-count-to-merge=2.
+  //
+  //   merge-append G(cat=a, 60) at seq 5:
+  //     pack_end([new_g, m1, m2, m3, m4], target) produces:
+  //       bin [new_g]  (size=1, kept)
+  //       bin [m1, m2] (size=2 ≥ min-count=2, MERGED)
+  //       bin [m3, m4] (size=2 ≥ min-count=2, MERGED)
+  //     → TWO merged manifests, each carrying Existing entries.
+  //
+  // CORRECTNESS POINT: all 7 rows must survive: A(10/20/30) + B(40) + C1(50) + C2(55) + G(60).
+  // The multi-bin merge proves that MULTIPLE merged manifests are produced (bin-count assertion),
+  // each with carried Existing entries (existing_files_count > 0 on both merged manifests), and
+  // that a scan across all bins still returns the complete row set.
+  //
+  // Partition-column pin: a-rows = {10,20,30,50,60}; b-rows = {40,55}.
+  // =============================================================================================
+
+  static final class MultiBinMergeAppendDataOracle {
+    private MultiBinMergeAppendDataOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the partitioned V2 table on local disk under <dir>/table.
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_multi_bin_merge_append_data");
+
+      // 2. Partition values for identity(category).
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partitionA = new PartitionData(partitionType);
+      partitionA.set(0, "a");
+      PartitionData partitionB = new PartitionData(partitionType);
+      partitionB.set(0, "b");
+
+      // 3. Write REAL parquet data files.
+      //    A: cat=a, rows (10,"a")(20,"b")(30,"c")
+      //    B: cat=b, row  (40,"d")
+      //    C1: cat=a, row (50,"e")
+      //    C2: cat=b, row (55,"f")
+      //    G: cat=a, row  (60,"g")
+      File catADir = new File(dataDir, "category=a");
+      File catBDir = new File(dataDir, "category=b");
+      if (!catADir.isDirectory() && !catADir.mkdirs()) {
+        throw new IOException("failed to create category=a data dir");
+      }
+      if (!catBDir.isDirectory() && !catBDir.mkdirs()) {
+        throw new IOException("failed to create category=b data dir");
+      }
+
+      DataFile dataFileA =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionA,
+              new File(catADir, "00000-mb-a.parquet").getAbsolutePath(),
+              new long[] {10L, 20L, 30L}, new String[] {"a", "b", "c"});
+      DataFile dataFileB =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionB,
+              new File(catBDir, "00000-mb-b.parquet").getAbsolutePath(),
+              new long[] {40L}, new String[] {"d"});
+      DataFile dataFileC1 =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionA,
+              new File(catADir, "00001-mb-c1.parquet").getAbsolutePath(),
+              new long[] {50L}, new String[] {"e"});
+      DataFile dataFileC2 =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionB,
+              new File(catBDir, "00001-mb-c2.parquet").getAbsolutePath(),
+              new long[] {55L}, new String[] {"f"});
+      DataFile dataFileG =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionA,
+              new File(catADir, "00002-mb-g.parquet").getAbsolutePath(),
+              new long[] {60L}, new String[] {"g"});
+
+      // 4. Four separate fast-appends → four separate manifests (m1..m4, each in its own seq).
+      //    This is the key: four separate commits produce four manifest files, each carrying
+      //    exactly the data files from that commit. The merge_append G step must pack these
+      //    into ≥2 bins so ≥2 merged manifests are produced.
+      table.newFastAppend().appendFile(dataFileA).commit();
+      table.newFastAppend().appendFile(dataFileB).commit();
+      table.newFastAppend().appendFile(dataFileC1).commit();
+      table.newFastAppend().appendFile(dataFileC2).commit();
+
+      // 5. Measure manifest sizes from the current snapshot's manifest-list.
+      //    Set target-size-bytes = max_size * 2 + 1 so exactly 2 manifests fit per bin.
+      //    With 4 manifests and target fitting 2 per bin, pack_end yields 2 bins of 2 → both
+      //    satisfy min-count=2 → both MERGE.
+      List<ManifestFile> currentManifests = table.currentSnapshot().allManifests(table.io());
+      long maxManifestSize = 0;
+      for (ManifestFile mf : currentManifests) {
+        if (mf.length() > maxManifestSize) {
+          maxManifestSize = mf.length();
+        }
+      }
+      long targetSizeBytes = maxManifestSize * 2 + 1;
+      System.out.println(
+          "multi-bin fixture: 4 manifests, max manifest size = "
+              + maxManifestSize
+              + " bytes; target-size-bytes = "
+              + targetSizeBytes
+              + " (fits exactly 2 per bin)");
+
+      // 6. Set merge properties (no snapshot) — arm the two-bin merge.
+      table
+          .updateProperties()
+          .set(TableProperties.MANIFEST_MIN_MERGE_COUNT, "2")
+          .set(TableProperties.MANIFEST_TARGET_SIZE_BYTES, Long.toString(targetSizeBytes))
+          .commit();
+
+      // 7. merge-append G(cat=a, id=60, "g") — fires the two-bin merge.
+      table.newAppend().appendFile(dataFileG).commit();
+
+      // 8. Verify ≥2 merged manifests (manifests with existing_files_count > 0).
+      List<ManifestFile> finalManifests = table.currentSnapshot().allManifests(table.io());
+      long mergedCount =
+          finalManifests.stream()
+              .filter(
+                  mf ->
+                      mf.content() == ManifestContent.DATA
+                          && mf.existingFilesCount() != null
+                          && mf.existingFilesCount() > 0)
+              .count();
+      System.out.println(
+          "multi-bin fixture: final manifest list has "
+              + finalManifests.size()
+              + " manifests, "
+              + mergedCount
+              + " with existing_files_count > 0 (must be ≥ 2)");
+      if (mergedCount < 2) {
+        throw new IllegalStateException(
+            "multi-bin merge_append FIXTURE BROKEN: expected ≥2 manifests with existing entries, "
+                + "got "
+                + mergedCount
+                + ". This means the bin-packing did not produce multi-bin output. "
+                + "Check target-size-bytes="
+                + targetSizeBytes
+                + " vs manifest sizes.");
+      }
+
+      // 9. Write the FINAL metadata to a KNOWN path.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 10. Java materializes its OWN IcebergGenerics read → emit java_multi_bin_merge_append_rows.json.
+      //     Expected = [{10,a},{20,b},{30,c},{40,d},{50,e},{55,f},{60,g}] (7 rows, no deletes).
+      writeJson(
+          dir.resolve("java_multi_bin_merge_append_rows.json"),
+          readLiveRowsToJson(table, "data"));
+      System.out.println(
+          "generated multi-bin-merge-append-data table + java_multi_bin_merge_append_rows.json to "
+              + dir);
+    }
+
+    /**
+     * DIRECTION 2 verify — read the RUST-written multi-bin merge-append table and assert live rows.
+     *
+     * <p>Loads {@code <dir>/rust_table/metadata/final.metadata.json}, reads every live row with {@code
+     * IcebergGenerics}, and asserts all 7 rows are present: {@code
+     * {(10,a),(20,b),(30,c),(40,d),(50,e),(55,f),(60,g)}}. Additionally asserts ≥2 manifests in the final
+     * manifest list carry {@code existing_files_count > 0}, proving the multi-bin merge fired.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL multi-bin-merge-append-data-d2: missing "
+                + finalMetadata
+                + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL multi-bin-merge-append-data-d2: Java could not parse the Rust-written "
+                + "final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table =
+          new BaseTable(
+              new InMemoryInspectionOperations(metadata, io), "rust_multi_bin_merge_append_data");
+
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL multi-bin-merge-append-data-d2: Java could not READ the Rust-written "
+                + "multi-bin-merge-append table via IcebergGenerics: "
+                + readError);
+        return 1;
+      }
+
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+
+      // 3a. Exactly 7 live rows (A:3 + B:1 + C1:1 + C2:1 + G:1, no deletes).
+      if (liveIds.size() != 7) {
+        System.out.println(
+            "FAIL multi-bin-merge-append-data-d2: expected 7 live rows (A+B+C1+C2+G), got "
+                + liveIds.size()
+                + " "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS multi-bin-merge-append-data-d2: 7 live rows (all files carried through multi-bin "
+                + "merge boundary)");
+      }
+
+      // 3b. All expected ids present.
+      for (Long expected : new long[] {10L, 20L, 30L, 40L, 50L, 55L, 60L}) {
+        if (!liveIds.contains(expected)) {
+          System.out.println(
+              "FAIL multi-bin-merge-append-data-d2: id "
+                  + expected
+                  + " must be PRESENT, but live set is "
+                  + liveIds);
+          failures++;
+        }
+      }
+      if (failures == 0) {
+        System.out.println(
+            "PASS multi-bin-merge-append-data-d2: all expected ids present "
+                + "{10,20,30,40,50,55,60}");
+      }
+
+      // 3c. Exact (id, data) set matches.
+      Map<Long, String> expected = new LinkedHashMap<>();
+      expected.put(10L, "a");
+      expected.put(20L, "b");
+      expected.put(30L, "c");
+      expected.put(40L, "d");
+      expected.put(50L, "e");
+      expected.put(55L, "f");
+      expected.put(60L, "g");
+      boolean valuesMatch = liveIds.equals(new ArrayList<>(expected.keySet()));
+      for (Long id : liveIds) {
+        String actual = dataById.get(id);
+        String want = expected.get(id);
+        if (want == null || !want.equals(actual)) {
+          valuesMatch = false;
+        }
+      }
+      if (!valuesMatch) {
+        System.out.println(
+            "FAIL multi-bin-merge-append-data-d2: live (id,data) set mismatch: java-read="
+                + dataById
+                + " expected={10=a, 20=b, 30=c, 40=d, 50=e, 55=f, 60=g}");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS multi-bin-merge-append-data-d2: Java read the Rust-written multi-bin-merge-append "
+                + "table → {(10,a),(20,b),(30,c),(40,d),(50,e),(55,f),(60,g)}");
+      }
+
+      // 3d. Partition-column pin: a-rows = {10,20,30,50,60}; b-rows = {40,55}.
+      Map<Long, String> categoryById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object cat = record.getField("category");
+          categoryById.put(id, cat == null ? null : cat.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL multi-bin-merge-append-data-d2: second IcebergGenerics read (partition-column "
+                + "pin) failed: "
+                + readError);
+        failures++;
+      }
+      boolean categoryOk = true;
+      Map<Long, String> expectedCats = new LinkedHashMap<>();
+      expectedCats.put(10L, "a"); expectedCats.put(20L, "a"); expectedCats.put(30L, "a");
+      expectedCats.put(40L, "b"); expectedCats.put(50L, "a"); expectedCats.put(55L, "b");
+      expectedCats.put(60L, "a");
+      for (Map.Entry<Long, String> e : expectedCats.entrySet()) {
+        String actual = categoryById.get(e.getKey());
+        if (!e.getValue().equals(actual)) {
+          System.out.println(
+              "FAIL multi-bin-merge-append-data-d2: partition-column (category) mismatch for id="
+                  + e.getKey()
+                  + ": expected="
+                  + e.getValue()
+                  + " actual="
+                  + actual);
+          categoryOk = false;
+          failures++;
+        }
+      }
+      if (categoryOk) {
+        System.out.println(
+            "PASS multi-bin-merge-append-data-d2: partition-column (category) correct "
+                + "(a={10,20,30,50,60}, b={40,55})");
+      }
+
+      // 3e. Assert ≥2 merged manifests in the Rust-written table (bin-count proof).
+      try {
+        List<ManifestFile> finalManifests =
+            table.currentSnapshot().allManifests(io);
+        long mergedCount =
+            finalManifests.stream()
+                .filter(
+                    mf ->
+                        mf.content() == ManifestContent.DATA
+                            && mf.existingFilesCount() != null
+                            && mf.existingFilesCount() > 0)
+                .count();
+        System.out.println(
+            "multi-bin-merge-append-data-d2: Rust table has "
+                + finalManifests.size()
+                + " manifests, "
+                + mergedCount
+                + " with existing_files_count > 0 (need ≥ 2)");
+        if (mergedCount < 2) {
+          System.out.println(
+              "FAIL multi-bin-merge-append-data-d2: bin-count proof: need ≥2 manifests with "
+                  + "existing entries, got "
+                  + mergedCount
+                  + " — multi-bin merge did not fire");
+          failures++;
+        } else {
+          System.out.println(
+              "PASS multi-bin-merge-append-data-d2: bin-count proof: "
+                  + mergedCount
+                  + " merged manifests (≥2) confirmed");
+        }
+      } catch (RuntimeException e) {
+        System.out.println(
+            "FAIL multi-bin-merge-append-data-d2: could not read manifest list for bin-count "
+                + "proof: "
+                + e);
+        failures++;
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-multi-bin-merge-append-data OK — Java read the RUST-written multi-bin "
+                + "merge-append table (real parquet + ≥2 merged manifests, 7 live rows)");
       }
       return failures;
     }
