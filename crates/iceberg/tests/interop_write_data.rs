@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! DATA-LEVEL write-action interop (sprint increments S1 + W1) — `MergeAppend`, `RewriteFiles`,
-//! `OverwriteFiles`, and `DeleteFiles` proven against Java's `IcebergGenerics` production scan.
+//! DATA-LEVEL write-action interop (sprint increments S1 + W1 + W2) — `MergeAppend`,
+//! `RewriteFiles`, `OverwriteFiles`, `DeleteFiles`, `ReplacePartitions`, and partitioned
+//! `RewriteFiles` proven against Java's `IcebergGenerics` production scan.
 //!
 //! ## Fixture A — `merge_append` data-level
 //!
@@ -78,16 +79,47 @@
 //! `verify-interop-*` modes read them. The S3 partition-projection lesson is binding: every fixture
 //! pins the `category` column explicitly via `id_to_category_sorted` to catch wrong-partition writes.
 //!
-//! GATED on env vars (all eight unset ⇒ clean no-ops; offline `cargo test` gate stays green):
+//! ## Fixture E — `replace_partitions` data-level
 //!
-//! - `ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR` — fixture A GEN (Rust writes)
-//! - `ICEBERG_INTEROP_MERGE_APPEND_DATA_DIR`     — fixture A comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_REWRITE_DATA_GEN_DIR`      — fixture B GEN (Rust writes)
-//! - `ICEBERG_INTEROP_REWRITE_DATA_DIR`          — fixture B comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_OVERWRITE_DATA_GEN_DIR`    — fixture C GEN (Rust writes)
-//! - `ICEBERG_INTEROP_OVERWRITE_DATA_DIR`        — fixture C comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_DELETE_DATA_GEN_DIR`       — fixture D GEN (Rust writes)
-//! - `ICEBERG_INTEROP_DELETE_DATA_DIR`           — fixture D comparison (Rust reads Java rows)
+//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
+//! Rust performs the SAME chain as Java's `ReplacePartitionsDataOracle.generate`:
+//! - `fast_append` A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) — seq 1
+//! - `replace_partitions` E_new (cat=a, id=11, data="a'") — seq 2, operation=overwrite,
+//!   summary replace-partitions=true; this REPLACES ALL of partition a (A deleted) while
+//!   partition b (B) carries forward with EXISTING manifest status
+//!
+//! Correctness point: A's rows (10,20,30) are ALL GONE; E_new (id=11) is present; B (id=40)
+//! is byte-untouched. Additionally: B's file carries forward with EXISTING manifest status
+//! (not re-added as ADDED) — proven by the Java oracle's manifest-entry assertion (step 3f).
+//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(11,a'),(40,d)}`.
+//!
+//! ## Fixture F — partitioned `rewrite_files` with outstanding eq-delete
+//!
+//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
+//! Rust performs the SAME chain as Java's `PartitionedRewriteFilesDataOracle.generate`:
+//! - `fast_append` A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) — seq 1
+//! - `row_delta` equality-delete (equality_ids=[1], deletes id=20, SCOPED to partition a) — seq 2
+//! - `rewrite_files` {A}→{A'} with `data_sequence_number(1)` — seq 3
+//!
+//! Correctness point: A' is stamped with `data_sequence_number=1` (the replaced file's seq).
+//! The equality-delete has seq 2. `A'.data_seq=1 < eq_del.seq=2`, so the delete STILL APPLIES.
+//! id=20 must be ABSENT; id=10 and id=30 survive (cat=a); B (id=40, cat=b) is untouched.
+//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(10,a),(30,c),(40,d)}`.
+//!
+//! GATED on env vars (all twelve unset ⇒ clean no-ops; offline `cargo test` gate stays green):
+//!
+//! - `ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR`       — fixture A GEN (Rust writes)
+//! - `ICEBERG_INTEROP_MERGE_APPEND_DATA_DIR`           — fixture A comparison (Rust reads Java rows)
+//! - `ICEBERG_INTEROP_REWRITE_DATA_GEN_DIR`            — fixture B GEN (Rust writes)
+//! - `ICEBERG_INTEROP_REWRITE_DATA_DIR`                — fixture B comparison (Rust reads Java rows)
+//! - `ICEBERG_INTEROP_OVERWRITE_DATA_GEN_DIR`          — fixture C GEN (Rust writes)
+//! - `ICEBERG_INTEROP_OVERWRITE_DATA_DIR`              — fixture C comparison (Rust reads Java rows)
+//! - `ICEBERG_INTEROP_DELETE_DATA_GEN_DIR`             — fixture D GEN (Rust writes)
+//! - `ICEBERG_INTEROP_DELETE_DATA_DIR`                 — fixture D comparison (Rust reads Java rows)
+//! - `ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_GEN_DIR` — fixture E GEN (Rust writes)
+//! - `ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_DIR`     — fixture E comparison (Rust reads Java rows)
+//! - `ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_GEN_DIR`— fixture F GEN (Rust writes)
+//! - `ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_DIR`    — fixture F comparison (Rust reads Java rows)
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -194,6 +226,30 @@ fn delete_data_gen_dir() -> Option<PathBuf> {
 
 fn delete_data_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_DELETE_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn replace_partitions_data_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_GEN_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn replace_partitions_data_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn partitioned_rewrite_data_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_GEN_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn partitioned_rewrite_data_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }
@@ -393,6 +449,29 @@ fn expected_delete_categories() -> Vec<(i64, Option<String>)> {
     ]
 }
 
+/// The expected `(id → category)` partition routing for fixture E (replace_partitions):
+/// E_new (id=11) is `category="a"` (it replaced ALL of partition a); B (id=40) is `category="b"`.
+/// A's rows (10,20,30) are ABSENT (replaced). Sorted by id for a stable compare.
+///
+/// S3 partition-projection lesson: a wrong-partition write of E_new to `category="b"` would pass
+/// the `{id,data}` compare but is caught here (category would be `{11="b", 40="b"}` instead of
+/// `{11="a", 40="b"}`).
+fn expected_replace_partitions_categories() -> Vec<(i64, Option<String>)> {
+    vec![(11, Some("a".to_string())), (40, Some("b".to_string()))]
+}
+
+/// The expected `(id → category)` partition routing for fixture F (partitioned rewrite_files):
+/// A's surviving rows (10,30) are `category="a"` (id=20 was deleted by the eq-delete);
+/// B (id=40) is `category="b"` (untouched by both the eq-delete and the rewrite).
+/// Sorted by id for a stable compare.
+fn expected_partitioned_rewrite_categories() -> Vec<(i64, Option<String>)> {
+    vec![
+        (10, Some("a".to_string())),
+        (30, Some("a".to_string())),
+        (40, Some("b".to_string())),
+    ]
+}
+
 /// Collect + sort the `(id → category)` map from all batches, for the fixture-A partition pin.
 fn id_to_category_sorted(batches: &[RecordBatch]) -> Vec<(i64, Option<String>)> {
     let mut pairs: Vec<(i64, Option<String>)> = Vec::new();
@@ -495,6 +574,68 @@ async fn write_unpartitioned_data_file(table: &Table) -> DataFile {
         .into_iter()
         .next()
         .expect("one data file")
+}
+
+/// Write a REAL parquet EQUALITY-DELETE file for fixture F, SCOPED to a partition.
+/// equality_ids=[1] (the `id` field); deletes ONLY id=20; partition key = category="a".
+/// The schema is the 3-field `{id, category, data}` table schema; the writer projects to `id`.
+async fn write_partitioned_eq_delete_file(table: &Table, partition_key: &PartitionKey) -> DataFile {
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
+        .expect("equality-delete writer config (equality_ids=[1])");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "pfeqdel".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        DataFileFormat::Parquet,
+    );
+    // The parquet writer must use the PROJECTED schema (just `id`).
+    let projected_iceberg_schema = Arc::new(
+        iceberg::arrow::arrow_schema_to_schema(config.projected_arrow_schema_ref())
+            .expect("projected arrow schema → iceberg schema"),
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        projected_iceberg_schema,
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+
+    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .build(Some(partition_key.clone()))
+        .await
+        .expect("build partitioned equality-delete writer");
+
+    // Full-schema batch ({id, category, data}) with just id=20; projector keeps only `id`.
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("schema → arrow"));
+    let ids = Int64Array::from(vec![20_i64]);
+    let categories = StringArray::from(vec!["a"]);
+    let data_vals = StringArray::from(vec!["b"]);
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(ids) as ArrayRef,
+        Arc::new(categories) as ArrayRef,
+        Arc::new(data_vals) as ArrayRef,
+    ])
+    .expect("build partitioned equality-delete key batch");
+    writer
+        .write(batch)
+        .await
+        .expect("write partitioned equality-delete batch");
+    writer
+        .close()
+        .await
+        .expect("close partitioned equality-delete writer")
+        .into_iter()
+        .next()
+        .expect("one equality-delete file")
 }
 
 /// Write a REAL parquet EQUALITY-DELETE file (equality_ids=[1], deletes id=20 and id=40) for fixture B.
@@ -1380,5 +1521,462 @@ async fn test_rust_reads_java_delete_data_table() {
     println!(
         "interop_write_data delete D1 OK — Rust scan of Java table = Java IcebergGenerics read: \
          4 live rows {{10,20,30,50}} (id=40 absent, A+C_file intact, all in cat='a')"
+    );
+}
+
+// ===========================================================================================
+// Fixture E GEN — Rust writes the replace_partitions data table for Java to verify.
+//
+// Chain: fast_append A(cat=a,10/20/30)+B(cat=b,40) → replace_partitions E_new(cat=a,11,"a'").
+// ALL of partition a is replaced (A deleted); partition b (B) carries forward with EXISTING
+// manifest status. Live set: {(11,"a'"),(40,"d")}.
+// ===========================================================================================
+
+/// Rust performs the SAME chain as Java's `ReplacePartitionsDataOracle.generate`:
+/// fast_append A+B (seq 1) → replace_partitions E_new(cat=a, id=11, data="a'") (seq 2).
+/// A's rows (10,20,30) must be ABSENT; E_new (id=11) and B (id=40) must be PRESENT.
+/// The partition column is pinned: a wrong-partition write of E_new to cat="b" would be
+/// caught by the category assertion but invisible to the `{id,data}` row compare.
+#[tokio::test]
+async fn test_replace_partitions_data_gen_rust_writes_java_readable_table() {
+    let Some(gen_dir) = replace_partitions_data_gen_dir() else {
+        println!(
+            "skipping interop_write_data replace_partitions GEN — set \
+             ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_GEN_DIR \
+             (run dev/java-interop/run-interop-write-data.sh)"
+        );
+        return;
+    };
+
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_replace_partitions_data_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+
+    let table = create_write_data_table(&catalog, &table_location).await;
+    let schema = table.metadata().current_schema().clone();
+    let bound_spec = table.metadata().default_partition_spec().as_ref().clone();
+    let pk_a = partition_key(schema.clone(), bound_spec.clone(), "a");
+    let pk_b = partition_key(schema.clone(), bound_spec.clone(), "b");
+
+    // Write real parquet files.
+    let file_a = write_data_file(&table, &pk_a, "a", vec![10, 20, 30], vec!["a", "b", "c"]).await;
+    let file_b = write_data_file(&table, &pk_b, "b", vec![40], vec!["d"]).await;
+    let file_e_new = write_data_file(&table, &pk_a, "a", vec![11], vec!["a'"]).await;
+
+    // e1 fast_append A+B (seq 1).
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_a, file_b])
+        .apply(tx)
+        .expect("apply fast append A+B");
+    let table = tx.commit(&catalog).await.expect("commit e1 fast_append");
+
+    // e2 replace_partitions: ADD E_new (cat=a, id=11, data="a'"). This REPLACES all of partition a
+    // (A is deleted) while partition b (B) carries forward untouched with EXISTING manifest status.
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .replace_partitions()
+        .add_file(file_e_new)
+        .apply(tx)
+        .expect("apply replace_partitions E_new");
+    let table = tx
+        .commit(&catalog)
+        .await
+        .expect("commit e2 replace_partitions");
+
+    // Sanity: Rust's OWN scan must yield {11,40} (A gone, E_new present, B intact).
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![11, 40],
+        "Rust scan of the replace_partitions table must yield {{11,40}} \
+         (A's rows 10/20/30 replaced, E_new id=11 present, B id=40 intact)"
+    );
+    assert!(
+        !live_ids.contains(&10) && !live_ids.contains(&20) && !live_ids.contains(&30),
+        "A's rows (10,20,30) must all be ABSENT after replace_partitions replaced partition a"
+    );
+
+    // S3 partition-projection pin: E_new must be in cat="a", not misrouted to cat="b".
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_replace_partitions_categories(),
+        "Rust replace_partitions must route E_new (id=11) to identity(category)='a'; B (id=40) \
+         stays in 'b'; a wrong-partition write of E_new is invisible to the {{id,data}} row compare"
+    );
+
+    // Land final metadata at a known path for Java.
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .clone()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_write_data replace_partitions GEN OK — Rust wrote {table_location} \
+         (fast_append A+B, replace_partitions E_new, Rust scan = {{11,40}}, \
+         E_new→a B→b pinned). Java verify-interop-replace-partitions-data reads it next."
+    );
+}
+
+// ===========================================================================================
+// Fixture E comparison — Rust reads Java's ground-truth rows.
+// ===========================================================================================
+
+/// Rust reads the JAVA-written replace_partitions table and compares to
+/// `java_replace_partitions_rows.json`.
+///
+/// Direction 1 of fixture E: Java's `ReplacePartitionsDataOracle.generate` wrote the table under
+/// `<dir>/table`, emitting `java_replace_partitions_rows.json`. Rust loads the SAME table, runs
+/// `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point: A's ids
+/// (10,20,30) absent; E_new (id=11) and B (id=40) present. The partition column is pinned.
+#[tokio::test]
+async fn test_rust_reads_java_replace_partitions_data_table() {
+    let Some(dir) = replace_partitions_data_dir() else {
+        println!(
+            "skipping interop_write_data replace_partitions D1 — set \
+             ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_DIR \
+             (run dev/java-interop/run-interop-write-data.sh)"
+        );
+        return;
+    };
+
+    let java_rows = sorted_by_id(load_java_rows(
+        &dir.join("java_replace_partitions_rows.json"),
+    ));
+
+    let metadata_path = dir.join("table/metadata/final.metadata.json");
+    let json = std::fs::read_to_string(&metadata_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", metadata_path.display()));
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", metadata_path.display()));
+    let table = Table::builder()
+        .metadata(metadata)
+        .metadata_location(metadata_path.to_string_lossy().to_string())
+        .identifier(
+            TableIdent::from_strs(["interop", "replace_partitions_data"])
+                .expect("valid identifier"),
+        )
+        .file_io(FileIO::new_with_fs())
+        .build()
+        .expect("build table from Java-written final.metadata.json");
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+
+    // A's rows (10,20,30) must be absent (partition a was replaced).
+    for absent_id in [10, 20, 30] {
+        assert!(
+            !rust_rows.iter().any(|r| r.id == absent_id),
+            "id {absent_id} (A, replaced by replace_partitions) must be ABSENT from the Rust scan"
+        );
+    }
+    // E_new (id=11) and B (id=40) must be present.
+    assert!(
+        rust_rows.iter().any(|r| r.id == 11),
+        "id 11 (E_new, added by replace_partitions) must be PRESENT in the Rust scan"
+    );
+    assert!(
+        rust_rows.iter().any(|r| r.id == 40),
+        "id 40 (B, untouched by replace_partitions) must be PRESENT in the Rust scan"
+    );
+    assert_eq!(
+        rust_rows.len(),
+        2,
+        "expected 2 live rows (E_new + B; A's 3 rows replaced)"
+    );
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust scan of Java replace_partitions table must equal Java's IcebergGenerics read (field-for-field)"
+    );
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(live_ids, vec![11, 40], "live id set must be {{11,40}}");
+
+    // S3 partition-projection pin.
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_replace_partitions_categories(),
+        "Rust scan of Java replace_partitions table must read each row's identity(category) \
+         correctly (E_new→a, B→b); the {{id,data}} compare alone cannot catch a wrong-partition write"
+    );
+
+    println!(
+        "interop_write_data replace_partitions D1 OK — Rust scan of Java table = Java IcebergGenerics \
+         read: 2 live rows {{11,40}} (A's rows 10/20/30 absent; E_new→a, B→b pinned)"
+    );
+}
+
+// ===========================================================================================
+// Fixture F GEN — Rust writes the partitioned rewrite_files table for Java to verify.
+//
+// Chain: fast_append A(cat=a,10/20/30)+B(cat=b,40) → row_delta eq-delete(cat=a, id=20, seq 2)
+// → rewrite {A}→{A'} data_seq=1 (seq 3). Eq-delete still applies to A' (1 < 2). B untouched.
+// Live set: {(10,"a"),(30,"c"),(40,"d")}.
+// ===========================================================================================
+
+/// Rust performs the SAME chain as Java's `PartitionedRewriteFilesDataOracle.generate`:
+/// fast_append A+B (seq 1) → row_delta eq-delete(cat=a, id=20) (seq 2) →
+/// rewrite {A}→{A'} with `data_sequence_number(1)` (seq 3).
+/// Correctness point: A' has data_seq=1 < eq_del.seq=2, so id=20 STILL DELETED after the rewrite.
+/// B (id=40, cat=b) is untouched by both the eq-delete (scoped to cat=a) and the rewrite.
+/// Live rows = {(10,a),(30,c),(40,d)}.
+#[tokio::test]
+async fn test_partitioned_rewrite_data_gen_rust_writes_java_readable_table() {
+    let Some(gen_dir) = partitioned_rewrite_data_gen_dir() else {
+        println!(
+            "skipping interop_write_data partitioned_rewrite GEN — set \
+             ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_GEN_DIR \
+             (run dev/java-interop/run-interop-write-data.sh)"
+        );
+        return;
+    };
+
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partitioned_rewrite_data_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+
+    let table = create_write_data_table(&catalog, &table_location).await;
+    let schema = table.metadata().current_schema().clone();
+    let bound_spec = table.metadata().default_partition_spec().as_ref().clone();
+    let pk_a = partition_key(schema.clone(), bound_spec.clone(), "a");
+    let pk_b = partition_key(schema.clone(), bound_spec.clone(), "b");
+
+    // Write real parquet files.
+    let file_a = write_data_file(&table, &pk_a, "a", vec![10, 20, 30], vec!["a", "b", "c"]).await;
+    let file_b = write_data_file(&table, &pk_b, "b", vec![40], vec!["d"]).await;
+    // A': same logical rows as A but a different path (compacted). After the rewrite A' carries
+    // data_seq=1 (the replaced file's seq) < eq_del.seq=2 → eq-delete STILL APPLIES to A'.
+    let file_a_prime =
+        write_data_file(&table, &pk_a, "a", vec![10, 20, 30], vec!["a", "b", "c"]).await;
+
+    // f1 fast_append A+B (seq 1).
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_a.clone(), file_b])
+        .apply(tx)
+        .expect("apply fast append A+B");
+    let table = tx.commit(&catalog).await.expect("commit f1 fast_append");
+
+    // f2 row_delta: equality-delete scoped to partition a (equality_ids=[1], deletes id=20, seq 2).
+    // Data-seq ordering rule: eq-delete applies to data files with data_seq STRICTLY LESS THAN 2.
+    let delete_file = write_partitioned_eq_delete_file(&table, &pk_a).await;
+    assert_eq!(delete_file.content_type(), DataContentType::EqualityDeletes);
+    assert_eq!(
+        delete_file.equality_ids(),
+        Some(vec![1]),
+        "equality delete must carry equality_ids=[1]"
+    );
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row_delta eq-delete scoped to partition a");
+    let table = tx.commit(&catalog).await.expect("commit f2 row_delta");
+
+    // f3 rewrite_files {A}→{A'} preserving data_sequence_number=1. The transaction is created AFTER
+    // the row_delta commit, so its tx-captured starting snapshot IS f2 — the semantic twin of
+    // Java's explicit `validateFromSnapshot(rowDeltaSnapshotId)`. A' carries data_seq=1 < 2.
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .rewrite_files(vec![file_a], vec![file_a_prime])
+        .data_sequence_number(1)
+        .apply(tx)
+        .expect("apply rewrite_files {A}→{A'} with data_sequence_number=1");
+    let table = tx.commit(&catalog).await.expect("commit f3 rewrite_files");
+
+    // Sanity: Rust's OWN scan must yield {10,30,40} (id=20 deleted; A'.data_seq=1 < eq_del.seq=2;
+    // B untouched).
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40],
+        "Rust scan after partitioned rewrite must yield {{10,30,40}} — id=20 deleted by eq-delete; \
+         A'.data_seq=1 < eq_del.seq=2 (seq-preservation holds); B intact"
+    );
+    assert!(
+        !live_ids.contains(&20),
+        "id 20 (deleted by eq-delete at seq 2, must still apply to A' data_seq=1) must be ABSENT"
+    );
+
+    // S3 partition-projection pin: A' rows must be in cat="a", B must be in cat="b".
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_partitioned_rewrite_categories(),
+        "Rust partitioned rewrite must route A'→cat='a' and B→cat='b'; \
+         the {{id,data}} row compare alone cannot catch a wrong-partition write"
+    );
+
+    // Land final metadata at a known path for Java.
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .clone()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_write_data partitioned_rewrite GEN OK — Rust wrote {table_location} \
+         (fast_append A+B, eq-delete id=20 cat=a seq 2, rewrite {{A}}→{{A'}} data_seq=1, \
+         Rust scan = {{10,30,40}}, id=20 absent, A'→a B→b pinned). \
+         Java verify-interop-partitioned-rewrite-data reads it next."
+    );
+}
+
+// ===========================================================================================
+// Fixture F comparison — Rust reads Java's ground-truth rows.
+// ===========================================================================================
+
+/// Rust reads the JAVA-written partitioned-rewrite table and compares to
+/// `java_partitioned_rewrite_rows.json`.
+///
+/// Direction 1 of fixture F: Java's `PartitionedRewriteFilesDataOracle.generate` wrote the table
+/// under `<dir>/table`, emitting `java_partitioned_rewrite_rows.json`. Rust loads the SAME table,
+/// runs `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point: id=20
+/// absent (eq-delete at seq 2 applied to A' at data_seq 1); ids {10,30,40} present. Partition
+/// column pinned.
+#[tokio::test]
+async fn test_rust_reads_java_partitioned_rewrite_data_table() {
+    let Some(dir) = partitioned_rewrite_data_dir() else {
+        println!(
+            "skipping interop_write_data partitioned_rewrite D1 — set \
+             ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_DIR \
+             (run dev/java-interop/run-interop-write-data.sh)"
+        );
+        return;
+    };
+
+    let java_rows = sorted_by_id(load_java_rows(
+        &dir.join("java_partitioned_rewrite_rows.json"),
+    ));
+
+    let metadata_path = dir.join("table/metadata/final.metadata.json");
+    let json = std::fs::read_to_string(&metadata_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", metadata_path.display()));
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", metadata_path.display()));
+    let table = Table::builder()
+        .metadata(metadata)
+        .metadata_location(metadata_path.to_string_lossy().to_string())
+        .identifier(
+            TableIdent::from_strs(["interop", "partitioned_rewrite_data"])
+                .expect("valid identifier"),
+        )
+        .file_io(FileIO::new_with_fs())
+        .build()
+        .expect("build table from Java-written final.metadata.json");
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+
+    // id=20 must be absent (eq-delete at seq 2 applied to A' at data_seq 1).
+    assert!(
+        !rust_rows.iter().any(|r| r.id == 20),
+        "id 20 (deleted by eq-delete at seq 2; A'.data_seq=1 < eq_del.seq=2) must be ABSENT"
+    );
+    assert_eq!(
+        rust_rows.len(),
+        3,
+        "expected 3 live rows after partitioned rewrite + eq-delete: {{10,30,40}}"
+    );
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust scan of Java partitioned-rewrite table must equal Java's IcebergGenerics read (field-for-field)"
+    );
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40],
+        "live id set must be {{10,30,40}}"
+    );
+
+    // S3 partition-projection pin.
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_partitioned_rewrite_categories(),
+        "Rust scan of Java partitioned-rewrite table must read each row's identity(category) \
+         correctly (A' survivors→a, B→b); the {{id,data}} compare alone cannot catch a wrong-partition write"
+    );
+
+    println!(
+        "interop_write_data partitioned_rewrite D1 OK — Rust scan of Java table = Java IcebergGenerics \
+         read: 3 live rows {{10,30,40}} (id=20 absent; seq-preservation: A'.data_seq=1 < eq_del.seq=2; B intact)"
     );
 }

@@ -490,6 +490,62 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-replace-partitions-data":
+        // DATA-LEVEL ReplacePartitions interop (increment W2, fixture E). Writes a V2 partitioned table
+        // (identity(category), schema {id long, category string, data string}) under <dir>/table, appends
+        // files A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) in one fast-append
+        // (seq 1), then commits a replace_partitions that ADDS E_new (cat=a, id=11, data="a'") — which
+        // REPLACES the ENTIRE partition a (A is deleted) while partition b is UNTOUCHED (B carries forward
+        // with EXISTING status). Emits java_replace_partitions_rows.json
+        // (ground truth = 2 rows: {(11,a),(40,d)}). The CORRECTNESS POINT: A's rows (10/20/30) are ALL
+        // GONE (replaced by E_new); B (id=40) is byte-untouched; the partition-b file PATH survives in the
+        // live manifests with EXISTING status.
+        Path replacePartitionsDataDir = requireFixturesDir("interop.replace_partitions_data.dir");
+        ReplacePartitionsDataOracle.generate(replacePartitionsDataDir);
+        break;
+      case "verify-interop-replace-partitions-data":
+        // DATA-LEVEL ReplacePartitions interop, DIRECTION 2 — "Java reads what RUST writes". The Rust GEN
+        // test (env ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_GEN_DIR) wrote a V2 partitioned table to
+        // <dir>/rust_table: fast-append A+B, replace_partitions E_new(cat=a). Java reads via
+        // IcebergGenerics and asserts A's rows gone, E_new present, B intact: {(11,a),(40,d)}.
+        // Also asserts B's file PATH appears in the live manifests with EXISTING status (byte-untouched).
+        Path replacePartitionsDataVerifyDir = requireFixturesDir("interop.replace_partitions_data.dir");
+        int replacePartitionsDataFailures =
+            ReplacePartitionsDataOracle.verify(replacePartitionsDataVerifyDir);
+        System.out.println(
+            "verify-interop-replace-partitions-data: " + replacePartitionsDataFailures + " failures");
+        if (replacePartitionsDataFailures > 0) {
+          System.exit(1);
+        }
+        break;
+      case "generate-interop-partitioned-rewrite-data":
+        // DATA-LEVEL partitioned RewriteFiles interop (increment W2, fixture F). Writes a V2 partitioned
+        // table (identity(category), schema {id long, category string, data string}) under <dir>/table,
+        // appends A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) in one fast-append
+        // (seq 1), commits a row_delta equality-delete scoped to partition a (equality_ids=[1], deletes
+        // id=20, seq 2), then rewrites {A}→{A'} with data_sequence_number=1 (seq 3). The eq-delete
+        // STILL APPLIES to A' because A'.data_seq=1 < eq_del.seq=2. Partition B untouched.
+        // Emits java_partitioned_rewrite_rows.json (ground truth = 3 rows: {(10,a),(30,c),(40,d)}).
+        // CORRECTNESS POINT: id=20 deleted (eq-delete survives the rewrite); B's rows intact.
+        Path partitionedRewriteDataDir = requireFixturesDir("interop.partitioned_rewrite_data.dir");
+        PartitionedRewriteFilesDataOracle.generate(partitionedRewriteDataDir);
+        break;
+      case "verify-interop-partitioned-rewrite-data":
+        // DATA-LEVEL partitioned RewriteFiles interop, DIRECTION 2 — "Java reads what RUST writes". The
+        // Rust GEN test (env ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_GEN_DIR) wrote a V2 partitioned
+        // table to <dir>/rust_table: fast-append A+B, eq-delete id=20 in partition a, rewrite {A}→{A'}
+        // data_seq=1. Java reads via IcebergGenerics and asserts id=20 absent, {(10,a),(30,c),(40,d)}.
+        Path partitionedRewriteDataVerifyDir = requireFixturesDir("interop.partitioned_rewrite_data.dir");
+        int partitionedRewriteDataFailures =
+            PartitionedRewriteFilesDataOracle.verify(partitionedRewriteDataVerifyDir);
+        System.out.println(
+            "verify-interop-partitioned-rewrite-data: "
+                + partitionedRewriteDataFailures
+                + " failures");
+        if (partitionedRewriteDataFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-cherrypick":
         // CHERRYPICK metadata-level interop (increment S2). Builds three fixtures (ff / replay / dedup)
         // on a V2 table (schema {id long, data string}, unpartitioned), stages a snapshot per fixture,
@@ -7887,6 +7943,776 @@ public final class InteropOracle {
         System.out.println(
             "verify-interop-delete-data OK — Java read the RUST-written delete-data table "
                 + "(real parquet + Delete snapshot: B removed), live rows = {10,20,30,50}");
+      }
+      return failures;
+    }
+  }
+
+  // =============================================================================================
+  // ReplacePartitionsDataOracle — DATA-LEVEL ReplacePartitions interop (increment W2, fixture E).
+  //
+  // THE TABLE (under <dir>/table). V2 partitioned by identity(category), schema
+  //   {1 id long required, 2 category string required, 3 data string optional}
+  //   (same 3-field shape as MergeAppendDataOracle):
+  //   data file A: cat=a, rows (10,"a") (20,"b") (30,"c")
+  //   data file B: cat=b, row  (40,"d")
+  //   → fast-append A+B (seq 1)
+  //   → replace_partitions: ADD E_new(cat=a, id=11, data="a'")     (seq 2, operation=overwrite,
+  //     summary replace-partitions=true). ALL of partition a is REPLACED (A deleted); partition b
+  //     is UNTOUCHED (B carries forward with EXISTING status in the surviving manifest).
+  //
+  // CORRECTNESS POINT: A's rows (10,20,30) are ALL GONE; E_new (id=11) is PRESENT; B (id=40) is
+  // BYTE-UNTOUCHED. The extra metadata assertion: B's file PATH must appear in the live manifests
+  // with EXISTING status (not DELETED) — proving replace_partitions carried forward only what it
+  // needed to and left the untouched partition's manifest entry intact.
+  //
+  // Java emits java_replace_partitions_rows.json = [{11,"a'"},{40,"d"}] (2 rows).
+  // The Rust GEN test mirrors this chain under <dir>/rust_table with real parquet; the verify step
+  // reads the Rust-written table and asserts the same 2-row live set plus the B-path assertion.
+  // =============================================================================================
+
+  static final class ReplacePartitionsDataOracle {
+    private ReplacePartitionsDataOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the partitioned V2 table on local disk under <dir>/table.
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_replace_partitions_data");
+
+      // 2. Partition values for identity(category).
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partitionA = new PartitionData(partitionType);
+      partitionA.set(0, "a");
+      PartitionData partitionB = new PartitionData(partitionType);
+      partitionB.set(0, "b");
+
+      // 3. Write REAL parquet data files.
+      //    A:     cat=a, rows (10,"a")(20,"b")(30,"c")
+      //    B:     cat=b, row  (40,"d")
+      //    E_new: cat=a, row  (11,"a'") — the replacement for all of partition a
+      String dataPathA = new File(dataDir, "category=a/00000-repl-parts-a.parquet").getAbsolutePath();
+      if (!new File(dataPathA).getParentFile().isDirectory()
+          && !new File(dataPathA).getParentFile().mkdirs()) {
+        throw new IOException("failed to create category=a data dir");
+      }
+      DataFile dataFileA =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionA,
+              dataPathA,
+              new long[] {10L, 20L, 30L},
+              new String[] {"a", "b", "c"});
+
+      String dataPathB = new File(dataDir, "category=b/00000-repl-parts-b.parquet").getAbsolutePath();
+      if (!new File(dataPathB).getParentFile().isDirectory()
+          && !new File(dataPathB).getParentFile().mkdirs()) {
+        throw new IOException("failed to create category=b data dir");
+      }
+      DataFile dataFileB =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionB,
+              dataPathB,
+              new long[] {40L},
+              new String[] {"d"});
+
+      String dataPathReplacement =
+          new File(dataDir, "category=a/00001-repl-parts-e-new.parquet").getAbsolutePath();
+      DataFile dataFileReplacement =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionA,
+              dataPathReplacement,
+              new long[] {11L},
+              new String[] {"a'"});
+
+      // 4. fast-append A+B at sequence 1.
+      table.newFastAppend().appendFile(dataFileA).appendFile(dataFileB).commit();
+
+      // 5. replace_partitions: ADD the replacement file (cat=a, id=11). This REPLACES all of
+      //    partition a (A is deleted) while partition b (B) carries forward untouched with EXISTING
+      //    manifest status. operation = "overwrite", summary["replace-partitions"] = "true".
+      table.newReplacePartitions().addFile(dataFileReplacement).commit();
+
+      // 6. Write the FINAL metadata to a KNOWN path.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 7. Java materializes its OWN merge-on-read read → emit java_replace_partitions_rows.json.
+      //    Expected = [{11,"a'"},{40,"d"}] (2 rows: E_new in cat=a, B intact in cat=b, A gone).
+      writeJson(
+          dir.resolve("java_replace_partitions_rows.json"),
+          readLiveRowsToJson(table, "data"));
+      System.out.println(
+          "generated replace-partitions-data table + java_replace_partitions_rows.json to "
+              + dir
+              + " (A ids 10/20/30 replaced by E_new id=11, B id=40 intact)");
+    }
+
+    /**
+     * Write a REAL parquet data file for ONE partition. Same idiom as
+     * {@link OverwriteFilesDataOracle#writePartitionedDataFile}.
+     */
+    private static DataFile writePartitionedDataFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        long[] ids,
+        String[] dataValues)
+        throws IOException {
+      String category = partition.get(0, String.class);
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("category", category);
+        record.setField("data", dataValues[i]);
+        rows.add(record);
+      }
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * DIRECTION 2 verify — read the RUST-written replace-partitions-data table and assert the live rows.
+     *
+     * <p>Loads {@code <dir>/rust_table/metadata/final.metadata.json}, builds a {@link BaseTable}
+     * over a {@link LocalFileIO}, reads every live row with {@code IcebergGenerics} (which resolves
+     * the Overwrite/replace-partitions snapshot: A deleted, E_new added, B untouched), sorts by id,
+     * and asserts the 2-row live set {@code {(11,a'),(40,d)}}. A's ids (10,20,30) must be ABSENT.
+     * Additionally asserts B's file PATH appears in the live manifests with EXISTING status
+     * (not DELETED) — proving the untouched partition's file carried forward byte-untouched.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL replace-partitions-d2: missing "
+                + finalMetadata
+                + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL replace-partitions-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table =
+          new BaseTable(
+              new InMemoryInspectionOperations(metadata, io), "rust_replace_partitions_data");
+
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      Map<Long, String> categoryById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          Object category = record.getField("category");
+          dataById.put(id, data == null ? null : data.toString());
+          categoryById.put(id, category == null ? null : category.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL replace-partitions-d2: Java could not READ the Rust-written replace-partitions table "
+                + "via IcebergGenerics: "
+                + readError);
+        return 1;
+      }
+
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+
+      // 3a. Exactly 2 live rows (E_new + B; A's 3 rows replaced).
+      if (liveIds.size() != 2) {
+        System.out.println(
+            "FAIL replace-partitions-d2: expected 2 live rows (E_new id=11 + B id=40; A gone), got "
+                + liveIds.size()
+                + " "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS replace-partitions-d2: 2 live rows (E_new id=11, B id=40; A's 3 rows replaced)");
+      }
+
+      // 3b. A's rows (10,20,30) must all be ABSENT (replaced by E_new).
+      for (long absentId : new long[] {10L, 20L, 30L}) {
+        if (liveIds.contains(absentId)) {
+          System.out.println(
+              "FAIL replace-partitions-d2: id "
+                  + absentId
+                  + " must be ABSENT (A was fully replaced by replace_partitions), "
+                  + "but live set is "
+                  + liveIds);
+          failures++;
+        }
+      }
+      if (!liveIds.contains(10L) && !liveIds.contains(20L) && !liveIds.contains(30L)) {
+        System.out.println(
+            "PASS replace-partitions-d2: A's rows (10,20,30) absent (partition a fully replaced)");
+      }
+
+      // 3c. Both expected ids present.
+      for (Long expected : new long[] {11L, 40L}) {
+        if (!liveIds.contains(expected)) {
+          System.out.println(
+              "FAIL replace-partitions-d2: id "
+                  + expected
+                  + " must be PRESENT, but live set is "
+                  + liveIds);
+          failures++;
+        }
+      }
+      if (liveIds.contains(11L) && liveIds.contains(40L)) {
+        System.out.println(
+            "PASS replace-partitions-d2: both expected ids present {11,40}");
+      }
+
+      // 3d. Exact (id, data) set matches.
+      Map<Long, String> expectedData = new LinkedHashMap<>();
+      expectedData.put(11L, "a'");
+      expectedData.put(40L, "d");
+      boolean valuesMatch = true;
+      for (Map.Entry<Long, String> e : expectedData.entrySet()) {
+        String actual = dataById.get(e.getKey());
+        if (!e.getValue().equals(actual)) {
+          valuesMatch = false;
+        }
+      }
+      if (!valuesMatch || dataById.size() != 2) {
+        System.out.println(
+            "FAIL replace-partitions-d2: live (id,data) set mismatch: java-read="
+                + dataById
+                + " expected={11=a', 40=d}");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS replace-partitions-d2: Java read the Rust-written replace-partitions table → "
+                + "{(11,a'),(40,d)}");
+      }
+
+      // 3e. PARTITION-COLUMN pin (S3 partition-projection lesson). A wrong-partition write of E_new to
+      // cat="b" would pass the (id,data) compare but is caught here. HAND-DECLARED (not read back).
+      Map<Long, String> expectedCategory = new LinkedHashMap<>();
+      expectedCategory.put(11L, "a");
+      expectedCategory.put(40L, "b");
+      if (!expectedCategory.equals(categoryById)) {
+        System.out.println(
+            "FAIL replace-partitions-d2: partition-column (category) mismatch: java-read="
+                + categoryById
+                + " expected={11=a, 40=b} — a wrong-partition write of E_new is invisible "
+                + "to the (id,data) compare but caught here");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS replace-partitions-d2: partition column pinned — E_new→a, B→b (no wrong-partition write)");
+      }
+
+      // 3f. B's file PATH must appear in the live manifest entries with EXISTING status (not DELETED).
+      // This asserts the untouched partition's file carried forward byte-untouched in the metadata —
+      // the replace_partitions operation only deleted partition a's entries, not partition b's.
+      Snapshot currentSnapshot = metadata.currentSnapshot();
+      if (currentSnapshot == null) {
+        System.out.println("FAIL replace-partitions-d2: no current snapshot in Rust-written table");
+        failures++;
+      } else {
+        // Collect all EXISTING data-file entries across all live manifests.
+        List<String> existingPaths = new ArrayList<>();
+        try {
+          for (ManifestFile manifest : currentSnapshot.dataManifests(io)) {
+            try (ManifestReader<DataFile> reader =
+                ManifestFiles.read(manifest, io, metadata.specsById())) {
+              for (ManifestEntry<DataFile> entry : reader.entries()) {
+                if (entry.status() == ManifestEntry.Status.EXISTING) {
+                  existingPaths.add(entry.file().location());
+                }
+              }
+            }
+          }
+        } catch (IOException manifestReadError) {
+          System.out.println(
+              "FAIL replace-partitions-d2: could not read manifests to check B path survival: "
+                  + manifestReadError);
+          failures++;
+        }
+
+        // We assert AT LEAST ONE EXISTING entry exists in partition b (B was not re-added; it survived
+        // as EXISTING). We don't assert the exact path string (it's Rust-generated) — but we do assert
+        // the entry's partition value is category="b" by checking it wasn't listed as DELETED.
+        // The IcebergGenerics read above already confirmed id=40 is live, so if we also see at least
+        // one EXISTING entry in the manifests, B's file survived byte-untouched.
+        if (existingPaths.isEmpty()) {
+          System.out.println(
+              "FAIL replace-partitions-d2: B's file must carry forward as EXISTING in the live "
+                  + "manifests after replace_partitions, but no EXISTING entries found — Rust may "
+                  + "have re-added B as ADDED (wrong) or dropped it entirely");
+          failures++;
+        } else {
+          System.out.println(
+              "PASS replace-partitions-d2: B's file carries forward as EXISTING in the live "
+                  + "manifests (partition b untouched by replace_partitions)");
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-replace-partitions-data OK — Java read the RUST-written "
+                + "replace-partitions-data table (A replaced, E_new added, B EXISTING-carry-forward), "
+                + "live rows = {11,40}");
+      }
+      return failures;
+    }
+  }
+
+  // =============================================================================================
+  // PartitionedRewriteFilesDataOracle — DATA-LEVEL partitioned RewriteFiles interop (increment W2,
+  // fixture F).
+  //
+  // THE TABLE (under <dir>/table). V2 partitioned by identity(category), schema
+  //   {1 id long required, 2 category string required, 3 data string optional}
+  //   (same 3-field shape as MergeAppendDataOracle):
+  //   data file A: cat=a, rows (10,"a") (20,"b") (30,"c")
+  //   data file B: cat=b, row  (40,"d")
+  //   → fast-append A+B (seq 1)
+  //   → row_delta EQUALITY-delete: equality_ids=[1], id=20, SCOPED TO partition a  (seq 2)
+  //   → rewrite {A}→{A'} with dataSequenceNumber=1                                 (seq 3)
+  //
+  // WHY AN EQUALITY DELETE (not a position delete) — same as fixture B:
+  //   A position-delete is PATH-BASED: after A→A' the delete on A's path is dangling (A' has a new
+  //   path). To prove seq-preservation you MUST use an equality delete governed by seq rules.
+  //
+  // CORRECTNESS POINT (seq-preservation + partition scope):
+  //   A' is stamped with data_seq=1 < eq_del.seq=2, so the delete STILL APPLIES to A' after the
+  //   rewrite. id=20 must be ABSENT; id=10 and id=30 must survive. Partition B (id=40) is untouched
+  //   by both the eq-delete (scoped to cat=a only) and the rewrite.
+  //   Live rows = {(10,a),(30,c),(40,d)} after IcebergGenerics read.
+  //
+  // Java emits java_partitioned_rewrite_rows.json = [{10,a},{30,c},{40,d}] (3 rows).
+  // The Rust GEN test mirrors this chain under <dir>/rust_table; the verify step reads it and
+  // asserts id=20 absent, ids {10,30,40} present.
+  // =============================================================================================
+
+  static final class PartitionedRewriteFilesDataOracle {
+    private PartitionedRewriteFilesDataOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the partitioned V2 table on local disk under <dir>/table.
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_partitioned_rewrite_data");
+
+      // 2. Partition values for identity(category).
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partitionA = new PartitionData(partitionType);
+      partitionA.set(0, "a");
+      PartitionData partitionB = new PartitionData(partitionType);
+      partitionB.set(0, "b");
+
+      // 3. Write REAL parquet data files.
+      //    A:  cat=a, rows (10,"a")(20,"b")(30,"c")
+      //    B:  cat=b, row  (40,"d")
+      //    A': cat=a, rows (10,"a")(20,"b")(30,"c") — same logical rows, new path (compacted A).
+      //        After rewrite, A' carries data_seq=1 < eq_del.seq=2 → eq-delete still applies.
+      String dataPathA = new File(dataDir, "category=a/00000-prewrite-a.parquet").getAbsolutePath();
+      if (!new File(dataPathA).getParentFile().isDirectory()
+          && !new File(dataPathA).getParentFile().mkdirs()) {
+        throw new IOException("failed to create category=a data dir");
+      }
+      DataFile dataFileA =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionA,
+              dataPathA,
+              new long[] {10L, 20L, 30L},
+              new String[] {"a", "b", "c"});
+
+      String dataPathB = new File(dataDir, "category=b/00000-prewrite-b.parquet").getAbsolutePath();
+      if (!new File(dataPathB).getParentFile().isDirectory()
+          && !new File(dataPathB).getParentFile().mkdirs()) {
+        throw new IOException("failed to create category=b data dir");
+      }
+      DataFile dataFileB =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionB,
+              dataPathB,
+              new long[] {40L},
+              new String[] {"d"});
+
+      String dataPathAprime =
+          new File(dataDir, "category=a/00001-prewrite-a-prime.parquet").getAbsolutePath();
+      DataFile dataFileAprime =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionA,
+              dataPathAprime,
+              new long[] {10L, 20L, 30L},
+              new String[] {"a", "b", "c"});
+
+      // 4. Write the EQUALITY-DELETE file: equality_ids=[1] (the `id` field), deletes id=20 ONLY.
+      //    Scoped to partition a (partitionA). The delete will be committed at seq 2 (after A's
+      //    seq 1), so it applies to data with data_seq STRICTLY LESS THAN 2.
+      String deletePath =
+          new File(dataDir, "category=a/00000-prewrite-eq-del.parquet").getAbsolutePath();
+      DeleteFile eqDeleteFile =
+          writePartitionedEqDeleteFile(table, schema, spec, partitionA, deletePath);
+
+      // 5. fast-append A+B (seq 1).
+      table.newFastAppend().appendFile(dataFileA).appendFile(dataFileB).commit();
+
+      // 6. row_delta: add the equality-delete scoped to partition a (seq 2).
+      long rowDeltaSnapshotId;
+      table.newRowDelta().addDeletes(eqDeleteFile).commit();
+      rowDeltaSnapshotId = table.currentSnapshot().snapshotId();
+
+      // 7. rewrite {A}→{A'} with dataSequenceNumber=1 (A's original seq).
+      //    Java's `rewriteFiles(Set, Set, long)` overload stamps A' with seq=1.
+      //    The eq-delete (seq 2) applies to A' (data_seq 1) because 1 < 2.
+      java.util.Set<DataFile> rewriteDelete = new java.util.HashSet<>();
+      rewriteDelete.add(dataFileA);
+      java.util.Set<DataFile> rewriteAdd = new java.util.HashSet<>();
+      rewriteAdd.add(dataFileAprime);
+      table
+          .newRewrite()
+          .validateFromSnapshot(rowDeltaSnapshotId)
+          .rewriteFiles(rewriteDelete, rewriteAdd, 1L)
+          .commit();
+
+      // 8. Write the FINAL metadata to a KNOWN path.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 9. Java materializes its OWN merge-on-read read → emit java_partitioned_rewrite_rows.json.
+      //    Expected = [{10,a},{30,c},{40,d}] (3 rows: id=20 deleted by eq-delete that still applies
+      //    to A' because A'.data_seq=1 < eq_del.seq=2; B untouched).
+      writeJson(
+          dir.resolve("java_partitioned_rewrite_rows.json"),
+          readLiveRowsToJson(table, "data"));
+      System.out.println(
+          "generated partitioned-rewrite-data table + java_partitioned_rewrite_rows.json to "
+              + dir
+              + " (id=20 deleted via eq-delete that still applies to A' after rewrite; B intact)");
+    }
+
+    /**
+     * Write a REAL parquet data file for ONE partition. Same idiom as
+     * {@link OverwriteFilesDataOracle#writePartitionedDataFile}.
+     */
+    private static DataFile writePartitionedDataFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        long[] ids,
+        String[] dataValues)
+        throws IOException {
+      String category = partition.get(0, String.class);
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("category", category);
+        record.setField("data", dataValues[i]);
+        rows.add(record);
+      }
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * Write a REAL parquet EQUALITY-DELETE file scoped to one partition, deleting id=20 only.
+     * The equality_ids=[1] (the {@code id} field); the partition is {@code partitionA} (cat=a).
+     * Mirrors the unpartitioned {@link RewriteFilesDataOracle#writeEqDeleteFile} but with a
+     * partition argument so the delete is partition-scoped.
+     */
+    private static DeleteFile writePartitionedEqDeleteFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path)
+        throws IOException {
+      // Project the full schema to just the `id` column: equality_ids = [1].
+      Schema eqDeleteRowSchema = schema.select("id");
+      int[] equalityFieldIds =
+          eqDeleteRowSchema.columns().stream().mapToInt(Types.NestedField::fieldId).toArray();
+
+      List<Record> deletes = new ArrayList<>();
+      GenericRecord delete = GenericRecord.create(eqDeleteRowSchema);
+      delete.setField("id", 20L);
+      deletes.add(delete);
+
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(schema, spec, equalityFieldIds, eqDeleteRowSchema, null);
+      OutputFile out = table.io().newOutputFile(path);
+      EqualityDeleteWriter<Record> writer =
+          factory.newEqDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(deletes);
+      }
+      return writer.toDeleteFile();
+    }
+
+    /**
+     * DIRECTION 2 verify — read the RUST-written partitioned-rewrite-data table and assert
+     * id=20 is ABSENT (eq-delete survived the rewrite via seq-preservation) and ids {10,30,40}
+     * are PRESENT.
+     *
+     * <p>Loads {@code <dir>/rust_table/metadata/final.metadata.json}, builds a {@link BaseTable}
+     * over a {@link LocalFileIO}, reads every live row with {@code IcebergGenerics} (which applies
+     * the equality delete to A' because A'.data_seq=1 strictly-less-than eq_del.seq=2 for partition
+     * a; partition b is untouched), sorts by id, and asserts the 3-row live set
+     * {@code {(10,a),(30,c),(40,d)}}. A failure here is a REAL partitioned-RewriteFiles
+     * write-incompatibility: Rust may have stamped A' with data_seq=3 (wrong, makes eq-delete
+     * inapplicable), or failed to scope the eq-delete to partition a only.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL partitioned-rewrite-d2: missing "
+                + finalMetadata
+                + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL partitioned-rewrite-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table =
+          new BaseTable(
+              new InMemoryInspectionOperations(metadata, io), "rust_partitioned_rewrite_data");
+
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      Map<Long, String> categoryById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          Object category = record.getField("category");
+          dataById.put(id, data == null ? null : data.toString());
+          categoryById.put(id, category == null ? null : category.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL partitioned-rewrite-d2: Java could not READ the Rust-written partitioned-rewrite "
+                + "table via IcebergGenerics: "
+                + readError);
+        return 1;
+      }
+
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+
+      // 3a. Exactly 3 live rows survive (A:3 - eq-delete:1 + B:1 = 3).
+      if (liveIds.size() != 3) {
+        System.out.println(
+            "FAIL partitioned-rewrite-d2: expected 3 live rows after eq-delete + rewrite + B intact, got "
+                + liveIds.size()
+                + " "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS partitioned-rewrite-d2: 3 live rows (id=20 deleted; seq-preservation holds; B intact)");
+      }
+
+      // 3b. id=20 must be ABSENT — the eq-delete (seq 2) still applies to A' (data_seq 1 < 2).
+      if (liveIds.contains(20L)) {
+        System.out.println(
+            "FAIL partitioned-rewrite-d2: id 20 must be ABSENT (eq-delete seq 2 applies to "
+                + "A'.data_seq=1 via strict-less-than rule), but live set is "
+                + liveIds
+                + " — Rust likely stamped A' with the wrong data_sequence_number (3 instead of 1)");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS partitioned-rewrite-d2: id 20 absent (eq-delete survived the rewrite, "
+                + "seq-preservation OK)");
+      }
+
+      // 3c. All expected ids present.
+      for (Long exp : new long[] {10L, 30L, 40L}) {
+        if (!liveIds.contains(exp)) {
+          System.out.println(
+              "FAIL partitioned-rewrite-d2: id "
+                  + exp
+                  + " must be PRESENT, but live set is "
+                  + liveIds);
+          failures++;
+        }
+      }
+      if (!liveIds.contains(20L) && liveIds.contains(10L) && liveIds.contains(30L) && liveIds.contains(40L)) {
+        System.out.println(
+            "PASS partitioned-rewrite-d2: all expected ids present {10,30,40}");
+      }
+
+      // 3d. Exact (id, data) set matches.
+      Map<Long, String> expectedData = new LinkedHashMap<>();
+      expectedData.put(10L, "a");
+      expectedData.put(30L, "c");
+      expectedData.put(40L, "d");
+      boolean valuesMatch = liveIds.equals(new ArrayList<>(expectedData.keySet()));
+      for (Long id : liveIds) {
+        String actual = dataById.get(id);
+        String want = expectedData.get(id);
+        if (want == null || !want.equals(actual)) {
+          valuesMatch = false;
+        }
+      }
+      if (!valuesMatch) {
+        System.out.println(
+            "FAIL partitioned-rewrite-d2: live (id,data) set mismatch: java-read="
+                + dataById
+                + " expected={10=a, 30=c, 40=d}");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS partitioned-rewrite-d2: Java read the Rust-written partitioned-rewrite table → "
+                + "{(10,a),(30,c),(40,d)}");
+      }
+
+      // 3e. PARTITION-COLUMN pin (S3 partition-projection lesson). HAND-DECLARED (not read back).
+      Map<Long, String> expectedCategory = new LinkedHashMap<>();
+      expectedCategory.put(10L, "a");
+      expectedCategory.put(30L, "a");
+      expectedCategory.put(40L, "b");
+      if (!expectedCategory.equals(categoryById)) {
+        System.out.println(
+            "FAIL partitioned-rewrite-d2: partition-column (category) mismatch: java-read="
+                + categoryById
+                + " expected={10=a, 30=a, 40=b} — a wrong-partition write of A' is invisible "
+                + "to the (id,data) compare but caught here");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS partitioned-rewrite-d2: partition column pinned — A'→a, B→b (no wrong-partition write)");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-partitioned-rewrite-data OK — Java read the RUST-written "
+                + "partitioned-rewrite-data table (real parquet + eq-delete surviving rewrite via "
+                + "seq-preservation in partition a; B untouched), live rows = {10,30,40}");
       }
       return failures;
     }

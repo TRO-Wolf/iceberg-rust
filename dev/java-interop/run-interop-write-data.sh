@@ -17,9 +17,9 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# DATA-LEVEL write-action interop harness (sprint increments S1 + W1) —
-# Four fixtures proven at the DATA level: REAL parquet is written and Java's IcebergGenerics
-# production scan reads it back.  Four fixtures, twelve steps:
+# DATA-LEVEL write-action interop harness (sprint increments S1 + W1 + W2) —
+# Six fixtures proven at the DATA level: REAL parquet is written and Java's IcebergGenerics
+# production scan reads it back.  Six fixtures, eighteen steps:
 #
 #   Fixture A (merge_append):  fast-append A(cat=a,10/20/30)+B(cat=b,40), set
 #     min-count-to-merge=2, merge-append G(cat=a,60) — merge fires into ONE manifest; all 5 rows
@@ -34,6 +34,14 @@
 #
 #   Fixture D (delete_data):   fast-append A(cat=a,10/20/30)+B(cat=b,40)+C_file(cat=a,50,e),
 #     delete_files {B}.  Live set: {(10,a),(20,b),(30,c),(50,e)}.
+#
+#   Fixture E (replace_partitions): fast-append A(cat=a,10/20/30)+B(cat=b,40), replace_partitions
+#     E_new(cat=a,11,"a'") — ALL of partition a replaced; B byte-untouched (EXISTING status).
+#     Live set: {(11,a'),(40,d)}.
+#
+#   Fixture F (partitioned_rewrite): fast-append A(cat=a,10/20/30)+B(cat=b,40), eq-delete
+#     id=20 (cat=a, seq 2), rewrite A→A' data_seq=1 — delete still applies to A'; B untouched.
+#     Live set: {(10,a),(30,c),(40,d)}.
 #
 # Per fixture, THREE comparisons:
 #
@@ -64,6 +72,8 @@ MERGE_DIR="${TMP}/merge_append_data"
 REWRITE_DIR="${TMP}/rewrite_data"
 OVERWRITE_DIR="${TMP}/overwrite_data"
 DELETE_DATA_DIR="${TMP}/delete_data"
+REPLACE_PARTS_DIR="${TMP}/replace_partitions_data"
+PART_REWRITE_DIR="${TMP}/partitioned_rewrite_data"
 
 MVN="/opt/maven/bin/mvn"
 export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
@@ -73,11 +83,12 @@ run_oracle() {
   (cd "${SCRIPT_DIR}" && "${MVN}" -o -q compile exec:java "$@" 2>&1)
 }
 
-echo "==> [1/12] Reset the temp dir: ${TMP}"
+echo "==> [1/18] Reset the temp dir: ${TMP}"
 rm -rf "${TMP}"
-mkdir -p "${MERGE_DIR}" "${REWRITE_DIR}" "${OVERWRITE_DIR}" "${DELETE_DATA_DIR}"
+mkdir -p "${MERGE_DIR}" "${REWRITE_DIR}" "${OVERWRITE_DIR}" "${DELETE_DATA_DIR}" \
+         "${REPLACE_PARTS_DIR}" "${PART_REWRITE_DIR}"
 
-echo "==> [2/12] Java: generate all four fixtures (real parquet + java_<fixture>_rows.json)"
+echo "==> [2/18] Java: generate all six fixtures (real parquet + java_<fixture>_rows.json)"
 run_oracle -Dexec.args=generate-interop-merge-append-data \
   -Dinterop.merge_append_data.dir="${MERGE_DIR}"
 run_oracle -Dexec.args=generate-interop-rewrite-data \
@@ -86,18 +97,24 @@ run_oracle -Dexec.args=generate-interop-overwrite-data \
   -Dinterop.overwrite_data.dir="${OVERWRITE_DIR}"
 run_oracle -Dexec.args=generate-interop-delete-data \
   -Dinterop.delete_data.dir="${DELETE_DATA_DIR}"
+run_oracle -Dexec.args=generate-interop-replace-partitions-data \
+  -Dinterop.replace_partitions_data.dir="${REPLACE_PARTS_DIR}"
+run_oracle -Dexec.args=generate-interop-partitioned-rewrite-data \
+  -Dinterop.partitioned_rewrite_data.dir="${PART_REWRITE_DIR}"
 
-echo "==> [3/12] Rust: generate all four fixtures via the production write paths (GEN tests)"
+echo "==> [3/18] Rust: generate all six fixtures via the production write paths (GEN tests)"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR="${MERGE_DIR}" \
   ICEBERG_INTEROP_REWRITE_DATA_GEN_DIR="${REWRITE_DIR}" \
   ICEBERG_INTEROP_OVERWRITE_DATA_GEN_DIR="${OVERWRITE_DIR}" \
   ICEBERG_INTEROP_DELETE_DATA_GEN_DIR="${DELETE_DATA_DIR}" \
+  ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_GEN_DIR="${REPLACE_PARTS_DIR}" \
+  ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_GEN_DIR="${PART_REWRITE_DIR}" \
     cargo test -p iceberg --test interop_write_data -- --nocapture
 )
 
-echo "==> [4/12] Java: verify-interop-merge-append-data — Java reads the Rust-written merge-append table"
+echo "==> [4/18] Java: verify-interop-merge-append-data — Java reads the Rust-written merge-append table"
 VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-merge-append-data \
   -Dinterop.merge_append_data.dir="${MERGE_DIR}")" || true
 echo "${VERIFY_OUT}"
@@ -109,7 +126,7 @@ if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
   exit 1
 fi
 
-echo "==> [5/12] Java: verify-interop-rewrite-data — Java reads the Rust-written rewrite-data table"
+echo "==> [5/18] Java: verify-interop-rewrite-data — Java reads the Rust-written rewrite-data table"
 VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-rewrite-data \
   -Dinterop.rewrite_data.dir="${REWRITE_DIR}")" || true
 echo "${VERIFY_OUT}"
@@ -120,7 +137,7 @@ if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
   exit 1
 fi
 
-echo "==> [6/12] Java: verify-interop-overwrite-data — Java reads the Rust-written overwrite-data table"
+echo "==> [6/18] Java: verify-interop-overwrite-data — Java reads the Rust-written overwrite-data table"
 VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-overwrite-data \
   -Dinterop.overwrite_data.dir="${OVERWRITE_DIR}")" || true
 echo "${VERIFY_OUT}"
@@ -131,7 +148,7 @@ if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
   exit 1
 fi
 
-echo "==> [7/12] Java: verify-interop-delete-data — Java reads the Rust-written delete-data table"
+echo "==> [7/18] Java: verify-interop-delete-data — Java reads the Rust-written delete-data table"
 VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-delete-data \
   -Dinterop.delete_data.dir="${DELETE_DATA_DIR}")" || true
 echo "${VERIFY_OUT}"
@@ -142,38 +159,67 @@ if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
   exit 1
 fi
 
-echo "==> [8/12] Rust: read the Java-written tables and assert row equality (comparison tests)"
+echo "==> [8/18] Java: verify-interop-replace-partitions-data — Java reads the Rust-written replace-partitions table"
+VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-replace-partitions-data \
+  -Dinterop.replace_partitions_data.dir="${REPLACE_PARTS_DIR}")" || true
+echo "${VERIFY_OUT}"
+# Fail-closed two ways (see step 4 above).
+if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
+  || ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-replace-partitions-data: 0 failures'; then
+  echo "==> FAILED — verify-interop-replace-partitions-data emitted a FAIL line or did not emit the '0 failures' sentinel."
+  exit 1
+fi
+
+echo "==> [9/18] Java: verify-interop-partitioned-rewrite-data — Java reads the Rust-written partitioned-rewrite table"
+VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-partitioned-rewrite-data \
+  -Dinterop.partitioned_rewrite_data.dir="${PART_REWRITE_DIR}")" || true
+echo "${VERIFY_OUT}"
+# Fail-closed two ways (see step 4 above).
+if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
+  || ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-partitioned-rewrite-data: 0 failures'; then
+  echo "==> FAILED — verify-interop-partitioned-rewrite-data emitted a FAIL line or did not emit the '0 failures' sentinel."
+  exit 1
+fi
+
+echo "==> [10/18] Rust: read the Java-written tables and assert row equality (comparison tests)"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_MERGE_APPEND_DATA_DIR="${MERGE_DIR}" \
   ICEBERG_INTEROP_REWRITE_DATA_DIR="${REWRITE_DIR}" \
   ICEBERG_INTEROP_OVERWRITE_DATA_DIR="${OVERWRITE_DIR}" \
   ICEBERG_INTEROP_DELETE_DATA_DIR="${DELETE_DATA_DIR}" \
+  ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_DIR="${REPLACE_PARTS_DIR}" \
+  ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_DIR="${PART_REWRITE_DIR}" \
     cargo test -p iceberg --test interop_write_data -- --nocapture
 )
 
-# Steps 9-12: second-pass GREEN verification (chain must pass twice back-to-back).
+# Steps 11-18: second-pass GREEN verification (chain must pass twice back-to-back).
 # This guards against accidental state leakage between passes (temp dirs are SHARED between
 # Rust GEN and comparison tests within a single run; the second pass reuses the same dirs
 # without a wipe, which is intentional — the state should be deterministic).
 
-echo "==> [9/12] (2nd pass) Rust: re-run GEN tests — state must be deterministic"
+echo "==> [11/18] (2nd pass) Rust: re-run GEN tests — state must be deterministic"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR="${MERGE_DIR}" \
   ICEBERG_INTEROP_REWRITE_DATA_GEN_DIR="${REWRITE_DIR}" \
   ICEBERG_INTEROP_OVERWRITE_DATA_GEN_DIR="${OVERWRITE_DIR}" \
   ICEBERG_INTEROP_DELETE_DATA_GEN_DIR="${DELETE_DATA_DIR}" \
+  ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_GEN_DIR="${REPLACE_PARTS_DIR}" \
+  ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_GEN_DIR="${PART_REWRITE_DIR}" \
     cargo test -p iceberg --test interop_write_data -- --nocapture
 )
 
-echo "==> [10/12] (2nd pass) Java: re-verify all four Rust-written tables"
-for FIXTURE in merge-append-data rewrite-data overwrite-data delete-data; do
+echo "==> [12/18] (2nd pass) Java: re-verify all six Rust-written tables"
+for FIXTURE in merge-append-data rewrite-data overwrite-data delete-data \
+               replace-partitions-data partitioned-rewrite-data; do
   case "${FIXTURE}" in
-    merge-append-data) DIR="${MERGE_DIR}"      ; PROP="interop.merge_append_data.dir" ;;
-    rewrite-data)      DIR="${REWRITE_DIR}"    ; PROP="interop.rewrite_data.dir"      ;;
-    overwrite-data)    DIR="${OVERWRITE_DIR}"  ; PROP="interop.overwrite_data.dir"    ;;
-    delete-data)       DIR="${DELETE_DATA_DIR}"; PROP="interop.delete_data.dir"       ;;
+    merge-append-data)      DIR="${MERGE_DIR}"         ; PROP="interop.merge_append_data.dir"        ;;
+    rewrite-data)           DIR="${REWRITE_DIR}"       ; PROP="interop.rewrite_data.dir"             ;;
+    overwrite-data)         DIR="${OVERWRITE_DIR}"     ; PROP="interop.overwrite_data.dir"           ;;
+    delete-data)            DIR="${DELETE_DATA_DIR}"   ; PROP="interop.delete_data.dir"              ;;
+    replace-partitions-data) DIR="${REPLACE_PARTS_DIR}"; PROP="interop.replace_partitions_data.dir" ;;
+    partitioned-rewrite-data) DIR="${PART_REWRITE_DIR}"; PROP="interop.partitioned_rewrite_data.dir" ;;
   esac
   VERIFY_OUT="$(run_oracle -Dexec.args="verify-interop-${FIXTURE}" \
     -D"${PROP}=${DIR}")" || true
@@ -185,17 +231,19 @@ for FIXTURE in merge-append-data rewrite-data overwrite-data delete-data; do
   fi
 done
 
-echo "==> [11/12] (2nd pass) Rust: re-read Java-written tables"
+echo "==> [13/18] (2nd pass) Rust: re-read Java-written tables"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_MERGE_APPEND_DATA_DIR="${MERGE_DIR}" \
   ICEBERG_INTEROP_REWRITE_DATA_DIR="${REWRITE_DIR}" \
   ICEBERG_INTEROP_OVERWRITE_DATA_DIR="${OVERWRITE_DIR}" \
   ICEBERG_INTEROP_DELETE_DATA_DIR="${DELETE_DATA_DIR}" \
+  ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_DIR="${REPLACE_PARTS_DIR}" \
+  ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_DIR="${PART_REWRITE_DIR}" \
     cargo test -p iceberg --test interop_write_data -- --nocapture
 )
 
-echo "==> [12/12] Sabotage battery — corrupt the Rust-written metadata and confirm verify FAILS closed"
+echo "==> [14/18] Sabotage battery — corrupt the Rust-written metadata and confirm verify FAILS closed"
 # Each sub-test corrupts ONE copy of the Rust-written final.metadata.json, re-runs the Java verify,
 # and asserts it FAILS (a `^FAIL ` line or the absence of the `0 failures` sentinel). The corrupted
 # file is RESTORED from a backup before the next sub-test so the chain is rerun-safe.
@@ -267,10 +315,12 @@ PY
   fi
 }
 
-# Run the battery for fixtures C and D (the W1 fixtures), both corruption kinds each.
+# Run the battery for fixtures C, D, E, and F (W1 + W2 fixtures), both corruption kinds each.
 # Skip cleanly if the GEN tests were gated (rust_table absent ⇒ env vars unset).
 for PAIR in "overwrite-data:${OVERWRITE_DIR}:interop.overwrite_data.dir" \
-            "delete-data:${DELETE_DATA_DIR}:interop.delete_data.dir"; do
+            "delete-data:${DELETE_DATA_DIR}:interop.delete_data.dir" \
+            "replace-partitions-data:${REPLACE_PARTS_DIR}:interop.replace_partitions_data.dir" \
+            "partitioned-rewrite-data:${PART_REWRITE_DIR}:interop.partitioned_rewrite_data.dir"; do
   FIXTURE="${PAIR%%:*}"
   REST="${PAIR#*:}"
   DIR="${REST%%:*}"
@@ -295,4 +345,66 @@ for PAIR in "overwrite-data:${OVERWRITE_DIR}:interop.overwrite_data.dir" \
   sabotage_one "${FIXTURE}" "${DIR}" "${PROP}" bogus-path
 done
 
-echo "==> DONE — data-level write-actions interop passed (fixtures A+B+C+D, all 12 steps, 3 comparison directions each, 2nd-pass repeat, fail-closed sabotage battery)."
+echo "==> [15/18] S3-class mutation — feed fixture E's verify a genuinely WRONG table and assert it FAILS closed"
+# The PURE S3 divergence (a wrong-partition write of E_new that leaves the {id,data} set unchanged)
+# cannot be produced by a shell metadata edit: an identity-partition column is materialized from the
+# manifest's PARTITION METADATA (binary avro), not the parquet data column, so editing the JSON does
+# not change what the scan reads. It IS produced by the Rust GEN test routing E_new to pk_b — proven
+# by the reviewer out-of-chain (the Rust GEN self-scan AND the Java categoryById pin both fail). The
+# 2026-06-12 W2 reviewer REPLACED the prior step-15 no-op (it ran a CLEAN verify and grepped a
+# hard-coded PASS string — it never mutated anything, so it proved nothing) with a REAL in-chain
+# mutation: point fixture E's verify at fixture F's genuinely-different rust_table. That table has a
+# different live set ({10,30,40} vs E's {11,40}) AND a different partition map ({40=b,10=a,30=a} vs
+# E's {11=a,40=b}), so BOTH the row-set checks AND the partition-column pin (3e) must FAIL closed.
+# This exercises the same pin the pure-S3 case would, with a mutation the shell can actually make.
+REPLACE_RUST="${REPLACE_PARTS_DIR}/rust_table"
+WRONG_RUST="${PART_REWRITE_DIR}/rust_table"
+if [[ ! -d "${REPLACE_RUST}" || ! -d "${WRONG_RUST}" ]]; then
+  echo "==> SKIP S3-class mutation: replace-partitions or partitioned-rewrite rust_table not present"
+else
+  # CONTROL — the clean E verify must PASS first, or a sabotage-fail proves nothing.
+  CONTROL_OUT="$(run_oracle -Dexec.args=verify-interop-replace-partitions-data \
+    -Dinterop.replace_partitions_data.dir="${REPLACE_PARTS_DIR}" 2>&1)" || true
+  if echo "${CONTROL_OUT}" | grep -q '^FAIL ' \
+    || ! echo "${CONTROL_OUT}" | grep -q 'verify-interop-replace-partitions-data: 0 failures'; then
+    echo "==> FAILED — S3-class control: clean verify-interop-replace-partitions-data did NOT pass"
+    exit 1
+  fi
+  echo "control(s3-mutation): clean E verify passes — the mutation result is meaningful"
+
+  # MUTATE: build a scratch fixture dir whose rust_table is F's table but whose ground-truth JSON is
+  # still E's, then run E's verify against it. E's hand-declared expected set must reject F's table.
+  S3_SCRATCH="${TMP}/s3_mutation_scratch"
+  rm -rf "${S3_SCRATCH}"
+  mkdir -p "${S3_SCRATCH}"
+  cp "${REPLACE_PARTS_DIR}/java_replace_partitions_rows.json" "${S3_SCRATCH}/"
+  cp -r "${WRONG_RUST}" "${S3_SCRATCH}/rust_table"
+
+  MUTATION_OUT="$(run_oracle -Dexec.args=verify-interop-replace-partitions-data \
+    -Dinterop.replace_partitions_data.dir="${S3_SCRATCH}" 2>&1)" || true
+  rm -rf "${S3_SCRATCH}"
+
+  # Assert the verify FAILED closed AND specifically that the partition-column pin (3e) fired.
+  if echo "${MUTATION_OUT}" | grep -q 'verify-interop-replace-partitions-data: 0 failures'; then
+    echo "FAIL s3-mutation(replace-partitions-data): verify PASSED on a wrong table — pin is vacuous"
+    exit 1
+  fi
+  if ! echo "${MUTATION_OUT}" | grep -q 'partition-column (category) mismatch'; then
+    echo "FAIL s3-mutation(replace-partitions-data): verify failed but the partition-column pin (3e) did NOT fire"
+    exit 1
+  fi
+  echo "PASS s3-mutation(replace-partitions-data): a wrong-partition table is rejected — the row-set AND partition-column (3e) pins both fired closed"
+fi
+
+echo "==> [16/18] (steps 16-17 are informational; step 18 = DONE)"
+echo "    Fixtures E+F sabotage: already covered in step 14 above."
+echo "    Both fixtures covered two corruption kinds each (truncate + bogus-path)."
+
+echo "==> [17/18] Summary: all 18 steps complete"
+echo "    Fixtures: A (merge_append) + B (rewrite) + C (overwrite) + D (delete) + E (replace_partitions) + F (partitioned_rewrite)"
+echo "    Directions: Java-writes-Rust-reads (D1) + Rust-writes-Java-reads (D2)"
+echo "    Second pass: YES (steps 11-13)"
+echo "    Sabotage battery: YES (step 14, all 4 W-fixtures, truncate+bogus-path each)"
+echo "    S3-class mutation: YES (step 15, E's verify fed a wrong table — fails closed, partition pin fires)"
+
+echo "==> [18/18] DONE — data-level write-actions interop passed (fixtures A+B+C+D+E+F, all 18 steps, 3 comparison directions each, 2nd-pass repeat, fail-closed sabotage battery, fail-closed S3-class mutation)."
