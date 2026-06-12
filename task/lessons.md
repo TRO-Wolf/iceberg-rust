@@ -937,3 +937,63 @@ How to use it (see the manuals' §2):
   Java `MultiSpecOracle.verify()` method + its `verify-interop-multi-spec` dispatch case are written
   but NEVER invoked by the run script (D1 is done inline via emit+diff instead) — harmless redundancy,
   flagged not removed (builder-owned code, no correctness impact).
+
+### 2026-06-12 (Z3 — partition-stats file interop, BUILDER Sonnet, wt-interop3)
+
+- **`DataFiles.Builder` has NO `withContent(FileContent)` method — it only builds DATA files.**
+  *Why it matters:* the Java oracle code to build a position-delete file for a row-delta commit
+  must use `FileMetadata.deleteFileBuilder(spec).ofPositionDeletes()`, NOT
+  `DataFiles.builder(spec).withContent(FileContent.POSITION_DELETES)`. The `DataFiles.Builder`
+  API has no `withContent` method; using it produces a compile error (`cannot find symbol: method
+  withContent(org.apache.iceberg.FileContent)`). Rule: when building a delete file in Java oracle
+  code, always use `FileMetadata.deleteFileBuilder(spec)` — confirmed via `javap` of the 1.10.0
+  api jar.
+
+- **`PartitionStatisticsFile` in the 1.10.0 jar has `path()`, NOT `statisticsPath()`.**
+  *Why it matters:* calling `.statisticsPath()` produces a compile error
+  (`cannot find symbol: method statisticsPath()`). The 1.10.0 api jar's
+  `PartitionStatisticsFile.class` exposes `path()`, `snapshotId()`, and `fileSizeInBytes()` —
+  confirmed via `javap -p`. Rule: for any 1.10.0 API class whose method signature is uncertain,
+  run `javap -p ~/.m2/…/iceberg-api-1.10.0.jar!/…` BEFORE writing the call, not after the
+  compile fails.
+
+- **`PartitionStats.partition()` returns `StructLike`, NOT `PartitionData`, when decoded via
+  `readPartitionStatsFile`.** *Why:* the `generate()` path builds `PartitionData` instances
+  directly (via `PartitionData.put()`), but `readPartitionStatsFile` deserializes the partition
+  struct from the parquet file as a `GenericRecord` / `StructProjection` — the runtime type is
+  NOT `PartitionData`. Casting `row.partition()` to `PartitionData` produces a
+  `ClassCastException: GenericRecord cannot be cast to PartitionData`. Rule: always use
+  `StructLike partition = row.partition()` (the declared return type) and access fields with
+  `partition.get(0, Object.class)` without a downcast — the concrete type is decoder-dependent.
+
+### 2026-06-12 (Z3 — partition-stats file interop, REVIEWER Opus 2-of-2, wt-interop3)
+
+- **A re-invoked Java verify that rebuilds a `Table` via `LocalTableOperations.commit(null, meta)` was
+  CRASHING on `v0.metadata.json` "File already exists" — which the sabotage check misread as a
+  fail-closed.** *Why (STOP-grade, caught by cold-start):* the Z3 sabotage steps 7a/7b/7d call
+  `verify-interop-partition-stats` a SECOND/THIRD/FOURTH time against the SAME dir. The verify path
+  builds a `Table` from the Rust metadata (to get `Partitioning.partitionType`) via
+  `buildTableFromMetadata` → `ops.commit(null, meta)`, which writes `v0.metadata.json` with
+  `LocalOutputFile.create()` (REFUSES to overwrite). The clean D1 step (step 4) writes `v0.metadata.json`
+  first; every later verify call then throws "File already exists" BEFORE reading the stats parquet. The
+  script's pass test is `! grep 'verify…: 0 failures'` — ANY exception (including the unrelated v0
+  collision) satisfies it, so 7a/7b/7d "passed" on a file that was never even read. PROVEN by running 3
+  consecutive CLEAN verifies: pre-fix #2/#3 collided (no "0 failures"); a wholly-UNcorrupted file thus
+  "passed" the sabotage check. FIX (harness, scoped to `PartitionStatsOracle.buildTableFromMetadata`):
+  delete any leftover `v\d+\.metadata\.json` (this helper's exclusive artifact — the Rust table uses
+  `00000-*.metadata.json` + `final.metadata.json`) before each commit, so every verify reaches the real
+  decode. Post-fix: 3 clean verifies all report "0 failures"; the sabotage check now means something.
+  Rule (reviewer mandate): for a sabotage that asserts "the run FAILED," confirm the run failed for the
+  RIGHT reason — re-run the SAME step on an UNcorrupted artifact and require it to PASS; a fail-closed
+  that also "fails" clean is testing the wrong exception (the W2 false-green pattern).
+- **The exact-field decode-depth check needs a parquet-AWARE rewrite, not a byte-search.** *Why:* 7b's
+  byte-search for the int64-LE `0x0300000000000000` finds 4 occurrences (data page + footer min/max
+  stats) and mutates the FIRST (offset 105), which structurally CORRUPTS the parquet — Java fails via a
+  decode EXCEPTION, not a clean field mismatch (proves "garbage rejected," not "wrong counter caught at
+  the right column"). To prove the field-level comparison is load-bearing, read the stats parquet, mutate
+  ONE Int64 column's row-0 value preserving the field-id schema, rewrite, and re-verify: Java then emits
+  `FAIL row 0 (partition cat=a): position_delete_record_count expected=1 actual=7` — confirming the exact
+  column is compared. Reviewer-verified for `data_record_count`, `position_delete_record_count`,
+  `last_updated_snapshot_id` (each fails on exactly its own line). The only stats field NEVER compared is
+  `last_updated_at` (wall-clock millis, run-variant — `last_updated_snapshot_id` is its stable proxy);
+  defensible omission, not a gap.

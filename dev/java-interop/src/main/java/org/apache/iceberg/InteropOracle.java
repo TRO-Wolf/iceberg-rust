@@ -648,6 +648,35 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-partition-stats":
+        // PARTITION-STATS FILE interop (increment Z3). Builds a V2 table partitioned by
+        // identity(category) with two snapshots: S1 fast-appends two data files (A: cat=a,
+        // 3 records, 300 bytes; B: cat=b, 2 records, 200 bytes); S2 adds a position-delete
+        // file scoped to cat=a (1 deleted record, 50 bytes). Calls Java's PRODUCTION
+        // PartitionStatsHandler.computeAndWriteStatsFile(table, snapshotId), registers the
+        // resulting PartitionStatisticsFile in the table, then reads it back with
+        // readPartitionStatsFile and emits java_stats.json (canonical partition-stats rows)
+        // for the cross-language comparison. The dir is via -Dinterop.partition_stats.dir.
+        Path partitionStatsGenDir = requireFixturesDir("interop.partition_stats.dir");
+        PartitionStatsOracle.generate(partitionStatsGenDir);
+        break;
+      case "verify-interop-partition-stats":
+        // PARTITION-STATS FILE interop, DIRECTION 1 — "Java reads what RUST writes".
+        // The Rust GEN test (env ICEBERG_INTEROP_PARTITION_STATS_GEN_DIR,
+        // tests/interop_partition_stats.rs) ran compute_and_write_stats_file on its table,
+        // registered the file, and landed the table at <dir>/rust_table + the stats parquet
+        // at its registered path + expected_stats.json (the hand-declared expected rows from
+        // the computed PartitionStats objects). Here Java reads the Rust-written stats parquet
+        // with PartitionStatsHandler.readPartitionStatsFile and compares the decoded rows
+        // against expected_stats.json.
+        Path partitionStatsVerifyDir = requireFixturesDir("interop.partition_stats.dir");
+        int partitionStatsFailures = PartitionStatsOracle.verify(partitionStatsVerifyDir);
+        System.out.println(
+            "verify-interop-partition-stats: " + partitionStatsFailures + " failures");
+        if (partitionStatsFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-staged-wap":
         // STAGED-WAP metadata-level interop (increment Z1). Builds three fixtures (S-ff / S-replay /
         // S-dedup) on a V2 table using REAL Java `stageOnly()` (the production API), stages each
@@ -9751,6 +9780,506 @@ public final class InteropOracle {
    *       attempt is also compared.
    * </ul>
    */
+  // ===========================================================================================
+  // PartitionStatsOracle — Z3 partition-stats file interop
+  //
+  // Fixture: V2 table identity(category) {id long, category string, data string}.
+  //   S1: fast-append file A (cat=a, 3 records, 300 bytes) + file B (cat=b, 2 records, 200 bytes).
+  //   S2: row-delta adds position-delete PD (cat=a, 1 record deleted, 50 bytes).
+  //
+  // Expected stats rows (sorted by partition tuple = category string, ascending):
+  //   Row 0 — partition {cat=a}: spec_id=0, data_records=3, data_files=1, size=300,
+  //     pos_del_records=1, pos_del_files=1, eq_del_records=0, eq_del_files=0,
+  //     total_records=null, last_updated_snapshot_id=S2.id (pos-delete at S2 > A added at S1),
+  //     dv_count=0.
+  //   Row 1 — partition {cat=b}: spec_id=0, data_records=2, data_files=1, size=200,
+  //     pos_del_records=0, pos_del_files=0, eq_del_records=0, eq_del_files=0,
+  //     total_records=null, last_updated_snapshot_id=S1.id (B added at S1 only),
+  //     dv_count=0.
+  //
+  // Direction 1 (Java judges Rust): Rust computes + writes the stats parquet → Java reads it
+  // with the PRODUCTION readPartitionStatsFile → compares decoded rows against
+  // expected_stats.json (written by Rust from the computed PartitionStats objects).
+  //
+  // Direction 2 (Rust verifies Java): Java computes + writes the stats parquet → Rust reads it
+  // via read_partition_stats_file and compares against the same expected row set.
+  //
+  // Both sides use the SAME hand-declared COUNTER VALUES (data/pos_del record + file counts,
+  // total_data_file_size_in_bytes). Snapshot IDs and timestamps are resolved from the actual
+  // written metadata (the "last_updated" fields reference a named snapshot, not a hard-coded id)
+  // by comparing which snapshot_id appears in the stats vs what S1/S2 IDs are in the table.
+  // ===========================================================================================
+
+  static final class PartitionStatsOracle {
+    private PartitionStatsOracle() {}
+
+    // Hand-declared counter values (anti-circular — same on both sides regardless of which
+    // language wrote the file). These are the ONLY values that change the stats semantics;
+    // snapshot IDs and timestamps are derived from the actual table after writing.
+
+    /** Category-a partition: 3 data records across 1 data file. */
+    static final long A_DATA_RECORDS = 3L;
+    /** Category-a data file size in bytes. */
+    static final long A_DATA_FILE_SIZE = 300L;
+    /** Category-a: 1 position-delete record in 1 position-delete file. */
+    static final long A_POS_DEL_RECORDS = 1L;
+
+    /** Category-b partition: 2 data records across 1 data file. */
+    static final long B_DATA_RECORDS = 2L;
+    /** Category-b data file size in bytes. */
+    static final long B_DATA_FILE_SIZE = 200L;
+
+    /** Position-delete file size in bytes (cat=a, 1 record). */
+    static final long PD_FILE_SIZE = 50L;
+
+    /** Table schema: {1 id long required, 2 category string required, 3 data string optional}. */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "category", Types.StringType.get()),
+          Types.NestedField.optional(3, "data", Types.StringType.get()));
+    }
+
+    /**
+     * Build the fixture: S1 (fast_append A+B) + S2 (row_delta pos-delete PD in cat=a), then
+     * call the PRODUCTION {@code PartitionStatsHandler.computeAndWriteStatsFile(table, snapshotId)},
+     * register the returned {@link PartitionStatisticsFile}, and emit:
+     * <ul>
+     *   <li>{@code java_stats.json} — the decoded partition-stats rows (canonical JSON), for the
+     *       cross-language D2 comparison (Rust reads the Java-written parquet + verifies against
+     *       this reference).
+     *   <li>{@code final.metadata.json} under {@code table/metadata/} — the table metadata AFTER
+     *       registration (for Rust to load the table and locate the stats file).
+     * </ul>
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Path tableDir = dir.resolve("table");
+      Path metadataDir = tableDir.resolve("metadata");
+      Files.createDirectories(metadataDir);
+
+      Schema schema = schema();
+      PartitionSpec spec =
+          PartitionSpec.builderFor(schema).identity("category").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.toAbsolutePath().toString(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir.toFile(), metadataDir.toFile());
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_partition_stats");
+      String dataDir = tableDir.toAbsolutePath() + "/data";
+
+      // S1: fast-append file A (cat=a) + file B (cat=b).
+      PartitionData partA = new PartitionData(spec.partitionType());
+      partA.set(0, "a");
+      PartitionData partB = new PartitionData(spec.partitionType());
+      partB.set(0, "b");
+
+      DataFile fileA =
+          DataFiles.builder(spec)
+              .withPath(dataDir + "/file_a.parquet")
+              .withFileSizeInBytes(A_DATA_FILE_SIZE)
+              .withRecordCount(A_DATA_RECORDS)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partA)
+              .build();
+      DataFile fileB =
+          DataFiles.builder(spec)
+              .withPath(dataDir + "/file_b.parquet")
+              .withFileSizeInBytes(B_DATA_FILE_SIZE)
+              .withRecordCount(B_DATA_RECORDS)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partB)
+              .build();
+
+      table.newFastAppend().appendFile(fileA).appendFile(fileB).commit();
+      long s1Id = table.currentSnapshot().snapshotId();
+
+      // S2: row-delta — add a position-delete file scoped to partition cat=a.
+      // Use FileMetadata.deleteFileBuilder (DataFiles.Builder has no withContent/ofPositionDeletes).
+      DeleteFile posDeleteA =
+          FileMetadata.deleteFileBuilder(spec)
+              .ofPositionDeletes()
+              .withPath(dataDir + "/pos_delete_a.parquet")
+              .withFileSizeInBytes(PD_FILE_SIZE)
+              .withRecordCount(A_POS_DEL_RECORDS)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partA)
+              .build();
+
+      table.newRowDelta().addDeletes(posDeleteA).commit();
+      long s2Id = table.currentSnapshot().snapshotId();
+
+      // Compute and write the stats file using the PRODUCTION API — this is the Direction-2
+      // oracle (Java's own output). The stats file path and size are embedded in the returned
+      // PartitionStatisticsFile; we register it in the table to complete the metadata chain.
+      PartitionStatisticsFile statsFile =
+          PartitionStatsHandler.computeAndWriteStatsFile(table);
+      if (statsFile == null) {
+        throw new RuntimeException("computeAndWriteStatsFile returned null — fixture is wrong");
+      }
+
+      // Register the stats file so final.metadata.json carries the partition_statistics entry.
+      table
+          .updatePartitionStatistics()
+          .setPartitionStatistics(statsFile)
+          .commit();
+
+      // Read the stats back and emit java_stats.json — this is the D2 ground truth that Rust
+      // will compare its decoded rows against.
+      Schema statsSchema =
+          PartitionStatsHandler.schema(
+              Partitioning.partitionType(table),
+              TableUtil.formatVersion(table));
+      InputFile statsInputFile =
+          table.io().newInputFile(statsFile.path());
+      List<PartitionStats> statsRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInputFile)) {
+        for (PartitionStats row : rows) {
+          statsRows.add(row);
+        }
+      }
+
+      String statsJson = statsRowsToJson(statsRows, table, s1Id, s2Id);
+      writeJson(dir.resolve("java_stats.json"), statsJson);
+      System.out.println("generate-interop-partition-stats: java_stats.json written to " + dir);
+
+      // Also emit final.metadata.json so Rust can locate the stats parquet by reading the
+      // registered PartitionStatisticsFile path from the metadata.
+      Path finalMetadataPath = metadataDir.resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadataPath.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+      System.out.println(
+          "generate-interop-partition-stats: final.metadata.json written to " + finalMetadataPath);
+    }
+
+    /**
+     * Direction 1 — "Java reads what RUST writes."
+     *
+     * <p>The Rust GEN test wrote its table to {@code <dir>/rust_table} and emitted
+     * {@code expected_stats.json} (the decoded {@code PartitionStats} rows from the computed
+     * stats objects). Here Java reads the stats parquet at the path registered in the table's
+     * {@code final.metadata.json} using the PRODUCTION {@link PartitionStatsHandler#readPartitionStatsFile},
+     * then compares the decoded rows against {@code expected_stats.json}.
+     *
+     * @return the number of failures (0 = all pass).
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path rustTableMetadata =
+          dir.resolve("rust_table/metadata/final.metadata.json");
+      if (!Files.exists(rustTableMetadata)) {
+        System.out.println(
+            "FAIL partition-stats/verify: missing rust_table/metadata/final.metadata.json"
+                + " — run the Rust GEN step first");
+        return 1;
+      }
+
+      // Load the Rust-produced table metadata to find the registered stats file path.
+      TableMetadata rustMeta =
+          TableMetadataParser.fromJson(
+              rustTableMetadata.toString(), readString(rustTableMetadata));
+
+      // Locate the registered partition statistics file for the current snapshot.
+      long currentSnapshotId = rustMeta.currentSnapshot() == null
+          ? -1L : rustMeta.currentSnapshot().snapshotId();
+      if (currentSnapshotId == -1L) {
+        System.out.println(
+            "FAIL partition-stats/verify: Rust table has no current snapshot");
+        return 1;
+      }
+
+      PartitionStatisticsFile registeredFile = null;
+      for (PartitionStatisticsFile file : rustMeta.partitionStatisticsFiles()) {
+        if (file.snapshotId() == currentSnapshotId) {
+          registeredFile = file;
+          break;
+        }
+      }
+      if (registeredFile == null) {
+        System.out.println(
+            "FAIL partition-stats/verify: no PartitionStatisticsFile registered for snapshot "
+                + currentSnapshotId + " in the Rust table metadata");
+        return 1;
+      }
+
+      String statsPath = registeredFile.path();
+      System.out.println(
+          "partition-stats/verify: reading Rust stats file at " + statsPath);
+
+      // Read the Rust-written stats parquet with Java's PRODUCTION readPartitionStatsFile.
+      // The schema argument must match the file's format version — derive from the table metadata.
+      Types.StructType unifiedPartType = Partitioning.partitionType(
+          // Build a minimal Table view using the Rust metadata's partition specs + schema.
+          buildTableFromMetadata(rustMeta, rustTableMetadata));
+      Schema statsSchema =
+          PartitionStatsHandler.schema(
+              unifiedPartType,
+              rustMeta.formatVersion());
+
+      InputFile statsInputFile = new LocalFileIO().newInputFile(statsPath);
+      List<PartitionStats> decodedRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInputFile)) {
+        for (PartitionStats row : rows) {
+          decodedRows.add(row);
+        }
+      }
+
+      // Load the expected stats from the Rust-emitted expected_stats.json.
+      Path expectedPath = dir.resolve("expected_stats.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL partition-stats/verify: missing expected_stats.json — "
+                + "run the Rust GEN step first");
+        return 1;
+      }
+      String expectedJson = readString(expectedPath);
+      com.fasterxml.jackson.databind.JsonNode expectedNode =
+          new com.fasterxml.jackson.databind.ObjectMapper().readTree(expectedJson);
+
+      // Compare the decoded rows count.
+      int expectedCount = expectedNode.size();
+      if (decodedRows.size() != expectedCount) {
+        System.out.println(
+            "FAIL partition-stats/verify: decoded "
+                + decodedRows.size()
+                + " rows, expected "
+                + expectedCount);
+        failures++;
+        return failures;
+      }
+
+      // Compare each row against the expected row from expected_stats.json.
+      // The expected JSON is sorted by partition tuple (cat=a first, then cat=b).
+      // Rows from readPartitionStatsFile are in file order (the stats file is already sorted
+      // by the writer). We compare them positionally.
+      for (int i = 0; i < decodedRows.size(); i++) {
+        PartitionStats row = decodedRows.get(i);
+        com.fasterxml.jackson.databind.JsonNode expected = expectedNode.get(i);
+        String partition = expected.path("partition_category").asText();
+        failures += compareStatsRow(row, expected, "row " + i + " (partition cat=" + partition + ")");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS partition-stats/verify: all "
+                + decodedRows.size()
+                + " rows decoded by Java's readPartitionStatsFile match expected_stats.json");
+      }
+      return failures;
+    }
+
+    /**
+     * Compare one decoded {@link PartitionStats} row against its expected JSON node.
+     * Returns the number of field-level failures.
+     */
+    private static int compareStatsRow(
+        PartitionStats row,
+        com.fasterxml.jackson.databind.JsonNode expected,
+        String label) {
+      int failures = 0;
+
+      // The partition category string (field 0 in the partition struct).
+      String expectedCategory = expected.path("partition_category").asText();
+      String actualCategory = partitionCategoryString(row);
+      if (!expectedCategory.equals(actualCategory)) {
+        System.out.println(
+            "FAIL " + label + ": partition_category expected="
+                + expectedCategory + " actual=" + actualCategory);
+        failures++;
+      }
+
+      failures += assertLong(label, "spec_id", expected.path("spec_id").asLong(), row.specId());
+      failures +=
+          assertLong(
+              label, "data_record_count",
+              expected.path("data_record_count").asLong(),
+              row.dataRecordCount());
+      failures +=
+          assertLong(
+              label, "data_file_count",
+              expected.path("data_file_count").asLong(),
+              row.dataFileCount());
+      failures +=
+          assertLong(
+              label, "total_data_file_size_in_bytes",
+              expected.path("total_data_file_size_in_bytes").asLong(),
+              row.totalDataFileSizeInBytes());
+      failures +=
+          assertLong(
+              label, "position_delete_record_count",
+              expected.path("position_delete_record_count").asLong(),
+              row.positionDeleteRecordCount());
+      failures +=
+          assertLong(
+              label, "position_delete_file_count",
+              expected.path("position_delete_file_count").asLong(),
+              row.positionDeleteFileCount());
+      failures +=
+          assertLong(
+              label, "equality_delete_record_count",
+              expected.path("equality_delete_record_count").asLong(),
+              row.equalityDeleteRecordCount());
+      failures +=
+          assertLong(
+              label, "equality_delete_file_count",
+              expected.path("equality_delete_file_count").asLong(),
+              row.equalityDeleteFileCount());
+      failures +=
+          assertLong(label, "dv_count", expected.path("dv_count").asLong(), row.dvCount());
+
+      // last_updated_snapshot_id — must match the expected snapshot id value.
+      long expectedSnapshotId = expected.path("last_updated_snapshot_id").asLong(-1L);
+      Long actualSnapshotId = row.lastUpdatedSnapshotId();
+      if (actualSnapshotId == null || actualSnapshotId != expectedSnapshotId) {
+        System.out.println(
+            "FAIL " + label + ": last_updated_snapshot_id expected="
+                + expectedSnapshotId + " actual=" + actualSnapshotId);
+        failures++;
+      }
+
+      // total_record_count must be null (Java never computes it in the full-compute path).
+      if (row.totalRecords() != null) {
+        System.out.println(
+            "FAIL " + label
+                + ": total_record_count must be null (never computed), got "
+                + row.totalRecords());
+        failures++;
+      }
+
+      return failures;
+    }
+
+    /** Extract the category string from the partition struct (field 0).
+     * The partition() return type is {@link StructLike} — the generate path produces a
+     * {@link PartitionData}, but the readPartitionStatsFile path decodes to a generic record
+     * (GenericRecord / StructProjection). We use {@code StructLike.get(0, Object.class)} to avoid
+     * a ClassCastException.
+     */
+    private static String partitionCategoryString(PartitionStats row) {
+      StructLike partition = row.partition();
+      Object val = partition.get(0, Object.class);
+      return val == null ? "null" : val.toString();
+    }
+
+    /** Assert two long values are equal; returns 0 on success, 1 on failure. */
+    private static int assertLong(String label, String field, long expected, long actual) {
+      if (expected != actual) {
+        System.out.println(
+            "FAIL " + label + ": " + field + " expected=" + expected + " actual=" + actual);
+        return 1;
+      }
+      return 0;
+    }
+
+    /**
+     * Serialize the decoded {@link PartitionStats} rows to canonical JSON, resolving the
+     * last_updated_snapshot_id to the known S1/S2 snapshot ids from the freshly-written table.
+     *
+     * <p>JSON shape (array, one object per row):
+     * <pre>
+     * [
+     *   {
+     *     "partition_category": "a",
+     *     "spec_id": 0,
+     *     "data_record_count": 3,
+     *     "data_file_count": 1,
+     *     "total_data_file_size_in_bytes": 300,
+     *     "position_delete_record_count": 1,
+     *     "position_delete_file_count": 1,
+     *     "equality_delete_record_count": 0,
+     *     "equality_delete_file_count": 0,
+     *     "dv_count": 0,
+     *     "last_updated_snapshot_id": &lt;s2Id&gt;,
+     *     "last_updated_at": &lt;s2.timestampMs&gt;,
+     *     "total_record_count_null": true
+     *   },
+     *   ...
+     * ]
+     * </pre>
+     */
+    private static String statsRowsToJson(
+        List<PartitionStats> rows,
+        BaseTable table,
+        long s1Id,
+        long s2Id)
+        throws IOException {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (PartitionStats row : rows) {
+              gen.writeStartObject();
+              // partition — the category string value.
+              gen.writeStringField(
+                  "partition_category", partitionCategoryString(row));
+              gen.writeNumberField("spec_id", row.specId());
+              gen.writeNumberField("data_record_count", row.dataRecordCount());
+              gen.writeNumberField("data_file_count", row.dataFileCount());
+              gen.writeNumberField(
+                  "total_data_file_size_in_bytes", row.totalDataFileSizeInBytes());
+              gen.writeNumberField(
+                  "position_delete_record_count", row.positionDeleteRecordCount());
+              gen.writeNumberField(
+                  "position_delete_file_count", row.positionDeleteFileCount());
+              gen.writeNumberField(
+                  "equality_delete_record_count", row.equalityDeleteRecordCount());
+              gen.writeNumberField(
+                  "equality_delete_file_count", row.equalityDeleteFileCount());
+              gen.writeNumberField("dv_count", row.dvCount());
+              // last_updated_snapshot_id — the actual id from the written table.
+              Long lastUpdatedId = row.lastUpdatedSnapshotId();
+              if (lastUpdatedId != null) {
+                gen.writeNumberField("last_updated_snapshot_id", lastUpdatedId);
+              } else {
+                gen.writeNullField("last_updated_snapshot_id");
+              }
+              // total_record_count — must be null in the full-compute path.
+              gen.writeBooleanField("total_record_count_null", row.totalRecords() == null);
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * Build a minimal {@link Table} view from a {@link TableMetadata} backed by a
+     * {@link LocalFileIO} — needed to call {@link Partitioning#partitionType(Table)} without a
+     * live catalog. Uses {@link LocalTableOperations} in read-only mode (no commit).
+     */
+    private static Table buildTableFromMetadata(
+        TableMetadata metadata, Path metadataFilePath) throws IOException {
+      File tableDir = metadataFilePath.getParent().getParent().toFile();
+      File metadataDir = metadataFilePath.getParent().toFile();
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      // ops.commit(null, metadata) writes vN.metadata.json via LocalOutputFile.create(), which
+      // REFUSES to overwrite ("File already exists"). The verify path is invoked MULTIPLE times
+      // against the same dir (the clean D1 step + each sabotage re-run); without clearing the
+      // helper's own prior vN.metadata.json artifacts, the 2nd+ call throws BEFORE reading the
+      // stats parquet — masking sabotage as a false fail-closed. Delete any leftover vN.metadata.json
+      // (this helper's exclusive artifact; the Rust table uses 00000-*.metadata.json + final.metadata.json)
+      // so each call commits cleanly and reaches the real stats decode.
+      File[] stale = metadataDir.listFiles((d, name) -> name.matches("v\\d+\\.metadata\\.json"));
+      if (stale != null) {
+        for (File f : stale) {
+          if (!f.delete()) {
+            throw new IOException("failed to delete stale verify-helper metadata file " + f);
+          }
+        }
+      }
+      // Seed the ops with the pre-loaded metadata (version 0 so the next commit writes v1).
+      ops.commit(null, metadata);
+      // After ops.commit(null, metadata), ops.current() == the pinned metadata.
+      return new BaseTable(ops, "interop_rust_table");
+    }
+  }
+
   static final class StagedWapOracle {
     private StagedWapOracle() {}
 

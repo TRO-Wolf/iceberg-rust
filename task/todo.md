@@ -109,6 +109,71 @@ tie-shaped ms4 manifests. 4-sabotage battery all closed. Verbatim gate ×2 green
   ×2 green (2168). Tree clean. Flagged: dead `verify-interop-multi-spec` Java dispatch (unused;
   builder-owned, left in place).
 
+## ACTIVE (2026-06-12): Z3 — partition-stats file interop (BUILDER Sonnet, wt-interop3)
+
+**Structure choice:** SIBLING script `dev/java-interop/run-interop-partition-stats.sh` + new Rust
+test `crates/iceberg/tests/interop_partition_stats.rs`. Oracle inner class `PartitionStatsOracle`
+added to `InteropOracle.java`.
+
+**Fixture:** V2 table `identity(category)` {id long, category string, data string optional},
+S1 fast-append (cat=a 3rec 300B + cat=b 2rec 200B), S2 row-delta pos-delete (cat=a 1rec 50B).
+
+**Key discoveries:**
+- `DataFiles.Builder` has NO `withContent()` — position-delete files must use
+  `FileMetadata.deleteFileBuilder(spec).ofPositionDeletes()` (class is `org.apache.iceberg.FileMetadata`).
+- `PartitionStatisticsFile.statisticsPath()` does NOT exist — the method is `path()` (confirmed
+  via `javap` of the 1.10.0 api jar).
+- `PartitionStats.partition()` returns `StructLike` (not `PartitionData`) when decoded via
+  `readPartitionStatsFile` (the reader instantiates a `GenericRecord` / `StructProjection`, not a
+  `PartitionData`). The oracle uses `StructLike.get(0, Object.class)` without casting.
+
+**Plan:**
+
+- [x] Record plan (this section).
+- [x] **Step 1: Java `PartitionStatsOracle` (new inner class in InteropOracle.java).** Fixture
+  build + `PartitionStatsHandler.computeAndWriteStatsFile(table)` + register +
+  `readPartitionStatsFile` read-back + emit `java_stats.json` + `table/metadata/final.metadata.json`.
+  `verify()` reads `rust_table/metadata/final.metadata.json`, locates the registered stats path via
+  `partitionStatisticsFiles()`, decodes with `readPartitionStatsFile`, compares against `expected_stats.json`.
+  Fix: `withContent(FileContent.POSITION_DELETES)` → `FileMetadata.deleteFileBuilder(spec).ofPositionDeletes()`;
+  `statisticsPath()` → `path()`; `(PartitionData)` cast → `StructLike.get(0, Object)`.
+- [x] **Step 2: Rust interop test `crates/iceberg/tests/interop_partition_stats.rs`.** Three tests:
+  GEN (build fixture, compute+write+register, emit expected_stats.json + final.metadata.json),
+  D2 (read Java stats parquet, compare against java_stats.json), cross-version (V2 file vs V3 schema
+  — `project_struct_type_to_batch` null-fills dv_count to 0).
+- [x] **Step 3: Shell script `dev/java-interop/run-interop-partition-stats.sh`.** 8 steps, chain ×2.
+  Sabotage 4: truncate Rust parquet (7a), SOURCE byte-edit counter + re-read (7b, Z2 lesson), truncate
+  Java parquet (7c), remove partition-statistics from metadata (7d).
+- [x] **Step 4: map.md updates** (dev/java-interop/map.md, crates/iceberg/tests/map.md).
+- [x] **Step 5: GAP_MATRIX.md update** — Z3 interop landed cell, pipe audit.
+- [x] **Step 6: Run full chain ×2, paste output; run verbatim gate ×2.**
+  Chain ×2 green (D1 0 failures both chains; D2 2/2 rows; cross-version dv_count=0;
+  sabotage 7a/7b/7c/7d all closed). Gate: typos/fmt/clippy/lib all clean (2168 lib tests ×2).
+- [x] **Step 7: task/lessons.md update.**
+
+**Outcome:** Z3 partition-stats file interop landed 2026-06-12. Bidirectional: D1 (Rust writes,
+Java's `readPartitionStatsFile` judges, 0 failures both chains) + D2 (Java writes, Rust reads,
+all rows match) + cross-version V2→V3 projection (dv_count null-filled to 0). 4-sabotage battery
+all closed (SOURCE byte-edit re-derive for 7b, per Z2 lesson). Verbatim gate ×2 green (2168).
+
+- [x] **REVIEWER (Opus 2-of-2, 2026-06-12): cold-start verify + STOP-grade harness fix.** Chain ×2
+  re-run green (D1/D2/cross-version PASS, sabotage 7a-7d closed). **Found + fixed a false-green in the
+  sabotage battery:** the Java `verify` rebuilds a `Table` via `LocalTableOperations.commit(null,meta)`
+  which writes `v0.metadata.json` with non-overwriting `create()`; the clean D1 step writes it first, so
+  every later verify (7a/7b/7d) crashed on "File already exists" BEFORE reading the stats parquet — the
+  sabotage check (`! grep '0 failures'`) misread that crash as a fail-closed. PROVEN: 3 clean verifies
+  pre-fix collided on #2/#3 (an UNcorrupted file "passed" sabotage). FIX (scoped to
+  `PartitionStatsOracle.buildTableFromMetadata`): clear leftover `vN.metadata.json` before each commit.
+  Post-fix: 3 clean verifies all "0 failures"; patched chain ×2 still green. **Decode-depth independently
+  proven** via parquet-aware per-field rewrites (the byte-search in 7b merely structurally corrupts):
+  mutating `data_record_count`/`position_delete_record_count`/`last_updated_snapshot_id` each yields the
+  exact `FAIL row … <field> expected=X actual=Y` line. Anti-circularity: D1 `expected_stats.json` is
+  gated by the GEN test's hard `assert_eq!` against hand-declared constants before emission; D2
+  `java_stats.json` anchored to the same constants via fixture construction (`withRecordCount(...)`).
+  `last_updated_at` (wall-clock millis) intentionally uncompared (snapshot_id is its stable proxy).
+  Cross-chain (multi-spec + staged-wap) re-run green — shared oracle classes untouched. Gate ×2 green
+  (2168). Tree = allowed set.
+
 ## ACTIVE (2026-06-12): Z1 — staged-WAP interop fixture (BUILDER Sonnet, wt-interop3)
 
 **Structure choice:** a SIBLING script `dev/java-interop/run-interop-staged-wap.sh` (separate from
@@ -171,15 +236,12 @@ constants-map, ExpireSnapshots + interop, DeleteOrphanFiles, RewriteDataFiles,
 RemoveDanglingDeleteFiles, the variant arc end-to-end, stage_only + WAP dedup, ComputePartitionStats,
 data-level interop fixtures A–G, cherrypick interop). Statuses live ONLY in the GAP_MATRIX.
 
-- [ ] **THIS BRANCH (Wave 5 Group Z, SONNET-builder + OPUS-critic per the calibrated split,
-      user-approved 2026-06-12): the named interop items.** Z1: the staged-WAP fixture (V1's
-      `stage_only()` + the cherrypick chain; THE EXIT-AUDIT CAVEAT IS BINDING — the Java
-      `SnapshotMetaOracle` enumerates ALL metadata snapshots, NOT ancestry/history, and a staged
-      ref-less snapshot must appear identically on both sides); Z2: the multi-spec fixture
-      (comparator groundwork RESOLVED in W3 — spec_id is already the final tiebreaker on all
-      three view copies); Z3: Java-reads-our-partition-stats-file (PartitionStatsHandler
-      .readPartitionStatsFile as the Direction-2 oracle). Worktree `wt-interop3`, parallel to
-      Group Y (`phase6/compute-table-stats`, Opus) and Group U (`phase5/view-ops`, Opus).
+- [x] **THIS BRANCH (Wave 5 Group Z, SONNET-builder + OPUS-critic per the calibrated split,
+      user-approved 2026-06-12): the named interop items.** Z1: staged-WAP fixture DONE (2026-06-12).
+      Z2: multi-spec fixture DONE (2026-06-12). Z3: partition-stats file interop DONE (2026-06-12) —
+      bidirectional D1+D2 + cross-version V2→V3 projection + 4-sabotage battery. Worktree
+      `wt-interop3`, parallel to Group Y (`phase6/compute-table-stats`, Opus) and Group U
+      (`phase5/view-ops`, Opus).
 - [ ] **Partition-stats residue:** the INCREMENTAL compute path; time/uuid/fixed/binary partition
       values in stats files (loud errors today).
 - [ ] **`ComputeTableStats` (NDV/theta sketches) — DEPENDENCY-GATED, user decision:** needs a
