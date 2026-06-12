@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! DATA-LEVEL write-action interop (sprint increment S1) — `MergeAppend` and `RewriteFiles`
-//! proven against Java's `IcebergGenerics` production scan in TWO fixtures.
+//! DATA-LEVEL write-action interop (sprint increments S1 + W1) — `MergeAppend`, `RewriteFiles`,
+//! `OverwriteFiles`, and `DeleteFiles` proven against Java's `IcebergGenerics` production scan.
 //!
 //! ## Fixture A — `merge_append` data-level
 //!
@@ -50,17 +50,44 @@
 //! a new path). To prove `data_sequence_number` preservation you MUST use an equality delete,
 //! which is governed by seq applicability rules, not by file path.
 //!
-//! Both fixtures use REAL parquet files written via the production Rust writers (`DataFileWriter`,
-//! `EqualityDeleteFileWriter`). The tables land at `<gen_dir>/rust_table` with
-//! `metadata/final.metadata.json`; Java's `verify-interop-{merge-append-data,rewrite-data}` modes
-//! read them.
+//! ## Fixture C — `overwrite_files` data-level
 //!
-//! GATED on env vars (all four unset ⇒ clean no-ops; offline `cargo test` gate stays green):
+//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
+//! Rust performs the SAME chain as Java's `OverwriteFilesDataOracle.generate`:
+//! - `fast_append` A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) — seq 1
+//! - `overwrite_files` DELETE B + ADD B' (cat=b, id 41, data d') — seq 2, operation=overwrite
+//!
+//! Correctness point: B (id=40) is GONE; B' (id=41) is present; A's rows (10,20,30) INTACT.
+//! The partition column is pinned: a wrong-partition write of B' to cat="a" would be invisible to
+//! the `{id, data}` row compare but is caught by the `id_to_category_sorted` assertion.
+//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(10,a),(20,b),(30,c),(41,d')}`.
+//!
+//! ## Fixture D — `delete_files` data-level
+//!
+//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
+//! Rust performs the SAME chain as Java's `DeleteFilesDataOracle.generate`:
+//! - `fast_append` A (cat=a, ids 10/20/30, data a/b/c), B (cat=b, id 40, data d),
+//!   C_file (cat=a, id 50, data e) — seq 1
+//! - `delete_files` {B} by path — seq 2, operation=delete
+//!
+//! Correctness point: B (cat=b, id=40) is GONE; A and C_file (cat=a) are INTACT.
+//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(10,a),(20,b),(30,c),(50,e)}`.
+//!
+//! All fixtures use REAL parquet files written via the production Rust writers (`DataFileWriter`).
+//! The tables land at `<gen_dir>/rust_table` with `metadata/final.metadata.json`; Java's
+//! `verify-interop-*` modes read them. The S3 partition-projection lesson is binding: every fixture
+//! pins the `category` column explicitly via `id_to_category_sorted` to catch wrong-partition writes.
+//!
+//! GATED on env vars (all eight unset ⇒ clean no-ops; offline `cargo test` gate stays green):
 //!
 //! - `ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR` — fixture A GEN (Rust writes)
 //! - `ICEBERG_INTEROP_MERGE_APPEND_DATA_DIR`     — fixture A comparison (Rust reads Java rows)
 //! - `ICEBERG_INTEROP_REWRITE_DATA_GEN_DIR`      — fixture B GEN (Rust writes)
 //! - `ICEBERG_INTEROP_REWRITE_DATA_DIR`          — fixture B comparison (Rust reads Java rows)
+//! - `ICEBERG_INTEROP_OVERWRITE_DATA_GEN_DIR`    — fixture C GEN (Rust writes)
+//! - `ICEBERG_INTEROP_OVERWRITE_DATA_DIR`        — fixture C comparison (Rust reads Java rows)
+//! - `ICEBERG_INTEROP_DELETE_DATA_GEN_DIR`       — fixture D GEN (Rust writes)
+//! - `ICEBERG_INTEROP_DELETE_DATA_DIR`           — fixture D comparison (Rust reads Java rows)
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -143,6 +170,30 @@ fn rewrite_data_gen_dir() -> Option<PathBuf> {
 
 fn rewrite_data_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_REWRITE_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn overwrite_data_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_OVERWRITE_DATA_GEN_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn overwrite_data_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_OVERWRITE_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn delete_data_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_DELETE_DATA_GEN_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn delete_data_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_DELETE_DATA_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }
@@ -312,6 +363,33 @@ fn expected_merge_append_categories() -> Vec<(i64, Option<String>)> {
         (30, Some("a".to_string())),
         (40, Some("b".to_string())),
         (60, Some("a".to_string())),
+    ]
+}
+
+/// The expected `(id → category)` partition routing for fixture C (overwrite_files):
+/// A's rows (10,20,30) are `category="a"`; B' (41) is `category="b"`. B (40) is ABSENT.
+/// Sorted by id for a stable compare.
+///
+/// S3 partition-projection lesson: a scan that drops the `category` column cannot detect a
+/// wrong-partition write of B' to `category="a"`. This pin makes that class of regression visible.
+fn expected_overwrite_categories() -> Vec<(i64, Option<String>)> {
+    vec![
+        (10, Some("a".to_string())),
+        (20, Some("a".to_string())),
+        (30, Some("a".to_string())),
+        (41, Some("b".to_string())),
+    ]
+}
+
+/// The expected `(id → category)` partition routing for fixture D (delete_files):
+/// A's rows (10,20,30) and C_file (50) are `category="a"`; B (40) is ABSENT (deleted).
+/// Sorted by id for a stable compare.
+fn expected_delete_categories() -> Vec<(i64, Option<String>)> {
+    vec![
+        (10, Some("a".to_string())),
+        (20, Some("a".to_string())),
+        (30, Some("a".to_string())),
+        (50, Some("a".to_string())),
     ]
 }
 
@@ -896,5 +974,411 @@ async fn test_rust_reads_java_rewrite_data_table() {
     println!(
         "interop_write_data rewrite D1 OK — Rust scan of Java table = Java IcebergGenerics read: \
          3 live rows {{10,30,50}} (ids 20+40 absent; seq-preservation: A'.data_seq=1 < eq_del.seq=2)"
+    );
+}
+
+// ===========================================================================================
+// Fixture C GEN — Rust writes the overwrite_files data table for Java to verify.
+// ===========================================================================================
+
+/// Rust performs the SAME chain as Java's `OverwriteFilesDataOracle.generate`:
+/// fast_append A(cat=a,ids=10/20/30)+B(cat=b,id=40) → overwrite_files DELETE B ADD B'(cat=b,id=41,d'),
+/// landing `final.metadata.json` for the Java verify step.
+/// Correctness point: B (id=40) is GONE; B' (id=41) is PRESENT; A's rows INTACT.
+/// The partition column is pinned: a wrong-partition write of B' is caught by the category assert.
+#[tokio::test]
+async fn test_overwrite_data_gen_rust_writes_java_readable_table() {
+    let Some(gen_dir) = overwrite_data_gen_dir() else {
+        println!(
+            "skipping interop_write_data overwrite GEN — set \
+             ICEBERG_INTEROP_OVERWRITE_DATA_GEN_DIR \
+             (run dev/java-interop/run-interop-write-data.sh)"
+        );
+        return;
+    };
+
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_overwrite_data_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+
+    let table = create_write_data_table(&catalog, &table_location).await;
+    let schema = table.metadata().current_schema().clone();
+    let bound_spec = table.metadata().default_partition_spec().as_ref().clone();
+    let pk_a = partition_key(schema.clone(), bound_spec.clone(), "a");
+    let pk_b = partition_key(schema.clone(), bound_spec.clone(), "b");
+
+    // Write real parquet files.
+    let file_a = write_data_file(&table, &pk_a, "a", vec![10, 20, 30], vec!["a", "b", "c"]).await;
+    let file_b = write_data_file(&table, &pk_b, "b", vec![40], vec!["d"]).await;
+    let file_b_prime = write_data_file(&table, &pk_b, "b", vec![41], vec!["d'"]).await;
+
+    // s1 fast_append A+B (seq 1).
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_a, file_b.clone()])
+        .apply(tx)
+        .expect("apply fast append A+B");
+    let table = tx.commit(&catalog).await.expect("commit s1 fast_append");
+
+    // s2 overwrite_files: DELETE B, ADD B' (seq 2, operation = overwrite).
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .overwrite_files()
+        .delete_data_files(vec![file_b])
+        .add_file(file_b_prime)
+        .apply(tx)
+        .expect("apply overwrite_files DELETE B ADD B'");
+    let table = tx
+        .commit(&catalog)
+        .await
+        .expect("commit s2 overwrite_files");
+
+    // Sanity: Rust's OWN scan must yield {10,20,30,41} (B gone, B' present, A intact).
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 20, 30, 41],
+        "Rust scan of the overwrite table must yield {{10,20,30,41}} (B id=40 gone, B' id=41 present)"
+    );
+    assert!(
+        !live_ids.contains(&40),
+        "id 40 (B, deleted by overwrite_files) must be ABSENT from the Rust scan"
+    );
+
+    // S3 partition-projection pin: B' must be in cat="b", not misrouted to cat="a".
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_overwrite_categories(),
+        "Rust overwrite must route B' (id=41) to identity(category)='b', not misroute to 'a'; \
+         the {{id,data}} row compare alone is blind to wrong-partition writes"
+    );
+
+    // Land final metadata at a known path for Java.
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .clone()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_write_data overwrite GEN OK — Rust wrote {table_location} \
+         (fast_append A+B, overwrite DELETE B ADD B', Rust scan = {{10,20,30,41}}, \
+         B'→b pinned). Java verify-interop-overwrite-data reads it next."
+    );
+}
+
+// ===========================================================================================
+// Fixture C comparison — Rust reads Java's ground-truth rows.
+// ===========================================================================================
+
+/// Rust reads the JAVA-written overwrite table and compares to `java_overwrite_data_rows.json`.
+///
+/// Direction 1 of fixture C: Java's `OverwriteFilesDataOracle.generate` wrote the table under
+/// `<dir>/table`, emitting `java_overwrite_data_rows.json`. Rust loads the SAME table, runs
+/// `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point: id=40 absent,
+/// id=41 present, A rows intact. The partition column is pinned via `expected_overwrite_categories`.
+#[tokio::test]
+async fn test_rust_reads_java_overwrite_data_table() {
+    let Some(dir) = overwrite_data_dir() else {
+        println!(
+            "skipping interop_write_data overwrite D1 — set \
+             ICEBERG_INTEROP_OVERWRITE_DATA_DIR \
+             (run dev/java-interop/run-interop-write-data.sh)"
+        );
+        return;
+    };
+
+    let java_rows = sorted_by_id(load_java_rows(&dir.join("java_overwrite_data_rows.json")));
+
+    let metadata_path = dir.join("table/metadata/final.metadata.json");
+    let json = std::fs::read_to_string(&metadata_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", metadata_path.display()));
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", metadata_path.display()));
+    let table = Table::builder()
+        .metadata(metadata)
+        .metadata_location(metadata_path.to_string_lossy().to_string())
+        .identifier(TableIdent::from_strs(["interop", "overwrite_data"]).expect("valid identifier"))
+        .file_io(FileIO::new_with_fs())
+        .build()
+        .expect("build table from Java-written final.metadata.json");
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+
+    // id=40 (B, deleted by overwrite_files) must be absent.
+    assert!(
+        !rust_rows.iter().any(|r| r.id == 40),
+        "id 40 (B, deleted by overwrite_files) must be ABSENT from the Rust scan"
+    );
+    // id=41 (B', added by overwrite_files) must be present.
+    assert!(
+        rust_rows.iter().any(|r| r.id == 41),
+        "id 41 (B', added by overwrite_files) must be PRESENT in the Rust scan"
+    );
+    assert_eq!(
+        rust_rows.len(),
+        4,
+        "expected 4 live rows (A:3 + B':1; B deleted)"
+    );
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust scan of Java overwrite table must equal Java's IcebergGenerics read (field-for-field)"
+    );
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 20, 30, 41],
+        "live id set must be {{10,20,30,41}}"
+    );
+
+    // S3 partition-projection pin.
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_overwrite_categories(),
+        "Rust scan of Java overwrite table must read each row's identity(category) correctly \
+         (A→a, B'→b); the {{id,data}} row compare alone cannot catch a wrong-partition Java write"
+    );
+
+    println!(
+        "interop_write_data overwrite D1 OK — Rust scan of Java table = Java IcebergGenerics read: \
+         4 live rows {{10,20,30,41}} (id=40 absent, id=41 present, A intact, B'→b pinned)"
+    );
+}
+
+// ===========================================================================================
+// Fixture D GEN — Rust writes the delete_files data table for Java to verify.
+// ===========================================================================================
+
+/// Rust performs the SAME chain as Java's `DeleteFilesDataOracle.generate`:
+/// fast_append A(cat=a,ids=10/20/30)+B(cat=b,id=40)+C_file(cat=a,id=50,e) →
+/// delete_files {B} by path, landing `final.metadata.json` for the Java verify step.
+/// Correctness point: B (cat=b, id=40) is GONE; A and C_file (cat=a) INTACT.
+/// The partition column is pinned: B's cat="b" rows must be absent; A+C rows must be in cat="a".
+#[tokio::test]
+async fn test_delete_data_gen_rust_writes_java_readable_table() {
+    let Some(gen_dir) = delete_data_gen_dir() else {
+        println!(
+            "skipping interop_write_data delete GEN — set \
+             ICEBERG_INTEROP_DELETE_DATA_GEN_DIR \
+             (run dev/java-interop/run-interop-write-data.sh)"
+        );
+        return;
+    };
+
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_delete_data_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+
+    let table = create_write_data_table(&catalog, &table_location).await;
+    let schema = table.metadata().current_schema().clone();
+    let bound_spec = table.metadata().default_partition_spec().as_ref().clone();
+    let pk_a = partition_key(schema.clone(), bound_spec.clone(), "a");
+    let pk_b = partition_key(schema.clone(), bound_spec.clone(), "b");
+
+    // Write real parquet files.
+    let file_a = write_data_file(&table, &pk_a, "a", vec![10, 20, 30], vec!["a", "b", "c"]).await;
+    let file_b = write_data_file(&table, &pk_b, "b", vec![40], vec!["d"]).await;
+    let file_c = write_data_file(&table, &pk_a, "a", vec![50], vec!["e"]).await;
+
+    // s1 fast_append A+B+C_file (seq 1).
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_a, file_b.clone(), file_c])
+        .apply(tx)
+        .expect("apply fast append A+B+C");
+    let table = tx.commit(&catalog).await.expect("commit s1 fast_append");
+
+    // s2 delete_files {B} by path (seq 2, operation = delete).
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .delete_files()
+        .delete_data_files(vec![file_b])
+        .apply(tx)
+        .expect("apply delete_files {B}");
+    let table = tx.commit(&catalog).await.expect("commit s2 delete_files");
+
+    // Sanity: Rust's OWN scan must yield {10,20,30,50} (B gone, A + C_file intact).
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 20, 30, 50],
+        "Rust scan of the delete table must yield {{10,20,30,50}} (B id=40 gone, A + C_file intact)"
+    );
+    assert!(
+        !live_ids.contains(&40),
+        "id 40 (B, deleted by delete_files) must be ABSENT from the Rust scan"
+    );
+
+    // S3 partition-projection pin: all surviving rows must be in cat="a" (B's cat="b" is gone).
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_delete_categories(),
+        "Rust delete_files must leave rows 10/20/30/50 in category='a' and id=40 absent; \
+         the {{id,data}} row compare alone cannot catch a wrong-partition residue"
+    );
+
+    // Land final metadata at a known path for Java.
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .clone()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_write_data delete GEN OK — Rust wrote {table_location} \
+         (fast_append A+B+C, delete_files B, Rust scan = {{10,20,30,50}}, \
+         id=40 absent, A+C→a pinned). Java verify-interop-delete-data reads it next."
+    );
+}
+
+// ===========================================================================================
+// Fixture D comparison — Rust reads Java's ground-truth rows.
+// ===========================================================================================
+
+/// Rust reads the JAVA-written delete table and compares to `java_delete_data_rows.json`.
+///
+/// Direction 1 of fixture D: Java's `DeleteFilesDataOracle.generate` wrote the table under
+/// `<dir>/table`, emitting `java_delete_data_rows.json`. Rust loads the SAME table, runs
+/// `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point: id=40 absent,
+/// A and C_file rows intact. The partition column is pinned via `expected_delete_categories`.
+#[tokio::test]
+async fn test_rust_reads_java_delete_data_table() {
+    let Some(dir) = delete_data_dir() else {
+        println!(
+            "skipping interop_write_data delete D1 — set ICEBERG_INTEROP_DELETE_DATA_DIR \
+             (run dev/java-interop/run-interop-write-data.sh)"
+        );
+        return;
+    };
+
+    let java_rows = sorted_by_id(load_java_rows(&dir.join("java_delete_data_rows.json")));
+
+    let metadata_path = dir.join("table/metadata/final.metadata.json");
+    let json = std::fs::read_to_string(&metadata_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", metadata_path.display()));
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", metadata_path.display()));
+    let table = Table::builder()
+        .metadata(metadata)
+        .metadata_location(metadata_path.to_string_lossy().to_string())
+        .identifier(TableIdent::from_strs(["interop", "delete_data"]).expect("valid identifier"))
+        .file_io(FileIO::new_with_fs())
+        .build()
+        .expect("build table from Java-written final.metadata.json");
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+
+    // id=40 (B, deleted by delete_files) must be absent.
+    assert!(
+        !rust_rows.iter().any(|r| r.id == 40),
+        "id 40 (B, deleted by delete_files) must be ABSENT from the Rust scan"
+    );
+    assert_eq!(
+        rust_rows.len(),
+        4,
+        "expected 4 live rows (A:3 + C_file:1; B deleted)"
+    );
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust scan of Java delete table must equal Java's IcebergGenerics read (field-for-field)"
+    );
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 20, 30, 50],
+        "live id set must be {{10,20,30,50}}"
+    );
+
+    // S3 partition-projection pin.
+    assert_eq!(
+        id_to_category_sorted(&batches),
+        expected_delete_categories(),
+        "Rust scan of Java delete table must read each row's identity(category) correctly \
+         (A+C_file→a, B absent); the {{id,data}} compare alone cannot catch a wrong-partition residue"
+    );
+
+    println!(
+        "interop_write_data delete D1 OK — Rust scan of Java table = Java IcebergGenerics read: \
+         4 live rows {{10,20,30,50}} (id=40 absent, A+C_file intact, all in cat='a')"
     );
 }

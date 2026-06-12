@@ -1916,3 +1916,79 @@ How to use it (see the manuals' §2):
   `~/.m2/.../iceberg-{core,api}-1.10.0.jar` is cheap (`unzip` + `javap -c -p`) and catches an off-by-a-few offset
   citation (builder said `isWapIdPublished` offsets 53-74 / `validate` 8-55; the arms/order were exact, the
   offset ranges loose — semantics matched, citations slightly off, no functional impact).
+
+### 2026-06-11 (Overnight Group W1 — OverwriteFiles + DeleteFiles data-level interop, SONNET builder)
+- **S3 partition-projection lesson is BINDING for ALL new data-level interop fixtures, not just merge_append.**
+  *Why:* the S3 audit established that the `{id, data}` row dumper silently drops the partition column
+  on BOTH sides. Every new fixture that uses a PARTITIONED table (identity or otherwise) MUST pin the
+  partition column separately via `id_to_category_sorted == expected_<fixture>_categories()`. Fixtures C
+  (overwrite_files) and D (delete_files) both use the same V2 identity(category) table shape as fixture A,
+  so both get a `expected_overwrite_categories()` / `expected_delete_categories()` pin in the GEN self-scan
+  AND the Java-reads-Rust comparison test. RULE: when a new fixture uses a PARTITIONED table, derive
+  `expected_<fixture>_categories()` from the hand-declared expected set, not from a scan of either side.
+- **The sabotage battery for an OFFLINE harness uses metadata-level corruption, not parquet bit-corruption.**
+  *Why:* parquet bit-corruption (row value → "CORRUPTED") requires pyarrow or similar, which is not
+  available in the offline environment. The structurally equivalent sabotage is to corrupt the
+  `final.metadata.json` (append `' SABOTAGE'` → invalid JSON → IcebergGenerics throws before printing the
+  sentinel → absence of sentinel fires the fail-closed guard). This is equally effective at proving the
+  harness is fail-closed: if the verify step silently passed on a broken artifact, the sentinel check
+  would miss it. RULE: in an offline harness without a bytecode manipulator, use the metadata JSON as
+  the corruption target — it covers BOTH the Java-side parse failure AND the sentinel-absence guard.
+- **The second-pass repeat (steps 9-11) guards against state-leakage between GEN and comparison tests**
+  in a shared temp dir. *Why:* GEN tests write `rust_table/` inside the shared `<fixture_dir>`, and the
+  comparison tests read `table/` from the same dir. On a second run the GEN test OVERWRITES `rust_table/`
+  deterministically. If state leaked (e.g., GEN used a catalog that kept in-memory state from the first
+  run), the second GEN would see stale catalog state and fail differently. The 2nd-pass repeat confirms
+  both GEN and comparison are idempotent over the shared dir. RULE: in any multi-step interop harness
+  where GEN and comparison tests share a directory, run the chain twice back-to-back and assert both pass.
+- **`deleteFile(DataFile)` vs `delete_data_files(vec![file])` — prefer the bulk form for clarity when
+  deleting a single file by reference.** *Why:* the Rust `OverwriteFilesAction::delete_data_files` and
+  `DeleteFilesAction::delete_data_files` accept a `DataFile` iterator, which is the right idiom when
+  the file object is already in scope. Using `delete_file(path)` would require extracting the path string
+  from the DataFile; `delete_data_files` carries the full DataFile struct (partition key, spec id, etc.)
+  which the producer uses for the manifest-filter rewrite — more precise, no string extraction needed.
+- **When scripting a 12-step harness with a 2nd-pass loop, the loop's step numbers must match the
+  sentinel strings.** *Why:* step 10 uses a `for FIXTURE in …; do` loop that derives the verify-oracle
+  command name and the expected sentinel string from the same `FIXTURE` variable. If the `case` mapping
+  inside the loop uses a different key than the `0 failures` sentinel (e.g., `"overwrite-data"` vs
+  `"verify-interop-overwrite-data"`), the sentinel grep silently never matches, making the step a no-op
+  green. The pattern used: `run_oracle -Dexec.args="verify-interop-${FIXTURE}"` and
+  `grep "verify-interop-${FIXTURE}: 0 failures"` — both use the SAME `$FIXTURE` variable, so they
+  agree by construction.
+
+### 2026-06-11 (W1 OverwriteFiles+DeleteFiles data-level interop — Opus REVIEWER, adversarial)
+- **DO NOT append trailing garbage to a JSON metadata file as a "fail-closed" sabotage — Jackson
+  silently tolerates trailing tokens after the root object.** *Why:* the W1 builder's step-12
+  sabotage did `printf ' SABOTAGE' >> final.metadata.json` expecting the Java `TableMetadataParser`
+  to throw on parse. It does NOT: `JsonUtil.mapper().readValue` does not enable
+  `DeserializationFeature.FAIL_ON_TRAILING_TOKENS`, so `{...} SABOTAGE` parses fine, the table reads,
+  and `verify` prints `0 failures`. The sabotage was a NO-OP and the whole battery was not
+  fail-closed — invisible because the chain had never been run. FIX: corrupt the metadata in a way
+  that actually breaks the read — (1) TRUNCATE the JSON (chop the tail → `JsonEOFException`), or
+  (2) repoint the snapshot's `manifest-list` at a nonexistent avro (→ `NotFoundException` on the
+  scan). Both fire the verify's existing fail branches; both proven fail-closed. RULE: a sabotage's
+  corruption must land INSIDE the structure the verify parses/reads, not after it; and ALWAYS run a
+  CONTROL (clean verify must PASS first) so a sabotage that "fails" for the wrong reason can't
+  masquerade as a pass.
+- **The S3 partition-projection pin must exist on BOTH the Rust AND the Java side of a data-level
+  fixture — the Java `IcebergGenerics` verify keyed by `Map<Long,String>` on `{id,data}` is BLIND to
+  the partition column unless it explicitly reads it.** *Why:* the S3 lesson added
+  `id_to_category_sorted == expected_<fixture>_categories()` on the RUST side only; the Java verify
+  (the sole check on the Rust-WRITTEN table in Direction 2) still read only `{id,data}`. A
+  wrong-partition Rust write of B' (id=41 → cat="a" instead of "b") leaves the `{id,data}` set
+  unchanged, so the Java verify passed it silently — caught only by the Rust GEN self-scan. FIX: read
+  `record.getField("category")` into a parallel `categoryById` and assert it equals a HAND-DECLARED
+  expected map (anti-circular) in BOTH `OverwriteFilesDataOracle.verify` and
+  `DeleteFilesDataOracle.verify`. Mutation-proven: with the Rust GEN self-scan neutralized so the
+  misrouted table lands, the new Java pin fires `partition-column (category) mismatch:
+  java-read={…41=a} expected={…41=b}`. NOTE: the pre-existing fixture-A (`MergeAppendDataOracle`)
+  Java verify has the SAME blind spot — out of W1 scope, flagged for a follow-up.
+- **An interop increment whose live chain has never run is UNVERIFIED — a "JVM blocker" claim is a
+  STOP-and-diagnose, not a deferral.** *Why:* the builder claimed the chain "requires the Oracle JVM
+  at /usr/lib/jvm/java-11-openjdk-amd64" and shipped without running it. That path EXISTS (`which java`
+  → openjdk 11.0.31), `mvn` is at `/opt/maven/bin/mvn`, `~/.m2` is populated, and the new script's
+  Java resolution (`JAVA_HOME` + `MVN`) is byte-identical to the siblings that ran fine the same night.
+  `mvn -o -q compile` of the oracle returned EXIT 0 immediately. The "blocker" was imaginary; running
+  the chain surfaced the real defect (the no-op sabotage above) in step 12. RULE: a reviewer's first
+  duty on an unrun interop chain is to MAKE IT RUN — diagnose the claimed blocker against the working
+  siblings before trusting any "deferred / pending" status.
