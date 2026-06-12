@@ -284,6 +284,95 @@ How to use it (see the manuals' §2):
   6 in-crate test call sites of the now-3-arg `*Action::new`. DO check for direct constructor calls
   in unit tests when widening a private constructor signature.
 
+### 2026-06-12 (Wave-6 O2 — partition-stats incremental + exotic value types, BUILDER Opus, wt-core6)
+- **The 1.10.0 jar's `PartitionStatsHandler` ALREADY has the full incremental surface — the `collectStatsForManifest`
+  signature carries `boolean incremental`, and the X1/X2 port had silently dropped that 4th param.** Bytecode
+  (iceberg-core-1.10.0.jar): `collectStatsForManifest(Table, ManifestFile, StructType, boolean)`,
+  `computeStats(Table, List, boolean)`, plus `computeAndMergeStatsIncremental`/`latestStatsFile`/`computeStatsDiff`
+  and `PartitionStats.deletedEntryForIncrementalCompute`. The standing journal lesson "MAIN source is
+  post-1.10.0-refactored on PartitionStatsHandler" is REAL — but here MAIN and 1.10.0 AGREE on the incremental
+  surface; the X1 port had just scoped it out, not wrongly derived it. DO `javap -p` the WHOLE class to recover the
+  method surface before assuming a feature is absent — a dropped boolean param is invisible in a source read.
+- **The incremental entry dispatch is bytecode-exact and has TWO subtle gates a fast-append fixture CANNOT
+  exercise** (offsets 197-259 in `collectStatsForManifest`): (1) a LIVE entry contributes ONLY if
+  `incremental && status==ADDED` — a carried-forward EXISTING entry is SKIPPED (already in the seed); (2) a
+  tombstone calls `deletedEntryForIncrementalCompute` (the `lsub`/`isub` SUBTRACT mirror of `liveEntry`), not
+  `deletedEntry`. The diff (`computeStatsDiff`) selects per-range-snapshot ONLY the manifests it added
+  (`added_snapshot_id == snapshot.id`). A FAST-APPEND S2 adds a manifest containing only ADDED entries, so the
+  ADDED-only filter NEVER fires — a `if true` mutation over the filter PASSED every fast-append test SILENTLY.
+  The fixture that makes it load-bearing is a MERGE-APPEND with `commit.manifest.min-count-to-merge=2`: S2's
+  merged manifest re-stamps S1's file as EXISTING, so the filter MUST skip it (else x=1 double-counts: 11≠8).
+  DO build a merge-append (not fast-append) fixture whenever a test must see an EXISTING entry in a
+  newly-added manifest; a fast-append cannot produce one.
+- **Java's corrupt-base fallback is scoped to the BASE READ ONLY (`catch(Exception)` over offsets 11-99), NOT the
+  diff compute.** `computeAndMergeStatsIncremental` wraps `readPartitionStatsFile(base)` in
+  `catch(Exception) → throw InvalidStatsFileException`; the caller (`computeAndWriteStatsFile`) catches THAT and
+  falls back to full compute. The diff (`computeStatsDiff`, AFTER the try block) propagates its errors. Ported as:
+  `compute_and_merge_stats_incremental` returns `Ok(None)` on ANY base-read error (the fallback signal) but `Err`
+  on a diff failure. DO NOT collapse "corrupt base" and "diff IO error" into one error path — they have OPPOSITE
+  Java semantics (fall-back vs hard-fail). The deterministic test registers a base `PartitionStatisticsFile` at a
+  NON-EXISTENT path and asserts the write still equals a full recompute.
+- **`computeAndWriteStatsFile(table, snapshotId)` SHORT-CIRCUITS when the latest stats file IS already for the
+  target snapshot — it returns the existing file UNCHANGED, no rewrite (offset 104-132 "Returning existing
+  statistics file").** The X2 port always wrote a fresh file; adding the Java-faithful selection broke the X2
+  `test_replace_on_rewrite` test (it called `compute_and_write_stats_file` twice for the same snapshot expecting
+  a fresh uuid path — now the 2nd call returns the existing file). The test's REPLACE intent is real but the
+  "fresh path on re-write" assertion was X2-specific, not Java. DO re-pin REPLACE semantics by registering a
+  DIFFERENT-sized `PartitionStatisticsFile` (the metadata `set_partition_statistics` map keyed by snapshot id),
+  and separately assert the case-3 short-circuit returns the existing file.
+- **The exotic partition-value byte forms were ALREADY half-built — the production READER
+  (`arrow_struct_to_literal`) handles Time64/FixedSizeBinary(16-uuid)/FixedSizeBinary(L-fixed)/LargeBinary, and
+  `schema_to_arrow_schema` maps the iceberg types to those Arrow types; only the stats-file WRITER lacked the
+  arms.** The loud `FeatureUnsupported` residue was a one-sided gap. The literal storage forms: Time→`Long`(micros),
+  Uuid→`UInt128` (write 16 BE bytes via `Uuid::from_u128(v).into_bytes()` == Java `Conversions.toByteBuffer`,
+  reader `Uuid::from_bytes` round-trips), Fixed/Binary→`Binary(Vec<u8>)`. DO check the reader + the type mapper
+  before assuming an "unsupported type" needs new byte-form derivation — the write arm may be the only missing
+  half, and the round-trip through the existing reader IS the byte-form verification. `FixedSizeBinaryArray::
+  try_from_sparse_iter_with_size(iter, size)` is the null-tolerant + width-validating constructor (rejects a
+  wrong-width fixed value loudly — a free correctness guard).
+
+#### O2 REVIEWER corrections (2026-06-12, wt-core6) — adversarial pass against 1.10.0 bytecode
+- **The whole O2 incremental contract is bytecode-EXACT — re-derived independently from the 1.10.0 jar
+  (`javap -p -c`), every clause CONFIRMED.** `computeAndWriteStatsFile(Table,long)` offsets:
+  null-base→full (69), `base.snapshotId==target`→return-existing `areturn`(104-132), older-base→incremental
+  with the exception table `from 133 to 144 target 147 type InvalidStatsFileException` scoping ONLY the
+  merge call (so a DIFF error propagates, only the BASE read falls back — `computeAndMergeStatsIncremental`'s
+  inner `from 11 to 99 target 102 type Exception` wraps `readPartitionStatsFile`+`forEach`, the diff at
+  offset 114+ is OUTSIDE it). `collectStatsForManifest` offset 207-221: LIVE contributes iff
+  `incremental==false || status==ADDED` (`if_acmpne 259` skips carried EXISTING); 236-246: tombstone→
+  `deletedEntryForIncrementalCompute` (incremental) else `deletedEntry`. `deletedEntryForIncrementalCompute`
+  is `liveEntry` with `ladd→lsub`/`iadd→isub` AND IDENTICAL last-updated tail (offset 210-230 in both):
+  counters SUBTRACT, last-updated-at/snapshot-id is **MAX via `updateSnapshotInfo` (strict `<`), NOT
+  subtracted/overwritten** — the deleted-entry-attribution question the brief flagged. `ancestorsBetween`
+  truncation lambda returns null on reaching `from` ⇒ range is `(from, to]`; `ancestorsOf(long)` is
+  INCLUSIVE of the start (resolves the start snapshot then walks parents) ⇒ `latestStatsFile` includes the
+  target snapshot. The Rust port matches every one.
+- **COVERAGE GAP FOUND + FIXED: the builder pinned incremental==full on 2 APPEND shapes (append-only +
+  add-a-delete-FILE), but NEITHER exercises the SUBTRACT arm end-to-end — a `delete_files` op is what
+  produces a DELETED tombstone in an S2-added manifest that fires `deleted_entry_for_incremental_compute`.**
+  Probe-confirmed: `delete_files().delete_file(a.parquet)` re-stamps the removed file as `status=Deleted`
+  (added_by_s2=true) and the surviving file as `status=Existing`, and incremental==full==(5rec,1file) only
+  when the subtract fires. The unit test `test_deleted_entry_..._subtracts_each_cell_back_to_zero` pins the
+  arithmetic but NOT that the arm fires in the real pipeline. FIX (this pass): added
+  `test_incremental_equals_full_recompute_with_delete_subtracting_base_file` (the strongest subtract-arm
+  pin) — caught by the mutation that no-ops the data subtract AND the include-all-manifests diff mutation.
+  DO add a `delete_files`-driven equivalence shape for any incremental-stats subtract path; an append-with-
+  delete-FILE shape adds a delete file (a LIVE entry) and never produces the DELETED tombstone the subtract
+  arm needs.
+- **Mutation battery (6 for real, all caught; reverted): (a) no-op data subtract → unit + new e2e subtract
+  test fail; (b) `if true` over ADDED-only filter → merge-append + subtract tests fail (double-count);
+  (c) corrupt-base `Err(e)=>return Err` (no fallback) → corrupt-base test fails; (d) `if false` over case-3
+  guard → return-existing + rewritten replace test fail; (e) uuid bytes `.reverse()` (LE not BE) → uuid
+  round-trip fails BECAUSE the production reader (`arrow_struct_to_literal` → `Uuid::from_bytes`, BE) is
+  NOT mutated — proving the round-trip reads through the production path, not a test-local decode; (f) `if
+  true` over the `added_snapshot_id` diff filter → both append equivalence tests fail.** Every seam pinned.
+- **The 5 failing iceberg DOCTESTS (`src/lib.rs:24`, `writer/mod.rs:42/117/257/321`) are PRE-EXISTING and
+  UNTOUCHED by O2 — verified by `git stash` to the clean O1 commit d3fba2bf: identical 5-failure set.** Root
+  cause is environmental (`error: default runtime flavor is multi_thread, but rt-multi-thread feature is
+  disabled`), not code — `cargo test -p iceberg --lib` (the builder's gate) excludes doctests, and the O2
+  diff touches no doctest. DO run the doctest set on the base commit before attributing a doctest failure to
+  the increment under review.
+
 ### 2026-06-12 (Wave-5 Group Y / Y3 — Alpha-family update sketch, BUILDER Opus, wt-tstats)
 - **THE ndv-source ruling: Iceberg's `ndv` reads the COMPACT sketch's `getEstimate`, NOT the Alpha
   update sketch's. The two genuinely DIFFER in estimation mode — derive which object from

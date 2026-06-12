@@ -127,6 +127,62 @@ pinned as cosmetic-only; byte-exact view round-trip is next-wave.
 parquet, 8-row fixture (base 4 + bump 1 + staged 3), chain ×2, sabotage 4 closed. Key lessons:
 S-replay order (stage before bump); updateProperties does not create a snapshot; LocalTableOperations
 v0.metadata.json collision fixed with Files.createTempDirectory.
+## INCREMENT O2 (2026-06-12): partition-stats residue — incremental compute + exotic value types (BUILDER Opus, wt-core6)
+
+Charter: brief O2. Two halves on `maintenance/partition_stats.rs`. (a) the INCREMENTAL compute path
+(Java 1.10.0 `PartitionStatsHandler.computeAndWriteStatsFile(table, snapshotId)` chooses incremental
+when a prior stats file exists in the target snapshot's lineage). (b) exotic partition value types
+(time/uuid/fixed/binary) in the stats-file write path (currently loud FeatureUnsupported).
+
+Java 1.10.0 contract DERIVED FROM BYTECODE (iceberg-core-1.10.0.jar, javap; /tmp/ps-bytecode):
+- `computeAndWriteStatsFile(table, snapshotId)`: precond table≠null, isPartitioned, snapshot found.
+  `latestStatsFile(table, snapshotId)` → null ⇒ FULL compute (LOG "not present"). Non-null & its
+  snapshotId == target ⇒ RETURN the existing file as-is (no recompute). Else (differs) ⇒
+  `computeAndMergeStatsIncremental`, and on `InvalidStatsFileException` (base file unreadable) ⇒ LOG
+  WARN + FULL compute fallback (exception table 133-147). Then empty⇒null else sort+write.
+- `latestStatsFile`: map snapshotId→file from `partitionStatisticsFiles()`; walk `ancestorsOf(target)`
+  (lineage back via parentId, inclusive); return the FIRST ancestor with a stats file, else null.
+- `computeAndMergeStatsIncremental`: seed statsMap from the base stats file rows (read via
+  `readPartitionStatsFile(schema(unifiedType, fv), file.path())` — whole try wrapped in catch(Exception)
+  → throw InvalidStatsFileException); then `computeStatsDiff(table, table.snapshot(baseFile.snapshotId),
+  toSnapshot)` and merge each diff row into the seed via `appendStats` (counts ADD, last-updated MAX).
+- `computeStatsDiff(table, from, to)`: `ancestorsBetween(to.id, from.id)` → per snapshot flatMap its
+  `allManifests(io).filter(manifest.snapshotId().equals(snapshot.snapshotId()))` (ONLY the manifests
+  ADDED by that snapshot) → `computeStats(table, manifests, incremental=true)`.
+- `collectStatsForManifest(.., incremental)` entry dispatch (bytecode 197-259): LIVE entry —
+  incremental && status≠ADDED ⇒ SKIP; else `liveEntry` (+counts). NON-live tombstone — incremental ⇒
+  `deletedEntryForIncrementalCompute` (SUBTRACTS the file's counts: data/pos/eq rec+file, PUFFIN→dv,
+  then updateSnapshotInfo); non-incremental ⇒ `deletedEntry` (last-updated only).
+- Exotic byte forms (verified vs reader `arrow_struct_to_literal` + writer `to_arrow` in arrow/):
+  Time→`Time64(Microsecond)` from `PrimitiveLiteral::Long`; Uuid→`FixedSizeBinary(16)` 16 BE bytes
+  (`Uuid::from_u128(v).into_bytes()`, reader `Uuid::from_bytes`); Fixed(len)→`FixedSizeBinary(len)`
+  from `PrimitiveLiteral::Binary`; Binary→`LargeBinary` from `PrimitiveLiteral::Binary`.
+
+- [x] Port incremental: `deleted_entry_for_incremental_compute` (subtract mirror of `live_entry`); threaded
+      `incremental` through `collect_stats_for_manifest` (ADDED-only LIVE via `entry.status()==Added`,
+      tombstone→subtract); added `latest_stats_file` (lineage walk), `compute_stats_diff` (`(base,target]`
+      range × `added_snapshot_id`-filtered manifests), `compute_and_merge_stats_incremental`; branched
+      `compute_and_write_stats_file` (full / return-existing / incremental w/ corrupt-base→`Ok(None)`
+      fallback). No new error kind needed — corrupt base maps to `Ok(None)`, the fallback signal.
+- [x] Exotic types in `build_partition_field_column`: Time→`Time64MicrosecondArray`, Uuid→`FixedSizeBinary(16)`
+      16 BE bytes, Fixed→`FixedSizeBinary(L)`, Binary→`LargeBinaryArray` (two helpers for the sparse-iter
+      FixedSizeBinary constructors); removed the loud-error residue arm (match is now exhaustive over primitives).
+- [x] Tests (a): incremental==full on append-only (2 shapes: single-field + with-delete-in-diff);
+      return-existing; corrupt-base fallback; per-cell subtract unit; ADDED-only filter via merge-append
+      fixture. 4 mutations caught (knock-out subtracted field; drop ADDED-only filter; drop fallback;
+      include-all-manifests-in-diff).
+- [x] Tests (b): 4 per-type round-trips (write→reopen→read, value + Arrow child type exact) + fixed-width
+      loud-error guard. Replaced `test_unsupported_partition_value_type_errors_loudly` (binary now supported).
+- [x] Interop decision: Z3 chain RE-RUN GREEN (both chains + 4 sabotage). Extending the oracle for
+      incremental/exotic is > ~1h (new InteropOracle case + fixture, pom-free) → DEFERRED, residue recorded
+      in matrix row 118 (byte forms already verified vs Java via the production reader round-trip).
+- [x] Gate chain + taplo + Z3 GREEN; matrix row 118 cell updated (terse, 5-pipe audit clean); lessons added;
+      report to /tmp/wave6/O2-builder.md.
+
+Outcome: partition-stats incremental compute (Java-bytecode-faithful selection + diff + subtract) and the
+time/uuid/fixed/binary write-path residue both LANDED in `maintenance/partition_stats.rs`. Lib suite 2225
+(>= 2215 baseline), 0 failures; Z3 interop green; interop extension deferred (residue named in matrix).
+
 ## INCREMENT O1 (2026-06-12): optimistic-concurrency parity for MemoryCatalog (BUILDER Opus, wt-core6)
 
 Charter: U1-REVIEWER block in lessons.md. Today a STALE commit (built from a superseded base) to
