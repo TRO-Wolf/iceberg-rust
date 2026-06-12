@@ -229,6 +229,119 @@ was secondary.
 - [x] GAP_MATRIX pipe audit clean (5 pipes/row). Tier-ledger data point recorded in final report.
 ## IN-FLIGHT (2026-06-12): Wave-5 Group Y / Y1 — theta-sketch foundation (BUILDER Opus, wt-tstats)
 ## IN-FLIGHT (2026-06-12): Wave-5 Group Y / Y2 — ComputeTableStats action (BUILDER Opus, wt-tstats)
+## IN-FLIGHT (2026-06-12): Wave-5 Group Y / Y3 — Alpha-family update sketch (BUILDER Opus, wt-tstats)
+
+**Goal:** close the Y2 STOP-finding. Java's NDV pipeline (`ThetaSketchAgg.createAggregationBuffer` →
+`UpdateSketch.builder.setFamily(Family.ALPHA).build()`, default lgK 12 / seed 9001) builds an ALPHA-family
+update sketch; the Y1 crate ports only QuickSelect. Estimation-mode NDV bytes + values diverge on
+high-cardinality columns. Add `AlphaSketch` (the UPDATE-side retention/estimation) whose `compact()`
+produces the SAME family-COMPACT `CompactThetaSketch` Y1 already serializes (one serialization path). Switch
+`compute_table_stats.rs` construction to Alpha; re-pin the Y2 estimation-mode test on Alpha values.
+
+**Bytecode-derived Alpha algorithm facts (datasketches-java-3.3.0 jar, `javap -p -c -constants`):**
+- **Construction (`newHeapInstance(lgK, seed, p, rf)`):** `ALPHA_MIN_LG_NOM_LONGS = 9` (lgK >= 9 required;
+  default builder lgK 12 satisfies it). `nominal = 2^lgK` (double); `alpha_ = nominal/(nominal+1)`;
+  `split1_ = (long)((p*(alpha+1)/2)*2^63)`; `thetaLong_ = (long)(p*2^63)` (with p=1.0 = `Long.MAX_VALUE`);
+  `lgArrLongs_ = startingSubMultiple(lgK+1, rf.lg()=3, 5)`; `hashTableThreshold_ =
+  setHashTableThreshold(lgK, lgArr) = floor((lgArr<=lgNom?0.5:0.9375)*2^lgArr)`. Probe consts: lgK12 →
+  alpha=0.9997559189650964, split1=9222246411758747648; lgK9 → alpha=0.9980506822612085,
+  split1=9214382395493318656.
+- **`hashUpdate(hash)`:** reject if `continueCondition` (hash==0 || hash>=theta). If `dirty_` → CLEAN-vs-
+  DIRTY split → `enhancedHashInsert`. Else CLEAN path: `hashSearchOrInsert` (dup → reject); `curCount_++`;
+  if `theta > split1` (sampling not yet started): if `curCount > 2^lgK` → `theta = (long)(theta*alpha)`,
+  `dirty=true`; else if `isOutOfSpace(curCount)` (`curCount > threshold`) → `resizeClean()`. Else
+  (`theta <= split1`, sampling started): `theta = (long)(theta*alpha)`, `dirty=true`; if
+  `isOutOfSpace(curCount)` → `rebuildDirty()`.
+- **`enhancedHashInsert(cache, hash)` (DIRTY path):** open-addressing probe (stride
+  `2*((hash>>>lgArr)&127)+1`); on the way it may overwrite an above-theta slot (it tracks the first
+  slot whose value >= theta as a "delete" target). On finding the value → RejectedDuplicate; on an empty
+  slot or a stale (>=theta) slot → insert there, `theta = (long)(theta*alpha)`, `dirty=true`. If it
+  reused a stale slot: InsertedCountNotIncremented (no curCount++). If it used a truly empty slot:
+  curCount++, and if `curCount > threshold` → `rebuildDirty()`.
+- **`resizeClean()` (CLEAN grow):** `lgTgt = lgNom+1`; if `lgTgt > lgArr`:
+  `lgDelta = max(1, min(rf.lg()=3, lgTgt-lgArr))`; `forceResizeCleanCache(lgDelta)`; else
+  `forceResizeCleanCache(1)`. `forceResizeCleanCache(d)`: `lgArr += d`; new table; `curCount =
+  hashArrayInsert(old,new,lgArr,theta)` (re-insert below theta); `threshold` recomputed.
+- **`rebuildDirty()`:** `prev = curCount`; `forceRebuildDirtyCache()` (new SAME-size table; re-insert
+  below the now-lowered theta; `curCount` = count kept; `dirty=false`); if `prev == curCount` (nothing
+  purged) → `forceResizeCleanCache(1)` (grow by 1).
+- **`getEstimate()` (the UPDATE/Alpha form):** `theta > split1` → standard `count*(2^63/theta)`;
+  `theta <= split1` → SAMPLING `nominal*(2^63/theta)`. (Used only if someone reads the UPDATE sketch.)
+- **`toByteArray()` / `compact()`:** the compact form is family-COMPACT (id 3), NOT family-ALPHA.
+  `UpdateSketch.compact()` → `componentsToCompact(thetaLong, getRetainedEntries(true), seedHash,
+  isEmpty, ..., cache)` → `compactCache` keeps cache entries `0 < h < theta`, `Arrays.sort` ascending,
+  `loadCompactMemory` writes the SAME preamble Y1 emits. `getRetainedEntries(true)` is the DIRTY-aware
+  count (`countPart` over the cache below theta when dirty) — exactly the size of the below-theta set.
+  So compact = `serialize_compact_from_parts(is_empty, theta, sorted_below_theta_hashes, seed)` — Y1's
+  path verbatim.
+
+**THE ndv-source ruling (decisive — `NDVSketchUtil.toBlob`, spark MAIN v3.5/4.0/4.1 identical):**
+`Sketch sketch = CompactSketch.wrap(...)` then `ndv = String.valueOf((long) sketch.getEstimate())` and
+bytes = `sketch.toByteArray()`. Both read the COMPACT sketch — the STANDARD estimate
+`compactRetained * (2^63/theta)`, NOT the Alpha update sketch's sampling estimate. PROBE (lgK12, seed
+9001): n=1M Alpha → compact retained=4103, theta=37691512080307240 → compact getEstimate=1004032.297 →
+**ndv 1004032** (the prompt's pinned value), while the UPDATE Alpha getEstimate = sampling 1002319.349.
+n=7000 → compact ndv **6963** (update sampling 6973). So Rust feeds the action's `ndv` from the COMPACT
+sketch's `estimate()` (which `CompactThetaSketch::estimate()` already computes), NOT the update form's.
+
+**Plan:**
+- [x] `crates/sketches/src/alpha.rs`: `AlphaSketch` ported one-to-one from `HeapAlphaSketch` bytecode —
+      construction (alpha/split1/theta0/lgArr/threshold), clean/dirty insert (`hashUpdate` +
+      `enhancedHashInsert` stale-slot reuse), `resizeClean`/`rebuildDirty`/`forceResize`/`forceRebuild`,
+      `serialize_compact()`/`compact()` via the SHARED `serialize_compact_from_parts` (no fork),
+      `estimate()` (Alpha sampling form). Made 8 theta.rs helpers `pub(crate)` + added shared
+      `hash_search_or_insert`/`hash_array_insert`/`TWO_POW_63_AS_F64`.
+- [x] lib.rs export `AlphaSketch` + `ALPHA_MIN_LG_NOM_LONGS`; map.md updated; testdata generator extended
+      with Alpha cases (reproduced live: exact==QuickSelect, lgK9/520, deep, n=7000=6963, n=1M=1004032).
+- [x] `maintenance/compute_table_stats.rs`: builds `AlphaSketch::new()` (lgK 12); `ndv` =
+      `CompactThetaSketch::deserialize(&payload).estimate()` (the COMPACT sketch's estimate, Java
+      `NDVSketchUtil` = `CompactSketch.wrap(bytes).getEstimate()`), NOT the update sampling form.
+- [x] Re-pinned the Y2 estimation visibility test to ALPHA (action ndv == 1004032 ≠ QuickSelect 1002714).
+- [x] Tests: exact-mode compact == QuickSelect's bytes (equivalence ×2); n=7000=6963 + n=1M=1004032
+      (compact ndv) + retained + theta; byte-exact lgK9/520; deep-resize lgK9/50k; update-path pins
+      (alpha/split1/theta0/lgArr/threshold consts, theta-decay-at-nominal+1, split1 crossing, lgK clamp,
+      dup, byte/long agree, empty, round-trip); Y2 e2e re-pinned; mutation-bait VERIFIED (revert action to
+      QuickSelect → ONLY `test_estimation_mode_ndv_matches_java_alpha_not_quickselect` fails, the 20
+      exact-mode pins survive).
+- [x] GAP_MATRIX ComputeTableStats row: family gap CLOSED (2026-06-12); interop stays the named deferral
+      (row stays 🟡 on interop alone). Pipe-audit 5/5. Lessons entry added. NO Cargo edits.
+- [x] Gate ×2: typos + taplo + fmt + clippy(-D warnings) all clean; `iceberg --lib` 2189 ×2;
+      `iceberg-sketches` 56 + 1 doctest ×2.
+
+**Outcome (Y3 DONE — family gap CLOSED, 🟡 on interop only):** `crates/sketches/src/alpha.rs` (new,
+`AlphaSketch` = `HeapAlphaSketch` port + 15 tests) + theta.rs shared `pub(crate)` helpers (no serializer
+fork) + the action switched to Alpha with the `ndv` read off the COMPACT sketch. Key derived fact: Java's
+`NDVSketchUtil` reads `getEstimate()` on the COMPACT sketch (standard estimator 1004032), NOT the Alpha
+UPDATE sketch (sampling estimator 1002319) — the prompt's pinned 6963/1004032 are the COMPACT values. The
+on-disk form stays family-COMPACT (Y1's serialization reused). REUSED: `serialize_compact_from_parts`,
+`estimate`, `get_stride`, `set_hash_table_threshold`, `starting_sub_multiple`, `CompactThetaSketch`,
+`UpdateStatisticsAction`, the X2 local-fs harness. BUILT: `AlphaSketch` (construction/update/resize/rebuild)
++ the shared open-addressing primitives. DEFERRED (named): Java-reads-our-theta-blob interop (NEXT-WAVE,
+Group W/Z owns dev/java-interop — kept READ-ONLY) is the ONLY remaining gap on the row.
+
+- [x] **Y3 REVIEWER (Opus 2-of-2, wt-tstats):** ADVERSARIAL pass vs datasketches-java-3.3.0 bytecode +
+  fresh Java fixtures + 7 mutations. Re-derived the three trickiest bytecode facts independently and
+  CONFIRMED alpha.rs matches: `enhancedHashInsert` first-stale-slot reuse (no count bump) + truly-empty
+  bump+rebuild; `rebuildDirty` grows ONLY when `prev==curCount` (nothing purged); `getRetainedEntries(true)`
+  = dirty-aware `countPart` (`{0<h<theta}`) and `compact()` feeds THAT (not raw curCount) to
+  `componentsToCompact` (which throws if the below-theta count < curCount). Generated + byte-verified
+  adversarial SEAM fixtures (n=512/513/514 lgK9; stale-reuse n=600/1000/5000 dup-interleave; lgK12/n=10000)
+  — all byte-exact, then deleted (redundant). FOUND + FIXED the real bug: NO test pinned that PRODUCTION
+  `write_stats_file` reads the COMPACT estimate vs the Alpha UPDATE sampling estimate — the headline ndv
+  re-pin reconstructs the path inline + the crown jewel is exact-mode only, so a `write_stats_file` mutation
+  reading `sketch.estimate()` SURVIVED all 21 tests (emits 1002319). Added
+  `test_write_stats_file_ndv_property_reads_compact_estimate_in_estimation_mode` (1M distinct → drives the
+  real write path → on-disk ndv == 1004032 ≠ 1002319); fail-before/pass-after verified. KEY FINDING: the
+  dirty-path stale-slot machinery is byte-output-EQUIVALENT to a naive clean port (theta decays once/insert
+  either way; retained set is size/layout-invariant) — mutations `if false`, count-on-reuse, rebuild-grow-flip
+  ALL survived a 200k-random differential (Rust==Java). The stale-slot reuse is load-bearing for LIVENESS
+  only (reuse-empty-instead-of-stale → infinite probe loop / hang). Gate ×2 GREEN: typos/taplo/fmt/clippy
+  clean; `iceberg --lib` 2190 (2189 + 1 added); `iceberg-sketches` 56 + 1 doctest ×2. NO Cargo edits; tree =
+  allowed set (alpha.rs untracked + the action re-pin); siblings + dev/java-interop untouched.
+
+---
+
+## DONE (2026-06-12): Wave-5 Group Y / Y2 — ComputeTableStats action (BUILDER Opus, wt-tstats)
 
 **Goal:** wire the Y1 `iceberg-sketches` crate into the `ComputeTableStats` maintenance action — per-column
 NDV via theta sketches into one Puffin `apache-datasketches-theta-v1` blob per column, written into a single

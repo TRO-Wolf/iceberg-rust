@@ -44,6 +44,10 @@ const FAMILY_COMPACT: u8 = 3;
 pub const MAX_THETA: i64 = i64::MAX;
 /// The default DataSketches sampling probability `p`, serialized as a float at preamble bytes 12-15.
 const DEFAULT_P: f32 = 1.0;
+/// The DataSketches `9.223372036854776E18` double literal (`2^63` rounded to the nearest `f64`). Both
+/// the standard estimate and the Alpha construction math multiply by this exact constant; it equals
+/// [`MAX_THETA`] `as f64` to the bit (`0x43e0_0000_0000_0000`).
+pub(crate) const TWO_POW_63_AS_F64: f64 = 9.223372036854776e18;
 /// Read-only flag bit — always set on a compact (serialized) sketch.
 const FLAG_READ_ONLY: u8 = 2;
 /// Empty flag bit.
@@ -66,6 +70,11 @@ const MIN_LG_ARR_LONGS: u32 = 5;
 /// The default lg nominal entries used by Iceberg's `theta_sketch_agg` (`UpdateSketch.builder()`
 /// default = 4096 nominal = lgK 12).
 pub const DEFAULT_LG_NOMINAL_LONGS: u32 = 12;
+/// The DataSketches default lg resize factor as a plain integer (`ResizeFactor.X8.lg() == 3`). Shared
+/// by the QuickSelect resize path and the Alpha clean-grow path.
+pub(crate) const DEFAULT_LG_RESIZE_FACTOR_LG: u32 = DEFAULT_LG_RESIZE_FACTOR as u32;
+/// The minimum lg array size for an update hash table, shared by both update families.
+pub(crate) const MIN_LG_ARR_LONGS_SHARED: u32 = MIN_LG_ARR_LONGS;
 
 /// A theta sketch in mutable (update) form — accepts values and retains a bounded hash set.
 ///
@@ -468,10 +477,11 @@ impl CompactThetaSketch {
     }
 }
 
-/// Serializes the compact byte form from explicit parts. Shared by [`ThetaSketch`] and tests.
+/// Serializes the compact byte form from explicit parts. Shared by [`ThetaSketch`], the Alpha update
+/// form ([`crate::alpha::AlphaSketch`]), and tests — the single serialization path (no per-family fork).
 ///
 /// `hashes` must be ascending-sorted. `is_empty` true forces the empty form regardless of hashes.
-fn serialize_compact_from_parts(
+pub(crate) fn serialize_compact_from_parts(
     is_empty: bool,
     theta: i64,
     hashes: &[u64],
@@ -539,13 +549,18 @@ fn serialize_compact_from_parts(
 /// must match Java bit-exactly, not just within a tolerance.
 ///
 /// A corrupt `theta == 0` yields `+inf` here — exactly as Java's helper does (division by `0.0`).
-fn estimate(theta: i64, retained: usize, _is_empty: bool) -> f64 {
+///
+/// Shared by [`ThetaSketch`], [`CompactThetaSketch`], and the Alpha update form's COMPACT estimate
+/// ([`crate::alpha::AlphaSketch::compact`]). This is the family-COMPACT estimator Java's
+/// `CompactSketch.getEstimate` uses — it is NOT the Alpha update sketch's sampling-mode estimator
+/// (see [`crate::alpha::AlphaSketch::estimate`]).
+pub(crate) fn estimate(theta: i64, retained: usize, _is_empty: bool) -> f64 {
     let max_theta_as_f64 = MAX_THETA as f64;
     (retained as f64) * (max_theta_as_f64 / (theta as f64))
 }
 
-/// `Util.startingSubMultiple(lgTarget, lgRF, minLg)`.
-fn starting_sub_multiple(lg_target: u32, lg_resize_factor: u32, min_lg: u32) -> u32 {
+/// `Util.startingSubMultiple(lgTarget, lgRF, minLg)`. Shared by both update families.
+pub(crate) fn starting_sub_multiple(lg_target: u32, lg_resize_factor: u32, min_lg: u32) -> u32 {
     if lg_target <= min_lg {
         min_lg
     } else if lg_resize_factor == 0 {
@@ -555,8 +570,9 @@ fn starting_sub_multiple(lg_target: u32, lg_resize_factor: u32, min_lg: u32) -> 
     }
 }
 
-/// `HeapQuickSelectSketch.setHashTableThreshold`: `floor(fraction * 2^lgArr)`.
-fn set_hash_table_threshold(lg_nominal_longs: u32, lg_arr_longs: u32) -> usize {
+/// `setHashTableThreshold`: `floor(fraction * 2^lgArr)`. Identical for the QuickSelect and Alpha
+/// update families (both call the same `setHashTableThreshold(lgNom, lgArr)`).
+pub(crate) fn set_hash_table_threshold(lg_nominal_longs: u32, lg_arr_longs: u32) -> usize {
     let fraction = if lg_arr_longs <= lg_nominal_longs {
         0.5
     } else {
@@ -566,8 +582,59 @@ fn set_hash_table_threshold(lg_nominal_longs: u32, lg_arr_longs: u32) -> usize {
 }
 
 /// `HashOperations.getStride`: an odd double-hashing stride `2 * ((hash >>> lgArr) & 127) + 1`.
-fn get_stride(hash: u64, lg_arr_longs: u32) -> u64 {
+/// Shared by both update families' open-addressing probes.
+pub(crate) fn get_stride(hash: u64, lg_arr_longs: u32) -> u64 {
     2 * ((hash >> lg_arr_longs) & 127) + 1
+}
+
+/// `HashOperations.hashSearchOrInsert(table, lgArr, hash)`: open-addressing search-or-insert into a
+/// clean table. Returns `Some(index)` on a found duplicate (no insert), `None` after inserting.
+///
+/// Shared by [`ThetaSketch`] and [`crate::alpha::AlphaSketch`]'s clean path — both use the same
+/// `HashOperations` primitive. The probe stride is [`get_stride`].
+pub(crate) fn hash_search_or_insert(
+    table: &mut [u64],
+    lg_arr_longs: u32,
+    hash: u64,
+) -> Option<usize> {
+    let mask = (1u64 << lg_arr_longs) - 1;
+    let stride = get_stride(hash, lg_arr_longs);
+    let mut probe = (hash & mask) as usize;
+    let loop_index = probe;
+    loop {
+        let value = table[probe];
+        if value == 0 {
+            table[probe] = hash;
+            return None;
+        }
+        if value == hash {
+            return Some(probe);
+        }
+        probe = ((probe as u64 + stride) & mask) as usize;
+        if probe == loop_index {
+            // Unreachable past threshold: the table is never full when this is called.
+            return None;
+        }
+    }
+}
+
+/// `HashOperations.hashArrayInsert(srcArr, destArr, lgArr, theta)`: re-insert every non-zero source
+/// entry strictly below `theta` into `dest`, returning the inserted count. The rebuild/resize
+/// primitive shared by both update families.
+pub(crate) fn hash_array_insert(
+    source: &[u64],
+    dest: &mut [u64],
+    lg_arr_longs: u32,
+    theta: i64,
+) -> usize {
+    let mut count = 0;
+    for &hash in source {
+        if hash != 0 && (hash as i64) < theta {
+            hash_search_or_insert(dest, lg_arr_longs, hash);
+            count += 1;
+        }
+    }
+    count
 }
 
 /// `QuickSelect.selectExcludingZeros(cache, curCount, nominal+1)`: returns the (nominal+1)-th

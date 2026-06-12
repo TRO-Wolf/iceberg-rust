@@ -35,40 +35,37 @@
 //! silently disagree with Spark/Trino/Flink — hence the per-type byte-form pins in the tests.
 //!
 //! The puffin blob payload is the DataSketches theta `CompactSketch` serialized format produced by the
-//! [`iceberg_sketches`] crate (Y1 — byte-pinned against Java DataSketches). The blob's `ndv` property
-//! is `String.valueOf((long) sketch.getEstimate())` — the estimate **truncated** toward zero to an
-//! `i64` and rendered as decimal digits (Java `NDVSketchUtil`; puffin spec: "stored as non-negative
-//! integer value represented using decimal digits with no leading or trailing spaces").
+//! [`iceberg_sketches`] crate (byte-pinned against Java DataSketches).
 //!
-//! # KNOWN DIVERGENCE — sketch update family (Alpha vs QuickSelect)
+//! # The sketch update family is `Alpha` (Y3 — closes the Y2 family gap)
 //!
-//! **Java's NDV pipeline builds an `Alpha`-family update sketch; the Y1 [`iceberg_sketches`] port is
-//! `QuickSelect`.** Verified this session against three independent sources: the puffin spec
-//! (`format/puffin-spec.md`: "constructing **Alpha family sketch** with default seed"), the Spark
-//! `ThetaSketchAgg.createAggregationBuffer` source (`UpdateSketch.builder.setFamily(Family.ALPHA)
-//! .build()`, identical across spark v3.5/v4.0/v4.1 + the class doc "generates Alpha family sketch"),
-//! and the `datasketches-java-3.3.0` bytecode (`UpdateSketchBuilder`'s default family IS `QUICKSELECT`,
-//! so the explicit `.setFamily(ALPHA)` is load-bearing — it overrides the default the Y1 port matches).
+//! **Java's NDV pipeline builds an `Alpha`-family update sketch, not `QuickSelect`.** Three independent
+//! sources agree: the puffin spec (`format/puffin-spec.md`: "constructing **Alpha family sketch** with
+//! default seed"), the Spark `ThetaSketchAgg.createAggregationBuffer` source
+//! (`UpdateSketch.builder.setFamily(Family.ALPHA).build()`, identical across spark v3.5/v4.0/v4.1), and
+//! the `datasketches-java-3.3.0` bytecode (`UpdateSketchBuilder`'s default family is `QUICKSELECT`, so
+//! the explicit `.setFamily(ALPHA)` is load-bearing). This action therefore builds an
+//! [`AlphaSketch`](iceberg_sketches::AlphaSketch) (the Rust port of `HeapAlphaSketch`) at the
+//! Iceberg-default lgK 12 / seed 9001. In **exact mode** (`theta == Long.MAX_VALUE`) Alpha and
+//! QuickSelect are byte-identical; in **estimation mode** they diverge (n=1M → Alpha `ndv` 1 004 032 vs
+//! QuickSelect 1 002 714), and Alpha is what every other engine writes — so on high-cardinality columns
+//! this action now produces cross-engine-matching bytes + `ndv`.
 //!
-//! Consequence (Java probe, datasketches-java-3.3.0, lgK 12 / seed 9001 — both families):
-//! - **Exact mode (≲ a few thousand distinct values, `theta == Long.MAX_VALUE`): Alpha and QuickSelect
-//!   are byte-identical and yield the same `ndv` (the true count).** Every test below feeds ≤ 6 distinct
-//!   values, so the suite cannot observe the divergence — it is SILENT here by construction.
-//! - **Estimation mode (≳ 7 000 distinct): they diverge.** n=7 000 → Alpha `ndv`=6963 vs QuickSelect
-//!   7000; n=1 000 000 → Alpha 1 004 032 vs QuickSelect 1 002 714, with different retained-entry counts
-//!   and different on-disk sketch bytes. Alpha uses a distinct sampling-mode estimate
-//!   (`nominal * MAX_THETA / theta`) once `theta <= split1`, which QuickSelect never does.
+//! # The `ndv` property reads the COMPACT sketch, not the update sketch
 //!
-//! So on a high-cardinality column this action emits a theta blob whose bytes and `ndv` differ from
-//! what Spark/Trino/Flink write — a cross-engine VALUE-contract gap. Closing it requires an `Alpha`
-//! update-family port in the Y1 `iceberg-sketches` crate (an `Alpha`/`QuickSelect` family selector);
-//! that is Y1's committed byte surface, so it is flagged here, not silently changed in Y2. Until then
-//! this action is exact-mode-correct and estimation-mode-divergent — tracked in the GAP_MATRIX cell.
+//! The blob's `ndv` property is `String.valueOf((long) sketch.getEstimate())`, but **`sketch` is the
+//! COMPACT sketch** Java reads back from the serialized bytes, not the live Alpha update sketch. Java
+//! `NDVSketchUtil.toBlob` does `Sketch sketch = CompactSketch.wrap(Memory.wrap(bytes))` then reads
+//! `getEstimate()` off that — the family-COMPACT *standard* estimator `compactRetained * (2^63/theta)`
+//! (truncated toward zero to an `i64`, decimal digits, no leading/trailing spaces — puffin spec). This
+//! differs from the Alpha update sketch's own *sampling* estimator (`nominal * 2^63/theta`): for n=1M
+//! the update sketch estimates 1 002 319 but the compact sketch (and thus the `ndv`) is 1 004 032. So
+//! this action feeds `ndv` from `sketch.compact().estimate()`, never from the update form's estimate.
 
 use std::collections::HashMap;
 
 use futures::TryStreamExt;
-use iceberg_sketches::ThetaSketch;
+use iceberg_sketches::{AlphaSketch, CompactThetaSketch};
 use uuid::Uuid;
 
 use crate::arrow::arrow_primitive_to_literal;
@@ -241,8 +238,8 @@ impl ComputeTableStats {
         &self,
         snapshot: &Snapshot,
         columns: &[StatsColumn],
-    ) -> Result<Vec<ThetaSketch>> {
-        let mut sketches: Vec<ThetaSketch> = columns.iter().map(|_| ThetaSketch::new()).collect();
+    ) -> Result<Vec<AlphaSketch>> {
+        let mut sketches: Vec<AlphaSketch> = columns.iter().map(|_| AlphaSketch::new()).collect();
 
         // No columns ⇒ nothing to scan; an empty stats file (no blobs) is still valid.
         if columns.is_empty() {
@@ -304,7 +301,7 @@ struct StatsColumn {
 /// (Java `Conversions.toByteBuffer` + `update(byte[])`). A `None` literal (a null cell) never updates
 /// the sketch — distinct-value counting excludes nulls, matching Java's `theta_sketch_agg`.
 fn feed_column(
-    sketch: &mut ThetaSketch,
+    sketch: &mut AlphaSketch,
     primitive_type: &PrimitiveType,
     literals: Vec<Option<Literal>>,
 ) -> Result<()> {
@@ -351,14 +348,13 @@ async fn write_stats_file(
     path: &str,
     snapshot: &Snapshot,
     columns: &[StatsColumn],
-    sketches: Vec<ThetaSketch>,
+    sketches: Vec<AlphaSketch>,
 ) -> Result<StatisticsFile> {
     let output_file = file_io.new_output(path)?;
     let mut writer = PuffinWriter::new(&output_file, HashMap::new(), false).await?;
     let mut blob_metadata = Vec::with_capacity(columns.len());
 
     for (column, sketch) in columns.iter().zip(sketches.into_iter()) {
-        let ndv_estimate = sketch.estimate() as i64;
         let payload = sketch.serialize_compact().map_err(|error| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -369,6 +365,23 @@ async fn write_stats_file(
             )
             .with_source(error)
         })?;
+        // The `ndv` reads the COMPACT sketch's estimate (Java `NDVSketchUtil.toBlob`:
+        // `CompactSketch.wrap(bytes).getEstimate()`), NOT the Alpha update sketch's sampling estimate —
+        // the two diverge in estimation mode (n=1M → compact 1004032 vs update 1002319). Parse the
+        // freshly-serialized payload through the same reader Java uses (`CompactSketch.wrap`).
+        let ndv_estimate = CompactThetaSketch::deserialize(&payload)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "Failed to read back the compact theta sketch for column field id {} to \
+                         compute its ndv",
+                        column.field_id
+                    ),
+                )
+                .with_source(error)
+            })?
+            .estimate() as i64;
         let blob = Blob::builder()
             .r#type(APACHE_DATASKETCHES_THETA_V1.to_string())
             .fields(vec![column.field_id])
@@ -411,7 +424,7 @@ mod tests {
     use arrow_array::{
         ArrayRef, Date32Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
     };
-    use iceberg_sketches::CompactThetaSketch;
+    use iceberg_sketches::{AlphaSketch, CompactThetaSketch, ThetaSketch};
     use tempfile::TempDir;
 
     use super::*;
@@ -774,6 +787,77 @@ mod tests {
     }
 
     // ============================================================================================
+    // End-to-end estimation-mode ndv pin — drives the PRODUCTION `write_stats_file` so the blob's
+    // `ndv` property is computed by the real code path (NOT reconstructed inline). RISK: the crown
+    // jewel only feeds exact-mode (≤6 distinct) data, where the Alpha update estimate and the COMPACT
+    // estimate coincide, so it cannot see which object `write_stats_file` reads. This test feeds a
+    // high-cardinality (1M distinct) Alpha sketch where the two estimators DIVERGE (compact 1004032 vs
+    // update sampling 1002319) and asserts the on-disk blob carries the COMPACT value — so a mutation
+    // in `write_stats_file` that reads the update sketch's `estimate()` fails here with 1002319.
+    // ============================================================================================
+
+    #[tokio::test]
+    async fn test_write_stats_file_ndv_property_reads_compact_estimate_in_estimation_mode() {
+        // 1M distinct longs ⇒ Alpha is in estimation mode (theta < MAX, sampling phase). Cross-checked
+        // against datasketches-java-3.3.0 (lgK 12 / seed 9001): COMPACT getEstimate 1004032.297 → ndv
+        // 1004032; the live Alpha UPDATE sampling estimate is the DIFFERENT 1002319. NDVSketchUtil reads
+        // the compact one — the on-disk `ndv` property MUST be 1004032.
+        const DISTINCT: u64 = 1_000_000;
+        const JAVA_ALPHA_COMPACT_NDV: i64 = 1_004_032;
+        const ALPHA_UPDATE_SAMPLING_NDV: i64 = 1_002_319; // the WRONG value an update-estimate read emits
+
+        let (catalog, _guard) = local_fs_catalog().await;
+        let table = create_unpartitioned_table(&catalog, multi_type_schema()).await;
+        // Append one tiny data file just to mint a real snapshot to stamp the blob with.
+        let table = append_files(&catalog, &table, vec![
+            write_data_file(&table, "seed.parquet", &canonical_rows()).await,
+        ])
+        .await;
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .expect("a current snapshot")
+            .clone();
+
+        // Build the action's per-column Alpha sketch directly, fed the same LE8 byte form the action
+        // feeds, then call the PRODUCTION write path.
+        let mut sketch = AlphaSketch::new();
+        for value in 0..DISTINCT {
+            sketch.update_bytes(&value.to_le_bytes());
+        }
+        // Sanity: the live update sketch's own estimate IS the divergent value (so the assertion below
+        // genuinely discriminates the two objects, not a coincidence).
+        assert_eq!(sketch.estimate() as i64, ALPHA_UPDATE_SAMPLING_NDV);
+
+        let columns = vec![StatsColumn {
+            name: "id".to_string(),
+            field_id: 1,
+            primitive_type: PrimitiveType::Long,
+        }];
+        let path = format!("{}/metadata/est-ndv.stats", table.metadata().location());
+        let statistics_file =
+            write_stats_file(table.file_io(), &path, &snapshot, &columns, vec![sketch])
+                .await
+                .expect("write stats file");
+
+        let blobs = reopen(table.file_io(), &statistics_file.statistics_path).await;
+        assert_eq!(blobs.len(), 1);
+        let (fields, _blob_type, ndv, _estimate) = &blobs[0];
+        assert_eq!(fields, &vec![1]);
+        assert_eq!(
+            ndv,
+            &JAVA_ALPHA_COMPACT_NDV.to_string(),
+            "the on-disk ndv property must be the COMPACT estimate (Java NDVSketchUtil), not the Alpha \
+             update sketch's sampling estimate {ALPHA_UPDATE_SAMPLING_NDV}"
+        );
+        assert_ne!(
+            ndv,
+            &ALPHA_UPDATE_SAMPLING_NDV.to_string(),
+            "reading the update sketch's estimate would emit {ALPHA_UPDATE_SAMPLING_NDV} — the bug this pins"
+        );
+    }
+
+    // ============================================================================================
     // Per-type byte-form pins — the Conversions.toByteBuffer single-value serialization, declared
     // by hand. RISK: feeding the JSON / display form (or BE longs, or length-prefixed strings)
     // diverges every NDV silently. A sketch fed the hand-declared bytes must equal the action's.
@@ -908,14 +992,14 @@ mod tests {
         // The action feeds update_bytes(Datum::to_bytes()). A hand-built sketch fed the SAME bytes
         // must produce the identical serialized payload — pins that the action uses the byte form,
         // not the display/JSON form.
-        let mut action_sketch = ThetaSketch::new();
+        let mut action_sketch = AlphaSketch::new();
         let literals: Vec<Option<Literal>> = ["x", "y", "x"]
             .iter()
             .map(|s| Some(Literal::string(*s)))
             .collect();
         feed_column(&mut action_sketch, &PrimitiveType::String, literals).expect("feed");
 
-        let mut hand_sketch = ThetaSketch::new();
+        let mut hand_sketch = AlphaSketch::new();
         for value in ["x", "y", "x"] {
             hand_sketch.update_bytes(value.as_bytes());
         }
@@ -932,13 +1016,13 @@ mod tests {
     fn test_feed_column_rejects_json_form_drift() {
         // MUTATION BAIT: if the action fed the JSON/display form ("x" → "\"x\"" or similar) the bytes
         // would differ. A sketch fed the JSON-quoted bytes must NOT match the byte-form sketch.
-        let mut byte_form = ThetaSketch::new();
+        let mut byte_form = AlphaSketch::new();
         feed_column(&mut byte_form, &PrimitiveType::String, vec![Some(
             Literal::string("x"),
         )])
         .expect("feed");
 
-        let mut json_form = ThetaSketch::new();
+        let mut json_form = AlphaSketch::new();
         json_form.update_bytes("\"x\"".as_bytes()); // the JSON-serialized form
 
         assert_ne!(
@@ -949,47 +1033,63 @@ mod tests {
     }
 
     // ============================================================================================
-    // Estimation-mode value pin + the Alpha-vs-QuickSelect family divergence (see the module doc).
-    // The strongest offline value-level evidence: feed a large distinct input, pin the EXACT Rust
-    // `ndv` (QuickSelect) AND assert it differs from the Java NDV pipeline's Alpha value — making the
-    // STOP-grade divergence VISIBLE rather than silent. When the Y1 crate gains an Alpha family port,
-    // this test should flip to assert equality with the Alpha column.
+    // Estimation-mode value pin — the Y2 STOP-finding CLOSED on Alpha (Y3). The action now builds an
+    // Alpha sketch and reads the `ndv` off the COMPACT sketch, so a high-cardinality column's `ndv`
+    // matches what Spark/Trino/Flink write. This pins the Alpha value AND proves the suite discriminates
+    // families: a revert to QuickSelect would break this pin while the exact-mode pins survive.
     // ============================================================================================
 
     #[test]
-    fn test_estimation_mode_ndv_pins_quickselect_and_documents_alpha_divergence() {
+    fn test_estimation_mode_ndv_matches_java_alpha_not_quickselect() {
         // 1_000_000 distinct longs fed in the action's single-value byte form (LE8 — same input as the
-        // Java probe). All three values are cross-checked against datasketches-java-3.3.0 probes:
-        //   Rust QuickSelect estimate == Java QuickSelect estimate (UpdateSketch.builder().build())
-        //                                == 1_002_714 (retained 6560, theta 60341508738660257) — bit-exact.
-        //   Java ALPHA estimate (UpdateSketch.builder().setFamily(ALPHA).build(), the REAL NDV pipeline)
-        //                                == 1_004_032 — DIFFERENT.
+        // Java probe). Cross-checked against datasketches-java-3.3.0 probes (lgK 12 / seed 9001):
+        //   Java ALPHA pipeline (UpdateSketch.builder().setFamily(ALPHA).build() → compact()):
+        //     compact retained 4103, theta 37691512080307240, COMPACT getEstimate 1004032.297 → ndv 1004032.
+        //   Java QUICKSELECT (UpdateSketch.builder().build() → compact()): ndv 1002714 — DIFFERENT.
+        // The action reads the COMPACT sketch's estimate (Java NDVSketchUtil), which for Alpha is 1004032.
         const DISTINCT: u64 = 1_000_000;
-        const JAVA_QUICKSELECT_NDV: i64 = 1_002_714; // == Rust (Y1 is a QuickSelect port)
         const JAVA_ALPHA_NDV: i64 = 1_004_032; // == what Spark/Trino/Flink actually write
+        const JAVA_QUICKSELECT_NDV: i64 = 1_002_714; // the OLD (wrong-family) value Y2 emitted
 
-        let mut sketch = ThetaSketch::new();
+        // The action's exact code path: feed an Alpha sketch the LE8 bytes, serialize, read the ndv
+        // off the COMPACT sketch.
+        let mut alpha = AlphaSketch::new();
         for value in 0..DISTINCT {
-            sketch.update_bytes(&value.to_le_bytes());
+            alpha.update_bytes(&value.to_le_bytes());
         }
-        let rust_ndv = sketch.estimate() as i64;
+        let payload = alpha.serialize_compact().unwrap();
+        let action_ndv = CompactThetaSketch::deserialize(&payload)
+            .unwrap()
+            .estimate() as i64;
 
-        // The action renders `ndv` as exactly this truncated string.
         assert_eq!(
-            rust_ndv, JAVA_QUICKSELECT_NDV,
-            "Rust ndv must equal the Java QuickSelect estimate"
+            action_ndv, JAVA_ALPHA_NDV,
+            "the action's ndv must equal the Java Alpha NDV pipeline (compact estimate)"
         );
         assert_eq!(
-            (sketch.estimate() as i64).to_string(),
-            JAVA_QUICKSELECT_NDV.to_string(),
+            action_ndv.to_string(),
+            JAVA_ALPHA_NDV.to_string(),
             "the ndv property string in estimation mode"
         );
-        // The divergence the module doc flags: the Y1 QuickSelect port does NOT reproduce the Java
-        // Alpha NDV pipeline once past exact mode. This assertion documents (and guards the size of)
-        // the gap — it is NOT a passing-parity claim.
+
+        // FAMILY DISCRIMINATION (the mutation proof): reverting the action to QuickSelect would make
+        // this same 1M input render 1002714, NOT 1004032 — so the pin fails on a family revert. Confirm
+        // the QuickSelect value really is different (and equals the OLD Y2 ndv).
+        let mut quickselect = ThetaSketch::new();
+        for value in 0..DISTINCT {
+            quickselect.update_bytes(&value.to_le_bytes());
+        }
+        let quickselect_ndv =
+            CompactThetaSketch::deserialize(&quickselect.serialize_compact().unwrap())
+                .unwrap()
+                .estimate() as i64;
+        assert_eq!(
+            quickselect_ndv, JAVA_QUICKSELECT_NDV,
+            "QuickSelect ndv (the reverted value)"
+        );
         assert_ne!(
-            rust_ndv, JAVA_ALPHA_NDV,
-            "KNOWN GAP: QuickSelect != Alpha in estimation mode — see the module-level divergence note"
+            action_ndv, quickselect_ndv,
+            "Alpha and QuickSelect ndv MUST differ in estimation mode — the gap Y3 closes"
         );
     }
 
@@ -999,7 +1099,7 @@ mod tests {
 
     #[test]
     fn test_nulls_are_excluded_from_distinct_count() {
-        let mut sketch = ThetaSketch::new();
+        let mut sketch = AlphaSketch::new();
         let literals = vec![
             Some(Literal::long(7)),
             None, // null cell

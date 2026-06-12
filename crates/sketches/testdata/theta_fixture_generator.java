@@ -21,6 +21,7 @@
 
 import java.nio.charset.StandardCharsets;
 
+import org.apache.datasketches.Family;
 import org.apache.datasketches.Util;
 import org.apache.datasketches.hash.MurmurHash3;
 import org.apache.datasketches.theta.CompactSketch;
@@ -93,6 +94,69 @@ public class ThetaFixtureGenerator {
 
         // Unordered compact form (the ORDERED flag is clear; same set, hash-table order).
         dumpSketch("EXACT10_UNORDERED", exact.compact(false, null));
+
+        // ---- ALPHA-family fixtures (Wave-5 Y3) ------------------------------------------------
+        // The family Iceberg's NDV pipeline actually builds: ThetaSketchAgg.createAggregationBuffer
+        // → UpdateSketch.builder.setFamily(Family.ALPHA).build(). In EXACT mode (theta==MAX) Alpha is
+        // byte-identical to QuickSelect; in ESTIMATION mode they DIVERGE. Iceberg's `ndv` reads the
+        // COMPACT sketch's getEstimate (NDVSketchUtil: CompactSketch.wrap(bytes).getEstimate()), which
+        // is the STANDARD estimator, NOT the Alpha update sketch's sampling estimator.
+        UpdateSketch alphaExact = UpdateSketch.builder().setSeed(seed).setFamily(Family.ALPHA).build();
+        for (long i = 0; i < 10; i++) {
+            alphaExact.update(i);
+        }
+        dumpSketch("ALPHA_EXACT10", alphaExact.compact()); // == EXACT10 bytes (equivalence pin)
+
+        UpdateSketch alphaSingle =
+            UpdateSketch.builder().setSeed(seed).setFamily(Family.ALPHA).build();
+        alphaSingle.update(1L);
+        dumpSketch("ALPHA_SINGLE", alphaSingle.compact()); // == SINGLE bytes
+
+        UpdateSketch alphaEmpty =
+            UpdateSketch.builder().setSeed(seed).setFamily(Family.ALPHA).build();
+        dumpSketch("ALPHA_EMPTY", alphaEmpty.compact()); // == EMPTY bytes
+
+        // Byte-inlinable estimation fixture: lgK 9 (Alpha minimum), 520 distinct longs `0..520`.
+        // retained=514, theta=9080515283922012160, COMPACT getEstimate=522.0863661049558 → ndv 522.
+        UpdateSketch alphaEst =
+            UpdateSketch.builder().setSeed(seed).setFamily(Family.ALPHA).setLogNominalEntries(9).build();
+        for (long i = 0; i < 520; i++) {
+            alphaEst.update(i);
+        }
+        dumpSketch("ALPHA_EST_LGK9_520", alphaEst.compact());
+
+        // Deep-resize estimation case: lgK 9, 50_000 distinct of a seed-independent value set (repeated
+        // dirty rebuilds). retained=536, theta=99944646323968464, COMPACT getEstimate=49464.654... .
+        UpdateSketch alphaDeep =
+            UpdateSketch.builder().setSeed(seed).setFamily(Family.ALPHA).setLogNominalEntries(9).build();
+        for (long i = 0; i < 50000; i++) {
+            alphaDeep.update(1_000_000L + i * 7);
+        }
+        dumpSketch("ALPHA_DEEP_LGK9_50K", alphaDeep.compact());
+
+        // The headline lgK=12-default estimation pins (only the COMPACT estimate / retained / theta are
+        // inlined; the full multi-KB blobs are not). n=7000 → ndv 6963; n=1_000_000 → ndv 1_004_032.
+        UpdateSketch alpha7000 = UpdateSketch.builder().setSeed(seed).setFamily(Family.ALPHA).build();
+        for (long i = 0; i < 7000; i++) {
+            alpha7000.update(i);
+        }
+        CompactSketch alpha7000c = alpha7000.compact();
+        System.out.println("ALPHA_EST7000_LGK12 | retained=" + alpha7000c.getRetainedEntries()
+            + " | theta=" + alpha7000c.getThetaLong()
+            + " | compactEst=" + alpha7000c.getEstimate()
+            + " | ndv=" + ((long) alpha7000c.getEstimate())
+            + " | updateSamplingEst=" + alpha7000.getEstimate());
+
+        UpdateSketch alpha1m = UpdateSketch.builder().setSeed(seed).setFamily(Family.ALPHA).build();
+        for (long i = 0; i < 1_000_000L; i++) {
+            alpha1m.update(i);
+        }
+        CompactSketch alpha1mc = alpha1m.compact();
+        System.out.println("ALPHA_EST1M_LGK12 | retained=" + alpha1mc.getRetainedEntries()
+            + " | theta=" + alpha1mc.getThetaLong()
+            + " | compactEst=" + alpha1mc.getEstimate()
+            + " | ndv=" + ((long) alpha1mc.getEstimate())
+            + " | updateSamplingEst=" + alpha1m.getEstimate());
 
         // ---- MurmurHash3 vectors (byte tails 1..=18) ----
         String base = "0123456789abcdefXYZ";

@@ -23,9 +23,21 @@
 //!
 //! The goal is **cross-engine byte compatibility**: a theta blob this crate writes is readable by
 //! Java DataSketches (and therefore Spark/Trino/Flink Iceberg engines), and blobs those engines
-//! write are readable here. To guarantee that, the hash ([`hash`]) and the build/serialize path
-//! ([`ThetaSketch`]) are ported one-to-one from the DataSketches 1.10.0 jar bytecode, and pinned
-//! against Java-generated fixtures (see the crate's `testdata`).
+//! write are readable here. To guarantee that, the hash ([`hash`]) and the build/serialize paths
+//! ([`ThetaSketch`], [`AlphaSketch`]) are ported one-to-one from the DataSketches 3.3.0 jar bytecode,
+//! and pinned against Java-generated fixtures (see the crate's `testdata`).
+//!
+//! ## Two update families
+//!
+//! - [`ThetaSketch`] ports `HeapQuickSelectSketch` (the `UpdateSketch.builder()` default family).
+//! - [`AlphaSketch`] ports `HeapAlphaSketch` — **the family Apache Iceberg's NDV pipeline actually
+//!   builds** (`ThetaSketchAgg` → `UpdateSketch.builder.setFamily(Family.ALPHA).build()`). In exact
+//!   mode the two are byte-identical; in estimation mode they diverge (different retained set, theta,
+//!   bytes, and NDV). Use [`AlphaSketch`] to match what other engines write on high-cardinality
+//!   columns.
+//!
+//! Both families serialize to the SAME family-COMPACT [`CompactThetaSketch`] form — one serialization
+//! path, no per-family fork.
 //!
 //! ## Usage
 //!
@@ -48,14 +60,18 @@
 //!
 //! This crate is the byte-contract foundation only. Wiring it into `ComputeTableStats` (per-column
 //! NDV over a scan, the Puffin `StatisticsFile` write, registration via `UpdateStatisticsAction`)
-//! lives in the `iceberg` crate and is intentionally out of scope here.
+//! lives in the `iceberg` crate. Note that the Iceberg `ndv` property reads the COMPACT sketch's
+//! estimate ([`CompactThetaSketch::estimate`]) — the family-COMPACT standard estimator — NOT the Alpha
+//! update sketch's own sampling estimate; the two differ in estimation mode (see [`AlphaSketch`]).
 
 #![deny(missing_docs)]
 
+pub mod alpha;
 pub mod error;
 pub mod hash;
 pub mod theta;
 
+pub use alpha::{ALPHA_MIN_LG_NOM_LONGS, AlphaSketch};
 pub use error::{SketchError, SketchResult};
 pub use hash::{DEFAULT_UPDATE_SEED, compute_seed_hash, hash_bytes, hash_long, hash_longs};
 pub use theta::{CompactThetaSketch, DEFAULT_LG_NOMINAL_LONGS, MAX_THETA, ThetaSketch};

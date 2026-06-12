@@ -1137,3 +1137,102 @@ How to use it (see the manuals' §2):
   in m2 — it did NOT (only `datasketches-java`/`-memory` jars are there). For spark-action provenance read
   the MAIN source tree, not m2 bytecode; for the FAMILY question that source (`setFamily(ALPHA)`) is the
   authoritative oracle, cross-checked against the datasketches jar's builder-default bytecode.
+
+### 2026-06-12 (Wave-5 Group Y / Y3 — Alpha-family update sketch, BUILDER Opus, wt-tstats)
+- **THE ndv-source ruling: Iceberg's `ndv` reads the COMPACT sketch's `getEstimate`, NOT the Alpha
+  update sketch's. The two genuinely DIFFER in estimation mode — derive which object from
+  `NDVSketchUtil.toBlob`, never assume "the sketch's estimate".** *Why (decisive — spark v3.5/4.0/4.1
+  `NDVSketchUtil.java` identical):* `Sketch sketch = CompactSketch.wrap(Memory.wrap(bytes)); ... ndv =
+  String.valueOf((long) sketch.getEstimate())`. `sketch` is the COMPACT sketch reparsed from the
+  serialized bytes — its `getEstimate` is the family-COMPACT STANDARD estimator `retained*(2^63/theta)`.
+  The live Alpha UPDATE sketch's `getEstimate` (`HeapAlphaSketch.getEstimate` bytecode) is family-aware:
+  `theta>split1` → standard, `theta<=split1` → SAMPLING `nominal*(2^63/theta)`. Java probe (lgK12/seed9001,
+  n=1M): UPDATE sampling estimate = 1002319 but COMPACT estimate = 1004032 — and **1004032 is the prompt's
+  pinned ndv**. So the action must do `CompactThetaSketch::deserialize(&payload).estimate()`, exactly
+  Java's `CompactSketch.wrap(bytes).getEstimate()`. Pinning BOTH values (the compact one as the ndv, the
+  update one as "NOT the ndv") makes the object-selection load-bearing. The prompt framed `nominal*MAX/theta`
+  as "the Alpha estimator the Y2 probe saw" — true of the UPDATE sketch, but the ndv uses the COMPACT one;
+  a builder who wired `alpha.estimate()` would emit 1002319 and silently diverge from every engine.
+- **`HeapAlphaSketch.compact()` is family-COMPACT, not family-ALPHA — the on-disk form REUSES the
+  QuickSelect serializer verbatim; only the UPDATE-side retention/theta differs.** *Why:* `toByteArray()`
+  on the live Alpha sketch writes a family-ALPHA preamble, but Iceberg serializes via `UpdateSketch.compact()`
+  → `componentsToCompact(thetaLong, getRetainedEntries(true), seedHash, isEmpty, ..., cache)` → `compactCache`
+  keeps cache entries `0<h<theta`, `Arrays.sort` ascending, `loadCompactMemory` writes the family-COMPACT (id 3)
+  preamble. So `AlphaSketch::serialize_compact()` = the Y1 `serialize_compact_from_parts(is_empty, theta,
+  sorted_below_theta_hashes, seed)` UNCHANGED — one path, no fork. The reused retained count is
+  `getRetainedEntries(true)` (the DIRTY-aware `countPart` = the below-theta cache count), NOT the raw
+  `curCount_` (which over-counts dirty stale slots). Make the shared helpers `pub(crate)` rather than
+  duplicating the serializer.
+- **The Alpha dirty-phase insert (`enhancedHashInsert`) reuses stale (≥theta) slots WITHOUT a count
+  bump and does NOT rebuild every insert — port it faithfully or the retained set drifts by an element.**
+  *Why:* once `theta<=split1` the table accumulates above-theta entries; a new insert probes, and on the
+  FIRST stale slot it reuses it in place (`InsertedCountNotIncremented`), decays theta, sets dirty; only a
+  truly-empty slot bumps `curCount` and may trigger `rebuildDirty` (a same-size purge; if nothing purged,
+  grow by 1). A naive "rebuild on every dirty insert" or "always land in an empty slot" port produced a
+  retained SET that differed from Java by ONE borderline hash near theta — invisible to retained-count and
+  theta pins (both matched) but caught by the BYTE-EXACT fixture. Lesson: for a stateful Java sketch, the
+  byte-exact estimation fixture is the only pin that catches a single-element set drift; pin retained+theta
+  AND the full bytes.
+- **A byte-exact `*_HEX` const transcribed by hand into Rust is error-prone — generate it, then REPLACE
+  the const programmatically from the verified-equal Rust/Java output, never retype a 8000-char hex.**
+  *Why:* my first paste of the lgK9/520 fixture had 2 extra hex chars at byte 1880; the retained SET and
+  theta were byte-identical (proven by dumping both sets — zero diff), so the bug was purely a transcription
+  typo in the const, not the algorithm. A `python3 re.sub` replacing the const with the Java-generated hex
+  (after confirming the live Rust `serialize_compact()` == the Java hex) fixed it in one shot. DO diff the
+  retained SETS first when an estimation fixture fails — if the sets match, the bug is in the const, not the
+  sketch.
+- **`setHashTableThreshold(lgNom, lgArr)` uses the 0.5 fraction when `lgArr <= lgNom` (NOT 0.9375).** *Why:*
+  the initial Alpha table at lgK12 has lgArr=7 (`startingSubMultiple(13,3,5)=7`), and 7<=12 ⇒ threshold =
+  `floor(0.5*2^7)=64`, not 120. I twice wrongly asserted the 0.9375 branch; it only applies once the table
+  has grown PAST nominal. Read the `if_icmpgt` direction in the bytecode, don't assume the resize-phase fraction.
+
+### 2026-06-12 (Wave-5 Group Y / Y3 — Alpha-family update sketch, REVIEWER Opus, wt-tstats)
+- **HEADLINE — the real bug was at the ACTION level, not in the dirty-path sketch: NO test pinned that
+  PRODUCTION `write_stats_file` reads the COMPACT estimate (1004032), not the Alpha UPDATE sampling
+  estimate (1002319). The headline `ndv` re-pin RECONSTRUCTED the path inline (`AlphaSketch` →
+  `serialize_compact` → `CompactThetaSketch::deserialize().estimate()`) and never called
+  `write_stats_file`; the crown jewel calls `execute()` but only on ≤6-distinct EXACT-mode data where
+  the two estimators COINCIDE.** *Proof:* mutating `write_stats_file` to `let ndv = sketch.estimate()`
+  (the update form) SURVIVED all 21 compute_table_stats tests. FIX: added
+  `test_write_stats_file_ndv_property_reads_compact_estimate_in_estimation_mode` — mints a real snapshot,
+  feeds a 1M-distinct `AlphaSketch`, drives the PRODUCTION `write_stats_file`, reopens the puffin, and
+  asserts the on-disk `ndv` PROPERTY == 1004032 (≠ 1002319). Fail-before (1002319) / pass-after (1004032)
+  verified. RULE: a pin that reconstructs the code path inline does NOT pin production — drive the real
+  fn, and put the discriminating input (estimation-mode, where the two objects diverge) through it, or the
+  object-selection decision is unguarded where it actually lives.
+- **The dirty-path stale-slot machinery (`enhancedHashInsert` reuse, `rebuildDirty` grow-if-nothing-purged,
+  count-on-empty-vs-reuse) is byte-output-EQUIVALENT to a naive clean-path port — so the byte-exact
+  fixtures CANNOT catch most dirty-path mutations.** *Why:* theta decays exactly once per successful
+  insert in BOTH paths (same decay count ⇒ same theta trajectory); the retained set is `{0<h<theta}`,
+  invariant under table size and probe layout; rebuilds purge stale entries + re-sync count but never
+  change theta or the below-theta set. Verified: `if false` (never take the dirty path), `current_count
+  += 1` on stale reuse, and flipping `rebuildDirty`'s grow condition ALL produced byte-identical output on
+  a 200k-element adversarial pseudo-random sequence (Rust == Java FNV-of-bytes identical). The ONE
+  dirty-path mutation that bites is "reuse the EMPTY slot instead of the stale slot" — it leaves stale
+  entries forever, the table fills, and the inner stale-search loop (no `loop_index` guard, faithful to
+  Java) SPINS FOREVER (test hangs at 100% CPU). So the stale-slot reuse is load-bearing for LIVENESS, not
+  for the bytes. LESSON: for a stateful sketch where the serialized form is a pure function of (theta,
+  below-theta set), byte fixtures pin the OUTPUT contract but NOT the internal state machine; to pin the
+  machine you need a differential oracle (run both candidate algorithms, diff) or a liveness/timeout pin —
+  the prompt's worry "a subtle miss hides DESPITE byte-exact fixtures" is real, but it lives in the ACTION
+  object-selection, not the cache mechanics.
+- **The three trickiest bytecode facts RE-DERIVED independently and CONFIRMED against alpha.rs:**
+  (a) `enhancedHashInsert` tracks the FIRST stale (`>= theta`) slot (`deleteIndex`, local 10) and reuses
+  it in place WITHOUT a count bump (`InsertedCountNotIncremented`, offsets 154-179); a truly-empty slot
+  bumps count + may `rebuildDirty` (offsets 272-318). The probe order is first-stale-wins (the inner loop
+  at 89-119 only breaks on hash-found or empty, never on a later stale). (b) `rebuildDirty` (offsets 0-22):
+  `prev=curCount; forceRebuildDirtyCache(); if (prev == curCount) forceResizeCleanCache(1)` — grow ONLY
+  when NOTHING was purged (`prev == curCount`). (c) `getRetainedEntries(true)` = `(curCount>0 && arg &&
+  isDirty()) ? HashOperations.countPart(cache,lgArr,theta) : curCount`; `countPart` counts `!continueCondition`
+  = `{0<h<theta}`; `UpdateSketch.compact(b,mem)` feeds `getRetainedEntries(true)` (NOT raw curCount) to
+  `componentsToCompact`, and `compactCache` THROWS "curCount parameter is incorrect" if the below-theta
+  count `< curCount` — so a port that fed raw curCount when dirty would error in Java. Rust's
+  `retained_entries()` (dirty ⇒ `below_theta_hashes().len()`) + `serialize_compact` (direct below-theta
+  filter) match all three. The "raw curCount" mutation IS caught by the `retained_entries()` assertions.
+- **Seam fixtures at the dirty-state-machine transitions (n=nominal/nominal+1/nominal+2 at lgK9; stale-reuse
+  checkpoints n=600/1000/5000 with dup-interleave; mid-size lgK12/n=10000) are all byte-EXACT vs fresh
+  datasketches-java-3.3.0 — but they catch nothing the existing endpoint fixtures miss** (per the
+  equivalence finding above). Generated + verified them as a probe, then DELETED rather than bloat the
+  suite with multi-KB redundant hex (the lesson's transcription-hazard warning). The benign `>` vs `>=`
+  split1-comparison mutations also survive (boundary `theta == split1` is measure-zero) — not gaps; the
+  estimator BRANCH-DIRECTION flip IS caught by the n=7000/1M sampling-estimate pins (6973/1002319).
