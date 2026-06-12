@@ -37,6 +37,11 @@
 //!   file (per-partition/spec min-data-seq comparison + DV reference check), committed through the
 //!   [`RewriteFilesAction`](crate::transaction::rewrite_files) delete-file-removal surface. The Rust
 //!   port of Java's `RemoveDanglingDeletesSparkAction`. **This action removes delete files.**
+//! - [`compute_partition_stats`] / [`PartitionStats`] — the `ComputePartitionStats` compute core (the
+//!   Rust port of Java 1.10.0 `PartitionStatsHandler`'s full-compute aggregation): per-partition
+//!   statistics rolled up over a snapshot's manifests into the Java-exact partition-stats schema. This
+//!   is the **X1** scope — it does NOT write the stats file or register it in metadata (that is X2),
+//!   and it reads the table without mutating it. See [`partition_stats`] for the schema + traversal.
 //!
 //! # Relationship to `transaction::expire_cleanup`
 //!
@@ -49,6 +54,7 @@
 //! reusing `expire_cleanup`'s delta machinery).
 
 mod delete_orphan_files;
+pub mod partition_stats;
 mod remove_dangling_delete_files;
 mod rewrite_data_files;
 
@@ -56,6 +62,9 @@ mod rewrite_data_files;
 mod tests;
 
 pub use delete_orphan_files::{DeleteOrphanFiles, DeleteOrphanFilesResult, PrefixMismatchMode};
+pub use partition_stats::{
+    PartitionStats, compute_partition_stats, partition_stats_schema, unified_partition_type,
+};
 pub use remove_dangling_delete_files::{
     RemoveDanglingDeleteFiles, RemoveDanglingDeleteFilesResult,
 };

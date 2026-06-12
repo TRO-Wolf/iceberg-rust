@@ -2141,3 +2141,82 @@ How to use it (see the manuals' §2):
   regardless of absolute path length. Verified: max=3863 → target=7727 → 2 bins of 2; the bin-count
   assert is a real `assert!` (fail-loud), proven by forcing target=max*1000 (collapses to 1 merged
   manifest, assert panics "got 1"). No fragility found — the measurement is the right design.
+
+### 2026-06-12 (Group X / X1 — ComputePartitionStats COMPUTE core, BUILDER Opus, wt-pstats)
+- **The 1.10.0 JAR's `PartitionStatsHandler` DIVERGES from the /tmp MAIN-source checkout — bytecode
+  wins, and the divergence is load-bearing.** *Why:* the jar holds the stats schema as field-id
+  constants ON the handler (`PARTITION_FIELD_ID=1 … DV_COUNT=13`) + a concrete `PartitionStats`
+  class; the MAIN checkout (crawled 2026-06-06) is POST-1.10.0 — refactored to a `PartitionStatistics`
+  INTERFACE + `BasePartitionStatistics`, with an `appendStats` that GUARDS `dv_count` behind a
+  V2-backward-compat `targetStats.size() > DV_COUNT_POSITION` check. The 1.10.0 jar's `appendStats`
+  adds `dv_count` UNCONDITIONALLY (bytecode: `getfield dvCount; iadd; putfield` with no size guard).
+  Porting the MAIN guard would diverge from the pinned oracle. RULE (re-confirmed): `javap -p -c
+  -constants` the JAR named by the brief BEFORE reading the MAIN .java — for an actively-refactored
+  class the two can differ in class shape AND merge logic.
+- **`total_record_count` is NEVER computed in the compute path — it stays NULL (boxed `Long`, Java
+  comment "needs scanning the data").** The in-memory `PartitionStats` keeps the count members as
+  PRIMITIVES (default 0) and only `totalRecordCount`/`lastUpdatedAt`/`lastUpdatedSnapshotId` as boxed
+  nullable `Long`. The Rust row type must mirror that exactly (`i64`/`i32` counters, `Option<i64>` for
+  the three nullables) — a "compute total_record_count from data_record_count" shortcut would diverge
+  (Java leaves it null even when data records are counted).
+- **FULL-compute reads `snapshot.allManifests` over ALL entries (LIVE + DELETED) — a DELETED tombstone
+  bumps ONLY last-updated and KEEPS a zero-count row.** Bytecode `computeAndWriteStatsFile(Table,long)`
+  full branch: `snapshot.allManifests(io)` (the snapshot's whole manifest list, data + delete) →
+  `computeStats(.., incremental=false)`; `collectStatsForManifest` iterates `reader.entries()` (NOT
+  `liveEntries`) and routes `isLive()` → `liveEntry`, else → `deletedEntry` (last-updated only). This
+  is the OPPOSITE of `inspect::partitions` (which `continue`s on non-alive) — reusing that loop
+  verbatim would DROP fully-deleted partition rows (Java `testCopyOnWriteDelete` keeps them at
+  dataRecordCount==0). The mutation (add `if !is_alive { continue }`) is caught ONLY by a
+  fully-deleted-partition fixture (append → delete-the-only-file → the tombstone's row must survive).
+- **A same-order coercion fixture MASKS the "drop the spec-coercion" mutation — the field-id REMAP
+  needs a REVERSED-spec-order pin.** *Why:* `coercePartition` must map each unified field BY FIELD ID
+  to the file's per-spec tuple POSITION. When the spec's partition fields are already in ascending-id
+  order (the common case — `identity(x)` then `identity(y)`), the spec position == the unified index,
+  so a mutation that indexes by the UNIFIED position instead of remapping passes every same-order test
+  AND the null-fill guard (`index < file_values.len()`) catches the missing trailing field. The ONLY
+  distinguishing fixture is a spec whose partition tuple is in a DIFFERENT positional order than the
+  unified ascending-by-id order (`[y@1001, x@1000]` with unified `{x@1000, y@1001}` → coerced must be
+  `(x,y)` not `(y,x)`). Same family as the multi-spec "same-arity different-name" masking lesson: when
+  a fix routes a per-element index/id, pin it with elements whose POSITION differs from their ID order.
+- **The Rust core has NO cross-spec partition-type unifier — `inspect::partitions` documents this and
+  keys by the file's OWN struct against `default_partition_type()`.** So `Partitioning.partitionType`
+  (one struct field per unique partition field id across all specs, deduped, newest-spec name wins,
+  sorted ascending) + `PartitionUtil.coercePartition` (`StructProjection.createAllowMissing`) had to be
+  PORTED, not reused (both `inspect/` + `spec/` are READ-ONLY this increment). Built entirely from the
+  public `PartitionSpec`/`StructType`/`Struct` accessors — zero visibility change needed. Reused only
+  the manifest-iteration loop SHAPE + the partition-tuple COMPARATOR pattern from `inspect::partitions`
+  (re-authored locally since the module is READ-ONLY).
+
+### 2026-06-12 (Group X / X1 — ComputePartitionStats, REVIEWER Opus, wt-pstats)
+- **`PartitionStats.liveEntry`'s PUFFIN test is the DV-routing oracle — a deletion vector is a PUFFIN
+  position delete, and it routes to `dv_count` NOT `position_delete_file_count`, while STILL adding its
+  records to `position_delete_record_count`.** *Why (1.10.0 jar bytecode, `liveEntry` POSITION_DELETES
+  case, offsets 107-157):* `positionDeleteRecordCount += recordCount` ALWAYS, then
+  `if format == PUFFIN → dvCount++ else positionDeleteFileCount++`. So a DV moves TWO cells
+  (`dv_count` + `position_delete_record_count`), leaves `position_delete_file_count` at 0. DO pin this
+  with a REAL V3 Puffin-DV fixture (V2 commits reject DVs via `validate_delete_file_for_version`; a DV
+  `DataFile` needs `file_format=Puffin` + `referenced_data_file` + `content_offset`/`content_size`).
+  A unit `live_entry` test alone is necessary but not sufficient — the routing only matters once a real
+  DV survives the row-delta commit gate.
+- **Last-updated for a CARRIED-FORWARD (EXISTING) manifest entry attributes to the ORIGINAL committer,
+  not the compute target.** *Why:* Java `collectStatsForManifest` keys off
+  `table.snapshot(entry.snapshotId())` (the entry's OWN id, bytecode offsets 145-161), and a carried
+  EXISTING entry keeps its original `snapshot_id` (Rust `ManifestEntry::inherit_data` only fills it from
+  the manifest's `added_snapshot_id` when it is `None`). DO probe this directly: append partition A (S1),
+  then touch a DIFFERENT partition B (S2) so A's manifest is re-listed as EXISTING — A's `last_updated`
+  must stay S1. The crown jewel pins it implicitly (its spec-0 rows stay at S1); an explicit probe
+  catches the "key off current_snapshot" headline mutation independently.
+- **A row's `spec_id` is the file's OWN spec = the MANIFEST's `partition_spec_id`, never the newest-seen
+  spec for that partition.** Java's per-manifest supplier is `new PartitionStats(coercedPartition,
+  manifestFile.partitionSpecId())` and `liveEntry` asserts `file.specId() == row.specId`. Across spec
+  evolution, the same logical partition value can produce two rows (one per spec) with different
+  `spec_id`s. DO pin explicitly (write under spec 0, evolve, write under spec 1 → two rows, spec_id 0
+  and 1) — the crown jewel pins it only implicitly.
+- **Java keys the partition map by `(specId, RAW file partition)` but stores the COERCED partition in the
+  row; the Rust keys by `(spec_id, COERCED partition)` throughout — behaviorally equivalent** because
+  coercion under a fixed spec is injective (id-remap + null-fill), so the `specId` prefix + the per-spec
+  bijection make the two keyings produce identical groupings/merges. Worth confirming, not a bug.
+- **Mutation-sweep a `coercePartition`-style remap with TWO disorder fixtures of different shapes** (a
+  2-field reversed `[y,x]` AND a 3-field scramble `[z,x,y]`). The index-by-position mutation must fail
+  on BOTH — a single fixture is the "fragile one-pin" the builder flagged. (Same family as the
+  earlier "same-arity different-name masking" lesson.)
