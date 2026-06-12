@@ -65,9 +65,14 @@
 //! land in a manifest stamped with their own spec id, and a scan reads them correctly. Pinned by
 //! `test_cherrypick_multispec_replay_produces_per_spec_manifest`.
 //!
+//! The stage-only WAP WRITE path that creates a staged snapshot in the first place
+//! (`FastAppendAction::stage_only()` / `DeleteFilesAction::stage_only()`, Java `SnapshotProducer.stageOnly()`)
+//! landed in Group V (2026-06-11); see [`crate::transaction::snapshot::SnapshotProducer::with_stage_only`].
+//! Most tests here still graft staged snapshots by `set_current`-ing main off a normally-published snapshot
+//! (a staged snapshot is just a dangling one), which is equivalent for the publish path under test.
+//!
 //! **Out of scope (deferred):** Java↔Rust byte-level interop for the published snapshot (this is a 🟡
-//! unit-proven action); the stage-only WAP WRITE path (`stageOnly()` on the append/overwrite producers that
-//! creates the staged snapshot in the first place) — the tests graft staged snapshots directly.
+//! unit-proven action).
 
 use std::collections::HashSet;
 use std::sync::Arc;

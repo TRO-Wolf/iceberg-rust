@@ -695,8 +695,17 @@ result-count-swap, task→file mapping. Gate ×2. Tree: maintenance/** + 4 docs 
       shredding; surface the dependency question, do not touch Cargo. Runs in worktree
       `wt-vschema` parallel to Group O (`phase6/rewrites-and-debt`, Opus) and Group S
       (`interop/data-level-paydown`, Sonnet).
+- [ ] **THIS BRANCH (Overnight 2026-06-12 Group V, Opus actor-critic, user-approved):
+      `stageOnly` + WAP completion** — V1: `SnapshotProducer.stageOnly` parity (snapshot lands in
+      metadata, refs untouched, wap.id summary handling; on-disk pins re-parsing metadata);
+      V2: wap-path publish dedup (duplicate `wap.id` cherrypick rejection — the WAP-path twin of
+      the landed ancestry-path dedup) + apply-vs-commit staging pins; V3 (stretch):
+      `write.wap.enabled` audit-mode IF 1.10.0 core enforces it (bytecode settles; skip if
+      engine-side). Production-only tonight (transaction/**); the staged-WAP interop fixture
+      upgrade is next-wave. Worktree `wt-wap`, parallel to Group W (`interop/data-level-wave2`,
+      Sonnet-builder+Opus-critic) and Group X (`phase6/partition-stats`, Opus).
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
-- [ ] **Opus-queue (post-handoff or parallel):** cherrypick `stageOnly` WAP-write path, ORC/Avro breadth, view ops, incremental-scan interop.
+- [ ] **Opus-queue (post-handoff or parallel):** ORC/Avro breadth, view ops, incremental-scan interop.
 - [ ] **THIS BRANCH (Group B, Fable actor-critic, user-approved 2026-06-11): variant-type
       groundwork** — B1: the variant binary format read side (`org.apache.iceberg.variants`
       Serialized* + VariantUtil parity: metadata dictionary, value headers, all primitive
@@ -1483,6 +1492,99 @@ the full 2066-test lib). Visitor drivers + finally semantics bytecode-confirmed 
 tables 71-90→99 / 193-214→223; exactly two static `visit` overloads). Gate ×2 CLEAN: typos /
 fmt / clippy `-D warnings`, `cargo test -p iceberg --lib` **2066 ×2** (2062 + 4 reviewer tests;
 one builder test extended). Probes/mutations reverted from /tmp snapshots; tree = allowed set.
+## ACTIVE (2026-06-11): Overnight Group V increment V1 — `stage_only()` WAP staging path (worktree wt-wap, BUILDER Opus)
+
+Expose Java `SnapshotProducer.stageOnly()` on the Rust snapshot-producing actions: a staged commit ADDS its
+snapshot to table metadata WITHOUT moving any ref (no `SetSnapshotRef`), so the snapshot is staged for later
+cherry-pick/publish. Corruption surface: a staged commit that moves a ref publishes unaudited data; a staging
+that mangles snapshot-log / refs / current-snapshot-id corrupts the table for every reader.
+
+**Java authority (1.10.0 bytecode, all confirmed):**
+- `SnapshotProducer.stageOnly()` — `iconst_1; putfield stageOnly:Z; return self()`. The flag is declared on the
+  `SnapshotUpdate<ThisT>` API interface (`api/SnapshotUpdate.class`: `public abstract ThisT stageOnly()`), so
+  EVERY snapshot-producing action exposes it.
+- `SnapshotProducer.apply()` (the `Snapshot apply()`) computes `long seq = base.nextSequenceNumber()`
+  UNCONDITIONALLY (off 18-24) and builds `new BaseSnapshot(seq, snapshotId, ...)` (off 367-418) — NO stageOnly
+  branch. ⇒ **a staged snapshot CONSUMES a sequence number exactly like a normal commit** (load-bearing for
+  cherrypick seq behavior).
+- `SnapshotProducer.commit` → `lambda$commit$2`: builds `TableMetadata.Builder` from base; `if base.snapshot(id)
+  != null` → `setBranchSnapshot(id, branch)` (already-present); `else if stageOnly` → `addSnapshot(snapshot)`
+  ONLY; `else` → `setBranchSnapshot(snapshot, branch)` (add + move ref). So the staged update set is
+  `AddSnapshot` ALONE; the normal set is `AddSnapshot` + the branch-ref move.
+- `TableMetadata.Builder.addSnapshot(Snapshot)` (bytecode): adds to `snapshots`/`snapshotsById`, sets
+  `lastSequenceNumber`/`lastUpdatedMillis`, emits `MetadataUpdate.AddSnapshot`, advances `nextRowId` (V3) —
+  **does NOT touch `snapshotLog`, `currentSnapshotId`, or `refs`** (the snapshot-log entry + current id live in
+  `setRef`/`setBranchSnapshotInternal`, only reached by the non-staged path). ⇒ Java does NOT advance the
+  snapshot log for a staged snapshot.
+- WAP `wap.id`: engine sets it via `SnapshotUpdate.set(String, String)` (api interface) → the producer's
+  `summaryBuilder.set(...)`. The summary then carries `wap.id` on the staged snapshot. Constants
+  (`SnapshotSummary`): `STAGED_WAP_ID_PROP = "wap.id"`, `PUBLISHED_WAP_ID_PROP = "published-wap-id"`.
+
+**Rust-side findings (verified before writing code):**
+- The producer's `commit()` (snapshot.rs L1451-1462) ALWAYS emits BOTH `AddSnapshot` + `SetSnapshotRef(main)`.
+  The whole change is: thread a `stage_only` flag onto `SnapshotProducer`, and when set, emit ONLY `AddSnapshot`
+  (and drop the `RefSnapshotIdMatch` requirement, since no ref moves — keep only `UuidMatch`).
+- Rust `TableMetadataBuilder::add_snapshot` already mirrors Java: inserts into `snapshots`, bumps
+  `last_sequence_number`/`last_updated_ms`/`next_row_id`, emits `AddSnapshot` — does NOT touch `snapshot_log`
+  or `current_snapshot_id`. `update_snapshot_log()` early-returns when no `SetSnapshotRef(main)` is present
+  (`get_intermediate_snapshots` is empty) ⇒ **NO snapshot-log entry for a staged snapshot. NO spec/ change
+  needed** (the brief's "spec/ only if genuinely needed" condition is NOT met — flagged in the report).
+- `wap.id` is ALREADY expressible via `set_snapshot_properties(HashMap)` (present on every action) — the Rust
+  equivalent of Java's per-producer `set()`. The cherry_pick tests already stage `wap.id` this way. So point 2
+  needs NO new `set()` — documented, not added (a minimal Java-parity `set()` would be redundant with the
+  existing surface).
+- Point 3 (retention): `unreferenced_snapshots_to_retain` iterates `metadata.snapshots()` (a staged snapshot is
+  in `snapshots`), drops those referenced by a retained ref (a staged snapshot is referenced by none), keeps
+  only `timestamp_ms >= cutoff` ⇒ a staged-but-never-published snapshot aged past the cutoff IS expirable. NO
+  expire_snapshots change — pin only.
+
+**Surface decision:** `stage_only` lives on the `SnapshotProducer` (Java's `private boolean stageOnly`); each
+action builder gets a `stage_only()` setter + a `stage_only: bool` field threaded into the producer at commit.
+This increment wires it on `FastAppendAction` (crown-jewel) and `DeleteFilesAction` (the delete-bearing action),
+mirroring Java's reach (any SnapshotProducer-derived action can stage). Other actions can adopt the one-line
+setter later — out of scope tonight.
+
+- [x] 1. Write this plan in todo.md.
+- [x] 2. snapshot.rs: add `stage_only: bool` field + `with_stage_only()` builder; in `commit()` emit only
+      `AddSnapshot` (no `SetSnapshotRef`) and only the `UuidMatch` requirement when staged.
+- [x] 3. append.rs: `FastAppendAction.stage_only` field + `stage_only()` setter; thread into the producer.
+- [x] 4. delete_files.rs: same `stage_only()` setter on `DeleteFilesAction`.
+- [x] 5. Tests (each named for its risk): the on-disk staging crown jewel (snapshot exists, current-snapshot-id
+      / main ref / snapshot-log UNCHANGED, summary carries `wap.id`, seq == normal-commit seq); scan returns
+      pre-staging data; e2e stage→cherry_pick publishes (published-wap-id present); two staged snapshots coexist
+      and are each cherrypickable; stage_only on delete_files stages identically; mutation-bait (emit the ref
+      update → crown jewel must fail).
+- [x] 6. GAP_MATRIX cherrypick row: `stageOnly` landed (date; staged-WAP interop fixture still deferred);
+      5-pipe audit.
+- [x] 7. transaction/map.md: note stage_only on the snapshot.rs/append.rs/delete_files.rs rows.
+- [x] 8. Verify (twice): typos + fmt + clippy -D warnings + `cargo test -p iceberg --lib` (baseline 2044).
+
+**Outcome (2026-06-11): V1 LANDED.** See FINAL REPORT. NO spec/ change (Rust builder already Java-faithful for
+add-snapshot-without-ref). `wap.id` rides the existing `set_snapshot_properties` surface (no new `set()`).
+Retention + cherrypick consume staged snapshots unchanged. Deferred: staged-WAP Java interop fixture (next wave);
+stage_only on the remaining actions (one-line setters, not needed tonight); V2 (wap-path publish dedup).
+
+**Reviewer (2026-06-11, Opus, wt-wap): VERIFIED — APPROVED.** Both headlines bytecode-settled:
+(#1 requirements) `UpdateRequirements.forUpdateTable(base, [AddSnapshot])` derives `AssertTableUUID` ALONE —
+the 1.10.0 `Builder.update(MetadataUpdate)` dispatcher has 8 `instanceof` arms (SetSnapshotRef, AddSchema,
+SetCurrentSchema, AddPartitionSpec, SetDefaultPartitionSpec, SetDefaultSortOrder, RemovePartitionSpecs,
+RemoveSchemas) and NO `AddSnapshot` arm, so an AddSnapshot-only update adds no requirement. The Rust staged
+set (`UuidMatch` alone) is Java-EXACT — not over-strict, not under-strict. (#2 retry) `apply()` reads
+`base.nextSequenceNumber()` (off 17-24, unconditional) + `latestSnapshot(base, main)` (off 5-16) — NO stageOnly
+branch in `apply()`; the Rust action recomputes both against the refreshed `current_table` on every
+`do_commit`, so a staged retry takes the NEW seq + NEW parent (pinned). `lambda$commit$2` stageOnly branch +
+`addSnapshot` (touches no snapshotLog/currentSnapshotId/refs) confirmed; the Rust builder's add-without-ref path
+mirrors it exactly ⇒ NO spec/ change correct. **Mutation sweep:** the update-neutering mutation (`if true` on
+the updates block) kills 9 tests; the wap.id-drop mutation kills the crown jewel's wap.id assertion. **Survivor
+caught:** the over-strict-REQUIREMENT mutation (`if true` on the requirements block) is INVISIBLE to every
+end-to-end test (the retry/rebase recomputes `RefSnapshotIdMatch` against the refreshed base, masking it) — the
+reviewer added a wire-level exact update/requirement-set pin
+(`test_stage_only_emits_add_snapshot_alone_with_uuid_match_only`) that catches it at the ActionCommit source.
+**+7 reviewer tests** (the exact-set pin, concurrent-vs-stage both orders, retry/rebase seq+parent, wap.id
+coexistence, readable-by-explicit-id+inspect-posture, reverse-publish-order coexist). Sanctioned cherry_pick.rs
+module-doc fix applied; e2e test docstring corrected (fast-forward keeps original wap.id, not `published-wap-id`).
+Gate ×2 CLEAN: typos/fmt/clippy `-D warnings` clean, `cargo test -p iceberg --lib` **2058 ×2** (baseline 2051 +7).
+Tree = allowed set + the doc fix; zero spec/ edits; no Cargo/pom diffs. NO COMMIT.
 
 ## Carried-forward open items (full context in todo-archive/)
 
