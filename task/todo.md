@@ -1117,6 +1117,135 @@ Gate ×2: typos clean, fmt clean, clippy -D warnings clean (ex-sqllogictest), `c
 --lib` **2068 passed ×2** (2044 + 24 = 20 builder + 4 reviewer pins). Tree = allowed set only
 (maintenance/{partition_stats.rs, mod.rs}, GAP_MATRIX 1 row, todo, lessons); inspect/spec/writer/Cargo
 byte-untouched. NO commit. The DV fixture USES the writer (no writer edit).
+
+## ACTIVE (2026-06-12): Group X increment X2 — partition-stats FILE write + registration + read-back (worktree wt-pstats, BUILDER Opus)
+
+Extend `maintenance/partition_stats.rs` from X1's in-memory rows to Java-parity on-disk artifacts: the
+stats FILE write at Java's location/naming/format, metadata REGISTRATION (`SetPartitionStatistics`),
+and a READ-BACK reader (round-trip). The X1 field ids 1-13 become ON-DISK parquet field ids here.
+Modify ONLY: `crates/iceberg/src/maintenance/**`, `docs/parity/GAP_MATRIX.md` (stats row), `task/todo.md`,
+`task/lessons.md`. transaction/ / spec/ / writer/ READ-ONLY (registration must NOT need a new
+TransactionAction or visibility opening).
+
+**Java authority (1.10.0 JAR BYTECODE — `PartitionStatsHandler` + `BaseMetastoreTableOperations` +
+`SetPartitionStatistics` + `UpdateRequirements`, all disassembled):**
+- **FORMAT:** `writePartitionStatsFile` reads `table.properties().getOrDefault("write.format.default",
+  "parquet")` → `FileFormat.fromString`. So the file format is the table's `write.format.default`
+  property, DEFAULT parquet (offsets 6-18). We write PARQUET (the default; ORC/Avro are out — no ORC
+  writer in the fork, and the property defaults to parquet for every test table).
+- **LOCATION/NAMING:** `newPartitionStatsFile` builds the name `String.format(ROOT,
+  "partition-stats-%d-%s", snapshotId, UUID.randomUUID())` then `FileFormat.addExtension` (`.parquet`),
+  then `TableOperations.metadataFileLocation(name)` (offsets — `partition-stats-%d-%s` const #393).
+  `metadataFileLocation(name)` (`BaseMetastoreTableOperations`): if `write.metadata.path` set →
+  `<stripTrailingSlash(write.metadata.path)>/<name>`; ELSE `<TableMetadata.location()>/metadata/<name>`.
+  VERBATIM: `<table.location()>/metadata/partition-stats-<snapshotId>-<uuid>.parquet`.
+- **WRITER + WHAT LANDS:** `InternalData.write(format, outputFile).schema(statsSchema).build()` →
+  `FileAppender`; append each `PartitionStats` record; close. The parquet internal-object writer stamps
+  the iceberg `field-id` on each parquet column (the on-disk contract). NO sort order / compression
+  override (defaults). Rows are pre-sorted by `sortStatsByPartition` (= X1's output sort) BEFORE writing.
+- **RETURN:** `ImmutableGenericPartitionStatisticsFile{snapshotId, path=outputFile.location(),
+  fileSizeInBytes=outputFile.toInputFile().getLength()}` — the REAL on-disk size.
+- **READER (`readPartitionStatsFile(Schema, InputFile)`):** `FileFormat.fromFileName` →
+  `InternalData.read(format, inputFile).project(schema).build()` → transform each record via
+  `recordToPartitionStats`: POSITIONAL decode — idx 0 = partition (StructLike), idx 1 = specId (Integer),
+  then `set(idx, get(idx, Object))` for idx 2..size. So read-back maps positionally over the stats schema.
+- **REGISTRATION:** Java `table.updatePartitionStatistics().setPartitionStatistics(file).commit()` →
+  `SetPartitionStatistics.internalApply` = `TableMetadata.buildFrom(base).setPartitionStatistics(file)`
+  (REPLACES per snapshot id — `statsToSet` is a Map keyed by snapshotId). `UpdateRequirements
+  .forUpdateTable` emits ONLY `AssertTableUUID` (no ref-snapshot requirement — not a snapshot update).
+- **EDGES:** empty stats (collection isEmpty after sort) → returns NULL (no file written, no registration).
+  No current snapshot → `computeAndWriteStatsFile(Table)` returns null. Unpartitioned → X1 already errors
+  ("Table must be partitioned"). Invalid snapshot id → "Snapshot not found" (X1's caller passes a real
+  `&Snapshot`, so this is the caller's concern; the table-level helper checks current snapshot).
+
+**REGISTRATION SURFACE VERDICT (the scope decision):** `TableUpdate::SetPartitionStatistics` +
+`RemovePartitionStatistics` variants + `TableMetadataBuilder::set_partition_statistics` ALREADY exist and
+apply correctly (catalog/mod.rs:641-646, table_metadata_builder.rs:635). The existing
+`UpdateStatisticsAction` (transaction/) handles ONLY `StatisticsFile`/`SetStatistics`, NOT partition
+statistics — and transaction/ is READ-ONLY. Therefore registration commits a `TableCommit` carrying the
+`SetPartitionStatistics` update + an `AssertTableUUID` requirement (Java `forUpdateTable`) through
+`Catalog::update_table` — NO transaction action, NO visibility change. This is the in-scope, faithful
+mirror of Java's `updatePartitionStatistics().commit()`. NOT a STOP (the metadata-level surface is fully
+public). Flagged in the final report as the design choice.
+
+**Plan:**
+- [x] `partition_stats_to_record_batch(stats, stats_schema, unified_type)` — Arrow `RecordBatch` from
+      the rows: partition → `StructArray` over the unified type's fields (per-row literal values; field
+      ids stamped from `schema_to_arrow_schema`'s nested struct), spec_id/counters → Int32/Int64 arrays,
+      nullable cols honor `Option`, v3 dv_count Int32. Partition value types: boolean/int/long/string
+      (Date/Time/Timestamp/Decimal error loudly — need logical-Arrow builders, named deferral).
+- [x] `write_partition_stats_parquet(table, path, stats_schema, batch)` — sync `parquet::arrow::
+      ArrowWriter` into a `Vec<u8>` buffer (avoids the pub(crate) AsyncFileWriter in writer/), schema =
+      `schema_to_arrow_schema(stats_schema)` (FIELD IDS stamped HERE — the writer's schema, not the
+      batch's, is what lands on disk), then `OutputFile::write(Bytes)`; size = buffer length.
+- [x] `compute_and_write_stats_file(table, snapshot) -> Result<Option<PartitionStatisticsFile>>` —
+      compute (X1, already sorted) → empty ⇒ Ok(None) (Java null) → schema per format version → write ONE
+      parquet at `<location>/metadata/partition-stats-<snapshotId>-<uuid>.parquet` (`write.metadata.path`
+      honored) → return `PartitionStatisticsFile{snapshot_id, statistics_path, file_size_in_bytes}`.
+- [x] `register_partition_stats_file(catalog, table, file) -> Result<Table>` — `TableCommit` with
+      `SetPartitionStatistics` + `AssertTableUUID`, committed via `catalog.update_table`. Re-parse: one
+      entry per snapshot id; a SECOND write for the same snapshot REPLACES (Java map keyed by snapshot id).
+- [x] `read_partition_stats_file(table, stats_schema, path) -> Result<Vec<PartitionStats>>` — read whole
+      file bytes → `ParquetRecordBatchReaderBuilder` → `StructArray::from(batch)` →
+      `arrow_struct_to_literal` against the stats-schema struct type → reconstruct `PartitionStats`
+      POSITIONALLY (Java `recordToPartitionStats`). Decode split into `read_partition_stats_from_bytes`.
+- [x] Tests (9 X2): crown-jewel write→raw-reopen (field ids 1-12 + nested 1000/1001 + row count + decode)
+      →register→re-parse metadata→read_back==computed; v3 file dv_count(13)+DV survives; v2 lacks 13;
+      replace-on-rewrite (same snapshot 2nd write) + multi-snapshot coexistence; on-disk row order =
+      sorted; empty-stats no-file; explicit per-field-id raw stamp; record-batch round-trips every counter
+      distinctly; register keys by file snapshot id. 3 mutation-baits caught (drop field-id stamping → 4
+      raw pins fail; swap two counters at write → 3 round-trips fail; wrong snapshot id at register → 3
+      metadata pins fail).
+- [x] GAP_MATRIX stats row update (write+registration+read-back landed; deferrals named) + 5-pipe audit.
+- [x] Verify: typos + fmt + clippy -D warnings (ex-sqllogictest) + `cargo test -p iceberg --lib` ×2 (2068 baseline).
+
+**Outcome (2026-06-12): X2 LANDED.** The on-disk partition-stats FILE write + metadata registration +
+read-back round-trip. FORMAT = `write.format.default` property (default parquet, bytecode
+`writePartitionStatsFile`); LOCATION/NAMING = `<table.location()>/metadata/partition-stats-<snapshotId>-
+<uuid>.parquet` (bytecode `newPartitionStatsFile` + `BaseMetastoreTableOperations.metadataFileLocation`,
+honors `write.metadata.path`); WRITER stamps field ids 1..=13 on the parquet columns via
+`schema_to_arrow_schema`; SORT = X1's partition-tuple sort (Java `sortStatsByPartition`); READER decodes
+positionally (Java `recordToPartitionStats`). REGISTRATION SURFACE: NOT a STOP — `TableUpdate::
+SetPartitionStatistics` + builder `set_partition_statistics` already exist; the only gap was a
+transaction action (the existing `UpdateStatisticsAction` is `StatisticsFile`-only, transaction/ is
+READ-ONLY), so `register_partition_stats_file` commits a `TableCommit{SetPartitionStatistics,
+AssertTableUUID}` through `Catalog::update_table` (faithful mirror of Java `updatePartitionStatistics().
+commit()`, `forUpdateTable` emits only `AssertTableUUID`). Files: `maintenance/{partition_stats.rs (+X2
+fns + 9 tests), mod.rs (+3 re-exports + doc)}`, GAP_MATRIX (1 row), todo, lessons. ZERO transaction/ /
+spec/ / writer/ edits (all READ-ONLY; reused `schema_to_arrow_schema` + `arrow_struct_to_literal` from
+arrow/, `ParquetRecordBatchReaderBuilder`/`ArrowWriter` from parquet, `TableCommit`/`Catalog` from
+catalog/). Gate CLEAN from wt-pstats root: typos clean, fmt clean, clippy `-D warnings` clean (workspace
+ex-sqllogictest), `cargo test -p iceberg --lib` **2077 passed ×2** (baseline 2068 + 9). 3 mutation-baits
+run + restored, ALL caught. NO commit. DEFERRED (named): **Java-reads-our-stats-file interop is
+NEXT-WAVE (Group W owns dev/java-interop — NOT touched)**; the INCREMENTAL compute path (diff vs prior
+stats file); partition value types beyond boolean/int/long/string (need logical-Arrow array builders —
+error loudly). EXPLICITLY OUT (Cargo frozen): `ComputeTableStats` NDV/theta sketches.
+
+**X2 REVIEWER (2026-06-12, Opus reviewer 2/2, wt-pstats, adversarial+constructive): ACCEPT — HEADLINE DATE-PARTITION GAP FIXED.**
+- **#1 date partitions — FIXED (surgical, arrow/ untouched).** `build_partition_field_column` extended via the
+  `pub(crate)` `crate::arrow::create_primitive_array_single_element` helper (already handles Date32 / Timestamp
+  micro+nano with/without tz / Decimal128 / Float / Double) — built per-row + `arrow_select::concat::concat`,
+  driven by the field's EXACT arrow `DataType` (timezone matches the schema, no manual tz logic). Now writes
+  Date / Timestamp / Timestamptz / TimestampNs / TimestamptzNs / Decimal / Float / Double partition columns.
+  Fail-before/pass-after probe confirmed (Date → `FeatureUnsupported` pre-fix). Added a date-partitioned
+  crown-jewel: write→raw-reopen (partition child is a real `Date32` with field id 1000)→read-back round-trips.
+  Residue NARROWED to Time / Uuid / Fixed / Binary (Time64/FixedSizeBinary/LargeBinary — no single_element arm);
+  GAP_MATRIX cell updated to name the residue, not "date partitions".
+- **#2 cross-version projection:** Rust read-back is schema-DRIVEN (`arrow_struct_to_literal` projects by field id,
+  `partition_stats_from_record` is `fields.len() >= 13` tolerant) — reading a v2 file against the v3 schema
+  null-fills dv_count (matches Java `InternalData.read().project()` null-fill of a missing optional). The
+  `>= 13` check is NOT positional-fragile for the v2→v3 direction. PINNED with a cross-version test.
+- **#3 write.metadata.path:** HONORED (`new_partition_stats_file_path` reads the property, strips trailing slash) —
+  matches Java `metadataFileLocation`. PINNED with a property-set test.
+- **#4 nested partition field ids:** the evolved-spec fixture's raw-reopened stats file carries {1000,1001} — the
+  SPEC's real assigned ids (not renumbered). Verified via the existing crown-jewel raw pin.
+- **#5 empty-stats:** `Ok(None)`, no file — matches Java `computeAndWriteStatsFile` returning null. Already pinned.
+- **#6 mutation sweep:** every builder bait + my added pins survive; no survivors.
+- Files added to changed set by reviewer: NONE beyond `maintenance/partition_stats.rs` (the in-scope fix + tests).
+  Gate: fmt/clippy/typos clean, `cargo test -p iceberg --lib` **2082 passed ×2** (2077 baseline + 5 reviewer
+  tests). 4 mutation sweeps run + restored, all caught (sort drop / spec_id off-by-one / projection drop / date-arm
+  drop). arrow/ spec/ writer/ transaction/ Cargo byte-untouched.
+
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** ORC/Avro breadth, view ops, incremental-scan interop.
 - [ ] **THIS BRANCH (Group B, Fable actor-critic, user-approved 2026-06-11): variant-type

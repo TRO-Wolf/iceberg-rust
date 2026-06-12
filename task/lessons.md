@@ -2220,3 +2220,73 @@ How to use it (see the manuals' §2):
   2-field reversed `[y,x]` AND a 3-field scramble `[z,x,y]`). The index-by-position mutation must fail
   on BOTH — a single fixture is the "fragile one-pin" the builder flagged. (Same family as the
   earlier "same-arity different-name masking" lesson.)
+### 2026-06-12 (Group X increment X2 — partition-stats FILE write + registration + read-back, BUILDER Opus)
+- **The field-id stamping that lands on disk is the WRITER's arrow schema, NOT the RecordBatch's column
+  metadata.** *Why:* `ArrowWriter::try_new(buf, arrow_schema, ...)` writes columns under the SCHEMA you
+  hand it; the batch's own field metadata is irrelevant to the file footer. When I mutation-tested "drop
+  the field-id stamping" by stripping metadata in `partition_stats_to_record_batch`, the raw field-id
+  test still PASSED — the file was stamped from `write_partition_stats_parquet`'s independent
+  `schema_to_arrow_schema(stats_schema)`. Only stripping the WRITER's schema killed the raw pins (4
+  tests). DO target the writer's schema for any "is the field id on disk" mutation, and DO derive the
+  writer schema from the iceberg `Schema` (not from the batch) so the on-disk field-id contract is
+  single-sourced.
+- **The full `SetPartitionStatistics` metadata path already existed; the ONLY gap was a transaction
+  action — so register at the CATALOG level, not by opening transaction/.** *Why:* `TableUpdate::
+  SetPartitionStatistics` + `RemovePartitionStatistics` variants, their `apply` arms, and
+  `TableMetadataBuilder::set_partition_statistics` all shipped (catalog/mod.rs + table_metadata_builder.rs).
+  The existing `UpdateStatisticsAction` (transaction/) handles ONLY `StatisticsFile`/`SetStatistics` —
+  partition statistics have no action, and transaction/ was READ-ONLY this increment. The in-scope path
+  is a `TableCommit{updates: [SetPartitionStatistics], requirements: [UuidMatch]}` through
+  `Catalog::update_table` — a faithful mirror of Java `updatePartitionStatistics().setPartitionStatistics()
+  .commit()` (`UpdateRequirements.forUpdateTable` emits ONLY `AssertTableUUID` for a non-snapshot update,
+  bytecode-verified). This was NOT a STOP — check whether the METADATA surface is already public before
+  concluding a registration needs a new action.
+- **`arrow_struct_to_literal(StructArray::from(batch), struct_type)` is the read-back oracle for any
+  positional record decode.** *Why:* Java `recordToPartitionStats` reads `record.get(idx, Class)`
+  positionally; the Rust mirror turns the whole RecordBatch into one `StructArray`, decodes it to one
+  `Literal::Struct` per row via the existing arrow accessor (maps Arrow columns to the iceberg struct by
+  field id), then reads the struct's fields positionally (0 = partition, 1 = spec_id, 2..N = counters).
+  Reused the arrow read accessor verbatim — no new decoder. A v2 file (12 cols) and v3 file (13 cols)
+  decode against their OWN `stats_schema` struct type, so the positional optional `dv_count` is only read
+  when `fields.len() >= 13`.
+- **Java's partition-stats LOCATION is `TableMetadata.location()` (the table base), NOT the metadata-file
+  directory derived from the current metadata-json path.** *Why:* `BaseMetastoreTableOperations
+  .metadataFileLocation(name)` = `write.metadata.path` if set, ELSE `<location()>/metadata/<name>`
+  (bytecode const `%s/%s/%s` with `location, "metadata", name`). Deriving the dir by stripping the
+  metadata-json filename would diverge whenever `write.metadata.path` is set or the metadata lives
+  outside `<location>/metadata`. Build the path from `metadata.location()` + the `write.metadata.path`
+  property directly, matching the bytecode.
+- **`typos` flags the `m-i-s` hyphen-prefix as a typo (wants `miss`/`mist`)** — avoid hyphenated
+  `m-i-s` prefixes (the "map/key/assign" verbs) in comments AND in lessons that quote them; write
+  "resolve the wrong column" / "keys wrongly" / "wrongly assigned" instead. Cost two gate re-runs (the
+  comment, then the lesson that quoted the offending forms).
+
+## 2026-06-12 — X2 reviewer (partition-stats file write/read-back)
+
+- **DO build logical-Arrow partition columns (Date32 / Timestamp ±tz / Decimal128) by calling the
+  shared `pub(crate)` `crate::arrow::create_primitive_array_single_element(arrow_data_type, &prim_lit)`
+  per row + `arrow_select::concat::concat`, NOT a hand-rolled native-array match.** *Why:* X2 originally
+  refused any partition value beyond boolean/int/long/string (date/timestamp/decimal — the MOST common
+  production partition shapes — errored `FeatureUnsupported`). The helper already maps the literal to the
+  right Arrow array AND applies the field's exact timezone/precision/scale from the passed `arrow_data_type`
+  — so feed it the field's actual Arrow `DataType` (from `schema_to_arrow_schema`) and the built array's
+  type matches the on-disk schema field exactly (no manual `+00:00` tz logic, no `StructArray::from` type
+  mismatch). The helper is reachable from `maintenance/` via the `pub use value::*` glob without touching
+  arrow/ (read-only). RESIDUE after the fix: time/uuid/fixed/binary (Time64 / FixedSizeBinary / LargeBinary
+  have no helper arm) — keep erroring loudly, never a corrupt column.
+- **DO project the read schema down to the file's ACTUAL columns before `arrow_struct_to_literal` when
+  reading a stats file that may be a different format version than the schema.** *Why:* `arrow_struct_to_literal`
+  REQUIRES every iceberg schema field be present in the Arrow array (`Field id N not found in struct array`);
+  it does NOT null-fill. Java `InternalData.read().project(schema)` null-fills a missing optional, and
+  `PartitionStats.set(dvCountIdx, null)` coalesces dv_count→0 (1.10.0 bytecode: `ifnonnull` else `iconst_0`).
+  So a V2 file (12 cols) read against the V3 schema (13 fields) ERRORED in Rust until the decode projected
+  the struct type to the field ids present in the batch (`PARQUET_FIELD_ID_META_KEY` on each Arrow field),
+  preserving schema order — then the existing `partition_stats_from_record` `fields.len() >= 13` tolerance
+  leaves dv_count at its `PartitionStats::new` default (0). The reverse (V3 file / V2 schema) already worked
+  (extra column ignored). This was a real divergence the builder's `>= 13` check could not reach because the
+  arrow decode failed first.
+- **DO drive a date/timestamp partition test through a REAL table fixture (identity over a Date column),
+  then RAW-reopen the stats file and assert the partition child is a logical `Date32` (not Int32) carrying
+  the spec field id.** *Why:* a write-side type mismatch (building an Int32 array for a Date32 schema field)
+  would either panic at `StructArray::from` or silently produce the wrong on-disk physical type; asserting
+  the raw Arrow child DataType == `Date32` pins the on-disk contract other engines read.
