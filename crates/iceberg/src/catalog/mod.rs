@@ -42,7 +42,7 @@ use crate::io::StorageFactory;
 use crate::spec::{
     EncryptedKey, FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot,
     SnapshotReference, SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder,
-    UnboundPartitionSpec, ViewFormatVersion, ViewMetadata, ViewMetadataBuilder,
+    UnboundPartitionSpec, ViewFormatVersion, ViewMetadata, ViewMetadataBuilder, ViewRepresentation,
     ViewRepresentations, ViewVersion,
 };
 use crate::table::Table;
@@ -1003,6 +1003,18 @@ pub struct ViewCreation {
     /// Typical keys are "engine-name" and "engine-version"
     #[builder(default)]
     pub summary: HashMap<String, String>,
+}
+
+impl ViewRepresentations {
+    /// Construct a list of view representations from the given representations.
+    ///
+    /// The tuple constructor of [`ViewRepresentations`] is crate-private; this public constructor
+    /// lets out-of-crate catalog implementations (the SQL / REST / Glue / S3 Tables catalogs) build
+    /// the [`ViewCreation::representations`] field, which is otherwise unconstructable outside the
+    /// `iceberg` crate.
+    pub fn new(representations: Vec<ViewRepresentation>) -> Self {
+        Self(representations)
+    }
 }
 
 /// ViewUpdate represents an update to a view in the catalog.

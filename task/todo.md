@@ -119,6 +119,73 @@ directions) — added symmetric cross-guards to `insert_new_table`/`insert_new_v
 Gate green ×2 (2186→2188 with the 2 collision tests). Verdict: APPROVE with the concurrency-CAS gap
 flagged for the orchestrator.
 
+### Wave-5 Group U / U2 — SQL catalog views + REST view shapes (BUILDER Opus, wt-views)
+
+**JDBC storage-scheme verdict (1.10.0 bytecode, `JdbcUtil`):** views live in the SAME `iceberg_tables`
+table, discriminated by the EXISTING `iceberg_type` column = `'VIEW'` (constant `VIEW_RECORD_TYPE`).
+Tables use `'TABLE'` OR-NULL (V0 backcompat); views are V1-only (`JdbcViewOperations.doCommit` uses
+`SchemaVersion.V1` unconditionally — exact-match `iceberg_type = 'VIEW'`, no OR-NULL). The Rust SQL
+catalog already creates the V1 schema (the `iceberg_type` column exists), so it is V1-native — mirror
+the posture, no schema-version flag needed. The view SQL constants (`GET_VIEW_SQL`, `LIST_VIEW_SQL`,
+`RENAME_VIEW_SQL`, `DROP_VIEW_SQL`, `V1_DO_COMMIT_VIEW_SQL`, `V1_DO_COMMIT_CREATE_SQL`) are the exact
+table-CRUD SQL with `AND iceberg_type = 'VIEW'`. CAS: `V1_DO_COMMIT_VIEW_SQL` = `UPDATE ... WHERE ...
+AND metadata_location = ?` (0 rows = conflict, `CommitFailedException "Cannot commit %s: metadata
+location %s has changed from %s"`). Collisions: create-view checks `tableExists` → `AlreadyExists
+"Table with same name already exists: %s"`; create-table checks `viewExists` → `"View with same name
+already exists: %s"`; rename cross-checks the other map.
+
+**REST verdict (1.10.0 bytecode):** routes `GET/POST /v1/{prefix}/namespaces/{ns}/views`,
+`GET/POST/DELETE/HEAD .../views/{view}`, `POST /v1/{prefix}/views/rename`. Wire types: CreateViewRequest
+`{name, location, view-version, schema, properties}`; LoadViewResponse `{metadata-location, metadata,
+config}`; the replace/commit reuses `UpdateTableRequest` shape `{identifier, requirements, updates}` but
+with VIEW requirements/updates (`UpdateRequirements.forReplaceView`). `ViewUpdate`/`ViewRequirement`
+already carry the correct REST serde tags. Rename reuses the `{source, destination}` shape.
+
+- [x] **U2a — SQL catalog view CRUD (7 methods):** done. `iceberg_type = 'VIEW'` discriminator
+      (`CATALOG_FIELD_VIEW_RECORD_TYPE`), view error helpers, all 7 methods, collision guards both
+      directions (added the table-side guards to `create_table`/`rename_table` too), location-CAS in
+      `update_view` (`AND metadata_location = ?` → 0 rows = `CatalogCommitConflicts`).
+- [x] **U2b — SQL tests (10, the full U1 lifecycle e2e ported + risk-named):** create/load/list;
+      duplicate-fails; full lifecycle; update_properties; identical-version reuse; load-missing;
+      collision BOTH directions; rename-onto-table rejected; list_views scoping; the CONCURRENT
+      location-CAS conflict (barrier-synchronized two-task race — deterministic, ran ×5).
+- [x] **U2c — REST view shapes:** `CreateViewRequest`/`LoadViewResult`/`CommitViewRequest` in
+      `types.rs` + 3 serde round-trip tests vs hand-pinned Java-wire JSON.
+- [x] **U2d — REST view methods:** all 7 wired (endpoint builders + `build_view_from_load_result`
+      helper). Full impls landed (machinery cheap) + 7 mockito route/status-mapping tests.
+- [x] **U2e — gate ×2 (SQL 62×2), GAP_MATRIX row 107 (5-pipe audit clean), lessons, todo.**
+
+Outcome: U2 landed. SQL catalog views are a faithful JDBC-scheme port (`iceberg_type='VIEW'` in the
+shared `iceberg_tables`, V1-schema exact-match — the Rust catalog is already V1-native). The SQL
+`update_view` IMPLEMENTS the JDBC location-CAS (Java `V1_DO_COMMIT_VIEW_SQL`), a deliberate per-catalog
+divergence from MemoryCatalog's no-CAS posture. REST landed BOTH the typed shapes AND full method
+impls (the machinery made full impls cheap). One flagged shared-type fix: `ViewRepresentations` had no
+public constructor, so `ViewCreation` was unconstructable from out-of-crate catalogs — added
+`ViewRepresentations::new` in `catalog/mod.rs` (in-scope shared-type escape). Gate: iceberg 2188, SQL
+62×2, REST 51, clippy/fmt/typos clean. Deferred per scope: Glue/S3Tables views (credentialed), view
+interop (next wave).
+
+U2 REVIEWER (2026-06-12, adversarial vs 1.10.0 bytecode): JDBC verbatim-ness CONFIRMED — re-derived all
+six `JdbcUtil` view constants; Rust queries are SEMANTICALLY verbatim (conjunct SET identical; only
+AND-clause/SET-column order differs, commutative-safe), CAS clause present, exact-match VIEW posture vs
+TABLE-or-NULL backcompat mirrored, collision messages byte-verbatim. CROSS-CATALOG error-kind
+consistency HOLDS (Memory U1 + SQL U2 both: view-over-table→TableAlreadyExists,
+table-over-view→ViewAlreadyExists). CAS race test NON-VACUOUS — drop `AND metadata_location = ?` ⇒ both
+win ×5 (corruption); loser kind/retryable match the table-side `update_table` convention; auto-rebase
+off the freshly-reloaded base verified. REST wire EXACT vs bytecode (`ResourcePaths` routes,
+`CreateViewRequestParser` keys, `RESTViewOperations`→`UpdateTableRequest.create` commit body). FIXED two
+real gaps in touched files: (1) REST `update_view` 5xx now maps to CommitStateUnknown (Java
+`ViewCommitErrorHandler` 500/502/503/504; was folded into the generic default arm, diverging from the
+table side) + test; (2) tightened the body-blind commit mockito test with a hand-pinned body matcher.
+ADDED two permanent pins the builder lacked: `rename_view` rejects a TABLE source (discriminator-on-
+rename, mutation-proven), and a compile-level out-of-crate accessibility probe (pins the
+`ViewRepresentations::new` gap CLASS forever — removing the fix fails the SQL test build). REPORTED, not
+fixed (benign/unreachable): create-view collision-check ORDER is reversed vs Java (only matters if both
+a table AND view of the same name exist — guards make that unconstructible). Mutations ×5 all killed
+(CAS-drop, list_views filter-drop, REST route typo, rename discriminator-drop, accessibility-fix
+removal). Gate ×2 green: iceberg 2188, SQL 64, REST 52, clippy/fmt/typos clean; GAP_MATRIX 5-pipe
+audit clean; tree = allowed set + the flagged mod.rs line. Verdict: APPROVE.
+
 - [ ] **Scheduled with the user:** real-catalog (Glue + S3 Tables) hardening — needs credentials.
 - [ ] **Opus-queue (post-handoff or parallel):** ORC/Avro breadth, view ops + SessionCatalog +
       LockManager (Sonnet-builder + Opus-critic per the calibrated split), incremental-scan interop,

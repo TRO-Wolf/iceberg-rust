@@ -673,3 +673,129 @@ How to use it (see the manuals' §2):
   (field order + always-emit-empty-properties), not blocking — byte-level view interop stays a
   next-wave item but bidirectional field-set reads work now. Mutation pinned: dropping the required
   `default-namespace` field makes the parse fail (`ViewVersionV1.default_namespace` is non-Option).
+
+### 2026-06-12 (Wave-5 Group U / U2 — SQL catalog views + REST view shapes, BUILDER Opus, wt-views)
+- **The JDBC view storage scheme was ALREADY half-built in the Rust SQL catalog — views reuse the
+  EXISTING `iceberg_type` discriminator column with value `'VIEW'`, no schema migration needed.**
+  1.10.0 `JdbcUtil` bytecode: `CATALOG_TABLE_VIEW_NAME = "iceberg_tables"`, `RECORD_TYPE =
+  "iceberg_type"`, `TABLE_RECORD_TYPE = "TABLE"`, `VIEW_RECORD_TYPE = "VIEW"`. Views live in the SAME
+  `iceberg_tables` table; the view SQL constants (`GET_VIEW_SQL`, `LIST_VIEW_SQL`, `RENAME_VIEW_SQL`,
+  `DROP_VIEW_SQL`, `V1_DO_COMMIT_VIEW_SQL`, `V1_DO_COMMIT_CREATE_SQL`) are the table-CRUD SQL with
+  `AND iceberg_type = 'VIEW'`. KEY POSTURE DIFFERENCE: tables match `iceberg_type = 'TABLE' OR
+  iceberg_type IS NULL` (V0-schema backward compat), but views match `iceberg_type = 'VIEW'` EXACTLY —
+  `JdbcViewOperations.doCommit` always uses `SchemaVersion.V1` (views are a V1-only feature, no
+  NULL-tolerance). The Rust catalog already creates the V1 schema (the `iceberg_type` column exists in
+  its `CREATE TABLE`), so it is V1-native — mirror the exact-match posture, no version-flag gating
+  needed. DO `javap -p -constants JdbcUtil` BEFORE designing view storage — the whole scheme is
+  inlined string constants.
+- **Java's JDBC location-CAS is a one-line WHERE-clause addition the Rust `update_table` ALREADY had
+  — mirror it verbatim for views, it's genuinely per-catalog (not the shared seam the U1 reviewer
+  deferred).** `V1_DO_COMMIT_VIEW_SQL` = `UPDATE iceberg_tables SET metadata_location = ?,
+  previous_metadata_location = ? WHERE ... AND iceberg_type = 'VIEW' AND metadata_location = ?` →
+  `rows_affected() == 0` is the conflict (Java raises `CommitFailedException "Cannot commit %s:
+  metadata location %s has changed from %s"`). The Rust SQL `update_table` already does this for tables;
+  `update_view` mirrors it ⇒ a per-catalog CAS that diverges DELIBERATELY from the in-tree MemoryCatalog
+  (which has NO CAS — `[AssertViewUUID]` alone, UUID-invariant). This is the right split: the SQL
+  catalog's store-level CAS is cheap and in-scope; the MemoryCatalog/shared-seam CAS is the separate
+  deferred increment.
+- **A reload-then-apply-then-CAS catalog method CANNOT be pinned by a SEQUENTIAL stale-commit test —
+  the internal reload auto-rebases over the staleness (the V1 retry-masking lesson, again). Use a
+  BARRIER-SYNCHRONIZED concurrent two-task race instead.** My first CAS test (two commits from the same
+  in-memory base, applied sequentially) FAILED to conflict: `update_view` reloads the current view
+  inside the call, so the "stale" second commit re-applied against the already-advanced store and
+  succeeded at version 3. The genuine CAS race is: both tasks `load_view` (observe the SAME base
+  metadata_location), a `tokio::sync::Barrier(2)` releases them together, both `apply` + `write` + CAS —
+  the store serializes each update statement, the first wins, the second's `WHERE metadata_location =
+  <stale>` matches 0 rows ⇒ `CatalogCommitConflicts`. The barrier makes it DETERMINISTIC (ran ×5,
+  always exactly one winner). DO reach for a barrier'd concurrent test the moment a CAS sits behind a
+  reload.
+- **`ViewRepresentations` had a `pub(crate)` tuple constructor but is a `pub` field of the public
+  `ViewCreation` — so NO out-of-crate catalog could construct a `ViewCreation` to call `create_view`.**
+  This is a real public-API accessibility gap (the whole external-catalog view surface depends on it).
+  Fixed with `ViewRepresentations::new(Vec<ViewRepresentation>)` added in `catalog/mod.rs` (the in-scope
+  shared-type escape — `catalog/mod.rs` is in the iceberg crate so it can see the `pub(crate)` ctor; it
+  also owns `ViewCreation`). DO check that every `pub` field of a public creation/builder struct is
+  itself CONSTRUCTABLE from out-of-crate before declaring a trait method usable by external impls.
+- **REST view commit reuses Java's `UpdateTableRequest` SHAPE (`identifier`/`requirements`/`updates`)
+  but carries VIEW requirements/updates — and the Rust `ViewRequirement`/`ViewUpdate` types already
+  serialize with the correct REST tags (`assert-view-uuid`, `set-properties`, etc.), so the wire types
+  drop in for free.** 1.10.0 `RESTViewOperations` bytecode: commit calls
+  `UpdateRequirements.forReplaceView(metadata, updates)` then `UpdateTableRequest.create(identifier,
+  requirements, updates)` — the SAME request class as tables, just fed view-shaped lists. So
+  `CommitViewRequest` is a structural twin of `CommitTableRequest` with `Vec<ViewRequirement>` /
+  `Vec<ViewUpdate>`. The view request/response field names (`view-version`, `metadata-location`) are
+  in `CreateViewRequestParser`/`LoadViewResponseParser` constant pools — `javap -c -constants` them.
+- **`typos` flags the plural-`s` form of the SQL `UPDATE` verb (the inlined `U-P-D-A-T` substring) in
+  a comment — write "each update statement", never the bare plural.** Same family as the earlier
+  `m-i-s`-prefix and camelCase-token typos false-positives, AND the W2/X2 lesson "never paste the
+  flagged spelling into prose" (this very entry tripped the gate twice by doing exactly that):
+  after any comment mentioning SQL verbs in plural, run `typos .` over the whole tree
+  before claiming the gate is clean.
+
+### 2026-06-12 (Wave-5 Group U / U2 — SQL catalog views + REST view shapes, REVIEWER Opus, wt-views)
+- **JDBC verbatim-ness verdict: CONFIRMED from `JdbcUtil` bytecode (`javap -p -c -constants`). The Rust
+  SQL queries are SEMANTICALLY verbatim — the conjunct SET is identical; only AND-clause/SET-column
+  ORDER differs, which is commutative-safe.** Re-derived all six view constants and diffed: the CAS
+  `V1_DO_COMMIT_VIEW_SQL` carries `AND metadata_location = ?` (present in Rust); `iceberg_type = 'VIEW'`
+  is EXACT-match for views vs `(iceberg_type = 'TABLE' OR iceberg_type IS NULL)` for tables (V0
+  backcompat) — Rust mirrors both postures. The Rust create-view INSERT omits `previous_metadata_location`
+  (Java inserts it `=null`), but that matches the EXISTING Rust `create_table` INSERT (the verified
+  table port) — the Rust catalog relies on the column's NULL default, not a divergence. Collision
+  messages are byte-verbatim against the inlined Java strings: `"Table with same name already exists:
+  %s"` (JdbcViewOperations.createView off 93, fires on `tableExists`), `"View with same name already
+  exists: %s"` (ViewAwareTableBuilder off 31), `"Cannot commit %s: metadata location %s has changed
+  from %s"` (JdbcViewOperations off 41 — Rust truncates the `from %s` tail, keeps the load-bearing
+  prefix). DO `javap -c -constants org/apache/iceberg/jdbc/JdbcUtil.class` and diff conjunct-SETS, not
+  string-equality — the clause order is a red herring.
+- **CROSS-CATALOG error-kind consistency is the real interop contract for collisions, and it HOLDS:
+  MemoryCatalog (U1) and SqlCatalog (U2) both reject view-over-table with `TableAlreadyExists` and
+  table-over-view with `ViewAlreadyExists`.** A consumer matching on `ErrorKind` must not care which
+  catalog raised it. DO grep both catalogs' collision-error helpers and assert the kind pairs line up
+  — message wording may differ (it does: Memory says "Cannot create view ... Table with same name
+  already exists"; SQL says "Table with same name already exists: <ident>") but the KIND is the
+  contract.
+- **The CAS race test is NON-VACUOUS — mutation-proven.** Dropping `AND metadata_location = ?` from
+  `update_view` makes the barrier'd race test fail ×5 with "both concurrent commits succeeded — the
+  location-CAS did not fire" (both win = the loser silently overwrites the winner's metadata pointer =
+  corruption). The loser's error is `CatalogCommitConflicts` + `.with_retryable(true)` — EXACTLY the
+  table-side `update_table` convention (same kind, same retryable flag). Sequential-staleness
+  auto-rebases correctly: `update_view` applies the commit to the FRESHLY-reloaded `load_view` base
+  (not a caller-held stale view), and `ViewCommit::apply` recomputes `new_metadata_location` via
+  `with_next_version()` off the fresh `current_metadata_location` — same structure as `update_table`.
+  There is NO internal retry loop (single CAS attempt), also matching the table side.
+- **REST mockito tests were BODY-BLIND — tightened the commit test with a hand-pinned body matcher.**
+  None of the 7 view route-tests used `.match_body`, so a regression sending TABLE requirements/updates
+  through the view commit (or a wrong wire key) would pass route+status checks. Added a
+  `mockito::Matcher::AllOf` pinning `identifier` / `assert-view-uuid` / the uuid / `set-properties` /
+  `comment:daily` on `test_update_view_maps_conflict_to_retryable`; mutation-verified (swap
+  `assert-view-uuid`→`assert-table-uuid` ⇒ body misses the mock ⇒ the 409 conflict assertion fails).
+  REST commit body shape re-derived from `RESTViewOperations` bytecode: `UpdateRequirements.forReplaceView`
+  → `UpdateTableRequest.create(identifier, requirements, updates)` → `RESTClient.post(this.path,...)`
+  where `path` = `V1_VIEW` (`.../views/{view}`). Routes confirmed verbatim from `ResourcePaths`
+  constant pool. The `types.rs` serde round-trips ARE exact-JSON-pinned (`assert_eq!(reserialized,
+  json)`), so the wire SHAPE was already body-pinned at the serde layer; only the catalog mockito layer
+  was route-only.
+- **REST view-commit 5xx → `CommitStateUnknown` was MISSING — added (Java `ViewCommitErrorHandler`
+  lookupswitch: 404→NoSuchView, 409→CommitFailed, 500/502/503/504→CommitStateUnknownException).** The
+  view `update_view` folded all 5xx into the generic default arm, diverging from BOTH Java AND the
+  table-side `update_table` (which already maps 500/502/504→"commit state is unknown", `Unexpected`,
+  NON-retryable). Added the four 5xx arms to `update_view` + a fail-before/pass-after test (503 ⇒
+  `Unexpected` + "commit state is unknown" + NOT retryable). DO bytecode the matching error handler's
+  lookupswitch when reviewing a REST commit method — a missing 5xx arm is invisible to a happy-path +
+  conflict test.
+- **REPORTED, not fixed (benign, unreachable): the create-view collision-check ORDER is reversed vs
+  Java.** Java `createView` checks `tableExists` (→TableAlreadyExists) BEFORE `viewExists`
+  (→ViewAlreadyExists); Rust checks `view_exists` first. This only changes the outcome when BOTH a
+  table AND a view of the same name exist — a state the shared-namespace guards make unconstructible —
+  so when at most one exists the order is irrelevant. Cosmetic divergence; not worth a behavior-changing
+  fix.
+- **Added two permanent pins the builder's suite lacked: (1) `rename_view` rejecting a TABLE source
+  (the `iceberg_type='VIEW'` discriminator on rename was unpinned — mutation: drop the `view_exists(src)`
+  guard + the WHERE filter ⇒ a table gets silently relocated ⇒ the new test fails); (2) a compile-level
+  accessibility probe (`test_public_view_api_is_fully_constructible_out_of_crate`) in the SQL crate that
+  builds the WHOLE public view surface — `ViewRepresentations::new`, `SqlViewRepresentation`,
+  `ViewCreation::builder`, `ViewVersion::builder`, the `View` ops, and references `ViewUpdate`/
+  `ViewRequirement` — purely out-of-crate, so any regression to crate-private STOPS THE BUILD forever
+  (mutation: remove `ViewRepresentations::new` ⇒ the SQL test target fails E0599).** The probe couldn't
+  name `uuid::Uuid` (not a SQL-crate dep) — used `ViewRequirement::NotExist` (unit variant) + pattern
+  matches instead. Result: SQL 62→64, REST 51→52, iceberg 2188 unchanged; gate ×2 green.
