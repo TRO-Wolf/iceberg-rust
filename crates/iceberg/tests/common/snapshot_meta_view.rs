@@ -21,10 +21,11 @@
 //! contract (incl. the V1 sequence-number-tie ordinal limit) is documented on the E1 test module
 //! and the Java emitter; the two sides' allowlists + sort tuples must stay IDENTICAL.
 //!
-//! W3 (2026-06-11): `partition_spec_id` added to the manifest-level EMITTED JSON on both sides
+//! W3 (2026-06-12): `partition_spec_id` added to the manifest-level EMITTED JSON on both sides
 //! (Rust here + Java `SnapshotMetaOracle`). All existing single-spec fixtures have spec_id=0 so
-//! the constant field does not disturb the byte-level comparisons. The sort-tuple POSITION for
-//! `partition_spec_id` is DEFERRED (ESCALATION pending Opus decision — see W3 final report).
+//! the constant field does not disturb the byte-level comparisons. The sort-tuple POSITION was
+//! RESOLVED by orchestrator ruling: FINAL tiebreaker (position 10) on all three sides — the sort
+//! exists to erase writer-dependent ordering, so its only contract is cross-language determinism.
 
 use std::collections::BTreeMap;
 use std::fs;
