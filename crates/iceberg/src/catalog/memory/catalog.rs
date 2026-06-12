@@ -174,6 +174,44 @@ impl MemoryCatalog {
     }
 }
 
+/// Optimistic-concurrency CAS for the in-process catalog — the Rust port of the location-equality
+/// check in Java `InMemoryTableOperations.doCommit` / `InMemoryViewOperations.doCommit`.
+///
+/// Java's `doCommit` runs `tables.compute(...)` / `views.compute(...)` inside a lock and compares
+/// the STORED metadata location (the map value) against the BASE the commit was built from
+/// (`base.metadataFileLocation()`); on a mismatch it throws `CommitFailedException` — the retryable
+/// "clean" conflict the commit-retry machinery refreshes-and-retries on.
+///
+/// Returns `Ok(())` when the stored location matches the commit's base location (the commit is not
+/// stale), or a retryable [`ErrorKind::CatalogCommitConflicts`] error mirroring Java's
+/// `CommitFailedException` message shape otherwise. `base_metadata_location == None` models Java's
+/// `base == null` create edge; the update paths never reach this helper with `None` (they always
+/// have a current stored location and a base), but a `None` base never equals a `Some` stored
+/// location, so it is correctly treated as a conflict rather than silently passing.
+///
+/// `object_kind` is `"table"` or `"view"` so one helper serves both seams (the Java messages differ
+/// only in that noun).
+fn check_no_concurrent_modification(
+    object_kind: &str,
+    identifier: &TableIdent,
+    stored_metadata_location: &str,
+    base_metadata_location: Option<&str>,
+    new_metadata_location: &str,
+) -> Result<()> {
+    if base_metadata_location == Some(stored_metadata_location) {
+        return Ok(());
+    }
+
+    Err(Error::new(
+        ErrorKind::CatalogCommitConflicts,
+        format!(
+            "Cannot commit to {object_kind} {identifier:?} metadata location from {} to {new_metadata_location} because it has been concurrently modified to {stored_metadata_location}",
+            base_metadata_location.unwrap_or("<none>"),
+        ),
+    )
+    .with_retryable(true))
+}
+
 #[async_trait]
 impl Catalog for MemoryCatalog {
     /// List namespaces inside the catalog.
@@ -394,17 +432,31 @@ impl Catalog for MemoryCatalog {
         let current_table = self
             .load_table_from_locked_state(commit.identifier(), &root_namespace_state)
             .await?;
+        // The location currently stored for this table — Java's `tables.get(identifier)`, the value
+        // the `compute` lambda compares against the commit's base.
+        let stored_metadata_location = current_table.metadata_location_result()?.to_string();
+        let base_metadata_location = commit.base_metadata_location().map(str::to_string);
 
         // Apply TableCommit to get staged table
         let staged_table = commit.apply(current_table)?;
+        let new_metadata_location = staged_table.metadata_location_result()?.to_string();
+
+        // Optimistic-concurrency CAS BEFORE the write — reject a stale commit (built from a
+        // superseded base) rather than silently last-write-win. Java `InMemoryTableOperations
+        // .doCommit` does the same equality check inside `tables.compute`. The whole `update_table`
+        // body holds the catalog lock, so the check and the pointer flip are atomic.
+        check_no_concurrent_modification(
+            "table",
+            staged_table.identifier(),
+            &stored_metadata_location,
+            base_metadata_location.as_deref(),
+            &new_metadata_location,
+        )?;
 
         // Write table metadata to the new location
         staged_table
             .metadata()
-            .write_to(
-                staged_table.file_io(),
-                staged_table.metadata_location_result()?,
-            )
+            .write_to(staged_table.file_io(), &new_metadata_location)
             .await?;
 
         // Flip the pointer to reference the new metadata file.
@@ -499,10 +551,26 @@ impl Catalog for MemoryCatalog {
         let current_view = self
             .load_view_from_locked_state(commit.identifier(), &root_namespace_state)
             .await?;
+        // The location currently stored for this view — Java's `views.get(identifier)`, the value
+        // the `compute` lambda compares against the commit's base.
+        let stored_metadata_location = current_view.metadata_location_result()?.to_string();
+        let base_metadata_location = commit.base_metadata_location().map(str::to_string);
 
         // Apply the commit (checks requirements + applies updates, bumping the version).
         let staged_view = commit.apply(current_view)?;
         let new_metadata_location = staged_view.metadata_location_result()?.to_string();
+
+        // Optimistic-concurrency CAS BEFORE the write. For a view the `[AssertViewUUID]` requirement
+        // is invariant across replaces, so the location-CAS is the ONLY mechanism that detects a
+        // stale concurrent commit — Java `InMemoryViewOperations.doCommit` does the same equality
+        // check inside `views.compute`. The catalog lock makes the check + pointer flip atomic.
+        check_no_concurrent_modification(
+            "view",
+            staged_view.identifier(),
+            &stored_metadata_location,
+            base_metadata_location.as_deref(),
+            &new_metadata_location,
+        )?;
 
         // Write the new metadata file before flipping the catalog pointer.
         staged_view
@@ -527,6 +595,7 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::TableUpdate;
     use crate::io::FileIO;
     use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
     use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -2339,5 +2408,196 @@ pub(crate) mod tests {
         // The source view is untouched and the table is intact.
         assert!(catalog.view_exists(&view_ident).await.unwrap());
         assert!(catalog.table_exists(&table_ident).await.unwrap());
+    }
+
+    // ========================================================================
+    // Optimistic-concurrency parity (increment O1) — the location-CAS in MemoryCatalog
+    // `update_table` / `update_view`, mirroring Java `InMemory{Table,View}Operations.doCommit`.
+    // ========================================================================
+
+    // RISK: two REPLACE commits built from the SAME base view, applied sequentially, must NOT
+    // last-write-win — the second is STALE and Java `InMemoryViewOperations.doCommit` rejects it
+    // with `CommitFailedException`. The `[AssertViewUUID]` requirement is INVARIANT across replaces,
+    // so the location-CAS is the ONLY thing that can detect this (the bug the U1 reviewer pinned:
+    // before the CAS, the second commit silently advanced versions 1→2→3, clobbering the winner).
+    #[tokio::test]
+    async fn test_view_stale_second_replace_conflicts_via_location_cas() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("ns".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        let view_ident = TableIdent::new(namespace_ident.clone(), "v1".into());
+
+        // Both commits are built from the SAME base `view` handle (same metadata location).
+        let view = create_view(&catalog, &view_ident, "SELECT 1 AS event_count").await;
+        let base_location = view.metadata_location().unwrap().to_string();
+
+        let first_commit = view
+            .replace_version()
+            .with_query("spark", "SELECT 2 AS event_count")
+            .with_schema(simple_view_schema())
+            .with_default_namespace(namespace_ident.clone())
+            .to_commit()
+            .unwrap();
+        let second_commit = view
+            .replace_version()
+            .with_query("spark", "SELECT 3 AS event_count")
+            .with_schema(simple_view_schema())
+            .with_default_namespace(namespace_ident.clone())
+            .to_commit()
+            .unwrap();
+
+        // Both commits carry the base location they were built against.
+        assert_eq!(
+            first_commit.base_metadata_location(),
+            Some(base_location.as_str())
+        );
+        assert_eq!(
+            second_commit.base_metadata_location(),
+            Some(base_location.as_str())
+        );
+
+        // The first commit lands: the stored location still equals the base, so the CAS passes.
+        let winner = catalog.update_view(first_commit).await.unwrap();
+        assert_eq!(winner.metadata().current_version_id(), 2);
+
+        // The second commit is now STALE (stored location advanced past its base) and must be
+        // rejected with a retryable commit conflict, NOT silently applied.
+        let error = catalog.update_view(second_commit).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable());
+        assert!(
+            error
+                .to_string()
+                .contains("because it has been concurrently modified to")
+        );
+
+        // The store still reflects the WINNER — the loser did not overwrite it.
+        let loaded = catalog.load_view(&view_ident).await.unwrap();
+        assert_eq!(loaded.metadata().current_version_id(), 2);
+        assert_eq!(loaded.metadata_location(), winner.metadata_location());
+    }
+
+    // RISK: the same stale-commit shape for TABLES, through a property-only `TableCommit`. A
+    // property update carries an EMPTY requirement set (`UpdatePropertiesAction` emits no
+    // requirements), so NO `TableRequirement` can catch the staleness — only the location-CAS can.
+    // This is the case the prompt asks to pin: "ONLY the location CAS can fire".
+    #[tokio::test]
+    async fn test_table_stale_property_commit_conflicts_only_location_cas_can_fire() {
+        let catalog = new_memory_catalog().await;
+        let table = create_table_with_namespace(&catalog).await;
+        let base_location = table.metadata_location().unwrap().to_string();
+
+        // Two property-only commits from the SAME base location. They carry NO requirements, so the
+        // CAS is the sole guard. Build them directly so the transaction's reload cannot mask the race.
+        let first_commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([("round".to_string(), "first".to_string())]),
+            }])
+            .base_metadata_location(Some(base_location.clone()))
+            .build();
+        let second_commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([("round".to_string(), "second".to_string())]),
+            }])
+            .base_metadata_location(Some(base_location.clone()))
+            .build();
+
+        // First lands; the stored location matched the base.
+        let winner = catalog.update_table(first_commit).await.unwrap();
+        assert_eq!(
+            winner.metadata().properties().get("round").unwrap(),
+            "first"
+        );
+
+        // Second is stale: the location advanced, and with no requirements ONLY the CAS fires.
+        let error = catalog.update_table(second_commit).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable());
+        assert!(
+            error
+                .to_string()
+                .contains("because it has been concurrently modified to")
+        );
+
+        // The winner's property survived — the loser did not overwrite the pointer.
+        let loaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            loaded.metadata().properties().get("round").unwrap(),
+            "first"
+        );
+        assert_eq!(loaded.metadata_location(), winner.metadata_location());
+    }
+
+    // RISK: the happy path must be UNCHANGED — a single non-stale property commit (built from the
+    // current base) still lands. A CAS that rejected non-stale commits would break every writer.
+    #[tokio::test]
+    async fn test_table_non_stale_commit_still_succeeds_with_cas() {
+        let catalog = new_memory_catalog().await;
+        let table = create_table_with_namespace(&catalog).await;
+
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([("key".to_string(), "value".to_string())]),
+            }])
+            .base_metadata_location(table.metadata_location().map(str::to_string))
+            .build();
+
+        let updated = catalog.update_table(commit).await.unwrap();
+        assert_eq!(updated.metadata().properties().get("key").unwrap(), "value");
+        assert_ne!(updated.metadata_location(), table.metadata_location());
+    }
+
+    // RISK: a stale transaction must RECOVER end-to-end. Two `Transaction`s start from the same base
+    // table; the first commits, then the second commits. The transaction's `do_commit` reloads the
+    // (now-advanced) base before building its `TableCommit`, so the location-CAS passes against the
+    // refreshed base and the second commit lands on TOP of the winner — refresh-and-retry resilience
+    // through the real commit machinery, not a silent last-write-win. Both properties survive.
+    #[tokio::test]
+    async fn test_table_two_transactions_from_same_base_both_land_via_refresh() {
+        let catalog = new_memory_catalog().await;
+        let table = create_table_with_namespace(&catalog).await;
+
+        // First transaction commits a property.
+        let tx_first = Transaction::new(&table);
+        let after_first = tx_first
+            .update_table_properties()
+            .set("first".to_string(), "1".to_string())
+            .apply(tx_first)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_first.metadata().properties().get("first").unwrap(),
+            "1"
+        );
+
+        // Second transaction is built from the STALE original `table` handle, but its `do_commit`
+        // refreshes to the winner's base before committing — so it succeeds and the first property
+        // is preserved (the refresh re-applied on top of the winner, no clobber).
+        let tx_second = Transaction::new(&table);
+        let after_second = tx_second
+            .update_table_properties()
+            .set("second".to_string(), "2".to_string())
+            .apply(tx_second)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_second.metadata().properties().get("second").unwrap(),
+            "2"
+        );
+
+        // Both writes survive end-to-end — the second did not last-write-win over the first.
+        let loaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(loaded.metadata().properties().get("first").unwrap(), "1");
+        assert_eq!(loaded.metadata().properties().get("second").unwrap(), "2");
     }
 }

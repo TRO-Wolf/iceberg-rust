@@ -947,6 +947,9 @@ pub async fn register_partition_stats_file(
             partition_statistics: partition_statistics_file,
         }])
         .requirements(vec![TableRequirement::UuidMatch { uuid }])
+        // Base location for the in-process catalog's location-CAS — `UuidMatch` alone cannot detect
+        // a stale concurrent commit because the table UUID is invariant.
+        .base_metadata_location(table.metadata_location().map(str::to_string))
         .build();
 
     catalog.update_table(table_commit).await

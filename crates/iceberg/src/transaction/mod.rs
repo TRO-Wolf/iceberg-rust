@@ -416,6 +416,11 @@ impl Transaction {
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
             .requirements(existing_requirements)
+            // The base the commit was built (and re-applied) against — `self.table` is the refreshed
+            // base after the staleness check above. An in-process catalog uses this for its
+            // location-CAS; on a conflict the retry reloads, advancing this to the winner's location
+            // so the next attempt's CAS matches (Java `BaseMetastoreTableOperations.commit` retry).
+            .base_metadata_location(self.table.metadata_location().map(str::to_string))
             .build();
 
         catalog.update_table(table_commit).await

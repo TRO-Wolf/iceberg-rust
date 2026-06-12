@@ -193,12 +193,20 @@ impl View {
 
     /// Begin a `replaceVersion` operation (Java `View.replaceVersion()`).
     pub fn replace_version(&self) -> ReplaceViewVersionAction {
-        ReplaceViewVersionAction::new(self.identifier.clone(), self.metadata.clone())
+        ReplaceViewVersionAction::new(
+            self.identifier.clone(),
+            self.metadata.clone(),
+            self.metadata_location.clone(),
+        )
     }
 
     /// Begin an `updateProperties` operation (Java `View.updateProperties()`).
     pub fn update_properties(&self) -> UpdateViewPropertiesAction {
-        UpdateViewPropertiesAction::new(self.identifier.clone(), self.metadata.clone())
+        UpdateViewPropertiesAction::new(
+            self.identifier.clone(),
+            self.metadata.clone(),
+            self.metadata_location.clone(),
+        )
     }
 }
 
@@ -214,12 +222,32 @@ pub struct ViewCommit {
     identifier: TableIdent,
     requirements: Vec<ViewRequirement>,
     updates: Vec<ViewUpdate>,
+    /// The metadata location of the base the commit was built against — the Rust analogue of the
+    /// `base` argument Java passes into `InMemoryViewOperations.doCommit`.
+    ///
+    /// An in-process catalog with no transactional store (e.g. [`crate::catalog::memory`]) compares
+    /// the location currently stored for the view against this value (Java's
+    /// `Objects.equal(stored, base.metadataFileLocation())`) and rejects a stale commit with a
+    /// retryable conflict when they differ. This is the optimistic-concurrency CAS the
+    /// `[AssertViewUUID]`-alone requirement set cannot provide — the view UUID is invariant across
+    /// replaces, so only the location CAS detects staleness. `None` models Java's `base == null`
+    /// create edge; the catalog update path always carries `Some`. Catalogs with a store-side CAS
+    /// (REST server, SQL `... AND metadata_location = ?`) ignore this field.
+    base_metadata_location: Option<String>,
 }
 
 impl ViewCommit {
     /// Returns the view identifier.
     pub fn identifier(&self) -> &TableIdent {
         &self.identifier
+    }
+
+    /// Returns the metadata location of the base the commit was built against, if known.
+    ///
+    /// See [`ViewCommit::base_metadata_location`] for the optimistic-concurrency contract this
+    /// supports.
+    pub fn base_metadata_location(&self) -> Option<&str> {
+        self.base_metadata_location.as_deref()
     }
 
     /// Take all requirements, leaving the commit's requirement list empty.
@@ -272,6 +300,9 @@ impl ViewCommit {
 pub struct ReplaceViewVersionAction {
     identifier: TableIdent,
     base: ViewMetadataRef,
+    /// Metadata location of the base view — threaded into the [`ViewCommit`] for the catalog's
+    /// optimistic-concurrency CAS (see [`ViewCommit::base_metadata_location`]).
+    base_metadata_location: Option<String>,
     representations: Vec<ViewRepresentation>,
     schema: Option<Schema>,
     default_namespace: Option<NamespaceIdent>,
@@ -279,10 +310,15 @@ pub struct ReplaceViewVersionAction {
 }
 
 impl ReplaceViewVersionAction {
-    fn new(identifier: TableIdent, base: ViewMetadataRef) -> Self {
+    fn new(
+        identifier: TableIdent,
+        base: ViewMetadataRef,
+        base_metadata_location: Option<String>,
+    ) -> Self {
         Self {
             identifier,
             base,
+            base_metadata_location,
             representations: Vec::new(),
             schema: None,
             default_namespace: None,
@@ -378,6 +414,7 @@ impl ReplaceViewVersionAction {
                 uuid: self.base.uuid(),
             }],
             updates: build_result.changes,
+            base_metadata_location: self.base_metadata_location,
         })
     }
 }
@@ -391,15 +428,23 @@ impl ReplaceViewVersionAction {
 pub struct UpdateViewPropertiesAction {
     identifier: TableIdent,
     base: ViewMetadataRef,
+    /// Metadata location of the base view — threaded into the [`ViewCommit`] for the catalog's
+    /// optimistic-concurrency CAS (see [`ViewCommit::base_metadata_location`]).
+    base_metadata_location: Option<String>,
     updates: HashMap<String, String>,
     removals: HashSet<String>,
 }
 
 impl UpdateViewPropertiesAction {
-    fn new(identifier: TableIdent, base: ViewMetadataRef) -> Self {
+    fn new(
+        identifier: TableIdent,
+        base: ViewMetadataRef,
+        base_metadata_location: Option<String>,
+    ) -> Self {
         Self {
             identifier,
             base,
+            base_metadata_location,
             updates: HashMap::new(),
             removals: HashSet::new(),
         }
@@ -458,6 +503,7 @@ impl UpdateViewPropertiesAction {
                 uuid: self.base.uuid(),
             }],
             updates: build_result.changes,
+            base_metadata_location: self.base_metadata_location,
         })
     }
 }
@@ -512,6 +558,12 @@ mod tests {
             NamespaceIdent::new("default".to_string()),
             "event_agg".to_string(),
         )
+    }
+
+    /// A representative base metadata location for the action constructors — the value the catalog's
+    /// location-CAS compares against.
+    fn base_location() -> Option<String> {
+        Some("s3://bucket/warehouse/default.db/event_agg/metadata/00000-base.json".to_string())
     }
 
     // RISK: a uuid-match requirement that does not actually compare uuids would let a commit land
@@ -580,7 +632,11 @@ mod tests {
     #[test]
     fn test_replace_version_requires_query_schema_namespace() {
         let metadata = base_metadata();
-        let action = ReplaceViewVersionAction::new(view_ident(), Arc::new(metadata.clone()));
+        let action = ReplaceViewVersionAction::new(
+            view_ident(),
+            Arc::new(metadata.clone()),
+            base_location(),
+        );
         assert!(
             action
                 .to_commit()
@@ -589,8 +645,12 @@ mod tests {
                 .contains("without specifying a query")
         );
 
-        let action = ReplaceViewVersionAction::new(view_ident(), Arc::new(metadata.clone()))
-            .with_query("spark", "SELECT 1");
+        let action = ReplaceViewVersionAction::new(
+            view_ident(),
+            Arc::new(metadata.clone()),
+            base_location(),
+        )
+        .with_query("spark", "SELECT 1");
         assert!(
             action
                 .to_commit()
@@ -599,9 +659,10 @@ mod tests {
                 .contains("without specifying schema")
         );
 
-        let action = ReplaceViewVersionAction::new(view_ident(), Arc::new(metadata))
-            .with_query("spark", "SELECT 1")
-            .with_schema(test_schema());
+        let action =
+            ReplaceViewVersionAction::new(view_ident(), Arc::new(metadata), base_location())
+                .with_query("spark", "SELECT 1")
+                .with_schema(test_schema());
         assert!(
             action
                 .to_commit()
@@ -617,12 +678,16 @@ mod tests {
     fn test_replace_version_reuses_identical_version() {
         let metadata = base_metadata();
         // The base already carries the `spark` "SELECT 1 AS event_count" version as version 1.
-        let commit = ReplaceViewVersionAction::new(view_ident(), Arc::new(metadata.clone()))
-            .with_query("spark", "SELECT 1 AS event_count")
-            .with_schema(test_schema())
-            .with_default_namespace(NamespaceIdent::new("default".to_string()))
-            .to_commit()
-            .unwrap();
+        let commit = ReplaceViewVersionAction::new(
+            view_ident(),
+            Arc::new(metadata.clone()),
+            base_location(),
+        )
+        .with_query("spark", "SELECT 1 AS event_count")
+        .with_schema(test_schema())
+        .with_default_namespace(NamespaceIdent::new("default".to_string()))
+        .to_commit()
+        .unwrap();
 
         // Apply the commit's updates against a fresh builder from the same base and confirm the
         // version count did NOT grow (the identical version was reused at id 1).
@@ -639,12 +704,16 @@ mod tests {
     #[test]
     fn test_replace_version_mints_new_version_and_flips_current() {
         let metadata = base_metadata();
-        let commit = ReplaceViewVersionAction::new(view_ident(), Arc::new(metadata.clone()))
-            .with_query("spark", "SELECT 99 AS event_count")
-            .with_schema(test_schema())
-            .with_default_namespace(NamespaceIdent::new("default".to_string()))
-            .to_commit()
-            .unwrap();
+        let commit = ReplaceViewVersionAction::new(
+            view_ident(),
+            Arc::new(metadata.clone()),
+            base_location(),
+        )
+        .with_query("spark", "SELECT 99 AS event_count")
+        .with_schema(test_schema())
+        .with_default_namespace(NamespaceIdent::new("default".to_string()))
+        .to_commit()
+        .unwrap();
 
         let mut builder = metadata.clone().into_builder();
         for update in commit.updates.clone() {
@@ -670,9 +739,13 @@ mod tests {
     #[test]
     fn test_update_properties_cannot_set_and_remove_same_key() {
         let metadata = base_metadata();
-        let action = UpdateViewPropertiesAction::new(view_ident(), Arc::new(metadata.clone()))
-            .set("comment", "hello")
-            .unwrap();
+        let action = UpdateViewPropertiesAction::new(
+            view_ident(),
+            Arc::new(metadata.clone()),
+            base_location(),
+        )
+        .set("comment", "hello")
+        .unwrap();
         assert!(
             action
                 .remove("comment")
@@ -681,9 +754,10 @@ mod tests {
                 .contains("Cannot remove and update the same key")
         );
 
-        let action = UpdateViewPropertiesAction::new(view_ident(), Arc::new(metadata))
-            .remove("comment")
-            .unwrap();
+        let action =
+            UpdateViewPropertiesAction::new(view_ident(), Arc::new(metadata), base_location())
+                .remove("comment")
+                .unwrap();
         assert!(
             action
                 .set("comment", "hello")
@@ -697,11 +771,15 @@ mod tests {
     #[test]
     fn test_update_properties_emits_uuid_requirement_and_applies() {
         let metadata = base_metadata();
-        let commit = UpdateViewPropertiesAction::new(view_ident(), Arc::new(metadata.clone()))
-            .set("comment", "daily counts")
-            .unwrap()
-            .to_commit()
-            .unwrap();
+        let commit = UpdateViewPropertiesAction::new(
+            view_ident(),
+            Arc::new(metadata.clone()),
+            base_location(),
+        )
+        .set("comment", "daily counts")
+        .unwrap()
+        .to_commit()
+        .unwrap();
 
         assert_eq!(commit.requirements, vec![ViewRequirement::UuidMatch {
             uuid: metadata.uuid()
@@ -715,6 +793,40 @@ mod tests {
         assert_eq!(
             new_metadata.properties().get("comment"),
             Some(&"daily counts".to_string())
+        );
+    }
+
+    // RISK: the catalog's location-CAS can only fire if the base metadata location actually reaches
+    // the `ViewCommit`. Pin that BOTH view actions thread it through — a regression to `None` would
+    // silently disable the stale-commit guard (the U1 reviewer's exact gap).
+    #[test]
+    fn test_view_commits_carry_base_metadata_location() {
+        let metadata = base_metadata();
+
+        let replace_commit = ReplaceViewVersionAction::new(
+            view_ident(),
+            Arc::new(metadata.clone()),
+            base_location(),
+        )
+        .with_query("spark", "SELECT 7 AS event_count")
+        .with_schema(test_schema())
+        .with_default_namespace(NamespaceIdent::new("default".to_string()))
+        .to_commit()
+        .unwrap();
+        assert_eq!(
+            replace_commit.base_metadata_location(),
+            base_location().as_deref()
+        );
+
+        let properties_commit =
+            UpdateViewPropertiesAction::new(view_ident(), Arc::new(metadata), base_location())
+                .set("comment", "x")
+                .unwrap()
+                .to_commit()
+                .unwrap();
+        assert_eq!(
+            properties_commit.base_metadata_location(),
+            base_location().as_deref()
         );
     }
 }

@@ -127,6 +127,41 @@ pinned as cosmetic-only; byte-exact view round-trip is next-wave.
 parquet, 8-row fixture (base 4 + bump 1 + staged 3), chain ×2, sabotage 4 closed. Key lessons:
 S-replay order (stage before bump); updateProperties does not create a snapshot; LocalTableOperations
 v0.metadata.json collision fixed with Files.createTempDirectory.
+## INCREMENT O1 (2026-06-12): optimistic-concurrency parity for MemoryCatalog (BUILDER Opus, wt-core6)
+
+Charter: U1-REVIEWER block in lessons.md. Today a STALE commit (built from a superseded base) to
+MemoryCatalog `update_table`/`update_view` silently lands LWW. Java `InMemoryTableOperations.doCommit`
+/ `InMemoryViewOperations.doCommit` compare the STORED location against the commit's BASE location
+and throw `CommitFailedException` on mismatch. Close the gap on BOTH seams symmetrically — the CAS
+belongs in the CATALOG (Java's posture), NOT in the requirement set.
+
+- [x] Survey: base location does NOT reach MemoryCatalog today (`TableCommit`/`ViewCommit` carry
+      only ident/requirements/updates). Java threads `base` into `doCommit`. REST only takes
+      requirements/updates on the wire → unaffected by a new commit field. Retry loop gates on
+      `e.retryable()`; conflict kind is `CatalogCommitConflicts` + `with_retryable(true)`.
+      Java message shape (bytecode-pinned): "Cannot commit to {table|view} %s metadata location
+      from %s to %s because it has been concurrently modified to %s".
+- [x] Thread base metadata location through the seam: added `base_metadata_location: Option<String>`
+      to `TableCommit` (catalog/mod.rs, `#[builder(default)]` + accessor) and `ViewCommit` (view.rs,
+      + accessor). Populated from the base in transaction `do_commit` (`self.table.metadata_location`),
+      both view actions (source `View::metadata_location`), and `register_partition_stats_file`. REST
+      `update_*` still sends only requirements/updates → wire/semantics unaffected; SQL keeps its own
+      store-side CAS and ignores the field.
+- [x] Added `check_no_concurrent_modification` shared helper in MemoryCatalog and wired it into
+      `update_table` + `update_view`: compares the STORED location against `commit.base_metadata_location`
+      INSIDE the lock, BEFORE the write; on mismatch raises `CatalogCommitConflicts` + retryable with
+      Java's "...because it has been concurrently modified to %s" message shape. Symmetric both seams.
+- [x] Tests: `test_view_stale_second_replace_conflicts_via_location_cas` (view U1 probe),
+      `test_table_stale_property_commit_conflicts_only_location_cas_can_fire` (table, empty-requirement
+      commit so ONLY the CAS fires), `test_table_non_stale_commit_still_succeeds_with_cas` (happy path),
+      `test_table_two_transactions_from_same_base_both_land_via_refresh` (refresh-and-retry e2e through
+      the transaction machinery), `test_view_commits_carry_base_metadata_location` (view.rs plumbing pin).
+- [x] Mutation check: replacing the CAS condition with `if true` → exactly the two stale-conflict tests
+      FAIL, happy-path + refresh tests stay green. Reverted.
+- [ ] Gate chain + taplo; report to /tmp/wave6/O1-builder.md.
+
+Outcome: location-CAS landed symmetrically on both MemoryCatalog update seams, Java-bytecode-faithful;
+SQL-catalog weaker-CAS divergence flagged in lessons as a follow-up (out of O1 scope).
 
 ## ACTIVE (2026-06-12): Near-full-parity direction — open queue (planning record)
 

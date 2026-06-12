@@ -210,6 +210,80 @@ How to use it (see the manuals' §2):
   the MAIN source tree, not m2 bytecode; for the FAMILY question that source (`setFamily(ALPHA)`) is the
   authoritative oracle, cross-checked against the datasketches jar's builder-default bytecode.
 
+#### O1 REVIEWER corrections (2026-06-12, wt-core6) — adversarial pass against 1.10.0 bytecode
+- **The Java VIEW base-location capture is `currentMetadataLocation()`, NOT `base.metadataFileLocation()`
+  — the table path differs from the view path, and the builder's report blurred them (cosmetic, not a
+  behavioral bug).** 1.10.0 bytecode: `InMemoryTableOperations.doCommit` offset 23-24 captures
+  `baseLocation = base.metadataFileLocation()` (the BASE arg's location); `InMemoryViewOperations.doCommit`
+  offset 14-15 captures `baseLocation = this.currentMetadataLocation()` (the OPS object's current location)
+  when `base != null`. For the in-process case these are equal (the commit's base IS `current()`, loaded
+  from the same map slot), so the Rust port threading `View::metadata_location` matches functionally. DO
+  cite the exact capture expression per seam — the table/view asymmetry is real bytecode, even though it
+  collapses to the same value here. Both lambdas' `CommitFailedException` arg order is bytecode-confirmed
+  `(identifier, baseLocation, newLocation, storedLocation)` (table offsets 73-91, view offsets 72-91).
+- **VERIFIED the None-bypass hole is closed AND the mutation battery is complete (5 seams pinned).**
+  Probe (explicit `base_metadata_location=None` against a stored table via `update_table`): does NOT
+  silently land — raises `CatalogCommitConflicts` (`None != Some(stored)`), Java-conservative. Mutation
+  battery run for real: (a) `if true` CAS → exactly the 2 stale-conflict tests fail, happy/refresh stay
+  green; (b) knock out population at `ReplaceViewVersionAction::to_commit` → 4 fail (incl. the carry pin);
+  (b') `UpdateViewPropertiesAction::to_commit` → 2 fail (incl. carry pin); (c) transaction `do_commit`
+  site → 377 fail (central commit path); (c') `register_partition_stats_file` site → 3 fail. NO population
+  seam survived its knockout — none unpinned. DO run every population site's knockout, not just the CAS:
+  an unpopulated seam is a silent door even with a correct CAS.
+- **MATRIX-DISCIPLINE FIX (the builder's miss): the GAP_MATRIX row 107 still said "`update_view` has no
+  base-location CAS … needs a dedicated concurrency-parity increment" AFTER this increment closed it.**
+  The de-triplication rule puts STATUS only in the matrix, so leaving the "gap open / needs increment"
+  clause was a stale-status defect. FIX (this pass): rewrote the KNOWN-GAP clause to the **O1**-landed CAS
+  narrative + the SQL weaker-CAS follow-up, and corrected the stale "MemoryCatalog's no-CAS posture" phrase
+  in the U2 sub-cell; pipe-audit re-run (row still 5 pipes). DO flip/refresh the matrix cell in the SAME
+  increment that closes the gap it describes — a builder that lands the fix but not the cell leaves the
+  matrix lying.
+- **CONFIRMED the SQL-weaker-CAS finding is real (read the path, not just the report).** `crates/catalog/
+  sql/src/catalog.rs:965-1002` `update_table` CAS's `... AND metadata_location = ?` against
+  `current_metadata_location = self.load_table(...).metadata_location_result()` — the location it loads
+  INSIDE its own `update_table` (line 967-968), NOT `commit.base_metadata_location()` (which is now
+  available but unread). Guards only the load→UPDATE TOCTOU window; a strictly-sequential stale commit
+  passes. Correctly flagged as a follow-up (NOT half-fixed). The retry classification is also confirmed:
+  `transaction/mod.rs:361` `.when(|e| e.retryable())` gates the `backon` loop; the helper raises
+  `CatalogCommitConflicts.with_retryable(true)`, and the mock tests (`...retryable(Some(2),3)` + `.times(3)`)
+  prove the loop iterates on exactly that error. VERDICT: SHIP.
+
+### 2026-06-12 (Wave-6 O1 — optimistic-concurrency parity for MemoryCatalog, BUILDER Opus, wt-core6)
+- **Java's in-memory CAS compares the STORED location against the commit's BASE location, NOT the
+  catalog's own freshly-loaded location — and the SQL catalog in THIS fork does the WEAKER thing.**
+  1.10.0 bytecode `InMemory{Table,View}Operations.doCommit`: capture `baseLocation = base == null ?
+  null : base.metadataFileLocation()` from the `base` ARGUMENT, then `tables.compute(id, (k, stored)
+  -> Objects.equal(stored, baseLocation) ? newLoc : throw)`. The `base` is what the commit was built
+  from, threaded in as a method arg. The Rust `TableCommit`/`ViewCommit` did NOT carry it, so the fix
+  added `base_metadata_location: Option<String>` to BOTH and a `check_no_concurrent_modification`
+  helper in MemoryCatalog. NOTE the divergence I found and did NOT fix (out of O1 scope): the SQL
+  catalog (`crates/catalog/sql`) CAS's against `current_metadata_location` = the location it loads
+  INSIDE its own `update_view`/`update_table`, NOT the commit's base — so it only guards the TOCTOU
+  window between its own load and its own UPDATE; a strictly-sequential stale commit (load, winner
+  lands, then loser's `update_*` re-loads the advanced location and CAS's it against itself) would
+  PASS. The SQL `test_*_concurrent_commits_*` tests use a `Barrier` + true threads to hit the window,
+  so they pass, but the posture is weaker than Java. The Java-faithful SQL fix is to CAS against
+  `commit.base_metadata_location()` too — a follow-up increment.
+- **`Transaction::do_commit` reloads the base RIGHT BEFORE building the `TableCommit`, so two
+  sequential transactions from the same base BOTH succeed via refresh — the conflict→retry loop is
+  hard to reach in-process.** The location-CAS in MemoryCatalog therefore fires for (a) a `TableCommit`
+  / `ViewCommit` built DIRECTLY from a stale base (the `register_*` maintenance paths, the view
+  actions held across a concurrent commit) and (b) the tiny window of a true external race inside
+  `do_commit`. The deterministic test for the conflict is to build the commit directly (bypassing the
+  transaction reload) — `update_table_properties` emits an EMPTY requirement set, so a property-only
+  `TableCommit` has NO requirement that could catch staleness and ONLY the location-CAS can fire
+  (the prompt's "only the CAS" case). Append-style staleness is separately caught FIRST by
+  `RefSnapshotIdMatch` (snapshot.rs emits it when `current_snapshot_id` is `Some`); the CAS is the
+  net for metadata-only updates and for views (`[AssertViewUUID]` is invariant across replaces).
+- **A new `TypedBuilder` field on `TableCommit` needs `#[builder(default)]` or every existing
+  `.build()` call site breaks; `ViewCommit` is a plain struct literal so its two `to_commit` sites +
+  the REST/SQL paths must set the field explicitly (they don't construct it — REST only calls
+  `take_requirements`/`take_updates`, so the wire is unaffected and REST semantics are untouched).**
+  The view actions had to grow a `base_metadata_location` field threaded from the source `View`'s
+  `metadata_location`, which meant updating the `View::replace_version`/`update_properties` ctors and
+  6 in-crate test call sites of the now-3-arg `*Action::new`. DO check for direct constructor calls
+  in unit tests when widening a private constructor signature.
+
 ### 2026-06-12 (Wave-5 Group Y / Y3 — Alpha-family update sketch, BUILDER Opus, wt-tstats)
 - **THE ndv-source ruling: Iceberg's `ndv` reads the COMPACT sketch's `getEstimate`, NOT the Alpha
   update sketch's. The two genuinely DIFFER in estimation mode — derive which object from
