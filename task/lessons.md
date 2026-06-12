@@ -1854,3 +1854,65 @@ How to use it (see the manuals' §2):
   `#[serde(flatten)] additional_properties` — a user property literally named `operation` would collide with the
   flattened key on serialize; Java's `SnapshotParser.toJson` explicitly SKIPS a summary-map `operation` entry
   (writes the field once). This is a pre-existing property-channel edge, not a stage_only regression.
+
+### 2026-06-11 (Overnight Group V V2 — WAP-path publish dedup, BUILDER Opus, wt-wap)
+- **READ THE FILE before assuming a feature is unbuilt — the V1 cherrypick land already contained the entire
+  WAP-path dedup CORE; V2 was a verify-and-fill-coverage increment, not an implement-from-scratch one.** *Why:*
+  the V2 brief framed "the WAP-path publish dedup" as new work, but `cherry_pick.rs` already had
+  `validate_wap_publish`, `is_wap_id_published` (both arms), the wired call in `validate()` in Java's order, the
+  verbatim `DuplicateWAPCommitException` message, the replay-side `published-wap-id` stamp, AND a crown-jewel
+  test — all from V1's Arc F cherrypick. The honest deliverable was: re-derive every semantic from 1.10.0
+  bytecode, confirm byte-exact, and add the MISSING test coverage. ZERO production change. When a brief says
+  "port X," grep the target file for X FIRST; a sibling increment may have already landed it.
+- **`WapUtil.isWapIdPublished` compares the picked `wap.id` against BOTH each ancestor's OWN `wap.id`
+  (STAGED_WAP_ID_PROP) AND its `published-wap-id` (PUBLISHED_WAP_ID_PROP) — and BOTH arms are load-bearing
+  because the FAST-FORWARD publish path never stamps `published-wap-id`.** *Why (1.10.0 bytecode
+  `WapUtil.isWapIdPublished` offsets 53-74):* a REPLAY publish mints a new snapshot stamped with
+  `published-wap-id` (caught via THAT arm); a FAST-FORWARD publish moves `main` to the staged snapshot VERBATIM
+  (no new snapshot, no restamp — `apply()` offsets 59-72 return `base.snapshot(picked.id)`), so a later same-id
+  pick is caught ONLY via the staged `wap.id` arm. Java `TestWapWorkflow.testDuplicateCherrypick`'s first
+  publish IS a fast-forward (wapSnapshot1.parent == head), proving the STAGED arm. The pre-existing Rust test
+  exercised only the REPLAY→`published-wap-id` arm; the new FF-path test is the discriminating pin — a mutation
+  dropping the staged-`wap.id` arm fails ONLY it (the replay test stays green via the other arm), proving each
+  arm is independently pinned (the docs/testing.md mutate-each-arm rule).
+- **The cherrypick rejection ORDER is `validateNonAncestor` → `validateReplacedPartitions` →
+  `validateWapPublish` (1.10.0 bytecode `CherryPickOperation.validate` offsets 8-55) — so when a pick is BOTH
+  already-an-ancestor AND its wap id is published, the ANCESTRY error fires, NOT the duplicate-WAP one.** *Why
+  it matters:* re-picking a fast-forwarded snapshot hits both conditions (it is now the head AND carries the
+  published `wap.id`); a port that ran the WAP check first would surface the wrong message. Pinned with a
+  both-paths test asserting the `already an ancestor` message AND the absence of the `Duplicate request to
+  cherry pick wap id` substring.
+- **`write.wap.enabled` is ENGINE-side only — core never gates an ordinary commit (V3 settled OUT by
+  bytecode).** *Why:* `TableProperties.WRITE_AUDIT_PUBLISH_ENABLED = "write.wap.enabled"` is DEFINED in core but
+  read by NO core production class (the literal appears in zero core `*.class` files; only `TableProperties`
+  itself + `TestWapWorkflow` reference it; the real consumers are Spark `SparkWriteConf`/`SparkReadConf`/
+  `SparkTableUtil`). `SnapshotProducer.apply()` calls only the overridable per-subclass `validate` — never
+  `WapUtil`; the ONLY core caller of `validateWapPublish` is `CherryPickOperation`. So a `wap.id` present on a
+  NON-staged ordinary commit is not validated/blocked core-side. The settle-it move: grep the jar's `*.class`
+  bytecode for the property STRING (`write.wap.enabled`) + for callers of the validation method — "defined as a
+  constant" ≠ "enforced"; trace the actual consumer.
+
+### 2026-06-11 (Overnight Group V V2 — WAP-path publish dedup, REVIEWER Opus, wt-wap)
+- **An ancestry-scoped dedup/guard has an "escape hatch" by construction — probe the SCOPE, not just the
+  positive/negative cases, and PIN it as Java-faithful (or as a divergence) with a fail-before mutation that
+  WIDENS the scope.** *Why:* `WapUtil.isWapIdPublished` walks `SnapshotUtil.ancestorIds(meta.currentSnapshot())`
+  — the LIVE `main` ancestry only. So a WAP publish that is rolled BACK past (or whose snapshot is orphaned off
+  `main` — cherry-pick only ever targets `main`) drops out of the walk and its `wap.id` REOPENS: a second same-id
+  publish then succeeds. Java has the identical hole (same `currentSnapshot()` root) — NOT a Rust divergence. The
+  discriminating test is fail-before/pass-after against a *scope-widening* mutation (walk ALL snapshots instead
+  of the current ancestry → the legitimate rollback-and-redo is spuriously rejected), which is a sharper pin than
+  the happy-path success assertion alone. Lesson: when a guard keys off "the current ancestry / live ref," the
+  reviewer's job is to construct the off-ancestry case and document whether the resulting hole matches Java.
+- **To settle a "is this constant enforced anywhere in core?" question, grep the constant-pool of EVERY core
+  class for the inlined STRING VALUE, not the field symbol.** *Why:* a `static final String` is a compile-time
+  constant — every consumer inlines its VALUE into ITS OWN constant pool, so the field reference vanishes but the
+  literal `write.wap.enabled` would appear in any reader's class. Across all 1212 core 1.10.0 classes the literal
+  appears in EXACTLY ONE (`TableProperties`, the definition) ⇒ zero runtime readers ⇒ V3 OUT, conclusively. The
+  loop is `for c in $(find . -name '*.class'); do javap -v "$c" | grep -q 'write.wap.enabled' && echo "$c"; done`.
+- **Reviewing a "verify-and-fill-coverage, zero-production-change" increment: confirm the byte-identical claim
+  FIRST (diff the touched production region against HEAD), then re-derive the cited bytecode from the m2 jars
+  independently — do NOT trust the builder's /tmp artifacts.** *Why:* the whole increment's value is the claim
+  "Rust already matches Java"; if the re-derivation is borrowed, the review is circular. Re-extracting from
+  `~/.m2/.../iceberg-{core,api}-1.10.0.jar` is cheap (`unzip` + `javap -c -p`) and catches an off-by-a-few offset
+  citation (builder said `isWapIdPublished` offsets 53-74 / `validate` 8-55; the arms/order were exact, the
+  offset ranges loose — semantics matched, citations slightly off, no functional impact).
