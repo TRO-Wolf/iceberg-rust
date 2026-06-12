@@ -997,3 +997,80 @@ How to use it (see the manuals' §2):
   `last_updated_snapshot_id` (each fails on exactly its own line). The only stats field NEVER compared is
   `last_updated_at` (wall-clock millis, run-variant — `last_updated_snapshot_id` is its stable proxy);
   defensible omission, not a gap.
+### 2026-06-12 (Wave-5 Group Y / Y1 — theta-sketch foundation, BUILDER Opus, wt-tstats)
+- **DataSketches' MurmurHash3 is NOT the canonical byte-stream MurmurHash3 — DO port from the jar
+  bytecode, never reuse the `murmur3` crate, even though it ships `murmur3_x64_128`.** *Why:* the
+  crate streams bytes with a `u32` seed and XORs the running byte count; DataSketches'
+  `MurmurHash3$HashState` (1.10.0 jar) processes the input as 16-byte BLOCKS of two LE `u64`s with a
+  64-bit seed, the long-array path passes `len*8` (not `len`) as lengthBytes to `finalMix128`, and it
+  REJECTS zero-length input (`checkPositive` throws). Constants: C1=0x87c37b911142_53d5,
+  C2=0x4cf5ad4327_45937f, block adds 0x52dce729/0x38495ab5, fmix64 standard. The seed-hash for the
+  Iceberg default seed 9001 is `computeSeedHash(9001) = hash([9001L],0)[0] & 0xFFFF = 37836` (0x93cc).
+  A single divergent bit makes every NDV blob incompatible with all other engines — so the hash is
+  pinned against Java vectors for byte-tail lengths 1..=18 AND representative longs.
+- **The estimation-mode CompactSketch is byte-reproducible WITHOUT the C++ library if you port
+  `HeapQuickSelectSketch.hashUpdate` + `quickSelectAndRebuild` faithfully — and the retained SET is
+  probe-order-INDEPENDENT, so a simple stride-1 reproduction confirms the algorithm before porting the
+  real `getStride`.** *Why:* I reproduced the lib's exact retained set (24 hashes) + theta
+  (266783384329207353) for "1000 longs at lgK=4" in pure Java first. Keys are `hash[0] >>> 1` (63-bit);
+  `theta = selectExcludingZeros(cache, curCount, 2^lgK + 1)` = the (2^lgK)-th smallest non-zero hash
+  (0-based index 2^lgK); initial `lgArrLongs = startingSubMultiple(lgK+1, 3, 5)`; threshold =
+  `floor((lgArr<=lgNom?0.5:0.9375) * 2^lgArr)`; on overflow grow if `lgArr<=lgNom` else quickselect.
+  The real probe is `getStride = 2*((hash>>>lgArr)&127)+1` (odd) — ported for fidelity, but the SET is
+  the same regardless of probe order, so a quick stride-1 Java repro is a cheap pre-port sanity oracle.
+- **The COMPACT serialized form ZEROES bytes 3-4 (lgNomLongs/lgArrLongs) — those are update-only
+  state, NOT part of the cross-engine contract.** *Why:* a decoded compact sketch reported lgNom=0
+  lgArr=0 even at lgK=4. The compact contract is only: preamble (preLongs 1/2/3) + theta (stored only
+  when preLongs=3 / theta<MAX) + the ascending hashes; count at b8-11, P=1.0f at b12-15. Empty stores
+  NO seed hash (b6-7=0); single-item uses preLongs=1 + SINGLEITEM flag (0x20) + one hash, theta=MAX.
+- **A new in-workspace crate can be ZERO-dependency (std-only) and is `cargo machete`-clean by
+  construction — flag that explicitly when machete/taplo aren't installed locally.** *Why:* the
+  theta hash + serialization are pure arithmetic + byte layout; no external crate is needed (the
+  `murmur3` crate would be WRONG anyway). The crate's `[dependencies]` table is empty, so there is
+  nothing for machete to flag; the Cargo.lock entry has no dependency list. Stated in the report
+  since neither tool was runnable in this environment.
+
+### 2026-06-12 (Wave-5 Group Y / Y1 — theta-sketch foundation, REVIEWER Opus, wt-tstats)
+- **A "byte-exact vs Java" estimate pin with a `< 1e-6` tolerance is NOT a regression pin — it hides a
+  real 1-ULP formula divergence. For any cross-engine numeric, assert `f64::to_bits()`, never a
+  tolerance.** *Why:* the builder computed NDV `estimate` as `count / (theta / MAX)`; Java
+  `Sketch.estimate(long thetaLong, int curCount)` (bytecode) is `curCount * (9.223372036854776E18 /
+  thetaLong)` — i.e. `count * (2^63_f64 / theta)`. The two are algebraically equal but round ONE ULP
+  apart on the lgK=4 fixture (Java `829.7403132548839` bits `…142c`; the builder's form `…142d`). The
+  builder's own test asserted `(est - 829.7403132548839).abs() < 1e-6` → it PASSED on the wrong value.
+  Fixed to Java's exact order-of-operations + pinned `to_bits()`. RULE: derive the estimator's exact
+  expression from `getEstimate`'s bytecode and reproduce the OPERATION ORDER, not just the algebra; the
+  constant `2^63` (Java's literal) equals `i64::MAX as f64` to the bit, so `MAX_THETA as f64` is right.
+- **A compact-sketch parser that branches on `preLongs` MUST special-case `preLongs==1`, or a hostile
+  8-byte blob panics on `bytes[8..12]`.** *Why (Java `CompactOperations.memoryToCompact` bytecode):*
+  curCount is read from bytes 8-11 ONLY for `preLongs > 1`; a 1-long preamble that is neither EMPTY nor
+  single carries curCount=0 (no count field — the buffer is only 8 bytes). The builder's reader fell
+  through to the multi-entry path for `preLongs==1` and index-panicked (range end 12 > len 8). Java
+  reads it as a 0-entry sketch (heapify-probed). Two sub-cases: ALSO single-item when `flags & 31 == 26`
+  (READ_ONLY|COMPACT|ORDERED, no bit-32 — the LEGACY single encoding `otherCheckForSingleItem`), reading
+  the hash at byte 8. Fixed both; pinned no-panic + Java-parity. RULE: a deserializer's "required-bytes"
+  guard must be keyed off the SAME field shape the body-reader assumes — a length check that passes
+  `8 < 8` does not protect a read of bytes 8-11.
+- **Update-overload equivalence (`hash(long[]{v}) == hash(LE8(v))`) is a provable IDENTITY, not a
+  coincidence — but verify the per-overload Java path from bytecode before trusting it.** *Why:* the
+  headline cross-engine question for Y2 is whether feeding a long column via `update_u64` (long-array
+  path) matches Java's `UpdateSketch.update(long)`. Bytecode: `update(long v)` builds `long[]{v}` and
+  hashes via `MurmurHash3.hash([J,J)` then `>>> 1`; `update(byte[])` hashes the raw bytes via
+  `hash([B,J)`. For a single long both reduce to `finalMix128(k1=v, k2=0, lengthBytes=8)` — identical.
+  Confirmed EQ=true for all 17 edge values against datasketches-java-3.3.0. So `update_u64` is
+  Java-faithful for long columns; a Y2 caller may feed either form for longs. (String/binary columns go
+  through the byte path with their own bytes — no equivalence claim needed there.)
+- **The DataSketches serial-version reader posture: Java accepts v1/v2/v3 (`CompactSketch.heapify` →
+  `ForwardCompatibility.heapify{1,2}to3`); a v3-ONLY Rust reader is defensible because every Iceberg
+  theta blob is v3, but it IS a documented reader gap — say so in the code + map, don't leave it
+  implicit.** Likewise Java CAN emit UNORDERED compact (`compact(false,…)`, ORDERED flag clear, flags
+  0x0a); the reader must accept it verbatim (Java only records the flag, never re-validates ordering).
+  Both pinned. Positive divergence found + kept: a `count=i32::MAX` allocation-bomb blob errors
+  (TruncatedInput) in Rust BEFORE allocating, where Java's heapify trusts curCount and throws
+  OutOfMemoryError — Rust's fail-closed-before-alloc is strictly safer and still loud.
+- **Reviewer probe hygiene: drive the crate's PUBLIC API from a throwaway `crates/<c>/tests/*.rs`
+  integration file to compare against Java, then DELETE the dir before the gate.** Each probe test
+  output was cross-checked line-by-line against a fresh Java oracle (`AdversarialOracle.java` +
+  `HeapifyProbe.java`, compiled against the m2 jar) — `cargo test --nocapture` interleaves stdout when
+  multiple `println!` race, so run each probe test with `--exact` individually for clean capture, or it
+  silently drops lines and looks like a divergence.

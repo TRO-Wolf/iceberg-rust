@@ -3498,6 +3498,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-sketches"
+version = "0.9.1"
+
+[[package]]
 name = "iceberg-sqllogictest"
 version = "0.9.1"
 dependencies = [

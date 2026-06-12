@@ -227,6 +227,70 @@ was secondary.
 - [x] Verbatim gate ×2 (2168 lib tests ×2, typos/fmt/clippy clean). Cross-chain: cherrypick + expire
       green; write-data running.
 - [x] GAP_MATRIX pipe audit clean (5 pipes/row). Tier-ledger data point recorded in final report.
+## IN-FLIGHT (2026-06-12): Wave-5 Group Y / Y1 — theta-sketch foundation (BUILDER Opus, wt-tstats)
+
+**Goal:** new workspace crate `iceberg-sketches` implementing the DataSketches theta CompactSketch
+v1/v3 serialized format (the `apache-datasketches-theta-v1` puffin blob payload), byte-compatible
+with Java DataSketches so cross-engine NDV blobs round-trip. Y1 = the crate + its byte contract; the
+action (Y2) wires NOTHING this increment.
+
+**Decision (justified in the final report):** in-workspace crate `crates/sketches`. The cargo
+registry cache holds NO theta/datasketches crate (only `murmur3-0.5.2`, which is a byte-stream
+canonical MurmurHash3 with a `u32` seed — NOT DataSketches' long-block variant), so a third-party
+crate is not offline-viable, and even if it were, the byte format is a cross-engine contract we must
+own and pin. The DataSketches Java jar (`datasketches-java-3.3.0` + `datasketches-memory-2.1.0`) IS
+present in `~/.m2`, so fixtures are Java-GENERATED (full-hex pins with provenance), not spec-derived.
+
+**Format facts pinned from the 1.10.0 jar bytecode + the live generator (`/tmp/theta-fixtures/Gen.java`):**
+- Preamble layout (`theta/PreambleUtil`): byte0 preLongs|lgResizeFactor, b1 serial-version=3, b2 FamilyID=3
+  (COMPACT, `Family` ctor id=3 minPre=1 maxPre=3), b3 lgNomLongs, b4 lgArrLongs, b5 flags,
+  b6-7 seedHash(short LE), b8-11 retainedEntries(int LE), b12-15 P(float LE), b16-23 thetaLong(LE).
+- Flags: BIG_ENDIAN=1, READ_ONLY=2, EMPTY=4, COMPACT=8, ORDERED=16, SINGLEITEM=32.
+- Hash seed = `Util.DEFAULT_UPDATE_SEED = 9001`; `computeSeedHash(9001)=37836` (0x93cc); the hash is
+  DataSketches' long-block MurmurHash3 (`MurmurHash3$HashState` blockMix128/finalMix128, C1=0x87c3..,
+  C2=0x4cf5.., fmix64), NOT the canonical byte-stream variant.
+- Modes (Java-generated, exact bytes captured): EMPTY=8B preLongs=1 flags=0x1e seedhash NOT stored;
+  SINGLE=16B preLongs=1 flags=0x3a (SINGLEITEM set) + one 8B hash; EXACT=preLongs=2 flags=0x1a
+  theta=MAX (not stored); ESTIMATION=preLongs=3 flags=0x1a theta<MAX stored at b16.
+
+**Plan:**
+- [x] Add `crates/sketches` to the workspace members + a minimal `iceberg-sketches` Cargo.toml
+      (ZERO external deps; exact diff in the report). Built → Cargo.lock regenerated.
+- [x] `hash.rs`: DataSketches MurmurHash3 (long + byte paths), seed 9001 default; pinned against the
+      Java hash vectors (tail len 1..=18 + longs). `compute_seed_hash` → 37836.
+- [x] `theta.rs`: `ThetaSketch` update form (`HeapQuickSelectSketch` quickselect port, reproduces
+      Java's retained set + theta to the bit) + `update_u64`/`update_bytes`, compact serialization
+      (empty/single/exact/estimation), `CompactThetaSketch` deserialize, `estimate()`.
+- [x] Fixtures: Java-generated `*_HEX` consts + the generator in `testdata/` (provenance README).
+      27 tests + 1 doctest: 4 byte-exact modes, round-trip, malformed rejection, estimate accuracy.
+- [x] `crates/sketches/src/map.md`; GAP_MATRIX ComputeTableStats row updated (gate lifted, Y1
+      landed); pipe-audit 5/5. Gate green (typos/fmt/clippy/iceberg-2168/new-crate ×2).
+
+**Outcome (Y1 DONE, 🟡):** byte contract unit-pinned vs Java; the action + interop are Y2. CARGO DIFF
+(SANCTIONED, minimal): root `Cargo.toml` +`"crates/sketches"` member, +`iceberg-sketches` workspace
+dep entry; `crates/sketches/Cargo.toml` new (no `[dependencies]` entries). `cargo machete` not
+installed locally BUT the crate has zero external deps (std-only) so it is machete-clean by
+construction; `taplo` not installed (cargo parsed the TOML clean). The per-Iceberg-type
+VALUE→bytes mapping (single-value serialization) is FLAGGED as MAIN-only / Y2-scoped.
+
+**Y1 REVIEWER (Opus 2-of-2, wt-tstats, 2026-06-12):** ADVERSARIAL pass against datasketches-java-3.3.0
+bytecode + fresh Java vectors. Verdicts: hash breadth (#1) CONFIRMED byte-exact (multiblock 32/64/100/1000,
+all-zeros, 0xFF runs, multi-elem long[]); update-overload equivalence CONFIRMED for all 17 values
+(`hash(long[]{v})==hash(LE8(v))` — provable identity, Java `update(long)` uses the long-array path).
+Estimation breadth (#2): new lgK=8/5000 fixture byte-exact; lgK=12/100k retained/theta byte-exact
+(exercises resize→quickselect at scale). Serial-version (#3): Java accepts v1/v2/v3 via
+`ForwardCompatibility.heapify{1,2}to3`; Rust v3-only is a DOCUMENTED reader gap (Iceberg blobs always v3 —
+acceptable). Ordered-vs-unordered: Java CAN emit unordered compact (flags 0x0a); Rust accepts it verbatim
+(parity). FOUND + FIXED 2 real defects:
+- **DEFECT 1 (PANIC):** a `preLongs=1` non-empty non-single blob index-panicked at theta.rs:409 (`bytes[8..12]`
+  on an 8-byte buffer). Java reads preLongs=1 as curCount=0 (or single-item when `flags&31==26`, the
+  legacy no-bit-32 single encoding). Fixed the parser to handle preLongs=1 per `memoryToCompact` +
+  `otherCheckForSingleItem`. Pinned with hostile fixtures (no panic, Java-parity output).
+- **DEFECT 2 (1-ULP estimate drift):** Rust `count/(theta/MAX)` diverged from Java `count*(2^63_f64/theta)`
+  by 1 ULP on EST1000 (829.7403132548839 vs …4). The builder's `<1e-6` tolerance HID it. Fixed to Java's
+  exact formula; pinned bit-exact. Other modes already bit-matched.
+NON-FIXES (parity, documented): theta=0 → +Inf in BOTH; count=i32::MAX → Rust errs before alloc (Java OOMs —
+Rust safer); EMPTY-flag+count short-circuits both.
 
 ## ACTIVE (2026-06-12): Near-full-parity direction — open queue (planning record)
 
@@ -244,8 +308,16 @@ data-level interop fixtures A–G, cherrypick interop). Statuses live ONLY in th
       (`phase5/view-ops`, Opus).
 - [ ] **Partition-stats residue:** the INCREMENTAL compute path; time/uuid/fixed/binary partition
       values in stats files (loud errors today).
-- [ ] **`ComputeTableStats` (NDV/theta sketches) — DEPENDENCY-GATED, user decision:** needs a
-      DataSketches-equivalent crate; Cargo frozen.
+- [ ] **THIS BRANCH (Wave 5 Group Y, Opus actor-critic, user-approved 2026-06-12):
+      `ComputeTableStats` — the dependency gate is LIFTED (user authorized the crate).** Y1: the
+      theta-sketch foundation — investigate existing Rust crates vs an in-workspace
+      `crates/sketches` implementation; the deliverable is the DataSketches theta CompactSketch
+      v1 SERIALIZED format (the `apache-datasketches-theta-v1` puffin blob payload) byte-pinned
+      against Java-generated fixtures; Cargo edits SANCTIONED for this branch (flag the exact
+      diff loudly for the orchestrator gate). Y2: the action — per-column NDV via the scan,
+      puffin StatisticsFile write, registration via the existing UpdateStatisticsAction,
+      read-back. Worktree `wt-tstats`, parallel to Group Z (`interop/wave5`, Sonnet+Opus-critic)
+      and Group U (`phase5/view-ops`, Opus).
 - [ ] **Reported divergences awaiting their increments:** manifest-list carried-vs-new entry ORDER
       differs from Java (cosmetic — readers + the canonical oracle reconcile by seq; O1 reviewer);
       F1 pre-existing global flags (Java lowercases ALL type names on parse, Rust exact-lowercase;
