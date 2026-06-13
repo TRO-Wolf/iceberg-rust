@@ -754,6 +754,37 @@ fn avro_convert_test_list() {
     );
 }
 
+#[test]
+fn avro_convert_test_uuid() {
+    // Round-trip pin for the UInt128/Uuid Avro serde fix (R2): a Uuid-typed `UInt128` literal must
+    // round-trip through a REAL Avro schema (`schema_to_avro_schema` emits `AvroSchema::Uuid`). The
+    // deserialize side accepts BOTH the String form (this serialize arm) and the legacy 16-byte
+    // Bytes form (covered by `test_raw_literal_bytes_uuid_correct_length`), so Java-written bytes
+    // still decode.
+    let uuid = Uuid::parse_str("f79c3e09-677c-4bbd-a479-3f349cb785e7").unwrap();
+    check_convert_with_avro(
+        Literal::Primitive(PrimitiveLiteral::UInt128(uuid.as_u128())),
+        &Type::Primitive(PrimitiveType::Uuid),
+    );
+}
+
+#[test]
+fn avro_serialize_uuid_resolves_against_schema_uuid() {
+    // Mutation-resistant pin for the load-bearing R2 fix. The production bug was on the Avro
+    // schema-RESOLUTION path (`.resolve(&avro_schema)` against `AvroSchema::Uuid`), NOT the plain
+    // round-trip: apache-avro's `resolve_uuid` accepts a `Value::String` (or `Value::Uuid`) but
+    // REJECTS a `Value::Bytes` with an unresolvable-union error. `check_serialize_avro` exercises
+    // exactly that `.resolve()` path, so reverting the serialize arm to `Bytes` makes this fail
+    // closed (the plain `check_convert_with_avro` round-trip above does NOT, because the 16-byte
+    // deserialize arm still decodes the bytes).
+    let uuid = Uuid::parse_str("f79c3e09-677c-4bbd-a479-3f349cb785e7").unwrap();
+    check_serialize_avro(
+        Literal::Primitive(PrimitiveLiteral::UInt128(uuid.as_u128())),
+        &Type::Primitive(PrimitiveType::Uuid),
+        Value::Uuid(uuid),
+    );
+}
+
 fn check_convert_with_avro_map(expected_literal: Literal, expected_type: &Type) {
     let fields = vec![NestedField::required(1, "col", expected_type.clone()).into()];
     let schema = Schema::builder()
