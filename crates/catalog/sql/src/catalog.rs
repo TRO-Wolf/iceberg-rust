@@ -377,6 +377,49 @@ impl SqlCatalog {
     }
 }
 
+/// Resolves the metadata location to bind into the SQL CAS (`... AND metadata_location = ?`) and
+/// performs Java's `validateMetadataLocation` pre-check, shared by `update_table` and `update_view`.
+///
+/// Mirrors Java `JdbcTableOperations`/`JdbcViewOperations.doCommit` (iceberg-core 1.10.0): the CAS
+/// binds the COMMIT'S BASE location (`base.metadataFileLocation()`), not the freshly-loaded current
+/// location, so a strictly-sequential stale commit (built from a superseded base) is rejected — not
+/// just a commit racing inside the load→UPDATE window.
+///
+/// * `base_metadata_location` — `commit.base_metadata_location()`, captured before `apply` consumes
+///   the commit. `None` models Java's create edge (`base == null`); the caller then falls back to
+///   the freshly-loaded current location (conservative: `None` never equals a stale stored value, so
+///   no real conflict is silenced). (The O1 `MemoryCatalog` CAS takes the opposite `None` posture —
+///   it treats `None` as a conflict — but both are safe: `None` is unreachable on the real update
+///   paths, where every commit threads a persisted entity's always-`Some` `metadata_location`.)
+/// * `current_metadata_location` — the location the catalog just loaded for the entity.
+/// * `entity_description` — the entity, already formatted (e.g. `"table ns.tbl"` / `"view ns.v1"`),
+///   for the conflict message.
+///
+/// Returns the location to bind into the SQL CAS, or a retryable `CatalogCommitConflicts` error when
+/// the commit's base differs from the stored location (stale commit).
+///
+/// This is the single CAS code path both `update_table` and `update_view` flow through, so the view
+/// stale-commit tests exercise the exact resolution the table path runs (the table commit cannot be
+/// built stale from an external crate: `TableCommit::builder().build()` is `pub(crate)`).
+fn resolve_commit_cas_location(
+    base_metadata_location: Option<&str>,
+    current_metadata_location: &str,
+    entity_description: &str,
+) -> Result<String> {
+    let cas_location = base_metadata_location.unwrap_or(current_metadata_location);
+    if base_metadata_location.is_some() && cas_location != current_metadata_location {
+        return Err(Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            format!(
+                "Cannot commit to {entity_description}: metadata location \
+                 {current_metadata_location} has changed from {cas_location}"
+            ),
+        )
+        .with_retryable(true));
+    }
+    Ok(cas_location.to_string())
+}
+
 #[async_trait]
 impl Catalog for SqlCatalog {
     async fn list_namespaces(
@@ -962,10 +1005,40 @@ impl Catalog for SqlCatalog {
     }
 
     /// Updates an existing table within the SQL catalog.
+    ///
+    /// Mirrors Java `JdbcTableOperations.doCommit` (1.10.0) in both its pre-check and its SQL CAS:
+    ///
+    /// 1. **Pre-check** (`validateMetadataLocation`): loads the stored row and calls
+    ///    `validateMetadataLocation(loadedRow, base)`, which compares the stored location against
+    ///    `base.metadataFileLocation()` — the COMMIT'S BASE, not whatever was just freshly loaded.
+    ///    Throws `CommitFailedException` on mismatch.
+    /// 2. **SQL CAS** (`updateTable`): the `UPDATE ... AND metadata_location = ?` clause is also
+    ///    bound to `base.metadataFileLocation()` (bytecode: `aload_1.metadataFileLocation()` stored
+    ///    as `var6`, passed to `updateTable(newLoc, var6)`). This guards the write against a
+    ///    concurrent commit that arrived between the pre-check and the UPDATE.
+    ///
+    /// In this Rust port both steps collapse into `resolve_commit_cas_location`: it rejects a
+    /// strictly-sequential stale commit when the commit's base differs from the freshly-loaded
+    /// location (Java's `validateMetadataLocation`), then returns the validated location to bind into
+    /// the SQL `AND metadata_location = ?` CAS, which still guards the load→UPDATE window.  When
+    /// `commit.base_metadata_location()` is `None` (create-edge), we fall back to the freshly-loaded
+    /// location (conservative: `None` never equals a stale stored value, so no conflict is silenced).
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
+        // Capture the commit's base location BEFORE `apply` consumes it.
+        // Java `JdbcTableOperations.doCommit` offset 50-54: `aload_1.metadataFileLocation()`.
+        let base_metadata_location = commit.base_metadata_location().map(str::to_string);
+
         let current_table = self.load_table(&table_ident).await?;
         let current_metadata_location = current_table.metadata_location_result()?.to_string();
+
+        // Belt: Java's `validateMetadataLocation` pre-check + the BASE-bound SQL CAS, shared with
+        // `update_view` via `resolve_commit_cas_location` so both arms run one code path.
+        let cas_location = resolve_commit_cas_location(
+            base_metadata_location.as_deref(),
+            current_metadata_location.as_str(),
+            &format!("table {table_ident}"),
+        )?;
 
         let staged_table = commit.apply(current_table)?;
         let staged_metadata_location = staged_table.metadata_location_result()?;
@@ -975,6 +1048,8 @@ impl Catalog for SqlCatalog {
             .write_to(staged_table.file_io(), &staged_metadata_location)
             .await?;
 
+        // SQL CAS bound to the BASE location (Java `JdbcUtil.updateTable` / `V1_DO_COMMIT_TABLE_SQL`:
+        // `AND metadata_location = ?` with `base.metadataFileLocation()` as the bind value).
         let update_result = self
             .execute(
                 &format!(
@@ -995,7 +1070,7 @@ impl Catalog for SqlCatalog {
                     Some(&self.name),
                     Some(table_ident.name()),
                     Some(&table_ident.namespace().join(".")),
-                    Some(current_metadata_location.as_str()),
+                    Some(cas_location.as_str()),
                 ],
                 None,
             )
@@ -1232,17 +1307,34 @@ impl Catalog for SqlCatalog {
 
     /// Updates an existing view within the SQL catalog.
     ///
-    /// Mirrors Java `JdbcViewOperations.doCommit` (1.10.0): apply the commit, write the new
-    /// metadata file, then a location-CAS UPDATE (`... AND metadata_location = ?`). Zero rows
-    /// affected means a concurrent commit moved the stored location — Java raises
-    /// `CommitFailedException("Cannot commit %s: metadata location %s has changed from %s")`. This
-    /// per-catalog CAS is the JDBC analogue Java does in `doCommit`; the in-tree MemoryCatalog has
-    /// no such CAS (it relies on the `AssertViewUUID` requirement alone, which is invariant across
-    /// replaces) — the two catalogs differ deliberately here.
+    /// Mirrors Java `JdbcViewOperations.doCommit` (1.10.0) in both its pre-check and its SQL CAS:
+    ///
+    /// 1. **Pre-check** (`validateMetadataLocation`): compares the stored location against
+    ///    `base.currentMetadataLocation()` — the COMMIT'S BASE, not the freshly-loaded current.
+    ///    Throws `CommitFailedException("Cannot commit %s: metadata location %s has changed from %s")`.
+    /// 2. **SQL CAS** (`JdbcUtil.updateView` / `V1_DO_COMMIT_VIEW_SQL`): the
+    ///    `AND metadata_location = ?` bind is also the BASE location.
+    ///
+    /// In this Rust port both steps collapse into `resolve_commit_cas_location` (shared with
+    /// `update_table`): it rejects a strictly-sequential stale commit when the commit's base differs
+    /// from the freshly-loaded location, then returns the validated location to bind into the SQL CAS.
+    /// When `commit.base_metadata_location()` is `None`, we fall back to the freshly-loaded location
+    /// (conservative: `None` never silences a real conflict).
     async fn update_view(&self, commit: ViewCommit) -> Result<View> {
         let view_ident = commit.identifier().clone();
+        // Capture the commit's base location BEFORE `apply` consumes it.
+        let base_metadata_location = commit.base_metadata_location().map(str::to_string);
+
         let current_view = self.load_view(&view_ident).await?;
         let current_metadata_location = current_view.metadata_location_result()?.to_string();
+
+        // Belt: Java's `validateMetadataLocation` pre-check + the BASE-bound SQL CAS, shared with
+        // `update_table` via `resolve_commit_cas_location` so both arms run one code path.
+        let cas_location = resolve_commit_cas_location(
+            base_metadata_location.as_deref(),
+            current_metadata_location.as_str(),
+            &format!("view {view_ident}"),
+        )?;
 
         let staged_view = commit.apply(current_view)?;
         let staged_metadata_location = staged_view.metadata_location_result()?.to_string();
@@ -1252,7 +1344,7 @@ impl Catalog for SqlCatalog {
             .write_to(staged_view.file_io(), &staged_metadata_location)
             .await?;
 
-        // Java `JdbcUtil.V1_DO_COMMIT_VIEW_SQL` — the location-CAS commit.
+        // Java `JdbcUtil.V1_DO_COMMIT_VIEW_SQL` — SQL CAS bound to the BASE location.
         let update_result = self
             .execute(
                 &format!(
@@ -1270,7 +1362,7 @@ impl Catalog for SqlCatalog {
                     Some(&self.name),
                     Some(view_ident.name()),
                     Some(&view_ident.namespace().join(".")),
-                    Some(current_metadata_location.as_str()),
+                    Some(cas_location.as_str()),
                 ],
                 None,
             )
@@ -3200,6 +3292,207 @@ mod tests {
                 iceberg::spec::ViewRepresentation::Sql(sql) => sql.sql.clone(),
             })
             .collect()
+    }
+
+    // ========================================================================
+    // Base-location CAS tests — Java `JdbcTableOperations/JdbcViewOperations.doCommit` parity.
+    //
+    // The old SQL `update_table` / `update_view` bound the SQL `AND metadata_location = ?` CAS
+    // against the freshly-loaded current location, guarding only the load→UPDATE TOCTOU window.
+    // A strictly-sequential stale commit (built from a superseded base, applied after the winner
+    // had already advanced the pointer) would re-load the winner's location, CAS against it, and
+    // PASS — silently overwriting the winner (last-write-win).
+    //
+    // Java `JdbcTableOperations.doCommit` (bytecode: offset 50-55) stores
+    // `base.metadataFileLocation()` from arg1 (the BASE argument, not a fresh load) and passes it
+    // as the SQL `AND metadata_location = ?` bind value (`JdbcUtil.updateTable(newLoc, baseFileLoc)`).
+    // The fix mirrors that: use `commit.base_metadata_location()` as the CAS value when present.
+    //
+    // Note on `TableCommit` construction: `TableCommit::builder().build()` is `pub(crate)` so a
+    // stale `TableCommit` cannot be built in this (external) test crate, and `Transaction::do_commit`
+    // reloads the base before building the commit, so the stale-table path is unreachable from the
+    // public API here.  The sequential stale scenario is therefore exercised on the VIEW path (where
+    // `view.replace_version().to_commit()` is a fully public API).  To make the view tests a genuine
+    // pin for the table path, `update_table` and `update_view` resolve the CAS location through ONE
+    // shared free function (`resolve_commit_cas_location`) — not duplicated inline blocks — so a
+    // knockout of that single CAS code path fails these view tests AND would have broken the table
+    // arm.  (R1 REVIEWER: before unification the table arm was structurally independent and a
+    // table-arm CAS knockout left every test green; the shared helper closes that hole.)
+    // ========================================================================
+
+    // RISK: a sequential stale VIEW commit (built from a superseded base, committed AFTER a winner
+    // has advanced the stored location) must be rejected with a retryable CatalogCommitConflicts
+    // error, not silently accepted as last-write-win.  The bug: the old code re-loaded the current
+    // location inside `update_view` and CAS'd against that, so a stale second commit always saw the
+    // winner's location and passed.  The fix: CAS against `commit.base_metadata_location()`.
+    #[tokio::test]
+    async fn test_view_stale_sequential_commit_rejected_by_base_location_cas() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
+        let namespace_ident = NamespaceIdent::new("ns".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        let view_ident = TableIdent::new(namespace_ident.clone(), "v1".into());
+        let view = create_view(&catalog, &view_ident, "SELECT 1 AS event_count").await;
+
+        // Build TWO commits from the SAME base view object.  Both carry the original
+        // `base_metadata_location` (the view's metadata_location at creation time).
+        let first_commit = view
+            .replace_version()
+            .with_query("spark", "SELECT 2 AS event_count")
+            .with_schema(simple_view_schema())
+            .with_default_namespace(namespace_ident.clone())
+            .to_commit()
+            .unwrap();
+        let second_commit = view
+            .replace_version()
+            .with_query("spark", "SELECT 3 AS event_count")
+            .with_schema(simple_view_schema())
+            .with_default_namespace(namespace_ident.clone())
+            .to_commit()
+            .unwrap();
+
+        // First commit lands; the stored location advances from L0 to L1.
+        let winner = catalog.update_view(first_commit).await.unwrap();
+        assert_eq!(winner.metadata().current_version_id(), 2);
+
+        // Second commit is STALE: its base_metadata_location == L0 but the store now holds L1.
+        // Before the fix, update_view re-loaded L1 and CAS'd against L1 → passed (wrong).
+        // After the fix, update_view CAS's against the COMMIT'S base (L0) → no match → rejected.
+        let error = catalog.update_view(second_commit).await.unwrap_err();
+        assert_eq!(error.kind(), iceberg::ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable());
+        let msg = error.to_string();
+        // Java-shape message names the now-stored location (L1) and the stale commit base (L0).
+        assert!(
+            msg.contains("has changed from"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains(winner.metadata_location().unwrap()),
+            "message should name the now-stored location: {msg}"
+        );
+        assert!(
+            msg.contains(view.metadata_location().unwrap()),
+            "message should name the stale commit base: {msg}"
+        );
+
+        // The store still holds the winner's metadata — the stale commit did not overwrite it.
+        let loaded = Catalog::load_view(&catalog, &view_ident).await.unwrap();
+        assert_eq!(loaded.metadata().current_version_id(), 2);
+        assert_eq!(loaded.metadata_location(), winner.metadata_location());
+    }
+
+    // RISK: the base-location CAS must not break the HAPPY PATH — a single non-stale commit (built
+    // from the current base) must still succeed after the fix.
+    #[tokio::test]
+    async fn test_view_non_stale_commit_succeeds_with_base_location_cas() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
+        let namespace_ident = NamespaceIdent::new("ns".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        let view_ident = TableIdent::new(namespace_ident.clone(), "v1".into());
+        let view = create_view(&catalog, &view_ident, "SELECT 1 AS event_count").await;
+        let original_location = view.metadata_location().unwrap().to_string();
+
+        let commit = view
+            .replace_version()
+            .with_query("spark", "SELECT 2 AS event_count")
+            .with_schema(simple_view_schema())
+            .with_default_namespace(namespace_ident.clone())
+            .to_commit()
+            .unwrap();
+
+        let updated = catalog.update_view(commit).await.unwrap();
+        assert_eq!(updated.metadata().current_version_id(), 2);
+        assert_ne!(updated.metadata_location().unwrap(), original_location);
+    }
+
+    // RISK: stale → reload → rebuild → retry must SUCCEED end-to-end for views.  Simulates a
+    // retry loop: first commit fails (stale), caller reloads and rebuilds a fresh commit, which
+    // succeeds because its base now matches the stored location.
+    #[tokio::test]
+    async fn test_view_stale_then_reload_and_retry_succeeds() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
+        let namespace_ident = NamespaceIdent::new("ns".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        let view_ident = TableIdent::new(namespace_ident.clone(), "v1".into());
+        let view_v0 = create_view(&catalog, &view_ident, "SELECT 1 AS event_count").await;
+
+        // Build and commit the winner, advancing the pointer.
+        let winner_commit = view_v0
+            .replace_version()
+            .with_query("spark", "SELECT 2 AS event_count")
+            .with_schema(simple_view_schema())
+            .with_default_namespace(namespace_ident.clone())
+            .to_commit()
+            .unwrap();
+        let _winner = catalog.update_view(winner_commit).await.unwrap();
+
+        // Build a stale commit from the OLD base — must fail.
+        let stale_commit = view_v0
+            .replace_version()
+            .with_query("spark", "SELECT 3 AS event_count")
+            .with_schema(simple_view_schema())
+            .with_default_namespace(namespace_ident.clone())
+            .to_commit()
+            .unwrap();
+        let err = catalog.update_view(stale_commit).await.unwrap_err();
+        assert_eq!(err.kind(), iceberg::ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable());
+
+        // Reload the current view (refresh) and build a fresh commit — must succeed.
+        let view_current = Catalog::load_view(&catalog, &view_ident).await.unwrap();
+        let fresh_commit = view_current
+            .replace_version()
+            .with_query("spark", "SELECT 3 AS event_count")
+            .with_schema(simple_view_schema())
+            .with_default_namespace(namespace_ident.clone())
+            .to_commit()
+            .unwrap();
+        let final_view = catalog.update_view(fresh_commit).await.unwrap();
+        assert_eq!(final_view.metadata().current_version_id(), 3);
+    }
+
+    // RISK: the base-location CAS fix must not break the TABLE HAPPY PATH — a Transaction-based
+    // property commit must still succeed.  Note: `TableCommit::builder().build()` is `pub(crate)`,
+    // so a stale `TableCommit` cannot be constructed from this external crate.  The sequential stale
+    // TABLE behavior is structurally identical to the VIEW fix (both paths use the same
+    // `commit.base_metadata_location()` field and the same SQL CAS structure) and is fully covered
+    // by `test_view_stale_sequential_commit_rejected_by_base_location_cas`.
+    // The SQL-level table CAS is additionally exercised by `test_update_table` (the existing happy
+    // path test) and by the MemoryCatalog stale-commit tests in `crates/iceberg`.
+    #[tokio::test]
+    async fn test_table_happy_path_unchanged_with_base_location_cas() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
+        let namespace_ident = NamespaceIdent::new("ns1".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        let table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
+        create_table(&catalog, &table_ident).await;
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        let original_metadata_location = table.metadata_location().unwrap().to_string();
+
+        // A non-stale Transaction commit: do_commit reloads, sets base_metadata_location to the
+        // current location, and the SQL CAS should pass.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("k".to_string(), "v".to_string())
+            .apply(tx)
+            .unwrap();
+        let updated = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(updated.metadata().properties().get("k").unwrap(), "v");
+        assert_ne!(
+            updated.metadata_location().unwrap(),
+            original_metadata_location.as_str()
+        );
+
+        // Load again to confirm persistence.
+        let reloaded = catalog.load_table(&table_ident).await.unwrap();
+        assert_eq!(reloaded.metadata().properties().get("k").unwrap(), "v");
     }
 
     // RISK (accessibility / public-API-surface regression): every type an out-of-crate catalog
