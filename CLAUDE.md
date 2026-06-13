@@ -208,12 +208,14 @@ These are irreversible or hard-block. The operating manuals (Non-Negotiables) re
 
 ## Rust conventions
 
-The full engineering contract lives in the [skills/](skills/) manuals; this section is only the
-repo-specific house style they point to.
+The full engineering contract lives in the [skills/](skills/) manuals and — for crate code
+(`crates/`) — in [AGENTS.md](AGENTS.md); this section is the repo-specific house style they point to.
 
 - **Error handling:** library crates define error types with `thiserror` (the `iceberg` crate uses a
   central `Error` in [crates/iceberg/src/error.rs](crates/iceberg/src/error.rs)); binaries/examples
   may use `anyhow`. **No bare `.unwrap()` / `.unwrap_err()` in production paths** — carry context.
+  Public APIs return a **typed error enum**, never `Result<_, String>` or `Box<dyn Error>`; when you
+  wrap an inner error, implement `Error::source()` so the chain survives (see [AGENTS.md](AGENTS.md)).
 - **Imports & formatting:** let `cargo fmt` own layout (config in [rustfmt.toml](rustfmt.toml)); do
   not hand-format imports — the `StdExternalCrate` grouping and module granularity are automatic.
 - **Lints:** code must pass `cargo clippy --all-targets --workspace -- -D warnings`.
@@ -224,6 +226,15 @@ repo-specific house style they point to.
   surrounding module already uses it.)
 - **Logging:** `tracing` with structured fields (`?error`, ids, durations), never `println!` in
   library code, and never log secrets.
+- **Numeric casts:** never `as` for conversions that may truncate/overflow — use `try_into()` (with
+  handling) or a clamped cast on a bounded domain; treat every `as` as a review flag.
+- **Concurrency:** document lock-acquisition order (never acquire the same locks in different orders);
+  do not hold a `RwLock`/`Mutex` write guard across `.await` unless the section is unavoidably async
+  and bounded; prefer `compare_exchange` loops for concurrent counters.
+- **Recursion:** user-influenced tree/graph walks carry a depth limit or use an explicit-stack
+  iterative form — malformed input must not overflow the thread stack.
+- **Async & tests:** keep async paths non-blocking (`spawn_blocking` for CPU-heavy work); every test
+  asserts at least once and prefers `.expect("context")` over a bare `.unwrap()`.
 
 <subagent_policy>
 
