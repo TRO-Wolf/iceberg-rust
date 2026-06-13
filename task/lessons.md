@@ -772,7 +772,7 @@ How to use it (see the manuals' §2):
   The companion deserialization arm in `RawLiteralEnum::String` must also handle `PrimitiveType::Uuid`
   (Apache Avro decodes `Schema::Uuid` to `Value::Uuid` which serde-deserializes as a `String`). This fix
   is transparent to the partition-stats Parquet path (UUID goes through Arrow FixedSizeBinary(16), not
-  Avro); all 2236 lib tests pass. LESSON: any `UInt128` serialization path must be type-gated — the Avro
+  Avro); all 2238 lib tests pass. LESSON: any `UInt128` serialization path must be type-gated — the Avro
   crate's UUID schema uses a TYPE-SPECIFIC resolver that rejects the raw byte form.
 - **Incremental path engagement can only be pinned INDIRECTLY when `latest_stats_file` is a private `fn`.**
   *Why:* there is no public hook to assert "the incremental branch was taken". Pin it via observable

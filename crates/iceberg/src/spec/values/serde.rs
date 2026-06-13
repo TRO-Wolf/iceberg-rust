@@ -242,8 +242,8 @@ pub(crate) mod _serde {
                         // runtime resolves against `Schema::Uuid` (which accepts `Value::Uuid`
                         // OR `Value::String`). Emitting `Bytes` for a Uuid-typed field causes
                         // an "unresolvable union" error because apache-avro's `resolve_uuid`
-                        // rejects `Value::Bytes`. Non-UUID UInt128 uses (e.g. Fixed/Binary
-                        // via the Int128 arm already cover Decimal) fall back to the raw bytes.
+                        // rejects `Value::Bytes`. `UInt128` is only type-valid for `Uuid`
+                        // (see `datatypes.rs`), so the `else` arm is a defensive fallback.
                         if matches!(ty, Type::Primitive(PrimitiveType::Uuid)) {
                             RawLiteralEnum::String(uuid::Uuid::from_u128(v).to_string())
                         } else {
