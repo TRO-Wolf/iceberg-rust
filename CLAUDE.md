@@ -50,7 +50,8 @@ capability's *status*, the **GAP_MATRIX** (re-audited against the live base) win
 3. **The operating manual for your model tier** — [skills/Fable.md](skills/Fable.md) (Mythos-class),
    [skills/Opus.md](skills/Opus.md), [skills/Sonnet.md](skills/Sonnet.md), or
    [skills/Haiku.md](skills/Haiku.md) (the portable engineering contract; see
-   [skills/map.md](skills/map.md)). CLAUDE.md wins on any conflict.
+   [skills/map.md](skills/map.md)). CLAUDE.md wins on any conflict. For crate code (`crates/`), also
+   read **[AGENTS.md](AGENTS.md)** — the per-crate Rust engineering rules (error chains, etc.).
 4. **[task/lessons.md](task/lessons.md) in full, then [task/todo.md](task/todo.md)** — accumulated
    lessons and any mid-flight plan to pick up.
 5. **The `map.md` of every directory your task will touch** (where present — see the navigation
