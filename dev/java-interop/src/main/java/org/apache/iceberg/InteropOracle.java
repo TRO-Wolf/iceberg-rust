@@ -818,6 +818,58 @@ public final class InteropOracle {
         WapDataOracle.generateJavaTable(wapDataJavaTableDir);
         break;
 
+      case "generate-interop-partition-stats-incr":
+        // PARTITION-STATS INCREMENTAL interop (increment R2). Builds an incremental fixture:
+        // S1 fast-append A+B → compute+register S1 stats (full); S2 delete file_a (the
+        // SUBTRACT arm) → compute S2 stats (incremental, Java auto-selects because the S1
+        // stats file exists). Emits java_incr_table/metadata/final.metadata.json +
+        // java_incr_stats.json (D2 ground truth for Rust to read).
+        // The dir is supplied via -Dinterop.partition_stats_incr.dir.
+        Path partitionStatsIncrGenDir = requireFixturesDir("interop.partition_stats_incr.dir");
+        IncrementalPartitionStatsOracle.generate(partitionStatsIncrGenDir);
+        break;
+
+      case "verify-interop-partition-stats-incr":
+        // PARTITION-STATS INCREMENTAL interop, DIRECTION 1 — "Java reads what RUST writes."
+        // The Rust GEN test wrote its incremental stats to rust_incr_table/ and emitted
+        // incr_expected.json. Java reads the Rust stats file via the PRODUCTION
+        // readPartitionStatsFile and compares against incr_expected.json.
+        // The dir is supplied via -Dinterop.partition_stats_incr.dir.
+        Path partitionStatsIncrVerifyDir = requireFixturesDir("interop.partition_stats_incr.dir");
+        int partitionStatsIncrFailures =
+            IncrementalPartitionStatsOracle.verify(partitionStatsIncrVerifyDir);
+        System.out.println(
+            "verify-interop-partition-stats-incr: " + partitionStatsIncrFailures + " failures");
+        if (partitionStatsIncrFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
+      case "generate-interop-partition-stats-uuid":
+        // UUID PARTITION-STATS interop (increment R2). A table partitioned by uuid identity,
+        // Java writes stats parquet via PRODUCTION computeAndWriteStatsFile, emits
+        // java_uuid_table/metadata/final.metadata.json + java_uuid_stats.json (D2 ground truth).
+        // The dir is supplied via -Dinterop.partition_stats_uuid.dir.
+        Path partitionStatsUuidGenDir = requireFixturesDir("interop.partition_stats_uuid.dir");
+        UuidPartitionStatsOracle.generate(partitionStatsUuidGenDir);
+        break;
+
+      case "verify-interop-partition-stats-uuid":
+        // UUID PARTITION-STATS interop, DIRECTION 1 — "Java reads what RUST writes."
+        // The Rust GEN test wrote a uuid-partitioned stats file to rust_uuid_table/ and emitted
+        // uuid_expected.json. Java reads the Rust stats file via the PRODUCTION
+        // readPartitionStatsFile and compares against uuid_expected.json.
+        // The dir is supplied via -Dinterop.partition_stats_uuid.dir.
+        Path partitionStatsUuidVerifyDir = requireFixturesDir("interop.partition_stats_uuid.dir");
+        int partitionStatsUuidFailures =
+            UuidPartitionStatsOracle.verify(partitionStatsUuidVerifyDir);
+        System.out.println(
+            "verify-interop-partition-stats-uuid: " + partitionStatsUuidFailures + " failures");
+        if (partitionStatsUuidFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -10191,7 +10243,7 @@ public final class InteropOracle {
      * Compare one decoded {@link PartitionStats} row against its expected JSON node.
      * Returns the number of field-level failures.
      */
-    private static int compareStatsRow(
+    static int compareStatsRow(
         PartitionStats row,
         com.fasterxml.jackson.databind.JsonNode expected,
         String label) {
@@ -10274,14 +10326,14 @@ public final class InteropOracle {
      * (GenericRecord / StructProjection). We use {@code StructLike.get(0, Object.class)} to avoid
      * a ClassCastException.
      */
-    private static String partitionCategoryString(PartitionStats row) {
+    static String partitionCategoryString(PartitionStats row) {
       StructLike partition = row.partition();
       Object val = partition.get(0, Object.class);
       return val == null ? "null" : val.toString();
     }
 
     /** Assert two long values are equal; returns 0 on success, 1 on failure. */
-    private static int assertLong(String label, String field, long expected, long actual) {
+    static int assertLong(String label, String field, long expected, long actual) {
       if (expected != actual) {
         System.out.println(
             "FAIL " + label + ": " + field + " expected=" + expected + " actual=" + actual);
@@ -10365,7 +10417,7 @@ public final class InteropOracle {
      * {@link LocalFileIO} — needed to call {@link Partitioning#partitionType(Table)} without a
      * live catalog. Uses {@link LocalTableOperations} in read-only mode (no commit).
      */
-    private static Table buildTableFromMetadata(
+    static Table buildTableFromMetadata(
         TableMetadata metadata, Path metadataFilePath) throws IOException {
       File tableDir = metadataFilePath.getParent().getParent().toFile();
       File metadataDir = metadataFilePath.getParent().toFile();
@@ -10389,6 +10441,581 @@ public final class InteropOracle {
       ops.commit(null, metadata);
       // After ops.commit(null, metadata), ops.current() == the pinned metadata.
       return new BaseTable(ops, "interop_rust_table");
+    }
+  }
+
+  // ===========================================================================================
+  // IncrementalPartitionStatsOracle — R2 incremental partition-stats interop
+  //
+  // Fixture: V2 table identity(category) {id long, category string, data string}.
+  //   S1: fast-append file A (cat=a, 3 records, 300 bytes) + file B (cat=b, 2 records, 200 bytes).
+  //       compute stats S1 (FULL) → register (this becomes the base stats file).
+  //   S2: delete file A (the SUBTRACT arm) → compute stats S2 (INCREMENTAL: Java's
+  //       computeAndWriteStatsFile auto-selects incremental because the S1 stats file exists in
+  //       the lineage) → register.
+  //
+  // Expected stats rows after S2:
+  //   cat=a: data_records=0, data_files=0, size=0 (subtracted), last_updated=S2.
+  //   cat=b: data_records=2, data_files=1, size=200 (unchanged from S1 base), last_updated=S1.
+  //
+  // Direction 1: Rust writes its incremental stats → Java reads via readPartitionStatsFile.
+  // Direction 2: Java writes above → Rust reads via read_partition_stats_file.
+  // ===========================================================================================
+
+  static final class IncrementalPartitionStatsOracle {
+    private IncrementalPartitionStatsOracle() {}
+
+    /** Same schema as PartitionStatsOracle: {1 id long, 2 category string, 3 data string}. */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "category", Types.StringType.get()),
+          Types.NestedField.optional(3, "data", Types.StringType.get()));
+    }
+
+    /**
+     * Build the incremental fixture: S1 fast-append + compute S1 full stats + register; S2
+     * delete file_a + compute S2 incremental stats + register. Emits:
+     * <ul>
+     *   <li>{@code java_incr_table/metadata/final.metadata.json} — Java table after S2.
+     *   <li>{@code java_incr_stats.json} — the decoded S2 partition-stats rows (D2 ground truth
+     *       for the Rust direction-2 test).
+     * </ul>
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Path tableDir = dir.resolve("java_incr_table");
+      Path metadataDir = tableDir.resolve("metadata");
+      Files.createDirectories(metadataDir);
+
+      Schema schema = schema();
+      PartitionSpec spec =
+          PartitionSpec.builderFor(schema).identity("category").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.toAbsolutePath().toString(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir.toFile(), metadataDir.toFile());
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_partition_stats_incr");
+      String dataDir = tableDir.toAbsolutePath() + "/data";
+
+      // S1: fast-append file A (cat=a) + file B (cat=b).
+      PartitionData partA = new PartitionData(spec.partitionType());
+      partA.set(0, "a");
+      PartitionData partB = new PartitionData(spec.partitionType());
+      partB.set(0, "b");
+
+      DataFile fileA =
+          DataFiles.builder(spec)
+              .withPath(dataDir + "/file_a.parquet")
+              .withFileSizeInBytes(300L)
+              .withRecordCount(3L)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partA)
+              .build();
+      DataFile fileB =
+          DataFiles.builder(spec)
+              .withPath(dataDir + "/file_b.parquet")
+              .withFileSizeInBytes(200L)
+              .withRecordCount(2L)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partB)
+              .build();
+
+      table.newFastAppend().appendFile(fileA).appendFile(fileB).commit();
+      long s1Id = table.currentSnapshot().snapshotId();
+
+      // Compute S1 stats (FULL — no prior stats file exists). Register.
+      PartitionStatisticsFile s1StatsFile = PartitionStatsHandler.computeAndWriteStatsFile(table);
+      if (s1StatsFile == null) {
+        throw new RuntimeException(
+            "computeAndWriteStatsFile(S1) returned null — fixture is wrong");
+      }
+      table.updatePartitionStatistics().setPartitionStatistics(s1StatsFile).commit();
+
+      // S2: delete file A. Java's newDelete().deleteFile(fileA) commits a delete snapshot
+      // that marks file A as DELETED in a merged manifest. The SUBTRACT arm of the incremental
+      // diff will process this DELETED tombstone.
+      table.newDelete().deleteFile(fileA).commit();
+      long s2Id = table.currentSnapshot().snapshotId();
+
+      // Compute S2 stats (INCREMENTAL: Java auto-selects because S1 stats file is in the lineage).
+      // This is the production computeAndWriteStatsFile — no override needed.
+      PartitionStatisticsFile s2StatsFile = PartitionStatsHandler.computeAndWriteStatsFile(table);
+      if (s2StatsFile == null) {
+        throw new RuntimeException(
+            "computeAndWriteStatsFile(S2) returned null — fixture is wrong");
+      }
+      table.updatePartitionStatistics().setPartitionStatistics(s2StatsFile).commit();
+
+      // Read back the S2 stats and emit java_incr_stats.json (D2 ground truth).
+      Types.StructType unifiedType = Partitioning.partitionType(table);
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedType, TableUtil.formatVersion(table));
+      InputFile statsInput = table.io().newInputFile(s2StatsFile.path());
+      List<PartitionStats> statsRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInput)) {
+        for (PartitionStats row : rows) {
+          statsRows.add(row);
+        }
+      }
+
+      String statsJson = statsRowsToJson(statsRows, s1Id, s2Id);
+      writeJson(dir.resolve("java_incr_stats.json"), statsJson);
+      System.out.println(
+          "generate-interop-partition-stats-incr: java_incr_stats.json written (s1Id="
+              + s1Id + " s2Id=" + s2Id + " rows=" + statsRows.size() + ")");
+
+      // Emit final.metadata.json so Rust can find the registered stats path.
+      Path finalMetadataPath = metadataDir.resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadataPath.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+      System.out.println(
+          "generate-interop-partition-stats-incr: final.metadata.json written to "
+              + finalMetadataPath);
+    }
+
+    /**
+     * Direction 1 — "Java reads what RUST writes."
+     *
+     * <p>The Rust incremental GEN test wrote its table to {@code <dir>/rust_incr_table} and emitted
+     * {@code incr_expected.json}. Here Java reads the S2 stats file via the PRODUCTION
+     * readPartitionStatsFile and compares against incr_expected.json.
+     *
+     * @return the number of failures (0 = all pass).
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path rustTableMetadata = dir.resolve("rust_incr_table/metadata/final.metadata.json");
+      if (!Files.exists(rustTableMetadata)) {
+        System.out.println(
+            "FAIL incr-partition-stats/verify: missing rust_incr_table/metadata/final.metadata.json"
+                + " — run the Rust incremental GEN step first");
+        return 1;
+      }
+
+      TableMetadata rustMeta =
+          TableMetadataParser.fromJson(
+              rustTableMetadata.toString(), readString(rustTableMetadata));
+
+      long currentSnapshotId =
+          rustMeta.currentSnapshot() == null ? -1L : rustMeta.currentSnapshot().snapshotId();
+      if (currentSnapshotId == -1L) {
+        System.out.println("FAIL incr-partition-stats/verify: Rust table has no current snapshot");
+        return 1;
+      }
+
+      PartitionStatisticsFile registeredFile = null;
+      for (PartitionStatisticsFile file : rustMeta.partitionStatisticsFiles()) {
+        if (file.snapshotId() == currentSnapshotId) {
+          registeredFile = file;
+          break;
+        }
+      }
+      if (registeredFile == null) {
+        System.out.println(
+            "FAIL incr-partition-stats/verify: no PartitionStatisticsFile for snapshot "
+                + currentSnapshotId + " in the Rust table");
+        return 1;
+      }
+
+      String statsPath = registeredFile.path();
+      System.out.println(
+          "incr-partition-stats/verify: reading Rust incremental stats file at " + statsPath);
+
+      Types.StructType unifiedPartType = Partitioning.partitionType(
+          buildTableFromMetadata(rustMeta, rustTableMetadata));
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedPartType, rustMeta.formatVersion());
+
+      InputFile statsInputFile = new LocalFileIO().newInputFile(statsPath);
+      List<PartitionStats> decodedRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInputFile)) {
+        for (PartitionStats row : rows) {
+          decodedRows.add(row);
+        }
+      }
+
+      Path expectedPath = dir.resolve("incr_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL incr-partition-stats/verify: missing incr_expected.json"
+                + " — run the Rust incremental GEN step first");
+        return 1;
+      }
+      String expectedJson = readString(expectedPath);
+      com.fasterxml.jackson.databind.JsonNode expectedNode =
+          new com.fasterxml.jackson.databind.ObjectMapper().readTree(expectedJson);
+
+      int expectedCount = expectedNode.size();
+      if (decodedRows.size() != expectedCount) {
+        System.out.println(
+            "FAIL incr-partition-stats/verify: decoded "
+                + decodedRows.size() + " rows, expected " + expectedCount);
+        return failures + 1;
+      }
+
+      for (int i = 0; i < decodedRows.size(); i++) {
+        PartitionStats row = decodedRows.get(i);
+        com.fasterxml.jackson.databind.JsonNode expected = expectedNode.get(i);
+        String partition = expected.path("partition_category").asText();
+        failures += PartitionStatsOracle.compareStatsRow(
+            row, expected, "incr row " + i + " (cat=" + partition + ")");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS incr-partition-stats/verify: all " + decodedRows.size()
+                + " rows match incr_expected.json");
+      }
+      return failures;
+    }
+
+    /**
+     * Serialize incremental stats rows to JSON (same shape as PartitionStatsOracle.statsRowsToJson).
+     */
+    private static String statsRowsToJson(List<PartitionStats> rows, long s1Id, long s2Id)
+        throws IOException {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (PartitionStats row : rows) {
+              gen.writeStartObject();
+              gen.writeStringField("partition_category",
+                  PartitionStatsOracle.partitionCategoryString(row));
+              gen.writeNumberField("spec_id", row.specId());
+              gen.writeNumberField("data_record_count", row.dataRecordCount());
+              gen.writeNumberField("data_file_count", row.dataFileCount());
+              gen.writeNumberField(
+                  "total_data_file_size_in_bytes", row.totalDataFileSizeInBytes());
+              gen.writeNumberField(
+                  "position_delete_record_count", row.positionDeleteRecordCount());
+              gen.writeNumberField(
+                  "position_delete_file_count", row.positionDeleteFileCount());
+              gen.writeNumberField(
+                  "equality_delete_record_count", row.equalityDeleteRecordCount());
+              gen.writeNumberField(
+                  "equality_delete_file_count", row.equalityDeleteFileCount());
+              gen.writeNumberField("dv_count", row.dvCount());
+              Long lastUpdatedId = row.lastUpdatedSnapshotId();
+              if (lastUpdatedId != null) {
+                gen.writeNumberField("last_updated_snapshot_id", lastUpdatedId);
+              } else {
+                gen.writeNullField("last_updated_snapshot_id");
+              }
+              gen.writeBooleanField("total_record_count_null", row.totalRecords() == null);
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * Reuse PartitionStatsOracle's buildTableFromMetadata (package-private in the same class).
+     */
+    private static Table buildTableFromMetadata(TableMetadata metadata, Path metadataFilePath)
+        throws IOException {
+      return PartitionStatsOracle.buildTableFromMetadata(metadata, metadataFilePath);
+    }
+  }
+
+  // ===========================================================================================
+  // UuidPartitionStatsOracle — R2 uuid-partitioned partition-stats interop
+  //
+  // Fixture: V2 table identity(partition_id uuid) {1 id long, 2 partition_id uuid}.
+  //   S1: fast-append one data file with a fixed known UUID partition value.
+  //   compute stats (FULL).
+  //
+  // The UUID partition value is the "spiciest" exotic type: Iceberg serializes it as 16
+  // big-endian bytes (Java Conversions.toByteBuffer, Rust Uuid::from_u128(v).into_bytes()).
+  //
+  // Direction 1: Rust writes → Java reads via readPartitionStatsFile.
+  // Direction 2: Java writes → Rust reads via read_partition_stats_file.
+  // ===========================================================================================
+
+  static final class UuidPartitionStatsOracle {
+    private UuidPartitionStatsOracle() {}
+
+    /** A fixed known UUID string — agreed between Java and Rust. */
+    static final String KNOWN_UUID_STRING = "550e8400-e29b-41d4-a716-446655440000";
+    /** Data file record count. */
+    static final long UUID_DATA_RECORDS = 5L;
+    /** Data file size in bytes. */
+    static final long UUID_DATA_FILE_SIZE = 500L;
+
+    /** Table schema: {1 id long required, 2 partition_id uuid required}. */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "partition_id", Types.UUIDType.get()));
+    }
+
+    /**
+     * Build the UUID-partitioned fixture: S1 fast-append one data file with the known UUID
+     * partition value. Calls Java's PRODUCTION computeAndWriteStatsFile and emits:
+     * <ul>
+     *   <li>{@code java_uuid_table/metadata/final.metadata.json} — table after stats registration.
+     *   <li>{@code java_uuid_stats.json} — the decoded stats row (D2 ground truth for Rust).
+     * </ul>
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Path tableDir = dir.resolve("java_uuid_table");
+      Path metadataDir = tableDir.resolve("metadata");
+      Files.createDirectories(metadataDir);
+
+      Schema schema = schema();
+      PartitionSpec spec =
+          PartitionSpec.builderFor(schema).identity("partition_id").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.toAbsolutePath().toString(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir.toFile(), metadataDir.toFile());
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_partition_stats_uuid");
+      String dataDir = tableDir.toAbsolutePath() + "/data";
+
+      // Build the known UUID partition value.
+      java.util.UUID knownUuid = java.util.UUID.fromString(KNOWN_UUID_STRING);
+      PartitionData partUuid = new PartitionData(spec.partitionType());
+      partUuid.set(0, knownUuid);
+
+      DataFile fileUuid =
+          DataFiles.builder(spec)
+              .withPath(dataDir + "/file_uuid.parquet")
+              .withFileSizeInBytes(UUID_DATA_FILE_SIZE)
+              .withRecordCount(UUID_DATA_RECORDS)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partUuid)
+              .build();
+
+      table.newFastAppend().appendFile(fileUuid).commit();
+      long s1Id = table.currentSnapshot().snapshotId();
+
+      // Compute and write stats (FULL — a uuid-partitioned table, one row for the known UUID).
+      PartitionStatisticsFile statsFile = PartitionStatsHandler.computeAndWriteStatsFile(table);
+      if (statsFile == null) {
+        throw new RuntimeException(
+            "computeAndWriteStatsFile(uuid) returned null — fixture is wrong");
+      }
+      table.updatePartitionStatistics().setPartitionStatistics(statsFile).commit();
+
+      // Read back and emit java_uuid_stats.json (D2 ground truth).
+      Types.StructType unifiedType = Partitioning.partitionType(table);
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedType, TableUtil.formatVersion(table));
+      InputFile statsInput = table.io().newInputFile(statsFile.path());
+      List<PartitionStats> statsRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInput)) {
+        for (PartitionStats row : rows) {
+          statsRows.add(row);
+        }
+      }
+
+      String statsJson = uuidStatsRowsToJson(statsRows, knownUuid);
+      writeJson(dir.resolve("java_uuid_stats.json"), statsJson);
+      System.out.println(
+          "generate-interop-partition-stats-uuid: java_uuid_stats.json written"
+              + " (s1Id=" + s1Id + " uuid=" + KNOWN_UUID_STRING + " rows=" + statsRows.size() + ")");
+
+      Path finalMetadataPath = metadataDir.resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadataPath.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+      System.out.println(
+          "generate-interop-partition-stats-uuid: final.metadata.json written to "
+              + finalMetadataPath);
+    }
+
+    /**
+     * Direction 1 — "Java reads what RUST writes."
+     *
+     * <p>Rust wrote its uuid-partitioned stats to {@code <dir>/rust_uuid_table} and emitted
+     * {@code uuid_expected.json}. Java reads via PRODUCTION readPartitionStatsFile.
+     *
+     * @return number of failures (0 = pass).
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path rustTableMetadata = dir.resolve("rust_uuid_table/metadata/final.metadata.json");
+      if (!Files.exists(rustTableMetadata)) {
+        System.out.println(
+            "FAIL uuid-partition-stats/verify: missing rust_uuid_table/metadata/final.metadata.json"
+                + " — run the Rust uuid GEN step first");
+        return 1;
+      }
+
+      TableMetadata rustMeta =
+          TableMetadataParser.fromJson(
+              rustTableMetadata.toString(), readString(rustTableMetadata));
+
+      long currentSnapshotId =
+          rustMeta.currentSnapshot() == null ? -1L : rustMeta.currentSnapshot().snapshotId();
+      if (currentSnapshotId == -1L) {
+        System.out.println("FAIL uuid-partition-stats/verify: Rust table has no current snapshot");
+        return 1;
+      }
+
+      PartitionStatisticsFile registeredFile = null;
+      for (PartitionStatisticsFile file : rustMeta.partitionStatisticsFiles()) {
+        if (file.snapshotId() == currentSnapshotId) {
+          registeredFile = file;
+          break;
+        }
+      }
+      if (registeredFile == null) {
+        System.out.println(
+            "FAIL uuid-partition-stats/verify: no PartitionStatisticsFile for snapshot "
+                + currentSnapshotId);
+        return 1;
+      }
+
+      String statsPath = registeredFile.path();
+      System.out.println(
+          "uuid-partition-stats/verify: reading Rust uuid stats file at " + statsPath);
+
+      Types.StructType unifiedPartType = Partitioning.partitionType(
+          buildTableFromMetadata(rustMeta, rustTableMetadata));
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedPartType, rustMeta.formatVersion());
+
+      InputFile statsInputFile = new LocalFileIO().newInputFile(statsPath);
+      List<PartitionStats> decodedRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInputFile)) {
+        for (PartitionStats row : rows) {
+          decodedRows.add(row);
+        }
+      }
+
+      Path expectedPath = dir.resolve("uuid_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL uuid-partition-stats/verify: missing uuid_expected.json"
+                + " — run the Rust uuid GEN step first");
+        return 1;
+      }
+      String expectedJson = readString(expectedPath);
+      com.fasterxml.jackson.databind.JsonNode expectedNode =
+          new com.fasterxml.jackson.databind.ObjectMapper().readTree(expectedJson);
+
+      int expectedCount = expectedNode.size();
+      if (decodedRows.size() != expectedCount) {
+        System.out.println(
+            "FAIL uuid-partition-stats/verify: decoded "
+                + decodedRows.size() + " rows, expected " + expectedCount);
+        return failures + 1;
+      }
+
+      // Verify the single row: the uuid partition value + counters.
+      for (int i = 0; i < decodedRows.size(); i++) {
+        PartitionStats row = decodedRows.get(i);
+        com.fasterxml.jackson.databind.JsonNode expected = expectedNode.get(i);
+
+        // uuid partition value — compare as a UUID string.
+        String expectedUuid = expected.path("partition_uuid").asText();
+        String actualUuid = uuidPartitionString(row);
+        if (!expectedUuid.equalsIgnoreCase(actualUuid)) {
+          System.out.println(
+              "FAIL uuid row " + i + ": partition_uuid expected=" + expectedUuid
+                  + " actual=" + actualUuid);
+          failures++;
+        }
+        failures += PartitionStatsOracle.assertLong(
+            "uuid row " + i, "spec_id", expected.path("spec_id").asLong(), row.specId());
+        failures += PartitionStatsOracle.assertLong(
+            "uuid row " + i, "data_record_count",
+            expected.path("data_record_count").asLong(), row.dataRecordCount());
+        failures += PartitionStatsOracle.assertLong(
+            "uuid row " + i, "data_file_count",
+            expected.path("data_file_count").asLong(), row.dataFileCount());
+        failures += PartitionStatsOracle.assertLong(
+            "uuid row " + i, "total_data_file_size_in_bytes",
+            expected.path("total_data_file_size_in_bytes").asLong(), row.totalDataFileSizeInBytes());
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS uuid-partition-stats/verify: " + decodedRows.size()
+                + " row(s) match uuid_expected.json");
+      }
+      return failures;
+    }
+
+    /**
+     * Extract the UUID string from a partition row's first field (the uuid identity partition).
+     * The partition field is stored as a ByteBuffer (16 big-endian bytes); convert to UUID string.
+     */
+    private static String uuidPartitionString(PartitionStats row) {
+      StructLike partition = row.partition();
+      Object val = partition.get(0, Object.class);
+      if (val == null) return "null";
+      if (val instanceof java.util.UUID) return val.toString();
+      if (val instanceof ByteBuffer) {
+        ByteBuffer buf = (ByteBuffer) val;
+        buf = buf.duplicate();
+        long mostSig = buf.getLong();
+        long leastSig = buf.getLong();
+        return new java.util.UUID(mostSig, leastSig).toString();
+      }
+      return val.toString();
+    }
+
+    /**
+     * Serialize UUID partition stats rows to JSON.
+     * Each row: partition_uuid (String), spec_id, data_record_count, data_file_count,
+     * total_data_file_size_in_bytes, [other counters], last_updated_snapshot_id.
+     */
+    private static String uuidStatsRowsToJson(
+        List<PartitionStats> rows, java.util.UUID knownUuid) throws IOException {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (PartitionStats row : rows) {
+              gen.writeStartObject();
+              gen.writeStringField("partition_uuid", uuidPartitionString(row));
+              gen.writeNumberField("spec_id", row.specId());
+              gen.writeNumberField("data_record_count", row.dataRecordCount());
+              gen.writeNumberField("data_file_count", row.dataFileCount());
+              gen.writeNumberField(
+                  "total_data_file_size_in_bytes", row.totalDataFileSizeInBytes());
+              gen.writeNumberField(
+                  "position_delete_record_count", row.positionDeleteRecordCount());
+              gen.writeNumberField(
+                  "position_delete_file_count", row.positionDeleteFileCount());
+              gen.writeNumberField(
+                  "equality_delete_record_count", row.equalityDeleteRecordCount());
+              gen.writeNumberField(
+                  "equality_delete_file_count", row.equalityDeleteFileCount());
+              gen.writeNumberField("dv_count", row.dvCount());
+              Long lastUpdatedId = row.lastUpdatedSnapshotId();
+              if (lastUpdatedId != null) {
+                gen.writeNumberField("last_updated_snapshot_id", lastUpdatedId);
+              } else {
+                gen.writeNullField("last_updated_snapshot_id");
+              }
+              gen.writeBooleanField("total_record_count_null", row.totalRecords() == null);
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    private static Table buildTableFromMetadata(TableMetadata metadata, Path metadataFilePath)
+        throws IOException {
+      return PartitionStatsOracle.buildTableFromMetadata(metadata, metadataFilePath);
     }
   }
 

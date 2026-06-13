@@ -238,7 +238,17 @@ pub(crate) mod _serde {
                     PrimitiveLiteral::Double(v) => RawLiteralEnum::Double(v.0),
                     PrimitiveLiteral::String(v) => RawLiteralEnum::String(v),
                     PrimitiveLiteral::UInt128(v) => {
-                        RawLiteralEnum::Bytes(ByteBuf::from(v.to_be_bytes()))
+                        // UUID fields must be serialized as a string value so that the Avro
+                        // runtime resolves against `Schema::Uuid` (which accepts `Value::Uuid`
+                        // OR `Value::String`). Emitting `Bytes` for a Uuid-typed field causes
+                        // an "unresolvable union" error because apache-avro's `resolve_uuid`
+                        // rejects `Value::Bytes`. `UInt128` is only type-valid for `Uuid`
+                        // (see `datatypes.rs`), so the `else` arm is a defensive fallback.
+                        if matches!(ty, Type::Primitive(PrimitiveType::Uuid)) {
+                            RawLiteralEnum::String(uuid::Uuid::from_u128(v).to_string())
+                        } else {
+                            RawLiteralEnum::Bytes(ByteBuf::from(v.to_be_bytes()))
+                        }
                     }
                     PrimitiveLiteral::Binary(v) => RawLiteralEnum::Bytes(ByteBuf::from(v)),
                     PrimitiveLiteral::Int128(v) => {
@@ -444,6 +454,14 @@ pub(crate) mod _serde {
                 },
                 RawLiteralEnum::String(v) => match ty {
                     Type::Primitive(PrimitiveType::String) => Ok(Some(Literal::string(v))),
+                    // Apache Avro decodes Schema::Uuid values to Value::Uuid, which serde
+                    // de-serializes to a string. Accept the UUID string here and convert to
+                    // the internal UInt128 representation.
+                    Type::Primitive(PrimitiveType::Uuid) => {
+                        Ok(Some(Literal::uuid_from_str(&v).map_err(|_| {
+                            invalid_err_with_reason("string", "not a valid UUID")
+                        })?))
+                    }
                     _ => Err(invalid_err("string")),
                 },
                 RawLiteralEnum::Bytes(v) => match ty {
