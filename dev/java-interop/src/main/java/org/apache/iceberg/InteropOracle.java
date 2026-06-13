@@ -706,6 +706,118 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-theta":
+        // THETA-BLOB PUFFIN interop (increment I1), DIRECTION 1 — "Rust writes, Java verifies".
+        // Builds a fixture table (unpartitioned V2, schema {1 id long, 2 name string, 3 val long}),
+        // writes REAL parquet data for two sketch modes — exact (3 rows, small distinct count) and
+        // estimation (1 000 000 distinct longs in the `val` column), calls Java's own Puffin writer
+        // with datasketches-java-3.3.0 to write the ground-truth .stats file, and emits:
+        //   theta_expected.json   — the expected blob metadata (type/fields/ndv) for both modes,
+        //                           for the Java verify step to compare against the Rust output.
+        // The dir is supplied via -Dinterop.theta.dir.
+        Path thetaGenDir = requireFixturesDir("interop.theta.dir");
+        ThetaBlobOracle.generate(thetaGenDir);
+        break;
+      case "verify-interop-theta":
+        // THETA-BLOB PUFFIN interop, DIRECTION 1 — Java reads the Rust-written .stats puffin file
+        // and verifies: blob type, fields, snapshot-id, sequence-number, ndv property, and the
+        // deserialized CompactSketch.getEstimate() matches the ndv EXACTLY (integer-exact).
+        // The Rust GEN test (env ICEBERG_INTEROP_THETA_GEN_DIR, tests/interop_theta.rs) wrote
+        // rust_stats.puffin + emitted rust_stats_expected.json (the expected blob metadata).
+        // Verifies both EXACT-MODE and ESTIMATION-MODE blobs.
+        Path thetaVerifyDir = requireFixturesDir("interop.theta.dir");
+        int thetaFailures = ThetaBlobOracle.verify(thetaVerifyDir);
+        System.out.println("verify-interop-theta: " + thetaFailures + " failures");
+        if (thetaFailures > 0) {
+          System.exit(1);
+        }
+        break;
+      case "generate-interop-theta-java-to-rust":
+        // THETA-BLOB PUFFIN interop (increment I1), DIRECTION 2 — "Java writes, Rust reads".
+        // Java writes a .stats puffin file (using iceberg-core PuffinWriter +
+        // datasketches-java-3.3.0 UpdateSketchBuilder.setFamily(ALPHA)) with two blobs: exact
+        // mode and estimation mode (n=1M), and emits:
+        //   java_stats.puffin         — the Java-written puffin file
+        //   java_stats_expected.json  — the expected blob metadata (type/fields/ndv/snapshotId/seq)
+        // The Rust test (test_theta_d2_rust_reads_java_puffin) reads java_stats.puffin through
+        // the PRODUCTION Rust PuffinReader + CompactThetaSketch::deserialize path and verifies
+        // against java_stats_expected.json.
+        Path thetaJavaGenDir = requireFixturesDir("interop.theta.dir");
+        ThetaBlobOracle.generateJavaToRust(thetaJavaGenDir);
+        break;
+
+      case "verify-interop-view":
+        // VIEW METADATA interop (increment I2), DIRECTION 1 — "Rust writes, Java judges".
+        // The Rust GEN test (env ICEBERG_INTEROP_VIEW_GEN_DIR) wrote rust_view_metadata.json
+        // (via ViewMetadata::write_to) and rust_view_expected.json (the expected field values).
+        // This mode reads rust_view_metadata.json via Java's PRODUCTION ViewMetadataParser.fromJson
+        // and asserts field-by-field against rust_view_expected.json.
+        Path viewVerifyDir = requireFixturesDir("interop.view.dir");
+        int viewVerifyFailures = ViewOracle.verifyRustMetadata(viewVerifyDir);
+        System.out.println("verify-interop-view: " + viewVerifyFailures + " failures");
+        if (viewVerifyFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
+      case "generate-interop-view-java-to-rust":
+        // VIEW METADATA interop (increment I2), DIRECTION 2 — "Java writes, Rust reads".
+        // Java builds a multi-version view (create + replace via InMemoryCatalog.buildView) so
+        // reuseOrCreateNewViewVersionId produces 2 DISTINCT versions and a 2-entry version-log.
+        // Emits:
+        //   java_view_metadata.json  — the Java-written view metadata (ViewMetadataParser.toJson)
+        //   java_view_expected.json  — the expected field values for the Rust D2 test
+        // The Rust test (test_view_d2_rust_reads_java) reads java_view_metadata.json via
+        // ViewMetadata::read_from and asserts all fields against java_view_expected.json.
+        Path viewJavaGenDir = requireFixturesDir("interop.view.dir");
+        ViewOracle.generateJavaToRust(viewJavaGenDir);
+        break;
+
+      case "generate-interop-wap-data":
+        // WAP DATA-LEVEL interop (increment I3), DIRECTION 1 — "Rust stages, Java cherry-picks".
+        // Builds a V2 partitioned table (identity(category), schema {id long, category string, data
+        // string}), commits base data (REAL parquet: cat=a 10/20/30, cat=b 40), then stages a WAP
+        // append (REAL parquet: cat=a 50/60, cat=b 70) via REAL stageOnly(). Emits:
+        //   java_base_rows.json          — rows present BEFORE cherry-pick (base data only)
+        //   java_staged_snapshot_id.json — the staged snapshot id (for Rust to target)
+        //   java_expected_final_rows.json — expected rows AFTER cherry-pick (base + staged)
+        //   java_wap_table/              — the staged-state table Rust will cherry-pick
+        // The dir is supplied via -Dinterop.wap_data.dir.
+        Path wapDataGenDir = requireFixturesDir("interop.wap_data.dir");
+        WapDataOracle.generate(wapDataGenDir);
+        break;
+
+      case "verify-interop-wap-data":
+        // WAP DATA-LEVEL interop (increment I3), DIRECTION 1 verify — Java cherry-picks the
+        // RUST-staged table and reads via IcebergGenerics, asserting exact rows + WAP semantics.
+        // The Rust GEN test (env ICEBERG_INTEROP_WAP_DATA_GEN_DIR) wrote:
+        //   rust_table/                  — the staged-state table (staged snapshot present, not main)
+        //   rust_staged_snapshot_id.json — the staged snapshot id to cherry-pick
+        // This mode loads the Rust-written table, cherry-picks via manageSnapshots().cherrypick(),
+        // reads via IcebergGenerics, asserts rows == java_expected_final_rows.json, and asserts
+        // WAP summary semantics (published-wap-id / source-snapshot-id) on the cherry-pick snapshot.
+        // Prints "verify-interop-wap-data: 0 failures" sentinel on success.
+        Path wapDataVerifyDir = requireFixturesDir("interop.wap_data.dir");
+        int wapDataFailures = WapDataOracle.verifyRustTable(wapDataVerifyDir);
+        System.out.println("verify-interop-wap-data: " + wapDataFailures + " failures");
+        if (wapDataFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
+      case "generate-interop-wap-data-java-table":
+        // WAP DATA-LEVEL interop (increment I3), DIRECTION 2 — "Java stages + cherry-picks, Rust reads".
+        // Java creates the same partitioned V2 table, commits base data (REAL parquet), stages WAP
+        // append (REAL parquet) via REAL stageOnly(), cherry-picks via manageSnapshots().cherrypick(),
+        // then reads via IcebergGenerics. Emits:
+        //   java_cherrypick_table/metadata/final.metadata.json — the cherry-picked Java table
+        //   java_cherrypick_rows.json    — the expected rows for Rust to assert (base + staged)
+        //   java_cherrypick_snapshot_summary.json — WAP summary facts (published-wap-id/source-snapshot-id)
+        // The dir is supplied via -Dinterop.wap_data.dir.
+        Path wapDataJavaTableDir = requireFixturesDir("interop.wap_data.dir");
+        WapDataOracle.generateJavaTable(wapDataJavaTableDir);
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -11047,6 +11159,1585 @@ public final class InteropOracle {
           gen.writeEndArray();
         },
         true);
+  }
+
+  // ===========================================================================================
+  // ThetaBlobOracle — I1 theta-blob puffin interop
+  // ===========================================================================================
+
+  /**
+   * Oracle for the {@code apache-datasketches-theta-v1} Puffin blob interop (increment I1).
+   *
+   * <p><b>Direction 1 (Rust writes, Java judges):</b> {@link #generate} writes a
+   * {@code theta_expected.json} ground truth.  {@link #verify} reads a Rust-written
+   * {@code rust_stats.puffin} file, checks blob type / fields / snapshot-id / sequence-number /
+   * {@code ndv} property, and asserts that
+   * {@code (long) CompactSketch.wrap(Memory.wrap(bytes)).getEstimate() == ndv} EXACTLY (integer-
+   * exact, no tolerance) for BOTH exact-mode and estimation-mode blobs.
+   *
+   * <p><b>Direction 2 (Java writes, Rust reads):</b> {@link #generateJavaToRust} builds a Puffin
+   * file via iceberg-core's {@link org.apache.iceberg.puffin.PuffinWriter} with
+   * datasketches-java-3.3.0 {@code UpdateSketchBuilder.setFamily(ALPHA)} sketches (the same family
+   * Spark's NDVSketchUtil builds) and emits {@code java_stats_expected.json} for the Rust test.
+   *
+   * <p>Two blobs are covered: <em>exact mode</em> (small distinct count, theta == MAX) and
+   * <em>estimation mode</em> (n = 1 000 000 distinct longs, theta &lt; MAX, Alpha sampling
+   * engaged). The known pin: lgK12 / seed 9001 / n=1M distinct longs →
+   * compact ndv {@code 1004032}.
+   */
+  static final class ThetaBlobOracle {
+    private ThetaBlobOracle() {}
+
+    // ===========================================================================================
+    // Fixture constants — agreed by both language sides (anti-circular).
+    // ===========================================================================================
+
+    /** Snapshot id used for the ground-truth blobs (a stable sentinel, not a real table commit). */
+    private static final long SNAPSHOT_ID = 42L;
+    /** Sequence number used for all blobs. */
+    private static final long SEQUENCE_NUMBER = 1L;
+    /** Field id for the exact-mode column (id, long). */
+    private static final int EXACT_FIELD_ID = 1;
+    /** Field id for the estimation-mode column (val, long). */
+    private static final int ESTIMATION_FIELD_ID = 3;
+    /** Exact-mode distinct count — small enough to keep theta == MAX_VALUE. */
+    private static final int EXACT_DISTINCT_COUNT = 5;
+    /** Estimation-mode distinct count — the known pin value from the prompt. */
+    private static final long ESTIMATION_DISTINCT_COUNT = 1_000_000L;
+    /** Known ndv for lgK12/seed9001/n=1M distinct longs (COMPACT sketch estimate). */
+    private static final long ESTIMATION_NDV_PIN = 1_004_032L;
+
+    // ===========================================================================================
+    // Shared sketch helpers (datasketches-java-3.3.0 ALPHA family, default seed 9001).
+    // ===========================================================================================
+
+    /**
+     * Build a fresh Alpha-family update sketch at lgK=12 / seed=9001 (the Iceberg defaults
+     * Spark's {@code NDVSketchUtil} uses) and update it with {@code count} distinct long values
+     * starting from 0, using the same 8-byte little-endian byte form the Rust action feeds.
+     * Compact it and return the payload bytes.
+     *
+     * <p>The ndv is read off the COMPACT sketch ({@code CompactSketch.wrap(bytes).getEstimate()})
+     * — NOT off the live Alpha update sketch's sampling estimator — matching the
+     * {@code NDVSketchUtil.toBlob} contract.
+     */
+    private static byte[] buildSketchPayload(long count) {
+      org.apache.datasketches.theta.UpdateSketch sketch =
+          new org.apache.datasketches.theta.UpdateSketchBuilder()
+              .setLogNominalEntries(12)
+              .setSeed(9001L)
+              .setFamily(org.apache.datasketches.Family.ALPHA)
+              .build();
+      // Feed distinct longs as 8-byte little-endian (the Iceberg single-value byte form for long).
+      for (long value = 0; value < count; value++) {
+        java.nio.ByteBuffer buf =
+            java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        buf.putLong(value);
+        sketch.update(buf.array());
+      }
+      return sketch.compact().toByteArray();
+    }
+
+    /**
+     * Read the {@code ndv} off a compact-sketch payload: the same operation as Java's
+     * {@code NDVSketchUtil.toBlob} — {@code (long) CompactSketch.wrap(Memory.wrap(bytes)).getEstimate()}.
+     */
+    private static long compactNdv(byte[] payload) {
+      org.apache.datasketches.theta.CompactSketch compact =
+          org.apache.datasketches.theta.CompactSketch.wrap(
+              org.apache.datasketches.memory.Memory.wrap(payload));
+      return (long) compact.getEstimate();
+    }
+
+    // ===========================================================================================
+    // generate — emit theta_expected.json (ground truth, anti-circular).
+    // ===========================================================================================
+
+    /**
+     * Emits {@code theta_expected.json} — the ground-truth expected blob metadata for the Rust
+     * GEN test's output.  Two entries: exact mode (ndv == EXACT_DISTINCT_COUNT) and estimation
+     * mode (ndv == ESTIMATION_NDV_PIN).
+     *
+     * <p>The JSON shape (array of blob descriptors):
+     * <pre>
+     * [
+     *   {"field_id": 1, "ndv": 5, "mode": "exact"},
+     *   {"field_id": 3, "ndv": 1004032, "mode": "estimation"}
+     * ]
+     * </pre>
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // Build both payloads and confirm the ndvs BEFORE writing any file.
+      byte[] exactPayload = buildSketchPayload(EXACT_DISTINCT_COUNT);
+      long exactNdv = compactNdv(exactPayload);
+      if (exactNdv != EXACT_DISTINCT_COUNT) {
+        throw new RuntimeException(
+            "exact-mode ndv sanity check failed: expected "
+                + EXACT_DISTINCT_COUNT + ", got " + exactNdv);
+      }
+
+      byte[] estimationPayload = buildSketchPayload(ESTIMATION_DISTINCT_COUNT);
+      long estimationNdv = compactNdv(estimationPayload);
+      if (estimationNdv != ESTIMATION_NDV_PIN) {
+        throw new RuntimeException(
+            "estimation-mode ndv sanity check FAILED: expected "
+                + ESTIMATION_NDV_PIN + " (the lgK12/seed9001/n=1M pin), got " + estimationNdv
+                + " — the pin is wrong or the classpath carries a wrong datasketches version");
+      }
+
+      String json = JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            gen.writeStartObject();
+            gen.writeNumberField("field_id", EXACT_FIELD_ID);
+            gen.writeNumberField("ndv", exactNdv);
+            gen.writeStringField("mode", "exact");
+            gen.writeEndObject();
+            gen.writeStartObject();
+            gen.writeNumberField("field_id", ESTIMATION_FIELD_ID);
+            gen.writeNumberField("ndv", estimationNdv);
+            gen.writeStringField("mode", "estimation");
+            gen.writeEndObject();
+            gen.writeEndArray();
+          },
+          true);
+
+      writeJson(dir.resolve("theta_expected.json"), json);
+      System.out.println(
+          "generate-interop-theta: theta_expected.json written (exact ndv="
+              + exactNdv + " estimation ndv=" + estimationNdv + ")");
+    }
+
+    // ===========================================================================================
+    // verify — Java reads the Rust-written puffin, asserts all blob metadata.
+    // ===========================================================================================
+
+    /**
+     * Verify the Rust-written {@code rust_stats.puffin} file against {@code rust_stats_expected.json}.
+     *
+     * <p>Checks per blob:
+     * <ol>
+     *   <li>blob type == {@code apache-datasketches-theta-v1}</li>
+     *   <li>fields == [expected field_id]</li>
+     *   <li>snapshot-id == expected snapshot_id</li>
+     *   <li>sequence-number == expected sequence_number</li>
+     *   <li>{@code ndv} property == expected ndv (string)</li>
+     *   <li>{@code (long) CompactSketch.wrap(Memory.wrap(payload)).getEstimate() == ndv}
+     *       (integer-exact, no tolerance)</li>
+     * </ol>
+     *
+     * @return the number of assertion failures (0 = PASS)
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+
+      Path puffinPath = dir.resolve("rust_stats.puffin");
+      if (!Files.exists(puffinPath)) {
+        System.out.println(
+            "FAIL verify-interop-theta: missing " + puffinPath
+                + " — run the Rust GEN test first");
+        return 1;
+      }
+
+      Path expectedPath = dir.resolve("rust_stats_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL verify-interop-theta: missing " + expectedPath
+                + " — run the Rust GEN test first");
+        return 1;
+      }
+
+      // Read the expected blob metadata from the Rust GEN step.
+      com.fasterxml.jackson.databind.JsonNode expectedArray =
+          JsonUtil.mapper().readTree(expectedPath.toFile());
+      if (!expectedArray.isArray()) {
+        System.out.println("FAIL verify-interop-theta: rust_stats_expected.json is not an array");
+        return 1;
+      }
+      int expectedBlobCount = expectedArray.size();
+
+      // Read the Rust-written puffin via Java's PRODUCTION PuffinReader.
+      InputFile inputFile = new LocalFileIO().newInputFile(puffinPath.toAbsolutePath().toString());
+      org.apache.iceberg.puffin.FileMetadata fileMetadata;
+      try (org.apache.iceberg.puffin.PuffinReader reader =
+          org.apache.iceberg.puffin.Puffin.read(inputFile).build()) {
+        fileMetadata = reader.fileMetadata();
+      }
+
+      int actualBlobCount = fileMetadata.blobs().size();
+      if (actualBlobCount != expectedBlobCount) {
+        System.out.println(
+            "FAIL verify-interop-theta: blob count expected="
+                + expectedBlobCount + " actual=" + actualBlobCount);
+        return 1;
+      }
+
+      // Re-open for the ranged read (PuffinReader is single-pass for metadata; re-open to read data).
+      try (org.apache.iceberg.puffin.PuffinReader reader =
+          org.apache.iceberg.puffin.Puffin.read(inputFile).build()) {
+        java.util.List<org.apache.iceberg.puffin.BlobMetadata> blobs = fileMetadata.blobs();
+        Iterable<org.apache.iceberg.util.Pair<org.apache.iceberg.puffin.BlobMetadata, java.nio.ByteBuffer>>
+            blobPairs = reader.readAll(blobs);
+
+        int blobIndex = 0;
+        for (org.apache.iceberg.util.Pair<org.apache.iceberg.puffin.BlobMetadata, java.nio.ByteBuffer>
+            pair : blobPairs) {
+          org.apache.iceberg.puffin.BlobMetadata blobMeta = pair.first();
+          java.nio.ByteBuffer blobData = pair.second();
+          com.fasterxml.jackson.databind.JsonNode expected = expectedArray.get(blobIndex);
+
+          String label = "blob[" + blobIndex + "]";
+
+          // 1. Blob type.
+          String expectedType = org.apache.iceberg.puffin.StandardBlobTypes.APACHE_DATASKETCHES_THETA_V1;
+          if (!expectedType.equals(blobMeta.type())) {
+            System.out.println(
+                "FAIL " + label + ": type expected=" + expectedType + " actual=" + blobMeta.type());
+            failures++;
+          }
+
+          // 2. Fields == [field_id].
+          int expectedFieldId = expected.path("field_id").asInt(-1);
+          if (blobMeta.inputFields().size() != 1
+              || blobMeta.inputFields().get(0) != expectedFieldId) {
+            System.out.println(
+                "FAIL " + label + ": fields expected=[" + expectedFieldId + "] actual="
+                    + blobMeta.inputFields());
+            failures++;
+          }
+
+          // 3. snapshot-id.
+          long expectedSnapshotId = expected.path("snapshot_id").asLong(SNAPSHOT_ID);
+          if (blobMeta.snapshotId() != expectedSnapshotId) {
+            System.out.println(
+                "FAIL " + label + ": snapshot-id expected=" + expectedSnapshotId
+                    + " actual=" + blobMeta.snapshotId());
+            failures++;
+          }
+
+          // 4. sequence-number.
+          long expectedSeqNum = expected.path("sequence_number").asLong(SEQUENCE_NUMBER);
+          if (blobMeta.sequenceNumber() != expectedSeqNum) {
+            System.out.println(
+                "FAIL " + label + ": sequence-number expected=" + expectedSeqNum
+                    + " actual=" + blobMeta.sequenceNumber());
+            failures++;
+          }
+
+          // 5. ndv property (string).
+          long expectedNdv = expected.path("ndv").asLong(-1);
+          String expectedNdvStr = String.valueOf(expectedNdv);
+          String actualNdvStr = blobMeta.properties().get("ndv");
+          if (!expectedNdvStr.equals(actualNdvStr)) {
+            System.out.println(
+                "FAIL " + label + ": ndv property expected=\"" + expectedNdvStr
+                    + "\" actual=\"" + actualNdvStr + "\"");
+            failures++;
+          }
+
+          // 6. CompactSketch.getEstimate() == ndv (integer-exact).
+          byte[] payload = new byte[blobData.remaining()];
+          blobData.get(payload);
+          long actualSketchNdv = compactNdv(payload);
+          if (actualSketchNdv != expectedNdv) {
+            System.out.println(
+                "FAIL " + label + ": CompactSketch.getEstimate() as long expected=" + expectedNdv
+                    + " actual=" + actualSketchNdv
+                    + " (deserialized sketch disagrees with the ndv property)");
+            failures++;
+          }
+
+          String mode = expected.path("mode").asText("unknown");
+          if (failures == 0) {
+            System.out.println(
+                "PASS " + label + " (mode=" + mode + "): type/fields/snapshot_id/seq_num/ndv "
+                    + "all match; CompactSketch.getEstimate()=" + actualSketchNdv);
+          }
+          blobIndex++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS verify-interop-theta: all " + expectedBlobCount
+                + " blobs verified (exact-mode + estimation-mode)");
+      }
+      return failures;
+    }
+
+    // ===========================================================================================
+    // generateJavaToRust — Java writes a .stats puffin for Rust to read (Direction 2).
+    // ===========================================================================================
+
+    /**
+     * Write a Java-authored Puffin file with two {@code apache-datasketches-theta-v1} blobs
+     * (exact mode + estimation mode) using iceberg-core's {@link org.apache.iceberg.puffin.PuffinWriter}
+     * and datasketches-java-3.3.0 ALPHA-family sketches.  Emits:
+     * <ul>
+     *   <li>{@code java_stats.puffin} — the puffin file for Rust to read</li>
+     *   <li>{@code java_stats_expected.json} — the expected metadata for the Rust test to compare
+     *       (field_id, ndv, snapshot_id, sequence_number, mode)</li>
+     * </ul>
+     */
+    static void generateJavaToRust(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // Build exact-mode and estimation-mode sketch payloads.
+      byte[] exactPayload = buildSketchPayload(EXACT_DISTINCT_COUNT);
+      long exactNdv = compactNdv(exactPayload);
+      if (exactNdv != EXACT_DISTINCT_COUNT) {
+        throw new RuntimeException(
+            "exact-mode ndv check failed: expected " + EXACT_DISTINCT_COUNT + " got " + exactNdv);
+      }
+
+      byte[] estimationPayload = buildSketchPayload(ESTIMATION_DISTINCT_COUNT);
+      long estimationNdv = compactNdv(estimationPayload);
+      if (estimationNdv != ESTIMATION_NDV_PIN) {
+        throw new RuntimeException(
+            "estimation ndv pin check FAILED: expected " + ESTIMATION_NDV_PIN + " got " + estimationNdv);
+      }
+
+      // Write the puffin file via iceberg-core's PRODUCTION PuffinWriter.
+      Path puffinPath = dir.resolve("java_stats.puffin");
+      OutputFile outputFile = new LocalFileIO().newOutputFile(puffinPath.toAbsolutePath().toString());
+
+      // Two blobs: exact mode (field_id=EXACT_FIELD_ID) and estimation mode (field_id=ESTIMATION_FIELD_ID).
+      org.apache.iceberg.puffin.Blob exactBlob = new org.apache.iceberg.puffin.Blob(
+          org.apache.iceberg.puffin.StandardBlobTypes.APACHE_DATASKETCHES_THETA_V1,
+          java.util.Collections.singletonList(EXACT_FIELD_ID),
+          SNAPSHOT_ID,
+          SEQUENCE_NUMBER,
+          java.nio.ByteBuffer.wrap(exactPayload),
+          org.apache.iceberg.puffin.PuffinCompressionCodec.NONE,
+          java.util.Collections.singletonMap("ndv", String.valueOf(exactNdv)));
+
+      org.apache.iceberg.puffin.Blob estimationBlob = new org.apache.iceberg.puffin.Blob(
+          org.apache.iceberg.puffin.StandardBlobTypes.APACHE_DATASKETCHES_THETA_V1,
+          java.util.Collections.singletonList(ESTIMATION_FIELD_ID),
+          SNAPSHOT_ID,
+          SEQUENCE_NUMBER,
+          java.nio.ByteBuffer.wrap(estimationPayload),
+          org.apache.iceberg.puffin.PuffinCompressionCodec.NONE,
+          java.util.Collections.singletonMap("ndv", String.valueOf(estimationNdv)));
+
+      org.apache.iceberg.puffin.PuffinWriter writer =
+          org.apache.iceberg.puffin.Puffin.write(outputFile).build();
+      try {
+        writer.add(exactBlob);
+        writer.add(estimationBlob);
+        writer.finish();
+      } finally {
+        writer.close();
+      }
+
+      long fileSize = Files.size(puffinPath);
+      System.out.println(
+          "generate-interop-theta-java-to-rust: java_stats.puffin written ("
+              + fileSize + " bytes, exact ndv=" + exactNdv
+              + " estimation ndv=" + estimationNdv + ")");
+
+      // Emit java_stats_expected.json for the Rust test.
+      String json = JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            gen.writeStartObject();
+            gen.writeNumberField("field_id", EXACT_FIELD_ID);
+            gen.writeNumberField("ndv", exactNdv);
+            gen.writeNumberField("snapshot_id", SNAPSHOT_ID);
+            gen.writeNumberField("sequence_number", SEQUENCE_NUMBER);
+            gen.writeStringField("mode", "exact");
+            gen.writeEndObject();
+            gen.writeStartObject();
+            gen.writeNumberField("field_id", ESTIMATION_FIELD_ID);
+            gen.writeNumberField("ndv", estimationNdv);
+            gen.writeNumberField("snapshot_id", SNAPSHOT_ID);
+            gen.writeNumberField("sequence_number", SEQUENCE_NUMBER);
+            gen.writeStringField("mode", "estimation");
+            gen.writeEndObject();
+            gen.writeEndArray();
+          },
+          true);
+
+      writeJson(dir.resolve("java_stats_expected.json"), json);
+      System.out.println(
+          "generate-interop-theta-java-to-rust: java_stats_expected.json written");
+    }
+  }
+
+  // ===========================================================================================
+  // ViewOracle — I2 view metadata interop
+  // ===========================================================================================
+
+  /**
+   * Bidirectional view-metadata interop oracle (increment I2).
+   *
+   * <p>Two directions:
+   * <ul>
+   *   <li><b>D1 (Rust writes, Java judges):</b> the Rust GEN test creates a view via MemoryCatalog,
+   *       performs a ReplaceViewVersionAction so there are {@code ≥ 2} distinct versions, and
+   *       writes {@code rust_view_metadata.json} via {@code ViewMetadata::write_to} plus
+   *       {@code rust_view_expected.json} (the expected field values).  Java reads the metadata
+   *       via the PRODUCTION {@code ViewMetadataParser.fromJson} and checks every field against
+   *       the expected JSON ({@link #verifyRustMetadata}).</li>
+   *   <li><b>D2 (Java writes, Rust reads):</b> Java creates a multi-version view via the
+   *       production {@code InMemoryCatalog.buildView(...).create()} +
+   *       {@code .replace()} path so {@code reuseOrCreateNewViewVersionId} produces 2 distinct
+   *       versions, serializes via {@code ViewMetadataParser.toJson} to
+   *       {@code java_view_metadata.json}, and emits {@code java_view_expected.json}.  The Rust
+   *       test ({@link test_view_d2_rust_reads_java}) reads via
+   *       {@code ViewMetadata::read_from} ({@link #generateJavaToRust}).</li>
+   * </ul>
+   *
+   * <p><b>Tolerance contract (field-SET, NOT byte-order):</b> Java writes fields in the order
+   * {@code view-uuid, format-version, location, [properties if non-empty], schemas,
+   * current-version-id, versions, version-log}; Rust writes {@code format-version} first and
+   * always emits {@code "properties":{}}.  Both sides parse each other's output because all
+   * readers are order-insensitive and treat missing {@code properties} as empty.  This class
+   * confirms the tolerance by reading Rust-ordered bytes on the Java side and Java-ordered bytes
+   * on the Rust side — field-SET equality is the contract, NOT byte equality.
+   */
+  static final class ViewOracle {
+    private ViewOracle() {}
+
+    // ===========================================================================================
+    // Fixture constants — agreed by both sides (anti-circular).
+    // ===========================================================================================
+
+    /** Format version for the view fixture. */
+    private static final int FORMAT_VERSION = 1;
+    /** Schema id used for both versions. */
+    private static final int SCHEMA_ID = 0;
+    /**
+     * SQL for the FIRST view version (create).
+     * The Rust and Java GEN tests use this exact string so the expected JSONs are stable.
+     */
+    static final String SQL_V1 = "SELECT id, name FROM events WHERE id > 0";
+    /** Dialect for the first version. */
+    static final String DIALECT_V1 = "spark";
+    /**
+     * SQL for the SECOND view version (replace).
+     * MUST be different from SQL_V1 so reuseOrCreateNewViewVersionId does NOT reuse version 1.
+     */
+    static final String SQL_V2 = "SELECT id, name FROM events WHERE id > 100";
+    /** Dialect for the second version. */
+    static final String DIALECT_V2 = "spark";
+    /** Expected version count after create + replace. */
+    static final int EXPECTED_VERSION_COUNT = 2;
+    /** Expected version-log length after create + replace. */
+    static final int EXPECTED_VERSION_LOG_COUNT = 2;
+    /** The current-version-id after one replace (builder assigns max+1 = 2). */
+    static final int EXPECTED_CURRENT_VERSION_ID = 2;
+    /** Schema field names used by both sides. */
+    static final String[] SCHEMA_FIELD_NAMES = {"id", "name"};
+
+    // ===========================================================================================
+    // D1: verifyRustMetadata — Java reads Rust-written rust_view_metadata.json.
+    // ===========================================================================================
+
+    /**
+     * Reads {@code rust_view_metadata.json} + {@code rust_view_expected.json} from {@code dir},
+     * parses the metadata via Java's PRODUCTION {@code ViewMetadataParser.fromJson}, and checks
+     * every field against the expected values.
+     *
+     * <p>Checks (all integer/string-exact, no tolerances):
+     * <ol>
+     *   <li>{@code format-version} == {@link #FORMAT_VERSION}</li>
+     *   <li>{@code view-uuid} is non-null and equals the expected uuid</li>
+     *   <li>{@code location} is non-empty and equals the expected location</li>
+     *   <li>{@code schemas} count == 1; field names == {@link #SCHEMA_FIELD_NAMES}</li>
+     *   <li>{@code current-version-id} == {@link #EXPECTED_CURRENT_VERSION_ID}</li>
+     *   <li>Versions count == {@link #EXPECTED_VERSION_COUNT}</li>
+     *   <li>Version 1: schema-id, sql, dialect match the expected values</li>
+     *   <li>Version 2: schema-id, sql, dialect match the expected values</li>
+     *   <li>{@code version-log} length == {@link #EXPECTED_VERSION_LOG_COUNT}</li>
+     *   <li>{@code version-log[0].version-id} == 1, {@code version-log[1].version-id} == 2</li>
+     * </ol>
+     *
+     * @return the number of assertion failures (0 = PASS)
+     */
+    static int verifyRustMetadata(Path dir) throws IOException {
+      int failures = 0;
+
+      Path metaPath = dir.resolve("rust_view_metadata.json");
+      if (!java.nio.file.Files.exists(metaPath)) {
+        System.out.println(
+            "FAIL verify-interop-view: missing " + metaPath
+                + " — run the Rust GEN test first");
+        return 1;
+      }
+
+      Path expectedPath = dir.resolve("rust_view_expected.json");
+      if (!java.nio.file.Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL verify-interop-view: missing " + expectedPath
+                + " — run the Rust GEN test first");
+        return 1;
+      }
+
+      // Read expected values from the Rust GEN step.
+      com.fasterxml.jackson.databind.JsonNode expectedNode =
+          JsonUtil.mapper().readTree(expectedPath.toFile());
+
+      // Parse the Rust-written metadata via Java's PRODUCTION ViewMetadataParser.
+      String metaJson = new String(java.nio.file.Files.readAllBytes(metaPath), StandardCharsets.UTF_8);
+      org.apache.iceberg.view.ViewMetadata metadata =
+          org.apache.iceberg.view.ViewMetadataParser.fromJson(metaJson);
+
+      // 1. format-version
+      if (metadata.formatVersion() != FORMAT_VERSION) {
+        System.out.println(
+            "FAIL format-version: expected=" + FORMAT_VERSION
+                + " actual=" + metadata.formatVersion());
+        failures++;
+      }
+
+      // 2. view-uuid — non-null and matches expected
+      String expectedUuid = expectedNode.path("view_uuid").asText(null);
+      String actualUuid = metadata.uuid();
+      if (actualUuid == null || actualUuid.isEmpty()) {
+        System.out.println("FAIL view-uuid: null or empty");
+        failures++;
+      } else if (expectedUuid != null && !expectedUuid.equals(actualUuid)) {
+        System.out.println(
+            "FAIL view-uuid: expected=" + expectedUuid + " actual=" + actualUuid);
+        failures++;
+      }
+
+      // 3. location — non-empty and matches expected
+      String expectedLocation = expectedNode.path("location").asText(null);
+      String actualLocation = metadata.location();
+      if (actualLocation == null || actualLocation.isEmpty()) {
+        System.out.println("FAIL location: null or empty");
+        failures++;
+      } else if (expectedLocation != null && !expectedLocation.equals(actualLocation)) {
+        System.out.println(
+            "FAIL location: expected=" + expectedLocation + " actual=" + actualLocation);
+        failures++;
+      }
+
+      // 4. schemas count == 1; field names match
+      java.util.List<org.apache.iceberg.Schema> schemas = metadata.schemas();
+      if (schemas.size() != 1) {
+        System.out.println(
+            "FAIL schemas count: expected=1 actual=" + schemas.size());
+        failures++;
+      } else {
+        org.apache.iceberg.Schema schema = schemas.get(0);
+        java.util.List<String> actualFieldNames = new java.util.ArrayList<>();
+        for (org.apache.iceberg.types.Types.NestedField field : schema.columns()) {
+          actualFieldNames.add(field.name());
+        }
+        java.util.List<String> expectedFieldNames = java.util.Arrays.asList(SCHEMA_FIELD_NAMES);
+        if (!expectedFieldNames.equals(actualFieldNames)) {
+          System.out.println(
+              "FAIL schema field names: expected=" + expectedFieldNames
+                  + " actual=" + actualFieldNames);
+          failures++;
+        }
+        // Schema field TYPE + required flag — load-bearing correctness fields. Compare each
+        // field's type string + required flag against rust_view_expected.json (keyed by name).
+        com.fasterxml.jackson.databind.JsonNode schemaFieldsNode = expectedNode.path("schema_fields");
+        if (schemaFieldsNode.isArray()) {
+          for (com.fasterxml.jackson.databind.JsonNode fieldExpected : schemaFieldsNode) {
+            String expectedName = fieldExpected.path("name").asText();
+            String expectedType = fieldExpected.path("type").asText();
+            boolean expectedRequired = fieldExpected.path("required").asBoolean();
+            org.apache.iceberg.types.Types.NestedField actualField = schema.findField(expectedName);
+            if (actualField == null) {
+              System.out.println("FAIL schema field " + expectedName + ": missing");
+              failures++;
+              continue;
+            }
+            if (!expectedType.equals(actualField.type().toString())) {
+              System.out.println(
+                  "FAIL schema field " + expectedName + " type: expected=" + expectedType
+                      + " actual=" + actualField.type());
+              failures++;
+            }
+            if (expectedRequired != actualField.isRequired()) {
+              System.out.println(
+                  "FAIL schema field " + expectedName + " required: expected=" + expectedRequired
+                      + " actual=" + actualField.isRequired());
+              failures++;
+            }
+          }
+        }
+      }
+
+      // 5. current-version-id
+      int expectedCurrentVersionId = expectedNode.path("current_version_id").asInt(EXPECTED_CURRENT_VERSION_ID);
+      if (metadata.currentVersionId() != expectedCurrentVersionId) {
+        System.out.println(
+            "FAIL current-version-id: expected=" + expectedCurrentVersionId
+                + " actual=" + metadata.currentVersionId());
+        failures++;
+      }
+
+      // 6. versions count
+      java.util.List<org.apache.iceberg.view.ViewVersion> versions = metadata.versions();
+      int expectedVersionCount = expectedNode.path("version_count").asInt(EXPECTED_VERSION_COUNT);
+      if (versions.size() != expectedVersionCount) {
+        System.out.println(
+            "FAIL versions count: expected=" + expectedVersionCount
+                + " actual=" + versions.size());
+        failures++;
+      }
+
+      // 7 + 8. Per-version assertions
+      // Find version by id to handle any iteration order.
+      java.util.Map<Integer, org.apache.iceberg.view.ViewVersion> versionById = new java.util.LinkedHashMap<>();
+      for (org.apache.iceberg.view.ViewVersion version : versions) {
+        versionById.put(version.versionId(), version);
+      }
+
+      // Version 1
+      org.apache.iceberg.view.ViewVersion v1 = versionById.get(1);
+      if (v1 == null) {
+        System.out.println("FAIL version 1: not present");
+        failures++;
+      } else {
+        failures += checkVersion(v1, 1, SCHEMA_ID, SQL_V1, DIALECT_V1, "version[1]");
+      }
+
+      // Version 2
+      org.apache.iceberg.view.ViewVersion v2 = versionById.get(EXPECTED_CURRENT_VERSION_ID);
+      if (v2 == null) {
+        System.out.println("FAIL version " + EXPECTED_CURRENT_VERSION_ID + ": not present");
+        failures++;
+      } else {
+        failures += checkVersion(v2, EXPECTED_CURRENT_VERSION_ID, SCHEMA_ID, SQL_V2, DIALECT_V2,
+            "version[" + EXPECTED_CURRENT_VERSION_ID + "]");
+      }
+
+      // 9. version-log length
+      java.util.List<org.apache.iceberg.view.ViewHistoryEntry> history = metadata.history();
+      int expectedLogCount = expectedNode.path("version_log_count").asInt(EXPECTED_VERSION_LOG_COUNT);
+      if (history.size() != expectedLogCount) {
+        System.out.println(
+            "FAIL version-log count: expected=" + expectedLogCount
+                + " actual=" + history.size());
+        failures++;
+      }
+
+      // 10. version-log entry version-ids (must be [1, 2] in creation order).
+      if (history.size() == 2) {
+        if (history.get(0).versionId() != 1) {
+          System.out.println(
+              "FAIL version-log[0].version-id: expected=1 actual=" + history.get(0).versionId());
+          failures++;
+        }
+        if (history.get(1).versionId() != EXPECTED_CURRENT_VERSION_ID) {
+          System.out.println(
+              "FAIL version-log[1].version-id: expected=" + EXPECTED_CURRENT_VERSION_ID
+                  + " actual=" + history.get(1).versionId());
+          failures++;
+        }
+      }
+
+      // 11. Version-log entry timestamps in order — pins that a version-log timestamp is not
+      // silently mutated. Each entry's timestamp-ms must equal the value Rust recorded.
+      com.fasterxml.jackson.databind.JsonNode versionLogNode = expectedNode.path("version_log");
+      if (versionLogNode.isArray() && versionLogNode.size() == history.size()) {
+        for (int i = 0; i < history.size(); i++) {
+          long expectedTimestamp = versionLogNode.get(i).path("timestamp_ms").asLong();
+          if (history.get(i).timestampMillis() != expectedTimestamp) {
+            System.out.println(
+                "FAIL version-log[" + i + "].timestamp-ms: expected=" + expectedTimestamp
+                    + " actual=" + history.get(i).timestampMillis());
+            failures++;
+          }
+        }
+      }
+
+      // 12. Per-version timestamp-ms (keyed by version-id) — pins that a NON-current version's
+      // timestamp is not silently mutated.
+      com.fasterxml.jackson.databind.JsonNode versionTimestampsNode =
+          expectedNode.path("version_timestamps");
+      if (versionTimestampsNode.isArray()) {
+        for (com.fasterxml.jackson.databind.JsonNode vtNode : versionTimestampsNode) {
+          int versionId = vtNode.path("version_id").asInt();
+          long expectedTimestamp = vtNode.path("timestamp_ms").asLong();
+          org.apache.iceberg.view.ViewVersion version = versionById.get(versionId);
+          if (version == null) {
+            System.out.println("FAIL version-timestamp[" + versionId + "]: version missing");
+            failures++;
+          } else if (version.timestampMillis() != expectedTimestamp) {
+            System.out.println(
+                "FAIL version[" + versionId + "].timestamp-ms: expected=" + expectedTimestamp
+                    + " actual=" + version.timestampMillis());
+            failures++;
+          }
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS verify-interop-view: all checks passed (uuid=" + actualUuid
+                + " versions=" + versions.size()
+                + " current-version-id=" + metadata.currentVersionId() + ")");
+      }
+      return failures;
+    }
+
+    /**
+     * Check a version's schema-id, sql, and dialect; returns the failure count.
+     *
+     * <p>For the SQL representation we take the FIRST representation (both sides produce exactly
+     * one).  The check is an EXACT string comparison — no whitespace normalization.
+     */
+    private static int checkVersion(
+        org.apache.iceberg.view.ViewVersion version,
+        int expectedVersionId,
+        int expectedSchemaId,
+        String expectedSql,
+        String expectedDialect,
+        String label) {
+      int failures = 0;
+
+      if (version.versionId() != expectedVersionId) {
+        System.out.println(
+            "FAIL " + label + " version-id: expected=" + expectedVersionId
+                + " actual=" + version.versionId());
+        failures++;
+      }
+
+      if (version.schemaId() != expectedSchemaId) {
+        System.out.println(
+            "FAIL " + label + " schema-id: expected=" + expectedSchemaId
+                + " actual=" + version.schemaId());
+        failures++;
+      }
+
+      // Representations: expect exactly one SQL representation.
+      java.util.List<org.apache.iceberg.view.ViewRepresentation> representations = version.representations();
+      if (representations.isEmpty()) {
+        System.out.println("FAIL " + label + ": no representations");
+        failures++;
+      } else {
+        org.apache.iceberg.view.ViewRepresentation rep = representations.get(0);
+        if (!(rep instanceof org.apache.iceberg.view.SQLViewRepresentation)) {
+          System.out.println("FAIL " + label + ": first representation is not SQL: " + rep.getClass().getSimpleName());
+          failures++;
+        } else {
+          org.apache.iceberg.view.SQLViewRepresentation sqlRep =
+              (org.apache.iceberg.view.SQLViewRepresentation) rep;
+          if (!expectedSql.equals(sqlRep.sql())) {
+            System.out.println(
+                "FAIL " + label + " sql: expected=\"" + expectedSql
+                    + "\" actual=\"" + sqlRep.sql() + "\"");
+            failures++;
+          }
+          if (!expectedDialect.equals(sqlRep.dialect())) {
+            System.out.println(
+                "FAIL " + label + " dialect: expected=\"" + expectedDialect
+                    + "\" actual=\"" + sqlRep.dialect() + "\"");
+            failures++;
+          }
+        }
+      }
+
+      return failures;
+    }
+
+    // ===========================================================================================
+    // D2: generateJavaToRust — Java builds a multi-version view and writes it.
+    // ===========================================================================================
+
+    /**
+     * Build a multi-version view via the PRODUCTION {@code InMemoryCatalog.buildView} path,
+     * serialize it via {@code ViewMetadataParser.toJson} to {@code java_view_metadata.json}, and
+     * emit {@code java_view_expected.json} for the Rust D2 test.
+     *
+     * <p>The view is created with one SQL representation ({@link #SQL_V1} / {@link #DIALECT_V1})
+     * then REPLACED with a DIFFERENT SQL ({@link #SQL_V2} / {@link #DIALECT_V2}) so
+     * {@code reuseOrCreateNewViewVersionId} assigns version-id 2 (not reuse version 1), giving
+     * exactly {@link #EXPECTED_VERSION_COUNT} versions and a {@link #EXPECTED_VERSION_LOG_COUNT}
+     * -entry version-log.
+     *
+     * <p>The emitted {@code java_view_expected.json} records the view-uuid, location,
+     * current-version-id, version count, version-log count, and per-version field values — the
+     * same structure that {@link #verifyRustMetadata} reads for D1.
+     */
+    static void generateJavaToRust(Path dir) throws IOException {
+      java.nio.file.Files.createDirectories(dir);
+
+      // Build a transient InMemoryCatalog to host the view (no persistent storage needed).
+      org.apache.iceberg.inmemory.InMemoryCatalog catalog = new org.apache.iceberg.inmemory.InMemoryCatalog();
+      catalog.initialize("interop-view-oracle", new java.util.HashMap<>());
+
+      org.apache.iceberg.catalog.Namespace namespace =
+          org.apache.iceberg.catalog.Namespace.of("interop");
+      catalog.createNamespace(namespace);
+
+      org.apache.iceberg.catalog.TableIdentifier viewIdent =
+          org.apache.iceberg.catalog.TableIdentifier.of(namespace, "java_view");
+
+      // Schema: {1: id long required, 2: name string required} — matches the Rust GEN schema.
+      org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
+          org.apache.iceberg.types.Types.NestedField.required(1, "id",
+              org.apache.iceberg.types.Types.LongType.get()),
+          org.apache.iceberg.types.Types.NestedField.required(2, "name",
+              org.apache.iceberg.types.Types.StringType.get()));
+
+      String viewLocation = "file:///tmp/interop-view-oracle/java_view";
+
+      // Step 1: create the view with SQL_V1 (produces version 1).
+      catalog
+          .buildView(viewIdent)
+          .withSchema(schema)
+          .withDefaultNamespace(namespace)
+          .withQuery(DIALECT_V1, SQL_V1)
+          .withLocation(viewLocation)
+          .create();
+
+      // Step 2: replace with SQL_V2 — DIFFERENT from SQL_V1 so reuseOrCreateNewViewVersionId
+      // assigns a NEW version-id (2), not reuse version 1.
+      catalog
+          .buildView(viewIdent)
+          .withSchema(schema)
+          .withDefaultNamespace(namespace)
+          .withQuery(DIALECT_V2, SQL_V2)
+          .withLocation(viewLocation)
+          .replace();
+
+      // Reload to get the final committed metadata.  Cast to BaseView to reach operations().
+      org.apache.iceberg.view.View finalView = catalog.loadView(viewIdent);
+      org.apache.iceberg.view.ViewMetadata metadata =
+          ((org.apache.iceberg.view.BaseView) finalView).operations().current();
+
+      // Sanity-check the builder's output before writing any file.
+      if (metadata.versions().size() != EXPECTED_VERSION_COUNT) {
+        throw new RuntimeException(
+            "D2 sanity: expected " + EXPECTED_VERSION_COUNT + " versions, got "
+                + metadata.versions().size()
+                + " — SQL_V1 and SQL_V2 may be identical (reuseOrCreateNewViewVersionId dedup)");
+      }
+      if (metadata.currentVersionId() != EXPECTED_CURRENT_VERSION_ID) {
+        throw new RuntimeException(
+            "D2 sanity: expected current-version-id=" + EXPECTED_CURRENT_VERSION_ID
+                + " got " + metadata.currentVersionId());
+      }
+      if (metadata.history().size() != EXPECTED_VERSION_LOG_COUNT) {
+        throw new RuntimeException(
+            "D2 sanity: expected version-log count=" + EXPECTED_VERSION_LOG_COUNT
+                + " got " + metadata.history().size());
+      }
+
+      // Write java_view_metadata.json via Java's PRODUCTION ViewMetadataParser.toJson.
+      String metaJson = org.apache.iceberg.view.ViewMetadataParser.toJson(metadata, true);
+      writeJson(dir.resolve("java_view_metadata.json"), metaJson);
+      System.out.println(
+          "generate-interop-view-java-to-rust: java_view_metadata.json written ("
+              + metaJson.length() + " chars, uuid=" + metadata.uuid()
+              + " versions=" + metadata.versions().size() + ")");
+
+      // Emit java_view_expected.json — the field values the Rust D2 test will compare against.
+      String expectedJson = JsonUtil.generate(
+          gen -> {
+            gen.writeStartObject();
+            gen.writeNumberField("format_version", metadata.formatVersion());
+            gen.writeStringField("view_uuid", metadata.uuid());
+            gen.writeStringField("location", metadata.location());
+            gen.writeNumberField("current_version_id", metadata.currentVersionId());
+            gen.writeNumberField("version_count", metadata.versions().size());
+            gen.writeNumberField("version_log_count", metadata.history().size());
+            // Schema: field names in column order.
+            gen.writeArrayFieldStart("schema_field_names");
+            for (org.apache.iceberg.types.Types.NestedField field : metadata.schema().columns()) {
+              gen.writeString(field.name());
+            }
+            gen.writeEndArray();
+            // Schema: per-field name/type/required — load-bearing correctness fields the Rust D2
+            // test pins so a type or required-flag divergence is caught field-by-field.
+            gen.writeArrayFieldStart("schema_fields");
+            for (org.apache.iceberg.types.Types.NestedField field : metadata.schema().columns()) {
+              gen.writeStartObject();
+              gen.writeStringField("name", field.name());
+              gen.writeStringField("type", field.type().toString());
+              gen.writeBooleanField("required", field.isRequired());
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+            // Per-version SQL and dialect (keyed by version-id).
+            gen.writeArrayFieldStart("versions");
+            for (org.apache.iceberg.view.ViewVersion version : metadata.versions()) {
+              gen.writeStartObject();
+              gen.writeNumberField("version_id", version.versionId());
+              gen.writeNumberField("schema_id", version.schemaId());
+              // First (and only) SQL representation.
+              java.util.List<org.apache.iceberg.view.ViewRepresentation> reps = version.representations();
+              if (!reps.isEmpty() && reps.get(0) instanceof org.apache.iceberg.view.SQLViewRepresentation) {
+                org.apache.iceberg.view.SQLViewRepresentation sqlRep =
+                    (org.apache.iceberg.view.SQLViewRepresentation) reps.get(0);
+                gen.writeStringField("sql", sqlRep.sql());
+                gen.writeStringField("dialect", sqlRep.dialect());
+              }
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+            // Per-version timestamp-ms (keyed by version-id) — pins a non-current version's
+            // timestamp against silent mutation.
+            gen.writeArrayFieldStart("version_timestamps");
+            for (org.apache.iceberg.view.ViewVersion version : metadata.versions()) {
+              gen.writeStartObject();
+              gen.writeNumberField("version_id", version.versionId());
+              gen.writeNumberField("timestamp_ms", version.timestampMillis());
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+            // Version-log entry version-ids in order.
+            gen.writeArrayFieldStart("version_log_ids");
+            for (org.apache.iceberg.view.ViewHistoryEntry entry : metadata.history()) {
+              gen.writeNumber(entry.versionId());
+            }
+            gen.writeEndArray();
+            // Version-log entries with timestamps in order — pins each version-log timestamp.
+            gen.writeArrayFieldStart("version_log");
+            for (org.apache.iceberg.view.ViewHistoryEntry entry : metadata.history()) {
+              gen.writeStartObject();
+              gen.writeNumberField("version_id", entry.versionId());
+              gen.writeNumberField("timestamp_ms", entry.timestampMillis());
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+            gen.writeEndObject();
+          },
+          true);
+
+      writeJson(dir.resolve("java_view_expected.json"), expectedJson);
+      System.out.println(
+          "generate-interop-view-java-to-rust: java_view_expected.json written "
+              + "(current-version-id=" + metadata.currentVersionId()
+              + " version-log=" + metadata.history().size() + " entries)");
+
+      catalog.close();
+    }
+  }
+
+  // ===========================================================================================
+  // WapDataOracle — I3 DATA-LEVEL WAP interop (both directions).
+  //
+  // THE TABLE (under <dir>/java_wap_table or <dir>/rust_table). V2 partitioned by
+  //   identity(category), schema {1 id long required, 2 category string required,
+  //   3 data string optional}
+  //
+  // DIRECTION 1 (Rust stages, Java cherry-picks + verifies):
+  //   Java GEN (generate):
+  //     Writes a partitioned V2 table with REAL parquet BASE data:
+  //       cat=a: (10,"a"), (20,"b"), (30,"c")   [wdata-base-a.parquet]
+  //       cat=b: (40,"d")                        [wdata-base-b.parquet]
+  //     Then stages WAP append (wap.id="w1") with REAL parquet STAGED data:
+  //       cat=a: (50,"e"), (60,"f")              [wdata-staged-a.parquet]
+  //       cat=b: (70,"g")                        [wdata-staged-b.parquet]
+  //     REPLAY shape: after base commit a "bump" commit is made (no data, just a property change)
+  //     so staged.parent (base) != current head (bump). This forces a REPLAY cherry-pick that
+  //     produces a NEW snapshot with source-snapshot-id + published-wap-id in the summary.
+  //     Emits:
+  //       java_wap_table/metadata/final.metadata.json  — staged-state table for Rust to read
+  //       java_staged_snapshot_id.json                 — the staged snapshot id
+  //       java_base_rows.json                          — rows present BEFORE cherry-pick
+  //       java_expected_final_rows.json                — expected rows AFTER cherry-pick (7 rows)
+  //
+  //   Java VERIFY (verifyRustTable):
+  //     Loads Rust-written <dir>/rust_table/, reads rust_staged_snapshot_id.json, cherry-picks
+  //     the staged snapshot via manageSnapshots().cherrypick(), reads via IcebergGenerics,
+  //     asserts 7 rows {10,20,30,40,50,60,70}, asserts WAP summary semantics on the cherry-pick
+  //     snapshot: source-snapshot-id == staged_id, published-wap-id == "w1".
+  //
+  // DIRECTION 2 (Java stages + cherry-picks, Rust reads):
+  //   generateJavaTable: creates a NEW identical table, commits base data, stages WAP append
+  //   (same REPLAY shape — bump commit between base and stage), cherry-picks via
+  //   manageSnapshots().cherrypick(), reads via IcebergGenerics (7 rows), emits:
+  //     java_cherrypick_table/metadata/final.metadata.json — the post-cherry-pick table
+  //     java_cherrypick_rows.json     — 7-row expected set (base + staged)
+  //     java_cherrypick_snapshot_summary.json — {source_snapshot_id, published_wap_id}
+  // ===========================================================================================
+
+  static final class WapDataOracle {
+    private WapDataOracle() {}
+
+    /** Schema: {1 id long required, 2 category string required, 3 data string optional}. */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "category", Types.StringType.get()),
+          Types.NestedField.optional(3, "data", Types.StringType.get()));
+    }
+
+    /** Build a LocalTableOperations + BaseTable over a fresh temp directory. */
+    private static BaseTable createTable(File tableDir, File metadataDir, File dataDir)
+        throws IOException {
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+      Schema schema = schema();
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      return new BaseTable(ops, "interop_wap_data");
+    }
+
+    /** Build the staged-table commit chain for both direction setups.
+     *
+     * <p>The sequence (S-replay pattern: stage FIRST, THEN bump — so staged.parent ≠ head):
+     * <ol>
+     *   <li>fast-append BASE files (cat=a rows 10/20/30, cat=b row 40) — seq 1; current=base.
+     *   <li>stageOnly WAP append (cat=a rows 50/60, cat=b row 70, wap.id=w1) — seq 2 (staged).
+     *       Current still = base (seq 1). Staged.parent = base.
+     *   <li>BUMP fast-append (cat=a row 99, data="bump") — seq 3; current = bump.
+     *       Now staged.parent (base=seq1) ≠ current head (bump=seq3) → REPLAY cherry-pick shape.
+     * </ol>
+     *
+     * <p>REPLAY cherry-pick produces a NEW snapshot with {@code source-snapshot-id} = staged id
+     * and {@code published-wap-id} = "w1".
+     *
+     * <p>After cherry-pick: 8 live rows: base (10,20,30,40) + bump (99) + staged (50,60,70).
+     */
+    private static long buildStagedTable(BaseTable table, File dataDir) throws IOException {
+      Schema schema = schema();
+      PartitionSpec spec = table.spec();
+      Types.StructType partitionType = spec.partitionType();
+
+      PartitionData partitionA = new PartitionData(partitionType);
+      partitionA.set(0, "a");
+      PartitionData partitionB = new PartitionData(partitionType);
+      partitionB.set(0, "b");
+
+      // 1. Write base parquet files.
+      File catADir = new File(dataDir, "category=a");
+      if (!catADir.isDirectory() && !catADir.mkdirs()) throw new IOException("mkdir category=a");
+      File catBDir = new File(dataDir, "category=b");
+      if (!catBDir.isDirectory() && !catBDir.mkdirs()) throw new IOException("mkdir category=b");
+
+      String baseAPath = new File(catADir, "wdata-base-a.parquet").getAbsolutePath();
+      DataFile baseA =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionA, baseAPath,
+              new long[] {10L, 20L, 30L}, new String[] {"a", "b", "c"});
+
+      String baseBPath = new File(catBDir, "wdata-base-b.parquet").getAbsolutePath();
+      DataFile baseB =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionB, baseBPath,
+              new long[] {40L}, new String[] {"d"});
+
+      // 2. Commit base files — seq 1; this is staged-snapshot's parent.
+      table.newFastAppend().appendFile(baseA).appendFile(baseB).commit();
+      long baseSnapshotId = table.currentSnapshot().snapshotId();
+
+      // 3. Write staged parquet files.
+      String stagedAPath = new File(catADir, "wdata-staged-a.parquet").getAbsolutePath();
+      DataFile stagedA =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionA, stagedAPath,
+              new long[] {50L, 60L}, new String[] {"e", "f"});
+
+      String stagedBPath = new File(catBDir, "wdata-staged-b.parquet").getAbsolutePath();
+      DataFile stagedB =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionB, stagedBPath,
+              new long[] {70L}, new String[] {"g"});
+
+      // 4. Stage the WAP append BEFORE the bump (S-replay pattern).
+      //    staged.parent = base (seq 1). Current still = base.
+      //    REAL stageOnly(): only AddSnapshot fires, no SetSnapshotRef.
+      table.newFastAppend()
+          .appendFile(stagedA)
+          .appendFile(stagedB)
+          .set("wap.id", "w1")
+          .stageOnly()
+          .commit();
+      long stagedId = findStagedSnapshotId(table, baseSnapshotId, "w1");
+
+      // 5. BUMP fast-append: advance main so staged.parent (base) ≠ current head (bump).
+      //    The bump row (id=99, cat=a, data="bump") is a known fixture row.
+      //    REPLAY cherry-pick shape: when cherry-pick fires, current=bump, staged.parent=base.
+      String bumpPath = new File(catADir, "wdata-bump.parquet").getAbsolutePath();
+      DataFile bumpFile =
+          MergeAppendDataOracle.writePartitionedDataFile(
+              table, schema, spec, partitionA, bumpPath,
+              new long[] {99L}, new String[] {"bump"});
+      table.newFastAppend().appendFile(bumpFile).commit();
+      long bumpSnapshotId = table.currentSnapshot().snapshotId();
+
+      System.out.println(
+          "WapDataOracle.buildStagedTable: base=" + baseSnapshotId
+              + " staged=" + stagedId + " bump=" + bumpSnapshotId
+              + " (REPLAY shape: staged.parent=" + baseSnapshotId
+              + " ≠ head=" + bumpSnapshotId + ")");
+      return stagedId;
+    }
+
+    /**
+     * Find the staged snapshot id — the snapshot in {@code table.metadata().snapshots()} that is
+     * NOT the current snapshot AND carries {@code wap.id == wapId}. When {@code parentId >= 0},
+     * also asserts the staged snapshot's parent is {@code parentId}.
+     */
+    private static long findStagedSnapshotId(BaseTable table, long parentId, String wapId) {
+      for (Snapshot snap : table.snapshots()) {
+        Map<String, String> props = snap.summary();
+        if (wapId.equals(props.get("wap.id"))
+            && snap.snapshotId() != table.currentSnapshot().snapshotId()) {
+          if (parentId >= 0 && snap.parentId() != null && snap.parentId() != parentId) {
+            throw new RuntimeException(
+                "WapDataOracle.findStagedSnapshotId: staged snapshot "
+                    + snap.snapshotId()
+                    + " has parent "
+                    + snap.parentId()
+                    + " but expected "
+                    + parentId);
+          }
+          return snap.snapshotId();
+        }
+      }
+      throw new RuntimeException(
+          "WapDataOracle.findStagedSnapshotId: no staged snapshot with wap.id="
+              + wapId
+              + " found (current="
+              + table.currentSnapshot().snapshotId()
+              + ")");
+    }
+
+    /** Write the table's current metadata as {@code final.metadata.json} to {@code tableDir}. */
+    private static void writeFinalMetadata(LocalTableOperations ops, Path tableDir)
+        throws IOException {
+      Files.createDirectories(tableDir.resolve("metadata"));
+      Path out = tableDir.resolve("metadata/final.metadata.json");
+      OutputFile outputFile = new LocalFileIO().newOutputFile(out.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), outputFile);
+    }
+
+    /** Read live rows as a JSON array with {id, data} objects (sorted by id).
+     *  Reads all three fields but serializes only id + data (matching the shared helper).
+     */
+    private static String readLiveWapRowsToJson(BaseTable table) {
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("WapDataOracle: failed to read live rows via IcebergGenerics", error);
+      }
+      List<Long> ids = new ArrayList<>(dataById.keySet());
+      ids.sort(Long::compareTo);
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (Long id : ids) {
+              gen.writeStartObject();
+              gen.writeNumberField("id", id);
+              String data = dataById.get(id);
+              if (data == null) {
+                gen.writeNullField("data");
+              } else {
+                gen.writeStringField("data", data);
+              }
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * DIRECTION 1 GEN — Java writes the staged-state table artifacts for Rust to use.
+     *
+     * <p>Creates a partitioned V2 table under {@code <dir>/java_wap_table}, commits REAL parquet
+     * base data, stages a WAP append (REAL parquet, wap.id=w1) via {@code stageOnly()}, and emits:
+     * <ul>
+     *   <li>{@code java_wap_table/metadata/final.metadata.json} — the staged-state table
+     *   <li>{@code java_staged_snapshot_id.json} — {@code {"staged_snapshot_id": NNN}}
+     *   <li>{@code java_base_rows.json} — 5 rows present before cherry-pick (base + bump)
+     *   <li>{@code java_expected_final_rows.json} — 8 rows expected after cherry-pick
+     * </ul>
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      Path tableRootPath = dir.resolve("java_wap_table");
+      File tableDir = tableRootPath.toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+
+      BaseTable table = createTable(tableDir, metadataDir, dataDir);
+      LocalTableOperations ops = (LocalTableOperations) table.operations();
+
+      // Build: base data + bump + staged WAP.
+      long stagedId = buildStagedTable(table, dataDir);
+
+      // Emit the staged-state table (current = bump, staged = WAP w1).
+      writeFinalMetadata(ops, tableRootPath);
+
+      // Emit the staged snapshot id for Rust to target.
+      String stagedIdJson =
+          JsonUtil.generate(
+              gen -> {
+                gen.writeStartObject();
+                gen.writeNumberField("staged_snapshot_id", stagedId);
+                gen.writeEndObject();
+              },
+              false);
+      writeJson(dir.resolve("java_staged_snapshot_id.json"), stagedIdJson);
+
+      // Emit java_base_rows.json — read CURRENT live rows (base only, staged not published).
+      String baseRowsJson = readLiveWapRowsToJson(table);
+      writeJson(dir.resolve("java_base_rows.json"), baseRowsJson);
+
+      // Emit java_expected_final_rows.json — what rows should be present AFTER cherry-pick.
+      // 8 rows: base (10,20,30,40) + bump (99) + staged (50,60,70).
+      // The bump row (id=99, data="bump") is on main before cherry-pick (it's what creates the
+      // REPLAY shape); the cherry-pick REPLAYS the staged files onto main, so all bump files
+      // remain in the live set.
+      Map<Long, String> expectedFinal = new LinkedHashMap<>();
+      expectedFinal.put(10L, "a"); expectedFinal.put(20L, "b"); expectedFinal.put(30L, "c");
+      expectedFinal.put(40L, "d"); expectedFinal.put(50L, "e"); expectedFinal.put(60L, "f");
+      expectedFinal.put(70L, "g"); expectedFinal.put(99L, "bump");
+      String expectedJson =
+          JsonUtil.generate(
+              gen -> {
+                gen.writeStartArray();
+                for (Map.Entry<Long, String> entry : expectedFinal.entrySet()) {
+                  gen.writeStartObject();
+                  gen.writeNumberField("id", entry.getKey());
+                  gen.writeStringField("data", entry.getValue());
+                  gen.writeEndObject();
+                }
+                gen.writeEndArray();
+              },
+              true);
+      writeJson(dir.resolve("java_expected_final_rows.json"), expectedJson);
+
+      System.out.println(
+          "generate-interop-wap-data: staged table + artifacts written to " + dir
+              + " (staged_snapshot_id=" + stagedId + ")");
+    }
+
+    /**
+     * DIRECTION 1 VERIFY — Java cherry-picks the Rust-staged table and verifies rows + WAP semantics.
+     *
+     * <p>Loads {@code <dir>/rust_table/metadata/final.metadata.json}, reads
+     * {@code rust_staged_snapshot_id.json} to get the staged id, cherry-picks via
+     * {@code manageSnapshots().cherrypick()}, reads all rows via {@link IcebergGenerics}, asserts
+     * rows == {@code java_expected_final_rows.json}, and asserts WAP summary semantics on the
+     * produced cherry-pick snapshot (source-snapshot-id == staged_id, published-wap-id == "w1").
+     */
+    static int verifyRustTable(Path dir) throws IOException {
+      int failures = 0;
+
+      // 1. Load the Rust-written staged table.
+      Path finalMetadataPath =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadataPath)) {
+        System.out.println(
+            "FAIL wap-data-d1: missing "
+                + finalMetadataPath
+                + " (run the Rust GEN test first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(
+                finalMetadataPath.toString(), readString(finalMetadataPath));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL wap-data-d1: Java could not parse Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      // 2. Load the staged snapshot id that Rust wrote.
+      Path stagedIdPath = dir.resolve("rust_staged_snapshot_id.json");
+      if (!Files.exists(stagedIdPath)) {
+        System.out.println(
+            "FAIL wap-data-d1: missing " + stagedIdPath + " (run the Rust GEN test first)");
+        return 1;
+      }
+      long stagedSnapshotId;
+      try {
+        String json = readString(stagedIdPath);
+        com.fasterxml.jackson.databind.JsonNode node =
+            new com.fasterxml.jackson.databind.ObjectMapper().readTree(json);
+        stagedSnapshotId = node.get("staged_snapshot_id").asLong();
+      } catch (Exception parseError) {
+        System.out.println(
+            "FAIL wap-data-d1: could not parse rust_staged_snapshot_id.json: " + parseError);
+        return 1;
+      }
+
+      // 3. Load expected final rows.
+      Path expectedPath = dir.resolve("java_expected_final_rows.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL wap-data-d1: missing " + expectedPath
+                + " (run generate-interop-wap-data first)");
+        return 1;
+      }
+      // 8 rows: base (10,20,30,40) + bump (99) + staged (50,60,70).
+      Map<Long, String> expectedRows = new LinkedHashMap<>();
+      expectedRows.put(10L, "a"); expectedRows.put(20L, "b"); expectedRows.put(30L, "c");
+      expectedRows.put(40L, "d"); expectedRows.put(50L, "e"); expectedRows.put(60L, "f");
+      expectedRows.put(70L, "g"); expectedRows.put(99L, "bump");
+
+      // 4. Build a mutable BaseTable over the Rust metadata for cherry-pick.
+      //    Use a unique temp directory per verify run so idempotent reruns don't collide on
+      //    v0.metadata.json. The data files are referenced by ABSOLUTE paths in the manifests;
+      //    they live in the original rust_table/data/ and don't need to be copied.
+      File rustTableDir = dir.resolve("rust_table").toFile();
+      Path verifyTempDir = Files.createTempDirectory(dir, "wap_verify_");
+      Files.createDirectories(verifyTempDir.resolve("metadata"));
+      // Rebuild metadata pointing at the temp dir location (manifests are written there).
+      // Data-file paths in manifests are absolute — they resolve to the original parquet files.
+      TableMetadata tempMetadata =
+          TableMetadata.buildFrom(metadata)
+              .discardChanges()
+              .setLocation(verifyTempDir.toAbsolutePath().toString())
+              .build();
+
+      LocalTableOperations mutableOps =
+          new LocalTableOperations(verifyTempDir.toFile(), verifyTempDir.resolve("metadata").toFile());
+      mutableOps.commit(null, tempMetadata); // writes v0.metadata.json in the fresh temp dir
+
+      // Read-only view for the ancestry check (uses the original metadata location).
+      FileIO io = new LocalFileIO();
+      BaseTable table =
+          new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_wap_data");
+      BaseTable mutableTable = new BaseTable(mutableOps, "rust_wap_data_mutable");
+
+      try {
+        mutableTable.manageSnapshots().cherrypick(stagedSnapshotId).commit();
+      } catch (RuntimeException cherryPickError) {
+        System.out.println(
+            "FAIL wap-data-d1: cherry-pick of staged snapshot "
+                + stagedSnapshotId
+                + " FAILED: "
+                + cherryPickError);
+        return failures + 1;
+      }
+
+      // 7. Read all live rows via IcebergGenerics.
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(mutableTable).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL wap-data-d1: IcebergGenerics read after cherry-pick FAILED: " + readError);
+        return failures + 1;
+      }
+
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+
+      // 8a. Exactly 8 live rows (base 4 + bump 1 + staged 3).
+      if (liveIds.size() != 8) {
+        System.out.println(
+            "FAIL wap-data-d1: expected 8 live rows after cherry-pick, got "
+                + liveIds.size() + " " + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS wap-data-d1: 8 live rows after cherry-pick (base 4 + bump 1 + staged 3)");
+      }
+
+      // 8b. All expected ids present and data values match.
+      boolean valuesMatch = true;
+      for (Map.Entry<Long, String> entry : expectedRows.entrySet()) {
+        Long id = entry.getKey();
+        String wantData = entry.getValue();
+        if (!dataById.containsKey(id)) {
+          System.out.println("FAIL wap-data-d1: id " + id + " missing from live rows " + liveIds);
+          failures++;
+          valuesMatch = false;
+        } else {
+          String gotData = dataById.get(id);
+          if (!wantData.equals(gotData)) {
+            System.out.println(
+                "FAIL wap-data-d1: id=" + id + " expected data=" + wantData
+                    + " but got=" + gotData);
+            failures++;
+            valuesMatch = false;
+          }
+        }
+      }
+      if (valuesMatch && liveIds.size() == 8) {
+        System.out.println(
+            "PASS wap-data-d1: all 8 rows correct {10=a,20=b,30=c,40=d,50=e,60=f,70=g,99=bump}");
+      }
+
+      // 9. WAP summary semantics: the cherry-pick snapshot must carry source-snapshot-id +
+      //    published-wap-id (REPLAY shape: staged.parent was bump, not the current head when
+      //    cherry-pick fired, so a NEW snapshot is produced with these tags).
+      Snapshot cherryPickSnapshot = mutableTable.currentSnapshot();
+      if (cherryPickSnapshot == null) {
+        System.out.println("FAIL wap-data-d1: no current snapshot after cherry-pick");
+        failures++;
+      } else {
+        String sourceId = cherryPickSnapshot.summary().get("source-snapshot-id");
+        String publishedWapId = cherryPickSnapshot.summary().get("published-wap-id");
+
+        if (sourceId == null) {
+          System.out.println(
+              "FAIL wap-data-d1: cherry-pick snapshot missing source-snapshot-id "
+                  + "(expected REPLAY shape)");
+          failures++;
+        } else if (!String.valueOf(stagedSnapshotId).equals(sourceId)) {
+          System.out.println(
+              "FAIL wap-data-d1: cherry-pick snapshot source-snapshot-id=" + sourceId
+                  + " but expected " + stagedSnapshotId);
+          failures++;
+        } else {
+          System.out.println(
+              "PASS wap-data-d1: source-snapshot-id=" + sourceId + " OK");
+        }
+
+        if (publishedWapId == null) {
+          System.out.println(
+              "FAIL wap-data-d1: cherry-pick snapshot missing published-wap-id");
+          failures++;
+        } else if (!"w1".equals(publishedWapId)) {
+          System.out.println(
+              "FAIL wap-data-d1: cherry-pick snapshot published-wap-id=" + publishedWapId
+                  + " but expected w1");
+          failures++;
+        } else {
+          System.out.println(
+              "PASS wap-data-d1: published-wap-id=" + publishedWapId + " OK");
+        }
+      }
+
+      // 10. Partition routing pin (S3 partition-projection lesson): cat=a-rows are {10,20,30,50,60}
+      //     and cat=b-rows are {40,70}. We verify category column via IcebergGenerics.
+      Map<Long, String> categoryById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(mutableTable).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object cat = record.getField("category");
+          categoryById.put(id, cat == null ? null : cat.toString());
+        }
+      } catch (RuntimeException | IOException catError) {
+        System.out.println("FAIL wap-data-d1: category scan failed: " + catError);
+        failures++;
+      }
+
+      // Category routing: a={10,20,30,50,60,99(bump)}, b={40,70}.
+      Map<Long, String> expectedCategory = new LinkedHashMap<>();
+      expectedCategory.put(10L, "a"); expectedCategory.put(20L, "a"); expectedCategory.put(30L, "a");
+      expectedCategory.put(40L, "b"); expectedCategory.put(50L, "a"); expectedCategory.put(60L, "a");
+      expectedCategory.put(70L, "b"); expectedCategory.put(99L, "a");
+      boolean catOk = true;
+      for (Map.Entry<Long, String> entry : expectedCategory.entrySet()) {
+        Long id = entry.getKey();
+        String wantCat = entry.getValue();
+        String gotCat = categoryById.get(id);
+        if (!wantCat.equals(gotCat)) {
+          System.out.println(
+              "FAIL wap-data-d1: id=" + id + " expected category=" + wantCat
+                  + " but got=" + gotCat + " (partition routing error)");
+          failures++;
+          catOk = false;
+        }
+      }
+      if (catOk) {
+        System.out.println("PASS wap-data-d1: partition routing OK — a={10,20,30,50,60,99} b={40,70}");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-wap-data OK — Java cherry-picked the Rust-staged snapshot; "
+                + "8 rows correct; WAP semantics (source-snapshot-id + published-wap-id) present");
+      }
+      return failures;
+    }
+
+    /**
+     * DIRECTION 2 GEN — Java stages + cherry-picks its own table; Rust reads.
+     *
+     * <p>Creates a partitioned V2 table under {@code <dir>/java_cherrypick_table}, commits base
+     * data + bump (REPLAY shape), stages WAP append via {@code stageOnly()}, cherry-picks via
+     * {@code manageSnapshots().cherrypick()}, reads via {@link IcebergGenerics}, and emits:
+     * <ul>
+     *   <li>{@code java_cherrypick_table/metadata/final.metadata.json} — the post-cherry-pick table
+     *   <li>{@code java_cherrypick_rows.json} — 8 expected rows (base 4 + bump 1 + staged 3)
+     *   <li>{@code java_cherrypick_snapshot_summary.json} —
+     *       {@code {"source_snapshot_id": NNN, "published_wap_id": "w1"}}
+     * </ul>
+     */
+    static void generateJavaTable(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      Path tableRootPath = dir.resolve("java_cherrypick_table");
+      File tableDir = tableRootPath.toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+
+      BaseTable table = createTable(tableDir, metadataDir, dataDir);
+      LocalTableOperations ops = (LocalTableOperations) table.operations();
+
+      // Build the staged table (base + bump + staged WAP w1).
+      long stagedId = buildStagedTable(table, dataDir);
+      long bumpId = table.currentSnapshot().snapshotId();
+
+      // Cherry-pick the staged WAP — REPLAY shape produces new snapshot with WAP semantics.
+      table.manageSnapshots().cherrypick(stagedId).commit();
+      Snapshot cherryPickSnap = table.currentSnapshot();
+
+      String sourceId = cherryPickSnap.summary().get("source-snapshot-id");
+      String publishedWapId = cherryPickSnap.summary().get("published-wap-id");
+
+      if (sourceId == null || publishedWapId == null) {
+        throw new RuntimeException(
+            "generateJavaTable: cherry-pick snapshot missing WAP summary semantics: "
+                + "source-snapshot-id=" + sourceId
+                + " published-wap-id=" + publishedWapId);
+      }
+      System.out.println(
+          "WapDataOracle.generateJavaTable: cherry-pick snapshot "
+              + cherryPickSnap.snapshotId()
+              + " source-snapshot-id=" + sourceId
+              + " published-wap-id=" + publishedWapId);
+
+      // Emit the post-cherry-pick table.
+      writeFinalMetadata(ops, tableRootPath);
+
+      // Emit rows JSON.
+      String rowsJson = readLiveWapRowsToJson(table);
+      writeJson(dir.resolve("java_cherrypick_rows.json"), rowsJson);
+
+      // Emit snapshot summary JSON.
+      String summaryJson =
+          JsonUtil.generate(
+              gen -> {
+                gen.writeStartObject();
+                gen.writeStringField("source_snapshot_id", sourceId);
+                gen.writeStringField("published_wap_id", publishedWapId);
+                gen.writeEndObject();
+              },
+              false);
+      writeJson(dir.resolve("java_cherrypick_snapshot_summary.json"), summaryJson);
+
+      System.out.println(
+          "generate-interop-wap-data-java-table: cherry-picked table + artifacts written to " + dir
+              + " (7 rows, source_snapshot_id=" + sourceId
+              + ", published_wap_id=" + publishedWapId + ")");
+    }
   }
 
   // ===========================================================================================

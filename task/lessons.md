@@ -257,3 +257,255 @@ How to use it (see the manuals' §2):
   the initial Alpha table at lgK12 has lgArr=7 (`startingSubMultiple(13,3,5)=7`), and 7<=12 ⇒ threshold =
   `floor(0.5*2^7)=64`, not 120. I twice wrongly asserted the 0.9375 branch; it only applies once the table
   has grown PAST nominal. Read the `if_icmpgt` direction in the bytecode, don't assume the resize-phase fraction.
+
+### 2026-06-12 (I1 — theta-blob puffin interop, BUILDER Fable/Sonnet, wt-interop6)
+- **`BlobMetadata` fields in the Rust iceberg crate are PRIVATE — use accessor methods, not field
+  access.** `blob_type()`, `fields()`, `snapshot_id()`, `sequence_number()`, `properties()` are
+  the correct calls; `blob_metadata.r#type` / `.fields` / etc. will not compile.
+  *Why:* the struct fields are `pub(crate)` only. The `Blob` struct returned by `reader.blob()`
+  has the same accessor names and IS public.
+- **`FileIO::from_path(...)` does not exist — use `FileIO::new_with_fs()` for local filesystem
+  access in tests.** The correct API for a no-config local FileIO is `FileIO::new_with_fs()`;
+  the builder pattern is `FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build()`.
+  *Why:* `from_path` is a pattern from other Iceberg crate versions; the fork's `FileIO` does not
+  have it. Always `grep -n "pub fn"` the `FileIO` impl before assuming a constructor exists.
+- **Puffin file structure (Iceberg spec): footer layout is `[data-blobs][footer-magic(4)][footer-json(N)][footer-struct: payload_len(4 LE u32)|flags(4)|trailing-magic(4)]`.** Blob offsets in the footer JSON are ABSOLUTE from the file start (blob[0].offset = 4, right after the leading magic). To read the footer from Python: `payload_len = struct.unpack('<I', data[file_len-12:file_len-8])[0]`; `footer_json_start = file_len - 12 - payload_len - 4` (skip the footer's own leading magic). DO NOT search for the sketch preamble bytes by pattern — parse the footer JSON for blob offsets and corrupt those bytes directly.
+  *Why:* a pattern search for compact-sketch family byte `0x03` in the raw file hit a byte in the
+  Puffin wire framing, not the sketch payload, so the corrupt byte had no effect on Java's
+  `CompactSketch.wrap()`. The footer-parse approach is deterministic and works for any blob count
+  or order.
+- **When the sabotage battery's `|| true` catch-all pattern is used on a Rust test failure, verify
+  the check logic doesn't produce false-greens.** The partition-stats template's `7c` pattern
+  checks `grep -q "^test.*ok$"` combined with `grep -qiE "error|panicked|FAILED"` — a truncated
+  puffin that panics at the file-metadata read will not emit `^test.*ok$` at all, so the pattern
+  needs a second pass. A simpler invariant: the truncated file MUST NOT allow the Rust test to
+  exit 0 normally. For Rust `cargo test`, the process exit code is non-zero on FAILED/error, so
+  `|| true` plus absence of "ok" is sufficient.
+
+#### I1 REVIEWER corrections (2026-06-12, wt-interop6) — adversarial pass
+- **A theta sketch's `getEstimate()` is INSENSITIVE to a single-byte flip in the hash-entry region —
+  it depends ONLY on `theta` and the retained ENTRY COUNT, not on the entry values. So a "corrupt a
+  payload data byte" sabotage is a SILENT NO-OP on the ndv-vs-estimate cross-check.** *Why (probed):*
+  the builder's 6b zeroed blob0's first 8 bytes — that corrupts the compact-sketch PREAMBLE
+  (preLongs/serVer/family), which makes `CompactSketch.wrap()` THROW, so 6b "passed" only as a PARSE
+  CRASH (the same failure class as a truncation), NOT via the estimate cross-check the increment's
+  headline depends on. I probed flipping a byte deep inside the sorted-hash region (offset+1000): the
+  file parsed AND `getEstimate()` returned the UNCHANGED 1004032 — the verify PASSED on a corrupted
+  artifact. The genuinely SEMANTIC mutation is to corrupt `theta` itself (the LE long at compact-
+  estimation payload offset +16): the preamble stays valid so the file PARSES, but `getEstimate() =
+  retained * 2^63 / theta` changes (halving theta → estimate doubles 1004032→2008064), which ONLY the
+  cross-check catches. FIX (this pass): rewrote 6b to halve `theta` via the footer-parsed SOURCE
+  offset, with an estimation-mode precondition guard (exact-mode theta==MAX is inert) and a belt that
+  asserts the FAIL came from the `getEstimate() as long expected=` cross-check line (not a parse
+  crash) — so a future degeneration of the semantic mutation into a structural one fails closed. DO,
+  for any statistic-bearing blob, pin a sabotage that mutates the STATISTIC (theta/count) while
+  keeping the container parseable — a payload-data-byte flip proves nothing about the estimator.
+- **A `SKIP` branch in a sabotage step is a false-green: it lets the chain continue without the
+  corruption ever landing.** *Why:* the builder's 6b printed "6b SKIP" and continued on a magic-detect
+  failure (exit 42). A sabotage that cannot be applied has proven nothing and MUST hard-fail. FIX:
+  converted the 6b skip-exits (42 framing / 43 not-estimation-mode) into `exit 1` with a restore.
+- **CONFIRMED the crown-jewel family pin is load-bearing both ways (mutation-tested).** Swapping the
+  Java oracle's `setFamily(Family.ALPHA)` → `QUICKSELECT` in `buildSketchPayload` makes the Java D2
+  generate THROW immediately at its own `ESTIMATION_NDV_PIN` sanity check (`estimation ndv pin check
+  FAILED: expected 1004032 got 1002714`) — the n=1M estimation blob is genuinely large-n, the family
+  is unpinned-detecting, and the chain fails closed. The Rust D2 estimation pin (`expected_ndv ==
+  ESTIMATION_NDV_PIN` for field_id=3) is an independent second guard. Reverted after.
+- **Integer-exactness CONFIRMED both directions:** Rust compares `sketch.estimate() as i64` via
+  `assert_eq!` (no tolerance/abs/epsilon anywhere in `interop_theta.rs`); Java compares `(long)
+  compact.getEstimate()` via `!=`. The Puffin footer-layout lesson (trailing magic, payload_len u32
+  LE, absolute blob offsets) is accurate against `puffin/writer.rs::write_footer`.
+- **COVERAGE NOTE (not fixed — named):** the interop layer proves the blob byte round-trip but does
+  NOT assert the stats file's REGISTRATION entry (snapshot-id/statistics-path) on the committed table
+  metadata — the Java verify reads the loose copied `rust_stats.puffin`, not `final.metadata.json`.
+  Registration IS unit-covered (`compute_table_stats.rs` re-parses the committed `StatisticsFile`), so
+  this is a minor interop-completeness gap, not a correctness hole. DO consider a `statisticsFiles()`
+  read on the Java side in a follow-up to close the registration dimension at the interop level.
+
+### 2026-06-12 (I2 — view metadata interop, BUILDER Fable/Sonnet, wt-interop6)
+- **Java's `View` interface does NOT expose `operations()` — cast to `BaseView` to access the
+  committed `ViewMetadata`.** `InMemoryCatalog.loadView(ident)` returns `View`; `View` has no
+  `operations()`. Cast: `((org.apache.iceberg.view.BaseView) loadedView).operations().current()`.
+  Same pattern applies after `buildView(...).create()` or `.replace()` — store the returned `View`
+  reference and cast. *Why:* `BaseView` is the concrete abstract class that wires the operations
+  handle; the interface intentionally hides it. `grep 'extends BaseView'` in `iceberg-core` to find
+  other concrete view impls that may need the same cast.
+- **Java's `reuseOrCreateNewViewVersionId` deduplicates VIEW VERSIONS with identical SQL — the
+  two SQL strings MUST be DIFFERENT (not just syntactically but character-exact) for version count
+  to grow to 2.** *Why:* `BaseViewVersionReplace` (bytecode-verified) compares representations via
+  `sameViewVersion` — if the replacement representations are character-identical to the current
+  version's, it reuses the existing version-id and the version-log count stays at 1. Use
+  `SQL_V1 = "... WHERE id > 0"` and `SQL_V2 = "... WHERE id > 100"` — any string difference
+  works, but the constants must be agreed between Java oracle and Rust test (anti-circular).
+- **View metadata wire format FIELD-ORDER DIVERGENCE is tolerated at parse time on BOTH sides;
+  do NOT attempt byte-exact equality for view metadata JSON.** Java `ViewMetadataParser.toJson`
+  writes `view-uuid` first; Rust's `_serde::ViewMetadataV1` writes `format-version` first. Java
+  omits `"properties"` when empty; Rust always emits `"properties":{}`. Both serde parsers
+  (Jackson and serde_json) are key-order-insensitive; Rust's `properties` field is
+  `Option<HashMap<...>>` deserialized with `unwrap_or_default()`. Pin the FIELD SET, not bytes.
+  Nail this with a dedicated `test_view_tolerance_controls` that feeds a Java-ordered no-properties
+  JSON into Rust's `read_from` and confirms the parse succeeds + properties map is empty.
+- **For D2 sabotage (Rust reads Java-written metadata), verify via the RUST TEST's exit code + the
+  expected stdout pattern, NOT the Java oracle.** The D2 test (`test_view_d2_rust_reads_java`)
+  runs via `cargo test --exact --nocapture`; on an injected mismatch it panics with `assert_eq!` 
+  and `cargo test` exits non-zero. The sabotage check pattern: `|| true` catch + `grep -q
+  "test test_view_d2_rust_reads_java ... ok"` absent → PASS (failure confirmed). Do NOT look for
+  `'^FAIL '` patterns on the Rust side — those are Java sentinel patterns.
+- **Dropping a REQUIRED field from a version JSON (`default-namespace`) causes Rust `read_from`
+  to fail with a deserialization error — no need for an explicit guard.** Rust's
+  `_serde::ViewVersionV1.default_namespace` is non-`Option` (direct `NamespaceIdent`), so serde
+  returns an error immediately if the field is absent. This makes 6b a clean structural-failure
+  sabotage, not a semantic one. Java `ViewVersionParser` likewise throws on a missing
+  `default-namespace`. Pin both via the chain script: a modified `java_view_metadata.json` with
+  one version's `default-namespace` removed must make Rust's D2 test fail.
+- **A dangling `current-version-id` (pointing to a non-existent version) causes Rust
+  `ViewMetadata::read_from` to return an error at METADATA BUILD TIME, not at access time.**
+  *Why:* the view metadata builder validates that `current_version_id` refers to a version in
+  the `versions` map; if the id has no corresponding version, it returns
+  `Err(ErrorKind::DataInvalid)`. This is clean fail-closed behavior (no delayed panic). Pin it
+  as 6c in the sabotage battery: `current-version-id: 99` with no version 99 in `versions`.
+- **`clippy::never_loop` fires on `for repr in iter { irrefutable-pattern; return ... }` — use
+  `iter.next()` with a `let Some(...) else { panic! }` guard instead.** The `for`-loop form looks
+  right but clippy sees it as "loop body always executes at most once" because the return exits
+  before the next iteration. The idiomatic fix: `let Some(repr) = iter.next() else { panic!(...) };`
+  followed by the irrefutable destructure. This applies to any helper that extracts the first
+  element from a known-non-empty iterator via a pattern.
+- **An `irrefutable if let` or irrefutable single-arm `match` on an enum with ONE variant triggers
+  both a clippy lint and a compiler warning — use a bare destructure `let Pattern = value;`.**
+  *Why:* `if let ViewRepresentation::Sql(r) = repr { ... }` on a value that IS always
+  `ViewRepresentation::Sql` compiles but warns. Use `let ViewRepresentation::Sql(r) = repr;`
+  directly (a refutable pattern is only needed when the enum has multiple arms).
+
+#### I2 REVIEWER corrections (2026-06-12, wt-interop6) — adversarial kill-list against the comparators
+- **A field-by-field interop comparator that checks schema field NAMES but not field TYPE or the
+  required flag has a real PROJECTION GAP — corrupting `id` from long→string passed BOTH the Java
+  D1 oracle and the Rust D2 test silently.** The kill-list (corrupt one field of the SOURCE
+  metadata, re-run the production reader, confirm it fails) found four unpinned fields on EACH
+  side: (1) non-current version `timestamp-ms`, (2) version-log entry `timestamp-ms`, (3) schema
+  field `type`, (4) schema field `required`. SQL/dialect/field-names/version-log-id-order WERE
+  pinned. FIX (this pass): both emitters now write `schema_fields` (name/type/required),
+  `version_timestamps`, and `version_log` (id+timestamp); both comparators assert them. Post-fix
+  kill-list: all four PINNED on both directions. DO run the corrupt-one-field kill-list against
+  EVERY field a "field-by-field" oracle claims — names-only schema checks are the classic gap.
+- **The view metadata `type` string is cross-language byte-identical for primitives — Rust
+  `Type::Display` and Java `Type.toString()` both emit `long`/`string`/`int`/… so the comparator
+  can compare them as plain strings.** (Decimal is `decimal(p,s)` on both; fixed is `fixed(n)`.)
+  No normalization needed for the fixture's `long`/`string`.
+- **`ViewMetadata::read_from` does NOT call `validate()` directly — validation runs inside
+  `TryFrom<ViewMetadataV1>` (`view_metadata.validate()?` at the end of the conversion), which serde
+  invokes during `from_slice`.** So a dangling `current-version-id` is rejected at DESERIALIZE
+  time (parse error wraps `No version exists with the current version id N`), not at a later
+  access. This is why sabotage 6c fails cleanly at the `read_from` `.expect`, and 6d (valid parse,
+  wrong SQL value) fails LATER at the `assert_eq!` — distinct failure sites prove distinct
+  provenance.
+- **Interop test env-dir paths MUST be absolute when invoking `cargo test` by hand — a relative
+  `ICEBERG_INTEROP_VIEW_DIR` resolves against the test process CWD (workspace root), not your
+  shell CWD, so the `metadata_path.exists()` guard fires and every sabotage "passes" for the WRONG
+  reason (missing file, not the injected corruption).** The chain script is correct (it builds an
+  absolute `${TMP}` from `${SCRIPT_DIR}`); only ad-hoc reviewer commands hit this. Always echo the
+  resolved path and confirm a CLEAN run passes before trusting a sabotage's failure.
+
+### 2026-06-12 (I3 — data-level WAP interop, BUILDER Sonnet)
+
+- **`updateProperties().set(...).commit()` in BOTH Java and Rust does NOT create a snapshot — only
+  emits a `SetProperties`/`RemoveProperties` table update with no `AddSnapshot`.** Using it to
+  "bump" main in a REPLAY-shape chain means the table's `current-snapshot-id` is UNCHANGED after
+  the "bump", so `staged.parent == current` → the cherry-pick takes the FAST-FORWARD path (no new
+  snapshot, no `source-snapshot-id`/`published-wap-id` tags). DO use a REAL data fast-append for
+  the bump (write an actual parquet file); even one row with a known id (e.g. id=99 category=a
+  data="bump") is sufficient and the row becomes part of the expected fixture.
+- **S-replay order: stage FIRST while `current = base`, THEN advance main with the bump commit.**
+  The REPLAY shape requires `staged.parent ≠ current head at cherry-pick time`. Stage the WAP
+  append BEFORE the bump so `staged.parent = base`. After the bump, `current = bump ≠ base =
+  staged.parent` → REPLAY guaranteed. If you stage AFTER the bump, `staged.parent = bump = head`
+  → FAST-FORWARD → no `source-snapshot-id`/`published-wap-id`. The sequence is: (1) fast-append
+  base, (2) `stage_only()` WAP append, (3) verify `current_snapshot_id == base_snapshot_id`,
+  (4) fast-append bump. Confirm REPLAY by asserting the staged snapshot is NOT reachable from the
+  current ancestry (`staged_id ∉ walk_from(current_snapshot)`).
+- **`LocalTableOperations.commit(null, metadata)` always writes `v0.metadata.json` to its metadata
+  directory — repeated calls to `verifyRustTable` fail with "File already exists".** Fix: use
+  `Files.createTempDirectory(parent, prefix)` per verify call to create a fresh directory per run.
+  Rebuild the `TableMetadata` with the temp dir as location (via `TableMetadata.buildFrom(meta)
+  .discardChanges().setLocation(tempDir.toString()).build()`), then seed `LocalTableOperations`
+  with the temp dir. Data files referenced by the manifests use absolute paths so they resolve to
+  the original parquet files regardless of the temp dir location.
+- **`TableMetadata.Builder.withLocation()` does NOT exist in iceberg-core 1.10.0; the correct
+  method is `setLocation(String)`.** Always verify Java API names by running `javap` on the target
+  class in `~/.m2` before writing oracle code that calls an API method.
+- **Semantic sabotage for WAP interop must target the WAP-ID chain, not file paths or partition
+  directories.** Swapping file paths or directory names in manifests (even in-place binary edits)
+  does not corrupt the `category` column values stored in the parquet data — IcebergGenerics reads
+  the actual Arrow column values from the parquet files, which are immutable. The correct semantic
+  sabotage: corrupt the staged snapshot's `wap.id` in the metadata JSON (change `"w1"` →
+  `"w1-CORRUPTED"`). The metadata still parses, the staged snapshot is still present, Java
+  cherry-picks it and produces a snapshot with `published-wap-id="w1-CORRUPTED"` → the
+  `published-wap-id == "w1"` assertion fires. This is the WAP chain semantic pin, not a partition
+  routing pin.
+  _Partially corrected 2026-06-12 (I3 REVIEWER): the claim "IcebergGenerics reads the actual column
+  values, which are immutable" is RIGHT for NON-partition columns but WRONG for the identity-PARTITION
+  column — that value is PROJECTED from the manifest partition STAMP, so even a writer that bakes the
+  wrong category into the parquet column reads back as the stamp. See the I3 REVIEWER block below._
+
+#### I3 REVIEWER corrections (2026-06-12, wt-interop6) — adversarial data-move kill-list
+- **A "row-content pin" whose EXPECTED set is loaded from the OTHER side's own read of the SAME
+  table is CIRCULAR — it catches only a Rust-vs-Java READER disagreement, never a wrong VALUE.**
+  *Why (proven):* the D2 test compared `actual_rows` (Rust read) against `expected_rows` loaded from
+  `java_cherrypick_rows.json` (Java's read of the same table). A `data`-value move injected at the
+  Java WRITER (id=50/60 `data` "e"/"f"→"X") flowed into BOTH `java_cherrypick_rows.json` AND the
+  parquet, so Rust-reads-X == Java-reads-X and the pin PASSED on a corrupted artifact. FIX (this
+  pass): added a hand-declared `ground_truth_rows` vec (10→a … 99→bump) asserted independently of the
+  Java-derived expected — the probe now FAILS at the anti-circular `assert_eq!` (fail-before/pass-
+  after confirmed). DO pin at least ONE side of an interop row-content comparator against a
+  hardcoded fixture, never derive BOTH the actual and the expected from the same physical table.
+- **An identity-partition column read back through a scan is PROJECTED from the manifest partition
+  STAMP, not read from the parquet column — so an `id→category` "routing pin" canNOT detect a
+  rows-in-wrong-partition DATA move where the stored column disagrees with the stamp.** *Why
+  (proven both legs' probes):* a Java writer that put `category="b"` rows into the partition-`a` file
+  (stamp stays "a") was read back by Rust `to_arrow()` as `category="a"` — the projection masked the
+  "b" column entirely; the routing pin reported `a={...50,60...}` and PASSED. This is INHERENT Iceberg
+  behavior (neither Java `IcebergGenerics` nor Rust validates stored-column == partition-stamp; a
+  "garbage in" gap), so it is NAMED RESIDUE, not a fixable assertion. The data-VALUE move is caught
+  by the anti-circular ground-truth pin (on the non-partition `data` column); the column-vs-stamp case
+  is documented in the test + matrix.
+- **A literal parquet file SWAP and an in-place same-length byte patch BOTH trip a STRUCTURAL belt
+  before any semantic pin — do NOT rely on a file-swap to exercise a row-content pin.** *Why
+  (proven):* swapping two staged files of different sizes crashes the reader on `file_size_in_bytes`
+  buffer-fill (manifest records the size); a same-length category-byte flip corrupts the gzip page
+  checksum (`corrupt gzip stream does not have a matching checksum`). Both are parse crashes (the
+  fail-closed structural belt), NOT the routing/content pin. To exercise a row-content pin with a
+  PARSE-CLEAN data move you must drive the WRITER to emit a valid-but-wrong file — a post-hoc file
+  edit cannot. The I1 critic's "swap two staged files" sabotage does NOT translate to a partitioned
+  identity table: the swap is structurally rejected, and even a clean move is projection-masked.
+- **CONFIRMED both lesson-7 bytecode claims against 1.10.0 jars:** `TableMetadata$Builder` has
+  `setLocation(String)` + `withMetadataLocation(String)` but NO `withLocation` (javap);
+  `PropertiesUpdate` (impl of `UpdateProperties`) calls `TableMetadata.replaceProperties` and contains
+  NO `addSnapshot`/`newSnapshot` — so `updateProperties().commit()` creates no snapshot. Both builder
+  lessons are correct.
+- **CRITIC PROCESS SCAR: `git checkout <file>` on an UNCOMMITTED working-tree file reverts it to
+  HEAD, DESTROYING the uncommitted work — it does not "undo my probe edit."** *Why:* I `git checkout`ed
+  `InteropOracle.java` to drop a temporary probe, but I3 was uncommitted on top of HEAD, so the
+  checkout wiped all 669 lines of the builder's WapDataOracle. Recovered by reconstructing from the
+  in-context Reads + the builder transcript (verified: 669 insertions, compiles, chain ×2 green). DO
+  revert a temporary probe with the INVERSE edit (or a `.bak` copy), NEVER `git checkout` a file that
+  carries uncommitted work.
+
+### 2026-06-12 (I-LANE AUDIT — cross-cutting sweep of the wave6 3-increment branch, Opus)
+- **DO finish the journal/map "same-change" obligations PER INCREMENT when each increment adds a
+  test/script file — the per-increment critics review their own increment in isolation and DON'T
+  catch a sibling increment's omission.** *Finding:* I1 (theta) added `interop_theta.rs` +
+  `run-interop-theta.sh` but never added their rows to `crates/iceberg/tests/map.md` OR
+  `dev/java-interop/map.md`; I3 (wap-data) added its java-interop/map.md row but missed the
+  `tests/map.md` row. Two `map.md` files each had 1 of 3 new entries missing — invisible to the
+  three per-increment critics (each saw only its own map edit). The cross-cutting auditor found it
+  by enumerating every new file × every map.md it belongs in. *Apply:* when auditing a multi-increment
+  branch, grep each new artifact name against every `map.md` that indexes its directory; a per-increment
+  green does not imply the union is complete.
+- **DO scrub the OTHER clauses of a shared status cell when an increment flips a sub-status — a
+  status flip that only APPENDS a "LANDED" note leaves a stale "NEXT-WAVE/deferred" clause that now
+  contradicts it.** *Finding:* I1 appended `I1 THETA-BLOB INTEROP LANDED` to the ComputeTableStats
+  GAP_MATRIX cell but left the cell's earlier `Java-reads-our-theta-blob interop is NEXT-WAVE` clause
+  intact — a self-contradiction inside one cell. Same shape in `task/todo.md`: the "Named next-wave
+  interop items" planning bullet still listed theta/view/WAP as open after all three landed. *Apply:*
+  the de-triplication rule ("edit the cell, link don't duplicate") extends to KILLING the now-false
+  deferral text in the same cell/bullet, not just adding the landing note. (A pre-existing
+  `Java-reads-our-stats-file interop is NEXT-WAVE` contradiction predates this branch and is left for
+  the next phase re-audit — out of this branch's scope.)
