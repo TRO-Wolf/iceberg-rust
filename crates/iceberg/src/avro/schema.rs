@@ -153,13 +153,15 @@ impl SchemaVisitor for SchemaToAvroSchema {
     ) -> Result<AvroSchemaOrField> {
         let mut key_field_schema = key_value.unwrap_left();
         let mut value_field_schema = value.unwrap_left();
-        // A variant key/value record is renamed to Java's `r<fieldId>` (1.10.0 `TypeToSchema`
-        // names every record from its field-id stack; live-Java-probed: a variant map value
-        // converts to a record named `r8` for value-id 8). Without the rename, two variant-valued
-        // maps in one schema would emit two records both named "variant" — an Avro-spec
-        // duplicate-definition that Java's `Schema.Parser` rejects with "Can't redefine: variant".
-        rename_variant_record(&mut key_field_schema, map.key_field.id);
-        rename_variant_record(&mut value_field_schema, map.value_field.id);
+        // A key/value RECORD (struct or variant) is renamed to Java's `r<fieldId>` (1.10.0
+        // `TypeToSchema.struct` names every record `"r" + fieldIds.peek()`, the enclosing field's
+        // id; live-Java-probed: a variant map value converts to a record named `r8` for value-id
+        // 8, and a struct map value to `r<value-id>`). Without the rename, two struct- or
+        // variant-valued maps in one schema would emit duplicate placeholder record names — an
+        // Avro-spec duplicate-definition that Java's `Schema.Parser` rejects ("Can't redefine: …").
+        // (A non-record map value — primitive, list, or nested map — is unaffected.)
+        rename_map_record(&mut key_field_schema, map.key_field.id);
+        rename_map_record(&mut value_field_schema, map.value_field.id);
         if !map.value_field.required {
             value_field_schema = avro_optional(value_field_schema)?;
         }
@@ -295,7 +297,7 @@ fn avro_record_schema(name: &str, fields: Vec<AvroRecordField>) -> Result<AvroSc
 ///
 /// The record name here is Java's no-enclosing-field fallback `"variant"`; the rename hooks in
 /// [`SchemaToAvroSchema::field`] / [`SchemaToAvroSchema::list`] (any record) and
-/// [`SchemaToAvroSchema::map`] (via [`rename_variant_record`]) rename it to `r{field_id}`,
+/// [`SchemaToAvroSchema::map`] (via [`rename_map_record`]) rename it to `r{field_id}`,
 /// matching Java's `r<fieldId>` naming in every placement (Java derives the name from its
 /// field-id stack; this converter renames records after the fact — same resulting name,
 /// live-Java-probed against 1.10.0 `AvroSchemaUtil.convert`).
@@ -337,22 +339,26 @@ fn avro_variant_schema() -> Result<AvroSchema> {
     Ok(avro_schema)
 }
 
-/// Renames a variant record (identified by its `"variant"` logical-type attribute) to Java's
-/// `r<fieldId>` recipe name for the enclosing map key/value field.
+/// Renames the record enclosed by a map key/value field to Java's `r<fieldId>` recipe name.
 ///
-/// [`SchemaToAvroSchema::field`] and [`SchemaToAvroSchema::list`] already rename ANY record they
-/// enclose; the map visitor historically renames nothing (a struct map value keeps the `"null"`
-/// placeholder — a pre-existing divergence from Java's `r<fieldId>`), so this hook renames only
-/// the variant record to avoid changing pre-existing struct naming while matching Java's shape
-/// (live-probed: 1.10.0 emits `r8` for a variant map value with value-id 8).
-fn rename_variant_record(schema: &mut AvroSchema, field_id: i32) {
-    if let AvroSchema::Record(record) = schema
-        && record
-            .attributes
-            .get(LOGICAL_TYPE)
-            .and_then(Value::as_str)
-            .is_some_and(|logical_type| logical_type == VARIANT_LOGICAL_TYPE)
-    {
+/// Java `TypeToSchema.struct` names every struct record `"r" + fieldIds.peek()` (1.10.0 bytecode:
+/// the `r` makeConcat recipe over the field-id deque, whose top is the enclosing field's id —
+/// the map key-id for a key struct, the value-id for a value struct), and `TypeToSchema.variant`
+/// produces a record named `"variant"` that the same field-id naming overrides. This converter
+/// builds records bottom-up with a placeholder name (`"null"` for a struct via
+/// [`SchemaToAvroSchema::r#struct`], `"variant"` for a variant) and renames them after the fact:
+/// [`SchemaToAvroSchema::field`] and [`SchemaToAvroSchema::list`] already do this for ANY record
+/// they enclose, but a map key/value is visited as a bare type (not through `field`), so the map
+/// visitor must do the rename itself.
+///
+/// Renaming ANY record (not just variant) closes a pre-existing divergence: two struct-valued
+/// maps in one schema would otherwise both emit a record named `"null"`, an Avro
+/// duplicate-definition that Java's `Schema.Parser` rejects ("Can't redefine: null") — the exact
+/// failure the variant arm already fixed (`r<fieldId>` per field id, live-probed `r8` for a
+/// variant value-id 8). The `field_id` is the enclosing map field's id (key-id or value-id), which
+/// is what Java peeks off the deque.
+fn rename_map_record(schema: &mut AvroSchema, field_id: i32) {
+    if let AvroSchema::Record(record) = schema {
         record.name = Name::from(format!("r{field_id}").as_str());
     }
 }
@@ -1338,6 +1344,142 @@ mod tests {
         // The serialized JSON re-parses (no duplicate definitions) and converts back losslessly.
         let avro_json = serde_json::to_string(&avro_schema).expect("serialize avro schema");
         let reparsed = AvroSchema::parse_str(&avro_json).expect("re-parse the avro schema JSON");
+        let round_tripped = avro_schema_to_schema(&reparsed).expect("convert back to iceberg");
+        assert_eq!(iceberg_schema, round_tripped);
+    }
+
+    // RISK (item O3(d), 1.10.0-bytecode-derived): a STRUCT map value must get Java's `r<valueId>`
+    // record name, not the `"null"` placeholder the struct visitor leaves. Java
+    // `TypeToSchema.struct` names every record `"r" + fieldIds.peek()` — for a map value the deque
+    // top is the value-id. Before this fix only VARIANT map records were renamed, so two
+    // struct-valued maps in one schema both emitted a record named `"null"` — an Avro
+    // duplicate-definition Java's `Schema.Parser` rejects ("Can't redefine: null"). This pins the
+    // distinct `r<id>` names AND the lossless round-trip. Self-mutation: restoring the
+    // variant-only rename (or the `"null"` placeholder) re-collides the two records.
+    #[test]
+    fn test_two_struct_map_values_get_unique_r_field_id_record_names() {
+        // A map<string, struct{ inner: long }> with the given key/value/inner field ids.
+        let map_of_struct = |key_id: i32, value_id: i32, inner_id: i32| {
+            Type::Map(MapType {
+                key_field: NestedField::map_key_element(
+                    key_id,
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+                value_field: NestedField::map_value_element(
+                    value_id,
+                    Type::Struct(StructType::new(vec![
+                        NestedField::required(
+                            inner_id,
+                            "inner",
+                            Type::Primitive(PrimitiveType::Long),
+                        )
+                        .into(),
+                    ])),
+                    false,
+                )
+                .into(),
+            })
+        };
+        let iceberg_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "attrs_a", map_of_struct(2, 3, 4)).into(),
+                NestedField::required(5, "attrs_b", map_of_struct(6, 7, 8)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let avro_schema = schema_to_avro_schema("avro_schema", &iceberg_schema).unwrap();
+        let AvroSchema::Record(root) = &avro_schema else {
+            panic!("root must be a record");
+        };
+        let AvroSchema::Map(map_a) = &root.fields[0].schema else {
+            panic!("attrs_a must be an avro map");
+        };
+        let AvroSchema::Map(map_b) = &root.fields[1].schema else {
+            panic!("attrs_b must be an avro map");
+        };
+        // Each struct value record is named `r<value-id>` (3 and 7), NOT the `"null"` placeholder.
+        assert_eq!(expect_record_schema(&map_a.types).name.name, "r3");
+        assert_eq!(expect_record_schema(&map_b.types).name.name, "r7");
+
+        // The serialized JSON re-parses (no `"Can't redefine: null"`) and converts back losslessly.
+        let avro_json = serde_json::to_string(&avro_schema).expect("serialize avro schema");
+        let reparsed = AvroSchema::parse_str(&avro_json)
+            .expect("re-parse the avro schema JSON (no duplicate `null` records)");
+        let round_tripped = avro_schema_to_schema(&reparsed).expect("convert back to iceberg");
+        assert_eq!(iceberg_schema, round_tripped);
+    }
+
+    // RISK (item O3(d)): the non-string-key (ARRAY-form) map path renames a struct KEY record too —
+    // Java peeks the key-id for the key struct. Two array-form maps with struct keys must produce
+    // distinct `r<key-id>` records, and the value struct keeps its own `r<value-id>`.
+    #[test]
+    fn test_array_form_map_struct_key_gets_r_key_id_record_name() {
+        // A map<struct{ k: long }, struct{ v: long }> forces the array (key-value record) form.
+        let struct_keyed_map = |key_id: i32, k_inner: i32, value_id: i32, v_inner: i32| {
+            Type::Map(MapType {
+                key_field: NestedField::map_key_element(
+                    key_id,
+                    Type::Struct(StructType::new(vec![
+                        NestedField::required(k_inner, "k", Type::Primitive(PrimitiveType::Long))
+                            .into(),
+                    ])),
+                )
+                .into(),
+                value_field: NestedField::map_value_element(
+                    value_id,
+                    Type::Struct(StructType::new(vec![
+                        NestedField::required(v_inner, "v", Type::Primitive(PrimitiveType::Long))
+                            .into(),
+                    ])),
+                    true,
+                )
+                .into(),
+            })
+        };
+        let iceberg_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "m_a", struct_keyed_map(2, 3, 4, 5)).into(),
+                NestedField::required(6, "m_b", struct_keyed_map(7, 8, 9, 10)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let avro_schema = schema_to_avro_schema("avro_schema", &iceberg_schema).unwrap();
+        let AvroSchema::Record(root) = &avro_schema else {
+            panic!("root must be a record");
+        };
+        // The array-form map is `array<record k<keyId>_v<valueId>{ key, value }>`; the key and
+        // value field schemas are the renamed struct records `r<keyId>` / `r<valueId>`. Assert the
+        // INNER record names explicitly — a round-trip alone is a weak pin here (apache-avro
+        // tolerates duplicate `"null"` records in this nesting), so without the explicit-name
+        // assertion the variant-only rename would slip through.
+        let inner_struct_names = |map_field: &AvroRecordField| -> (String, String) {
+            let AvroSchema::Array(array) = &map_field.schema else {
+                panic!("array-form map must be an avro array");
+            };
+            let AvroSchema::Record(kv) = array.items.as_ref() else {
+                panic!("array items must be a key-value record");
+            };
+            (
+                expect_record_schema(&kv.fields[0].schema).name.name.clone(),
+                expect_record_schema(&kv.fields[1].schema).name.name.clone(),
+            )
+        };
+        assert_eq!(
+            inner_struct_names(&root.fields[0]),
+            ("r2".into(), "r4".into())
+        );
+        assert_eq!(
+            inner_struct_names(&root.fields[1]),
+            ("r7".into(), "r9".into())
+        );
+
+        // And it re-parses + converts back losslessly.
+        let avro_json = serde_json::to_string(&avro_schema).expect("serialize avro schema");
+        let reparsed =
+            AvroSchema::parse_str(&avro_json).expect("re-parse the array-form map schema JSON");
         let round_tripped = avro_schema_to_schema(&reparsed).expect("convert back to iceberg");
         assert_eq!(iceberg_schema, round_tripped);
     }

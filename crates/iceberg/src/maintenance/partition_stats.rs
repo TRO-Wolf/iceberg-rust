@@ -76,7 +76,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, LargeBinaryArray,
+    RecordBatch, StringArray, StructArray, Time64MicrosecondArray,
 };
 use arrow_schema::{Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use bytes::Bytes;
@@ -89,8 +90,9 @@ use crate::arrow::{
 };
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, Manifest, ManifestEntry,
-    NestedField, NestedFieldRef, PartitionSpec, PartitionStatisticsFile, PrimitiveLiteral,
-    PrimitiveType, Schema, SchemaRef, Snapshot, Struct, StructType, TableMetadata, Type,
+    ManifestFile, ManifestStatus, NestedField, NestedFieldRef, PartitionSpec,
+    PartitionStatisticsFile, PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, Snapshot, Struct,
+    StructType, TableMetadata, Type,
 };
 use crate::table::Table;
 use crate::{Catalog, Error, ErrorKind, Result, TableCommit, TableRequirement, TableUpdate};
@@ -311,6 +313,51 @@ impl PartitionStats {
     /// creates / keeps the partition row (via `computeIfAbsent`), which is why a fully-deleted
     /// partition keeps a zero-count row (`testCopyOnWriteDelete`).
     fn deleted_entry(&mut self, snapshot_timestamp_ms: Option<i64>, snapshot_id: Option<i64>) {
+        if let (Some(timestamp_ms), Some(id)) = (snapshot_timestamp_ms, snapshot_id) {
+            self.update_snapshot_info(id, timestamp_ms);
+        }
+    }
+
+    /// SUBTRACTS a DELETED manifest entry's file from the per-content-type counters, then updates the
+    /// last-updated snapshot info — the Rust port of Java 1.10.0
+    /// `PartitionStats.deletedEntryForIncrementalCompute(ContentFile, Snapshot)`.
+    ///
+    /// This is the exact byte-for-byte mirror of [`PartitionStats::live_entry`] with each `+=` replaced
+    /// by `-=`: a DELETED entry seen during an INCREMENTAL diff removes the file's contribution from the
+    /// base stats (a row whose only files were deleted goes to zero / negative if the base did not carry
+    /// them). Java calls this ONLY in the incremental branch; the full-compute branch uses
+    /// [`PartitionStats::deleted_entry`] (last-updated only, no decrement). Counters CAN legitimately go
+    /// negative here when the diff removes a file the seeded base never added (Java has the same signed
+    /// arithmetic — `lsub`/`isub`, no clamp).
+    fn deleted_entry_for_incremental_compute(
+        &mut self,
+        content_type: DataContentType,
+        file_format: DataFileFormat,
+        record_count: i64,
+        file_size_in_bytes: i64,
+        snapshot_timestamp_ms: Option<i64>,
+        snapshot_id: Option<i64>,
+    ) {
+        match content_type {
+            DataContentType::Data => {
+                self.data_record_count -= record_count;
+                self.data_file_count -= 1;
+                self.total_data_file_size_in_bytes -= file_size_in_bytes;
+            }
+            DataContentType::PositionDeletes => {
+                self.position_delete_record_count -= record_count;
+                if file_format == DataFileFormat::Puffin {
+                    self.dv_count -= 1;
+                } else {
+                    self.position_delete_file_count -= 1;
+                }
+            }
+            DataContentType::EqualityDeletes => {
+                self.equality_delete_record_count -= record_count;
+                self.equality_delete_file_count -= 1;
+            }
+        }
+
         if let (Some(timestamp_ms), Some(id)) = (snapshot_timestamp_ms, snapshot_id) {
             self.update_snapshot_info(id, timestamp_ms);
         }
@@ -665,43 +712,224 @@ pub async fn compute_partition_stats(
     }
 
     let unified_type = unified_partition_type(metadata)?;
-    let schema = metadata.current_schema();
     let file_io = table.file_io();
 
-    // The final per-(spec_id, coerced-partition) map (Java's `statsMap`). Each manifest produces its
-    // own map, which is merged into this one via append_stats (Java `mergePartitionMap`).
-    let mut stats_by_key: HashMap<(i32, Struct), PartitionStats> = HashMap::new();
-
+    // Full compute = `computeStats(table, snapshot.allManifests(io), incremental=false)`.
     let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
-    for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file.load_manifest(file_io).await?;
-        // All files in one manifest share the manifest's partition spec id; resolve the spec's
-        // partition type ONCE per manifest (the residual/constants-map per-manifest idiom).
-        let spec_id = manifest_file.partition_spec_id;
-        let spec_type = resolve_spec_partition_type(metadata, schema, spec_id)?;
-
-        let per_manifest =
-            collect_stats_for_manifest(metadata, &manifest, spec_id, &spec_type, &unified_type);
-        merge_partition_map(per_manifest, &mut stats_by_key)?;
-    }
+    let manifest_files: Vec<_> = manifest_list.entries().to_vec();
+    let stats_by_key =
+        compute_stats_over_manifests(table, &unified_type, &manifest_files, false).await?;
 
     let mut stats: Vec<PartitionStats> = stats_by_key.into_values().collect();
     stats.sort_by(|left, right| compare_partition_values(&left.partition, &right.partition));
     Ok(stats)
 }
 
-/// Collects one manifest's per-partition statistics into a fresh map — the Rust port of Java
-/// `PartitionStatsHandler.collectStatsForManifest` (full-compute, `incremental=false`).
+/// Aggregates a LIST of manifest files into a `(spec_id, coerced-partition) -> PartitionStats` map —
+/// the Rust port of Java 1.10.0 `PartitionStatsHandler.computeStats(table, manifests, incremental)`.
 ///
-/// Iterates every entry (LIVE + DELETED), coerces the file's partition into the unified type, and
-/// keys the row by `(spec_id, coerced-partition)`. A LIVE entry rolls up the content-type counters;
-/// a DELETED tombstone updates only last-updated info — but both create/keep the partition row.
+/// Each manifest produces its own per-partition map ([`collect_stats_for_manifest`], with the same
+/// `incremental` flag), folded into the running total via [`merge_partition_map`]
+/// (Java `mergePartitionMap` → [`PartitionStats::append_stats`]). The result is UNSORTED — callers sort
+/// (full compute) or merge it into a seeded map (incremental).
+async fn compute_stats_over_manifests(
+    table: &Table,
+    unified_type: &StructType,
+    manifest_files: &[ManifestFile],
+    incremental: bool,
+) -> Result<HashMap<(i32, Struct), PartitionStats>> {
+    let metadata = table.metadata();
+    let schema = metadata.current_schema();
+    let file_io = table.file_io();
+
+    let mut stats_by_key: HashMap<(i32, Struct), PartitionStats> = HashMap::new();
+    for manifest_file in manifest_files {
+        let manifest = manifest_file.load_manifest(file_io).await?;
+        // All files in one manifest share the manifest's partition spec id; resolve the spec's
+        // partition type ONCE per manifest (the residual/constants-map per-manifest idiom).
+        let spec_id = manifest_file.partition_spec_id;
+        let spec_type = resolve_spec_partition_type(metadata, schema, spec_id)?;
+
+        let per_manifest = collect_stats_for_manifest(
+            metadata,
+            &manifest,
+            spec_id,
+            &spec_type,
+            unified_type,
+            incremental,
+        );
+        merge_partition_map(per_manifest, &mut stats_by_key)?;
+    }
+    Ok(stats_by_key)
+}
+
+/// Finds the most recent partition-stats file in `snapshot_id`'s lineage — the Rust port of Java 1.10.0
+/// `PartitionStatsHandler.latestStatsFile(table, snapshotId)`.
+///
+/// Java builds a `snapshotId -> PartitionStatisticsFile` map from `table.partitionStatisticsFiles()`,
+/// then walks `SnapshotUtil.ancestorsOf(snapshotId, table::snapshot)` (the snapshot's lineage, back
+/// through `parentId`, INCLUDING the start snapshot) and returns the FIRST ancestor that has a stats
+/// file — i.e. the newest stats file on this snapshot's branch. Returns `None` when none of the lineage
+/// snapshots carries one (the full-compute trigger).
+fn latest_stats_file(
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+) -> Option<&PartitionStatisticsFile> {
+    let stats_by_snapshot: HashMap<i64, &PartitionStatisticsFile> = metadata
+        .partition_statistics_iter()
+        .map(|file| (file.snapshot_id, file))
+        .collect();
+    if stats_by_snapshot.is_empty() {
+        return None;
+    }
+
+    // Walk the lineage from `snapshot_id` back through parent ids (inclusive of the start), returning
+    // the first ancestor that has a stats file. The walk is bounded by the snapshot history length.
+    let mut current = metadata.snapshot_by_id(snapshot_id);
+    while let Some(snapshot) = current {
+        if let Some(file) = stats_by_snapshot.get(&snapshot.snapshot_id()) {
+            return Some(file);
+        }
+        current = match snapshot.parent_snapshot_id() {
+            Some(parent_id) => metadata.snapshot_by_id(parent_id),
+            None => None,
+        };
+    }
+    None
+}
+
+/// Collects the manifest files that make up the incremental diff between `from_snapshot` (EXCLUSIVE)
+/// and `to_snapshot` (INCLUSIVE), aggregating them in `incremental=true` mode — the Rust port of Java
+/// `PartitionStatsHandler.computeStatsDiff(table, fromSnapshot, toSnapshot)`.
+///
+/// Java walks `SnapshotUtil.ancestorsBetween(toSnapshot.snapshotId(), fromSnapshot.snapshotId(), ...)`
+/// — the lineage range `(from, to]` (from excluded, to included) — and for each snapshot in that range
+/// takes ONLY the manifests it newly added (`manifest.snapshotId().equals(snapshot.snapshotId())`,
+/// i.e. `added_snapshot_id == snapshot.snapshot_id()`), then `computeStats(table, manifests, true)`.
+///
+/// # Errors
+///
+/// Propagates manifest-list / manifest read errors.
+async fn compute_stats_diff(
+    table: &Table,
+    unified_type: &StructType,
+    from_snapshot: &Snapshot,
+    to_snapshot: &Snapshot,
+) -> Result<HashMap<(i32, Struct), PartitionStats>> {
+    let metadata = table.metadata();
+    let file_io = table.file_io();
+    let from_snapshot_id = from_snapshot.snapshot_id();
+
+    // The snapshots in the lineage range (from, to]: walk back from `to` through parent ids, stopping
+    // BEFORE `from` (Java `ancestorsBetween`'s truncation lambda returns null on reaching `from`).
+    let mut range_snapshots: Vec<&Snapshot> = Vec::new();
+    let mut current = Some(to_snapshot);
+    while let Some(snapshot) = current {
+        if snapshot.snapshot_id() == from_snapshot_id {
+            break;
+        }
+        range_snapshots.push(snapshot);
+        current = match snapshot.parent_snapshot_id() {
+            Some(parent_id) => metadata.snapshot_by_id(parent_id).map(|s| s.as_ref()),
+            None => None,
+        };
+    }
+
+    // For each snapshot in the range, take only the manifests IT added (added_snapshot_id == its id).
+    let mut diff_manifests: Vec<ManifestFile> = Vec::new();
+    for snapshot in range_snapshots {
+        let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.added_snapshot_id == snapshot.snapshot_id() {
+                diff_manifests.push(manifest_file.clone());
+            }
+        }
+    }
+
+    compute_stats_over_manifests(table, unified_type, &diff_manifests, true).await
+}
+
+/// Computes incremental partition stats by seeding from a base stats file and merging the diff — the
+/// Rust port of Java 1.10.0 `PartitionStatsHandler.computeAndMergeStatsIncremental`.
+///
+/// Reads `base_stats_file`'s rows into the seed map, then merges the `(base.snapshot, target]` diff
+/// (`compute_stats_diff`) into them via [`PartitionStats::append_stats`] (counts ADD, last-updated MAX).
+/// The base read is the corruption-sensitive step: Java wraps it in `catch(Exception) -> throw
+/// InvalidStatsFileException`, and the caller falls back to a full compute. Here any base-read failure
+/// is returned as `Ok(None)` (the "corrupt base → full compute" signal); a `Some(rows)` is the merged
+/// incremental result. A diff-read failure (after the seed) propagates as a hard `Err`, matching Java
+/// (its catch covers only the base read, not the diff).
+async fn compute_and_merge_stats_incremental(
+    table: &Table,
+    unified_type: &StructType,
+    target_snapshot: &Snapshot,
+    base_stats_file: &PartitionStatisticsFile,
+) -> Result<Option<Vec<PartitionStats>>> {
+    let metadata = table.metadata();
+    let format_version = metadata.format_version();
+    let base_schema = partition_stats_schema(unified_type, format_version)?;
+
+    // Seed from the base stats file. ANY failure here (missing/corrupt/foreign file) is Java's
+    // InvalidStatsFileException → signal a full-compute fallback by returning Ok(None).
+    let seed_rows = match read_partition_stats_file(
+        table,
+        &base_schema,
+        &base_stats_file.statistics_path,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_corrupt_base) => return Ok(None),
+    };
+
+    let mut stats_by_key: HashMap<(i32, Struct), PartitionStats> = seed_rows
+        .into_iter()
+        .map(|row| ((row.spec_id, row.partition.clone()), row))
+        .collect();
+
+    // The base file's snapshot is the (exclusive) start of the diff range; the target is inclusive.
+    let base_snapshot = metadata
+        .snapshot_by_id(base_stats_file.snapshot_id)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Base partition-stats file references snapshot {} which is absent from metadata",
+                    base_stats_file.snapshot_id
+                ),
+            )
+        })?;
+
+    let diff =
+        compute_stats_diff(table, unified_type, base_snapshot.as_ref(), target_snapshot).await?;
+    merge_partition_map(diff, &mut stats_by_key)?;
+
+    Ok(Some(stats_by_key.into_values().collect()))
+}
+
+/// Collects one manifest's per-partition statistics into a fresh map — the Rust port of Java
+/// `PartitionStatsHandler.collectStatsForManifest(table, manifest, partitionType, incremental)`.
+///
+/// Iterates every entry, coerces the file's partition into the unified type, and keys the row by
+/// `(spec_id, coerced-partition)`. The per-entry dispatch is the bytecode-exact `incremental` branch:
+///
+/// - **LIVE entry, `incremental == false`** (full compute): `live_entry` (rolls up the counters).
+/// - **LIVE entry, `incremental == true`** (diff): `live_entry` ONLY if the entry's status is `Added`
+///   (newly added by this snapshot); an `Existing` carried-forward entry is SKIPPED (it was already
+///   counted in the base stats the diff is merged into — counting it again would double it).
+/// - **DELETED tombstone, `incremental == false`**: `deleted_entry` (last-updated only, no counter).
+/// - **DELETED tombstone, `incremental == true`**: `deleted_entry_for_incremental_compute`
+///   (SUBTRACTS the removed file's contribution from the base stats).
+///
+/// In all branches the partition row is created/kept (Java `computeIfAbsent`), so a fully-deleted
+/// partition retains its row.
 fn collect_stats_for_manifest(
     metadata: &TableMetadata,
     manifest: &Manifest,
     spec_id: i32,
     spec_type: &StructType,
     unified_type: &StructType,
+    incremental: bool,
 ) -> HashMap<(i32, Struct), PartitionStats> {
     let mut stats_map: HashMap<(i32, Struct), PartitionStats> = HashMap::new();
 
@@ -718,7 +946,19 @@ fn collect_stats_for_manifest(
             .or_insert_with(|| PartitionStats::new(coerced, spec_id));
 
         if entry.is_alive() {
-            accumulate_live_entry(row, data_file, snapshot_timestamp_ms, snapshot_id);
+            // In the incremental diff only NEWLY-ADDED live files contribute; a carried-forward
+            // (Existing) entry is already in the base stats (Java: `incremental && status != ADDED`
+            // skips it, after `computeIfAbsent` has already kept the row).
+            if !incremental || entry.status() == ManifestStatus::Added {
+                accumulate_live_entry(row, data_file, snapshot_timestamp_ms, snapshot_id);
+            }
+        } else if incremental {
+            accumulate_deleted_entry_incremental(
+                row,
+                data_file,
+                snapshot_timestamp_ms,
+                snapshot_id,
+            );
         } else {
             row.deleted_entry(snapshot_timestamp_ms, snapshot_id);
         }
@@ -801,6 +1041,27 @@ fn accumulate_live_entry(
     );
 }
 
+/// Subtracts a DELETED entry's file from the row during an INCREMENTAL diff (the byte-exact mirror of
+/// [`accumulate_live_entry`], same width narrowing) — Java
+/// `PartitionStats.deletedEntryForIncrementalCompute`.
+fn accumulate_deleted_entry_incremental(
+    row: &mut PartitionStats,
+    data_file: &DataFile,
+    snapshot_timestamp_ms: Option<i64>,
+    snapshot_id: Option<i64>,
+) {
+    let record_count = i64::try_from(data_file.record_count()).unwrap_or(i64::MAX);
+    let file_size = i64::try_from(data_file.file_size_in_bytes()).unwrap_or(i64::MAX);
+    row.deleted_entry_for_incremental_compute(
+        data_file.content_type(),
+        data_file.file_format(),
+        record_count,
+        file_size,
+        snapshot_timestamp_ms,
+        snapshot_id,
+    );
+}
+
 /// Compares two unified-partition tuples field-by-field for the deterministic output sort — the local
 /// analogue of Java `Comparators.forType(partitionType)`. Mirrors `inspect::partitions`'s comparator
 /// (which is in a READ-ONLY module): null sorts before any value, primitive values compare via
@@ -863,32 +1124,67 @@ const WRITE_FORMAT_DEFAULT_PROPERTY: &str = "write.format.default";
 const WRITE_METADATA_PATH_PROPERTY: &str = "write.metadata.path";
 
 /// Computes per-partition statistics for `snapshot` and writes them to a single on-disk stats file —
-/// the Rust port of Java 1.10.0 `PartitionStatsHandler.computeAndWriteStatsFile(table, snapshotId)`'s
-/// full-compute branch.
+/// the Rust port of Java 1.10.0 `PartitionStatsHandler.computeAndWriteStatsFile(table, snapshotId)`,
+/// INCLUDING the incremental-vs-full-compute selection.
 ///
-/// The pipeline mirrors Java exactly: [`compute_partition_stats`] (already sorted by partition tuple,
-/// Java `sortStatsByPartition`) → if the result is empty, return `Ok(None)` (Java returns `null`, no
-/// file) → build the v2-or-v3 [`partition_stats_schema`] for the table's format version → write ONE
-/// file at Java's location/naming in the table's `write.format.default` format (default parquet), with
-/// the field ids 1..=13 stamped on the columns → return a [`PartitionStatisticsFile`] carrying the
-/// real on-disk size.
+/// The pipeline mirrors Java's `computeAndWriteStatsFile(table, snapshotId)`:
 ///
-/// The returned [`PartitionStatisticsFile`] is NOT yet registered in the table metadata; pass it to
-/// [`register_partition_stats_file`] to commit it (Java's
-/// `updatePartitionStatistics().setPartitionStatistics(file).commit()`).
+/// 1. Locate the most recent stats file in `snapshot`'s lineage ([`latest_stats_file`]).
+/// 2. **No base file** → FULL compute ([`compute_partition_stats`] over `snapshot.allManifests`).
+/// 3. **Base file IS for `snapshot`** → RETURN it unchanged (already up to date; no recompute, no
+///    rewrite — Java returns the existing `PartitionStatisticsFile`).
+/// 4. **Base file is for an older snapshot** → INCREMENTAL compute
+///    ([`compute_and_merge_stats_incremental`]): seed from the base, merge the `(base, snapshot]` diff.
+///    If the base file is corrupt/unreadable (Java `InvalidStatsFileException`), FALL BACK to a full
+///    compute.
+///
+/// Then (cases 2/4): sort by partition tuple (Java `sortStatsByPartition`) → if empty, return `Ok(None)`
+/// (Java `null`, no file) → write ONE file at Java's location/naming in the `write.format.default`
+/// format (default parquet) with the field ids 1..=13 stamped → return the [`PartitionStatisticsFile`].
+///
+/// The returned file is NOT yet registered in the table metadata; pass it to
+/// [`register_partition_stats_file`] to commit it.
 ///
 /// # Errors
 ///
-/// - `DataInvalid` "Table must be partitioned" (via [`compute_partition_stats`]) for an unpartitioned
-///   table.
-/// - `FeatureUnsupported` if the table's `write.format.default` is not `parquet` (the only stats-file
-///   writer this fork ships; Java additionally supports Avro/ORC).
-/// - Propagates manifest-read / IO / parquet-encode errors.
+/// - `DataInvalid` "Table must be partitioned" for an unpartitioned table.
+/// - `FeatureUnsupported` if `write.format.default` is not `parquet`.
+/// - Propagates manifest-read / IO / parquet-encode errors (a DIFF read failure during an incremental
+///   compute is a hard error, matching Java; only a BASE-file read failure triggers the full-compute
+///   fallback).
 pub async fn compute_and_write_stats_file(
     table: &Table,
     snapshot: &Snapshot,
 ) -> Result<Option<PartitionStatisticsFile>> {
-    let stats = compute_partition_stats(table, snapshot).await?;
+    let metadata = table.metadata();
+    let snapshot_id = snapshot.snapshot_id();
+
+    // Java preconditions surface as the unpartitioned error inside the compute paths; the format check
+    // below also mirrors `Partitioning.isPartitioned` via `unified_partition_type`.
+    let unified_type = unified_partition_type(metadata)?;
+
+    // Branch on the base stats file in this snapshot's lineage (Java `latestStatsFile`).
+    let stats = match latest_stats_file(metadata, snapshot_id) {
+        // Case 3: an up-to-date stats file already exists for THIS snapshot — return it unchanged.
+        Some(base) if base.snapshot_id == snapshot_id => {
+            return Ok(Some(base.clone()));
+        }
+        // Case 4: an older base file exists — incremental compute, falling back to full on a corrupt base.
+        Some(base) => {
+            match compute_and_merge_stats_incremental(table, &unified_type, snapshot, base).await? {
+                Some(mut rows) => {
+                    rows.sort_by(|left, right| {
+                        compare_partition_values(&left.partition, &right.partition)
+                    });
+                    rows
+                }
+                // Corrupt/unreadable base file (Java `InvalidStatsFileException`) → full compute.
+                None => compute_partition_stats(table, snapshot).await?,
+            }
+        }
+        // Case 2: no base file in the lineage — full compute.
+        None => compute_partition_stats(table, snapshot).await?,
+    };
 
     // Java: if the computed collection is empty after sorting, return null (write no file). An empty
     // file with a degenerate schema would mislead a later incremental compute.
@@ -896,13 +1192,10 @@ pub async fn compute_and_write_stats_file(
         return Ok(None);
     }
 
-    let metadata = table.metadata();
     let format_version = metadata.format_version();
-    let unified_type = unified_partition_type(metadata)?;
     let stats_schema = partition_stats_schema(&unified_type, format_version)?;
 
     let file_format = stats_file_format(metadata)?;
-    let snapshot_id = snapshot.snapshot_id();
     let path = new_partition_stats_file_path(metadata, snapshot_id, file_format);
 
     let batch = partition_stats_to_record_batch(&stats, &stats_schema, &unified_type)?;
@@ -947,6 +1240,9 @@ pub async fn register_partition_stats_file(
             partition_statistics: partition_statistics_file,
         }])
         .requirements(vec![TableRequirement::UuidMatch { uuid }])
+        // Base location for the in-process catalog's location-CAS — `UuidMatch` alone cannot detect
+        // a stale concurrent commit because the table UUID is invariant.
+        .base_metadata_location(table.metadata_location().map(str::to_string))
         .build();
 
     catalog.update_table(table_commit).await
@@ -1426,13 +1722,14 @@ fn build_partition_field_column(
     }
 
     // Boolean / Int / Long / String build directly with the plain Arrow array constructors (one alloc).
-    // Everything else (Date32, Timestamp micro/nano ±tz, Decimal128, Float, Double) uses logical Arrow
-    // types whose array constructors carry extra metadata (timezone, precision/scale) — those are built
+    // Time / Uuid / Fixed / Binary build directly too, into the Arrow types `schema_to_arrow_schema`
+    // emits for them — Time64(Microsecond) from a `Long` (micros since midnight), FixedSizeBinary(16)
+    // from a `UInt128` written as 16 big-endian bytes (Java `Uuid::from_u128(v).into_bytes()`, the
+    // read-back `Uuid::from_bytes` round-trips it), FixedSizeBinary(len) / LargeBinary from a `Binary`.
+    // The temporal/decimal/float/double types (Date32, Timestamp micro/nano ±tz, Decimal128, Float,
+    // Double) use logical Arrow constructors carrying extra metadata (timezone, precision/scale) — built
     // through `create_primitive_array_single_element` (the existing, tested arrow helper) driven by the
-    // field's EXACT `arrow_data_type`, so the resulting array type matches the on-disk schema field
-    // (timezone/precision included). Time / Uuid / Fixed / Binary (Time64 / FixedSizeBinary /
-    // LargeBinary) have no `create_primitive_array_single_element` arm and still error loudly (the
-    // narrowed residue, named in the GAP_MATRIX) rather than silently producing a mismatched column.
+    // field's EXACT `arrow_data_type`, so the array type matches the on-disk schema field exactly.
     let array: ArrayRef = match primitive_type {
         PrimitiveType::Boolean => {
             let values = collect_primitive!(PrimitiveLiteral::Boolean);
@@ -1450,6 +1747,33 @@ fn build_partition_field_column(
             let values = collect_primitive!(PrimitiveLiteral::String);
             Arc::new(StringArray::from(values))
         }
+        PrimitiveType::Time => {
+            // Iceberg time = microseconds since midnight, stored as a `Long` literal; the on-disk Arrow
+            // type is Time64(Microsecond) (Java parquet `time-micros`). The read-back path decodes a
+            // Time64MicrosecondArray back to `Literal::time(micros)`, so the round-trip is exact.
+            let values = collect_primitive!(PrimitiveLiteral::Long);
+            Arc::new(Time64MicrosecondArray::from(values))
+        }
+        PrimitiveType::Uuid => build_uuid_partition_field_column(stats, field_index)?,
+        PrimitiveType::Fixed(length) => {
+            build_fixed_partition_field_column(stats, field_index, *length, primitive_type)?
+        }
+        PrimitiveType::Binary => {
+            let values: Vec<Option<Vec<u8>>> = stats
+                .iter()
+                .map(|row| match value_at(row, field_index) {
+                    None => Ok(None),
+                    Some(Literal::Primitive(PrimitiveLiteral::Binary(value))) => {
+                        Ok(Some(value.clone()))
+                    }
+                    Some(other) => Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Partition value {other:?} does not match field type Binary"),
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(LargeBinaryArray::from_iter(values))
+        }
         PrimitiveType::Date
         | PrimitiveType::Timestamp
         | PrimitiveType::Timestamptz
@@ -1463,14 +1787,6 @@ fn build_partition_field_column(
             primitive_type,
             arrow_data_type,
         )?,
-        other => {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "Partition value type {other:?} is not yet supported in a partition-stats file (supported: boolean/int/long/string/date/timestamp(tz)/decimal/float/double; unsupported: time/uuid/fixed/binary)"
-                ),
-            ));
-        }
     };
 
     Ok(array)
@@ -1523,6 +1839,97 @@ fn build_logical_partition_field_column(
         )
         .with_source(error)
     })
+}
+
+/// Builds a `uuid` partition-field child array as a `FixedSizeBinary(16)` of 16 big-endian bytes per
+/// row — the exact on-disk form Java emits (`Conversions.toByteBuffer(UUID, value)` writes the UUID's
+/// most/least-significant longs big-endian; the read-back [`arrow_struct_to_literal`] decodes a 16-byte
+/// FixedSizeBinary back to `Literal::uuid` via `Uuid::from_bytes`). A coerced-null row is a null entry.
+fn build_uuid_partition_field_column(
+    stats: &[PartitionStats],
+    field_index: usize,
+) -> Result<ArrayRef> {
+    let rows: Vec<Option<[u8; 16]>> = stats
+        .iter()
+        .map(|row| {
+            match row
+                .partition
+                .fields()
+                .get(field_index)
+                .and_then(|value| value.as_ref())
+            {
+                None => Ok(None),
+                Some(Literal::Primitive(PrimitiveLiteral::UInt128(value))) => {
+                    Ok(Some(Uuid::from_u128(*value).into_bytes()))
+                }
+                Some(other) => Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Partition value {other:?} does not match field type Uuid"),
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let array = FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows.into_iter(), 16)
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Failed to assemble the uuid partition-field FixedSizeBinary(16) array",
+            )
+            .with_source(error)
+        })?;
+    Ok(Arc::new(array))
+}
+
+/// Builds a `fixed[L]` partition-field child array as a `FixedSizeBinary(L)` per row — the exact on-disk
+/// form Java emits (the raw `L` bytes; the read-back [`arrow_struct_to_literal`] decodes a length-`L`
+/// FixedSizeBinary back to `Literal::fixed`). Each non-null value's length MUST equal `length` (the
+/// FixedSizeBinary constructor rejects a wrong width loudly). A coerced-null row is a null entry.
+fn build_fixed_partition_field_column(
+    stats: &[PartitionStats],
+    field_index: usize,
+    length: u64,
+    primitive_type: &PrimitiveType,
+) -> Result<ArrayRef> {
+    let width = i32::try_from(length).map_err(|_| {
+        Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Fixed partition value width {length} exceeds the Arrow FixedSizeBinary limit"),
+        )
+    })?;
+
+    let rows: Vec<Option<Vec<u8>>> = stats
+        .iter()
+        .map(|row| {
+            match row
+                .partition
+                .fields()
+                .get(field_index)
+                .and_then(|value| value.as_ref())
+            {
+                None => Ok(None),
+                Some(Literal::Primitive(PrimitiveLiteral::Binary(value))) => {
+                    Ok(Some(value.clone()))
+                }
+                Some(other) => Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Partition value {other:?} does not match field type {primitive_type:?}"
+                    ),
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let array = FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows.into_iter(), width)
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Failed to assemble the fixed[{length}] partition-field array (a value's byte length must equal {length})"),
+            )
+            .with_source(error)
+        })?;
+    Ok(Arc::new(array))
 }
 
 #[cfg(test)]
@@ -1774,6 +2181,109 @@ mod tests {
         assert_eq!(eq_row.equality_delete_file_count(), 1);
         assert_eq!(eq_row.position_delete_record_count(), 0);
         assert_eq!(eq_row.dv_count(), 0);
+    }
+
+    /// RISK (a — incremental subtract arithmetic): `deleted_entry_for_incremental_compute` must SUBTRACT
+    /// exactly the same per-content-type cells `live_entry` ADDS (Java `deletedEntryForIncrementalCompute`
+    /// is the `lsub`/`isub` mirror of `liveEntry`). A row seeded with a file's contribution, then
+    /// subtracted, must return to zero — for EVERY content type and the DV vs parquet-pos split. A
+    /// mutation that subtracts the wrong cell (or fails to subtract one) leaves a non-zero residue here.
+    #[test]
+    fn test_deleted_entry_for_incremental_compute_subtracts_each_cell_back_to_zero() {
+        // DATA: add then subtract → all data cells back to 0.
+        let mut data_row = PartitionStats::new(x_struct(1), 0);
+        data_row.live_entry(
+            DataContentType::Data,
+            DataFileFormat::Parquet,
+            5,
+            100,
+            None,
+            None,
+        );
+        data_row.deleted_entry_for_incremental_compute(
+            DataContentType::Data,
+            DataFileFormat::Parquet,
+            5,
+            100,
+            None,
+            None,
+        );
+        assert_eq!(data_row.data_record_count(), 0, "data records subtracted");
+        assert_eq!(data_row.data_file_count(), 0, "data file count subtracted");
+        assert_eq!(
+            data_row.total_data_file_size_in_bytes(),
+            0,
+            "data size subtracted"
+        );
+
+        // POSITION_DELETES parquet: subtract bumps DOWN position_delete_file_count, not dv_count.
+        let mut pos_row = PartitionStats::new(x_struct(1), 0);
+        pos_row.live_entry(
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet,
+            3,
+            7,
+            None,
+            None,
+        );
+        pos_row.deleted_entry_for_incremental_compute(
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet,
+            3,
+            7,
+            None,
+            None,
+        );
+        assert_eq!(pos_row.position_delete_record_count(), 0);
+        assert_eq!(pos_row.position_delete_file_count(), 0);
+        assert_eq!(
+            pos_row.dv_count(),
+            0,
+            "a parquet pos delete never touches dv_count"
+        );
+
+        // POSITION_DELETES PUFFIN: subtract bumps DOWN dv_count, not position_delete_file_count.
+        let mut dv_row = PartitionStats::new(x_struct(1), 0);
+        dv_row.live_entry(
+            DataContentType::PositionDeletes,
+            DataFileFormat::Puffin,
+            4,
+            9,
+            None,
+            None,
+        );
+        dv_row.deleted_entry_for_incremental_compute(
+            DataContentType::PositionDeletes,
+            DataFileFormat::Puffin,
+            4,
+            9,
+            None,
+            None,
+        );
+        assert_eq!(dv_row.position_delete_record_count(), 0);
+        assert_eq!(dv_row.dv_count(), 0, "the DV is subtracted from dv_count");
+        assert_eq!(dv_row.position_delete_file_count(), 0);
+
+        // EQUALITY_DELETES: subtract bumps DOWN the equality cells.
+        let mut eq_row = PartitionStats::new(x_struct(1), 0);
+        eq_row.live_entry(
+            DataContentType::EqualityDeletes,
+            DataFileFormat::Parquet,
+            6,
+            11,
+            None,
+            None,
+        );
+        eq_row.deleted_entry_for_incremental_compute(
+            DataContentType::EqualityDeletes,
+            DataFileFormat::Parquet,
+            6,
+            11,
+            None,
+            None,
+        );
+        assert_eq!(eq_row.equality_delete_record_count(), 0);
+        assert_eq!(eq_row.equality_delete_file_count(), 0);
     }
 
     /// RISK: last-updated semantics — the MAX timestamp must win (strict `<`), and a TIE must keep the
@@ -3438,9 +3948,11 @@ mod tests {
         assert!(!top_ids.contains(&13), "v2 must NOT have dv_count(13)");
     }
 
-    /// RISK: REPLACE-on-rewrite — a SECOND write+register for the SAME snapshot must REPLACE the entry
-    /// (Java `statsToSet` is a map keyed by snapshot id), not accumulate two. Plus MULTI-SNAPSHOT
-    /// coexistence: stats for two different snapshots are both registered (a wrong key would clobber).
+    /// RISK: REPLACE-on-rewrite — registering a SECOND stats file for the SAME snapshot must REPLACE the
+    /// entry (Java `statsToSet` is a map keyed by snapshot id), not accumulate two. Plus the Java
+    /// `computeAndWriteStatsFile(table, snapshotId)` short-circuit: once a stats file IS registered for a
+    /// snapshot, re-computing for that snapshot RETURNS the existing file unchanged (no rewrite — Java's
+    /// "Returning existing statistics file" branch). Plus MULTI-SNAPSHOT coexistence (a wrong key clobbers).
     #[tokio::test]
     async fn test_replace_on_rewrite_same_snapshot_and_multi_snapshot_coexistence() {
         let (catalog, file_io, _temp) = e2e_catalog().await;
@@ -3469,16 +3981,25 @@ mod tests {
             .await
             .unwrap();
 
-        // A SECOND write for the SAME snapshot (different UUID path) must REPLACE on register.
-        let file_s1_second = compute_and_write_stats_file(&table, &s1)
+        // Java case 3: a SECOND compute for the SAME snapshot now finds the registered stats file in the
+        // snapshot's lineage and RETURNS it unchanged (no fresh path, no rewrite).
+        let file_s1_again = compute_and_write_stats_file(&table, &s1)
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(
-            file_s1_first.statistics_path, file_s1_second.statistics_path,
-            "each write gets a fresh uuid path"
+        assert_eq!(
+            file_s1_again, file_s1_first,
+            "re-computing for an already-stats'd snapshot returns the existing file unchanged (Java case 3)"
         );
-        let table = register_partition_stats_file(&catalog, &table, file_s1_second.clone())
+
+        // REPLACE semantics: re-registering a DIFFERENT-sized file for the same snapshot id replaces the
+        // entry (Java `statsToSet` keyed by snapshot id), not accumulates. (Re-uses the same real path so
+        // the file stays readable for the S2 incremental base read below; only the size differs.)
+        let file_s1_replacement = PartitionStatisticsFile {
+            file_size_in_bytes: file_s1_first.file_size_in_bytes + 7,
+            ..file_s1_first.clone()
+        };
+        let table = register_partition_stats_file(&catalog, &table, file_s1_replacement.clone())
             .await
             .unwrap();
         let after_replace: Vec<_> = table.metadata().partition_statistics_iter().collect();
@@ -3492,9 +4013,14 @@ mod tests {
                 .metadata()
                 .partition_statistics_for_snapshot(s1.snapshot_id())
                 .unwrap(),
-            &file_s1_second,
-            "the second write wins"
+            &file_s1_replacement,
+            "the second registration wins"
         );
+
+        // Restore the real (correctly-sized) S1 file so the S2 incremental base read is exact.
+        let table = register_partition_stats_file(&catalog, &table, file_s1_first.clone())
+            .await
+            .unwrap();
 
         // S2: a new snapshot → its stats coexist with S1's.
         let table = append(&catalog, &table, vec![
@@ -3525,7 +4051,8 @@ mod tests {
                 .metadata()
                 .partition_statistics_for_snapshot(s1.snapshot_id())
                 .unwrap(),
-            &file_s1_second
+            &file_s1_first,
+            "S1's (restored real) entry is still present after S2 registers"
         );
         assert_eq!(
             table
@@ -3915,31 +4442,153 @@ mod tests {
         );
     }
 
-    /// RISK: the NARROWED residue must still error LOUDLY (never a corrupt file). A `binary`-partitioned
-    /// table (Arrow `LargeBinary`, no `create_primitive_array_single_element` arm) must fail with a
-    /// FeatureUnsupported error naming the unsupported type, not silently write a mismatched column.
-    #[test]
-    fn test_unsupported_partition_value_type_errors_loudly() {
-        // Binary is in the residue (LargeBinary has no single-element builder arm).
+    /// Builds a single-row `PartitionStats` carrying `partition_value` as its sole partition field, then
+    /// round-trips it through the PRODUCTION write path (`partition_stats_to_record_batch` → parquet) and
+    /// the PRODUCTION read path (`read_partition_stats_from_bytes`). Returns the decoded row plus the
+    /// Arrow child type of the partition struct's only field (so a test can pin the on-disk Arrow type).
+    fn round_trip_single_partition_value(
+        partition_type: PrimitiveType,
+        partition_value: Literal,
+    ) -> (PartitionStats, arrow_schema::DataType) {
         let unified = StructType::new(vec![Arc::new(NestedField::optional(
             1000,
-            "b",
-            Type::Primitive(PrimitiveType::Binary),
+            "p",
+            Type::Primitive(partition_type),
+        ))]);
+        let stats_schema = partition_stats_schema(&unified, FormatVersion::V2).unwrap();
+
+        let mut row = PartitionStats::new(Struct::from_iter([Some(partition_value)]), 0);
+        row.data_record_count = 7;
+        row.data_file_count = 1;
+        row.total_data_file_size_in_bytes = 123;
+
+        let batch =
+            partition_stats_to_record_batch(std::slice::from_ref(&row), &stats_schema, &unified)
+                .expect("the exotic partition value must write, not error");
+
+        // The Arrow child type of the partition struct's only field.
+        let child_type = match batch.schema().field(0).data_type() {
+            arrow_schema::DataType::Struct(fields) => fields[0].data_type().clone(),
+            other => panic!("partition column must be a struct, got {other:?}"),
+        };
+
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&stats_schema).unwrap());
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let decoded = read_partition_stats_from_bytes(&stats_schema, Bytes::from(buffer)).unwrap();
+        assert_eq!(decoded.len(), 1, "exactly one row round-trips");
+        (decoded.into_iter().next().unwrap(), child_type)
+    }
+
+    /// RISK (b — time): a `time`-partitioned stats file must write a `Time64(Microsecond)` child column
+    /// and round-trip the micros-since-midnight value EXACTLY (Java parquet `time-micros`). A drift in
+    /// the Arrow type or the micros value (e.g. building an Int64 column) is caught here.
+    #[test]
+    fn test_time_partition_value_round_trips_as_time64_micros() {
+        let micros = 13 * 3_600_000_000 + 45 * 60_000_000 + 30_000_001; // 13:45:30.000001
+        let (decoded, child_type) =
+            round_trip_single_partition_value(PrimitiveType::Time, Literal::time(micros));
+        assert_eq!(
+            child_type,
+            arrow_schema::DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            "time partition column must be a logical Time64(Microsecond) on disk"
+        );
+        assert_eq!(
+            decoded.partition().fields().first(),
+            Some(&Some(Literal::Primitive(PrimitiveLiteral::Long(micros)))),
+            "the time value (micros since midnight) must round-trip exactly"
+        );
+    }
+
+    /// RISK (b — uuid): a `uuid`-partitioned stats file must write a `FixedSizeBinary(16)` of 16
+    /// BIG-ENDIAN bytes and round-trip the UUID exactly (Java `Conversions.toByteBuffer(UUID)`). A
+    /// little-endian or wrong-width write fails the value or the type pin.
+    #[test]
+    fn test_uuid_partition_value_round_trips_as_fixed_size_binary_16_big_endian() {
+        let uuid = uuid::Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8").unwrap();
+        let (decoded, child_type) =
+            round_trip_single_partition_value(PrimitiveType::Uuid, Literal::uuid(uuid));
+        assert_eq!(
+            child_type,
+            arrow_schema::DataType::FixedSizeBinary(16),
+            "uuid partition column must be a FixedSizeBinary(16) on disk"
+        );
+        // The decoded value is a UInt128 of the SAME uuid (round-trip is identity).
+        assert_eq!(
+            decoded.partition().fields().first(),
+            Some(&Some(Literal::Primitive(PrimitiveLiteral::UInt128(
+                uuid.as_u128()
+            )))),
+            "the uuid value must round-trip exactly (16 BE bytes, Java byte form)"
+        );
+    }
+
+    /// RISK (b — fixed): a `fixed[L]`-partitioned stats file must write a `FixedSizeBinary(L)` carrying
+    /// the raw bytes and round-trip them exactly. A length mismatch (writing a wrong-width column) is
+    /// rejected by the FixedSizeBinary constructor; a correct write round-trips the bytes.
+    #[test]
+    fn test_fixed_partition_value_round_trips_as_fixed_size_binary_len() {
+        let bytes = vec![0xde, 0xad, 0xbe, 0xef];
+        let (decoded, child_type) = round_trip_single_partition_value(
+            PrimitiveType::Fixed(4),
+            Literal::fixed(bytes.clone()),
+        );
+        assert_eq!(
+            child_type,
+            arrow_schema::DataType::FixedSizeBinary(4),
+            "fixed[4] partition column must be a FixedSizeBinary(4) on disk"
+        );
+        assert_eq!(
+            decoded.partition().fields().first(),
+            Some(&Some(Literal::Primitive(PrimitiveLiteral::Binary(bytes)))),
+            "the fixed bytes must round-trip exactly"
+        );
+    }
+
+    /// RISK (b — binary): a `binary`-partitioned stats file must write a `LargeBinary` carrying the raw
+    /// bytes and round-trip them exactly. Previously this raised a loud FeatureUnsupported error; now it
+    /// must WRITE and read back the exact bytes.
+    #[test]
+    fn test_binary_partition_value_round_trips_as_large_binary() {
+        let bytes = vec![1u8, 2, 3, 255, 0, 128];
+        let (decoded, child_type) = round_trip_single_partition_value(
+            PrimitiveType::Binary,
+            Literal::binary(bytes.clone()),
+        );
+        assert_eq!(
+            child_type,
+            arrow_schema::DataType::LargeBinary,
+            "binary partition column must be a LargeBinary on disk"
+        );
+        assert_eq!(
+            decoded.partition().fields().first(),
+            Some(&Some(Literal::Primitive(PrimitiveLiteral::Binary(bytes)))),
+            "the binary bytes must round-trip exactly"
+        );
+    }
+
+    /// RISK (b — fixed width guard): a `fixed[L]` partition value whose byte length does NOT equal `L`
+    /// must error LOUDLY (the FixedSizeBinary constructor rejects a width mismatch), never write a
+    /// corrupt column. Pins the guard: a 3-byte value declared `fixed[4]` fails.
+    #[test]
+    fn test_fixed_partition_value_wrong_width_errors_loudly() {
+        let unified = StructType::new(vec![Arc::new(NestedField::optional(
+            1000,
+            "p",
+            Type::Primitive(PrimitiveType::Fixed(4)),
         ))]);
         let stats_schema = partition_stats_schema(&unified, FormatVersion::V2).unwrap();
         let mut row =
-            PartitionStats::new(Struct::from_iter([Some(Literal::binary(vec![1, 2, 3]))]), 0);
+            PartitionStats::new(Struct::from_iter([Some(Literal::fixed(vec![1, 2, 3]))]), 0);
         row.data_record_count = 1;
         row.data_file_count = 1;
-        row.total_data_file_size_in_bytes = 100;
         let error =
             partition_stats_to_record_batch(std::slice::from_ref(&row), &stats_schema, &unified)
-                .expect_err("a binary partition value must error, not write a corrupt column");
-        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            error.message().contains("Binary"),
-            "the error must name the unsupported type: {error}"
-        );
+                .expect_err("a fixed value of the wrong byte length must error, not write");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 
     /// RISK (#2 cross-version projection — the upgrade scenario): a V2 stats file (12 columns, no
@@ -4142,5 +4791,441 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(read_back.len(), 1);
+    }
+
+    // =========================================================================================
+    // INCREMENTAL compute (O2 part a) — the diff-from-base path vs the full recompute
+    // =========================================================================================
+
+    /// Computes+registers a stats file for the table's CURRENT snapshot, returning the refreshed table.
+    /// Used to SEED a base stats file so a later `compute_and_write_stats_file` takes the incremental path.
+    async fn compute_register_current(catalog: &impl Catalog, table: &Table) -> Table {
+        let snapshot = table.metadata().current_snapshot().unwrap().clone();
+        let file = compute_and_write_stats_file(table, &snapshot)
+            .await
+            .unwrap()
+            .expect("a partitioned snapshot with data writes a stats file");
+        register_partition_stats_file(catalog, table, file)
+            .await
+            .unwrap()
+    }
+
+    /// Reads back the registered stats file for `snapshot`, returning the rows sorted for comparison.
+    async fn read_back_registered(table: &Table, snapshot: &Snapshot) -> Vec<PartitionStats> {
+        let file = table
+            .metadata()
+            .partition_statistics_for_snapshot(snapshot.snapshot_id())
+            .expect("a stats file is registered for this snapshot");
+        let stats_schema = partition_stats_schema(
+            &unified_partition_type(table.metadata()).unwrap(),
+            table.metadata().format_version(),
+        )
+        .unwrap();
+        sort_rows(
+            read_partition_stats_file(table, &stats_schema, &file.statistics_path)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// HEADLINE (a): the INCREMENTAL compute (seed from S1's stats + merge the S2 append diff) must equal
+    /// a FULL recompute of S2 on an APPEND-ONLY history — for two table shapes. This is the contract that
+    /// matters: incremental is an optimization that must produce byte-identical stats to a full compute.
+    /// Shape 1 = a single-field identity(x) partition; the diff adds files to an existing partition AND a
+    /// brand-new partition. A bug in the ADDED-only LIVE filter (double-counting carried S1 files) or the
+    /// diff manifest selection breaks the equality here.
+    #[tokio::test]
+    async fn test_incremental_equals_full_recompute_append_only_single_field() {
+        let (catalog, file_io, _temp) = e2e_catalog().await;
+        let table = create_x_partitioned_table(&catalog).await;
+        let location = table.metadata().location().to_string();
+
+        // S1: x=1 (3 rec), x=2 (5 rec).
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=1/a.parquet"),
+                0,
+                x_struct(1),
+                3,
+            )
+            .await,
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=2/b.parquet"),
+                0,
+                x_struct(2),
+                5,
+            )
+            .await,
+        ])
+        .await;
+        let table = compute_register_current(&catalog, &table).await;
+
+        // S2 (append-only): MORE files into x=1 (a new file, 4 rec) and a NEW partition x=3 (2 rec).
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=1/c.parquet"),
+                0,
+                x_struct(1),
+                4,
+            )
+            .await,
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=3/d.parquet"),
+                0,
+                x_struct(3),
+                2,
+            )
+            .await,
+        ])
+        .await;
+        let s2 = table.metadata().current_snapshot().unwrap().clone();
+
+        // Incremental write+register for S2 (S1's stats file is the base in S2's lineage).
+        let table = compute_register_current(&catalog, &table).await;
+        let incremental = read_back_registered(&table, &s2).await;
+
+        // The reference: a FULL recompute of S2.
+        let full = sort_rows(compute_partition_stats(&table, &s2).await.unwrap());
+
+        assert_eq!(
+            incremental, full,
+            "incremental == full recompute on an append-only history (single-field partition)"
+        );
+        // Sanity: the merged x=1 row carries S1's 3 + S2's 4 = 7 records, 2 files.
+        let x1 = full
+            .iter()
+            .find(|row| row.partition() == &x_struct(1))
+            .unwrap();
+        assert_eq!(
+            x1.data_record_count(),
+            7,
+            "x=1 = S1's 3 + S2's 4 (not double-counted)"
+        );
+        assert_eq!(x1.data_file_count(), 2);
+    }
+
+    /// HEADLINE (a) shape 2: incremental == full recompute when the S2 diff includes a DELETE (an equality
+    /// delete) on top of an append. This exercises both the ADDED-only LIVE filter AND the live counter of
+    /// a newly-added delete file in the diff. The two paths must still agree.
+    #[tokio::test]
+    async fn test_incremental_equals_full_recompute_with_delete_in_diff() {
+        let (catalog, file_io, _temp) = e2e_catalog().await;
+        let table = create_x_partitioned_table(&catalog).await;
+        let location = table.metadata().location().to_string();
+
+        // S1: x=1 (6 rec).
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=1/a.parquet"),
+                0,
+                x_struct(1),
+                6,
+            )
+            .await,
+        ])
+        .await;
+        let table = compute_register_current(&catalog, &table).await;
+
+        // S2: append x=2 (4 rec) AND add an equality delete scoped to x=1 (2 rec).
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=2/b.parquet"),
+                0,
+                x_struct(2),
+                4,
+            )
+            .await,
+        ])
+        .await;
+        let table = add_deletes(&catalog, &table, vec![
+            equality_delete_file(
+                &file_io,
+                &format!("{location}/data/x=1/eq.parquet"),
+                0,
+                x_struct(1),
+                2,
+            )
+            .await,
+        ])
+        .await;
+        let s2 = table.metadata().current_snapshot().unwrap().clone();
+
+        let table = compute_register_current(&catalog, &table).await;
+        let incremental = read_back_registered(&table, &s2).await;
+        let full = sort_rows(compute_partition_stats(&table, &s2).await.unwrap());
+
+        assert_eq!(
+            incremental, full,
+            "incremental == full recompute when the diff carries a newly-added delete file"
+        );
+        // The x=1 row carries its data plus the equality delete from S2's diff.
+        let x1 = full
+            .iter()
+            .find(|row| row.partition() == &x_struct(1))
+            .unwrap();
+        assert_eq!(x1.data_record_count(), 6);
+        assert_eq!(x1.equality_delete_record_count(), 2);
+        assert_eq!(x1.equality_delete_file_count(), 1);
+    }
+
+    /// RISK (a — ADDED-only LIVE filter, the SILENT double-count): a merge-append re-stamps S1's carried
+    /// files as EXISTING into a NEW manifest added by S2. The incremental diff SELECTS that manifest (its
+    /// `added_snapshot_id == S2`), so it ENCOUNTERS the EXISTING S1 entries — which the ADDED-only filter
+    /// MUST skip (they are already in the base seed). Without the filter, x=1's records would be counted
+    /// TWICE (seed + diff). A fast-append fixture cannot see this (S2's manifest carries only ADDED
+    /// entries); the merge-append fixture is what makes the filter load-bearing. Pins incremental == full.
+    #[tokio::test]
+    async fn test_incremental_added_only_filter_skips_existing_entries_in_merged_manifest() {
+        let (catalog, file_io, _temp) = e2e_catalog().await;
+        let table = create_x_partitioned_table(&catalog).await;
+        let location = table.metadata().location().to_string();
+
+        // Force merging at 2 manifests so S2's merge_append re-stamps S1's entry as EXISTING.
+        let table = {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .update_table_properties()
+                .set(
+                    "commit.manifest.min-count-to-merge".to_string(),
+                    "2".to_string(),
+                )
+                .apply(tx)
+                .unwrap();
+            tx.commit(&catalog).await.unwrap()
+        };
+
+        // S1: x=1 (3 rec) via a plain fast append (one manifest, added by S1).
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=1/a.parquet"),
+                0,
+                x_struct(1),
+                3,
+            )
+            .await,
+        ])
+        .await;
+        let table = compute_register_current(&catalog, &table).await;
+
+        // S2: merge_append a SECOND x=1 file (5 rec). The bin reaches 2 manifests >= min-count ⇒ MERGE:
+        // S2's new manifest carries S1's x=1 entry as EXISTING + the new x=1 file as Added.
+        let table = {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .merge_append()
+                .add_data_files(vec![
+                    data_file(
+                        &file_io,
+                        &format!("{location}/data/x=1/b.parquet"),
+                        0,
+                        x_struct(1),
+                        5,
+                    )
+                    .await,
+                ])
+                .apply(tx)
+                .unwrap();
+            tx.commit(&catalog).await.unwrap()
+        };
+        let s2 = table.metadata().current_snapshot().unwrap().clone();
+
+        let table = compute_register_current(&catalog, &table).await;
+        let incremental = read_back_registered(&table, &s2).await;
+        let full = sort_rows(compute_partition_stats(&table, &s2).await.unwrap());
+
+        assert_eq!(
+            incremental, full,
+            "the ADDED-only filter must skip the EXISTING (carried) entries in S2's merged manifest"
+        );
+        // x=1 = S1's 3 + S2's new 5 = 8 records over 2 files — counted ONCE, not 11 (3 doubled).
+        let x1 = full
+            .iter()
+            .find(|row| row.partition() == &x_struct(1))
+            .unwrap();
+        assert_eq!(
+            x1.data_record_count(),
+            8,
+            "x=1 = 3 (seed) + 5 (diff's ADDED file); the EXISTING carried file is NOT re-counted"
+        );
+        assert_eq!(x1.data_file_count(), 2);
+    }
+
+    /// RISK (a — corrupt-base fallback): when the base stats file is registered but UNREADABLE (Java
+    /// `InvalidStatsFileException`), `compute_and_write_stats_file` must FALL BACK to a full compute, not
+    /// error. Pins Java's catch-and-full-compute branch by registering a base file pointing at a
+    /// non-existent path, then asserting the S2 stats still equal a full recompute.
+    #[tokio::test]
+    async fn test_incremental_falls_back_to_full_when_base_stats_file_is_corrupt() {
+        let (catalog, file_io, _temp) = e2e_catalog().await;
+        let table = create_x_partitioned_table(&catalog).await;
+        let location = table.metadata().location().to_string();
+
+        // S1: x=1 (3 rec).
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=1/a.parquet"),
+                0,
+                x_struct(1),
+                3,
+            )
+            .await,
+        ])
+        .await;
+        let s1 = table.metadata().current_snapshot().unwrap().clone();
+
+        // Register a BOGUS stats file for S1 (path does not exist → unreadable base).
+        let bogus = PartitionStatisticsFile {
+            snapshot_id: s1.snapshot_id(),
+            statistics_path: format!(
+                "{location}/metadata/partition-stats-{}-bogus.parquet",
+                s1.snapshot_id()
+            ),
+            file_size_in_bytes: 999,
+        };
+        let table = register_partition_stats_file(&catalog, &table, bogus)
+            .await
+            .unwrap();
+
+        // S2: append x=2 (5 rec).
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=2/b.parquet"),
+                0,
+                x_struct(2),
+                5,
+            )
+            .await,
+        ])
+        .await;
+        let s2 = table.metadata().current_snapshot().unwrap().clone();
+
+        // Incremental tries to read the bogus base → InvalidStatsFile → full-compute fallback (no error).
+        let table = compute_register_current(&catalog, &table).await;
+        let written = read_back_registered(&table, &s2).await;
+        let full = sort_rows(compute_partition_stats(&table, &s2).await.unwrap());
+
+        assert_eq!(
+            written, full,
+            "a corrupt base stats file makes the incremental path fall back to a full compute"
+        );
+        // Both partitions are present with correct counts (no half-result from a swallowed error).
+        assert_eq!(written.len(), 2, "both x=1 and x=2 present after fallback");
+    }
+
+    /// RISK (a — return existing): when the target snapshot ALREADY has a registered stats file in its
+    /// lineage (its own snapshot id), `compute_and_write_stats_file` must RETURN that file unchanged (Java
+    /// case 3 — "Returning existing statistics file"), neither recomputing nor writing a new file.
+    #[tokio::test]
+    async fn test_compute_returns_existing_stats_file_for_already_computed_snapshot() {
+        let (catalog, file_io, _temp) = e2e_catalog().await;
+        let table = create_x_partitioned_table(&catalog).await;
+        let location = table.metadata().location().to_string();
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=1/a.parquet"),
+                0,
+                x_struct(1),
+                3,
+            )
+            .await,
+        ])
+        .await;
+        let snapshot = table.metadata().current_snapshot().unwrap().clone();
+
+        let first = compute_and_write_stats_file(&table, &snapshot)
+            .await
+            .unwrap()
+            .unwrap();
+        let table = register_partition_stats_file(&catalog, &table, first.clone())
+            .await
+            .unwrap();
+
+        let again = compute_and_write_stats_file(&table, &snapshot)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            again, first,
+            "an already-stats'd snapshot returns its existing file unchanged (no rewrite)"
+        );
+    }
+
+    /// RISK (a — the SUBTRACT arm, the strongest end-to-end pin): incremental == full recompute when the
+    /// diff range includes a DELETE that produces a DELETED tombstone for a file the BASE counted. The
+    /// seed carries the deleted file's contribution; the diff's `deleted_entry_for_incremental_compute`
+    /// must SUBTRACT it back out so the merged total matches a full recompute (which simply never counts
+    /// the no-longer-live file). The builder's append-only / add-delete-file equivalence shapes never
+    /// exercise the subtract arm (no DELETED tombstone in their diff manifests); this fixture does.
+    /// (O2 REVIEWER 2026-06-12 — closes the coverage gap flagged in attack vector 3.)
+    #[tokio::test]
+    async fn test_incremental_equals_full_recompute_with_delete_subtracting_base_file() {
+        let (catalog, file_io, _temp) = e2e_catalog().await;
+        let table = create_x_partitioned_table(&catalog).await;
+        let location = table.metadata().location().to_string();
+
+        // S1: x=1 has TWO data files (a = 3 rec, b = 5 rec) — both counted in the base stats.
+        let table = append(&catalog, &table, vec![
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=1/a.parquet"),
+                0,
+                x_struct(1),
+                3,
+            )
+            .await,
+            data_file(
+                &file_io,
+                &format!("{location}/data/x=1/b.parquet"),
+                0,
+                x_struct(1),
+                5,
+            )
+            .await,
+        ])
+        .await;
+        let table = compute_register_current(&catalog, &table).await;
+
+        // S2: DELETE a.parquet. Its DELETED tombstone lands in an S2-added manifest, so the incremental
+        // diff SUBTRACTS it from the seed (b.parquet is carried EXISTING and skipped by the ADDED filter).
+        let table = {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .delete_files()
+                .delete_file(format!("{location}/data/x=1/a.parquet"))
+                .apply(tx)
+                .unwrap();
+            tx.commit(&catalog).await.unwrap()
+        };
+        let s2 = table.metadata().current_snapshot().unwrap().clone();
+
+        let table = compute_register_current(&catalog, &table).await;
+        let incremental = read_back_registered(&table, &s2).await;
+        let full = sort_rows(compute_partition_stats(&table, &s2).await.unwrap());
+
+        assert_eq!(
+            incremental, full,
+            "incremental == full recompute when the diff's DELETED tombstone subtracts a base file"
+        );
+        // x=1 = seed(3+5, 2 files) - a.parquet(3, 1 file) = 5 records over 1 file (only b survives).
+        let x1 = full
+            .iter()
+            .find(|row| row.partition() == &x_struct(1))
+            .unwrap();
+        assert_eq!(
+            x1.data_record_count(),
+            5,
+            "the deleted a.parquet (3 rec) is subtracted back out: 8 - 3 = 5"
+        );
+        assert_eq!(x1.data_file_count(), 1, "2 base files - 1 deleted = 1");
     }
 }

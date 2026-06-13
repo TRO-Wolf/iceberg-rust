@@ -410,12 +410,33 @@ pub struct TableCommit {
     requirements: Vec<TableRequirement>,
     /// The updates of the table.
     updates: Vec<TableUpdate>,
+    /// The metadata location of the base the commit was built against — the Rust analogue of the
+    /// `base` argument Java passes into `InMemoryTableOperations.doCommit` /
+    /// `BaseMetastoreTableOperations.commit`.
+    ///
+    /// An in-process catalog with no transactional store (e.g. [`crate::catalog::memory`]) uses
+    /// this to detect a stale commit: it compares the location currently stored for the table
+    /// against this value (Java's `Objects.equal(stored, base.metadataFileLocation())`) and rejects
+    /// the commit with a retryable conflict when they differ — the optimistic-concurrency CAS Java
+    /// performs in `doCommit`. `None` models Java's `base == null` create edge; the catalog update
+    /// paths always carry `Some`. Catalogs with their own store-side CAS (REST server, SQL `... AND
+    /// metadata_location = ?`) ignore this field.
+    #[builder(default)]
+    base_metadata_location: Option<String>,
 }
 
 impl TableCommit {
     /// Return the table identifier.
     pub fn identifier(&self) -> &TableIdent {
         &self.ident
+    }
+
+    /// Return the metadata location of the base the commit was built against, if known.
+    ///
+    /// See [`TableCommit::base_metadata_location`] for the optimistic-concurrency contract this
+    /// supports.
+    pub fn base_metadata_location(&self) -> Option<&str> {
+        self.base_metadata_location.as_deref()
     }
 
     /// Take all requirements.

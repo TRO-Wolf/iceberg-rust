@@ -210,6 +210,169 @@ How to use it (see the manuals' §2):
   the MAIN source tree, not m2 bytecode; for the FAMILY question that source (`setFamily(ALPHA)`) is the
   authoritative oracle, cross-checked against the datasketches jar's builder-default bytecode.
 
+#### O1 REVIEWER corrections (2026-06-12, wt-core6) — adversarial pass against 1.10.0 bytecode
+- **The Java VIEW base-location capture is `currentMetadataLocation()`, NOT `base.metadataFileLocation()`
+  — the table path differs from the view path, and the builder's report blurred them (cosmetic, not a
+  behavioral bug).** 1.10.0 bytecode: `InMemoryTableOperations.doCommit` offset 23-24 captures
+  `baseLocation = base.metadataFileLocation()` (the BASE arg's location); `InMemoryViewOperations.doCommit`
+  offset 14-15 captures `baseLocation = this.currentMetadataLocation()` (the OPS object's current location)
+  when `base != null`. For the in-process case these are equal (the commit's base IS `current()`, loaded
+  from the same map slot), so the Rust port threading `View::metadata_location` matches functionally. DO
+  cite the exact capture expression per seam — the table/view asymmetry is real bytecode, even though it
+  collapses to the same value here. Both lambdas' `CommitFailedException` arg order is bytecode-confirmed
+  `(identifier, baseLocation, newLocation, storedLocation)` (table offsets 73-91, view offsets 72-91).
+- **VERIFIED the None-bypass hole is closed AND the mutation battery is complete (5 seams pinned).**
+  Probe (explicit `base_metadata_location=None` against a stored table via `update_table`): does NOT
+  silently land — raises `CatalogCommitConflicts` (`None != Some(stored)`), Java-conservative. Mutation
+  battery run for real: (a) `if true` CAS → exactly the 2 stale-conflict tests fail, happy/refresh stay
+  green; (b) knock out population at `ReplaceViewVersionAction::to_commit` → 4 fail (incl. the carry pin);
+  (b') `UpdateViewPropertiesAction::to_commit` → 2 fail (incl. carry pin); (c) transaction `do_commit`
+  site → 377 fail (central commit path); (c') `register_partition_stats_file` site → 3 fail. NO population
+  seam survived its knockout — none unpinned. DO run every population site's knockout, not just the CAS:
+  an unpopulated seam is a silent door even with a correct CAS.
+- **MATRIX-DISCIPLINE FIX (the builder's miss): the GAP_MATRIX row 107 still said "`update_view` has no
+  base-location CAS … needs a dedicated concurrency-parity increment" AFTER this increment closed it.**
+  The de-triplication rule puts STATUS only in the matrix, so leaving the "gap open / needs increment"
+  clause was a stale-status defect. FIX (this pass): rewrote the KNOWN-GAP clause to the **O1**-landed CAS
+  narrative + the SQL weaker-CAS follow-up, and corrected the stale "MemoryCatalog's no-CAS posture" phrase
+  in the U2 sub-cell; pipe-audit re-run (row still 5 pipes). DO flip/refresh the matrix cell in the SAME
+  increment that closes the gap it describes — a builder that lands the fix but not the cell leaves the
+  matrix lying.
+- **CONFIRMED the SQL-weaker-CAS finding is real (read the path, not just the report).** `crates/catalog/
+  sql/src/catalog.rs:965-1002` `update_table` CAS's `... AND metadata_location = ?` against
+  `current_metadata_location = self.load_table(...).metadata_location_result()` — the location it loads
+  INSIDE its own `update_table` (line 967-968), NOT `commit.base_metadata_location()` (which is now
+  available but unread). Guards only the load→UPDATE TOCTOU window; a strictly-sequential stale commit
+  passes. Correctly flagged as a follow-up (NOT half-fixed). The retry classification is also confirmed:
+  `transaction/mod.rs:361` `.when(|e| e.retryable())` gates the `backon` loop; the helper raises
+  `CatalogCommitConflicts.with_retryable(true)`, and the mock tests (`...retryable(Some(2),3)` + `.times(3)`)
+  prove the loop iterates on exactly that error. VERDICT: SHIP.
+
+### 2026-06-12 (Wave-6 O1 — optimistic-concurrency parity for MemoryCatalog, BUILDER Opus, wt-core6)
+- **Java's in-memory CAS compares the STORED location against the commit's BASE location, NOT the
+  catalog's own freshly-loaded location — and the SQL catalog in THIS fork does the WEAKER thing.**
+  1.10.0 bytecode `InMemory{Table,View}Operations.doCommit`: capture `baseLocation = base == null ?
+  null : base.metadataFileLocation()` from the `base` ARGUMENT, then `tables.compute(id, (k, stored)
+  -> Objects.equal(stored, baseLocation) ? newLoc : throw)`. The `base` is what the commit was built
+  from, threaded in as a method arg. The Rust `TableCommit`/`ViewCommit` did NOT carry it, so the fix
+  added `base_metadata_location: Option<String>` to BOTH and a `check_no_concurrent_modification`
+  helper in MemoryCatalog. NOTE the divergence I found and did NOT fix (out of O1 scope): the SQL
+  catalog (`crates/catalog/sql`) CAS's against `current_metadata_location` = the location it loads
+  INSIDE its own `update_view`/`update_table`, NOT the commit's base — so it only guards the TOCTOU
+  window between its own load and its own UPDATE; a strictly-sequential stale commit (load, winner
+  lands, then loser's `update_*` re-loads the advanced location and CAS's it against itself) would
+  PASS. The SQL `test_*_concurrent_commits_*` tests use a `Barrier` + true threads to hit the window,
+  so they pass, but the posture is weaker than Java. The Java-faithful SQL fix is to CAS against
+  `commit.base_metadata_location()` too — a follow-up increment.
+- **`Transaction::do_commit` reloads the base RIGHT BEFORE building the `TableCommit`, so two
+  sequential transactions from the same base BOTH succeed via refresh — the conflict→retry loop is
+  hard to reach in-process.** The location-CAS in MemoryCatalog therefore fires for (a) a `TableCommit`
+  / `ViewCommit` built DIRECTLY from a stale base (the `register_*` maintenance paths, the view
+  actions held across a concurrent commit) and (b) the tiny window of a true external race inside
+  `do_commit`. The deterministic test for the conflict is to build the commit directly (bypassing the
+  transaction reload) — `update_table_properties` emits an EMPTY requirement set, so a property-only
+  `TableCommit` has NO requirement that could catch staleness and ONLY the location-CAS can fire
+  (the prompt's "only the CAS" case). Append-style staleness is separately caught FIRST by
+  `RefSnapshotIdMatch` (snapshot.rs emits it when `current_snapshot_id` is `Some`); the CAS is the
+  net for metadata-only updates and for views (`[AssertViewUUID]` is invariant across replaces).
+- **A new `TypedBuilder` field on `TableCommit` needs `#[builder(default)]` or every existing
+  `.build()` call site breaks; `ViewCommit` is a plain struct literal so its two `to_commit` sites +
+  the REST/SQL paths must set the field explicitly (they don't construct it — REST only calls
+  `take_requirements`/`take_updates`, so the wire is unaffected and REST semantics are untouched).**
+  The view actions had to grow a `base_metadata_location` field threaded from the source `View`'s
+  `metadata_location`, which meant updating the `View::replace_version`/`update_properties` ctors and
+  6 in-crate test call sites of the now-3-arg `*Action::new`. DO check for direct constructor calls
+  in unit tests when widening a private constructor signature.
+
+### 2026-06-12 (Wave-6 O2 — partition-stats incremental + exotic value types, BUILDER Opus, wt-core6)
+- **The 1.10.0 jar's `PartitionStatsHandler` ALREADY has the full incremental surface — the `collectStatsForManifest`
+  signature carries `boolean incremental`, and the X1/X2 port had silently dropped that 4th param.** Bytecode
+  (iceberg-core-1.10.0.jar): `collectStatsForManifest(Table, ManifestFile, StructType, boolean)`,
+  `computeStats(Table, List, boolean)`, plus `computeAndMergeStatsIncremental`/`latestStatsFile`/`computeStatsDiff`
+  and `PartitionStats.deletedEntryForIncrementalCompute`. The standing journal lesson "MAIN source is
+  post-1.10.0-refactored on PartitionStatsHandler" is REAL — but here MAIN and 1.10.0 AGREE on the incremental
+  surface; the X1 port had just scoped it out, not wrongly derived it. DO `javap -p` the WHOLE class to recover the
+  method surface before assuming a feature is absent — a dropped boolean param is invisible in a source read.
+- **The incremental entry dispatch is bytecode-exact and has TWO subtle gates a fast-append fixture CANNOT
+  exercise** (offsets 197-259 in `collectStatsForManifest`): (1) a LIVE entry contributes ONLY if
+  `incremental && status==ADDED` — a carried-forward EXISTING entry is SKIPPED (already in the seed); (2) a
+  tombstone calls `deletedEntryForIncrementalCompute` (the `lsub`/`isub` SUBTRACT mirror of `liveEntry`), not
+  `deletedEntry`. The diff (`computeStatsDiff`) selects per-range-snapshot ONLY the manifests it added
+  (`added_snapshot_id == snapshot.id`). A FAST-APPEND S2 adds a manifest containing only ADDED entries, so the
+  ADDED-only filter NEVER fires — a `if true` mutation over the filter PASSED every fast-append test SILENTLY.
+  The fixture that makes it load-bearing is a MERGE-APPEND with `commit.manifest.min-count-to-merge=2`: S2's
+  merged manifest re-stamps S1's file as EXISTING, so the filter MUST skip it (else x=1 double-counts: 11≠8).
+  DO build a merge-append (not fast-append) fixture whenever a test must see an EXISTING entry in a
+  newly-added manifest; a fast-append cannot produce one.
+- **Java's corrupt-base fallback is scoped to the BASE READ ONLY (`catch(Exception)` over offsets 11-99), NOT the
+  diff compute.** `computeAndMergeStatsIncremental` wraps `readPartitionStatsFile(base)` in
+  `catch(Exception) → throw InvalidStatsFileException`; the caller (`computeAndWriteStatsFile`) catches THAT and
+  falls back to full compute. The diff (`computeStatsDiff`, AFTER the try block) propagates its errors. Ported as:
+  `compute_and_merge_stats_incremental` returns `Ok(None)` on ANY base-read error (the fallback signal) but `Err`
+  on a diff failure. DO NOT collapse "corrupt base" and "diff IO error" into one error path — they have OPPOSITE
+  Java semantics (fall-back vs hard-fail). The deterministic test registers a base `PartitionStatisticsFile` at a
+  NON-EXISTENT path and asserts the write still equals a full recompute.
+- **`computeAndWriteStatsFile(table, snapshotId)` SHORT-CIRCUITS when the latest stats file IS already for the
+  target snapshot — it returns the existing file UNCHANGED, no rewrite (offset 104-132 "Returning existing
+  statistics file").** The X2 port always wrote a fresh file; adding the Java-faithful selection broke the X2
+  `test_replace_on_rewrite` test (it called `compute_and_write_stats_file` twice for the same snapshot expecting
+  a fresh uuid path — now the 2nd call returns the existing file). The test's REPLACE intent is real but the
+  "fresh path on re-write" assertion was X2-specific, not Java. DO re-pin REPLACE semantics by registering a
+  DIFFERENT-sized `PartitionStatisticsFile` (the metadata `set_partition_statistics` map keyed by snapshot id),
+  and separately assert the case-3 short-circuit returns the existing file.
+- **The exotic partition-value byte forms were ALREADY half-built — the production READER
+  (`arrow_struct_to_literal`) handles Time64/FixedSizeBinary(16-uuid)/FixedSizeBinary(L-fixed)/LargeBinary, and
+  `schema_to_arrow_schema` maps the iceberg types to those Arrow types; only the stats-file WRITER lacked the
+  arms.** The loud `FeatureUnsupported` residue was a one-sided gap. The literal storage forms: Time→`Long`(micros),
+  Uuid→`UInt128` (write 16 BE bytes via `Uuid::from_u128(v).into_bytes()` == Java `Conversions.toByteBuffer`,
+  reader `Uuid::from_bytes` round-trips), Fixed/Binary→`Binary(Vec<u8>)`. DO check the reader + the type mapper
+  before assuming an "unsupported type" needs new byte-form derivation — the write arm may be the only missing
+  half, and the round-trip through the existing reader IS the byte-form verification. `FixedSizeBinaryArray::
+  try_from_sparse_iter_with_size(iter, size)` is the null-tolerant + width-validating constructor (rejects a
+  wrong-width fixed value loudly — a free correctness guard).
+
+#### O2 REVIEWER corrections (2026-06-12, wt-core6) — adversarial pass against 1.10.0 bytecode
+- **The whole O2 incremental contract is bytecode-EXACT — re-derived independently from the 1.10.0 jar
+  (`javap -p -c`), every clause CONFIRMED.** `computeAndWriteStatsFile(Table,long)` offsets:
+  null-base→full (69), `base.snapshotId==target`→return-existing `areturn`(104-132), older-base→incremental
+  with the exception table `from 133 to 144 target 147 type InvalidStatsFileException` scoping ONLY the
+  merge call (so a DIFF error propagates, only the BASE read falls back — `computeAndMergeStatsIncremental`'s
+  inner `from 11 to 99 target 102 type Exception` wraps `readPartitionStatsFile`+`forEach`, the diff at
+  offset 114+ is OUTSIDE it). `collectStatsForManifest` offset 207-221: LIVE contributes iff
+  `incremental==false || status==ADDED` (`if_acmpne 259` skips carried EXISTING); 236-246: tombstone→
+  `deletedEntryForIncrementalCompute` (incremental) else `deletedEntry`. `deletedEntryForIncrementalCompute`
+  is `liveEntry` with `ladd→lsub`/`iadd→isub` AND IDENTICAL last-updated tail (offset 210-230 in both):
+  counters SUBTRACT, last-updated-at/snapshot-id is **MAX via `updateSnapshotInfo` (strict `<`), NOT
+  subtracted/overwritten** — the deleted-entry-attribution question the brief flagged. `ancestorsBetween`
+  truncation lambda returns null on reaching `from` ⇒ range is `(from, to]`; `ancestorsOf(long)` is
+  INCLUSIVE of the start (resolves the start snapshot then walks parents) ⇒ `latestStatsFile` includes the
+  target snapshot. The Rust port matches every one.
+- **COVERAGE GAP FOUND + FIXED: the builder pinned incremental==full on 2 APPEND shapes (append-only +
+  add-a-delete-FILE), but NEITHER exercises the SUBTRACT arm end-to-end — a `delete_files` op is what
+  produces a DELETED tombstone in an S2-added manifest that fires `deleted_entry_for_incremental_compute`.**
+  Probe-confirmed: `delete_files().delete_file(a.parquet)` re-stamps the removed file as `status=Deleted`
+  (added_by_s2=true) and the surviving file as `status=Existing`, and incremental==full==(5rec,1file) only
+  when the subtract fires. The unit test `test_deleted_entry_..._subtracts_each_cell_back_to_zero` pins the
+  arithmetic but NOT that the arm fires in the real pipeline. FIX (this pass): added
+  `test_incremental_equals_full_recompute_with_delete_subtracting_base_file` (the strongest subtract-arm
+  pin) — caught by the mutation that no-ops the data subtract AND the include-all-manifests diff mutation.
+  DO add a `delete_files`-driven equivalence shape for any incremental-stats subtract path; an append-with-
+  delete-FILE shape adds a delete file (a LIVE entry) and never produces the DELETED tombstone the subtract
+  arm needs.
+- **Mutation battery (6 for real, all caught; reverted): (a) no-op data subtract → unit + new e2e subtract
+  test fail; (b) `if true` over ADDED-only filter → merge-append + subtract tests fail (double-count);
+  (c) corrupt-base `Err(e)=>return Err` (no fallback) → corrupt-base test fails; (d) `if false` over case-3
+  guard → return-existing + rewritten replace test fail; (e) uuid bytes `.reverse()` (LE not BE) → uuid
+  round-trip fails BECAUSE the production reader (`arrow_struct_to_literal` → `Uuid::from_bytes`, BE) is
+  NOT mutated — proving the round-trip reads through the production path, not a test-local decode; (f) `if
+  true` over the `added_snapshot_id` diff filter → both append equivalence tests fail.** Every seam pinned.
+- **The 5 failing iceberg DOCTESTS (`src/lib.rs:24`, `writer/mod.rs:42/117/257/321`) are PRE-EXISTING and
+  UNTOUCHED by O2 — verified by `git stash` to the clean O1 commit d3fba2bf: identical 5-failure set.** Root
+  cause is environmental (`error: default runtime flavor is multi_thread, but rt-multi-thread feature is
+  disabled`), not code — `cargo test -p iceberg --lib` (the builder's gate) excludes doctests, and the O2
+  diff touches no doctest. DO run the doctest set on the base commit before attributing a doctest failure to
+  the increment under review.
+
 ### 2026-06-12 (Wave-5 Group Y / Y3 — Alpha-family update sketch, BUILDER Opus, wt-tstats)
 - **THE ndv-source ruling: Iceberg's `ndv` reads the COMPACT sketch's `getEstimate`, NOT the Alpha
   update sketch's. The two genuinely DIFFER in estimation mode — derive which object from
@@ -509,3 +672,91 @@ How to use it (see the manuals' §2):
   deferral text in the same cell/bullet, not just adding the landing note. (A pre-existing
   `Java-reads-our-stats-file interop is NEXT-WAVE` contradiction predates this branch and is left for
   the next phase re-audit — out of this branch's scope.)
+### 2026-06-12 (Wave-6 O3 — divergence burn-down: type-case / sort-bind / manifest-order / avro-map-name, BUILDER Opus, wt-core6)
+- **Java's type-name case fold is SCOPED to primitive names — `Types.fromTypeName` lowercases
+  (`toLowerCase(Locale.ROOT)`) but `SchemaParser.typeFromJson` matches the WRAPPER names
+  `struct`/`list`/`map` with `String.equals` (case-SENSITIVE). Fold primitives + `fixed[..]`/`decimal(..)`
+  ONLY; do NOT fold wrappers.** *Why (bytecode):* `fromTypeName` offsets 0-7 lowercase, then the TYPES
+  map / FIXED / DECIMAL regexes all consume `aload_1` (the lowercased var); `typeFromJson` offsets 41/55/69
+  are `String.equals("struct"/"list"/"map")` on the ORIGINAL. So a one-line `.to_lowercase()` in Rust's
+  `PrimitiveType::deserialize` (+ the variant marker `eq_ignore_ascii_case`) is the WHOLE fix — wrappers are
+  matched structurally by the untagged `SerdeType` and need no change. NOTE the residual asymmetry: Rust's
+  untagged matcher IGNORES the wrapper `type` string for List/Map (accepts `{"type":"STRUCT"}` where Java
+  rejects) — a PRE-EXISTING separate posture (Rust too LENIENT on wrappers), NOT the reported divergence
+  (Rust too STRICT on primitives); pin it as a scope test, don't fix it in a primitive-case increment.
+- **Sort orders: Java binds+`checkCompatibility`-validates ONLY the DEFAULT order at metadata parse; all
+  others are `bindUnchecked` (lenient). Mirror exactly — validating every order would be STRICTER than
+  Java.** *Why (bytecode):* `TableMetadataParser.fromJson` → `SortOrderParser.fromJson(Schema, node,
+  defaultId)`: `if unbound.orderId()==defaultId → bind` (→ `Builder.build()` → `SortOrder.checkCompatibility`
+  = source-exists/primitive/transform-applies) `else → bindUnchecked` (no check). Binding itself NEVER throws
+  on a missing source id (it keeps the unbound transform string); only `checkCompatibility` does. Rust already
+  had a 1:1 `SortOrderBuilder::check_compatibility` — the only gap was `try_normalize_sort_order` never
+  CALLING it. Schema bound against is the CURRENT schema (var 10 = current-schema-id). The fix is one
+  `check_compatibility(default_order, current_schema)?` call; non-default orders stay untouched.
+- **Manifest-list entry order: Java is new-then-carried, all-DATA-before-all-DELETE (`FastAppend.apply` =
+  `writeNewManifests()` then `snapshot.allManifests`; `MergingSnapshotProducer.apply` =
+  `concat(prepareNewData, carriedData)` then `concat(prepareNewDelete, carriedDelete)`). Rust's SHARED
+  `manifest_file` is carried(mixed)-then-new — opposite, in the ONE path every action uses.** *Verdict:*
+  DOCUMENT not fix — the oracle SORTS manifests (`snapshot_meta_view.rs:127`), both readers reconcile by
+  seq, so it's byte-invisible after the canonical sort; matching Java needs a content-type-separated
+  restructure of the shared path that ripples into `manifests[0]`-indexed tests. A "cosmetic, readers
+  reconcile" order divergence in a SHARED producer path is a DOCUMENT, not a bounded-cleanup fix.
+- **The avro map key/value record rename must cover ANY record (struct included), not just variant —
+  Java `TypeToSchema.struct` names EVERY record `"r"+fieldIds.peek()` (the enclosing key/value-id).** *Why:*
+  the F1 variant fix renamed only variant map records; a struct map value kept the `"null"` placeholder, so
+  two struct-valued maps in one schema emitted duplicate `"null"` records Java's `Schema.Parser` rejects.
+  Generalizing `rename_variant_record`→`rename_map_record` (drop the logical-type guard) is the fix.
+  TEST-RIGOR TRAP: the array-form (non-string-key) map's ROUND-TRIP test PASSES even under the variant-only
+  mutation because apache-avro tolerates duplicate `"null"` records in that array nesting — the round-trip
+  is a WEAK pin there; assert the explicit inner record NAMES (`r<keyId>`/`r<valueId>`) to make it
+  load-bearing. The string-key Map form's explicit-name assertion catches the mutation directly.
+- **`git checkout <file>` to undo a self-mutation WIPES uncommitted work — use a `/tmp` backup `cp`, never
+  `git checkout`, when the file has un-committed changes you need to keep.** *Why:* mid-increment a
+  `git checkout crates/.../avro/schema.rs` reverted to the O2 commit and erased the (d) fix + tests (the
+  worktree changes weren't committed). Restored from the `/tmp/avro.bak` I'd made before mutating. For
+  mutation-testing an uncommitted file: `cp file /tmp/x.bak` → mutate → test → `cp /tmp/x.bak file`.
+
+#### O3 REVIEWER corrections (2026-06-12, wt-core6) — adversarial pass vs 1.10.0 bytecode + live Java probe
+- **The (a) case-fold fix was correct BUT incomplete — building a Java-vs-Rust acceptance table over the
+  parameterized edge spellings exposed FIVE `fixed[..]`/`decimal(..)` parse mismatches the case-fold alone
+  did not touch. FIXED.** *Why:* a live `Types.fromTypeName` probe (compiled against the api jar +
+  `iceberg-bundled-guava` + caffeine — the static initializer needs the relocated guava `ImmutableMap`)
+  vs a Rust acceptance-probe test showed Java's anchored regexes `fixed\[\s*(\d+)\s*\]` /
+  `decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)` ACCEPT inner whitespace (`fixed[ 16 ]`, `decimal( 38 , 2 )`) and
+  REQUIRE the close bracket/paren, whereas Rust's `deserialize_fixed`/`deserialize_decimal` used
+  `trim_end_matches(']'/')')` (a NO-OP when the close char is absent — so `fixed[16`/`decimal(38,2` parsed,
+  too LENIENT) and never trimmed the inner content (so `fixed[ 16 ]` was rejected, too STRICT). Fix:
+  `strip_prefix` + `strip_suffix` (require the wrapper) + `.trim()` the inner operands. LESSON: when a fix
+  is "case-fold the name", the PARAMETERIZED forms have a SECOND parse layer (the bracket/paren structure)
+  the fold doesn't reach — build the full accept/reject acceptance table against the live oracle, both
+  directions, before declaring parity. The bytecode also reveals GEOMETRY/GEOGRAPHY use `aload_0` (the
+  ORIGINAL, case-INSENSITIVE-flag regex) while FIXED/DECIMAL use `aload_1` (the lowercased) — a scope
+  detail invisible in source.
+- **The builder's documented "open risk" (Rust accepts `{"type":"STRUCT"}` where Java rejects) was REAL,
+  WORSE than framed, and the builder's own scope test gave FALSE comfort. FIXED.** *Why:* the test
+  `wrapper_type_names_are_not_folded_by_the_primitive_case_fix` asserted rejection via the dedicated
+  `StructType` deserializer — a path the production `Type`/`Schema` read NEVER takes. The real read path
+  routes through the untagged `_serde::SerdeType`, which matches a wrapper by its FIELD SHAPE and IGNORES
+  the `type` string: a probe via `serde_json::from_str::<Type>` accepted `{"type":"STRUCT"}`,
+  `{"type":"LIST"}`, `{"type":"MAP"}` ALL. Java `SchemaParser.typeFromJson` (1.10.0 bytecode offsets
+  41/55/69 + live `SchemaParser.fromJson` probe) matches with `String.equals` → `IllegalArgumentException`.
+  RULING: cheap contained fix (≤30 lines, no untagged-machinery fight) over documentation — added
+  `SerdeType::wrapper_type_mismatch()` and a guard in `Type::deserialize` re-imposing Java's exact
+  `String.equals`; Rust's writer always emits lowercase, so it never rejects a self-round-trip. LESSON: a
+  read-leniency "open risk" must be probed on the PRODUCTION deserialization path, not a sibling
+  deserializer — an untagged-enum arm that captures-but-ignores a discriminator field is a silent
+  over-acceptance, and a scope test on the wrong path is no pin at all.
+- **CONFIRMED (b)/(c)/(d) by independent re-derivation + mutation battery — no defect.** (b)
+  `SortOrderParser.fromJson(Schema,node,int)` offsets 5-24: `if orderId==defaultId → bind` (→`build()`→
+  `checkCompatibility`) `else → bindUnchecked`; var-10 = current-schema-id schema (bytecode-confirmed);
+  knockout of `check_compatibility` fails exactly the 2 reject tests. (c) `FastAppend.apply` new-then-carried
+  (addAll at 18 then 94) + `MergingSnapshotProducer.apply` `concat(prepareNew*, filtered*)` data-before-delete
+  (offsets 166-272); Rust shared `manifest_file` is carried-then-new; the `current_manifests` test helper
+  returns RAW manifest-list order (NOT the oracle's canonical sort), so the `data_manifests[0]`/`manifests[0]`
+  spec-order assertions in merge_append/rewrite_manifests ARE writer-order-coupled — the DOCUMENT-not-fix
+  defer is justified, the ripple is real. (d) `TypeToSchema.struct` names EVERY struct record `"r"+fieldIds.peek()`
+  (offset 4-35); variant-only revert reproduces the two-`"null"` collision on BOTH the string-key and array
+  forms, and the array-form caught it ONLY via the explicit `r2`/`r4` name assertion (round-trip alone is a
+  weak pin — apache-avro tolerates duplicate `"null"` in that nesting), exactly as the builder warned. The
+  manifest schema has only PRIMITIVE-valued maps, so `rename_map_record` never fires on the manifest write
+  path — (d) is byte-invisible to interop (write-data chain re-run GREEN, exit 0).
