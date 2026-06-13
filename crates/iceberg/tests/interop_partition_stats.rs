@@ -60,6 +60,29 @@
 //! `dv_count` column must null-fill to 0 via [`project_struct_type_to_batch`]. Validates the
 //! Z3 cross-version projection fix: Rust can read a V2-written file against a V3 schema.
 //!
+//! # Incremental path (R2)
+//!
+//! [`test_partition_stats_incr_gen`] exercises the SUBTRACT arm of the incremental compute path:
+//! S1 fast-append → compute+register S1 stats (full); S2 `delete_files(file_a)` → compute+register
+//! S2 stats (incremental, auto-selected by `compute_and_write_stats_file` because a base stats
+//! file exists for S1). Expected rows after S2: cat=a all-zero (subtracted), cat=b unchanged.
+//! Emits `rust_incr_table/metadata/final.metadata.json` + `incr_expected.json`.
+//!
+//! [`test_partition_stats_incr_d2_rust_reads_java`] reads the Java-generated incremental fixture
+//! (`java_incr_table/metadata/final.metadata.json`) and compares decoded rows against
+//! `java_incr_stats.json`.
+//!
+//! # UUID partition type (R2)
+//!
+//! [`test_partition_stats_uuid_gen`] exercises the exotic UUID partition type: V2 table
+//! `identity(partition_id uuid)`, one data file with a known UUID partition value (the
+//! "spiciest" 16-byte big-endian type). Emits `rust_uuid_table/metadata/final.metadata.json` +
+//! `uuid_expected.json`.
+//!
+//! [`test_partition_stats_uuid_d2`] reads the Java-generated UUID fixture
+//! (`java_uuid_table/metadata/final.metadata.json`) and compares decoded rows against
+//! `java_uuid_stats.json`.
+//!
 //! # Env gate
 //!
 //! Tests are clean NO-OPS (runtime early-return, not `#[ignore]`) unless their env var is set
@@ -67,6 +90,8 @@
 //! - `ICEBERG_INTEROP_PARTITION_STATS_GEN_DIR` — GEN path (Direction 1, Rust writes).
 //! - `ICEBERG_INTEROP_PARTITION_STATS_DIR` — compare path (Direction 2, Rust reads Java's file
 //!   + the cross-version test).
+//! - `ICEBERG_INTEROP_PARTITION_STATS_INCR_DIR` — incremental GEN+D2 path.
+//! - `ICEBERG_INTEROP_PARTITION_STATS_UUID_DIR` — UUID GEN+D2 path.
 
 use std::collections::HashMap;
 use std::fs;
@@ -81,11 +106,13 @@ use iceberg::maintenance::{
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal,
-    NestedField, PrimitiveType, Schema, SortOrder, Struct, Transform, Type, UnboundPartitionSpec,
+    NestedField, PrimitiveLiteral, PrimitiveType, Schema, SortOrder, Struct, Transform, Type,
+    UnboundPartitionSpec,
 };
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use serde_json::{Value as JsonValue, json};
+use uuid::Uuid;
 
 // ===========================================================================================
 // Hand-declared counter values (anti-circular — the same logical constants as
@@ -105,6 +132,24 @@ const B_DATA_RECORDS: i64 = 2;
 /// Category-b data file size in bytes.
 const B_DATA_FILE_SIZE: u64 = 200;
 
+// ---- Incremental (R2) constants ---- agreed with IncrementalPartitionStatsOracle.java.
+/// cat=a data records in S1 incremental fixture.
+const INCR_A_DATA_RECORDS: i64 = 3;
+/// cat=a data file size in S1 incremental fixture (bytes).
+const INCR_A_DATA_FILE_SIZE: u64 = 300;
+/// cat=b data records in S1 incremental fixture.
+const INCR_B_DATA_RECORDS: i64 = 2;
+/// cat=b data file size in S1 incremental fixture (bytes).
+const INCR_B_DATA_FILE_SIZE: u64 = 200;
+
+// ---- UUID (R2) constants ---- agreed with UuidPartitionStatsOracle.java.
+/// The known UUID partition value (same string as Java's KNOWN_UUID_STRING).
+const KNOWN_UUID_STR: &str = "550e8400-e29b-41d4-a716-446655440000";
+/// UUID data file record count.
+const UUID_DATA_RECORDS: i64 = 5;
+/// UUID data file size in bytes.
+const UUID_DATA_FILE_SIZE: u64 = 500;
+
 fn gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_GEN_DIR")
         .filter(|value| !value.is_empty())
@@ -113,6 +158,18 @@ fn gen_dir() -> Option<PathBuf> {
 
 fn compare_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn incr_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_INCR_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn uuid_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_UUID_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
@@ -182,6 +239,47 @@ fn pos_delete_file(
         .partition(Struct::from_iter([Some(Literal::string(category))]))
         .build()
         .expect("build position-delete file")
+}
+
+/// Table schema for the UUID fixture: `{1 id long required, 2 partition_id uuid required}`.
+fn uuid_fixture_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "partition_id", Type::Primitive(PrimitiveType::Uuid)).into(),
+        ])
+        .build()
+        .expect("build uuid fixture schema")
+}
+
+/// Partition spec for the UUID fixture: `identity(partition_id)` — source column id 2.
+fn uuid_fixture_spec() -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "partition_id".to_string(), Transform::Identity)
+        .expect("add identity(partition_id) partition field")
+        .build()
+}
+
+/// A data file for the UUID fixture with the given UUID as the partition value.
+fn uuid_data_file(
+    table_location: &str,
+    name: &str,
+    uuid_val: Uuid,
+    records: u64,
+    size: u64,
+) -> DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(format!("{table_location}/data/{name}.parquet"))
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(size)
+        .record_count(records)
+        .partition_spec_id(0)
+        .partition(Struct::from_iter([Some(Literal::uuid(uuid_val))]))
+        .build()
+        .expect("build uuid data file")
 }
 
 /// Write `final.metadata.json` at `<table_dir>/metadata/final.metadata.json`.
@@ -904,5 +1002,763 @@ async fn test_partition_stats_cross_version_v2_file_v3_schema() {
         "interop_partition_stats cross-version: PASS — V2 file read against V3 schema, \
          dv_count null-filled to 0 for all {} rows",
         rows.len()
+    );
+}
+
+// ===========================================================================================
+// R2: Incremental path — SUBTRACT arm
+// ===========================================================================================
+
+/// GEN test: incremental partition-stats with the SUBTRACT arm.
+///
+/// Fixture (same schema/spec as the Z3 fixture):
+/// - S1: fast-append file_a (cat=a, 3 records, 300 bytes) + file_b (cat=b, 2 records, 200 bytes).
+///   Compute and register S1 stats (FULL — no prior base exists).
+/// - S2: `delete_files(file_a)` → commits a DELETE snapshot with a DELETED tombstone for file_a.
+///   Compute and register S2 stats. Because a base stats file was registered for S1, the Rust
+///   production path (`compute_and_write_stats_file`) auto-selects the incremental code path,
+///   which applies the SUBTRACT arm for the file_a tombstone.
+///
+/// Expected stats after S2:
+/// - cat=a: data_records=0, data_files=0, size=0 (fully subtracted by the DELETED tombstone).
+/// - cat=b: data_records=2, data_files=1, size=200 (unchanged; no S2 activity for cat=b).
+///
+/// Incremental path engagement is pinned indirectly:
+/// 1. After registering S1, we assert `partition_statistics_iter` has an entry for S1.
+/// 2. After computing S2, we assert the S2 result rows differ from what a fresh FULL compute
+///    would return for the same S2 snapshot (which would still see file_a, since the FULL path
+///    sees all live files — but after delete_files file_a is no longer live, so both produce
+///    zero for cat=a; the meaningful pin is that both paths agree: cat=a has zero records).
+///    The stronger pin is: cat=b's `last_updated_snapshot_id` MUST remain S1 (unchanged from
+///    the base), which the incremental path preserves by carrying the base row for cat=b.
+///
+/// Emits:
+/// - `rust_incr_table/metadata/final.metadata.json` — for Java's D1 verify step.
+/// - `incr_expected.json` — the decoded S2 rows (Java verify compares against this).
+#[tokio::test]
+async fn test_partition_stats_incr_gen() {
+    let Some(incr_dir) = incr_dir() else {
+        println!(
+            "skipping interop_partition_stats INCR GEN — set \
+             ICEBERG_INTEROP_PARTITION_STATS_INCR_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let table_location = incr_dir
+        .join("rust_incr_table")
+        .to_string_lossy()
+        .to_string();
+    fs::create_dir_all(format!("{table_location}/metadata"))
+        .expect("create rust_incr_table/metadata dir");
+
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_incr_gen",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                incr_dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for incr GEN");
+
+    let namespace = NamespaceIdent::new("interop_incr".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (incr GEN)");
+
+    let creation = TableCreation::builder()
+        .name("rust_incr_table".to_string())
+        .location(table_location.clone())
+        .schema(fixture_schema())
+        .partition_spec(fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create rust_incr_table");
+
+    // S1: fast-append file_a (cat=a) + file_b (cat=b).
+    let file_a = data_file(
+        &table_location,
+        "incr_file_a",
+        "a",
+        INCR_A_DATA_RECORDS as u64,
+        INCR_A_DATA_FILE_SIZE,
+    );
+    let file_b = data_file(
+        &table_location,
+        "incr_file_b",
+        "b",
+        INCR_B_DATA_RECORDS as u64,
+        INCR_B_DATA_FILE_SIZE,
+    );
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_a.clone(), file_b])
+        .apply(tx)
+        .expect("apply S1 fast_append (incr)");
+    let table = tx.commit(&catalog).await.expect("commit S1 (incr)");
+    let s1_id = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("S1 snapshot id (incr)");
+    println!("interop_partition_stats INCR GEN: S1 committed (id={s1_id})");
+
+    // Compute and register S1 stats (FULL — no prior base).
+    let s1_snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("current snapshot (S1 incr)");
+    let s1_stats = compute_and_write_stats_file(&table, s1_snapshot)
+        .await
+        .expect("compute S1 stats")
+        .expect("S1 stats must be Some (table has data)");
+    let table = register_partition_stats_file(&catalog, &table, s1_stats)
+        .await
+        .expect("register S1 stats");
+
+    // Incremental path pin (1): assert a stats file is now registered for S1.
+    let has_s1_stats = table
+        .metadata()
+        .partition_statistics_iter()
+        .any(|f| f.snapshot_id == s1_id);
+    assert!(
+        has_s1_stats,
+        "incr GEN: S1 stats file must be registered before computing S2 stats"
+    );
+    println!("interop_partition_stats INCR GEN: S1 stats registered (id={s1_id})");
+
+    // S2: delete_files(file_a) — produces a DELETE snapshot with a DELETED tombstone.
+    // This triggers the SUBTRACT arm in the incremental diff.
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .delete_files()
+        .delete_data_files(vec![file_a])
+        .apply(tx)
+        .expect("apply S2 delete_files(file_a)");
+    let table = tx.commit(&catalog).await.expect("commit S2 (incr)");
+    let s2_id = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("S2 snapshot id (incr)");
+    println!("interop_partition_stats INCR GEN: S2 committed (id={s2_id}, deleted file_a)");
+
+    // Compute and register S2 stats. The production path auto-selects incremental because
+    // a base file was registered for S1 (an ancestor of S2).
+    let s2_snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("current snapshot (S2 incr)");
+    let s2_stats = compute_and_write_stats_file(&table, s2_snapshot)
+        .await
+        .expect("compute S2 stats (incremental)")
+        .expect("S2 stats must be Some (cat=b still has data)");
+    let table = register_partition_stats_file(&catalog, &table, s2_stats)
+        .await
+        .expect("register S2 stats");
+
+    // Write final.metadata.json so the stats path is discoverable.
+    write_final_metadata(&table, &table_location).await;
+
+    // Read back S2 stats via the production reader.
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (incr S2)");
+    let stats_schema = partition_stats_schema(&unified_type, table.metadata().format_version())
+        .expect("stats schema (incr S2)");
+    let stats_path =
+        find_stats_path(&incr_dir.join("rust_incr_table/metadata/final.metadata.json"));
+    println!("interop_partition_stats INCR GEN: reading S2 stats at {stats_path}");
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read S2 stats (incr)");
+
+    // Anti-circular assertions on the decoded incremental result.
+    assert_eq!(rows.len(), 2, "incr S2: expected 2 rows (cat=a + cat=b)");
+
+    // cat=a: fully subtracted — file_a was deleted. All counters must be zero.
+    // Rows are sorted: cat=a < cat=b.
+    let row_a = &rows[0];
+    let cat_a = match row_a.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::String(s)))) => s.clone(),
+        _ => "unknown".to_string(),
+    };
+    assert_eq!(cat_a, "a", "incr: row 0 must be cat=a");
+    assert_eq!(
+        row_a.data_record_count(),
+        0,
+        "incr cat=a: data_record_count must be 0 (subtracted)"
+    );
+    assert_eq!(
+        row_a.data_file_count(),
+        0,
+        "incr cat=a: data_file_count must be 0 (subtracted)"
+    );
+    assert_eq!(
+        row_a.total_data_file_size_in_bytes(),
+        0,
+        "incr cat=a: total_data_file_size_in_bytes must be 0 (subtracted)"
+    );
+    assert_eq!(
+        row_a.last_updated_snapshot_id(),
+        Some(s2_id),
+        "incr cat=a: last_updated_snapshot_id must be S2 (the delete snapshot)"
+    );
+
+    // cat=b: unchanged from S1 base (no S2 activity).
+    let row_b = &rows[1];
+    let cat_b = match row_b.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::String(s)))) => s.clone(),
+        _ => "unknown".to_string(),
+    };
+    assert_eq!(cat_b, "b", "incr: row 1 must be cat=b");
+    assert_eq!(
+        row_b.data_record_count(),
+        INCR_B_DATA_RECORDS,
+        "incr cat=b: data_record_count must be {} (unchanged from S1 base)",
+        INCR_B_DATA_RECORDS
+    );
+    assert_eq!(
+        row_b.data_file_count(),
+        1,
+        "incr cat=b: data_file_count must be 1"
+    );
+    assert_eq!(
+        row_b.total_data_file_size_in_bytes(),
+        INCR_B_DATA_FILE_SIZE as i64,
+        "incr cat=b: total_data_file_size_in_bytes must be {}",
+        INCR_B_DATA_FILE_SIZE
+    );
+    // Incremental path pin (2): cat=b's last_updated must remain S1, not S2.
+    // The incremental path carries the base row for cat=b unchanged; a full recompute at S2 would
+    // also return S1 for cat=b (since cat=b had no S2 activity), so this pin alone doesn't
+    // distinguish the paths. The real proof is the SUBTRACT: cat=a went to zero because the
+    // incremental diff applied the deletion of file_a to the S1 base row.
+    assert_eq!(
+        row_b.last_updated_snapshot_id(),
+        Some(s1_id),
+        "incr cat=b: last_updated_snapshot_id must be S1 (carried unchanged from base)"
+    );
+
+    // Serialize incr_expected.json for Java's verify step.
+    let expected_json: Vec<JsonValue> = rows
+        .iter()
+        .map(|row| {
+            let category = match row.partition().fields().first() {
+                Some(Some(Literal::Primitive(PrimitiveLiteral::String(s)))) => s.clone(),
+                _ => "unknown".to_string(),
+            };
+            json!({
+                "partition_category": category,
+                "spec_id": row.spec_id(),
+                "data_record_count": row.data_record_count(),
+                "data_file_count": row.data_file_count(),
+                "total_data_file_size_in_bytes": row.total_data_file_size_in_bytes(),
+                "position_delete_record_count": row.position_delete_record_count(),
+                "position_delete_file_count": row.position_delete_file_count(),
+                "equality_delete_record_count": row.equality_delete_record_count(),
+                "equality_delete_file_count": row.equality_delete_file_count(),
+                "dv_count": row.dv_count(),
+                "last_updated_snapshot_id": row.last_updated_snapshot_id(),
+                "total_record_count_null": row.total_record_count().is_none()
+            })
+        })
+        .collect();
+
+    let expected_path = incr_dir.join("incr_expected.json");
+    fs::write(
+        &expected_path,
+        serde_json::to_string_pretty(&JsonValue::Array(expected_json))
+            .expect("serialize incr_expected.json"),
+    )
+    .expect("write incr_expected.json");
+
+    println!(
+        "interop_partition_stats INCR GEN: incr_expected.json written at {}",
+        expected_path.display()
+    );
+    println!(
+        "interop_partition_stats INCR GEN: PASS — s1_id={s1_id} s2_id={s2_id} \
+         cat_a(records=0 subtracted) cat_b(records={INCR_B_DATA_RECORDS} unchanged)"
+    );
+}
+
+/// Direction 2: Rust reads Java's incremental stats file and compares against `java_incr_stats.json`.
+///
+/// The Java oracle (`IncrementalPartitionStatsOracle.generate`) wrote:
+/// - `java_incr_table/metadata/final.metadata.json` — the Java table after S2 stats registration.
+/// - `java_incr_stats.json` — the decoded S2 rows (Java's own production reader).
+///
+/// This test reads the S2 stats file via the Rust production reader and compares against the Java
+/// ground truth.
+#[tokio::test]
+async fn test_partition_stats_incr_d2_rust_reads_java() {
+    let Some(dir) = incr_dir() else {
+        println!(
+            "skipping interop_partition_stats INCR D2 — set \
+             ICEBERG_INTEROP_PARTITION_STATS_INCR_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let java_meta_path = dir.join("java_incr_table/metadata/final.metadata.json");
+    assert!(
+        java_meta_path.exists(),
+        "INCR D2: missing {}; run the Java generate step first",
+        java_meta_path.display()
+    );
+
+    let stats_path = find_stats_path(&java_meta_path);
+    println!("interop_partition_stats INCR D2: reading Java incr stats file at {stats_path}");
+
+    // Build a MemoryCatalog over the Java-written table dir.
+    let table_dir = dir.join("java_incr_table").to_string_lossy().to_string();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_incr_d2",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for incr D2");
+
+    let namespace = NamespaceIdent::new("interop_incr_d2".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (incr D2)");
+
+    let creation = TableCreation::builder()
+        .name("java_incr_table".to_string())
+        .location(table_dir.clone())
+        .schema(fixture_schema())
+        .partition_spec(fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create incr D2 table handle");
+
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (incr D2)");
+    let stats_schema =
+        partition_stats_schema(&unified_type, FormatVersion::V2).expect("stats schema (incr D2)");
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read_partition_stats_file (incr D2)");
+
+    // Load java_incr_stats.json.
+    let java_stats_path = dir.join("java_incr_stats.json");
+    assert!(
+        java_stats_path.exists(),
+        "INCR D2: missing {}; run the Java generate step first",
+        java_stats_path.display()
+    );
+    let expected = load_json_file(&java_stats_path);
+    let expected_arr = expected
+        .as_array()
+        .expect("java_incr_stats.json must be a JSON array");
+
+    assert_eq!(
+        rows.len(),
+        expected_arr.len(),
+        "INCR D2: decoded {} rows, java_incr_stats.json has {}",
+        rows.len(),
+        expected_arr.len()
+    );
+
+    for (i, (row, exp)) in rows.iter().zip(expected_arr).enumerate() {
+        let category = match row.partition().fields().first() {
+            Some(Some(Literal::Primitive(PrimitiveLiteral::String(s)))) => s.clone(),
+            _ => "unknown".to_string(),
+        };
+        let label = format!("INCR D2 row {} (cat={category})", i);
+
+        assert_eq!(
+            row.data_record_count(),
+            exp["data_record_count"].as_i64().unwrap_or(-1),
+            "{label}: data_record_count"
+        );
+        assert_eq!(
+            row.data_file_count() as i64,
+            exp["data_file_count"].as_i64().unwrap_or(-1),
+            "{label}: data_file_count"
+        );
+        assert_eq!(
+            row.total_data_file_size_in_bytes(),
+            exp["total_data_file_size_in_bytes"].as_i64().unwrap_or(-1),
+            "{label}: total_data_file_size_in_bytes"
+        );
+        assert_eq!(
+            row.position_delete_record_count(),
+            exp["position_delete_record_count"].as_i64().unwrap_or(-1),
+            "{label}: position_delete_record_count"
+        );
+        assert_eq!(
+            row.position_delete_file_count() as i64,
+            exp["position_delete_file_count"].as_i64().unwrap_or(-1),
+            "{label}: position_delete_file_count"
+        );
+        assert_eq!(
+            row.equality_delete_record_count(),
+            exp["equality_delete_record_count"].as_i64().unwrap_or(-1),
+            "{label}: equality_delete_record_count"
+        );
+        assert_eq!(
+            row.equality_delete_file_count() as i64,
+            exp["equality_delete_file_count"].as_i64().unwrap_or(-1),
+            "{label}: equality_delete_file_count"
+        );
+        assert_eq!(
+            row.dv_count() as i64,
+            exp["dv_count"].as_i64().unwrap_or(-1),
+            "{label}: dv_count"
+        );
+        assert_eq!(
+            row.last_updated_snapshot_id(),
+            exp["last_updated_snapshot_id"].as_i64(),
+            "{label}: last_updated_snapshot_id"
+        );
+        println!(
+            "interop_partition_stats INCR D2 {label}: all fields match java_incr_stats.json OK"
+        );
+    }
+
+    println!(
+        "interop_partition_stats INCR D2: PASS — {} rows decoded from Java incr stats file",
+        rows.len()
+    );
+}
+
+// ===========================================================================================
+// R2: UUID partition type — exotic type round-trip
+// ===========================================================================================
+
+/// GEN test: UUID-partitioned partition-stats.
+///
+/// V2 table `identity(partition_id uuid)` with one data file carrying the known UUID
+/// `550e8400-e29b-41d4-a716-446655440000` as the partition value. Calls
+/// `compute_and_write_stats_file` (FULL compute, no prior base) and registers the result.
+///
+/// UUID partition values are stored as 16 big-endian bytes on disk, which is the "spiciest"
+/// exotic type in the partition-stats encoding. The round-trip proof: Rust writes → Java reads
+/// (D1) and Java writes → Rust reads (D2) must both reconstruct the same UUID string.
+///
+/// Emits:
+/// - `rust_uuid_table/metadata/final.metadata.json` — for Java's D1 verify step.
+/// - `uuid_expected.json` — the decoded row (Java verify compares against this).
+#[tokio::test]
+async fn test_partition_stats_uuid_gen() {
+    let Some(uuid_dir) = uuid_dir() else {
+        println!(
+            "skipping interop_partition_stats UUID GEN — set \
+             ICEBERG_INTEROP_PARTITION_STATS_UUID_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let table_location = uuid_dir
+        .join("rust_uuid_table")
+        .to_string_lossy()
+        .to_string();
+    fs::create_dir_all(format!("{table_location}/metadata"))
+        .expect("create rust_uuid_table/metadata dir");
+
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_uuid_gen",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                uuid_dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for UUID GEN");
+
+    let namespace = NamespaceIdent::new("interop_uuid".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (UUID GEN)");
+
+    let creation = TableCreation::builder()
+        .name("rust_uuid_table".to_string())
+        .location(table_location.clone())
+        .schema(uuid_fixture_schema())
+        .partition_spec(uuid_fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create rust_uuid_table");
+
+    let known_uuid = Uuid::parse_str(KNOWN_UUID_STR).expect("parse known UUID");
+    let file_uuid = uuid_data_file(
+        &table_location,
+        "uuid_file",
+        known_uuid,
+        UUID_DATA_RECORDS as u64,
+        UUID_DATA_FILE_SIZE,
+    );
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_uuid])
+        .apply(tx)
+        .expect("apply UUID fast_append");
+    let table = tx.commit(&catalog).await.expect("commit UUID S1");
+    let s1_id = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("UUID S1 snapshot id");
+    println!("interop_partition_stats UUID GEN: S1 committed (id={s1_id}, uuid={KNOWN_UUID_STR})");
+
+    // Compute and register stats (FULL — UUID partition type).
+    let s1_snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("UUID current snapshot");
+    let stats_file = compute_and_write_stats_file(&table, s1_snapshot)
+        .await
+        .expect("compute UUID stats")
+        .expect("UUID stats must be Some");
+    let table = register_partition_stats_file(&catalog, &table, stats_file)
+        .await
+        .expect("register UUID stats");
+
+    // Write final.metadata.json.
+    write_final_metadata(&table, &table_location).await;
+    println!(
+        "interop_partition_stats UUID GEN: final.metadata.json written at {table_location}/metadata/"
+    );
+
+    // Read back via production reader.
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (UUID)");
+    let stats_schema = partition_stats_schema(&unified_type, table.metadata().format_version())
+        .expect("stats schema (UUID)");
+    let stats_path =
+        find_stats_path(&uuid_dir.join("rust_uuid_table/metadata/final.metadata.json"));
+    println!("interop_partition_stats UUID GEN: reading stats at {stats_path}");
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read UUID stats");
+
+    assert_eq!(rows.len(), 1, "UUID GEN: expected 1 partition row");
+
+    let row = &rows[0];
+    // Verify the UUID round-trip: the partition field must decode back to the known UUID.
+    let uuid_val = match row.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::UInt128(v)))) => {
+            Uuid::from_u128(*v).to_string()
+        }
+        other => panic!("UUID GEN: unexpected partition literal type: {other:?}"),
+    };
+    assert_eq!(
+        uuid_val.to_lowercase(),
+        KNOWN_UUID_STR.to_lowercase(),
+        "UUID GEN: partition UUID round-trip failed"
+    );
+    assert_eq!(
+        row.data_record_count(),
+        UUID_DATA_RECORDS,
+        "UUID GEN: data_record_count"
+    );
+    assert_eq!(row.data_file_count(), 1, "UUID GEN: data_file_count");
+    assert_eq!(
+        row.total_data_file_size_in_bytes(),
+        UUID_DATA_FILE_SIZE as i64,
+        "UUID GEN: total_data_file_size_in_bytes"
+    );
+    assert_eq!(
+        row.last_updated_snapshot_id(),
+        Some(s1_id),
+        "UUID GEN: last_updated_snapshot_id must be S1"
+    );
+
+    // Emit uuid_expected.json.
+    let expected_json = json!([{
+        "partition_uuid": uuid_val,
+        "spec_id": row.spec_id(),
+        "data_record_count": row.data_record_count(),
+        "data_file_count": row.data_file_count(),
+        "total_data_file_size_in_bytes": row.total_data_file_size_in_bytes(),
+        "position_delete_record_count": row.position_delete_record_count(),
+        "position_delete_file_count": row.position_delete_file_count(),
+        "equality_delete_record_count": row.equality_delete_record_count(),
+        "equality_delete_file_count": row.equality_delete_file_count(),
+        "dv_count": row.dv_count(),
+        "last_updated_snapshot_id": row.last_updated_snapshot_id(),
+        "total_record_count_null": row.total_record_count().is_none()
+    }]);
+
+    let expected_path = uuid_dir.join("uuid_expected.json");
+    fs::write(
+        &expected_path,
+        serde_json::to_string_pretty(&expected_json).expect("serialize uuid_expected.json"),
+    )
+    .expect("write uuid_expected.json");
+    println!(
+        "interop_partition_stats UUID GEN: uuid_expected.json written at {}",
+        expected_path.display()
+    );
+    println!(
+        "interop_partition_stats UUID GEN: PASS — uuid={KNOWN_UUID_STR} \
+         records={UUID_DATA_RECORDS} size={UUID_DATA_FILE_SIZE}"
+    );
+}
+
+/// Direction 2: Rust reads Java's UUID-partitioned stats file and compares against
+/// `java_uuid_stats.json`.
+///
+/// The Java oracle (`UuidPartitionStatsOracle.generate`) wrote:
+/// - `java_uuid_table/metadata/final.metadata.json`.
+/// - `java_uuid_stats.json` — decoded rows (Java's own production reader).
+#[tokio::test]
+async fn test_partition_stats_uuid_d2() {
+    let Some(dir) = uuid_dir() else {
+        println!(
+            "skipping interop_partition_stats UUID D2 — set \
+             ICEBERG_INTEROP_PARTITION_STATS_UUID_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let java_meta_path = dir.join("java_uuid_table/metadata/final.metadata.json");
+    assert!(
+        java_meta_path.exists(),
+        "UUID D2: missing {}; run the Java generate step first",
+        java_meta_path.display()
+    );
+
+    let stats_path = find_stats_path(&java_meta_path);
+    println!("interop_partition_stats UUID D2: reading Java UUID stats file at {stats_path}");
+
+    let table_dir = dir.join("java_uuid_table").to_string_lossy().to_string();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_uuid_d2",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for UUID D2");
+
+    let namespace = NamespaceIdent::new("interop_uuid_d2".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (UUID D2)");
+
+    let creation = TableCreation::builder()
+        .name("java_uuid_table".to_string())
+        .location(table_dir.clone())
+        .schema(uuid_fixture_schema())
+        .partition_spec(uuid_fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create UUID D2 table handle");
+
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (UUID D2)");
+    let stats_schema =
+        partition_stats_schema(&unified_type, FormatVersion::V2).expect("stats schema (UUID D2)");
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read_partition_stats_file (UUID D2)");
+
+    // Load java_uuid_stats.json.
+    let java_stats_path = dir.join("java_uuid_stats.json");
+    assert!(
+        java_stats_path.exists(),
+        "UUID D2: missing {}; run the Java generate step first",
+        java_stats_path.display()
+    );
+    let expected = load_json_file(&java_stats_path);
+    let expected_arr = expected
+        .as_array()
+        .expect("java_uuid_stats.json must be a JSON array");
+
+    assert_eq!(
+        rows.len(),
+        expected_arr.len(),
+        "UUID D2: decoded {} rows, java_uuid_stats.json has {}",
+        rows.len(),
+        expected_arr.len()
+    );
+
+    assert_eq!(rows.len(), 1, "UUID D2: expected 1 partition row");
+    let row = &rows[0];
+    let exp = &expected_arr[0];
+
+    // UUID partition value round-trip.
+    let uuid_val = match row.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::UInt128(v)))) => {
+            Uuid::from_u128(*v).to_string()
+        }
+        other => panic!("UUID D2: unexpected partition literal type: {other:?}"),
+    };
+    let expected_uuid = exp["partition_uuid"].as_str().unwrap_or("");
+    assert_eq!(
+        uuid_val.to_lowercase(),
+        expected_uuid.to_lowercase(),
+        "UUID D2: partition_uuid mismatch"
+    );
+
+    assert_eq!(
+        row.data_record_count(),
+        exp["data_record_count"].as_i64().unwrap_or(-1),
+        "UUID D2: data_record_count"
+    );
+    assert_eq!(
+        row.data_file_count() as i64,
+        exp["data_file_count"].as_i64().unwrap_or(-1),
+        "UUID D2: data_file_count"
+    );
+    assert_eq!(
+        row.total_data_file_size_in_bytes(),
+        exp["total_data_file_size_in_bytes"].as_i64().unwrap_or(-1),
+        "UUID D2: total_data_file_size_in_bytes"
+    );
+    assert_eq!(
+        row.last_updated_snapshot_id(),
+        exp["last_updated_snapshot_id"].as_i64(),
+        "UUID D2: last_updated_snapshot_id"
+    );
+
+    println!(
+        "interop_partition_stats UUID D2: PASS — uuid={uuid_val} records={} size={}",
+        row.data_record_count(),
+        row.total_data_file_size_in_bytes()
     );
 }

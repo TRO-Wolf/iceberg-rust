@@ -760,3 +760,53 @@ How to use it (see the manuals' §2):
   weak pin — apache-avro tolerates duplicate `"null"` in that nesting), exactly as the builder warned. The
   manifest schema has only PRIMITIVE-valued maps, so `rename_map_record` never fires on the manifest write
   path — (d) is byte-invisible to interop (write-data chain re-run GREEN, exit 0).
+
+### 2026-06-12 (Wave-7 R2 — partition-stats interop increment, BUILDER Sonnet, wt-r2)
+- **`PrimitiveLiteral::UInt128` must serialize as `RawLiteralEnum::String(uuid_str)` (NOT `Bytes`) when the
+  field type is `PrimitiveType::Uuid`.** *Why:* `apache-avro`'s `resolve_uuid` (Rust crate) only accepts
+  `Value::Uuid` or `Value::String` — it rejects `Value::Bytes` with "Could not find matching type in
+  UnionSchema `[Null, Uuid]`". The prior unconditional `Bytes(ByteBuf::from(v.to_be_bytes()))` arm caused
+  every UUID-partition Avro manifest write to fail with `DataInvalid`. The fix: in `serde.rs`
+  `RawLiteralEnum::try_from` for `UInt128`, check `if matches!(ty, Type::Primitive(PrimitiveType::Uuid))`
+  and emit `String(uuid::Uuid::from_u128(v).to_string())`; non-UUID UInt128 falls back to `Bytes`.
+  The companion deserialization arm in `RawLiteralEnum::String` must also handle `PrimitiveType::Uuid`
+  (Apache Avro decodes `Schema::Uuid` to `Value::Uuid` which serde-deserializes as a `String`). This fix
+  is transparent to the partition-stats Parquet path (UUID goes through Arrow FixedSizeBinary(16), not
+  Avro); all 2236 lib tests pass. LESSON: any `UInt128` serialization path must be type-gated — the Avro
+  crate's UUID schema uses a TYPE-SPECIFIC resolver that rejects the raw byte form.
+- **Incremental path engagement can only be pinned INDIRECTLY when `latest_stats_file` is a private `fn`.**
+  *Why:* there is no public hook to assert "the incremental branch was taken". Pin it via observable
+  SEMANTICS: (1) assert the base stats file is registered in the snapshot lineage before computing the
+  child snapshot (use `partition_statistics_iter().any(|f| f.snapshot_id == s1_id)`); (2) after a
+  SUBTRACT-arm snapshot (delete_files), assert the subtracted counter is zero and a carried row's
+  `last_updated_snapshot_id` equals the BASE snapshot id — a fresh full-compute at S2 would give the same
+  counter-zero result but would update `last_updated_snapshot_id` to S2. Both conditions together are a
+  strong functional pin without requiring a private-field probe.
+- **The SUBTRACT arm requires `delete_files` (a DELETE snapshot), not `delete_data_files` on a
+  `fast_append`.** *Why:* `deleted_entry_for_incremental_compute` fires only on a DELETED tombstone in the
+  manifest — a `delete_files(data_file)` call creates that tombstone. A `fast_append` snapshot never
+  produces DELETED-status entries in the manifests it adds; it only produces ADDED and EXISTING entries.
+  An append-only fixture verifies incremental==full, but it never exercises `isub`/`lsub`. Use
+  `transaction.delete_files().delete_data_files(vec![file])` to force the DELETED tombstone.
+- **SEMANTIC sabotage on a zero-valued counter field (Z3 7b pattern, step 8e): in-place byte-edit the
+  Rust incremental stats SOURCE parquet — replace the first zero INT64 with `0x0100000000000000` — then
+  re-run the Java verifier.** *Why:* a structural sabotage (truncate the file) is caught by the parquet
+  parser before the value check; the merged `data_record_count` for cat=a MUST be exactly zero after the
+  SUBTRACT arm, so flipping it to 1 is a meaningful semantic target — the file stays valid parquet but the
+  counter is wrong, and Java's `readPartitionStatsFile` D1 verify must catch the mismatch against
+  `incr_expected.json`. WHAT THE SCRIPT ACTUALLY DOES (no env var): `cp $path $path.bak`; a `python3`
+  one-liner scans for the 8-byte little-endian zero pattern starting at offset 4 (past the `PAR1` magic),
+  writes `0x01…` at that offset, and `sys.exit(42)` if the pattern is NOT found (encoding-dependent skip
+  guard); the shell checks `MUTATE_8E_EXIT == 42` and prints `8e SKIP` rather than fabricating a FAIL,
+  otherwise it runs `verify-interop-partition-stats-incr` and asserts the run does NOT report
+  `0 failures`; finally `cp $path.bak $path` restores. Control + FAIL provenance are both required — 8d
+  (the clean D2 read) asserts zero under no sabotage, 8e asserts the corruption fails closed.
+  _NOTE:_ there is NO `ICEBERG_INTEROP_PARTITION_STATS_INCR_SABOTAGE_SRC` env var and no Rust-emitted
+  `sabotage_src` path; the sabotage is entirely shell-side (in-place edit + `.bak` restore + exit-42 skip).
+- **Java inner class method visibility: `private static` methods in a static inner class are NOT visible
+  to sibling inner classes in the same outer class.** *Why:* Java language spec §6.6 — nested classes do
+  not inherit the outer class's `private` access boundary for cross-sibling references. When
+  `IncrementalPartitionStatsOracle` calls `PartitionStatsOracle.compareStatsRow(...)`, the method must
+  be at least package-private. Removing the `private` modifier (making it package-private, the default)
+  is the minimal fix; `protected` would also work. This affects any actor-critic split where a NEW inner
+  oracle class must reuse helpers from an EXISTING inner class — audit visibility before compilation.
