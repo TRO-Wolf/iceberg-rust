@@ -31,6 +31,7 @@ reconstructing why a shipped increment did what it did).
 
 | File | Covers |
 |---|---|
+| [2026-06_wave6-wave7.md](2026-06_wave6-wave7.md) | **Waves 6–7 (PRs #43–#47; pass-scoped).** Wave 6 — the I increments (I1 theta-blob interop, I2 view-metadata interop, I3 data-level WAP interop, all LANDED) + the O increments (O1 MemoryCatalog optimistic-concurrency CAS, O2 partition-stats incremental+exotic-type residue, O3 divergence burn-down — type-name case / sort-order bind / manifest-list order / map-value avro naming, incl. its O3 REVIEWER sub-section); Wave 7 — the R increments (R1 SQL-catalog base-location CAS + doctest fixes, R2 partition-stats interop chain extension incl. UUID, R3 partition-stats time/fixed/binary exotic-type interop + 7b fail-closed). Added by archival pass 5 (2026-06-13). |
 | [2026-06_wave5.md](2026-06_wave5.md) | **Wave 5 (PRs #39–#41; pass-scoped).** U views (U1 layer + U2 SQL/REST CRUD), Z interop chains (Z1 staged-WAP, Z2 multi-spec, Z3 partition-stats), Y theta/Alpha (Y1 crate, Y2 action + the family STOP-finding, Y3 Alpha port). Added by archival pass 4 (2026-06-12). |
 | [2026-06_wave3-wave4-overnight.md](2026-06_wave3-wave4-overnight.md) | **Waves 3–4 + the 2026-06-12 overnight session (PRs #25–#37; pass-scoped, not phase-filed — deviation documented in the header).** Multi-spec writes + constants-map activation + removeRows; ExpireSnapshots B1/B2 + the A3 interop chain; DeleteOrphanFiles A1/A2; the variant arc (B1/B2 read+write, F1 schema-type entry, F2 shredding overlay); Wave-4 O1 (FastAppend carry fix) / O2 (RewriteDataFiles) / O3 (RemoveDanglingDeleteFiles); the S1–S3 Sonnet interop arc + W1–W3 data-level fixtures C–G + the spec-id comparator groundwork; overnight V1 (stage_only) / V2 (WAP dedup) / X1–X2 (ComputePartitionStats); the pass-2 doc-pass records; the superseded wave-charter planning section. Added by archival pass 3 (2026-06-12). |
 | [2026-06_ops-hardening.md](2026-06_ops-hardening.md) | **Meta-sprints (not phase work).** Increment D status de-triplication + the operational-hardening & Opus-handoff sprint plan (2026-06-09/10). Deliberately not phase-filed (deviation documented in the file header). Added by archival pass 2 (2026-06-11), which also appended to the three phase files: phase2 +9 sections (the write-engine completion arc, the DV arc, the overnight plan + morning report, Arc F cherrypick, E1, E2, the OverwriteFiles branch-A increment, the superseded RewriteManifests sketch), phase1 +2 (Arc G + the closed carried-forward items), phase3 +1 (readable_metrics interop). |
@@ -58,6 +59,12 @@ reconstructing why a shipped increment did what it did).
 
 ## Archival log
 
+- **2026-06-13** (pass 5 — Wave-6/Wave-7 union, live `todo.md` was 466 lines): archived the nine spent
+  Wave-6 + Wave-7 increment narratives → [2026-06_wave6-wave7.md](2026-06_wave6-wave7.md). 12 `## ` /
+  1 `### ` pre-pass — 3 `## ` kept live (the refreshed open queue, Carried-forward, Archived-narratives),
+  9 `## ` + 1 `### ` archived (R1/R2/R3, I1/I2/I3, O1/O2/O3 incl. the O3 REVIEWER sub-section). The
+  ACTIVE open queue was refreshed in place to the 2026-06-13 re-audit (ranked next-work; statuses link
+  to GAP_MATRIX). Live `todo.md` → 96 lines.
 - **2026-06-09** (size trigger — live `todo.md` was 4,344 lines): first todo-archival pass. 18 `## ` /
   42 `### ` sections — 1 `## ` kept live (the hardening sprint), 17 archived (phase1 1, phase2 4,
   phase3 12); 2 genuinely-open Phase-1 follow-ups lifted into the live "Carried-forward open items"
