@@ -907,3 +907,53 @@ Run the pipe-count audit on the edited row immediately after editing (exactly 5 
   `#[tokio::main]` → `#[tokio::main(flavor = "current_thread")]` (5 iceberg + 1 catalog-sql); no
   ` ```no_run `/` ```ignore ` fence was added. `git diff --name-only` carries zero Cargo.toml/Cargo.lock.
   `cargo test -p iceberg --doc` 85/85, re-run independently.
+
+---
+
+### 2026-06-13 — R3: partition-stats time/fixed/binary exotic-type interop + 7b fail-closed
+
+**DO** extend an existing interop chain to a new partition-value type by following the established
+template (here R2's `UuidPartitionStatsOracle`) verbatim per type, NOT by inventing a new structure:
+one Java oracle class per exotic type (`Time`/`Fixed`/`BinaryPartitionStatsOracle`) with a
+`generate()` (D2 ground truth) + `verify()` (D1 — Java reads Rust), wired into the main switch before
+`default`; one Rust GEN + one Rust D2 test per type, env-gated (clean no-op when the env dir is unset),
+with HAND-DECLARED anti-circular constants agreed by both sides. The chain script gets a `{generate,
+Rust GEN, verify, Rust D2}` block per type, each grepping for the `…: 0 failures` sentinel, chained ×2.
+
+**WHY (the load-bearing facts this increment pinned):**
+
+- **Java's GENERIC in-memory representation of a partition value is `Type.TypeID.javaClass()`, NOT the
+  logical type.** Decompiling `Type$TypeID` (iceberg-api-1.10.0.jar) gives the exact mapping the oracle's
+  `partition.get(0, Object.class)` returns after `readPartitionStatsFile`: **time → `java.lang.Long`**
+  (micros since midnight), **fixed → `java.nio.ByteBuffer`**, **binary → `java.nio.ByteBuffer`** (uuid →
+  `ByteBuffer` too, which is why the R2 oracle handled both `UUID` and `ByteBuffer`). So the time oracle
+  compares a `Long`; the fixed/binary oracles compare a `ByteBuffer` decoded to a hex string. Building the
+  data file uses the SAME generic rep: `PartitionData.set(0, Long)` for time, `PartitionData.set(0,
+  ByteBuffer.wrap(bytes))` for fixed/binary. DO decompile `Type$TypeID` rather than guessing the boxed type.
+
+- **No production change was needed — and that is the correct, verified outcome (contrast R2's UUID).**
+  O2 had already landed the production reader/writer arms for all four exotic types (`partition_stats.rs`
+  `build_partition_field_column`: `Time64MicrosecondArray` from a `Long`; `FixedSizeBinary(L)` for fixed;
+  `LargeBinary` for binary; + `arrow/value.rs` read-back `Time` → `Literal::time`, `Fixed(len)` →
+  `Literal::fixed`, `Binary` → `Literal::binary`). I VERIFIED these arms exist before writing any test,
+  then proved them through the live interop chain — so unlike R2 (where the UUID Avro-serde gap surfaced
+  and shipped under-pinned), R3 surfaced NO gap. DON'T add speculative production code when the chain is
+  green; DO record the "no production change" explicitly so a reviewer can confirm the arms were exercised,
+  not bypassed. Rust `Literal::time(i64)` → `PrimitiveLiteral::Long`; `Literal::fixed`/`Literal::binary`
+  → `PrimitiveLiteral::Binary(Vec<u8>)` (fixed and binary share the variant; the schema width discriminates).
+
+- **The 7b SKIP false-green was the SAME anti-pattern 8e already killed — fixed identically.** 7b printed
+  "7b SKIP" and proceeded on `sys.exit(42)` when the INT64-3 byte pattern was absent. Converted to
+  fail-closed: `sys.exit(1)` on pattern-absent → shell restores `.bak` + aborts the chain. **`set -e`
+  GOTCHA (genuinely load-bearing, tested empirically):** a bare failing `python3 -c …` on its own line
+  ABORTS the script immediately under `set -euo pipefail` — BEFORE the `MUTATE_*_EXIT=$?` capture and the
+  `.bak` restore run. Both the original 8e and a naive 7b therefore aborted without restoring. FIX: capture
+  the exit with `MUTATE_*_EXIT=0; python3 … || MUTATE_*_EXIT=$?` so the explicit guard (restore + abort)
+  is genuinely reachable. Applied to BOTH 7b and 8e so the "exactly like 8e" mirror is true AND correct.
+  DO verify a "restore on abort" claim with a throwaway `set -e` repro — the abort-before-restore footgun
+  is invisible in a green run (the temp dir is wiped next chain anyway).
+
+- **Pipe-count audit catches raw `|` inside code spans in a matrix cell.** My first GAP_MATRIX row-118
+  edit embedded `` `|| MUTATE_*_EXIT=$?` `` — the literal `||` made the awk pipe count 7, not 5. Reworded
+  to drop the `||` literal. DO re-run `awk '/^\|/ {n=gsub(/\|/,"|"); if (n!=5) print NR}'` after ANY cell
+  edit that mentions shell `||`/`|` operators; code spans do not protect raw pipes from the table parser.

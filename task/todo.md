@@ -38,6 +38,45 @@ How to use it (see the manuals' §1):
 > lines → the wave3-wave4 file), 2026-06-11 (pass 2), 2026-06-09 (pass 1). Procedure:
 > [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## INCREMENT R3 (2026-06-13): partition-stats time/fixed/binary exotic-type interop + 7b fail-closed (BUILDER Opus, wt-r3)
+
+Charter: Close the partition-stats exotic-type interop residue named by R2 — extend the chain to
+`time`/`fixed[L]`/`binary` partition values (R2 landed UUID). Plus: harden the pre-existing 7b SKIP
+sabotage to fail-closed (mirror 8e); re-audit GAP_MATRIX row 118 (narrow the now-met residue).
+
+**Plan (pre-code, per manual §1):**
+- [x] **Step 1 (Java oracles):** Added `TimePartitionStatsOracle` / `FixedPartitionStatsOracle` /
+  `BinaryPartitionStatsOracle` to `InteropOracle.java`, each mirroring `UuidPartitionStatsOracle`
+  (generate = D2 ground truth, verify = D1), wired `{generate,verify}-interop-partition-stats-{time,
+  fixed,binary}` into the switch before `default`. Shared `bytesPartitionHex`/`bytesToHex` helpers for
+  fixed+binary; time compared as a `Long`. _Decompiled `Type$TypeID` to pin the generic reps: time →
+  `Long`, fixed/binary → `ByteBuffer`._
+- [x] **Step 2 (Rust GEN/D2 tests):** Added `test_partition_stats_{time,fixed,binary}_{gen,d2}` to
+  `tests/interop_partition_stats.rs`, env-gated on new `*_TIME_DIR`/`*_FIXED_DIR`/`*_BINARY_DIR` vars
+  (clean no-op when unset), hand-declared anti-circular constants (time 45296789012 micros; fixed
+  0xdeadbeef; binary 0x0102030405), per-type schema/spec/data-file helpers + a `bytes_to_hex` helper.
+- [x] **Step 3 (Chain script):** Extended `run-interop-partition-stats.sh` to 13 steps (10 time / 11
+  fixed / 12 binary, each `{Java gen, Rust GEN, Java D1, Rust D2}` grepping `…: 0 failures`), chain ×2.
+- [x] **Step 4 (7b fail-closed):** Converted 7b from the exit-42 SKIP false-green to `sys.exit(1)` on
+  pattern-absent + a `set -e`-safe `MUTATE_7B_EXIT=$?` or-capture so the shell restores `.bak` + aborts
+  the chain (exactly like 8e). Applied the same or-capture robustness to 8e so its restore is genuinely
+  reachable. Reconciled the header/summary doc text; no stale SKIP language remains.
+- [x] **Step 5 (GAP_MATRIX + journal + gate):** Re-audited row 118 — partition-stats exotic interop
+  residue CLOSED; row stays 🟡 only for the SEPARATE Group-Y `ComputeTableStats` surface. Pipe-count
+  audit clean (5 per row). Lessons + this section appended. Gate: typos/fmt/clippy/lib tests + chain ×2.
+
+**Residue:** NONE for partition-stats exotic types — uuid + time + fixed + binary + incremental are all
+bidirectionally interop-proven. `ComputeTableStats` (theta-NDV) end-to-end + broader Compute*Stats action
+breadth remain a separate Group-Y deferral (row 118 stays 🟡 for that reason alone, honestly).
+
+**Production change:** NONE. O2's reader/writer already round-tripped all four exotic types; R3 verified
+the arms through the live chain and added only oracle fixtures + tests + chain steps (contrast R2, where
+the UUID Avro-serde gap surfaced).
+
+**Outcome (2026-06-13):** R3 LANDED — partition-stats time/fixed/binary exotic-type interop (bidirectional,
+chain ×2) + 7b sabotage hardened to fail-closed. The partition-stats exotic-type interop residue named by
+R2 is closed.
+
 ## INCREMENT R2 (2026-06-12): partition-stats interop chain extension — incremental + exotic-type (BUILDER Sonnet, wt-r2)
 
 Charter: Extend the partition-stats interop chain (Z3) to (a) the incremental compute path — both Rust-writes→Java-reads and Java-writes→Rust-reads; (b) exotic partition-value types (uuid as the spiciest; also time/fixed/binary if cheap); (c) a SEMANTIC sabotage on a merged counter; (d) GAP_MATRIX row 118 re-audit. All env-gated tests, fail-closed sentinels, chain ×2.
@@ -384,8 +423,9 @@ views end-to-end, and TEN interop chains). Statuses live ONLY in the GAP_MATRIX.
       comparison still the open half; data-level WAP interop — **LANDED 2026-06-12 (I3)**, with
       data-level FAST-FORWARD + column-vs-stamp routing as named residue. STILL OPEN: variant
       file-level I/O + interop (the parquet-crate boundary).
-- [ ] **Partition-stats residue:** the INCREMENTAL compute path; time/uuid/fixed/binary partition
-      values in stats files (loud errors today).
+- [x] **Partition-stats residue — CLOSED (R3, 2026-06-13):** the INCREMENTAL compute path (R2) and
+      all exotic partition-value types — uuid (R2), time/fixed/binary (R3) — now write, read, AND are
+      bidirectionally interop-proven. No loud-error residue remains on the partition-stats surface.
 - [ ] **The shared-seam concurrency-parity increment** (U1 reviewer): no location-CAS on
       MemoryCatalog update_table/update_view (stale second commit last-write-wins); the SQL
       catalog has it per-catalog — port the posture to the shared seam + MemoryCatalog.
