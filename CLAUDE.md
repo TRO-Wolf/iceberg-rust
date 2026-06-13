@@ -266,6 +266,12 @@ them to Sonnet or Haiku; only run an Opus sub-agent on a direct, explicit instru
 - **Pipe-count-audit the GAP_MATRIX after any matrix-wide edit** — every `^|` row must carry
   exactly 5 `|` characters (raw pipes inside code spans split cells silently; the de-triplication
   pass once stranded half a cell as a phantom column). _Promoted 2026-06-11 from lessons._
+- **A sabotage step that cannot be applied must HARD-FAIL, never SKIP.** A negative/sabotage test
+  that did not actually corrupt anything has proven nothing — a SKIP branch is a false-green. When
+  the corruption cannot be applied (e.g. the target byte pattern is absent), exit non-zero and abort
+  the chain (restoring any `.bak` first); under `set -euo pipefail`, capture the mutator's exit with
+  `|| rc=$?` so the restore stays reachable. _Promoted 2026-06-13 from a thrice-repeated lessons
+  entry (interop sabotage 6b / 8e / 7b)._
 - **Upstream is a sync baseline, not a constraint.** This is an owned fork for Java `iceberg-core`
   parity — edit freely; sync up from upstream and cherry-pick wins, but mergeability is not required.
 - **Tests ship with the change**, plus interop tests where applicable (see the Parity mandate and the
