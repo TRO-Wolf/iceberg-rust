@@ -29,7 +29,7 @@
 //! use iceberg::memory::MemoryCatalogBuilder;
 //! use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, Result, TableIdent};
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> Result<()> {
 //!     // Connect to a catalog.
 //!     use iceberg::memory::MEMORY_CATALOG_WAREHOUSE;

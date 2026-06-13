@@ -56,6 +56,46 @@ Charter: Extend the partition-stats interop chain (Z3) to (a) the incremental co
 
 **Outcome (2026-06-13):** R2 partition-stats interop chain extension LANDED — R2-INCR (SUBTRACT arm, bidirectional, 8a-8e incl. SEMANTIC sabotage) + R2-UUID (exotic type, bidirectional, 9a-9d), chain ×2. Production fix: `PrimitiveLiteral::UInt128` typed `PrimitiveType::Uuid` now serializes to an Avro String (was `Bytes`, rejected by apache-avro's `resolve_uuid`) with the matching deserialize arm. time/fixed/binary interop named as precise residue.
 
+## INCREMENT R1 (2026-06-12): SQL catalog base-location CAS + doctest rt fixes (BUILDER Sonnet, wt-r1)
+
+Charter: Two bounded tasks on the `fix/sql-cas-doctests` branch.
+
+**Task A — SQL catalog base-location CAS** (Java `JdbcTableOperations/JdbcViewOperations.doCommit` parity):
+
+Java bytecode evidence (`JdbcTableOperations.doCommit`, `iceberg-core-1.10.0.jar`):
+- offset 46-47: `aload_1` (=base arg, type `TableMetadata`) → `validateMetadataLocation(loadedRow, base)` 
+- `validateMetadataLocation` offset 16-24: `base.metadataFileLocation()` (null if base==null) vs stored from DB
+- offset 50-55: after validate, captures `base.metadataFileLocation()` as `var6` for the SQL CAS
+- `updateTable(newLoc=var4, baseFileLoc=var6)` → SQL `AND metadata_location = ?` binds `base.metadataFileLocation()`
+- The current Rust code binds its own freshly-loaded `current_metadata_location` (TOCTOU window only); Java binds the COMMIT'S BASE.
+
+Design: in `update_table` and `update_view`, prefer `commit.base_metadata_location()` when `Some`; fall back to current for the SQL CAS. None-base behavior: if the commit carries `None` (shouldn't happen in normal flow), use the freshly-loaded location (safe conservative fallback — None base never equals stale stored, so this can't silence a conflict).
+
+- [x] **Step A1 (Survey imports):** Read the current `update_table`/`update_view` bodies and their tests; confirm `TableCommit::base_metadata_location()` / `ViewCommit::base_metadata_location()` are public and callable.
+- [x] **Step A2 (Fix update_table):** Used `commit.base_metadata_location()` captured before `apply()` as `cas_location`; pre-check + SQL CAS both bind to `cas_location`. `TableCommit::builder()` is `pub(crate)` — no stale-table test from external crate; documented.
+- [x] **Step A3 (Fix update_view):** Same pattern on the view path; ViewCommit buildable via public `view.replace_version().to_commit()` API.
+- [x] **Step A4 (Tests):** Added 4 tests (SQLite in-memory):
+  - `test_view_stale_sequential_commit_rejected_by_base_location_cas` — stale view commit rejected with `CatalogCommitConflicts`.
+  - `test_view_non_stale_commit_succeeds_with_base_location_cas` — non-stale view commit succeeds.
+  - `test_view_stale_then_reload_and_retry_succeeds` — stale→reload→retry succeeds.
+  - `test_table_happy_path_unchanged_with_base_location_cas` — table Transaction commit still works.
+- [x] **Step A5 (Mutation check):** Knocked out `cas_location` → `current_metadata_location` + `if false` pre-check. Two tests failed: `test_view_stale_sequential_commit_rejected` + `test_view_stale_then_reload`. Reverted. Mutation caught.
+
+**Task B — doctest rt-multi-thread fix** (5 pre-existing compile failures):
+
+Root cause: `#[tokio::main]` defaults to `multi_thread` flavor; `rt-multi-thread` is not enabled in doctest builds → compile failure. Fix: change to `#[tokio::main(flavor = "current_thread")]` in the 5 failing doctests. The doctests are already `no_run` (or can compile-and-run with current_thread — prefer run over no_run). HARD CONSTRAINT: no Cargo.toml edits.
+
+- [x] **Step B1 (Fix lib.rs:24):** Changed `#[tokio::main]` → `#[tokio::main(flavor = "current_thread")]` in the crate-level doc example.
+- [x] **Step B2 (Fix writer/mod.rs:42,117,257,321):** Same fix in all four writer doctests (2 visible lines + 2 hidden `# ` lines). Also fixed `crates/catalog/sql/src/lib.rs:32` (pre-existing failure in gate).
+- [x] **Step B3 (Verify):** `cargo test -p iceberg --doc` → 85 passed; 0 failed (was 80 pass / 5 fail).
+
+- [x] **Gate chain (ONE `&&`):** `typos . && cargo fmt --all -- --check && cargo clippy --all-targets --workspace --exclude iceberg-sqllogictest -- -D warnings && cargo test -p iceberg --lib && cargo test -p iceberg --doc && cargo test -p iceberg-catalog-sql` + taplo check. All PASS. Lib: 2236 pass, 0 fail.
+- [x] **GAP_MATRIX update:** Row 107 FOLLOW-UP clause updated from `(open)` to `(closed, R1 2026-06-12)`. Pipe-count audit: 5 pipes. ✓
+- [x] **Report:** Written to /tmp/wave7/R1-builder.md.
+- [x] **Lessons:** Appended 4 dated entries to task/lessons.md.
+
+**Outcome (2026-06-12):** R1 COMPLETE — SQL catalog CAS now uses `commit.base_metadata_location()` (Java-faithful); 5 doctest failures fixed; all gate checks green.
+
 ## ACTIVE (2026-06-12): I1 — theta-blob interop (LANDED)
 
 **Plan (pre-code, 3–7 bullets per manual §1):**

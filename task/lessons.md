@@ -814,3 +814,96 @@ How to use it (see the manuals' §2):
   be at least package-private. Removing the `private` modifier (making it package-private, the default)
   is the minimal fix; `protected` would also work. This affects any actor-critic split where a NEW inner
   oracle class must reuse helpers from an EXISTING inner class — audit visibility before compilation.
+
+---
+
+### 2026-06-12 — R1: SQL catalog CAS uses base_metadata_location, not freshly-loaded location
+
+**DO** capture `commit.base_metadata_location()` BEFORE calling `commit.apply()` — `apply` consumes the
+commit. Use the captured `cas_location` for BOTH the pre-check and the SQL `AND metadata_location = ?`
+bind.  Falling back to the freshly-loaded `current_metadata_location` only guards the TOCTOU window; it
+cannot catch a strictly-sequential stale commit.
+
+**WHY:** Java `JdbcTableOperations.doCommit` bytecode (iceberg-core-1.10.0.jar): `validateMetadataLocation`
+fetches `base.metadataFileLocation()` (the BASE commit arg), not the freshly-loaded DB row; `updateTable`
+binds `baseFileLoc` (captured as `var6 = aload_1.metadataFileLocation()`) into the SQL CAS, NOT the loaded
+location.  The pre-fix Rust code compared the freshly-loaded location, creating a gap: a caller who loaded
+the table, then another writer committed, then the first caller tried to commit — the pre-fix code accepted
+it (both its "load" and its "CAS" saw the intermediate location).  The fix: `cas_location` = base when
+Some, else current (create-edge / legacy).
+
+---
+
+### 2026-06-12 — R1: TableCommit is pub(crate) — cannot test table stale-base from external crates
+
+**DO NOT** try to construct a stale `TableCommit` in `iceberg-catalog-sql` tests — the
+`TableCommit::builder().build()` method is `pub(crate)`.  Use `ViewCommit` instead: `ViewCommit` is
+buildable via the public `view.replace_version().to_commit()` API, and both `update_table` and
+`update_view` share identical CAS fix structure.  Document the constraint in test comments.
+
+**WHY:** `TypedBuilder` macro exposes `build_method(vis = "pub(crate)")` on `TableCommit`; cross-crate
+callers get a compile error.  `Transaction.do_commit` always reloads the table before building a
+`TableCommit`, so you cannot exercise the stale path via `Transaction` either.
+
+---
+
+### 2026-06-12 — R1: Fix tokio doctest failures with flavor = "current_thread"
+
+**DO** fix `cargo test --doc` failures from missing `rt-multi-thread` by switching the doctest's runtime
+attribute to `#[tokio::main(flavor = "current_thread")]` within the doc comment string.  This requires
+zero Cargo.toml changes.
+
+**WHY:** `#[tokio::main]` expands to a multi-thread runtime by default, which requires the `rt-multi-thread`
+Tokio feature.  Doctest builds do not enable this feature in the iceberg/sql-catalog crates.  The
+`current_thread` flavor uses only `rt` (always enabled).  Hidden doc-comment lines (prefixed with
+`//! # `) need a separate `replace_all` pass since they have a different string prefix from visible lines
+(`//! `).  The sql catalog lib.rs has the same issue as the iceberg crate — fix both when fixing the gate.
+
+---
+
+### 2026-06-12 — GAP_MATRIX: close FOLLOW-UP (open) clauses with date + what landed
+
+**DO** replace a `FOLLOW-UP (open): ...` clause with `FOLLOW-UP (closed, R1 YYYY-MM-DD): ...` plus a
+1-2 sentence summary of the fix when the work lands.  Do NOT delete the clause — the history matters.
+Run the pipe-count audit on the edited row immediately after editing (exactly 5 `|` per `^|` row).
+
+---
+
+#### R1 REVIEWER corrections (2026-06-12, wt-r1) — adversarial actor-critic audit
+
+- **"Both arms share the identical CAS fix structure, so the view tests pin the table path too" was a
+  FALSE COVERAGE CLAIM — the code was DUPLICATED, not SHARED, and the table arm was UNPINNED.** The
+  builder copy-pasted the `cas_location` + pre-check block into BOTH `update_table` and `update_view`.
+  Mutation battery (run for real): knocking out the TABLE-arm CAS ALONE (`if false` guard + revert SQL
+  bind to `current_metadata_location`) left ALL 68 sql-crate tests GREEN — zero detection; knocking out
+  the VIEW-arm CAS alone failed exactly the 2 view stale tests. So the view tests pinned ONLY the view
+  arm. *Structural identity of two duplicated blocks is NOT behavioral coverage of both* — a future
+  edit to the table block (or a Sonnet that "cleans up" one copy) would silently regress with a green
+  suite. FIX (this pass): extracted ONE shared free fn `resolve_commit_cas_location(base, current,
+  entity_desc) -> Result<String>` that both arms call; re-ran the battery — knocking out the single
+  helper now fails the 2 view tests, and because the table arm flows through the SAME function its CAS
+  computation is now genuinely pinned. DO, when a test can only be built for one of two arms (here
+  `TableCommit::builder().build()` is `pub(crate)` + `Transaction::do_commit` reloads, so a stale TABLE
+  commit is unconstructable from an external crate — VERIFIED, the builder's impossibility claim is
+  TRUE), UNIFY the code path so the reachable test pins both, rather than asserting "identical structure"
+  and calling it covered. A duplicate-and-claim is the canonical false-1:1 dodge.
+- **CONFIRMED the None-fallback is Java-faithful, not a silent door, and consistent with the O1
+  MemoryCatalog precedent.** When `commit.base_metadata_location()` is `None` (Java's `base == null`
+  create edge), the SQL helper falls back to `current_metadata_location` for the CAS — and the guard is
+  `base_metadata_location.is_some() && ...`, so a `None` base NEVER triggers a conflict, matching Java
+  `validateMetadataLocation` (which no-ops the location check when `base == null`). This is the same
+  posture O1 gave MemoryCatalog (`base == null` → create edge, no CAS), so the two in-repo catalogs are
+  now consistent. The SQL posture is no longer weaker than the O1 precedent — the O1 follow-up is
+  genuinely closed.
+- **CONFIRMED the retry test is honest, not a hand-rolled pass.** `test_view_stale_then_reload_and_retry_succeeds`
+  asserts the stale commit fails with `CatalogCommitConflicts` AND `err.retryable() == true`, then reloads
+  the view (genuine `Catalog::load_view`), rebuilds a fresh commit whose `base_metadata_location` now
+  matches the stored location (verified: `replace_version()` threads `self.metadata_location` → `to_commit`
+  populates the field, view.rs:199/417), and that fresh commit succeeds. It does not falsely claim to drive
+  the `backon` loop — the actual loop classification (`.when(|e| e.retryable())` at transaction/mod.rs) was
+  already pinned by O1's mock tests. The hand-rolled reload accurately models the retry contract.
+- **CONFIRMED no sneaky `no_run`/`ignore` downgrade — the doctests were already `no_run` and stay that
+  way (compiled under the doctest harness; `main()` does not execute).** The diff hunks change ONLY
+  `#[tokio::main]` → `#[tokio::main(flavor = "current_thread")]` (5 iceberg + 1 catalog-sql); no
+  ` ```no_run `/` ```ignore ` fence was added. `git diff --name-only` carries zero Cargo.toml/Cargo.lock.
+  `cargo test -p iceberg --doc` 85/85, re-run independently.

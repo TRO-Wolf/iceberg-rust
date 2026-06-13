@@ -56,7 +56,7 @@
 //! use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 //! use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, Result, TableIdent};
 //! use parquet::file::properties::WriterProperties;
-//! #[tokio::main]
+//! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> Result<()> {
 //!     // Connect to a catalog.
 //!     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -177,7 +177,7 @@
 //!     }
 //! }
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> Result<()> {
 //!     // Connect to a catalog.
 //!     use iceberg::memory::MEMORY_CATALOG_WAREHOUSE;
@@ -266,7 +266,7 @@
 //! # };
 //! # use parquet::file::properties::WriterProperties;
 //! # use std::collections::HashMap;
-//! # #[tokio::main]
+//! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<()> {
 //! # let catalog = MemoryCatalogBuilder::default()
 //! #     .load("memory", HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), "file:///path/to/warehouse".to_string())]))
@@ -330,7 +330,7 @@
 //! # };
 //! # use parquet::file::properties::WriterProperties;
 //! # use std::collections::HashMap;
-//! # #[tokio::main]
+//! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<()> {
 //! # let catalog = MemoryCatalogBuilder::default()
 //! #     .load("memory", HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), "file:///path/to/warehouse".to_string())]))
