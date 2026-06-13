@@ -796,13 +796,17 @@ How to use it (see the manuals' §2):
   counter is wrong, and Java's `readPartitionStatsFile` D1 verify must catch the mismatch against
   `incr_expected.json`. WHAT THE SCRIPT ACTUALLY DOES (no env var): `cp $path $path.bak`; a `python3`
   one-liner scans for the 8-byte little-endian zero pattern starting at offset 4 (past the `PAR1` magic),
-  writes `0x01…` at that offset, and `sys.exit(42)` if the pattern is NOT found (encoding-dependent skip
-  guard); the shell checks `MUTATE_8E_EXIT == 42` and prints `8e SKIP` rather than fabricating a FAIL,
-  otherwise it runs `verify-interop-partition-stats-incr` and asserts the run does NOT report
-  `0 failures`; finally `cp $path.bak $path` restores. Control + FAIL provenance are both required — 8d
-  (the clean D2 read) asserts zero under no sabotage, 8e asserts the corruption fails closed.
+  writes `0x01…` at that offset, and — if the pattern is NOT found — HARD-FAILS (`sys.exit(1)`, and the
+  shell aborts the chain on any non-zero `MUTATE_8E_EXIT` after restoring the `.bak`). It does NOT skip:
+  cat=a's `data_record_count` is 0 after the SUBTRACT, so a literal zero INT64 is guaranteed present;
+  its absence means the parquet encoding changed and the sabotage no longer corrupts a counter, which
+  per the promoted "a SKIP branch in a sabotage step is a false-green" lesson MUST hard-fail, never SKIP
+  (critic fix, 2026-06-13 — the original 8e shipped an exit-42 SKIP that contradicted that rule). On a
+  successful mutation the shell runs `verify-interop-partition-stats-incr` and asserts the run does NOT
+  report `0 failures`; finally `cp $path.bak $path` restores. Control + FAIL provenance are both required
+  — 8d (the clean D2 read) asserts zero under no sabotage, 8e asserts the corruption fails closed.
   _NOTE:_ there is NO `ICEBERG_INTEROP_PARTITION_STATS_INCR_SABOTAGE_SRC` env var and no Rust-emitted
-  `sabotage_src` path; the sabotage is entirely shell-side (in-place edit + `.bak` restore + exit-42 skip).
+  `sabotage_src` path; the sabotage is entirely shell-side (in-place edit + `.bak` restore + hard-fail).
 - **Java inner class method visibility: `private static` methods in a static inner class are NOT visible
   to sibling inner classes in the same outer class.** *Why:* Java language spec §6.6 — nested classes do
   not inherit the outer class's `private` access boundary for cross-sibling references. When

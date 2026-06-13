@@ -437,8 +437,12 @@ replacement = bytes([0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
 # Find in the row group data section (skip the first 4 bytes = 'PAR1' magic).
 idx = data.find(target, 4)
 if idx == -1:
-    print('WARNING: zero INT64 pattern not found in incr parquet — skipping 8e mutation', file=sys.stderr)
-    sys.exit(42)
+    # A sabotage that cannot be applied has proven NOTHING — hard-fail (do NOT skip).
+    # (lessons.md: 'A SKIP branch in a sabotage step is a false-green'.) cat=a's
+    # data_record_count is 0 after the SUBTRACT, so a literal zero INT64 must be present;
+    # its absence means the parquet encoding changed and 8e no longer corrupts a counter.
+    print('8e ERROR: zero INT64 pattern not found in incr parquet — sabotage cannot be applied', file=sys.stderr)
+    sys.exit(1)
 
 data[idx:idx+8] = replacement
 
@@ -448,22 +452,25 @@ with open(sys.argv[1], 'wb') as f:
 print(f'8e: mutated INT64 at offset {idx}: 0 -> 1 (SEMANTIC corruption in merged counter)')
 " "${RUST_INCR_STATS_PATH}"
   MUTATE_8E_EXIT=$?
-  if [[ ${MUTATE_8E_EXIT} -eq 42 ]]; then
-    echo "        8e SKIP: zero INT64 pattern not found in incr parquet encoding — mutation not applied"
-  else
-    SABOTAGE_8E="$(
-      cd "${SCRIPT_DIR}"
-      "${MVN}" -o -q compile exec:java \
-        -Dexec.args=verify-interop-partition-stats-incr \
-        -Dinterop.partition_stats_incr.dir="${TMP_INCR}" 2>&1
-    )" || true
-    if echo "${SABOTAGE_8E}" | grep -q 'verify-interop-partition-stats-incr: 0 failures'; then
-      echo "==> SABOTAGE 8e FAILED (chain ${chain_num}): SEMANTIC corruption still passed Java D1 incr"
-      cp "${RUST_INCR_STATS_PATH}.bak" "${RUST_INCR_STATS_PATH}"
-      exit 1
-    fi
-    echo "        8e PASS: SEMANTIC corruption in merged counter caused Java D1 incr to fail as expected"
+  if [[ ${MUTATE_8E_EXIT} -ne 0 ]]; then
+    # The mutation could not land. Per the promoted lessons.md rule, a sabotage that cannot be
+    # applied MUST hard-fail (never SKIP) — a skip is a false-green. Restore and abort the chain.
+    echo "==> SABOTAGE 8e FAILED (chain ${chain_num}): mutation could not be applied (exit ${MUTATE_8E_EXIT})"
+    cp "${RUST_INCR_STATS_PATH}.bak" "${RUST_INCR_STATS_PATH}"
+    exit 1
   fi
+  SABOTAGE_8E="$(
+    cd "${SCRIPT_DIR}"
+    "${MVN}" -o -q compile exec:java \
+      -Dexec.args=verify-interop-partition-stats-incr \
+      -Dinterop.partition_stats_incr.dir="${TMP_INCR}" 2>&1
+  )" || true
+  if echo "${SABOTAGE_8E}" | grep -q 'verify-interop-partition-stats-incr: 0 failures'; then
+    echo "==> SABOTAGE 8e FAILED (chain ${chain_num}): SEMANTIC corruption still passed Java D1 incr"
+    cp "${RUST_INCR_STATS_PATH}.bak" "${RUST_INCR_STATS_PATH}"
+    exit 1
+  fi
+  echo "        8e PASS: SEMANTIC corruption in merged counter caused Java D1 incr to fail as expected"
   cp "${RUST_INCR_STATS_PATH}.bak" "${RUST_INCR_STATS_PATH}"
   echo "        8e: restored"
 
