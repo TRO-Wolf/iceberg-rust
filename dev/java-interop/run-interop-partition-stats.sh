@@ -44,6 +44,12 @@
 #   S1: fast-append one file (partition_id=550e8400-e29b-41d4-a716-446655440000, 5 records, 500 bytes).
 #   Compute+register stats (FULL — exercises 16-byte big-endian UUID partition encoding).
 #
+# FIXTURE R3-TIME / R3-FIXED / R3-BINARY: V2 tables partitioned by the remaining exotic types:
+#   time   identity(partition_time)   = 45296789012 micros-since-midnight (Time64(Microsecond)).
+#   fixed  identity(partition_fixed)  = fixed[4] 0xdeadbeef (FixedSizeBinary(4) raw bytes).
+#   binary identity(partition_binary) = binary 0x0102030405 (LargeBinary raw bytes).
+#   Each: S1 fast-append one file, compute+register stats (FULL), bidirectional D1+D2.
+#
 # THE CHAIN:
 #
 #   1. Reset the temp dir.
@@ -55,7 +61,9 @@
 #   7. Sabotage battery (Z3):
 #        7a: truncate the Rust stats parquet → Java D1 verify must FAIL
 #        7b: corrupt one counter cell in the Rust stats parquet via SOURCE byte-level edit +
-#            RE-READ (Z2 lesson: mutate the SOURCE, re-derive through the production reader)
+#            RE-READ (Z2 lesson: mutate the SOURCE, re-derive through the production reader).
+#            FAIL-CLOSED (R3): pattern-absent → python sys.exit(1) → shell restores .bak + aborts
+#            the chain (NO exit-42 SKIP — a sabotage that cannot be applied proves nothing; mirrors 8e).
 #        7c: truncate the Java stats parquet → Rust D2 read must FAIL
 #        7d: remove the partition-statistics entry from the Rust metadata → Java verify must FAIL
 #   8. Incremental (R2-INCR):
@@ -64,13 +72,16 @@
 #        8c: Java: verify-interop-partition-stats-incr D1 (Java reads Rust incremental stats)
 #        8d: Rust: INCR D2 (Rust reads Java incremental stats + compare against java_incr_stats.json)
 #        8e: Sabotage SEMANTIC: corrupt a merged counter in the Rust incr stats SOURCE parquet
-#            (replace data_record_count=0 for cat=a with a non-zero value) → Java D1 must FAIL
+#            (replace data_record_count=0 for cat=a with a non-zero value) → Java D1 must FAIL (fail-closed)
 #   9. UUID exotic type (R2-UUID):
 #        9a: Java: generate-interop-partition-stats-uuid
 #        9b: Rust: UUID GEN (test_partition_stats_uuid_gen)
 #        9c: Java: verify-interop-partition-stats-uuid D1 (Java reads Rust UUID stats)
 #        9d: Rust: UUID D2 (Rust reads Java UUID stats + compare against java_uuid_stats.json)
-#  10. Repeat the full chain (steps 1–9) a second time (chain ×2).
+#  10. TIME exotic type (R3):   10a Java gen / 10b Rust GEN / 10c Java D1 / 10d Rust D2.
+#  11. FIXED[4] exotic type (R3): 11a Java gen / 11b Rust GEN / 11c Java D1 / 11d Rust D2.
+#  12. BINARY exotic type (R3): 12a Java gen / 12b Rust GEN / 12c Java D1 / 12d Rust D2.
+#  13. Repeat the full chain (steps 1–12) a second time (chain ×2).
 #
 # Requirements: Maven at /opt/maven/bin/mvn, Java 11 at /usr/lib/jvm/java-11-openjdk-amd64, the
 # repo's pinned Rust toolchain. Run from anywhere; paths resolve relative to this script.
@@ -91,7 +102,7 @@ run_oracle() {
 
 run_chain() {
   local chain_num="$1"
-  local total_steps=10
+  local total_steps=13
 
   echo "==> [${chain_num}/chains] CHAIN ${chain_num} BEGIN"
 
@@ -215,6 +226,9 @@ sys.exit(1)
   # Then RE-READ via the production reader — never post-edit the output JSON.
   echo "        7b: corrupt counter cell in Rust stats parquet (SOURCE edit + re-read → D1 must FAIL)"
   cp "${RUST_STATS_PATH}.bak" "${RUST_STATS_PATH}"
+  # Capture the mutate exit WITHOUT letting `set -e` abort the chain before the guard below runs
+  # (a bare failing command would short-circuit past the .bak restore). `|| MUTATE_7B_EXIT=$?`.
+  MUTATE_7B_EXIT=0
   python3 -c "
 import sys
 
@@ -231,8 +245,13 @@ replacement = bytes([0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
 
 idx = data.find(target)
 if idx == -1:
-    print('WARNING: target byte pattern not found; parquet encoding may differ — skipping 7b mutation', file=sys.stderr)
-    sys.exit(42)
+    # A sabotage that cannot be applied has proven NOTHING — hard-fail (do NOT skip).
+    # (lessons.md: 'A SKIP branch in a sabotage step is a false-green'; mirrors 8e below.)
+    # cat=a's data_record_count is 3 in the full-compute fixture, so the literal INT64 0x03..
+    # MUST be present; its absence means the parquet encoding changed and 7b no longer
+    # corrupts a counter — abort rather than declare a hollow pass.
+    print('7b ERROR: counter byte pattern (INT64 3) not found in parquet — sabotage cannot be applied', file=sys.stderr)
+    sys.exit(1)
 
 data[idx:idx+8] = replacement
 
@@ -240,24 +259,26 @@ with open(sys.argv[1], 'wb') as f:
     f.write(data)
 
 print(f'7b: mutated int64 at offset {idx}: 3 -> 9')
-" "${RUST_STATS_PATH}"
-  MUTATE_EXIT=$?
-  if [[ ${MUTATE_EXIT} -eq 42 ]]; then
-    echo "        7b SKIP: byte pattern not found in parquet encoding — mutation not applied"
-  else
-    SABOTAGE_7B="$(
-      cd "${SCRIPT_DIR}"
-      "${MVN}" -o -q compile exec:java \
-        -Dexec.args=verify-interop-partition-stats \
-        -Dinterop.partition_stats.dir="${TMP}" 2>&1
-    )" || true
-    if echo "${SABOTAGE_7B}" | grep -q 'verify-interop-partition-stats: 0 failures'; then
-      echo "==> SABOTAGE 7b FAILED (chain ${chain_num}): corrupted counter still passed Java D1"
-      cp "${RUST_STATS_PATH}.bak" "${RUST_STATS_PATH}"
-      exit 1
-    fi
-    echo "        7b PASS: corrupted counter caused Java D1 to fail as expected (re-derive through production reader)"
+" "${RUST_STATS_PATH}" || MUTATE_7B_EXIT=$?
+  if [[ ${MUTATE_7B_EXIT} -ne 0 ]]; then
+    # The mutation could not land. Per the promoted lessons.md rule, a sabotage that cannot be
+    # applied MUST hard-fail (never SKIP) — a skip is a false-green. Restore and abort the chain.
+    echo "==> SABOTAGE 7b FAILED (chain ${chain_num}): mutation could not be applied (exit ${MUTATE_7B_EXIT})"
+    cp "${RUST_STATS_PATH}.bak" "${RUST_STATS_PATH}"
+    exit 1
   fi
+  SABOTAGE_7B="$(
+    cd "${SCRIPT_DIR}"
+    "${MVN}" -o -q compile exec:java \
+      -Dexec.args=verify-interop-partition-stats \
+      -Dinterop.partition_stats.dir="${TMP}" 2>&1
+  )" || true
+  if echo "${SABOTAGE_7B}" | grep -q 'verify-interop-partition-stats: 0 failures'; then
+    echo "==> SABOTAGE 7b FAILED (chain ${chain_num}): corrupted counter still passed Java D1"
+    cp "${RUST_STATS_PATH}.bak" "${RUST_STATS_PATH}"
+    exit 1
+  fi
+  echo "        7b PASS: corrupted counter caused Java D1 to fail as expected (re-derive through production reader)"
   cp "${RUST_STATS_PATH}.bak" "${RUST_STATS_PATH}"
   echo "        7b: restored"
 
@@ -425,6 +446,8 @@ sys.exit(1)
   # row-group data is the count field. This is a SEMANTIC corruption: the file is still valid
   # parquet but the counter value is wrong — the production reader will decode it and the Java
   # verifier will catch the mismatch against incr_expected.json.
+  # Capture the mutate exit WITHOUT letting `set -e` abort before the guard below (`|| ...=$?`).
+  MUTATE_8E_EXIT=0
   python3 -c "
 import sys
 
@@ -450,8 +473,7 @@ with open(sys.argv[1], 'wb') as f:
     f.write(data)
 
 print(f'8e: mutated INT64 at offset {idx}: 0 -> 1 (SEMANTIC corruption in merged counter)')
-" "${RUST_INCR_STATS_PATH}"
-  MUTATE_8E_EXIT=$?
+" "${RUST_INCR_STATS_PATH}" || MUTATE_8E_EXIT=$?
   if [[ ${MUTATE_8E_EXIT} -ne 0 ]]; then
     # The mutation could not land. Per the promoted lessons.md rule, a sabotage that cannot be
     # applied MUST hard-fail (never SKIP) — a skip is a false-green. Restore and abort the chain.
@@ -544,7 +566,199 @@ print(f'8e: mutated INT64 at offset {idx}: 0 -> 1 (SEMANTIC corruption in merged
 
   echo "    [9/${total_steps}] UUID R2-UUID: PASS (9a–9d)"
 
-  echo "    [10/${total_steps}] Chain complete"
+  # ==================================================================
+  # Step 10: TIME exotic type (R3) — identity(partition_time time)
+  # ==================================================================
+  TMP_TIME="${TMP}/time"
+  mkdir -p "${TMP_TIME}"
+  echo "    [10/${total_steps}] TIME exotic type R3 (identity(partition_time time))"
+
+  echo "        10a: Java: generate-interop-partition-stats-time"
+  run_oracle \
+    -Dexec.args=generate-interop-partition-stats-time \
+    -Dinterop.partition_stats_time.dir="${TMP_TIME}"
+  if [[ ! -f "${TMP_TIME}/java_time_table/metadata/final.metadata.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Java did not emit java_time_table/metadata/final.metadata.json"
+    exit 1
+  fi
+  if [[ ! -f "${TMP_TIME}/java_time_stats.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Java did not emit java_time_stats.json"
+    exit 1
+  fi
+  echo "        10a Java TIME generate: OK"
+
+  echo "        10b: Rust: TIME GEN (test_partition_stats_time_gen)"
+  (
+    cd "${REPO_ROOT}"
+    ICEBERG_INTEROP_PARTITION_STATS_TIME_DIR="${TMP_TIME}" \
+      cargo test -p iceberg --test interop_partition_stats test_partition_stats_time_gen \
+      -- --exact --nocapture
+  )
+  if [[ ! -f "${TMP_TIME}/rust_time_table/metadata/final.metadata.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Rust TIME GEN did not emit rust_time_table/metadata/final.metadata.json"
+    exit 1
+  fi
+  if [[ ! -f "${TMP_TIME}/time_expected.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Rust TIME GEN did not emit time_expected.json"
+    exit 1
+  fi
+  echo "        10b Rust TIME GEN: OK"
+
+  echo "        10c: Java: verify-interop-partition-stats-time (D1 — Java reads Rust TIME stats)"
+  TIME_VERIFY_OUT="$(
+    cd "${SCRIPT_DIR}"
+    "${MVN}" -o -q compile exec:java \
+      -Dexec.args=verify-interop-partition-stats-time \
+      -Dinterop.partition_stats_time.dir="${TMP_TIME}" 2>&1
+  )" || true
+  echo "${TIME_VERIFY_OUT}"
+  if echo "${TIME_VERIFY_OUT}" | grep -q '^FAIL ' \
+    || ! echo "${TIME_VERIFY_OUT}" | grep -q 'verify-interop-partition-stats-time: 0 failures'; then
+    echo "==> FAILED (chain ${chain_num}): Java rejected the Rust-written TIME stats (D1 time)"
+    exit 1
+  fi
+  echo "        10c D1 Java-reads-Rust-TIME: PASS"
+
+  echo "        10d: Rust: TIME D2 (read Java TIME stats + compare against java_time_stats.json)"
+  (
+    cd "${REPO_ROOT}"
+    ICEBERG_INTEROP_PARTITION_STATS_TIME_DIR="${TMP_TIME}" \
+      cargo test -p iceberg --test interop_partition_stats \
+        test_partition_stats_time_d2 \
+      -- --exact --nocapture
+  )
+  echo "        10d D2 Rust-reads-Java-TIME: PASS"
+  echo "    [10/${total_steps}] TIME R3: PASS (10a–10d)"
+
+  # ==================================================================
+  # Step 11: FIXED[4] exotic type (R3) — identity(partition_fixed fixed[4])
+  # ==================================================================
+  TMP_FIXED="${TMP}/fixed"
+  mkdir -p "${TMP_FIXED}"
+  echo "    [11/${total_steps}] FIXED exotic type R3 (identity(partition_fixed fixed[4]))"
+
+  echo "        11a: Java: generate-interop-partition-stats-fixed"
+  run_oracle \
+    -Dexec.args=generate-interop-partition-stats-fixed \
+    -Dinterop.partition_stats_fixed.dir="${TMP_FIXED}"
+  if [[ ! -f "${TMP_FIXED}/java_fixed_table/metadata/final.metadata.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Java did not emit java_fixed_table/metadata/final.metadata.json"
+    exit 1
+  fi
+  if [[ ! -f "${TMP_FIXED}/java_fixed_stats.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Java did not emit java_fixed_stats.json"
+    exit 1
+  fi
+  echo "        11a Java FIXED generate: OK"
+
+  echo "        11b: Rust: FIXED GEN (test_partition_stats_fixed_gen)"
+  (
+    cd "${REPO_ROOT}"
+    ICEBERG_INTEROP_PARTITION_STATS_FIXED_DIR="${TMP_FIXED}" \
+      cargo test -p iceberg --test interop_partition_stats test_partition_stats_fixed_gen \
+      -- --exact --nocapture
+  )
+  if [[ ! -f "${TMP_FIXED}/rust_fixed_table/metadata/final.metadata.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Rust FIXED GEN did not emit rust_fixed_table/metadata/final.metadata.json"
+    exit 1
+  fi
+  if [[ ! -f "${TMP_FIXED}/fixed_expected.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Rust FIXED GEN did not emit fixed_expected.json"
+    exit 1
+  fi
+  echo "        11b Rust FIXED GEN: OK"
+
+  echo "        11c: Java: verify-interop-partition-stats-fixed (D1 — Java reads Rust FIXED stats)"
+  FIXED_VERIFY_OUT="$(
+    cd "${SCRIPT_DIR}"
+    "${MVN}" -o -q compile exec:java \
+      -Dexec.args=verify-interop-partition-stats-fixed \
+      -Dinterop.partition_stats_fixed.dir="${TMP_FIXED}" 2>&1
+  )" || true
+  echo "${FIXED_VERIFY_OUT}"
+  if echo "${FIXED_VERIFY_OUT}" | grep -q '^FAIL ' \
+    || ! echo "${FIXED_VERIFY_OUT}" | grep -q 'verify-interop-partition-stats-fixed: 0 failures'; then
+    echo "==> FAILED (chain ${chain_num}): Java rejected the Rust-written FIXED stats (D1 fixed)"
+    exit 1
+  fi
+  echo "        11c D1 Java-reads-Rust-FIXED: PASS"
+
+  echo "        11d: Rust: FIXED D2 (read Java FIXED stats + compare against java_fixed_stats.json)"
+  (
+    cd "${REPO_ROOT}"
+    ICEBERG_INTEROP_PARTITION_STATS_FIXED_DIR="${TMP_FIXED}" \
+      cargo test -p iceberg --test interop_partition_stats \
+        test_partition_stats_fixed_d2 \
+      -- --exact --nocapture
+  )
+  echo "        11d D2 Rust-reads-Java-FIXED: PASS"
+  echo "    [11/${total_steps}] FIXED R3: PASS (11a–11d)"
+
+  # ==================================================================
+  # Step 12: BINARY exotic type (R3) — identity(partition_binary binary)
+  # ==================================================================
+  TMP_BINARY="${TMP}/binary"
+  mkdir -p "${TMP_BINARY}"
+  echo "    [12/${total_steps}] BINARY exotic type R3 (identity(partition_binary binary))"
+
+  echo "        12a: Java: generate-interop-partition-stats-binary"
+  run_oracle \
+    -Dexec.args=generate-interop-partition-stats-binary \
+    -Dinterop.partition_stats_binary.dir="${TMP_BINARY}"
+  if [[ ! -f "${TMP_BINARY}/java_binary_table/metadata/final.metadata.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Java did not emit java_binary_table/metadata/final.metadata.json"
+    exit 1
+  fi
+  if [[ ! -f "${TMP_BINARY}/java_binary_stats.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Java did not emit java_binary_stats.json"
+    exit 1
+  fi
+  echo "        12a Java BINARY generate: OK"
+
+  echo "        12b: Rust: BINARY GEN (test_partition_stats_binary_gen)"
+  (
+    cd "${REPO_ROOT}"
+    ICEBERG_INTEROP_PARTITION_STATS_BINARY_DIR="${TMP_BINARY}" \
+      cargo test -p iceberg --test interop_partition_stats test_partition_stats_binary_gen \
+      -- --exact --nocapture
+  )
+  if [[ ! -f "${TMP_BINARY}/rust_binary_table/metadata/final.metadata.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Rust BINARY GEN did not emit rust_binary_table/metadata/final.metadata.json"
+    exit 1
+  fi
+  if [[ ! -f "${TMP_BINARY}/binary_expected.json" ]]; then
+    echo "==> FAILED (chain ${chain_num}): Rust BINARY GEN did not emit binary_expected.json"
+    exit 1
+  fi
+  echo "        12b Rust BINARY GEN: OK"
+
+  echo "        12c: Java: verify-interop-partition-stats-binary (D1 — Java reads Rust BINARY stats)"
+  BINARY_VERIFY_OUT="$(
+    cd "${SCRIPT_DIR}"
+    "${MVN}" -o -q compile exec:java \
+      -Dexec.args=verify-interop-partition-stats-binary \
+      -Dinterop.partition_stats_binary.dir="${TMP_BINARY}" 2>&1
+  )" || true
+  echo "${BINARY_VERIFY_OUT}"
+  if echo "${BINARY_VERIFY_OUT}" | grep -q '^FAIL ' \
+    || ! echo "${BINARY_VERIFY_OUT}" | grep -q 'verify-interop-partition-stats-binary: 0 failures'; then
+    echo "==> FAILED (chain ${chain_num}): Java rejected the Rust-written BINARY stats (D1 binary)"
+    exit 1
+  fi
+  echo "        12c D1 Java-reads-Rust-BINARY: PASS"
+
+  echo "        12d: Rust: BINARY D2 (read Java BINARY stats + compare against java_binary_stats.json)"
+  (
+    cd "${REPO_ROOT}"
+    ICEBERG_INTEROP_PARTITION_STATS_BINARY_DIR="${TMP_BINARY}" \
+      cargo test -p iceberg --test interop_partition_stats \
+        test_partition_stats_binary_d2 \
+      -- --exact --nocapture
+  )
+  echo "        12d D2 Rust-reads-Java-BINARY: PASS"
+  echo "    [12/${total_steps}] BINARY R3: PASS (12a–12d)"
+
+  echo "    [13/${total_steps}] Chain complete"
   echo "==> CHAIN ${chain_num} COMPLETE"
 }
 
@@ -563,8 +777,9 @@ echo "        S1 fast-append (cat=a 3rec + cat=b 2rec), S2 row-delta pos-delete 
 echo "    D1 (Rust writes, Java judges): 0 failures (both chains)"
 echo "    D2 (Java writes, Rust reads): all rows matched (both chains)"
 echo "    Cross-version V2→V3: dv_count null-filled to 0 for all rows (both chains)"
-echo "    Sabotage battery: 4 corruptions failed closed (7a truncate Rust, 7b corrupt counter,"
-echo "        7c truncate Java, 7d remove partition-statistics metadata entry)"
+echo "    Sabotage battery: 4 corruptions failed closed (7a truncate Rust, 7b corrupt counter"
+echo "        [R3: fail-closed — pattern-absent aborts, no SKIP], 7c truncate Java,"
+echo "        7d remove partition-statistics metadata entry)"
 echo ""
 echo "    R2-INCR (SUBTRACT arm): V2 table identity(category),"
 echo "        S1 fast-append → FULL stats; S2 delete_files(file_a) → INCREMENTAL stats"
@@ -577,3 +792,9 @@ echo "    R2-UUID (exotic type): V2 table identity(partition_id uuid),"
 echo "        known UUID 550e8400-e29b-41d4-a716-446655440000, 5 records, 500 bytes"
 echo "    D1 uuid: Java reads Rust UUID stats — PASS (both chains)"
 echo "    D2 uuid: Rust reads Java UUID stats — PASS (both chains)"
+echo ""
+echo "    R3 exotic types (the remaining residue — time / fixed / binary):"
+echo "        time   identity(partition_time)   = 45296789012 micros (Time64(Microsecond))"
+echo "        fixed  identity(partition_fixed)  = fixed[4] 0xdeadbeef (FixedSizeBinary(4))"
+echo "        binary identity(partition_binary) = binary 0x0102030405 (LargeBinary)"
+echo "    D1 (Java reads Rust stats) + D2 (Rust reads Java stats): PASS for all three (both chains)"

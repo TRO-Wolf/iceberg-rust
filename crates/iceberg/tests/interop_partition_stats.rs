@@ -83,6 +83,21 @@
 //! (`java_uuid_table/metadata/final.metadata.json`) and compares decoded rows against
 //! `java_uuid_stats.json`.
 //!
+//! # Time / fixed / binary partition types (R3)
+//!
+//! [`test_partition_stats_time_gen`]/`_d2`, [`test_partition_stats_fixed_gen`]/`_d2`,
+//! [`test_partition_stats_binary_gen`]/`_d2` extend the exotic-type interop chain to the remaining
+//! three partition-value types (joining UUID + the incremental path):
+//! - **time** — `Time64(Microsecond)` on disk, carried as a `PrimitiveLiteral::Long` (micros since
+//!   midnight); the known value is `45_296_789_012` micros (12:34:56.789012).
+//! - **fixed[4]** — `FixedSizeBinary(4)` on disk, carried as a `PrimitiveLiteral::Binary` of exactly
+//!   4 bytes; the known value is `0xdeadbeef`.
+//! - **binary** — `LargeBinary` on disk, carried as a `PrimitiveLiteral::Binary`; the known value is
+//!   the 5-byte `0x0102030405`.
+//!
+//! Each GEN test (Direction 1) writes the fixture + `<type>_expected.json` for Java to judge; each D2
+//! test (Direction 2) reads the Java-written stats file and compares against `java_<type>_stats.json`.
+//!
 //! # Env gate
 //!
 //! Tests are clean NO-OPS (runtime early-return, not `#[ignore]`) unless their env var is set
@@ -92,6 +107,9 @@
 //!   + the cross-version test).
 //! - `ICEBERG_INTEROP_PARTITION_STATS_INCR_DIR` — incremental GEN+D2 path.
 //! - `ICEBERG_INTEROP_PARTITION_STATS_UUID_DIR` — UUID GEN+D2 path.
+//! - `ICEBERG_INTEROP_PARTITION_STATS_TIME_DIR` — time GEN+D2 path (R3).
+//! - `ICEBERG_INTEROP_PARTITION_STATS_FIXED_DIR` — fixed[4] GEN+D2 path (R3).
+//! - `ICEBERG_INTEROP_PARTITION_STATS_BINARY_DIR` — binary GEN+D2 path (R3).
 
 use std::collections::HashMap;
 use std::fs;
@@ -150,6 +168,44 @@ const UUID_DATA_RECORDS: i64 = 5;
 /// UUID data file size in bytes.
 const UUID_DATA_FILE_SIZE: u64 = 500;
 
+// ---- TIME (R3) constants ---- agreed with TimePartitionStatsOracle.java.
+/// The known time-of-day partition value in microseconds since midnight (12:34:56.789012).
+/// Same value as Java's `TimePartitionStatsOracle.KNOWN_TIME_MICROS`.
+const KNOWN_TIME_MICROS: i64 = 45_296_789_012;
+/// Time data file record count.
+const TIME_DATA_RECORDS: i64 = 7;
+/// Time data file size in bytes.
+const TIME_DATA_FILE_SIZE: u64 = 700;
+
+// ---- FIXED[4] (R3) constants ---- agreed with FixedPartitionStatsOracle.java.
+/// The fixed-field byte width (`fixed[4]`).
+const FIXED_LENGTH: usize = 4;
+/// The known `fixed[4]` partition value (hex 0xdeadbeef), same bytes as Java's KNOWN_FIXED_BYTES.
+const KNOWN_FIXED_BYTES: [u8; FIXED_LENGTH] = [0xde, 0xad, 0xbe, 0xef];
+/// Fixed data file record count.
+const FIXED_DATA_RECORDS: i64 = 8;
+/// Fixed data file size in bytes.
+const FIXED_DATA_FILE_SIZE: u64 = 800;
+
+// ---- BINARY (R3) constants ---- agreed with BinaryPartitionStatsOracle.java.
+/// The known variable-length binary partition value (hex 0x0102030405), same bytes as Java's
+/// KNOWN_BINARY_BYTES.
+const KNOWN_BINARY_BYTES: [u8; 5] = [0x01, 0x02, 0x03, 0x04, 0x05];
+/// Binary data file record count.
+const BINARY_DATA_RECORDS: i64 = 9;
+/// Binary data file size in bytes.
+const BINARY_DATA_FILE_SIZE: u64 = 900;
+
+/// Lowercase hex encoding of a byte slice (two chars per byte, no separator) — matches Java's
+/// `bytesToHex` in the fixed/binary oracles.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
 fn gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_GEN_DIR")
         .filter(|value| !value.is_empty())
@@ -170,6 +226,24 @@ fn incr_dir() -> Option<PathBuf> {
 
 fn uuid_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_UUID_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn time_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_TIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn fixed_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_FIXED_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn binary_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_PARTITION_STATS_BINARY_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
@@ -280,6 +354,143 @@ fn uuid_data_file(
         .partition(Struct::from_iter([Some(Literal::uuid(uuid_val))]))
         .build()
         .expect("build uuid data file")
+}
+
+/// Table schema for the time fixture: `{1 id long required, 2 partition_time time required}`.
+fn time_fixture_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "partition_time", Type::Primitive(PrimitiveType::Time)).into(),
+        ])
+        .build()
+        .expect("build time fixture schema")
+}
+
+/// Partition spec for the time fixture: `identity(partition_time)` — source column id 2.
+fn time_fixture_spec() -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "partition_time".to_string(), Transform::Identity)
+        .expect("add identity(partition_time) partition field")
+        .build()
+}
+
+/// A data file for the time fixture with the given micros-since-midnight as the partition value.
+fn time_data_file(
+    table_location: &str,
+    name: &str,
+    micros: i64,
+    records: u64,
+    size: u64,
+) -> DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(format!("{table_location}/data/{name}.parquet"))
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(size)
+        .record_count(records)
+        .partition_spec_id(0)
+        .partition(Struct::from_iter([Some(Literal::time(micros))]))
+        .build()
+        .expect("build time data file")
+}
+
+/// Table schema for the fixed fixture: `{1 id long required, 2 partition_fixed fixed[4] required}`.
+fn fixed_fixture_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(
+                2,
+                "partition_fixed",
+                Type::Primitive(PrimitiveType::Fixed(FIXED_LENGTH as u64)),
+            )
+            .into(),
+        ])
+        .build()
+        .expect("build fixed fixture schema")
+}
+
+/// Partition spec for the fixed fixture: `identity(partition_fixed)` — source column id 2.
+fn fixed_fixture_spec() -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "partition_fixed".to_string(), Transform::Identity)
+        .expect("add identity(partition_fixed) partition field")
+        .build()
+}
+
+/// A data file for the fixed fixture with the given bytes as the `fixed[L]` partition value.
+fn fixed_data_file(
+    table_location: &str,
+    name: &str,
+    bytes: &[u8],
+    records: u64,
+    size: u64,
+) -> DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(format!("{table_location}/data/{name}.parquet"))
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(size)
+        .record_count(records)
+        .partition_spec_id(0)
+        .partition(Struct::from_iter([Some(Literal::fixed(
+            bytes.iter().copied(),
+        ))]))
+        .build()
+        .expect("build fixed data file")
+}
+
+/// Table schema for the binary fixture: `{1 id long required, 2 partition_binary binary required}`.
+fn binary_fixture_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(
+                2,
+                "partition_binary",
+                Type::Primitive(PrimitiveType::Binary),
+            )
+            .into(),
+        ])
+        .build()
+        .expect("build binary fixture schema")
+}
+
+/// Partition spec for the binary fixture: `identity(partition_binary)` — source column id 2.
+fn binary_fixture_spec() -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "partition_binary".to_string(), Transform::Identity)
+        .expect("add identity(partition_binary) partition field")
+        .build()
+}
+
+/// A data file for the binary fixture with the given bytes as the `binary` partition value.
+fn binary_data_file(
+    table_location: &str,
+    name: &str,
+    bytes: &[u8],
+    records: u64,
+    size: u64,
+) -> DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(format!("{table_location}/data/{name}.parquet"))
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(size)
+        .record_count(records)
+        .partition_spec_id(0)
+        .partition(Struct::from_iter([Some(Literal::binary(
+            bytes.iter().copied(),
+        ))]))
+        .build()
+        .expect("build binary data file")
 }
 
 /// Write `final.metadata.json` at `<table_dir>/metadata/final.metadata.json`.
@@ -1761,4 +1972,835 @@ async fn test_partition_stats_uuid_d2() {
         row.data_record_count(),
         row.total_data_file_size_in_bytes()
     );
+}
+
+// ===========================================================================================
+// TIME partition type (R3)
+// ===========================================================================================
+
+/// Direction 1 (GEN): Rust builds a `identity(partition_time)` fixture, writes the stats file,
+/// registers it, and emits `rust_time_table/metadata/final.metadata.json` + `time_expected.json`
+/// for Java's `verify-interop-partition-stats-time` to judge.
+#[tokio::test]
+async fn test_partition_stats_time_gen() {
+    let Some(time_dir) = time_dir() else {
+        println!(
+            "skipping interop_partition_stats TIME GEN — set \
+             ICEBERG_INTEROP_PARTITION_STATS_TIME_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let table_location = time_dir
+        .join("rust_time_table")
+        .to_string_lossy()
+        .to_string();
+    fs::create_dir_all(format!("{table_location}/metadata"))
+        .expect("create rust_time_table/metadata dir");
+
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_time_gen",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                time_dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for TIME GEN");
+
+    let namespace = NamespaceIdent::new("interop_time".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (TIME GEN)");
+
+    let creation = TableCreation::builder()
+        .name("rust_time_table".to_string())
+        .location(table_location.clone())
+        .schema(time_fixture_schema())
+        .partition_spec(time_fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create rust_time_table");
+
+    let file_time = time_data_file(
+        &table_location,
+        "time_file",
+        KNOWN_TIME_MICROS,
+        TIME_DATA_RECORDS as u64,
+        TIME_DATA_FILE_SIZE,
+    );
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_time])
+        .apply(tx)
+        .expect("apply TIME fast_append");
+    let table = tx.commit(&catalog).await.expect("commit TIME S1");
+    let s1_id = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("TIME S1 snapshot id");
+    println!(
+        "interop_partition_stats TIME GEN: S1 committed (id={s1_id}, micros={KNOWN_TIME_MICROS})"
+    );
+
+    let s1_snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("TIME current snapshot");
+    let stats_file = compute_and_write_stats_file(&table, s1_snapshot)
+        .await
+        .expect("compute TIME stats")
+        .expect("TIME stats must be Some");
+    let table = register_partition_stats_file(&catalog, &table, stats_file)
+        .await
+        .expect("register TIME stats");
+
+    write_final_metadata(&table, &table_location).await;
+
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (TIME)");
+    let stats_schema = partition_stats_schema(&unified_type, table.metadata().format_version())
+        .expect("stats schema (TIME)");
+    let stats_path =
+        find_stats_path(&time_dir.join("rust_time_table/metadata/final.metadata.json"));
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read TIME stats");
+
+    assert_eq!(rows.len(), 1, "TIME GEN: expected 1 partition row");
+    let row = &rows[0];
+
+    // Verify the time round-trip: the partition field must decode back to the known micros (Long).
+    let micros = match row.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::Long(v)))) => *v,
+        other => panic!("TIME GEN: unexpected partition literal type: {other:?}"),
+    };
+    assert_eq!(
+        micros, KNOWN_TIME_MICROS,
+        "TIME GEN: partition micros round-trip failed"
+    );
+    assert_eq!(
+        row.data_record_count(),
+        TIME_DATA_RECORDS,
+        "TIME GEN: data_record_count"
+    );
+    assert_eq!(row.data_file_count(), 1, "TIME GEN: data_file_count");
+    assert_eq!(
+        row.total_data_file_size_in_bytes(),
+        TIME_DATA_FILE_SIZE as i64,
+        "TIME GEN: total_data_file_size_in_bytes"
+    );
+    assert_eq!(
+        row.last_updated_snapshot_id(),
+        Some(s1_id),
+        "TIME GEN: last_updated_snapshot_id must be S1"
+    );
+
+    let expected_json = json!([{
+        "partition_time_micros": micros,
+        "spec_id": row.spec_id(),
+        "data_record_count": row.data_record_count(),
+        "data_file_count": row.data_file_count(),
+        "total_data_file_size_in_bytes": row.total_data_file_size_in_bytes(),
+        "position_delete_record_count": row.position_delete_record_count(),
+        "position_delete_file_count": row.position_delete_file_count(),
+        "equality_delete_record_count": row.equality_delete_record_count(),
+        "equality_delete_file_count": row.equality_delete_file_count(),
+        "dv_count": row.dv_count(),
+        "last_updated_snapshot_id": row.last_updated_snapshot_id(),
+        "total_record_count_null": row.total_record_count().is_none()
+    }]);
+
+    let expected_path = time_dir.join("time_expected.json");
+    fs::write(
+        &expected_path,
+        serde_json::to_string_pretty(&expected_json).expect("serialize time_expected.json"),
+    )
+    .expect("write time_expected.json");
+    println!(
+        "interop_partition_stats TIME GEN: PASS — micros={KNOWN_TIME_MICROS} \
+         records={TIME_DATA_RECORDS} size={TIME_DATA_FILE_SIZE}"
+    );
+}
+
+/// Direction 2: Rust reads Java's time-partitioned stats file and compares against
+/// `java_time_stats.json`.
+#[tokio::test]
+async fn test_partition_stats_time_d2() {
+    let Some(dir) = time_dir() else {
+        println!(
+            "skipping interop_partition_stats TIME D2 — set \
+             ICEBERG_INTEROP_PARTITION_STATS_TIME_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let java_meta_path = dir.join("java_time_table/metadata/final.metadata.json");
+    assert!(
+        java_meta_path.exists(),
+        "TIME D2: missing {}; run the Java generate step first",
+        java_meta_path.display()
+    );
+
+    let stats_path = find_stats_path(&java_meta_path);
+    let table_dir = dir.join("java_time_table").to_string_lossy().to_string();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_time_d2",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for TIME D2");
+
+    let namespace = NamespaceIdent::new("interop_time_d2".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (TIME D2)");
+
+    let creation = TableCreation::builder()
+        .name("java_time_table".to_string())
+        .location(table_dir.clone())
+        .schema(time_fixture_schema())
+        .partition_spec(time_fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create TIME D2 table handle");
+
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (TIME D2)");
+    let stats_schema =
+        partition_stats_schema(&unified_type, FormatVersion::V2).expect("stats schema (TIME D2)");
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read_partition_stats_file (TIME D2)");
+
+    let java_stats_path = dir.join("java_time_stats.json");
+    assert!(
+        java_stats_path.exists(),
+        "TIME D2: missing {}; run the Java generate step first",
+        java_stats_path.display()
+    );
+    let expected = load_json_file(&java_stats_path);
+    let expected_arr = expected
+        .as_array()
+        .expect("java_time_stats.json must be a JSON array");
+
+    assert_eq!(
+        rows.len(),
+        expected_arr.len(),
+        "TIME D2: row count mismatch"
+    );
+    assert_eq!(rows.len(), 1, "TIME D2: expected 1 partition row");
+    let row = &rows[0];
+    let exp = &expected_arr[0];
+
+    let micros = match row.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::Long(v)))) => *v,
+        other => panic!("TIME D2: unexpected partition literal type: {other:?}"),
+    };
+    assert_eq!(
+        micros,
+        exp["partition_time_micros"].as_i64().unwrap_or(-1),
+        "TIME D2: partition_time_micros mismatch"
+    );
+    assert_eq!(
+        row.data_record_count(),
+        exp["data_record_count"].as_i64().unwrap_or(-1),
+        "TIME D2: data_record_count"
+    );
+    assert_eq!(
+        row.data_file_count() as i64,
+        exp["data_file_count"].as_i64().unwrap_or(-1),
+        "TIME D2: data_file_count"
+    );
+    assert_eq!(
+        row.total_data_file_size_in_bytes(),
+        exp["total_data_file_size_in_bytes"].as_i64().unwrap_or(-1),
+        "TIME D2: total_data_file_size_in_bytes"
+    );
+    assert_eq!(
+        row.last_updated_snapshot_id(),
+        exp["last_updated_snapshot_id"].as_i64(),
+        "TIME D2: last_updated_snapshot_id"
+    );
+    println!("interop_partition_stats TIME D2: PASS — micros={micros}");
+}
+
+// ===========================================================================================
+// FIXED[4] partition type (R3)
+// ===========================================================================================
+
+/// Direction 1 (GEN): Rust builds a `identity(partition_fixed: fixed[4])` fixture, writes the stats
+/// file, registers it, and emits `rust_fixed_table/metadata/final.metadata.json` +
+/// `fixed_expected.json` for Java's `verify-interop-partition-stats-fixed` to judge.
+#[tokio::test]
+async fn test_partition_stats_fixed_gen() {
+    let Some(fixed_dir) = fixed_dir() else {
+        println!(
+            "skipping interop_partition_stats FIXED GEN — set \
+             ICEBERG_INTEROP_PARTITION_STATS_FIXED_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let table_location = fixed_dir
+        .join("rust_fixed_table")
+        .to_string_lossy()
+        .to_string();
+    fs::create_dir_all(format!("{table_location}/metadata"))
+        .expect("create rust_fixed_table/metadata dir");
+
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_fixed_gen",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                fixed_dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for FIXED GEN");
+
+    let namespace = NamespaceIdent::new("interop_fixed".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (FIXED GEN)");
+
+    let creation = TableCreation::builder()
+        .name("rust_fixed_table".to_string())
+        .location(table_location.clone())
+        .schema(fixed_fixture_schema())
+        .partition_spec(fixed_fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create rust_fixed_table");
+
+    let file_fixed = fixed_data_file(
+        &table_location,
+        "fixed_file",
+        &KNOWN_FIXED_BYTES,
+        FIXED_DATA_RECORDS as u64,
+        FIXED_DATA_FILE_SIZE,
+    );
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_fixed])
+        .apply(tx)
+        .expect("apply FIXED fast_append");
+    let table = tx.commit(&catalog).await.expect("commit FIXED S1");
+    let s1_id = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("FIXED S1 snapshot id");
+
+    let s1_snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("FIXED current snapshot");
+    let stats_file = compute_and_write_stats_file(&table, s1_snapshot)
+        .await
+        .expect("compute FIXED stats")
+        .expect("FIXED stats must be Some");
+    let table = register_partition_stats_file(&catalog, &table, stats_file)
+        .await
+        .expect("register FIXED stats");
+
+    write_final_metadata(&table, &table_location).await;
+
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (FIXED)");
+    let stats_schema = partition_stats_schema(&unified_type, table.metadata().format_version())
+        .expect("stats schema (FIXED)");
+    let stats_path =
+        find_stats_path(&fixed_dir.join("rust_fixed_table/metadata/final.metadata.json"));
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read FIXED stats");
+
+    assert_eq!(rows.len(), 1, "FIXED GEN: expected 1 partition row");
+    let row = &rows[0];
+
+    // Verify the fixed round-trip: the partition field must decode back to the known bytes.
+    let hex = match row.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::Binary(b)))) => {
+            assert_eq!(
+                b.len(),
+                FIXED_LENGTH,
+                "FIXED GEN: width must be {FIXED_LENGTH}"
+            );
+            bytes_to_hex(b)
+        }
+        other => panic!("FIXED GEN: unexpected partition literal type: {other:?}"),
+    };
+    assert_eq!(
+        hex,
+        bytes_to_hex(&KNOWN_FIXED_BYTES),
+        "FIXED GEN: partition bytes round-trip failed"
+    );
+    assert_eq!(
+        row.data_record_count(),
+        FIXED_DATA_RECORDS,
+        "FIXED GEN: data_record_count"
+    );
+    assert_eq!(row.data_file_count(), 1, "FIXED GEN: data_file_count");
+    assert_eq!(
+        row.total_data_file_size_in_bytes(),
+        FIXED_DATA_FILE_SIZE as i64,
+        "FIXED GEN: total_data_file_size_in_bytes"
+    );
+    assert_eq!(
+        row.last_updated_snapshot_id(),
+        Some(s1_id),
+        "FIXED GEN: last_updated_snapshot_id must be S1"
+    );
+
+    let expected_json = json!([{
+        "partition_fixed_hex": hex,
+        "spec_id": row.spec_id(),
+        "data_record_count": row.data_record_count(),
+        "data_file_count": row.data_file_count(),
+        "total_data_file_size_in_bytes": row.total_data_file_size_in_bytes(),
+        "position_delete_record_count": row.position_delete_record_count(),
+        "position_delete_file_count": row.position_delete_file_count(),
+        "equality_delete_record_count": row.equality_delete_record_count(),
+        "equality_delete_file_count": row.equality_delete_file_count(),
+        "dv_count": row.dv_count(),
+        "last_updated_snapshot_id": row.last_updated_snapshot_id(),
+        "total_record_count_null": row.total_record_count().is_none()
+    }]);
+
+    let expected_path = fixed_dir.join("fixed_expected.json");
+    fs::write(
+        &expected_path,
+        serde_json::to_string_pretty(&expected_json).expect("serialize fixed_expected.json"),
+    )
+    .expect("write fixed_expected.json");
+    println!(
+        "interop_partition_stats FIXED GEN: PASS — hex={} records={FIXED_DATA_RECORDS} size={FIXED_DATA_FILE_SIZE}",
+        bytes_to_hex(&KNOWN_FIXED_BYTES)
+    );
+}
+
+/// Direction 2: Rust reads Java's fixed-partitioned stats file and compares against
+/// `java_fixed_stats.json`.
+#[tokio::test]
+async fn test_partition_stats_fixed_d2() {
+    let Some(dir) = fixed_dir() else {
+        println!(
+            "skipping interop_partition_stats FIXED D2 — set \
+             ICEBERG_INTEROP_PARTITION_STATS_FIXED_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let java_meta_path = dir.join("java_fixed_table/metadata/final.metadata.json");
+    assert!(
+        java_meta_path.exists(),
+        "FIXED D2: missing {}; run the Java generate step first",
+        java_meta_path.display()
+    );
+
+    let stats_path = find_stats_path(&java_meta_path);
+    let table_dir = dir.join("java_fixed_table").to_string_lossy().to_string();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_fixed_d2",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for FIXED D2");
+
+    let namespace = NamespaceIdent::new("interop_fixed_d2".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (FIXED D2)");
+
+    let creation = TableCreation::builder()
+        .name("java_fixed_table".to_string())
+        .location(table_dir.clone())
+        .schema(fixed_fixture_schema())
+        .partition_spec(fixed_fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create FIXED D2 table handle");
+
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (FIXED D2)");
+    let stats_schema =
+        partition_stats_schema(&unified_type, FormatVersion::V2).expect("stats schema (FIXED D2)");
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read_partition_stats_file (FIXED D2)");
+
+    let java_stats_path = dir.join("java_fixed_stats.json");
+    assert!(
+        java_stats_path.exists(),
+        "FIXED D2: missing {}; run the Java generate step first",
+        java_stats_path.display()
+    );
+    let expected = load_json_file(&java_stats_path);
+    let expected_arr = expected
+        .as_array()
+        .expect("java_fixed_stats.json must be a JSON array");
+
+    assert_eq!(
+        rows.len(),
+        expected_arr.len(),
+        "FIXED D2: row count mismatch"
+    );
+    assert_eq!(rows.len(), 1, "FIXED D2: expected 1 partition row");
+    let row = &rows[0];
+    let exp = &expected_arr[0];
+
+    let hex = match row.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::Binary(b)))) => bytes_to_hex(b),
+        other => panic!("FIXED D2: unexpected partition literal type: {other:?}"),
+    };
+    assert_eq!(
+        hex.to_lowercase(),
+        exp["partition_fixed_hex"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase(),
+        "FIXED D2: partition_fixed_hex mismatch"
+    );
+    assert_eq!(
+        row.data_record_count(),
+        exp["data_record_count"].as_i64().unwrap_or(-1),
+        "FIXED D2: data_record_count"
+    );
+    assert_eq!(
+        row.data_file_count() as i64,
+        exp["data_file_count"].as_i64().unwrap_or(-1),
+        "FIXED D2: data_file_count"
+    );
+    assert_eq!(
+        row.total_data_file_size_in_bytes(),
+        exp["total_data_file_size_in_bytes"].as_i64().unwrap_or(-1),
+        "FIXED D2: total_data_file_size_in_bytes"
+    );
+    assert_eq!(
+        row.last_updated_snapshot_id(),
+        exp["last_updated_snapshot_id"].as_i64(),
+        "FIXED D2: last_updated_snapshot_id"
+    );
+    println!("interop_partition_stats FIXED D2: PASS — hex={hex}");
+}
+
+// ===========================================================================================
+// BINARY partition type (R3)
+// ===========================================================================================
+
+/// Direction 1 (GEN): Rust builds a `identity(partition_binary: binary)` fixture, writes the stats
+/// file, registers it, and emits `rust_binary_table/metadata/final.metadata.json` +
+/// `binary_expected.json` for Java's `verify-interop-partition-stats-binary` to judge.
+#[tokio::test]
+async fn test_partition_stats_binary_gen() {
+    let Some(binary_dir) = binary_dir() else {
+        println!(
+            "skipping interop_partition_stats BINARY GEN — set \
+             ICEBERG_INTEROP_PARTITION_STATS_BINARY_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let table_location = binary_dir
+        .join("rust_binary_table")
+        .to_string_lossy()
+        .to_string();
+    fs::create_dir_all(format!("{table_location}/metadata"))
+        .expect("create rust_binary_table/metadata dir");
+
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_binary_gen",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                binary_dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for BINARY GEN");
+
+    let namespace = NamespaceIdent::new("interop_binary".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (BINARY GEN)");
+
+    let creation = TableCreation::builder()
+        .name("rust_binary_table".to_string())
+        .location(table_location.clone())
+        .schema(binary_fixture_schema())
+        .partition_spec(binary_fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create rust_binary_table");
+
+    let file_binary = binary_data_file(
+        &table_location,
+        "binary_file",
+        &KNOWN_BINARY_BYTES,
+        BINARY_DATA_RECORDS as u64,
+        BINARY_DATA_FILE_SIZE,
+    );
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_binary])
+        .apply(tx)
+        .expect("apply BINARY fast_append");
+    let table = tx.commit(&catalog).await.expect("commit BINARY S1");
+    let s1_id = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("BINARY S1 snapshot id");
+
+    let s1_snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("BINARY current snapshot");
+    let stats_file = compute_and_write_stats_file(&table, s1_snapshot)
+        .await
+        .expect("compute BINARY stats")
+        .expect("BINARY stats must be Some");
+    let table = register_partition_stats_file(&catalog, &table, stats_file)
+        .await
+        .expect("register BINARY stats");
+
+    write_final_metadata(&table, &table_location).await;
+
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (BINARY)");
+    let stats_schema = partition_stats_schema(&unified_type, table.metadata().format_version())
+        .expect("stats schema (BINARY)");
+    let stats_path =
+        find_stats_path(&binary_dir.join("rust_binary_table/metadata/final.metadata.json"));
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read BINARY stats");
+
+    assert_eq!(rows.len(), 1, "BINARY GEN: expected 1 partition row");
+    let row = &rows[0];
+
+    // Verify the binary round-trip: the partition field must decode back to the known bytes.
+    let hex = match row.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::Binary(b)))) => bytes_to_hex(b),
+        other => panic!("BINARY GEN: unexpected partition literal type: {other:?}"),
+    };
+    assert_eq!(
+        hex,
+        bytes_to_hex(&KNOWN_BINARY_BYTES),
+        "BINARY GEN: partition bytes round-trip failed"
+    );
+    assert_eq!(
+        row.data_record_count(),
+        BINARY_DATA_RECORDS,
+        "BINARY GEN: data_record_count"
+    );
+    assert_eq!(row.data_file_count(), 1, "BINARY GEN: data_file_count");
+    assert_eq!(
+        row.total_data_file_size_in_bytes(),
+        BINARY_DATA_FILE_SIZE as i64,
+        "BINARY GEN: total_data_file_size_in_bytes"
+    );
+    assert_eq!(
+        row.last_updated_snapshot_id(),
+        Some(s1_id),
+        "BINARY GEN: last_updated_snapshot_id must be S1"
+    );
+
+    let expected_json = json!([{
+        "partition_binary_hex": hex,
+        "spec_id": row.spec_id(),
+        "data_record_count": row.data_record_count(),
+        "data_file_count": row.data_file_count(),
+        "total_data_file_size_in_bytes": row.total_data_file_size_in_bytes(),
+        "position_delete_record_count": row.position_delete_record_count(),
+        "position_delete_file_count": row.position_delete_file_count(),
+        "equality_delete_record_count": row.equality_delete_record_count(),
+        "equality_delete_file_count": row.equality_delete_file_count(),
+        "dv_count": row.dv_count(),
+        "last_updated_snapshot_id": row.last_updated_snapshot_id(),
+        "total_record_count_null": row.total_record_count().is_none()
+    }]);
+
+    let expected_path = binary_dir.join("binary_expected.json");
+    fs::write(
+        &expected_path,
+        serde_json::to_string_pretty(&expected_json).expect("serialize binary_expected.json"),
+    )
+    .expect("write binary_expected.json");
+    println!(
+        "interop_partition_stats BINARY GEN: PASS — hex={} records={BINARY_DATA_RECORDS} size={BINARY_DATA_FILE_SIZE}",
+        bytes_to_hex(&KNOWN_BINARY_BYTES)
+    );
+}
+
+/// Direction 2: Rust reads Java's binary-partitioned stats file and compares against
+/// `java_binary_stats.json`.
+#[tokio::test]
+async fn test_partition_stats_binary_d2() {
+    let Some(dir) = binary_dir() else {
+        println!(
+            "skipping interop_partition_stats BINARY D2 — set \
+             ICEBERG_INTEROP_PARTITION_STATS_BINARY_DIR \
+             (run dev/java-interop/run-interop-partition-stats.sh)"
+        );
+        return;
+    };
+
+    let java_meta_path = dir.join("java_binary_table/metadata/final.metadata.json");
+    assert!(
+        java_meta_path.exists(),
+        "BINARY D2: missing {}; run the Java generate step first",
+        java_meta_path.display()
+    );
+
+    let stats_path = find_stats_path(&java_meta_path);
+    let table_dir = dir.join("java_binary_table").to_string_lossy().to_string();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_partition_stats_binary_d2",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog for BINARY D2");
+
+    let namespace = NamespaceIdent::new("interop_binary_d2".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace (BINARY D2)");
+
+    let creation = TableCreation::builder()
+        .name("java_binary_table".to_string())
+        .location(table_dir.clone())
+        .schema(binary_fixture_schema())
+        .partition_spec(binary_fixture_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create BINARY D2 table handle");
+
+    let unified_type =
+        unified_partition_type(table.metadata()).expect("unified_partition_type (BINARY D2)");
+    let stats_schema =
+        partition_stats_schema(&unified_type, FormatVersion::V2).expect("stats schema (BINARY D2)");
+
+    let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
+        .await
+        .expect("read_partition_stats_file (BINARY D2)");
+
+    let java_stats_path = dir.join("java_binary_stats.json");
+    assert!(
+        java_stats_path.exists(),
+        "BINARY D2: missing {}; run the Java generate step first",
+        java_stats_path.display()
+    );
+    let expected = load_json_file(&java_stats_path);
+    let expected_arr = expected
+        .as_array()
+        .expect("java_binary_stats.json must be a JSON array");
+
+    assert_eq!(
+        rows.len(),
+        expected_arr.len(),
+        "BINARY D2: row count mismatch"
+    );
+    assert_eq!(rows.len(), 1, "BINARY D2: expected 1 partition row");
+    let row = &rows[0];
+    let exp = &expected_arr[0];
+
+    let hex = match row.partition().fields().first() {
+        Some(Some(Literal::Primitive(PrimitiveLiteral::Binary(b)))) => bytes_to_hex(b),
+        other => panic!("BINARY D2: unexpected partition literal type: {other:?}"),
+    };
+    assert_eq!(
+        hex.to_lowercase(),
+        exp["partition_binary_hex"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase(),
+        "BINARY D2: partition_binary_hex mismatch"
+    );
+    assert_eq!(
+        row.data_record_count(),
+        exp["data_record_count"].as_i64().unwrap_or(-1),
+        "BINARY D2: data_record_count"
+    );
+    assert_eq!(
+        row.data_file_count() as i64,
+        exp["data_file_count"].as_i64().unwrap_or(-1),
+        "BINARY D2: data_file_count"
+    );
+    assert_eq!(
+        row.total_data_file_size_in_bytes(),
+        exp["total_data_file_size_in_bytes"].as_i64().unwrap_or(-1),
+        "BINARY D2: total_data_file_size_in_bytes"
+    );
+    assert_eq!(
+        row.last_updated_snapshot_id(),
+        exp["last_updated_snapshot_id"].as_i64(),
+        "BINARY D2: last_updated_snapshot_id"
+    );
+    println!("interop_partition_stats BINARY D2: PASS — hex={hex}");
 }

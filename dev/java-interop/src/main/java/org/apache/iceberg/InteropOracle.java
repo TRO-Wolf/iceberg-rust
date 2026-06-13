@@ -870,6 +870,76 @@ public final class InteropOracle {
         }
         break;
 
+      case "generate-interop-partition-stats-time":
+        // TIME PARTITION-STATS interop (increment R3). A table partitioned by time identity; Java
+        // writes stats parquet via PRODUCTION computeAndWriteStatsFile, emits java_time_table/.../
+        // final.metadata.json + java_time_stats.json (D2 ground truth). Time = 8-byte LE micros.
+        // The dir is supplied via -Dinterop.partition_stats_time.dir.
+        Path partitionStatsTimeGenDir = requireFixturesDir("interop.partition_stats_time.dir");
+        TimePartitionStatsOracle.generate(partitionStatsTimeGenDir);
+        break;
+
+      case "verify-interop-partition-stats-time":
+        // TIME PARTITION-STATS interop, DIRECTION 1 — "Java reads what RUST writes." The Rust GEN
+        // step wrote a time-partitioned stats file to rust_time_table/ and emitted time_expected.json.
+        // The dir is supplied via -Dinterop.partition_stats_time.dir.
+        Path partitionStatsTimeVerifyDir = requireFixturesDir("interop.partition_stats_time.dir");
+        int partitionStatsTimeFailures =
+            TimePartitionStatsOracle.verify(partitionStatsTimeVerifyDir);
+        System.out.println(
+            "verify-interop-partition-stats-time: " + partitionStatsTimeFailures + " failures");
+        if (partitionStatsTimeFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
+      case "generate-interop-partition-stats-fixed":
+        // FIXED[L] PARTITION-STATS interop (increment R3). A table partitioned by fixed[4] identity;
+        // Java writes stats parquet via PRODUCTION computeAndWriteStatsFile, emits java_fixed_table/
+        // .../final.metadata.json + java_fixed_stats.json (D2 ground truth). Fixed[L] = raw L bytes.
+        // The dir is supplied via -Dinterop.partition_stats_fixed.dir.
+        Path partitionStatsFixedGenDir = requireFixturesDir("interop.partition_stats_fixed.dir");
+        FixedPartitionStatsOracle.generate(partitionStatsFixedGenDir);
+        break;
+
+      case "verify-interop-partition-stats-fixed":
+        // FIXED[L] PARTITION-STATS interop, DIRECTION 1 — "Java reads what RUST writes." The Rust GEN
+        // step wrote a fixed-partitioned stats file to rust_fixed_table/ and emitted fixed_expected.json.
+        // The dir is supplied via -Dinterop.partition_stats_fixed.dir.
+        Path partitionStatsFixedVerifyDir = requireFixturesDir("interop.partition_stats_fixed.dir");
+        int partitionStatsFixedFailures =
+            FixedPartitionStatsOracle.verify(partitionStatsFixedVerifyDir);
+        System.out.println(
+            "verify-interop-partition-stats-fixed: " + partitionStatsFixedFailures + " failures");
+        if (partitionStatsFixedFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
+      case "generate-interop-partition-stats-binary":
+        // BINARY PARTITION-STATS interop (increment R3). A table partitioned by binary identity; Java
+        // writes stats parquet via PRODUCTION computeAndWriteStatsFile, emits java_binary_table/.../
+        // final.metadata.json + java_binary_stats.json (D2 ground truth). Binary = raw bytes (var-len).
+        // The dir is supplied via -Dinterop.partition_stats_binary.dir.
+        Path partitionStatsBinaryGenDir = requireFixturesDir("interop.partition_stats_binary.dir");
+        BinaryPartitionStatsOracle.generate(partitionStatsBinaryGenDir);
+        break;
+
+      case "verify-interop-partition-stats-binary":
+        // BINARY PARTITION-STATS interop, DIRECTION 1 — "Java reads what RUST writes." The Rust GEN
+        // step wrote a binary-partitioned stats file to rust_binary_table/ and emitted
+        // binary_expected.json. The dir is supplied via -Dinterop.partition_stats_binary.dir.
+        Path partitionStatsBinaryVerifyDir =
+            requireFixturesDir("interop.partition_stats_binary.dir");
+        int partitionStatsBinaryFailures =
+            BinaryPartitionStatsOracle.verify(partitionStatsBinaryVerifyDir);
+        System.out.println(
+            "verify-interop-partition-stats-binary: " + partitionStatsBinaryFailures + " failures");
+        if (partitionStatsBinaryFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -11017,6 +11087,845 @@ public final class InteropOracle {
         throws IOException {
       return PartitionStatsOracle.buildTableFromMetadata(metadata, metadataFilePath);
     }
+  }
+
+  // ===========================================================================================
+  // TimePartitionStatsOracle — R3 time-partitioned partition-stats interop
+  //
+  // Fixture: V2 table identity(partition_time time) {1 id long, 2 partition_time time}.
+  //   S1: fast-append one data file with a fixed known time-of-day partition value.
+  //   compute stats (FULL).
+  //
+  // The Iceberg time type is microseconds since midnight, serialized on-disk as an 8-byte LE
+  // little-endian long (Java parquet `time-micros`); the Rust side carries it as a `Long` literal
+  // and writes a Time64(Microsecond) Arrow column. The read-back yields a `Long` in Java's generic
+  // representation (Type.TypeID.TIME.javaClass() == Long).
+  //
+  // Direction 1: Rust writes → Java reads via readPartitionStatsFile.
+  // Direction 2: Java writes → Rust reads via read_partition_stats_file.
+  // ===========================================================================================
+
+  static final class TimePartitionStatsOracle {
+    private TimePartitionStatsOracle() {}
+
+    /** A fixed known time-of-day in microseconds since midnight — agreed between Java and Rust. */
+    static final long KNOWN_TIME_MICROS = 45_296_789_012L; // 12:34:56.789012
+    /** Data file record count. */
+    static final long TIME_DATA_RECORDS = 7L;
+    /** Data file size in bytes. */
+    static final long TIME_DATA_FILE_SIZE = 700L;
+
+    /** Table schema: {1 id long required, 2 partition_time time required}. */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "partition_time", Types.TimeType.get()));
+    }
+
+    /**
+     * Build the time-partitioned fixture: S1 fast-append one data file with the known time-of-day
+     * partition value. Calls Java's PRODUCTION computeAndWriteStatsFile and emits:
+     * <ul>
+     *   <li>{@code java_time_table/metadata/final.metadata.json} — table after stats registration.
+     *   <li>{@code java_time_stats.json} — the decoded stats row (D2 ground truth for Rust).
+     * </ul>
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Path tableDir = dir.resolve("java_time_table");
+      Path metadataDir = tableDir.resolve("metadata");
+      Files.createDirectories(metadataDir);
+
+      Schema schema = schema();
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("partition_time").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.toAbsolutePath().toString(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir.toFile(), metadataDir.toFile());
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_partition_stats_time");
+      String dataDir = tableDir.toAbsolutePath() + "/data";
+
+      // Build the known time partition value (generic representation = Long micros-since-midnight).
+      PartitionData partTime = new PartitionData(spec.partitionType());
+      partTime.set(0, KNOWN_TIME_MICROS);
+
+      DataFile fileTime =
+          DataFiles.builder(spec)
+              .withPath(dataDir + "/file_time.parquet")
+              .withFileSizeInBytes(TIME_DATA_FILE_SIZE)
+              .withRecordCount(TIME_DATA_RECORDS)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partTime)
+              .build();
+
+      table.newFastAppend().appendFile(fileTime).commit();
+      long s1Id = table.currentSnapshot().snapshotId();
+
+      PartitionStatisticsFile statsFile = PartitionStatsHandler.computeAndWriteStatsFile(table);
+      if (statsFile == null) {
+        throw new RuntimeException(
+            "computeAndWriteStatsFile(time) returned null — fixture is wrong");
+      }
+      table.updatePartitionStatistics().setPartitionStatistics(statsFile).commit();
+
+      Types.StructType unifiedType = Partitioning.partitionType(table);
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedType, TableUtil.formatVersion(table));
+      InputFile statsInput = table.io().newInputFile(statsFile.path());
+      List<PartitionStats> statsRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInput)) {
+        for (PartitionStats row : rows) {
+          statsRows.add(row);
+        }
+      }
+
+      String statsJson = timeStatsRowsToJson(statsRows);
+      writeJson(dir.resolve("java_time_stats.json"), statsJson);
+      System.out.println(
+          "generate-interop-partition-stats-time: java_time_stats.json written"
+              + " (s1Id=" + s1Id + " micros=" + KNOWN_TIME_MICROS + " rows=" + statsRows.size() + ")");
+
+      Path finalMetadataPath = metadataDir.resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadataPath.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+      System.out.println(
+          "generate-interop-partition-stats-time: final.metadata.json written to "
+              + finalMetadataPath);
+    }
+
+    /**
+     * Direction 1 — "Java reads what RUST writes." Rust wrote its time-partitioned stats to
+     * {@code <dir>/rust_time_table} and emitted {@code time_expected.json}. Java reads via PRODUCTION
+     * readPartitionStatsFile.
+     *
+     * @return number of failures (0 = pass).
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path rustTableMetadata = dir.resolve("rust_time_table/metadata/final.metadata.json");
+      if (!Files.exists(rustTableMetadata)) {
+        System.out.println(
+            "FAIL time-partition-stats/verify: missing rust_time_table/metadata/final.metadata.json"
+                + " — run the Rust time GEN step first");
+        return 1;
+      }
+
+      TableMetadata rustMeta =
+          TableMetadataParser.fromJson(
+              rustTableMetadata.toString(), readString(rustTableMetadata));
+
+      long currentSnapshotId =
+          rustMeta.currentSnapshot() == null ? -1L : rustMeta.currentSnapshot().snapshotId();
+      if (currentSnapshotId == -1L) {
+        System.out.println("FAIL time-partition-stats/verify: Rust table has no current snapshot");
+        return 1;
+      }
+
+      PartitionStatisticsFile registeredFile = null;
+      for (PartitionStatisticsFile file : rustMeta.partitionStatisticsFiles()) {
+        if (file.snapshotId() == currentSnapshotId) {
+          registeredFile = file;
+          break;
+        }
+      }
+      if (registeredFile == null) {
+        System.out.println(
+            "FAIL time-partition-stats/verify: no PartitionStatisticsFile for snapshot "
+                + currentSnapshotId);
+        return 1;
+      }
+
+      String statsPath = registeredFile.path();
+      System.out.println(
+          "time-partition-stats/verify: reading Rust time stats file at " + statsPath);
+
+      Types.StructType unifiedPartType =
+          Partitioning.partitionType(buildTableFromMetadata(rustMeta, rustTableMetadata));
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedPartType, rustMeta.formatVersion());
+
+      InputFile statsInputFile = new LocalFileIO().newInputFile(statsPath);
+      List<PartitionStats> decodedRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInputFile)) {
+        for (PartitionStats row : rows) {
+          decodedRows.add(row);
+        }
+      }
+
+      Path expectedPath = dir.resolve("time_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL time-partition-stats/verify: missing time_expected.json"
+                + " — run the Rust time GEN step first");
+        return 1;
+      }
+      String expectedJson = readString(expectedPath);
+      com.fasterxml.jackson.databind.JsonNode expectedNode =
+          new com.fasterxml.jackson.databind.ObjectMapper().readTree(expectedJson);
+
+      int expectedCount = expectedNode.size();
+      if (decodedRows.size() != expectedCount) {
+        System.out.println(
+            "FAIL time-partition-stats/verify: decoded "
+                + decodedRows.size() + " rows, expected " + expectedCount);
+        return failures + 1;
+      }
+
+      for (int i = 0; i < decodedRows.size(); i++) {
+        PartitionStats row = decodedRows.get(i);
+        com.fasterxml.jackson.databind.JsonNode expected = expectedNode.get(i);
+
+        long expectedMicros = expected.path("partition_time_micros").asLong();
+        long actualMicros = timePartitionMicros(row);
+        if (expectedMicros != actualMicros) {
+          System.out.println(
+              "FAIL time row " + i + ": partition_time_micros expected=" + expectedMicros
+                  + " actual=" + actualMicros);
+          failures++;
+        }
+        failures += PartitionStatsOracle.assertLong(
+            "time row " + i, "spec_id", expected.path("spec_id").asLong(), row.specId());
+        failures += PartitionStatsOracle.assertLong(
+            "time row " + i, "data_record_count",
+            expected.path("data_record_count").asLong(), row.dataRecordCount());
+        failures += PartitionStatsOracle.assertLong(
+            "time row " + i, "data_file_count",
+            expected.path("data_file_count").asLong(), row.dataFileCount());
+        failures += PartitionStatsOracle.assertLong(
+            "time row " + i, "total_data_file_size_in_bytes",
+            expected.path("total_data_file_size_in_bytes").asLong(), row.totalDataFileSizeInBytes());
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS time-partition-stats/verify: " + decodedRows.size()
+                + " row(s) match time_expected.json");
+      }
+      return failures;
+    }
+
+    /** Extract the time micros-since-midnight from a partition row's first field (a Long). */
+    private static long timePartitionMicros(PartitionStats row) {
+      StructLike partition = row.partition();
+      Object val = partition.get(0, Object.class);
+      if (val == null) {
+        throw new RuntimeException("time-partition-stats: null partition value — fixture is wrong");
+      }
+      if (val instanceof Long) {
+        return (Long) val;
+      }
+      if (val instanceof Number) {
+        return ((Number) val).longValue();
+      }
+      throw new RuntimeException(
+          "time-partition-stats: unexpected partition value class " + val.getClass());
+    }
+
+    /** Serialize time partition stats rows to JSON (one object per row). */
+    private static String timeStatsRowsToJson(List<PartitionStats> rows) throws IOException {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (PartitionStats row : rows) {
+              gen.writeStartObject();
+              gen.writeNumberField("partition_time_micros", timePartitionMicros(row));
+              gen.writeNumberField("spec_id", row.specId());
+              gen.writeNumberField("data_record_count", row.dataRecordCount());
+              gen.writeNumberField("data_file_count", row.dataFileCount());
+              gen.writeNumberField(
+                  "total_data_file_size_in_bytes", row.totalDataFileSizeInBytes());
+              gen.writeNumberField(
+                  "position_delete_record_count", row.positionDeleteRecordCount());
+              gen.writeNumberField("position_delete_file_count", row.positionDeleteFileCount());
+              gen.writeNumberField(
+                  "equality_delete_record_count", row.equalityDeleteRecordCount());
+              gen.writeNumberField("equality_delete_file_count", row.equalityDeleteFileCount());
+              gen.writeNumberField("dv_count", row.dvCount());
+              Long lastUpdatedId = row.lastUpdatedSnapshotId();
+              if (lastUpdatedId != null) {
+                gen.writeNumberField("last_updated_snapshot_id", lastUpdatedId);
+              } else {
+                gen.writeNullField("last_updated_snapshot_id");
+              }
+              gen.writeBooleanField("total_record_count_null", row.totalRecords() == null);
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    private static Table buildTableFromMetadata(TableMetadata metadata, Path metadataFilePath)
+        throws IOException {
+      return PartitionStatsOracle.buildTableFromMetadata(metadata, metadataFilePath);
+    }
+  }
+
+  // ===========================================================================================
+  // FixedPartitionStatsOracle — R3 fixed[L]-partitioned partition-stats interop
+  //
+  // Fixture: V2 table identity(partition_fixed fixed[4]) {1 id long, 2 partition_fixed fixed[4]}.
+  //   S1: fast-append one data file with a fixed known 4-byte partition value.
+  //   compute stats (FULL).
+  //
+  // Iceberg fixed[L] is the raw L bytes; on-disk the partition column is a FixedSizeBinary(L) Arrow
+  // type. Java's generic representation (Type.TypeID.FIXED.javaClass() == ByteBuffer) yields a
+  // ByteBuffer of exactly L bytes on read-back.
+  //
+  // Direction 1: Rust writes → Java reads via readPartitionStatsFile.
+  // Direction 2: Java writes → Rust reads via read_partition_stats_file.
+  // ===========================================================================================
+
+  static final class FixedPartitionStatsOracle {
+    private FixedPartitionStatsOracle() {}
+
+    /** The fixed-field byte width. */
+    static final int FIXED_LENGTH = 4;
+    /** A fixed known 4-byte fixed[4] partition value (hex 0xdeadbeef) — agreed Java↔Rust. */
+    static final byte[] KNOWN_FIXED_BYTES =
+        new byte[] {(byte) 0xde, (byte) 0xad, (byte) 0xbe, (byte) 0xef};
+    /** Data file record count. */
+    static final long FIXED_DATA_RECORDS = 8L;
+    /** Data file size in bytes. */
+    static final long FIXED_DATA_FILE_SIZE = 800L;
+
+    /** Table schema: {1 id long required, 2 partition_fixed fixed[4] required}. */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "partition_fixed", Types.FixedType.ofLength(FIXED_LENGTH)));
+    }
+
+    /**
+     * Build the fixed[4]-partitioned fixture and emit:
+     * <ul>
+     *   <li>{@code java_fixed_table/metadata/final.metadata.json}.
+     *   <li>{@code java_fixed_stats.json} — the decoded stats row (D2 ground truth for Rust).
+     * </ul>
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Path tableDir = dir.resolve("java_fixed_table");
+      Path metadataDir = tableDir.resolve("metadata");
+      Files.createDirectories(metadataDir);
+
+      Schema schema = schema();
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("partition_fixed").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.toAbsolutePath().toString(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir.toFile(), metadataDir.toFile());
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_partition_stats_fixed");
+      String dataDir = tableDir.toAbsolutePath() + "/data";
+
+      // Generic representation of fixed = ByteBuffer of exactly L bytes.
+      PartitionData partFixed = new PartitionData(spec.partitionType());
+      partFixed.set(0, ByteBuffer.wrap(KNOWN_FIXED_BYTES.clone()));
+
+      DataFile fileFixed =
+          DataFiles.builder(spec)
+              .withPath(dataDir + "/file_fixed.parquet")
+              .withFileSizeInBytes(FIXED_DATA_FILE_SIZE)
+              .withRecordCount(FIXED_DATA_RECORDS)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partFixed)
+              .build();
+
+      table.newFastAppend().appendFile(fileFixed).commit();
+      long s1Id = table.currentSnapshot().snapshotId();
+
+      PartitionStatisticsFile statsFile = PartitionStatsHandler.computeAndWriteStatsFile(table);
+      if (statsFile == null) {
+        throw new RuntimeException(
+            "computeAndWriteStatsFile(fixed) returned null — fixture is wrong");
+      }
+      table.updatePartitionStatistics().setPartitionStatistics(statsFile).commit();
+
+      Types.StructType unifiedType = Partitioning.partitionType(table);
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedType, TableUtil.formatVersion(table));
+      InputFile statsInput = table.io().newInputFile(statsFile.path());
+      List<PartitionStats> statsRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInput)) {
+        for (PartitionStats row : rows) {
+          statsRows.add(row);
+        }
+      }
+
+      String statsJson = fixedStatsRowsToJson(statsRows);
+      writeJson(dir.resolve("java_fixed_stats.json"), statsJson);
+      System.out.println(
+          "generate-interop-partition-stats-fixed: java_fixed_stats.json written"
+              + " (s1Id=" + s1Id + " hex=" + bytesToHex(KNOWN_FIXED_BYTES)
+              + " rows=" + statsRows.size() + ")");
+
+      Path finalMetadataPath = metadataDir.resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadataPath.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+      System.out.println(
+          "generate-interop-partition-stats-fixed: final.metadata.json written to "
+              + finalMetadataPath);
+    }
+
+    /**
+     * Direction 1 — "Java reads what RUST writes." Rust wrote its fixed-partitioned stats to
+     * {@code <dir>/rust_fixed_table} and emitted {@code fixed_expected.json}.
+     *
+     * @return number of failures (0 = pass).
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path rustTableMetadata = dir.resolve("rust_fixed_table/metadata/final.metadata.json");
+      if (!Files.exists(rustTableMetadata)) {
+        System.out.println(
+            "FAIL fixed-partition-stats/verify: missing"
+                + " rust_fixed_table/metadata/final.metadata.json — run the Rust fixed GEN step first");
+        return 1;
+      }
+
+      TableMetadata rustMeta =
+          TableMetadataParser.fromJson(
+              rustTableMetadata.toString(), readString(rustTableMetadata));
+
+      long currentSnapshotId =
+          rustMeta.currentSnapshot() == null ? -1L : rustMeta.currentSnapshot().snapshotId();
+      if (currentSnapshotId == -1L) {
+        System.out.println("FAIL fixed-partition-stats/verify: Rust table has no current snapshot");
+        return 1;
+      }
+
+      PartitionStatisticsFile registeredFile = null;
+      for (PartitionStatisticsFile file : rustMeta.partitionStatisticsFiles()) {
+        if (file.snapshotId() == currentSnapshotId) {
+          registeredFile = file;
+          break;
+        }
+      }
+      if (registeredFile == null) {
+        System.out.println(
+            "FAIL fixed-partition-stats/verify: no PartitionStatisticsFile for snapshot "
+                + currentSnapshotId);
+        return 1;
+      }
+
+      String statsPath = registeredFile.path();
+      System.out.println(
+          "fixed-partition-stats/verify: reading Rust fixed stats file at " + statsPath);
+
+      Types.StructType unifiedPartType =
+          Partitioning.partitionType(buildTableFromMetadata(rustMeta, rustTableMetadata));
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedPartType, rustMeta.formatVersion());
+
+      InputFile statsInputFile = new LocalFileIO().newInputFile(statsPath);
+      List<PartitionStats> decodedRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInputFile)) {
+        for (PartitionStats row : rows) {
+          decodedRows.add(row);
+        }
+      }
+
+      Path expectedPath = dir.resolve("fixed_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL fixed-partition-stats/verify: missing fixed_expected.json"
+                + " — run the Rust fixed GEN step first");
+        return 1;
+      }
+      String expectedJson = readString(expectedPath);
+      com.fasterxml.jackson.databind.JsonNode expectedNode =
+          new com.fasterxml.jackson.databind.ObjectMapper().readTree(expectedJson);
+
+      int expectedCount = expectedNode.size();
+      if (decodedRows.size() != expectedCount) {
+        System.out.println(
+            "FAIL fixed-partition-stats/verify: decoded "
+                + decodedRows.size() + " rows, expected " + expectedCount);
+        return failures + 1;
+      }
+
+      for (int i = 0; i < decodedRows.size(); i++) {
+        PartitionStats row = decodedRows.get(i);
+        com.fasterxml.jackson.databind.JsonNode expected = expectedNode.get(i);
+
+        String expectedHex = expected.path("partition_fixed_hex").asText();
+        String actualHex = bytesPartitionHex(row);
+        if (!expectedHex.equalsIgnoreCase(actualHex)) {
+          System.out.println(
+              "FAIL fixed row " + i + ": partition_fixed_hex expected=" + expectedHex
+                  + " actual=" + actualHex);
+          failures++;
+        }
+        failures += PartitionStatsOracle.assertLong(
+            "fixed row " + i, "spec_id", expected.path("spec_id").asLong(), row.specId());
+        failures += PartitionStatsOracle.assertLong(
+            "fixed row " + i, "data_record_count",
+            expected.path("data_record_count").asLong(), row.dataRecordCount());
+        failures += PartitionStatsOracle.assertLong(
+            "fixed row " + i, "data_file_count",
+            expected.path("data_file_count").asLong(), row.dataFileCount());
+        failures += PartitionStatsOracle.assertLong(
+            "fixed row " + i, "total_data_file_size_in_bytes",
+            expected.path("total_data_file_size_in_bytes").asLong(), row.totalDataFileSizeInBytes());
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS fixed-partition-stats/verify: " + decodedRows.size()
+                + " row(s) match fixed_expected.json");
+      }
+      return failures;
+    }
+
+    /** Serialize fixed partition stats rows to JSON (one object per row). */
+    private static String fixedStatsRowsToJson(List<PartitionStats> rows) throws IOException {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (PartitionStats row : rows) {
+              gen.writeStartObject();
+              gen.writeStringField("partition_fixed_hex", bytesPartitionHex(row));
+              gen.writeNumberField("spec_id", row.specId());
+              gen.writeNumberField("data_record_count", row.dataRecordCount());
+              gen.writeNumberField("data_file_count", row.dataFileCount());
+              gen.writeNumberField(
+                  "total_data_file_size_in_bytes", row.totalDataFileSizeInBytes());
+              gen.writeNumberField(
+                  "position_delete_record_count", row.positionDeleteRecordCount());
+              gen.writeNumberField("position_delete_file_count", row.positionDeleteFileCount());
+              gen.writeNumberField(
+                  "equality_delete_record_count", row.equalityDeleteRecordCount());
+              gen.writeNumberField("equality_delete_file_count", row.equalityDeleteFileCount());
+              gen.writeNumberField("dv_count", row.dvCount());
+              Long lastUpdatedId = row.lastUpdatedSnapshotId();
+              if (lastUpdatedId != null) {
+                gen.writeNumberField("last_updated_snapshot_id", lastUpdatedId);
+              } else {
+                gen.writeNullField("last_updated_snapshot_id");
+              }
+              gen.writeBooleanField("total_record_count_null", row.totalRecords() == null);
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    private static Table buildTableFromMetadata(TableMetadata metadata, Path metadataFilePath)
+        throws IOException {
+      return PartitionStatsOracle.buildTableFromMetadata(metadata, metadataFilePath);
+    }
+  }
+
+  // ===========================================================================================
+  // BinaryPartitionStatsOracle — R3 binary-partitioned partition-stats interop
+  //
+  // Fixture: V2 table identity(partition_binary binary) {1 id long, 2 partition_binary binary}.
+  //   S1: fast-append one data file with a fixed known variable-length byte partition value.
+  //   compute stats (FULL).
+  //
+  // Iceberg binary is the raw bytes (variable length); on-disk the partition column is a LargeBinary
+  // Arrow type. Java's generic representation (Type.TypeID.BINARY.javaClass() == ByteBuffer) yields a
+  // ByteBuffer on read-back.
+  //
+  // Direction 1: Rust writes → Java reads via readPartitionStatsFile.
+  // Direction 2: Java writes → Rust reads via read_partition_stats_file.
+  // ===========================================================================================
+
+  static final class BinaryPartitionStatsOracle {
+    private BinaryPartitionStatsOracle() {}
+
+    /** A fixed known variable-length binary partition value (hex 0x0102030405) — agreed Java↔Rust. */
+    static final byte[] KNOWN_BINARY_BYTES =
+        new byte[] {(byte) 0x01, (byte) 0x02, (byte) 0x03, (byte) 0x04, (byte) 0x05};
+    /** Data file record count. */
+    static final long BINARY_DATA_RECORDS = 9L;
+    /** Data file size in bytes. */
+    static final long BINARY_DATA_FILE_SIZE = 900L;
+
+    /** Table schema: {1 id long required, 2 partition_binary binary required}. */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "partition_binary", Types.BinaryType.get()));
+    }
+
+    /**
+     * Build the binary-partitioned fixture and emit:
+     * <ul>
+     *   <li>{@code java_binary_table/metadata/final.metadata.json}.
+     *   <li>{@code java_binary_stats.json} — the decoded stats row (D2 ground truth for Rust).
+     * </ul>
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Path tableDir = dir.resolve("java_binary_table");
+      Path metadataDir = tableDir.resolve("metadata");
+      Files.createDirectories(metadataDir);
+
+      Schema schema = schema();
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("partition_binary").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.toAbsolutePath().toString(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir.toFile(), metadataDir.toFile());
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_partition_stats_binary");
+      String dataDir = tableDir.toAbsolutePath() + "/data";
+
+      // Generic representation of binary = ByteBuffer.
+      PartitionData partBinary = new PartitionData(spec.partitionType());
+      partBinary.set(0, ByteBuffer.wrap(KNOWN_BINARY_BYTES.clone()));
+
+      DataFile fileBinary =
+          DataFiles.builder(spec)
+              .withPath(dataDir + "/file_binary.parquet")
+              .withFileSizeInBytes(BINARY_DATA_FILE_SIZE)
+              .withRecordCount(BINARY_DATA_RECORDS)
+              .withFormat(FileFormat.PARQUET)
+              .withPartition(partBinary)
+              .build();
+
+      table.newFastAppend().appendFile(fileBinary).commit();
+      long s1Id = table.currentSnapshot().snapshotId();
+
+      PartitionStatisticsFile statsFile = PartitionStatsHandler.computeAndWriteStatsFile(table);
+      if (statsFile == null) {
+        throw new RuntimeException(
+            "computeAndWriteStatsFile(binary) returned null — fixture is wrong");
+      }
+      table.updatePartitionStatistics().setPartitionStatistics(statsFile).commit();
+
+      Types.StructType unifiedType = Partitioning.partitionType(table);
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedType, TableUtil.formatVersion(table));
+      InputFile statsInput = table.io().newInputFile(statsFile.path());
+      List<PartitionStats> statsRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInput)) {
+        for (PartitionStats row : rows) {
+          statsRows.add(row);
+        }
+      }
+
+      String statsJson = binaryStatsRowsToJson(statsRows);
+      writeJson(dir.resolve("java_binary_stats.json"), statsJson);
+      System.out.println(
+          "generate-interop-partition-stats-binary: java_binary_stats.json written"
+              + " (s1Id=" + s1Id + " hex=" + bytesToHex(KNOWN_BINARY_BYTES)
+              + " rows=" + statsRows.size() + ")");
+
+      Path finalMetadataPath = metadataDir.resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadataPath.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+      System.out.println(
+          "generate-interop-partition-stats-binary: final.metadata.json written to "
+              + finalMetadataPath);
+    }
+
+    /**
+     * Direction 1 — "Java reads what RUST writes." Rust wrote its binary-partitioned stats to
+     * {@code <dir>/rust_binary_table} and emitted {@code binary_expected.json}.
+     *
+     * @return number of failures (0 = pass).
+     */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path rustTableMetadata = dir.resolve("rust_binary_table/metadata/final.metadata.json");
+      if (!Files.exists(rustTableMetadata)) {
+        System.out.println(
+            "FAIL binary-partition-stats/verify: missing"
+                + " rust_binary_table/metadata/final.metadata.json — run the Rust binary GEN step"
+                + " first");
+        return 1;
+      }
+
+      TableMetadata rustMeta =
+          TableMetadataParser.fromJson(
+              rustTableMetadata.toString(), readString(rustTableMetadata));
+
+      long currentSnapshotId =
+          rustMeta.currentSnapshot() == null ? -1L : rustMeta.currentSnapshot().snapshotId();
+      if (currentSnapshotId == -1L) {
+        System.out.println(
+            "FAIL binary-partition-stats/verify: Rust table has no current snapshot");
+        return 1;
+      }
+
+      PartitionStatisticsFile registeredFile = null;
+      for (PartitionStatisticsFile file : rustMeta.partitionStatisticsFiles()) {
+        if (file.snapshotId() == currentSnapshotId) {
+          registeredFile = file;
+          break;
+        }
+      }
+      if (registeredFile == null) {
+        System.out.println(
+            "FAIL binary-partition-stats/verify: no PartitionStatisticsFile for snapshot "
+                + currentSnapshotId);
+        return 1;
+      }
+
+      String statsPath = registeredFile.path();
+      System.out.println(
+          "binary-partition-stats/verify: reading Rust binary stats file at " + statsPath);
+
+      Types.StructType unifiedPartType =
+          Partitioning.partitionType(buildTableFromMetadata(rustMeta, rustTableMetadata));
+      Schema statsSchema =
+          PartitionStatsHandler.schema(unifiedPartType, rustMeta.formatVersion());
+
+      InputFile statsInputFile = new LocalFileIO().newInputFile(statsPath);
+      List<PartitionStats> decodedRows = new ArrayList<>();
+      try (CloseableIterable<PartitionStats> rows =
+          PartitionStatsHandler.readPartitionStatsFile(statsSchema, statsInputFile)) {
+        for (PartitionStats row : rows) {
+          decodedRows.add(row);
+        }
+      }
+
+      Path expectedPath = dir.resolve("binary_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println(
+            "FAIL binary-partition-stats/verify: missing binary_expected.json"
+                + " — run the Rust binary GEN step first");
+        return 1;
+      }
+      String expectedJson = readString(expectedPath);
+      com.fasterxml.jackson.databind.JsonNode expectedNode =
+          new com.fasterxml.jackson.databind.ObjectMapper().readTree(expectedJson);
+
+      int expectedCount = expectedNode.size();
+      if (decodedRows.size() != expectedCount) {
+        System.out.println(
+            "FAIL binary-partition-stats/verify: decoded "
+                + decodedRows.size() + " rows, expected " + expectedCount);
+        return failures + 1;
+      }
+
+      for (int i = 0; i < decodedRows.size(); i++) {
+        PartitionStats row = decodedRows.get(i);
+        com.fasterxml.jackson.databind.JsonNode expected = expectedNode.get(i);
+
+        String expectedHex = expected.path("partition_binary_hex").asText();
+        String actualHex = bytesPartitionHex(row);
+        if (!expectedHex.equalsIgnoreCase(actualHex)) {
+          System.out.println(
+              "FAIL binary row " + i + ": partition_binary_hex expected=" + expectedHex
+                  + " actual=" + actualHex);
+          failures++;
+        }
+        failures += PartitionStatsOracle.assertLong(
+            "binary row " + i, "spec_id", expected.path("spec_id").asLong(), row.specId());
+        failures += PartitionStatsOracle.assertLong(
+            "binary row " + i, "data_record_count",
+            expected.path("data_record_count").asLong(), row.dataRecordCount());
+        failures += PartitionStatsOracle.assertLong(
+            "binary row " + i, "data_file_count",
+            expected.path("data_file_count").asLong(), row.dataFileCount());
+        failures += PartitionStatsOracle.assertLong(
+            "binary row " + i, "total_data_file_size_in_bytes",
+            expected.path("total_data_file_size_in_bytes").asLong(), row.totalDataFileSizeInBytes());
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS binary-partition-stats/verify: " + decodedRows.size()
+                + " row(s) match binary_expected.json");
+      }
+      return failures;
+    }
+
+    /** Serialize binary partition stats rows to JSON (one object per row). */
+    private static String binaryStatsRowsToJson(List<PartitionStats> rows) throws IOException {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (PartitionStats row : rows) {
+              gen.writeStartObject();
+              gen.writeStringField("partition_binary_hex", bytesPartitionHex(row));
+              gen.writeNumberField("spec_id", row.specId());
+              gen.writeNumberField("data_record_count", row.dataRecordCount());
+              gen.writeNumberField("data_file_count", row.dataFileCount());
+              gen.writeNumberField(
+                  "total_data_file_size_in_bytes", row.totalDataFileSizeInBytes());
+              gen.writeNumberField(
+                  "position_delete_record_count", row.positionDeleteRecordCount());
+              gen.writeNumberField("position_delete_file_count", row.positionDeleteFileCount());
+              gen.writeNumberField(
+                  "equality_delete_record_count", row.equalityDeleteRecordCount());
+              gen.writeNumberField("equality_delete_file_count", row.equalityDeleteFileCount());
+              gen.writeNumberField("dv_count", row.dvCount());
+              Long lastUpdatedId = row.lastUpdatedSnapshotId();
+              if (lastUpdatedId != null) {
+                gen.writeNumberField("last_updated_snapshot_id", lastUpdatedId);
+              } else {
+                gen.writeNullField("last_updated_snapshot_id");
+              }
+              gen.writeBooleanField("total_record_count_null", row.totalRecords() == null);
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    private static Table buildTableFromMetadata(TableMetadata metadata, Path metadataFilePath)
+        throws IOException {
+      return PartitionStatsOracle.buildTableFromMetadata(metadata, metadataFilePath);
+    }
+  }
+
+  /**
+   * Extract the bytes of a fixed/binary partition row's first field (a ByteBuffer) as a lowercase
+   * hex string. Shared by the fixed + binary oracles. A null value is a fixture bug (the partition
+   * column is required).
+   */
+  private static String bytesPartitionHex(PartitionStats row) {
+    StructLike partition = row.partition();
+    Object val = partition.get(0, Object.class);
+    if (val == null) {
+      throw new RuntimeException(
+          "bytes-partition-stats: null partition value — fixture is wrong");
+    }
+    if (val instanceof ByteBuffer) {
+      ByteBuffer dup = ((ByteBuffer) val).duplicate();
+      byte[] bytes = new byte[dup.remaining()];
+      dup.get(bytes);
+      return bytesToHex(bytes);
+    }
+    if (val instanceof byte[]) {
+      return bytesToHex((byte[]) val);
+    }
+    throw new RuntimeException(
+        "bytes-partition-stats: unexpected partition value class " + val.getClass());
+  }
+
+  /** Lowercase hex encoding of a byte array (two chars per byte, no separator). */
+  private static String bytesToHex(byte[] bytes) {
+    StringBuilder hex = new StringBuilder(bytes.length * 2);
+    for (byte b : bytes) {
+      hex.append(String.format("%02x", b & 0xff));
+    }
+    return hex.toString();
   }
 
   static final class StagedWapOracle {
