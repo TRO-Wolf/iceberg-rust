@@ -67,6 +67,34 @@ Ranked, highest-value first:
 
 See the 2026-06-13 GAP_MATRIX provenance block for the per-row status and residue of every item above.
 
+## ACTIVE (2026-06-13): RewriteFiles DELETE-file ADD surface (builder, this increment)
+
+Goal: port the unported DELETE-file ADD surface on `RewriteFiles` — `addFile(DeleteFile)` /
+`addFile(DeleteFile, long)` (explicit-seq overload) + the 4-set
+`rewriteFiles(data_to_replace, delete_to_replace, data_to_add, delete_to_add)` — and lift the third
+precondition (`addsDeleteFiles() ⇒ deletesDeleteFiles()`) into reachability. Java spec from 1.10.0
+bytecode (`BaseRewriteFiles`, `MergingSnapshotProducer.add(DeleteFile)/(DeleteFile,long)`,
+`Delegates.PendingDeleteFile`, `SnapshotProducer.writeDeleteFileGroup`). Files: `rewrite_files.rs`,
+`snapshot.rs` ONLY. Done-bar 🟡 (unit-tested, interop deferred).
+
+- [ ] **snapshot.rs** — model the `PendingDeleteFile` per-file optional explicit data-seq: store added
+      delete files as `Vec<(DataFile, Option<i64>)>` (None = inherit). Keep
+      `with_added_delete_files(Vec<DataFile>)` mapping each to `(file, None)` (RowDelta unchanged); add
+      `with_added_delete_files_with_seq(...)`. Stamp the explicit seq in `write_added_delete_manifests`
+      (mirror `writeDeleteFileGroup`: `add(file, seq)` if Some, else `add(file)` = inherit). Update the
+      validation/empty-check/summary read sites to destructure the pair.
+- [ ] **rewrite_files.rs** — `add_delete_file(DeleteFile)` / `add_delete_files(...)` (inherited seq),
+      `add_delete_file_with_sequence_number(DeleteFile, i64)` (Java `addFile(DeleteFile, long)`),
+      `rewrite_files_with_deletes(4 sets)` (Java 4-arg). Make precondition (3) reachable
+      (`adds_delete_files = !added_delete_files.is_empty()`). Content-guard + negative-seq guard on
+      added delete files. Route added deletes through `with_added_delete_files_with_seq`.
+- [ ] **Tests** (rewrite_files.rs): crown-jewel rewrite a delete file into a NEW delete file + post-commit
+      MoR scan (no resurrection); explicit-seq overload stamps the given seq (on-disk pre-inheritance via
+      the manifest reader); 4-arg atomic (data AND delete sets in ONE Replace snapshot); precondition (3)
+      both-directions; content + negative-seq guards. Mutation: seq-strip → resurrection test fails.
+- [ ] **Gate**: `typos . && cargo fmt --check && cargo clippy -D warnings && cargo test -p iceberg --lib`
+      (twice). Update `transaction/map.md` rewrite_files row + the third-precondition note.
+
 ## ACTIVE (2026-06-13, Opus builder): `caseSensitive(bool)` on the expression-binding write actions
 
 Add `case_sensitive(bool)` (DEFAULT TRUE = Java default, 1.10.0 bytecode-confirmed:

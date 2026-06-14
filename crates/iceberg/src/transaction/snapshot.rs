@@ -135,6 +135,13 @@ pub(crate) trait ManifestProcess: Send + Sync {
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
+/// An ADDED delete file paired with its OPTIONAL explicit DATA sequence number — the Rust analogue of
+/// Java's `Delegates.PendingDeleteFile` (a delete file wrapped with a nullable `dataSequenceNumber()`).
+/// `None` ⇒ the entry inherits the new snapshot's sequence number at read time (Java
+/// `addFile(DeleteFile)`); `Some(seq)` ⇒ the entry is written with that explicit data seq (Java
+/// `addFile(DeleteFile, long)` → `writeDeleteFileGroup`'s `writer.add(file, dataSeq)`).
+pub(crate) type PendingDeleteFile = (DataFile, Option<i64>);
+
 pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
     snapshot_id: i64,
@@ -142,12 +149,20 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
-    // DELETE files (position / equality) this snapshot adds, written into a DELETE manifest alongside
-    // the DATA manifest (Java `MergingSnapshotProducer.add(DeleteFile)`). The merge-on-read write path
-    // (`RowDelta`) populates this; add-only data operations (fast append, overwrite-by-files) leave it
-    // empty. Their entries inherit the new snapshot's sequence number at read time, exactly like added
-    // data files (so a delete added now applies to earlier data: `data_seq <= delete_seq`).
-    added_delete_files: Vec<DataFile>,
+    // DELETE files (position / equality / DV) this snapshot adds, each paired with an OPTIONAL explicit
+    // DATA sequence number — the Rust analogue of Java's `Delegates.PendingDeleteFile` (a delete file
+    // wrapped with a nullable `dataSequenceNumber()`; `MergingSnapshotProducer.add(DeleteFile)` wraps with
+    // `null`, `add(DeleteFile, long)` with the explicit value). `None` ⇒ the entry inherits the new
+    // snapshot's sequence number at read time, exactly like an added data file (so a delete added now
+    // applies to earlier data: `data_seq <= delete_seq`). `Some(seq)` ⇒ the entry is written with that
+    // explicit data seq (Java `writeDeleteFileGroup` calling `writer.add(file, dataSeq)` when the pending
+    // file's `dataSequenceNumber()` is non-null) — the `RewriteFiles.addFile(DeleteFile, long)` path that
+    // re-stamps a rewritten delete file with the seq it must keep so it still applies to its data.
+    //
+    // The merge-on-read write path (`RowDelta`) populates this via [`Self::with_added_delete_files`] (all
+    // `None`); the compaction path (`RewriteFiles`) via [`Self::with_added_delete_files_with_seq`].
+    // Add-only data operations (fast append, overwrite-by-files) leave it empty.
+    added_delete_files: Vec<PendingDeleteFile>,
     // An explicit DATA sequence number to stamp on every ADDED data file (Java
     // `MergingSnapshotProducer.newDataFilesDataSequenceNumber`). When `Some(seq)`, each added data
     // entry is written with this explicit data seq instead of inheriting the new snapshot's seq at
@@ -220,10 +235,31 @@ impl<'a> SnapshotProducer<'a> {
         self
     }
 
-    /// Attach the DELETE files (position / equality) this snapshot adds. They are written into a
-    /// DELETE manifest alongside the DATA manifest in the same snapshot (Java
-    /// `MergingSnapshotProducer.add(DeleteFile)`). Used by the merge-on-read write path (`RowDelta`).
+    /// Attach the DELETE files (position / equality) this snapshot adds with the DEFAULT (inherited)
+    /// sequence number. They are written into a DELETE manifest alongside the DATA manifest in the same
+    /// snapshot (Java `MergingSnapshotProducer.add(DeleteFile)` → `pendingDeleteFile(file, null)`). Each
+    /// entry inherits the new snapshot's sequence number at read time. Used by the merge-on-read write
+    /// path (`RowDelta`).
     pub(crate) fn with_added_delete_files(mut self, added_delete_files: Vec<DataFile>) -> Self {
+        self.added_delete_files = added_delete_files
+            .into_iter()
+            .map(|file| (file, None))
+            .collect();
+        self
+    }
+
+    /// Attach the DELETE files this snapshot adds, each paired with an OPTIONAL explicit DATA sequence
+    /// number — the Rust analogue of Java's per-file `Delegates.PendingDeleteFile.dataSequenceNumber()`.
+    /// `None` ⇒ the entry inherits the new snapshot's seq (Java `addFile(DeleteFile)`); `Some(seq)` ⇒ the
+    /// entry is written with that explicit data seq (Java `addFile(DeleteFile, long)` →
+    /// `writeDeleteFileGroup`'s `writer.add(file, dataSeq)`). Used by the compaction write path
+    /// (`RewriteFiles`) to re-stamp a rewritten delete file with the data seq it must keep so it still
+    /// applies to its data. A `Some(seq)` value MUST be non-negative (the caller validates this; the
+    /// manifest writer silently strips a negative explicit seq back into re-inheritance).
+    pub(crate) fn with_added_delete_files_with_seq(
+        mut self,
+        added_delete_files: Vec<PendingDeleteFile>,
+    ) -> Self {
         self.added_delete_files = added_delete_files;
         self
     }
@@ -373,7 +409,7 @@ impl<'a> SnapshotProducer<'a> {
     /// version on every retry.
     pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
         let format_version = self.table.metadata().format_version();
-        for delete_file in &self.added_delete_files {
+        for (delete_file, _explicit_seq) in &self.added_delete_files {
             match delete_file.content_type() {
                 crate::spec::DataContentType::PositionDeletes
                 | crate::spec::DataContentType::EqualityDeletes => {}
@@ -980,11 +1016,22 @@ impl<'a> SnapshotProducer<'a> {
     /// Write one DELETE manifest per partition-spec group of the added delete files, returning the
     /// [`ManifestFile`]s for the manifest list. Mirrors [`write_added_manifests`](Self::write_added_manifests)
     /// but uses the `Deletes` cluster writer (Java `MergingSnapshotProducer.newDeleteFilesAsManifests`:
-    /// `newDeleteFilesBySpec.forEach((specId, files) -> writeDeleteManifests(files, spec(specId)))`). The
-    /// entries are `Added` with no sequence number for V2/V3 so they inherit the new snapshot's sequence
-    /// number at read time — exactly the mechanism added data files use — which makes the delete apply to
-    /// earlier data (`data_seq <= delete_seq`). Each group's writer is built under THAT group's spec, so a
-    /// delete file under an older spec keeps its own spec id / partition type.
+    /// `newDeleteFilesBySpec.forEach((specId, files) -> writeDeleteManifests(files, spec(specId)))`).
+    ///
+    /// Each added delete file carries an OPTIONAL explicit DATA sequence number (the
+    /// `Delegates.PendingDeleteFile.dataSequenceNumber()` analogue). Java `writeDeleteFileGroup` branches
+    /// per file (1.10.0 bytecode): a non-null pending seq writes `writer.add(file, dataSeq)` (explicit), a
+    /// null one writes `writer.add(file)` (inherit). This Rust port mirrors that exactly:
+    /// - `None` ⇒ for V2/V3 the entry is `Added` with NO sequence number, so it inherits the new
+    ///   snapshot's sequence number at read time (the merge-on-read default — Java `addFile(DeleteFile)`).
+    /// - `Some(seq)` ⇒ the entry is written with that EXPLICIT data seq (Java
+    ///   `addFile(DeleteFile, long)`), so a rewritten delete file keeps the seq it must retain to still
+    ///   apply to its data (`data_seq < delete_seq`). The FILE sequence number still inherits.
+    ///
+    /// A V1 table has no delete manifests (position/equality deletes are V2+ concepts); the explicit seq
+    /// is ignored there (V1 manifests carry no sequence numbers) and the entry just stamps the snapshot id.
+    /// Each group's writer is built under THAT group's spec, so a delete file under an older spec keeps its
+    /// own spec id / partition type.
     async fn write_added_delete_manifests(&mut self) -> Result<Vec<ManifestFile>> {
         let added_delete_files = std::mem::take(&mut self.added_delete_files);
         if added_delete_files.is_empty() {
@@ -998,16 +1045,22 @@ impl<'a> SnapshotProducer<'a> {
         let format_version = self.table.metadata().format_version();
 
         let mut manifest_files = Vec::new();
-        for (partition_spec_id, group) in Self::group_files_by_spec(added_delete_files) {
+        for (partition_spec_id, group) in Self::group_delete_files_by_spec(added_delete_files) {
             let mut writer =
                 self.new_cluster_manifest_writer(partition_spec_id, ManifestContentType::Deletes)?;
-            for delete_file in group {
+            for (delete_file, explicit_seq) in group {
                 let builder = ManifestEntry::builder()
                     .status(crate::spec::ManifestStatus::Added)
                     .data_file(delete_file);
                 let entry = if format_version == FormatVersion::V1 {
-                    // Position/equality deletes are V2+ concepts; a V1 table has no delete manifests.
+                    // Position/equality deletes are V2+ concepts; a V1 table has no delete manifests, and
+                    // V1 manifests carry no sequence numbers — so the explicit seq is irrelevant here.
                     builder.snapshot_id(snapshot_id).build()
+                } else if let Some(sequence_number) = explicit_seq {
+                    // Explicit per-file data seq (Java `writeDeleteFileGroup`'s `writer.add(file, dataSeq)`
+                    // when the pending delete file's `dataSequenceNumber()` is non-null). The writer keeps a
+                    // non-negative explicit data seq and lets the FILE sequence number inherit at read time.
+                    builder.sequence_number(sequence_number).build()
                 } else {
                     // For format version > 1, set the snapshot id + sequence number at inherited time so
                     // the manifest does not need rewriting on a commit retry (same as added data files).
@@ -1018,6 +1071,27 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(writer.write_manifest_file().await?);
         }
         Ok(manifest_files)
+    }
+
+    /// Group the added delete files (each paired with its optional explicit data seq) by their own
+    /// `partition_spec_id`, in the same DETERMINISTIC spec-id-DESCENDING order as
+    /// [`group_files_by_spec`](Self::group_files_by_spec) (the data-file sibling). Carries each file's
+    /// explicit seq through the grouping so [`write_added_delete_manifests`](Self::write_added_delete_manifests)
+    /// can stamp it per Java `writeDeleteFileGroup`.
+    fn group_delete_files_by_spec(
+        files: Vec<PendingDeleteFile>,
+    ) -> Vec<(i32, Vec<PendingDeleteFile>)> {
+        let mut groups: HashMap<i32, Vec<PendingDeleteFile>> = HashMap::new();
+        for (file, explicit_seq) in files {
+            groups
+                .entry(file.partition_spec_id)
+                .or_default()
+                .push((file, explicit_seq));
+        }
+        let mut groups: Vec<(i32, Vec<PendingDeleteFile>)> = groups.into_iter().collect();
+        // Reverse spec-id order (Java `groupBySpec` TreeMap with `Comparator.reverseOrder()`).
+        groups.sort_unstable_by(|(left, _), (right, _)| right.cmp(left));
+        groups
     }
 
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
@@ -1321,7 +1395,7 @@ impl<'a> SnapshotProducer<'a> {
         // file's content type and increments the added-delete-file + added-position/equality-delete
         // counters (Java `MergingSnapshotProducer.add(DeleteFile)` → the delete-file summary). Empty for
         // operations that add no delete files. Summarized under each delete file's OWN spec.
-        for delete_file in &self.added_delete_files {
+        for (delete_file, _explicit_seq) in &self.added_delete_files {
             summary_collector.add_file(
                 delete_file,
                 table_metadata.current_schema().clone(),

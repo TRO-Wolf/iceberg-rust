@@ -99,14 +99,31 @@
 //!      (**"Data files to add must be empty because there's no data file to be rewritten"**).
 //!   3. `deletesDeleteFiles() || !addsDeleteFiles()` — delete files may be added only if delete files are
 //!      deleted (**"Delete files to add must be empty because there's no delete file to be rewritten"**).
-//!      ADD-of-delete-files is NOT yet supported by this action (only REMOVAL), so `addsDeleteFiles()` is
-//!      always false and (3) always passes; the message is mirrored for when the add-delete surface lands.
+//!      Now REACHABLE: the DELETE-file ADD surface is ported (below), so `addsDeleteFiles()` reflects a
+//!      non-empty added set and (3) genuinely guards an add-delete-without-delete-delete rewrite.
 //!
-//! **Out of scope (deferred, with precise reasons):**
-//! - **DELETE-file ADD** — Java `RewriteFiles.addFile(DeleteFile)` / `addFile(DeleteFile, long)` (rewriting a
-//!   position-delete / DV file into a NEW delete file). That needs the delete-file WRITE path threaded into
-//!   the producer's added-delete-file machinery; the REMOVAL surface (above) is all `RemoveDanglingDeleteFiles`
-//!   needs. The third precondition is already carried for when this lands.
+//! **DELETE-file ADD surface (Java `RewriteFiles.addFile(DeleteFile)` / `addFile(DeleteFile, long)`,
+//! `BaseRewriteFiles`/`MergingSnapshotProducer.add(DeleteFile)`/`add(DeleteFile, long)` 1.10.0 bytecode):**
+//! this action can ADD position-delete / equality-delete / deletion-vector files via
+//! [`RewriteFilesAction::add_delete_file`] / [`RewriteFilesAction::add_delete_files`] (DEFAULT inherited
+//! seq — Java `addFile(DeleteFile)` → `Delegates.pendingDeleteFile(file, null)`) and
+//! [`RewriteFilesAction::add_delete_file_with_sequence_number`] (EXPLICIT seq — Java
+//! `addFile(DeleteFile, long)` → `pendingDeleteFile(file, Long.valueOf(seq))`). The added delete files
+//! reach the producer through the SAME added-delete-file machinery `RowDelta` routes its new deletes
+//! through ([`SnapshotProducer::with_added_delete_files_with_seq`] → `write_added_delete_manifests`),
+//! NOT a fork. The 4-set [`RewriteFilesAction::rewrite_files_with_deletes`] (Java's 4-arg
+//! `rewriteFiles(dataToReplace, deleteToReplace, dataToAdd, deleteToAdd)`) replaces data AND delete files
+//! and adds data AND delete files in ONE `Replace` snapshot.
+//!
+//! **Added-delete SEQUENCE NUMBER (the silent-corruption line — `RewritePositionDeleteFiles`):** Java
+//! `Delegates.PendingDeleteFile` carries a per-file nullable `dataSequenceNumber()`; `writeDeleteFileGroup`
+//! writes `writer.add(file, dataSeq)` when non-null (explicit) and `writer.add(file)` when null (inherit).
+//! The Rust port stamps the explicit seq the same way. A delete file rewritten into a NEW file MUST keep
+//! the data seq it had so it still applies to EXACTLY its data (`data_seq < delete_seq`): an inherited
+//! (higher) seq makes it stop applying ⇒ deleted rows RESURRECT; the explicit overload is the fix.
+//! A negative explicit seq is REJECTED at commit ([`ErrorKind::DataInvalid`]) — the manifest writer would
+//! silently strip it into re-inheritance (the exact corruption this exists to prevent), mirroring the
+//! data-file `data_sequence_number` guard.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -118,19 +135,23 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, PendingDeleteFile, SnapshotProduceOperation, SnapshotProducer,
     validate_no_new_deletes_for_data_files,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
-/// A transaction action that rewrites data files: it atomically removes a set of data files and adds a
-/// new set of data files in a single `Replace` snapshot — the compaction-commit primitive.
+/// A transaction action that rewrites files: it atomically removes a set of data and/or DELETE files and
+/// adds a new set of data and/or DELETE files in a single `Replace` snapshot — the compaction-commit
+/// primitive (data compaction AND the `RewritePositionDeleteFiles` delete-rewrite primitive).
 ///
 /// Use [`crate::transaction::Transaction::rewrite_files`] to create one. The primary entry point is
-/// [`RewriteFilesAction::rewrite_files`] (the files to delete + the files to add); the
+/// [`RewriteFilesAction::rewrite_files`] (data files to delete + data files to add); the
 /// [`RewriteFilesAction::delete_file`] / [`RewriteFilesAction::add_file`] (and `*_files`) builders are the
-/// incremental equivalents. The files to delete are passed as [`DataFile`]s (callers hold them after a
-/// scan) and resolved against the current snapshot BY PATH.
+/// incremental equivalents for DATA files, and [`RewriteFilesAction::delete_delete_file`] /
+/// [`RewriteFilesAction::add_delete_file`] / [`RewriteFilesAction::add_delete_file_with_sequence_number`]
+/// the equivalents for DELETE files. [`RewriteFilesAction::rewrite_files_with_deletes`] is the 4-set form
+/// (replace data + delete, add data + delete) in one snapshot. The files to delete are passed as
+/// [`DataFile`]s (callers hold them after a scan) and resolved against the current snapshot BY PATH.
 ///
 /// The set of files to delete MUST be non-empty (Java `BaseRewriteFiles` "Files to delete cannot be
 /// empty"); a delete-only rewrite is allowed, but an add-only rewrite is rejected. Deleting a file that is
@@ -152,6 +173,17 @@ pub struct RewriteFilesAction {
     /// paths are resolved against the current snapshot's DELETE manifests and tombstoned in one snapshot.
     /// This is the commit vehicle `RemoveDanglingDeleteFiles` drives.
     deleted_delete_files: Vec<DataFile>,
+    /// DELETE files (position / equality / deletion-vector content) to ADD to the table — the Java
+    /// `RewriteFiles.addFile(DeleteFile)` / `addFile(DeleteFile, long)` surface
+    /// (`MergingSnapshotProducer.add(DeleteFile)` / `add(DeleteFile, long)`). Each is paired with an
+    /// OPTIONAL explicit DATA sequence number (the `Delegates.PendingDeleteFile.dataSequenceNumber()`
+    /// analogue): `None` ⇒ the added delete inherits the new snapshot's seq (`addFile(DeleteFile)`),
+    /// `Some(seq)` ⇒ it is stamped with that explicit data seq (`addFile(DeleteFile, long)`). They reach
+    /// the producer through the SAME added-delete-file machinery `RowDelta` uses
+    /// ([`SnapshotProducer::with_added_delete_files_with_seq`]). Stamping the right seq is the silent-
+    /// corruption line: a rewritten position-delete written into a new delete file with the WRONG seq
+    /// stops applying (rows resurrect) or over-applies — this is the `RewritePositionDeleteFiles` primitive.
+    added_delete_files: Vec<PendingDeleteFile>,
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
@@ -172,6 +204,7 @@ impl RewriteFilesAction {
             added_data_files: vec![],
             deleted_data_files: vec![],
             deleted_delete_files: vec![],
+            added_delete_files: vec![],
             commit_uuid: None,
             key_metadata: None,
             snapshot_properties: HashMap::default(),
@@ -237,6 +270,79 @@ impl RewriteFilesAction {
         self
     }
 
+    /// Add a single rewritten DELETE file (position / equality / deletion-vector content) to the table with
+    /// the DEFAULT (inherited) sequence number — the Java `RewriteFiles.addFile(DeleteFile)` overload
+    /// (`MergingSnapshotProducer.add(DeleteFile)` → `Delegates.pendingDeleteFile(file, null)`). The added
+    /// delete file INHERITS the new (rewrite) snapshot's sequence number, exactly like a row-delta-added
+    /// delete, so it applies to data at a strictly lower data seq. The supplied file must be
+    /// `PositionDeletes` or `EqualityDeletes` content (a `Data` file is rejected at commit — that goes
+    /// through [`Self::add_file`]).
+    ///
+    /// To rewrite an EXISTING delete file into a new one that must keep applying to the SAME data, use
+    /// [`Self::add_delete_file_with_sequence_number`] with the original file's data sequence number
+    /// instead — an inherited (higher) seq makes the rewritten delete stop applying to its older data and
+    /// silently resurrect deleted rows (the `RewritePositionDeleteFiles` corruption line).
+    pub fn add_delete_file(mut self, delete_file: DataFile) -> Self {
+        self.added_delete_files.push((delete_file, None));
+        self
+    }
+
+    /// Add multiple rewritten DELETE files with the DEFAULT (inherited) sequence number — the plural of
+    /// [`Self::add_delete_file`]. Each must be `PositionDeletes` or `EqualityDeletes` content.
+    pub fn add_delete_files(mut self, delete_files: impl IntoIterator<Item = DataFile>) -> Self {
+        self.added_delete_files
+            .extend(delete_files.into_iter().map(|file| (file, None)));
+        self
+    }
+
+    /// Add a single rewritten DELETE file with an EXPLICIT data sequence number — the Java
+    /// `RewriteFiles.addFile(DeleteFile, long)` overload (`MergingSnapshotProducer.add(DeleteFile, long)` →
+    /// `Delegates.pendingDeleteFile(file, Long.valueOf(seq))`). The added delete file is stamped with
+    /// `sequence_number` as its DATA sequence number instead of inheriting the new snapshot's seq, so a
+    /// position/equality delete rewritten into a new file keeps applying to EXACTLY the data it applied to
+    /// before (`data_seq < delete_seq` preserved). This is the load-bearing primitive of
+    /// `RewritePositionDeleteFiles`: a wrong (higher) seq silently resurrects deleted rows, a wrong (lower)
+    /// seq over-applies.
+    ///
+    /// `sequence_number` must be NON-NEGATIVE; a negative value is rejected at commit with
+    /// [`ErrorKind::DataInvalid`] (the manifest writer silently strips a negative explicit seq back into
+    /// re-inheritance — the exact corruption this overload exists to prevent — so the action fails loudly).
+    pub fn add_delete_file_with_sequence_number(
+        mut self,
+        delete_file: DataFile,
+        sequence_number: i64,
+    ) -> Self {
+        self.added_delete_files
+            .push((delete_file, Some(sequence_number)));
+        self
+    }
+
+    /// The 4-set rewrite (Java `RewriteFiles.rewriteFiles(Set<DataFile> dataFilesToReplace,
+    /// Set<DeleteFile> deleteFilesToReplace, Set<DataFile> dataFilesToAdd, Set<DeleteFile>
+    /// deleteFilesToAdd)`, `BaseRewriteFiles` 1.10.0 bytecode): replace data AND delete files and add data
+    /// AND delete files, all in ONE `Replace` snapshot. Equivalent to calling [`Self::delete_file`] for
+    /// each `data_to_replace`, [`Self::delete_delete_file`] for each `delete_to_replace`, [`Self::add_file`]
+    /// for each `data_to_add`, and [`Self::add_delete_file`] for each `delete_to_add` (Java iterates the
+    /// four sets in exactly that order; the added DELETE files take the DEFAULT inherited seq — Java's 4-arg
+    /// form routes through `addFile(DeleteFile)`, NOT the explicit-seq overload).
+    ///
+    /// All three `validateReplacedAndAddedFiles()` preconditions apply at commit, including the third
+    /// (`addsDeleteFiles() ⇒ deletesDeleteFiles()`): adding delete files requires deleting delete files.
+    pub fn rewrite_files_with_deletes(
+        mut self,
+        data_to_replace: impl IntoIterator<Item = DataFile>,
+        delete_to_replace: impl IntoIterator<Item = DataFile>,
+        data_to_add: impl IntoIterator<Item = DataFile>,
+        delete_to_add: impl IntoIterator<Item = DataFile>,
+    ) -> Self {
+        self.deleted_data_files.extend(data_to_replace);
+        self.deleted_delete_files.extend(delete_to_replace);
+        self.added_data_files.extend(data_to_add);
+        self.added_delete_files
+            .extend(delete_to_add.into_iter().map(|file| (file, None)));
+        self
+    }
+
     /// Set the commit UUID for the snapshot (otherwise a fresh v7 UUID is generated).
     pub fn set_commit_uuid(mut self, commit_uuid: Uuid) -> Self {
         self.commit_uuid = Some(commit_uuid);
@@ -299,6 +405,7 @@ impl TransactionAction for RewriteFilesAction {
         let deletes_data_files = !self.deleted_data_files.is_empty();
         let deletes_delete_files = !self.deleted_delete_files.is_empty();
         let adds_data_files = !self.added_data_files.is_empty();
+        let adds_delete_files = !self.added_delete_files.is_empty();
 
         // Precondition (1): `deletesDataFiles() || deletesDeleteFiles()` — the to-delete set (DATA or DELETE
         // files) must be non-empty ("Files to delete cannot be empty"). A delete-file-only rewrite (the
@@ -321,13 +428,9 @@ impl TransactionAction for RewriteFilesAction {
         }
 
         // Precondition (3): `deletesDeleteFiles() || !addsDeleteFiles()` ("Delete files to add must be empty
-        // because there's no delete file to be rewritten"). `addsDeleteFiles()` is always false here (the
-        // add-delete surface is not yet ported), so this always passes; the check + Java-exact message are
-        // mirrored for when the add-delete surface lands.
-        // NOTE: with `addsDeleteFiles()` unconditionally false, this branch is presently unreachable; it is
-        // kept (rather than omitted) so the third precondition is enforced the moment the add-delete builder
-        // lands. The added-delete count would replace the `false` below.
-        let adds_delete_files = false;
+        // because there's no delete file to be rewritten") — delete files may be ADDED only when delete
+        // files are being deleted (`BaseRewriteFiles.validateReplacedAndAddedFiles()`, 1.10.0 bytecode).
+        // Now REACHABLE: the add-delete surface is ported, so `addsDeleteFiles()` ⇔ a non-empty added set.
         if !deletes_delete_files && adds_delete_files {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -342,6 +445,35 @@ impl TransactionAction for RewriteFilesAction {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Only position-delete or equality-delete content is allowed for removed delete files (use delete_file to remove data files)",
+                ));
+            }
+        }
+
+        // Content-type + negative-seq guards on the ADDED DELETE set (Java
+        // `RewriteFiles.addFile(DeleteFile)` takes a DeleteFile — a Data file must go through `add_file`).
+        // The format-version gate (V1 rejects deletes, V2 rejects DVs, V3 requires DVs for position
+        // deletes) runs in the producer's `validate_added_delete_files` below, against the REFRESHED base.
+        for (delete_file, explicit_seq) in &self.added_delete_files {
+            if delete_file.content_type() == crate::spec::DataContentType::Data {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Only position-delete or equality-delete content is allowed for added delete files (use add_file to add data files)",
+                ));
+            }
+            // A negative explicit delete-file data seq would be STRIPPED by the manifest writer back into
+            // re-inheritance (the added delete re-inherits the new, higher snapshot seq ⇒ it stops applying
+            // to its older data ⇒ resurrection). Reject it loudly rather than silently corrupt the table —
+            // the same fail-loud posture as the data-file `data_sequence_number` guard below.
+            if let Some(sequence_number) = explicit_seq
+                && *sequence_number < 0
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Invalid data sequence number for added delete file: {sequence_number} (must be \
+                         non-negative; a negative value would be stripped into sequence-number \
+                         re-inheritance and resurrect deleted rows)"
+                    ),
                 ));
             }
         }
@@ -391,11 +523,28 @@ impl TransactionAction for RewriteFilesAction {
                 snapshot_producer.with_removed_delete_files(self.deleted_delete_files.clone());
         }
 
+        // Route the ADDED DELETE files (Java `RewriteFiles.addFile(DeleteFile)` / `addFile(DeleteFile,
+        // long)` → `MergingSnapshotProducer.add(DeleteFile)` / `add(DeleteFile, long)`) through the SAME
+        // producer added-delete-file machinery `RowDelta` uses — each paired with its optional explicit
+        // data seq (`Delegates.PendingDeleteFile.dataSequenceNumber()`): `None` inherits the new snapshot's
+        // seq, `Some(seq)` stamps the explicit one. The producer writes them into a per-spec DELETE
+        // manifest alongside the rewritten manifests in the SAME snapshot. Empty for a data-only rewrite.
+        if adds_delete_files {
+            snapshot_producer =
+                snapshot_producer.with_added_delete_files_with_seq(self.added_delete_files.clone());
+        }
+
         // Validate the added files like fast append: data content type, partition-spec match, and
         // partition-value compatibility (Java `MergingSnapshotProducer.add`). The delete paths are resolved
         // and validated (every one present; an absent path errors) inside the producer's commit via the
-        // operation's `delete_files` seam (Java `failMissingDeletePaths`).
+        // operation's `delete_files` seam (Java `failMissingDeletePaths`). The added DELETE files are
+        // validated (content type, the format-version gate, partition-spec match) against the REFRESHED
+        // base via `validate_added_delete_files` (Java `MergingSnapshotProducer.add(DeleteFile)` →
+        // `validateNewDeleteFile`).
         snapshot_producer.validate_added_data_files()?;
+        if adds_delete_files {
+            snapshot_producer.validate_added_delete_files()?;
+        }
 
         snapshot_producer
             .commit(
@@ -1814,6 +1963,21 @@ mod tests {
 
     /// The set of live DELETE-file paths in the table's current snapshot.
     async fn live_delete_file_paths(table: &Table) -> HashSet<String> {
+        live_paths_of_content(table, crate::spec::ManifestContentType::Deletes).await
+    }
+
+    /// The set of live DATA-file paths in the table's current snapshot — the DATA-only counterpart of
+    /// [`live_delete_file_paths`]. (Distinct from [`live_file_paths`], which counts EVERY live entry
+    /// across DATA and DELETE manifests; with delete files present that mixes the two sets.)
+    async fn live_data_file_paths(table: &Table) -> HashSet<String> {
+        live_paths_of_content(table, crate::spec::ManifestContentType::Data).await
+    }
+
+    /// The set of live file paths in manifests of the given content type (Data or Deletes).
+    async fn live_paths_of_content(
+        table: &Table,
+        content: crate::spec::ManifestContentType,
+    ) -> HashSet<String> {
         let snapshot = table.metadata().current_snapshot().unwrap();
         let manifest_list = snapshot
             .load_manifest_list(table.file_io(), table.metadata())
@@ -1821,7 +1985,7 @@ mod tests {
             .unwrap();
         let mut paths = HashSet::new();
         for manifest_file in manifest_list.entries() {
-            if manifest_file.content != crate::spec::ManifestContentType::Deletes {
+            if manifest_file.content != content {
                 continue;
             }
             let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
@@ -2056,6 +2220,538 @@ mod tests {
         assert!(
             found_tombstone,
             "the removed delete must be tombstoned (producer routing fired)"
+        );
+    }
+
+    // ============================================================================================
+    // DELETE-file ADD surface (Java `RewriteFiles.addFile(DeleteFile)` / `addFile(DeleteFile, long)` +
+    // the 4-set `rewriteFiles`). These pin: the crown-jewel rewrite of a delete file into a NEW delete
+    // file with the EXPLICIT seq (over-deletion of a re-inserted row is the seq-strip corruption); the
+    // on-disk pre-inheritance seq of the added delete; the 4-arg atomic data+delete rewrite; the third
+    // precondition (addsDeleteFiles ⇒ deletesDeleteFiles) in BOTH directions; and the content +
+    // negative-seq guards on the added-delete set.
+    // ============================================================================================
+
+    /// THE CROWN JEWEL (risk: a rewritten DELETE file stamped with the WRONG — inherited, higher —
+    /// sequence number OVER-DELETES a re-inserted row). An equality delete E (seq 2) removes y=20 from X
+    /// (seq 1). A LATER append W (seq 3) RE-INSERTS y=20, which E must NOT touch (eq deletes apply only to
+    /// `data_seq < delete_seq`, and 3 is not < 2). Rewriting E → E' via the 4-set form, stamping E' with
+    /// E's ORIGINAL seq (2) through `add_delete_file_with_sequence_number`, keeps E' applying to EXACTLY X
+    /// — the post-commit scan stays {10, 20, 30} (W's re-inserted 20 survives, X's 20 stays deleted).
+    ///
+    /// Proves: (a) a delete file can be rewritten into a NEW delete file (delete_to_replace +
+    /// delete_to_add) in ONE Replace snapshot; (b) the post-commit MoR scan drops EXACTLY the originally
+    /// deleted rows — no resurrection of X's 20, no over-deletion of W's 20.
+    ///
+    /// MUTATION (run manually, then restore): in `write_added_delete_manifests`, drop the explicit-seq
+    /// branch so the added delete inherits the fresh rewrite seq (`else if let Some(..) = explicit_seq` →
+    /// always `else`) ⇒ E' lands at the new, higher seq, applies to W too, and this test FAILS with W's
+    /// y=20 wrongly over-deleted (scan becomes {10, 30}).
+    #[tokio::test]
+    async fn test_rewrite_delete_into_new_delete_with_explicit_seq_no_over_deletion() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // 1. Append X (seq 1): y = [10, 20] in partition 0.
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x]).await;
+
+        // 2. RowDelta an equality delete E removing y=20 (seq 2). Scan = {10}.
+        let eq_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let eq_delete_seq = {
+            let tx = Transaction::new(&table);
+            let action = tx.row_delta().add_deletes(vec![eq_delete.clone()]);
+            let tx = action.apply(tx).unwrap();
+            let table = tx.commit(&catalog).await.unwrap();
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .sequence_number()
+        };
+        let table = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10]),
+            "before the re-insert E drops both X's rows except y=10"
+        );
+
+        // 3. Append W (seq 3): y = [20, 30] — y=20 RE-INSERTED. E (seq 2) must NOT apply to W (seq 3).
+        let w = write_data_file(&table, "w.parquet", 0, &[(0, 20, 201), (0, 30, 300)]).await;
+        let table = append_files(&catalog, &table, vec![w]).await;
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10, 20, 30]),
+            "W re-inserts y=20 (E does not apply to the later W)"
+        );
+
+        // 4. Rewrite E → E' via the 4-set form, stamping E' with E's ORIGINAL seq (2). E' must drop the
+        //    SAME rows E did (X's 20) and NOT touch W's 20.
+        let eq_delete_prime = write_equality_delete_file(&table, 0, &[20]).await;
+        let eq_prime_path = eq_delete_prime.file_path().to_string();
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files(vec![], vec![]).rewrite_files_with_deletes(
+            vec![],
+            vec![eq_delete],
+            vec![],
+            vec![],
+        );
+        // Add E' with the EXPLICIT original seq (the 4-set form's added-delete default inherits — here we
+        // need the explicit overload to preserve the seq, so add it separately).
+        let action = action.add_delete_file_with_sequence_number(eq_delete_prime, eq_delete_seq);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Replace
+        );
+
+        // 5. The scan stays {10, 20, 30}: E' drops X's y=20 (no resurrection) and does NOT over-delete W's
+        //    re-inserted y=20.
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10, 20, 30]),
+            "E' (explicit seq 2) drops X's y=20 but leaves W's re-inserted y=20 — no over-deletion"
+        );
+
+        // 6. E' carries the EXPLICIT seq on disk (pre-inheritance) — the on-disk pin the seq-strip breaks.
+        assert_eq!(
+            on_disk_data_seq(&table, &eq_prime_path).await,
+            Some(eq_delete_seq),
+            "E' must store the explicit data seq EXPLICITLY on disk (never null ⇒ never re-inherits a higher seq)"
+        );
+    }
+
+    /// EXPLICIT-SEQ STAMP PIN (risk: the explicit-seq overload silently inheriting instead of stamping the
+    /// given seq). `add_delete_file_with_sequence_number(file, seq)` must write the added delete entry with
+    /// `seq` as its DATA sequence number ON DISK, pre-inheritance (Java `addFile(DeleteFile, long)` →
+    /// `writeDeleteFileGroup`'s `writer.add(file, dataSeq)`). Reads the raw avro manifest entry, so a
+    /// re-inheriting (null-seq) entry would read back `None` and fail. Distinct from the crown jewel: this
+    /// is the direct metadata pin, independent of the scan.
+    #[tokio::test]
+    async fn test_rewrite_add_delete_file_with_sequence_number_stamps_on_disk_seq() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x]).await;
+
+        // An existing delete to satisfy precondition (3) (addsDeleteFiles ⇒ deletesDeleteFiles).
+        let old_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![old_delete.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Choose an explicit seq DISTINCT from the new snapshot's seq so an inherited entry would differ.
+        let explicit_seq = 1i64;
+        let new_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let new_delete_path = new_delete.file_path().to_string();
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![], vec![])
+            .delete_delete_files(vec![old_delete])
+            .add_delete_file_with_sequence_number(new_delete, explicit_seq);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let snapshot_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+        assert_ne!(
+            explicit_seq, snapshot_seq,
+            "the test is only meaningful when the explicit seq differs from the snapshot seq"
+        );
+        assert_eq!(
+            on_disk_data_seq(&table, &new_delete_path).await,
+            Some(explicit_seq),
+            "the explicit-seq overload must stamp the given seq on disk (pre-inheritance), not inherit"
+        );
+    }
+
+    /// INHERITED-SEQ PIN (risk: `add_delete_file` wrongly stamping an explicit seq instead of inheriting).
+    /// The DEFAULT `add_delete_file` (Java `addFile(DeleteFile)` → `pendingDeleteFile(file, null)`) must
+    /// leave the added delete entry with NO explicit seq on disk, so it inherits the new snapshot's seq at
+    /// read time. Reads the raw avro entry: a `None` on-disk seq is the inherit signal. Complements the
+    /// explicit-seq pin (both directions of the `Option<i64>` stamping).
+    #[tokio::test]
+    async fn test_rewrite_add_delete_file_default_inherits_seq_on_disk() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x]).await;
+
+        let old_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![old_delete.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let new_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let new_delete_path = new_delete.file_path().to_string();
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![], vec![])
+            .delete_delete_files(vec![old_delete])
+            .add_delete_file(new_delete);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(
+            on_disk_data_seq(&table, &new_delete_path).await,
+            None,
+            "the default add_delete_file must leave NO explicit seq on disk (it inherits the snapshot seq)"
+        );
+    }
+
+    /// ATOMIC 4-ARG PIN (risk: the 4-set rewrite applying only SOME of its four sets — a partial,
+    /// non-atomic rewrite). `rewrite_files_with_deletes(data_to_replace, delete_to_replace, data_to_add,
+    /// delete_to_add)` must apply ALL FOUR in ONE Replace snapshot: the live DATA set AND the live DELETE
+    /// set must both be correct after the single commit. Replace data X→X' and delete D_old→D_new.
+    #[tokio::test]
+    async fn test_rewrite_four_arg_replaces_data_and_delete_atomically() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // Append X (seq 1).
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let x_path = x.file_path().to_string();
+        let table = append_files(&catalog, &table, vec![x.clone()]).await;
+        let x_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        // RowDelta an equality delete D_old (removes y=20).
+        let d_old = write_equality_delete_file(&table, 0, &[20]).await;
+        let d_old_path = d_old.file_path().to_string();
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![d_old.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // 4-set rewrite: replace X→X' (data) AND D_old→D_new (delete), all in ONE snapshot. Preserve X's
+        // data seq so D_new (also removing y=20) still applies. D_new added with the default inherited seq
+        // (the 4-arg form's default) — an inherited (higher) eq-delete seq still applies to X' at the
+        // preserved seq.
+        let x_prime =
+            write_data_file(&table, "x-prime.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let x_prime_path = x_prime.file_path().to_string();
+        let d_new = write_equality_delete_file(&table, 0, &[20]).await;
+        let d_new_path = d_new.file_path().to_string();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![], vec![])
+            .rewrite_files_with_deletes(vec![x], vec![d_old], vec![x_prime], vec![d_new])
+            .data_sequence_number(x_seq);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // ONE Replace snapshot.
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Replace
+        );
+
+        // The live DATA set is exactly {X'} (X replaced).
+        assert_eq!(
+            live_data_file_paths(&table).await,
+            HashSet::from([x_prime_path]),
+            "the 4-set rewrite must replace X with X' in the same snapshot"
+        );
+        assert_deleted_tombstone(&table, &x_path).await;
+
+        // The live DELETE set is exactly {D_new} (D_old replaced).
+        let live_deletes = live_delete_file_paths(&table).await;
+        assert!(
+            live_deletes.contains(&d_new_path),
+            "D_new must be live after the 4-set rewrite"
+        );
+        assert!(
+            !live_deletes.contains(&d_old_path),
+            "D_old must be replaced (not live) after the 4-set rewrite"
+        );
+
+        // The scan still drops y=20 — both the data and the delete were rewritten consistently.
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10]),
+            "after the atomic data+delete rewrite the equality delete still drops y=20"
+        );
+    }
+
+    /// PRECONDITION (3) — REJECTION DIRECTION (risk: the guard `addsDeleteFiles ⇒ deletesDeleteFiles`
+    /// being disabled — an add-delete-only rewrite that deletes nothing is silently allowed). Java
+    /// `validateReplacedAndAddedFiles` rejects adding delete files when no delete files are deleted:
+    /// "Delete files to add must be empty because there's no delete file to be rewritten". Here a rewrite
+    /// that ADDS a delete but deletes a DATA file (not a delete file) must be rejected by (3).
+    ///
+    /// MUTATION (run manually, then restore): in `RewriteFilesAction::commit`, change the precondition (3)
+    /// guard to `if false` (disable it) ⇒ this test FAILS (the illegal add-delete-without-delete-delete
+    /// rewrite wrongly commits).
+    #[tokio::test]
+    async fn test_rewrite_add_delete_without_deleting_delete_rejected() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x.clone()]).await;
+        let x_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        // Delete a DATA file and ADD a delete file, but delete NO delete file ⇒ precondition (3) fires.
+        let x_prime =
+            write_data_file(&table, "x-prime.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let new_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![x], vec![x_prime])
+            .add_delete_file(new_delete)
+            .data_sequence_number(x_seq);
+        let tx = action.apply(tx).unwrap();
+        let error = tx
+            .commit(&catalog)
+            .await
+            .expect_err("adding a delete file without deleting one must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains(
+                "Delete files to add must be empty because there's no delete file to be rewritten"
+            ),
+            "unexpected message: {}",
+            error.message()
+        );
+    }
+
+    /// PRECONDITION (3) — LEGAL DIRECTION (risk: the guard OVER-FIRING — rejecting a legal rewrite that
+    /// both deletes AND adds delete files). When delete files ARE deleted, adding delete files is legal:
+    /// the `RewritePositionDeleteFiles` shape (replace D_old with D_new). Must COMMIT.
+    ///
+    /// MUTATION (run manually, then restore): over-broaden precondition (3) to `if adds_delete_files`
+    /// (drop the `!deletes_delete_files` conjunct) ⇒ this test FAILS (a legal delete-rewrite is rejected).
+    #[tokio::test]
+    async fn test_rewrite_replace_delete_with_delete_is_allowed() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x]).await;
+
+        let d_old = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![d_old.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let d_old_seq = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        // Replace D_old with D_new (delete a delete file AND add a delete file) — legal, must commit.
+        let d_new = write_equality_delete_file(&table, 0, &[20]).await;
+        let d_new_path = d_new.file_path().to_string();
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![], vec![])
+            .delete_delete_files(vec![d_old])
+            .add_delete_file_with_sequence_number(d_new, d_old_seq);
+        let tx = action.apply(tx).unwrap();
+        let committed = tx.commit(&catalog).await;
+        assert!(
+            committed.is_ok(),
+            "replacing a delete file with a delete file is legal under precondition (3): {:?}",
+            committed.err()
+        );
+        let table = committed.unwrap();
+        assert!(
+            live_delete_file_paths(&table).await.contains(&d_new_path),
+            "D_new must be live after the legal delete-rewrite"
+        );
+    }
+
+    /// CONTENT GUARD on the ADDED delete set (risk: a Data-content file silently routed into the
+    /// delete-ADD path). Java `addFile(DeleteFile)` takes a DeleteFile; a Data file must go through
+    /// `add_file`. Pins the rejection with the added-delete content message.
+    #[tokio::test]
+    async fn test_rewrite_add_delete_file_rejects_data_content() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x]).await;
+
+        // Need a deleted delete file to pass precondition (3) before the content guard is reached, so the
+        // content guard (which runs first, before the producer) is what fires.
+        let old_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![old_delete.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![], vec![])
+            .delete_delete_files(vec![old_delete])
+            .add_delete_file(data_file("test/not-a-delete.parquet", 0));
+        let tx = action.apply(tx).unwrap();
+        let error = tx
+            .commit(&catalog)
+            .await
+            .expect_err("add_delete_file must reject a Data-content file");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains(
+                "Only position-delete or equality-delete content is allowed for added delete files"
+            ),
+            "unexpected message: {}",
+            error.message()
+        );
+    }
+
+    /// ACTION-LEVEL content guard pinned AT ITS OWN DOOR (risk: the action-level guard on the added-delete
+    /// set — rewrite_files.rs `RewriteFilesAction::commit` L457 — silently disabled while the test stays
+    /// green because the PRODUCER-level guard (`SnapshotProducer::validate_added_delete_files`,
+    /// snapshot.rs L416-421) fires with the SAME generic substring). The two defense-in-depth layers carry
+    /// DISTINCT messages: only the action-level guard appends "(use add_file to add data files)" — the
+    /// producer guard's message ends at "...for added delete files". This test asserts that
+    /// action-guard-ONLY suffix, so disabling the action guard (`content==Data && false`) makes the
+    /// producer guard fire WITHOUT the suffix and this test goes RED — closing the blind spot per
+    /// docs/testing.md's "pin each defense-in-depth layer at its own public entry point" requirement.
+    /// Companion to `test_rewrite_add_delete_file_rejects_data_content` (which pins the producer-shared
+    /// substring); together they distinguish the two layers.
+    #[tokio::test]
+    async fn test_rewrite_add_delete_file_data_content_hits_action_guard_first() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x]).await;
+
+        // A deleted delete file satisfies precondition (3) (addsDeleteFiles ⇒ deletesDeleteFiles) so the
+        // content guard — not the precondition — is what the commit reaches.
+        let old_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![old_delete.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![], vec![])
+            .delete_delete_files(vec![old_delete])
+            .add_delete_file(data_file("test/not-a-delete.parquet", 0));
+        let tx = action.apply(tx).unwrap();
+        let error = tx
+            .commit(&catalog)
+            .await
+            .expect_err("add_delete_file must reject a Data-content file at the ACTION guard");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        // The action-level guard's message — and ONLY it — carries this suffix. The producer-level guard
+        // (snapshot.rs L416-421) stops at "...for added delete files" with no parenthetical. Asserting the
+        // suffix makes this test fail iff the action guard is bypassed and the producer guard fires instead.
+        assert!(
+            error.message().contains("(use add_file to add data files)"),
+            "the ACTION-level guard message must carry the 'use add_file' suffix (a bypass that lets the \
+             producer guard fire instead loses this suffix); got: {}",
+            error.message()
+        );
+    }
+
+    /// NEGATIVE-SEQ GUARD on the added delete (risk: a negative explicit delete seq silently stripped into
+    /// re-inheritance ⇒ the rewritten delete re-inherits a higher seq ⇒ resurrection/over-deletion). The
+    /// action must REJECT it loudly with a `DataInvalid` naming non-negativity, not pass it to the writer.
+    #[tokio::test]
+    async fn test_rewrite_add_delete_file_negative_sequence_number_rejected() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x]).await;
+
+        let old_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![old_delete.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let new_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![], vec![])
+            .delete_delete_files(vec![old_delete])
+            .add_delete_file_with_sequence_number(new_delete, -1);
+        let tx = action.apply(tx).unwrap();
+        let error = tx
+            .commit(&catalog)
+            .await
+            .expect_err("a negative added-delete data sequence number must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Invalid data sequence number for added delete file")
+                && error.message().contains("non-negative"),
+            "unexpected message: {}",
+            error.message()
+        );
+    }
+
+    /// NEGATIVE-SEQ GUARD — LOWER BOUNDARY (risk: the `< 0` guard over-firing as `<= 0` and wrongly
+    /// rejecting a LEGAL explicit data seq of 0). Java's `addFile(DeleteFile, long)` takes a raw `long`
+    /// with no lower bound; seq 0 is the initial-sequence-number sentinel and is a legal value, so the
+    /// guard must reject ONLY strictly-negative seqs. This pins the boundary EXACTLY at 0: an explicit
+    /// seq of 0 must COMMIT and be stamped on disk as `Some(0)` (pre-inheritance). The companion
+    /// `..._negative_sequence_number_rejected` test pins the `-1` side; only a test at exactly 0
+    /// distinguishes `< 0` from `<= 0`.
+    #[tokio::test]
+    async fn test_rewrite_add_delete_file_zero_sequence_number_allowed() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
+        let table = append_files(&catalog, &table, vec![x]).await;
+
+        // An existing delete to satisfy precondition (3) (addsDeleteFiles ⇒ deletesDeleteFiles).
+        let old_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![old_delete.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let new_delete = write_equality_delete_file(&table, 0, &[20]).await;
+        let new_delete_path = new_delete.file_path().to_string();
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files(vec![], vec![])
+            .delete_delete_files(vec![old_delete])
+            .add_delete_file_with_sequence_number(new_delete, 0);
+        let tx = action.apply(tx).unwrap();
+        let committed = tx.commit(&catalog).await;
+        assert!(
+            committed.is_ok(),
+            "an explicit data sequence number of 0 is legal and must commit (guard is `< 0`, not `<= 0`): {:?}",
+            committed.err()
+        );
+        let table = committed.unwrap();
+
+        // The explicit seq 0 is stamped on disk (pre-inheritance) — never re-inherited into the higher
+        // snapshot seq. This is what the `<= 0` over-fire mutation cannot reach: it would reject 0 outright.
+        assert_eq!(
+            on_disk_data_seq(&table, &new_delete_path).await,
+            Some(0),
+            "the explicit seq 0 must be stamped on disk, not re-inherited"
         );
     }
 }
