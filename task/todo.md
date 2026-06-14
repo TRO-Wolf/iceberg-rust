@@ -67,6 +67,33 @@ Ranked, highest-value first:
 
 See the 2026-06-13 GAP_MATRIX provenance block for the per-row status and residue of every item above.
 
+## ACTIVE (2026-06-13, Opus builder): `DeleteFiles.deleteFromRowFilter(Expression)` delete-by-predicate
+
+Close the deferral in `delete_files.rs` L30-32. Java bytecode-confirmed (`javap -p -c` on
+iceberg-api/core 1.10.0): `StreamingDelete.deleteFromRowFilter(Expression)` → `MergingSnapshotProducer.deleteByRowFilter`
+→ the SAME `ManifestFilterManager.manifestHasDeletedFiles` path `OverwriteFiles.overwriteByRowFilter`
+already ports via `SnapshotProducer::resolve_filter_deletes`. `StreamingDelete.operation()` is the
+CONSTANT `"delete"` (NOT dynamic). PARTIAL ⇒ "Cannot delete file where some, but not all, rows match
+filter %s: %s" (verbatim string in the 1.10.0 jar). Scope: `crates/iceberg/src/transaction/delete_files.rs` ONLY.
+
+- [x] Add `delete_from_row_filter(Predicate)` builder method (stores `Option<Predicate>` row filter).
+- [x] Thread the row filter into `DeleteFilesOperation`; its `delete_files` unions `resolve_delete_paths`
+      with `resolve_filter_deletes(row_filter)` (de-dupe by path) — mirroring `OverwriteFilesOperation`.
+      `operation()` stays `Operation::Delete` (StreamingDelete constant).
+- [x] Tests: A strictly-covered (deleted), B provably-cannot-match (kept), C partial (ERROR, nothing
+      committed); residual KEEP/DELETE/PARTIAL pins; negative residual-non-match; combine-with-by-path.
+- [x] Update `delete_files.rs` module doc (remove the deferral note) + the map.md row 39.
+- Done-bar: 🟡 (unit-tested; interop deferred — flagged for the critic). `caseSensitive(bool)` is a
+  SEPARATE GAP_MATRIX row — explicitly OUT of this increment (filter bound case-sensitive `true`, the
+  Java default, as the precedent does).
+- Outcome (2026-06-13): landed in `delete_files.rs` (`delete_from_row_filter` builder + `row_filter`
+  field threaded into `DeleteFilesOperation`, unioned with by-path via the SHARED
+  `resolve_filter_deletes` — no fork). 8 new tests; full gate green (typos/fmt/clippy + lib ×2 =
+  2246 passed). Two mutations verified-then-reverted (residual→full-predicate caught by 3 tests incl.
+  the dedicated partition-residual pin; strict→inclusive over-broaden caught by the crown-jewel partial
+  test). DEFERRED for the reviewer/orchestrator: flip the GAP_MATRIX `deleteFromRowFilter` row ❌→🟡
+  (outside the explicit modify-list), and data-level Java↔Rust interop.
+
 ## Carried-forward open items (full context in todo-archive/)
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the
