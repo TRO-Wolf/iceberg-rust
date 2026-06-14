@@ -62,9 +62,15 @@
 //! belongs in `snapshot.rs` and is deferred; the divergence is pinned by
 //! `test_delete_from_row_filter_bypath_and_partial_match_diverges_failsafe`.
 //!
-//! **Out of scope (deferred):** `caseSensitive(boolean)` (a separate GAP_MATRIX row that rides the
-//! same Java builder — the row filter here binds case-sensitive, the Iceberg/Java default) and
-//! `dropPartition` (Java `DeleteFiles.dropPartition` partition-drop — `ReplacePartitions` territory).
+//! **Case sensitivity (`caseSensitive(boolean)`):** [`DeleteFilesAction::case_sensitive`] threads the Java
+//! `MergingSnapshotProducer.caseSensitive` flag into the row-filter binding (Java
+//! `ManifestFilterManager.caseSensitive` → `ResidualEvaluator.of(spec, expr, caseSensitive)` and the
+//! metrics-evaluator binding). It DEFAULTS to `true` (the Iceberg/Java default, 1.10.0-bytecode-confirmed:
+//! the `MergingSnapshotProducer`/`ManifestFilterManager` ctors set `caseSensitive = true`), so the row
+//! filter resolves column names case-sensitively unless the caller opts into `case_sensitive(false)`.
+//!
+//! **Out of scope (deferred):** `dropPartition` (Java `DeleteFiles.dropPartition` partition-drop —
+//! `ReplacePartitions` territory).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -111,6 +117,11 @@ pub struct DeleteFilesAction {
     /// a PARTIAL match is a non-retryable error). When `None`, no by-filter delete is performed (Java
     /// `alwaysFalse()`). See [`DeleteFilesAction::delete_from_row_filter`].
     row_filter: Option<Predicate>,
+    /// Column-name resolution case sensitivity for binding the [`Self::row_filter`] predicate (Java
+    /// `MergingSnapshotProducer.caseSensitive`). DEFAULTS to `true` (the Iceberg/Java default — the
+    /// `MergingSnapshotProducer` ctor sets `caseSensitive = true`, 1.10.0 bytecode). `case_sensitive(false)`
+    /// switches the row filter to case-insensitive column resolution. See [`DeleteFilesAction::case_sensitive`].
+    case_sensitive: bool,
 }
 
 impl DeleteFilesAction {
@@ -124,6 +135,8 @@ impl DeleteFilesAction {
             validate_from_snapshot: None,
             stage_only: false,
             row_filter: None,
+            // Java `MergingSnapshotProducer` ctor default `caseSensitive = true` (1.10.0 bytecode).
+            case_sensitive: true,
         }
     }
 
@@ -166,10 +179,25 @@ impl DeleteFilesAction {
     /// [`Predicate::AlwaysTrue`] filter deletes EVERY data file.
     ///
     /// The recorded operation stays [`Operation::Delete`] (Java `StreamingDelete.operation()` is the
-    /// constant `"delete"`). The predicate is bound case-sensitive (the Iceberg/Java default; the separate
-    /// Java `caseSensitive(boolean)` toggle is not yet ported).
+    /// constant `"delete"`). The predicate is bound with this action's case-sensitivity (default `true`, the
+    /// Iceberg/Java default — see [`Self::case_sensitive`]).
     pub fn delete_from_row_filter(mut self, predicate: Predicate) -> Self {
         self.row_filter = Some(predicate);
+        self
+    }
+
+    /// Set whether the [`Self::delete_from_row_filter`] predicate resolves column names CASE-SENSITIVELY
+    /// (Java `DeleteFiles.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`).
+    ///
+    /// DEFAULT (this method NOT called) = `true`, the Iceberg/Java default (1.10.0 bytecode: the
+    /// `MergingSnapshotProducer` ctor sets `caseSensitive = true`). With `true`, a column named `X` in the
+    /// row filter binds only to a schema column named exactly `X`; a wrong-cased reference (filter on `X` for
+    /// a schema column `x`) fails to bind and the commit errors. Calling `case_sensitive(false)` switches to
+    /// case-INSENSITIVE column resolution, so the filter on `X` binds to the schema column `x` and deletes
+    /// its matching files. Only affects the by-row-filter mode ([`Self::delete_from_row_filter`]); by-path
+    /// deletes do not resolve column names.
+    pub fn case_sensitive(mut self, case_sensitive: bool) -> Self {
+        self.case_sensitive = case_sensitive;
         self
     }
 
@@ -248,6 +276,9 @@ impl TransactionAction for DeleteFilesAction {
                     // The delete-by-row-filter predicate (Java `deleteExpression`). When `Some`, the producer
                     // also resolves the live data files this predicate strictly matches.
                     row_filter: self.row_filter.clone(),
+                    // Column-name case sensitivity for binding the row filter (Java
+                    // `MergingSnapshotProducer.caseSensitive`, default `true`).
+                    case_sensitive: self.case_sensitive,
                 },
                 DefaultManifestProcess,
             )
@@ -324,6 +355,9 @@ struct DeleteFilesOperation {
     /// resolves every live data file this predicate STRICTLY matches (via `resolve_filter_deletes`),
     /// unioned with the path-resolved deletes. `None` ⇒ Java `alwaysFalse` (no by-filter delete).
     row_filter: Option<Predicate>,
+    /// Column-name resolution case sensitivity for binding `row_filter` (Java
+    /// `MergingSnapshotProducer.caseSensitive`, default `true`). Passed into `resolve_filter_deletes`.
+    case_sensitive: bool,
 }
 
 impl SnapshotProduceOperation for DeleteFilesOperation {
@@ -355,7 +389,9 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
         // path, so a duplicate would be harmless, but the summary counts must stay accurate). Mirrors
         // `OverwriteFilesOperation::delete_files` — the SAME shared helper, not a fork.
         if let Some(row_filter) = &self.row_filter {
-            let filter_deletes = snapshot_produce.resolve_filter_deletes(row_filter).await?;
+            let filter_deletes = snapshot_produce
+                .resolve_filter_deletes(row_filter, self.case_sensitive)
+                .await?;
             let mut seen: HashSet<String> = resolved
                 .iter()
                 .map(|data_file| data_file.file_path().to_string())
@@ -2298,5 +2334,125 @@ mod tests {
             Some("1"),
             "a file removed by BOTH path and filter contributes its records once, not twice"
         );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the delete-by-row-filter binding (Java
+    // `DeleteFiles.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`, DEFAULT TRUE).
+    //
+    // The minimal V3 schema is `x,y,z: long` partitioned by identity(x). A row filter on the WRONG-cased
+    // column `X` (schema column is `x`) binds ONLY when case sensitivity is OFF. These three tests pin the
+    // load-bearing flag in BOTH directions on the boundary:
+    //   (1) DEFAULT (flag unset) + correctly-cased `x` ⇒ binds and deletes (regression: behaves as today).
+    //   (2) case_sensitive(false) + wrong-cased `X` ⇒ binds case-insensitively and deletes x=0's file.
+    //   (3) DEFAULT / case_sensitive(true) + wrong-cased `X` ⇒ REJECTS at bind (the flag is load-bearing).
+    // Mutation guards: ignore the flag (always true) ⇒ (2) fails to bind; hard-code false ⇒ (1)/(3) bind
+    // the wrong-case column and (3) stops rejecting.
+    // ============================================================================================
+
+    /// REGRESSION PIN (default unchanged). With the flag UNSET (Java default `caseSensitive = true`) a
+    /// CORRECTLY-cased row filter `x == 0` binds and deletes the x=0 file exactly as today. Risk: a default
+    /// flip to case-insensitive would still bind here (so this alone is not the boundary), but a regression
+    /// that broke the case-sensitive happy path (e.g. wiring the flag to always-false-then-error) would fail
+    /// this. Asserts the OBSERVABLE post-commit live set.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_default_case_sensitive_correct_case_deletes() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        // No case_sensitive(..) call ⇒ default true; correctly-cased `x`.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("x").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "a correctly-cased x==0 filter binds and deletes under the default (case-sensitive)",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "x==0 deletes the x=0 file; the x=1 anchor survives"
+        );
+    }
+
+    /// LOAD-BEARING (false direction). With `case_sensitive(false)` a WRONG-cased row filter `X == 0` (schema
+    /// column is `x`) binds CASE-INSENSITIVELY and deletes the x=0 file. Risk pinned: a missed delete (stale
+    /// data) when the engine binds case-insensitively — proves `case_sensitive(false)` actually switches
+    /// resolution. Mutation `ignore the flag (always true)` ⇒ the wrong-case `X` fails to bind and this test
+    /// errors. Asserts the OBSERVABLE post-commit live set.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_case_insensitive_wrong_case_deletes() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        // WRONG-cased `X` (schema column is `x`); case_sensitive(false) ⇒ binds case-insensitively.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .case_sensitive(false)
+            .delete_from_row_filter(Reference::new("X").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "case_sensitive(false) binds the wrong-cased X to schema column x and deletes the x=0 file",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "the wrong-cased X==0 deletes the x=0 file under case-insensitive resolution"
+        );
+    }
+
+    /// THE BOUNDARY (true direction — proves the flag is load-bearing). With the DEFAULT (flag unset =
+    /// `case_sensitive(true)`), a WRONG-cased row filter `X == 0` (schema column is `x`) must REJECT at bind:
+    /// the column `X` does not exist case-sensitively, so the commit errors and NOTHING is deleted. Risk
+    /// pinned: a wrongly-matched bind (deleting under a name the user did not spell) — and the both-direction
+    /// guard against (2). Mutation `hard-code false` ⇒ the wrong-case `X` would bind and this rejection test
+    /// fails. Asserts the OBSERVABLE result: the commit errors and the live set is unchanged.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_default_case_sensitive_wrong_case_rejects() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `X` ⇒ must fail to bind.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("X").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let error = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased X must NOT bind under the default (case-sensitive) and must reject",
+        );
+
+        // The table is untouched — the rejected delete removed nothing (re-load from the catalog).
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_file_paths(&reloaded).await,
+            HashSet::from([
+                "test/del.parquet".to_string(),
+                "test/keep.parquet".to_string()
+            ]),
+            "the rejected case-sensitive bind deleted nothing: both files survive"
+        );
+        // The same wrong-case column under case_sensitive(false) succeeds (the both-direction guard) — see
+        // `test_delete_from_row_filter_case_insensitive_wrong_case_deletes`. Sanity-pin the error here.
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 }

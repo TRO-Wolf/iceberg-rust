@@ -67,6 +67,38 @@ Ranked, highest-value first:
 
 See the 2026-06-13 GAP_MATRIX provenance block for the per-row status and residue of every item above.
 
+## ACTIVE (2026-06-13, Opus builder): `caseSensitive(bool)` on the expression-binding write actions
+
+Add `case_sensitive(bool)` (DEFAULT TRUE = Java default, 1.10.0 bytecode-confirmed:
+`MergingSnapshotProducer` ctor `iconst_1; putfield caseSensitive`; `ManifestFilterManager` ctor same)
+to `DeleteFiles` / `OverwriteFiles` / `RowDelta` and thread through the shared snapshot.rs binding
+sites. Scope: `delete_files.rs`, `overwrite_files.rs`, `row_delta.rs`, `replace_partitions.rs`,
+`snapshot.rs` ONLY. Java refs: `api/{DeleteFiles,OverwriteFiles,RowDelta}.caseSensitive(boolean)`
+present; `api/ReplacePartitions` has NO `caseSensitive` (javap-confirmed) — narrow it out.
+
+- [x] snapshot.rs: threaded `case_sensitive` into `resolve_filter_deletes` (+`build_residual_evaluator`
+      →`ResidualEvaluator::of`) and `validate_no_new_deletes_for_data_files`. The `eval(..., true)`
+      (include_empty_files) calls left untouched. Forced 1-token out-of-scope edit: `rewrite_files.rs`
+      passes `true` (inert — its conflict filter is `None`; documented).
+- [x] delete_files.rs: `case_sensitive: bool` field (default true) + `case_sensitive(bool)` builder;
+      threaded via `DeleteFilesOperation`. Deferred doc comment rewritten.
+- [x] overwrite_files.rs: field + builder; threaded into `resolve_filter_deletes`, the 4 conflict
+      helpers, and the StrictMetricsEvaluator row-filter bind in
+      `check_added_files_match_overwrite_filter`. Java-faithful: partition-projection binds stay `true`
+      (Java uses the single-arg `Projections`/two-arg `Evaluator`; only the StrictMetricsEvaluator takes
+      `isCaseSensitive()` — bytecode-verified).
+- [x] row_delta.rs: field + builder; threaded into the conflict helpers, `validate_added_dvs`, and
+      `validate_no_new_deletes_for_data_files`. `validate_fresh_dvs_only` left (by-path/partition).
+- [x] replace_partitions.rs: NARROWED — `javap -p` confirms no `caseSensitive` in the Java public API +
+      validate path is partition-set-based (no `Predicate::bind`). Documented, no builder added.
+- [x] Tests: 9 total (3/action). Mutation-verified BOTH directions at BOTH shared sites, failing all 3
+      actions' tests simultaneously (ignore-flag ⇒ false-direction tests fail; hard-code-false ⇒
+      boundary tests fail).
+
+> **Done (2026-06-13):** `case_sensitive(bool)` landed on DeleteFiles/OverwriteFiles/RowDelta (DEFAULT
+> TRUE), narrowed out of ReplacePartitions per Java 1.10.0 API. Gate green (typos/fmt/clippy + 2× lib
+> @ 2258). Interop deferred → row 134 stays 🟡. GAP_MATRIX rows 134/135 updated.
+
 ## ACTIVE (2026-06-13, Opus builder): `DeleteFiles.deleteFromRowFilter(Expression)` delete-by-predicate
 
 Close the deferral in `delete_files.rs` L30-32. Java bytecode-confirmed (`javap -p -c` on

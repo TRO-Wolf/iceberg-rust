@@ -732,12 +732,16 @@ impl<'a> SnapshotProducer<'a> {
     /// `alwaysTrue` filter, which strictly matches every file ⇒ every live data file is deleted (Java
     /// `deleteByRowFilter(alwaysTrue)` full-replace).
     ///
-    /// The predicate is bound case-sensitive (`true`, the Iceberg/Java default; this mode has no
-    /// case-sensitivity field). The residual evaluator is cached per partition-spec id (different manifests
-    /// can carry different spec ids), mirroring Java's per-spec `PartitionAndMetricsEvaluator`.
+    /// The predicate is bound with the caller-supplied `case_sensitive` flag (Java
+    /// `ManifestFilterManager.caseSensitive`, fed into the `PartitionAndMetricsEvaluator`'s
+    /// `ResidualEvaluator.of(spec, expr, caseSensitive)` and the metrics-evaluator binding; the actions
+    /// default it to `true`, the Iceberg/Java default for column resolution). The residual evaluator is
+    /// cached per partition-spec id (different manifests can carry different spec ids), mirroring Java's
+    /// per-spec `PartitionAndMetricsEvaluator`.
     pub(crate) async fn resolve_filter_deletes(
         &self,
         predicate: &Predicate,
+        case_sensitive: bool,
     ) -> Result<Vec<DataFile>> {
         let Some(snapshot) = self.table.metadata().current_snapshot() else {
             return Ok(vec![]);
@@ -745,8 +749,12 @@ impl<'a> SnapshotProducer<'a> {
 
         let schema = self.table.metadata().current_schema().clone();
         // Bind the row predicate to the table schema once (Java `deleteExpression`). `rewrite_not` first so
-        // the projection / residual visitors never see a `Not` (they reject it).
-        let bound_predicate = predicate.clone().rewrite_not().bind(schema.clone(), true)?;
+        // the projection / residual visitors never see a `Not` (they reject it). `case_sensitive` mirrors
+        // Java `ManifestFilterManager.caseSensitive` (column-name resolution case sensitivity).
+        let bound_predicate = predicate
+            .clone()
+            .rewrite_not()
+            .bind(schema.clone(), case_sensitive)?;
 
         // Per-partition-spec cache of the residual evaluator (Java's per-spec `PartitionAndMetricsEvaluator`).
         let mut residual_evaluators: HashMap<i32, ResidualEvaluator> = HashMap::new();
@@ -779,6 +787,7 @@ impl<'a> SnapshotProducer<'a> {
                             &bound_predicate,
                             &schema,
                             spec_id,
+                            case_sensitive,
                         )?;
                         e.insert(evaluator)
                     }
@@ -786,7 +795,7 @@ impl<'a> SnapshotProducer<'a> {
                 let residual = residual_evaluator
                     .residual_for(data_file.partition())?
                     .rewrite_not()
-                    .bind(schema.clone(), true)?;
+                    .bind(schema.clone(), case_sensitive)?;
 
                 // 1. `rowsMightMatch` (Java L470, L592-596): no rows can match ⇒ KEEP.
                 if !InclusiveMetricsEvaluator::eval(&residual, data_file, true)? {
@@ -816,12 +825,14 @@ impl<'a> SnapshotProducer<'a> {
     /// Build the [`ResidualEvaluator`] for `spec_id` from the bound row predicate (Java
     /// `ResidualEvaluator.of(spec, deleteExpression, caseSensitive)` inside `PartitionAndMetricsEvaluator`).
     /// An unpartitioned spec degrades to `ResidualEvaluator::unpartitioned` (every residual is the whole
-    /// filter).
+    /// filter). `case_sensitive` is threaded from the action (Java `ManifestFilterManager.caseSensitive` →
+    /// the `PartitionAndMetricsEvaluator`'s `ResidualEvaluator.of(..., caseSensitive)`).
     fn build_residual_evaluator(
         table: &Table,
         bound_predicate: &BoundPredicate,
         schema: &Schema,
         spec_id: i32,
+        case_sensitive: bool,
     ) -> Result<ResidualEvaluator> {
         let partition_spec = table
             .metadata()
@@ -837,7 +848,7 @@ impl<'a> SnapshotProducer<'a> {
             partition_spec.clone(),
             schema,
             bound_predicate.clone(),
-            true,
+            case_sensitive,
         )
     }
 
@@ -1959,9 +1970,9 @@ fn starting_sequence_number(table: &Table, starting_snapshot_id: Option<i64>) ->
 ///
 /// **Enumerate concurrently-added deletes (Java L530):** the concurrently-added DELETE files are gathered via
 /// [`added_delete_files_with_seq_after`] (the DELETE-manifest walk + the V2 guard), then optionally narrowed
-/// by `conflict_filter` with the existing [`InclusiveMetricsEvaluator`] — mirroring Java passing `dataFilter`
-/// into `addedDeleteFiles` (a delete file whose metrics cannot match the filter cannot conflict). `None` ⇒
-/// no metrics narrowing (every concurrently-added delete is a candidate — the conservative default).
+/// by `bound_conflict_filter` with the existing [`InclusiveMetricsEvaluator`] — mirroring Java passing
+/// `dataFilter` into `addedDeleteFiles` (a delete file whose metrics cannot match the filter cannot conflict).
+/// `None` ⇒ no metrics narrowing (every concurrently-added delete is a candidate — the conservative default).
 ///
 /// **Starting sequence number (Java L533):** [`starting_sequence_number`] — the sequence number of the
 /// starting snapshot, or 0 when there is none.
@@ -1991,6 +2002,12 @@ fn starting_sequence_number(table: &Table, starting_snapshot_id: Option<i64>) ->
 /// delete for replaced data file" message); when `false`, ANY applicable delete is a conflict (the "found
 /// new delete for replaced data file" message). `OverwriteFiles` passes `false`.
 ///
+/// **`bound_conflict_filter` (Java `DeleteFileIndex.Builder.caseSensitive(isCaseSensitive())`):** the metrics
+/// narrowing filter ALREADY bound to the table schema by the caller, so the column-name resolution case
+/// sensitivity is the caller's (`OverwriteFiles`/`RowDelta` bind it with their `case_sensitive(bool)` builder
+/// value, default `true` — the Iceberg/Java default). `RewriteFiles` passes `None` (no narrowing, no builder).
+/// Binding in the caller keeps this shared helper's signature stable across all three actions.
+///
 /// On the FIRST conflicting data file this returns a NON-retryable [`ErrorKind::DataInvalid`] error matching
 /// Java's message ("Cannot commit, found new delete for replaced data file: <path>" /
 /// "...found new position delete..."), so the commit retry loop stops and the error propagates (Java's
@@ -1998,7 +2015,7 @@ fn starting_sequence_number(table: &Table, starting_snapshot_id: Option<i64>) ->
 pub(crate) async fn validate_no_new_deletes_for_data_files(
     table: &Table,
     starting_snapshot_id: Option<i64>,
-    conflict_filter: Option<&Predicate>,
+    bound_conflict_filter: Option<&BoundPredicate>,
     data_files: &[DataFile],
     ignore_equality_deletes: bool,
 ) -> Result<()> {
@@ -2016,15 +2033,11 @@ pub(crate) async fn validate_no_new_deletes_for_data_files(
     }
 
     // Java passes `dataFilter` into `addedDeleteFiles`: a delete whose metrics cannot match the conflict
-    // filter cannot conflict. Bind the filter ONCE (None ⇒ no narrowing — every added delete is a candidate).
-    let bound_filter = match conflict_filter {
-        Some(filter) => Some(
-            filter
-                .clone()
-                .bind(table.metadata().current_schema().clone(), true)?,
-        ),
-        None => None,
-    };
+    // filter cannot conflict. The filter is bound by the CALLER with its `case_sensitive(bool)` value (Java
+    // `DeleteFileIndex.Builder.caseSensitive(isCaseSensitive())`) so this shared helper's signature stays
+    // stable across `OverwriteFiles` / `RowDelta` / `RewriteFiles` (None ⇒ no narrowing — every added delete
+    // is a candidate).
+    let bound_filter = bound_conflict_filter;
 
     // Java L533: the sequence number of the starting snapshot (or 0 if none).
     let starting_sequence_number = starting_sequence_number(table, starting_snapshot_id);
