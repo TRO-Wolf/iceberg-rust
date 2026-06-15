@@ -35,6 +35,15 @@ on:
       - '!LICENSE'
       - '!NOTICE'
       - '!README.md'
+      # Fork-specific: the agentic / documentation layer never affects the Rust
+      # build or tests, so a PR touching only these must not trigger the heavy
+      # multi-OS Rust matrix (it only wastes runner minutes and trips the fork's
+      # disk-space limits). The default branch still builds on push.
+      - '!CLAUDE.md'        # repo guide / agent harness entrypoint
+      - '!AGENTS.md'        # per-crate engineering rules (docs)
+      - '!skills/**'        # per-tier operating manuals + the SEPMO control plane
+      - '!docs/**'          # parity docs + the testing-discipline gate
+      - '!task/**'          # markdown plan / lessons workflow
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
