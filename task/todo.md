@@ -48,26 +48,92 @@ end-to-end; SQL-catalog CAS; and the theta/view/WAP/partition-stats interop chai
 **2026-06-13 re-audit's** ranked next-work; **statuses live ONLY in
 [docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md)** — link, do not restate cells.
 
+> **Queue re-audited 2026-06-15 against the live suite + GAP_MATRIX (Opus).** The prior #1
+> ("write-action DATA-level interop FIRST") was already DONE — `interop_write_data.rs` +
+> `run-interop-write-data.sh` landed the data-level round-trips for delete/overwrite/replace/rewrite
+> (+ partitioned) and merge (one-bin + multi-bin), both directions, 2026-06-11 (GAP_MATRIX rows
+> 90-95). The residue that actually keeps rows 91-95 at 🟡 is the phrase repeated in every cell:
+> **"multi-spec / conflict-validation paths NOT covered."** The queue below is re-ranked to that
+> reality. Statuses live ONLY in [docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md).
+
 Ranked, highest-value first:
 
-- [ ] **1. Write-action DATA-level interop FIRST** — `DeleteFiles` / `RowDelta` / `RewriteFiles`
-      proven through real Java↔Rust byte-level round-trips (the merge-append data-level chain is the
-      template). The write engine is feature-complete; the residue is *interop evidence*, not code.
-- [ ] **2. Conflict-detection + `caseSensitive` builder surfaces** — the validation-builder family
-      (`conflictDetectionFilter` / `validateNoConflicting*` wiring) and the `caseSensitive` toggles on
-      the scan/expression builders, both newly-tracked rows from the re-audit.
-- [ ] **3. Multi-spec writes** — writing under more than one partition spec in a single table's history.
+- [ ] **1. Conflict-validation interop** — prove the `validateNoConflictingData` /
+      `validateNewDeletes` / `validateDataFilesExist` family on real concurrent-commit Java↔Rust
+      scenarios (Rust rejects exactly when Java rejects). Gates rows 91-95. **Start: OverwriteFiles**
+      (the C1 active increment below), then DeleteFiles / RowDelta / ReplacePartitions / RewriteFiles.
+- [ ] **2. Multi-spec write interop** — the merging actions (overwrite / replace / row-delta) under
+      more than one partition spec; `fast_append` multi-spec is already ✅ (Z2 — the template).
+- [ ] **3. Builder-surface interop flips** — `case_sensitive` (row 134) + `delete_from_row_filter`
+      (row 135): code landed 2026-06-13, interop deferred → flip to proven.
 - [ ] **4. `unknown` → geometry / geography types** — the V3 type-breadth follow-on.
-- [ ] **5. `RewritePositionDeleteFiles` + the cheap maintenance wrappers** — the position-delete
-      rewrite action plus the remaining thin `ActionsProvider` maintenance wrappers.
-- [ ] **6. Glue / S3Tables views + encryption** — the credentialed real-catalog view surface (needs
-      AWS creds, scheduled with the user) and the frontier-grade encryption work.
-- [ ] **7. `BatchScan` / `ScanTaskGroup` + `ExpressionParser` JSON** — scan-completion (task-group /
+- [ ] **5. `RewritePositionDeleteFiles` + the cheap `ActionsProvider` maintenance wrappers.**
+- [ ] **6. `BatchScan` / `ScanTaskGroup` + `ExpressionParser` JSON** — scan-completion (task-group /
       `planTasks` split planning) and the JSON expression (de)serializer.
+- [ ] **7. [FRONTIER — parked until Fable returns] Glue / S3Tables views + encryption** — the
+      credentialed real-catalog view surface (needs AWS creds) and frontier-grade encryption. Held
+      out of the Opus queue per the 2026-06-15 tier decision (Fable off limits).
 
-See the 2026-06-13 GAP_MATRIX provenance block for the per-row status and residue of every item above.
+Recently landed (2026-06-11 → 06-13) — status lives in the GAP_MATRIX rows; pointers only:
 
-## ACTIVE (2026-06-13): RewriteFiles DELETE-file ADD surface (builder, this increment)
+- Write-action DATA-level interop (delete/overwrite/replace/rewrite + partitioned + merge one-bin /
+  multi-bin), both directions — `interop_write_data.rs` + `run-interop-write-data.sh`. Rows 90-95.
+- `case_sensitive(bool)` on DeleteFiles/OverwriteFiles/RowDelta (default true; narrowed out of
+  ReplacePartitions) — row 134. Interop deferred.
+- `DeleteFiles.delete_from_row_filter(Predicate)` — row 135. Interop deferred.
+- `RewriteFiles` DELETE-file ADD surface (`add_delete_file` / `_with_sequence_number` + 4-arg
+  `rewrite_files_with_deletes`, third precondition reachable) — rows 95/140. Interop deferred.
+
+See the 2026-06-13 GAP_MATRIX provenance block for per-row status and residue.
+
+## DONE (2026-06-15, Opus): OverwriteFiles conflict-validation interop (C1 — first conflict unit)
+
+Goal: prove the FIRST slice of the rows 91-95 residue ("conflict-validation paths NOT covered").
+Show `OverwriteFiles.validate_no_conflicting_data()` + `conflict_detection_filter(Predicate)` matches
+Java `BaseOverwriteFiles.validate` → `validateAddedDataFiles` (`validateNoConflictingData`) on the
+SAME concurrent-commit scenario — Rust rejects exactly when Java rejects, accepts exactly when Java
+accepts, including the filter boundary. INTEROP-ONLY (no production change expected). Scope:
+`dev/java-interop/src/main/java/org/apache/iceberg/InteropOracle.java` (new `OverwriteConflictOracle`),
+`dev/java-interop/run-interop-overwrite-conflict.sh` (new), `crates/iceberg/tests/interop_overwrite_conflict.rs`
+(new), committed fixtures, + GAP_MATRIX row 91 (annotate the conflict-validation evidence) and the two
+map.md rows (dev/java-interop, crates/iceberg/tests). Java 1.10.0 oracle; mvn + JDK11 confirmed live.
+
+- [ ] Read the EXISTING OverwriteFiles conflict unit tests (overwrite_files.rs) + the shared walk in
+      snapshot.rs (`added_data_files_after` / `validate_no_conflicting_added_data_files` /
+      `first_conflicting_file`) — the template for the Rust side. Re-confirm Java 1.10.0 semantics
+      (`BaseOverwriteFiles.validate` → `validateAddedDataFiles`) against the jar before coding.
+- [ ] Scenario matrix (≥3): (REJECT) concurrent add MATCHES `conflict_detection_filter`;
+      (ACCEPT) concurrent add does NOT match the filter; (ACCEPT) no concurrent add. Each: base S0 →
+      build overwrite capturing S0 → concurrent S1 add → commit overwrite → record ACCEPT|REJECT.
+- [ ] Java `OverwriteConflictOracle`: `generate` (build history + emit expected-outcome JSON) +
+      `verify` (read the Rust-built history, run the same overwrite, assert SAME outcome, emit the
+      `verify-…: N failures` sentinel). Mirror `WriteActionsOracle` structure.
+- [ ] Rust `interop_overwrite_conflict.rs`: GEN test (build the concurrent history via the catalog +
+      attempt the validated overwrite; assert a REJECT is non-retryable `DataInvalid` + `!retryable()`)
+      and comparison test (Rust validates the Java-built history → outcome == Java's expected JSON).
+      Env-var gated (unset ⇒ clean no-op; offline `cargo test` gate stays green).
+- [ ] Shell `run-interop-overwrite-conflict.sh`: reset → Java generate → Rust GEN → Java verify (D2)
+      → Rust compare (D1) → 2nd pass → SABOTAGE (flip a REJECT scenario's filter so the conflict
+      vanishes ⇒ verify must FAIL closed; HARD-FAIL, never SKIP, if the mutation cannot apply).
+- [ ] Run the LIVE oracle end-to-end (mvn) + commit the generated fixtures. Gate in ONE `&&` chain to
+      the commit: `typos . && cargo fmt --all --check && cargo clippy --all-targets -p iceberg --
+      -D warnings && cargo test -p iceberg --test interop_overwrite_conflict`.
+- [ ] Annotate GAP_MATRIX row 91 with the conflict-validation interop evidence (cell edit + link
+      ONLY); update the two map.md rows. Done-bar: ✅ for the OverwriteFiles conflict-validation
+      SLICE (unit + interop); row 91 stays 🟡 until its multi-spec + row-filter residue also closes;
+      rows 92-95 conflict-validation are follow-on units (queue item 1).
+
+> **Done (2026-06-15):** all steps landed. New files: `crates/iceberg/tests/interop_overwrite_conflict.rs`
+> (GEN + D1) and `dev/java-interop/run-interop-overwrite-conflict.sh`; new `OverwriteConflictOracle`
+> (+ 2 dispatch cases) in `InteropOracle.java`. Live harness GREEN end-to-end: Java-gen → Rust-gen →
+> D2 (Java validates Rust, `0 failures`) → D1 (Rust validates Java, register_table) → sabotage battery
+> (semantic-swap + truncate, both fail-closed; control-gated). Both directions agree on all 3
+> scenarios. Offline gate green (typos / fmt / clippy / `cargo test --test interop_overwrite_conflict`
+> = clean no-op skip). GAP_MATRIX row 91 annotated (stays 🟡 — multi-spec + row-filter conflict
+> interop still open); both map.md rows added. Next (queue item 1): replicate to DeleteFiles / RowDelta
+> / ReplacePartitions / RewriteFiles conflict interop.
+
+## LANDED (2026-06-13) — status in GAP_MATRIX rows 95/140; clears next archival pass: RewriteFiles DELETE-file ADD surface
 
 Goal: port the unported DELETE-file ADD surface on `RewriteFiles` — `addFile(DeleteFile)` /
 `addFile(DeleteFile, long)` (explicit-seq overload) + the 4-set
@@ -95,7 +161,7 @@ bytecode (`BaseRewriteFiles`, `MergingSnapshotProducer.add(DeleteFile)/(DeleteFi
 - [ ] **Gate**: `typos . && cargo fmt --check && cargo clippy -D warnings && cargo test -p iceberg --lib`
       (twice). Update `transaction/map.md` rewrite_files row + the third-precondition note.
 
-## ACTIVE (2026-06-13, Opus builder): `caseSensitive(bool)` on the expression-binding write actions
+## LANDED (2026-06-13) — status in GAP_MATRIX row 134; clears next archival pass: `caseSensitive(bool)` on the expression-binding write actions
 
 Add `case_sensitive(bool)` (DEFAULT TRUE = Java default, 1.10.0 bytecode-confirmed:
 `MergingSnapshotProducer` ctor `iconst_1; putfield caseSensitive`; `ManifestFilterManager` ctor same)
@@ -127,7 +193,7 @@ present; `api/ReplacePartitions` has NO `caseSensitive` (javap-confirmed) — na
 > TRUE), narrowed out of ReplacePartitions per Java 1.10.0 API. Gate green (typos/fmt/clippy + 2× lib
 > @ 2258). Interop deferred → row 134 stays 🟡. GAP_MATRIX rows 134/135 updated.
 
-## ACTIVE (2026-06-13, Opus builder): `DeleteFiles.deleteFromRowFilter(Expression)` delete-by-predicate
+## LANDED (2026-06-13) — status in GAP_MATRIX row 135; clears next archival pass: `DeleteFiles.deleteFromRowFilter(Expression)` delete-by-predicate
 
 Close the deferral in `delete_files.rs` L30-32. Java bytecode-confirmed (`javap -p -c` on
 iceberg-api/core 1.10.0): `StreamingDelete.deleteFromRowFilter(Expression)` → `MergingSnapshotProducer.deleteByRowFilter`
