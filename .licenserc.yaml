@@ -34,4 +34,8 @@ header:
     - "target"
     - "Cargo.lock"
     - ".github/PULL_REQUEST_TEMPLATE.md"
+    # Claude Code skill definition: YAML frontmatter must be the first line, so
+    # an ASF header comment cannot precede it. Companion SEPMO docs
+    # (binding-manifest.md, map.md, references/*) carry the header normally.
+    - "skills/sepmo/SKILL.md"
   comment: on-failure
