@@ -59,13 +59,13 @@ No other agent enters state 4 without the Orchestrator's dispatch.
 ## Charter model — derives from, never restates
 
 The Orchestrator's source of truth for **what to build** is the project's
-plan-of-record — in this repo, `Roadmap.md` (binding row: *Plan-of-record* in
-`../binding-manifest.md`). The charter is derived from the Roadmap: the current
-phase, sequenced capabilities, phase exit criteria.
+plan-of-record (binding row: *Plan-of-record* in `../binding-manifest.md`). The
+charter is derived from it: the current phase, sequenced capabilities, phase exit
+criteria.
 
 For **capability status** — which rows are open and which are already done —
-the Orchestrator reads the capability status SSOT (`docs/parity/GAP_MATRIX.md`
-in this repo; binding row: *Capability status (SSOT)* in `../binding-manifest.md`).
+the Orchestrator reads the capability status SSOT (binding row: *Capability
+status (SSOT)* in `../binding-manifest.md`).
 It binds to that file and **restates none of its contents**. The Orchestrator
 references capabilities by their GAP_MATRIX row ID or anchor — never by copying
 cell content. If the same status would appear in two places, one of them is
@@ -139,8 +139,8 @@ PR_UNIT:
 
 ## Plan tracking
 
-The Orchestrator maintains the project's **active plan file** — in this repo,
-`task/todo.md` (binding row: *Active plan tracking* in `../binding-manifest.md`).
+The Orchestrator maintains the project's **active plan file** (binding row:
+*Active plan tracking* in `../binding-manifest.md`).
 There is **no parallel tracker**. The plan file carries the 3–7 bullet active
 plan; the Orchestrator flips bullets complete and adds sub-bullets when a Wave
 surfaces unexpected complexity. Plan-tracking discipline (format, flip rules,

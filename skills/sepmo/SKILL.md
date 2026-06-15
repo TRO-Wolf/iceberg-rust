@@ -41,8 +41,9 @@ reference tells you *how*.
 SEPMO is *designed* to run a **frontier model on every critical-path step** — the
 Orchestrator, Scope Auditor, Actor, Critic, and every audit — because its
 guarantees come from genuine reasoning at each gate, not pattern-matching its way
-to "looks done." **"OO" / "Opus–Opus"** denotes an Actor–Critic pair with *both*
-roles at frontier tier.
+to "looks done." **"FF" / "frontier–frontier"** denotes an Actor–Critic pair with
+*both* roles at frontier tier — which concrete model that is, is the project's
+choice, resolved by the binding manifest, not fixed in this portable shell.
 
 How that aspiration is *governed* is **not restated here** (one home per fact):
 when frontier is required, when tier may be turned down, single-agent default
@@ -51,7 +52,7 @@ live in the project's sub-agent & tier policy and its frontier operating notes �
 see [binding-manifest.md](binding-manifest.md) (*Sub-agent / tier policy*). For
 **this** repo that resolves to a **single-agent default**: one session runs the
 Actor phase, then deliberately shifts into the Critic phase, sequentially; a
-literal separate-agent OO pair is opt-in, used only when the user lifts that
+literal separate-agent FF pair is opt-in, used only when the user lifts that
 policy.
 
 ---
@@ -143,9 +144,9 @@ PR_SCOPING ─▶ for each PR unit:
 
 **Governing rules of the sub-machine**
 
-- **One sequential OO-AC is the minimum.** The smallest legal execution of a PR
-  unit is a single Actor–Critic cycle with *both* roles frontier (Opus–Opus),
-  run sequentially: Actor builds, then Critic attacks. Larger or riskier units
+- **One sequential FF cycle is the minimum.** The smallest legal execution of a PR
+  unit is a single Actor–Critic cycle with *both* roles at frontier tier (an FF
+  cycle), run sequentially: Actor builds, then Critic attacks. Larger or riskier units
   run multiple cycles.
 - **The Critic almost always finds something — by design.** A first-pass
   "no findings" is the exception, not the norm, and a too-clean review is itself
@@ -264,7 +265,7 @@ others operate inside the slice they are handed.
    Critic and a passed readiness audit. Never declare `DELIVERY` for a PR
    without charter-by-charter verification.
 5. **Think in PRs.** At the top level, every plan is a sequence of PR-sized
-   scope groups, each ending in one or more OO Actor–Critic cycles.
+   scope groups, each ending in one or more FF Actor–Critic cycles.
 6. **Fall back without shame.** Dropping from execution to a re-audit because a
    new requirement appeared is SEPMO working correctly, not a failure. The only
    failure is proceeding on an assumption.
@@ -298,16 +299,16 @@ others operate inside the slice they are handed.
   format, worked examples. **Built.**
 - `references/02-orchestrator.md` — Orchestrator: context model, charter→PR
   scoping, AC-loop coordination, PR-readiness audit, doctrine enforcement.
-  *Planned.*
+  **Built.**
 - `references/03-self-logic-review.md` — The mandatory pre-action review every
   agent runs. **Built.**
 - `references/04-actor.md` — Actor: the developer agent — build outstanding
-  engineering within doctrine. *Planned (next).*
+  engineering within doctrine. **Built.**
 - `references/05-critic.md` — Critic: the risk-manager-first adversary — find
-  everything that could go wrong. *Planned (next).*
+  everything that could go wrong. **Built.**
 - `references/06-vigilance.md` — Drift/scope-creep detection and alarm protocol.
-  *Planned.*
+  **Built.**
 - `references/07-delivery.md` — Per-PR acceptance verification and handoff.
-  *Planned.*
+  **Built.**
 - `references/08-retrospective.md` — Learning capture and feed-forward.
-  *Planned.*
+  **Built.**
