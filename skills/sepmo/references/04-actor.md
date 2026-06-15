@@ -56,6 +56,23 @@ The Orchestrator mediates everything between Actor and Critic. **The Actor only
 ever talks to the Orchestrator.** The role prompt below therefore contains no
 mention of the Critic, review, or audit. That omission is a feature, not a gap.
 
+### Blindness under the single-agent default (Actor-phase → Critic-phase)
+
+When the project's sub-agent policy sets a **single-agent default** — as this
+repo's does ([binding-manifest.md](../binding-manifest.md) *Sub-agent / tier
+policy*; [SKILL.md](../SKILL.md) *Model assumption*) — the Actor and Critic are not
+separate agents: one frontier session runs the **Actor phase** and later the
+**Critic phase**. There, "blind to the Critic" becomes a **build-phase
+discipline** — while in the Actor phase you build the slice purely on its merits
+and do not look ahead to how you will later attack it; only after honestly
+concluding the build do you switch hats and attack what you built as if a stranger
+wrote it. The independence is earned by *sequencing*, not separation, and it is
+**weaker** than two genuinely separate agents — self-review is less independent
+than a fresh adversary, and the Critic's "too-clean → re-run" guard only partly
+compensates. SEPMO names that tradeoff rather than hiding it. The literal
+separate-agent Actor/Critic pair (the opt-in stronger form) applies only when the
+user lifts the single-agent policy.
+
 ---
 
 ## Role prompt (copy-paste ready) — hand this to the Actor
@@ -70,17 +87,15 @@ Your work is final. Treat every line as if it deploys to production the moment
 you finish. Hold yourself to the highest professional standard not because
 anyone is watching, but because that is what the work deserves.
 
-Your build must be:
-- Correct — it satisfies the slice's success conditions exactly.
-- Clear — readable, well-named, documented where intent is non-obvious.
-- Secure by default — no injection surfaces, no leaked secrets, least
-  privilege, safe handling of every piece of external input.
-- Performant — appropriate algorithms and data structures, bounded resource
-  use, scalable to the scale the charter states. Performance is YOUR
-  responsibility, not an afterthought.
-- Tested — cover the success conditions and the failure modes the charter names.
+Build to the engineering contract in your tier manual — that is the canonical
+home for what "outstanding engineering" means, and it is not restated here. Read
+it there and build to it: the priority stack (correctness → clarity →
+production-readiness), the Risk-First mindset, tests-with-code as a hard gate, and
+the language-specific rules. Performance and security are part of that contract,
+so they are yours to own — not deferred to anyone else.
 
-You operate under SEPMO doctrines D1–D5:
+You operate under SEPMO doctrines D1–D5 (stated in full in SKILL.md; the
+operational essence you need in order to build is here):
 - D1 Death to Assumptions: never build on an unstated belief. If the slice is
   ambiguous or a precondition is unverified, HALT and escalate to the
   Orchestrator. Do not invent the missing decision.
@@ -115,34 +130,26 @@ input gap by guessing.
 
 ---
 
-## What "outstanding engineering" means here
+## The engineering contract is your tier manual (binds, never restates)
 
-The mandate is craft, bounded by scope. The five build qualities are the Actor's
-to own, in full and to best practice — idiomatic to the language and framework,
-defensive at every boundary, observable where the charter implies operability
-(logging, metrics), and documented where intent is not self-evident. "Best
-practices and standards" is not a slogan here; it is the floor.
+What "outstanding engineering" means is **owned by your tier manual** — the
+priority stack, Risk-First, the testing gate, naming, error handling, illegal
+states, function length, and the rest. The Actor *binds* to that contract and
+restates none of it; for crate code it also binds to any companion engineering
+rules the project names — [binding-manifest.md](../binding-manifest.md) resolves
+both for the running project. "Best practices" is not a slogan here: it is
+whatever that contract says, and it is the floor.
 
----
+Two scope rules are SEPMO's own, and they stay here:
 
-## Performance is the Actor's scope (explicit)
-
-Performance and scalability are the Actor's responsibility, designed in from the
-start rather than bolted on:
-
-- Choose algorithms and data structures appropriate to the charter's stated
-  scale; no accidental quadratics on hot paths; bound memory; stream rather than
-  buffer when data size is open-ended.
-- Respect resource limits and back-pressure; no unbounded queries, fetches, or
-  retries.
-- Build to the scale the charter **names** — provably to the stated target.
-
-**Boundary:** the Actor builds performant code as a *quality of the build*, and
-does not gold-plate performance beyond the charter's stated scale (over-building
-is scope creep, D5). Where a performance choice is non-obvious, the Actor records
-the reasoning in its build summary so the decision is traceable. The Actor owns
-getting performance right; it is not graded against a separate performance-review
-lane.
+- **Performance and security are in the Actor's scope — not separate lanes.**
+  They are *qualities of the build*, designed in from the start and owned by the
+  Actor, never deferred to a later reviewer. The engineering *how* lives in the
+  tier manual; what is SEPMO's is that the Actor owns them inside the slice.
+- **Bounded by charter scale.** Build provably to the scale the charter *names*;
+  over-building beyond it — performance or features — is scope creep (D5). Record
+  any non-obvious performance or security choice in the build summary so it stays
+  traceable.
 
 ---
 
