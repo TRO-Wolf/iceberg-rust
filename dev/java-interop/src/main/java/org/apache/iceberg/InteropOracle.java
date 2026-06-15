@@ -494,6 +494,29 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-overwrite-conflict":
+        // CONFLICT-VALIDATION OverwriteFiles interop (increment C1). For each scenario, writes an
+        // UNPARTITIONED V2 {id long, y long} table under <dir>/<scenario>/table: fast-append A0
+        // (y bounds [0,5]) at S0, then fast-append a CONCURRENT file (y bounds [lo,hi]) at S1. The
+        // validating engine runs the symmetric overwrite (add fresh file + conflictDetectionFilter +
+        // validateFromSnapshot(S0) + validateNoConflictingData) and its ACCEPT/REJECT must equal the
+        // hand-declared expected (same contract as Rust's interop_overwrite_conflict.rs).
+        Path overwriteConflictDir = requireFixturesDir("interop.overwrite_conflict.dir");
+        OverwriteConflictOracle.generate(overwriteConflictDir);
+        break;
+      case "verify-interop-overwrite-conflict":
+        // CONFLICT-VALIDATION interop, DIRECTION 2 — "Java validates what RUST writes". The Rust GEN
+        // test (env ICEBERG_INTEROP_OVERWRITE_CONFLICT_GEN_DIR) wrote each scenario's S0+S1 table to
+        // <dir>/<scenario>/rust_table. Java loads each, runs the symmetric overwrite, and asserts the
+        // conflict decision matches the scenario's hand-declared expected outcome.
+        Path overwriteConflictVerifyDir = requireFixturesDir("interop.overwrite_conflict.dir");
+        int overwriteConflictFailures = OverwriteConflictOracle.verify(overwriteConflictVerifyDir);
+        System.out.println(
+            "verify-interop-overwrite-conflict: " + overwriteConflictFailures + " failures");
+        if (overwriteConflictFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-delete-data":
         // DATA-LEVEL DeleteFiles interop (increment W1, fixture D). Writes a V2 partitioned table
         // (identity(category), schema {id long, category string, data string}) under <dir>/table, appends
@@ -8554,6 +8577,270 @@ public final class InteropOracle {
                 + "(real parquet + Overwrite snapshot: B deleted, B' added), live rows = {10,20,30,41}");
       }
       return failures;
+    }
+  }
+
+  // =============================================================================================
+  // OverwriteConflictOracle — CONFLICT-VALIDATION OverwriteFiles interop (increment C1).
+  //
+  // Proves OverwriteFiles.validateNoConflictingData() + conflictDetectionFilter agrees with Rust's
+  // validate_no_conflicting_data() + conflict_detection_filter on the SAME concurrent-commit history.
+  // Unlike the DATA-level oracles (which assert surviving ROWS), this asserts the conflict DECISION
+  // (ACCEPT vs REJECT). validateNoConflictingData depends ONLY on the data files a CONCURRENT commit
+  // added after the read snapshot + the conflict filter — NOT on the overwrite's own payload — so
+  // both engines run a SYMMETRIC overwrite (add one fresh file + conflictDetectionFilter(F) +
+  // validateFromSnapshot(S0) + validateNoConflictingData()) against the OTHER engine's table.
+  //
+  // Per scenario, an UNPARTITIONED V2 {1 id long, 2 y long} table:
+  //   S0: fast-append A0 rows (1,0)(2,5)             → y bounds [0,5]   (seq 1)
+  //   S1: fast-append CONCURRENT rows (100,lo)(101,hi) → y bounds [lo,hi] (seq 2)
+  // Real parquet gives the concurrent file its y column bounds (the inclusive-metrics inputs).
+  //
+  //   scenario        | filter   | concurrent y | expected
+  //   ge50_overlap    | y >= 50  | [60,70]      | REJECT  (could contain y>=50 ⇒ lost write)
+  //   ge50_excluded   | y >= 50  | [10,20]      | ACCEPT  (bounds below 50 ⇒ excluded)
+  //   nofilter_any    | (none)   | [60,70]      | REJECT  (alwaysTrue default ⇒ any add conflicts)
+  //
+  // This MUST mirror Rust's interop_overwrite_conflict.rs scenario set exactly (names, bounds,
+  // expected outcomes). generate writes <dir>/<scenario>/table (Java) for Rust's D1; verify loads
+  // <dir>/<scenario>/rust_table (Rust's GEN) for Java's D2 and prints the "N failures" sentinel.
+  // =============================================================================================
+  static final class OverwriteConflictOracle {
+    private OverwriteConflictOracle() {}
+
+    private enum Filter {
+      GE50,
+      NONE
+    }
+
+    private static final class Scenario {
+      final String name;
+      final Filter filter;
+      final long lo;
+      final long hi;
+      final boolean expectReject;
+
+      Scenario(String name, Filter filter, long lo, long hi, boolean expectReject) {
+        this.name = name;
+        this.filter = filter;
+        this.lo = lo;
+        this.hi = hi;
+        this.expectReject = expectReject;
+      }
+    }
+
+    private static final List<Scenario> SCENARIOS =
+        List.of(
+            new Scenario("ge50_overlap", Filter.GE50, 60L, 70L, true),
+            new Scenario("ge50_excluded", Filter.GE50, 10L, 20L, false),
+            new Scenario("nofilter_any", Filter.NONE, 60L, 70L, true));
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "y", Types.LongType.get()));
+
+    static void generate(Path dir) throws IOException {
+      for (Scenario scenario : SCENARIOS) {
+        Path scenarioDir = dir.resolve(scenario.name);
+        File tableDir = scenarioDir.resolve("table").toFile();
+        File metadataDir = new File(tableDir, "metadata");
+        File dataDir = new File(tableDir, "data");
+        mkdirs(metadataDir);
+        mkdirs(dataDir);
+
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, "2");
+        TableMetadata seed =
+            TableMetadata.newTableMetadata(
+                SCHEMA,
+                PartitionSpec.unpartitioned(),
+                SortOrder.unsorted(),
+                tableDir.getAbsolutePath(),
+                props);
+
+        LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+        ops.commit(null, seed);
+        BaseTable table = new BaseTable(ops, "interop_overwrite_conflict_" + scenario.name);
+
+        // S0: base file A0 (y bounds [0,5]).
+        DataFile a0 =
+            writeYidFile(
+                table,
+                new File(dataDir, "00000-a0.parquet").getAbsolutePath(),
+                new long[] {1L, 2L},
+                new long[] {0L, 5L});
+        table.newFastAppend().appendFile(a0).commit();
+
+        // S1: the CONCURRENT file (y bounds [lo,hi]).
+        DataFile concurrent =
+            writeYidFile(
+                table,
+                new File(dataDir, "00001-concurrent.parquet").getAbsolutePath(),
+                new long[] {100L, 101L},
+                new long[] {scenario.lo, scenario.hi});
+        table.newFastAppend().appendFile(concurrent).commit();
+
+        Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+        OutputFile finalOut =
+            new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+        TableMetadataParser.write(ops.current(), finalOut);
+
+        System.out.println(
+            "generated overwrite-conflict scenario "
+                + scenario.name
+                + " (S0 y[0,5] + concurrent S1 y["
+                + scenario.lo
+                + ","
+                + scenario.hi
+                + "], expected "
+                + (scenario.expectReject ? "REJECT" : "ACCEPT")
+                + ") to "
+                + scenarioDir);
+      }
+    }
+
+    /**
+     * DIRECTION 2 verify — for each scenario, load the RUST-written table and run the symmetric
+     * overwrite; the ACCEPT/REJECT outcome must equal the hand-declared expected.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      for (Scenario scenario : SCENARIOS) {
+        Path finalMetadata =
+            dir.resolve(scenario.name)
+                .resolve("rust_table")
+                .resolve("metadata")
+                .resolve("final.metadata.json");
+        if (!Files.exists(finalMetadata)) {
+          System.out.println(
+              "FAIL overwrite-conflict-d2["
+                  + scenario.name
+                  + "]: missing "
+                  + finalMetadata
+                  + " (run the Rust GEN path first)");
+          failures++;
+          continue;
+        }
+
+        try {
+          boolean rejected = runOverwriteAndDetect(finalMetadata, scenario);
+          if (rejected == scenario.expectReject) {
+            System.out.println(
+                "PASS overwrite-conflict-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " matches expected");
+          } else {
+            System.out.println(
+                "FAIL overwrite-conflict-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " but expected "
+                    + (scenario.expectReject ? "REJECT" : "ACCEPT"));
+            failures++;
+          }
+        } catch (RuntimeException | IOException error) {
+          System.out.println(
+              "FAIL overwrite-conflict-d2["
+                  + scenario.name
+                  + "]: unexpected error running the overwrite: "
+                  + error);
+          failures++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-overwrite-conflict OK — Java's OverwriteFiles conflict decision matches "
+                + "Rust on all "
+                + SCENARIOS.size()
+                + " scenarios (ge50_overlap REJECT, ge50_excluded ACCEPT, nofilter_any REJECT)");
+      }
+      return failures;
+    }
+
+    /**
+     * Load the Rust-written {@code final.metadata.json} into a committable {@link
+     * LocalTableOperations} (seed via {@code commit(null, loaded)} — S0+S1 snapshot ids preserved),
+     * run the symmetric overwrite, and return {@code true} when it was REJECTED (a {@code
+     * ValidationException}) or {@code false} when it committed (ACCEPT).
+     */
+    private static boolean runOverwriteAndDetect(Path rustFinalMetadata, Scenario scenario)
+        throws IOException {
+      File metadataDir = rustFinalMetadata.getParent().toFile();
+      File tableDir = metadataDir.getParentFile(); // .../rust_table
+      File dataDir = new File(tableDir, "data");
+      mkdirs(dataDir);
+
+      TableMetadata loaded =
+          TableMetadataParser.fromJson(rustFinalMetadata.toString(), readString(rustFinalMetadata));
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, loaded); // seed `current` with the Rust S0+S1 history
+      BaseTable table = new BaseTable(ops, "rust_overwrite_conflict_" + scenario.name);
+
+      long s0 = rootSnapshotId(table);
+      DataFile fresh =
+          writeYidFile(
+              table,
+              new File(dataDir, "fresh-" + scenario.name + "-" + System.nanoTime() + ".parquet")
+                  .getAbsolutePath(),
+              new long[] {999L},
+              new long[] {1L});
+
+      org.apache.iceberg.OverwriteFiles overwrite =
+          table.newOverwrite().addFile(fresh).validateFromSnapshot(s0).validateNoConflictingData();
+      if (scenario.filter == Filter.GE50) {
+        overwrite.conflictDetectionFilter(Expressions.greaterThanOrEqual("y", 50L));
+      }
+      try {
+        overwrite.commit();
+        return false; // ACCEPT
+      } catch (org.apache.iceberg.exceptions.ValidationException validationFailure) {
+        return true; // REJECT
+      }
+    }
+
+    /** The ROOT snapshot (no parent) — after S0+S1 this is S0, so S1 is the concurrent commit. */
+    private static long rootSnapshotId(BaseTable table) {
+      for (Snapshot snapshot : table.snapshots()) {
+        if (snapshot.parentId() == null) {
+          return snapshot.snapshotId();
+        }
+      }
+      throw new IllegalStateException("no root snapshot (S0) found in the table history");
+    }
+
+    /** Write a REAL unpartitioned parquet {id, y} file; the y values become the column bounds. */
+    private static DataFile writeYidFile(BaseTable table, String path, long[] ids, long[] ys)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", ids[i]);
+        record.setField("y", ys[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null); // null partition = unpartitioned
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
     }
   }
 
