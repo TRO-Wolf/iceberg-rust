@@ -54,6 +54,16 @@
 //!   rejects when, in a replaced partition, a concurrent snapshot either DELETED a data file
 //!   (`validateDeletedDataFiles`) or ADDED a delete file (`validateNoNewDeleteFiles`).
 //!
+//! **No `caseSensitive(boolean)` — intentionally absent (Java API parity):** unlike `DeleteFiles` /
+//! `OverwriteFiles` / `RowDelta`, the Java `ReplacePartitions` interface (`api/ReplacePartitions.java`,
+//! 1.10.0) exposes NO `caseSensitive(boolean)` method (`javap -p` on `iceberg-api-1.10.0.jar` lists only
+//! `addFile`, `validateAppendOnly`, `validateFromSnapshot`, `validateNoConflictingDeletes`,
+//! `validateNoConflictingData`). `BaseReplacePartitions` inherits the field from `MergingSnapshotProducer`
+//! but never surfaces it, and this action's validate path is PURELY PARTITION-SET-BASED (it compares
+//! `(spec_id, partition)` tuples — see [`file_in_replaced_partition`]) with NO `Expression`/`Predicate`
+//! binding anywhere, so there is no column-name resolution for a case-sensitivity flag to affect. Adding
+//! one would be an inert no-op that diverges from the Java public surface. Deferred deliberately.
+//!
 //! **Out of scope (deferred):**
 //! - static `replaceByRowFilter` / explicit-partition overwrite APIs — need inclusive/strict metrics
 //!   evaluators to select files by row predicate.

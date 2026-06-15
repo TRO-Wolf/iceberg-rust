@@ -67,6 +67,93 @@ Ranked, highest-value first:
 
 See the 2026-06-13 GAP_MATRIX provenance block for the per-row status and residue of every item above.
 
+## ACTIVE (2026-06-13): RewriteFiles DELETE-file ADD surface (builder, this increment)
+
+Goal: port the unported DELETE-file ADD surface on `RewriteFiles` — `addFile(DeleteFile)` /
+`addFile(DeleteFile, long)` (explicit-seq overload) + the 4-set
+`rewriteFiles(data_to_replace, delete_to_replace, data_to_add, delete_to_add)` — and lift the third
+precondition (`addsDeleteFiles() ⇒ deletesDeleteFiles()`) into reachability. Java spec from 1.10.0
+bytecode (`BaseRewriteFiles`, `MergingSnapshotProducer.add(DeleteFile)/(DeleteFile,long)`,
+`Delegates.PendingDeleteFile`, `SnapshotProducer.writeDeleteFileGroup`). Files: `rewrite_files.rs`,
+`snapshot.rs` ONLY. Done-bar 🟡 (unit-tested, interop deferred).
+
+- [ ] **snapshot.rs** — model the `PendingDeleteFile` per-file optional explicit data-seq: store added
+      delete files as `Vec<(DataFile, Option<i64>)>` (None = inherit). Keep
+      `with_added_delete_files(Vec<DataFile>)` mapping each to `(file, None)` (RowDelta unchanged); add
+      `with_added_delete_files_with_seq(...)`. Stamp the explicit seq in `write_added_delete_manifests`
+      (mirror `writeDeleteFileGroup`: `add(file, seq)` if Some, else `add(file)` = inherit). Update the
+      validation/empty-check/summary read sites to destructure the pair.
+- [ ] **rewrite_files.rs** — `add_delete_file(DeleteFile)` / `add_delete_files(...)` (inherited seq),
+      `add_delete_file_with_sequence_number(DeleteFile, i64)` (Java `addFile(DeleteFile, long)`),
+      `rewrite_files_with_deletes(4 sets)` (Java 4-arg). Make precondition (3) reachable
+      (`adds_delete_files = !added_delete_files.is_empty()`). Content-guard + negative-seq guard on
+      added delete files. Route added deletes through `with_added_delete_files_with_seq`.
+- [ ] **Tests** (rewrite_files.rs): crown-jewel rewrite a delete file into a NEW delete file + post-commit
+      MoR scan (no resurrection); explicit-seq overload stamps the given seq (on-disk pre-inheritance via
+      the manifest reader); 4-arg atomic (data AND delete sets in ONE Replace snapshot); precondition (3)
+      both-directions; content + negative-seq guards. Mutation: seq-strip → resurrection test fails.
+- [ ] **Gate**: `typos . && cargo fmt --check && cargo clippy -D warnings && cargo test -p iceberg --lib`
+      (twice). Update `transaction/map.md` rewrite_files row + the third-precondition note.
+
+## ACTIVE (2026-06-13, Opus builder): `caseSensitive(bool)` on the expression-binding write actions
+
+Add `case_sensitive(bool)` (DEFAULT TRUE = Java default, 1.10.0 bytecode-confirmed:
+`MergingSnapshotProducer` ctor `iconst_1; putfield caseSensitive`; `ManifestFilterManager` ctor same)
+to `DeleteFiles` / `OverwriteFiles` / `RowDelta` and thread through the shared snapshot.rs binding
+sites. Scope: `delete_files.rs`, `overwrite_files.rs`, `row_delta.rs`, `replace_partitions.rs`,
+`snapshot.rs` ONLY. Java refs: `api/{DeleteFiles,OverwriteFiles,RowDelta}.caseSensitive(boolean)`
+present; `api/ReplacePartitions` has NO `caseSensitive` (javap-confirmed) — narrow it out.
+
+- [x] snapshot.rs: threaded `case_sensitive` into `resolve_filter_deletes` (+`build_residual_evaluator`
+      →`ResidualEvaluator::of`) and `validate_no_new_deletes_for_data_files`. The `eval(..., true)`
+      (include_empty_files) calls left untouched. Forced 1-token out-of-scope edit: `rewrite_files.rs`
+      passes `true` (inert — its conflict filter is `None`; documented).
+- [x] delete_files.rs: `case_sensitive: bool` field (default true) + `case_sensitive(bool)` builder;
+      threaded via `DeleteFilesOperation`. Deferred doc comment rewritten.
+- [x] overwrite_files.rs: field + builder; threaded into `resolve_filter_deletes`, the 4 conflict
+      helpers, and the StrictMetricsEvaluator row-filter bind in
+      `check_added_files_match_overwrite_filter`. Java-faithful: partition-projection binds stay `true`
+      (Java uses the single-arg `Projections`/two-arg `Evaluator`; only the StrictMetricsEvaluator takes
+      `isCaseSensitive()` — bytecode-verified).
+- [x] row_delta.rs: field + builder; threaded into the conflict helpers, `validate_added_dvs`, and
+      `validate_no_new_deletes_for_data_files`. `validate_fresh_dvs_only` left (by-path/partition).
+- [x] replace_partitions.rs: NARROWED — `javap -p` confirms no `caseSensitive` in the Java public API +
+      validate path is partition-set-based (no `Predicate::bind`). Documented, no builder added.
+- [x] Tests: 9 total (3/action). Mutation-verified BOTH directions at BOTH shared sites, failing all 3
+      actions' tests simultaneously (ignore-flag ⇒ false-direction tests fail; hard-code-false ⇒
+      boundary tests fail).
+
+> **Done (2026-06-13):** `case_sensitive(bool)` landed on DeleteFiles/OverwriteFiles/RowDelta (DEFAULT
+> TRUE), narrowed out of ReplacePartitions per Java 1.10.0 API. Gate green (typos/fmt/clippy + 2× lib
+> @ 2258). Interop deferred → row 134 stays 🟡. GAP_MATRIX rows 134/135 updated.
+
+## ACTIVE (2026-06-13, Opus builder): `DeleteFiles.deleteFromRowFilter(Expression)` delete-by-predicate
+
+Close the deferral in `delete_files.rs` L30-32. Java bytecode-confirmed (`javap -p -c` on
+iceberg-api/core 1.10.0): `StreamingDelete.deleteFromRowFilter(Expression)` → `MergingSnapshotProducer.deleteByRowFilter`
+→ the SAME `ManifestFilterManager.manifestHasDeletedFiles` path `OverwriteFiles.overwriteByRowFilter`
+already ports via `SnapshotProducer::resolve_filter_deletes`. `StreamingDelete.operation()` is the
+CONSTANT `"delete"` (NOT dynamic). PARTIAL ⇒ "Cannot delete file where some, but not all, rows match
+filter %s: %s" (verbatim string in the 1.10.0 jar). Scope: `crates/iceberg/src/transaction/delete_files.rs` ONLY.
+
+- [x] Add `delete_from_row_filter(Predicate)` builder method (stores `Option<Predicate>` row filter).
+- [x] Thread the row filter into `DeleteFilesOperation`; its `delete_files` unions `resolve_delete_paths`
+      with `resolve_filter_deletes(row_filter)` (de-dupe by path) — mirroring `OverwriteFilesOperation`.
+      `operation()` stays `Operation::Delete` (StreamingDelete constant).
+- [x] Tests: A strictly-covered (deleted), B provably-cannot-match (kept), C partial (ERROR, nothing
+      committed); residual KEEP/DELETE/PARTIAL pins; negative residual-non-match; combine-with-by-path.
+- [x] Update `delete_files.rs` module doc (remove the deferral note) + the map.md row 39.
+- Done-bar: 🟡 (unit-tested; interop deferred — flagged for the critic). `caseSensitive(bool)` is a
+  SEPARATE GAP_MATRIX row — explicitly OUT of this increment (filter bound case-sensitive `true`, the
+  Java default, as the precedent does).
+- Outcome (2026-06-13): landed in `delete_files.rs` (`delete_from_row_filter` builder + `row_filter`
+  field threaded into `DeleteFilesOperation`, unioned with by-path via the SHARED
+  `resolve_filter_deletes` — no fork). 8 new tests; full gate green (typos/fmt/clippy + lib ×2 =
+  2246 passed). Two mutations verified-then-reverted (residual→full-predicate caught by 3 tests incl.
+  the dedicated partition-residual pin; strict→inclusive over-broaden caught by the crown-jewel partial
+  test). DEFERRED for the reviewer/orchestrator: flip the GAP_MATRIX `deleteFromRowFilter` row ❌→🟡
+  (outside the explicit modify-list), and data-level Java↔Rust interop.
+
 ## Carried-forward open items (full context in todo-archive/)
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the

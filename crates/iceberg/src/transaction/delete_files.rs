@@ -27,9 +27,50 @@
 //! Deleting a path that is not present in any live entry of the table is an error (mirrors Java
 //! `failMissingDeletePaths`).
 //!
-//! **Out of scope (deferred):** delete-by-row-filter / partition-predicate (Java
-//! `DeleteFiles.deleteFromRowFilter` / `dropPartition`) — these need inclusive/strict metrics
-//! evaluation and will land with the `OverwriteFiles` / `ReplacePartitions` increments.
+//! **Delete-by-row-filter mode (`deleteFromRowFilter(Expression)`):**
+//! [`DeleteFilesAction::delete_from_row_filter`] stores a row predicate (Java
+//! `StreamingDelete.deleteFromRowFilter` → `MergingSnapshotProducer.deleteByRowFilter`, 1.10.0
+//! bytecode-verified). At apply time the producer resolves every LIVE data file the predicate
+//! STRICTLY matches (all of its rows match) via [`SnapshotProducer::resolve_filter_deletes`] — the
+//! Rust port of Java `ManifestFilterManager.manifestHasDeletedFiles` + `PartitionAndMetricsEvaluator`
+//! that `OverwriteFiles.overwriteByRowFilter` already drives, REUSED unchanged (not forked). Per LIVE
+//! data file the predicate is reduced to its per-partition RESIDUAL (Java
+//! `ResidualEvaluator.residualFor`) using that file's OWN partition spec, then the strict / inclusive
+//! METRICS evaluators classify the file: KEEP (inclusive says no rows can match) / DELETE (strict says
+//! all rows match) / PARTIAL. A PARTIAL match (some-but-not-all rows) is a non-retryable error (Java's
+//! "Cannot delete file where some, but not all, rows match filter %s: %s" — `StreamingDelete` deletes
+//! WHOLE files only, it cannot split a file). An unpartitioned `Predicate::AlwaysTrue` row filter
+//! deletes every data file (full delete). The recorded operation stays [`Operation::Delete`]
+//! unconditionally — Java `StreamingDelete.operation()` is the CONSTANT `"delete"` (NOT the dynamic
+//! `BaseOverwriteFiles.operation()`), confirmed by the 1.10.0 bytecode. When a by-path delete is ALSO
+//! set, the by-filter matches are UNIONED with the by-path resolution (de-duped by path) in the one
+//! `Delete` snapshot — mirroring Java's single `ManifestFilterManager` carrying both the `deletePaths`
+//! set and the `deleteExpression`.
+//!
+//! **Known inherited divergence (fail-safe, by-path + PARTIAL filter on the SAME file).** Java's
+//! `ManifestFilterManager.manifestHasDeletedFiles` (1.10.0 bytecode, offsets 68-96) computes
+//! `markedForDelete = deletePaths.contains(file) || deleteFiles.contains(file) ||
+//! dropPartitions.contains(...)` BEFORE the metrics check, and a `markedForDelete` file skips the
+//! `rowsMightMatch`/`rowsMustMatch` classification entirely (forcing `allRowsMatch = true`, offsets
+//! 195-245) — so a file already marked for deletion by path is DELETED even when the row filter matches
+//! only SOME of its rows. The shared [`SnapshotProducer::resolve_filter_deletes`] (in `snapshot.rs`) has
+//! NO such short-circuit: it classifies every live data file by metrics alone, so a file that is BOTH
+//! `delete_file`d by path AND a PARTIAL row-filter match raises the non-retryable "some, but not all,
+//! rows match" error where Java would have deleted it. This is PRE-EXISTING and INHERITED — the same
+//! helper drives `OverwriteFiles.overwriteByRowFilter`, which shares the blind spot — and it is FAIL-SAFE
+//! (Rust refuses the commit and never wrongly deletes data). The fix (the `markedForDelete` short-circuit)
+//! belongs in `snapshot.rs` and is deferred; the divergence is pinned by
+//! `test_delete_from_row_filter_bypath_and_partial_match_diverges_failsafe`.
+//!
+//! **Case sensitivity (`caseSensitive(boolean)`):** [`DeleteFilesAction::case_sensitive`] threads the Java
+//! `MergingSnapshotProducer.caseSensitive` flag into the row-filter binding (Java
+//! `ManifestFilterManager.caseSensitive` → `ResidualEvaluator.of(spec, expr, caseSensitive)` and the
+//! metrics-evaluator binding). It DEFAULTS to `true` (the Iceberg/Java default, 1.10.0-bytecode-confirmed:
+//! the `MergingSnapshotProducer`/`ManifestFilterManager` ctors set `caseSensitive = true`), so the row
+//! filter resolves column names case-sensitively unless the caller opts into `case_sensitive(false)`.
+//!
+//! **Out of scope (deferred):** `dropPartition` (Java `DeleteFiles.dropPartition` partition-drop —
+//! `ReplacePartitions` territory).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,6 +79,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::expr::Predicate;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
@@ -68,6 +110,18 @@ pub struct DeleteFilesAction {
     /// Stage the produced delete snapshot for write-audit-publish instead of moving `main` (Java
     /// `SnapshotProducer.stageOnly()`). See [`DeleteFilesAction::stage_only`].
     stage_only: bool,
+    /// The delete-by-row-filter predicate (Java `StreamingDelete.deleteFromRowFilter` →
+    /// `MergingSnapshotProducer.deleteByRowFilter`, stored as `deleteExpression`). When `Some`, every LIVE
+    /// data file the predicate STRICTLY matches is removed at apply time via
+    /// [`SnapshotProducer::resolve_filter_deletes`] (per-partition residual + strict/inclusive metrics;
+    /// a PARTIAL match is a non-retryable error). When `None`, no by-filter delete is performed (Java
+    /// `alwaysFalse()`). See [`DeleteFilesAction::delete_from_row_filter`].
+    row_filter: Option<Predicate>,
+    /// Column-name resolution case sensitivity for binding the [`Self::row_filter`] predicate (Java
+    /// `MergingSnapshotProducer.caseSensitive`). DEFAULTS to `true` (the Iceberg/Java default — the
+    /// `MergingSnapshotProducer` ctor sets `caseSensitive = true`, 1.10.0 bytecode). `case_sensitive(false)`
+    /// switches the row filter to case-insensitive column resolution. See [`DeleteFilesAction::case_sensitive`].
+    case_sensitive: bool,
 }
 
 impl DeleteFilesAction {
@@ -80,6 +134,9 @@ impl DeleteFilesAction {
             validate_files_exist: false,
             validate_from_snapshot: None,
             stage_only: false,
+            row_filter: None,
+            // Java `MergingSnapshotProducer` ctor default `caseSensitive = true` (1.10.0 bytecode).
+            case_sensitive: true,
         }
     }
 
@@ -103,6 +160,44 @@ impl DeleteFilesAction {
     pub fn delete_data_files(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
         self.delete_paths
             .extend(files.into_iter().map(|file| file.file_path));
+        self
+    }
+
+    /// DELETE every current data file the `predicate` STRICTLY matches (Java
+    /// `DeleteFiles.deleteFromRowFilter(Expression)` → `StreamingDelete.deleteFromRowFilter` →
+    /// `MergingSnapshotProducer.deleteByRowFilter`, 1.10.0 bytecode-verified). At apply time the producer
+    /// resolves the live data files whose ALL rows match the predicate (via
+    /// [`SnapshotProducer::resolve_filter_deletes`]) and removes them in the SAME `Delete` snapshot as any
+    /// explicit [`Self::delete_file`] / [`Self::delete_files`] / [`Self::delete_data_files`] removals.
+    ///
+    /// Per LIVE data file the predicate is reduced to its per-partition RESIDUAL (Java
+    /// `ResidualEvaluator.residualFor`) using THAT file's own partition spec, then classified by the
+    /// strict / inclusive METRICS evaluators: KEEP (inclusive: no rows can match) / DELETE (strict: all
+    /// rows match) / PARTIAL. A file the predicate matches only PARTIALLY (some-but-not-all rows) makes the
+    /// commit fail with a non-retryable error ("Cannot delete file where some, but not all, rows match
+    /// filter ...") — `StreamingDelete` deletes WHOLE files only and cannot split a file. An unpartitioned
+    /// [`Predicate::AlwaysTrue`] filter deletes EVERY data file.
+    ///
+    /// The recorded operation stays [`Operation::Delete`] (Java `StreamingDelete.operation()` is the
+    /// constant `"delete"`). The predicate is bound with this action's case-sensitivity (default `true`, the
+    /// Iceberg/Java default — see [`Self::case_sensitive`]).
+    pub fn delete_from_row_filter(mut self, predicate: Predicate) -> Self {
+        self.row_filter = Some(predicate);
+        self
+    }
+
+    /// Set whether the [`Self::delete_from_row_filter`] predicate resolves column names CASE-SENSITIVELY
+    /// (Java `DeleteFiles.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`).
+    ///
+    /// DEFAULT (this method NOT called) = `true`, the Iceberg/Java default (1.10.0 bytecode: the
+    /// `MergingSnapshotProducer` ctor sets `caseSensitive = true`). With `true`, a column named `X` in the
+    /// row filter binds only to a schema column named exactly `X`; a wrong-cased reference (filter on `X` for
+    /// a schema column `x`) fails to bind and the commit errors. Calling `case_sensitive(false)` switches to
+    /// case-INSENSITIVE column resolution, so the filter on `X` binds to the schema column `x` and deletes
+    /// its matching files. Only affects the by-row-filter mode ([`Self::delete_from_row_filter`]); by-path
+    /// deletes do not resolve column names.
+    pub fn case_sensitive(mut self, case_sensitive: bool) -> Self {
+        self.case_sensitive = case_sensitive;
         self
     }
 
@@ -178,6 +273,12 @@ impl TransactionAction for DeleteFilesAction {
             .commit(
                 DeleteFilesOperation {
                     delete_paths: self.delete_paths.clone(),
+                    // The delete-by-row-filter predicate (Java `deleteExpression`). When `Some`, the producer
+                    // also resolves the live data files this predicate strictly matches.
+                    row_filter: self.row_filter.clone(),
+                    // Column-name case sensitivity for binding the row filter (Java
+                    // `MergingSnapshotProducer.caseSensitive`, default `true`).
+                    case_sensitive: self.case_sensitive,
                 },
                 DefaultManifestProcess,
             )
@@ -243,15 +344,26 @@ impl TransactionAction for DeleteFilesAction {
 
 /// The [`SnapshotProduceOperation`] for [`DeleteFilesAction`].
 ///
-/// Records `Operation::Delete`, exposes every current data manifest as the set to filter, and
-/// resolves the requested paths against the current snapshot's live data entries (the resolved
-/// [`DataFile`]s drive the producer's manifest rewrite).
+/// Records `Operation::Delete` (Java `StreamingDelete.operation()` is the constant `"delete"`),
+/// exposes every current data manifest as the set to filter, and resolves the files to remove —
+/// the requested paths against the current snapshot's live data entries, UNIONED with the live data
+/// files the optional row filter strictly matches (the resolved [`DataFile`]s drive the producer's
+/// manifest rewrite).
 struct DeleteFilesOperation {
     delete_paths: HashSet<String>,
+    /// The delete-by-row-filter predicate (Java `deleteExpression`). When `Some`, `delete_files` also
+    /// resolves every live data file this predicate STRICTLY matches (via `resolve_filter_deletes`),
+    /// unioned with the path-resolved deletes. `None` ⇒ Java `alwaysFalse` (no by-filter delete).
+    row_filter: Option<Predicate>,
+    /// Column-name resolution case sensitivity for binding `row_filter` (Java
+    /// `MergingSnapshotProducer.caseSensitive`, default `true`). Passed into `resolve_filter_deletes`.
+    case_sensitive: bool,
 }
 
 impl SnapshotProduceOperation for DeleteFilesOperation {
     fn operation(&self) -> Operation {
+        // Java `StreamingDelete.operation()` returns the CONSTANT `"delete"` (1.10.0 bytecode) — UNLIKE
+        // `BaseOverwriteFiles.operation()`, a by-row-filter delete is still a plain `Delete`.
         Operation::Delete
     }
 
@@ -266,9 +378,32 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
         // Resolve the requested paths against the current snapshot's live data entries, validating that
         // EVERY requested path matched a live entry (Java `failMissingDeletePaths`). Shared with
         // `OverwriteFiles` via `SnapshotProducer::resolve_delete_paths`.
-        snapshot_produce
+        let mut resolved = snapshot_produce
             .resolve_delete_paths(&self.delete_paths)
-            .await
+            .await?;
+
+        // Union the delete-by-row-filter matches (Java `deleteByRowFilter` — every live data file the
+        // predicate STRICTLY matches; per-partition residual + strict/inclusive metrics, a PARTIAL match is a
+        // non-retryable error inside `resolve_filter_deletes`). De-dupe by path so a file removed by BOTH an
+        // explicit path and the row filter is not deleted twice (the producer's `process_deletes` matches by
+        // path, so a duplicate would be harmless, but the summary counts must stay accurate). Mirrors
+        // `OverwriteFilesOperation::delete_files` — the SAME shared helper, not a fork.
+        if let Some(row_filter) = &self.row_filter {
+            let filter_deletes = snapshot_produce
+                .resolve_filter_deletes(row_filter, self.case_sensitive)
+                .await?;
+            let mut seen: HashSet<String> = resolved
+                .iter()
+                .map(|data_file| data_file.file_path().to_string())
+                .collect();
+            for data_file in filter_deletes {
+                if seen.insert(data_file.file_path().to_string()) {
+                    resolved.push(data_file);
+                }
+            }
+        }
+
+        Ok(resolved)
     }
 
     async fn existing_manifest(
@@ -288,16 +423,17 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, Int64Array, RecordBatch};
     use futures::TryStreamExt;
 
+    use crate::expr::{Predicate, Reference};
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, ManifestContentType,
-        ManifestStatus, Operation, Struct,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal,
+        ManifestContentType, ManifestStatus, Operation, Struct,
     };
     use crate::table::Table;
     use crate::transaction::tests::{
@@ -326,6 +462,83 @@ mod tests {
             .record_count(1)
             .partition_spec_id(0)
             .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .build()
+            .unwrap()
+    }
+
+    /// Build a data file routed to partition `x = part_value` whose column `y` (schema field id 2, a
+    /// `long`) carries `[y_lower, y_upper]` value bounds (no null/nan counts). The bounds let
+    /// [`crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator`] include or
+    /// exclude this file against a `y` predicate — the discriminating input for KEEP vs PARTIAL. Without
+    /// the zero null/nan counts the [`crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator`]
+    /// conservatively returns "might not match", so a file built with this helper can never be classified
+    /// DELETE on a `y` predicate (it lands in the KEEP or PARTIAL branch) — exactly what the partial-match
+    /// and keep-non-matching tests need. The minimal V3 schema is `x,y,z: long` (ids 1,2,3).
+    fn data_file_with_y_bounds(
+        path: &str,
+        part_value: i64,
+        y_lower: i64,
+        y_upper: i64,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .lower_bounds(HashMap::from([(2, Datum::long(y_lower))]))
+            .upper_bounds(HashMap::from([(2, Datum::long(y_upper))]))
+            .build()
+            .unwrap()
+    }
+
+    /// Like [`data_file_with_y_bounds`] but with COMPLETE `y` (field id 2) stats: lower/upper bounds plus
+    /// `value_counts`, `null_value_counts = 0`, `nan_value_counts = 0`. The zero null/nan counts let the
+    /// [`crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator`] classify the file as
+    /// strictly-all-match against a `y` predicate (the strict evaluator conservatively returns "might not
+    /// match" when a column might contain a null/nan). This is the realistic shape a real Parquet writer
+    /// produces, and it is what the delete-by-row-filter DELETE branch needs to classify a file's whole
+    /// `y` range as covered without a spurious partial-match error.
+    fn data_file_with_y_stats(path: &str, part_value: i64, y_lower: i64, y_upper: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .value_counts(HashMap::from([(2, 1)]))
+            .null_value_counts(HashMap::from([(2, 0)]))
+            .nan_value_counts(HashMap::from([(2, 0)]))
+            .lower_bounds(HashMap::from([(2, Datum::long(y_lower))]))
+            .upper_bounds(HashMap::from([(2, Datum::long(y_upper))]))
+            .build()
+            .unwrap()
+    }
+
+    /// Build a data file routed to a TWO-field partition `(x = x_value, y = y_value)` under partition spec
+    /// `spec_id` — the shape produced by evolving the base `identity(x)` spec to `identity(x), identity(y)`
+    /// (spec id 1) via [`crate::transaction::Transaction::update_partition_spec`]. Carries NO `y` column
+    /// bounds, so a `y` predicate can only be decided by the PARTITION residual: under the 2-field spec the
+    /// partition value `y` reduces `y == y_value` to `alwaysTrue` (DELETE), but evaluated under the base
+    /// 1-field spec (`y` not partitioned) the predicate stays `y == y_value` with no bounds to satisfy
+    /// strict metrics (PARTIAL ⇒ error). That divergence is exactly what the two-spec residual-cache test
+    /// uses to distinguish "uses this file's OWN spec" from "hard-codes spec 0".
+    fn data_file_spec1_xy(path: &str, spec_id: i32, x_value: i64, y_value: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(spec_id)
+            .partition(Struct::from_iter([
+                Some(Literal::long(x_value)),
+                Some(Literal::long(y_value)),
+            ]))
             .build()
             .unwrap()
     }
@@ -1504,5 +1717,742 @@ mod tests {
             HashSet::from(["test/a.parquet".to_string(), "test/b.parquet".to_string()]),
             "the staged delete does not remove a from the readable table; both files stay live"
         );
+    }
+
+    // ============================================================================================
+    // Delete-by-row-filter (Java `StreamingDelete.deleteFromRowFilter(Expression)` →
+    // `MergingSnapshotProducer.deleteByRowFilter`, 1.10.0 bytecode-verified). The producer's
+    // `resolve_filter_deletes` (`snapshot.rs`) ports Java `ManifestFilterManager.manifestHasDeletedFiles`
+    // + `PartitionAndMetricsEvaluator`: per live data file, reduce the predicate to its per-partition
+    // RESIDUAL via `ResidualEvaluator::residual_for` (the file's OWN spec), then DELETE if strict-metrics
+    // says all rows match, KEEP if inclusive says none match, and ERROR ("some, but not all, rows match")
+    // on a partial match. `StreamingDelete` deletes WHOLE files only — a partial match is a hard error,
+    // never a silent partial delete. The recorded operation stays the constant `Delete`.
+    // ============================================================================================
+
+    /// THE THREE-FILE CROWN JEWEL (A strictly-covered ⇒ DELETE, B provably-cannot-match ⇒ KEEP, C
+    /// partially-overlapping ⇒ ERROR). Under one filter `y >= 50`: A `x=0,y=[60,70]` (complete stats,
+    /// strict-metrics all-match ⇒ DELETE), B `x=1,y=[0,10]` (inclusive says no rows match ⇒ KEEP), C
+    /// `x=0,y=[40,60]` (inclusive yes, strict no — straddles ⇒ PARTIAL). Because C is a partial match,
+    /// `StreamingDelete` (which deletes whole files only) FAILS the WHOLE commit with Java's exact message
+    /// and commits NOTHING — A stays, B stays, C stays. This pins the data-loss line: a partially-matching
+    /// file is NEVER silently dropped, and the failure is atomic (A is not deleted either).
+    #[tokio::test]
+    async fn test_delete_from_row_filter_partial_file_is_never_silently_dropped() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            // A: x=0, y=[60,70] — complete stats so strict-metrics can prove ALL rows >= 50 ⇒ DELETE.
+            data_file_with_y_stats("test/a.parquet", 0, 60, 70),
+            // B: x=1, y=[0,10] — upper 10 < 50 ⇒ inclusive says no rows match ⇒ KEEP.
+            data_file_with_y_bounds("test/b.parquet", 1, 0, 10),
+            // C: x=0, y=[40,60] — straddles 50 ⇒ inclusive yes, strict no ⇒ PARTIAL.
+            data_file_with_y_bounds("test/c.parquet", 0, 40, 60),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)));
+        let tx = action.apply(tx).unwrap();
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("a partial (some-but-not-all) row match must fail the whole delete");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            !err.retryable(),
+            "a partial-match delete is a non-retryable validation error"
+        );
+        assert!(
+            err.message()
+                .contains("Cannot delete file where some, but not all, rows match filter"),
+            "must match Java's ManifestFilterManager message, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/c.parquet"),
+            "the error must name the offending partial file C, got: {}",
+            err.message()
+        );
+
+        // ATOMICITY / NO-DATA-LOSS PIN: the failed commit changed nothing — A (strictly covered) is NOT
+        // deleted, B (non-matching) stays, C (partial) stays. All three remain live.
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_file_paths(&reloaded).await,
+            HashSet::from([
+                "test/a.parquet".to_string(),
+                "test/b.parquet".to_string(),
+                "test/c.parquet".to_string(),
+            ]),
+            "the partial-match failure is atomic: A is not deleted, B and C survive"
+        );
+    }
+
+    /// DELETE BRANCH (A, strictly covered). With NO partial file present, `delete_from_row_filter(y >= 50)`
+    /// DELETES the strictly-covered file A (`x=0,y=[60,70]`, complete stats ⇒ strict-metrics all-match) and
+    /// the post-commit SCAN no longer contains it. Pins the observable DELETE of a strictly-matching file
+    /// and that the operation recorded is the constant `Delete` (NOT the dynamic Overwrite).
+    #[tokio::test]
+    async fn test_delete_from_row_filter_deletes_strictly_matching_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file_with_y_stats("test/a.parquet", 0, 60, 70),
+            // A keep-anchor with y entirely below 50 so the commit is non-empty AND survives.
+            data_file_with_y_bounds("test/keep.parquet", 1, 0, 10),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("a strictly-covered file must be deleted by the row filter");
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "A (all rows y>=50) is deleted; the y<50 anchor survives"
+        );
+        // Java `StreamingDelete.operation()` is the constant "delete" — a by-row-filter delete is a Delete.
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Delete,
+            "a delete-by-row-filter records Delete (Java StreamingDelete.operation() == \"delete\")"
+        );
+    }
+
+    /// KEEP / NEGATIVE BRANCH (B, residual reduces to a non-matching predicate). `delete_from_row_filter`
+    /// must NOT delete a file whose per-partition residual cannot match. Using the partition predicate
+    /// `x == 0`: file B in partition x=1 has residual `alwaysFalse` ⇒ inclusive says no rows ⇒ KEEP. The
+    /// post-commit SCAN still contains B. This is the mandatory residual-non-match negative: a file the
+    /// residual excludes is never deleted (mutation: swapping the per-file residual for the FULL predicate
+    /// would still exclude B here via partition projection, but the partition-residual is what makes A's
+    /// no-`x`-bounds file deletable — see the companion DELETE test). Pins KEEP on the boundary.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_keeps_residual_non_matching_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            // Deleted: x=0 ⇒ residual of `x==0` is alwaysTrue ⇒ strict-match ⇒ DELETE.
+            data_file("test/del.parquet", 0),
+            // Kept: x=1 ⇒ residual of `x==0` is alwaysFalse ⇒ inclusive no rows ⇒ KEEP.
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("x").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("x==0 deletes the x=0 file and keeps the x=1 file");
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "the x=1 file (residual alwaysFalse) is KEPT; only the x=0 file is deleted"
+        );
+    }
+
+    /// PARTITION-RESIDUAL PIN (the silent-data-loss line). A file in partition x=0 carries NO `x` column
+    /// bounds, yet `delete_from_row_filter(x == 0)` must DELETE it: the predicate is reduced to its
+    /// per-partition RESIDUAL (`ResidualEvaluator::residual_for`) which is `alwaysTrue` for partition x=0,
+    /// and strict-metrics trivially satisfies `alwaysTrue`. Running the metrics on the FULL `x == 0`
+    /// predicate instead (the mutation) would wrongly classify the file as PARTIAL (no `x` bounds ⇒ strict
+    /// false, inclusive true) and ERROR — so this test FAILS under that mutation. Pins residual-not-full.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_uses_partition_residual_not_full_predicate() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // x=0 file with NO column bounds at all — only the partition value identifies it as x=0.
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/no-bounds.parquet", 0),
+            data_file("test/other.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("x").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "the no-`x`-bounds file in partition x=0 must DELETE via the alwaysTrue partition residual, \
+             not error as a partial match",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/other.parquet".to_string()]),
+            "the partition-residual makes the no-bounds x=0 file deletable; x=1 survives"
+        );
+    }
+
+    /// FULL-DELETE (unpartitioned-style `AlwaysTrue` residual). `delete_from_row_filter(AlwaysTrue)`
+    /// deletes EVERY live data file (the residual is the whole `alwaysTrue`, strict-matched by every file).
+    /// Pins the full-delete shape — and that an all-matching by-filter delete leaves an empty live set.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_always_true_deletes_all() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Predicate::AlwaysTrue);
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("AlwaysTrue must delete every live data file");
+
+        assert!(
+            live_file_paths(&table).await.is_empty(),
+            "AlwaysTrue deletes every file; the live set is empty"
+        );
+    }
+
+    /// NO-OP REJECTION (a by-filter delete that matches nothing). `delete_from_row_filter(x == 99)` matches
+    /// no live file (every residual is `alwaysFalse`), so the resolved delete set is empty and the producer
+    /// rejects the truly-empty commit — it does NOT silently produce an empty no-op Delete snapshot, and it
+    /// deletes nothing. Pins that a non-matching by-filter delete neither deletes nor commits.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_matching_nothing_is_rejected_and_deletes_nothing() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("x").equal_to(Datum::long(99)));
+        let tx = action.apply(tx).unwrap();
+        let result = tx.commit(&catalog).await;
+
+        assert!(
+            result.is_err(),
+            "a by-filter delete that matches no file is an empty no-op commit and must be rejected"
+        );
+        // Nothing was deleted — both files stay live.
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_file_paths(&reloaded).await,
+            HashSet::from(["test/a.parquet".to_string(), "test/b.parquet".to_string()]),
+            "the non-matching by-filter delete removed nothing"
+        );
+    }
+
+    /// COMBINE WITH BY-PATH DELETE (Java: one `ManifestFilterManager` carries both `deletePaths` and the
+    /// `deleteExpression`). A `delete_file("a")` (by path, x=0) PLUS `delete_from_row_filter(x == 1)`
+    /// (by filter) in one action removes BOTH a (path) and the x=1 file b (filter), de-duped, in one Delete
+    /// snapshot — c (x=0, not the named path, residual alwaysFalse for `x==1`) survives. Pins that the
+    /// by-path and by-filter removals are unioned and both applied.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_combines_with_by_path_delete() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 1),
+            data_file("test/c.parquet", 0),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_file("test/a.parquet")
+            .delete_from_row_filter(Reference::new("x").equal_to(Datum::long(1)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("by-path delete of a + by-filter delete of x=1 must both apply");
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/c.parquet".to_string()]),
+            "a removed by path, b removed by filter (x=1); c (x=0, not named) survives"
+        );
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Delete
+        );
+    }
+
+    /// PROVENANCE ACROSS SNAPSHOTS for a by-filter delete (the #1 corruption class). Append A (x=0) in S1
+    /// and B,C (x=0) in S2 (one manifest). `delete_from_row_filter` deleting B's partition without touching
+    /// C would re-stamp; here the filter `x == 0` strictly covers A, B, C. We instead delete only C's
+    /// neighbour by a `y`-keyed filter to force a manifest rewrite that keeps a survivor: filter
+    /// `y >= 100` deletes B (`y=[100,110]`, complete stats) and KEEPS C (`y=[0,10]`). The surviving C must
+    /// carry its ORIGINAL S2 snapshot id + sequence numbers (not the delete snapshot's). Pins no re-stamp.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_preserves_surviving_entry_provenance() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // S1: A alone.
+        let table = append_files(&catalog, &table, vec![data_file_with_y_stats(
+            "test/a.parquet",
+            0,
+            0,
+            5,
+        )])
+        .await;
+
+        // S2: B (y high, will be deleted) and C (y low, survives) in ONE manifest.
+        let table = append_files(&catalog, &table, vec![
+            data_file_with_y_stats("test/b.parquet", 0, 100, 110),
+            data_file_with_y_bounds("test/c.parquet", 0, 0, 10),
+        ])
+        .await;
+        let s2 = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let (c_snap_before, c_seq_before, c_fseq_before) =
+            entry_provenance(&table, "test/c.parquet").await;
+        assert_eq!(c_snap_before, Some(s2), "C added by S2");
+
+        // Delete B by row filter (y >= 100) — forces a rewrite of S2's manifest; C survives.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(100)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("y>=100 deletes B and keeps A and C");
+        let s3 = table.metadata().current_snapshot().unwrap().snapshot_id();
+        assert_ne!(s3, s2);
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/a.parquet".to_string(), "test/c.parquet".to_string()]),
+            "B (y>=100) deleted; A and C survive"
+        );
+
+        // The surviving C keeps its ORIGINAL S2 provenance — NOT re-stamped with the delete snapshot S3.
+        let (c_snap_after, c_seq_after, c_fseq_after) =
+            entry_provenance(&table, "test/c.parquet").await;
+        assert_eq!(
+            c_snap_after,
+            Some(s2),
+            "surviving C must keep its ORIGINAL snapshot id S2, not the delete snapshot S3"
+        );
+        assert_eq!(
+            c_seq_after, c_seq_before,
+            "surviving C must keep its ORIGINAL data sequence number"
+        );
+        assert_eq!(
+            c_fseq_after, c_fseq_before,
+            "surviving C must keep its ORIGINAL file sequence number"
+        );
+    }
+
+    /// INHERITED DIVERGENCE PIN (by-path delete + PARTIAL row-filter match on the SAME file). Java's
+    /// `ManifestFilterManager.manifestHasDeletedFiles` (iceberg-core 1.10.0 bytecode, offsets 68-96)
+    /// computes `markedForDelete = deletePaths.contains(file) || deleteFiles.contains(file) ||
+    /// dropPartitions.contains(...)` BEFORE the metrics check, then at offsets 195-245 a `markedForDelete`
+    /// file SKIPS `rowsMightMatch`/`rowsMustMatch` and forces `allRowsMatch = true` (iconst_1 at offset
+    /// 223) — so the PARTIAL guard `ValidationException.check(allRowsMatch || isDelete, "Cannot delete file
+    /// where some, but not all, rows match filter %s: %s", ...)` at offsets 230-269 NEVER fires for a file
+    /// already marked for deletion by path. Java DELETES such a file outright.
+    ///
+    /// Rust DIVERGES here and ERRORS instead: the shared `SnapshotProducer::resolve_filter_deletes`
+    /// (`snapshot.rs`) classifies EVERY live data file by metrics with NO knowledge of the by-path
+    /// `delete_paths` set (it has no `markedForDelete` short-circuit — that lives in the helper, OUTSIDE
+    /// this increment's allowed file set). So file C below — which is BOTH explicitly `delete_file`d AND a
+    /// some-but-not-all match for `y >= 50` — raises the non-retryable partial-match error where Java would
+    /// have deleted it.
+    ///
+    /// This divergence is PRE-EXISTING and INHERITED: the identical shared helper drives
+    /// `OverwriteFiles.overwriteByRowFilter`, which has the same blind spot. It is FAIL-SAFE — Rust REFUSES
+    /// the commit (non-retryable, names the file) and never silently drops or wrongly deletes data, so the
+    /// only behavioral cost is rejecting a commit Java would accept. The eventual fix (teach
+    /// `resolve_filter_deletes` the `markedForDelete` short-circuit) is in `snapshot.rs` and is therefore
+    /// deferred to a separate increment.
+    ///
+    /// Risk pinned: this test makes the divergence VISIBLE and asserts its exact fail-safe shape (the bug
+    /// was previously an UNPINNED blind spot — no test flagged that this case errors in Rust). When the
+    /// `snapshot.rs` short-circuit lands, this assertion FLIPS (ERR → the file is deleted) — at which point
+    /// this test is updated in the SAME change as the fix, guaranteeing the divergence is not closed
+    /// silently. The throwaway probe in remediation confirmed the live behavior: `DataInvalid`,
+    /// non-retryable, message `Cannot delete file where some, but not all, rows match filter y >= 50:
+    /// test/c.parquet`.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_bypath_and_partial_match_diverges_failsafe() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // C: x=0, y=[40,60] — straddles 50 ⇒ inclusive yes, strict no ⇒ PARTIAL for `y >= 50`. It is ALSO
+        // explicitly named in `delete_file` below (Java would mark it for delete by path and skip the
+        // metrics PARTIAL check entirely).
+        let table = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/c.parquet",
+            0,
+            40,
+            60,
+        )])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            // C is requested BY PATH (markedForDelete in Java) ...
+            .delete_file("test/c.parquet")
+            // ... AND is a PARTIAL match for this filter. Java deletes it via the markedForDelete
+            // short-circuit; Rust's shared helper has no such short-circuit and errors.
+            .delete_from_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)));
+        let tx = action.apply(tx).unwrap();
+        let err = tx.commit(&catalog).await.expect_err(
+            "INHERITED DIVERGENCE: Rust errors on a by-path file that is ALSO a partial filter match, \
+             where Java's markedForDelete short-circuit would have deleted it (fail-safe: refuses the \
+             commit, never wrongly deletes). The fix lives in snapshot.rs::resolve_filter_deletes — when \
+             it lands, flip this assertion to expect the file deleted, in the SAME change.",
+        );
+
+        // The divergence is FAIL-SAFE: a non-retryable validation error naming the offending file — never a
+        // silent partial delete or data loss.
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "the inherited divergence surfaces as a non-retryable validation error, not data loss"
+        );
+        assert!(
+            !err.retryable(),
+            "the partial-match error is non-retryable (the retry loop must not spin on it)"
+        );
+        assert!(
+            err.message()
+                .contains("Cannot delete file where some, but not all, rows match filter"),
+            "the divergence uses the shared ManifestFilterManager partial-match wording, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/c.parquet"),
+            "the fail-safe error must NAME the by-path file Java would have deleted, got: {}",
+            err.message()
+        );
+
+        // ATOMICITY / NO-DATA-LOSS PIN: the refused commit changed nothing — C is STILL live (it was
+        // neither deleted by path nor by filter; the whole commit was rejected).
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_file_paths(&reloaded).await,
+            HashSet::from(["test/c.parquet".to_string()]),
+            "the fail-safe rejection is atomic: C is not removed (no silent data loss in either direction)"
+        );
+    }
+
+    /// TWO-SPEC RESIDUAL PIN (the per-file partition spec is what reduces the predicate). The shared
+    /// `SnapshotProducer::resolve_filter_deletes` reduces the row filter to its per-partition RESIDUAL using
+    /// EACH live data file's OWN `partition_spec_id` (Java `PartitionAndMetricsEvaluator` is per-spec — Rust
+    /// caches one `ResidualEvaluator` per spec id, building a fresh one on the Vacant branch). Every OTHER
+    /// row-filter test in this file (and in `overwrite_files.rs`) uses a table with a SINGLE spec
+    /// (`partition_spec_id(0)`), so the second-spec residual path and the per-spec cache miss are NEVER
+    /// exercised — a mutation that hard-codes spec 0 (ignoring `data_file.partition_spec_id`) would survive
+    /// the entire suite. This test builds a table with TWO live specs and proves the per-file spec drives
+    /// the residual.
+    ///
+    /// Setup: spec 0 = `identity(x)`. Append `s0-keep.parquet` in partition `x=5` WITH `y` bounds `[0,10]`.
+    /// Evolve to spec 1 = `identity(x), identity(y)` (`update_partition_spec().add_field("y")`). Append
+    /// `s1-del.parquet` in partition `(x=0, y=99)` with NO `y` bounds. Filter `y == 99`.
+    ///
+    /// - `s0-keep.parquet` (spec 0): `y` is NOT a partition field under spec 0, so the residual stays
+    ///   `y == 99`; the `y` bounds `[0,10]` exclude 99 ⇒ inclusive says no rows match ⇒ KEEP.
+    /// - `s1-del.parquet` (spec 1): for partition `y=99` the spec-1 residual of `y == 99` is `alwaysTrue` ⇒
+    ///   strict metrics trivially all-match ⇒ DELETE.
+    ///
+    /// Correct behavior: the commit SUCCEEDS, `s1-del.parquet` is deleted, `s0-keep.parquet` survives.
+    ///
+    /// MUTATION KILLED: hard-code the residual evaluator to spec 0 (i.e. evaluate `s1-del.parquet` with the
+    /// spec-0 evaluator instead of its own spec 1). Then `s1-del.parquet`'s residual stays the full `y == 99`
+    /// (spec 0 does not partition `y`) and the file has NO `y` bounds ⇒ strict false, inclusive true ⇒ PARTIAL
+    /// ⇒ the WHOLE commit ERRORS with "Cannot delete file where some, but not all, rows match filter" naming
+    /// `s1-del.parquet`. So this test FAILS under the hard-coded-spec-0 mutation (commit errors instead of
+    /// succeeding) — pinning that the per-file `partition_spec_id` is what selects the residual evaluator.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_uses_each_files_own_partition_spec() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // S0 under spec 0 (`identity(x)`): a keep-anchor in partition x=5 with y bounds [0,10] (so the
+        // residual `y == 99` excludes it on the spec-0 evaluator ⇒ KEEP, deterministically).
+        let table = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/s0-keep.parquet",
+            5,
+            0,
+            10,
+        )])
+        .await;
+
+        // Evolve the spec to `identity(x), identity(y)` (a SECOND distinct spec id).
+        let tx = Transaction::new(&table);
+        let action = tx.update_partition_spec().add_field("y");
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let spec1 = table.metadata().default_partition_spec_id();
+        assert_ne!(spec1, 0, "fixture sanity: the spec evolved away from 0");
+        assert_eq!(
+            table.metadata().default_partition_spec().fields().len(),
+            2,
+            "fixture sanity: the evolved spec partitions by both x and y"
+        );
+
+        // S1 under spec 1 (`identity(x), identity(y)`): a file in partition (x=0, y=99) with NO y bounds —
+        // deletable ONLY via the spec-1 partition residual (`y == 99` ⇒ alwaysTrue for partition y=99).
+        let table = append_files(&catalog, &table, vec![data_file_spec1_xy(
+            "test/s1-del.parquet",
+            spec1,
+            0,
+            99,
+        )])
+        .await;
+
+        // Sanity: two live files, one under each spec.
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from([
+                "test/s0-keep.parquet".to_string(),
+                "test/s1-del.parquet".to_string(),
+            ]),
+        );
+
+        // Delete by `y == 99`. The spec-1 file deletes via its OWN spec's partition residual; the spec-0 file
+        // is KEPT (its residual stays `y == 99`, excluded by the [0,10] bounds).
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("y").equal_to(Datum::long(99)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "the spec-1 file must DELETE via its OWN partition residual (y==99 ⇒ alwaysTrue); a hard-coded \
+             spec-0 residual would make it a PARTIAL match and error",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/s0-keep.parquet".to_string()]),
+            "the spec-1 file (partition y=99) is deleted via its own spec; the spec-0 keep-anchor survives"
+        );
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Delete,
+        );
+    }
+
+    /// DEDUP PIN (a file removed by BOTH an explicit path AND the row filter is counted ONCE). When a
+    /// single live file matches a `delete_file(path)` AND a `delete_from_row_filter(predicate)` in the same
+    /// action, `DeleteFilesOperation::delete_files` de-dupes by path (the `seen` guard) so the file lands in
+    /// the resolved removal set ONCE. The on-disk manifest rewrite is path-set-deduped downstream
+    /// (`process_deletes` keys on a `HashSet`), so the LIVE set is correct either way — but the snapshot
+    /// SUMMARY counters (`deleted-data-files` / `deleted-records`) are computed by iterating the resolved
+    /// `removed_data_files` Vec one entry at a time (`snapshot.rs` summary loop), so a double-push would
+    /// report `deleted-data-files=2` / `deleted-records=2` for a SINGLE removed file — a Java-parity
+    /// divergence in downstream-readable metadata (the builder's own comment requires "the summary counts
+    /// must stay accurate"). File A (x=0, record_count=1) is named by path AND strictly matched by the
+    /// `x == 0` partition residual; the summary must report exactly ONE deleted file / record.
+    ///
+    /// MUTATION KILLED: drop the `seen.insert` dedup guard (push every filter match unconditionally). A is
+    /// then pushed twice and the summary reports `deleted-data-files=2` / `deleted-records=2`, failing the
+    /// `Some("1")` assertions below.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_bypath_and_filter_same_file_counted_once() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            // A: x=0, record_count=1 — strictly matches `x == 0` (partition residual alwaysTrue) AND is
+            // named by path below, so it is resolved by BOTH removal paths.
+            data_file("test/a.parquet", 0),
+            // A keep-anchor in a different partition so the commit is non-empty and survives.
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_file("test/a.parquet")
+            .delete_from_row_filter(Reference::new("x").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("A removed by both path and filter; the keep-anchor survives");
+
+        // LIVE set is correct (A gone, keep survives) regardless of the dedup.
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "A is removed (by path and filter); the x=1 anchor survives"
+        );
+
+        // SUMMARY must count A exactly ONCE — not twice (the dedup pin).
+        let summary = table.metadata().current_snapshot().unwrap().summary();
+        let props = &summary.additional_properties;
+        assert_eq!(
+            props.get("deleted-data-files").map(String::as_str),
+            Some("1"),
+            "a file removed by BOTH path and filter is one deleted data file, not two"
+        );
+        assert_eq!(
+            props.get("deleted-records").map(String::as_str),
+            Some("1"),
+            "a file removed by BOTH path and filter contributes its records once, not twice"
+        );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the delete-by-row-filter binding (Java
+    // `DeleteFiles.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`, DEFAULT TRUE).
+    //
+    // The minimal V3 schema is `x,y,z: long` partitioned by identity(x). A row filter on the WRONG-cased
+    // column `X` (schema column is `x`) binds ONLY when case sensitivity is OFF. These three tests pin the
+    // load-bearing flag in BOTH directions on the boundary:
+    //   (1) DEFAULT (flag unset) + correctly-cased `x` ⇒ binds and deletes (regression: behaves as today).
+    //   (2) case_sensitive(false) + wrong-cased `X` ⇒ binds case-insensitively and deletes x=0's file.
+    //   (3) DEFAULT / case_sensitive(true) + wrong-cased `X` ⇒ REJECTS at bind (the flag is load-bearing).
+    // Mutation guards: ignore the flag (always true) ⇒ (2) fails to bind; hard-code false ⇒ (1)/(3) bind
+    // the wrong-case column and (3) stops rejecting.
+    // ============================================================================================
+
+    /// REGRESSION PIN (default unchanged). With the flag UNSET (Java default `caseSensitive = true`) a
+    /// CORRECTLY-cased row filter `x == 0` binds and deletes the x=0 file exactly as today. Risk: a default
+    /// flip to case-insensitive would still bind here (so this alone is not the boundary), but a regression
+    /// that broke the case-sensitive happy path (e.g. wiring the flag to always-false-then-error) would fail
+    /// this. Asserts the OBSERVABLE post-commit live set.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_default_case_sensitive_correct_case_deletes() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        // No case_sensitive(..) call ⇒ default true; correctly-cased `x`.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("x").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "a correctly-cased x==0 filter binds and deletes under the default (case-sensitive)",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "x==0 deletes the x=0 file; the x=1 anchor survives"
+        );
+    }
+
+    /// LOAD-BEARING (false direction). With `case_sensitive(false)` a WRONG-cased row filter `X == 0` (schema
+    /// column is `x`) binds CASE-INSENSITIVELY and deletes the x=0 file. Risk pinned: a missed delete (stale
+    /// data) when the engine binds case-insensitively — proves `case_sensitive(false)` actually switches
+    /// resolution. Mutation `ignore the flag (always true)` ⇒ the wrong-case `X` fails to bind and this test
+    /// errors. Asserts the OBSERVABLE post-commit live set.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_case_insensitive_wrong_case_deletes() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        // WRONG-cased `X` (schema column is `x`); case_sensitive(false) ⇒ binds case-insensitively.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .case_sensitive(false)
+            .delete_from_row_filter(Reference::new("X").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "case_sensitive(false) binds the wrong-cased X to schema column x and deletes the x=0 file",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "the wrong-cased X==0 deletes the x=0 file under case-insensitive resolution"
+        );
+    }
+
+    /// THE BOUNDARY (true direction — proves the flag is load-bearing). With the DEFAULT (flag unset =
+    /// `case_sensitive(true)`), a WRONG-cased row filter `X == 0` (schema column is `x`) must REJECT at bind:
+    /// the column `X` does not exist case-sensitively, so the commit errors and NOTHING is deleted. Risk
+    /// pinned: a wrongly-matched bind (deleting under a name the user did not spell) — and the both-direction
+    /// guard against (2). Mutation `hard-code false` ⇒ the wrong-case `X` would bind and this rejection test
+    /// fails. Asserts the OBSERVABLE result: the commit errors and the live set is unchanged.
+    #[tokio::test]
+    async fn test_delete_from_row_filter_default_case_sensitive_wrong_case_rejects() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `X` ⇒ must fail to bind.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_from_row_filter(Reference::new("X").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let error = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased X must NOT bind under the default (case-sensitive) and must reject",
+        );
+
+        // The table is untouched — the rejected delete removed nothing (re-load from the catalog).
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_file_paths(&reloaded).await,
+            HashSet::from([
+                "test/del.parquet".to_string(),
+                "test/keep.parquet".to_string()
+            ]),
+            "the rejected case-sensitive bind deleted nothing: both files survive"
+        );
+        // The same wrong-case column under case_sensitive(false) succeeds (the both-direction guard) — see
+        // `test_delete_from_row_filter_case_insensitive_wrong_case_deletes`. Sanity-pin the error here.
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 }

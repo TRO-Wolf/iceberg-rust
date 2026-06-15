@@ -173,6 +173,13 @@ pub struct OverwriteFilesAction {
     /// `OverwriteFiles.validateAddedFilesMatchOverwriteFilter`). OFF by default. Only meaningful together with
     /// [`Self::row_filter`].
     validate_added_files_match_overwrite_filter: bool,
+    /// Column-name resolution case sensitivity for binding the [`Self::row_filter`] /
+    /// [`Self::conflict_detection_filter`] predicates (Java `MergingSnapshotProducer.caseSensitive`).
+    /// DEFAULTS to `true` (the Iceberg/Java default — the `MergingSnapshotProducer` ctor sets
+    /// `caseSensitive = true`, 1.10.0 bytecode). `case_sensitive(false)` switches every filter binding this
+    /// action performs (the delete-by-row-filter resolution AND the conflict-detection validations) to
+    /// case-insensitive column resolution. See [`OverwriteFilesAction::case_sensitive`].
+    case_sensitive: bool,
 }
 
 impl OverwriteFilesAction {
@@ -190,6 +197,8 @@ impl OverwriteFilesAction {
             validate_from_snapshot: None,
             row_filter: None,
             validate_added_files_match_overwrite_filter: false,
+            // Java `MergingSnapshotProducer` ctor default `caseSensitive = true` (1.10.0 bytecode).
+            case_sensitive: true,
         }
     }
 
@@ -262,6 +271,23 @@ impl OverwriteFilesAction {
     /// `alwaysFalse` and no added file could match it. Default (this method NOT called) = no assertion.
     pub fn validate_added_files_match_overwrite_filter(mut self) -> Self {
         self.validate_added_files_match_overwrite_filter = true;
+        self
+    }
+
+    /// Set whether the row filter / conflict-detection filter resolve column names CASE-SENSITIVELY (Java
+    /// `OverwriteFiles.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`).
+    ///
+    /// DEFAULT (this method NOT called) = `true`, the Iceberg/Java default (1.10.0 bytecode: the
+    /// `MergingSnapshotProducer` ctor sets `caseSensitive = true`). With `true`, a column named `X` in any
+    /// of this action's filters binds only to a schema column named exactly `X`; a wrong-cased reference
+    /// (filter on `X` for a schema column `x`) fails to bind and the commit errors. Calling
+    /// `case_sensitive(false)` switches to case-INSENSITIVE column resolution for EVERY filter this action
+    /// binds: the [`Self::overwrite_by_row_filter`] delete resolution, the
+    /// [`Self::validate_added_files_match_overwrite_filter`] strict check, and the
+    /// `validateNoConflicting*` conflict-detection validations (Java threads the one `caseSensitive` field
+    /// into all of them). By-path deletes do not resolve column names and are unaffected.
+    pub fn case_sensitive(mut self, case_sensitive: bool) -> Self {
+        self.case_sensitive = case_sensitive;
         self
     }
 
@@ -386,11 +412,15 @@ impl OverwriteFilesAction {
         let schema = current.metadata().current_schema().clone();
         // Strict METRICS evaluator runs on the full row filter against the table schema (Java
         // `new StrictMetricsEvaluator(base.schema(), rowFilter, isCaseSensitive())`). `rewrite_not` so the
-        // visitor never sees a `Not`.
+        // visitor never sees a `Not`. The user-supplied column references are resolved with this action's
+        // case sensitivity (Java threads `isCaseSensitive()` into the `StrictMetricsEvaluator` ctor). This is
+        // the single binding of the user's `rowFilter` column names — the partition projection below re-binds
+        // the PROJECTED predicate to the spec-derived partition schema, whose field names are not
+        // user-influenced (Java uses the default-case-sensitive `Projections`/`Evaluator` overloads there).
         let bound_row_filter: BoundPredicate = row_filter
             .clone()
             .rewrite_not()
-            .bind(schema.clone(), true)?;
+            .bind(schema.clone(), self.case_sensitive)?;
 
         // The added files all share the table default partition spec (validated in `commit` via
         // `validate_added_data_files`); build the inclusive/strict PARTITION evaluators for that spec.
@@ -490,6 +520,9 @@ impl TransactionAction for OverwriteFilesAction {
                     // The recorded operation is classified on the REQUESTED sets (Java `addsDataFiles()` =
                     // requested added files non-empty), evaluated before the deletes are resolved.
                     adds_data_files: !self.added_data_files.is_empty(),
+                    // Column-name case sensitivity for binding the row filter (Java
+                    // `MergingSnapshotProducer.caseSensitive`, default `true`).
+                    case_sensitive: self.case_sensitive,
                 },
                 DefaultManifestProcess,
             )
@@ -539,8 +572,10 @@ impl TransactionAction for OverwriteFilesAction {
     ///      [`Self::delete_data_files`] entries (Java's `deletedDataFiles`) are checked — path-only
     ///      [`Self::delete_file`] / [`Self::delete_files`] removals are not. A no-op on a V1 table.
     ///
-    /// **Case sensitivity:** Java binds the conflict filter with `isCaseSensitive()`. This action has no such
-    /// field, so the filter is bound case-sensitive (`true`) — the Iceberg/Java default for column resolution.
+    /// **Case sensitivity:** Java binds the conflict filter with `isCaseSensitive()`. Every conflict
+    /// validation here threads this action's [`Self::case_sensitive`] flag (default `true`, the Iceberg/Java
+    /// default) into the shared helpers, so a `case_sensitive(false)` overwrite resolves the conflict
+    /// filter's column names case-insensitively just as Java does.
     async fn validate(
         self: Arc<Self>,
         starting_snapshot_id: Option<i64>,
@@ -567,7 +602,7 @@ impl TransactionAction for OverwriteFilesAction {
                 current,
                 effective_start,
                 conflict_filter,
-                true,
+                self.case_sensitive,
             )
             .await?;
         }
@@ -590,10 +625,16 @@ impl TransactionAction for OverwriteFilesAction {
                     current,
                     effective_start,
                     Some(&filter),
-                    true,
+                    self.case_sensitive,
                 )
                 .await?;
-                validate_deleted_data_files(current, effective_start, Some(&filter), true).await?;
+                validate_deleted_data_files(
+                    current,
+                    effective_start,
+                    Some(&filter),
+                    self.case_sensitive,
+                )
+                .await?;
             }
 
             // 3b. Branch B (Java L174-177): when this overwrite removes data files supplied with full metadata
@@ -603,10 +644,21 @@ impl TransactionAction for OverwriteFilesAction {
             //     validated — matching Java's `deletedDataFiles`. `ignore_equality_deletes = false` (Java
             //     passes the full set with equality deletes counted). UNCHANGED from the prior increment.
             if !self.deleted_data_files.is_empty() {
+                // Bind the conflict filter HERE with this action's `case_sensitive(bool)` (Java
+                // `DeleteFileIndex.Builder.caseSensitive(isCaseSensitive())`) and pass the bound predicate to
+                // the SHARED helper — keeping its signature stable across the actions (RewriteFiles passes
+                // `None`). `None` filter ⇒ no metrics narrowing (every concurrently-added delete is a candidate).
+                let bound_conflict_filter = match self.conflict_detection_filter.as_ref() {
+                    Some(filter) => Some(filter.clone().bind(
+                        current.metadata().current_schema().clone(),
+                        self.case_sensitive,
+                    )?),
+                    None => None,
+                };
                 validate_no_new_deletes_for_data_files(
                     current,
                     effective_start,
-                    self.conflict_detection_filter.as_ref(),
+                    bound_conflict_filter.as_ref(),
                     &self.deleted_data_files,
                     false,
                 )
@@ -636,6 +688,9 @@ struct OverwriteFilesOperation {
     /// `deleteExpression != alwaysFalse`), this classifies the recorded operation the way Java
     /// `BaseOverwriteFiles.operation()` does.
     adds_data_files: bool,
+    /// Column-name resolution case sensitivity for binding `row_filter` (Java
+    /// `MergingSnapshotProducer.caseSensitive`, default `true`). Passed into `resolve_filter_deletes`.
+    case_sensitive: bool,
 }
 
 impl SnapshotProduceOperation for OverwriteFilesOperation {
@@ -677,7 +732,9 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
         // (the producer's `process_deletes` matches by path, so a duplicate would be harmless, but the summary
         // counts must stay accurate — Java's `DataFileSet` likewise dedupes).
         if let Some(row_filter) = &self.row_filter {
-            let filter_deletes = snapshot_produce.resolve_filter_deletes(row_filter).await?;
+            let filter_deletes = snapshot_produce
+                .resolve_filter_deletes(row_filter, self.case_sensitive)
+                .await?;
             let mut seen: HashSet<String> = resolved
                 .iter()
                 .map(|df| df.file_path().to_string())
@@ -3181,6 +3238,689 @@ mod tests {
             count_delete_manifests(&table).await,
             1,
             "the overwrite_files commit must carry the outstanding delete manifest forward (not drop it)"
+        );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the overwrite-by-row-filter binding (Java
+    // `OverwriteFiles.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`, DEFAULT TRUE).
+    //
+    // Same three-way pin as `delete_files`, on the `overwrite_by_row_filter` path: the minimal V3 schema is
+    // `x,y,z: long` partitioned by identity(x); a row filter on the WRONG-cased `X` binds only when case
+    // sensitivity is OFF.
+    //   (1) DEFAULT + correctly-cased `x` ⇒ binds and deletes (regression: behaves as today).
+    //   (2) case_sensitive(false) + wrong-cased `X` ⇒ binds case-insensitively and deletes x=0's file.
+    //   (3) DEFAULT / case_sensitive(true) + wrong-cased `X` ⇒ REJECTS at bind (the flag is load-bearing).
+    // Mutation: ignore the flag (always true) ⇒ (2) fails to bind; hard-code false ⇒ (3) stops rejecting.
+    // ============================================================================================
+
+    /// REGRESSION PIN (default unchanged). With the flag UNSET (default `case_sensitive(true)`) a
+    /// CORRECTLY-cased `overwrite_by_row_filter(x == 0)` binds and deletes the x=0 file exactly as today.
+    /// Asserts the OBSERVABLE post-commit live set.
+    #[tokio::test]
+    async fn test_overwrite_row_filter_default_case_sensitive_correct_case_deletes() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("x").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx
+            .commit(&catalog)
+            .await
+            .expect("a correctly-cased x==0 overwrite filter binds and deletes under the default");
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "x==0 overwrite-by-row-filter deletes the x=0 file; the x=1 anchor survives"
+        );
+    }
+
+    /// LOAD-BEARING (false direction). With `case_sensitive(false)` a WRONG-cased
+    /// `overwrite_by_row_filter(X == 0)` (schema column is `x`) binds CASE-INSENSITIVELY and deletes the x=0
+    /// file. Risk pinned: a missed overwrite (stale data) when the engine binds case-insensitively. Mutation
+    /// `ignore the flag (always true)` ⇒ the wrong-case `X` fails to bind and this test errors. Asserts the
+    /// OBSERVABLE post-commit live set.
+    #[tokio::test]
+    async fn test_overwrite_row_filter_case_insensitive_wrong_case_deletes() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .case_sensitive(false)
+            .overwrite_by_row_filter(Reference::new("X").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "case_sensitive(false) binds the wrong-cased X to schema column x and deletes the x=0 file",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/keep.parquet".to_string()]),
+            "the wrong-cased X==0 overwrite deletes the x=0 file under case-insensitive resolution"
+        );
+    }
+
+    /// THE BOUNDARY (true direction — proves the flag is load-bearing). With the DEFAULT (flag unset =
+    /// `case_sensitive(true)`), a WRONG-cased `overwrite_by_row_filter(X == 0)` must REJECT at bind and leave
+    /// the table untouched. Risk pinned: a wrongly-matched bind, and the both-direction guard against (2).
+    /// Mutation `hard-code false` ⇒ the wrong-case `X` binds and this rejection test fails. Asserts the
+    /// OBSERVABLE result: the commit errors and the live set is unchanged.
+    #[tokio::test]
+    async fn test_overwrite_row_filter_default_case_sensitive_wrong_case_rejects() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/del.parquet", 0),
+            data_file("test/keep.parquet", 1),
+        ])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("X").equal_to(Datum::long(0)));
+        let tx = action.apply(tx).unwrap();
+        let error = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased X must NOT bind under the default (case-sensitive) and must reject",
+        );
+
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_file_paths(&reloaded).await,
+            HashSet::from([
+                "test/del.parquet".to_string(),
+                "test/keep.parquet".to_string()
+            ]),
+            "the rejected case-sensitive bind deleted nothing: both files survive"
+        );
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the SHARED `validate_no_new_deletes_for_data_files` conflict-filter bind
+    // reached via OverwriteFiles Branch B (Java `BaseOverwriteFiles.validate` →
+    // `validateNoNewDeletesForDataFiles(deletedDataFiles, dataFilter)` →
+    // `DeleteFileIndex.Builder.caseSensitive(isCaseSensitive())`). This is the SECOND consumer of the shared
+    // helper (RowDelta's `remove_data_files` is the first); the row-filter tests above bind through
+    // `resolve_filter_deletes`, NOT this helper. Without these two pins, hard-coding the OverwriteFiles
+    // Branch-B caller-side bind to case-sensitive `true` fails NO overwrite test (the blind spot the
+    // reviewer's mutation found, 2026-06-13). Discriminator = the OBSERVABLE error message:
+    //   - case_sensitive(false) + wrong-cased `Y` ⇒ binds ⇒ the concurrent position delete applies to the
+    //     removed file A ⇒ "found new delete for replaced data file".
+    //   - DEFAULT (case-sensitive) + wrong-cased `Y` ⇒ the bind FAILS ⇒ "Field Y not found".
+    // Mutation `hard-code this caller-side bind to true` ⇒ the false-direction test sees "Field Y not found"
+    // instead of the replaced-data-file conflict and FAILS.
+    // ============================================================================================
+
+    /// LOAD-BEARING (false direction) — pins the OverwriteFiles Branch-B conflict-filter bind to the action's
+    /// case-sensitivity. `case_sensitive(false)` + a WRONG-cased `conflict_detection_filter(Y >= 50)` (schema
+    /// column is `y`), removing A via `delete_data_files`, with `validate_no_conflicting_deletes()`, while a
+    /// concurrent commit lands a position delete applying to A ⇒ the filter binds CASE-INSENSITIVELY and the
+    /// removed-data-file conflict REJECTS. Risk pinned: the case-sensitivity flag being dropped on the
+    /// OverwriteFiles consumer of the shared helper (Java threads `isCaseSensitive()` into its
+    /// `DeleteFileIndex` bind) — a dropped flag would bind case-sensitively, fail on the wrong-cased `Y`, and
+    /// surface a BIND error instead of the conflict.
+    #[tokio::test]
+    async fn test_overwrite_branch_b_case_insensitive_wrong_case_detects_conflict() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![a.clone()]).await;
+
+        // Remove A with a WRONG-cased conflict filter; case_sensitive(false) ⇒ binds case-insensitively.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .add_file(data_file("test/b.parquet", 0))
+            .case_sensitive(false)
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit: a position delete in A's partition (x=0), seq > start ⇒ applies to removed A.
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased Y; the removed-data-file conflict must fire",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message()
+                .contains("found new delete for replaced data file"),
+            "the wrong-cased Y must bind case-insensitively and the removed-data-file conflict (not a bind \
+             error) must fire, got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction) — proves the OverwriteFiles Branch-B bind honors the case-sensitive
+    /// DEFAULT. DEFAULT (`case_sensitive(true)`) + the same WRONG-cased `conflict_detection_filter(Y >= 50)`
+    /// ⇒ the bind FAILS, so the commit errors with "Field Y not found" — NOT the removed-data-file conflict.
+    /// Risk pinned: the both-direction guard (a default flip to case-insensitive would bind `Y` and surface
+    /// the conflict instead). Mutation `hard-code this caller-side bind to false` ⇒ `Y` binds and this test
+    /// sees the conflict message and fails.
+    #[tokio::test]
+    async fn test_overwrite_branch_b_default_case_sensitive_wrong_case_fails_to_bind() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let a = data_file("test/a.parquet", 0);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![a.clone()]).await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `Y` ⇒ the Branch-B bind must fail.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_data_files(vec![a])
+            .add_file(data_file("test/b.parquet", 0))
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased Y must NOT bind under the default in Branch B; the validate must error",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field Y not found"),
+            "the rejection must be a BIND failure on the wrong-cased Y, not the conflict, got: {}",
+            err.message()
+        );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the `check_added_files_match_overwrite_filter` StrictMetricsEvaluator
+    // row-filter bind (Java `BaseOverwriteFiles.validateAddedFilesMatchOverwriteFilter` →
+    // `new StrictMetricsEvaluator(base.schema(), rowFilter, isCaseSensitive())` — 1.10.0 bytecode). This is a
+    // DISTINCT binding site from `resolve_filter_deletes` (the row-filter delete path) and from Branch B: it
+    // is reached only when `validate_added_files_match_overwrite_filter()` is set AND an added file is not
+    // strictly inside the filter by partition alone, so the row filter is re-bound for the strict-metrics
+    // fallback. The existing `validate_added_files_match_filter_*` tests use correctly-cased columns and so
+    // never pinned the flag here; hard-coding this bind to case-sensitive `true` failed NO test (the second
+    // blind spot the reviewer's mutation found, 2026-06-13). Discriminator = the OBSERVABLE error message:
+    //   - case_sensitive(false) + wrong-cased `X` + an out-of-filter added file ⇒ binds ⇒ the strict check
+    //     fires ⇒ "Cannot append file with rows that do not match filter".
+    //   - DEFAULT (case-sensitive) + wrong-cased `X` ⇒ the StrictMetricsEvaluator bind FAILS ⇒ "Field X not
+    //     found".
+    // Mutation `hard-code this StrictMetricsEvaluator bind to true` ⇒ the false-direction test sees "Field X
+    // not found" instead of the does-not-match-filter rejection and FAILS.
+    // ============================================================================================
+
+    /// LOAD-BEARING (false direction) — pins the `check_added_files_match_overwrite_filter`
+    /// StrictMetricsEvaluator bind to the action's case-sensitivity. `case_sensitive(false)` + a WRONG-cased
+    /// `overwrite_by_row_filter(X == 0)` (schema column is `x`) + `validate_added_files_match_overwrite_filter()`
+    /// + an added file in partition x=1 (rows OUTSIDE the filter) ⇒ the row filter binds CASE-INSENSITIVELY,
+    /// the strict-metrics fallback fires, and the commit REJECTS with "Cannot append file with rows that do
+    /// not match filter". Risk pinned: the case-sensitivity flag being dropped on the StrictMetricsEvaluator
+    /// bind (Java threads `isCaseSensitive()` into its ctor) — a dropped flag would bind case-sensitively,
+    /// fail on the wrong-cased `X`, and surface a BIND error instead of the strict-match rejection.
+    #[tokio::test]
+    async fn test_overwrite_added_files_match_filter_case_insensitive_wrong_case_rejects_out_of_filter()
+     {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .case_sensitive(false)
+            .overwrite_by_row_filter(Reference::new("X").equal_to(Datum::long(0)))
+            // Added file in partition x=1 — its rows are OUTSIDE `X == 0`.
+            .add_file(data_file("test/out-of-filter.parquet", 1))
+            .validate_added_files_match_overwrite_filter();
+        let tx = action.apply(tx).unwrap();
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased X; the out-of-filter added file must be rejected",
+        );
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message()
+                .contains("Cannot append file with rows that do not match filter"),
+            "the wrong-cased X must bind case-insensitively and the strict-match check (not a bind error) \
+             must fire, got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction) — proves the `check_added_files_match_overwrite_filter` bind honors the
+    /// case-sensitive DEFAULT. DEFAULT (`case_sensitive(true)`) + the same WRONG-cased
+    /// `overwrite_by_row_filter(X == 0)` + `validate_added_files_match_overwrite_filter()` ⇒ the
+    /// StrictMetricsEvaluator's row-filter bind FAILS, so the commit errors with "Field X not found" — NOT
+    /// the strict-match rejection. Risk pinned: the both-direction guard. Mutation `hard-code this bind to
+    /// false` ⇒ `X` binds and this test sees the does-not-match-filter message and fails.
+    #[tokio::test]
+    async fn test_overwrite_added_files_match_filter_default_case_sensitive_wrong_case_fails_to_bind()
+     {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `X` ⇒ the StrictMetricsEvaluator bind fails.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("X").equal_to(Datum::long(0)))
+            .add_file(data_file("test/out-of-filter.parquet", 1))
+            .validate_added_files_match_overwrite_filter();
+        let tx = action.apply(tx).unwrap();
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased X must NOT bind under the default; the strict-match validate must error",
+        );
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field X not found"),
+            "the rejection must be a BIND failure on the wrong-cased X, not the strict-match check, got: {}",
+            err.message()
+        );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the SHARED `validate_no_conflicting_added_data_files` conflict-filter bind
+    // reached via OverwriteFiles `validateNoConflictingData` (Java `BaseOverwriteFiles.validate` →
+    // `validateNewDataFiles` → `MergingSnapshotProducer.validateAddedDataFiles` → the
+    // `InclusiveMetricsEvaluator` bind with `isCaseSensitive()`). This is the OverwriteFiles consumer of the
+    // shared data-file conflict helper (RowDelta's `validate_no_conflicting_data_files` is the other); the
+    // existing OverwriteFiles data-conflict tests above all use a correctly-cased `y`, so hard-coding THIS
+    // caller-side bind to case-sensitive `true` failed NO overwrite test (the blind spot the reviewer's
+    // mutation found, 2026-06-13). Discriminator = the OBSERVABLE error message:
+    //   - case_sensitive(false) + wrong-cased `Y` + a MATCHING concurrent file ⇒ binds case-insensitively ⇒
+    //     the data-file conflict fires ⇒ "Found conflicting files that can contain records matching".
+    //   - DEFAULT (case-sensitive) + wrong-cased `Y` ⇒ the bind FAILS ⇒ "Field Y not found".
+    // Mutation `hard-code this caller-side bind to true` ⇒ the false-direction test sees "Field Y not found"
+    // instead of the conflicting-files rejection and FAILS.
+    // ============================================================================================
+
+    /// LOAD-BEARING (false direction) — pins the OverwriteFiles `validateNoConflictingData` conflict-filter
+    /// bind to the action's case-sensitivity. `case_sensitive(false)` + a WRONG-cased
+    /// `conflict_detection_filter(Y >= 50)` (schema column is `y`) + `validate_no_conflicting_data()`, while a
+    /// concurrent `fast_append` lands a file whose `y` bounds `[60,70]` overlap the filter ⇒ the filter binds
+    /// CASE-INSENSITIVELY and the data-file conflict REJECTS. Risk pinned: the case-sensitivity flag being
+    /// dropped on the OverwriteFiles consumer of the shared helper (Java threads `isCaseSensitive()` into its
+    /// `InclusiveMetricsEvaluator` bind) — a dropped flag would bind case-sensitively, fail on the wrong-cased
+    /// `Y`, and surface a BIND error instead of the conflict.
+    #[tokio::test]
+    async fn test_overwrite_data_conflict_case_insensitive_wrong_case_detects_conflict() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) =
+            append_and_snapshot_id(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        // Overwrite delete A + add B; WRONG-cased conflict filter `Y >= 50`; case_sensitive(false) ⇒ binds.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_file("test/a.parquet")
+            .add_file(data_file("test/b.parquet", 0))
+            .case_sensitive(false)
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a file whose y bounds [60,70] overlap `y >= 50` (could match).
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/concurrent.parquet",
+            0,
+            60,
+            70,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased Y; the data-file conflict must fire",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("conflicting files"),
+            "the wrong-cased Y must bind case-insensitively and the data-file conflict (not a bind error) \
+             must fire, got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction) — proves the OverwriteFiles `validateNoConflictingData` bind honors the
+    /// case-sensitive DEFAULT. DEFAULT (`case_sensitive(true)`) + the same WRONG-cased
+    /// `conflict_detection_filter(Y >= 50)` ⇒ the bind FAILS, so the commit errors with "Field Y not found" —
+    /// NOT the data-file conflict. The concurrent file's `y` bounds `[10,20]` do NOT match `y >= 50`, so under
+    /// a (mutated) case-insensitive bind there would be NO conflict and the commit would succeed — the ONLY
+    /// thing that makes this error is the case-sensitive default failing to bind `Y`. Risk pinned: the
+    /// both-direction guard. Mutation `hard-code this bind to false` ⇒ `Y` binds, no conflict, the commit
+    /// SUCCEEDS, and this test (which requires an ERROR) fails.
+    #[tokio::test]
+    async fn test_overwrite_data_conflict_default_case_sensitive_wrong_case_fails_to_bind() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) =
+            append_and_snapshot_id(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `Y` ⇒ the conflict-filter bind must fail.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_file("test/a.parquet")
+            .add_file(data_file("test/b.parquet", 0))
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // A concurrent file whose y bounds [10,20] do NOT match `y >= 50`: under a CORRECT case-insensitive
+        // bind there would be NO conflict (commit would succeed). The only thing that makes this error is the
+        // case-SENSITIVE default failing to bind the wrong-cased `Y`.
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/concurrent.parquet",
+            0,
+            10,
+            20,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased Y must NOT bind under the default (case-sensitive); the validate must error",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field Y not found"),
+            "the rejection must be a BIND failure on the wrong-cased Y (not a conflict — the concurrent file \
+             does not match), got: {}",
+            err.message()
+        );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the OverwriteFiles BRANCH A delete-conflict binds (Java
+    // `BaseOverwriteFiles.validate` L168-172): when `overwrite_by_row_filter` is set, BOTH
+    // `validate_no_conflicting_added_delete_files(.., self.case_sensitive)` (the concurrent-ADDED-delete walk,
+    // line 628) AND `validate_deleted_data_files(.., self.case_sensitive)` (the concurrent-DELETED-data-file
+    // walk, line 635) bind the conflict filter with the action's case-sensitivity. The existing Branch-A tests
+    // all use a correctly-cased `y`, so hard-coding EITHER of these caller-side binds to case-sensitive `true`
+    // failed NO overwrite test (the blind spot the reviewer's mutation found, 2026-06-13).
+    //
+    // The two binds each fire only on a DIFFERENT concurrent set (each helper binds the filter lazily, ONLY
+    // when its walk finds a candidate file), so each needs its OWN test to pin it:
+    //   - line 628 (`validate_no_conflicting_added_delete_files`) binds only when a concurrent commit ADDED a
+    //     delete file ⇒ the `..._added_delete_file_...` test below (concurrent ADDED delete).
+    //   - line 635 (`validate_deleted_data_files`) binds only when a concurrent commit DELETED a data file ⇒
+    //     the `..._deleted_data_file_...` test below (concurrent DELETED data file; no added delete ⇒ line 628
+    //     short-circuits before binding, so this test alone does NOT pin 628 — hence the split).
+    // Discriminator (both tests) = the OBSERVABLE error message:
+    //   - case_sensitive(false) + wrong-cased `Y` ⇒ the relevant bind succeeds ⇒ the conflict fires.
+    //   - DEFAULT (case-sensitive) + wrong-cased `Y` ⇒ that bind FAILS ⇒ "Field Y not found".
+    // Mutation `hard-code the corresponding caller-side bind to true` ⇒ the matching false-direction test sees
+    // "Field Y not found" instead of its conflict message and FAILS.
+    // ============================================================================================
+
+    /// LOAD-BEARING (false direction) — pins the OverwriteFiles Branch-A `validate_no_conflicting_added_delete_files`
+    /// bind (line 628) to the action's case-sensitivity. `case_sensitive(false)` +
+    /// `overwrite_by_row_filter(y >= 50)` + a WRONG-cased `conflict_detection_filter(Y >= 50)` (the local
+    /// Branch-A `filter`, schema column is `y`) + `validate_no_conflicting_deletes()`, while a concurrent
+    /// `row_delta` ADDS a delete file whose `y` bounds `[60,70]` match the filter ⇒ the filter binds
+    /// CASE-INSENSITIVELY and the added-delete conflict REJECTS. Risk pinned: the case-sensitivity flag being
+    /// dropped on the line-628 caller-side bind — a dropped flag binds case-sensitively, fails on the
+    /// wrong-cased `Y`, and surfaces a BIND error instead of the conflict.
+    #[tokio::test]
+    async fn test_overwrite_branch_a_added_delete_file_case_insensitive_wrong_case_detects_conflict()
+     {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        // Seed `a` lies OUTSIDE the row filter (y bounds [0,10] < 50) so the row filter keeps it — the
+        // conflict is entirely about the CONCURRENT delete file, not the base.
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/a.parquet",
+            0,
+            0,
+            10,
+        )])
+        .await;
+
+        // Build the overwrite: row filter y >= 50 (gates Branch A on), a WRONG-cased conflict filter `Y >= 50`
+        // (the local Branch-A `filter`), deletes validation on, pinned to S0; case_sensitive(false) ⇒ binds.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)))
+            .add_file(data_file_with_y_bounds("test/b.parquet", 0, 80, 90))
+            .case_sensitive(false)
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): ADD a position-delete file whose y bounds [60,70] match `y >= 50` ⇒ the
+        // line-628 walk finds it and binds the wrong-cased `Y`.
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file_with_y_bounds(
+            "test/concurrent-del.parquet",
+            0,
+            60,
+            70,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased Y in the line-628 check; the added-delete conflict \
+             must fire",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message()
+                .contains("Found new conflicting delete files that can apply to records matching"),
+            "the wrong-cased Y must bind case-insensitively in the added-delete check and the conflict (not a \
+             bind error) must fire, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/concurrent-del.parquet"),
+            "the error must name the conflicting delete file, got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction) — proves the OverwriteFiles Branch-A line-628 bind honors the
+    /// case-sensitive DEFAULT. DEFAULT (`case_sensitive(true)`) + the same WRONG-cased
+    /// `conflict_detection_filter(Y >= 50)` ⇒ the line-628 bind FAILS, so the commit errors with "Field Y not
+    /// found" — NOT the added-delete conflict. Risk pinned: the both-direction guard. Mutation `hard-code the
+    /// line-628 bind to false` ⇒ `Y` binds and this test sees the conflict message and fails.
+    #[tokio::test]
+    async fn test_overwrite_branch_a_added_delete_file_default_case_sensitive_wrong_case_fails_to_bind()
+     {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/a.parquet",
+            0,
+            0,
+            10,
+        )])
+        .await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `Y` ⇒ the line-628 bind must fail.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)))
+            .add_file(data_file_with_y_bounds("test/b.parquet", 0, 80, 90))
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        let _concurrent = add_deletes(&catalog, &table, vec![position_delete_file_with_y_bounds(
+            "test/concurrent-del.parquet",
+            0,
+            60,
+            70,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased Y must NOT bind under the default in the line-628 check; the validate must error",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field Y not found"),
+            "the rejection must be a BIND failure on the wrong-cased Y, not the conflict, got: {}",
+            err.message()
+        );
+    }
+
+    /// LOAD-BEARING (false direction) — pins the OverwriteFiles Branch-A `validate_deleted_data_files` bind
+    /// (line 635) to the action's case-sensitivity. `case_sensitive(false)` +
+    /// `overwrite_by_row_filter(y >= 50)` + a WRONG-cased `conflict_detection_filter(Y >= 50)` (the local
+    /// Branch-A `filter`, schema column is `y`) + `validate_no_conflicting_deletes()`, while a concurrent
+    /// commit DELETES a data file whose `y` bounds `[60,70]` match the filter ⇒ the filter binds
+    /// CASE-INSENSITIVELY (the line-628 added-delete walk finds nothing and short-circuits; line 635 fires) and
+    /// the deleted-data-file conflict REJECTS. Risk pinned: the case-sensitivity flag being dropped on the
+    /// line-635 caller-side bind — a dropped flag binds case-sensitively, fails on the wrong-cased `Y`, and
+    /// surfaces a BIND error instead of the conflict.
+    #[tokio::test]
+    async fn test_overwrite_branch_a_deleted_data_file_case_insensitive_wrong_case_detects_conflict()
+     {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // Seed `a` carries y bounds [60,70] — INSIDE the row filter `y >= 50`. When a concurrent commit
+        // deletes it, its tombstone (with these bounds) is what `validate_deleted_data_files` flags.
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![
+            data_file_with_y_bounds("test/a.parquet", 0, 60, 70),
+            // A second file the overwrite can keep, so the base is non-trivial.
+            data_file_with_y_bounds("test/keep.parquet", 1, 0, 10),
+        ])
+        .await;
+
+        // Build the overwrite: row filter y >= 50 (gates Branch A on), a WRONG-cased conflict filter `Y >= 50`
+        // (the local Branch-A `filter`), deletes validation on, pinned to S0. No explicit delete_data_files ⇒
+        // Branch B inert; only Branch A's two checks run.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)))
+            .add_file(data_file_with_y_bounds("test/b.parquet", 0, 80, 90))
+            .case_sensitive(false)
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): DELETE the data file `a` (records Operation::Delete, leaving a tombstone for
+        // `a` carrying its y bounds [60,70]). No ADDED delete file ⇒ the line-628 added-delete walk finds
+        // nothing and short-circuits WITHOUT binding, so the line-635 `validate_deleted_data_files` bind is
+        // what resolves the wrong-cased `Y` and fires on the deleted `a`.
+        let concurrent_tx = Transaction::new(&table);
+        let concurrent_action = concurrent_tx
+            .overwrite_files()
+            .delete_file("test/a.parquet");
+        let concurrent_tx = concurrent_action.apply(concurrent_tx).unwrap();
+        let _concurrent = concurrent_tx.commit(&catalog).await.unwrap();
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased Y in the line-635 check; the deleted-data-file \
+             conflict must fire",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message()
+                .contains("Found conflicting deleted files that can contain records matching"),
+            "the wrong-cased Y must bind case-insensitively in the deleted-data-file check and the conflict \
+             (not a bind error) must fire, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/a.parquet"),
+            "the error must name the concurrently-deleted data file, got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction) — proves the OverwriteFiles Branch-A line-635 bind honors the
+    /// case-sensitive DEFAULT. DEFAULT (`case_sensitive(true)`) + the same WRONG-cased
+    /// `conflict_detection_filter(Y >= 50)` ⇒ with only a concurrent DELETED data file (line 628's added-delete
+    /// walk short-circuits without binding), the line-635 `validate_deleted_data_files` bind FAILS, so the
+    /// commit errors with "Field Y not found" — NOT the deleted-data-file conflict. Risk pinned: the
+    /// both-direction guard. Mutation `hard-code the line-635 bind to false` ⇒ `Y` binds case-insensitively
+    /// and this test sees the conflict message and fails.
+    #[tokio::test]
+    async fn test_overwrite_branch_a_deleted_data_file_default_case_sensitive_wrong_case_fails_to_bind()
+     {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![
+            data_file_with_y_bounds("test/a.parquet", 0, 60, 70),
+            data_file_with_y_bounds("test/keep.parquet", 1, 0, 10),
+        ])
+        .await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `Y` ⇒ the Branch-A bind must fail.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)))
+            .add_file(data_file_with_y_bounds("test/b.parquet", 0, 80, 90))
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        let concurrent_tx = Transaction::new(&table);
+        let concurrent_action = concurrent_tx
+            .overwrite_files()
+            .delete_file("test/a.parquet");
+        let concurrent_tx = concurrent_action.apply(concurrent_tx).unwrap();
+        let _concurrent = concurrent_tx.commit(&catalog).await.unwrap();
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased Y must NOT bind under the default in Branch A; the validate must error",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field Y not found"),
+            "the rejection must be a BIND failure on the wrong-cased Y, not the conflict, got: {}",
+            err.message()
         );
     }
 }

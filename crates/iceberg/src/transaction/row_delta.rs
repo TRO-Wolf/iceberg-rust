@@ -260,6 +260,12 @@ pub struct RowDeltaAction {
     /// for one file. Each file must be `PositionDeletes` or `EqualityDeletes` content (a `Data` file is
     /// rejected — Java `removeDeletes` takes a `DeleteFile`); repeated calls ACCUMULATE.
     removed_delete_files: Vec<DataFile>,
+    /// Column-name resolution case sensitivity for binding the [`Self::conflict_detection_filter`] in the
+    /// concurrent-commit validations (Java `MergingSnapshotProducer.caseSensitive`). DEFAULTS to `true` (the
+    /// Iceberg/Java default — the `MergingSnapshotProducer` ctor sets `caseSensitive = true`, 1.10.0
+    /// bytecode). `case_sensitive(false)` switches every filter binding this action's `validate` performs to
+    /// case-insensitive column resolution. See [`RowDeltaAction::case_sensitive`].
+    case_sensitive: bool,
 }
 
 impl RowDeltaAction {
@@ -278,6 +284,8 @@ impl RowDeltaAction {
             validate_deleted_files: false,
             removed_data_files: vec![],
             removed_delete_files: vec![],
+            // Java `MergingSnapshotProducer` ctor default `caseSensitive = true` (1.10.0 bytecode).
+            case_sensitive: true,
         }
     }
 
@@ -421,6 +429,24 @@ impl RowDeltaAction {
         self
     }
 
+    /// Set whether the [`Self::conflict_detection_filter`] resolves column names CASE-SENSITIVELY in the
+    /// concurrent-commit validations (Java `RowDelta.caseSensitive(boolean)` →
+    /// `MergingSnapshotProducer.caseSensitive`).
+    ///
+    /// DEFAULT (this method NOT called) = `true`, the Iceberg/Java default (1.10.0 bytecode: the
+    /// `MergingSnapshotProducer` ctor sets `caseSensitive = true`). With `true`, a column named `X` in the
+    /// conflict-detection filter binds only to a schema column named exactly `X`; a wrong-cased reference
+    /// (filter on `X` for a schema column `x`) fails to bind and the commit errors. Calling
+    /// `case_sensitive(false)` switches to case-INSENSITIVE column resolution for EVERY filter this action's
+    /// `validate` binds: the `validateNoConflictingDataFiles` / `validateNoConflictingDeleteFiles` checks and
+    /// the `validateAddedDVs` metrics narrowing (Java threads the one `caseSensitive` field into all of
+    /// them). Has no effect when no `conflict_detection_filter` is set (the `AlwaysTrue` default binds no
+    /// column names).
+    pub fn case_sensitive(mut self, case_sensitive: bool) -> Self {
+        self.case_sensitive = case_sensitive;
+        self
+    }
+
     /// Override the snapshot from which concurrent-commit conflict validation starts (Java
     /// `RowDelta.validateFromSnapshot(long)`). By default the validation uses the transaction's starting
     /// snapshot (the table head when [`crate::transaction::Transaction::new`] was called); this lets the
@@ -541,6 +567,7 @@ impl RowDeltaAction {
         current: &Table,
         effective_start: Option<i64>,
         conflict_filter: Option<&Predicate>,
+        case_sensitive: bool,
     ) -> Result<()> {
         // Java L831: skip if this operation adds no DVs (`newDVRefs.isEmpty()`).
         let added_dv_referenced = self.added_dvs_by_referenced_file()?;
@@ -562,7 +589,7 @@ impl RowDeltaAction {
             Some(filter) => Some(
                 filter
                     .clone()
-                    .bind(current.metadata().current_schema().clone(), true)?,
+                    .bind(current.metadata().current_schema().clone(), case_sensitive)?,
             ),
             None => None,
         };
@@ -950,8 +977,10 @@ impl TransactionAction for RowDeltaAction {
     /// `startingSequenceNumber` refinement (see [`validate_no_conflicting_added_delete_files`]) — a
     /// conservative over-scan that can only over-reject, never under-reject.
     ///
-    /// **Case sensitivity:** Java binds the conflict filter with `isCaseSensitive()`. This action has no such
-    /// field, so the filter is bound case-sensitive (`true`) — the Iceberg/Java default for column resolution.
+    /// **Case sensitivity:** Java binds the conflict filter with `isCaseSensitive()`. Every conflict
+    /// validation here threads this action's [`Self::case_sensitive`] flag (default `true`, the Iceberg/Java
+    /// default) into the shared helpers and `validateAddedDVs`, so a `case_sensitive(false)` row delta
+    /// resolves the conflict filter's column names case-insensitively just as Java does.
     async fn validate(
         self: Arc<Self>,
         starting_snapshot_id: Option<i64>,
@@ -970,7 +999,7 @@ impl TransactionAction for RowDeltaAction {
                 current,
                 effective_start,
                 conflict_filter,
-                true,
+                self.case_sensitive,
             )
             .await?;
         }
@@ -986,10 +1015,21 @@ impl TransactionAction for RowDeltaAction {
             //     only when `remove_data_files`/`remove_rows` supplied removed files; reuses the same
             //     `effective_start` + `conflict_filter` (no refreshed-head re-read). A no-op on a V1 table.
             if !self.removed_data_files.is_empty() {
+                // Bind the conflict filter HERE with this action's `case_sensitive(bool)` (Java
+                // `DeleteFileIndex.Builder.caseSensitive(isCaseSensitive())`) and pass the bound predicate to
+                // the SHARED helper — keeping its signature stable across the actions (RewriteFiles passes
+                // `None`). `None` filter ⇒ no metrics narrowing (every concurrently-added delete is a candidate).
+                let bound_conflict_filter = match conflict_filter {
+                    Some(filter) => Some(filter.clone().bind(
+                        current.metadata().current_schema().clone(),
+                        self.case_sensitive,
+                    )?),
+                    None => None,
+                };
                 validate_no_new_deletes_for_data_files(
                     current,
                     effective_start,
-                    conflict_filter,
+                    bound_conflict_filter.as_ref(),
                     &self.removed_data_files,
                     false,
                 )
@@ -1003,7 +1043,7 @@ impl TransactionAction for RowDeltaAction {
                 current,
                 effective_start,
                 conflict_filter,
-                true,
+                self.case_sensitive,
             )
             .await?;
         }
@@ -1037,8 +1077,13 @@ impl TransactionAction for RowDeltaAction {
         // 5. Concurrently-added deletion-vector conflict (Java `validateAddedDVs`, L172 / L825-895). Called
         //    UNCONDITIONALLY (NOT behind any flag, unlike steps 1-3) but SELF-SKIPS when this row delta adds no
         //    DVs. Reuses the same `effective_start` + `conflict_filter`.
-        self.validate_added_dvs(current, effective_start, conflict_filter)
-            .await?;
+        self.validate_added_dvs(
+            current,
+            effective_start,
+            conflict_filter,
+            self.case_sensitive,
+        )
+        .await?;
 
         Ok(())
     }
@@ -6521,5 +6566,536 @@ mod tests {
         }
         assert!(a_tombstoned, "A must be a DATA-manifest tombstone");
         assert!(b_live, "B must remain live in the DATA manifest");
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the conflict-detection-filter binding (Java
+    // `RowDelta.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`, DEFAULT TRUE).
+    //
+    // RowDelta has no delete-by-row-filter; case sensitivity affects the CONFLICT-DETECTION FILTER binding in
+    // `validateNoConflictingDataFiles`. The minimal V3 schema is `x,y,z: long`; a conflict filter on the
+    // WRONG-cased `Y` (schema column is `y`) binds only when case sensitivity is OFF. The discriminator is
+    // chosen so the OBSERVABLE outcome (a CONFLICT rejection vs a BIND error vs a SUCCESSFUL commit)
+    // distinguishes the flag value:
+    //   (1) DEFAULT + correctly-cased `y` + a MATCHING concurrent file ⇒ binds, conflict, rejects with
+    //       "conflicting files" (regression: behaves as today).
+    //   (2) case_sensitive(false) + wrong-cased `Y` + a MATCHING concurrent file ⇒ binds case-insensitively,
+    //       conflict, rejects with "conflicting files".
+    //   (3) DEFAULT / case_sensitive(true) + wrong-cased `Y` + a NON-matching concurrent file ⇒ the bind
+    //       FAILS ("Field Y not found"), so the commit errors at bind — NOT a successful commit.
+    // Mutation `ignore the flag (always true)` ⇒ (2) bind-fails (message is "Field Y not found", not
+    // "conflicting files"). Mutation `hard-code false` ⇒ (3) binds case-insensitively, no conflict, and the
+    // commit SUCCEEDS (the rejection disappears).
+    // ============================================================================================
+
+    /// REGRESSION PIN (default unchanged). DEFAULT (`case_sensitive(true)`) + correctly-cased conflict filter
+    /// `y >= 50` + a concurrent file whose `y` bounds `[60,70]` match ⇒ the row delta REJECTS with the
+    /// "conflicting files" message exactly as today. Asserts the OBSERVABLE rejection (a conflict, named).
+    #[tokio::test]
+    async fn test_row_delta_conflict_filter_default_case_sensitive_correct_case_rejects() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_delete_file("test/a-pos-del.parquet", 0)])
+            .conflict_detection_filter(
+                Reference::new("y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data_files();
+        let tx = action.apply(tx).unwrap();
+
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/concurrent.parquet",
+            0,
+            60,
+            70,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "row delta must fail: a concurrent file matches the correctly-cased conflict filter",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("conflicting files"),
+            "the correctly-cased conflict filter must bind and detect the conflict, got: {}",
+            err.message()
+        );
+    }
+
+    /// LOAD-BEARING (false direction). `case_sensitive(false)` + WRONG-cased conflict filter `Y >= 50`
+    /// (schema column is `y`) + a concurrent file whose `y` bounds `[60,70]` match ⇒ the filter binds
+    /// CASE-INSENSITIVELY, the conflict IS detected, and the row delta REJECTS with "conflicting files".
+    /// Risk pinned: a conflict-detection filter that silently fails to bind (so the serializable check never
+    /// fires) under case-insensitivity. Mutation `ignore the flag (always true)` ⇒ the wrong-cased `Y` fails
+    /// to bind and the error becomes "Field Y not found", NOT "conflicting files" — this test asserts the
+    /// CONFLICT message, so it fails under that mutation. Asserts the OBSERVABLE rejection reason.
+    #[tokio::test]
+    async fn test_row_delta_conflict_filter_case_insensitive_wrong_case_detects_conflict() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_delete_file("test/a-pos-del.parquet", 0)])
+            .case_sensitive(false)
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data_files();
+        let tx = action.apply(tx).unwrap();
+
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/concurrent.parquet",
+            0,
+            60,
+            70,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased Y and the conflict check must still fire",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("conflicting files"),
+            "the wrong-cased Y must bind case-insensitively and detect the CONFLICT (not a bind error), \
+             got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction — proves the flag is load-bearing). DEFAULT (`case_sensitive(true)`) +
+    /// WRONG-cased conflict filter `Y >= 50` + a concurrent file whose `y` bounds `[10,20]` do NOT match the
+    /// filter. Under the (correct) case-sensitive default the filter `Y` FAILS to bind, so the commit errors
+    /// with "Field Y not found" — NOT a successful commit. Risk pinned: the both-direction guard. Mutation
+    /// `hard-code false` ⇒ `Y` binds case-insensitively, the non-matching concurrent file is no conflict, and
+    /// the commit SUCCEEDS — this test (which requires an ERROR) then fails. Asserts the OBSERVABLE result: a
+    /// bind error, and that the row delta did NOT commit.
+    #[tokio::test]
+    async fn test_row_delta_conflict_filter_default_case_sensitive_wrong_case_fails_to_bind() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_delete_file("test/a-pos-del.parquet", 0)])
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_data_files();
+        let tx = action.apply(tx).unwrap();
+
+        // A concurrent file whose y bounds [10,20] do NOT match `y >= 50`: under a CORRECT case-insensitive
+        // bind there would be NO conflict (commit would succeed). The only thing that makes this error is the
+        // case-SENSITIVE default failing to bind the wrong-cased `Y`.
+        let _concurrent = append_files(&catalog, &table, vec![data_file_with_y_bounds(
+            "test/concurrent.parquet",
+            0,
+            10,
+            20,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased Y must NOT bind under the default (case-sensitive); the validate must error",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field Y not found"),
+            "the rejection must be a BIND failure on the wrong-cased Y (not a conflict — the concurrent file \
+             does not match), got: {}",
+            err.message()
+        );
+
+        // The row delta did NOT commit: the catalog head is still S0's append, no DELETE manifest landed.
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        let manifest_list = reloaded
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .load_manifest_list(reloaded.file_io(), reloaded.metadata())
+            .await
+            .unwrap();
+        assert!(
+            !manifest_list
+                .entries()
+                .iter()
+                .any(|m| m.content == ManifestContentType::Deletes),
+            "the rejected row delta must not have committed a DELETE manifest"
+        );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the ALWAYS-ON `validateAddedDVs` conflict-filter binding (Java
+    // `MergingSnapshotProducer.validateAddedDVs` → the `conflictDetectionFilter` scan-narrowing bind).
+    //
+    // This is a SECOND row_delta binding site, distinct from `validateNoConflictingDataFiles` above: it is
+    // reached only when (a) this row delta adds a DV, (b) a concurrent commit added a DV-candidate delete
+    // file, and (c) a `conflict_detection_filter` is set. The three tests above never reach it (they add a
+    // position-delete and the concurrent commit adds a DATA file). Without this pin, hard-coding the bind at
+    // `validate_added_dvs` to case-sensitive `true` fails NO test (the blind spot the reviewer's mutation
+    // found). The discriminator is the OBSERVABLE error message:
+    //   - DEFAULT (case-sensitive) + wrong-cased `Y` ⇒ the bind FAILS ⇒ "Field Y not found".
+    //   - case_sensitive(false) + wrong-cased `Y` ⇒ the bind succeeds ⇒ the same-referenced-file DV
+    //     collision fires ⇒ "Found concurrently added DV for ...".
+    // Mutation `hard-code the validate_added_dvs bind to true` ⇒ the false-direction test below sees
+    // "Field Y not found" instead of the DV-conflict message and FAILS.
+    // ============================================================================================
+
+    /// LOAD-BEARING (false direction) — pins the `validateAddedDVs` conflict-filter bind to the action's
+    /// case-sensitivity. `case_sensitive(false)` + a WRONG-cased `conflict_detection_filter(Y >= 50)`
+    /// (schema column is `y`) ⇒ the filter binds CASE-INSENSITIVELY inside `validate_added_dvs`, so the
+    /// always-on DV check reaches the referenced-file collision and REJECTS with the DV-conflict message.
+    /// Risk pinned: the case-sensitivity flag being dropped on the DV-validation path (Java threads the one
+    /// `caseSensitive` field into `validateAddedDVs` too) — a dropped flag would bind case-sensitively,
+    /// fail on the wrong-cased `Y`, and surface a BIND error instead of the conflict.
+    #[tokio::test]
+    async fn test_row_delta_validate_added_dvs_case_insensitive_wrong_case_detects_conflict() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+
+        // This row delta adds a DV for A with a WRONG-cased conflict filter; case_sensitive(false) ⇒ binds.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_dv_file(
+                "test/a-dv.puffin",
+                0,
+                "test/a.parquet",
+            )])
+            .case_sensitive(false)
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0);
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit: a row delta adding a DV for the SAME A (the referenced-file collision).
+        let _concurrent = commit_concurrent_dvs(&catalog, &table, vec![synthetic_dv_file(
+            "test/a-dv-concurrent.puffin",
+            0,
+            "test/a.parquet",
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased Y in validate_added_dvs; the DV conflict must fire",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Found concurrently added DV for"),
+            "the wrong-cased Y must bind case-insensitively and the DV-conflict (not a bind error) must \
+             fire, got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction) — proves the `validateAddedDVs` bind honors the case-sensitive DEFAULT.
+    /// DEFAULT (`case_sensitive(true)`) + the same WRONG-cased `conflict_detection_filter(Y >= 50)` ⇒ the
+    /// bind inside `validate_added_dvs` FAILS, so the commit errors with "Field Y not found" — NOT the
+    /// DV-conflict message. Risk pinned: the both-direction guard (a default flip to case-insensitive would
+    /// bind `Y` and surface the conflict instead). Mutation `hard-code the bind to false` ⇒ this test sees
+    /// the DV-conflict message and fails.
+    #[tokio::test]
+    async fn test_row_delta_validate_added_dvs_default_case_sensitive_wrong_case_fails_to_bind() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `Y` ⇒ the validate_added_dvs bind must fail.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_dv_file(
+                "test/a-dv.puffin",
+                0,
+                "test/a.parquet",
+            )])
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0);
+        let tx = action.apply(tx).unwrap();
+
+        let _concurrent = commit_concurrent_dvs(&catalog, &table, vec![synthetic_dv_file(
+            "test/a-dv-concurrent.puffin",
+            0,
+            "test/a.parquet",
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased Y must NOT bind under the default in validate_added_dvs; the validate must error",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field Y not found"),
+            "the rejection must be a BIND failure on the wrong-cased Y, not the DV conflict, got: {}",
+            err.message()
+        );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the SHARED `validate_no_new_deletes_for_data_files` conflict-filter bind
+    // (Java `MergingSnapshotProducer.validateNoNewDeletesForDataFiles` → the `dataFilter`
+    // `DeleteFileIndex.Builder.caseSensitive(isCaseSensitive())` bind). Reached via RowDelta's
+    // `remove_data_files` removed-data-files sub-check (2a) AND by OverwriteFiles Branch B + RewriteFiles —
+    // a THIRD distinct binding site. The conflict-filter tests above go through
+    // `validate_no_conflicting_added_data_files`/`first_conflicting_file`, and the DV tests through
+    // `validate_added_dvs`; NEITHER reaches this helper's bind (those fixtures set no removed_data_files).
+    // Without these pins, hard-coding this helper's bind to case-sensitive `true` fails NO test (the second
+    // blind spot the reviewer's mutation found). Discriminator = the OBSERVABLE error message:
+    //   - case_sensitive(false) + wrong-cased `Y` ⇒ binds ⇒ the concurrent position delete applies to the
+    //     removed file A ⇒ "found new delete for replaced data file".
+    //   - DEFAULT (case-sensitive) + wrong-cased `Y` ⇒ the bind FAILS ⇒ "Field Y not found".
+    // Mutation `hard-code this helper's bind to true` ⇒ the false-direction test sees "Field Y not found"
+    // instead of the replaced-data-file conflict and FAILS.
+    // ============================================================================================
+
+    /// LOAD-BEARING (false direction) — pins the `validate_no_new_deletes_for_data_files` conflict-filter
+    /// bind (the removed-data-files sub-check) to the action's case-sensitivity. `case_sensitive(false)` +
+    /// a WRONG-cased `conflict_detection_filter(Y >= 50)` (schema column is `y`), removing A, while a
+    /// concurrent commit lands a position delete applying to A ⇒ the filter binds CASE-INSENSITIVELY and the
+    /// removed-data-file conflict REJECTS. Risk pinned: the case-sensitivity flag being dropped on this
+    /// shared helper (Java threads `isCaseSensitive()` into its `DeleteFileIndex` bind) — a dropped flag
+    /// would bind case-sensitively, fail on the wrong-cased `Y`, and surface a BIND error instead.
+    #[tokio::test]
+    async fn test_row_delta_removed_data_files_case_insensitive_wrong_case_detects_conflict() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let a = synthetic_data_file("test/a.parquet", 0);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![a.clone()]).await;
+
+        // Remove A with a WRONG-cased conflict filter; case_sensitive(false) ⇒ binds case-insensitively.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_delete_file("test/a-pos-del.parquet", 0)])
+            .remove_data_files(vec![a])
+            .case_sensitive(false)
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_delete_files();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit: a position delete in A's partition (x=0), seq > start ⇒ applies to removed A.
+        let _concurrent = commit_concurrent_deletes(&catalog, &table, vec![synthetic_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased Y; the removed-data-file conflict must fire",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message()
+                .contains("found new delete for replaced data file"),
+            "the wrong-cased Y must bind case-insensitively and the removed-data-file conflict (not a bind \
+             error) must fire, got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction) — proves this shared helper's bind honors the case-sensitive DEFAULT.
+    /// DEFAULT (`case_sensitive(true)`) + the same WRONG-cased `conflict_detection_filter(Y >= 50)` ⇒ the
+    /// bind FAILS, so the commit errors with "Field Y not found" — NOT the removed-data-file conflict. Risk
+    /// pinned: the both-direction guard. Mutation `hard-code this helper's bind to false` ⇒ `Y` binds and
+    /// this test sees the conflict message and fails.
+    #[tokio::test]
+    async fn test_row_delta_removed_data_files_default_case_sensitive_wrong_case_fails_to_bind() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let a = synthetic_data_file("test/a.parquet", 0);
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![a.clone()]).await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `Y` ⇒ the helper's bind must fail.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_delete_file("test/a-pos-del.parquet", 0)])
+            .remove_data_files(vec![a])
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_delete_files();
+        let tx = action.apply(tx).unwrap();
+
+        let _concurrent = commit_concurrent_deletes(&catalog, &table, vec![synthetic_delete_file(
+            "test/pos-del.parquet",
+            0,
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased Y must NOT bind under the default in the shared helper; the validate must error",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field Y not found"),
+            "the rejection must be a BIND failure on the wrong-cased Y, not the conflict, got: {}",
+            err.message()
+        );
+    }
+
+    // ============================================================================================
+    // caseSensitive(boolean) on the RowDelta 2b filter-based delete-conflict bind (Java
+    // `BaseRowDelta.validate` L167 → `validateNoNewDeleteFiles` → the shared
+    // `validate_no_conflicting_added_delete_files(.., self.case_sensitive)` DELETE-manifest walk + per-file
+    // inclusive-metrics bind with `isCaseSensitive()`). This is the RowDelta consumer of the shared
+    // added-delete helper that runs PURELY on the conflict filter (no removed data files): with NO
+    // `remove_data_files` the 2a removed-data-files sub-check is skipped, and with NO
+    // `validate_no_conflicting_data_files` the step-1 data-file check is skipped, so the 2b call at
+    // `validate.rs` ~L1042 is the FIRST (and only) bind of the conflict filter. The existing 2b tests above
+    // all use a correctly-cased `y`, so hard-coding THIS caller-side bind to case-sensitive `true` failed NO
+    // row-delta test (the blind spot the reviewer's mutation found, 2026-06-13). Discriminator = the
+    // OBSERVABLE error message:
+    //   - case_sensitive(false) + wrong-cased `Y` + a MATCHING concurrent ADDED delete ⇒ binds
+    //     case-insensitively ⇒ the delete-file conflict fires ⇒ "conflicting delete files".
+    //   - DEFAULT (case-sensitive) + wrong-cased `Y` ⇒ the bind FAILS ⇒ "Field Y not found".
+    // Mutation `hard-code this 2b caller-side bind to true` ⇒ the false-direction test sees "Field Y not
+    // found" instead of the conflicting-delete-files rejection and FAILS.
+    // ============================================================================================
+
+    /// LOAD-BEARING (false direction) — pins the RowDelta 2b filter-based delete-conflict bind to the action's
+    /// case-sensitivity. `case_sensitive(false)` + a WRONG-cased `conflict_detection_filter(Y >= 50)` (schema
+    /// column is `y`) + `validate_no_conflicting_delete_files()` (and NO `remove_data_files`, so the 2a
+    /// sub-check is skipped and 2b is the first bind), while a concurrent `row_delta` ADDS a DELETE file whose
+    /// `y` bounds `[60,70]` match the filter ⇒ the filter binds CASE-INSENSITIVELY and the delete-file
+    /// conflict REJECTS. Risk pinned: the case-sensitivity flag being dropped on the RowDelta 2b consumer of
+    /// the shared helper (Java threads `isCaseSensitive()` into its `InclusiveMetricsEvaluator` bind) — a
+    /// dropped flag would bind case-sensitively, fail on the wrong-cased `Y`, and surface a BIND error.
+    #[tokio::test]
+    async fn test_row_delta_delete_conflict_case_insensitive_wrong_case_detects_conflict() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+
+        // WRONG-cased conflict filter `Y >= 50`; case_sensitive(false) ⇒ binds case-insensitively. NO
+        // remove_data_files ⇒ the 2b filter-based check is the first (and only) bind of the conflict filter.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_delete_file("test/my-del.parquet", 0)])
+            .case_sensitive(false)
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_delete_files();
+        let tx = action.apply(tx).unwrap();
+
+        // CONCURRENT commit (S1): a row delta adding a DELETE file whose y bounds [60,70] overlap `y >= 50`.
+        let _concurrent =
+            commit_concurrent_deletes(&catalog, &table, vec![delete_file_with_y_bounds(
+                "test/concurrent-del.parquet",
+                0,
+                60,
+                70,
+            )])
+            .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "case_sensitive(false) binds the wrong-cased Y in the 2b check; the delete-file conflict must fire",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("conflicting delete files"),
+            "the wrong-cased Y must bind case-insensitively and the DELETE-file conflict (not a bind error) \
+             must fire, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/concurrent-del.parquet"),
+            "the error must name the conflicting DELETE file, got: {}",
+            err.message()
+        );
+    }
+
+    /// THE BOUNDARY (true direction) — proves the RowDelta 2b filter-based delete-conflict bind honors the
+    /// case-sensitive DEFAULT. DEFAULT (`case_sensitive(true)`) + the same WRONG-cased
+    /// `conflict_detection_filter(Y >= 50)` ⇒ the 2b bind FAILS, so the commit errors with "Field Y not
+    /// found" — NOT the delete-file conflict. Risk pinned: the both-direction guard. Mutation `hard-code this
+    /// 2b bind to false` ⇒ `Y` binds case-insensitively and this test sees the conflict message and fails.
+    #[tokio::test]
+    async fn test_row_delta_delete_conflict_default_case_sensitive_wrong_case_fails_to_bind() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let (table, s0) = append_and_snapshot_id(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+
+        // No case_sensitive(..) call ⇒ default true; WRONG-cased `Y` ⇒ the 2b bind must fail.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_delete_file("test/my-del.parquet", 0)])
+            .conflict_detection_filter(
+                Reference::new("Y").greater_than_or_equal_to(Datum::long(50)),
+            )
+            .validate_from_snapshot(s0)
+            .validate_no_conflicting_delete_files();
+        let tx = action.apply(tx).unwrap();
+
+        let _concurrent =
+            commit_concurrent_deletes(&catalog, &table, vec![delete_file_with_y_bounds(
+                "test/concurrent-del.parquet",
+                0,
+                60,
+                70,
+            )])
+            .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "a wrong-cased Y must NOT bind under the default in the 2b check; the validate must error",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("Field Y not found"),
+            "the rejection must be a BIND failure on the wrong-cased Y, not the conflict, got: {}",
+            err.message()
+        );
     }
 }
