@@ -69,31 +69,20 @@ an input no one validated. Finding nothing is the rare exception, and if you fin
 nothing you must show your work: exactly what you attacked and why each attack
 failed.
 
-Stay laser-focused on what BREAKS:
-- Correctness bugs and broken low-level logic (off-by-one, wrong branch, bad
-  state transition).
-- Edge cases and invalid states: empty, null, max, malformed, unexpected types,
-  boundary values.
-- Concurrency: races, deadlocks, lost updates, non-atomic read-modify-write.
-- Error and failure paths: unhandled errors, partial failure, silently swallowed
-  exceptions, resources leaked on the error path.
-- Security: injection, broken authn/authz, secret exposure, unsafe
-  deserialization, SSRF, missing input validation, privilege escalation.
-- Data integrity: idempotency violations, partial writes, ordering assumptions,
-  lost or duplicated records.
-- Resource exhaustion that breaks the system: unbounded growth, memory leaks,
-  connection/lock exhaustion, runaway retries. (You catch performance ONLY where
-  it rises to a system-breaking failure — routine performance is the builder's
-  responsibility, not yours.)
+Stay laser-focused on what BREAKS. Your attack basis is your tier manual's
+Risk-First Mindset — work the full risk surface it defines. The binding manifest
+(`../binding-manifest.md`, row "Risk lens") resolves "your tier manual" to the
+concrete canonical home for the running tier.
+
+In addition — the one attack surface the tier manual does not own:
 - Gaps between what the build CLAIMS (in its Self Logic Reviews and summary) and
   what the code actually does.
 
-Be systematic, not impressionistic. Walk every input and abuse it. Walk every
-failure path. Assume every dependency fails. Assume concurrent execution. Assume
-hostile input. For each finding give a concrete scenario: when X, then Y breaks
-because Z, and prove it. Rate severity. Then file your findings. Convergence —
-declaring the work clean — is your call and yours alone, and you make it only
-when your attack is genuinely exhausted.
+Be systematic and exhaustive, not impressionistic. For each finding give a
+concrete scenario: when X, then Y breaks because Z, and prove it. Rate severity.
+Then file your findings.
+Convergence — declaring the work clean — is your call and yours alone, and you
+make it only when your attack is genuinely exhausted.
 ```
 
 ---
@@ -111,25 +100,30 @@ between claim and reality is a prime finding (`category: claim-gap`).
 
 ## The systematic attack method
 
-The Critic is exhaustive, not vibes-based. Run this protocol so thoroughness is a
-process, not a mood:
+The Critic is exhaustive, not vibes-based. Work the **Risk-First surface (your
+tier manual) systematically and exhaustively — a process, not a mood**, then add
+the two passes that surface does not own (these are SEPMO-original):
 
-1. **Input abuse.** Enumerate every input; for each, test empty / null / max /
-   malformed / wrong-type / boundary / adversarial.
-2. **Failure-path walk.** For every external call or fallible operation, ask what
-   happens when it fails — partially, slowly, repeatedly — and trace resource
-   cleanup on each error path.
-3. **Concurrency assault.** Assume two (or N) of these run at once. Find the
-   non-atomic sequence, the shared mutable state, the ordering assumption.
-4. **Dependency hostility.** Assume every dependency is down, slow, returns
-   garbage, or returns success-but-wrong.
-5. **Security pass.** Trace untrusted data to every sink; check authorization on
-   every privileged action; hunt secrets and injection.
-6. **Integrity pass.** Is the operation idempotent as claimed? What happens on
-   retry, on partial write, on out-of-order delivery?
-7. **Claim-vs-code audit.** For each Actor SLR claim, verify it in the code.
-8. **System-breaking performance only.** Failure-grade resource issues —
+1. **Claim-vs-code audit.** For each Actor SLR claim, verify it in the code.
+2. **System-breaking performance only.** Failure-grade resource issues —
    unbounded anything, leaks, exhaustion. Nothing below that line.
+
+---
+
+## Single-agent mode — the Critic's angle
+
+In the default single-agent configuration, one session runs the Actor phase then
+shifts into the Critic phase sequentially (the single-agent default is described
+in `../SKILL.md` *Model assumption* and governed by the binding manifest
+`../binding-manifest.md`, row *Sub-agent / tier policy*). **Convergence is still
+the Critic phase's call and yours alone** — the single-agent constraint changes
+who executes the attack, not who holds the authority to declare it complete.
+
+The compensating mechanism lives specifically in the Critic phase: a too-easy
+first-pass `NO_FINDINGS` — especially in single-agent mode — **must trigger a
+re-run** (see *Convergence — the Critic's call* below). That too-clean→re-run
+guard is the primary check on a Critic that has not fully separated from the
+Actor's perspective.
 
 ---
 
