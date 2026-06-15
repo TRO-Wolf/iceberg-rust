@@ -70,3 +70,26 @@ How to use it (see the manuals' §2):
   delete-safety gate; reserve `--is-ancestor` for true (non-squash) merges where the parent link
   exists. If the diff is NON-empty, the branch carries commits the squash did not capture — stop and
   reconcile before deleting.
+
+### 2026-06-15 — When a stacked PR's base is squash-merged, rebase `--onto` to drop the now-redundant base commits
+
+- **DO, when the base branch of a stacked PR gets SQUASH-merged into the trunk, recover the dependent
+  branch with `git rebase --onto origin/main <old-base-tip> <dependent-branch>` — this replays ONLY
+  the dependent branch's own commits and lets the base's now-redundant commits fall away.** *Why:* the
+  squash lands the base PR's content as ONE new trunk commit with no parent link to the base branch
+  (see the 2026-06-13 entry — ancestry now lies). The dependent branch still carries the base's
+  ORIGINAL commits, so the same content lives under two unrelated histories; opening or merging the
+  dependent PR against the trunk then throws add/add conflicts on every shared file. A plain `merge` or
+  a normal re-push does NOT fix it — you must replay your commits onto the new trunk so the base
+  commits drop out. *Apply:* (1) `git fetch`, then confirm the trunk truly carries the base's content —
+  an EMPTY `git diff <base-branch> origin/main -- <base's paths>` (per the 2026-06-13 entry) — before
+  trusting the squash; (2) `git rebase --onto origin/main <old-base-tip> <dependent-branch>` (the range
+  `<old-base-tip>..<dependent-branch>` is exactly your own commits, so only they replay); (3) verify
+  `HEAD^ == origin/main` and that the PR diff is only your files; (4) update the remote with
+  `git push --force-with-lease` — the lease refuses if anyone else pushed since your fetch, and a
+  force-push needs explicit user approval per [CLAUDE.md](../CLAUDE.md) *Absolute prohibitions*; (5)
+  retarget the GitHub PR base to the trunk. (Came up 2026-06-15: PR-0 squash-merged as #52 while PR-1
+  was stacked on it; PR-1 showed conflicts until rebased `--onto origin/main`, dropping PR-0's two
+  commits and replaying only the one SKILL.md commit — a clean one-file diff with no conflicts.)
+  *Corollary:* when two pending PRs touch DISJOINT files, branch each independently off the trunk
+  instead of stacking — they merge in any order and never hit this trap.
