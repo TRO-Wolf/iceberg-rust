@@ -157,7 +157,7 @@ When the final PR is accepted:
 1. Delivery declares the charter fulfilled, citing the complete set of `DELIVERY_VERDICT` records
    and their stable IDs.
 2. Delivery hands its full set of `DELIVERY_VERDICT` records to the Retrospective agent
-   (08-retrospective.md, not yet built). The Orchestrator separately surfaces mid-flight HALT
+   (`08-retrospective.md`). The Orchestrator separately surfaces mid-flight HALT
    reviews, cycle-cap breaches, and escalation decisions per `02-orchestrator.md` *Handoff*. The
    Retrospective mines both for feed-forward lessons.
 

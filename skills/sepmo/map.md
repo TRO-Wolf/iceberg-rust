@@ -69,7 +69,6 @@ SEPMO governs *lifecycle*; it **cedes the engineering contract** to the tier man
 |---|---|
 | A SEPMO reference restates an engineering rule | It should point to the tier manual instead — precedence breach; fix the reference. |
 | Following a SEPMO rule that contradicts the repo | `CLAUDE.md` / the manuals win — re-check [CLAUDE.md](../../CLAUDE.md) `<precedence>`. |
-| A reference is marked _(planned)_ | The convergence build is incremental — see [SKILL.md](SKILL.md)'s reference map for current status. |
 | Unsure whether a change needs the full pipeline | Proportionality: substantial PR-units get full ceremony; trivial changes take the lightweight path ([SKILL.md](SKILL.md)). |
 
 ### First checks
