@@ -35,7 +35,7 @@ SEPMO governs *lifecycle*; it **cedes the engineering contract** to the tier man
 | `SKILL.md` | The spine: the Iron State Machine, the doctrines (thin — each points to its canonical home), the agent roster, and routing to the references below |
 | `binding-manifest.md` | The one project-specific file: maps SEPMO's abstractions → this repo's contract, plan, status SSOT, memory, and navigation. **Swap this to port SEPMO.** |
 | `references/01-scope-auditor.md` | Scope Auditor — the front-of-pipeline audit + the 100% gate |
-| `references/02-orchestrator.md` | Orchestrator — charter ← Roadmap+GAP_MATRIX, PR-grouping, AC-loop coordination, mode handling _(planned)_ |
+| `references/02-orchestrator.md` | Orchestrator — charter ← Roadmap+GAP_MATRIX, PR-grouping, AC-loop coordination, mode handling |
 | `references/03-self-logic-review.md` | The pre-action review every agent runs |
 | `references/04-actor.md` | Actor — builds under the tier manual (binds); blind to the Critic |
 | `references/05-critic.md` | Critic — attacks on the Risk-First lens (binds); convergence is its call |
