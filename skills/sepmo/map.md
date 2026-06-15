@@ -40,7 +40,7 @@ SEPMO governs *lifecycle*; it **cedes the engineering contract** to the tier man
 | `references/04-actor.md` | Actor — builds under the tier manual (binds); blind to the Critic |
 | `references/05-critic.md` | Critic — attacks on the Risk-First lens (binds); convergence is its call |
 | `references/06-vigilance.md` | Runtime enforcer of rules the repo already defines |
-| `references/07-delivery.md` | Per-PR acceptance = the §4 Done gate _(planned)_ |
+| `references/07-delivery.md` | Per-PR acceptance = the §4 Done gate + GAP_MATRIX flip discipline |
 | `references/08-retrospective.md` | A compaction pass + SEPMO feed-forward _(planned)_ |
 
 ## I want to...
