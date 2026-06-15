@@ -38,20 +38,21 @@ reference tells you *how*.
 
 ## Model assumption — frontier on the critical path
 
-SEPMO assumes a **frontier (Opus-class) model on every step of the critical
-path**: the Orchestrator, the Scope Auditor, the Actor, the Critic, and every
-audit. This is deliberate, not aspirational. SEPMO's guarantees come from
-genuine reasoning at each gate — surfacing an assumption nobody stated, running
-a risk pass that imagines *everything* that could break — and that quality of
-reasoning is what a frontier model is for. This is SEPMO in its purest form: an
-assistant that does not pattern-match its way to "looks done," but reasons its
-way to "proven done."
+SEPMO is *designed* to run a **frontier model on every critical-path step** — the
+Orchestrator, Scope Auditor, Actor, Critic, and every audit — because its
+guarantees come from genuine reasoning at each gate, not pattern-matching its way
+to "looks done." **"OO" / "Opus–Opus"** denotes an Actor–Critic pair with *both*
+roles at frontier tier.
 
-When this manual writes **"OO"** or **"Opus–Opus"** for an Actor–Critic pair, it
-means **both** roles are frontier. Tier is the one knob you may turn — and only
-*downward*, only into clearly-bounded low-judgment subtasks, and only with
-explicit written justification. The default everywhere is frontier. Rigor is
-never the thing that gets traded for cost.
+How that aspiration is *governed* is **not restated here** (one home per fact):
+when frontier is required, when tier may be turned down, single-agent default
+versus literal multi-agent fan-out, and the cost discipline that bounds it all
+live in the project's sub-agent & tier policy and its frontier operating notes —
+see [binding-manifest.md](binding-manifest.md) (*Sub-agent / tier policy*). For
+**this** repo that resolves to a **single-agent default**: one session runs the
+Actor phase, then deliberately shifts into the Critic phase, sequentially; a
+literal separate-agent OO pair is opt-in, used only when the user lifts that
+policy.
 
 ---
 
@@ -162,6 +163,20 @@ PR_SCOPING ─▶ for each PR unit:
 
 ---
 
+## Proportionality — ceremony scales with risk
+
+SEPMO's full machinery — a formal scope audit, multiple Actor–Critic cycles, an
+independent readiness audit — is sized to **substantial PR-units**, where a missed
+assumption is expensive. **Trivial, low-risk changes take a lightweight path** with
+proportionally less ceremony, so rigor never becomes a tax on a one-line change.
+What never scales down is the *standard*: the 100% scope gate and an exhausted
+Critic still hold on every unit — proportionality matches the *amount of process*
+to the risk, never the bar. When unsure whether a unit is substantial, treat it as
+substantial; under-scoping ceremony is the riskier error. The Orchestrator sets the
+path per unit.
+
+---
+
 ## Non-Negotiable Doctrines
 
 These bind **every** agent, including the Orchestrator, in **every** state. They
@@ -169,44 +184,38 @@ are not style preferences — they are the mechanism by which the 100% gate stay
 meaningful. An agent that violates a doctrine has already failed, regardless of
 the quality of its output.
 
-### D1 — Death to Assumptions
-Any reliance on an unstated belief is a defect. The words *assume, probably, I
-think, should work, ought to, presumably, likely, in most cases* are tripwires.
-When one fires, **halt**, surface the hidden assumption explicitly, and either
-prove it from a stated requirement or escalate it as a clarifying question. *Why
-this matters:* an assumption is a silent fork in the logic where two agents can
-diverge without either noticing — the exact failure SEPMO exists to prevent.
+**D1–D5 are not SEPMO inventions** — they are the repo's own engineering
+principles, named here so the doctrine set reads complete, each collapsed to a
+pointer at its canonical home (one home per fact: read the rule *there* and obey
+it there — the pointer is a routing aid, not the rule). **D6 is SEPMO-original and
+stated in full.**
 
-### D2 — Stop If Unsure
-Uncertainty is a full stop, not a speed bump. There is no "partial progress
-while we figure it out." If you cannot state the next action and its
-justification with complete confidence, you halt and escalate. *Why this
-matters:* partial progress under uncertainty manufactures rework and buries the
-moment of doubt under code that now has to be unwound.
+- **D1 — Death to Assumptions.** Reliance on an unstated belief is a defect;
+  *assume / probably / should work / likely* are tripwires — halt, surface the
+  assumption, then prove it from a requirement or escalate. → your tier manual's
+  **No Assumptions / Fail Loudly** (Core Principles) and **§1 Reason Before You
+  Act** (surface assumptions as questions; never silently guess).
+- **D2 — Stop If Unsure.** Uncertainty is a full stop, not a speed bump: if you
+  cannot state the next action and its justification with confidence, halt and
+  escalate rather than make partial progress. → your tier manual's **No
+  Assumptions / Fail Loudly** ("ambiguity that changes the outcome is a stop
+  condition") and **Mode Handling**.
+- **D3 — Mandatory Self Logic Review.** Before any implementation or decision, log
+  a complete Self Logic Review — no "this one is obvious." → the *discipline* is
+  your tier manual's **§1 Reason Before You Act**; the *formal artifact* is SEPMO's
+  [references/03-self-logic-review.md](references/03-self-logic-review.md).
+- **D4 — Logic Scoping.** Every scope element is a strict, provable logical
+  contract; a requirement that cannot be stated as a checkable proposition is a
+  wish, and wishes are rejected. → the premise the **100% gate** (above) and the
+  Scope Auditor ([references/01-scope-auditor.md](references/01-scope-auditor.md))
+  exist to enforce.
+- **D5 — Traceability Always.** Every decision, artifact, task, and PR links back
+  to a specific charter clause; orphan work is scope creep by definition. → your
+  tier manual's **§6 Scope Boundaries** (the anti-scope-creep rule), made
+  enforceable by SEPMO's charter-clause IDs; drift then trips `CONSTANT_VIGILANCE`
+  (state 5, above).
 
-### D3 — Mandatory Self Logic Review
-Before **any** implementation, code generation, task advancement, or decision,
-the acting agent stops and logs a complete Self Logic Review
-(`references/03-self-logic-review.md`). No exceptions, no "this one is obvious."
-*Why this matters:* the review is cheap insurance that the agent's plan still
-matches the approved contract — and writing it out catches errors that silent
-confidence does not.
-
-### D4 — Logic Scoping
-Every element of scope is a strict, provable logical contract. A requirement
-that cannot be stated as a checkable proposition is not a requirement — it is a
-wish, and wishes are rejected. *Why this matters:* if a requirement cannot be
-checked, it cannot be verified done, which makes "done" a matter of opinion.
-SEPMO does not run on opinion.
-
-### D5 — Traceability Always
-Every decision, artifact, task, and PR links back to a specific clause of the
-approved charter. Orphan work — anything not traceable to the charter — is scope
-creep by definition and triggers `CONSTANT_VIGILANCE`. *Why this matters:*
-traceability is what makes drift detectable; without it, scope creep is
-invisible until it is expensive.
-
-### D6 — Adversarial by Construction
+### D6 — Adversarial by Construction *(SEPMO-original)*
 No code is trusted until it has been attacked. Every Actor build is met by a
 Critic whose success is measured in defects found, not in approval given. *Why
 this matters:* self-review catches what you can see; an adversary with a mandate
@@ -272,8 +281,10 @@ others operate inside the slice they are handed.
 - **Every output is addressable.** Charters, PR units, tasks, decisions,
   Self Logic Reviews, and Critic findings get stable IDs so vigilance and
   traceability have something to point at.
-- **Escalate to the user, never around them.** When a doctrine fires, the
-  resolution path is a question to the user, not an agent-side guess.
+- **Escalate, never guess.** When a doctrine fires, the resolution is an
+  escalation, not an agent-side guess — *interactive:* a question to the user;
+  *delegated:* flagged in the final report. The interactive-vs-delegated mechanics
+  are your tier manual's **Mode Handling**, not restated here.
 - **Verdicts are machine-readable.** Audit results, review logs, Critic
   findings, and delivery sign-offs use the fixed formats in their reference
   files so any agent reading them reaches an identical understanding (this is D4
