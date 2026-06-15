@@ -28,6 +28,10 @@ the manuals' §2 points to. Read the manual matching the model you are running
 as, **after** root [CLAUDE.md](../CLAUDE.md). CLAUDE.md wins on any conflict
 (it is repo-specific; these are portable defaults).
 
+This directory also hosts [sepmo/](sepmo/) — the **SEPMO control plane** (the lifecycle/governance
+shell), which drives work through the scope audit, Actor–Critic execution, and delivery while
+*binding* to these manuals for the engineering contract.
+
 ## Contents
 
 | File | For |
@@ -37,6 +41,7 @@ as, **after** root [CLAUDE.md](../CLAUDE.md). CLAUDE.md wins on any conflict
 | `Sonnet.md` | Sonnet-tier sessions |
 | `Haiku.md` | Haiku-tier sessions (most explicit + procedural — concrete examples, spelled-out steps) |
 | `compaction.md` | The lessons-compaction procedure for [task/lessons.md](../task/lessons.md): lifecycle (PROMOTE / KEEP / ARCHIVE), triggers, archive layout, conservation gate |
+| `sepmo/` | The SEPMO control plane: lifecycle state machine, scope audit + 100% gate, Actor–Critic protocol, PR-grouping, delivery, retrospective. Governs lifecycle; binds to the manuals for the engineering contract. See [sepmo/map.md](sepmo/map.md). |
 
 The four manuals are variants of the same contract; **the rules are identical** — only the level of detail differs (Haiku = most explicit/procedural, Opus = fullest prose, Fable = tersest, plus its tier-specific Frontier Addendum, which adds operating notes without changing any rule). All four share one skeleton: Identity & Priority Stack → Non-Negotiables → Mode Handling → Risk-First → Workflow Orchestration §1–§9 → Navigation → Naming → Language-Specific Rules → Function Length & Recursion → Pre-Flight → Core Principles (TL;DR). (`Fable.md` inserts the Frontier Addendum between Non-Negotiables and Mode Handling.)
 
@@ -52,6 +57,7 @@ The four manuals are variants of the same contract; **the rules are identical** 
 | Find the plan / lessons workflow | [task/todo.md](../task/todo.md) + [task/lessons.md](../task/lessons.md) (each manual's Workflow Storage section) |
 | Compact the lessons file / decide what to archive | [compaction.md](compaction.md) — its own scoped change, interactive-approval-only |
 | Find an old archived lesson | [task/lessons-archive/map.md](../task/lessons-archive/map.md) (archives are read on demand, never by default — see [compaction.md](compaction.md)) |
+| Govern a project's lifecycle / audit a brief before coding | [sepmo/SKILL.md](sepmo/SKILL.md) (and [sepmo/binding-manifest.md](sepmo/binding-manifest.md)) |
 
 ## Pointers
 

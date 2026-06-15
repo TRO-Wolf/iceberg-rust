@@ -50,16 +50,42 @@ capability's *status*, the **GAP_MATRIX** (re-audited against the live base) win
 3. **The operating manual for your model tier** — [skills/Fable.md](skills/Fable.md) (Mythos-class),
    [skills/Opus.md](skills/Opus.md), [skills/Sonnet.md](skills/Sonnet.md), or
    [skills/Haiku.md](skills/Haiku.md) (the portable engineering contract; see
-   [skills/map.md](skills/map.md)). CLAUDE.md wins on any conflict. For crate code (`crates/`), also
+   [skills/map.md](skills/map.md)); precedence is in `<precedence>` below. For crate code (`crates/`), also
    read **[AGENTS.md](AGENTS.md)** — the per-crate Rust engineering rules (error chains, etc.).
-4. **[task/lessons.md](task/lessons.md) in full, then [task/todo.md](task/todo.md)** — accumulated
+4. **The SEPMO control plane** — [skills/sepmo/SKILL.md](skills/sepmo/SKILL.md) (the
+   lifecycle/governance shell: scope audit + 100% gate, Actor–Critic execution, PR-grouping,
+   delivery, retrospective) and [skills/sepmo/binding-manifest.md](skills/sepmo/binding-manifest.md)
+   (how it binds to this repo). SEPMO governs *lifecycle*; the tier manuals and this file win the
+   *engineering contract* and all conflicts (see `<precedence>`).
+5. **[task/lessons.md](task/lessons.md) in full, then [task/todo.md](task/todo.md)** — accumulated
    lessons and any mid-flight plan to pick up.
-5. **The `map.md` of every directory your task will touch** (where present — see the navigation
+6. **The `map.md` of every directory your task will touch** (where present — see the navigation
    rule below).
-6. **Upstream docs when you need depth:** [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md),
+7. **Upstream docs when you need depth:** [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md),
    the per-crate `README.md` files, and the [Iceberg Rust site](https://rust.iceberg.apache.org/).
 
 </read_order>
+
+<precedence>
+
+## Precedence — who wins on conflict
+
+One chain, highest authority first:
+
+1. **CLAUDE.md** (this file) — repo intent, prohibitions, precedence, the navigation contract.
+2. **Roadmap.md** — the plan and the current phase. *(Direction-vs-status nuance: the Roadmap owns
+   direction, the GAP_MATRIX owns capability status — see the intro paragraph above.)*
+3. **docs/parity/GAP_MATRIX.md** — the single source of truth for capability *status*.
+4. **The tier manuals** ([skills/](skills/)) **+ AGENTS.md** — the **engineering contract** (how the
+   code is written).
+5. **SEPMO** ([skills/sepmo/](skills/sepmo/)) — **lifecycle and orchestration only**.
+
+SEPMO **cedes the engineering contract** to the manuals and to this file; the manuals and this file
+**cede lifecycle/orchestration** (the scope audit, the gates, the Actor–Critic loop, PR-grouping,
+delivery, retrospective) to SEPMO. When a SEPMO rule conflicts with a higher item, the higher item
+wins and SEPMO is corrected.
+
+</precedence>
 
 ## Parity mandate
 
@@ -279,5 +305,3 @@ them to Sonnet or Haiku; only run an Opus sub-agent on a direct, explicit instru
 - **Keep `map.md` in lockstep** with the directories that use it (see `<map_md_navigation>`).
 - **Follow the operating manual for your tier** ([skills/](skills/)) — Risk-First, naming, the
   Rust rules, the debugging protocol, and the verification gate. CLAUDE.md wins on conflict.
-</content>
-</invoke>
