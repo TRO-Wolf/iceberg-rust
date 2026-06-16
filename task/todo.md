@@ -182,8 +182,21 @@ dormant for realistic single commits (narrow non-`first` ≥2-manifest sub-case 
       all 6 non-vacuity gates mutation-proven by the Critic. **GAP_MATRIX row 135 🟡→✅.** Two infra crashes
       first (529 overload) — hardened the workflow loop with null-guards (see [[parity-next-work]]). Files:
       `interop_remove_dangling.rs`, `run-interop-remove-dangling.sh`, `RemoveDanglingOracle`.
-- [ ] **PC #2 — next maintenance unit** (candidates: `ConvertEqualityDeleteFiles`, `ActionsProvider`
-      scaffold, `RewritePositionDeleteFiles` [engine-agnostic logic, Java impl is Spark-surface]).
+- [x] **PC #2 — ActionsProvider** — **DONE 2026-06-16 (#TBD).** Rust `ActionsProvider` trait (12
+      snake_case methods mirroring Java `api/actions/ActionsProvider` 1.10.0, javap-confirmed) + a concrete
+      `Actions` factory (`Actions::get`) overriding the 6 built actions (delete_orphan_files,
+      rewrite_data_files, compute_table_stats, remove_dangling_delete_files via `X::new(table)`;
+      expire_snapshots, rewrite_manifests via the transaction seam — required re-exporting the 2 seam types).
+      Unbuilt actions return `Result<NoAction>` over an UNINHABITED empty enum (Ok arm statically
+      unreachable ⇒ no stub can masquerade as real) → typed `FeatureUnsupported`. ORACLE-INDEPENDENT
+      (factory has no byte-level round-trip; offline gate IS the verification). Converged 1 cycle; Critic
+      javap-confirmed parity + mutation-tested the wiring (breaking a factory method fails 2 tests incl. a
+      live MemoryCatalog execute smoke test). **GAP_MATRIX row 151 ❌→🟡** (partial). Underlying actions
+      UNCHANGED. Files: `maintenance/actions_provider.rs` + 2 mod re-exports.
+- [ ] **PC #3 — complete row 151** (`DeleteReachableFiles` [reuses the reachability machinery from
+      ExpireSnapshots/DeleteOrphanFiles] + `ConvertEqualityDeleteFiles` [read eq-deletes → write position
+      deletes → commit; corruption-class, interop-provable]) to flip row 151 🟡→✅; then wire each into the
+      `ActionsProvider`.
 
 Follow-on residue (surfaced mid-charter 2026-06-16, see GAP_MATRIX row 94):
 
