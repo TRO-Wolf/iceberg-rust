@@ -626,6 +626,33 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-builder-flips":
+        // BUILDER-FLIPS interop (Wave 3) — DeleteFiles' two builder-flip capabilities:
+        // deleteFromRowFilter(Expression) (GAP_MATRIX row 135) + caseSensitive(boolean) (row 134),
+        // proven on the by-row-filter delete RESOLUTION (which file set is removed), not a conflict
+        // decision. For each scenario, writes a PARTITIONED V2 {id long, Category string, y long}
+        // (identity(Category), MIXED-CASE column) table under <dir>/<scenario>/table with two parquet
+        // files (cat=a y[10,20], cat=b y[60,70]) plus a straddling cat=b y[40,60] file for the partial
+        // scenario. The validating engine runs the symmetric
+        // newDelete().caseSensitive(flag).deleteFromRowFilter(filter) and the outcome (surviving
+        // category set, or ERROR) must equal the hand-declared expected (same contract as Rust's
+        // interop_builder_flips.rs).
+        Path builderFlipsDir = requireFixturesDir("interop.builder_flips.dir");
+        BuilderFlipsOracle.generate(builderFlipsDir);
+        break;
+      case "verify-interop-builder-flips":
+        // BUILDER-FLIPS interop, DIRECTION 2 — "Java validates what RUST writes". The Rust GEN test (env
+        // ICEBERG_INTEROP_BUILDER_FLIPS_GEN_DIR) wrote each scenario's pre-delete table to
+        // <dir>/<scenario>/rust_table. Java loads each, runs the symmetric
+        // newDelete().caseSensitive(flag).deleteFromRowFilter(filter), and asserts the outcome
+        // (surviving Category set, or ERROR) matches the hand-declared expected.
+        Path builderFlipsVerifyDir = requireFixturesDir("interop.builder_flips.dir");
+        int builderFlipsFailures = BuilderFlipsOracle.verify(builderFlipsVerifyDir);
+        System.out.println("verify-interop-builder-flips: " + builderFlipsFailures + " failures");
+        if (builderFlipsFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-rewritefiles-conflict":
         // CONFLICT-VALIDATION RewriteFiles interop (increment C5) — the MECHANICALLY most complex
         // write-action conflict unit (GAP_MATRIX row 95): the seq-preservation + position-vs-equality-
@@ -10233,6 +10260,374 @@ public final class InteropOracle {
         writer.write(rows);
       }
       return writer.toDataFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
+    }
+  }
+
+  // =============================================================================================
+  // BuilderFlipsOracle — BUILDER-FLIPS DeleteFiles interop (Wave 3).
+  //
+  // The two "builder flip" capabilities of DeleteFiles, proven bidirectionally against Java
+  // StreamingDelete (1.10.0): deleteFromRowFilter(Expression) (GAP_MATRIX row 135) and
+  // caseSensitive(boolean) (row 134). Both ride the SAME builder vehicle —
+  // table.newDelete().caseSensitive(flag).deleteFromRowFilter(filter).commit() →
+  // MergingSnapshotProducer.deleteByRowFilter / ManifestFilterManager.{caseSensitive,
+  // PartitionAndMetricsEvaluator} — mirrored by Rust DeleteFiles::delete_from_row_filter /
+  // case_sensitive → SnapshotProducer::resolve_filter_deletes / build_residual_evaluator →
+  // ResidualEvaluator.of(spec, expr, caseSensitive) + the strict/inclusive metrics evaluators. This is
+  // the FIRST interop exercising the by-row-filter delete RESOLUTION (which file set is removed), not a
+  // conflict ACCEPT/REJECT decision.
+  //
+  // The case_sensitive flag's ONLY observable effect is the column-name binding bind(schema,
+  // caseSensitive) (Java Binder / caseSensitive). deleteFromRowFilter drives the most-shared binding
+  // site (resolve_filter_deletes, which also backs OverwriteFiles.overwrite_by_row_filter), so proving
+  // the flag load-bearing here exercises the exact code path the other actions reach AND co-proves the
+  // row-135 delete RESOLUTION.
+  //
+  // Per scenario, a PARTITIONED V2 {1 id long, 2 Category string, 3 y long} table identity(Category) —
+  // the MIXED-CASE column Category is the case-sensitivity discriminator. Two real parquet files (cat=a
+  // y[10,20], cat=b y[60,70]); a straddling cat=b y[40,60] helper is added ONLY for the partial scenario.
+  //
+  //   scenario                  | filter (column ref) | caseSensitive | expected
+  //   filter_delete_partition   | Category == "a"     | true          | survivors = {b} (DELETE cat=a)
+  //   filter_keep_complement    | Category == "b"     | true          | survivors = {a} (DELETE cat=b, KEEP cat=a)
+  //   filter_partial_error      | y >= 55             | true          | ERROR — partial (cat=b straddles)
+  //   case_insensitive_match    | category == "a"     | FALSE         | survivors = {b} (binds insensitively)
+  //   case_sensitive_reject     | category == "a"     | true          | ERROR — wrong-case bind fails
+  //
+  // NAMED DIVERGENCE (kept OUT of the set, live-oracle finding 2026-06-16): a row filter matching NO
+  // live file diverges — Rust REJECTS the empty no-op commit, Java COMMITS a no-op Delete snapshot. The
+  // KEEP semantics are instead proven by filter_keep_complement / filter_delete_partition (non-empty,
+  // both engines agree). See interop_builder_flips.rs.
+  //
+  // File paths are random per engine, so the DELETE/KEEP signal is the SET of surviving Category
+  // partition values (identity(Category) ⇒ each file's category is its partition value). The expected
+  // outcome is HAND-DECLARED identically on both sides (anti-circular). This MUST mirror Rust's
+  // interop_builder_flips.rs scenario set exactly (names, filters, flags, expected outcomes). generate
+  // writes <dir>/<scenario>/table (Java) for Rust's D1; verify loads <dir>/<scenario>/rust_table (Rust's
+  // GEN) for Java's D2 and prints the "N failures" sentinel.
+  // =============================================================================================
+  static final class BuilderFlipsOracle {
+    private BuilderFlipsOracle() {}
+
+    private static final class Scenario {
+      final String name;
+      final String filterColumn;
+      final String filterValue; // null ⇒ the `y >= 55` partial probe
+      final boolean caseSensitive;
+      final boolean withPartialFile;
+      final boolean expectError;
+      final java.util.Set<String> expectedSurvivors; // empty when expectError
+
+      Scenario(
+          String name,
+          String filterColumn,
+          String filterValue,
+          boolean caseSensitive,
+          boolean withPartialFile,
+          boolean expectError,
+          String... expectedSurvivors) {
+        this.name = name;
+        this.filterColumn = filterColumn;
+        this.filterValue = filterValue;
+        this.caseSensitive = caseSensitive;
+        this.withPartialFile = withPartialFile;
+        this.expectError = expectError;
+        this.expectedSurvivors = new java.util.TreeSet<>(java.util.Arrays.asList(expectedSurvivors));
+      }
+    }
+
+    private static final List<Scenario> SCENARIOS =
+        List.of(
+            new Scenario("filter_delete_partition", "Category", "a", true, false, false, "b"),
+            new Scenario("filter_keep_complement", "Category", "b", true, false, false, "a"),
+            new Scenario("filter_partial_error", "y", null, true, true, true),
+            new Scenario("case_insensitive_match", "category", "a", false, false, false, "b"),
+            new Scenario("case_sensitive_reject", "category", "a", true, false, true));
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "Category", Types.StringType.get()),
+            Types.NestedField.required(3, "y", Types.LongType.get()));
+
+    private static final PartitionSpec SPEC =
+        PartitionSpec.builderFor(SCHEMA).identity("Category").build();
+
+    static void generate(Path dir) throws IOException {
+      for (Scenario scenario : SCENARIOS) {
+        Path scenarioDir = dir.resolve(scenario.name);
+        File tableDir = scenarioDir.resolve("table").toFile();
+        File metadataDir = new File(tableDir, "metadata");
+        File dataDir = new File(tableDir, "data");
+        mkdirs(metadataDir);
+        mkdirs(dataDir);
+
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, "2");
+        TableMetadata seed =
+            TableMetadata.newTableMetadata(
+                SCHEMA, SPEC, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+        LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+        ops.commit(null, seed);
+        BaseTable table = new BaseTable(ops, "interop_builder_flips_" + scenario.name);
+
+        buildScenarioHistory(table, dataDir, scenario);
+
+        Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+        OutputFile finalOut =
+            new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+        TableMetadataParser.write(ops.current(), finalOut);
+
+        System.out.println(
+            "generated builder-flips scenario "
+                + scenario.name
+                + " (expected "
+                + describe(scenario)
+                + ") to "
+                + scenarioDir);
+      }
+    }
+
+    /**
+     * Append cat=a (y[10,20]) + cat=b (y[60,70]); for the partial scenario also append a straddling
+     * cat=b (y[40,60]) so a `y >= 55` probe matches SOME but not all of partition b's rows.
+     */
+    private static void buildScenarioHistory(BaseTable table, File dataDir, Scenario scenario)
+        throws IOException {
+      Types.StructType partitionType = SPEC.partitionType();
+      PartitionData partitionA = new PartitionData(partitionType);
+      partitionA.set(0, "a");
+      PartitionData partitionB = new PartitionData(partitionType);
+      partitionB.set(0, "b");
+
+      DataFile fileA =
+          writePartitionedDataFile(
+              table,
+              partitionA,
+              new File(dataDir, "Category=a/00000-a.parquet").getAbsolutePath(),
+              "a",
+              new long[] {1L, 2L},
+              new long[] {10L, 20L});
+      DataFile fileB =
+          writePartitionedDataFile(
+              table,
+              partitionB,
+              new File(dataDir, "Category=b/00000-b.parquet").getAbsolutePath(),
+              "b",
+              new long[] {3L, 4L},
+              new long[] {60L, 70L});
+      AppendFiles append = table.newFastAppend().appendFile(fileA).appendFile(fileB);
+      if (scenario.withPartialFile) {
+        DataFile fileBStraddle =
+            writePartitionedDataFile(
+                table,
+                partitionB,
+                new File(dataDir, "Category=b/00001-b.parquet").getAbsolutePath(),
+                "b",
+                new long[] {5L, 6L},
+                new long[] {40L, 60L});
+        append = append.appendFile(fileBStraddle);
+      }
+      append.commit();
+    }
+
+    /**
+     * DIRECTION 2 verify — for each scenario, load the RUST-written table and run the symmetric
+     * newDelete().caseSensitive(flag).deleteFromRowFilter(filter); the outcome (surviving Category set,
+     * or ERROR) must equal the hand-declared expected.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      for (Scenario scenario : SCENARIOS) {
+        Path finalMetadata =
+            dir.resolve(scenario.name)
+                .resolve("rust_table")
+                .resolve("metadata")
+                .resolve("final.metadata.json");
+        if (!Files.exists(finalMetadata)) {
+          System.out.println(
+              "FAIL builder-flips-d2["
+                  + scenario.name
+                  + "]: missing "
+                  + finalMetadata
+                  + " (run the Rust GEN path first)");
+          failures++;
+          continue;
+        }
+
+        try {
+          Outcome observed = runDeleteAndDetect(finalMetadata, scenario);
+          if (observed.matches(scenario)) {
+            System.out.println(
+                "PASS builder-flips-d2[" + scenario.name + "]: outcome " + observed + " matches");
+          } else {
+            System.out.println(
+                "FAIL builder-flips-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + observed
+                    + " but expected "
+                    + describe(scenario));
+            failures++;
+          }
+        } catch (RuntimeException | IOException error) {
+          // A structural load failure (e.g. a truncated final.metadata.json ⇒ JsonEOFException, which
+          // TableMetadataParser.fromJson rethrows UNCHECKED) lands here, NOT in runDeleteAndDetect's
+          // inner commit-time catch (the parse precedes it). Fail closed with the load-error line.
+          System.out.println(
+              "FAIL builder-flips-d2["
+                  + scenario.name
+                  + "]: unexpected error loading the table: "
+                  + error);
+          failures++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-builder-flips OK — Java's DeleteFiles builder-flips outcome matches Rust "
+                + "on all "
+                + SCENARIOS.size()
+                + " scenarios (deleteFromRowFilter row 135 + caseSensitive row 134)");
+      }
+      return failures;
+    }
+
+    /** The observed outcome of the symmetric delete: a surviving-Category set, or an ERROR. */
+    private static final class Outcome {
+      final boolean error;
+      final java.util.Set<String> survivors; // empty when error
+
+      private Outcome(boolean error, java.util.Set<String> survivors) {
+        this.error = error;
+        this.survivors = survivors;
+      }
+
+      static Outcome committed(java.util.Set<String> survivors) {
+        return new Outcome(false, new java.util.TreeSet<>(survivors));
+      }
+
+      static Outcome failed() {
+        return new Outcome(true, new java.util.TreeSet<>());
+      }
+
+      boolean matches(Scenario scenario) {
+        if (scenario.expectError) {
+          return error;
+        }
+        return !error && survivors.equals(scenario.expectedSurvivors);
+      }
+
+      @Override
+      public String toString() {
+        return error ? "ERROR" : ("survivors=" + survivors);
+      }
+    }
+
+    /**
+     * Load the Rust-written {@code final.metadata.json} into a committable {@link LocalTableOperations}
+     * (seed via {@code commit(null, loaded)} — the Rust pre-delete history is preserved), run the
+     * symmetric {@code newDelete().caseSensitive(flag).deleteFromRowFilter(filter)}, and return the
+     * outcome: the surviving Category set on commit, or ERROR on ANY failure (the partial-match
+     * ValidationException, the wrong-case bind ValidationException, or the empty no-op rejection).
+     */
+    private static Outcome runDeleteAndDetect(Path rustFinalMetadata, Scenario scenario)
+        throws IOException {
+      File metadataDir = rustFinalMetadata.getParent().toFile();
+      File tableDir = metadataDir.getParentFile(); // .../rust_table
+
+      TableMetadata loaded =
+          TableMetadataParser.fromJson(rustFinalMetadata.toString(), readString(rustFinalMetadata));
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, loaded); // seed `current` with the Rust pre-delete history
+      BaseTable table = new BaseTable(ops, "rust_builder_flips_" + scenario.name);
+
+      try {
+        table
+            .newDelete()
+            .caseSensitive(scenario.caseSensitive)
+            .deleteFromRowFilter(scenarioFilter(scenario))
+            .commit();
+        return Outcome.committed(liveCategories(table));
+      } catch (RuntimeException failure) {
+        // Any commit-time failure (ValidationException for partial-match / wrong-case bind, or the
+        // empty-commit precondition) is the ERROR outcome — nothing was deleted.
+        return Outcome.failed();
+      }
+    }
+
+    /** The {@code y} metrics-probe threshold ({@code y >= Y_THRESHOLD}). MUST match Rust's Y_THRESHOLD. */
+    private static final long Y_THRESHOLD = 55L;
+
+    /** The scenario's row filter: {@code filterColumn == filterValue}, or the {@code y >= 55} probe. */
+    private static Expression scenarioFilter(Scenario scenario) {
+      if (scenario.filterValue == null) {
+        return Expressions.greaterThanOrEqual(scenario.filterColumn, Y_THRESHOLD);
+      }
+      return Expressions.equal(scenario.filterColumn, scenario.filterValue);
+    }
+
+    /**
+     * The set of live DATA-file Category partition values in the table's current snapshot — the
+     * engine-independent DELETE/KEEP signal (identity(Category) ⇒ each planned file's partition value
+     * is its category). Read via the production scan plan over the current snapshot.
+     */
+    private static java.util.Set<String> liveCategories(BaseTable table) {
+      java.util.Set<String> categories = new java.util.TreeSet<>();
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+        for (FileScanTask task : tasks) {
+          PartitionSpec taskSpec = task.spec();
+          StructLike partition = task.file().partition();
+          int pos = taskSpec.partitionType().fields().size() == 0 ? -1 : 0;
+          if (pos >= 0) {
+            categories.add(partition.get(pos, String.class));
+          }
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to plan files for live categories", error);
+      }
+      return categories;
+    }
+
+    /**
+     * Write a REAL parquet {id, Category, y} data file for ONE partition via the generic appender; the
+     * y values become the parquet column bounds (the strict/inclusive-metrics input for DELETE vs
+     * PARTIAL on the `y` probe).
+     */
+    private static DataFile writePartitionedDataFile(
+        BaseTable table, StructLike partition, String path, String category, long[] ids, long[] ys)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", ids[i]);
+        record.setField("Category", category);
+        record.setField("y", ys[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, SPEC);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static String describe(Scenario scenario) {
+      return scenario.expectError ? "ERROR" : ("survivors=" + scenario.expectedSurvivors);
     }
 
     private static void mkdirs(File directory) throws IOException {
