@@ -86,6 +86,43 @@ Recently landed (2026-06-11 → 06-13) — status lives in the GAP_MATRIX rows; 
 
 See the 2026-06-13 GAP_MATRIX provenance block for per-row status and residue.
 
+## CHARTER (2026-06-15, Opus): conflict-validation + multi-spec interop — AC·OO groups
+
+User-approved 8h charter (2026-06-15). Close the "conflict-validation paths NOT covered" residue on
+the write-action rows (C1 OverwriteFiles ✅ #64), then multi-spec. EVERY sequence is one **AC·OO
+group** = a coherent PR-unit run as **Opus Actor → Opus Critic** (the user lifted the single-agent
+default + named the tier). **One PR per group**; rebase on freshly-merged `main` between groups. The
+C1 increment (`interop_overwrite_conflict.rs` + `OverwriteConflictOracle` + `run-interop-overwrite-conflict.sh`)
+is the harness template; per-group loop = Actor builds + drives the LIVE oracle to green + offline
+gate → Critic adversarially re-verifies (sabotage truly fails, D1/D2 independence, claim-vs-Java-1.10.0,
+done-bar = unit + interop both directions, de-triplication, no over-scope) → finalize + PR.
+
+Wave 1 — conflict-validation closeout (order locked):
+
+- [x] **AC·OO #1 — C4 ReplacePartitions** (row 92) — **DONE 2026-06-15.** Partition-scoped conflict
+      (`file_in_replaced_partition`, no filter); 2 scenarios (replaced-partition→REJECT, other→ACCEPT)
+      both directions + fail-closed sabotage. Opus Actor → Opus Critic converged (2 cycles; cycle-1
+      caught a masked-sabotage defect, fixed + independently re-verified). Files: `interop_replace_partitions_conflict.rs`,
+      `run-interop-replace-partitions-conflict.sh`, `ReplacePartitionsConflictOracle`. Row 92 stays 🟡.
+- [ ] **AC·OO #2 — C3 RowDelta** (row 94). Richest: `validate_no_conflicting_data_files` +
+      `_delete_files` + `validate_data_files_exist` — concurrent data AND delete-file conflicts.
+- [ ] **AC·OO #3 — C2 DeleteFiles** (row 93). `validate_files_exist()` — concurrent REMOVAL of a file
+      this delete targets (missing-path shape, not added-data).
+- [ ] **AC·OO #4 — C5 RewriteFiles** (row 95). `validate_no_new_deletes_for_data_files` — a concurrent
+      delete that would apply to the rewritten files (seq-preservation angle).
+
+Wave 2 — multi-spec write interop (stretch):
+
+- [ ] **AC·OO #5 — MS** merging actions (overwrite/replace/row-delta) under >1 partition spec; extend
+      the Z2 `run-interop-multi-spec.sh` template (fast_append multi-spec already ✅).
+
+Wave 3 — builder-surface flips (stretch, only if 1+2 beat estimates):
+
+- [ ] **AC·OO #6 — BF** `case_sensitive` (row 134) + `delete_from_row_filter` (row 135) → interop-proven.
+
+See [[parity-next-work]] (memory) for the reusable harness gotchas (register_table `<version>-<uuid>`
+name; LocalTableOperations re-seed; final.metadata.json untouched).
+
 ## DONE (2026-06-15, Opus): OverwriteFiles conflict-validation interop (C1 — first conflict unit)
 
 Goal: prove the FIRST slice of the rows 91-95 residue ("conflict-validation paths NOT covered").

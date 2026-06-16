@@ -517,6 +517,36 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-replace-partitions-conflict":
+        // CONFLICT-VALIDATION ReplacePartitions interop (increment C4). For each scenario, writes a
+        // PARTITIONED (identity(category)) V2 {id long, category string} table under
+        // <dir>/<scenario>/table: fast-append base files in cat=a + cat=b at S0, then a CONCURRENT
+        // fast-append at S1 (cat=a for the REJECT scenario, cat=b for the ACCEPT scenario). The
+        // validating engine runs the symmetric replace_partitions (add fresh cat=a file +
+        // validateFromSnapshot(S0) + validateNoConflictingData) and its ACCEPT/REJECT must equal the
+        // hand-declared expected (same contract as Rust's interop_replace_partitions_conflict.rs).
+        Path replacePartitionsConflictDir =
+            requireFixturesDir("interop.replace_partitions_conflict.dir");
+        ReplacePartitionsConflictOracle.generate(replacePartitionsConflictDir);
+        break;
+      case "verify-interop-replace-partitions-conflict":
+        // CONFLICT-VALIDATION ReplacePartitions interop, DIRECTION 2 — "Java validates what RUST
+        // writes". The Rust GEN test (env ICEBERG_INTEROP_REPLACE_PARTITIONS_CONFLICT_GEN_DIR) wrote
+        // each scenario's S0+S1 table to <dir>/<scenario>/rust_table. Java loads each, runs the
+        // symmetric replace_partitions, and asserts the conflict decision matches the scenario's
+        // hand-declared expected outcome.
+        Path replacePartitionsConflictVerifyDir =
+            requireFixturesDir("interop.replace_partitions_conflict.dir");
+        int replacePartitionsConflictFailures =
+            ReplacePartitionsConflictOracle.verify(replacePartitionsConflictVerifyDir);
+        System.out.println(
+            "verify-interop-replace-partitions-conflict: "
+                + replacePartitionsConflictFailures
+                + " failures");
+        if (replacePartitionsConflictFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-delete-data":
         // DATA-LEVEL DeleteFiles interop (increment W1, fixture D). Writes a V2 partitioned table
         // (identity(category), schema {id long, category string, data string}) under <dir>/table, appends
@@ -8831,6 +8861,281 @@ public final class InteropOracle {
                   out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
               FileFormat.PARQUET,
               null); // null partition = unpartitioned
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
+    }
+  }
+
+  // =============================================================================================
+  // ReplacePartitionsConflictOracle — CONFLICT-VALIDATION ReplacePartitions interop (increment C4).
+  //
+  // Proves ReplacePartitions.validateNoConflictingData() (Java BaseReplacePartitions) agrees with
+  // Rust's validate_no_conflicting_data() on the SAME concurrent-commit history. Like
+  // OverwriteConflictOracle, this asserts the conflict DECISION (ACCEPT vs REJECT), but the conflict
+  // axis is DIFFERENT: ReplacePartitions' conflict is PARTITION-SCOPED (a concurrent add into a
+  // REPLACED (spec_id, partition) tuple), NOT an inclusive-metrics filter. There is NO
+  // conflictDetectionFilter and NO caseSensitive on ReplacePartitions (javap confirms). So the table
+  // is PARTITIONED by identity(category); the partition is the conflict axis.
+  //
+  // Per scenario, a PARTITIONED V2 {1 id long, 2 category string} table (identity(category)):
+  //   S0: fast-append base files cat=a (id=1) + cat=b (id=2)
+  //   S1: fast-append a CONCURRENT file into ONE partition (cat=a or cat=b)
+  // The symmetric action replace_partitions().addFile(<fresh cat=a file>)
+  //   .validateFromSnapshot(S0).validateNoConflictingData() REPLACES partition a; whether the
+  // concurrent S1 add lands in a REPLACED partition decides ACCEPT vs REJECT:
+  //
+  //   scenario            | concurrent add | expected
+  //   replaced_partition  | cat=a          | REJECT  (concurrent add raced the replaced partition a)
+  //   other_partition     | cat=b          | ACCEPT  (cat=b is not replaced ⇒ no conflict)
+  //
+  // This MUST mirror Rust's interop_replace_partitions_conflict.rs scenario set exactly (names,
+  // partitions, expected outcomes). generate writes <dir>/<scenario>/table (Java) for Rust's D1;
+  // verify loads <dir>/<scenario>/rust_table (Rust's GEN) for Java's D2 and prints the "N failures"
+  // sentinel.
+  // =============================================================================================
+  static final class ReplacePartitionsConflictOracle {
+    private ReplacePartitionsConflictOracle() {}
+
+    private static final class Scenario {
+      final String name;
+      final String concurrentCategory;
+      final boolean expectReject;
+
+      Scenario(String name, String concurrentCategory, boolean expectReject) {
+        this.name = name;
+        this.concurrentCategory = concurrentCategory;
+        this.expectReject = expectReject;
+      }
+    }
+
+    private static final List<Scenario> SCENARIOS =
+        List.of(
+            new Scenario("replaced_partition", "a", true),
+            new Scenario("other_partition", "b", false));
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "category", Types.StringType.get()));
+
+    static void generate(Path dir) throws IOException {
+      for (Scenario scenario : SCENARIOS) {
+        Path scenarioDir = dir.resolve(scenario.name);
+        File tableDir = scenarioDir.resolve("table").toFile();
+        File metadataDir = new File(tableDir, "metadata");
+        File dataDir = new File(tableDir, "data");
+        mkdirs(metadataDir);
+        mkdirs(dataDir);
+
+        PartitionSpec spec = PartitionSpec.builderFor(SCHEMA).identity("category").build();
+
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, "2");
+        TableMetadata seed =
+            TableMetadata.newTableMetadata(
+                SCHEMA, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+        LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+        ops.commit(null, seed);
+        BaseTable table = new BaseTable(ops, "interop_replace_partitions_conflict_" + scenario.name);
+
+        // S0: base files cat=a (id=1) + cat=b (id=2).
+        DataFile baseA =
+            writePartitionedFile(
+                table, spec, "a", new File(dataDir, "category=a/00000-a0.parquet"), new long[] {1L});
+        DataFile baseB =
+            writePartitionedFile(
+                table, spec, "b", new File(dataDir, "category=b/00000-b0.parquet"), new long[] {2L});
+        table.newFastAppend().appendFile(baseA).appendFile(baseB).commit();
+
+        // S1: the CONCURRENT file into ONE partition.
+        DataFile concurrent =
+            writePartitionedFile(
+                table,
+                spec,
+                scenario.concurrentCategory,
+                new File(
+                    dataDir,
+                    "category="
+                        + scenario.concurrentCategory
+                        + "/00001-concurrent.parquet"),
+                new long[] {100L});
+        table.newFastAppend().appendFile(concurrent).commit();
+
+        Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+        OutputFile finalOut =
+            new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+        TableMetadataParser.write(ops.current(), finalOut);
+
+        System.out.println(
+            "generated replace-partitions-conflict scenario "
+                + scenario.name
+                + " (S0 cat=a+cat=b + concurrent S1 cat="
+                + scenario.concurrentCategory
+                + ", expected "
+                + (scenario.expectReject ? "REJECT" : "ACCEPT")
+                + ") to "
+                + scenarioDir);
+      }
+    }
+
+    /**
+     * DIRECTION 2 verify — for each scenario, load the RUST-written table and run the symmetric
+     * replace_partitions; the ACCEPT/REJECT outcome must equal the hand-declared expected.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      for (Scenario scenario : SCENARIOS) {
+        Path finalMetadata =
+            dir.resolve(scenario.name)
+                .resolve("rust_table")
+                .resolve("metadata")
+                .resolve("final.metadata.json");
+        if (!Files.exists(finalMetadata)) {
+          System.out.println(
+              "FAIL replace-partitions-conflict-d2["
+                  + scenario.name
+                  + "]: missing "
+                  + finalMetadata
+                  + " (run the Rust GEN path first)");
+          failures++;
+          continue;
+        }
+
+        try {
+          boolean rejected = runReplaceAndDetect(finalMetadata, scenario);
+          if (rejected == scenario.expectReject) {
+            System.out.println(
+                "PASS replace-partitions-conflict-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " matches expected");
+          } else {
+            System.out.println(
+                "FAIL replace-partitions-conflict-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " but expected "
+                    + (scenario.expectReject ? "REJECT" : "ACCEPT"));
+            failures++;
+          }
+        } catch (RuntimeException | IOException error) {
+          System.out.println(
+              "FAIL replace-partitions-conflict-d2["
+                  + scenario.name
+                  + "]: unexpected error running the replace_partitions: "
+                  + error);
+          failures++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-replace-partitions-conflict OK — Java's ReplacePartitions conflict "
+                + "decision matches Rust on all "
+                + SCENARIOS.size()
+                + " scenarios (replaced_partition REJECT, other_partition ACCEPT)");
+      }
+      return failures;
+    }
+
+    /**
+     * Load the Rust-written {@code final.metadata.json} into a committable {@link
+     * LocalTableOperations} (seed via {@code commit(null, loaded)} — S0+S1 snapshot ids preserved),
+     * run the symmetric replace_partitions, and return {@code true} when it was REJECTED (a {@code
+     * ValidationException}) or {@code false} when it committed (ACCEPT).
+     */
+    private static boolean runReplaceAndDetect(Path rustFinalMetadata, Scenario scenario)
+        throws IOException {
+      File metadataDir = rustFinalMetadata.getParent().toFile();
+      File tableDir = metadataDir.getParentFile(); // .../rust_table
+      File dataDir = new File(tableDir, "data");
+      mkdirs(dataDir);
+
+      TableMetadata loaded =
+          TableMetadataParser.fromJson(rustFinalMetadata.toString(), readString(rustFinalMetadata));
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, loaded); // seed `current` with the Rust S0+S1 history
+      BaseTable table = new BaseTable(ops, "rust_replace_partitions_conflict_" + scenario.name);
+
+      long s0 = rootSnapshotId(table);
+      PartitionSpec spec = table.spec();
+      // The replace's own added file is a FRESH cat=a file (a replaced partition); the conflict
+      // decision turns on the concurrent S1 add, not this payload.
+      DataFile fresh =
+          writePartitionedFile(
+              table,
+              spec,
+              "a",
+              new File(dataDir, "fresh-" + scenario.name + "-" + System.nanoTime() + ".parquet"),
+              new long[] {999L});
+
+      org.apache.iceberg.ReplacePartitions replace =
+          table
+              .newReplacePartitions()
+              .addFile(fresh)
+              .validateFromSnapshot(s0)
+              .validateNoConflictingData();
+      try {
+        replace.commit();
+        return false; // ACCEPT
+      } catch (org.apache.iceberg.exceptions.ValidationException validationFailure) {
+        return true; // REJECT
+      }
+    }
+
+    /** The ROOT snapshot (no parent) — after S0+S1 this is S0, so S1 is the concurrent commit. */
+    private static long rootSnapshotId(BaseTable table) {
+      for (Snapshot snapshot : table.snapshots()) {
+        if (snapshot.parentId() == null) {
+          return snapshot.snapshotId();
+        }
+      }
+      throw new IllegalStateException("no root snapshot (S0) found in the table history");
+    }
+
+    /**
+     * Write a REAL parquet {id, category} file for ONE identity(category) partition; {@code category}
+     * is the partition value stamped on every row. Same idiom as {@link
+     * OverwriteFilesDataOracle#writePartitionedDataFile} but for the 2-field {id, category} schema.
+     */
+    private static DataFile writePartitionedFile(
+        BaseTable table, PartitionSpec spec, String category, File file, long[] ids)
+        throws IOException {
+      File parent = file.getParentFile();
+      if (!parent.isDirectory() && !parent.mkdirs()) {
+        throw new IOException("failed to create partition data dir " + parent);
+      }
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partition = new PartitionData(partitionType);
+      partition.set(0, category);
+
+      List<Record> rows = new ArrayList<>();
+      for (long id : ids) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", id);
+        record.setField("category", category);
+        rows.add(record);
+      }
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
       try (Closeable toClose = writer) {
         writer.write(rows);
       }
