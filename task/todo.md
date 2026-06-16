@@ -142,6 +142,10 @@ Wave 2 — multi-spec write interop (stretch):
       ignores min-count-to-merge) — Rust's merging producer does NOT mirror this. Documented in row 94.
       The multi-spec DATA cases (overwrite/rewrite carrying old-spec + adding new-spec) are deferred
       behind this asymmetry. **→ tracked as new queue item below.**
+      **⚠ RE-CHARACTERIZED 2026-06-16 (post-review, code-verified): the framing above is IMPRECISE —
+      `merge_append.rs` DOES port the force-merge faithfully; the real gap is that the NON-APPEND actions
+      route through `DefaultManifestProcess` (no merge). See the corrected follow-on item below + the
+      re-characterized GAP_MATRIX row 94.**
 
 Wave 3 — builder-surface flips (stretch, only if 1+2 beat estimates):
 
@@ -149,11 +153,20 @@ Wave 3 — builder-surface flips (stretch, only if 1+2 beat estimates):
 
 Follow-on residue (surfaced mid-charter 2026-06-16, see GAP_MATRIX row 94):
 
-- [ ] **Multi-spec MERGING-path DATA-manifest force-merge asymmetry** — Java `MergingSnapshotProducer.apply`
-      → `ManifestMergeManager.mergeManifests` force-MERGES every spec group NOT containing the
-      iterator-`first` manifest, ignoring `min-count-to-merge` (order-dependent); Rust's merging
-      producer does not mirror this. Decide correctness-vs-layout + whether to mirror Java; THEN the
-      multi-spec DATA cases (overwrite/rewrite carrying old-spec + adding new-spec) can be interop'd.
+- [ ] **Multi-spec MERGING-path: route `MergeManifestProcess` into the non-append actions (WIRING gap —
+      RE-CHARACTERIZED 2026-06-16 post-review, Rust-side code-verified).** The earlier framing ("Rust's
+      merging producer doesn't mirror Java's `first`-relative force-merge") was IMPRECISE and would have
+      sent a future session chasing a phantom bug. `merge_append.rs::bin_disposition` ALREADY ports Java's
+      `mergeGroup` force-merge of non-`first` spec bins faithfully (`bin_len==1` keep; `contains_first &&
+      < min_count_to_merge` keep; else MERGE), with a passing multi-spec test. The REAL gap: the non-append
+      merging actions (`RowDelta`/`OverwriteFiles`/`RewriteFiles`/`ReplacePartitions`/`DeleteFiles`) all
+      commit through `DefaultManifestProcess` (a no-op), so they NEVER merge manifests, while Java's extend
+      `MergingSnapshotProducer` (merge-capable past `min-count-to-merge`). Impact = manifest-list LAYOUT
+      only (NOT data / seq / partition), DORMANT below threshold. Steps: (a) FIRST confirm via the Java
+      reference checkout that `BaseRowDelta`/`BaseOverwriteFiles` actually merge multi-spec manifests at
+      default settings (the asymmetry may be narrower than assumed); (b) if so, reuse the existing
+      `MergeManifestProcess` in those actions; (c) THEN the multi-spec DATA cases (overwrite/rewrite
+      carrying old-spec + adding new-spec) can be interop'd.
 
 See [[parity-next-work]] (memory) for the reusable harness gotchas (register_table `<version>-<uuid>`
 name; LocalTableOperations re-seed; final.metadata.json untouched).
