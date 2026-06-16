@@ -128,8 +128,10 @@ approved a hardening sprint **before further parity work**. Live plan + checkbox
 
 ## Current state (one screen — details live in the GAP_MATRIX)
 
-> **Corrected 2026-06-13** (post R1/R2/R3 audit). Per-capability status lives ONLY in the
-> [GAP_MATRIX](docs/parity/GAP_MATRIX.md); this screen is a one-paragraph orientation that links there.
+> **Corrected 2026-06-13** (post R1/R2/R3 audit); **prose refreshed 2026-06-16** (`caseSensitive` /
+> `deleteFromRowFilter` builders built #51; conflict-validation interop proven for all 5 write actions
+> #64-#69). Per-capability status lives ONLY in the [GAP_MATRIX](docs/parity/GAP_MATRIX.md); this screen
+> is a one-paragraph orientation that links there.
 
 **Base:** upstream `iceberg` 0.9.1 (datafusion 52.2 / arrow 57.1 / parquet 57.1, MSRV 1.92), owned
 fork on `main` since 2026-06-07. No Python layers. Offline lib suite green (**2,238 `#[test]`/`#[tokio::test]`
@@ -147,7 +149,10 @@ theta-blob I1). See the matrix for the exact ✅ rows + flip dates.
 
 **Built but interop-deferred 🟡:** the metadata-level write actions (`DeleteFiles`, `OverwriteFiles`,
 `ReplacePartitions`, `RewriteFiles`, `RowDelta`, `RewriteManifests` — Java-judged via the 8-step
-chain) with their conflict validations; incremental append/changelog scans; residual evaluation;
+chain); their **conflict validations are now interop-proven both directions (2026-06-15/16, PRs
+#64-#69)** — the remaining 🟡 residue on those rows is the row-filter / multi-spec-DATA /
+DELETE-file-rewrite interop slices, not conflict validation; incremental append/changelog scans;
+residual evaluation;
 scan-metrics model + emission; views (memory + REST + SQL landed, interop'd I2 — Glue/S3Tables view
 ops still ❌); `variant` (binary read+write byte-exact both sides; shredded-parquet FILE I/O
 externally blocked by the parquet 57.1 pin). Per-row status + residue: the matrix.
@@ -155,9 +160,11 @@ externally blocked by the parquet 57.1 pin). Per-row status + residue: the matri
 **Missing ❌:** ORC/Avro DATA files, `geometry`/`geography`/`unknown` types, encryption,
 `SessionCatalog`, `LockManager` (ZERO code), `BatchScan`, the maintenance residue
 (`RewritePositionDeleteFiles`, `SnapshotTable`/`MigrateTable`/`RewriteTablePath`,
-`ComputePartitionStats` action wrapper + `UpdatePartitionStatistics` commit surface), and the
-unported builder/accessor surfaces (conflict-detection + `caseSensitive` builders, Catalog
-`name()`/`properties()`/`commitTransaction()`/`invalidate*`).
+`ComputePartitionStats` action wrapper + `UpdatePartitionStatistics` commit surface), the unported
+Catalog accessor surfaces (`name()`/`properties()`/`commitTransaction()`/`invalidate*`), and the
+conflict-detection sub-builders still unported (`validateAppendOnly`; `conflictDetectionFilter` on
+`DeleteFiles`/`ReplacePartitions`). *(`caseSensitive(bool)` and `DeleteFiles.deleteFromRowFilter`
+LANDED 2026-06-13 #51 — 🟡, no longer ❌; see GAP_MATRIX rows 134/135.)*
 
 **Row-by-row truth:** [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
 
@@ -222,9 +229,11 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   optimistic-concurrency retry validated against Glue + S3 Tables.
 - **Where it stands:** per-action status: GAP_MATRIX (the only status record). The DV writer + its
   row-delta commit are ✅ (interop both directions, 2026-06-11); `merge_append` data-level interop is
-  now ✅ both directions. Remaining in-phase: real-catalog (Glue + S3 Tables) hardening, data-level
-  interop for the remaining write actions, and the unported conflict-detection + `caseSensitive`
-  builder surfaces (engine exists — see Headline gaps #1).
+  now ✅ both directions; conflict-validation interop is proven for all 5 write actions (#64-#69).
+  Remaining in-phase: real-catalog (Glue + S3 Tables) hardening, data-level interop for the remaining
+  write actions, and the conflict-detection sub-builders still unported (`validateAppendOnly`,
+  `conflictDetectionFilter` on `DeleteFiles`/`ReplacePartitions`; engine exists — see Headline gaps #1).
+  (`caseSensitive`/`deleteFromRowFilter` landed #51.)
 - **Exit criteria:** each write action commits correctly through the real catalogs with conflict
   detection, with interop round-trips vs Java. Narratives:
   [task/todo-archive/phase2.md](task/todo-archive/phase2.md).
@@ -299,16 +308,17 @@ Sequenced for the near-full-parity directive (2026-06-11), with the model-tier h
 (frontier sessions until 2026-06-22, then Opus) deciding WHO does each: judgment-heavy /
 format-sensitive work front-loads into the frontier window; well-templated breadth follows.
 
-1. **Phase-2/3 closeout (frontier-first):** the highest-leverage TRACKED-but-unbuilt item is the
-   **shared conflict-detection + `caseSensitive` builder surfaces** on
-   `DeleteFiles`/`OverwriteFiles`/`RowDelta`/`ReplacePartitions`
-   (`validateNoConflictingData`/`DeleteFiles`, `conflictDetectionFilter(Expression)`,
-   `validateAppendOnly`, `caseSensitive(bool)`) — the `MergingSnapshotProducer.validate` engine is
-   already implemented, but the builder APIs are only partially ported (`DeleteFiles` has none;
-   `ReplacePartitions` lacks `conflictDetectionFilter`; NONE have `caseSensitive`/`validateAppendOnly`)
-   plus `DeleteFiles.deleteFromRowFilter(Expression)` (delete-by-predicate). Then: the constants-map
-   increment (reverted 2026-06-08 with known latent bugs), the writer-layer multi-spec threading, the
-   `dv_seq >= data_seq` index validation residue. (Real-catalog hardening needs user credentials —
+1. **Phase-2/3 closeout (frontier-first):** the conflict-detection + `caseSensitive` builder surfaces on
+   `DeleteFiles`/`OverwriteFiles`/`RowDelta`/`ReplacePartitions` are now mostly ported, and their
+   **conflict-validation interop is PROVEN both directions** (2026-06-15/16, PRs #64-#69): the
+   `MergingSnapshotProducer.validate` engine was already implemented; `caseSensitive(bool)` LANDED on
+   `DeleteFiles`/`OverwriteFiles`/`RowDelta` (narrowed out of `ReplacePartitions` per the Java API) and
+   `DeleteFiles.deleteFromRowFilter(Expression)` LANDED (both 2026-06-13 #51, 🟡 pending their own interop
+   flip — Wave 3). The genuinely STILL-unbuilt sub-items: `validateAppendOnly` (doc-only, not a method),
+   `conflictDetectionFilter` on `DeleteFiles` and `ReplacePartitions`, the constants-map increment
+   (reverted 2026-06-08 with known latent bugs), the writer-layer multi-spec threading (a WIRING gap —
+   `MergeManifestProcess` is not routed into the non-append merging actions; see GAP_MATRIX row 94), and
+   the `dv_seq >= data_seq` index validation residue. (Real-catalog hardening needs user credentials —
    scheduled with the user; data-level write-action interop is templated → Opus.)
 2. **Maintenance actions (frontier for the GC semantics):** `ExpireSnapshots` + `DeleteOrphanFiles`
    (reachability/retention/file-GC safety is the corruption-class judgment), then
