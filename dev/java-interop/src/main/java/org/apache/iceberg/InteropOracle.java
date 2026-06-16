@@ -547,6 +547,30 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-rowdelta-conflict":
+        // CONFLICT-VALIDATION RowDelta interop (increment C3) — the RICHEST write-action conflict unit
+        // (GAP_MATRIX row 94). For each scenario, writes an UNPARTITIONED V2 {id long, y long} table
+        // under <dir>/<scenario>/table with an axis-specific S0→S1 history (data-conflict: concurrent
+        // DATA add; delete-conflict: concurrent eq-delete add; files-exist: concurrent overwrite
+        // removal). The validating engine runs the symmetric row_delta (add fresh delete +
+        // validateFromSnapshot(S0) + the axis's validation) and its ACCEPT/REJECT must equal the
+        // hand-declared expected (same contract as Rust's interop_rowdelta_conflict.rs).
+        Path rowDeltaConflictDir = requireFixturesDir("interop.rowdelta_conflict.dir");
+        RowDeltaConflictOracle.generate(rowDeltaConflictDir);
+        break;
+      case "verify-interop-rowdelta-conflict":
+        // CONFLICT-VALIDATION RowDelta interop, DIRECTION 2 — "Java validates what RUST writes". The
+        // Rust GEN test (env ICEBERG_INTEROP_ROWDELTA_CONFLICT_GEN_DIR) wrote each scenario's S0+S1
+        // table to <dir>/<scenario>/rust_table. Java loads each, runs the symmetric row_delta for that
+        // scenario's axis, and asserts the conflict decision matches the hand-declared expected.
+        Path rowDeltaConflictVerifyDir = requireFixturesDir("interop.rowdelta_conflict.dir");
+        int rowDeltaConflictFailures = RowDeltaConflictOracle.verify(rowDeltaConflictVerifyDir);
+        System.out.println(
+            "verify-interop-rowdelta-conflict: " + rowDeltaConflictFailures + " failures");
+        if (rowDeltaConflictFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-delete-data":
         // DATA-LEVEL DeleteFiles interop (increment W1, fixture D). Writes a V2 partitioned table
         // (identity(category), schema {id long, category string, data string}) under <dir>/table, appends
@@ -9140,6 +9164,454 @@ public final class InteropOracle {
         writer.write(rows);
       }
       return writer.toDataFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
+    }
+  }
+
+  // =============================================================================================
+  // RowDeltaConflictOracle — CONFLICT-VALIDATION RowDelta interop (increment C3).
+  //
+  // RowDelta is the RICHEST write-action conflict unit (GAP_MATRIX row 94): the merge-on-read commit
+  // (adds DATA + DELETE files in one snapshot) with THREE independent conflict checks. This oracle
+  // proves all three agree with Rust's RowDelta on the conflict DECISION (ACCEPT vs REJECT) over the
+  // SAME concurrent-commit history, hand-declared identically on both sides (anti-circular). Like
+  // OverwriteConflictOracle / ReplacePartitionsConflictOracle, it asserts the DECISION, not surviving
+  // rows.
+  //
+  // The three axes (Java BaseRowDelta / MergingSnapshotProducer):
+  //   1. validateNoConflictingDataFiles() + conflictDetectionFilter(F) — a concurrent fast-append of a
+  //      DATA file matching F is the conflict (the inclusive-metrics axis, EXACTLY the C1 shape).
+  //   2. validateNoConflictingDeleteFiles() + filter — a concurrent row_delta adding a DELETE file
+  //      matching F is the conflict (RowDelta-specific). The concurrent DELETE is an EQUALITY delete
+  //      keyed on `y` (equalityFieldIds=[2]) so its real parquet carries the `y` bounds the
+  //      inclusive-metrics evaluator narrows on — the same metrics axis as 1, on a delete file.
+  //   3. validateDataFilesExist(paths) — a concurrent OVERWRITE that REMOVED the referenced data file
+  //      is the conflict (the {OVERWRITE} default op set, so it rejects WITHOUT validateDeletedFiles()).
+  //
+  // Per scenario, an UNPARTITIONED V2 {1 id long, 2 y long} table (like C1). The symmetric row delta
+  //   table.newRowDelta().addDeletes(<fresh y eq-delete>).validateFromSnapshot(S0)<axis validation>
+  // is independent of its own added payload, so each engine runs it against the OTHER's table.
+  //
+  //   scenario                | axis            | S1 concurrent commit                 | expected
+  //   data_conflict_reject    | data-conflict   | fast-append DATA y[60,70] (overlaps) | REJECT
+  //   data_conflict_accept    | data-conflict   | fast-append DATA y[10,20] (excluded) | ACCEPT
+  //   delete_conflict_reject  | delete-conflict | row_delta eq-delete on y[60,70]      | REJECT
+  //   delete_conflict_accept  | delete-conflict | row_delta eq-delete on y[10,20]      | ACCEPT
+  //   files_exist_reject      | files-exist     | overwrite removes f0 add f2          | REJECT
+  //   files_exist_accept      | files-exist     | overwrite removes f0 add f2          | ACCEPT
+  //
+  // The files_exist scenarios share the SAME history (S0 appends f0+f1; S1 overwrite removes f0 adds
+  // f2). The reject scenario references the REMOVED f0; the accept references the SURVIVING f1; both
+  // derived from the loaded table (live@S0 minus live@S1 = removed; live@S0 ∩ live@S1 = survivor) so
+  // there is no cross-engine path coupling.
+  //
+  // This MUST mirror Rust's interop_rowdelta_conflict.rs scenario set exactly (names, axes, bounds,
+  // expected outcomes). generate writes <dir>/<scenario>/table (Java) for Rust's D1; verify loads
+  // <dir>/<scenario>/rust_table (Rust's GEN) for Java's D2 and prints the "N failures" sentinel.
+  // =============================================================================================
+  static final class RowDeltaConflictOracle {
+    private RowDeltaConflictOracle() {}
+
+    private enum Axis {
+      DATA_CONFLICT,
+      DELETE_CONFLICT,
+      FILES_EXIST
+    }
+
+    private static final class Scenario {
+      final String name;
+      final Axis axis;
+      final long lo;
+      final long hi;
+      final boolean expectReject;
+
+      Scenario(String name, Axis axis, long lo, long hi, boolean expectReject) {
+        this.name = name;
+        this.axis = axis;
+        this.lo = lo;
+        this.hi = hi;
+        this.expectReject = expectReject;
+      }
+    }
+
+    private static final List<Scenario> SCENARIOS =
+        List.of(
+            new Scenario("data_conflict_reject", Axis.DATA_CONFLICT, 60L, 70L, true),
+            new Scenario("data_conflict_accept", Axis.DATA_CONFLICT, 10L, 20L, false),
+            new Scenario("delete_conflict_reject", Axis.DELETE_CONFLICT, 60L, 70L, true),
+            new Scenario("delete_conflict_accept", Axis.DELETE_CONFLICT, 10L, 20L, false),
+            new Scenario("files_exist_reject", Axis.FILES_EXIST, 0L, 0L, true),
+            new Scenario("files_exist_accept", Axis.FILES_EXIST, 0L, 0L, false));
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "y", Types.LongType.get()));
+
+    static void generate(Path dir) throws IOException {
+      for (Scenario scenario : SCENARIOS) {
+        Path scenarioDir = dir.resolve(scenario.name);
+        File tableDir = scenarioDir.resolve("table").toFile();
+        File metadataDir = new File(tableDir, "metadata");
+        File dataDir = new File(tableDir, "data");
+        mkdirs(metadataDir);
+        mkdirs(dataDir);
+
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, "2");
+        TableMetadata seed =
+            TableMetadata.newTableMetadata(
+                SCHEMA,
+                PartitionSpec.unpartitioned(),
+                SortOrder.unsorted(),
+                tableDir.getAbsolutePath(),
+                props);
+
+        LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+        ops.commit(null, seed);
+        BaseTable table = new BaseTable(ops, "interop_rowdelta_conflict_" + scenario.name);
+
+        buildScenarioHistory(table, dataDir, scenario);
+
+        Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+        OutputFile finalOut =
+            new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+        TableMetadataParser.write(ops.current(), finalOut);
+
+        System.out.println(
+            "generated rowdelta-conflict scenario "
+                + scenario.name
+                + " ("
+                + scenario.axis
+                + ", expected "
+                + (scenario.expectReject ? "REJECT" : "ACCEPT")
+                + ") to "
+                + scenarioDir);
+      }
+    }
+
+    /**
+     * Build the per-scenario S0→S1 history on {@code table}. Axis-specific: data-conflict appends a
+     * concurrent DATA file at S1; delete-conflict commits a concurrent row_delta eq-delete at S1;
+     * files-exist appends f0+f1 at S0 then an OVERWRITE removing f0 (adding f2) at S1.
+     */
+    private static void buildScenarioHistory(BaseTable table, File dataDir, Scenario scenario)
+        throws IOException {
+      switch (scenario.axis) {
+        case DATA_CONFLICT:
+          {
+            // S0: base file A0 (y bounds [0,5]).
+            DataFile a0 =
+                writeYidFile(
+                    table,
+                    new File(dataDir, "00000-a0.parquet").getAbsolutePath(),
+                    new long[] {1L, 2L},
+                    new long[] {0L, 5L});
+            table.newFastAppend().appendFile(a0).commit();
+            // S1: the CONCURRENT DATA file (y bounds [lo,hi]).
+            DataFile concurrent =
+                writeYidFile(
+                    table,
+                    new File(dataDir, "00001-concurrent.parquet").getAbsolutePath(),
+                    new long[] {100L, 101L},
+                    new long[] {scenario.lo, scenario.hi});
+            table.newFastAppend().appendFile(concurrent).commit();
+            break;
+          }
+        case DELETE_CONFLICT:
+          {
+            // S0: base file A0 (y bounds [0,5]).
+            DataFile a0 =
+                writeYidFile(
+                    table,
+                    new File(dataDir, "00000-a0.parquet").getAbsolutePath(),
+                    new long[] {1L, 2L},
+                    new long[] {0L, 5L});
+            table.newFastAppend().appendFile(a0).commit();
+            // S1: a CONCURRENT row_delta adding an EQUALITY delete keyed on y, bounds [lo,hi].
+            DeleteFile concurrentDelete =
+                writeYEqDeleteFile(
+                    table,
+                    new File(dataDir, "00001-concurrent-y-deletes.parquet").getAbsolutePath(),
+                    scenario.lo,
+                    scenario.hi);
+            table.newRowDelta().addDeletes(concurrentDelete).commit();
+            break;
+          }
+        case FILES_EXIST:
+          {
+            // S0: append two base files f0 (y[0,5]) + f1 (y[6,9]).
+            DataFile f0 =
+                writeYidFile(
+                    table,
+                    new File(dataDir, "00000-f0.parquet").getAbsolutePath(),
+                    new long[] {1L, 2L},
+                    new long[] {0L, 5L});
+            DataFile f1 =
+                writeYidFile(
+                    table,
+                    new File(dataDir, "00000-f1.parquet").getAbsolutePath(),
+                    new long[] {3L, 4L},
+                    new long[] {6L, 9L});
+            table.newFastAppend().appendFile(f0).appendFile(f1).commit();
+            // S1: an OVERWRITE that REMOVES f0 (in the {OVERWRITE} default op set) and adds f2.
+            DataFile f2 =
+                writeYidFile(
+                    table,
+                    new File(dataDir, "00001-f2.parquet").getAbsolutePath(),
+                    new long[] {5L, 6L},
+                    new long[] {10L, 12L});
+            table.newOverwrite().deleteFile(f0).addFile(f2).commit();
+            break;
+          }
+        default:
+          throw new IllegalStateException("unknown axis " + scenario.axis);
+      }
+    }
+
+    /**
+     * DIRECTION 2 verify — for each scenario, load the RUST-written table and run the symmetric row
+     * delta; the ACCEPT/REJECT outcome must equal the hand-declared expected.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      for (Scenario scenario : SCENARIOS) {
+        Path finalMetadata =
+            dir.resolve(scenario.name)
+                .resolve("rust_table")
+                .resolve("metadata")
+                .resolve("final.metadata.json");
+        if (!Files.exists(finalMetadata)) {
+          System.out.println(
+              "FAIL rowdelta-conflict-d2["
+                  + scenario.name
+                  + "]: missing "
+                  + finalMetadata
+                  + " (run the Rust GEN path first)");
+          failures++;
+          continue;
+        }
+
+        try {
+          boolean rejected = runRowDeltaAndDetect(finalMetadata, scenario);
+          if (rejected == scenario.expectReject) {
+            System.out.println(
+                "PASS rowdelta-conflict-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " matches expected");
+          } else {
+            System.out.println(
+                "FAIL rowdelta-conflict-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " but expected "
+                    + (scenario.expectReject ? "REJECT" : "ACCEPT"));
+            failures++;
+          }
+        } catch (RuntimeException | IOException error) {
+          System.out.println(
+              "FAIL rowdelta-conflict-d2["
+                  + scenario.name
+                  + "]: unexpected error running the row_delta: "
+                  + error);
+          failures++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-rowdelta-conflict OK — Java's RowDelta conflict decision matches Rust on "
+                + "all "
+                + SCENARIOS.size()
+                + " scenarios across 3 axes (data-conflict, delete-conflict, files-exist; "
+                + "reject+accept each)");
+      }
+      return failures;
+    }
+
+    /**
+     * Load the Rust-written {@code final.metadata.json} into a committable {@link LocalTableOperations}
+     * (seed via {@code commit(null, loaded)} — S0+S1 snapshot ids preserved), run the symmetric row
+     * delta for the scenario's axis, and return {@code true} when it was REJECTED (a {@code
+     * ValidationException}) or {@code false} when it committed (ACCEPT).
+     */
+    private static boolean runRowDeltaAndDetect(Path rustFinalMetadata, Scenario scenario)
+        throws IOException {
+      File metadataDir = rustFinalMetadata.getParent().toFile();
+      File tableDir = metadataDir.getParentFile(); // .../rust_table
+      File dataDir = new File(tableDir, "data");
+      mkdirs(dataDir);
+
+      TableMetadata loaded =
+          TableMetadataParser.fromJson(rustFinalMetadata.toString(), readString(rustFinalMetadata));
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, loaded); // seed `current` with the Rust S0+S1 history
+      BaseTable table = new BaseTable(ops, "rust_rowdelta_conflict_" + scenario.name);
+
+      long s0 = rootSnapshotId(table);
+      // The row delta's own added delete file is irrelevant to the conflict decision; a fresh eq-delete.
+      DeleteFile fresh =
+          writeYEqDeleteFile(
+              table,
+              new File(dataDir, "fresh-" + scenario.name + "-" + System.nanoTime() + ".parquet")
+                  .getAbsolutePath(),
+              1L,
+              1L);
+
+      org.apache.iceberg.RowDelta rowDelta =
+          table.newRowDelta().addDeletes(fresh).validateFromSnapshot(s0);
+      switch (scenario.axis) {
+        case DATA_CONFLICT:
+          rowDelta =
+              rowDelta
+                  .validateNoConflictingDataFiles()
+                  .conflictDetectionFilter(Expressions.greaterThanOrEqual("y", 50L));
+          break;
+        case DELETE_CONFLICT:
+          rowDelta =
+              rowDelta
+                  .validateNoConflictingDeleteFiles()
+                  .conflictDetectionFilter(Expressions.greaterThanOrEqual("y", 50L));
+          break;
+        case FILES_EXIST:
+          rowDelta =
+              rowDelta.validateDataFilesExist(List.of(filesExistReferencedPath(table, scenario)));
+          break;
+        default:
+          throw new IllegalStateException("unknown axis " + scenario.axis);
+      }
+      try {
+        rowDelta.commit();
+        return false; // ACCEPT
+      } catch (org.apache.iceberg.exceptions.ValidationException validationFailure) {
+        return true; // REJECT
+      }
+    }
+
+    /**
+     * For the files-exist axis: derive the referenced data file path the symmetric row delta pins, from
+     * the loaded table (no cross-engine path coupling). The reject scenario references a file S1 REMOVED
+     * (live@S0 minus live@S1); the accept scenario references a file that SURVIVED (live@S0 ∩ live@S1).
+     * The expected outcome is encoded by which path is referenced (same as Rust's
+     * files_exist_referenced_path).
+     */
+    private static String filesExistReferencedPath(BaseTable table, Scenario scenario) {
+      long s0 = rootSnapshotId(table);
+      long s1 = table.currentSnapshot().snapshotId();
+      java.util.Set<String> liveS0 = liveDataPathsAt(table, s0);
+      java.util.Set<String> liveS1 = liveDataPathsAt(table, s1);
+
+      if (scenario.expectReject) {
+        // A file live at S0 but tombstoned by S1 — the concurrently-removed file (the overwrite victim).
+        for (String path : liveS0) {
+          if (!liveS1.contains(path)) {
+            return path;
+          }
+        }
+        throw new IllegalStateException(
+            "no data file was removed by S1 (the overwrite victim is absent)");
+      } else {
+        // A file live at BOTH S0 and S1 — a survivor the overwrite did not touch.
+        for (String path : liveS0) {
+          if (liveS1.contains(path)) {
+            return path;
+          }
+        }
+        throw new IllegalStateException("no data file survived from S0 to S1 (no overwrite survivor)");
+      }
+    }
+
+    /** The set of live DATA file paths AS OF the snapshot {@code snapshotId} (scan plan at that id). */
+    private static java.util.Set<String> liveDataPathsAt(BaseTable table, long snapshotId) {
+      java.util.Set<String> live = new java.util.LinkedHashSet<>();
+      try (CloseableIterable<FileScanTask> tasks =
+          table.newScan().useSnapshot(snapshotId).planFiles()) {
+        for (FileScanTask task : tasks) {
+          live.add(task.file().location());
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to plan files at snapshot " + snapshotId, error);
+      }
+      return live;
+    }
+
+    /** The ROOT snapshot (no parent) — after S0+S1 this is S0, so S1 is the concurrent commit. */
+    private static long rootSnapshotId(BaseTable table) {
+      for (Snapshot snapshot : table.snapshots()) {
+        if (snapshot.parentId() == null) {
+          return snapshot.snapshotId();
+        }
+      }
+      throw new IllegalStateException("no root snapshot (S0) found in the table history");
+    }
+
+    /** Write a REAL unpartitioned parquet {id, y} DATA file; the y values become the column bounds. */
+    private static DataFile writeYidFile(BaseTable table, String path, long[] ids, long[] ys)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", ids[i]);
+        record.setField("y", ys[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null); // null partition = unpartitioned
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * Write a REAL unpartitioned parquet EQUALITY-delete file keyed on {@code y} (equalityFieldIds=[2]),
+     * carrying the two delete keys {@code y=lo} and {@code y=hi} so the file's parquet {@code y} column
+     * bounds are {@code [lo,hi]} — the inputs the inclusive-metrics evaluator narrows on when checking a
+     * concurrently-added delete file against the conflict filter. The delete-row schema is the single
+     * {@code y} column projected from the table schema (Java derives equalityFieldIds=[2] from it). Same
+     * idiom as {@link EqDeleteOracle#writeEqDeleteFile} but keyed on {@code y}.
+     */
+    private static DeleteFile writeYEqDeleteFile(BaseTable table, String path, long lo, long hi)
+        throws IOException {
+      Schema eqDeleteRowSchema = SCHEMA.select("y");
+      int[] equalityFieldIds =
+          eqDeleteRowSchema.columns().stream().mapToInt(Types.NestedField::fieldId).toArray();
+
+      List<Record> deletes = new ArrayList<>();
+      for (long y : new long[] {lo, hi}) {
+        GenericRecord delete = GenericRecord.create(eqDeleteRowSchema);
+        delete.setField("y", y);
+        deletes.add(delete);
+      }
+
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(
+              SCHEMA, PartitionSpec.unpartitioned(), equalityFieldIds, eqDeleteRowSchema, null);
+      OutputFile out = table.io().newOutputFile(path);
+      EqualityDeleteWriter<Record> writer =
+          factory.newEqDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(deletes);
+      }
+      return writer.toDeleteFile();
     }
 
     private static void mkdirs(File directory) throws IOException {
