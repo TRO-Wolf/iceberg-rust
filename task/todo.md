@@ -104,8 +104,12 @@ Wave 1 — conflict-validation closeout (order locked):
       both directions + fail-closed sabotage. Opus Actor → Opus Critic converged (2 cycles; cycle-1
       caught a masked-sabotage defect, fixed + independently re-verified). Files: `interop_replace_partitions_conflict.rs`,
       `run-interop-replace-partitions-conflict.sh`, `ReplacePartitionsConflictOracle`. Row 92 stays 🟡.
-- [ ] **AC·OO #2 — C3 RowDelta** (row 94). Richest: `validate_no_conflicting_data_files` +
-      `_delete_files` + `validate_data_files_exist` — concurrent data AND delete-file conflicts.
+- [x] **AC·OO #2 — C3 RowDelta** (row 94) — **DONE 2026-06-15.** All THREE axes proven both directions:
+      `validate_no_conflicting_data_files` (filter/metrics, C1 shape) + `_delete_files` (concurrent
+      y-keyed eq-delete add) + `validate_data_files_exist` (concurrent OVERWRITE removal). 6 scenarios
+      (reject+accept per axis). Opus Actor → Opus Critic converged in 1 cycle; Critic disabled each
+      axis's validation in turn to prove per-axis non-vacuity. Files: `interop_rowdelta_conflict.rs`,
+      `run-interop-rowdelta-conflict.sh`, `RowDeltaConflictOracle`. Row 94 stays 🟡.
 - [ ] **AC·OO #3 — C2 DeleteFiles** (row 93). `validate_files_exist()` — concurrent REMOVAL of a file
       this delete targets (missing-path shape, not added-data).
 - [ ] **AC·OO #4 — C5 RewriteFiles** (row 95). `validate_no_new_deletes_for_data_files` — a concurrent
