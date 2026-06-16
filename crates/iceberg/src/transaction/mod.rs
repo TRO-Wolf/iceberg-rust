@@ -61,12 +61,18 @@ mod expire_snapshots;
 pub use expire_cleanup::{
     CleanupFailure, CleanupFailureKind, CleanupReport, ExpireSnapshotsCleanup,
 };
+// Re-exported so the action type is nameable as a return type — it is handed out by both
+// `Transaction::expire_snapshots()` and `maintenance::Actions::expire_snapshots()`.
+pub use expire_snapshots::ExpireSnapshotsAction;
 mod manage_snapshots;
 mod merge_append;
 mod overwrite_files;
 mod replace_partitions;
 mod rewrite_files;
 mod rewrite_manifests;
+// Re-exported so the action type is nameable as a return type — it is handed out by both
+// `Transaction::rewrite_manifests()` and `maintenance::Actions::rewrite_manifests()`.
+pub use rewrite_manifests::RewriteManifestsAction;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -89,13 +95,11 @@ use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::cherry_pick::CherryPickAction;
 use crate::transaction::delete_files::DeleteFilesAction;
-use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 use crate::transaction::merge_append::MergeAppendAction;
 use crate::transaction::overwrite_files::OverwriteFilesAction;
 use crate::transaction::replace_partitions::ReplacePartitionsAction;
 use crate::transaction::rewrite_files::RewriteFilesAction;
-use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;

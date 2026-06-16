@@ -51,6 +51,13 @@
 //!   [`UpdateStatisticsAction`](crate::transaction::Transaction::update_statistics). The Rust port of
 //!   Java's `ComputeTableStats` action; each value is fed to the sketch in Iceberg single-value
 //!   serialization form (`Conversions.toByteBuffer`). See [`compute_table_stats`].
+//! - [`Actions`](crate::maintenance::Actions) / [`ActionsProvider`](crate::maintenance::ActionsProvider)
+//!   — the factory surface mirroring Java's `org.apache.iceberg.actions.ActionsProvider` (1.10.0): one
+//!   entry point that hands out the maintenance actions above (constructed `X::new(table)`) AND the
+//!   transaction-seam actions ([`ExpireSnapshotsAction`](crate::transaction::ExpireSnapshotsAction) /
+//!   [`RewriteManifestsAction`](crate::transaction::RewriteManifestsAction)), bridging both
+//!   construction idioms. Java methods with no Rust action surface as a typed
+//!   [`NoAction`](crate::maintenance::NoAction)-returning `FeatureUnsupported` (never faked).
 //!
 //! # Relationship to `transaction::expire_cleanup`
 //!
@@ -62,6 +69,7 @@
 //! [`DeleteOrphanFiles`] for why this module re-derives the *full* reachable set instead of
 //! reusing `expire_cleanup`'s delta machinery).
 
+mod actions_provider;
 mod compute_table_stats;
 mod delete_orphan_files;
 pub mod partition_stats;
@@ -71,6 +79,7 @@ mod rewrite_data_files;
 #[cfg(test)]
 mod tests;
 
+pub use actions_provider::{Actions, ActionsProvider, NoAction};
 pub use compute_table_stats::{ComputeTableStats, ComputeTableStatsResult};
 pub use delete_orphan_files::{DeleteOrphanFiles, DeleteOrphanFilesResult, PrefixMismatchMode};
 pub use partition_stats::{
