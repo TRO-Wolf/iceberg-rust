@@ -164,6 +164,27 @@ Wave 3 — builder-surface flips (stretch, only if 1+2 beat estimates):
       `interop_builder_flips.rs`, `run-interop-builder-flips.sh`, `BuilderFlipsOracle`.
       **Wave 3 COMPLETE — the 8h AC·OO charter (Waves 1 + 2 + 3) is fully landed.**
 
+## POST-CHARTER (2026-06-16, Opus) — maintenance/actions surface (AC·OO continues)
+
+Stance-review-ranked next surface (ActionsProvider + the cheap maintenance wrappers — orchestrate ✅
+primitives). AC·OO via Workflow, one PR per unit, same finalize cadence. Track A (multi-spec MERGING-path
+wiring gap) DEPRIORITIZED: recon confirmed `min-count-to-merge` default = 100, so the divergence is
+dormant for realistic single commits (narrow non-`first` ≥2-manifest sub-case only).
+
+- [x] **PC #1 — RemoveDanglingDeleteFiles → ✅** — **DONE 2026-06-16 (#TBD).** Interop-only (the action +
+      22 tests already existed; only interop was deferred). Converged 2 cycles (cycle-1 LOW: the position
+      at-exact-min boundary was unit-pinned only → cycle-2 restructured `pk` to a TRUE at-exact-min position
+      delete via data+pos-del in one `row_delta`, so BOTH off-by-one boundaries are now interop-pinned).
+      Proves 3 anti-circular engine-agnostic claims (Java's actual action is Spark-surface, N/A): semantics
+      match Java's independent `findDanglingDeletes`, API-contract counters/survivors, and CORRUPTION-SAFETY
+      read-identity (MoR live-id set identical before↔after, both directions). DV-REMOVE is now a real e2e
+      Puffin-DV fixture (closed the prior pure-fn-only gap). Live oracle GREEN (D1+D2+3 sabotages, exit 0);
+      all 6 non-vacuity gates mutation-proven by the Critic. **GAP_MATRIX row 135 🟡→✅.** Two infra crashes
+      first (529 overload) — hardened the workflow loop with null-guards (see [[parity-next-work]]). Files:
+      `interop_remove_dangling.rs`, `run-interop-remove-dangling.sh`, `RemoveDanglingOracle`.
+- [ ] **PC #2 — next maintenance unit** (candidates: `ConvertEqualityDeleteFiles`, `ActionsProvider`
+      scaffold, `RewritePositionDeleteFiles` [engine-agnostic logic, Java impl is Spark-surface]).
+
 Follow-on residue (surfaced mid-charter 2026-06-16, see GAP_MATRIX row 94):
 
 - [ ] **Multi-spec MERGING-path: route `MergeManifestProcess` into the non-append actions (WIRING gap —

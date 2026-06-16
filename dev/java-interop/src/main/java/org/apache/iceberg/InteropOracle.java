@@ -626,6 +626,29 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-remove-dangling":
+        // MAINTENANCE RemoveDanglingDeleteFiles interop (post-charter unit #1) — Java's mirror PRE-cleanup
+        // tables for Rust's D1. Writes two worlds (V2 parquet pos/eq/no-data under <dir>/table; V3 DVs
+        // under <dir>/table_v3), each carrying the hand-declared dangling set. The real Java action is
+        // Spark-surface (NOT on this classpath), so the interop instead proves Java's INDEPENDENT
+        // findDanglingDeletes recompute + read-identity agree with Rust (anti-circular). See
+        // RemoveDanglingOracle + crates/iceberg/tests/interop_remove_dangling.rs.
+        Path removeDanglingDir = requireFixturesDir("interop.remove_dangling.dir");
+        RemoveDanglingOracle.generate(removeDanglingDir);
+        break;
+      case "verify-interop-remove-dangling":
+        // MAINTENANCE RemoveDanglingDeleteFiles interop, DIRECTION 2 — "Java validates what RUST writes".
+        // For each world, Java loads the Rust-written PRE table (<dir>/rust_table[_v3]) + cleaned table
+        // (<dir>/rust_table_cleaned[_v3]), INDEPENDENTLY recomputes findDanglingDeletes over the PRE
+        // table's live entries (engine-agnostic manifest API), and checks read-identity PRE↔cleaned —
+        // proving removing the danglers resurrects nothing and loses no data.
+        Path removeDanglingVerifyDir = requireFixturesDir("interop.remove_dangling.dir");
+        int removeDanglingFailures = RemoveDanglingOracle.verify(removeDanglingVerifyDir);
+        System.out.println("verify-interop-remove-dangling: " + removeDanglingFailures + " failures");
+        if (removeDanglingFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-builder-flips":
         // BUILDER-FLIPS interop (Wave 3) — DeleteFiles' two builder-flip capabilities:
         // deleteFromRowFilter(Expression) (GAP_MATRIX row 135) + caseSensitive(boolean) (row 134),
@@ -15061,6 +15084,630 @@ public final class InteropOracle {
         count++;
       }
       return count;
+    }
+  }
+
+  // =============================================================================================
+  // RemoveDanglingOracle — MAINTENANCE RemoveDanglingDeleteFiles interop (post-charter unit #1).
+  //
+  // The real Java action is `RemoveDanglingDeletesSparkAction` (the SPARK module, NOT on the iceberg-core
+  // oracle classpath — no Spark jar here, mvn -o iceberg-core 1.10.0 + JDK11 only), so we CANNOT run it.
+  // The interop is therefore the three engine-agnostic, ANTI-CIRCULAR claims:
+  //
+  //  (1) SEMANTICS-MATCH (detection). This oracle INDEPENDENTLY recomputes Java's documented
+  //      `findDanglingDeletes` predicate over the PRE-cleanup table's LIVE entries — read via iceberg-core's
+  //      engine-agnostic manifest API (`Snapshot.dataManifests/deleteManifests` + `ManifestFiles.read/
+  //      readDeleteManifest`, the same data the ENTRIES/DATA_FILES/DELETE_FILES metadata tables project) —
+  //      and asserts the dangling set EQUALS the HAND-DECLARED REMOVE set (declared identically here and in
+  //      `interop_remove_dangling.rs` from the published spec, never derived from the other engine).
+  //  (2) API CONTRACT. The hand-declared REMOVE/KEEP partition of each delete file is the same set Rust's
+  //      action removed/kept (proven on the Rust side; this oracle confirms detection agreement).
+  //  (3) CORRUPTION SAFETY (read-identity, load-bearing). Java's `IcebergGenerics` merge-on-read read of the
+  //      PRE table and of the RUST-CLEANED table return the IDENTICAL live `id` set, and that set equals the
+  //      hand-declared `EXPECTED_LIVE_IDS` — removing the danglers resurrects NOTHING and loses NO data.
+  //
+  // THE PREDICATE (verbatim from `findDanglingDeletes`): group LIVE DATA entries by (spec_id, partition),
+  // take min(data sequence number). A POSITION delete dangles when seq < min (STRICT); an EQUALITY delete
+  // when seq <= min (NON-strict — THE OFF-BY-ONE); ANY delete with min IS NULL (no live data in its
+  // partition+spec) dangles; a DV (PUFFIN position delete) dangles when its referenced_data_file is not a
+  // live data-file path.
+  //
+  // The fixture is split into TWO worlds (the on-disk spec mandates DVs for V3 position deletes and forbids
+  // parquet position deletes there, while DVs are V3-only): the V2 world (`table` / `rust_table`) covers
+  // parquet position + equality + no-data; the V3 world (`table_v3` / `rust_table_v3`) covers DVs. The
+  // scenario set + EXPECTED_LIVE_IDS MUST mirror `interop_remove_dangling.rs` exactly.
+  //
+  // generate writes Java's mirror PRE-cleanup tables (<dir>/table[_v3]) for Rust's D1 register+act+verify.
+  // verify (D2) loads each Rust-written PRE table (<dir>/rust_table[_v3]) + cleaned table
+  // (<dir>/rust_table_cleaned[_v3]), recomputes findDanglingDeletes on the PRE table, and checks
+  // read-identity across PRE↔cleaned; it prints the "N failures" sentinel.
+  // =============================================================================================
+
+  static final class RemoveDanglingOracle {
+    private RemoveDanglingOracle() {}
+
+    /** Schema {1 id long required, 2 cat string required, 3 y long required}, spec 0 identity(cat). */
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "cat", Types.StringType.get()),
+            Types.NestedField.required(3, "y", Types.LongType.get()));
+
+    /** One world: the directory suffix + its format version + its scenario set + expected live ids. */
+    private static final class WorldSpec {
+      final String suffix;
+      final String formatVersion;
+
+      WorldSpec(String suffix, String formatVersion) {
+        this.suffix = suffix;
+        this.formatVersion = formatVersion;
+      }
+    }
+
+    private static final WorldSpec V2_WORLD = new WorldSpec("", "2");
+    private static final WorldSpec V3_WORLD = new WorldSpec("_v3", "3");
+
+    private static List<WorldSpec> worlds() {
+      return List.of(V2_WORLD, V3_WORLD);
+    }
+
+    // THE V3 DV DIVERGENCE (1:1-faithful, the reason this action exists for DVs). Java AUTO-PRUNES a
+    // dangling DV at the commit that removes its referenced data file (1.10.0 `ManifestFilterManager`
+    // prunes DVs whose referenced file is gone — `isDanglingDV` gated on PUFFIN). Rust's `RewriteFiles`
+    // carry-posture does NOT, leaving the dangling DV for `RemoveDanglingDeleteFiles` to clean. So:
+    //   - the RUST-built rust_table_v3 PERSISTS a dangling `dv` DV  ⇒ its dangling set is {dv} (verify/D2).
+    //   - the JAVA-built table_v3 has the `dv` DV auto-pruned at commit ⇒ its dangling set is {} (generate
+    //     self-check + Rust's D1 over it, where Rust's action correctly removes NOTHING — agreeing with
+    //     Java's already-clean state). The DV-REMOVE e2e is the D2 headline; D1 documents the divergence.
+
+    /** The hand-declared REMOVE-verdict `cat` values for the RUST-built table of `world` (D2 verify). */
+    private static java.util.Set<String> removeCatsRust(WorldSpec world) {
+      if (world.formatVersion.equals("3")) {
+        return new java.util.LinkedHashSet<>(List.of("dv"));
+      }
+      return new java.util.LinkedHashSet<>(List.of("pr", "er", "ne"));
+    }
+
+    /** The hand-declared REMOVE-verdict `cat` values for the JAVA-built table of `world` (generate
+     * self-check). Empty for V3 (Java auto-prunes the dangling DV at commit — the divergence). */
+    private static java.util.Set<String> removeCatsJava(WorldSpec world) {
+      if (world.formatVersion.equals("3")) {
+        return new java.util.LinkedHashSet<>(); // Java auto-pruned the dangling dv DV at commit.
+      }
+      return new java.util.LinkedHashSet<>(List.of("pr", "er", "ne"));
+    }
+
+    /** The hand-declared KEEP-verdict partition `cat` values for `world` (the survivors). Identical on
+     * both engines (the dk DV / pk+ek deletes still apply). */
+    private static java.util.Set<String> keepCats(WorldSpec world) {
+      if (world.formatVersion.equals("3")) {
+        return new java.util.LinkedHashSet<>(List.of("dk"));
+      }
+      return new java.util.LinkedHashSet<>(List.of("pk", "ek"));
+    }
+
+    /** The hand-declared merge-on-read live `id` set for `world` (BEFORE == AFTER cleanup). */
+    private static java.util.Set<Long> expectedLiveIds(WorldSpec world) {
+      if (world.formatVersion.equals("3")) {
+        // dv: 600,620,630 (REMOVED DV referenced the rewritten-away file) + dk: 700,730 (KEPT DV masks 720)
+        return new java.util.LinkedHashSet<>(List.of(600L, 620L, 630L, 700L, 730L));
+      }
+      // pk:100,130 ek:300,330 pr:200,220,230 er:400,420 nb:500,520 (ne masks nothing)
+      return new java.util.LinkedHashSet<>(
+          List.of(100L, 130L, 300L, 330L, 200L, 220L, 230L, 400L, 420L, 500L, 520L));
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // GENERATE — Java's mirror PRE-cleanup tables under <dir>/table[_v3], for Rust's D1.
+    // -------------------------------------------------------------------------------------------
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      for (WorldSpec world : worlds()) {
+        File tableDir = dir.resolve("table" + world.suffix).toFile();
+        File metadataDir = new File(tableDir, "metadata");
+        File dataDir = new File(tableDir, "data");
+        mkdirs(metadataDir);
+        mkdirs(dataDir);
+
+        PartitionSpec spec = PartitionSpec.builderFor(SCHEMA).identity("cat").build();
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, world.formatVersion);
+        TableMetadata seed =
+            TableMetadata.newTableMetadata(
+                SCHEMA, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+        LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+        ops.commit(null, seed);
+        BaseTable table = new BaseTable(ops, "interop_remove_dangling" + world.suffix);
+
+        if (world.formatVersion.equals("3")) {
+          buildV3World(table, dataDir);
+        } else {
+          buildV2World(table, dataDir);
+        }
+
+        Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+        OutputFile finalOut =
+            new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+        TableMetadataParser.write(ops.current(), finalOut);
+
+        // GEN self-check: Java's OWN findDanglingDeletes recompute must equal the hand-declared REMOVE set,
+        // and Java's own read must equal EXPECTED_LIVE_IDS — so a Java-side fixture regression is caught
+        // here, not silently shipped to Rust's D1.
+        BaseTable reloaded =
+            new BaseTable(new InMemoryInspectionOperations(ops.current(), new LocalFileIO()), "rd");
+        java.util.Set<String> danglingCats = danglingCats(reloaded);
+        if (!danglingCats.equals(removeCatsJava(world))) {
+          throw new IOException(
+              "GEN self-check failed (table"
+                  + world.suffix
+                  + "): findDanglingDeletes = "
+                  + danglingCats
+                  + " but hand-declared REMOVE (Java-built) = "
+                  + removeCatsJava(world));
+        }
+        java.util.Set<Long> liveIds = liveIds(reloaded);
+        if (!liveIds.equals(expectedLiveIds(world))) {
+          throw new IOException(
+              "GEN self-check failed (table"
+                  + world.suffix
+                  + "): live ids = "
+                  + liveIds
+                  + " but expected = "
+                  + expectedLiveIds(world));
+        }
+
+        System.out.println(
+            "generated remove-dangling world table"
+                + world.suffix
+                + " (REMOVE[Java-built]="
+                + removeCatsJava(world)
+                + ", KEEP="
+                + keepCats(world)
+                + ", live ids="
+                + liveIds
+                + ") to "
+                + tableDir);
+      }
+    }
+
+    /** The V2 world: pk (pos KEEP — at the EXACT partition min, the position off-by-one boundary), pr (pos
+     * REMOVE via fresh rewrite), ek (eq KEEP), er (eq REMOVE — same seq), ne (eq REMOVE — no live data),
+     * plus `nb` data ballast. Mirrors Rust `build_v2_world`. */
+    private static void buildV2World(BaseTable table, File dataDir) throws IOException {
+      PartitionSpec spec = table.spec();
+      // Commit 1 (seq 1): the POSITION OFF-BY-ONE pk — the pk data file AND its position delete in ONE
+      // row_delta (same seq ⇒ the pos delete is AT the exact partition min). A position delete applies when
+      // `delete_seq >= data_seq` (`1 >= 1`), so it KEEPs masking id=120, and dangles only when `seq < min`
+      // (`1 < 1` false) ⇒ KEEP. Flipping the position branch `<`→`<=` resurrects id=120 (`1 <= 1` true ⇒
+      // wrongly REMOVE) — so the position boundary is now interop-pinned, mirroring the `er` equality
+      // at-min boundary in the opposite content type.
+      DataFile pk =
+          writeData(table, spec, "pk", new File(dataDir, "cat=pk/00000-pk.parquet"), new long[] {100, 120, 130}, new long[] {10, 20, 30});
+      DeleteFile pkDel =
+          writePosDelete(table, spec, "pk", new File(dataDir, "cat=pk/00000-pk-deletes.parquet"), pk.location(), 1L);
+      table.newRowDelta().addRows(pk).addDeletes(pkDel).commit();
+
+      // Commit 2 (seq 2): base data for ek, pr.
+      DataFile ek =
+          writeData(table, spec, "ek", new File(dataDir, "cat=ek/00000-ek.parquet"), new long[] {300, 320, 330}, new long[] {10, 20, 30});
+      DataFile pr =
+          writeData(table, spec, "pr", new File(dataDir, "cat=pr/00000-pr.parquet"), new long[] {200, 220, 230}, new long[] {10, 20, 30});
+      table.newFastAppend().appendFile(ek).appendFile(pr).commit();
+
+      // Commit 3 (seq 3): ek eq KEEP, pr pos (KEEP-eligible until pr is rewritten).
+      DeleteFile ekDel =
+          writeEqDelete(table, spec, "ek", new File(dataDir, "cat=ek/00000-ek-deletes.parquet"), 20L);
+      DeleteFile prDel =
+          writePosDelete(table, spec, "pr", new File(dataDir, "cat=pr/00000-pr-deletes.parquet"), pr.location(), 1L);
+      table.newRowDelta().addDeletes(ekDel).addDeletes(prDel).commit();
+
+      // Commit 4 (seq 4): the OFF-BY-ONE er — data AND its eq delete in ONE row_delta (same seq ⇒ AT min).
+      DataFile er =
+          writeData(table, spec, "er", new File(dataDir, "cat=er/00000-er.parquet"), new long[] {400, 420}, new long[] {10, 20});
+      DeleteFile erDel =
+          writeEqDelete(table, spec, "er", new File(dataDir, "cat=er/00000-er-deletes.parquet"), 20L);
+      table.newRowDelta().addRows(er).addDeletes(erDel).commit();
+
+      // Commit 5 (seq 5): `nb` live ballast + the `ne` dangling delete in an EMPTY partition (min IS NULL).
+      DataFile nb =
+          writeData(table, spec, "nb", new File(dataDir, "cat=nb/00000-nb.parquet"), new long[] {500, 520}, new long[] {10, 20});
+      table.newFastAppend().appendFile(nb).commit();
+      DeleteFile neDel =
+          writeEqDelete(table, spec, "ne", new File(dataDir, "cat=ne/00000-ne-deletes.parquet"), 20L);
+      table.newRowDelta().addDeletes(neDel).commit();
+
+      // Commit 6 (seq 6+): a FRESH-seq replacement of pr -> pr' that pushes the partition min above the pr
+      // pos delete's seq (so `prDel seq < newMin` ⇒ the pr pos delete dangles). Java's `newRewrite()` would
+      // VALIDATE the replaced data file against its outstanding position delete and REJECT a
+      // seq-non-preserving rewrite (BaseRewriteFiles.validate runs validateNoNewDeletesForDataFiles when
+      // replacedDataFiles is non-empty, 1.10.0 bytecode) — the exact corruption guard. So Java reaches the
+      // SAME dangling end-state via the unguarded `newDelete().deleteFile(pr)` (StreamingDelete, no
+      // rewrite validation) + a fresh `newFastAppend(pr')`. The logical end-state is identical to Rust's
+      // carry-posture rewrite (old pr gone, pr' at a higher seq, the pr pos delete now below the min); the
+      // mechanism differs only because Java guards the rewrite path and Rust does not (the documented
+      // divergence the action exists to clean up). The hand-declared dangling set is unchanged.
+      DataFile prPrime =
+          writeData(table, spec, "pr", new File(dataDir, "cat=pr/00001-pr-prime.parquet"), new long[] {200, 220, 230}, new long[] {10, 20, 30});
+      table.newDelete().deleteFile(pr).commit();
+      table.newFastAppend().appendFile(prPrime).commit();
+    }
+
+    /** The V3 world: dv (DV REMOVE — referenced file rewritten away) + dk (DV KEEP). Mirrors Rust
+     * `build_v3_world`. */
+    private static void buildV3World(BaseTable table, File dataDir) throws IOException {
+      PartitionSpec spec = table.spec();
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partDv = new PartitionData(partitionType);
+      partDv.set(0, "dv");
+      PartitionData partDk = new PartitionData(partitionType);
+      partDk.set(0, "dk");
+
+      // Commit 1 (seq 1): base data for dv (rewritten away) + dk (stays live).
+      DataFile dv =
+          writeData(table, spec, "dv", new File(dataDir, "cat=dv/00000-dv.parquet"), new long[] {600, 620, 630}, new long[] {10, 20, 30});
+      DataFile dk =
+          writeData(table, spec, "dk", new File(dataDir, "cat=dk/00000-dk.parquet"), new long[] {700, 720, 730}, new long[] {10, 20, 30});
+      table.newFastAppend().appendFile(dv).appendFile(dk).commit();
+
+      // Commit 2 (seq 2): one Puffin DV per partition — dv-DV (-> removed) + dk-DV (-> kept), each deleting
+      // position 1 (id 620 / id 720) in its partition context, via the production BaseDVFileWriter.
+      org.apache.iceberg.io.OutputFileFactory dvFileFactory =
+          org.apache.iceberg.io.OutputFileFactory.builderFor(table, 1, 1L)
+              .format(FileFormat.PUFFIN)
+              .build();
+      org.apache.iceberg.deletes.DVFileWriter dvWriter =
+          new org.apache.iceberg.deletes.BaseDVFileWriter(dvFileFactory, path -> null);
+      dvWriter.delete(dv.location(), 1L, spec, partDv);
+      dvWriter.delete(dk.location(), 1L, spec, partDk);
+      dvWriter.close();
+      RowDelta rowDelta = table.newRowDelta();
+      for (DeleteFile dvFile : dvWriter.result().deleteFiles()) {
+        rowDelta.addDeletes(dvFile);
+      }
+      rowDelta.commit();
+
+      // Commit 3 (seq 3+): a FRESH-seq replacement of dv -> dv' so the dv-DV's referenced file is gone
+      // (⇒ dangling). As in the V2 world, Java's `newRewrite()` would reject the seq-non-preserving
+      // rewrite of a DV-bearing data file, so Java reaches the SAME end-state via the unguarded
+      // `newDelete().deleteFile(dv)` + a fresh `newFastAppend(dv')`. The dv-DV (keyed by the old dv path)
+      // now references a gone file ⇒ dangling; the dk-DV's referenced file stays live ⇒ kept.
+      DataFile dvPrime =
+          writeData(table, spec, "dv", new File(dataDir, "cat=dv/00001-dv-prime.parquet"), new long[] {600, 620, 630}, new long[] {10, 20, 30});
+      table.newDelete().deleteFile(dv).commit();
+      table.newFastAppend().appendFile(dvPrime).commit();
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // VERIFY (D2) — recompute findDanglingDeletes on the Rust PRE table + read-identity PRE↔cleaned.
+    // -------------------------------------------------------------------------------------------
+
+    static int verify(Path dir) {
+      int failures = 0;
+      for (WorldSpec world : worlds()) {
+        Path preMeta =
+            dir.resolve("rust_table" + world.suffix)
+                .resolve("metadata")
+                .resolve("final.metadata.json");
+        Path cleanedMeta =
+            dir.resolve("rust_table_cleaned" + world.suffix)
+                .resolve("metadata")
+                .resolve("final.metadata.json");
+        String tag = "remove-dangling-d2[table" + world.suffix + "]";
+
+        if (!Files.exists(preMeta) || !Files.exists(cleanedMeta)) {
+          System.out.println(
+              "FAIL "
+                  + tag
+                  + ": missing Rust tables ("
+                  + preMeta
+                  + " / "
+                  + cleanedMeta
+                  + ") — run the Rust GEN path first");
+          failures++;
+          continue;
+        }
+
+        try {
+          BaseTable pre = loadTable(preMeta);
+          BaseTable cleaned = loadTable(cleanedMeta);
+
+          // (1) SEMANTICS-MATCH: Java's INDEPENDENT findDanglingDeletes over the RUST-built PRE table ==
+          // the hand-declared REMOVE set for the Rust-built table (V3 = {dv} — Rust's carry-posture
+          // persists the dangling DV that Java would auto-prune; that is the gap this action closes).
+          java.util.Set<String> dangling = danglingCats(pre);
+          if (dangling.equals(removeCatsRust(world))) {
+            System.out.println(
+                "PASS " + tag + ": findDanglingDeletes = " + dangling + " matches hand-declared REMOVE");
+          } else {
+            System.out.println(
+                "FAIL "
+                    + tag
+                    + ": findDanglingDeletes = "
+                    + dangling
+                    + " but hand-declared REMOVE = "
+                    + removeCatsRust(world));
+            failures++;
+          }
+
+          // (3a) PRE read-identity: Java's merge-on-read read of the PRE table == EXPECTED_LIVE_IDS.
+          java.util.Set<Long> preIds = liveIds(pre);
+          if (preIds.equals(expectedLiveIds(world))) {
+            System.out.println("PASS " + tag + ": PRE live ids = " + preIds + " match expected");
+          } else {
+            System.out.println(
+                "FAIL "
+                    + tag
+                    + ": PRE live ids = "
+                    + preIds
+                    + " but expected = "
+                    + expectedLiveIds(world));
+            failures++;
+          }
+
+          // (3b) CORRUPTION SAFETY: the Rust-CLEANED table's read == the PRE read (no resurrection/loss).
+          java.util.Set<Long> cleanedIds = liveIds(cleaned);
+          if (cleanedIds.equals(preIds)) {
+            System.out.println(
+                "PASS " + tag + ": read-identity — cleaned live ids = " + cleanedIds + " == PRE");
+          } else {
+            System.out.println(
+                "FAIL "
+                    + tag
+                    + ": read-identity BROKEN — cleaned live ids = "
+                    + cleanedIds
+                    + " but PRE = "
+                    + preIds
+                    + " (removing the danglers resurrected or lost rows)");
+            failures++;
+          }
+
+          // (2) API CONTRACT: the cleaned table's surviving delete files == hand-declared KEEP; the removed
+          // ones (PRE minus cleaned by partition) == hand-declared REMOVE.
+          java.util.Set<String> survivors = liveDeleteCats(cleaned);
+          if (survivors.equals(keepCats(world))) {
+            System.out.println(
+                "PASS " + tag + ": surviving delete partitions = " + survivors + " match hand-declared KEEP");
+          } else {
+            System.out.println(
+                "FAIL "
+                    + tag
+                    + ": surviving delete partitions = "
+                    + survivors
+                    + " but hand-declared KEEP = "
+                    + keepCats(world));
+            failures++;
+          }
+        } catch (RuntimeException | IOException error) {
+          System.out.println("FAIL " + tag + ": unexpected error running the remove-dangling verify: " + error);
+          failures++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-remove-dangling OK — Java's INDEPENDENT findDanglingDeletes + read-identity "
+                + "agree with Rust on all "
+                + worlds().size()
+                + " worlds (V2 pos/eq/no-data, V3 DV)");
+      }
+      return failures;
+    }
+
+    /** Load a final.metadata.json into a read-only BaseTable over the on-disk LocalFileIO. */
+    private static BaseTable loadTable(Path finalMetadata) throws IOException {
+      TableMetadata metadata =
+          TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      return new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "rd_load");
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // The INDEPENDENT findDanglingDeletes recompute over the engine-agnostic manifest API. This is the
+    // exact data the ENTRIES/DATA_FILES/DELETE_FILES metadata tables project; it mirrors Rust's
+    // `find_dangling_deletes` and the documented Spark SQL.
+    // -------------------------------------------------------------------------------------------
+
+    /** The set of partition `cat` values whose delete file is dangling under findDanglingDeletes. */
+    private static java.util.Set<String> danglingCats(BaseTable table) {
+      Snapshot snapshot = table.currentSnapshot();
+      FileIO io = table.io();
+
+      // 1. Group LIVE DATA entries by (specId, partition cat); take min(dataSequenceNumber). Also collect
+      //    the set of live data-file paths (for the DV referenced-file join).
+      Map<String, Long> minSeqByGroup = new LinkedHashMap<>();
+      java.util.Set<String> liveDataPaths = new java.util.LinkedHashSet<>();
+      for (ManifestFile manifest : snapshot.dataManifests(io)) {
+        try (ManifestReader<DataFile> reader =
+            ManifestFiles.read(manifest, io, table.specs())) {
+          for (ManifestEntry<DataFile> entry : reader.liveEntries()) {
+            DataFile file = entry.file();
+            String key = groupKey(file);
+            long seq = entry.dataSequenceNumber();
+            minSeqByGroup.merge(key, seq, Math::min);
+            liveDataPaths.add(file.location());
+          }
+        } catch (IOException error) {
+          throw new RuntimeException("failed reading data manifest " + manifest.path(), error);
+        }
+      }
+
+      // 2. For each LIVE DELETE entry, apply the per-content-type dangling rule.
+      java.util.Set<String> dangling = new java.util.LinkedHashSet<>();
+      for (ManifestFile manifest : snapshot.deleteManifests(io)) {
+        try (ManifestReader<DeleteFile> reader =
+            ManifestFiles.readDeleteManifest(manifest, io, table.specs())) {
+          for (ManifestEntry<DeleteFile> entry : reader.liveEntries()) {
+            DeleteFile file = entry.file();
+            String cat = partitionCat(file);
+            if (isDv(file)) {
+              // A DV dangles when its referenced data file is not a live data-file path.
+              String referenced = file.referencedDataFile();
+              if (referenced == null || !liveDataPaths.contains(referenced)) {
+                dangling.add(cat);
+              }
+              continue;
+            }
+            String key = groupKey(file);
+            Long min = minSeqByGroup.get(key);
+            long deleteSeq = entry.dataSequenceNumber();
+            boolean dangles;
+            if (min == null) {
+              dangles = true; // min IS NULL — no live data in this partition+spec.
+            } else if (file.content() == FileContent.POSITION_DELETES) {
+              dangles = deleteSeq < min; // STRICT <
+            } else if (file.content() == FileContent.EQUALITY_DELETES) {
+              dangles = deleteSeq <= min; // NON-strict <= (the off-by-one)
+            } else {
+              dangles = false;
+            }
+            if (dangles) {
+              dangling.add(cat);
+            }
+          }
+        } catch (IOException error) {
+          throw new RuntimeException("failed reading delete manifest " + manifest.path(), error);
+        }
+      }
+      return dangling;
+    }
+
+    /** The set of partition `cat` values that still carry a LIVE delete file (the survivors). */
+    private static java.util.Set<String> liveDeleteCats(BaseTable table) {
+      Snapshot snapshot = table.currentSnapshot();
+      FileIO io = table.io();
+      java.util.Set<String> cats = new java.util.LinkedHashSet<>();
+      for (ManifestFile manifest : snapshot.deleteManifests(io)) {
+        try (ManifestReader<DeleteFile> reader =
+            ManifestFiles.readDeleteManifest(manifest, io, table.specs())) {
+          for (ManifestEntry<DeleteFile> entry : reader.liveEntries()) {
+            cats.add(partitionCat(entry.file()));
+          }
+        } catch (IOException error) {
+          throw new RuntimeException("failed reading delete manifest " + manifest.path(), error);
+        }
+      }
+      return cats;
+    }
+
+    /** Java's merge-on-read read of the table — the live `id` set (all deletes applied). */
+    private static java.util.Set<Long> liveIds(BaseTable table) {
+      java.util.Set<Long> ids = new java.util.LinkedHashSet<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          ids.add((Long) record.getField("id"));
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+      return ids;
+    }
+
+    /** The (specId, partition cat) group key — Java groups + joins on BOTH spec id and partition. */
+    private static String groupKey(ContentFile<?> file) {
+      return file.specId() + "::" + partitionCat(file);
+    }
+
+    /** The `cat` partition value (identity(cat) ⇒ the single partition field is the string). */
+    private static String partitionCat(ContentFile<?> file) {
+      Object value = file.partition().get(0, Object.class);
+      return value == null ? "<none>" : value.toString();
+    }
+
+    /** Whether a delete file is a deletion vector (PUFFIN-format position delete). */
+    private static boolean isDv(DeleteFile file) {
+      return file.content() == FileContent.POSITION_DELETES && file.format() == FileFormat.PUFFIN;
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Real-parquet / real-delete writers (partition-scoped).
+    // -------------------------------------------------------------------------------------------
+
+    /** Write a REAL parquet DATA file in partition `cat` with the given (id, y) rows. */
+    private static DataFile writeData(
+        BaseTable table, PartitionSpec spec, String cat, File file, long[] ids, long[] ys)
+        throws IOException {
+      mkdirs(file.getParentFile());
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, cat);
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", ids[i]);
+        record.setField("cat", cat);
+        record.setField("y", ys[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /** Write a REAL parquet POSITION-delete file in partition `cat` deleting `pos` of `referencedPath`. */
+    private static DeleteFile writePosDelete(
+        BaseTable table,
+        PartitionSpec spec,
+        String cat,
+        File file,
+        CharSequence referencedPath,
+        long pos)
+        throws IOException {
+      mkdirs(file.getParentFile());
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, cat);
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(referencedPath, pos, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    /** Write a REAL parquet EQUALITY-delete file (on field id 3 = `y`) in partition `cat` deleting `y`. */
+    private static DeleteFile writeEqDelete(
+        BaseTable table, PartitionSpec spec, String cat, File file, long deleteY) throws IOException {
+      mkdirs(file.getParentFile());
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, cat);
+      Schema eqDeleteRowSchema = SCHEMA.select("y");
+      int[] equalityFieldIds =
+          eqDeleteRowSchema.columns().stream().mapToInt(Types.NestedField::fieldId).toArray();
+      GenericRecord delete = GenericRecord.create(eqDeleteRowSchema);
+      delete.setField("y", deleteY);
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(SCHEMA, spec, equalityFieldIds, eqDeleteRowSchema, null);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      EqualityDeleteWriter<Record> writer =
+          factory.newEqDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(List.of(delete));
+      }
+      return writer.toDeleteFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
     }
   }
 
