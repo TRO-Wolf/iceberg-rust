@@ -193,10 +193,24 @@ dormant for realistic single commits (narrow non-`first` ≥2-manifest sub-case 
       javap-confirmed parity + mutation-tested the wiring (breaking a factory method fails 2 tests incl. a
       live MemoryCatalog execute smoke test). **GAP_MATRIX row 151 ❌→🟡** (partial). Underlying actions
       UNCHANGED. Files: `maintenance/actions_provider.rs` + 2 mod re-exports.
-- [ ] **PC #3 — complete row 151** (`DeleteReachableFiles` [reuses the reachability machinery from
-      ExpireSnapshots/DeleteOrphanFiles] + `ConvertEqualityDeleteFiles` [read eq-deletes → write position
-      deletes → commit; corruption-class, interop-provable]) to flip row 151 🟡→✅; then wire each into the
-      `ActionsProvider`.
+- [x] **PC #3 — DeleteReachableFiles** — **DONE 2026-06-16 (#TBD).** The DROP-TABLE-PURGE engine:
+      `DeleteReachableFiles::new(metadata_location: &str)` (Java String arg shape) collects the FULL
+      reachable set across ALL snapshots — categorized into the 6 javap-verified Java `Result` buckets
+      (manifest lists, manifests, data, position-deletes [DVs fold here by content-type], equality-deletes,
+      + current/all-previous metadata.json + version-hint + statistics + partition-statistics) — and deletes
+      each via FileIO. Reuses the `DeleteOrphanFiles::collect_valid_files` walk shape WITHOUT changing it
+      (separate categorizing collector). Interop-proven both directions against Java's ENGINE-AGNOSTIC
+      `ReachableFileUtil` (clean non-circular oracle): Rust reachable set == Java's, + delete-completeness
+      (no orphan-leak/under-delete, no data-loss/over-delete) + under-count sabotage. **Wired into
+      ActionsProvider** (`delete_reachable_files` FeatureUnsupported→real; factory now 7 supported / 5
+      unsupported). Converged 1 cycle; all 6 non-vacuity gates mutation-proven (each reachable category +
+      all-snapshots + the deletion + the provider override). `DeleteOrphanFiles` + Cargo UNCHANGED.
+      **GAP_MATRIX row 151 stays 🟡** (DeleteReachableFiles portion now ✅+interop). Files:
+      `delete_reachable_files.rs`, `interop_delete_reachable.rs`, `run-interop-delete-reachable.sh`,
+      `DeleteReachableOracle`.
+- [ ] **PC #4 — finish row 151 → ✅**: `ConvertEqualityDeleteFiles` (read eq-deletes → write position
+      deletes → commit; corruption-class, interop-provable; wire into ActionsProvider) + `SupportsNamespaces`
+      partial property set/remove. Both must land to flip row 151 🟡→✅.
 
 Follow-on residue (surfaced mid-charter 2026-06-16, see GAP_MATRIX row 94):
 

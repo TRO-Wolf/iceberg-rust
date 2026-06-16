@@ -32,7 +32,7 @@
 //! | `rewriteManifests(Table)` | table | [`Actions::rewrite_manifests`] |
 //! | `rewriteDataFiles(Table)` | table | [`Actions::rewrite_data_files`] |
 //! | `expireSnapshots(Table)` | table | [`Actions::expire_snapshots`] |
-//! | `deleteReachableFiles(String)` | location | unsupported (no Rust action) |
+//! | `deleteReachableFiles(String)` | location | [`Actions::delete_reachable_files`] |
 //! | `rewritePositionDeletes(Table)` | table | unsupported (no Rust action) |
 //! | `computeTableStats(Table)` | table | [`Actions::compute_table_stats`] |
 //! | `computePartitionStats(Table)` | table | unsupported (compute core only — see below) |
@@ -61,20 +61,21 @@
 //!
 //! # Unsupported actions — surfaced honestly, never faked
 //!
-//! Five Java methods have no Rust action behind them yet (`snapshotTable`, `migrateTable`,
-//! `deleteReachableFiles`, `rewritePositionDeletes`, `rewriteTablePath`), and `computePartitionStats`
-//! has only the *compute core* ([`compute_partition_stats`](crate::maintenance::compute_partition_stats))
-//! with no action wrapper. Rather than fabricate them, the [`ActionsProvider`] trait mirrors Java's
+//! Four Java methods have no Rust action behind them yet (`snapshotTable`, `migrateTable`,
+//! `rewritePositionDeletes`, `rewriteTablePath`), and `computePartitionStats` has only the *compute
+//! core* ([`compute_partition_stats`](crate::maintenance::compute_partition_stats)) with no action
+//! wrapper. Rather than fabricate them, the [`ActionsProvider`] trait mirrors Java's
 //! *throw-by-default* shape: each unsupported method has a default that returns a typed
 //! [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error naming the gap (the
 //! Rust analog of Java's `UnsupportedOperationException`). The concrete [`Actions`] factory overrides
-//! exactly the six methods Rust can actually run, and leaves the rest at the unsupported default. The
-//! gap is tracked in `docs/parity/GAP_MATRIX.md` row 151.
+//! exactly the seven methods Rust can actually run, and leaves the rest at the unsupported default.
+//! The gap is tracked in `docs/parity/GAP_MATRIX.md` row 151.
 
 use crate::Result;
 use crate::error::Error;
 use crate::maintenance::{
-    ComputeTableStats, DeleteOrphanFiles, RemoveDanglingDeleteFiles, RewriteDataFiles,
+    ComputeTableStats, DeleteOrphanFiles, DeleteReachableFiles, RemoveDanglingDeleteFiles,
+    RewriteDataFiles,
 };
 use crate::table::Table;
 use crate::transaction::{ExpireSnapshotsAction, RewriteManifestsAction};
@@ -135,10 +136,10 @@ pub trait ActionsProvider {
         Err(unsupported("expire_snapshots", "ExpireSnapshots"))
     }
 
-    /// Mirrors Java `deleteReachableFiles(String)`. **Unsupported in this crate** (no Rust
-    /// `DeleteReachableFiles` action): returns
-    /// [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported).
-    fn delete_reachable_files(&self, metadata_location: &str) -> Result<NoAction> {
+    /// Mirrors Java `deleteReachableFiles(String)`. **Unsupported by default**; the concrete
+    /// [`Actions`] factory overrides it to return [`DeleteReachableFiles::new`]. The argument is the
+    /// table's `metadata.json` LOCATION (Java's `String`), not a [`Table`].
+    fn delete_reachable_files(&self, metadata_location: &str) -> Result<DeleteReachableFiles> {
         let _ = metadata_location;
         Err(unsupported(
             "delete_reachable_files",
@@ -218,8 +219,8 @@ fn unsupported(method: &str, java_action: &str) -> Error {
 }
 
 /// The engine-agnostic concrete [`ActionsProvider`] for this crate: a zero-state factory that hands
-/// out the six table-maintenance actions Rust has built, leaving the other six Java methods at their
-/// unsupported default.
+/// out the seven table-maintenance actions Rust has built, leaving the other five Java methods at
+/// their unsupported default.
 ///
 /// This is the Rust analog of a Java engine's `ActionsProvider` implementation
 /// (`SparkActions.get()` / `FlinkActions.get()`), minus any engine binding — these actions are
@@ -251,6 +252,16 @@ impl ActionsProvider for Actions {
     /// lists storage and deletes orphans directly). **This action deletes files.**
     fn delete_orphan_files(&self, table: Table) -> Result<DeleteOrphanFiles> {
         Ok(DeleteOrphanFiles::new(table))
+    }
+
+    /// Returns a [`DeleteReachableFiles`] action for the table whose current metadata is at
+    /// `metadata_location` (Java `deleteReachableFiles(String)` — the engine behind
+    /// `DROP TABLE PURGE`). Configure it with [`DeleteReachableFiles::io`] /
+    /// [`DeleteReachableFiles::delete_with`] and run it with [`DeleteReachableFiles::execute`] (no
+    /// catalog — it loads the metadata directly and deletes the table's whole reachable footprint).
+    /// **This action deletes the whole table.**
+    fn delete_reachable_files(&self, metadata_location: &str) -> Result<DeleteReachableFiles> {
+        Ok(DeleteReachableFiles::new(metadata_location))
     }
 
     /// Returns a [`RewriteManifestsAction`](crate::transaction::RewriteManifestsAction) (Java
@@ -317,10 +328,11 @@ mod tests {
 
     /// The exact set of factory methods the concrete [`Actions`] supports (overrides off the
     /// unsupported default). Pins the supported surface so a wiring that silently drops or adds an
-    /// override fails this test. The six map 1:1 to Java `ActionsProvider` methods with a built Rust
-    /// action.
-    const SUPPORTED_METHODS: [&str; 6] = [
+    /// override fails this test. The seven map 1:1 to Java `ActionsProvider` methods with a built
+    /// Rust action.
+    const SUPPORTED_METHODS: [&str; 7] = [
         "delete_orphan_files",
+        "delete_reachable_files",
         "rewrite_manifests",
         "rewrite_data_files",
         "expire_snapshots",
@@ -330,10 +342,9 @@ mod tests {
 
     /// The Java `ActionsProvider` methods with NO Rust action behind them — the factory honestly
     /// reports these as unsupported.
-    const UNSUPPORTED_METHODS: [&str; 6] = [
+    const UNSUPPORTED_METHODS: [&str; 5] = [
         "snapshot_table",
         "migrate_table",
-        "delete_reachable_files",
         "rewrite_position_deletes",
         "compute_partition_stats",
         "rewrite_table_path",
@@ -472,6 +483,13 @@ mod tests {
 
         // Every supported method must hand out an action (Ok), proving the override is wired.
         assert!(actions.delete_orphan_files(table.clone()).is_ok());
+        assert!(
+            actions
+                .delete_reachable_files(
+                    table.metadata_location_result().expect("metadata location")
+                )
+                .is_ok()
+        );
         assert!(actions.rewrite_manifests(table.clone()).is_ok());
         assert!(actions.rewrite_data_files(table.clone()).is_ok());
         assert!(actions.expire_snapshots(table.clone()).is_ok());
@@ -489,9 +507,6 @@ mod tests {
         for err in [
             actions.snapshot_table("db.src").unwrap_err(),
             actions.migrate_table("db.src").unwrap_err(),
-            actions
-                .delete_reachable_files("s3://b/t/metadata.json")
-                .unwrap_err(),
         ] {
             assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
         }
@@ -540,6 +555,55 @@ mod tests {
         assert!(
             !exists(&file_io, &orphan_path).await,
             "orphan file must be physically gone"
+        );
+    }
+
+    /// Smoke test: a `DeleteReachableFiles` handed out by the factory actually RUNS (purges a real
+    /// committed table — the metadata.json + manifest list + manifest + data file all gone), proving
+    /// the override is live, not a stub. A broken override (e.g. one that ignored the location) fails
+    /// here. **This deletes a THROWAWAY local-fs MemoryCatalog table — never a shared/live catalog.**
+    #[tokio::test]
+    async fn delete_reachable_files_from_factory_executes_live() {
+        let (catalog, file_io, _tmp) = local_fs_catalog().await;
+        let table = create_unpartitioned_table(&catalog).await;
+        let location = table.metadata().location().to_string();
+
+        // A live, committed data file (reachable from the snapshot).
+        let data = real_data_file(&file_io, &format!("{location}/data/d.parquet"), b"data").await;
+        let table = append(&catalog, &table, vec![data]).await;
+        let metadata_location = table
+            .metadata_location_result()
+            .expect("metadata location")
+            .to_string();
+
+        let result = Actions::get()
+            .delete_reachable_files(&metadata_location)
+            .expect("factory returns delete-reachable-files action")
+            .io(file_io.clone())
+            .execute()
+            .await
+            .expect("execute delete reachable files");
+
+        assert_eq!(
+            result.deleted_data_files_count, 1,
+            "the one committed data file is purged"
+        );
+        assert!(
+            result.deleted_manifest_lists_count >= 1,
+            "the snapshot's manifest list is purged"
+        );
+        assert!(
+            result.deleted_other_files_count >= 1,
+            "the metadata.json is purged"
+        );
+        // The metadata.json is physically gone — the table no longer loadable from disk.
+        assert!(
+            !exists(&file_io, &metadata_location).await,
+            "the table metadata.json must be physically gone after a reachable-files purge"
+        );
+        assert!(
+            !exists(&file_io, &format!("{location}/data/d.parquet")).await,
+            "the committed data file must be physically gone"
         );
     }
 
