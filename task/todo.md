@@ -110,8 +110,16 @@ Wave 1 — conflict-validation closeout (order locked):
       (reject+accept per axis). Opus Actor → Opus Critic converged in 1 cycle; Critic disabled each
       axis's validation in turn to prove per-axis non-vacuity. Files: `interop_rowdelta_conflict.rs`,
       `run-interop-rowdelta-conflict.sh`, `RowDeltaConflictOracle`. Row 94 stays 🟡.
-- [ ] **AC·OO #3 — C2 DeleteFiles** (row 93). `validate_files_exist()` — concurrent REMOVAL of a file
-      this delete targets (missing-path shape, not added-data).
+- [x] **AC·OO #3 — C2 DeleteFiles** (row 93) — **DONE 2026-06-16.** Single `validate_files_exist`
+      axis; 2 scenarios (same-file→REJECT, different-file→ACCEPT) both directions + sabotage
+      (semantic-rollback + truncate). **Critic caught a MEDIUM** (D1 vacuous on the axis) but
+      wrongly marked CONVERGED; orchestrator caught the contradiction. The Critic's fix (assert the
+      reject message) proved FLAKY on my mutation test — Rust has TWO racing reject paths for a
+      removed target (the `validate_files_exist` axis vs an UNCONDITIONAL by-path `process_deletes`
+      check). Resolved HONESTLY: D2 isolates the axis (strip Java's flag → ACCEPT; Java gates the
+      check on the flag, Rust's by-path is unconditional — a documented mechanism divergence), D1
+      corroborates the DECISION, the axis is pinned by `delete_files.rs` unit tests. Row 93 stays 🟡.
+      Files: `interop_deletefiles_conflict.rs`, `run-interop-deletefiles-conflict.sh`, `DeleteFilesConflictOracle`.
 - [ ] **AC·OO #4 — C5 RewriteFiles** (row 95). `validate_no_new_deletes_for_data_files` — a concurrent
       delete that would apply to the rewritten files (seq-preservation angle).
 
