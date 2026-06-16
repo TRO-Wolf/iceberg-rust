@@ -149,7 +149,20 @@ Wave 2 — multi-spec write interop (stretch):
 
 Wave 3 — builder-surface flips (stretch, only if 1+2 beat estimates):
 
-- [ ] **AC·OO #6 — BF** `case_sensitive` (row 134) + `delete_from_row_filter` (row 135) → interop-proven.
+- [x] **AC·OO #6 — BF** — **DONE 2026-06-16 (#TBD).** DeleteFiles 2-for-1 vehicle
+      (`delete_from_row_filter` + `case_sensitive`) proven bidirectionally vs Java 1.10.0: 5 scenarios
+      (filter DELETE / KEEP-complement / PARTIAL-error + case-insensitive-match + case-sensitive-reject),
+      live oracle GREEN (D1 + D2 + semantic-rename & truncate sabotages, exit 0). **Row 135
+      (`deleteFromRowFilter`) → ✅** — the FIRST ✅ flip since Wave 1 began (2 named fail-safe
+      divergences: `markedForDelete` short-circuit + empty-match no-op, both Rust-stricter, kept out of
+      the set). **Row 134 stays 🟡** — its `caseSensitive` SLICE is now ✅ interop-proven (shared
+      `bind(schema, case_sensitive)` site; the conflict-filter family argued-equivalent via the same bind
+      call + 25 unit tests + C1/C3 interop), but the row's conflict-detection surfaces
+      (`validateNoConflictingData`/`conflictDetectionFilter`, ReplacePartitions `conflict_detection_filter`,
+      `validateAppendOnly`) remain unported. Converged 1 cycle; Critic CONVERGED (both non-vacuity gates
+      mutation-proven; orchestrator re-ran the live oracle + offline gate + fixed 2 LOW nits). Files:
+      `interop_builder_flips.rs`, `run-interop-builder-flips.sh`, `BuilderFlipsOracle`.
+      **Wave 3 COMPLETE — the 8h AC·OO charter (Waves 1 + 2 + 3) is fully landed.**
 
 Follow-on residue (surfaced mid-charter 2026-06-16, see GAP_MATRIX row 94):
 
