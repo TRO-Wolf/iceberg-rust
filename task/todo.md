@@ -131,12 +131,29 @@ Wave 1 — conflict-validation closeout (order locked):
 
 Wave 2 — multi-spec write interop (stretch):
 
-- [ ] **AC·OO #5 — MS** merging actions (overwrite/replace/row-delta) under >1 partition spec; extend
-      the Z2 `run-interop-multi-spec.sh` template (fast_append multi-spec already ✅).
+- [x] **AC·OO #5 — MS** — **DONE 2026-06-16.** RowDelta multi-spec DELETE commit: one `row_delta`
+      adding position deletes under spec 0 AND spec 1 → TWO per-spec DELETE manifests, canonical view
+      byte-matches Java 1.10.0 (3 directions + 4 sabotages incl. SB4 wrong-spec rendering). Closes the
+      "multi-spec delete commits" residue on row 94. Converged 1 cycle, NO_FINDINGS; Critic wrote its
+      own collapse probe to confirm `grouping_is_load_bearing`. Files: `interop_multispec_merge.rs`,
+      `run-interop-multispec-merge.sh`, `MultiSpecMergeOracle`.
+      **⚠ NEW PARITY FINDING (follow-on, surfaced by the Actor):** on the MERGING path Java
+      force-merges every spec group NOT containing the iterator-`first` manifest (order-dependent,
+      ignores min-count-to-merge) — Rust's merging producer does NOT mirror this. Documented in row 94.
+      The multi-spec DATA cases (overwrite/rewrite carrying old-spec + adding new-spec) are deferred
+      behind this asymmetry. **→ tracked as new queue item below.**
 
 Wave 3 — builder-surface flips (stretch, only if 1+2 beat estimates):
 
 - [ ] **AC·OO #6 — BF** `case_sensitive` (row 134) + `delete_from_row_filter` (row 135) → interop-proven.
+
+Follow-on residue (surfaced mid-charter 2026-06-16, see GAP_MATRIX row 94):
+
+- [ ] **Multi-spec MERGING-path DATA-manifest force-merge asymmetry** — Java `MergingSnapshotProducer.apply`
+      → `ManifestMergeManager.mergeManifests` force-MERGES every spec group NOT containing the
+      iterator-`first` manifest, ignoring `min-count-to-merge` (order-dependent); Rust's merging
+      producer does not mirror this. Decide correctness-vs-layout + whether to mirror Java; THEN the
+      multi-spec DATA cases (overwrite/rewrite carrying old-spec + adding new-spec) can be interop'd.
 
 See [[parity-next-work]] (memory) for the reusable harness gotchas (register_table `<version>-<uuid>`
 name; LocalTableOperations re-seed; final.metadata.json untouched).

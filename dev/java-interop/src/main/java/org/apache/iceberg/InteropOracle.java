@@ -387,6 +387,35 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-multispec-merge":
+        // MULTI-SPEC MERGING-ACTION metadata-level interop fixture (AC·OO #5, Wave 2). Builds a V2
+        // multi-spec table (ms1 spec0 append F0 / ms2 spec-evolve add identity(b) / ms3 spec1 append
+        // F3 — exactly ONE data manifest per spec), then ms4: ONE row_delta adding a POSITION-delete
+        // tagged spec 0 AND a POSITION-delete tagged spec 1 in a single commit. The merging
+        // producer's newDeleteFilesAsManifests (Rust write_added_delete_manifests) groups them per
+        // spec, so the ms4 snapshot owns TWO DELETE manifests with DIFFERENT partition_spec_id (0 and
+        // 1) — exercising the per-spec DELETE-manifest grouping the Z2 DATA-only chain never reached.
+        // Tie-shaped (both delete files record_count=1) so the W3 spec-id tiebreaker (position 10) is
+        // the ONLY disambiguator. Emits java_meta.json (via SnapshotMetaOracle.emit). The dir is
+        // supplied via -Dinterop.multispec_merge.dir.
+        Path multiSpecMergeGenDir = requireFixturesDir("interop.multispec_merge.dir");
+        MultiSpecMergeOracle.generate(multiSpecMergeGenDir);
+        break;
+      case "verify-interop-multispec-merge":
+        // MULTI-SPEC MERGING-ACTION interop, DIRECTION 2 — "Java verifies what RUST wrote". The Rust
+        // GEN test (env ICEBERG_INTEROP_MULTISPEC_MERGE_GEN_DIR, tests/interop_multispec_merge.rs)
+        // performed the SAME chain, writing the table to <dir>/rust_table. Here Java reads that
+        // RUST-produced table and emits its canonical snapshot-metadata view, which the run script
+        // byte-diffs against java_meta.json. NOTE: `mvn exec:java` does not propagate System.exit —
+        // the run script greps the "0 failures" sentinel.
+        Path multiSpecMergeVerifyDir = requireFixturesDir("interop.multispec_merge.dir");
+        int multiSpecMergeFailures = MultiSpecMergeOracle.verify(multiSpecMergeVerifyDir);
+        System.out.println(
+            "verify-interop-multispec-merge: " + multiSpecMergeFailures + " failures");
+        if (multiSpecMergeFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-expire":
         // EXPIRE-SNAPSHOTS interop (increment A3). Builds four fixtures (linear / tag_protected /
         // stats / deletes), each a real-manifest table with deterministically re-stamped snapshot
@@ -7023,6 +7052,227 @@ public final class InteropOracle {
           .withFileSizeInBytes(recordCount * 100)
           .withRecordCount(recordCount)
           .withPartitionPath(partitionPath)
+          .withFormat(FileFormat.PARQUET)
+          .build();
+    }
+  }
+
+  // =============================================================================================
+  // MultiSpecMergeOracle — MULTI-SPEC MERGING-ACTION metadata-level interop (AC·OO #5, Wave 2).
+  //
+  // The RESIDUE Z2 left on the table: Z2 proved a single multi-spec fast_append produces TWO DATA
+  // manifests with different partition_spec_id, but it carried NO delete files, so the symmetric
+  // per-spec DELETE-manifest grouping (Java MergingSnapshotProducer.newDeleteFilesAsManifests /
+  // Rust SnapshotProducer::write_added_delete_manifests) was NEVER exercised cross-language. This
+  // oracle closes that gap with a multi-spec DELETE commit driven by the RowDelta merging action.
+  //
+  // THE CHAIN (V2 table; NO parquet — the fixture only reads/writes MANIFESTS):
+  //
+  //   ms1: fast_append   F0(a="q", record_count=10)   spec 0 [identity(a)]    seq 1, op append
+  //   ms2: update_spec   add identity(b)               NO snapshot             → spec 1 becomes default
+  //   ms3: fast_append   F3(a="r",b="s", record_count=10)  spec 1            seq 2, op append
+  //   ms4: row_delta     D0(posDelete, a="q", rc=1) spec 0 + D1(posDelete, a="r",b="s", rc=1) spec 1
+  //                                                                             seq 3, op delete
+  //        ↑ THE HEADLINE — THE MULTI-SPEC DELETE COMMIT: ONE row_delta adding TWO position-delete
+  //          files under DIFFERENT specs. The merging producer groups them per spec, so the ms4
+  //          snapshot owns TWO DELETE manifests with partition_spec_id=0 AND partition_spec_id=1.
+  //          op is `delete` (addsDeleteFiles && !addsDataFiles — the 1.10.0 two-branch RowDelta
+  //          operation rule). TIE-SHAPING: D0 and D1 have IDENTICAL record_count=1, so the two ms4
+  //          DELETE manifests tie on all 9 prior sort-tuple keys (content=deletes, seq=3, min_seq=3,
+  //          added_files_count=1, existing_files_count=0, deleted_files_count=0, added_rows=1,
+  //          existing_rows=0, deleted_rows=0) and differ ONLY on partition_spec_id (0 vs 1). The W3
+  //          spec-id tiebreaker (position 10) is the ONLY disambiguator — identical to Z2's ms4 but
+  //          on the DELETE-manifest side this time.
+  //
+  // EXACTLY ONE DATA MANIFEST PER SPEC BEFORE ms4 (DELIBERATE — keeps the DATA-merge path dormant):
+  //   The chain seeds spec 0 with a SINGLE data manifest (ms1 F0) and spec 1 with a SINGLE data
+  //   manifest (ms3 F3). On the ms4 row_delta, Java's MergingSnapshotProducer.apply still runs the
+  //   DATA-side ManifestMergeManager over the existing manifests, but ManifestMergeManager's
+  //   per-bin handler RETURNS EACH SIZE-1 BIN AS-IS (the `bin.size() == 1` early return, 1.10.0
+  //   bytecode-verified) — so neither single-manifest spec group is rewritten and the DATA manifests
+  //   pass through unchanged on both sides. (A SECOND data manifest in one spec would trip Java's
+  //   `first`-relative force-merge of the OTHER spec group — an order-dependent DATA-manifest
+  //   rewrite the Rust merging producer does not mirror; out of scope for this DELETE-grouping unit,
+  //   so the chain is shaped to avoid it. That DATA-merge asymmetry is left as the FOLLOW-ON residue
+  //   for the OverwriteFiles/RewriteFiles multi-spec DATA cases.)
+  //
+  // The position deletes reference the live DATA files (D0→F0 in partition a="q"; D1→F3 in partition
+  // a="r"/b="s") so each delete sits in the SAME (spec, partition) as a LIVE data file. They are
+  // FRESH adds on a clean chain (no pre-existing live delete for those files), so Java's
+  // validateNoConflictingFileAndPositionDeletes / Rust's fresh-DV door stays dormant.
+  //
+  // PER-SPEC DELETE GROUPING — the load-bearing mechanism (1.10.0 bytecode-verified):
+  //   Java: newRowDelta().addDeletes(d0).addDeletes(d1).commit() — MergingSnapshotProducer.add(
+  //         DeleteFile) → addInternal(DeleteFile) routes each by file.specId() via computeIfAbsent
+  //         into newDeleteFilesBySpec (Map<Integer, DeleteFileSet>), and newDeleteFilesAsManifests
+  //         iterates that map to produce ONE delete manifest per spec bucket.
+  //   Rust: row_delta().add_deletes(vec![d0, d1]) — group_delete_files_by_spec routes by
+  //         file.partition_spec_id and write_added_delete_manifests produces one writer per spec
+  //         group (the SYMMETRIC sibling of write_added_manifests Z2 exercised).
+  //
+  // COMPARISON (via the SnapshotMetaOracle canonical view — IDENTICAL emitter to Z2):
+  //   java_meta.json = Java's canonical view of the Java-written chain.
+  //   Rust test D1: Rust's view of the Java chain == java_meta.json.
+  //   Script step: Java's view of the Rust chain byte-diffed against java_meta.json.
+  //   Rust test D2: Rust's view of the Rust chain == java_meta.json.
+  //
+  // Sabotage battery (in the run script):
+  //   SB1: truncate one manifest file → the load fails (structural corruption).
+  //   SB2: replace final.metadata.json with a copy that omits the ms4 snapshot → the view has 2
+  //        instead of 3 ordinals → byte diff fails.
+  //   SB3: control — run the comparison on the CLEAN Java chain → must pass → SB1/SB2/SB4 non-vacuous.
+  //   SB4: wrong-spec-rendering mutation — swap the two spec DEFINITIONS in the SOURCE metadata and
+  //        RE-EMIT. The ms4 spec-0 DELETE manifest's 1-field tuple is now projected under the 2-field
+  //        spec (and vice versa), so the rendered partition JSON of the DELETE entries changes → the
+  //        view diverges. Proves the per-own-spec partition rendering of DELETE entries is
+  //        load-bearing, not just the partition_spec_id integer.
+  // =============================================================================================
+
+  static final class MultiSpecMergeOracle {
+    private MultiSpecMergeOracle() {}
+
+    /**
+     * Perform the four-commit multi-spec merging-action chain on a V2 table (NO parquet) and emit
+     * {@code java_meta.json}. ms1-ms3 seed exactly ONE data manifest per spec (so the DATA-side
+     * merge stays dormant — see the class header); ms4 is the headline multi-spec DELETE row_delta.
+     *
+     * <p>Schema {@code {1 a string required, 2 b string optional}}; spec 0 {@code identity(a)}; spec
+     * 1 adds {@code identity(b)} via {@code updateSpec().addField("b")} — IDENTICAL spec shape to
+     * {@link MultiSpecOracle#generate}.
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+
+      // Schema: {a string required, b string optional}.
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "a", Types.StringType.get()),
+              Types.NestedField.optional(2, "b", Types.StringType.get()));
+
+      // Spec 0: identity(a) built directly — the table is CREATED with spec 0.
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      PartitionSpec spec0seed = PartitionSpec.builderFor(schema).identity("a").build();
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec0seed, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_multispec_merge");
+
+      PartitionSpec spec0 = table.spec();
+      String dataDir = tableDir.getAbsolutePath() + "/data";
+
+      // ms1: fast_append F0 under spec 0 (seq 1) — the SINGLE spec-0 data manifest.
+      DataFile fileF0 = fakeDataFile(spec0, dataDir + "/s0_f0.parquet", "a=q", 10L);
+      table.newFastAppend().appendFile(fileF0).commit();
+
+      // ms2: updateSpec() adds identity(b) → spec 1 becomes default. NO snapshot.
+      table.updateSpec().addField("b").commit();
+      PartitionSpec spec1 = table.spec();
+
+      // ms3: fast_append F3 under spec 1 (seq 2) — the SINGLE spec-1 data manifest.
+      DataFile fileF3 = fakeDataFile(spec1, dataDir + "/s1_f3.parquet", "a=r/b=s", 10L);
+      table.newFastAppend().appendFile(fileF3).commit();
+
+      // ms4: THE MULTI-SPEC DELETE commit — ONE row_delta adding:
+      //   D0: POSITION-delete under spec 0 (partition a="q"), referencing F0, record_count=1
+      //   D1: POSITION-delete under spec 1 (partition a="r"/b="s"), referencing F3, record_count=1
+      // MergingSnapshotProducer.addInternal(DeleteFile) routes each by specId into
+      // newDeleteFilesBySpec; newDeleteFilesAsManifests produces ONE delete manifest per spec ⇒ TWO
+      // delete manifests, partition_spec_id=0 AND 1. TIE-SHAPED (both record_count=1) so the W3
+      // spec-id tiebreaker (position 10) is the ONLY disambiguator. op = delete (addsDeleteFiles &&
+      // !addsDataFiles, the 1.10.0 two-branch rule). The two pre-existing data manifests (1 per spec)
+      // pass through the DATA-side merge as size-1 bins, unchanged on both sides.
+      DeleteFile deleteD0 =
+          fakePositionDeleteFile(
+              spec0, dataDir + "/s0_d0-deletes.parquet", "a=q", fileF0.path().toString(), 1L);
+      DeleteFile deleteD1 =
+          fakePositionDeleteFile(
+              spec1, dataDir + "/s1_d1-deletes.parquet", "a=r/b=s", fileF3.path().toString(), 1L);
+      table.newRowDelta().addDeletes(deleteD0).addDeletes(deleteD1).commit();
+
+      // The FINAL metadata at a known path for the emitter + the Rust test.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // Emit java_meta.json (the canonical snapshot-metadata view).
+      SnapshotMetaOracle.emit(finalMetadata, dir.resolve("java_meta.json"));
+      System.out.println("generated multi-spec MERGING-ACTION table to " + dir);
+    }
+
+    /**
+     * Direction 2 — "Java judges what RUST wrote." Reads the Rust-produced
+     * {@code rust_table/metadata/final.metadata.json}, emits its canonical view, and byte-diffs it
+     * against {@code java_meta.json}. Returns the failure count (0 = pass).
+     */
+    static int verify(Path dir) throws IOException {
+      Path javaMetaPath = dir.resolve("java_meta.json");
+      Path rustMetadataPath = dir.resolve("rust_table/metadata/final.metadata.json");
+      if (!Files.exists(rustMetadataPath)) {
+        System.out.println("FAIL verify-interop-multispec-merge: missing " + rustMetadataPath);
+        return 1;
+      }
+
+      Path rustViewPath = dir.resolve("java_view_rust_meta.json");
+      SnapshotMetaOracle.emit(rustMetadataPath, rustViewPath);
+
+      String javaView = readString(javaMetaPath);
+      String rustView = readString(rustViewPath);
+      if (javaView.equals(rustView)) {
+        System.out.println("verify-interop-multispec-merge: Rust chain == Java semantics OK");
+        return 0;
+      } else {
+        System.out.println("FAIL verify-interop-multispec-merge: Rust canonical view diverges:");
+        System.out.println("  expected: " + javaMetaPath);
+        System.out.println("  actual:   " + rustViewPath);
+        return 1;
+      }
+    }
+
+    /**
+     * A metadata-only {@link DataFile} built under a SPECIFIC {@link PartitionSpec} — IDENTICAL to
+     * {@link MultiSpecOracle#fakeDataFile}.
+     */
+    private static DataFile fakeDataFile(
+        PartitionSpec spec, String path, String partitionPath, long recordCount) {
+      return DataFiles.builder(spec)
+          .withPath(path)
+          .withFileSizeInBytes(recordCount * 100)
+          .withRecordCount(recordCount)
+          .withPartitionPath(partitionPath)
+          .withFormat(FileFormat.PARQUET)
+          .build();
+    }
+
+    /**
+     * A metadata-only POSITION-delete {@link DeleteFile} built under a SPECIFIC {@link PartitionSpec}
+     * (the metadata-only analog of {@link #fakeDataFile} on the delete side, via
+     * {@code FileMetadata.deleteFileBuilder(spec).ofPositionDeletes()} — the SAME idiom as
+     * {@link RewriteSeqOracle}). The path need not exist; the partition tuple is rendered under the
+     * delete file's OWN spec. {@code referencedDataFile} ties the delete to its data file so the
+     * delete sits in the same (spec, partition) as a live data file (kept off the dangling path).
+     */
+    private static DeleteFile fakePositionDeleteFile(
+        PartitionSpec spec,
+        String path,
+        String partitionPath,
+        String referencedDataFile,
+        long recordCount) {
+      return FileMetadata.deleteFileBuilder(spec)
+          .ofPositionDeletes()
+          .withPath(path)
+          .withFileSizeInBytes(recordCount * 100)
+          .withRecordCount(recordCount)
+          .withPartitionPath(partitionPath)
+          .withReferencedDataFile(referencedDataFile)
           .withFormat(FileFormat.PARQUET)
           .build();
     }
