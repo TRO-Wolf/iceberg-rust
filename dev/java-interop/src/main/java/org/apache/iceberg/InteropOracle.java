@@ -597,6 +597,33 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-rewritefiles-conflict":
+        // CONFLICT-VALIDATION RewriteFiles interop (increment C5) — the MECHANICALLY most complex
+        // write-action conflict unit (GAP_MATRIX row 95): the seq-preservation + position-vs-equality-
+        // delete nuance. For each scenario, writes a PARTITIONED V2 {x long, y long, z long} (identity(x))
+        // table under <dir>/<scenario>/table with an S0→S1 history (S0 appends A x=0 + B x=1; S1 a
+        // concurrent row_delta adding the scenario's delete file). The validating engine runs the
+        // symmetric rewrite (validateFromSnapshot(S0).rewriteFiles({A}, {A'}[, A's data seq])) and its
+        // ACCEPT/REJECT must equal the hand-declared expected (same contract as Rust's
+        // interop_rewritefiles_conflict.rs).
+        Path rewriteFilesConflictDir = requireFixturesDir("interop.rewritefiles_conflict.dir");
+        RewriteFilesConflictOracle.generate(rewriteFilesConflictDir);
+        break;
+      case "verify-interop-rewritefiles-conflict":
+        // CONFLICT-VALIDATION RewriteFiles interop, DIRECTION 2 — "Java validates what RUST writes". The
+        // Rust GEN test (env ICEBERG_INTEROP_REWRITEFILES_CONFLICT_GEN_DIR) wrote each scenario's S0+S1
+        // table to <dir>/<scenario>/rust_table. Java loads each, derives A from the loaded table, runs the
+        // symmetric rewrite for that scenario (preserve-seq + concurrent-delete), and asserts the conflict
+        // decision matches the hand-declared expected.
+        Path rewriteFilesConflictVerifyDir = requireFixturesDir("interop.rewritefiles_conflict.dir");
+        int rewriteFilesConflictFailures =
+            RewriteFilesConflictOracle.verify(rewriteFilesConflictVerifyDir);
+        System.out.println(
+            "verify-interop-rewritefiles-conflict: " + rewriteFilesConflictFailures + " failures");
+        if (rewriteFilesConflictFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-delete-data":
         // DATA-LEVEL DeleteFiles interop (increment W1, fixture D). Writes a V2 partitioned table
         // (identity(category), schema {id long, category string, data string}) under <dir>/table, appends
@@ -9956,6 +9983,451 @@ public final class InteropOracle {
         writer.write(rows);
       }
       return writer.toDataFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
+    }
+  }
+
+  // =============================================================================================
+  // RewriteFilesConflictOracle — CONFLICT-VALIDATION RewriteFiles interop (increment C5).
+  //
+  // RewriteFiles is the MECHANICALLY most complex write-action conflict unit (GAP_MATRIX row 95): the
+  // seq-preservation + position-vs-equality-delete nuance. This oracle proves Java
+  // BaseRewriteFiles.validate (the shared validateNoNewDeletesForDataFiles) agrees with Rust's
+  // RewriteFiles.validate (validate_no_new_deletes_for_data_files, run automatically in validate(),
+  // gated by the preserved data_sequence_number) on the conflict DECISION (ACCEPT vs REJECT) over the
+  // SAME concurrent-commit history, hand-declared identically on both sides (anti-circular).
+  //
+  // THE RULE (Java BaseRewriteFiles.validate L135-142): a rewrite REPLACES data files. A CONCURRENT
+  // DELETE file added since the rewrite's starting snapshot that APPLIES to one of the replaced files is
+  // a conflict (the rewrite would resurrect deleted rows) — UNLESS the rewrite PRESERVED the replaced
+  // file's data sequence number (the 3-arg rewriteFiles(toDelete, toAdd, startingDataSequenceNumber) or
+  // dataSequenceNumber(seq)), in which case a concurrently-added EQUALITY delete is IGNORED (it still
+  // applies to the rewritten file via the preserved seq — L500-517) but a POSITION delete is ALWAYS
+  // fatal (path-scoped, the new file has a new path — L538-543). The shared helper takes
+  // ignoreEqualityDeletes = newDataFilesDataSequenceNumber != null (L475-479).
+  //
+  // Per scenario, a PARTITIONED V2 {1 x long, 2 y long, 3 z long} (identity(x)) table — the same fixture
+  // as Rust's rewrite_files.rs conflict unit tests. S0 fast-appends A (x=0) + B (x=1); S1 is a CONCURRENT
+  // row_delta (newRowDelta().addDeletes(...)) adding a delete file. The symmetric rewrite
+  //   table.newRewrite().validateFromSnapshot(S0).rewriteFiles({A}, {A'}[, A's data seq])
+  // replaces A with a fresh A' (same rows, new path) — its conflict decision turns on the concurrent
+  // delete + the seq knob, not on A' itself, so each engine runs it against the OTHER's table.
+  //
+  //   scenario                  | preserve seq | S1 concurrent delete             | expected
+  //   no_seq_eq_delete_reject   | NO           | EQUALITY delete on A (x=0)        | REJECT
+  //   seq_eq_delete_accept      | YES          | EQUALITY delete on A (x=0)        | ACCEPT (ignored)
+  //   seq_position_delete_reject| YES          | POSITION delete path-scoped on A  | REJECT (always fatal)
+  //   disjoint_delete_accept    | YES          | POSITION delete path-scoped on B  | ACCEPT (disjoint)
+  //
+  // Scenarios 1 and 2 share the SAME S1 history (a concurrent equality delete on A) and differ ONLY by
+  // the seq knob — the load-bearing seq-preservation nuance. Scenario 3 keeps the seq yet a POSITION
+  // delete is still fatal. Scenario 4 is the over-firing negative control (a delete on the disjoint B
+  // does not conflict with replacing A; seq preserved so disjointness is the only reason it accepts).
+  //
+  // C2 VACUOUS-REJECT GUARD: A is live at BOTH S0 and S1 (the concurrent delete ADDS a delete file; it
+  // does not REMOVE A), so failMissingDeletePaths and the "Files to delete cannot be empty" precondition
+  // both PASS — the only thing that can reject is validateNoNewDeletesForDataFiles. The run script's
+  // sabotage battery mutation-confirms this (disabling the validation flips the rejects to accept).
+  //
+  // The replaced file A is DERIVED per engine from the loaded table (the live data file in partition x=0
+  // at S0), with NO cross-engine path coupling. This MUST mirror Rust's interop_rewritefiles_conflict.rs
+  // scenario set exactly (names, preserve-seq, concurrent delete, expected outcomes). generate writes
+  // <dir>/<scenario>/table (Java) for Rust's D1; verify loads <dir>/<scenario>/rust_table (Rust's GEN)
+  // for Java's D2 and prints the "N failures" sentinel.
+  // =============================================================================================
+  static final class RewriteFilesConflictOracle {
+    private RewriteFilesConflictOracle() {}
+
+    private enum Concurrent {
+      EQUALITY_ON_A,
+      POSITION_ON_A,
+      POSITION_ON_B
+    }
+
+    private static final class Scenario {
+      final String name;
+      final boolean preserveSeq;
+      final Concurrent concurrent;
+      final boolean expectReject;
+
+      Scenario(String name, boolean preserveSeq, Concurrent concurrent, boolean expectReject) {
+        this.name = name;
+        this.preserveSeq = preserveSeq;
+        this.concurrent = concurrent;
+        this.expectReject = expectReject;
+      }
+    }
+
+    private static final List<Scenario> SCENARIOS =
+        List.of(
+            new Scenario("no_seq_eq_delete_reject", false, Concurrent.EQUALITY_ON_A, true),
+            new Scenario("seq_eq_delete_accept", true, Concurrent.EQUALITY_ON_A, false),
+            new Scenario("seq_position_delete_reject", true, Concurrent.POSITION_ON_A, true),
+            new Scenario("disjoint_delete_accept", true, Concurrent.POSITION_ON_B, false));
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "x", Types.LongType.get()),
+            Types.NestedField.required(2, "y", Types.LongType.get()),
+            Types.NestedField.required(3, "z", Types.LongType.get()));
+
+    private static final PartitionSpec SPEC =
+        PartitionSpec.builderFor(SCHEMA).identity("x").build();
+
+    static void generate(Path dir) throws IOException {
+      for (Scenario scenario : SCENARIOS) {
+        Path scenarioDir = dir.resolve(scenario.name);
+        File tableDir = scenarioDir.resolve("table").toFile();
+        File metadataDir = new File(tableDir, "metadata");
+        File dataDir = new File(tableDir, "data");
+        mkdirs(metadataDir);
+        mkdirs(dataDir);
+
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, "2");
+        TableMetadata seed =
+            TableMetadata.newTableMetadata(
+                SCHEMA, SPEC, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+        LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+        ops.commit(null, seed);
+        BaseTable table = new BaseTable(ops, "interop_rewritefiles_conflict_" + scenario.name);
+
+        buildScenarioHistory(table, dataDir, scenario);
+
+        Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+        OutputFile finalOut =
+            new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+        TableMetadataParser.write(ops.current(), finalOut);
+
+        System.out.println(
+            "generated rewritefiles-conflict scenario "
+                + scenario.name
+                + " (preserveSeq="
+                + scenario.preserveSeq
+                + ", "
+                + scenario.concurrent
+                + ", expected "
+                + (scenario.expectReject ? "REJECT" : "ACCEPT")
+                + ") to "
+                + scenarioDir);
+      }
+    }
+
+    /**
+     * Build the per-scenario S0→S1 history on {@code table}: S0 fast-appends A (x=0) + B (x=1); S1 is a
+     * CONCURRENT row_delta adding the scenario's delete file (an equality delete on A, a position delete
+     * path-scoped on A, or a position delete path-scoped on the disjoint B). A and B both live at S0 and
+     * at S1 (the delete ADDS a delete file; it does not REMOVE A) so the by-path delete resolution always
+     * succeeds — the only thing that can reject is the concurrent-delete conflict.
+     */
+    private static void buildScenarioHistory(BaseTable table, File dataDir, Scenario scenario)
+        throws IOException {
+      // S0: A in partition x=0, B in partition x=1.
+      DataFile a =
+          writeDataFile(
+              table,
+              new File(dataDir, "x=0/00000-a0.parquet").getAbsolutePath(),
+              0L,
+              new long[][] {{10L, 100L}, {20L, 200L}});
+      DataFile b =
+          writeDataFile(
+              table,
+              new File(dataDir, "x=1/00000-b0.parquet").getAbsolutePath(),
+              1L,
+              new long[][] {{60L, 600L}, {70L, 700L}});
+      table.newFastAppend().appendFile(a).appendFile(b).commit();
+
+      // S1: a CONCURRENT row_delta adding the scenario's delete file.
+      DeleteFile delete;
+      switch (scenario.concurrent) {
+        case EQUALITY_ON_A:
+          delete =
+              writeEqualityDeleteFile(
+                  table,
+                  new File(dataDir, "x=0/00001-a-y-deletes.parquet").getAbsolutePath(),
+                  0L,
+                  20L);
+          break;
+        case POSITION_ON_A:
+          delete =
+              writePositionDeleteFile(
+                  table,
+                  new File(dataDir, "x=0/00001-a-pos-deletes.parquet").getAbsolutePath(),
+                  0L,
+                  a.location(),
+                  1L);
+          break;
+        case POSITION_ON_B:
+          delete =
+              writePositionDeleteFile(
+                  table,
+                  new File(dataDir, "x=1/00001-b-pos-deletes.parquet").getAbsolutePath(),
+                  1L,
+                  b.location(),
+                  0L);
+          break;
+        default:
+          throw new IllegalStateException("unknown concurrent " + scenario.concurrent);
+      }
+      table.newRowDelta().addDeletes(delete).commit();
+    }
+
+    /**
+     * DIRECTION 2 verify — for each scenario, load the RUST-written table and run the symmetric rewrite;
+     * the ACCEPT/REJECT outcome must equal the hand-declared expected.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      for (Scenario scenario : SCENARIOS) {
+        Path finalMetadata =
+            dir.resolve(scenario.name)
+                .resolve("rust_table")
+                .resolve("metadata")
+                .resolve("final.metadata.json");
+        if (!Files.exists(finalMetadata)) {
+          System.out.println(
+              "FAIL rewritefiles-conflict-d2["
+                  + scenario.name
+                  + "]: missing "
+                  + finalMetadata
+                  + " (run the Rust GEN path first)");
+          failures++;
+          continue;
+        }
+
+        try {
+          boolean rejected = runRewriteAndDetect(finalMetadata, scenario);
+          if (rejected == scenario.expectReject) {
+            System.out.println(
+                "PASS rewritefiles-conflict-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " matches expected");
+          } else {
+            System.out.println(
+                "FAIL rewritefiles-conflict-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " but expected "
+                    + (scenario.expectReject ? "REJECT" : "ACCEPT"));
+            failures++;
+          }
+        } catch (RuntimeException | IOException error) {
+          System.out.println(
+              "FAIL rewritefiles-conflict-d2["
+                  + scenario.name
+                  + "]: unexpected error running the rewrite_files: "
+                  + error);
+          failures++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-rewritefiles-conflict OK — Java's RewriteFiles conflict decision matches "
+                + "Rust on all "
+                + SCENARIOS.size()
+                + " scenarios (no_seq_eq_delete_reject REJECT, seq_eq_delete_accept ACCEPT, "
+                + "seq_position_delete_reject REJECT, disjoint_delete_accept ACCEPT — the "
+                + "seq-preservation + position-vs-equality-delete nuance)");
+      }
+      return failures;
+    }
+
+    /**
+     * Load the Rust-written {@code final.metadata.json} into a committable {@link LocalTableOperations}
+     * (seed via {@code commit(null, loaded)} — the Rust S0+S1 history is preserved), run the symmetric
+     * {@code newRewrite().validateFromSnapshot(S0).rewriteFiles({A}, {A'}[, A's data seq])}, and return
+     * {@code true} when it was REJECTED (a {@code ValidationException}) or {@code false} when it committed
+     * (ACCEPT). A is the live data file in partition x=0 at S0, derived from the loaded table.
+     */
+    private static boolean runRewriteAndDetect(Path rustFinalMetadata, Scenario scenario)
+        throws IOException {
+      File metadataDir = rustFinalMetadata.getParent().toFile();
+      File tableDir = metadataDir.getParentFile(); // .../rust_table
+      File dataDir = new File(tableDir, "data");
+      mkdirs(dataDir);
+
+      TableMetadata loaded =
+          TableMetadataParser.fromJson(rustFinalMetadata.toString(), readString(rustFinalMetadata));
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, loaded); // seed `current` with the Rust S0+S1 history
+      BaseTable table = new BaseTable(ops, "rust_rewritefiles_conflict_" + scenario.name);
+
+      long s0 = rootSnapshotId(table);
+      long s0Seq = table.snapshot(s0).sequenceNumber();
+      // A = the live data file in partition x=0 at S0 (the file the rewrite replaces).
+      DataFile a = deriveDataFileInPartition(table, s0, 0L);
+      // A' = a fresh file with the same rows in the same partition (a new path).
+      DataFile aPrime =
+          writeDataFile(
+              table,
+              new File(dataDir, "fresh-" + scenario.name + "-" + System.nanoTime() + ".parquet")
+                  .getAbsolutePath(),
+              0L,
+              new long[][] {{10L, 100L}, {20L, 200L}});
+
+      java.util.Set<DataFile> toDelete = new java.util.HashSet<>();
+      toDelete.add(a);
+      java.util.Set<DataFile> toAdd = new java.util.HashSet<>();
+      toAdd.add(aPrime);
+
+      org.apache.iceberg.RewriteFiles rewrite = table.newRewrite().validateFromSnapshot(s0);
+      if (scenario.preserveSeq) {
+        // The 3-arg overload stamps the added files with the replaced file's data sequence number (Java
+        // newDataFilesDataSequenceNumber != null ⇒ ignoreEqualityDeletes = true).
+        rewrite = rewrite.rewriteFiles(toDelete, toAdd, s0Seq);
+      } else {
+        rewrite = rewrite.rewriteFiles(toDelete, toAdd);
+      }
+      try {
+        rewrite.commit();
+        return false; // ACCEPT
+      } catch (org.apache.iceberg.exceptions.ValidationException validationFailure) {
+        return true; // REJECT
+      }
+    }
+
+    /**
+     * Derive the (single) live DATA {@link DataFile} in partition {@code x = partValue} as of snapshot
+     * {@code snapshotId}, reading the snapshot's DATA manifests via {@link ManifestFiles#read}. This is
+     * the EXACT {@link DataFile} the symmetric rewrite passes to {@code rewriteFiles} (so the by-path
+     * resolution against the current snapshot matches), with no cross-engine path coupling.
+     */
+    private static DataFile deriveDataFileInPartition(
+        BaseTable table, long snapshotId, long partValue) throws IOException {
+      Snapshot snapshot = table.snapshot(snapshotId);
+      FileIO io = table.io();
+      TableMetadata metadata = ((HasTableOperations) table).operations().current();
+      for (ManifestFile manifest : snapshot.dataManifests(io)) {
+        try (ManifestReader<DataFile> reader =
+            ManifestFiles.read(manifest, io, metadata.specsById())) {
+          for (DataFile file : reader) {
+            if (file.partition().get(0, Long.class) == partValue) {
+              return file.copy();
+            }
+          }
+        }
+      }
+      throw new IllegalStateException(
+          "no live data file in partition x=" + partValue + " at snapshot " + snapshotId);
+    }
+
+    /** The ROOT snapshot (no parent) — after S0+S1 this is S0, so S1 is the concurrent commit. */
+    private static long rootSnapshotId(BaseTable table) {
+      for (Snapshot snapshot : table.snapshots()) {
+        if (snapshot.parentId() == null) {
+          return snapshot.snapshotId();
+        }
+      }
+      throw new IllegalStateException("no root snapshot (S0) found in the table history");
+    }
+
+    /** Write a REAL parquet {x, y, z} DATA file for partition {@code x = partValue}; rows are {y, z}. */
+    private static DataFile writeDataFile(
+        BaseTable table, String path, long partValue, long[][] yzRows) throws IOException {
+      File parent = new File(path).getParentFile();
+      if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+        throw new IOException("failed to create data dir " + parent);
+      }
+      PartitionData partition = new PartitionData(SPEC.partitionType());
+      partition.set(0, partValue);
+
+      List<Record> rows = new ArrayList<>();
+      for (long[] yz : yzRows) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("x", partValue);
+        record.setField("y", yz[0]);
+        record.setField("z", yz[1]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, SPEC);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * Write a REAL parquet EQUALITY-delete file keyed on {@code y} (equalityFieldIds=[2]) in partition
+     * {@code x = partValue}, carrying the delete key {@code y = deleteY}. Partition-scoped (matches A by
+     * partition).
+     */
+    private static DeleteFile writeEqualityDeleteFile(
+        BaseTable table, String path, long partValue, long deleteY) throws IOException {
+      File parent = new File(path).getParentFile();
+      if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+        throw new IOException("failed to create data dir " + parent);
+      }
+      Schema eqDeleteRowSchema = SCHEMA.select("y");
+      int[] equalityFieldIds =
+          eqDeleteRowSchema.columns().stream().mapToInt(Types.NestedField::fieldId).toArray();
+      PartitionData partition = new PartitionData(SPEC.partitionType());
+      partition.set(0, partValue);
+
+      List<Record> deletes = new ArrayList<>();
+      GenericRecord delete = GenericRecord.create(eqDeleteRowSchema);
+      delete.setField("y", deleteY);
+      deletes.add(delete);
+
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(SCHEMA, SPEC, equalityFieldIds, eqDeleteRowSchema, null);
+      OutputFile out = table.io().newOutputFile(path);
+      EqualityDeleteWriter<Record> writer =
+          factory.newEqDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(deletes);
+      }
+      return writer.toDeleteFile();
+    }
+
+    /**
+     * Write a REAL parquet POSITION-delete file in partition {@code x = partValue}, path-scoped on
+     * {@code referencedDataPath} at position {@code pos} (the delete carries {@code referenced_data_file
+     * == referencedDataPath}, so it matches only that data file).
+     */
+    private static DeleteFile writePositionDeleteFile(
+        BaseTable table, String path, long partValue, CharSequence referencedDataPath, long pos)
+        throws IOException {
+      File parent = new File(path).getParentFile();
+      if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+        throw new IOException("failed to create data dir " + parent);
+      }
+      PartitionData partition = new PartitionData(SPEC.partitionType());
+      partition.set(0, partValue);
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, SPEC);
+      OutputFile out = table.io().newOutputFile(path);
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(referencedDataPath, pos, null));
+      }
+      return writer.toDeleteFile();
     }
 
     private static void mkdirs(File directory) throws IOException {

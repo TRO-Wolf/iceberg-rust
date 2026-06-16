@@ -120,8 +120,14 @@ Wave 1 — conflict-validation closeout (order locked):
       check on the flag, Rust's by-path is unconditional — a documented mechanism divergence), D1
       corroborates the DECISION, the axis is pinned by `delete_files.rs` unit tests. Row 93 stays 🟡.
       Files: `interop_deletefiles_conflict.rs`, `run-interop-deletefiles-conflict.sh`, `DeleteFilesConflictOracle`.
-- [ ] **AC·OO #4 — C5 RewriteFiles** (row 95). `validate_no_new_deletes_for_data_files` — a concurrent
-      delete that would apply to the rewritten files (seq-preservation angle).
+- [x] **AC·OO #4 — C5 RewriteFiles** (row 95) — **DONE 2026-06-16.** `validate_no_new_deletes_for_data_files`,
+      the seq-preservation + position-vs-equality nuance: 4 scenarios both directions —
+      no-seq+eq→REJECT, seq+eq→ACCEPT (ignored), seq+position→REJECT (always fatal), disjoint→ACCEPT.
+      Actor engineered AROUND the C2 trap (A live at S0 AND S1, so only the axis can reject; confirmed
+      by axis-message assertion + 2 mutation-swaps). Hardened loop; Critic source-disabled the
+      validation to prove non-vacuity → converged 1 cycle, NO_FINDINGS. Files:
+      `interop_rewritefiles_conflict.rs`, `run-interop-rewritefiles-conflict.sh`, `RewriteFilesConflictOracle`.
+      Row 95 stays 🟡. **Wave 1 COMPLETE — all 5 write-action conflict rows interop-proven.**
 
 Wave 2 — multi-spec write interop (stretch):
 
