@@ -1286,6 +1286,31 @@ public final class InteropOracle {
         }
         break;
 
+      case "generate-interop-expression":
+        // EXPRESSION-PARSER interop (GAP_MATRIX row 147), DIRECTION 2 source — "Rust reads what JAVA
+        // wrote". Java builds a battery of expressions INDEPENDENTLY (Expressions.* / Binder.bind),
+        // emits each as canonical ExpressionParser.toJson into <dir>/java_expressions.jsonl (one
+        // {name, json} per line) plus the schema (<dir>/schema.json). The Rust VERIFY test reads each
+        // line, from_json(json, schema), re-serializes via its codec, and asserts byte-equality.
+        Path expressionGenDir = requireFixturesDir("interop.expression.dir");
+        ExpressionParserOracle.generate(expressionGenDir);
+        break;
+      case "verify-interop-expression":
+        // EXPRESSION-PARSER interop, DIRECTION 1 — "Java validates what RUST wrote". The Rust GEN test
+        // (env ICEBERG_INTEROP_EXPRESSION_GEN_DIR) emitted <dir>/rust_expressions.jsonl (one
+        // {name, json} per line, Rust ExpressionParser.to_json output) + the schema. For each line
+        // Java (a) parses the Rust JSON via ExpressionParser.fromJson(json, schema), binds it, and
+        // RE-SERIALIZES via ExpressionParser.toJson, asserting it byte-equals the Rust JSON, and
+        // (b) independently builds the SAME expression in Java and asserts its toJson byte-equals the
+        // Rust JSON (anti-circular: the expected is constructed by Java, not echoed from Rust).
+        Path expressionVerifyDir = requireFixturesDir("interop.expression.dir");
+        int expressionFailures = ExpressionParserOracle.verify(expressionVerifyDir);
+        System.out.println("verify-interop-expression: " + expressionFailures + " failures");
+        if (expressionFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -18805,6 +18830,216 @@ public final class InteropOracle {
       }
       System.out.println("verify-interop-unknown: " + failures + " failures");
       return failures;
+    }
+  }
+
+  // ===========================================================================================
+  // ExpressionParser oracle — the REAL Java org.apache.iceberg.expressions.ExpressionParser is the
+  // oracle. The shared contract is the SCHEMA (SchemaParser.toJson <-> Rust serde Schema). The
+  // battery of expressions is built INDEPENDENTLY on each side (no JSON is copied across to derive
+  // the "expected"), so a byte-match proves real codec parity, not an echo.
+  // ===========================================================================================
+
+  static final class ExpressionParserOracle {
+    private ExpressionParserOracle() {}
+
+    /** The shared schema, fields chosen to exercise every SingleValueParser value type. */
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.optional(1, "i", Types.IntegerType.get()),
+          Types.NestedField.optional(2, "l", Types.LongType.get()),
+          Types.NestedField.optional(3, "s", Types.StringType.get()),
+          Types.NestedField.optional(4, "b", Types.BooleanType.get()),
+          Types.NestedField.optional(5, "d", Types.DateType.get()),
+          Types.NestedField.optional(6, "t", Types.TimeType.get()),
+          Types.NestedField.optional(7, "ts", Types.TimestampType.withoutZone()),
+          Types.NestedField.optional(8, "tstz", Types.TimestampType.withZone()),
+          Types.NestedField.optional(9, "dec", Types.DecimalType.of(9, 2)),
+          Types.NestedField.optional(10, "u", Types.UUIDType.get()),
+          Types.NestedField.optional(11, "bin", Types.BinaryType.get()),
+          Types.NestedField.optional(12, "fx", Types.FixedType.ofLength(3)),
+          Types.NestedField.optional(13, "f", Types.FloatType.get()),
+          Types.NestedField.optional(14, "x", Types.IntegerType.get()),
+          Types.NestedField.optional(15, "y", Types.IntegerType.get()),
+          Types.NestedField.optional(16, "dbl", Types.DoubleType.get()));
+    }
+
+    /**
+     * The shared battery, keyed by a stable name. Each expression is built independently with the
+     * Expressions API; bound forms (date/time/timestamp/decimal/uuid/binary/fixed) are bound so
+     * their toJson uses the typed SingleValueParser string form. The Rust GEN test builds the SAME
+     * battery by the same names.
+     */
+    private static java.util.LinkedHashMap<String, Expression> battery(Schema schema) {
+      Types.StructType struct = schema.asStruct();
+      java.util.LinkedHashMap<String, Expression> b = new java.util.LinkedHashMap<>();
+      b.put("is_null", Expressions.isNull("x"));
+      b.put("not_null", Expressions.notNull("x"));
+      b.put("is_nan", Expressions.isNaN("f"));
+      b.put("not_nan", Expressions.notNaN("f"));
+      b.put("lt", Expressions.lessThan("i", 10));
+      b.put("lt_eq", Expressions.lessThanOrEqual("i", 10));
+      b.put("gt", Expressions.greaterThan("i", 10));
+      b.put("gt_eq", Expressions.greaterThanOrEqual("i", 10));
+      b.put("eq_int", Expressions.equal("i", 42));
+      // float/double VALUE predicates — Java renders these via Float.toString / Double.toString
+      // (the value arm row 147 claims for typical magnitudes). 3.14f / 1e10 / 1e-4 byte-match the
+      // Rust formatter; the JDK-11 non-minimal residue is scoped out (Rust unit test pins it).
+      b.put("eq_float", Expressions.equal("f", 2.5f));
+      b.put("eq_double", Expressions.equal("dbl", 1e10));
+      b.put("eq_double_sci", Expressions.equal("dbl", 1e-4));
+      b.put("eq_long", Expressions.equal("l", 9000000000L));
+      b.put("not_eq_str", Expressions.notEqual("s", "hi"));
+      b.put("starts_with", Expressions.startsWith("s", "pre"));
+      b.put("not_starts_with", Expressions.notStartsWith("s", "pre"));
+      b.put("eq_bool", Expressions.equal("b", true));
+      b.put("eq_str", Expressions.equal("s", "hello"));
+      b.put("eq_date", bind(struct, Expressions.equal("d", "2017-11-16")));
+      b.put("eq_time", bind(struct, Expressions.equal("t", "13:14:15.000001")));
+      b.put("eq_ts", bind(struct, Expressions.equal("ts", "2017-11-16T14:15:16.123456")));
+      b.put("eq_tstz", bind(struct, Expressions.equal("tstz", "2017-11-16T14:15:16.123456+00:00")));
+      b.put("eq_dec", bind(struct, Expressions.equal("dec", "12.34")));
+      b.put("eq_dec_scale", bind(struct, Expressions.equal("dec", "12.30")));
+      b.put("eq_uuid", bind(struct, Expressions.equal("u", "f79c3e09-677c-4bbd-a479-3f349cb785e7")));
+      b.put(
+          "eq_bin",
+          bind(struct, Expressions.equal("bin", java.nio.ByteBuffer.wrap(new byte[] {0x01, (byte) 0xAB, (byte) 0xFF}))));
+      b.put(
+          "eq_fixed",
+          bind(struct, Expressions.equal("fx", java.nio.ByteBuffer.wrap(new byte[] {0x0A, 0x0B, 0x0C}))));
+      b.put("and", Expressions.and(Expressions.equal("i", 1), Expressions.equal("l", 2L)));
+      b.put("or", Expressions.or(Expressions.isNull("x"), Expressions.notNull("y")));
+      b.put("not", Expressions.not(Expressions.equal("i", 5)));
+      b.put("in", Expressions.in("i", 1, 2, 3));
+      b.put("not_in", Expressions.notIn("s", "a", "b"));
+      b.put("always_true", Expressions.alwaysTrue());
+      b.put("always_false", Expressions.alwaysFalse());
+      return b;
+    }
+
+    private static Expression bind(Types.StructType struct, Expression expr) {
+      return org.apache.iceberg.expressions.Binder.bind(struct, expr, false);
+    }
+
+    /** DIRECTION-2 source: emit each Java expression's canonical JSON + the schema. */
+    static void generate(Path dir) throws IOException {
+      mkdirs(dir.toFile());
+      Schema schema = schema();
+      writeJson(dir.resolve("schema.json"), SchemaParser.toJson(schema));
+      StringBuilder sb = new StringBuilder();
+      for (Map.Entry<String, Expression> e : battery(schema).entrySet()) {
+        String json = org.apache.iceberg.expressions.ExpressionParser.toJson(e.getValue());
+        sb.append("{\"name\":\"").append(e.getKey()).append("\",\"json\":")
+            .append(asJsonString(json)).append("}\n");
+      }
+      writeJson(dir.resolve("java_expressions.jsonl"), sb.toString());
+      System.out.println("generate-interop-expression: wrote java_expressions.jsonl + schema.json");
+    }
+
+    /** DIRECTION-1: validate the Rust-written JSON two independent ways. */
+    static int verify(Path dir) throws IOException {
+      Schema schema = schema();
+      Types.StructType struct = schema.asStruct();
+      java.util.LinkedHashMap<String, Expression> expected = battery(schema);
+
+      Path rustFile = dir.resolve("rust_expressions.jsonl");
+      if (!Files.exists(rustFile)) {
+        System.out.println("FAIL: rust_expressions.jsonl not found");
+        return 1;
+      }
+      int failures = 0;
+      int checked = 0;
+      for (String line : Files.readAllLines(rustFile)) {
+        if (line.trim().isEmpty()) {
+          continue;
+        }
+        com.fasterxml.jackson.databind.JsonNode node = JsonUtil.mapper().readTree(line);
+        String name = node.get("name").asText();
+        String rustJson = node.get("json").asText();
+        Expression want = expected.get(name);
+        if (want == null) {
+          System.out.println("FAIL " + name + ": no Java expression for this name");
+          failures++;
+          continue;
+        }
+        checked++;
+
+        // `in`/`not-in` serialize an UNORDERED set, so the `values` array byte order is not stable
+        // across Rust (FnvHashSet) and Java (Set). For those two names the check is set-SEMANTIC
+        // (compare the parsed value multiset); every other predicate is byte-exact.
+        boolean setPredicate = name.equals("in") || name.equals("not_in");
+
+        if (setPredicate) {
+          String wantJson = org.apache.iceberg.expressions.ExpressionParser.toJson(want);
+          java.util.List<String> wantVals = sortedValues(wantJson);
+          java.util.List<String> rustVals = sortedValues(rustJson);
+          if (!wantVals.equals(rustVals)) {
+            System.out.println(
+                "FAIL " + name + ": set values differ\n  java=" + wantVals + "\n  rust=" + rustVals);
+            failures++;
+          }
+          // The Rust JSON must still parse + bind cleanly.
+          org.apache.iceberg.expressions.ExpressionParser.fromJson(rustJson, schema);
+          continue;
+        }
+
+        // (a) Java independently produces the canonical JSON for the SAME expression; it must
+        // byte-equal the Rust JSON (anti-circular: Java built `want`, did not echo Rust).
+        String javaJson = org.apache.iceberg.expressions.ExpressionParser.toJson(want);
+        if (!javaJson.equals(rustJson)) {
+          System.out.println(
+              "FAIL " + name + ": Java toJson != Rust toJson\n  java=" + javaJson + "\n  rust=" + rustJson);
+          failures++;
+          continue;
+        }
+
+        // (b) Java parses the Rust JSON, binds it, and re-serializes; the bound round-trip must
+        // also byte-equal the Rust JSON (proves the Rust JSON is parseable + type-faithful).
+        Expression parsed = org.apache.iceberg.expressions.ExpressionParser.fromJson(rustJson, schema);
+        Expression bound = bindIfPredicate(struct, parsed);
+        String reser = org.apache.iceberg.expressions.ExpressionParser.toJson(bound);
+        if (!reser.equals(rustJson)) {
+          System.out.println(
+              "FAIL " + name + ": fromJson(rust)+bind+toJson != Rust JSON\n  out=" + reser + "\n  rust=" + rustJson);
+          failures++;
+        }
+      }
+      if (checked == 0) {
+        System.out.println("FAIL: no expressions checked");
+        return 1;
+      }
+      System.out.println("verify-interop-expression: checked " + checked + " expressions");
+      return failures;
+    }
+
+    /** Bind only predicates/logicals; alwaysTrue/alwaysFalse are already terminal. */
+    private static Expression bindIfPredicate(Types.StructType struct, Expression expr) {
+      if (expr == Expressions.alwaysTrue() || expr == Expressions.alwaysFalse()) {
+        return expr;
+      }
+      return org.apache.iceberg.expressions.Binder.bind(struct, expr, false);
+    }
+
+    /** Extract the `values` array of a set-predicate JSON as a sorted list of stringified nodes. */
+    private static java.util.List<String> sortedValues(String json) throws IOException {
+      com.fasterxml.jackson.databind.JsonNode node = JsonUtil.mapper().readTree(json);
+      java.util.List<String> vals = new java.util.ArrayList<>();
+      for (com.fasterxml.jackson.databind.JsonNode v : node.get("values")) {
+        vals.add(v.toString());
+      }
+      java.util.Collections.sort(vals);
+      return vals;
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.exists() && !directory.mkdirs()) {
+        throw new IOException("Failed to create directory: " + directory);
+      }
+    }
+
+    /** Encode `s` as a JSON string literal (for embedding the canonical JSON inside the JSONL). */
+    private static String asJsonString(String s) throws IOException {
+      return JsonUtil.mapper().writeValueAsString(s);
     }
   }
 

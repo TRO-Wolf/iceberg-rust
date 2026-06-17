@@ -21,6 +21,7 @@ mod term;
 use serde::{Deserialize, Serialize};
 pub use term::*;
 pub(crate) mod accessor;
+pub mod expression_parser;
 mod predicate;
 pub(crate) mod visitors;
 use std::fmt::{Display, Formatter};
