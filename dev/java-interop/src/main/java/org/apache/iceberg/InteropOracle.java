@@ -664,6 +664,22 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "verify-interop-rewrite-pos-deletes":
+        // MAINTENANCE RewritePositionDeleteFiles interop (BLOCK-2 G1), VERIFY-only direction — "Java
+        // validates what RUST compacted". Java loads the Rust-written PRE table (<dir>/rust_table, with
+        // MANY parquet position-delete files) + the compacted table (<dir>/rust_table_compacted, with the
+        // FEWER position-delete files the Rust action fused), reads each via IcebergGenerics, and asserts
+        // read-identity (the compacted position delete masks EXACTLY the rows the original ones masked,
+        // seq-stamp preserved) + the compaction shape (PRE pos > POST pos > 0). The real Java action is
+        // Spark-surface (NOT on this classpath) and Java cannot drive the compaction, so this is the
+        // no-Spark corroboration of Rust's materialization.
+        Path rewritePosDeletesDir = requireFixturesDir("interop.rewrite_pos_deletes.dir");
+        int rewritePosDeletesFailures = RewritePosDeleteOracle.verify(rewritePosDeletesDir);
+        System.out.println("verify-interop-rewrite-pos-deletes: " + rewritePosDeletesFailures + " failures");
+        if (rewritePosDeletesFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-builder-flips":
         // BUILDER-FLIPS interop (Wave 3) — DeleteFiles' two builder-flip capabilities:
         // deleteFromRowFilter(Expression) (GAP_MATRIX row 135) + caseSensitive(boolean) (row 134),
@@ -15891,6 +15907,159 @@ public final class InteropOracle {
           TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
       return new BaseTable(
           new InMemoryInspectionOperations(metadata, new LocalFileIO()), "convert_eq_load");
+    }
+
+    /** Java's merge-on-read read of the table — the live `id` set (all deletes applied). */
+    private static java.util.Set<Long> liveIdsConvert(BaseTable table) {
+      java.util.Set<Long> ids = new java.util.LinkedHashSet<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          ids.add((Long) record.getField("id"));
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+      return ids;
+    }
+
+    /** The count of LIVE delete files of `content` in the current snapshot. */
+    private static int countDeletes(BaseTable table, FileContent content) {
+      Snapshot snapshot = table.currentSnapshot();
+      FileIO io = table.io();
+      int count = 0;
+      for (ManifestFile manifest : snapshot.deleteManifests(io)) {
+        try (ManifestReader<DeleteFile> reader =
+            ManifestFiles.readDeleteManifest(manifest, io, table.specs())) {
+          for (ManifestEntry<DeleteFile> entry : reader.liveEntries()) {
+            if (entry.file().content() == content) {
+              count++;
+            }
+          }
+        } catch (IOException error) {
+          throw new RuntimeException("failed reading delete manifest " + manifest.path(), error);
+        }
+      }
+      return count;
+    }
+  }
+
+  // ===========================================================================================
+  // RewritePosDeleteOracle — MAINTENANCE RewritePositionDeleteFiles interop (BLOCK-2 G1), VERIFY-only
+  // direction "Java validates what RUST compacted". The PARQUET position-delete COMPACTION action is
+  // engine-agnostic in Rust, but the real Java action is a Spark-surface class (NOT on this classpath)
+  // and Java cannot DRIVE the compaction. So the corroboration is: RUST writes the PRE table (a real
+  // multi-pos-delete table masking a known subset) and the POST table (the same rows masked by the
+  // COMPACTED position delete), and Java's IcebergGenerics reads BOTH and asserts the live row sets are
+  // IDENTICAL — the no-Spark proof that the compacted position delete masks EXACTLY the rows the original
+  // pos-deletes masked, with the data sequence number preserved (a wrong seq-stamp would resurrect or
+  // over-mask a row and break read identity).
+  // ===========================================================================================
+  static final class RewritePosDeleteOracle {
+    private RewritePosDeleteOracle() {}
+
+    /** The hand-declared live `id` set BEFORE == AFTER compaction: the pos-deletes mask 120/220. */
+    private static java.util.Set<Long> expectedLiveIds() {
+      return new java.util.LinkedHashSet<>(List.of(100L, 130L, 200L, 230L));
+    }
+
+    static int verify(Path dir) {
+      int failures = 0;
+      Path preMeta = dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      Path postMeta =
+          dir.resolve("rust_table_compacted").resolve("metadata").resolve("final.metadata.json");
+      String tag = "rewrite-pos-deletes";
+
+      if (!Files.exists(preMeta) || !Files.exists(postMeta)) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + ": missing Rust tables ("
+                + preMeta
+                + " / "
+                + postMeta
+                + ") — run the Rust GEN path first");
+        return 1;
+      }
+
+      try {
+        BaseTable pre = loadConvertTable(preMeta);
+        BaseTable post = loadConvertTable(postMeta);
+
+        // (1) PRE read-identity: Java's merge-on-read read of the multi-pos-delete table == EXPECTED.
+        java.util.Set<Long> preIds = liveIdsConvert(pre);
+        if (preIds.equals(expectedLiveIds())) {
+          System.out.println("PASS " + tag + ": PRE (pos) live ids = " + preIds + " match expected");
+        } else {
+          System.out.println(
+              "FAIL "
+                  + tag
+                  + ": PRE (pos) live ids = "
+                  + preIds
+                  + " but expected = "
+                  + expectedLiveIds());
+          failures++;
+        }
+
+        // (2) READ IDENTITY: Java's read of the COMPACTED table == its read of the PRE table.
+        java.util.Set<Long> postIds = liveIdsConvert(post);
+        if (postIds.equals(preIds)) {
+          System.out.println(
+              "PASS " + tag + ": read-identity — compacted live ids = " + postIds + " == PRE");
+        } else {
+          System.out.println(
+              "FAIL "
+                  + tag
+                  + ": read-identity BROKEN — compacted live ids = "
+                  + postIds
+                  + " but PRE = "
+                  + preIds
+                  + " (the compacted position delete does not mask the same rows — a wrong seq-stamp"
+                  + " resurrects or over-masks a row)");
+          failures++;
+        }
+
+        // (3) The compaction genuinely FUSED files: PRE has MORE position deletes than POST (>0 each).
+        int prePos = countDeletes(pre, FileContent.POSITION_DELETES);
+        int postPos = countDeletes(post, FileContent.POSITION_DELETES);
+        if (prePos > postPos && postPos > 0) {
+          System.out.println(
+              "PASS "
+                  + tag
+                  + ": compaction shape — PRE pos="
+                  + prePos
+                  + " fused into POST pos="
+                  + postPos);
+        } else {
+          System.out.println(
+              "FAIL "
+                  + tag
+                  + ": compaction shape WRONG — PRE pos="
+                  + prePos
+                  + ", POST pos="
+                  + postPos
+                  + " (expected PRE pos > POST pos > 0)");
+          failures++;
+        }
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL " + tag + ": unexpected error running the rewrite-pos-deletes verify: " + error);
+        failures++;
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-rewrite-pos-deletes OK — Java's IcebergGenerics read is IDENTICAL before "
+                + "(many position deletes) and after (fewer, compacted position deletes); the compaction "
+                + "preserved every live row and masked exactly the same rows (seq-stamp preserved).");
+      }
+      return failures;
+    }
+
+    /** Load a final.metadata.json into a read-only BaseTable over the on-disk LocalFileIO. */
+    private static BaseTable loadConvertTable(Path finalMetadata) throws IOException {
+      TableMetadata metadata =
+          TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      return new BaseTable(
+          new InMemoryInspectionOperations(metadata, new LocalFileIO()), "rewrite_pos_load");
     }
 
     /** Java's merge-on-read read of the table — the live `id` set (all deletes applied). */

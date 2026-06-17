@@ -67,6 +67,18 @@
 //!   delete masks exactly the same rows. A FREE-STANDING action (not an `ActionsProvider` method, per
 //!   Java's javap-confirmed 12-method surface). Returns a [`ConvertEqualityDeleteFilesResult`] mirroring
 //!   Java `Result`'s two `int` counts. **This action rewrites delete files.**
+//! - [`RewritePositionDeleteFiles`] — COMPACT the live PARQUET position-delete files in the current
+//!   snapshot, per `(spec, partition)` group, into FEWER position-delete files and commit the swap in one
+//!   `Replace` snapshot per group (the Rust port of Java 1.10.0 `RewritePositionDeleteFiles`). For each
+//!   group of 2+ live parquet pos-deletes: read every member's `(file_path, pos)` pairs by RESERVED FIELD
+//!   ID, concat + sort, write one compacted file, and commit ONE `RewriteFiles` STAMPING the compacted
+//!   file with the group MAX rewritten data seq (via `add_delete_file_with_sequence_number`, NOT inherit)
+//!   so it masks exactly the same data generation. Puffin V3 DELETION VECTORS are SKIPPED (file-scoped,
+//!   never bin-packed) — V2 PARQUET only (documented divergence, GAP_MATRIX row 134). A STRICT SUBSET of
+//!   `ConvertEqualityDeleteFiles` (no row matching / predicate inversion / tuple parsing). One of the
+//!   twelve `ActionsProvider` methods (`rewrite_position_deletes(Table)`). Returns a
+//!   [`RewritePositionDeleteFilesResult`] mirroring Java `Result`'s four counts (rewritten/added file
+//!   counts + rewritten/added byte counts). **This action rewrites delete files.**
 //! - [`ComputeTableStats`] — per-column NDV (number of distinct values) via Apache DataSketches theta
 //!   sketches (the [`iceberg_sketches`] crate), written as one `apache-datasketches-theta-v1` Puffin
 //!   blob per column into a single statistics file and registered through the existing
@@ -100,6 +112,7 @@ mod delete_reachable_files;
 pub mod partition_stats;
 mod remove_dangling_delete_files;
 mod rewrite_data_files;
+mod rewrite_position_delete_files;
 
 #[cfg(test)]
 mod tests;
@@ -123,3 +136,6 @@ pub use remove_dangling_delete_files::{
     RemoveDanglingDeleteFiles, RemoveDanglingDeleteFilesResult,
 };
 pub use rewrite_data_files::{FileGroupRewriteResult, RewriteDataFiles, RewriteDataFilesResult};
+pub use rewrite_position_delete_files::{
+    RewritePositionDeleteFiles, RewritePositionDeleteFilesResult,
+};
