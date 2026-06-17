@@ -632,10 +632,21 @@ impl Catalog for SqlCatalog {
                 }
             }
 
+            // NOTE (named follow-up): this is NOT a faithful full-replace — keys present in
+            // `existing_properties` but absent from `properties` are NOT deleted, so a partial
+            // remove composed over this primitive (`Catalog::update_namespace_properties`) does
+            // not take effect on the SQL catalog. The naive fix (issue a DELETE for absent keys)
+            // is unsafe here: this catalog uses an `exists=true` sentinel property ROW to
+            // represent namespace existence (see `create_namespace` / `namespace_exists`), so
+            // blindly deleting absent keys would delete that anchor and make the namespace vanish
+            // on an empty/full replace. A correct fix must preserve the `exists` sentinel (or
+            // migrate to a dedicated namespace-existence row). Tracked as a SQL-catalog divergence
+            // from the Java full-replace contract; the partial-property tests are confined to the
+            // memory catalog until this is addressed.
             let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
             let update_stmt = format!(
                 "UPDATE {NAMESPACE_TABLE_NAME} SET {NAMESPACE_FIELD_PROPERTY_VALUE} = ?
-                 WHERE {CATALOG_FIELD_CATALOG_NAME} = ? 
+                 WHERE {CATALOG_FIELD_CATALOG_NAME} = ?
                  AND {NAMESPACE_FIELD_NAME} = ?
                  AND {NAMESPACE_FIELD_PROPERTY_KEY} = ?"
             );

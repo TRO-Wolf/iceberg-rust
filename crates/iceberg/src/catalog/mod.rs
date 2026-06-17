@@ -20,7 +20,7 @@
 pub mod memory;
 mod metadata_location;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::mem::take;
@@ -80,6 +80,84 @@ pub trait Catalog: Debug + Sync + Send {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<()>;
+
+    /// Partial namespace-property update: apply `removals` and `updates` atomically.
+    /// =============================================================================
+    ///
+    /// Mirrors the Java REST `updateNamespaceMetadata(ns, updates, removals)` shape
+    /// (`UpdateNamespacePropertiesRequest { removals, updates }`), which is itself the
+    /// union of the two public `SupportsNamespaces` methods —
+    /// `setProperties(ns, Map)` and `removeProperties(ns, Set)`. Unlike those two
+    /// methods (which return `boolean`), this returns `Result<()>` to match
+    /// [`Catalog::update_namespace`].
+    ///
+    /// This default composes over the full-replace [`Catalog::update_namespace`]
+    /// primitive: it (1) rejects any key that appears in *both* `removals` and
+    /// `updates` with [`ErrorKind::DataInvalid`] (the Java REST disjoint contract;
+    /// `UpdateNamespacePropertiesRequest.validate()` forbids overlap), (2) loads the
+    /// current properties via [`Catalog::get_namespace`] (erroring if the namespace
+    /// does not exist), (3) drops the `removals` keys — removing an absent key is a
+    /// no-op, matching `removeProperties` tolerance and the REST `missing` report —
+    /// (4) applies the `updates`, and (5) writes the merged set back via
+    /// [`Catalog::update_namespace`].
+    ///
+    /// A catalog whose `update_namespace` is not a faithful full-replace (i.e. does
+    /// not delete keys absent from the new map) will not observe `removals`; such a
+    /// catalog must override this method or fix its `update_namespace`.
+    async fn update_namespace_properties(
+        &self,
+        namespace: &NamespaceIdent,
+        removals: HashSet<String>,
+        updates: HashMap<String, String>,
+    ) -> Result<()> {
+        let overlap: Vec<&String> = removals
+            .iter()
+            .filter(|key| updates.contains_key(*key))
+            .collect();
+        if !overlap.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid namespace property update: keys cannot be both removed and updated: {overlap:?}"
+                ),
+            ));
+        }
+
+        let mut properties = self.get_namespace(namespace).await?.properties().clone();
+        for key in &removals {
+            properties.remove(key);
+        }
+        properties.extend(updates);
+
+        self.update_namespace(namespace, properties).await
+    }
+
+    /// Set (add or overwrite) namespace properties.
+    ///
+    /// Mirrors Java `SupportsNamespaces.setProperties(Namespace, Map)`. Thin wrapper
+    /// over [`Catalog::update_namespace_properties`] with no removals.
+    async fn set_namespace_properties(
+        &self,
+        namespace: &NamespaceIdent,
+        updates: HashMap<String, String>,
+    ) -> Result<()> {
+        self.update_namespace_properties(namespace, HashSet::new(), updates)
+            .await
+    }
+
+    /// Remove namespace properties.
+    ///
+    /// Mirrors Java `SupportsNamespaces.removeProperties(Namespace, Set)`. Thin
+    /// wrapper over [`Catalog::update_namespace_properties`] with no updates;
+    /// removing an absent key is a no-op.
+    async fn remove_namespace_properties(
+        &self,
+        namespace: &NamespaceIdent,
+        removals: HashSet<String>,
+    ) -> Result<()> {
+        self.update_namespace_properties(namespace, removals, HashMap::new())
+            .await
+    }
 
     /// Drop a namespace from the catalog, or returns error if it doesn't exist.
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()>;

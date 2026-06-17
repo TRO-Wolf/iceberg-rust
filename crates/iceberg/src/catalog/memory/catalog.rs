@@ -1184,6 +1184,164 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_namespace_properties_set_only() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("abc".into());
+        catalog
+            .create_namespace(
+                &namespace_ident,
+                HashMap::from([("keep".into(), "0".into())]),
+            )
+            .await
+            .unwrap();
+
+        catalog
+            .set_namespace_properties(
+                &namespace_ident,
+                HashMap::from([("k1".into(), "v1".into()), ("k2".into(), "v2".into())]),
+            )
+            .await
+            .unwrap();
+
+        let props = catalog
+            .get_namespace(&namespace_ident)
+            .await
+            .unwrap()
+            .properties()
+            .clone();
+        assert_eq!(props.get("keep"), Some(&"0".to_string()));
+        assert_eq!(props.get("k1"), Some(&"v1".to_string()));
+        assert_eq!(props.get("k2"), Some(&"v2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_update_namespace_properties_remove_only() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("abc".into());
+        catalog
+            .create_namespace(
+                &namespace_ident,
+                HashMap::from([("drop_me".into(), "x".into()), ("keep".into(), "y".into())]),
+            )
+            .await
+            .unwrap();
+
+        catalog
+            .remove_namespace_properties(&namespace_ident, HashSet::from(["drop_me".to_string()]))
+            .await
+            .unwrap();
+
+        let props = catalog
+            .get_namespace(&namespace_ident)
+            .await
+            .unwrap()
+            .properties()
+            .clone();
+        // Mutation guard: dropping the `properties.remove(key)` step in
+        // `update_namespace_properties` leaves "drop_me" present and fails this assertion.
+        assert_eq!(props.get("drop_me"), None);
+        assert_eq!(props.get("keep"), Some(&"y".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_update_namespace_properties_set_and_remove_combined() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("abc".into());
+        catalog
+            .create_namespace(
+                &namespace_ident,
+                HashMap::from([("drop_me".into(), "x".into()), ("keep".into(), "y".into())]),
+            )
+            .await
+            .unwrap();
+
+        catalog
+            .update_namespace_properties(
+                &namespace_ident,
+                HashSet::from(["drop_me".to_string()]),
+                HashMap::from([("new".into(), "z".into())]),
+            )
+            .await
+            .unwrap();
+
+        let props = catalog
+            .get_namespace(&namespace_ident)
+            .await
+            .unwrap()
+            .properties()
+            .clone();
+        assert_eq!(props.get("drop_me"), None);
+        assert_eq!(props.get("keep"), Some(&"y".to_string()));
+        assert_eq!(props.get("new"), Some(&"z".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_update_namespace_properties_overlap_rejected() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("abc".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let err = catalog
+            .update_namespace_properties(
+                &namespace_ident,
+                HashSet::from(["dup".to_string()]),
+                HashMap::from([("dup".to_string(), "v".to_string())]),
+            )
+            .await
+            .unwrap_err();
+
+        // Mutation guard: dropping the overlap check lets this succeed and fails the assertion.
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[tokio::test]
+    async fn test_update_namespace_properties_no_such_namespace() {
+        let catalog = new_memory_catalog().await;
+        let non_existent_namespace_ident = NamespaceIdent::new("def".into());
+
+        let err = catalog
+            .update_namespace_properties(
+                &non_existent_namespace_ident,
+                HashSet::new(),
+                HashMap::from([("k".to_string(), "v".to_string())]),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::NamespaceNotFound);
+    }
+
+    #[tokio::test]
+    async fn test_update_namespace_properties_remove_missing_key_is_noop() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("abc".into());
+        catalog
+            .create_namespace(
+                &namespace_ident,
+                HashMap::from([("keep".into(), "y".into())]),
+            )
+            .await
+            .unwrap();
+
+        // Removing an absent key must not error (Java `removeProperties` tolerance).
+        catalog
+            .remove_namespace_properties(
+                &namespace_ident,
+                HashSet::from(["never_existed".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        let props = catalog
+            .get_namespace(&namespace_ident)
+            .await
+            .unwrap()
+            .properties()
+            .clone();
+        assert_eq!(props.get("keep"), Some(&"y".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_drop_namespace() {
         let catalog = new_memory_catalog().await;
         let namespace_ident = NamespaceIdent::new("abc".into());
