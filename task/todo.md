@@ -265,6 +265,45 @@ parity ~25→28 ✅.
 > ✅ (capstone). **3 rows flipped to ✅ (144, 138, 151)** + ConvertEqualityDeleteFiles capability; parity
 > ~25✅→28✅; ActionsProvider 8/12. Near-zero 529 exposure (all offline-gated). Floor held + capstone landed.
 
+## BLOCK 2 (8-HOUR PLAN, 2026-06-17, Opus, signed off) — 3 sequential AC·OO PRs
+
+Grounded by an 8-unit parallel scoping pass (vs main #78 + 1.10.0 jars). Highest ✅-flip density yet: 4
+rows. All med-risk with strong reuse/templating (no HIGH capstone). Each independent → own PR, run
+one-at-a-time. Expected: rows 134/89/120/121 → ✅, ActionsProvider 9/12, parity ~28→32 ✅.
+(Pruned by scoping: AggregateEvaluator's BoundExtract = frontier-parked variant-shredding → only 🟡;
+SnapshotTable/MigrateTable need an external-table source → stay ❌; both deferred.)
+
+- [x] **G1 — `RewritePositionDeleteFiles`** — **DONE 2026-06-17 (#TBD). row 134 ❌→✅; provider 9/3.**
+      V2 parquet pos-delete compaction (V3 DV/Puffin OUT, documented), a strict subset of
+      `convert_equality_delete_files`. NEW parquet-pos-delete reader by RESERVED FIELD ID (2147483546/2147483545).
+      Seq-stamp = group MAX rewritten data-seq via `add_delete_file_with_sequence_number` — mutation-proven 3
+      ways (max→min, explicit→inherit both caught by an exact on-disk-seq assertion). 10 offline read-identity
+      tests + no-Spark Java interop GREEN (Java MoR identical {100,130,200,230} before 4 pos-deletes/after 2
+      compacted; sabotage battery HARD-FAILs). Converged 1 cycle, NO findings; Critic ran all 8
+      non-vacuity/staller mutations itself. `rewrite_position_deletes` flipped FeatureUnsupported→real (provider
+      8/4→9/3, mandatory — it IS a Java provider method). Orchestrator re-ran interop GREEN + full lib (2340).
+      Files: `rewrite_position_delete_files.rs`(+tests), `interop_rewrite_pos_deletes.rs`, `run-interop-rewrite-pos-deletes.sh`.
+      _Superseded plan note:_ near-complete blueprint = `convert_equality_delete_files.rs`. Front-loaded
+      (highest reuse → highest convergence confidence).
+- [ ] **G2 — `unknown` V3 primitive type** (2.5h, MED, metadata-only interop) → **row 89 ❌→✅**. Add
+      `PrimitiveType::Unknown` (serde rename gives "unknown" free) + the V3 `min_format_version` gate arm +
+      the ~10 compiler-forced exhaustive-match arms across iceberg/glue/hms (arrow/avro/datum/transform/
+      inspect/schema). ATOMIC — cannot ship partial (the enum arm breaks all sites at once). DEFER data-file
+      always-null write/read I/O (loud FeatureUnsupported); interop = metadata-only schema round-trip (clone
+      `interop_update_schema.rs`). Template: the landed Variant-F1 + timestamp_ns gate precedent.
+- [ ] **G3 — `IncrementalAppendScan` + `IncrementalChangelogScan` interop** (2.5h, MED, interop) →
+      **rows 120 + 121 🟡→✅** (TWO rows in one PR). The scans are built; interop is the sole deferral. Java
+      writes a multi-snapshot table; Rust incremental-scans a snapshot range; assert the added-files /
+      changelog-rows match Java `IncrementalAppendScan`/`IncrementalDataTableScan` over the same range.
+      NET-NEW Java oracle code (~60-100 lines each, no existing incremental-scan oracle calls). Annotate row
+      121 to retain BatchScan/CDC-net-changes residue if the changelog surface is data-file-only.
+
+Block-2 stretch (own PRs, if the spine beats estimates): `ExpressionParser` JSON (row 147 ✅ + retires the
+ScanReport filter divergence; L/3.5h/MED/3cy — type-erasure schema-overload risk) · Catalog accessors
+name/properties/invalidate* (❌→🟡; M/2h/**LOW/offline** — the parked "swap-in for lower 529 exposure"
+option, to revisit). Deferred to a later block: BatchScan U1 (ScanTaskGroup/bin-pack) · RewriteTablePath
+(137 🟡) · AggregateEvaluator (148 🟡, Extract parked).
+
 Stretch / next (own PRs, if the front beats estimates): `RewritePositionDeleteFiles` (134 🟡, provider
 9/3, MED) · `ExpressionParser` JSON (147 ✅ + retires the ScanReport filter divergence, oracle, MED) ·
 `unknown` V3 type (89 ✅, oracle, MED) · Catalog accessors name/properties/invalidate* (❌→🟡, LOW).
