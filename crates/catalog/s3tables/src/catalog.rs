@@ -31,7 +31,7 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
@@ -252,6 +252,17 @@ impl S3TablesCatalog {
 
 #[async_trait]
 impl Catalog for S3TablesCatalog {
+    /// Returns the catalog name supplied at construction (the `name` argument of
+    /// [`CatalogBuilder::load`]), or the [`UNNAMED_CATALOG`] sentinel when none was set.
+    fn name(&self) -> &str {
+        self.config.name.as_deref().unwrap_or(UNNAMED_CATALOG)
+    }
+
+    /// Returns the configuration properties supplied at construction.
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.config.props
+    }
+
     /// List namespaces from s3tables catalog.
     ///
     /// S3Tables doesn't support nested namespaces. If parent is provided, it will
@@ -1148,5 +1159,56 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(err.message(), "Catalog name cannot be empty");
         }
+    }
+
+    /// Offline: constructing an `S3TablesCatalog` builds the SDK client but performs no
+    /// network call, so the `name()`/`properties()` accessors are testable without
+    /// credentials or a live bucket.
+    #[tokio::test]
+    async fn test_name_and_properties_return_config() {
+        let config = S3TablesCatalogConfig {
+            name: Some("s3t_cat".to_string()),
+            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
+            endpoint_url: None,
+            client: None,
+            props: HashMap::from([("region_name".to_string(), "us-east-1".to_string())]),
+        };
+        let catalog = S3TablesCatalog::new(config, None).await.unwrap();
+
+        assert_eq!(catalog.name(), "s3t_cat");
+        // Mutation guard: the empty-map default fails this.
+        assert_eq!(
+            catalog.properties().get("region_name").map(String::as_str),
+            Some("us-east-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_name_defaults_to_sentinel_when_unset() {
+        let config = S3TablesCatalogConfig {
+            name: None,
+            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
+            endpoint_url: None,
+            client: None,
+            props: HashMap::new(),
+        };
+        let catalog = S3TablesCatalog::new(config, None).await.unwrap();
+        assert_eq!(catalog.name(), UNNAMED_CATALOG);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_defaults_are_noops() {
+        let config = S3TablesCatalogConfig {
+            name: Some("s3t_cat".to_string()),
+            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
+            endpoint_url: None,
+            client: None,
+            props: HashMap::new(),
+        };
+        let catalog = S3TablesCatalog::new(config, None).await.unwrap();
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
+        // No network: the inherited no-op defaults return Ok.
+        catalog.invalidate_table(&ident).await.unwrap();
+        catalog.invalidate_view(&ident).await.unwrap();
     }
 }

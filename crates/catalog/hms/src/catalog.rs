@@ -31,7 +31,7 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
 };
 use volo_thrift::MaybeException;
 
@@ -233,6 +233,17 @@ impl HmsCatalog {
 
 #[async_trait]
 impl Catalog for HmsCatalog {
+    /// Returns the catalog name supplied at construction (the `name` argument of
+    /// [`CatalogBuilder::load`]), or the [`UNNAMED_CATALOG`] sentinel when none was set.
+    fn name(&self) -> &str {
+        self.config.name.as_deref().unwrap_or(UNNAMED_CATALOG)
+    }
+
+    /// Returns the configuration properties supplied at construction.
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.config.props
+    }
+
     /// HMS doesn't support nested namespaces.
     ///
     /// We will return empty list if parent is some.

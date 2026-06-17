@@ -118,9 +118,11 @@ pub(crate) struct MemoryCatalogConfig {
 /// Memory catalog implementation.
 #[derive(Debug)]
 pub struct MemoryCatalog {
+    name: String,
     root_namespace_state: Mutex<NamespaceState>,
     file_io: FileIO,
     warehouse_location: String,
+    properties: HashMap<String, String>,
 }
 
 impl MemoryCatalog {
@@ -132,10 +134,17 @@ impl MemoryCatalog {
         // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
 
+        // The builder validates `config.name` is `Some` before constructing the catalog;
+        // fall back to the empty name defensively rather than panicking.
+        let name = config.name.unwrap_or_default();
+        let properties = config.props.clone();
+
         Ok(Self {
+            name,
             root_namespace_state: Mutex::new(NamespaceState::default()),
             file_io: FileIOBuilder::new(factory).with_props(config.props).build(),
             warehouse_location: config.warehouse,
+            properties,
         })
     }
 
@@ -214,6 +223,17 @@ fn check_no_concurrent_modification(
 
 #[async_trait]
 impl Catalog for MemoryCatalog {
+    /// Returns the catalog name supplied at construction (the `name` argument of
+    /// [`crate::CatalogBuilder::load`]).
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the configuration properties supplied at construction.
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
+    }
+
     /// List namespaces inside the catalog.
     async fn list_namespaces(
         &self,
@@ -595,10 +615,10 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::TableUpdate;
     use crate::io::FileIO;
     use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
     use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::{TableUpdate, UNNAMED_CATALOG};
 
     fn temp_path() -> String {
         let temp_dir = TempDir::new().unwrap();
@@ -2757,5 +2777,64 @@ pub(crate) mod tests {
         let loaded = catalog.load_table(table.identifier()).await.unwrap();
         assert_eq!(loaded.metadata().properties().get("first").unwrap(), "1");
         assert_eq!(loaded.metadata().properties().get("second").unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn test_name_returns_configured_name() {
+        let catalog = new_memory_catalog().await;
+        // `new_memory_catalog` loads with the name "memory"; the MemoryCatalog::new fix must
+        // retain it (it previously dropped name+props). An accessor that returned the sentinel
+        // or an empty string would fail here.
+        assert_eq!(catalog.name(), "memory");
+        assert_ne!(catalog.name(), UNNAMED_CATALOG);
+    }
+
+    #[tokio::test]
+    async fn test_properties_returns_configured_props() {
+        // Build a catalog with both the required warehouse and an extra property; the
+        // accessor must surface the extra property (the warehouse key is consumed and not a
+        // retained config property).
+        let warehouse_location = temp_path();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory_with_props",
+                HashMap::from([
+                    (MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_location),
+                    ("k1".to_string(), "v1".to_string()),
+                    ("k2".to_string(), "v2".to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(catalog.name(), "memory_with_props");
+        let props = catalog.properties();
+        // Mutation guard: an accessor returning the empty-map default fails both of these.
+        assert_eq!(props.get("k1").map(String::as_str), Some("v1"));
+        assert_eq!(props.get("k2").map(String::as_str), Some("v2"));
+        // The warehouse key is filtered out of the retained props (see `load`).
+        assert!(!props.contains_key(MEMORY_CATALOG_WAREHOUSE));
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_table_default_is_noop() {
+        let catalog = new_memory_catalog().await;
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "tbl".to_string());
+        // The default no-op (inherited; MemoryCatalog holds no cache) must not error even for
+        // an unknown table — it mirrors Java's empty-`return` default body.
+        catalog
+            .invalidate_table(&ident)
+            .await
+            .expect("invalidate_table default must be a no-op");
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_view_default_is_noop() {
+        let catalog = new_memory_catalog().await;
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "vw".to_string());
+        catalog
+            .invalidate_view(&ident)
+            .await
+            .expect("invalidate_view default must be a no-op");
     }
 }

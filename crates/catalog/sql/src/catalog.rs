@@ -229,6 +229,7 @@ pub struct SqlCatalog {
     warehouse_location: String,
     fileio: FileIO,
     sql_bind_style: SqlBindStyle,
+    properties: HashMap<String, String>,
 }
 
 #[derive(Debug, PartialEq, strum::EnumString, strum::Display)]
@@ -311,6 +312,7 @@ impl SqlCatalog {
             warehouse_location: config.warehouse_location,
             fileio,
             sql_bind_style: config.sql_bind_style,
+            properties: config.props,
         })
     }
 
@@ -422,6 +424,16 @@ fn resolve_commit_cas_location(
 
 #[async_trait]
 impl Catalog for SqlCatalog {
+    /// Returns the catalog name supplied at construction.
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the configuration properties supplied at construction.
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
+    }
+
     async fn list_namespaces(
         &self,
         parent: Option<&NamespaceIdent>,
@@ -3591,5 +3603,56 @@ mod tests {
 
         catalog.drop_view(&view_ident).await.unwrap();
         assert!(!catalog.view_exists(&view_ident).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_name_returns_configured_name() {
+        let warehouse_location = temp_path();
+        let catalog = new_sql_catalog(warehouse_location, Some("my_sql_cat")).await;
+        // The accessor returns the name supplied at construction; a stub returning the
+        // sentinel or an empty string would fail.
+        assert_eq!(catalog.name(), "my_sql_cat");
+    }
+
+    #[tokio::test]
+    async fn test_properties_returns_retained_props() {
+        // Build a catalog directly so an extra (non-reserved) property survives into the
+        // retained config props (URI/WAREHOUSE/BIND_STYLE are consumed by the builder).
+        let warehouse_location = temp_path();
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+        let props = HashMap::from_iter([
+            (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+            (SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse_location),
+            (
+                SQL_CATALOG_PROP_BIND_STYLE.to_string(),
+                SqlBindStyle::QMark.to_string(),
+            ),
+            ("custom.k".to_string(), "custom.v".to_string()),
+        ]);
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load("props_cat", props)
+            .await
+            .unwrap();
+
+        let retained = catalog.properties();
+        // Mutation guard: the empty-map default fails this assertion.
+        assert_eq!(
+            retained.get("custom.k").map(String::as_str),
+            Some("custom.v")
+        );
+        // Reserved builder keys are consumed, not retained as catalog properties.
+        assert!(!retained.contains_key(SQL_CATALOG_PROP_URI));
+        assert!(!retained.contains_key(SQL_CATALOG_PROP_WAREHOUSE));
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_defaults_are_noops() {
+        let warehouse_location = temp_path();
+        let catalog = new_sql_catalog(warehouse_location, None::<String>).await;
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
+        catalog.invalidate_table(&ident).await.unwrap();
+        catalog.invalidate_view(&ident).await.unwrap();
     }
 }

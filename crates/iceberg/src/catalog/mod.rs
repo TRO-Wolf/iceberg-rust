@@ -246,7 +246,67 @@ pub trait Catalog: Debug + Sync + Send {
     async fn update_view(&self, _commit: ViewCommit) -> Result<View> {
         Err(views_unsupported())
     }
+
+    /// The catalog's name.
+    /// ====================
+    ///
+    /// Mirrors Java `Catalog.name()`, which is itself a **default** method
+    /// (`org.apache.iceberg.catalog.Catalog`, javap-confirmed): its default body is
+    /// `return this.toString();` — i.e. the `Object.toString()` fallback. Following
+    /// that precedent this is a **default** trait method (it does not force every
+    /// implementor to add a `name()`), returning the [`UNNAMED_CATALOG`] sentinel for
+    /// catalogs that hold no name. Every in-tree catalog overrides it to return the
+    /// name supplied at construction (the `name` argument of
+    /// [`CatalogBuilder::load`]).
+    fn name(&self) -> &str {
+        UNNAMED_CATALOG
+    }
+
+    /// The catalog's configuration properties.
+    /// =======================================
+    ///
+    /// **Rust-convenience accessor — NOT a Java `Catalog`-interface method.** In Java,
+    /// `properties()` is **not** declared on `org.apache.iceberg.catalog.Catalog`,
+    /// `ViewCatalog`, or `SupportsNamespaces`; it exists only as a concrete method on
+    /// `org.apache.iceberg.rest.RESTCatalog` (javap-confirmed). It is surfaced here as
+    /// a documented default (empty map) so the in-tree catalogs can expose the
+    /// properties they were loaded with — mirroring `RESTCatalog.properties()` for the
+    /// REST catalog and offering the same convenience for the others — without claiming
+    /// it as part of the Java `Catalog` contract. Catalogs that hold the
+    /// load-time properties override it to return them.
+    fn properties(&self) -> &HashMap<String, String> {
+        static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
+    /// Invalidate any cached metadata held for `table`.
+    /// =================================================
+    ///
+    /// Mirrors Java `Catalog.invalidateTable(TableIdentifier)`, a **default** method
+    /// whose default body is an empty `return` (javap-confirmed: a no-op). Catalogs
+    /// that cache table metadata override this to evict their cache entry; catalogs
+    /// that hold no cache (every in-tree catalog today) inherit the no-op default.
+    async fn invalidate_table(&self, _table: &TableIdent) -> Result<()> {
+        Ok(())
+    }
+
+    /// Invalidate any cached metadata held for `view`.
+    /// ================================================
+    ///
+    /// Mirrors Java `ViewCatalog.invalidateView(TableIdentifier)`, a **default** method
+    /// whose default body is an empty `return` (javap-confirmed: a no-op). Catalogs
+    /// that cache view metadata override this to evict their cache entry; catalogs
+    /// without view caching inherit the no-op default.
+    async fn invalidate_view(&self, _view: &TableIdent) -> Result<()> {
+        Ok(())
+    }
 }
+
+/// The sentinel name returned by the default [`Catalog::name`] for a catalog that holds no
+/// name — the Rust analog of the `Object.toString()` fallback Java's `Catalog.name()` default
+/// uses. Every in-tree catalog overrides `name()` with the name supplied at construction, so this
+/// is only observed by bare/external implementors that do not.
+pub const UNNAMED_CATALOG: &str = "unnamed";
 
 /// The error returned by the default (no-op) view methods on the [`Catalog`] trait. A catalog
 /// that does not support views inherits these defaults; one that does overrides every view
@@ -1319,7 +1379,7 @@ mod tests {
     use serde::de::DeserializeOwned;
     use uuid::uuid;
 
-    use super::{ViewRequirement, ViewUpdate};
+    use super::{Catalog, UNNAMED_CATALOG, ViewRequirement, ViewUpdate};
     use crate::io::FileIO;
     use crate::spec::{
         BlobMetadata, EncryptedKey, FormatVersion, MAIN_BRANCH, NestedField, NullOrder, Operation,
@@ -2753,5 +2813,114 @@ mod tests {
             updated_table.metadata().location,
             "s3://bucket/test/new_location/data",
         );
+    }
+
+    /// A minimal [`Catalog`] that overrides NONE of the default accessor/lifecycle methods, so
+    /// it exercises the trait-supplied defaults: `name()` → [`UNNAMED_CATALOG`], `properties()`
+    /// → empty map, `invalidate_table`/`invalidate_view` → no-op `Ok(())`. The table/namespace
+    /// methods are never called in these tests; they return a typed error rather than panicking.
+    #[derive(Debug)]
+    struct BareCatalog;
+
+    fn bare_unsupported() -> crate::Error {
+        crate::Error::new(crate::ErrorKind::FeatureUnsupported, "bare test catalog")
+    }
+
+    #[async_trait::async_trait]
+    impl super::Catalog for BareCatalog {
+        async fn list_namespaces(
+            &self,
+            _parent: Option<&NamespaceIdent>,
+        ) -> crate::Result<Vec<NamespaceIdent>> {
+            Err(bare_unsupported())
+        }
+        async fn create_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> crate::Result<super::Namespace> {
+            Err(bare_unsupported())
+        }
+        async fn get_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+        ) -> crate::Result<super::Namespace> {
+            Err(bare_unsupported())
+        }
+        async fn namespace_exists(&self, _namespace: &NamespaceIdent) -> crate::Result<bool> {
+            Err(bare_unsupported())
+        }
+        async fn update_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> crate::Result<()> {
+            Err(bare_unsupported())
+        }
+        async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> crate::Result<()> {
+            Err(bare_unsupported())
+        }
+        async fn list_tables(&self, _namespace: &NamespaceIdent) -> crate::Result<Vec<TableIdent>> {
+            Err(bare_unsupported())
+        }
+        async fn create_table(
+            &self,
+            _namespace: &NamespaceIdent,
+            _creation: TableCreation,
+        ) -> crate::Result<Table> {
+            Err(bare_unsupported())
+        }
+        async fn load_table(&self, _table: &TableIdent) -> crate::Result<Table> {
+            Err(bare_unsupported())
+        }
+        async fn drop_table(&self, _table: &TableIdent) -> crate::Result<()> {
+            Err(bare_unsupported())
+        }
+        async fn table_exists(&self, _table: &TableIdent) -> crate::Result<bool> {
+            Err(bare_unsupported())
+        }
+        async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> crate::Result<()> {
+            Err(bare_unsupported())
+        }
+        async fn register_table(
+            &self,
+            _table: &TableIdent,
+            _metadata_location: String,
+        ) -> crate::Result<Table> {
+            Err(bare_unsupported())
+        }
+        async fn update_table(&self, _commit: TableCommit) -> crate::Result<Table> {
+            Err(bare_unsupported())
+        }
+    }
+
+    #[test]
+    fn test_bare_catalog_name_default_is_sentinel() {
+        // A catalog that does not override `name()` falls through to the trait default —
+        // the Rust analog of Java's `Object.toString()` fallback for `Catalog.name()`.
+        assert_eq!(BareCatalog.name(), UNNAMED_CATALOG);
+    }
+
+    #[test]
+    fn test_bare_catalog_properties_default_is_empty() {
+        // `properties()` is a Rust-convenience default (empty map); Java has no
+        // `Catalog.properties()` on the plain-Catalog surface — it's concrete only on
+        // RESTCatalog there (it also appears on the SessionCatalog/BaseSessionCatalog hierarchy).
+        assert!(BareCatalog.properties().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_bare_catalog_invalidate_defaults_are_noops() {
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
+        // Both mirror Java's empty-`return` default bodies (`Catalog.invalidateTable`,
+        // `ViewCatalog.invalidateView`): no-op, never error.
+        BareCatalog
+            .invalidate_table(&ident)
+            .await
+            .expect("default invalidate_table is a no-op");
+        BareCatalog
+            .invalidate_view(&ident)
+            .await
+            .expect("default invalidate_view is a no-op");
     }
 }
