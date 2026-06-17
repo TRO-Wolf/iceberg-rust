@@ -24,7 +24,7 @@ use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::{
-    IncrementalAppendScanBuilder, IncrementalChangelogScanBuilder, TableScanBuilder,
+    BatchScan, IncrementalAppendScanBuilder, IncrementalChangelogScanBuilder, TableScanBuilder,
 };
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
@@ -224,6 +224,19 @@ impl Table {
     /// Creates a table scan.
     pub fn scan(&self) -> TableScanBuilder<'_> {
         TableScanBuilder::new(self)
+    }
+
+    /// Creates a typed batch scan ([`BatchScan`]) — the Java `BatchScan` surface.
+    ///
+    /// Mirrors Java `Table.newBatchScan()` (→ `new BatchScanAdapter(newScan())`): a THIN typed
+    /// adapter over the SAME planning pipeline as [`scan`](Self::scan), adding the BatchScan
+    /// time-travel selectors [`use_snapshot`](BatchScan::use_snapshot) /
+    /// [`use_ref`](BatchScan::use_ref) / [`as_of_time`](BatchScan::as_of_time). Its
+    /// [`plan_files`](BatchScan::plan_files) / [`plan_tasks`](BatchScan::plan_tasks) DELEGATE 1:1
+    /// to the underlying [`TableScan`](crate::scan::TableScan) — `table.batch_scan().plan_tasks()`
+    /// yields the same groups as `table.scan().build()?.plan_tasks()`.
+    pub fn batch_scan(&self) -> BatchScan<'_> {
+        BatchScan::new(self)
     }
 
     /// Creates an incremental append scan, which plans the data files APPENDED between

@@ -4437,6 +4437,25 @@ public final class InteropOracle {
       String plan = planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST);
       writeJson(dir.resolve("java_scan_plan.json"), plan);
 
+      // BatchScan adapter delegation (row 122) — prove, IN JAVA, that
+      // `table.newBatchScan().planTasks()` yields exactly the SAME groups as
+      // `table.newScan().planTasks()`. This is the BatchScanAdapter delegation contract; if Java's
+      // own adapter ever diverged the comparison below would catch it before the cross-engine leg.
+      Set<Set<String>> scanGroups = planGroups(table, TARGET, LOOKBACK, OPEN_FILE_COST);
+      Set<Set<String>> batchGroups = planGroupsViaBatchScan(table, TARGET, LOOKBACK, OPEN_FILE_COST);
+      if (!scanGroups.equals(batchGroups)) {
+        throw new IllegalStateException(
+            "BatchScan adapter delegation broken IN JAVA: newScan().planTasks()="
+                + scanGroups
+                + " != newBatchScan().planTasks()="
+                + batchGroups);
+      }
+      // Emit the BatchScan plan for the Rust D1 BatchScan leg. It is identical to the scan plan by
+      // the assertion above, but emitted under its OWN name so row 122 has its own artifact and the
+      // Rust BatchScan test does not piggy-back on the scan-plan file by accident.
+      String batchPlan = planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST, batchGroups);
+      writeJson(dir.resolve("java_batch_scan_plan.json"), batchPlan);
+
       // Persist the final metadata at a known path for the Rust D1 load.
       Path finalMetadata =
           new File(tableDir, "metadata").toPath().resolve("final.metadata.json");
@@ -4445,7 +4464,7 @@ public final class InteropOracle {
       TableMetadataParser.write(((BaseTable) table).operations().current(), finalOut);
 
       System.out.println(
-          "generated scan-plan table + java_scan_plan.json to "
+          "generated scan-plan table + java_scan_plan.json + java_batch_scan_plan.json to "
               + dir
               + " (target="
               + TARGET
@@ -4453,7 +4472,7 @@ public final class InteropOracle {
               + LOOKBACK
               + " openFileCost="
               + OPEN_FILE_COST
-              + ")");
+              + "); BatchScan==Scan adapter delegation OK in Java");
     }
 
     /**
@@ -4490,11 +4509,24 @@ public final class InteropOracle {
       BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
 
       Set<Set<String>> javaGroups;
+      Set<Set<String>> javaBatchGroups;
       try {
         javaGroups = planGroups(table, TARGET, LOOKBACK, OPEN_FILE_COST);
+        // Also plan via the BatchScan adapter over the Rust-written table (row 122). It MUST equal
+        // the newScan() plan (the in-Java adapter delegation) before we even compare to Rust.
+        javaBatchGroups = planGroupsViaBatchScan(table, TARGET, LOOKBACK, OPEN_FILE_COST);
       } catch (RuntimeException scanError) {
         System.out.println(
             "FAIL scan-plan-d2: Java could not planTasks the Rust-written table: " + scanError);
+        return 1;
+      }
+      if (!javaGroups.equals(javaBatchGroups)) {
+        System.out.println(
+            "FAIL scan-plan-d2: Java BatchScan adapter diverged from newScan() over the Rust table: "
+                + "scan="
+                + javaGroups
+                + " batch="
+                + javaBatchGroups);
         return 1;
       }
 
@@ -4506,9 +4538,32 @@ public final class InteropOracle {
         return 1;
       }
 
+      // The Rust GEN path also emitted a BatchScan plan (rust_batch_scan_plan.json), alongside
+      // rust_scan_plan.json — Java's BatchScan plan must match that too, proving the Rust BatchScan
+      // adapter delegated to its own plan_tasks pipeline.
+      Path rustBatchPlanPath = dir.resolve("rust_table").resolve("rust_batch_scan_plan.json");
+      if (Files.exists(rustBatchPlanPath)) {
+        Set<Set<String>> rustBatchGroups;
+        try {
+          rustBatchGroups = readPlanGroups(rustBatchPlanPath);
+        } catch (RuntimeException | IOException readError) {
+          System.out.println(
+              "FAIL scan-plan-d2: could not read rust_batch_scan_plan.json: " + readError);
+          return 1;
+        }
+        if (!javaBatchGroups.equals(rustBatchGroups)) {
+          System.out.println(
+              "FAIL scan-plan-d2: Java BatchScan plan != Rust BatchScan plan: java="
+                  + javaBatchGroups
+                  + " rust="
+                  + rustBatchGroups);
+          return 1;
+        }
+      }
+
       if (javaGroups.equals(rustGroups)) {
         System.out.println(
-            "PASS scan-plan-d2: Java planTasks over the Rust table == Rust's plan ("
+            "PASS scan-plan-d2: Java planTasks (scan AND batchScan) over the Rust table == Rust's plan ("
                 + javaGroups.size()
                 + " groups)");
         return 0;
@@ -4794,6 +4849,36 @@ public final class InteropOracle {
       return groups;
     }
 
+    /**
+     * Run the REAL Java {@code table.newBatchScan().option(...).planTasks()} (the BatchScanAdapter,
+     * GAP_MATRIX row 122) and return the SET of per-group member-key sets — the SAME shape as
+     * {@link #planGroups}. The adapter delegates 1:1 to the underlying TableScan pipeline, so this
+     * is BY CONTRACT identical to {@code planGroups} over the same table + knobs; the oracle asserts
+     * exactly that (the delegation) on both the Java-written and Rust-written tables.
+     */
+    private static Set<Set<String>> planGroupsViaBatchScan(
+        Table table, long target, int lookback, long openFileCost) {
+      Set<Set<String>> groups = new java.util.HashSet<>();
+      BatchScan scan =
+          table
+              .newBatchScan()
+              .option(TableProperties.SPLIT_SIZE, Long.toString(target))
+              .option(TableProperties.SPLIT_LOOKBACK, Integer.toString(lookback))
+              .option(TableProperties.SPLIT_OPEN_FILE_COST, Long.toString(openFileCost));
+      try (CloseableIterable<ScanTaskGroup<ScanTask>> tasks = scan.planTasks()) {
+        for (ScanTaskGroup<ScanTask> combined : tasks) {
+          Set<String> members = new TreeSet<>();
+          for (ScanTask task : combined.tasks()) {
+            members.add(memberKey(task.asFileScanTask()));
+          }
+          groups.add(members);
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to planTasks via BatchScan", error);
+      }
+      return groups;
+    }
+
     /** A scan task's cross-engine member key: "(basename,start,length)". */
     private static String memberKey(FileScanTask task) {
       String base = basename(task.file().path().toString());
@@ -4808,9 +4893,19 @@ public final class InteropOracle {
 
     /** Serialize the planTasks result as {groupCount, groups:[[memberKey,...],...]} (each group sorted). */
     private static String planToJson(Table table, long target, int lookback, long openFileCost) {
+      return planToJson(table, target, lookback, openFileCost, planGroups(table, target, lookback, openFileCost));
+    }
+
+    /**
+     * Serialize a PRECOMPUTED set of per-group member-key sets as {groupCount, groups:[[...],...]}.
+     * Used by the BatchScan leg so the emitted artifact reflects the BatchScan-planned groups
+     * (which, by the adapter delegation, equal the newScan() groups).
+     */
+    private static String planToJson(
+        Table table, long target, int lookback, long openFileCost, Set<Set<String>> groups) {
       // Build a stable, sorted-of-sorted view so the JSON is deterministic for diffing.
       List<List<String>> groupList = new ArrayList<>();
-      for (Set<String> group : planGroups(table, target, lookback, openFileCost)) {
+      for (Set<String> group : groups) {
         groupList.add(new ArrayList<>(group)); // group is a TreeSet ⇒ already sorted.
       }
       groupList.sort(

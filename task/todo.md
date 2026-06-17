@@ -420,15 +420,29 @@ bin-pack(`largestBinFirst=true`). Props: `read.split.target-size`(128MiB)/`plann
       `{(path,start,length)}` sets + group count, both directions; anti-circular target/lookback/cost; fail-closed
       sabotage (±1B target re-pack; drop split-offset). RISK: MoR (every sub-task keeps same path+pos deletes),
       offset fidelity, i64/u64 no-`as`, the plan_files invariant.
-- [ ] **U2 — typed `BatchScan` scan-kind → row 122 ❌→✅** (thin, ~2h, LOW, 1cy; gates on U1). Mirror
-      `api/BatchScan.java` (`useSnapshot`/`useRef`/`asOfTime` + `plan_files`/`plan_tasks` delegating to U1's
-      pipeline, BatchScanAdapter shape), reuse the existing builder. **Interop:** extend U1's oracle to also
-      drive `newBatchScan().planTasks()`, assert == `newScan().planTasks()` (adapter delegation) and == Rust
-      `BatchScan::plan_tasks()` — keeps 122 ✅ interop-backed, not unit-test-only.
+- [x] **U2 — typed `BatchScan` scan-kind → rows 122 ❌→✅ AND 146 🟡→✅** — **DONE 2026-06-17.** AC·OO
+      converged 1 cycle, Critic refutation FAILED (mutation-tested `as_of_time` `<=` and the delegation →
+      reds the right tests; re-decoded `BatchScanAdapter`/`SnapshotUtil.snapshotIdAsOfTime` via javap).
+      `scan/batch.rs` (`Table::batch_scan()`) — thin `BatchScanAdapter`-shaped adapter delegating
+      `plan_files`/`plan_tasks` to the U1 `TableScan` pipeline (REUSED, not forked) + `use_snapshot`/`use_ref`/
+      `as_of_time` selectors (greatest `timestamp_ms <= ms`, first-wins conflict). 11 offline tests + 2
+      mutation-baits. Oracle EXTENDED to drive `table.newBatchScan().planTasks()` == `newScan().planTasks()`
+      (Java adapter delegation) == Rust, both directions (D1 11 / D2 16, 0 failures). Orchestrator fixed 1 LOW
+      (matrix `core/`→`api/BatchScanAdapter`), left 1 LOW cosmetic (conflict-msg id not embedded for
+      as_of_time/ref — behavior/kind/tests unaffected), re-ran the oracle + offline gate (125 scan + 2440 lib,
+      U1 unregressed), Cargo/datafusion untouched.
 
-Sequencing: U1 (DONE — flips 146 ❌→🟡, the planTasks core interop-proven) → merge → rebase → U2 (flips
-146 🟡→✅ AND 122 ❌→✅ together, since 146 subsumes the typed BatchScan surface). Both interop-proven.
-Parity after block 4: ~33✅, ❌ 10→9 (U1: ❌ 11→10 via 146→🟡; U2: +2 ✅ / −1 ❌).
+> **BLOCK 4 COMPLETE (2026-06-17).** BatchScan in 2 sequential AC·OO PRs: U1 `plan_tasks()` split+bin-pack+oracle
+> (146 ❌→🟡, #87) → U2 typed `BatchScan` surface (146 🟡→✅ + 122 ❌→✅). **2 ✅ flips (122, 146)**; both
+> interop-proven (real bidirectional `planTasks()` group-shape oracle — NOT a no-Spark case). Census
+> 32✅/26🟡/10❌ → **34✅/25🟡/9❌**. Honesty note: U1 deliberately flipped 146 to 🟡 (not ✅) because 146
+> subsumes the still-❌ BatchScan surface; U2 closed both together. `DataTask` (metadata-tables) carved out as
+> a separate surface (the capability exists via inspection tables). NEXT-BLOCK options: `RewriteTablePath`
+> (137 ❌, provider 9→10/3→2) · Avro-data-READ (117 🟡, own ~6.5h) · the `SnapshotTable`/`MigrateTable` pair
+> (137, need external sources).
+
+Sequencing (done): U1 (146 ❌→🟡) → merge #87 → rebase → U2 (146 🟡→✅ + 122 ❌→✅). Both interop-proven.
+Parity after block 4: **34✅, ❌ 9** (U1: ❌ 11→10 via 146→🟡; U2: 122 ❌→✅ + 146 🟡→✅).
 
 Block-3 stretch / deferred: BatchScan-U1 (ScanTaskGroup/bin-pack, 146 🟡, offline) · RewriteTablePath
 (137 🟡, provider 10/2, 4.5h — full TableMetadata rebuild) · Avro-data-READ (own ~6.5h block, 117 🟡).

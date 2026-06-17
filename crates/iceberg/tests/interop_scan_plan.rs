@@ -143,6 +143,15 @@ fn member_key(task: &iceberg::scan::FileScanTask) -> String {
     )
 }
 
+/// Reduce a list of [`CombinedScanTask`] groups to the canonical comparison multiset.
+fn groups_to_multiset(groups: &[CombinedScanTask]) -> PlanMultiset {
+    let group_sets: Vec<BTreeSet<String>> = groups
+        .iter()
+        .map(|group| group.tasks().iter().map(member_key).collect())
+        .collect();
+    normalize(group_sets)
+}
+
 /// Run `plan_tasks` and collect the canonical plan multiset for the table scan built with the hand-declared
 /// knobs (target / lookback / open-file-cost set via the builder).
 async fn rust_plan_multiset(
@@ -165,12 +174,30 @@ async fn rust_plan_multiset(
         .try_collect()
         .await
         .expect("collect groups");
+    groups_to_multiset(&groups)
+}
 
-    let group_sets: Vec<BTreeSet<String>> = groups
-        .iter()
-        .map(|group| group.tasks().iter().map(member_key).collect())
-        .collect();
-    normalize(group_sets)
+/// Run the typed [`BatchScan`] `plan_tasks` (row 122) and collect the canonical plan multiset, with the
+/// SAME hand-declared knobs set via the BatchScan builder. The BatchScan adapter delegates to the same
+/// pipeline as [`rust_plan_multiset`], so the two multisets MUST be equal — the tests assert exactly that.
+async fn rust_batch_plan_multiset(
+    table: &Table,
+    target: u64,
+    lookback: usize,
+    cost: u64,
+) -> PlanMultiset {
+    let groups: Vec<CombinedScanTask> = table
+        .batch_scan()
+        .with_split_size(target)
+        .with_split_lookback(lookback)
+        .with_split_open_file_cost(cost)
+        .plan_tasks()
+        .await
+        .expect("batch_scan plan_tasks")
+        .try_collect()
+        .await
+        .expect("collect batch groups");
+    groups_to_multiset(&groups)
 }
 
 /// Convert Java's emitted plan into the same canonical multiset form for comparison.
@@ -190,7 +217,12 @@ fn java_plan_multiset(plan: &JavaScanPlan) -> PlanMultiset {
 }
 
 fn read_java_plan(dir: &Path) -> JavaScanPlan {
-    let path = dir.join("java_scan_plan.json");
+    read_java_plan_file(dir, "java_scan_plan.json")
+}
+
+/// Read a named plan JSON file emitted by the Java oracle into a [`JavaScanPlan`].
+fn read_java_plan_file(dir: &Path, file_name: &str) -> JavaScanPlan {
+    let path = dir.join(file_name);
     let json = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     serde_json::from_str(&json).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
@@ -370,8 +402,24 @@ async fn test_scan_plan_d1_rust_plans_java_table() {
         "Rust plan_tasks over the Java table must equal Java's planTasks plan (multiset of per-group \
          member-key sets + group count)"
     );
+
+    // BatchScan leg (row 122): Rust `BatchScan::plan_tasks` over the SAME Java table must equal
+    //   (a) Java's `newBatchScan().planTasks()` plan (java_batch_scan_plan.json), AND
+    //   (b) the plain scan plan (proving the Rust adapter delegates to the same pipeline).
+    let rust_batch = rust_batch_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
+    let java_batch = java_plan_multiset(&read_java_plan_file(&dir, "java_batch_scan_plan.json"));
+    assert_eq!(
+        rust_batch, java_batch,
+        "Rust BatchScan::plan_tasks over the Java table must equal Java's newBatchScan().planTasks() plan"
+    );
+    assert_eq!(
+        rust_batch, rust,
+        "Rust BatchScan::plan_tasks must equal Rust TableScan::plan_tasks (adapter delegation)"
+    );
+
     println!(
-        "interop_scan_plan D1 OK — Rust plan_tasks over the Java table matches Java ({} groups)",
+        "interop_scan_plan D1 OK — Rust plan_tasks AND BatchScan::plan_tasks over the Java table match \
+         Java ({} groups)",
         rust.len()
     );
 }
@@ -434,6 +482,13 @@ async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
 
     // Compute OUR OWN plan and emit it for Java to verify.
     let rust = rust_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
+    // The typed BatchScan plan over the SAME Rust table must equal the scan plan (adapter delegation),
+    // and is emitted for the Java verify's BatchScan leg.
+    let rust_batch = rust_batch_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
+    assert_eq!(
+        rust_batch, rust,
+        "GEN: Rust BatchScan::plan_tasks must equal Rust TableScan::plan_tasks (adapter delegation)"
+    );
 
     // SANITY: the big file MUST have split into more than one sub-task (multi-row-group ⇒ offsets-aware
     // split), otherwise the offsets-aware branch is not actually exercised by the GEN fixture.
@@ -460,10 +515,16 @@ async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
     let plan_path = format!("{table_location}/rust_scan_plan.json");
     fs::write(&plan_path, plan_json).expect("write rust_scan_plan.json");
 
+    // Emit the BatchScan plan for the Java verify's BatchScan leg (row 122).
+    let batch_plan_json = rust_plan_to_json(&rust_batch);
+    let batch_plan_path = format!("{table_location}/rust_batch_scan_plan.json");
+    fs::write(&batch_plan_path, batch_plan_json).expect("write rust_batch_scan_plan.json");
+
     println!(
         "interop_scan_plan GEN OK — Rust wrote {table_location} (big/mid/small1/small2 + a position delete) \
-         and emitted rust_scan_plan.json ({} groups, big split into {big_sub_tasks} sub-tasks). Java \
-         verify-interop-scan-plan runs the REAL planTasks over it next.",
+         and emitted rust_scan_plan.json + rust_batch_scan_plan.json ({} groups, big split into \
+         {big_sub_tasks} sub-tasks). Java verify-interop-scan-plan runs the REAL planTasks (scan + \
+         batchScan) over it next.",
         rust.len()
     );
 }
