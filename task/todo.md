@@ -208,9 +208,44 @@ dormant for realistic single commits (narrow non-`first` ≥2-manifest sub-case 
       **GAP_MATRIX row 151 stays 🟡** (DeleteReachableFiles portion now ✅+interop). Files:
       `delete_reachable_files.rs`, `interop_delete_reachable.rs`, `run-interop-delete-reachable.sh`,
       `DeleteReachableOracle`.
-- [ ] **PC #4 — finish row 151 → ✅**: `ConvertEqualityDeleteFiles` (read eq-deletes → write position
-      deletes → commit; corruption-class, interop-provable; wire into ActionsProvider) + `SupportsNamespaces`
-      partial property set/remove. Both must land to flip row 151 🟡→✅.
+## 8-HOUR PLAN (2026-06-16, Opus, signed off) — 4 sequential AC·OO PRs
+
+Grounded by a 9-unit parallel scoping pass (each scoped vs the live code + 1.10.0 jars). Front-load the
+three low-risk OFFLINE-gated wins (near-zero 529 exposure), then the one hard capstone. Each is
+independent → its own PR; run strictly one-at-a-time (rebase on freshly-merged main between groups).
+Expected outcome: 3 rows flip ✅ (144, 138, 151), ActionsProvider 7/5→8/4, eq→pos capability lands;
+parity ~25→28 ✅.
+
+- [x] **G1 — `ReplacePartitions.validateAppendOnly()`** — **DONE 2026-06-16 (#TBD).** **row 144 🟡→✅.**
+      One bool + builder on `ReplacePartitionsAction`; guard = `!resolved.is_empty()` on the existing
+      `resolve_partition_deletes` result (snapshot.rs:703). Critic javap-verified + CORRECTED the wrong
+      residue: `conflictDetectionFilter` is NOT in Java 1.10.0 on DeleteFiles/ReplacePartitions (void),
+      `validateAppendOnly` is ReplacePartitions-only — built ONLY that, no anti-parity surface. 4 unit
+      tests + mutation-proven guard (disabling it fails the 2 reject tests). Converged 1 cycle, offline
+      gate green. Files: `replace_partitions.rs`, `transaction/map.md`, GAP_MATRIX row 144.
+      **CRITICAL: build ONLY validateAppendOnly** — javap proves `conflictDetectionFilter` on
+      DeleteFiles/ReplacePartitions does NOT exist in Java 1.10.0; the row-144 residue list is factually
+      wrong — ALSO correct the row text (the 2 void items + this 1 real port ⇒ row flips ✅).
+- [ ] **G2 — `ComputePartitionStats` action + `UpdatePartitionStatistics` commit seam** (2h, LOW, offline)
+      → **row 138 🟡→✅**; ActionsProvider `compute_partition_stats` FeatureUnsupported→real (7/5→8/4).
+      Both halves exist + interop-proven (Z3/R2/R3): clone `update_statistics.rs` for the seam + `ComputeTableStats`
+      for the action over `compute_and_write_stats_file`/`register_partition_stats_file`.
+- [ ] **G3 — `SupportsNamespaces` partial property set/remove** (1.25h, LOW, offline) → SupportsNamespaces
+      component ✅ (row 151 stays 🟡 until G4). ~25-line default `Catalog::update_namespace_properties`
+      (overlap-reject + get→mutate→full-replace). Optionally fix the latent SQL full-replace bug the
+      remove-test exposes (catalog.rs:612).
+- [ ] **G4 — `ConvertEqualityDeleteFiles`** (3.5h, HIGH, offline + corroborating no-Spark interop) → with
+      G3, **completes row 151 🟡→✅**. NEW write logic: per eq-delete, scan referenced data emitting ABSOLUTE
+      `_pos`, materialize MATCHING positions, write pos-deletes stamped with the eq-delete's data-seq
+      (`add_delete_file_with_sequence_number`), commit via the RewriteFiles 4-set. Corruption-class proof =
+      Java MoR reads the table IDENTICALLY before (eq) / after (pos) conversion. NOT an ActionsProvider
+      method (javap-confirmed). Capstone risk: absolute-pos, seq-stamping, applicability-scope,
+      matching-vs-surviving inversion. Floor: if it lands 🟡, G1-G3 still delivered 2 ✅ flips + provider 8/4.
+
+Stretch / next (own PRs, if the front beats estimates): `RewritePositionDeleteFiles` (134 🟡, provider
+9/3, MED) · `ExpressionParser` JSON (147 ✅ + retires the ScanReport filter divergence, oracle, MED) ·
+`unknown` V3 type (89 ✅, oracle, MED) · Catalog accessors name/properties/invalidate* (❌→🟡, LOW).
+Deferred (XL, split into 2 PRs later): `BatchScan` + `ScanTaskGroup`/`planTasks`.
 
 Follow-on residue (surfaced mid-charter 2026-06-16, see GAP_MATRIX row 94):
 
