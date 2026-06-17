@@ -17,12 +17,14 @@
 
 //! Table scan api.
 
+mod batch;
 mod bin_pack;
 mod cache;
 use cache::*;
 mod context;
 use context::*;
 mod incremental;
+pub use batch::*;
 pub use incremental::*;
 mod metrics_collector;
 mod task;
@@ -203,6 +205,13 @@ impl<'a> TableScanBuilder<'a> {
     pub fn snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
         self
+    }
+
+    /// Returns the [`Table`] this builder scans. Used by the [`BatchScan`](crate::scan::BatchScan)
+    /// adapter to resolve `as_of_time` over the table's snapshot log before pinning the snapshot
+    /// id via [`snapshot_id`](Self::snapshot_id).
+    pub(crate) fn table(&self) -> &Table {
+        self.table
     }
 
     /// Scan the snapshot that a branch or tag reference points to.
@@ -1061,7 +1070,7 @@ pub mod tests {
     //! shared tests for the table scan API
     #![allow(missing_docs)]
 
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::fs;
     use std::fs::File;
     use std::sync::Arc;
@@ -4671,5 +4680,409 @@ pub mod tests {
 
         // Assert it finished (didn't timeout)
         assert!(result.is_ok(), "Scan timed out - deadlock detected");
+    }
+
+    // =======================================================================================
+    // BatchScan (Java BatchScan / BatchScanAdapter) — the typed adapter over the SAME pipeline.
+    //
+    // The contract: `table.batch_scan()` is a thin typed wrapper whose plan_files()/plan_tasks()
+    // DELEGATE 1:1 to the TableScan pipeline (Java BatchScanAdapter), plus the three time-travel
+    // selectors use_snapshot / use_ref / as_of_time (Java SnapshotScan.useSnapshot/useRef/asOfTime,
+    // first-wins mutual exclusion). The fixture's snapshot LOG is
+    //   {id 3051729675574597004 @ 1515100955770} then {id 3055729675574597004 @ 1555100955770}
+    // with current = 3055729675574597004 and a `test` tag → 3051729675574597004.
+    // =======================================================================================
+
+    /// Older snapshot-log entry's timestamp (id 3051729675574597004).
+    const SNAP1_TS: i64 = 1515100955770;
+    /// Newer snapshot-log entry's timestamp (id 3055729675574597004 == current).
+    const SNAP2_TS: i64 = 1555100955770;
+
+    /// The canonical group multiset for a list of `CombinedScanTask`s: each group is the SORTED set
+    /// of member keys `(path,start,length)`, then the list of groups is sorted (order-insensitive
+    /// across groups, duplicate-preserving) — the same comparison contract as the interop oracle.
+    fn group_multiset(groups: &[CombinedScanTask]) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = groups
+            .iter()
+            .map(|group| {
+                let mut members: Vec<String> = group
+                    .tasks()
+                    .iter()
+                    .map(|task| {
+                        format!("({},{},{})", task.data_file_path(), task.start, task.length)
+                    })
+                    .collect();
+                members.sort();
+                members
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// DELEGATION (the crux): `BatchScan::plan_tasks()` must yield the SAME groups as
+    /// `TableScan::plan_tasks()` over the same table + the same split knobs. This is the Java
+    /// `table.newBatchScan().planTasks() == table.newScan().planTasks()` adapter identity.
+    #[tokio::test]
+    async fn test_batch_scan_plan_tasks_delegates_to_table_scan() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        // A non-trivial split + bin-pack config so the delegation covers real grouping, not a
+        // degenerate single group.
+        let table_scan = fixture
+            .table
+            .scan()
+            .with_split_size(500)
+            .with_split_lookback(10)
+            .with_split_open_file_cost(0)
+            .build()
+            .unwrap();
+        let scan_groups: Vec<CombinedScanTask> = table_scan
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let batch_groups: Vec<CombinedScanTask> = fixture
+            .table
+            .batch_scan()
+            .with_split_size(500)
+            .with_split_lookback(10)
+            .with_split_open_file_cost(0)
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            group_multiset(&batch_groups),
+            group_multiset(&scan_groups),
+            "BatchScan::plan_tasks must yield the SAME groups as TableScan::plan_tasks (adapter delegation)"
+        );
+        // Sanity: the fixture actually produces a multi-group plan (otherwise the delegation is
+        // vacuously trivial). 7 sub-tasks at target 500 cannot fit in one bin.
+        assert!(
+            scan_groups.len() > 1,
+            "the delegation fixture must produce >1 group (got {})",
+            scan_groups.len()
+        );
+    }
+
+    /// DELEGATION for `plan_files()`: the BatchScan file-scan-task stream must match the TableScan
+    /// one (same member keys), since the adapter forwards `planFiles()` 1:1.
+    #[tokio::test]
+    async fn test_batch_scan_plan_files_delegates_to_table_scan() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan_keys: BTreeSet<String> = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|task| format!("({},{},{})", task.data_file_path(), task.start, task.length))
+            .collect();
+
+        let batch_keys: BTreeSet<String> = fixture
+            .table
+            .batch_scan()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|task| format!("({},{},{})", task.data_file_path(), task.start, task.length))
+            .collect();
+
+        assert_eq!(
+            batch_keys, scan_keys,
+            "BatchScan::plan_files must match TableScan::plan_files (adapter delegation)"
+        );
+        assert!(
+            !scan_keys.is_empty(),
+            "the fixture must yield file scan tasks"
+        );
+    }
+
+    /// `batch_scan()` with NO selector reads the table default (current snapshot), like a plain
+    /// `scan()` and like Java's `useRef("main")` baseline.
+    #[tokio::test]
+    async fn test_batch_scan_default_is_current_snapshot() {
+        let table = TableTestFixture::new().table;
+        let snapshot = table
+            .batch_scan()
+            .snapshot()
+            .unwrap()
+            .expect("a current snapshot");
+        assert_eq!(snapshot.snapshot_id(), CURRENT_SNAPSHOT_ID);
+    }
+
+    /// `use_snapshot(id)` pins THAT snapshot (Java `BatchScan.useSnapshot`).
+    #[tokio::test]
+    async fn test_batch_scan_use_snapshot_selects_that_snapshot() {
+        let table = TableTestFixture::new().table;
+        let snapshot = table
+            .batch_scan()
+            .use_snapshot(TAG_TEST_SNAPSHOT_ID)
+            .snapshot()
+            .unwrap()
+            .expect("the pinned snapshot");
+        assert_eq!(snapshot.snapshot_id(), TAG_TEST_SNAPSHOT_ID);
+        assert_ne!(snapshot.snapshot_id(), CURRENT_SNAPSHOT_ID);
+    }
+
+    /// `use_ref("main")` resolves to the table default; `use_ref("test")` resolves to the tagged
+    /// (older) snapshot — NOT the current one (Java `BatchScan.useRef`).
+    #[tokio::test]
+    async fn test_batch_scan_use_ref() {
+        let table = TableTestFixture::new().table;
+
+        let main = table
+            .batch_scan()
+            .use_ref("main")
+            .snapshot()
+            .unwrap()
+            .expect("main snapshot");
+        assert_eq!(main.snapshot_id(), CURRENT_SNAPSHOT_ID);
+
+        let tagged = table
+            .batch_scan()
+            .use_ref("test")
+            .snapshot()
+            .unwrap()
+            .expect("tag snapshot");
+        assert_eq!(tagged.snapshot_id(), TAG_TEST_SNAPSHOT_ID);
+        assert_ne!(tagged.snapshot_id(), CURRENT_SNAPSHOT_ID);
+    }
+
+    /// An unknown ref surfaces as a typed error (Java "Cannot find ref %s"), naming the ref.
+    #[tokio::test]
+    async fn test_batch_scan_use_ref_unknown_errors() {
+        let table = TableTestFixture::new().table;
+        let error = table
+            .batch_scan()
+            .use_ref("does_not_exist")
+            .snapshot()
+            .expect_err("unknown ref must error");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("does_not_exist"),
+            "error should name the missing ref, got: {error}"
+        );
+    }
+
+    /// `as_of_time` BOUNDARY — the inclusive `<=` over the snapshot LOG (Java
+    /// `SnapshotUtil.snapshotIdAsOfTime`):
+    ///   * EXACTLY at snap2's timestamp ⇒ snap2 (== current). MUTATION BAIT: a `<` boundary would
+    ///     wrongly pick snap1; a "pick the earliest <=" bug would also pick snap1.
+    ///   * 1ms BEFORE snap2 ⇒ snap1 (the greatest `<=` is snap1).
+    ///   * EXACTLY at snap1's timestamp ⇒ snap1.
+    #[tokio::test]
+    async fn test_batch_scan_as_of_time_boundary_is_inclusive() {
+        let table = TableTestFixture::new().table;
+
+        // Exactly on snap2's timestamp ⇒ snap2 (the inclusive-boundary case; `<` would red this).
+        let at_snap2 = table
+            .batch_scan()
+            .as_of_time(SNAP2_TS)
+            .snapshot()
+            .unwrap()
+            .expect("a snapshot as of snap2's timestamp");
+        assert_eq!(
+            at_snap2.snapshot_id(),
+            CURRENT_SNAPSHOT_ID,
+            "as_of_time exactly at snap2's timestamp must select snap2 (inclusive <=)"
+        );
+
+        // 1ms before snap2 ⇒ snap1 (the greatest timestamp <= the arg is snap1).
+        let just_before_snap2 = table
+            .batch_scan()
+            .as_of_time(SNAP2_TS - 1)
+            .snapshot()
+            .unwrap()
+            .expect("a snapshot 1ms before snap2");
+        assert_eq!(
+            just_before_snap2.snapshot_id(),
+            TAG_TEST_SNAPSHOT_ID,
+            "as_of_time 1ms before snap2 must select snap1, not snap2"
+        );
+
+        // Exactly on snap1's timestamp ⇒ snap1 (inclusive again).
+        let at_snap1 = table
+            .batch_scan()
+            .as_of_time(SNAP1_TS)
+            .snapshot()
+            .unwrap()
+            .expect("a snapshot as of snap1's timestamp");
+        assert_eq!(at_snap1.snapshot_id(), TAG_TEST_SNAPSHOT_ID);
+
+        // Well after snap2 ⇒ still snap2 (the greatest <= is the latest entry).
+        let after_all = table
+            .batch_scan()
+            .as_of_time(SNAP2_TS + 1_000_000)
+            .snapshot()
+            .unwrap()
+            .expect("a snapshot well after snap2");
+        assert_eq!(after_all.snapshot_id(), CURRENT_SNAPSHOT_ID);
+    }
+
+    /// `as_of_time` with NO log entry `<=` the timestamp errors (Java "Cannot find a snapshot older
+    /// than %s"). MUTATION BAIT: a "pick the earliest snapshot regardless" bug would return snap1
+    /// here instead of erroring.
+    #[tokio::test]
+    async fn test_batch_scan_as_of_time_before_all_errors() {
+        let table = TableTestFixture::new().table;
+        let before = SNAP1_TS - 1;
+        let error = table
+            .batch_scan()
+            .as_of_time(before)
+            .snapshot()
+            .expect_err("a timestamp before every snapshot must error");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Cannot find a snapshot older than"),
+            "error should be the Java 'Cannot find a snapshot older than' message, got: {error}"
+        );
+        assert!(
+            error.message().contains(&before.to_string()),
+            "error should name the timestamp, got: {error}"
+        );
+    }
+
+    /// `as_of_time` then `plan_tasks` plans the SELECTED snapshot — the time-travel selector flows
+    /// through the delegated pipeline, not just `snapshot()`.
+    #[tokio::test]
+    async fn test_batch_scan_as_of_time_plans_selected_snapshot() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        // as_of_time at snap2's timestamp == the current snapshot, which is the one the planning
+        // manifest was written under ⇒ a non-empty plan equal to the default plan.
+        let default_groups: Vec<CombinedScanTask> = fixture
+            .table
+            .batch_scan()
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let as_of_groups: Vec<CombinedScanTask> = fixture
+            .table
+            .batch_scan()
+            .as_of_time(SNAP2_TS)
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            !default_groups.is_empty(),
+            "the default plan must be non-empty"
+        );
+        assert_eq!(
+            group_multiset(&as_of_groups),
+            group_multiset(&default_groups),
+            "as_of_time(current ts) must plan the same snapshot as the default"
+        );
+    }
+
+    /// MUTUAL EXCLUSION — two snapshot-pinning selectors conflict FIRST-WINS (Java `checkArgument`
+    /// "Cannot override snapshot/ref, already set snapshot id=%s"). The conflict is latched at the
+    /// SECOND selector and surfaces as a typed error at plan/snapshot time.
+    #[tokio::test]
+    async fn test_batch_scan_conflicting_selectors_error() {
+        let table = TableTestFixture::new().table;
+
+        // use_snapshot then use_snapshot.
+        let error = table
+            .batch_scan()
+            .use_snapshot(CURRENT_SNAPSHOT_ID)
+            .use_snapshot(TAG_TEST_SNAPSHOT_ID)
+            .snapshot()
+            .expect_err("two use_snapshot calls must conflict");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("Cannot override snapshot"),
+            "got: {error}"
+        );
+
+        // use_snapshot then use_ref.
+        let error = table
+            .batch_scan()
+            .use_snapshot(CURRENT_SNAPSHOT_ID)
+            .use_ref("test")
+            .snapshot()
+            .expect_err("use_snapshot then use_ref must conflict");
+        assert!(
+            error.message().contains("Cannot override ref"),
+            "got: {error}"
+        );
+
+        // use_snapshot then as_of_time, surfaced via the DELEGATED plan_tasks path (the stream type
+        // is not Debug, so match the error out by hand rather than via expect_err).
+        let result = table
+            .batch_scan()
+            .use_snapshot(CURRENT_SNAPSHOT_ID)
+            .as_of_time(SNAP2_TS)
+            .plan_tasks()
+            .await;
+        let error = match result {
+            Ok(_) => panic!("use_snapshot then as_of_time must conflict"),
+            Err(error) => error,
+        };
+        assert!(
+            error.message().contains("Cannot override snapshot"),
+            "got: {error}"
+        );
+
+        // as_of_time then use_snapshot (asOfTime pins via useSnapshot, so the SECOND conflicts).
+        let error = table
+            .batch_scan()
+            .as_of_time(SNAP2_TS)
+            .use_snapshot(TAG_TEST_SNAPSHOT_ID)
+            .snapshot()
+            .expect_err("as_of_time then use_snapshot must conflict");
+        assert!(
+            error.message().contains("Cannot override snapshot"),
+            "got: {error}"
+        );
+    }
+
+    /// `use_ref("main")` is the table-default no-op even AFTER another selector pinned a snapshot —
+    /// it must NOT conflict (Java `useRef(MAIN)` early-returns without touching the pin). It also
+    /// must NOT override the earlier pin.
+    #[tokio::test]
+    async fn test_batch_scan_use_ref_main_is_noop_not_conflict() {
+        let table = TableTestFixture::new().table;
+        let snapshot = table
+            .batch_scan()
+            .use_snapshot(TAG_TEST_SNAPSHOT_ID)
+            .use_ref("main")
+            .snapshot()
+            .unwrap()
+            .expect("the pinned snapshot survives a main no-op");
+        assert_eq!(
+            snapshot.snapshot_id(),
+            TAG_TEST_SNAPSHOT_ID,
+            "use_ref(main) must neither conflict nor override the earlier pin"
+        );
     }
 }
