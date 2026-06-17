@@ -248,13 +248,22 @@ parity ~25→28 ✅.
       the divergence in-code + GAP_MATRIX; confined tests to the memory catalog (faithful full-replace).
       SQL diff is comment-only (behavior unchanged; 68 SQL tests green). Converged 1 cycle, no findings.
       Files: `catalog/mod.rs`, `catalog/memory/catalog.rs`, `catalog/sql/catalog.rs` (NOTE only), GAP_MATRIX row 151.
-- [ ] **G4 — `ConvertEqualityDeleteFiles`** (3.5h, HIGH, offline + corroborating no-Spark interop) → with
-      G3, **completes row 151 🟡→✅**. NEW write logic: per eq-delete, scan referenced data emitting ABSOLUTE
-      `_pos`, materialize MATCHING positions, write pos-deletes stamped with the eq-delete's data-seq
-      (`add_delete_file_with_sequence_number`), commit via the RewriteFiles 4-set. Corruption-class proof =
-      Java MoR reads the table IDENTICALLY before (eq) / after (pos) conversion. NOT an ActionsProvider
-      method (javap-confirmed). Capstone risk: absolute-pos, seq-stamping, applicability-scope,
-      matching-vs-surviving inversion. Floor: if it lands 🟡, G1-G3 still delivered 2 ✅ flips + provider 8/4.
+- [x] **G4 — `ConvertEqualityDeleteFiles`** — **DONE 2026-06-17 (#TBD). COMPLETES row 151 🟡→✅.** The
+      capstone: NEW eq→pos write logic, 1:1 port of Java `api/actions/ConvertEqualityDeleteFiles` (free-standing,
+      not a provider method). Per eq-delete: build the survival predicate → applicable LIVE data files
+      (strictly-lower data-seq, same partition / global) → read with ABSOLUTE `_pos` → collect MATCHING
+      positions → sort → write pos-deletes stamped with the eq-delete's data-seq → RewriteFiles 4-set replace.
+      All FOUR corruption-stallers (absolute-pos, seq-stamp, applicability, matching-not-surviving)
+      mutation-proven by the Critic (each breaks read-identity). 9 offline read-identity tests + no-Spark
+      Java-MoR interop GREEN (live ids identical before-eq/after-pos). Converged 1 cycle. Read-path files
+      touched VISIBILITY-ONLY (`parse_equality_deletes_record_batch_stream`/`try_cast_literal` → pub(crate);
+      full 2329 lib suite green = no regression). Orchestrator re-ran the interop oracle (GREEN) + full lib.
+      Files: `convert_equality_delete_files.rs` (+tests), `interop_convert_eq_delete.rs`, `run-interop-convert-eq-delete.sh`.
+
+> **8-HOUR PLAN COMPLETE (2026-06-17).** All 4 sequential AC·OO PRs landed/pushed, each converged in 1
+> cycle: G1 row 144 ✅ (#75), G2 row 138 ✅ + provider 8/4 (#76), G3 SupportsNamespaces (#77), G4 row 151
+> ✅ (capstone). **3 rows flipped to ✅ (144, 138, 151)** + ConvertEqualityDeleteFiles capability; parity
+> ~25✅→28✅; ActionsProvider 8/12. Near-zero 529 exposure (all offline-gated). Floor held + capstone landed.
 
 Stretch / next (own PRs, if the front beats estimates): `RewritePositionDeleteFiles` (134 🟡, provider
 9/3, MED) · `ExpressionParser` JSON (147 ✅ + retires the ScanReport filter divergence, oracle, MED) ·

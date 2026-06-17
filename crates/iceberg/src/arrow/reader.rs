@@ -1986,7 +1986,11 @@ fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
 ///
 /// The Arrow compute kernels that we use must match the type exactly, so first cast the literal
 /// into the type of the batch we read from Parquet before sending it to the compute kernel.
-fn try_cast_literal(
+///
+/// `pub(crate)` so the `ConvertEqualityDeleteFiles` maintenance action's standalone predicate
+/// evaluator can align literals to column types with the SAME logic the read-side `PredicateConverter`
+/// uses.
+pub(crate) fn try_cast_literal(
     literal: &Arc<dyn ArrowDatum + Send + Sync>,
     column_type: &DataType,
 ) -> std::result::Result<Arc<dyn ArrowDatum + Send + Sync>, ArrowError> {

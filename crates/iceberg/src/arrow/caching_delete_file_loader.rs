@@ -522,7 +522,11 @@ impl CachingDeleteFileLoader {
         Ok(result)
     }
 
-    async fn parse_equality_deletes_record_batch_stream(
+    /// Parse an equality-delete file's record-batch stream into its SURVIVAL [`Predicate`] — a row that
+    /// does NOT match any of the file's delete tuples (so a row the eq-delete DELETES makes this
+    /// predicate false). `pub(crate)` so the `ConvertEqualityDeleteFiles` maintenance action can reuse
+    /// the exact read-side parse to build the same predicate it inverts to find matching positions.
+    pub(crate) async fn parse_equality_deletes_record_batch_stream(
         mut stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
     ) -> Result<Predicate> {
