@@ -296,12 +296,22 @@ SnapshotTable/MigrateTable need an external-table source → stay ❌; both defe
       Metadata-only interop GREEN both directions (Java writes V3 unknown schema → Rust reads+writes → Java
       verifies; caught+fixed a field-id-reindex bug). Committed Java fixtures under testdata/interop/unknown_type/.
       Converged 1 cycle, NO findings. Files: `datatypes.rs` + 8 arm sites + `interop_unknown.rs` + `run-interop-unknown.sh`.
-- [ ] **G3 — `IncrementalAppendScan` + `IncrementalChangelogScan` interop** (2.5h, MED, interop) →
-      **rows 120 + 121 🟡→✅** (TWO rows in one PR). The scans are built; interop is the sole deferral. Java
-      writes a multi-snapshot table; Rust incremental-scans a snapshot range; assert the added-files /
-      changelog-rows match Java `IncrementalAppendScan`/`IncrementalDataTableScan` over the same range.
-      NET-NEW Java oracle code (~60-100 lines each, no existing incremental-scan oracle calls). Annotate row
-      121 to retain BatchScan/CDC-net-changes residue if the changelog surface is data-file-only.
+- [x] **G3 — `IncrementalAppendScan` + `IncrementalChangelogScan` interop** — **DONE 2026-06-17 (#TBD).
+      rows 120 + 121 🟡→✅** (TWO rows). Interop-only (scans built; scan/incremental.rs UNCHANGED). 4-snapshot
+      fixture (S1-3 appends + S4 overwrite), compared by data-file BASENAME (anti-circular). Append: 3 ranges
+      (excl {b,c} / incl {a,b,c} / to-current {c}) — the incl/excl boundary pinned (a.parquet the only diff).
+      Changelog: data-file-level {+b,+c,−a,+d} vs Java IncrementalDataTableScan. Both proven D1+D2 vs Java's
+      REAL scans. Off-by-one boundary sabotage fails closed; PRODUCTION-level non-vacuity (mutating the
+      inclusive→parent resolution at incremental.rs:256 reds the D1 test). Row 121 ✅ for the DATA-FILE
+      changelog with row-level/CDC + BatchScan residue NAMED (matches Java current; not over-claimed).
+      Converged 1 cycle, NO findings. Files: `interop_incremental_scans.rs`, `run-interop-incremental-scans.sh`, `IncrementalScanOracle`.
+
+> **BLOCK 2 COMPLETE (2026-06-17).** All 3 sequential AC·OO PRs landed/pushed, each converged in 1 cycle,
+> ZERO findings across the block: G1 RewritePositionDeleteFiles (row 134 ✅, provider 9/3, #79), G2 unknown
+> V3 type (row 89 ✅, #80), G3 incremental-scans interop (rows 120+121 ✅). **4 rows flipped ✅ (134, 89, 120,
+> 121)**; parity ~28✅→32✅; ActionsProvider 9/12. Notable judgment: G2's legality doors matched Java bytecode
+> (identity(unknown) accepted, NOT mirror-Variant). Next: pick a block-3 (stretch: ExpressionParser-JSON 147;
+> Catalog-accessors offline; or the deferred BatchScan-U1 / RewriteTablePath / AggregateEvaluator partials).
 
 Block-2 stretch (own PRs, if the spine beats estimates): `ExpressionParser` JSON (row 147 ✅ + retires the
 ScanReport filter divergence; L/3.5h/MED/3cy — type-erasure schema-overload risk) · Catalog accessors

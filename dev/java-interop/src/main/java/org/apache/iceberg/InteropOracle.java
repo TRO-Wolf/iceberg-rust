@@ -38,9 +38,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
 import org.apache.iceberg.data.GenericAppenderFactory;
@@ -185,6 +189,55 @@ public final class InteropOracle {
         int scanExecFailures = ScanExecOracle.verify(scanExecVerifyDir);
         System.out.println("verify-interop-scan-exec: " + scanExecFailures + " failures");
         if (scanExecFailures > 0) {
+          System.exit(1);
+        }
+        break;
+      case "generate-interop-incremental-scans":
+        // INCREMENTAL SCANS, DIRECTION 1 — "Rust plans what JAVA wrote" (GAP_MATRIX rows 120/121). Writes a
+        // 4-snapshot V2 table (S1 append a, S2 append b, S3 append c, S4 OVERWRITE delete-a/add-d) with
+        // DETERMINISTIC data-file basenames, then runs the REAL Java IncrementalAppendScan (over three
+        // hand-declared ranges) + the REAL Java IncrementalChangelogScan (IncrementalDataTableScan, the
+        // data-file changelog) over (S1 excl, S4], and emits the planned-file SETS into
+        // java_append_sets.json + java_changelog_entries.json (keyed by data-file BASENAME — the cross-engine
+        // comparison key, since Rust + Java write at different roots with different snapshot ids). The dir is
+        // via -Dinterop.incremental_scans.dir.
+        Path incrementalScansDir = requireFixturesDir("interop.incremental_scans.dir");
+        IncrementalScanOracle.generate(incrementalScansDir);
+        break;
+      case "verify-interop-incremental-scans":
+        // INCREMENTAL SCANS, DIRECTION 2 — "Java plans what RUST wrote". The Rust GEN path (env
+        // ICEBERG_INTEROP_INCREMENTAL_SCANS_GEN_DIR) wrote the SAME 4-snapshot chain to <dir>/rust_table via
+        // its production write path, landing a final.metadata.json. Here Java loads that RUST-written
+        // metadata, builds a BaseTable over a LocalFileIO, runs the REAL Java IncrementalAppendScan +
+        // IncrementalChangelogScan over the SAME ranges, and asserts the planned-file BASENAME sets equal the
+        // HAND-DECLARED ground truth (anti-circular — declared identically in InteropOracle + the Rust test).
+        // A failure here is a REAL incremental-scan write-incompatibility finding.
+        Path incrementalScansVerifyDir = requireFixturesDir("interop.incremental_scans.dir");
+        int incrementalScansFailures = IncrementalScanOracle.verify(incrementalScansVerifyDir);
+        System.out.println(
+            "verify-interop-incremental-scans: " + incrementalScansFailures + " failures");
+        if (incrementalScansFailures > 0) {
+          System.exit(1);
+        }
+        break;
+      case "sabotage-interop-incremental-scans":
+        // INCREMENTAL SCANS SABOTAGE — the off-by-one boundary is the corruption edge. This re-runs the
+        // `append_excl` scenario over the RUST-written table but SHIFTS the exclusive lower bound by one
+        // snapshot (fromSnapshotExclusive(S2) instead of S1), so the planned set becomes {c} instead of the
+        // expected {b,c}. The verify ASSERTS THE MISMATCH: a shifted bound MUST diverge from the ground
+        // truth. If the shifted scan still equalled {b,c}, the boundary would not be load-bearing and the
+        // whole proof would be vacuous — so this mode exits NON-ZERO (proof of vacuity) when the mismatch
+        // does NOT appear, and exits ZERO (fail-closed confirmed) when it DOES.
+        Path incrementalScansSabotageDir = requireFixturesDir("interop.incremental_scans.dir");
+        int incrementalScansSabotageDiverged =
+            IncrementalScanOracle.sabotageShiftedBound(incrementalScansSabotageDir);
+        System.out.println(
+            "sabotage-interop-incremental-scans: "
+                + (incrementalScansSabotageDiverged == 0
+                    ? "boundary NOT load-bearing (VACUOUS)"
+                    : "shifted bound diverged (fail-closed confirmed)"));
+        // diverged == 0 means the shift did NOT change the set ⇒ the proof is vacuous ⇒ hard-fail.
+        if (incrementalScansSabotageDiverged == 0) {
           System.exit(1);
         }
         break;
@@ -4234,6 +4287,441 @@ public final class InteropOracle {
                 + "Rust position-delete), merge-on-read live rows = {10,30,50}");
       }
       return failures;
+    }
+  }
+
+  // ===========================================================================================
+  // INCREMENTAL SCANS oracle — GAP_MATRIX rows 120 (IncrementalAppendScan) + 121 (IncrementalChangelogScan).
+  //
+  // Builds a 4-snapshot UNPARTITIONED V2 table {1 id long required, 2 data string optional} with
+  // DETERMINISTIC data-file basenames (the cross-engine comparison key — Rust + Java write at different roots
+  // with different snapshot ids, so the BASENAME is the only stable key):
+  //   S1: newAppend a.parquet (id=10)               op=append
+  //   S2: newAppend b.parquet (id=20)               op=append
+  //   S3: newAppend c.parquet (id=30)               op=append
+  //   S4: newOverwrite delete a.parquet + add d.parquet (id=40)  op=overwrite
+  //
+  // It runs the REAL Java IncrementalAppendScan (Table.newIncrementalAppendScan, backed by
+  // IncrementalDataTableScan.appendsBetween) over three HAND-DECLARED ranges and the REAL Java
+  // IncrementalChangelogScan (Table.newIncrementalChangelogScan / BaseIncrementalChangelogScan) over
+  // (S1 exclusive, S4], and emits the planned-file BASENAME sets. The expected sets are HAND-DECLARED
+  // here AND in the Rust test (anti-circular — neither derives its expectation from the other):
+  //   append_excl  : fromSnapshotExclusive(S1).toSnapshot(S3)  ⇒ {b, c}     (S1's own a EXCLUDED)
+  //   append_incl  : fromSnapshotInclusive(S1).toSnapshot(S3)  ⇒ {a, b, c}  (S1's own a INCLUDED)
+  //   append_to_cur: fromSnapshotExclusive(S2) [to=current S4] ⇒ {c}        (S3's c; S4 overwrite EXCLUDED)
+  //   changelog    : fromSnapshotExclusive(S1).toSnapshot(S4)  ⇒ +b +c -a +d
+  //
+  // The inclusive/exclusive boundary is the corruption edge (an off-by-one snapshot includes/excludes the
+  // wrong file): the run script's sabotage shifts a range bound by one snapshot and the verify fails closed.
+  //
+  // RESIDUE (row 121, NAMED): this is Java's CURRENT DATA-FILE changelog (whole-file added/deleted), NOT
+  // row-level CDC — UPDATE_BEFORE/UPDATE_AFTER net-row changes are not computed. Matches Rust 1:1.
+  // ===========================================================================================
+
+  static final class IncrementalScanOracle {
+    private IncrementalScanOracle() {}
+
+    /** Direction 1 — Java writes the 4-snapshot table + emits the planned-file basename sets. */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_incremental_scans");
+
+      // The 4-snapshot chain (deterministic basenames a/b/c/d).
+      DataFile a = writeOneRowDataFile(table, schema, spec, new File(dataDir, "a.parquet"), 10L, "a");
+      table.newAppend().appendFile(a).commit();
+      DataFile b = writeOneRowDataFile(table, schema, spec, new File(dataDir, "b.parquet"), 20L, "b");
+      table.newAppend().appendFile(b).commit();
+      DataFile c = writeOneRowDataFile(table, schema, spec, new File(dataDir, "c.parquet"), 30L, "c");
+      table.newAppend().appendFile(c).commit();
+      DataFile d = writeOneRowDataFile(table, schema, spec, new File(dataDir, "d.parquet"), 40L, "d");
+      // OVERWRITE: delete a (by DataFile), add d → op=overwrite (a non-append snapshot).
+      table.newOverwrite().deleteFile(a).addFile(d).commit();
+
+      // The four snapshot ids in commit order (S1..S4), by walking the parent chain.
+      long[] ids = snapshotIdsInOrder(table);
+      if (ids.length != 4) {
+        throw new IllegalStateException(
+            "expected exactly 4 snapshots, got " + ids.length);
+      }
+      long s1 = ids[0];
+      long s2 = ids[1];
+      long s3 = ids[2];
+      long s4 = ids[3];
+
+      // Write the FINAL metadata to a known path so the Rust D1 test loads it deterministically.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // Run the REAL Java incremental APPEND scans over the three ranges → basename sets.
+      Map<String, List<String>> appendSets = new LinkedHashMap<>();
+      appendSets.put(
+          "append_excl",
+          planAppendBasenames(table.newIncrementalAppendScan().fromSnapshotExclusive(s1).toSnapshot(s3)));
+      appendSets.put(
+          "append_incl",
+          planAppendBasenames(table.newIncrementalAppendScan().fromSnapshotInclusive(s1).toSnapshot(s3)));
+      // append_to_cur: NO toSnapshot ⇒ Java defaults `to` to the current snapshot (S4).
+      appendSets.put(
+          "append_to_cur",
+          planAppendBasenames(table.newIncrementalAppendScan().fromSnapshotExclusive(s2)));
+      writeJson(dir.resolve("java_append_sets.json"), appendSetsToJson(appendSets));
+
+      // Run the REAL Java incremental CHANGELOG scan over (S1 excl, S4] → (basename, operation) entries.
+      List<String[]> changelog =
+          planChangelogEntries(
+              table.newIncrementalChangelogScan().fromSnapshotExclusive(s1).toSnapshot(s4));
+      writeJson(dir.resolve("java_changelog_entries.json"), changelogToJson(changelog));
+
+      System.out.println(
+          "generated incremental-scans table + java_append_sets.json + java_changelog_entries.json to "
+              + dir
+              + " (S1="
+              + s1
+              + " S2="
+              + s2
+              + " S3="
+              + s3
+              + " S4="
+              + s4
+              + ")");
+    }
+
+    /**
+     * Direction 2 verify — load the RUST-written 4-snapshot table, run the REAL Java incremental scans over
+     * the SAME ranges, and assert the planned-file BASENAME sets equal the HAND-DECLARED ground truth. A
+     * failure is a real incremental-scan write-incompatibility (Rust wrote a chain Java's incremental scans
+     * plan differently). Returns the failure count so {@code main} can {@code System.exit(1)}.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL incremental-scans-d2: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata = TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL incremental-scans-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      long[] ids;
+      try {
+        ids = snapshotIdsInOrder(table);
+      } catch (RuntimeException error) {
+        System.out.println(
+            "FAIL incremental-scans-d2: could not walk the Rust-written snapshot chain: " + error);
+        return 1;
+      }
+      if (ids.length != 4) {
+        System.out.println(
+            "FAIL incremental-scans-d2: expected exactly 4 snapshots in the Rust chain, got " + ids.length);
+        return 1;
+      }
+      long s1 = ids[0];
+      long s2 = ids[1];
+      long s3 = ids[2];
+      long s4 = ids[3];
+
+      try {
+        // -- APPEND scan: each scenario's planned basename set must equal the hand-declared expectation.
+        failures +=
+            checkSet(
+                "append_excl",
+                planAppendBasenames(
+                    table.newIncrementalAppendScan().fromSnapshotExclusive(s1).toSnapshot(s3)),
+                expectedAppendExcl());
+        failures +=
+            checkSet(
+                "append_incl",
+                planAppendBasenames(
+                    table.newIncrementalAppendScan().fromSnapshotInclusive(s1).toSnapshot(s3)),
+                expectedAppendIncl());
+        failures +=
+            checkSet(
+                "append_to_cur",
+                planAppendBasenames(table.newIncrementalAppendScan().fromSnapshotExclusive(s2)),
+                expectedAppendToCur());
+
+        // -- CHANGELOG scan: the (basename, operation) entry set must equal the hand-declared expectation.
+        List<String[]> changelog =
+            planChangelogEntries(
+                table.newIncrementalChangelogScan().fromSnapshotExclusive(s1).toSnapshot(s4));
+        failures += checkChangelog(changelog, expectedChangelog());
+      } catch (RuntimeException scanError) {
+        System.out.println(
+            "FAIL incremental-scans-d2: Java could not PLAN the Rust-written table's incremental scans: "
+                + scanError);
+        return failures + 1;
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-incremental-scans OK — Java's IncrementalAppendScan/IncrementalChangelogScan over "
+                + "the RUST-written 4-snapshot table match the hand-declared sets (append: {b,c}/{a,b,c}/{c}; "
+                + "changelog: +b +c -a +d)");
+      }
+      return failures;
+    }
+
+    /**
+     * SABOTAGE — shift the `append_excl` exclusive lower bound by ONE snapshot (S1 → S2) over the
+     * RUST-written table and assert the planned set DIVERGES from the expected {b,c}. Returns 1 when the
+     * shifted set differs (the boundary is load-bearing ⇒ fail-closed confirmed) and 0 when it is unchanged
+     * (the proof would be vacuous). This pins the inclusive/exclusive corruption edge: an off-by-one snapshot
+     * MUST change the file set.
+     */
+    static int sabotageShiftedBound(Path dir) {
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println("FAIL incremental-scans-sabotage: missing " + finalMetadata);
+        return 0; // missing artifact ⇒ cannot prove the boundary ⇒ treat as vacuous (hard-fail).
+      }
+      TableMetadata metadata;
+      try {
+        metadata = TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println("FAIL incremental-scans-sabotage: parse error: " + parseError);
+        return 0;
+      }
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+      long[] ids = snapshotIdsInOrder(table);
+      if (ids.length != 4) {
+        System.out.println(
+            "FAIL incremental-scans-sabotage: expected 4 snapshots, got " + ids.length);
+        return 0;
+      }
+      long s2 = ids[1];
+      long s3 = ids[2];
+
+      // The CORRECT range fromSnapshotExclusive(S1) would be {b,c}; we deliberately shift +1 to S2.
+      Set<String> shifted =
+          new TreeSet<>(
+              planAppendBasenames(
+                  table.newIncrementalAppendScan().fromSnapshotExclusive(s2).toSnapshot(s3)));
+      Set<String> correct = expectedAppendExcl(); // {b, c}
+      if (shifted.equals(correct)) {
+        System.out.println(
+            "FAIL incremental-scans-sabotage: shifted bound (S2 excl) STILL equals {b,c} — the off-by-one "
+                + "boundary is NOT load-bearing (vacuous proof): "
+                + shifted);
+        return 0;
+      }
+      System.out.println(
+          "PASS incremental-scans-sabotage: shifting the exclusive bound S1→S2 changed the set from "
+              + correct
+              + " to "
+              + shifted
+              + " — the inclusive/exclusive boundary is load-bearing (fail-closed)");
+      return 1;
+    }
+
+    // -- Hand-declared ground truth (anti-circular — IDENTICAL to expected_*_scenarios() in the Rust test). --
+
+    private static Set<String> expectedAppendExcl() {
+      return new TreeSet<>(Arrays.asList("b.parquet", "c.parquet"));
+    }
+
+    private static Set<String> expectedAppendIncl() {
+      return new TreeSet<>(Arrays.asList("a.parquet", "b.parquet", "c.parquet"));
+    }
+
+    private static Set<String> expectedAppendToCur() {
+      return new TreeSet<>(Arrays.asList("c.parquet"));
+    }
+
+    /** The expected `(basename -> operation)` changelog entries: +b +c -a +d. */
+    private static Map<String, String> expectedChangelog() {
+      Map<String, String> expected = new TreeMap<>();
+      expected.put("a.parquet", "DELETE");
+      expected.put("b.parquet", "INSERT");
+      expected.put("c.parquet", "INSERT");
+      expected.put("d.parquet", "INSERT");
+      return expected;
+    }
+
+    // -- Scan execution → comparable basename sets. --
+
+    /** Run an IncrementalAppendScan to completion and collect the BASENAME set of its planned data files. */
+    private static List<String> planAppendBasenames(IncrementalAppendScan scan) {
+      Set<String> basenames = new TreeSet<>();
+      try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
+        for (FileScanTask task : tasks) {
+          basenames.add(basename(task.file().path().toString()));
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to plan incremental append scan", error);
+      }
+      return new ArrayList<>(basenames);
+    }
+
+    /**
+     * Run an IncrementalChangelogScan to completion and collect `[basename, operation]` pairs. Each
+     * {@link ChangelogScanTask} is a {@link ContentScanTask} over a {@link DataFile} (an
+     * {@code AddedRowsScanTask} ⇒ INSERT or a {@code DeletedDataFileScanTask} ⇒ DELETE), so the file path +
+     * the {@link ChangelogOperation} are read directly. This is the DATA-FILE changelog (whole-file
+     * added/deleted), Java's current behavior — NOT row-level CDC.
+     */
+    @SuppressWarnings("unchecked")
+    private static List<String[]> planChangelogEntries(IncrementalChangelogScan scan) {
+      List<String[]> entries = new ArrayList<>();
+      try (CloseableIterable<ChangelogScanTask> tasks = scan.planFiles()) {
+        for (ChangelogScanTask task : tasks) {
+          ContentScanTask<DataFile> fileTask = (ContentScanTask<DataFile>) task;
+          entries.add(
+              new String[] {basename(fileTask.file().path().toString()), task.operation().name()});
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to plan incremental changelog scan", error);
+      }
+      return entries;
+    }
+
+    // -- Assertions (verify side). --
+
+    private static int checkSet(String name, List<String> actualList, Set<String> expected) {
+      Set<String> actual = new TreeSet<>(actualList);
+      if (actual.equals(expected)) {
+        System.out.println("PASS incremental-scans-d2 [" + name + "]: " + actual);
+        return 0;
+      }
+      System.out.println(
+          "FAIL incremental-scans-d2 [" + name + "]: java-planned=" + actual + " expected=" + expected);
+      return 1;
+    }
+
+    private static int checkChangelog(List<String[]> actualEntries, Map<String, String> expected) {
+      Map<String, String> actual = new TreeMap<>();
+      for (String[] entry : actualEntries) {
+        actual.put(entry[0], entry[1]);
+      }
+      if (actual.equals(expected)) {
+        System.out.println("PASS incremental-scans-d2 [changelog]: " + actual);
+        return 0;
+      }
+      System.out.println(
+          "FAIL incremental-scans-d2 [changelog]: java-planned=" + actual + " expected=" + expected);
+      return 1;
+    }
+
+    // -- Helpers. --
+
+    /** Write a REAL one-row parquet data file (id, data) and return its DataFile (the FileHelpers template). */
+    private static DataFile writeOneRowDataFile(
+        BaseTable table, Schema schema, PartitionSpec spec, File file, long id, String data)
+        throws IOException {
+      GenericRecord record = GenericRecord.create(schema);
+      record.setField("id", id);
+      record.setField("data", data);
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(record);
+      }
+      return writer.toDataFile();
+    }
+
+    /** The snapshot ids in commit order (root → current), walking the parent chain from the current head. */
+    private static long[] snapshotIdsInOrder(Table table) {
+      List<Long> ids = new ArrayList<>();
+      Snapshot current = table.currentSnapshot();
+      while (current != null) {
+        ids.add(current.snapshotId());
+        Long parent = current.parentId();
+        current = parent == null ? null : table.snapshot(parent);
+      }
+      java.util.Collections.reverse(ids);
+      long[] out = new long[ids.size()];
+      for (int i = 0; i < ids.size(); i++) {
+        out[i] = ids.get(i);
+      }
+      return out;
+    }
+
+    /** Strip a path down to its file basename (the cross-engine comparison key). */
+    private static String basename(String path) {
+      int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+      return slash < 0 ? path : path.substring(slash + 1);
+    }
+
+    private static String appendSetsToJson(Map<String, List<String>> appendSets) {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartObject();
+            gen.writeObjectFieldStart("scenarios");
+            for (Map.Entry<String, List<String>> entry : appendSets.entrySet()) {
+              gen.writeArrayFieldStart(entry.getKey());
+              for (String basename : entry.getValue()) {
+                gen.writeString(basename);
+              }
+              gen.writeEndArray();
+            }
+            gen.writeEndObject();
+            gen.writeEndObject();
+          },
+          true);
+    }
+
+    private static String changelogToJson(List<String[]> entries) {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (String[] entry : entries) {
+              gen.writeStartObject();
+              gen.writeStringField("basename", entry[0]);
+              gen.writeStringField("operation", entry[1]);
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
     }
   }
 
