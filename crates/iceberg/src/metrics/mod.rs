@@ -46,14 +46,13 @@
 //! and the report's top-level field names (`table-name`, `snapshot-id`, `schema-id`,
 //! `projected-field-ids`, `projected-field-names`, `metrics`, `metadata`).
 //!
-//! **Deferred divergence — the `filter` field.** Java serializes the scan `filter`
-//! ([`Expression`]) with `ExpressionParser.toJson`, a structured expression-tree JSON.
-//! Rust serializes the [`Predicate`] with its own `serde` derive, which does NOT byte-match
-//! Java's `ExpressionParser` shape. Porting `ExpressionParser` is a large, separate effort;
-//! it is tracked as a follow-up. The metric data — the high-value part of the contract — is
-//! faithful; only the `filter` sub-document differs.
-//!
-//! [`Expression`]: crate::expr::Predicate
+//! **The `filter` field** is serialized through the canonical Java-`ExpressionParser` codec
+//! ([`crate::expr::expression_parser`]) via custom serde, so the emitted `ScanReport.filter`
+//! sub-document byte-matches Java `ExpressionParser.toJson`. Deserialization mirrors Java's
+//! schema-less `ScanReportParser.fromJson` (which reads the filter via untyped
+//! `ExpressionParser.fromJson(JsonNode)`): integral literals become `long`, floating `double`,
+//! and date/time/timestamp/decimal literals collapse to their JSON scalar — exactly as in Java,
+//! because a `ScanReport` carries no schema to recover those types.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -472,7 +471,12 @@ pub struct ScanReport {
     /// The snapshot the scan read. Java `snapshotId()` → `snapshot-id`.
     #[serde(rename = "snapshot-id")]
     pub snapshot_id: i64,
-    /// The row filter applied. Java `filter()`. See module docs for the JSON divergence.
+    /// The row filter applied. Java `filter()`. Serialized via the canonical Java
+    /// `ExpressionParser` codec (see module docs).
+    #[serde(
+        serialize_with = "serialize_filter",
+        deserialize_with = "deserialize_filter"
+    )]
     pub filter: Predicate,
     /// The id of the schema the scan projected against. Java `schemaId()` → `schema-id`.
     #[serde(rename = "schema-id")]
@@ -492,6 +496,28 @@ pub struct ScanReport {
     /// writes `metadata` when the map is non-empty).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+}
+
+/// Serialize the scan `filter` as canonical Java-`ExpressionParser` JSON (an embedded object, not
+/// a string), so the `ScanReport.filter` sub-document byte-matches Java `ExpressionParser.toJson`.
+fn serialize_filter<S>(filter: &Predicate, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    use serde::ser::Error as _;
+    let json = crate::expr::expression_parser::to_json(filter).map_err(S::Error::custom)?;
+    // Re-parse into a serde_json::Value so the filter is embedded as a JSON sub-document (matching
+    // Java's `writeFieldName("filter"); ExpressionParser.toJson(filter, gen)`), not as a string.
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(S::Error::custom)?;
+    value.serialize(serializer)
+}
+
+/// Deserialize the scan `filter` from canonical Java-`ExpressionParser` JSON via the schema-less
+/// (untyped) path, mirroring Java `ScanReportParser.fromJson` → `ExpressionParser.fromJson(node)`.
+fn deserialize_filter<'de, D>(deserializer: D) -> std::result::Result<Predicate, D::Error>
+where D: serde::Deserializer<'de> {
+    use serde::de::Error as _;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let json = serde_json::to_string(&value).map_err(D::Error::custom)?;
+    crate::expr::expression_parser::from_json_untyped(&json).map_err(D::Error::custom)
 }
 
 /// A metrics report produced by a table operation.
@@ -721,6 +747,13 @@ mod tests {
             "projected-field-names present"
         );
         assert!(json.get("filter").is_some(), "filter present");
+        // The filter is the canonical Java `ExpressionParser` JSON (an embedded object), NOT the
+        // old Rust-`Predicate`-serde shape. `x < 10` ⇒ `{"type":"lt","term":"x","value":10}`.
+        assert_eq!(
+            json["filter"],
+            serde_json::json!({ "type": "lt", "term": "x", "value": 10 }),
+            "filter byte-matches Java ExpressionParser.toJson shape"
+        );
         assert!(json.get("metrics").is_some(), "metrics present");
         // `metadata` is empty here ⇒ omitted, matching Java.
         assert!(json.get("metadata").is_none(), "empty metadata omitted");

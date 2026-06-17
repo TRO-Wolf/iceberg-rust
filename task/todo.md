@@ -313,6 +313,47 @@ SnapshotTable/MigrateTable need an external-table source → stay ❌; both defe
 > (identity(unknown) accepted, NOT mirror-Variant). Next: pick a block-3 (stretch: ExpressionParser-JSON 147;
 > Catalog-accessors offline; or the deferred BatchScan-U1 / RewriteTablePath / AggregateEvaluator partials).
 
+## BLOCK 3 (8-HOUR PLAN, 2026-06-17, Opus, signed off — the SPINE) — 3 sequential AC·OO PRs
+
+Grounded by an 8-unit parallel scoping pass (vs main #81). **The easy ✅ flips are spent** — block 3 trades
+✅-density for capability-advancement: only ExpressionParser is a clean ❌→✅ in one unit; the rest are
+❌→🟡 advances or matrix corrections. Each independent → own PR, run one-at-a-time. Expected: 1 ✅ (147) +
+2 ❌→🟡 (148, 149) + matrix corrections; parity 32→33✅, ❌ 14→12. Front-loaded with the marquee ✅; only
+G1 is oracle-dependent.
+
+- [x] **G1 — `ExpressionParser` JSON (toJson/fromJson)** — **DONE 2026-06-17 (#TBD). row 147 ❌→✅** + retired
+      the ScanReport `filter` divergence (row 123 annotated, stays 🟡). Canonical codec over `Predicate`
+      (`expr/expression_parser.rs`): byte-exact wire shape + op hyphen-map + SingleValueParser value forms;
+      schema-aware `from_json(_, &Schema)` recovers the typed Datum (the typed-vs-untyped staller — handled);
+      transform/aggregate terms rejected; depth-limited read recursion; wired into ScanReport.filter via custom
+      serde. Converged 2 cycles (cycle-1 MEDIUM = float/double byte-parity → cycle-2 ported Java
+      `Float/Double.toString` formatting, byte-confirmed vs the jar). Live interop D1+D2 byte-exact over 34
+      expressions (0 failures) + 4-sabotage battery fails closed; Critic ran 4 source mutations (op-map,
+      date-codec, float-E, binary-hex). **NAMED RESIDUE (honest, documented in row 147 + pinned by a unit
+      test):** JDK-11 `FloatingDecimal` non-minimal floats (~0.33% large-magnitude) — Rust emits the minimal
+      form (== JDK 19+), diverging only from the JDK-11 oracle; non-finite floats rejected. 2 LOW findings
+      ACCEPTED-as-is (write-side depth limit — input already bounded by the read-side cap; signed-zero
+      round-trip test gap — write preserves it). Files: `expression_parser.rs`, `interop_expression.rs`, `run-interop-expression.sh`.
+- [ ] **G2 — `AggregateEvaluator` (count/min/max pushdown)** (3h, MED, offline) → **row 148 ❌→🟡**.
+      UnboundAggregate/BoundAggregate/AggregateEvaluator computing count(*)/count(col)/min/max from manifest
+      DataFile metrics (value_counts/null_value_counts/lower_bounds/upper_bounds) WITHOUT scanning. CUT
+      Bound/UnboundExtract (FRONTIER-PARKED variant-shredding extract term) — annotate. Reuse expr/ bound
+      machinery + the metrics evaluators. STALLER (mutation-test): metrics-unavailable (hasValue→false) MUST
+      invalidate the aggregator (force a scan) — else pushed-down counts are silently wrong. Self-contained,
+      offline; row stays 🟡 (interop deferred). Aggregate tree + evaluator reach ✅-quality.
+- [ ] **G3 — Catalog accessors + the Glue/S3Tables-views matrix correction** (2h, LOW, offline) → **row 149
+      ❌→🟡**. Four non-breaking DEFAULT `Catalog` methods: name() (Java default), invalidate_table() /
+      invalidate_view() (Java/ViewCatalog default no-ops), properties() (RESTCatalog-only in Java — include as
+      a documented Rust-convenience default, empty map). Wire to the name+props each impl holds; MemoryCatalog
+      needs a 1-field plumbing fix (memory/catalog.rs:135 drops them). commitTransaction(List) SPLIT OUT
+      (REST-server multi-table commit — deferred). #[automock] auto-covers defaults. ALSO (matrix correction,
+      verified by scoping): rewrite the rows 124(a)/125 ViewCatalog residue — Glue/S3Tables view-unsupported
+      is parity-CORRECT (Java GlueCatalog 1.10.0 has no ViewCatalog #12488; S3Tables has no view API), NOT a
+      gap; annotate SessionCatalog row 126 as assessed-deferred (dead surface — Rust binds identity per-catalog).
+
+Block-3 stretch / deferred: BatchScan-U1 (ScanTaskGroup/bin-pack, 146 🟡, offline) · RewriteTablePath
+(137 🟡, provider 10/2, 4.5h — full TableMetadata rebuild) · Avro-data-READ (own ~6.5h block, 117 🟡).
+
 Block-2 stretch (own PRs, if the spine beats estimates): `ExpressionParser` JSON (row 147 ✅ + retires the
 ScanReport filter divergence; L/3.5h/MED/3cy — type-erasure schema-overload risk) · Catalog accessors
 name/properties/invalidate* (❌→🟡; M/2h/**LOW/offline** — the parked "swap-in for lower 529 exposure"
