@@ -365,6 +365,29 @@ G1 is oracle-dependent.
 > 19+); G2 matched Java's real count(col)=value−null via bytecode; G3 corrected a false-premise residue +
 > its own 2 doc nits. Next block: BatchScan U1/U2 (scan completion), RewriteTablePath, or Avro-data-read.
 
+## ROADMAP CHECK (2026-06-17, Opus) — audit + 1 integrity fill-in
+
+A verify-driven workflow audited Roadmap/GAP_MATRIX/live-code alignment + adversarially mutation-tested
+the recent ✅ flips. **Verdict: on track.** Matrix accurate (~33✅/24🟡/11❌, pipe-clean); ActionsProvider
+genuinely 9/3 in code; **6 of 7 recent greens (134/89/147/120-121/151/138) held under hostile
+mutation-testing.** One crack found + fixed:
+
+- [x] **VAO — `ReplacePartitions.validateAppendOnly` interop** — **DONE 2026-06-17.** The skeptic refuted
+      row 144's ✅: `validateAppendOnly` had flipped on unit tests ALONE (#75), no interop — and unlike our
+      no-Spark-oracle cases it has a real engine-agnostic Java oracle (core-API, not Spark). Built the
+      missing bidirectional interop (`ValidateAppendOnlyOracle` + `run-interop-validate-append-only.sh` +
+      `interop_validate_append_only.rs`): 4-case behavior-equivalence battery, Rust REJECTS exactly where
+      Java THROWS `DeleteException`, COMMITS exactly where Java commits; `javap -c` re-decode confirmed the
+      Rust guard already matches Java — **NO Rust fix needed.** AC·OO converged 1 cycle, Critic refutation
+      FAILED (guard-neuter reds 2 unit tests + the mirror). Row 144 ✅ now meets the unit-tests-AND-interop
+      bar. _Orchestrator re-ran the oracle (D1 4/4, D2 1-pass, sabotage fail-closed) + offline gate._
+
+**Doc-drift follow-up (queued, next PR):** the Roadmap's "Current state" + "Headline gaps" prose drifted
+16 places (all UNDER-claims — doc behind reality: stale ❌ for RewritePositionDeleteFiles/ComputePartitionStats/
+Catalog-accessors/validateAppendOnly/unknown; "5/8 actions"→9/12; incremental scans called interop-deferred
+but ✅). Plus 3 GAP_MATRIX internal nits (row 105 xref 140→150; row 145 xref 134→144; row 138 stale 8/4→9/3).
+Package as a docs-only correction PR (shape of #70) after VAO merges.
+
 Block-3 stretch / deferred: BatchScan-U1 (ScanTaskGroup/bin-pack, 146 🟡, offline) · RewriteTablePath
 (137 🟡, provider 10/2, 4.5h — full TableMetadata rebuild) · Avro-data-READ (own ~6.5h block, 117 🟡).
 

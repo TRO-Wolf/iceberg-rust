@@ -629,6 +629,23 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "verify-interop-validate-append-only":
+        // SAME-COMMIT append-only ASSERTION interop (GAP_MATRIX row 144), DIRECTION 1 — "Java DRIVES
+        // the real core API". ReplacePartitions.validateAppendOnly() is pure iceberg-core (NOT
+        // Spark-surface), so Java builds each case's table itself and runs the REAL
+        // newReplacePartitions()[.validateAppendOnly()].commit(), asserting THROW (the
+        // DeleteException/ValidationException family — NON-retryable) vs COMMIT against a HAND-DECLARED
+        // expectation. Rust's interop_validate_append_only.rs mirrors the SAME four cases against the
+        // SAME expectations (anti-circular: neither side derives the other's expectation). Nothing is
+        // read from Rust here; the case tables are built fresh under <dir>.
+        Path validateAppendOnlyDir = requireFixturesDir("interop.validate_append_only.dir");
+        int validateAppendOnlyFailures = ValidateAppendOnlyOracle.verify(validateAppendOnlyDir);
+        System.out.println(
+            "verify-interop-validate-append-only: " + validateAppendOnlyFailures + " failures");
+        if (validateAppendOnlyFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-rowdelta-conflict":
         // CONFLICT-VALIDATION RowDelta interop (increment C3) — the RICHEST write-action conflict unit
         // (GAP_MATRIX row 94). For each scenario, writes an UNPARTITIONED V2 {id long, y long} table
@@ -10099,6 +10116,271 @@ public final class InteropOracle {
         GenericRecord record = GenericRecord.create(SCHEMA);
         record.setField("id", id);
         record.setField("category", category);
+        rows.add(record);
+      }
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
+    }
+  }
+
+  // =============================================================================================
+  // ValidateAppendOnlyOracle — SAME-COMMIT append-only ASSERTION interop (GAP_MATRIX row 144).
+  //
+  // `ReplacePartitions.validateAppendOnly()` is a PURE engine-agnostic iceberg-core API (NOT a
+  // Spark-surface class), so unlike the eq/pos conversion oracles Java CAN DRIVE the real action
+  // and observe its commit decision directly. The 1:1 evidence for a validation guard is NOT a
+  // byte-level artifact (the guard fires and nothing is written) — it is "Java throws <=> Rust
+  // rejects under IDENTICAL table+commit shapes". So this is a BIDIRECTIONAL behavior-equivalence
+  // battery, each side self-contained:
+  //   - D1 (this oracle): Java builds each case's table and runs the REAL
+  //       table.newReplacePartitions().addFile(..)[.validateAppendOnly()].commit()
+  //     asserting THROW (DeleteException, a ValidationException — NON-retryable) vs COMMIT against a
+  //     HAND-DECLARED expectation; System.exit(1) on any mismatch.
+  //   - D2 (Rust mirror, interop_validate_append_only.rs): builds the equivalent tables and runs
+  //       replace_partitions().add_file(..)[.validate_append_only()]
+  //     asserting REJECT (DataInvalid, non-retryable) vs COMMIT against the SAME hand-declared
+  //     expectations.
+  //
+  // The Java 1.10.0 contract (decoded from the iceberg-core jar via javap -c):
+  //   BaseReplacePartitions.validateAppendOnly() -> MergingSnapshotProducer.failAnyDelete() ->
+  //   ManifestFilterManager.failAnyDelete = true. During filterManifestWithDeletedFiles, the moment a
+  //   live entry would be dropped while failAnyDelete is set, it throws
+  //   `new ManifestFilterManager$DeleteException(spec.partitionToPath(file.partition()))`.
+  //   DeleteException extends org.apache.iceberg.exceptions.ValidationException extends
+  //   RuntimeException (NOT CommitFailedException) — i.e. NON-retryable.
+  //
+  // The four cases (hand-declared IDENTICALLY here and in interop_validate_append_only.rs):
+  //   case                        | table                    | replace add | flag | expected
+  //   matching_partition          | partitioned, cat=a live  | cat=a       | YES  | THROW
+  //   empty_new_partition         | partitioned, cat=a live  | cat=b       | YES  | COMMIT
+  //   unpartitioned_full_replace  | unpartitioned, non-empty | (full)      | YES  | THROW
+  //   matching_partition_no_flag  | partitioned, cat=a live  | cat=a       | NO   | COMMIT
+  //
+  // matching_partition_no_flag is the SAME table+payload as matching_partition WITHOUT the flag — it
+  // proves the FLAG is the gate (a replace that removes a live file commits fine without the
+  // assertion). empty_new_partition is the false-positive guard (filling a previously-empty partition
+  // removes nothing, so even with the flag it must commit). unpartitioned_full_replace pins that an
+  // unpartitioned replace removes ALL existing files (Java deleteByRowFilter(alwaysTrue)) so the
+  // assertion rejects it.
+  //
+  // This is a TEST-ONLY ORACLE (a dev tool) — NOT shipped, NOT part of the offline cargo gate (it
+  // needs Java + Maven). No new pom deps (the SAME iceberg-core/data/parquet 1.10.0 the conflict
+  // oracles already pull). Driven by dev/java-interop/run-interop-validate-append-only.sh.
+  // =============================================================================================
+  static final class ValidateAppendOnlyOracle {
+    private ValidateAppendOnlyOracle() {}
+
+    /** A case's hand-declared outcome under the real `validateAppendOnly` commit. */
+    private enum Expected {
+      /** The commit must THROW (Java DeleteException / ValidationException — non-retryable). */
+      THROW,
+      /** The commit must SUCCEED (the replace is purely additive, or the flag is off). */
+      COMMIT
+    }
+
+    /**
+     * One battery case: a stable name, whether the table is partitioned by identity(category),
+     * whether the {@code validateAppendOnly()} flag is set, the partition the replace's added file
+     * lands in (the {@code category} value, or {@code null} for the unpartitioned table), and the
+     * hand-declared expected outcome.
+     */
+    private static final class Case {
+      final String name;
+      final boolean partitioned;
+      final boolean validateAppendOnly;
+      final String addCategory; // null for the unpartitioned table
+      final Expected expected;
+
+      Case(
+          String name,
+          boolean partitioned,
+          boolean validateAppendOnly,
+          String addCategory,
+          Expected expected) {
+        this.name = name;
+        this.partitioned = partitioned;
+        this.validateAppendOnly = validateAppendOnly;
+        this.addCategory = addCategory;
+        this.expected = expected;
+      }
+    }
+
+    // The four cases — MUST match interop_validate_append_only.rs::cases() exactly (names, shapes,
+    // expectations). The expectation is HAND-DECLARED, never derived from Rust's output.
+    private static final List<Case> CASES =
+        List.of(
+            // (A) replace a NON-EMPTY matching partition with the flag set -> a live file is removed
+            //     -> THROW.
+            new Case("matching_partition", true, true, "a", Expected.THROW),
+            // (B) replace a brand-new EMPTY partition with the flag set -> nothing removed (pure add)
+            //     -> COMMIT (the false-positive guard).
+            new Case("empty_new_partition", true, true, "b", Expected.COMMIT),
+            // (C) full-replace a NON-EMPTY UNPARTITIONED table with the flag set -> ALL files removed
+            //     -> THROW.
+            new Case("unpartitioned_full_replace", false, true, null, Expected.THROW),
+            // (D) the SAME non-empty matching-partition replace WITHOUT the flag -> the gate is open
+            //     -> COMMIT (proves the flag is what rejects).
+            new Case("matching_partition_no_flag", true, false, "a", Expected.COMMIT));
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "category", Types.StringType.get()));
+
+    /**
+     * D1 — Java DRIVES the real {@code newReplacePartitions().validateAppendOnly().commit()} and
+     * asserts the THROW/COMMIT outcome equals each case's hand-declared expectation. Each case is run
+     * in a FRESH table directory under {@code dir}; nothing is read from Rust. Returns the number of
+     * mismatches (0 = all cases matched).
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      for (Case testCase : CASES) {
+        try {
+          boolean threw = runReplaceAndDetect(dir, testCase);
+          boolean expectedThrow = testCase.expected == Expected.THROW;
+          if (threw == expectedThrow) {
+            System.out.println(
+                "PASS validate-append-only["
+                    + testCase.name
+                    + "]: outcome "
+                    + (threw ? "THROW" : "COMMIT")
+                    + " matches hand-declared expected");
+          } else {
+            System.out.println(
+                "FAIL validate-append-only["
+                    + testCase.name
+                    + "]: outcome "
+                    + (threw ? "THROW" : "COMMIT")
+                    + " but expected "
+                    + testCase.expected);
+            failures++;
+          }
+        } catch (RuntimeException | IOException error) {
+          System.out.println(
+              "FAIL validate-append-only["
+                  + testCase.name
+                  + "]: unexpected error building/running the replace: "
+                  + error);
+          failures++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-validate-append-only OK — Java's real ReplacePartitions.validateAppendOnly "
+                + "matches every hand-declared outcome over all "
+                + CASES.size()
+                + " cases (matching_partition THROW, empty_new_partition COMMIT, "
+                + "unpartitioned_full_replace THROW, matching_partition_no_flag COMMIT)");
+      }
+      return failures;
+    }
+
+    /**
+     * Build the case's table, run the real {@code newReplacePartitions()} (with the flag iff the case
+     * sets it), and return {@code true} iff the commit threw a {@link
+     * org.apache.iceberg.exceptions.ValidationException} (the Java {@code DeleteException} family —
+     * NON-retryable). A {@code false} return means the commit SUCCEEDED.
+     */
+    private static boolean runReplaceAndDetect(Path dir, Case testCase) throws IOException {
+      Path caseDir = dir.resolve(testCase.name);
+      File tableDir = caseDir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      mkdirs(metadataDir);
+      mkdirs(dataDir);
+
+      PartitionSpec spec =
+          testCase.partitioned
+              ? PartitionSpec.builderFor(SCHEMA).identity("category").build()
+              : PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              SCHEMA, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_validate_append_only_" + testCase.name);
+
+      // S0: the base live file. For the partitioned cases it lands in cat=a (so a cat=a replace
+      // removes it, a cat=b replace does not); for the unpartitioned case it is the single
+      // non-empty file a full replace removes.
+      DataFile base =
+          testCase.partitioned
+              ? writeFile(
+                  table, spec, "a", new File(dataDir, "category=a/00000-base.parquet"), new long[] {1L})
+              : writeFile(table, spec, null, new File(dataDir, "00000-base.parquet"), new long[] {1L});
+      table.newFastAppend().appendFile(base).commit();
+
+      // The replace's added file. For the partitioned cases it lands in `addCategory` (cat=a removes
+      // the base file; cat=b fills an empty partition). For the unpartitioned case any added file is
+      // a full replace.
+      String addCategory = testCase.addCategory;
+      File addFile =
+          testCase.partitioned
+              ? new File(dataDir, "category=" + addCategory + "/00001-replace.parquet")
+              : new File(dataDir, "00001-replace.parquet");
+      DataFile fresh = writeFile(table, spec, addCategory, addFile, new long[] {999L});
+
+      org.apache.iceberg.ReplacePartitions replace = table.newReplacePartitions().addFile(fresh);
+      if (testCase.validateAppendOnly) {
+        replace = replace.validateAppendOnly();
+      }
+      try {
+        replace.commit();
+        return false; // COMMIT
+      } catch (org.apache.iceberg.exceptions.ValidationException validationFailure) {
+        // DeleteException (the failAnyDelete throw) is a ValidationException — NON-retryable.
+        return true; // THROW
+      }
+    }
+
+    /**
+     * Write a REAL parquet {@code {id, category}} file. When {@code category} is non-null the file is
+     * routed to that identity(category) partition (every row stamped with it); when null the table is
+     * unpartitioned and the file carries no partition. Same idiom as {@link
+     * ReplacePartitionsConflictOracle#writePartitionedFile}.
+     */
+    private static DataFile writeFile(
+        BaseTable table, PartitionSpec spec, String category, File file, long[] ids)
+        throws IOException {
+      File parent = file.getParentFile();
+      if (!parent.isDirectory() && !parent.mkdirs()) {
+        throw new IOException("failed to create data dir " + parent);
+      }
+
+      PartitionData partition = null;
+      if (category != null) {
+        partition = new PartitionData(spec.partitionType());
+        partition.set(0, category);
+      }
+
+      List<Record> rows = new ArrayList<>();
+      for (long id : ids) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", id);
+        record.setField("category", category == null ? "x" : category);
         rows.add(record);
       }
 
