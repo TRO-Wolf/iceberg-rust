@@ -1419,3 +1419,32 @@ fn test_variant_literal_to_json_is_rejected() {
         error.message()
     );
 }
+
+// RISK: `unknown` has NO single-value byte encoding (its values are always null; Java keeps no
+// value class for `UnknownType`). `Datum::try_from_bytes` must REJECT it rather than fabricate a
+// `Datum`. Mutation guard: a value-producing arm here would flip this test red.
+#[test]
+fn test_datum_try_from_bytes_rejects_unknown() {
+    let error = Datum::try_from_bytes(&[0u8, 1u8, 2u8], PrimitiveType::Unknown)
+        .expect_err("unknown has no single-value byte encoding");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(
+        error.message().contains("unknown"),
+        "the rejection must name the unknown type, got: {}",
+        error.message()
+    );
+}
+
+// RISK: a null single-value JSON for an `unknown` column must round-trip to `None` (the column is
+// always null), mirroring Java `SingleValueParser.fromJson` returning null for a null node of any
+// type. A non-null JSON value for an unknown column must NOT silently parse.
+#[test]
+fn test_unknown_single_value_json_null_is_none() {
+    let none = Literal::try_from_json(JsonValue::Null, &Primitive(PrimitiveType::Unknown))
+        .expect("a null unknown value parses");
+    assert_eq!(none, None, "a null unknown single-value must be None");
+
+    let error = Literal::try_from_json(JsonValue::from(7), &Primitive(PrimitiveType::Unknown))
+        .expect_err("a non-null unknown value must not parse");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+}

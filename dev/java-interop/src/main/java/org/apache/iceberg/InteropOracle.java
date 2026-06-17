@@ -680,6 +680,27 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-unknown":
+        // V3 `unknown` primitive type (BLOCK-2 G2) — METADATA-ONLY interop. Java writes a V3 schema
+        // carrying an `unknown` column at every placement (top-level, nested struct, list element,
+        // map value) to java.metadata.json + java.schema.json via TableMetadataParser/SchemaParser.
+        // `unknown` is an always-null column with no physical storage, so the whole contract is this
+        // schema/metadata round-trip — no data files, no Docker.
+        Path unknownGenDir = requireFixturesDir("interop.unknown.dir");
+        UnknownTypeOracle.generate(unknownGenDir);
+        break;
+      case "verify-interop-unknown":
+        // V3 `unknown` interop, DIRECTION 2 — "Java reads what RUST writes". The Rust GEN test (env
+        // ICEBERG_INTEROP_UNKNOWN_GEN_DIR) wrote rust.metadata.json; Java parses it via
+        // TableMetadataParser and asserts the parsed schema struct equals the canonical unknown
+        // schema (field id / name / type / required recursively).
+        Path unknownVerifyDir = requireFixturesDir("interop.unknown.dir");
+        int unknownFailures = UnknownTypeOracle.verify(unknownVerifyDir);
+        System.out.println("verify-interop-unknown: " + unknownFailures + " failures");
+        if (unknownFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-builder-flips":
         // BUILDER-FLIPS interop (Wave 3) — DeleteFiles' two builder-flip capabilities:
         // deleteFromRowFilter(Expression) (GAP_MATRIX row 135) + caseSensitive(boolean) (row 134),
@@ -18197,6 +18218,105 @@ public final class InteropOracle {
           "generate-interop-wap-data-java-table: cherry-picked table + artifacts written to " + dir
               + " (7 rows, source_snapshot_id=" + sourceId
               + ", published_wap_id=" + publishedWapId + ")");
+    }
+  }
+
+  // ===========================================================================================
+  // UnknownType oracle — the V3 `unknown` primitive (Types.UnknownType, typeId UNKNOWN, toString
+  // "unknown"; Schema.MIN_FORMAT_VERSIONS gates it at v3). This is a METADATA-ONLY round-trip: a V3
+  // schema carrying an `unknown` column (top-level + nested in a struct, a list element, and a map
+  // value) is written via TableMetadataParser.toJson (java.metadata.json), and the Rust-written
+  // metadata (rust.metadata.json) is parsed back and compared STRUCTURALLY (Schema#asStruct, which
+  // includes field id / name / type / required / doc / default recursively). No data files: `unknown`
+  // is an always-null column with no physical storage (TypeToMessageType returns null), so the whole
+  // contract for this type is the schema/metadata round-trip.
+  // ===========================================================================================
+
+  static final class UnknownTypeOracle {
+    private UnknownTypeOracle() {}
+
+    private static final String UNKNOWN_LOCATION = "s3://interop-bucket/unknown_type";
+
+    /** The single V3 schema exercised in both directions: `unknown` at every placement. */
+    private static Schema unknownSchema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          // top-level unknown column
+          Types.NestedField.optional(2, "u", Types.UnknownType.get()),
+          // unknown nested in a struct
+          Types.NestedField.optional(
+              3,
+              "payload",
+              Types.StructType.of(
+                  Types.NestedField.optional(4, "nested_u", Types.UnknownType.get()))),
+          // unknown as a list element
+          Types.NestedField.optional(
+              5, "events", Types.ListType.ofOptional(6, Types.UnknownType.get())),
+          // unknown as a map value (string key)
+          Types.NestedField.optional(
+              7,
+              "tags",
+              Types.MapType.ofOptional(
+                  8, 9, Types.StringType.get(), Types.UnknownType.get())));
+    }
+
+    private static TableMetadata buildMetadata() {
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "3");
+      return TableMetadata.newTableMetadata(
+          unknownSchema(),
+          PartitionSpec.unpartitioned(),
+          SortOrder.unsorted(),
+          UNKNOWN_LOCATION,
+          props);
+    }
+
+    private static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      TableMetadata java = buildMetadata();
+      // The metadata-level fixture the Rust Direction-1 test reads, and the Java-view ground truth
+      // the run-script diffs the Rust-written metadata against.
+      writeJson(dir.resolve("java.metadata.json"), TableMetadataParser.toJson(java));
+      // Also emit the bare schema JSON (SchemaParser.toJson) — the most direct evidence that Java
+      // writes `unknown` as the bare string and re-parses it to UnknownType.
+      writeJson(dir.resolve("java.schema.json"), SchemaParser.toJson(java.schema()));
+      System.out.println(
+          "generate-interop-unknown: wrote java.metadata.json + java.schema.json to " + dir);
+    }
+
+    /** Returns the number of failures. */
+    private static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path rustPath = dir.resolve("rust.metadata.json");
+      if (!Files.exists(rustPath)) {
+        System.out.println("FAIL unknown: missing rust.metadata.json (run the Rust gen)");
+        return 1;
+      }
+
+      TableMetadata rust;
+      try {
+        rust = TableMetadataParser.fromJson(rustPath.toString(), readString(rustPath));
+      } catch (RuntimeException parseError) {
+        System.out.println("FAIL unknown: Java could not parse rust.metadata.json: " + parseError);
+        return 1;
+      }
+
+      // Compare against the schema AS REINDEXED by newTableMetadata (the same fresh-id assignment
+      // the generate step applied) — NOT the raw `unknownSchema()` ids — so the field-id layout
+      // matches what Java actually wrote (and what Rust round-tripped from the fixture).
+      Schema expected = buildMetadata().schema();
+      if (!expected.asStruct().equals(rust.schema().asStruct())) {
+        System.out.println(
+            "FAIL unknown: schema struct mismatch:\n  java= "
+                + expected.asStruct()
+                + "\n  rust= "
+                + rust.schema().asStruct());
+        failures++;
+      } else {
+        System.out.println("PASS unknown: Java parsed the Rust-written unknown schema, structs equal");
+      }
+      System.out.println("verify-interop-unknown: " + failures + " failures");
+      return failures;
     }
   }
 

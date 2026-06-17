@@ -285,12 +285,17 @@ SnapshotTable/MigrateTable need an external-table source → stay ❌; both defe
       Files: `rewrite_position_delete_files.rs`(+tests), `interop_rewrite_pos_deletes.rs`, `run-interop-rewrite-pos-deletes.sh`.
       _Superseded plan note:_ near-complete blueprint = `convert_equality_delete_files.rs`. Front-loaded
       (highest reuse → highest convergence confidence).
-- [ ] **G2 — `unknown` V3 primitive type** (2.5h, MED, metadata-only interop) → **row 89 ❌→✅**. Add
-      `PrimitiveType::Unknown` (serde rename gives "unknown" free) + the V3 `min_format_version` gate arm +
-      the ~10 compiler-forced exhaustive-match arms across iceberg/glue/hms (arrow/avro/datum/transform/
-      inspect/schema). ATOMIC — cannot ship partial (the enum arm breaks all sites at once). DEFER data-file
-      always-null write/read I/O (loud FeatureUnsupported); interop = metadata-only schema round-trip (clone
-      `interop_update_schema.rs`). Template: the landed Variant-F1 + timestamp_ns gate precedent.
+- [x] **G2 — `unknown` V3 primitive type** — **DONE 2026-06-17 (#TBD). row 89 ❌→✅.** `PrimitiveType::Unknown`
+      arm (Java-faithful PRIMITIVE, not a top-level Type; serde "unknown" free) + the V3 `min_format_version`
+      gate (mutation-proven: removing it reds 3 V2-reject tests) + 9 compiler-forced arms (arrow→Null,
+      avro→null, datum/glue/hms/inspect/partition_stats reject-loud). DEFERRED-LOUD: data-file always-null
+      I/O (FeatureUnsupported, no silent wrong bytes). **Legality doors matched Java 1.10.0 bytecode EXACTLY
+      (Critic-confirmed) — NOT mirror-Variant: `identity(unknown)` is ACCEPTED as a partition source (Java
+      `Identity.UNSUPPORTED_TYPES` excludes UNKNOWN), value-producing transforms reject, identifier accepts.**
+      Atomic full-workspace compile (iceberg+glue+hms); 2351 lib + 2 interop + 15 glue + 15 hms green.
+      Metadata-only interop GREEN both directions (Java writes V3 unknown schema → Rust reads+writes → Java
+      verifies; caught+fixed a field-id-reindex bug). Committed Java fixtures under testdata/interop/unknown_type/.
+      Converged 1 cycle, NO findings. Files: `datatypes.rs` + 8 arm sites + `interop_unknown.rs` + `run-interop-unknown.sh`.
 - [ ] **G3 — `IncrementalAppendScan` + `IncrementalChangelogScan` interop** (2.5h, MED, interop) →
       **rows 120 + 121 🟡→✅** (TWO rows in one PR). The scans are built; interop is the sole deferral. Java
       writes a multi-snapshot table; Rust incremental-scans a snapshot range; assert the added-files /

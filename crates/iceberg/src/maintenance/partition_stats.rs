@@ -1784,6 +1784,15 @@ fn build_partition_field_column(
             primitive_type,
             arrow_data_type,
         )?,
+        // `unknown` is never a partition source (it is rejected as a partition transform source —
+        // see `Transform::result_type`), so it can never appear as a partition-field type. Fail
+        // loudly if it somehow reaches here rather than fabricate a column.
+        PrimitiveType::Unknown => {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Partition field type unknown is not a supported partition value type: unknown is always null and cannot be a partition source",
+            ));
+        }
     };
 
     Ok(array)

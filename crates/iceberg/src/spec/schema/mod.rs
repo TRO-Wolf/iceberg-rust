@@ -149,16 +149,19 @@ fn build_lowercase_name_index(
 /// map; static-initializer bytecode): `{TIMESTAMP_NANO: 3, VARIANT: 3, UNKNOWN: 3, GEOMETRY: 3,
 /// GEOGRAPHY: 3}` — these types were only introduced in format version 3 and must be rejected on
 /// an older table. Both `timestamp_ns` and `timestamptz_ns` map to Java's single `TIMESTAMP_NANO`
-/// type id; `variant` is the [`Type::Variant`] arm below.
+/// type id; `variant` is the [`Type::Variant`] arm below, and `unknown` is the
+/// [`PrimitiveType::Unknown`] arm.
 ///
-/// Java also gates `unknown`, `geometry`, and `geography` at v3 in the same map, but those types
-/// are not yet representable in the Rust `Type`/`PrimitiveType` enums. When they land, add a
-/// one-line arm each here — the helper is shaped so each new V3-only type is a single addition.
+/// Java also gates `geometry` and `geography` at v3 in the same map, but those types are not yet
+/// representable in the Rust `Type`/`PrimitiveType` enums. When they land, add a one-line arm each
+/// here — the helper is shaped so each new V3-only type is a single addition.
 fn min_format_version(ty: &Type) -> Option<FormatVersion> {
     match ty {
         Type::Primitive(PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs) => {
             Some(FormatVersion::V3)
         }
+        // Java `MIN_FORMAT_VERSIONS` maps `UNKNOWN -> 3` exactly like `TIMESTAMP_NANO`/`VARIANT`.
+        Type::Primitive(PrimitiveType::Unknown) => Some(FormatVersion::V3),
         Type::Variant => Some(FormatVersion::V3),
         _ => None,
     }
@@ -498,8 +501,8 @@ impl Schema {
     ///
     /// - **V3-only types** — a field whose type requires a later format version than the table's
     ///   (see [`min_format_version`]) is rejected. Today that is `timestamp_ns` / `timestamptz_ns`
-    ///   (Java `TIMESTAMP_NANO`) and `variant`, which require v3; Java also gates
-    ///   `unknown`/`geometry`/`geography` at v3, but those are not yet representable in Rust.
+    ///   (Java `TIMESTAMP_NANO`), `variant`, and `unknown`, which require v3; Java also gates
+    ///   `geometry`/`geography` at v3, but those are not yet representable in Rust.
     /// - **Column initial-defaults** — a non-null
     ///   [`initial_default`](NestedField::initial_default) on any field is only valid at format
     ///   version [`DEFAULT_VALUES_MIN_FORMAT_VERSION`] (v3) or later. Only `initial_default` is gated
@@ -1787,6 +1790,102 @@ table {
             schema_with_top_level_type("v", Type::Variant).min_format_version(),
             FormatVersion::V3,
             "a variant schema must demand v3"
+        );
+    }
+
+    // RISK: the `unknown` arm of the SAME gate (Java 1.10.0 `MIN_FORMAT_VERSIONS` maps UNKNOWN -> 3
+    // exactly like TIMESTAMP_NANO/VARIANT). A V1/V2 schema with an unknown column must be rejected
+    // with the Java-format message; missing this arm would let Rust emit V2 metadata Java refuses
+    // to read. Mutation guard: deleting the `PrimitiveType::Unknown => Some(V3)` arm in
+    // `min_format_version` flips this test red.
+    #[test]
+    fn test_check_compatibility_rejects_unknown_below_v3() {
+        use crate::spec::table_metadata::FormatVersion;
+
+        let schema = schema_with_top_level_type("u", Type::Primitive(PrimitiveType::Unknown));
+        for format_version in [FormatVersion::V1, FormatVersion::V2] {
+            let error = schema
+                .check_compatibility(format_version)
+                .expect_err("unknown must be rejected below v3");
+            assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+            assert!(
+                error
+                    .message()
+                    .contains("Invalid type for u: unknown is not supported until v3"),
+                "got: {}",
+                error.message()
+            );
+            assert!(
+                error
+                    .message()
+                    .contains(&format!("Invalid schema for {format_version}")),
+                "message must carry the format-version header, got: {}",
+                error.message()
+            );
+        }
+    }
+
+    // RISK: the gate must NOT over-fire — an unknown column is legal at v3, where the type was
+    // introduced. Blocking it would make the V3 type unusable.
+    #[test]
+    fn test_check_compatibility_allows_unknown_at_v3() {
+        use crate::spec::table_metadata::FormatVersion;
+
+        let schema = schema_with_top_level_type("u", Type::Primitive(PrimitiveType::Unknown));
+        assert!(
+            schema.check_compatibility(FormatVersion::V3).is_ok(),
+            "unknown is allowed at v3",
+        );
+    }
+
+    // RISK: the gate must reach an unknown NESTED in a struct (Java iterates all of
+    // `lazyIdToField()`), and the message must carry the dotted path.
+    #[test]
+    fn test_check_compatibility_rejects_nested_unknown_below_v3() {
+        use crate::spec::table_metadata::FormatVersion;
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(
+                    2,
+                    "payload",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "raw", Type::Primitive(PrimitiveType::Unknown))
+                            .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let error = schema
+            .check_compatibility(FormatVersion::V2)
+            .expect_err("a nested unknown must be rejected below v3");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Invalid type for payload.raw: unknown is not supported until v3"),
+            "message must carry the dotted path to the nested column, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK: `unknown` must flow through the SAME `min_format_version` mechanism as
+    // `timestamp_ns`/`variant` — a schema with an unknown column must demand v3, exactly like the
+    // others, so a DataFusion-created table picks v3 rather than v2-then-rejected.
+    #[test]
+    fn test_unknown_min_format_version_is_v3() {
+        use crate::spec::table_metadata::FormatVersion;
+
+        let schema = schema_with_top_level_type("u", Type::Primitive(PrimitiveType::Unknown));
+        assert_eq!(
+            schema.min_format_version(),
+            FormatVersion::V3,
+            "an unknown schema must demand v3"
         );
     }
 

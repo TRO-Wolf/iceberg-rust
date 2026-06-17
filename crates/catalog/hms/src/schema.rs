@@ -132,6 +132,15 @@ impl SchemaVisitor for HiveSchemaBuilder {
                 "string".to_string()
             }
             PrimitiveType::Binary | PrimitiveType::Fixed(_) => "binary".to_string(),
+            // `unknown` has no Hive column type (it is an always-null column with no physical
+            // storage). Java's Hive type conversion has no UNKNOWN mapping and throws; mirror that
+            // here rather than fabricate a column type.
+            PrimitiveType::Unknown => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!("Conversion from {p:?} is not supported"),
+                ));
+            }
             PrimitiveType::Decimal { precision, scale } => {
                 format!("decimal({precision},{scale})")
             }
@@ -455,5 +464,17 @@ mod tests {
         assert_eq!(result, expected);
 
         Ok(())
+    }
+
+    // RISK: `unknown` has no Hive column type (it is an always-null column with no physical
+    // storage). Java's Hive type conversion has no UNKNOWN mapping and throws; the Rust converter
+    // must fail loudly with FeatureUnsupported rather than fabricate a column type.
+    #[test]
+    fn test_unknown_type_conversion_is_rejected() {
+        let mut builder = HiveSchemaBuilder::default();
+        let error = builder
+            .primitive(&iceberg::spec::PrimitiveType::Unknown)
+            .expect_err("unknown has no Hive type");
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
     }
 }

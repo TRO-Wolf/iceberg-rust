@@ -707,6 +707,14 @@ impl SchemaVisitor for ToArrowSchemaConverter {
             crate::spec::PrimitiveType::Binary => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::LargeBinary))
             }
+            // `unknown` is an always-null column with no physical storage; Arrow's `Null` type is
+            // its natural in-memory shape (Java `TypeToMessageType` returns null — no parquet
+            // column). This lets a metadata schema carrying `unknown` participate in Arrow schema
+            // conversion; the file-level always-null write/read I/O is deferred (the parquet
+            // writer and Arrow value path fail loudly on `unknown`).
+            crate::spec::PrimitiveType::Unknown => {
+                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Null))
+            }
         }
     }
 }
@@ -1146,6 +1154,10 @@ pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> DataType {
         PrimitiveType::Decimal { precision, scale } => {
             make_ree(DataType::Decimal128(*precision as u8, *scale as i8))
         }
+        // `unknown` carries no `PrimitiveLiteral`, so a `Datum` of this type is unconstructable —
+        // this arm is unreachable in practice. Keep it consistent with `type_to_arrow_type`
+        // (`unknown` -> Arrow `Null`) rather than panicking.
+        PrimitiveType::Unknown => make_ree(DataType::Null),
     }
 }
 
@@ -1956,6 +1968,30 @@ mod tests {
             "got: {}",
             error.message()
         );
+    }
+
+    // RISK: `unknown` is an always-null column with no physical storage (Java `TypeToMessageType`
+    // returns null — no parquet column). Its natural Arrow shape is `DataType::Null`, which lets a
+    // metadata schema carrying `unknown` participate in Arrow schema conversion (the metadata-only
+    // round-trip contract). A wrong mapping (e.g. a real physical type) would invent storage Java
+    // never emits.
+    #[test]
+    fn test_unknown_to_arrow_is_null_type() {
+        let arrow_type = type_to_arrow_type(&Type::Primitive(PrimitiveType::Unknown))
+            .expect("unknown converts to the Arrow Null type");
+        assert_eq!(arrow_type, DataType::Null);
+
+        // Whole-schema conversion succeeds with an unknown column present.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Unknown)).into(),
+            ])
+            .build()
+            .unwrap();
+        let arrow =
+            schema_to_arrow_schema(&schema).expect("a schema containing unknown converts to Arrow");
+        assert_eq!(arrow.field(1).data_type(), &DataType::Null);
     }
 
     #[test]
