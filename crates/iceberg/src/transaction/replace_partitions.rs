@@ -54,6 +54,17 @@
 //!   rejects when, in a replaced partition, a concurrent snapshot either DELETED a data file
 //!   (`validateDeletedDataFiles`) or ADDED a delete file (`validateNoNewDeleteFiles`).
 //!
+//! **Append-only assertion (Java `ReplacePartitions.validateAppendOnly`):** opt-in, and ORTHOGONAL to the two
+//! conflict checks above (it is a SAME-COMMIT guard, not a concurrent-commit one).
+//! [`ReplacePartitionsAction::validate_append_only`] mirrors `BaseReplacePartitions.validateAppendOnly()` →
+//! `MergingSnapshotProducer.failAnyDelete()` → `ManifestFilterManager.failAnyDelete = true`: the commit is
+//! rejected (Java's non-retryable `DeleteException`) if this dynamic overwrite would REMOVE any existing live
+//! data file — i.e. the operation must be purely additive. Java enforces it in `filterManifest` the moment a
+//! manifest is found to delete files; here the equivalent is one non-empty check on the resolved partition
+//! deletes (which already enumerate the exact files removed) inside
+//! [`ReplacePartitionsOperation::delete_files`]. `validateAppendOnly` is on `ReplacePartitions` ONLY in the
+//! Java 1.10.0 API (`javap` — it is NOT on `DeleteFiles`/`OverwriteFiles`/`RowDelta`).
+//!
 //! **No `caseSensitive(boolean)` — intentionally absent (Java API parity):** unlike `DeleteFiles` /
 //! `OverwriteFiles` / `RowDelta`, the Java `ReplacePartitions` interface (`api/ReplacePartitions.java`,
 //! 1.10.0) exposes NO `caseSensitive(boolean)` method (`javap -p` on `iceberg-api-1.10.0.jar` lists only
@@ -119,6 +130,13 @@ pub struct ReplacePartitionsAction {
     /// An explicit starting snapshot for conflict validation (Java `validateFromSnapshot`). When `None`, the
     /// validation uses the transaction's starting snapshot (the table head when the transaction was created).
     validate_from_snapshot: Option<i64>,
+    /// Whether the append-only assertion is enabled (Java `ReplacePartitions.validateAppendOnly` →
+    /// `MergingSnapshotProducer.failAnyDelete` → `ManifestFilterManager.failAnyDelete`). OFF by default.
+    /// When ON, the commit is rejected if the dynamic overwrite would actually REMOVE any existing live data
+    /// file — i.e. the operation must be PURELY ADDITIVE (it may only fill previously-empty partitions). This
+    /// is a SAME-COMMIT guard on this action's own resolved partition deletes, NOT a concurrent-commit check
+    /// (it is independent of and orthogonal to the two `validate_no_conflicting_*` flags above).
+    validate_append_only: bool,
 }
 
 impl ReplacePartitionsAction {
@@ -131,6 +149,7 @@ impl ReplacePartitionsAction {
             validate_no_conflicting_data: false,
             validate_no_conflicting_deletes: false,
             validate_from_snapshot: None,
+            validate_append_only: false,
         }
     }
 
@@ -207,6 +226,33 @@ impl ReplacePartitionsAction {
         self
     }
 
+    /// ENABLE the append-only assertion (Java `ReplacePartitions.validateAppendOnly`): the commit is rejected
+    /// with a non-retryable error if this dynamic overwrite would actually REMOVE any existing live data file.
+    /// In other words, the replace must be PURELY ADDITIVE — it may only fill partitions that currently have
+    /// no live data; if any replaced `(spec_id, partition)` already holds a live file (so a real delete would
+    /// occur), the commit fails.
+    ///
+    /// **Java chain mirrored:** `BaseReplacePartitions.validateAppendOnly()` calls
+    /// `MergingSnapshotProducer.failAnyDelete()`, which sets `ManifestFilterManager.failAnyDelete = true`;
+    /// during `filterManifest` Java throws a `DeleteException` ("Operation would delete existing data") the
+    /// moment any manifest is found to delete files. Here the equivalent is enforced in
+    /// [`ReplacePartitionsOperation::delete_files`]: the by-partition resolution
+    /// ([`crate::transaction::snapshot::SnapshotProducer::resolve_partition_deletes`]) already returns the
+    /// EXACT set of live files this overwrite would remove, so the guard is one non-empty check on that result.
+    ///
+    /// **Unpartitioned tables = full replace:** every file is in the single empty partition, so any added file
+    /// removes ALL existing files — `validate_append_only` therefore rejects any replace on a non-empty
+    /// unpartitioned table (Java has the same effect via `deleteByRowFilter(alwaysTrue)`).
+    ///
+    /// INDEPENDENT of [`Self::validate_no_conflicting_data`] / [`Self::validate_no_conflicting_deletes`]: those
+    /// are concurrent-commit (serializable-isolation) partition-set checks against the REFRESHED base; this is
+    /// a SAME-COMMIT check on this action's OWN resolved deletes. Default (this method NOT called) = no
+    /// assertion (current behavior unchanged).
+    pub fn validate_append_only(mut self) -> Self {
+        self.validate_append_only = true;
+        self
+    }
+
     /// Collect the set of `(partition_spec_id, partition)` tuples the added files belong to — the
     /// partitions to replace (Java `replacedPartitions` / the per-file `dropPartition`).
     fn drop_partitions(&self) -> HashSet<(i32, Struct)> {
@@ -251,6 +297,7 @@ impl TransactionAction for ReplacePartitionsAction {
             .commit(
                 ReplacePartitionsOperation {
                     drop_partitions: self.drop_partitions(),
+                    validate_append_only: self.validate_append_only,
                 },
                 DefaultManifestProcess,
             )
@@ -433,6 +480,9 @@ impl ReplacePartitionsAction {
 struct ReplacePartitionsOperation {
     /// The `(partition_spec_id, partition)` tuples to replace, derived from the added files.
     drop_partitions: HashSet<(i32, Struct)>,
+    /// Java `ManifestFilterManager.failAnyDelete` (set by `ReplacePartitions.validateAppendOnly`): when true,
+    /// the resolved deletes must be EMPTY — if this overwrite would remove any live file, the commit fails.
+    validate_append_only: bool,
 }
 
 impl SnapshotProduceOperation for ReplacePartitionsOperation {
@@ -453,9 +503,34 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
         // data file whose `(spec_id, partition)` is in the set is removed (Java
         // `ManifestFilterManager`'s `dropPartitions.contains(...)`). No missing-target validation —
         // a replaced partition with no existing files is a pure add.
-        snapshot_produce
+        let resolved = snapshot_produce
             .resolve_partition_deletes(&self.drop_partitions)
-            .await
+            .await?;
+
+        // Java `ManifestFilterManager.failAnyDelete` (set by `ReplacePartitions.validateAppendOnly`): if this
+        // dynamic overwrite would REMOVE any existing live data file, the operation is not purely additive, so
+        // fail the commit. `resolved` is the exact set of files this overwrite removes (Java's
+        // `manifestHasDeletedFiles` would find these in `filterManifest`), so a non-empty `resolved` is exactly
+        // the condition under which Java throws its non-retryable `DeleteException`. NON-retryable
+        // `ErrorKind::DataInvalid` so the commit retry loop stops and the assertion propagates (it is not a
+        // transient commit conflict). On an unpartitioned table every replace removes ALL existing files, so
+        // any replace on a non-empty unpartitioned table fails here.
+        if self.validate_append_only && !resolved.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot commit ReplacePartitions with validateAppendOnly: the dynamic overwrite would \
+                     delete {} existing data file(s) (e.g. {} in spec {}, partition {:?}); the operation is \
+                     not append-only",
+                    resolved.len(),
+                    resolved[0].file_path(),
+                    resolved[0].partition_spec_id,
+                    resolved[0].partition(),
+                ),
+            ));
+        }
+
+        Ok(resolved)
     }
 
     async fn existing_manifest(
@@ -1921,6 +1996,168 @@ mod tests {
             count_delete_manifests(&table).await,
             1,
             "the replace_partitions commit must carry the outstanding delete manifest forward (not drop it)"
+        );
+    }
+
+    // ============================================================================================
+    // Append-only assertion (Java `ReplacePartitions.validateAppendOnly` → `failAnyDelete`).
+    //
+    // `validate_append_only()` asserts the dynamic overwrite is PURELY ADDITIVE: the commit fails (non-retryable
+    // `DataInvalid`, Java's `DeleteException`) the moment the by-partition resolution would actually REMOVE any
+    // existing live data file. It is a SAME-COMMIT guard on this action's OWN resolved deletes — independent of
+    // the two concurrent-commit `validate_no_conflicting_*` flags. The guard is one `!resolved.is_empty()` check
+    // in `ReplacePartitionsOperation::delete_files`; removing it makes test (a)/(d) below pass-through (false
+    // green), which is the mutation these tests pin.
+    // ============================================================================================
+
+    /// (a) REJECT — replacing a partition that ALREADY HOLDS a live file, with `validate_append_only()`, must
+    /// FAIL non-retryably (a real delete would occur ⇒ not append-only). Append A@x=0; then
+    /// `replace_partitions(x=0).validate_append_only()` adds A2@x=0 — A would be removed, so the commit is
+    /// rejected. The catalog head is unchanged (A still live, A2 absent).
+    ///
+    /// Risk pinned (MUTATION): deleting the `validate_append_only && !resolved.is_empty()` guard in
+    /// `delete_files` makes this commit SUCCEED (A2 replaces A) — this test then fails, catching the removal.
+    #[tokio::test]
+    async fn test_replace_partitions_append_only_rejects_replacing_nonempty_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        // Replace x=0 (which already holds A) with A2, asserting append-only ⇒ must reject (A would be removed).
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file("test/a2.parquet", 0))
+            .validate_append_only();
+        let tx = action.apply(tx).unwrap();
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "validate_append_only must reject a replace that removes an existing live file in x=0",
+        );
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "the append-only assertion is a non-retryable validation failure (DataInvalid), Java DeleteException"
+        );
+        assert!(
+            !err.retryable(),
+            "the append-only failure must be NON-retryable so the retry loop stops and it propagates"
+        );
+        assert!(
+            err.message().contains("not append-only"),
+            "the error must name the append-only assertion, got: {}",
+            err.message()
+        );
+
+        // The catalog head is unchanged: A is still live, A2 never landed.
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        let live = live_file_paths(&reloaded).await;
+        assert_eq!(
+            live,
+            HashSet::from(["test/a.parquet".to_string()]),
+            "the rejected append-only replace must not have altered the table (A kept, A2 absent)"
+        );
+    }
+
+    /// (b) COMMIT — replacing ONLY empty/new partitions (a pure add) WITH `validate_append_only()` succeeds: no
+    /// existing live file is removed, so the assertion holds. Append A@x=0; then
+    /// `replace_partitions(x=1).validate_append_only()` adds B@x=1 (x=1 is empty) ⇒ commits; live set {A, B}.
+    ///
+    /// Risk pinned: an over-eager guard that rejects every `validate_append_only` replace (false positive)
+    /// would block the legitimate pure-add case.
+    #[tokio::test]
+    async fn test_replace_partitions_append_only_allows_pure_add_to_empty_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        // Replace x=1 (currently EMPTY) with B, asserting append-only ⇒ pure add, must commit.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file("test/b.parquet", 1))
+            .validate_append_only();
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "validate_append_only must allow a pure add to an empty partition (no delete occurs)",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/a.parquet".to_string(), "test/b.parquet".to_string()]),
+            "append-only pure add: B added to empty x=1, A in x=0 untouched"
+        );
+    }
+
+    /// (c) REGRESSION — the SAME replace of a non-empty partition WITHOUT `validate_append_only()` still
+    /// succeeds (default behavior unchanged): A@x=0 is replaced by A2@x=0, live set {A2}. This is the exact
+    /// scenario test (a) rejects, minus the flag — proving the flag is OPT-IN and behavior-preserving when off.
+    #[tokio::test]
+    async fn test_replace_partitions_without_append_only_replaces_nonempty_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
+
+        // Same replace as test (a) but WITHOUT the flag ⇒ default behavior: A2 replaces A.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file("test/a2.parquet", 0));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.expect(
+            "without validate_append_only the replace must succeed (default behavior unchanged)",
+        );
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/a2.parquet".to_string()]),
+            "without the flag, x=0 is replaced normally (A2 replaces A)"
+        );
+    }
+
+    /// (d) REJECT (full replace) — an UNPARTITIONED replace WITH `validate_append_only()` must FAIL: every file
+    /// is in the single empty partition, so adding any file removes ALL existing files (Java reaches this via
+    /// `deleteByRowFilter(alwaysTrue)`). Append A, B (unpartitioned); then
+    /// `replace_partitions().add_file(C).validate_append_only()` ⇒ rejected (A and B would be removed), and the
+    /// table is unchanged.
+    ///
+    /// Risk pinned (MUTATION): deleting the guard makes this full replace SUCCEED (live set {C}); the test
+    /// catches that. Also pins the unpartitioned = full-replace path through the assertion specifically.
+    #[tokio::test]
+    async fn test_replace_partitions_append_only_rejects_full_replace_on_unpartitioned_table() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_unpartitioned_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![
+            unpartitioned_data_file("test/a.parquet"),
+            unpartitioned_data_file("test/b.parquet"),
+        ])
+        .await;
+
+        // Unpartitioned: adding C replaces the single empty partition ⇒ removes A and B ⇒ not append-only.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(unpartitioned_data_file("test/c.parquet"))
+            .validate_append_only();
+        let tx = action.apply(tx).unwrap();
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "validate_append_only must reject a full replace on a non-empty unpartitioned table (every file removed)",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(
+            err.message().contains("not append-only"),
+            "the error must name the append-only assertion, got: {}",
+            err.message()
+        );
+
+        // The table is unchanged: A and B still live, C never landed.
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_file_paths(&reloaded).await,
+            HashSet::from(["test/a.parquet".to_string(), "test/b.parquet".to_string()]),
+            "the rejected full replace must not have altered the table (A, B kept, C absent)"
         );
     }
 }
