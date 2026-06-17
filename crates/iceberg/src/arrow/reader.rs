@@ -2344,6 +2344,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -2667,6 +2668,7 @@ message schema {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
 
         // Task 2: read the second and third row groups
@@ -2685,6 +2687,7 @@ message schema {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
 
         let tasks1 = Box::pin(futures::stream::iter(vec![Ok(task1)])) as FileScanTaskStream;
@@ -2816,6 +2819,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -2995,6 +2999,7 @@ message schema {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3220,6 +3225,7 @@ message schema {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3438,6 +3444,7 @@ message schema {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3545,6 +3552,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3646,6 +3654,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3736,6 +3745,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3840,6 +3850,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3973,6 +3984,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4073,6 +4085,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4186,6 +4199,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4280,6 +4294,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_1.parquet"))
@@ -4298,6 +4313,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_2.parquet"))
@@ -4316,6 +4332,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             }),
         ];
 
@@ -4498,6 +4515,7 @@ message schema {
                 partition_spec: Some(partition_spec),
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4914,6 +4932,7 @@ message schema {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
+                split_offsets: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4982,6 +5001,7 @@ message schema {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;

@@ -1125,6 +1125,7 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
 
         // Load the deletes - should handle both types without error
@@ -1671,6 +1672,7 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         }
     }
 
