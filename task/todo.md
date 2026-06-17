@@ -345,15 +345,25 @@ G1 is oracle-dependent.
       extract type to construct; zero `*Extract` defs). 17 unit tests; full lib 2392. Converged 1 cycle. 2 LOW
       accepted (min/max NaN-ordering + partial_cmp→None=DataInvalid conservative — part of the 🟡 residue,
       addressed at the later interop ✅). Offline (529-light). Files: `expr/visitors/aggregate_evaluator.rs`.
-- [ ] **G3 — Catalog accessors + the Glue/S3Tables-views matrix correction** (2h, LOW, offline) → **row 149
-      ❌→🟡**. Four non-breaking DEFAULT `Catalog` methods: name() (Java default), invalidate_table() /
-      invalidate_view() (Java/ViewCatalog default no-ops), properties() (RESTCatalog-only in Java — include as
-      a documented Rust-convenience default, empty map). Wire to the name+props each impl holds; MemoryCatalog
-      needs a 1-field plumbing fix (memory/catalog.rs:135 drops them). commitTransaction(List) SPLIT OUT
-      (REST-server multi-table commit — deferred). #[automock] auto-covers defaults. ALSO (matrix correction,
-      verified by scoping): rewrite the rows 124(a)/125 ViewCatalog residue — Glue/S3Tables view-unsupported
-      is parity-CORRECT (Java GlueCatalog 1.10.0 has no ViewCatalog #12488; S3Tables has no view API), NOT a
-      gap; annotate SessionCatalog row 126 as assessed-deferred (dead surface — Rust binds identity per-catalog).
+- [x] **G3 — Catalog accessors + the Glue/S3Tables-views matrix correction** — **DONE 2026-06-17 (#TBD).
+      row 149 ❌→🟡.** Four non-breaking DEFAULT `Catalog` methods (name/properties/invalidate_table/
+      invalidate_view), overridden per impl from held config (REST/Glue/HMS/S3Tables/SQL) + the MemoryCatalog
+      retain-name+props fix; `commitTransaction(List)` split out (deferred). `properties()` honestly disclaimed
+      as a Rust-convenience (not a Java Catalog-interface method). Matrix correction: rewrote rows 124(a)/125
+      (Glue/S3Tables view-unsupported = parity-correct — S3Tables SDK-verified zero view ops; Glue via #12488
+      + Rust no-override) + annotated row 126 SessionCatalog assessed-deferred (dead surface). Converged 1
+      cycle; Critic javap-confirmed parity + matrix accuracy + ran accessor mutations. Offline gate green
+      (iceberg 2399 + glue 18 + hms 15 + rest 55 + s3tables 23 + sql 71). 2 LOW doc-accuracy nits the Critic
+      caught (#12488 is OPEN not closed; properties() also on SessionCatalog) — FIXED by orchestrator before
+      commit. HMS accessor compile-only (socket-resolving new()). Files: `catalog/mod.rs` + 6 impl files.
+
+> **BLOCK 3 COMPLETE (2026-06-17).** 3 sequential AC·OO PRs: G1 ExpressionParser JSON (row 147 ❌→✅ +
+> ScanReport divergence retired, #82), G2 AggregateEvaluator (row 148 ❌→🟡, #83), G3 Catalog accessors +
+> views matrix correction (row 149 ❌→🟡). **1 ✅ flip (147) + 2 ❌→🟡 (148, 149) + matrix corrections**
+> (views-false-premise 124/125, SessionCatalog 126 deferred); parity ~32✅→33✅, ❌ 14→12. Lower ✅-density
+> as forecast (easy flips spent). Notable: G1's JDK-11-non-minimal-float named residue (Rust matches JDK
+> 19+); G2 matched Java's real count(col)=value−null via bytecode; G3 corrected a false-premise residue +
+> its own 2 doc nits. Next block: BatchScan U1/U2 (scan completion), RewriteTablePath, or Avro-data-read.
 
 Block-3 stretch / deferred: BatchScan-U1 (ScanTaskGroup/bin-pack, 146 🟡, offline) · RewriteTablePath
 (137 🟡, provider 10/2, 4.5h — full TableMetadata rebuild) · Avro-data-READ (own ~6.5h block, 117 🟡).

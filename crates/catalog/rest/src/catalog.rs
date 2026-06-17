@@ -28,7 +28,7 @@ use iceberg::table::Table;
 use iceberg::view::{View, ViewCommit};
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit,
-    TableCreation, TableIdent, ViewCreation,
+    TableCreation, TableIdent, UNNAMED_CATALOG, ViewCreation,
 };
 use itertools::Itertools;
 use reqwest::header::{
@@ -513,6 +513,21 @@ impl RestCatalog {
 /// https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml
 #[async_trait]
 impl Catalog for RestCatalog {
+    /// Returns the catalog name supplied at construction (the `name` argument of
+    /// [`CatalogBuilder::load`]), or the [`UNNAMED_CATALOG`] sentinel when none was set.
+    /// Mirrors Java `RESTCatalog.name()`, which returns the configured catalog name.
+    fn name(&self) -> &str {
+        self.user_config.name.as_deref().unwrap_or(UNNAMED_CATALOG)
+    }
+
+    /// Returns the user-supplied configuration properties. Mirrors Java
+    /// `RESTCatalog.properties()` — the only Java catalog where `properties()` is a real
+    /// method. These are the as-loaded `user_config` props, not the server-merged runtime
+    /// config (which is only available after the first network round-trip).
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.user_config.props
+    }
+
     async fn list_namespaces(
         &self,
         parent: Option<&NamespaceIdent>,
@@ -3609,5 +3624,42 @@ mod tests {
         config_mock.assert_async().await;
         load_view_mock.assert_async().await;
         commit_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_name_and_properties_return_user_config() {
+        // The accessors read `user_config` and need no network round-trip.
+        let config = RestCatalogConfig::builder()
+            .name("rest_cat".to_string())
+            .uri("http://localhost:8181".to_string())
+            .props(HashMap::from([("k".to_string(), "v".to_string())]))
+            .build();
+        let catalog = RestCatalog::new(config, Some(Arc::new(LocalFsStorageFactory)));
+
+        assert_eq!(catalog.name(), "rest_cat");
+        // Mutation guard: the empty-map default fails here.
+        assert_eq!(catalog.properties().get("k").map(String::as_str), Some("v"));
+    }
+
+    #[tokio::test]
+    async fn test_name_defaults_to_sentinel_when_unset() {
+        // No `name` was set on the config, so the override falls back to the sentinel.
+        let config = RestCatalogConfig::builder()
+            .uri("http://localhost:8181".to_string())
+            .build();
+        let catalog = RestCatalog::new(config, Some(Arc::new(LocalFsStorageFactory)));
+        assert_eq!(catalog.name(), UNNAMED_CATALOG);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_defaults_are_noops() {
+        let config = RestCatalogConfig::builder()
+            .uri("http://localhost:8181".to_string())
+            .build();
+        let catalog = RestCatalog::new(config, Some(Arc::new(LocalFsStorageFactory)));
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
+        // No network: the inherited no-op defaults return Ok without touching the server.
+        catalog.invalidate_table(&ident).await.unwrap();
+        catalog.invalidate_view(&ident).await.unwrap();
     }
 }

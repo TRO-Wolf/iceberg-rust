@@ -32,7 +32,7 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
@@ -280,6 +280,17 @@ impl GlueCatalog {
 
 #[async_trait]
 impl Catalog for GlueCatalog {
+    /// Returns the catalog name supplied at construction (the `name` argument of
+    /// [`CatalogBuilder::load`]), or the [`UNNAMED_CATALOG`] sentinel when none was set.
+    fn name(&self) -> &str {
+        self.config.name.as_deref().unwrap_or(UNNAMED_CATALOG)
+    }
+
+    /// Returns the configuration properties supplied at construction.
+    fn properties(&self) -> &HashMap<String, String> {
+        &self.config.props
+    }
+
     /// List namespaces from glue catalog.
     ///
     /// Glue doesn't support nested namespaces.
@@ -863,5 +874,55 @@ impl Catalog for GlueCatalog {
         })?;
 
         Ok(staged_table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Offline: constructing a `GlueCatalog` builds the Glue SDK client but performs no
+    /// network call, so the `name()`/`properties()` accessors are testable without
+    /// credentials or a live Glue endpoint.
+    async fn build_glue_catalog(name: Option<&str>, props: HashMap<String, String>) -> GlueCatalog {
+        let config = GlueCatalogConfig {
+            name: name.map(str::to_string),
+            uri: None,
+            catalog_id: None,
+            warehouse: "s3://example-bucket/warehouse".to_string(),
+            props,
+        };
+        GlueCatalog::new(config, None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_name_and_properties_return_config() {
+        let catalog = build_glue_catalog(
+            Some("glue_cat"),
+            HashMap::from([("region_name".to_string(), "us-east-1".to_string())]),
+        )
+        .await;
+
+        assert_eq!(catalog.name(), "glue_cat");
+        // Mutation guard: the empty-map default fails this.
+        assert_eq!(
+            catalog.properties().get("region_name").map(String::as_str),
+            Some("us-east-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_name_defaults_to_sentinel_when_unset() {
+        let catalog = build_glue_catalog(None, HashMap::new()).await;
+        assert_eq!(catalog.name(), UNNAMED_CATALOG);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_defaults_are_noops() {
+        let catalog = build_glue_catalog(Some("glue_cat"), HashMap::new()).await;
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
+        // No network: the inherited no-op defaults return Ok.
+        catalog.invalidate_table(&ident).await.unwrap();
+        catalog.invalidate_view(&ident).await.unwrap();
     }
 }
