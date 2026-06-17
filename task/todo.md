@@ -226,10 +226,17 @@ parity ~25→28 ✅.
       **CRITICAL: build ONLY validateAppendOnly** — javap proves `conflictDetectionFilter` on
       DeleteFiles/ReplacePartitions does NOT exist in Java 1.10.0; the row-144 residue list is factually
       wrong — ALSO correct the row text (the 2 void items + this 1 real port ⇒ row flips ✅).
-- [ ] **G2 — `ComputePartitionStats` action + `UpdatePartitionStatistics` commit seam** (2h, LOW, offline)
-      → **row 138 🟡→✅**; ActionsProvider `compute_partition_stats` FeatureUnsupported→real (7/5→8/4).
-      Both halves exist + interop-proven (Z3/R2/R3): clone `update_statistics.rs` for the seam + `ComputeTableStats`
-      for the action over `compute_and_write_stats_file`/`register_partition_stats_file`.
+- [x] **G2 — `ComputePartitionStats` action + `UpdatePartitionStatistics` commit seam** — **DONE
+      2026-06-17 (#TBD).** **row 138 🟡→✅**; ActionsProvider `compute_partition_stats`
+      FeatureUnsupported→real (**8/4**). New `transaction/update_partition_statistics.rs` seam (clone of
+      `UpdateStatisticsAction` over `PartitionStatisticsFile`, emits Set/RemovePartitionStatistics +
+      UuidMatch) + `maintenance/compute_partition_stats.rs` action (clone of `ComputeTableStats`). Snags
+      resolved: register_partition_stats_file REWRITTEN to delegate through the new seam (ONE commit path,
+      no duplicate); Ok(None)→typed DataInvalid; UuidMatch attached. Converged 1 cycle; Critic
+      mutation-proved 3 wirings + confirmed the delegated commit is byte-identical to the proven path.
+      Orchestrator RE-RAN `run-interop-partition-stats.sh` GREEN (both chains) to confirm the refactor
+      preserved the Z3/R2/R3-proven bytes. Offline gate green (2314 lib). Files: `update_partition_statistics.rs`,
+      `compute_partition_stats.rs`, + seam/mod/provider/partition_stats wiring.
 - [ ] **G3 — `SupportsNamespaces` partial property set/remove** (1.25h, LOW, offline) → SupportsNamespaces
       component ✅ (row 151 stays 🟡 until G4). ~25-line default `Catalog::update_namespace_properties`
       (overlap-reject + get→mutate→full-replace). Optionally fix the latent SQL full-replace bug the

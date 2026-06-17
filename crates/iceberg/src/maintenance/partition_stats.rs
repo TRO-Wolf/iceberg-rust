@@ -95,7 +95,8 @@ use crate::spec::{
     StructType, TableMetadata, Type,
 };
 use crate::table::Table;
-use crate::{Catalog, Error, ErrorKind, Result, TableCommit, TableRequirement, TableUpdate};
+use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::{Catalog, Error, ErrorKind, Result};
 
 /// The partition struct's field id in the stats schema (Java `PartitionStatsHandler.PARTITION_FIELD_ID`).
 const PARTITION_FIELD_ID: i32 = 1;
@@ -1212,17 +1213,20 @@ pub async fn compute_and_write_stats_file(
 /// Registers a [`PartitionStatisticsFile`] in the table metadata — the Rust port of Java
 /// `table.updatePartitionStatistics().setPartitionStatistics(file).commit()`.
 ///
-/// Commits a [`TableUpdate::SetPartitionStatistics`] (which the metadata builder applies via
-/// `set_partition_statistics`, REPLACING any prior entry for the same snapshot id — Java's `statsToSet`
-/// is a map keyed by snapshot id) through [`Catalog::update_table`], with a single
-/// [`TableRequirement::UuidMatch`] requirement (Java `UpdateRequirements.forUpdateTable` emits only
-/// `AssertTableUUID` for a non-snapshot metadata update). Returns the refreshed [`Table`].
+/// Routes the commit THROUGH the [`UpdatePartitionStatisticsAction`](crate::transaction::Transaction::update_partition_statistics)
+/// transaction seam — exactly the Java idiom (`updatePartitionStatistics().setPartitionStatistics(file).commit()`).
+/// The seam emits a [`TableUpdate::SetPartitionStatistics`](crate::TableUpdate::SetPartitionStatistics)
+/// (which the metadata builder applies via `set_partition_statistics`, REPLACING any prior entry for
+/// the same snapshot id — Java's `statsToSet` is a map keyed by snapshot id) and attaches a single
+/// `AssertTableUUID` requirement (Java `UpdateRequirements.forUpdateTable` emits only `AssertTableUUID`
+/// for a non-snapshot metadata update). The [`Transaction`] then carries the base metadata location
+/// for the in-process catalog's location-CAS and supplies the commit-retry loop. Returns the refreshed
+/// [`Table`].
 ///
-/// This mirrors the [`UpdateStatisticsAction`](crate::transaction::Transaction::update_statistics)
-/// idiom for plain statistics, but partition statistics have no transaction action (the existing one
-/// handles only [`StatisticsFile`](crate::spec::StatisticsFile)), so registration commits the metadata
-/// update directly through the catalog. The full `SetPartitionStatistics` metadata path already exists
-/// (`TableUpdate::SetPartitionStatistics` + `TableMetadataBuilder::set_partition_statistics`).
+/// This is the single commit path for partition statistics: both this helper (a direct-call
+/// convenience) and the [`ComputePartitionStats`](crate::maintenance::ComputePartitionStats) action
+/// register through the same [`UpdatePartitionStatisticsAction`] seam, so there is no duplicate commit
+/// logic.
 ///
 /// # Errors
 ///
@@ -1233,19 +1237,12 @@ pub async fn register_partition_stats_file(
     table: &Table,
     partition_statistics_file: PartitionStatisticsFile,
 ) -> Result<Table> {
-    let uuid = table.metadata().uuid();
-    let table_commit = TableCommit::builder()
-        .ident(table.identifier().to_owned())
-        .updates(vec![TableUpdate::SetPartitionStatistics {
-            partition_statistics: partition_statistics_file,
-        }])
-        .requirements(vec![TableRequirement::UuidMatch { uuid }])
-        // Base location for the in-process catalog's location-CAS — `UuidMatch` alone cannot detect
-        // a stale concurrent commit because the table UUID is invariant.
-        .base_metadata_location(table.metadata_location().map(str::to_string))
-        .build();
-
-    catalog.update_table(table_commit).await
+    let transaction = Transaction::new(table);
+    let transaction = transaction
+        .update_partition_statistics()
+        .set_partition_statistics(partition_statistics_file)
+        .apply(transaction)?;
+    transaction.commit(catalog).await
 }
 
 /// Reads a partition-stats file back into [`PartitionStats`] rows — the Rust port of Java

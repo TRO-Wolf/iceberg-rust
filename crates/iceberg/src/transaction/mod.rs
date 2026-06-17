@@ -78,6 +78,7 @@ mod snapshot;
 mod sort_order;
 mod update_location;
 mod update_partition_spec;
+mod update_partition_statistics;
 mod update_properties;
 mod update_schema;
 mod update_statistics;
@@ -104,6 +105,7 @@ use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
+use crate::transaction::update_partition_statistics::UpdatePartitionStatisticsAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
@@ -341,6 +343,14 @@ impl Transaction {
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
+    }
+
+    /// Update the PARTITION statistics of the table (Java `Table.updatePartitionStatistics()` →
+    /// `UpdatePartitionStatistics`). Set/remove [`PartitionStatisticsFile`](crate::spec::PartitionStatisticsFile)
+    /// entries keyed by snapshot id; the commit attaches the table-UUID requirement (a non-snapshot
+    /// metadata update). This is the partition-statistics analog of [`Self::update_statistics`].
+    pub fn update_partition_statistics(&self) -> UpdatePartitionStatisticsAction {
+        UpdatePartitionStatisticsAction::new()
     }
 
     /// Commit transaction.
