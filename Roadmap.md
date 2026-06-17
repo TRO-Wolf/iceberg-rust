@@ -217,9 +217,11 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 - **Exit criteria:** each action matches the Java contract with unit + interop tests; GAP_MATRIX
   rows ✅. **Met for the entire surface** (all three capabilities bidirectionally interop-proven).
   V3 groundwork is largely closed here: `timestamp_ns`/`timestamptz_ns` ✅ with the
-  `MIN_FORMAT_VERSIONS` gate enforced, `variant` schema-type entry + gate landed; the remaining
-  `MIN_FORMAT_VERSIONS` arms (`unknown`/`geometry`/`geography`) are Phase-4 type-breadth items, not
-  Phase-1 groundwork. Increment narratives: [task/todo-archive/phase1.md](task/todo-archive/phase1.md).
+  `MIN_FORMAT_VERSIONS` gate enforced, `variant` schema-type entry + gate landed, and `unknown`
+  schema-type entry + gate landed (the gate now covers `timestamp_ns`/`variant`/`unknown` through
+  the SAME `min_format_version`/`check_compatibility` mechanism); the remaining `MIN_FORMAT_VERSIONS`
+  arms (`geometry`/`geography`) are Phase-4 type-breadth items, not Phase-1 groundwork. Increment
+  narratives: [task/todo-archive/phase1.md](task/todo-archive/phase1.md).
 
 ### Phase 2 — Write engine  ·  **Status: 🟡 nearly complete (the FULL action set + the COMPLETE DV write surface [row ✅ 2026-06-11] + `cherrypick`; metadata-level interop Java-judged throughout. Remaining: real-catalog hardening, multi-spec writes, data-level write-action interop, `stageOnly`/`removeRows` residue)**
 - **Goal:** the full commit/write surface beyond fast-append.
@@ -258,8 +260,10 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   (incl. shredding), geometry/geography + geospatial predicates, `unknown`.
 - **Where it stands:** `timestamp_ns` ✅ and column default values ✅ landed in the 0.9.1 base;
   `variant` is 🟡 (binary format read+write byte-exact BOTH sides — shredded-parquet FILE I/O is
-  externally blocked by the parquet 57.1 pin, no variant support upstream). Genuinely ❌:
-  `geometry`/`geography` + geospatial predicates, `unknown`, ORC + Avro DATA files. Per-row status:
+  externally blocked by the parquet 57.1 pin, no variant support upstream). `unknown` is ✅ at the
+  metadata level (schema-type entry + V3 gate + metadata-only schema round-trip interop; data-file
+  always-null I/O deferred-loud — a no-physical-column type's contract is the metadata round-trip).
+  Genuinely ❌: `geometry`/`geography` + geospatial predicates, ORC + Avro DATA files. Per-row status:
   GAP_MATRIX (the only status record).
 - **Exit criteria:** read/write parity for ORC + Avro data; V3 types round-trip and interop with Java.
 

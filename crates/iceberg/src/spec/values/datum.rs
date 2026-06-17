@@ -427,6 +427,14 @@ impl Datum {
                     )
                 })?)
             }
+            // `unknown` has no `PrimitiveLiteral` form — its values are always null, so there is no
+            // single-value byte encoding to decode (Java keeps no value class for `UnknownType`).
+            PrimitiveType::Unknown => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Cannot deserialize a value of the unknown type: unknown is always null and has no single-value encoding",
+                ));
+            }
         };
         Ok(Datum::new(data_type, literal))
     }

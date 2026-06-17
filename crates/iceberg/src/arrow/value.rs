@@ -424,6 +424,16 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                     ))
                 }
             }
+            // DEFERRED: data-file read for the `unknown` type. `unknown` is an always-null column
+            // with no physical storage (Java `TypeToMessageType` returns null — no parquet
+            // column), so a full reader would synthesize a column of nulls without touching the
+            // file. That data-path is a deeper change; defer it loudly here (mirroring the variant
+            // Arrow loud-error) so a scan of an `unknown` column fails visibly rather than reading
+            // arbitrary bytes. Metadata-only schema round-trips do not reach this path.
+            PrimitiveType::Unknown => Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Reading the unknown type from a data file is not supported yet: unknown is always null and has no physical column; this always-null read path is deferred",
+            )),
         }
     }
 }

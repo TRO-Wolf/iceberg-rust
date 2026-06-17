@@ -256,6 +256,9 @@ impl SchemaVisitor for SchemaToAvroSchema {
             PrimitiveType::Uuid => AvroSchema::Uuid,
             PrimitiveType::Fixed(len) => avro_fixed_schema((*len) as usize)?,
             PrimitiveType::Binary => AvroSchema::Bytes,
+            // Java 1.10.0 `TypeToSchema.primitive` maps `UNKNOWN` to Avro `NULL`
+            // (`Schema.create(Schema.Type.NULL)`): an always-null column with no physical bytes.
+            PrimitiveType::Unknown => AvroSchema::Null,
             PrimitiveType::Decimal { precision, scale } => {
                 avro_decimal_schema(*precision as usize, *scale as usize)?
             }
@@ -1239,6 +1242,24 @@ mod tests {
     // custom attributes (where the logical type lives), so this test asserts the attribute and
     // shape EXPLICITLY in the Iceberg→Avro direction, for a variant at top level, nested in a
     // struct, in a list element, and in a (string-keyed) map value.
+    // RISK: Java 1.10.0 `TypeToSchema.primitive` maps `UNKNOWN` to Avro `NULL`. A wrong mapping
+    // (e.g. bytes) would write a physical Avro column Java never emits for an always-null type.
+    // This walks the Iceberg->Avro converter for a top-level unknown field and asserts the
+    // converted primitive Avro schema is `null`.
+    #[test]
+    fn test_unknown_to_avro_is_null() {
+        // The visitor `primitive()` is the unit under test; assert it directly.
+        let mut visitor = SchemaToAvroSchema {
+            schema: "unknown_schema".to_string(),
+        };
+        let avro = visitor
+            .primitive(&PrimitiveType::Unknown)
+            .expect("unknown converts");
+        let Either::Left(AvroSchema::Null) = avro else {
+            panic!("unknown must convert to Avro null, got: {avro:?}");
+        };
+    }
+
     #[test]
     fn test_variant_to_avro_emits_java_shape_in_all_placements() {
         let iceberg_schema = Schema::builder()

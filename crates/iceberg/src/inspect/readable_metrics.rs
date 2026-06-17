@@ -441,6 +441,16 @@ fn append_typed_bound(
                 None => child.append_null(),
             }
         }
+        // `unknown` has no physical column and no `PrimitiveLiteral` form, so it can carry no
+        // bound. A readable-metrics entry for an unknown column is never produced (Java
+        // `TypeToMessageType` returns null — no parquet column, hence no metrics); reaching here
+        // means a malformed manifest, so fail loudly rather than guess.
+        PrimitiveType::Unknown => {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "readable_metrics bound for the unknown type is not supported: unknown has no physical column and no bound value",
+            ));
+        }
     }
     Ok(())
 }

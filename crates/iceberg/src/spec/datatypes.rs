@@ -273,6 +273,20 @@ pub enum PrimitiveType {
     Fixed(u64),
     /// Arbitrary-length byte array.
     Binary,
+    /// Unknown type (format version 3+): a column whose values are always null and that has no
+    /// physical storage.
+    ///
+    /// Mirrors Java 1.10.0 `org.apache.iceberg.types.Types.UnknownType`, which (unlike
+    /// [`Type::Variant`]) **extends `Type.PrimitiveType`** — so it is a Rust `PrimitiveType` arm,
+    /// not a top-level [`Type`] variant. It is a singleton (`UnknownType.get()`), its `toString()`
+    /// is the bare string `"unknown"` (so the `rename_all = "lowercase"` serde gives the JSON
+    /// `"unknown"` for free), and `Schema.MIN_FORMAT_VERSIONS` gates it at format version 3.
+    ///
+    /// `unknown` has no [`PrimitiveLiteral`](crate::spec::PrimitiveLiteral) form — its values are
+    /// always null — so the datum/literal layer rejects it rather than carrying a value, and Java
+    /// `TypeToMessageType` returns `null` for it (no physical parquet column). Data-file
+    /// always-null write/read I/O is deferred (see the writer/value paths, which fail loudly).
+    Unknown,
 }
 
 impl PrimitiveType {
@@ -466,6 +480,8 @@ impl fmt::Display for PrimitiveType {
             PrimitiveType::Uuid => write!(f, "uuid"),
             PrimitiveType::Fixed(size) => write!(f, "fixed({size})"),
             PrimitiveType::Binary => write!(f, "binary"),
+            // Java `UnknownType.toString()` returns exactly "unknown".
+            PrimitiveType::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -1376,6 +1392,107 @@ mod tests {
         ];
         for (ty, literal) in pairs {
             assert!(ty.compatible(&literal));
+        }
+    }
+
+    // RISK: `unknown` is a Java PRIMITIVE (`Types.UnknownType extends Type.PrimitiveType`), so it
+    // must be a `PrimitiveType` arm, not a top-level `Type` variant — the on-disk JSON is the bare
+    // string `"unknown"` (Java `UnknownType.toString()` and `Types.fromTypeName("unknown")`). The
+    // `rename_all = "lowercase"` serde must give that name for free; a wrong serialization would
+    // corrupt schema round-trips for every V3 table that uses it. Covers all four placements.
+    #[test]
+    fn unknown_type_serde_round_trip_in_all_placements() {
+        let record = r#"
+        {
+            "type": "struct",
+            "fields": [
+                {"id": 1, "name": "u", "required": false, "type": "unknown"},
+                {
+                    "id": 2,
+                    "name": "s",
+                    "required": false,
+                    "type": {
+                        "type": "struct",
+                        "fields": [
+                            {"id": 3, "name": "nested_u", "required": false, "type": "unknown"}
+                        ]
+                    }
+                },
+                {
+                    "id": 4,
+                    "name": "l",
+                    "required": false,
+                    "type": {
+                        "type": "list",
+                        "element-id": 5,
+                        "element": "unknown",
+                        "element-required": false
+                    }
+                },
+                {
+                    "id": 6,
+                    "name": "m",
+                    "required": false,
+                    "type": {
+                        "type": "map",
+                        "key-id": 7,
+                        "key": "string",
+                        "value-id": 8,
+                        "value": "unknown",
+                        "value-required": false
+                    }
+                }
+            ]
+        }
+        "#;
+
+        let de: Type = serde_json::from_str(record).expect("unknown schema must deserialize");
+        // Re-serialize and compare as JSON values (key order independent).
+        let reser = serde_json::to_value(&de).expect("re-serialize");
+        let orig = serde_json::from_str::<serde_json::Value>(record).expect("orig json");
+        assert_eq!(
+            reser, orig,
+            "unknown must round-trip structurally in every placement"
+        );
+    }
+
+    // RISK: the bare-string serde for `unknown` is the whole on-disk contract for a no-physical-
+    // column type. The JSON token must be exactly "unknown" (lowercase), and `Display` must match
+    // Java `UnknownType.toString()`.
+    #[test]
+    fn unknown_type_serializes_as_bare_lowercase_string() {
+        check_type_serde(r#""unknown""#, Type::Primitive(PrimitiveType::Unknown));
+        assert_eq!(PrimitiveType::Unknown.to_string(), "unknown");
+        assert_eq!(
+            Type::Primitive(PrimitiveType::Unknown).to_string(),
+            "unknown"
+        );
+        // Java `fromTypeName` lowercases the name first, so an upper-cased token also parses.
+        let upper: Type = serde_json::from_str(r#""UNKNOWN""#).expect("case-folded unknown");
+        assert_eq!(upper, Type::Primitive(PrimitiveType::Unknown));
+    }
+
+    // RISK: `unknown` has NO `PrimitiveLiteral` form (its values are always null). `compatible`
+    // must reject EVERY literal — a stray accept would let a value flow into a column that can
+    // hold none. Mutation guard: a `(Unknown, _) => true` arm would flip this red.
+    #[test]
+    fn unknown_type_is_compatible_with_no_literal() {
+        let literals = [
+            PrimitiveLiteral::Boolean(true),
+            PrimitiveLiteral::Int(1),
+            PrimitiveLiteral::Long(1),
+            PrimitiveLiteral::Float(1.0.into()),
+            PrimitiveLiteral::Double(1.0.into()),
+            PrimitiveLiteral::Int128(1),
+            PrimitiveLiteral::UInt128(1),
+            PrimitiveLiteral::String("x".to_string()),
+            PrimitiveLiteral::Binary(vec![1]),
+        ];
+        for literal in &literals {
+            assert!(
+                !PrimitiveType::Unknown.compatible(literal),
+                "unknown must reject {literal:?}",
+            );
         }
     }
 
