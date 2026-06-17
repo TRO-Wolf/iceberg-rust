@@ -237,10 +237,17 @@ parity ~25→28 ✅.
       Orchestrator RE-RAN `run-interop-partition-stats.sh` GREEN (both chains) to confirm the refactor
       preserved the Z3/R2/R3-proven bytes. Offline gate green (2314 lib). Files: `update_partition_statistics.rs`,
       `compute_partition_stats.rs`, + seam/mod/provider/partition_stats wiring.
-- [ ] **G3 — `SupportsNamespaces` partial property set/remove** (1.25h, LOW, offline) → SupportsNamespaces
-      component ✅ (row 151 stays 🟡 until G4). ~25-line default `Catalog::update_namespace_properties`
-      (overlap-reject + get→mutate→full-replace). Optionally fix the latent SQL full-replace bug the
-      remove-test exposes (catalog.rs:612).
+- [x] **G3 — `SupportsNamespaces` partial property set/remove** — **DONE 2026-06-17 (#TBD).**
+      SupportsNamespaces component ✅ (row 151 STAYS 🟡 until G4). 3 default `Catalog` methods:
+      `update_namespace_properties` (overlap-reject DataInvalid → get → clone → remove → extend →
+      full-replace `update_namespace`) + `set`/`remove_namespace_properties` wrappers (1:1 with Java's two
+      public methods; Result<()> not bool). 6 memory tests; 2 mutations proven (drop-remove, drop-overlap).
+      **SQL fallback (good judgment):** the "preferred 1-line SQL delete-absent-keys fix" proved UNSAFE —
+      the SQL catalog uses an `exists=true` SENTINEL property row as its namespace-existence anchor, so
+      deleting absent keys makes namespaces VANISH (broke 2 pre-existing SQL tests). Reverted; documented
+      the divergence in-code + GAP_MATRIX; confined tests to the memory catalog (faithful full-replace).
+      SQL diff is comment-only (behavior unchanged; 68 SQL tests green). Converged 1 cycle, no findings.
+      Files: `catalog/mod.rs`, `catalog/memory/catalog.rs`, `catalog/sql/catalog.rs` (NOTE only), GAP_MATRIX row 151.
 - [ ] **G4 — `ConvertEqualityDeleteFiles`** (3.5h, HIGH, offline + corroborating no-Spark interop) → with
       G3, **completes row 151 🟡→✅**. NEW write logic: per eq-delete, scan referenced data emitting ABSOLUTE
       `_pos`, materialize MATCHING positions, write pos-deletes stamped with the eq-delete's data-seq
