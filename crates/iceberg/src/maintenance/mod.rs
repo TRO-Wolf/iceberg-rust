@@ -29,6 +29,13 @@
 //! - [`DeleteOrphanFiles`] — list a location and delete files unreachable from any valid
 //!   snapshot (the Rust port of Java's `DeleteOrphanFiles` Spark action, minus the Spark
 //!   distribution layer). **This action deletes files.**
+//! - [`DeleteReachableFiles`] — given a table metadata LOCATION, delete EVERY file reachable from it
+//!   (all snapshots' manifest lists + manifests + data/position-delete/equality-delete files + DVs,
+//!   current + all previous `metadata.json`, version-hint, and statistics + partition-statistics).
+//!   The Rust port of Java's `DeleteReachableFiles` (the engine behind `DROP TABLE PURGE`), with the
+//!   six-count [`DeleteReachableFilesResult`] mirroring Java's `Result`. The destructive COMPLEMENT
+//!   of [`DeleteOrphanFiles`] (it deletes the reachable set ITSELF). **This action deletes the whole
+//!   table.**
 //! - [`RewriteDataFiles`] — bin-pack compaction: plan small-file groups per partition, read each
 //!   group's live rows (merge-on-read deletes applied), and rewrite them into target-sized files
 //!   committed through the seq-preserving [`RewriteFilesAction`](crate::transaction::rewrite_files).
@@ -72,6 +79,7 @@
 mod actions_provider;
 mod compute_table_stats;
 mod delete_orphan_files;
+mod delete_reachable_files;
 pub mod partition_stats;
 mod remove_dangling_delete_files;
 mod rewrite_data_files;
@@ -82,6 +90,10 @@ mod tests;
 pub use actions_provider::{Actions, ActionsProvider, NoAction};
 pub use compute_table_stats::{ComputeTableStats, ComputeTableStatsResult};
 pub use delete_orphan_files::{DeleteOrphanFiles, DeleteOrphanFilesResult, PrefixMismatchMode};
+pub use delete_reachable_files::{
+    DeleteReachableFiles, DeleteReachableFilesResult, ReachableDeleteFailure,
+    ReachableDeleteFunction,
+};
 pub use partition_stats::{
     PartitionStats, compute_and_write_stats_file, compute_partition_stats, partition_stats_schema,
     read_partition_stats_file, register_partition_stats_file, unified_partition_type,

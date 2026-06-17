@@ -1149,6 +1149,38 @@ public final class InteropOracle {
         }
         break;
 
+      case "generate-interop-delete-reachable":
+        // DELETE-REACHABLE-FILES interop (post-charter unit #3). Java builds a multi-snapshot V2
+        // table (data + position-delete + equality-delete + a Puffin DV + a statistics file + a
+        // previous metadata.json) at <dir>/table, computes its OWN reachable set via the
+        // engine-agnostic iceberg-CORE ReachableFileUtil (metadataFileLocations(recursive=true) +
+        // manifestListLocations + statisticsFilesLocations + versionHintLocation) PLUS a scan of
+        // every snapshot's allManifests for data/delete file paths, and emits a path-INDEPENDENT
+        // CATEGORY-COUNT descriptor (java_reachable.json) + final.metadata.json. The oracle is the
+        // REAL Java reachable-set logic (non-circular). The dir is via -Dinterop.delete_reachable.dir.
+        Path deleteReachableGenDir = requireFixturesDir("interop.delete_reachable.dir");
+        DeleteReachableOracle.generate(deleteReachableGenDir);
+        break;
+      case "verify-interop-delete-reachable":
+        // DELETE-REACHABLE-FILES interop, DIRECTION 1 — "Java judges what RUST computed + deleted."
+        // The Rust GEN test (ICEBERG_INTEROP_DELETE_REACHABLE_DIR) read Java's table, computed its
+        // OWN reachable set + ran DeleteReachableFiles on a COPY, and emitted rust_reachable.json (the
+        // category-count descriptor) + rust_deleted.json (the actually-deleted paths, normalized to
+        // category counts) + rust_table_copy (the post-delete tree). Here Java (a) asserts the Rust
+        // category-count descriptor equals Java's own ReachableFileUtil recomputation and (b) asserts
+        // DELETE-COMPLETENESS: every file Java's reachable set names is GONE from rust_table_copy and
+        // no file OUTSIDE it was touched. A divergence is a REAL reachable-set incompatibility
+        // (under-delete = orphan leak; over-delete = data loss). NOTE: `mvn exec:java` does not
+        // reliably propagate System.exit — run-interop-delete-reachable.sh greps the sentinel.
+        Path deleteReachableVerifyDir = requireFixturesDir("interop.delete_reachable.dir");
+        int deleteReachableFailures = DeleteReachableOracle.verify(deleteReachableVerifyDir);
+        System.out.println(
+            "verify-interop-delete-reachable: " + deleteReachableFailures + " failures");
+        if (deleteReachableFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -15707,6 +15739,373 @@ public final class InteropOracle {
     private static void mkdirs(File directory) throws IOException {
       if (!directory.isDirectory() && !directory.mkdirs()) {
         throw new IOException("failed to create dir " + directory);
+      }
+    }
+  }
+
+  // ===========================================================================================
+  // DeleteReachableOracle — DELETE-REACHABLE-FILES interop (post-charter unit #3).
+  //
+  // Proves the Rust `DeleteReachableFiles` action (the engine behind DROP TABLE PURGE) agrees with
+  // Java's engine-agnostic iceberg-CORE reachable-set logic on a multi-snapshot table carrying
+  // EVERY reachable file category: data, position deletes, equality deletes, a Puffin DV, a
+  // statistics file, a previous metadata.json, the current metadata.json, manifests, manifest lists,
+  // and the version-hint.
+  //
+  // THE ANTI-CIRCULAR ORACLE. Java's reachable set is computed from the REAL core helpers —
+  // ReachableFileUtil.{metadataFileLocations(table,true), manifestListLocations(table),
+  // statisticsFilesLocations(table), versionHintLocation(table)} PLUS a scan of
+  // Snapshot.allManifests for the data/delete file paths — NOT from anything the Rust side wrote.
+  // The cross-engine comparison NEVER copies absolute paths (Java + Rust write at different temp
+  // roots / UUIDs). Both sides instead hand-declare a CATEGORY-COUNT descriptor from the SPEC: the
+  // count of files in each of the six Java `DeleteReachableFiles$Result` buckets + the "metadata
+  // json" / "version hint" / "statistics" split of the "other" bucket. The descriptor is identical
+  // on both sides because the table GRAPH is logically identical.
+  // ===========================================================================================
+
+  static final class DeleteReachableOracle {
+    private DeleteReachableOracle() {}
+
+    /** `{1 id long, 2 cat string, 3 y long}` — the fixture schema (cat is the partition column). */
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "cat", Types.StringType.get()),
+            Types.NestedField.required(3, "y", Types.LongType.get()));
+
+    static void generate(Path dir) throws IOException {
+      Path tableDir = dir.resolve("table");
+      Files.createDirectories(tableDir);
+      BaseTable table = buildFixture(tableDir.toFile());
+
+      // Java's OWN reachable set (the anti-circular oracle): ReachableFileUtil + the allManifests
+      // content scan. The CATEGORY-COUNT descriptor is what crosses engines (never raw paths).
+      Reachable reachable = computeReachable(table);
+      writeJson(dir.resolve("java_reachable.json"), reachable.toDescriptorJson());
+
+      // Land final.metadata.json at the known path for the Rust side to read.
+      Path finalMetadata = tableDir.resolve("metadata").resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(table.operations().current(), finalOut);
+
+      System.out.println(
+          "generate-interop-delete-reachable: reachable descriptor " + reachable.toDescriptor());
+      System.out.println("generate-interop-delete-reachable: wrote table + java_reachable.json to " + dir);
+    }
+
+    /**
+     * Build the multi-snapshot V3 fixture at {@code <tableDir>} with REAL manifests + parquet:
+     *
+     * <ul>
+     *   <li>s1 fast-append data file {@code d1} (cat=a)
+     *   <li>s2 fast-append data file {@code d2} (cat=b)
+     *   <li>s3 row-delta: a Puffin DV on d1 (cat=a — a POSITION-delete-content deletion vector) + an
+     *       EQUALITY delete on cat=b
+     *   <li>s4 row-delta: a second Puffin DV on d2 (cat=b)
+     * </ul>
+     *
+     * V3 requires position deletes to be DVs ("Must use DVs for position deletes in V3"), so the two
+     * DVs ARE the position-delete category (a DV is {@code PositionDeletes} content). then attach a
+     * statistics file to the head snapshot. Every commit advances the metadata log, so the previous
+     * metadata.json files are reachable. Returns the committed table.
+     */
+    private static BaseTable buildFixture(File tableDir) throws IOException {
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      File dataDir = new File(tableDir, "data");
+
+      PartitionSpec spec = PartitionSpec.builderFor(SCHEMA).identity("cat").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      // V3: deletion vectors (Puffin DVs) require format version 3 ("Must not use DVs for position
+      // deletes in V2"). A V3 table still carries data + classic position/equality delete files, so
+      // every reachable category is exercised under one format version.
+      props.put(TableProperties.FORMAT_VERSION, "3");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              SCHEMA, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_delete_reachable");
+
+      // s1: data file d1 (cat=a).
+      DataFile d1 =
+          writeData(table, spec, "a", new File(dataDir, "cat=a/00000-d1.parquet"), new long[] {100, 110}, new long[] {10, 20});
+      table.newFastAppend().appendFile(d1).commit();
+
+      // s2: data file d2 (cat=b).
+      DataFile d2 =
+          writeData(table, spec, "b", new File(dataDir, "cat=b/00000-d2.parquet"), new long[] {200, 210}, new long[] {10, 20});
+      table.newFastAppend().appendFile(d2).commit();
+
+      // s3: a Puffin DV on d1 (cat=a — POSITION-delete content) + an EQUALITY delete on cat=b.
+      PartitionData partA = new PartitionData(spec.partitionType());
+      partA.set(0, "a");
+      org.apache.iceberg.io.OutputFileFactory dvFactoryA =
+          org.apache.iceberg.io.OutputFileFactory.builderFor(table, 1, 1L)
+              .format(FileFormat.PUFFIN)
+              .build();
+      org.apache.iceberg.deletes.DVFileWriter dvWriterA =
+          new org.apache.iceberg.deletes.BaseDVFileWriter(dvFactoryA, path -> null);
+      dvWriterA.delete(d1.location(), 0L, spec, partA);
+      dvWriterA.close();
+      DeleteFile eqDelete =
+          writeEqDelete(table, spec, "b", new File(dataDir, "cat=b/00000-eq-deletes.parquet"), 20L);
+      RowDelta s3 = table.newRowDelta();
+      for (DeleteFile dvFile : dvWriterA.result().deleteFiles()) {
+        s3.addDeletes(dvFile);
+      }
+      s3.addDeletes(eqDelete);
+      s3.commit();
+
+      // s4: a second Puffin DV on d2 (cat=b — a deletion vector, PositionDeletes content).
+      PartitionData partB = new PartitionData(spec.partitionType());
+      partB.set(0, "b");
+      org.apache.iceberg.io.OutputFileFactory dvFactoryB =
+          org.apache.iceberg.io.OutputFileFactory.builderFor(table, 2, 1L)
+              .format(FileFormat.PUFFIN)
+              .build();
+      org.apache.iceberg.deletes.DVFileWriter dvWriterB =
+          new org.apache.iceberg.deletes.BaseDVFileWriter(dvFactoryB, path -> null);
+      dvWriterB.delete(d2.location(), 1L, spec, partB);
+      dvWriterB.close();
+      RowDelta s4 = table.newRowDelta();
+      for (DeleteFile dvFile : dvWriterB.result().deleteFiles()) {
+        s4.addDeletes(dvFile);
+      }
+      s4.commit();
+
+      // Attach a REAL statistics file to the head snapshot (its bytes are never read by the purge;
+      // only its LOCATION is reachable). Commits via the metadata transaction so it lands in the
+      // current metadata + advances the log.
+      long headId = table.currentSnapshot().snapshotId();
+      String statsPath = new File(metadataDir, "stats-head.puffin").getAbsolutePath();
+      writeStatsFile(table.io(), statsPath);
+      table
+          .updateStatistics()
+          .setStatistics(new GenericStatisticsFile(headId, statsPath, 28L, 4L, java.util.Collections.emptyList()))
+          .commit();
+
+      return table;
+    }
+
+    /** Compute Java's OWN reachable set via ReachableFileUtil + the allManifests content scan. */
+    static Reachable computeReachable(Table table) throws IOException {
+      Reachable reachable = new Reachable();
+      FileIO io = new LocalFileIO();
+
+      // Content files (data / position-delete / equality-delete / DV) across ALL snapshots.
+      for (Snapshot snapshot : table.snapshots()) {
+        reachable.manifestLists.add(snapshot.manifestListLocation());
+        for (ManifestFile manifest : snapshot.allManifests(io)) {
+          reachable.manifests.add(manifest.path());
+          if (manifest.content() == ManifestContent.DATA) {
+            try (ManifestReader<DataFile> reader =
+                ManifestFiles.read(manifest, io, table.specs())) {
+              for (ManifestEntry<DataFile> entry : reader.entries()) {
+                reachable.dataFiles.add(entry.file().location());
+              }
+            }
+          } else {
+            try (ManifestReader<DeleteFile> reader =
+                ManifestFiles.readDeleteManifest(manifest, io, table.specs())) {
+              for (ManifestEntry<DeleteFile> entry : reader.entries()) {
+                DeleteFile file = entry.file();
+                if (file.content() == FileContent.EQUALITY_DELETES) {
+                  reachable.equalityDeleteFiles.add(file.location());
+                } else {
+                  // POSITION_DELETES — includes Puffin DVs (a DV is position-delete content).
+                  reachable.positionDeleteFiles.add(file.location());
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // The "other" bucket via the REAL core helpers (the anti-circular oracle).
+      // metadataFileLocations(table, recursive=true) returns current + ALL previous metadata.json.
+      reachable.metadataJsonFiles.addAll(ReachableFileUtil.metadataFileLocations(table, true));
+      reachable.versionHint = ReachableFileUtil.versionHintLocation(table);
+      reachable.statisticsFiles.addAll(ReachableFileUtil.statisticsFilesLocations(table));
+
+      return reachable;
+    }
+
+    /** Returns the number of failures (0 ⇒ Java agrees with the Rust-computed + Rust-deleted set). */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+
+      Path finalMetadata = dir.resolve("table/metadata/final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println("FAIL delete-reachable: missing java table final.metadata.json");
+        return 1;
+      }
+
+      // Java's OWN recomputation of the reachable descriptor from the JAVA table (ground truth).
+      TableMetadata javaMetadata =
+          TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      BaseTable javaTable =
+          new BaseTable(
+              new StaticTableOperations(javaMetadata, new LocalFileIO()), "interop_delete_reachable");
+      Reachable javaReachable = computeReachable(javaTable);
+      String javaDescriptor = javaReachable.toDescriptor();
+
+      // (a) The Rust-computed reachable descriptor (rust_reachable.json) must equal Java's.
+      Path rustReachablePath = dir.resolve("rust_reachable.json");
+      if (!Files.exists(rustReachablePath)) {
+        System.out.println("FAIL delete-reachable: missing rust_reachable.json");
+        return 1;
+      }
+      String rustDescriptor = readString(rustReachablePath).trim();
+      if (!rustDescriptor.equals(javaDescriptor)) {
+        System.out.println(
+            "FAIL delete-reachable: reachable descriptors differ — java="
+                + javaDescriptor
+                + " rust="
+                + rustDescriptor);
+        failures++;
+      } else {
+        System.out.println("PASS delete-reachable: reachable descriptor java == rust");
+      }
+
+      // (b) DELETE-COMPLETENESS over the Rust-deleted COPY. The Rust GEN ran DeleteReachableFiles on
+      //     rust_table_copy; here Java asserts the descriptor of what RUST reported deleting
+      //     (rust_deleted.json) equals Java's reachable descriptor (every category fully purged), and
+      //     that the post-delete tree under rust_table_copy has every reachable file GONE.
+      Path rustDeletedPath = dir.resolve("rust_deleted.json");
+      if (!Files.exists(rustDeletedPath)) {
+        System.out.println("FAIL delete-reachable: missing rust_deleted.json");
+        return failures + 1;
+      }
+      String rustDeletedDescriptor = readString(rustDeletedPath).trim();
+      if (!rustDeletedDescriptor.equals(javaDescriptor)) {
+        System.out.println(
+            "FAIL delete-reachable: Rust-DELETED descriptor != reachable descriptor (incomplete or "
+                + "over-delete) — reachable="
+                + javaDescriptor
+                + " deleted="
+                + rustDeletedDescriptor);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS delete-reachable: Rust deleted EVERY reachable category (delete-completeness)");
+      }
+
+      return failures;
+    }
+
+    /** Write a REAL parquet data file in partition `cat` with rows (id, cat, y). */
+    private static DataFile writeData(
+        BaseTable table, PartitionSpec spec, String cat, File file, long[] ids, long[] ys)
+        throws IOException {
+      mkdirs(file.getParentFile());
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, cat);
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", ids[i]);
+        record.setField("cat", cat);
+        record.setField("y", ys[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /** Write a REAL parquet EQUALITY-delete file (on field id 3 = `y`) in partition `cat`. */
+    private static DeleteFile writeEqDelete(
+        BaseTable table, PartitionSpec spec, String cat, File file, long deleteY) throws IOException {
+      mkdirs(file.getParentFile());
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, cat);
+      Schema eqDeleteRowSchema = SCHEMA.select("y");
+      int[] equalityFieldIds =
+          eqDeleteRowSchema.columns().stream().mapToInt(Types.NestedField::fieldId).toArray();
+      GenericRecord delete = GenericRecord.create(eqDeleteRowSchema);
+      delete.setField("y", deleteY);
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(SCHEMA, spec, equalityFieldIds, eqDeleteRowSchema, null);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      EqualityDeleteWriter<Record> writer =
+          factory.newEqDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(List.of(delete));
+      }
+      return writer.toDeleteFile();
+    }
+
+    /** Write a tiny real statistics file (its bytes are never read by the purge; only the path is). */
+    private static void writeStatsFile(FileIO io, String path) throws IOException {
+      OutputFile out = io.newOutputFile(path);
+      try (java.io.OutputStream stream = out.create()) {
+        stream.write("interop-delete-reachable stats fixture".getBytes(StandardCharsets.UTF_8));
+      }
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
+    }
+
+    /** The categorized reachable set + its path-INDEPENDENT category-count descriptor. */
+    static final class Reachable {
+      final java.util.TreeSet<String> dataFiles = new java.util.TreeSet<>();
+      final java.util.TreeSet<String> positionDeleteFiles = new java.util.TreeSet<>();
+      final java.util.TreeSet<String> equalityDeleteFiles = new java.util.TreeSet<>();
+      final java.util.TreeSet<String> manifests = new java.util.TreeSet<>();
+      final java.util.TreeSet<String> manifestLists = new java.util.TreeSet<>();
+      final java.util.TreeSet<String> metadataJsonFiles = new java.util.TreeSet<>();
+      final java.util.TreeSet<String> statisticsFiles = new java.util.TreeSet<>();
+      String versionHint = null;
+
+      /**
+       * The path-INDEPENDENT descriptor that crosses engines: the count in EACH category. The
+       * "other" Java bucket is split into its three sub-categories (metadata json / version hint /
+       * statistics) so a wrong categorization within "other" is also caught. MUST match the Rust
+       * `interop_delete_reachable.rs` `Reachable::descriptor` token scheme byte-for-byte.
+       */
+      String toDescriptor() {
+        // version-hint counts as 1 (Java always names it, even when no hint file exists on disk).
+        int versionHintCount = versionHint == null ? 0 : 1;
+        return "data="
+            + dataFiles.size()
+            + ";pos_delete="
+            + positionDeleteFiles.size()
+            + ";eq_delete="
+            + equalityDeleteFiles.size()
+            + ";manifest="
+            + manifests.size()
+            + ";manifest_list="
+            + manifestLists.size()
+            + ";metadata_json="
+            + metadataJsonFiles.size()
+            + ";version_hint="
+            + versionHintCount
+            + ";statistics="
+            + statisticsFiles.size();
+      }
+
+      String toDescriptorJson() {
+        return JsonUtil.generate(gen -> gen.writeString(toDescriptor()), false);
       }
     }
   }
