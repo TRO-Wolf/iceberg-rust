@@ -35,7 +35,7 @@
 //! | `deleteReachableFiles(String)` | location | [`Actions::delete_reachable_files`] |
 //! | `rewritePositionDeletes(Table)` | table | unsupported (no Rust action) |
 //! | `computeTableStats(Table)` | table | [`Actions::compute_table_stats`] |
-//! | `computePartitionStats(Table)` | table | unsupported (compute core only — see below) |
+//! | `computePartitionStats(Table)` | table | [`Actions::compute_partition_stats`] |
 //! | `rewriteTablePath(Table)` | table | unsupported (no Rust action) |
 //! | `removeDanglingDeleteFiles(Table)` | table | [`Actions::remove_dangling_delete_files`] |
 //!
@@ -61,21 +61,19 @@
 //!
 //! # Unsupported actions — surfaced honestly, never faked
 //!
-//! Four Java methods have no Rust action behind them yet (`snapshotTable`, `migrateTable`,
-//! `rewritePositionDeletes`, `rewriteTablePath`), and `computePartitionStats` has only the *compute
-//! core* ([`compute_partition_stats`](crate::maintenance::compute_partition_stats)) with no action
-//! wrapper. Rather than fabricate them, the [`ActionsProvider`] trait mirrors Java's
-//! *throw-by-default* shape: each unsupported method has a default that returns a typed
-//! [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error naming the gap (the
-//! Rust analog of Java's `UnsupportedOperationException`). The concrete [`Actions`] factory overrides
-//! exactly the seven methods Rust can actually run, and leaves the rest at the unsupported default.
-//! The gap is tracked in `docs/parity/GAP_MATRIX.md` row 151.
+//! Four Java methods have no Rust action behind them (`snapshotTable`, `migrateTable`,
+//! `rewritePositionDeletes`, `rewriteTablePath`). Rather than fabricate them, the [`ActionsProvider`]
+//! trait mirrors Java's *throw-by-default* shape: each unsupported method has a default that returns a
+//! typed [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error naming the gap
+//! (the Rust analog of Java's `UnsupportedOperationException`). The concrete [`Actions`] factory
+//! overrides exactly the eight methods Rust can actually run, and leaves the rest at the unsupported
+//! default. The gap is tracked in `docs/parity/GAP_MATRIX.md` row 151.
 
 use crate::Result;
 use crate::error::Error;
 use crate::maintenance::{
-    ComputeTableStats, DeleteOrphanFiles, DeleteReachableFiles, RemoveDanglingDeleteFiles,
-    RewriteDataFiles,
+    ComputePartitionStats, ComputeTableStats, DeleteOrphanFiles, DeleteReachableFiles,
+    RemoveDanglingDeleteFiles, RewriteDataFiles,
 };
 use crate::table::Table;
 use crate::transaction::{ExpireSnapshotsAction, RewriteManifestsAction};
@@ -165,11 +163,9 @@ pub trait ActionsProvider {
         Err(unsupported("compute_table_stats", "ComputeTableStats"))
     }
 
-    /// Mirrors Java `computePartitionStats(Table)`. **Unsupported in this crate**: only the compute
-    /// core ([`compute_partition_stats`](crate::maintenance::compute_partition_stats)) is ported, with
-    /// no action wrapper, so the factory cannot hand out a configurable action. Returns
-    /// [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported).
-    fn compute_partition_stats(&self, table: Table) -> Result<NoAction> {
+    /// Mirrors Java `computePartitionStats(Table)`. **Unsupported by default**; the concrete
+    /// [`Actions`] factory overrides it to return [`ComputePartitionStats::new`].
+    fn compute_partition_stats(&self, table: Table) -> Result<ComputePartitionStats> {
         let _ = table;
         Err(unsupported(
             "compute_partition_stats",
@@ -219,7 +215,7 @@ fn unsupported(method: &str, java_action: &str) -> Error {
 }
 
 /// The engine-agnostic concrete [`ActionsProvider`] for this crate: a zero-state factory that hands
-/// out the seven table-maintenance actions Rust has built, leaving the other five Java methods at
+/// out the eight table-maintenance actions Rust has built, leaving the other four Java methods at
 /// their unsupported default.
 ///
 /// This is the Rust analog of a Java engine's `ActionsProvider` implementation
@@ -301,6 +297,14 @@ impl ActionsProvider for Actions {
         Ok(ComputeTableStats::new(table))
     }
 
+    /// Returns a [`ComputePartitionStats`] action for `table` (Java `computePartitionStats(Table)`).
+    /// Configure it with [`ComputePartitionStats::snapshot_id`] and run it with
+    /// [`ComputePartitionStats::execute`] — it computes + writes + registers a partition-stats file
+    /// through the `UpdatePartitionStatistics` seam.
+    fn compute_partition_stats(&self, table: Table) -> Result<ComputePartitionStats> {
+        Ok(ComputePartitionStats::new(table))
+    }
+
     /// Returns a [`RemoveDanglingDeleteFiles`] action for `table` (Java
     /// `removeDanglingDeleteFiles(Table)`). Run it with [`RemoveDanglingDeleteFiles::execute`].
     /// **This action removes delete files.**
@@ -320,33 +324,33 @@ mod tests {
     use crate::io::{FileIO, FileIOBuilder, LocalFsStorageFactory};
     use crate::memory::MemoryCatalogBuilder;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, NestedField, PartitionSpec,
-        PrimitiveType, Schema, Struct, Type,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, NestedField,
+        PartitionSpec, PrimitiveType, Schema, Struct, Transform, Type,
     };
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation};
 
     /// The exact set of factory methods the concrete [`Actions`] supports (overrides off the
     /// unsupported default). Pins the supported surface so a wiring that silently drops or adds an
-    /// override fails this test. The seven map 1:1 to Java `ActionsProvider` methods with a built
+    /// override fails this test. The eight map 1:1 to Java `ActionsProvider` methods with a built
     /// Rust action.
-    const SUPPORTED_METHODS: [&str; 7] = [
+    const SUPPORTED_METHODS: [&str; 8] = [
         "delete_orphan_files",
         "delete_reachable_files",
         "rewrite_manifests",
         "rewrite_data_files",
         "expire_snapshots",
         "compute_table_stats",
+        "compute_partition_stats",
         "remove_dangling_delete_files",
     ];
 
     /// The Java `ActionsProvider` methods with NO Rust action behind them — the factory honestly
     /// reports these as unsupported.
-    const UNSUPPORTED_METHODS: [&str; 5] = [
+    const UNSUPPORTED_METHODS: [&str; 4] = [
         "snapshot_table",
         "migrate_table",
         "rewrite_position_deletes",
-        "compute_partition_stats",
         "rewrite_table_path",
     ];
 
@@ -413,6 +417,51 @@ mod tests {
             .create_table(&namespace, creation)
             .await
             .expect("create table")
+    }
+
+    /// Create a table partitioned by `identity(x)` (spec 0, field id 1000) under a fresh namespace —
+    /// for the `compute_partition_stats` smoke test (which requires a partitioned table).
+    async fn create_x_partitioned_table(catalog: &impl Catalog) -> Table {
+        let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create namespace");
+        let spec = PartitionSpec::builder(three_long_schema())
+            .with_spec_id(0)
+            .add_partition_field("x", "x", Transform::Identity)
+            .expect("add partition field")
+            .build()
+            .expect("build spec");
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .schema(three_long_schema())
+            .partition_spec(spec.into_unbound())
+            .build();
+        catalog
+            .create_table(&namespace, creation)
+            .await
+            .expect("create table")
+    }
+
+    /// A real data file stamped with spec 0 and the given partition tuple, holding `records` rows.
+    async fn partitioned_data_file(
+        file_io: &FileIO,
+        path: &str,
+        partition: Struct,
+        records: u64,
+    ) -> DataFile {
+        write_real_file(file_io, path, b"data").await;
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(4)
+            .record_count(records)
+            .partition_spec_id(0)
+            .partition(partition)
+            .build()
+            .expect("build data file")
     }
 
     /// Write `content` to `path` through `file_io` (creates parent dirs on the local fs).
@@ -494,6 +543,7 @@ mod tests {
         assert!(actions.rewrite_data_files(table.clone()).is_ok());
         assert!(actions.expire_snapshots(table.clone()).is_ok());
         assert!(actions.compute_table_stats(table.clone()).is_ok());
+        assert!(actions.compute_partition_stats(table.clone()).is_ok());
         assert!(actions.remove_dangling_delete_files(table.clone()).is_ok());
     }
 
@@ -513,7 +563,6 @@ mod tests {
         // Table-arg unsupported methods.
         for err in [
             actions.rewrite_position_deletes(table.clone()).unwrap_err(),
-            actions.compute_partition_stats(table.clone()).unwrap_err(),
             actions.rewrite_table_path(table.clone()).unwrap_err(),
         ] {
             assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
@@ -695,6 +744,62 @@ mod tests {
         assert!(
             committed.metadata().current_snapshot().is_some(),
             "the live snapshot survives a no-op manifest rewrite"
+        );
+    }
+
+    /// Smoke test: a `ComputePartitionStats` handed out by the factory actually RUNS (computes +
+    /// writes + registers a partition-stats file on a partitioned table), proving the override is
+    /// live, not a stub. A broken override (e.g. one that ignored the table) fails here. **This
+    /// computes over a THROWAWAY local-fs MemoryCatalog table — never a shared/live catalog.**
+    #[tokio::test]
+    async fn compute_partition_stats_from_factory_executes_live() {
+        let (catalog, file_io, _tmp) = local_fs_catalog().await;
+        let table = create_x_partitioned_table(&catalog).await;
+        let location = table.metadata().location().to_string();
+
+        // Two partitions so the computed collection is non-empty (the action errors on an empty one).
+        let table = append(&catalog, &table, vec![
+            partitioned_data_file(
+                &file_io,
+                &format!("{location}/data/x=1/d1.parquet"),
+                Struct::from_iter([Some(Literal::long(1))]),
+                3,
+            )
+            .await,
+            partitioned_data_file(
+                &file_io,
+                &format!("{location}/data/x=2/d2.parquet"),
+                Struct::from_iter([Some(Literal::long(2))]),
+                5,
+            )
+            .await,
+        ])
+        .await;
+        let snapshot_id = table.metadata().current_snapshot_id().unwrap();
+
+        let result = Actions::get()
+            .compute_partition_stats(table)
+            .expect("factory returns compute-partition-stats action")
+            .execute(&catalog)
+            .await
+            .expect("execute compute partition stats");
+
+        assert_eq!(result.statistics_file.snapshot_id, snapshot_id);
+        assert!(result.statistics_file.file_size_in_bytes > 0);
+        // The registered file lands in the refreshed metadata (the seam commit fired).
+        let registered = result
+            .table
+            .metadata()
+            .partition_statistics_for_snapshot(snapshot_id)
+            .expect("registered partition statistics");
+        assert_eq!(
+            registered.statistics_path,
+            result.statistics_file.statistics_path
+        );
+        // The file physically exists on disk.
+        assert!(
+            exists(&file_io, &result.statistics_file.statistics_path).await,
+            "the partition-stats file must be written to disk"
         );
     }
 }

@@ -44,14 +44,20 @@
 //!   file (per-partition/spec min-data-seq comparison + DV reference check), committed through the
 //!   [`RewriteFilesAction`](crate::transaction::rewrite_files) delete-file-removal surface. The Rust
 //!   port of Java's `RemoveDanglingDeletesSparkAction`. **This action removes delete files.**
+//! - [`ComputePartitionStats`] — the engine-agnostic action wrapper (the Rust port of Java 1.10.0
+//!   `ComputePartitionStats` / `BaseComputePartitionStats`): `new(table).snapshot_id(id).execute(catalog)`
+//!   resolves the snapshot, runs the compute/write core, and registers the file through the
+//!   [`UpdatePartitionStatisticsAction`](crate::transaction::Transaction::update_partition_statistics)
+//!   seam, returning a [`ComputePartitionStatsResult`].
 //! - [`compute_partition_stats`] / [`PartitionStats`] — the `ComputePartitionStats` compute core (the
 //!   Rust port of Java 1.10.0 `PartitionStatsHandler`'s full-compute aggregation): per-partition
 //!   statistics rolled up over a snapshot's manifests into the Java-exact partition-stats schema.
 //!   [`compute_and_write_stats_file`] writes those rows to an on-disk partition-stats parquet file at
 //!   Java's location/naming (`<location>/metadata/partition-stats-<snapshotId>-<uuid>.parquet`) with the
-//!   field ids 1..=13 stamped; [`register_partition_stats_file`] commits it into the table metadata
-//!   (`SetPartitionStatistics`); [`read_partition_stats_file`] decodes a written file back into rows. See
-//!   [`partition_stats`] for the schema + traversal + on-disk format.
+//!   field ids 1..=13 stamped; [`register_partition_stats_file`] commits it into the table metadata via
+//!   the `UpdatePartitionStatisticsAction` seam (`SetPartitionStatistics`); [`read_partition_stats_file`]
+//!   decodes a written file back into rows. See [`partition_stats`] for the schema + traversal + on-disk
+//!   format.
 //! - [`ComputeTableStats`] — per-column NDV (number of distinct values) via Apache DataSketches theta
 //!   sketches (the [`iceberg_sketches`] crate), written as one `apache-datasketches-theta-v1` Puffin
 //!   blob per column into a single statistics file and registered through the existing
@@ -77,6 +83,7 @@
 //! reusing `expire_cleanup`'s delta machinery).
 
 mod actions_provider;
+mod compute_partition_stats;
 mod compute_table_stats;
 mod delete_orphan_files;
 mod delete_reachable_files;
@@ -88,6 +95,7 @@ mod rewrite_data_files;
 mod tests;
 
 pub use actions_provider::{Actions, ActionsProvider, NoAction};
+pub use compute_partition_stats::{ComputePartitionStats, ComputePartitionStatsResult};
 pub use compute_table_stats::{ComputeTableStats, ComputeTableStatsResult};
 pub use delete_orphan_files::{DeleteOrphanFiles, DeleteOrphanFilesResult, PrefixMismatchMode};
 pub use delete_reachable_files::{
