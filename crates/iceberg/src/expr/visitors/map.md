@@ -34,6 +34,7 @@ modules are `pub(crate)`.
 | `expression_evaluator.rs` | `Evaluators` | evaluate a bound predicate against a concrete struct (e.g. a partition value) |
 | `inclusive_metrics_evaluator.rs` | `InclusiveMetricsEvaluator` | "might this FILE contain matching rows?" — file pruning AND write-side conflict detection (`first_conflicting_file`) |
 | `strict_metrics_evaluator.rs` | `StrictMetricsEvaluator` | "do ALL rows match?" |
+| `aggregate_evaluator.rs` | `UnboundAggregate`/`BoundAggregate`/`AggregateEvaluator` (`CountStar`/`CountNonNull`/`MinAggregate`/`MaxAggregate`) | compute `count(*)`/`count(col)`/`min`/`max` from `DataFile` metrics with no data scan; a missing required metric invalidates the aggregate (not pushable → engine scans). `Extract` (variant shredding) is CUT. Not yet wired to a scan consumer. |
 | `inclusive_projection.rs` / `strict_projection.rs` | `Projections` | row filter → partition-space predicate via `Transform::project`/`strict_project` |
 | `residual_evaluator.rs` | `ResidualEvaluator` | partial-evaluate a row filter against partition values → residual (strict-true ⇒ `AlwaysTrue`, inclusive-false ⇒ `AlwaysFalse`, else keep) |
 | `rewrite_not.rs` | `RewriteNot` | NOT-elimination pre-pass (evaluators assume NOT-free input) |
@@ -63,6 +64,7 @@ modules are `pub(crate)`.
 | Missing-metrics file behavior wrong | A file with absent counts/bounds must be treated as "might match" (cannot prune) — check the `None` arms |
 | Residual keeps/drops the wrong branch | The strict-projection-true / inclusive-projection-false short-circuits are order-sensitive; the partition-value substitution must use the file's own spec |
 | Evaluator panics on NOT | Run `rewrite_not` first — evaluators assume NOT-free bound predicates |
+| Aggregate returns a wrong number | A missing required metric must INVALIDATE the aggregate (`all_valid()`→false, `results()`→`None`), never produce a partial count/min/max. Check `aggregate_evaluator.rs::has_value` — `count(col)` needs both value+null counts; `min`/`max` need the bound or an all-null column |
 
 ### First checks
 

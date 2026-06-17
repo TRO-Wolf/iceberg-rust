@@ -334,13 +334,17 @@ G1 is oracle-dependent.
       form (== JDK 19+), diverging only from the JDK-11 oracle; non-finite floats rejected. 2 LOW findings
       ACCEPTED-as-is (write-side depth limit — input already bounded by the read-side cap; signed-zero
       round-trip test gap — write preserves it). Files: `expression_parser.rs`, `interop_expression.rs`, `run-interop-expression.sh`.
-- [ ] **G2 — `AggregateEvaluator` (count/min/max pushdown)** (3h, MED, offline) → **row 148 ❌→🟡**.
-      UnboundAggregate/BoundAggregate/AggregateEvaluator computing count(*)/count(col)/min/max from manifest
-      DataFile metrics (value_counts/null_value_counts/lower_bounds/upper_bounds) WITHOUT scanning. CUT
-      Bound/UnboundExtract (FRONTIER-PARKED variant-shredding extract term) — annotate. Reuse expr/ bound
-      machinery + the metrics evaluators. STALLER (mutation-test): metrics-unavailable (hasValue→false) MUST
-      invalidate the aggregator (force a scan) — else pushed-down counts are silently wrong. Self-contained,
-      offline; row stays 🟡 (interop deferred). Aggregate tree + evaluator reach ✅-quality.
+- [x] **G2 — `AggregateEvaluator` (count/min/max pushdown)** — **DONE 2026-06-17 (#TBD). row 148 ❌→🟡.**
+      UnboundAggregate{count_star/count/min/max}→bind→BoundAggregate + AggregateEvaluator folding from manifest
+      DataFile metrics, NO scan. Critic DECOMPILED Java 1.10.0 bytecode (AggregateEvaluator/NullSafeAggregator/
+      CountStar/CountNonNull/Min/MaxAggregate) — formulas match EXACTLY: count(*)=Σrecord_count,
+      count(col)=Σ(value_count−null_count) [corrected from the plan's record_count−null], min/max via typed
+      `Datum::partial_cmp`, the has_value AND/OR predicates + allNull short-circuit. STALLER mutation-proven:
+      dropping the latched `is_valid=false` invalidation fails 5 cant-push tests (missing metric ⇒ not-pushable,
+      never a silently-wrong partial). Bound/UnboundExtract CUT (the aggregate term is `Option<Reference>` — no
+      extract type to construct; zero `*Extract` defs). 17 unit tests; full lib 2392. Converged 1 cycle. 2 LOW
+      accepted (min/max NaN-ordering + partial_cmp→None=DataInvalid conservative — part of the 🟡 residue,
+      addressed at the later interop ✅). Offline (529-light). Files: `expr/visitors/aggregate_evaluator.rs`.
 - [ ] **G3 — Catalog accessors + the Glue/S3Tables-views matrix correction** (2h, LOW, offline) → **row 149
       ❌→🟡**. Four non-breaking DEFAULT `Catalog` methods: name() (Java default), invalidate_table() /
       invalidate_view() (Java/ViewCatalog default no-ops), properties() (RESTCatalog-only in Java — include as
