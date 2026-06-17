@@ -382,11 +382,53 @@ mutation-testing.** One crack found + fixed:
       FAILED (guard-neuter reds 2 unit tests + the mirror). Row 144 ✅ now meets the unit-tests-AND-interop
       bar. _Orchestrator re-ran the oracle (D1 4/4, D2 1-pass, sabotage fail-closed) + offline gate._
 
-**Doc-drift follow-up (queued, next PR):** the Roadmap's "Current state" + "Headline gaps" prose drifted
-16 places (all UNDER-claims — doc behind reality: stale ❌ for RewritePositionDeleteFiles/ComputePartitionStats/
-Catalog-accessors/validateAppendOnly/unknown; "5/8 actions"→9/12; incremental scans called interop-deferred
-but ✅). Plus 3 GAP_MATRIX internal nits (row 105 xref 140→150; row 145 xref 134→144; row 138 stale 8/4→9/3).
-Package as a docs-only correction PR (shape of #70) after VAO merges.
+- [x] **Doc-drift correction PR** — **DONE 2026-06-17 (#86).** Resynced 16 Roadmap under-claims (stale ❌
+      for RewritePositionDeleteFiles/ComputePartitionStats/Catalog-accessors/validateAppendOnly/unknown;
+      "5/8 actions"→9/12; incremental scans interop-deferred→✅) + 3 GAP_MATRIX nits (row 105 xref 140→150;
+      row 145 xref 134→144; row 138 stale 8/4→9/3 dropped per one-home). Docs-only, no glyph changed. _VAO
+      interop merged #85._
+
+## BLOCK 4 (8-HOUR PLAN, 2026-06-17, Opus, signed off) — BatchScan: 2 sequential AC·OO PRs
+
+Grounded by a 3-agent scoping pass (Java javap contract + live Rust scan module + matrix rows 122/146).
+**Decisive finding:** in Java 1.10.0 `Table.newBatchScan()` is a thin `BatchScanAdapter` delegating
+`planTasks()`/`planFiles()` 1:1 to `BaseTableScan` — so porting `planTasks()` IS porting BatchScan; rows
+122 + 146 are ONE gap, 146 subsumes 122. `planTasks()` = `splitFiles(planFiles(), target)` →
+bin-pack(`largestBinFirst=true`). Props: `read.split.target-size`(128MiB)/`planning-lookback`(10)/
+`open-file-cost`(4MiB). DataFusion uses `to_arrow()` not tasks → no forced ripple. Statuses live ONLY in
+[GAP_MATRIX](../docs/parity/GAP_MATRIX.md).
+
+- [x] **U1 — `plan_tasks()` + planning structures + Java oracle → row 146 ❌→🟡** — **DONE 2026-06-17.**
+      AC·OO converged 1 cycle, Critic refutation FAILED (mutation-tested largestBinFirst/weight-floor/offsets-split
+      → reds the right tests). Landed `scan/task_group.rs` + `scan/bin_pack.rs` + `FileScanTask::split` + flagged
+      `split_offsets` field (benign `split_offsets:None` ripple into arrow/* + rewrite_data_files test literals) +
+      `TableScan::plan_tasks()` ABOVE an unchanged `plan_files()`. 30 offline tests + bidirectional `ScanPlanOracle`
+      (D1 11 groups / D2 16 groups / sabotage 11→1 + 8→2). **HONEST FLIP: 146 ❌→🟡 not ✅** — 146 *subsumes* the
+      typed `BatchScan` surface (row 122, still ❌ until U2), so the core planTasks/split/bin-pack is interop-proven
+      but the row is not fully ✅ yet. Orchestrator fixed 1 LOW (stale off-by-one sabotage comment → large-target),
+      re-ran the oracle + offline gate, verified the arrow ripple is field-default-only + Cargo untouched.
+      `DataTask` = metadata-tables (separate surface, deferred). _Original plan said ❌→✅; corrected to ❌→🟡 for the
+      subsumption-honesty reason above._
+  _Delivered spec (reference):_ `ScanTaskGroup`/`CombinedScanTask` + `SplittableScanTask::split(target)` (offsets-aware: one
+      sub-task per strictly-ascending split-offset, target ignored; else fixed-size `min(target,remaining)`;
+      non-splittable→no split; sub-tasks clone deletes/residual/partition) + `BinPacking` port (largestBinFirst
+      eviction; weight `max(len+deleteBytes, (1+#deletes)·openFileCost)`). `TableScan::plan_tasks()` sits ABOVE
+      `plan_files()` (preserve its byte-unchanged/no-reporter invariant); builder knobs w/ Java defaults+override;
+      thread `split_offsets` from manifest entry into `FileScanTask` (flagged additive public field). **Interop
+      (real bidirectional, NOT no-Spark):** `ScanPlanOracle` drives `newScan().planTasks()` over a fixture
+      exercising fixed-size+bin-pack (+offsets-aware +MoR-delete-weight); compare multiset of per-group
+      `{(path,start,length)}` sets + group count, both directions; anti-circular target/lookback/cost; fail-closed
+      sabotage (±1B target re-pack; drop split-offset). RISK: MoR (every sub-task keeps same path+pos deletes),
+      offset fidelity, i64/u64 no-`as`, the plan_files invariant.
+- [ ] **U2 — typed `BatchScan` scan-kind → row 122 ❌→✅** (thin, ~2h, LOW, 1cy; gates on U1). Mirror
+      `api/BatchScan.java` (`useSnapshot`/`useRef`/`asOfTime` + `plan_files`/`plan_tasks` delegating to U1's
+      pipeline, BatchScanAdapter shape), reuse the existing builder. **Interop:** extend U1's oracle to also
+      drive `newBatchScan().planTasks()`, assert == `newScan().planTasks()` (adapter delegation) and == Rust
+      `BatchScan::plan_tasks()` — keeps 122 ✅ interop-backed, not unit-test-only.
+
+Sequencing: U1 (DONE — flips 146 ❌→🟡, the planTasks core interop-proven) → merge → rebase → U2 (flips
+146 🟡→✅ AND 122 ❌→✅ together, since 146 subsumes the typed BatchScan surface). Both interop-proven.
+Parity after block 4: ~33✅, ❌ 10→9 (U1: ❌ 11→10 via 146→🟡; U2: +2 ✅ / −1 ❌).
 
 Block-3 stretch / deferred: BatchScan-U1 (ScanTaskGroup/bin-pack, 146 🟡, offline) · RewriteTablePath
 (137 🟡, provider 10/2, 4.5h — full TableMetadata rebuild) · Avro-data-READ (own ~6.5h block, 117 🟡).

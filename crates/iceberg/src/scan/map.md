@@ -30,9 +30,11 @@ propagation, and opt-in scan-metrics reporting.
 
 | File | What it does |
 |---|---|
-| `mod.rs` | `TableScanBuilder` (filter / select / snapshot_id / use_ref / concurrency limits / row-group filtering / row selection / `with_metrics_reporter`) + `TableScan::plan_files` + `to_arrow` |
-| `context.rs` | `PlanContext` / `ManifestFileContext` / `ManifestEntryContext`: per-manifest evaluator caches (manifest evaluator, partition filter, residual evaluator built per manifest), `into_file_scan_task` (evaluates the **partition-reduced residual** per file, Java `residuals.residualFor(file.partition())`) |
-| `task.rs` | `FileScanTask` (+ delete-file attachments for merge-on-read) |
+| `mod.rs` | `TableScanBuilder` (filter / select / snapshot_id / use_ref / concurrency limits / row-group filtering / row selection / `with_metrics_reporter` / `with_split_size`·`with_split_lookback`·`with_split_open_file_cost`) + `TableScan::plan_files` + `TableScan::plan_tasks` (split + bin-pack, Java `Scan.planTasks`) + `to_arrow` |
+| `context.rs` | `PlanContext` / `ManifestFileContext` / `ManifestEntryContext`: per-manifest evaluator caches (manifest evaluator, partition filter, residual evaluator built per manifest), `into_file_scan_task` (evaluates the **partition-reduced residual** per file, Java `residuals.residualFor(file.partition())`; threads `split_offsets` from the manifest entry onto the task) |
+| `task.rs` | `FileScanTask` (+ delete-file attachments for merge-on-read, + flagged-additive `split_offsets`); `FileScanTask::split(target)` (Java `BaseContentScanTask.split`: non-splittable / offsets-aware / fixed-size) + `weight(open_file_cost)` (Java `lambda$planTasks$3` = `max(length+deleteBytes, (1+#deletes)*openFileCost)`) |
+| `task_group.rs` | `ScanTaskGroup` trait + `CombinedScanTask` (`Vec<FileScanTask>`; `size_bytes` = Σ lengths, `files_count`) — the `plan_tasks` group output (Java `ScanTaskGroup` / `CombinedScanTask`) |
+| `bin_pack.rs` | `PackingIterator` — a faithful Java `BinPacking.PackingIterable` port (FIFO `findBin`, `largestBinFirst` eviction, drain FIFO); self-contained + unit-testable |
 | `cache.rs` | object cache plumbing for manifest/manifest-list reads |
 | `incremental.rs` | incremental append scan (parity gap: changelog/batch scans missing) |
 | `metrics_collector.rs` | `ScanMetricsCollector` (Arc'd `AtomicI64`) — opt-in; report emitted ONCE on full stream consumption |
@@ -41,6 +43,7 @@ propagation, and opt-in scan-metrics reporting.
 
 | I want to... | go to |
 |---|---|
+| Touch split / bin-pack grouping (`plan_tasks`) | `task.rs::split` + `weight` (Java `BaseContentScanTask.split` / `lambda$planTasks$3`), `bin_pack.rs` (Java `BinPacking.PackingIterable`), and `mod.rs::plan_tasks` (drives `plan_files` UNCHANGED, then split + pack). The split target/lookback/open-file-cost resolve from table props + scan-option overrides (Java `BaseScan.targetSplitSize`/`splitLookback`/`splitOpenFileCost`). Cross-engine pinned by `tests/interop_scan_plan.rs` + `dev/java-interop/run-interop-scan-plan.sh` |
 | Change manifest/file pruning | `context.rs` (evaluator construction + the prune point) and [../expr/visitors/map.md](../expr/visitors/map.md) for the evaluators themselves |
 | Touch residual handling | `context.rs` — the residual is built per manifest from the file's spec, evaluated per partition, then **bound back to the snapshot schema** |
 | Add a scan metric | `metrics_collector.rs` + the count sites in `mod.rs`/`context.rs`; populated-vs-`None` counters are documented in `../metrics/mod.rs` |
@@ -62,6 +65,7 @@ propagation, and opt-in scan-metrics reporting.
 | Identity-partition constants wrong / type errors in record batches | The `PartitionUtil.constantsMap` constant-materialization path is **active**: each task carries its manifest's `partition_spec` (`context.rs::create_manifest_file_context`), and `arrow/record_batch_transformer` materializes identity-partition columns as PLAIN arrays of the declared scan-schema type (never REE) coerced to the column's Iceberg type (`Datum::to`). A constant field present in the file is forced down the `Modify` path so the constant OVERRIDES the file column (`constant_overrides_file_column`). Wrong value ⇒ check the spec/partition threading and `constants_map`; type/REE error ⇒ check the plain-array + `Datum::to` coercion in the transformer |
 | Metrics report emitted on a dropped stream / per task | The report fires ONCE on full consumption (`None` from the stream); early-drop emits NOTHING (pinned by test) |
 | No-reporter path changed | With no reporter there must be **no collector, no timer, no wrapper** — the plan path is byte-unchanged (structural test pins this) |
+| `plan_tasks` groups diverge from Java | Check the WEIGHT (`task.rs::weight` — delete bytes via `content_size_in_bytes`: DV→blob size, else file size; floor `(1+#deletes)*openFileCost`), the SPLIT branch order (offsets-aware IGNORES target; non-splittable = Puffin only), and the bin-pack eviction (`largestBinFirst`, ties → first-inserted; drain FIFO). EVERY split sub-task inherits the parent deletes (so deletes are charged per sub-task). Pinned by `bin_pack.rs`/`task.rs` unit tests + the `interop_scan_plan` oracle |
 | Wrong rows after partition evolution | The residual (and any per-file logic) must use the FILE's own spec (`partition_spec_by_id(manifest.partition_spec_id)`), never `default_partition_spec()`. A single-spec fixture is structurally BLIND to this swap — use the 2-spec `new_with_evolved_default_spec` fixture to pin it |
 
 ### First checks

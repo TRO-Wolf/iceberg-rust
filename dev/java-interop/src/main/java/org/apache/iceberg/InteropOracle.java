@@ -59,6 +59,7 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.DuplicateWAPCommitException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.expressions.ResidualEvaluator;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
 import org.apache.iceberg.io.CloseableIterable;
@@ -1324,6 +1325,53 @@ public final class InteropOracle {
         int expressionFailures = ExpressionParserOracle.verify(expressionVerifyDir);
         System.out.println("verify-interop-expression: " + expressionFailures + " failures");
         if (expressionFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
+      case "generate-interop-scan-plan":
+        // SCAN-PLAN (planTasks) interop, DIRECTION 1 source — "Rust plans what JAVA wrote" (GAP_MATRIX
+        // row 146). Writes a V2 table with several data files of VARYING declared size (so bin-packing
+        // is non-trivial), at least one file large enough to FIXED-SIZE split under a small target and
+        // one with MULTIPLE row groups so its split offsets drive the OFFSETS-AWARE split, plus a MoR
+        // file with a position delete so the bin-pack WEIGHT includes the delete bytes. It then runs
+        // the REAL Java `table.newScan().planTasks(target, lookback, openFileCost)` with the
+        // HAND-DECLARED target/lookback/cost and emits java_scan_plan.json — {groupCount, groups:[[
+        // memberKey,...],...]} where each memberKey is "(basename,start,length)" and each group's
+        // members are SORTED. The dir is via -Dinterop.scan_plan.dir.
+        Path scanPlanGenDir = requireFixturesDir("interop.scan_plan.dir");
+        ScanPlanOracle.generate(scanPlanGenDir);
+        break;
+      case "verify-interop-scan-plan":
+        // SCAN-PLAN (planTasks) interop, DIRECTION 2 — "Java plans what RUST wrote". The Rust GEN path
+        // (env ICEBERG_INTEROP_SCAN_PLAN_GEN_DIR) wrote the SAME logical table to <dir>/rust_table via
+        // its production write path, landing a final.metadata.json. Here Java loads the RUST-written
+        // metadata, builds a BaseTable over a LocalFileIO, runs the REAL Java planTasks with the SAME
+        // hand-declared target/lookback/cost, and asserts the MULTISET of per-group member-key sets
+        // (+ groupCount) equals what the RUST GEN path emitted into <dir>/rust_table/rust_scan_plan.json.
+        // A failure here is a real planTasks write/grouping incompatibility.
+        Path scanPlanVerifyDir = requireFixturesDir("interop.scan_plan.dir");
+        int scanPlanFailures = ScanPlanOracle.verify(scanPlanVerifyDir);
+        System.out.println("verify-interop-scan-plan: " + scanPlanFailures + " failures");
+        if (scanPlanFailures > 0) {
+          System.exit(1);
+        }
+        break;
+      case "sabotage-interop-scan-plan":
+        // SCAN-PLAN SABOTAGE (fail-closed), two load-bearing legs. (1) Re-run Java planTasks over the
+        // JAVA-written table with a MUCH LARGER target (TARGET * 1024), forcing the groups to MERGE, and
+        // assert the plan DIVERGES from the canonical java_scan_plan.json. (2) DROP big.parquet's split
+        // offsets and assert the offsets-aware split flips to fixed-size windows. If EITHER leg left its
+        // grouping unchanged the comparison would be vacuous, so this mode exits NON-ZERO on no-divergence
+        // (proof of vacuity ⇒ hard-fail) and ZERO only when BOTH legs diverge.
+        Path scanPlanSabotageDir = requireFixturesDir("interop.scan_plan.dir");
+        int scanPlanDiverged = ScanPlanOracle.sabotagePerturbedTarget(scanPlanSabotageDir);
+        System.out.println(
+            "sabotage-interop-scan-plan: "
+                + (scanPlanDiverged == 0
+                    ? "target NOT load-bearing (VACUOUS)"
+                    : "perturbed target diverged (fail-closed confirmed)"));
+        if (scanPlanDiverged == 0) {
           System.exit(1);
         }
         break;
@@ -4329,6 +4377,483 @@ public final class InteropOracle {
                 + "Rust position-delete), merge-on-read live rows = {10,30,50}");
       }
       return failures;
+    }
+  }
+
+  // ===========================================================================================
+  // SCAN-PLAN (planTasks) oracle — GAP_MATRIX row 146.
+  //
+  // Proves the Rust `TableScan::plan_tasks(target, lookback, openFileCost)` produces the SAME bin-packed
+  // CombinedScanTask GROUPS as Java's REAL `table.newScan().planTasks(...)`, in BOTH directions, with the
+  // target/lookback/openFileCost HAND-DECLARED IDENTICALLY on both sides (anti-circular — see the constants
+  // below, mirrored in interop_scan_plan.rs).
+  //
+  // THE FIXTURE (V2, UNPARTITIONED, schema {1 id long required, 2 data string optional}): several REAL
+  // parquet data files of VARYING size + a MoR position-delete, so split + bin-pack are non-trivial:
+  //   * big.parquet   — MANY rows written with a TINY parquet row-group size, so the file has MULTIPLE row
+  //                     groups ⇒ NON-NULL strictly-ascending split offsets ⇒ the OFFSETS-AWARE split branch
+  //                     fires (Java `BaseContentScanTask.split`). Also the largest file, so it FIXED-SIZE
+  //                     splits too were offsets absent.
+  //   * mid.parquet   — a medium file (single row group) ⇒ FIXED-SIZE split under a small target.
+  //   * small1/small2 — two small files that PACK together.
+  //   * del.parquet   — a position delete over `big.parquet` so the bin-pack WEIGHT of big's sub-tasks
+  //                     includes the delete bytes (Java `ScanTaskUtil.contentSizeInBytes`).
+  //
+  // THE COMPARISON. Each emitted group is serialized as a SORTED set of member keys "(basename,start,length)"
+  // (basename = the file's tail, the cross-engine key since the two engines write at different roots). The
+  // plan is {groupCount, groups:[[memberKey,...],...]}. Rust and Java BOTH plan the SAME on-disk table within
+  // a direction, so the split offsets (hence start/length) are byte-identical; the multiset of per-group
+  // member-key sets + groupCount must match exactly (group ORDER is not compared — bin emission order is an
+  // internal detail, the SET-of-SETS is the contract).
+  //
+  // THE DIRECTIONS + SABOTAGE (run-interop-scan-plan.sh):
+  //   D1: Java writes the table + emits java_scan_plan.json; Rust loads the SAME table, runs plan_tasks with
+  //       the hand-declared knobs, asserts its plan multiset == Java's.
+  //   D2: Rust writes the SAME logical table to <dir>/rust_table + emits rust_scan_plan.json; Java loads it,
+  //       runs the REAL planTasks, asserts == Rust's.
+  //   SABOTAGE: two legs — (1) Java re-plans with a much larger target (TARGET*1024) so groups MERGE; (2)
+  //       big.parquet's split-offsets are dropped so the offsets-aware split flips to fixed-size. Each MUST
+  //       diverge from the canonical plan (a no-op divergence is vacuous ⇒ hard-fail).
+  // ===========================================================================================
+
+  static final class ScanPlanOracle {
+    private ScanPlanOracle() {}
+
+    // -- HAND-DECLARED knobs (anti-circular — mirrored EXACTLY in interop_scan_plan.rs). --
+    /** The bin-pack target (bytes). Small enough that the files span several bins. */
+    static final long TARGET = 4096L;
+    /** The planning lookback (max simultaneously-open bins). */
+    static final int LOOKBACK = 5;
+    /** The per-open file cost (bytes) used in the weight floor. 0 isolates the byte-length packing. */
+    static final long OPEN_FILE_COST = 0L;
+
+    /** Direction 1 — Java writes the table + emits the canonical planTasks group plan. */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("table").toFile();
+      BaseTable table = buildTableWithFiles(tableDir);
+
+      // Run the REAL Java planTasks with the hand-declared knobs and emit the canonical plan.
+      String plan = planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST);
+      writeJson(dir.resolve("java_scan_plan.json"), plan);
+
+      // Persist the final metadata at a known path for the Rust D1 load.
+      Path finalMetadata =
+          new File(tableDir, "metadata").toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(((BaseTable) table).operations().current(), finalOut);
+
+      System.out.println(
+          "generated scan-plan table + java_scan_plan.json to "
+              + dir
+              + " (target="
+              + TARGET
+              + " lookback="
+              + LOOKBACK
+              + " openFileCost="
+              + OPEN_FILE_COST
+              + ")");
+    }
+
+    /**
+     * Direction 2 verify — load the RUST-written table, run the REAL Java planTasks with the SAME knobs, and
+     * assert the multiset of per-group member-key sets (+ groupCount) equals what the Rust GEN path emitted
+     * into {@code <dir>/rust_table/rust_scan_plan.json}. Returns the failure count.
+     */
+    static int verify(Path dir) {
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      Path rustPlanPath = dir.resolve("rust_table").resolve("rust_scan_plan.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL scan-plan-d2: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+      if (!Files.exists(rustPlanPath)) {
+        System.out.println("FAIL scan-plan-d2: missing " + rustPlanPath);
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL scan-plan-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      Set<Set<String>> javaGroups;
+      try {
+        javaGroups = planGroups(table, TARGET, LOOKBACK, OPEN_FILE_COST);
+      } catch (RuntimeException scanError) {
+        System.out.println(
+            "FAIL scan-plan-d2: Java could not planTasks the Rust-written table: " + scanError);
+        return 1;
+      }
+
+      Set<Set<String>> rustGroups;
+      try {
+        rustGroups = readPlanGroups(rustPlanPath);
+      } catch (RuntimeException | IOException readError) {
+        System.out.println("FAIL scan-plan-d2: could not read rust_scan_plan.json: " + readError);
+        return 1;
+      }
+
+      if (javaGroups.equals(rustGroups)) {
+        System.out.println(
+            "PASS scan-plan-d2: Java planTasks over the Rust table == Rust's plan ("
+                + javaGroups.size()
+                + " groups)");
+        return 0;
+      }
+      System.out.println(
+          "FAIL scan-plan-d2: java-planned groups=" + javaGroups + " rust-planned=" + rustGroups);
+      return 1;
+    }
+
+    /**
+     * SABOTAGE BATTERY (fail-closed) — re-plan the JAVA-written table under TWO independent corruptions and
+     * assert each one DIVERGES from the canonical java_scan_plan.json. Returns 1 only when BOTH legs diverge
+     * (each corruption is load-bearing ⇒ fail-closed confirmed); returns 0 (vacuous ⇒ hard-fail) if EITHER
+     * leg leaves the plan unchanged. The two corruption edges:
+     *
+     * <ul>
+     *   <li><b>target re-pack</b> — re-plan with a MUCH LARGER target (TARGET * 1024). A large target lets
+     *       many sub-tasks share one bin, MERGING the canonical many-group plan into far fewer groups ⇒ the
+     *       group SET diverges. (A pure 1-byte nudge is NOT reliably load-bearing for this fixture because
+     *       big.parquet's sub-tasks each already nearly fill a bin — the shared MoR delete bytes are charged
+     *       to every sub-task — so a substantive target change is needed to cross a packing boundary.)
+     *   <li><b>split-offset corruption</b> — DROP big.parquet's split offsets. With the offsets gone the
+     *       offsets-aware split no longer fires; big.parquet FIXED-SIZE splits on the target instead,
+     *       changing its sub-task windows (start/length) ⇒ the member keys diverge. This is the "drop/alter
+     *       a split-offset" corruption the harness must close.
+     * </ul>
+     */
+    static int sabotagePerturbedTarget(Path dir) {
+      Path finalMetadata = dir.resolve("table").resolve("metadata").resolve("final.metadata.json");
+      Path canonicalPlan = dir.resolve("java_scan_plan.json");
+      if (!Files.exists(finalMetadata) || !Files.exists(canonicalPlan)) {
+        System.out.println("FAIL scan-plan-sabotage: missing the Java fixture artifacts");
+        return 0;
+      }
+
+      Set<Set<String>> canonical;
+      try {
+        canonical = readPlanGroups(canonicalPlan);
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL scan-plan-sabotage: could not read the canonical plan: " + error);
+        return 0;
+      }
+
+      // -- Leg 1: re-pack with a MUCH LARGER target (TARGET * 1024) ⇒ groups MERGE. --
+      Set<Set<String>> repacked;
+      try {
+        TableMetadata metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+        BaseTable table =
+            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "java_t");
+        repacked = planGroups(table, TARGET * 1024, LOOKBACK, OPEN_FILE_COST);
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL scan-plan-sabotage[target]: " + error);
+        return 0;
+      }
+      if (canonical.equals(repacked)) {
+        System.out.println("scan-plan-sabotage[target]: LARGE-target plan UNCHANGED (VACUOUS)");
+        return 0;
+      }
+      System.out.println(
+          "scan-plan-sabotage[target]: LARGE-target plan diverged (load-bearing): canonical="
+              + canonical.size()
+              + " large-target="
+              + repacked.size());
+
+      // -- Leg 2: split-offset corruption. Take big.parquet's planned whole-file task and contrast its
+      // OFFSETS-AWARE split (the canonical many-window split) against the SAME task with its split offsets
+      // DROPPED — which falls through to a FIXED-SIZE split on the target. The two member-key sets MUST
+      // differ; if they did not, the split offsets would not be load-bearing. The corruption cannot be
+      // applied if big.parquet has no multi-entry split offsets, which HARD-FAILS (never silently skips).
+      Set<String> offsetsAwareKeys;
+      Set<String> offsetsDroppedKeys;
+      try {
+        TableMetadata metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+        BaseTable table =
+            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "java_t");
+        FileScanTask bigTask = null;
+        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+          for (FileScanTask task : tasks) {
+            if (basename(task.file().path().toString()).equals("big.parquet")) {
+              bigTask = task;
+            }
+          }
+        }
+        if (bigTask == null
+            || bigTask.file().splitOffsets() == null
+            || bigTask.file().splitOffsets().size() <= 1) {
+          // The sabotage target is absent ⇒ the corruption cannot be applied ⇒ hard-fail (never skip).
+          System.out.println(
+              "FAIL scan-plan-sabotage[offsets]: big.parquet has no multi-entry split offsets to corrupt");
+          return 0;
+        }
+
+        // Offsets-aware split (the canonical behavior): split(target) honors the offsets.
+        offsetsAwareKeys = new TreeSet<>();
+        for (FileScanTask sub : bigTask.split(TARGET)) {
+          offsetsAwareKeys.add(memberKey(sub));
+        }
+
+        // Corrupt: rebuild big.parquet's DataFile with NO split offsets (DataFiles.builder.copy then a
+        // fresh build omitting withSplitOffsets), wrap it in a new whole-file task, and split on the SAME
+        // target — now a FIXED-SIZE split (the offsets-aware branch no longer fires).
+        DataFile cleaned = copyDataFileWithoutSplitOffsets(table, bigTask.file());
+        BaseFileScanTask wholeNoOffsets =
+            new BaseFileScanTask(
+                cleaned,
+                bigTask.deletes().toArray(new DeleteFile[0]),
+                SchemaParser.toJson(table.schema()),
+                PartitionSpecParser.toJson(table.spec()),
+                ResidualEvaluator.unpartitioned(Expressions.alwaysTrue()));
+        offsetsDroppedKeys = new TreeSet<>();
+        for (FileScanTask sub : wholeNoOffsets.split(TARGET)) {
+          offsetsDroppedKeys.add(memberKey(sub));
+        }
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL scan-plan-sabotage[offsets]: " + error);
+        return 0;
+      }
+      if (offsetsAwareKeys.equals(offsetsDroppedKeys)) {
+        System.out.println(
+            "scan-plan-sabotage[offsets]: DROPPED-split-offset windows UNCHANGED (VACUOUS)");
+        return 0;
+      }
+      System.out.println(
+          "scan-plan-sabotage[offsets]: DROPPED-split-offset windows diverged (load-bearing): "
+              + "offsets-aware="
+              + offsetsAwareKeys.size()
+              + " fixed-size="
+              + offsetsDroppedKeys.size());
+
+      return 1;
+    }
+
+    /** Rebuild a DataFile identical to {@code source} but with its split offsets DROPPED (null). */
+    private static DataFile copyDataFileWithoutSplitOffsets(BaseTable table, DataFile source) {
+      // DataFiles.builder().copy(source) carries the split offsets; rebuild from scratch WITHOUT them.
+      return DataFiles.builder(table.spec())
+          .withPath(source.path().toString())
+          .withFileSizeInBytes(source.fileSizeInBytes())
+          .withRecordCount(source.recordCount())
+          .withFormat(source.format())
+          .build();
+    }
+
+    // -- The shared fixture: build the table + write its files. --
+
+    /**
+     * Builds the V2 unpartitioned table under {@code tableDir} with the varying-size data files + the MoR
+     * position delete described in the header. Reused by D1 generate (and, by Rust mirroring this shape, the
+     * comparison contract). The data files are written via the generic appender so on-disk parquet + manifest
+     * entries agree; `big.parquet` is written with a TINY row-group size so it carries multiple row groups
+     * (hence non-null split offsets).
+     */
+    private static BaseTable buildTableWithFiles(File tableDir) throws IOException {
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      // Drive `big.parquet` to MULTIPLE row groups: a tiny parquet row-group size so a few hundred rows
+      // span several groups ⇒ split offsets present + strictly ascending (the offsets-aware split branch).
+      props.put(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "1024");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_scan_plan");
+
+      // big.parquet — 800 rows so the 1 KiB row groups force several groups (multi-row-group ⇒ offsets).
+      DataFile big =
+          writeManyRowDataFile(table, schema, spec, new File(dataDir, "big.parquet"), 800);
+      // mid / small1 / small2 — few rows each (single row group).
+      DataFile mid = writeManyRowDataFile(table, schema, spec, new File(dataDir, "mid.parquet"), 40);
+      DataFile small1 =
+          writeManyRowDataFile(table, schema, spec, new File(dataDir, "small1.parquet"), 5);
+      DataFile small2 =
+          writeManyRowDataFile(table, schema, spec, new File(dataDir, "small2.parquet"), 5);
+
+      // A MoR position delete over big.parquet (deletes position 0), so big's sub-tasks carry deletes and
+      // the weight includes the delete bytes.
+      String deletePath = new File(dataDir, "big-deletes.parquet").getAbsolutePath();
+      DeleteFile del = writePosDelete(table, schema, spec, deletePath, big.path());
+
+      table.newAppend().appendFile(big).appendFile(mid).appendFile(small1).appendFile(small2).commit();
+      table.newRowDelta().addDeletes(del).commit();
+      return table;
+    }
+
+    /** Write a REAL parquet data file of {@code rowCount} rows and return its DataFile (real metrics). */
+    private static DataFile writeManyRowDataFile(
+        BaseTable table, Schema schema, PartitionSpec spec, File file, int rowCount)
+        throws IOException {
+      List<Record> rows = new ArrayList<>(rowCount);
+      for (int i = 0; i < rowCount; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", (long) i);
+        // A fixed-width-ish string so the file size grows predictably with rowCount.
+        record.setField("data", "row-" + String.format("%06d", i));
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      // Honor the table's parquet row-group size so big.parquet gets multiple row groups.
+      factory.set(
+          TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES,
+          table.properties().getOrDefault(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "1024"));
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /** Write a REAL position-delete deleting position 0 of {@code referenced} and return its DeleteFile. */
+    private static DeleteFile writePosDelete(
+        BaseTable table, Schema schema, PartitionSpec spec, String path, CharSequence referenced)
+        throws IOException {
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(referenced, 0L, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    // -- planTasks → group sets. --
+
+    /**
+     * Run the REAL Java {@code table.newScan().option(...).planTasks()} with the split knobs set via scan
+     * options (Java reads target/lookback/openFileCost from `TableScanContext.options()` —
+     * `BaseScan.targetSplitSize`/`splitLookback`/`splitOpenFileCost`), and return the SET of per-group
+     * member-key sets. Each member key is "(basename,start,length)"; each group is a sorted set.
+     */
+    private static Set<Set<String>> planGroups(
+        Table table, long target, int lookback, long openFileCost) {
+      Set<Set<String>> groups = new java.util.HashSet<>();
+      TableScan scan =
+          table
+              .newScan()
+              .option(TableProperties.SPLIT_SIZE, Long.toString(target))
+              .option(TableProperties.SPLIT_LOOKBACK, Integer.toString(lookback))
+              .option(TableProperties.SPLIT_OPEN_FILE_COST, Long.toString(openFileCost));
+      try (CloseableIterable<CombinedScanTask> tasks = scan.planTasks()) {
+        for (CombinedScanTask combined : tasks) {
+          Set<String> members = new TreeSet<>();
+          for (FileScanTask fileTask : combined.files()) {
+            members.add(memberKey(fileTask));
+          }
+          // A duplicate group (same member set) is preserved as a single entry by HashSet; the contract is
+          // the SET of distinct per-group member sets + the groupCount, both compared.
+          groups.add(members);
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to planTasks", error);
+      }
+      return groups;
+    }
+
+    /** A scan task's cross-engine member key: "(basename,start,length)". */
+    private static String memberKey(FileScanTask task) {
+      String base = basename(task.file().path().toString());
+      return "(" + base + "," + task.start() + "," + task.length() + ")";
+    }
+
+    /** Strip a path down to its basename (the cross-engine key). */
+    private static String basename(String path) {
+      int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+      return slash < 0 ? path : path.substring(slash + 1);
+    }
+
+    /** Serialize the planTasks result as {groupCount, groups:[[memberKey,...],...]} (each group sorted). */
+    private static String planToJson(Table table, long target, int lookback, long openFileCost) {
+      // Build a stable, sorted-of-sorted view so the JSON is deterministic for diffing.
+      List<List<String>> groupList = new ArrayList<>();
+      for (Set<String> group : planGroups(table, target, lookback, openFileCost)) {
+        groupList.add(new ArrayList<>(group)); // group is a TreeSet ⇒ already sorted.
+      }
+      groupList.sort(
+          (a, b) -> {
+            String ja = String.join("|", a);
+            String jb = String.join("|", b);
+            return ja.compareTo(jb);
+          });
+      int groupCount = groupList.size();
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartObject();
+            gen.writeNumberField("groupCount", groupCount);
+            gen.writeArrayFieldStart("groups");
+            for (List<String> group : groupList) {
+              gen.writeStartArray();
+              for (String member : group) {
+                gen.writeString(member);
+              }
+              gen.writeEndArray();
+            }
+            gen.writeEndArray();
+            gen.writeEndObject();
+          },
+          true);
+    }
+
+    /** Read a plan JSON ({groupCount, groups:[[memberKey,...],...]}) into a SET of per-group member SETS. */
+    private static Set<Set<String>> readPlanGroups(Path path) throws IOException {
+      Set<Set<String>> groups = new java.util.HashSet<>();
+      com.fasterxml.jackson.databind.JsonNode root =
+          new com.fasterxml.jackson.databind.ObjectMapper().readTree(readString(path));
+      com.fasterxml.jackson.databind.JsonNode groupsNode = root.get("groups");
+      if (groupsNode != null) {
+        for (com.fasterxml.jackson.databind.JsonNode group : groupsNode) {
+          Set<String> members = new TreeSet<>();
+          for (com.fasterxml.jackson.databind.JsonNode member : group) {
+            members.add(member.asText());
+          }
+          groups.add(members);
+        }
+      }
+      return groups;
     }
   }
 

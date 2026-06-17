@@ -2435,6 +2435,7 @@ mod tests {
             partition_spec: Some(spec.clone()),
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         }
     }
 

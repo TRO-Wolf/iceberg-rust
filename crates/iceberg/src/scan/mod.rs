@@ -17,6 +17,7 @@
 
 //! Table scan api.
 
+mod bin_pack;
 mod cache;
 use cache::*;
 mod context;
@@ -25,6 +26,7 @@ mod incremental;
 pub use incremental::*;
 mod metrics_collector;
 mod task;
+mod task_group;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,6 +37,7 @@ use futures::channel::mpsc::{Sender, channel};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt, TryStreamExt};
 pub use task::*;
+pub use task_group::*;
 
 use crate::arrow::ArrowReaderBuilder;
 use crate::delete_file_index::DeleteFileIndex;
@@ -53,6 +56,22 @@ use crate::{Error, ErrorKind, Result};
 /// A stream of arrow [`RecordBatch`]es.
 pub type ArrowRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 
+/// A stream of [`CombinedScanTask`]s — the output of [`TableScan::plan_tasks`].
+pub type CombinedScanTaskStream = BoxStream<'static, Result<CombinedScanTask>>;
+
+/// Java `TableProperties.SPLIT_SIZE` — the per-bin split target in bytes.
+pub(crate) const PROPERTY_SPLIT_SIZE: &str = "read.split.target-size";
+/// Java `TableProperties.SPLIT_SIZE_DEFAULT` — 128 MiB.
+pub(crate) const PROPERTY_SPLIT_SIZE_DEFAULT: u64 = 134_217_728;
+/// Java `TableProperties.SPLIT_LOOKBACK` — the max number of simultaneously-open bins.
+pub(crate) const PROPERTY_SPLIT_LOOKBACK: &str = "read.split.planning-lookback";
+/// Java `TableProperties.SPLIT_LOOKBACK_DEFAULT` — 10.
+pub(crate) const PROPERTY_SPLIT_LOOKBACK_DEFAULT: usize = 10;
+/// Java `TableProperties.SPLIT_OPEN_FILE_COST` — the per-open cost in bytes used in the weight floor.
+pub(crate) const PROPERTY_SPLIT_OPEN_FILE_COST: &str = "read.split.open-file-cost";
+/// Java `TableProperties.SPLIT_OPEN_FILE_COST_DEFAULT` — 4 MiB.
+pub(crate) const PROPERTY_SPLIT_OPEN_FILE_COST_DEFAULT: u64 = 4_194_304;
+
 /// Builder to create table scan.
 pub struct TableScanBuilder<'a> {
     table: &'a Table,
@@ -69,6 +88,15 @@ pub struct TableScanBuilder<'a> {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+    /// Scan-time OVERRIDE for the split target size (Java `TableScanContext.option(SPLIT_SIZE)`).
+    /// `None` ⇒ fall back to the table property then the Java default at [`plan_tasks`] time.
+    split_size: Option<u64>,
+    /// Scan-time OVERRIDE for the split planning lookback (Java
+    /// `TableScanContext.option(SPLIT_LOOKBACK)`).
+    split_lookback: Option<usize>,
+    /// Scan-time OVERRIDE for the split open-file cost (Java
+    /// `TableScanContext.option(SPLIT_OPEN_FILE_COST)`).
+    split_open_file_cost: Option<u64>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -89,7 +117,42 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             metrics_reporter: None,
+            split_size: None,
+            split_lookback: None,
+            split_open_file_cost: None,
         }
+    }
+
+    /// Overrides the split target size (bytes) used by [`TableScan::plan_tasks`], mirroring Java's
+    /// scan-time `option(TableProperties.SPLIT_SIZE, ...)`.
+    ///
+    /// When unset, [`plan_tasks`](TableScan::plan_tasks) reads the table property
+    /// `read.split.target-size`, defaulting to 128 MiB (Java `SPLIT_SIZE_DEFAULT`). The override
+    /// wins over the table property, which wins over the default — exactly Java's
+    /// `BaseScan.targetSplitSize()`.
+    pub fn with_split_size(mut self, split_size: u64) -> Self {
+        self.split_size = Some(split_size);
+        self
+    }
+
+    /// Overrides the split planning lookback (the max number of simultaneously-open bins) used by
+    /// [`TableScan::plan_tasks`], mirroring Java's `option(TableProperties.SPLIT_LOOKBACK, ...)`.
+    ///
+    /// When unset, [`plan_tasks`](TableScan::plan_tasks) reads `read.split.planning-lookback`,
+    /// defaulting to 10 (Java `SPLIT_LOOKBACK_DEFAULT`).
+    pub fn with_split_lookback(mut self, split_lookback: usize) -> Self {
+        self.split_lookback = Some(split_lookback);
+        self
+    }
+
+    /// Overrides the per-open file cost (bytes) used in the bin-packing weight floor by
+    /// [`TableScan::plan_tasks`], mirroring Java's `option(TableProperties.SPLIT_OPEN_FILE_COST, ...)`.
+    ///
+    /// When unset, [`plan_tasks`](TableScan::plan_tasks) reads `read.split.open-file-cost`,
+    /// defaulting to 4 MiB (Java `SPLIT_OPEN_FILE_COST_DEFAULT`).
+    pub fn with_split_open_file_cost(mut self, split_open_file_cost: u64) -> Self {
+        self.split_open_file_cost = Some(split_open_file_cost);
+        self
     }
 
     /// Sets the desired size of batches in the response
@@ -233,8 +296,45 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// Resolves the split planning config (target / lookback / open-file-cost) at `build` time,
+    /// porting Java `BaseScan.targetSplitSize()` / `splitLookback()` / `splitOpenFileCost()`:
+    /// read the table property (defaulting to the hard-coded Java default), then let the scan-time
+    /// override win over the SAME key. Validation (target > 0, lookback > 0, open-file-cost >= 0)
+    /// is enforced at [`plan_tasks`](TableScan::plan_tasks) time, matching Java's
+    /// `TableScanUtil.validatePlanningArguments`.
+    fn resolve_split_config(&self) -> SplitConfig {
+        let props = self.table.metadata().properties();
+
+        let split_size = self.split_size.unwrap_or_else(|| {
+            props
+                .get(PROPERTY_SPLIT_SIZE)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(PROPERTY_SPLIT_SIZE_DEFAULT)
+        });
+        let split_lookback = self.split_lookback.unwrap_or_else(|| {
+            props
+                .get(PROPERTY_SPLIT_LOOKBACK)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(PROPERTY_SPLIT_LOOKBACK_DEFAULT)
+        });
+        let split_open_file_cost = self.split_open_file_cost.unwrap_or_else(|| {
+            props
+                .get(PROPERTY_SPLIT_OPEN_FILE_COST)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(PROPERTY_SPLIT_OPEN_FILE_COST_DEFAULT)
+        });
+
+        SplitConfig {
+            split_size,
+            split_lookback,
+            split_open_file_cost,
+        }
+    }
+
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
+        let split_config = self.resolve_split_config();
+
         // Resolve a branch/tag reference (`use_ref`) to a concrete snapshot id,
         // honoring BOTH selectors (Java `SnapshotScan.useRef` L116-128):
         //   - a ref AND an explicit snapshot id are contradictory selectors
@@ -296,6 +396,7 @@ impl<'a> TableScanBuilder<'a> {
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
                         metrics: None,
+                        split_config,
                     });
                 };
                 current_snapshot_id.clone()
@@ -421,8 +522,19 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             metrics,
+            split_config,
         })
     }
+}
+
+/// The resolved split planning config — Java `BaseScan.targetSplitSize` / `splitLookback` /
+/// `splitOpenFileCost`. Captured once at [`build`](TableScanBuilder::build) time so
+/// [`TableScan::plan_tasks`] is a pure function of the captured config.
+#[derive(Debug, Clone, Copy)]
+struct SplitConfig {
+    split_size: u64,
+    split_lookback: usize,
+    split_open_file_cost: u64,
 }
 
 /// Table scan.
@@ -454,6 +566,11 @@ pub struct TableScan {
     /// opted in via [`TableScanBuilder::with_metrics_reporter`] AND the table has a
     /// snapshot to scan. `None` ⇒ no metrics are collected and `plan_files` is unchanged.
     metrics: Option<ScanMetricsContext>,
+
+    /// The resolved split planning config (target / lookback / open-file-cost) used by
+    /// [`Self::plan_tasks`]. Captured at [`build`](TableScanBuilder::build) time; never consulted by
+    /// [`Self::plan_files`] (whose path is byte-unchanged).
+    split_config: SplitConfig,
 }
 
 /// The reporter, the shared counter collector, and the immutable inputs needed to build a
@@ -626,6 +743,79 @@ impl TableScan {
             }
             _ => Ok(file_scan_task_rx.boxed()),
         }
+    }
+
+    /// Plans the scan into [`CombinedScanTask`] GROUPS — split + bin-packed — porting Java
+    /// `Scan.planTasks()` (1.10.0).
+    ///
+    /// This is the split-and-group layer that sits ABOVE [`plan_files`](Self::plan_files): it
+    /// drives `plan_files()` UNCHANGED (no reporter side effects, the byte-for-byte path), splits
+    /// each produced [`FileScanTask`] at the split target ([`FileScanTask::split`], Java
+    /// `TableScanUtil.splitFiles`), then bin-packs the resulting sub-tasks into groups with the
+    /// `largestBinFirst` packer (Java `TableScanUtil.planTasks` →
+    /// `BinPacking.PackingIterable(..., largestBinFirst = true)`).
+    ///
+    /// The arguments come from the resolved [`SplitConfig`] captured at build time (table property
+    /// then scan-time override then the Java default — see
+    /// [`with_split_size`](TableScanBuilder::with_split_size) etc.). They are validated exactly as
+    /// Java `TableScanUtil.validatePlanningArguments`: `target > 0`, `lookback > 0`,
+    /// `open_file_cost >= 0` (always true for a `u64`). The weight of each task is
+    /// [`FileScanTask::weight`] — `max(length + deleteBytes, (1 + #deletes) * openFileCost)`.
+    ///
+    /// The returned stream yields one [`CombinedScanTask`] per emitted bin, in the bin-packer's
+    /// emission order. This is the plain data-file group path: each [`CombinedScanTask`] carries NO
+    /// grouping key and the tasks are NOT merged (Java's partition-aware
+    /// `planTaskGroups(groupingKeyType)` overload is out of scope).
+    ///
+    /// Because the packer is order-sensitive (FIFO bin selection + largest-bin eviction), the
+    /// FileScanTask stream is COLLECTED in arrival order before packing — matching Java, which
+    /// drives the packer over the in-order `splitFiles(planFiles())` iterable.
+    pub async fn plan_tasks(&self) -> Result<CombinedScanTaskStream> {
+        let SplitConfig {
+            split_size,
+            split_lookback,
+            split_open_file_cost,
+        } = self.split_config;
+
+        // Java `TableScanUtil.validatePlanningArguments`: target > 0, lookback > 0,
+        // open-file-cost >= 0 (a `u64` is always >= 0). A misconfiguration is a hard error.
+        if split_size == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Split size must be > 0: {split_size}"),
+            ));
+        }
+        if split_lookback == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Split planning lookback must be > 0: {split_lookback}"),
+            ));
+        }
+
+        // Drive plan_files() UNCHANGED and collect its tasks in arrival order (the packer is
+        // order-sensitive; Java drives the bin-packer over the in-order splitFiles(planFiles())).
+        let file_scan_tasks: Vec<FileScanTask> = self.plan_files().await?.try_collect().await?;
+
+        // splitFiles: expand each whole-file task into its target-sized sub-tasks, preserving
+        // arrival order (Java `FluentIterable.transformAndConcat`).
+        let mut split_tasks: Vec<FileScanTask> = Vec::with_capacity(file_scan_tasks.len());
+        for task in file_scan_tasks {
+            split_tasks.extend(task.split(split_size)?);
+        }
+
+        // Bin-pack with largestBinFirst = true (the planTasks path). The weight is the
+        // FileScanTask weight under this scan's open-file cost.
+        let groups: Vec<CombinedScanTask> = bin_pack::PackingIterator::new(
+            split_tasks.into_iter(),
+            split_size,
+            split_lookback,
+            true,
+            move |task: &FileScanTask| task.weight(split_open_file_cost),
+        )
+        .map(CombinedScanTask::new)
+        .collect();
+
+        Ok(Box::pin(futures::stream::iter(groups.into_iter().map(Ok))))
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
@@ -896,7 +1086,7 @@ pub mod tests {
     use crate::io::{FileIO, OutputFile};
     use crate::metadata_columns::RESERVED_COL_NAME_FILE;
     use crate::metrics::{InMemoryMetricsReporter, MetricUnit, MetricsReport};
-    use crate::scan::{FileScanTask, FileScanTaskStream};
+    use crate::scan::{CombinedScanTask, FileScanTask, FileScanTaskStream};
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
         ManifestListWriter, ManifestStatus, ManifestWriterBuilder, NestedField, PartitionSpec,
@@ -1704,6 +1894,80 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
+        /// Builds a planning fixture for `plan_tasks` (split + bin-pack): writes ONE real parquet
+        /// payload to `1.parquet`, then declares FOUR live data file entries pointing at it whose
+        /// manifest-entry `file_size_in_bytes` (and, for one, `split_offsets`) are HAND-SET so the
+        /// split + bin-pack behavior is deterministic and independent of the real parquet byte size.
+        ///
+        /// The planning path reads only `file_size_in_bytes` (→ `length`), `data_file_format`,
+        /// `split_offsets`, and the delete attachments — never the file bytes — so a single shared
+        /// payload with overridden declared sizes is a faithful planning fixture. The four entries:
+        ///   * `big` 1000 bytes, split offsets `[0, 400, 800]`  (offsets-aware split target)
+        ///   * `mid` 600 bytes,  no offsets                     (fixed-size split on a small target)
+        ///   * `small_a` 100 bytes, `small_b` 100 bytes         (pack together)
+        ///
+        /// All four are partition `x == 1` (consistent with the real `x = [1;1024]` payload).
+        pub async fn setup_manifest_for_planning(&mut self) {
+            let current_snapshot = self.table.metadata().current_snapshot().unwrap();
+            let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
+            let current_partition_spec = self.table.metadata().default_partition_spec();
+
+            // Write the single real parquet payload all four entries point at.
+            self.write_parquet_data_files();
+
+            let mut writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                Some(current_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+            .build_v2_data();
+
+            let entry = |size: u64, offsets: Option<Vec<i64>>| {
+                let mut builder = DataFileBuilder::default();
+                builder
+                    .partition_spec_id(0)
+                    .content(DataContentType::Data)
+                    .file_path(format!("{}/1.parquet", &self.table_location))
+                    .file_format(DataFileFormat::Parquet)
+                    .file_size_in_bytes(size)
+                    .record_count(1)
+                    .partition(Struct::from_iter([Some(Literal::long(1))]))
+                    .key_metadata(None);
+                if offsets.is_some() {
+                    builder.split_offsets(offsets);
+                }
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(builder.build().unwrap())
+                    .build()
+            };
+
+            writer
+                .add_entry(entry(1000, Some(vec![0, 400, 800])))
+                .unwrap();
+            writer.add_entry(entry(600, None)).unwrap();
+            writer.add_entry(entry(100, None)).unwrap();
+            writer.add_entry(entry(100, None)).unwrap();
+
+            let data_file_manifest = writer.write_manifest_file().await.unwrap();
+
+            let mut manifest_list_write = ManifestListWriter::v2(
+                self.table
+                    .file_io()
+                    .new_output(current_snapshot.manifest_list())
+                    .unwrap(),
+                current_snapshot.snapshot_id(),
+                current_snapshot.parent_snapshot_id(),
+                current_snapshot.sequence_number(),
+            );
+            manifest_list_write
+                .add_manifests(vec![data_file_manifest].into_iter())
+                .unwrap();
+            manifest_list_write.close().await.unwrap();
+        }
+
         /// Writes identical Parquet data files (1.parquet, 2.parquet, 3.parquet)
         /// and returns the file size in bytes.
         fn write_parquet_data_files(&self) -> u64 {
@@ -2415,6 +2679,230 @@ pub mod tests {
             tasks[1].data_file_path,
             format!("{}/3.parquet", &fixture.table_location)
         );
+    }
+
+    // =======================================================================================
+    // plan_tasks() — split + bin-pack grouping (Java Scan.planTasks()).
+    // =======================================================================================
+
+    /// The total byte length across all sub-tasks of all groups — the conservation quantity that
+    /// must equal the sum of the source files' declared sizes (the split tiles every file with no
+    /// gap/overlap).
+    fn total_group_length(groups: &[CombinedScanTask]) -> u64 {
+        groups
+            .iter()
+            .flat_map(|group| group.tasks().iter())
+            .map(|task| task.length)
+            .sum()
+    }
+
+    /// End-to-end: the planning fixture (files 1000+600+100+100 = 1800 declared bytes; the 1000-byte
+    /// file carries split offsets [0,400,800]) plans into groups whose per-group weight is within
+    /// the target and whose total length is conserved.
+    #[tokio::test]
+    async fn test_plan_tasks_groups_conserve_length_and_respect_target() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        // target=500, lookback large, open-file-cost=0 so the weight is purely the byte length
+        // (isolates the split + pack from the open-cost floor).
+        let table_scan = fixture
+            .table
+            .scan()
+            .with_split_size(500)
+            .with_split_lookback(10)
+            .with_split_open_file_cost(0)
+            .build()
+            .unwrap();
+
+        let groups: Vec<CombinedScanTask> = table_scan
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // Length conservation: every byte of every file is covered exactly once.
+        assert_eq!(
+            total_group_length(&groups),
+            1800,
+            "the split must tile all four files (1000+600+100+100) exactly"
+        );
+
+        // With open-file-cost 0 the weight == group length, so every group must be <= target
+        // UNLESS it is a single oversized sub-task (none here: max sub-task is the 600-byte file's
+        // 500-byte first window, still <= 500... actually fixed-size keeps each <= target).
+        for group in &groups {
+            let weight: u64 = group.tasks().iter().map(|t| t.length).sum();
+            assert!(
+                weight <= 500 || group.files_count() == 1,
+                "group weight {weight} exceeds target 500 and is not a lone oversized task"
+            );
+            // size_bytes is the sum of member lengths (not the weight).
+            assert_eq!(group.size_bytes(), weight);
+        }
+
+        // The 1000-byte file is offsets-aware split into windows (0,400)(400,400)(800,200); the
+        // 600-byte file is fixed-size split into (0,500)(500,100); the two 100-byte files are whole.
+        // ⇒ 3 + 2 + 1 + 1 = 7 sub-tasks total across all groups.
+        let total_sub_tasks: usize = groups.iter().map(|g| g.files_count()).sum();
+        assert_eq!(total_sub_tasks, 7, "expected 7 split sub-tasks");
+    }
+
+    /// A LARGE target collapses everything into a single group (one bin holds all 1800 bytes).
+    #[tokio::test]
+    async fn test_plan_tasks_large_target_single_group() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let table_scan = fixture
+            .table
+            .scan()
+            .with_split_size(1_000_000)
+            .with_split_open_file_cost(0)
+            .build()
+            .unwrap();
+
+        let groups: Vec<CombinedScanTask> = table_scan
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // The 1000-byte file's offsets still split it into 3 windows (offsets-aware IGNORES target),
+        // but they all pack into ONE bin with everything else.
+        assert_eq!(
+            groups.len(),
+            1,
+            "a huge target packs all sub-tasks into one group"
+        );
+        assert_eq!(total_group_length(&groups), 1800);
+    }
+
+    /// The open-file-cost floor inflates each task's weight, forcing MORE groups than the raw byte
+    /// length would. Mutation bait: if the weight ignored the `(1 + #deletes) * openFileCost` floor,
+    /// the group count would collapse to the length-only case.
+    #[tokio::test]
+    async fn test_plan_tasks_open_file_cost_floor_changes_grouping() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        // target = 500, open-file-cost = 500. Each whole/sub-task now weighs at least 500 (the
+        // floor for a delete-free task is 1 * 500), so NO two sub-tasks can share a bin — every
+        // sub-task lands in its own group.
+        let table_scan = fixture
+            .table
+            .scan()
+            .with_split_size(500)
+            .with_split_lookback(10)
+            .with_split_open_file_cost(500)
+            .build()
+            .unwrap();
+
+        let groups: Vec<CombinedScanTask> = table_scan
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // 7 sub-tasks, each its own group because the floor (>=500) fills the 500 target alone.
+        assert_eq!(
+            groups.len(),
+            7,
+            "the open-file-cost floor must force one group per sub-task (mutation bait)"
+        );
+        assert_eq!(total_group_length(&groups), 1800);
+    }
+
+    /// `plan_tasks` rejects an invalid split target (Java `validatePlanningArguments`).
+    #[tokio::test]
+    async fn test_plan_tasks_rejects_zero_lookback() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let table_scan = fixture
+            .table
+            .scan()
+            .with_split_size(500)
+            .with_split_lookback(0)
+            .build()
+            .unwrap();
+
+        assert!(
+            table_scan.plan_tasks().await.is_err(),
+            "lookback 0 must be rejected"
+        );
+    }
+
+    /// `plan_tasks` over a snapshotless table is an empty stream (no panic).
+    #[tokio::test]
+    async fn test_plan_tasks_empty_when_no_snapshot() {
+        let fixture = TableTestFixture::new_empty();
+        let table_scan = fixture.table.scan().build().unwrap();
+        let groups: Vec<CombinedScanTask> = table_scan
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(groups.is_empty());
+    }
+
+    /// The builder knobs resolve from table properties when no scan-time override is given, and the
+    /// override wins over the property (Java `BaseScan.targetSplitSize` precedence). Pinned by the
+    /// resulting group count differing between the property default and an override.
+    #[tokio::test]
+    async fn test_plan_tasks_split_size_override_wins_over_property() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        // Override target to a tiny 200 bytes with no open-file-cost ⇒ many small groups.
+        let scan_small = fixture
+            .table
+            .scan()
+            .with_split_size(200)
+            .with_split_open_file_cost(0)
+            .build()
+            .unwrap();
+        let small: Vec<CombinedScanTask> = scan_small
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // A big override target ⇒ fewer (one) groups. The override must change the outcome.
+        let scan_big = fixture
+            .table
+            .scan()
+            .with_split_size(1_000_000)
+            .with_split_open_file_cost(0)
+            .build()
+            .unwrap();
+        let big: Vec<CombinedScanTask> = scan_big
+            .plan_tasks()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert!(
+            small.len() > big.len(),
+            "a smaller split target must yield more groups (override is load-bearing): {} vs {}",
+            small.len(),
+            big.len()
+        );
+        // Length is conserved regardless of target.
+        assert_eq!(total_group_length(&small), 1800);
+        assert_eq!(total_group_length(&big), 1800);
     }
 
     /// Drains a `FileScanTask` stream into a path-sorted `Vec`, asserting every item is
@@ -3810,6 +4298,7 @@ pub mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
         test_fn(task);
 
@@ -3829,6 +4318,7 @@ pub mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            split_offsets: None,
         };
         test_fn(task);
     }

@@ -185,6 +185,16 @@ impl ManifestEntryContext {
             // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
             name_mapping: None,
             case_sensitive: self.case_sensitive,
+
+            // Thread the data file's split offsets (Java `ContentFile.splitOffsets()`, field id
+            // 132 — Parquet row-group offsets) onto the whole-file task so the split layer
+            // (`FileScanTask::split` / `TableScan::plan_tasks`) can take the offsets-aware branch
+            // (Java `BaseContentScanTask.split`). `None` when the manifest entry has no offsets.
+            split_offsets: self
+                .manifest_entry
+                .data_file()
+                .split_offsets()
+                .map(<[i64]>::to_vec),
         })
     }
 
