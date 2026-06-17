@@ -649,6 +649,21 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "verify-interop-convert-eq-delete":
+        // MAINTENANCE ConvertEqualityDeleteFiles interop (G4 capstone), VERIFY-only direction — "Java
+        // validates what RUST converted". Java loads the Rust-written PRE table (<dir>/rust_table, with
+        // an equality delete) + the converted table (<dir>/rust_table_converted, with the position
+        // delete the Rust action materialized), reads each via IcebergGenerics, and asserts read-identity
+        // (the converted position delete masks EXACTLY the rows the equality delete masked) + the eq→pos
+        // conversion shape. The real Java action is Spark-surface (NOT on this classpath) and Java cannot
+        // drive the conversion, so this is the no-Spark corroboration of Rust's materialization.
+        Path convertEqDeleteDir = requireFixturesDir("interop.convert_eq_delete.dir");
+        int convertEqDeleteFailures = ConvertEqDeleteOracle.verify(convertEqDeleteDir);
+        System.out.println("verify-interop-convert-eq-delete: " + convertEqDeleteFailures + " failures");
+        if (convertEqDeleteFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-builder-flips":
         // BUILDER-FLIPS interop (Wave 3) — DeleteFiles' two builder-flip capabilities:
         // deleteFromRowFilter(Expression) (GAP_MATRIX row 135) + caseSensitive(boolean) (row 134),
@@ -15740,6 +15755,175 @@ public final class InteropOracle {
       if (!directory.isDirectory() && !directory.mkdirs()) {
         throw new IOException("failed to create dir " + directory);
       }
+    }
+  }
+
+  // ===========================================================================================
+  // ConvertEqDeleteOracle — CONVERT-EQUALITY-DELETE-FILES interop (G4 capstone).
+  //
+  // Proves the Rust `ConvertEqualityDeleteFiles` action (eq → pos delete materialization) is
+  // read-identity-correct WITHOUT Spark. The real Java action is a Spark-surface class NOT on this
+  // classpath, and Java cannot DRIVE the conversion, so this is a VERIFY-only oracle in the GEN
+  // direction: Rust writes a PRE table (data + a real EQUALITY-delete masking a known subset) and a
+  // POST table (the same rows masked by the CONVERTED POSITION-delete); Java loads BOTH, reads each
+  // via IcebergGenerics (applying whichever delete the table carries), and asserts:
+  //   (1) the PRE live row set == the hand-declared EXPECTED set (the eq-delete masks the subset);
+  //   (2) READ IDENTITY: the POST live row set == the PRE live row set (the converted position
+  //       delete masks EXACTLY the rows the equality delete masked — nothing resurrected/lost);
+  //   (3) the conversion genuinely converted: PRE carries an EQUALITY delete + NO position delete,
+  //       POST carries a POSITION delete + NO equality delete.
+  // The EXPECTED set is hand-declared HERE and in the Rust test INDEPENDENTLY from the fixture, never
+  // from the other engine's output (anti-circular). See crates/iceberg/tests/interop_convert_eq_delete.rs.
+  // ===========================================================================================
+
+  static final class ConvertEqDeleteOracle {
+    private ConvertEqDeleteOracle() {}
+
+    /** The hand-declared live `id` set BEFORE == AFTER conversion: the eq-delete (y=20) masks 120/220. */
+    private static java.util.Set<Long> expectedLiveIds() {
+      return new java.util.LinkedHashSet<>(List.of(100L, 130L, 200L, 230L));
+    }
+
+    static int verify(Path dir) {
+      int failures = 0;
+      Path preMeta = dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      Path postMeta =
+          dir.resolve("rust_table_converted").resolve("metadata").resolve("final.metadata.json");
+      String tag = "convert-eq-delete";
+
+      if (!Files.exists(preMeta) || !Files.exists(postMeta)) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + ": missing Rust tables ("
+                + preMeta
+                + " / "
+                + postMeta
+                + ") — run the Rust GEN path first");
+        return 1;
+      }
+
+      try {
+        BaseTable pre = loadConvertTable(preMeta);
+        BaseTable post = loadConvertTable(postMeta);
+
+        // (1) PRE read-identity: Java's merge-on-read read of the eq-delete table == EXPECTED.
+        java.util.Set<Long> preIds = liveIdsConvert(pre);
+        if (preIds.equals(expectedLiveIds())) {
+          System.out.println("PASS " + tag + ": PRE (eq) live ids = " + preIds + " match expected");
+        } else {
+          System.out.println(
+              "FAIL "
+                  + tag
+                  + ": PRE (eq) live ids = "
+                  + preIds
+                  + " but expected = "
+                  + expectedLiveIds());
+          failures++;
+        }
+
+        // (2) READ IDENTITY: Java's read of the CONVERTED (pos) table == its read of the PRE (eq) table.
+        java.util.Set<Long> postIds = liveIdsConvert(post);
+        if (postIds.equals(preIds)) {
+          System.out.println(
+              "PASS " + tag + ": read-identity — converted (pos) live ids = " + postIds + " == PRE (eq)");
+        } else {
+          System.out.println(
+              "FAIL "
+                  + tag
+                  + ": read-identity BROKEN — converted (pos) live ids = "
+                  + postIds
+                  + " but PRE (eq) = "
+                  + preIds
+                  + " (the converted position delete does not mask the same rows)");
+          failures++;
+        }
+
+        // (3) The conversion genuinely converted: PRE has eq + no pos; POST has pos + no eq.
+        int preEq = countDeletes(pre, FileContent.EQUALITY_DELETES);
+        int prePos = countDeletes(pre, FileContent.POSITION_DELETES);
+        int postEq = countDeletes(post, FileContent.EQUALITY_DELETES);
+        int postPos = countDeletes(post, FileContent.POSITION_DELETES);
+        if (preEq > 0 && prePos == 0 && postEq == 0 && postPos > 0) {
+          System.out.println(
+              "PASS "
+                  + tag
+                  + ": conversion shape — PRE eq="
+                  + preEq
+                  + "/pos="
+                  + prePos
+                  + ", POST eq="
+                  + postEq
+                  + "/pos="
+                  + postPos);
+        } else {
+          System.out.println(
+              "FAIL "
+                  + tag
+                  + ": conversion shape WRONG — PRE eq="
+                  + preEq
+                  + "/pos="
+                  + prePos
+                  + ", POST eq="
+                  + postEq
+                  + "/pos="
+                  + postPos
+                  + " (expected PRE eq>0/pos=0, POST eq=0/pos>0)");
+          failures++;
+        }
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL " + tag + ": unexpected error running the convert-eq-delete verify: " + error);
+        failures++;
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-convert-eq-delete OK — Java's IcebergGenerics read is IDENTICAL before "
+                + "(equality delete) and after (converted position delete); the conversion preserved every "
+                + "live row and masked exactly the same rows.");
+      }
+      return failures;
+    }
+
+    /** Load a final.metadata.json into a read-only BaseTable over the on-disk LocalFileIO. */
+    private static BaseTable loadConvertTable(Path finalMetadata) throws IOException {
+      TableMetadata metadata =
+          TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      return new BaseTable(
+          new InMemoryInspectionOperations(metadata, new LocalFileIO()), "convert_eq_load");
+    }
+
+    /** Java's merge-on-read read of the table — the live `id` set (all deletes applied). */
+    private static java.util.Set<Long> liveIdsConvert(BaseTable table) {
+      java.util.Set<Long> ids = new java.util.LinkedHashSet<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          ids.add((Long) record.getField("id"));
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+      return ids;
+    }
+
+    /** The count of LIVE delete files of `content` in the current snapshot. */
+    private static int countDeletes(BaseTable table, FileContent content) {
+      Snapshot snapshot = table.currentSnapshot();
+      FileIO io = table.io();
+      int count = 0;
+      for (ManifestFile manifest : snapshot.deleteManifests(io)) {
+        try (ManifestReader<DeleteFile> reader =
+            ManifestFiles.readDeleteManifest(manifest, io, table.specs())) {
+          for (ManifestEntry<DeleteFile> entry : reader.liveEntries()) {
+            if (entry.file().content() == content) {
+              count++;
+            }
+          }
+        } catch (IOException error) {
+          throw new RuntimeException("failed reading delete manifest " + manifest.path(), error);
+        }
+      }
+      return count;
     }
   }
 

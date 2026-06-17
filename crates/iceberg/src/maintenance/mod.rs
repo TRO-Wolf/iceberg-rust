@@ -58,6 +58,15 @@
 //!   the `UpdatePartitionStatisticsAction` seam (`SetPartitionStatistics`); [`read_partition_stats_file`]
 //!   decodes a written file back into rows. See [`partition_stats`] for the schema + traversal + on-disk
 //!   format.
+//! - [`ConvertEqualityDeleteFiles`] — materialize every live EQUALITY-delete file in the current
+//!   snapshot into an equivalent POSITION-delete file and commit the swap in one `Replace` snapshot (the
+//!   Rust port of Java 1.10.0 `ConvertEqualityDeleteFiles`). For each eq-delete: build its predicate from
+//!   its on-disk tuples, find the applicable lower-data-seq same-partition (global if unpartitioned) data
+//!   files, read each with an ABSOLUTE `_pos`, collect the MATCHING rows, and write a position-delete file
+//!   stamped (via `add_delete_file_with_sequence_number`) with the eq-delete's data seq so the converted
+//!   delete masks exactly the same rows. A FREE-STANDING action (not an `ActionsProvider` method, per
+//!   Java's javap-confirmed 12-method surface). Returns a [`ConvertEqualityDeleteFilesResult`] mirroring
+//!   Java `Result`'s two `int` counts. **This action rewrites delete files.**
 //! - [`ComputeTableStats`] — per-column NDV (number of distinct values) via Apache DataSketches theta
 //!   sketches (the [`iceberg_sketches`] crate), written as one `apache-datasketches-theta-v1` Puffin
 //!   blob per column into a single statistics file and registered through the existing
@@ -85,6 +94,7 @@
 mod actions_provider;
 mod compute_partition_stats;
 mod compute_table_stats;
+mod convert_equality_delete_files;
 mod delete_orphan_files;
 mod delete_reachable_files;
 pub mod partition_stats;
@@ -97,6 +107,9 @@ mod tests;
 pub use actions_provider::{Actions, ActionsProvider, NoAction};
 pub use compute_partition_stats::{ComputePartitionStats, ComputePartitionStatsResult};
 pub use compute_table_stats::{ComputeTableStats, ComputeTableStatsResult};
+pub use convert_equality_delete_files::{
+    ConvertEqualityDeleteFiles, ConvertEqualityDeleteFilesResult,
+};
 pub use delete_orphan_files::{DeleteOrphanFiles, DeleteOrphanFilesResult, PrefixMismatchMode};
 pub use delete_reachable_files::{
     DeleteReachableFiles, DeleteReachableFilesResult, ReachableDeleteFailure,
