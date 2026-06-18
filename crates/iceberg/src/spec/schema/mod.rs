@@ -25,6 +25,7 @@ mod utils;
 mod visitor;
 pub use self::visitor::*;
 pub(super) mod _serde;
+mod compat;
 mod id_reassigner;
 mod index;
 mod prune_columns;
@@ -34,10 +35,20 @@ use itertools::{Itertools, zip_eq};
 use serde::{Deserialize, Serialize};
 
 use self::_serde::SchemaEnum;
+pub use self::compat::{check_schema_compatibility, validate_schema, validate_write_schema};
 use self::id_reassigner::ReassignFieldIds;
+pub use self::id_reassigner::{
+    NextId, assign_fresh_ids, assign_fresh_ids_to_schema, assign_fresh_ids_with_base, assign_ids,
+    assign_increasing_fresh_ids, reassign_doc, reassign_ids, reassign_ids_with_case,
+    reassign_or_refresh_ids, reassign_or_refresh_ids_with_case, refresh_identifier_fields,
+};
 use self::index::{IndexByName, index_by_id, index_parents};
 pub use self::prune_columns::prune_columns;
 pub use self::type_promotion::{ensure_promotion_allowed, is_promotion_allowed};
+pub use self::utils::{
+    estimate_size, get_projected_ids, get_projected_ids_schema, index_quoted_name_by_id, join,
+    project, project_struct, select, select_not, select_not_struct, select_struct,
+};
 use super::NestedField;
 use crate::error::Result;
 use crate::expr::accessor::StructAccessor;

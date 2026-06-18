@@ -580,6 +580,39 @@ so a test-only encode would be an overclaim — W1 builds the engine, W2 proves 
 > Census **34✅/27🟡/7❌**. NEXT (user: move to a fresh capability): ORC read (116, own block) · SnapshotTable/MigrateTable
 > (137 residue, external sources) · the parked Avro tz-fix (on-disk-format unit, needs approval) if revisited.
 
+## BLOCK 8 (Type utilities `TypeUtil` completion, 2026-06-18, Opus, signed off) — 1 AC·OO PR → row 143 🟡→✅
+
+SnapshotTable/MigrateTable (137) was SCOPED then TABLED — the actions are Spark-only (api interfaces + empty core markers; only iceberg-spark has impls); the engine-agnostic core is `TableMigrationUtil` (directory→DataFiles+metrics) which needs a non-Iceberg source-catalog reader (Hive Metastore) this library lacks, NOT a query engine. Row 137 can't reach ✅ regardless (MigrateTable = destructive in-place source replace). User pivoted to an actionable green flip.
+
+- [x] **`TypeUtil` completion → row 143 🟡→✅** — **DONE 2026-06-18.** Ported the missing engine-agnostic `TypeUtil` fns
+      (all pure, no deps, interop N/A) into `spec/schema/`: **assign-ids** (`assign_fresh_ids` level-order, now the SHARED
+      engine consumed by `transaction/update_schema.rs` — its private copy DELETED; `assign_fresh_ids_with_base` name-reuse
+      overload; `assign_increasing_fresh_ids`; `assign_ids`), **reassign** (`reassign_ids`/`_or_refresh` align-by-name,
+      matched-name structural type-mismatch THROWS per Java `Preconditions.checkArgument`, `reassign_doc`,
+      `refresh_identifier_fields`), **check-compat** (`compat.rs`: `validate_write_schema`/`validate_schema`/
+      `check_schema_compatibility` porting `CheckCompatibility`), **projection** (`project`/`select`/`select_not`/
+      `get_projected_ids` — the project-vs-select subtree distinction pinned), **peripherals** (`join`, `estimate_size`,
+      `index_quoted_name_by_id`). 40+ unit tests; `CustomOrderSchemaVisitor` named-residue (every consumer ported as explicit
+      recursion). **PROCESS NOTE — did NOT converge in 3 AC·OO cycles; orchestrator remediated.** The cycle-3 Critic (which
+      ran LIVE Java 1.10.0) correctly REFUSED to converge: (1) **mustFix** — `check-compat` wiring was INVERTED
+      (`write/typeCompatibilityErrors` swapped `checkOrdering`↔`checkNullability`; Java's `CheckCompatibility(schema,
+      checkOrdering, checkNullability)` ctor + `if(checkNullability) writeCompat(.., checkOrdering)` — write/type differ ONLY
+      in nullability, the passed bool is ALWAYS checkOrdering), and 2 tests pinned behavior Java never produces; (2) **HIGH**
+      — `estimate_size` map arm was `12+5·(k+v)`, Java is `12+5·(12+k+v)` (map<int,string>=362 not 302); (3) **LOW** — a
+      `base_id_for` comment misdiagnosed a borrow workaround as an "optimizer miscompile". **Orchestrator fix (verified each
+      against the 1.10.0 bytecode MYSELF):** corrected the compat wiring (helpers take `check_ordering`, hardcode
+      `check_nullability` true/false; `check_schema_compatibility` branches on `check_nullability`; `validate_write_schema`
+      forwards correctly), fixed the 2 wrong tests to the live-Java truth table (assertions intact), fixed the map formula +
+      added a map=362 test, removed the misdiagnosis comment, corrected the matrix narrative (formula + wiring). Re-ran gate
+      MYSELF: lib **2544** passed/0, clippy 0, fmt + typos clean; row 143 pipe-5; only row 143 changed; Cargo untouched;
+      `compat.rs` tracked. Census **34✅/27🟡/7❌ → 35✅/26🟡/7❌**.
+
+> **BLOCK 8 COMPLETE (2026-06-18).** Engine-agnostic `TypeUtil` completed (assign/reassign/check-compat/project + cheap
+> peripherals), row 143 🟡→✅. Census **35✅/26🟡/7❌**. Did NOT converge in 3 cycles — the live-Java Critic caught a real
+> inverted check-compat wiring + a wrong estimate_size map formula; orchestrator remediated (each fix re-verified vs 1.10.0
+> bytecode), so the ✅ is honest. LESSON: the 3-cycle cap + an adversarial Critic that runs live Java is what catches a
+> plausible-but-wrong port; never trust the Actor's "all green" self-report over the final Critic verdict.
+
   _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
       tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
       action (rewrites the metadata graph into staging + emits a `(source,target)` copy-plan; does NOT copy data).
