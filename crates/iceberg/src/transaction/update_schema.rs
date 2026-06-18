@@ -516,58 +516,19 @@ impl<'a> SchemaEvolution<'a> {
     /// walk (assign this field's id, then immediately recurse its type) yields different ids whenever a
     /// nested field has a following sibling, which breaks Java interop and round-trip parity.
     fn assign_fresh_ids(&mut self, field_type: Type) -> Result<Type> {
-        match field_type {
-            Type::Primitive(primitive) => Ok(Type::Primitive(primitive)),
-            // Leaf, like a primitive — Java 1.10.0 `AssignFreshIds.variant` returns the type
-            // unchanged (variant has no nested ids to assign).
-            Type::Variant => Ok(Type::Variant),
-            Type::Struct(struct_type) => {
-                let fields = struct_type.fields();
-                // Pass 1: assign fresh ids for every immediate field (level-order), before recursing.
-                let new_ids: Vec<i32> = fields
-                    .iter()
-                    .map(|_| self.assign_new_column_id())
-                    .collect::<Result<_>>()?;
-                // Pass 2: recurse into each field's type (which assigns the next level's ids), in order.
-                let mut new_fields = Vec::with_capacity(fields.len());
-                for (field, new_id) in fields.iter().zip(new_ids) {
-                    let new_type = self.assign_fresh_ids((*field.field_type).clone())?;
-                    let mut rebuilt =
-                        NestedField::new(new_id, field.name.clone(), new_type, field.required);
-                    rebuilt.doc = field.doc.clone();
-                    rebuilt.initial_default = field.initial_default.clone();
-                    rebuilt.write_default = field.write_default.clone();
-                    new_fields.push(Arc::new(rebuilt));
-                }
-                Ok(Type::Struct(StructType::new(new_fields)))
-            }
-            Type::List(list_type) => {
-                // A list has a single immediate id (the element). Assign it, then recurse the element.
-                let element_id = self.assign_new_column_id()?;
-                let element = &list_type.element_field;
-                let new_element_type = self.assign_fresh_ids((*element.field_type).clone())?;
-                Ok(Type::List(ListType::new(Arc::new(
-                    NestedField::list_element(element_id, new_element_type, element.required),
-                ))))
-            }
-            Type::Map(map_type) => {
-                // Level-order: assign key id THEN value id (both immediate), then recurse key then value.
-                let key_id = self.assign_new_column_id()?;
-                let value_id = self.assign_new_column_id()?;
-                let key = &map_type.key_field;
-                let value = &map_type.value_field;
-                let new_key_type = self.assign_fresh_ids((*key.field_type).clone())?;
-                let new_value_type = self.assign_fresh_ids((*value.field_type).clone())?;
-                Ok(Type::Map(MapType::new(
-                    Arc::new(NestedField::map_key_element(key_id, new_key_type)),
-                    Arc::new(NestedField::map_value_element(
-                        value_id,
-                        new_value_type,
-                        value.required,
-                    )),
-                )))
-            }
-        }
+        // Delegate to the engine-agnostic `TypeUtil.assignFreshIds(Type, NextID)` port, supplying
+        // `assignNewColumnId` as the `NextID` source. The shared function owns the observable
+        // level-order traversal (a struct assigns ALL immediate field ids before descending; a map
+        // assigns key then value before recursing), pinned by Java `TestSchemaUpdate`.
+        let last_column_id = &mut self.last_column_id;
+        let mut next_id = move || -> Result<i32> {
+            let next = last_column_id.checked_add(1).ok_or_else(|| {
+                data_invalid("Field ID overflowed, cannot add more columns".to_string())
+            })?;
+            *last_column_id = next;
+            Ok(next)
+        };
+        crate::spec::assign_fresh_ids(&field_type, &mut next_id)
     }
 
     /// Replay `addColumn` / `addRequiredColumn` (Java `internalAddColumn`).

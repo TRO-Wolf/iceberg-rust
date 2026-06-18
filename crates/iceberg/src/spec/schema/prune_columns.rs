@@ -43,6 +43,26 @@ pub fn prune_columns(
     }
 }
 
+/// Prune a `StructType` directly (not via a `Schema`), returning the pruned struct. Mirrors Java
+/// `TypeUtil.project(StructType, ids)` / `select(StructType, ids)`: when every field is dropped the
+/// result is an empty struct (Java returns `StructType.of()` for a `null` visitor result). Used by
+/// the `TypeUtil` projection wrappers in [`crate::spec::schema`].
+pub(crate) fn prune_columns_struct(
+    struct_type: &StructType,
+    selected: impl IntoIterator<Item = i32>,
+    select_full_types: bool,
+) -> Result<StructType> {
+    let mut visitor = PruneColumn::new(HashSet::from_iter(selected), select_full_types);
+    match visit_struct(struct_type, &mut visitor)? {
+        Some(Type::Struct(s)) => Ok(s),
+        Some(other) => Err(Error::new(
+            ErrorKind::Unexpected,
+            format!("Pruned struct must be a struct, got: {other}"),
+        )),
+        None => Ok(StructType::default()),
+    }
+}
+
 impl PruneColumn {
     fn new(selected: HashSet<i32>, select_full_types: bool) -> Self {
         Self {
@@ -173,7 +193,11 @@ impl SchemaVisitor for PruneColumn {
             if self.select_full_types {
                 Ok(Some(Type::List(list.clone())))
             } else if list.element_field.field_type.is_struct() {
-                let projected_struct = PruneColumn::project_selected_struct(value).unwrap();
+                // Java `projectSelectedStruct(elementResult)` is null-tolerant (None -> empty
+                // struct); use `?` rather than `.unwrap()` to stay consistent with the map() arm
+                // below (the value is effectively never None on this gated path, but the unwrap was
+                // a latent panic the symmetric map() fix already removed).
+                let projected_struct = PruneColumn::project_selected_struct(value)?;
                 Ok(Some(Type::List(PruneColumn::project_list(
                     list,
                     Type::Struct(projected_struct),
@@ -206,8 +230,11 @@ impl SchemaVisitor for PruneColumn {
             if self.select_full_types {
                 Ok(Some(Type::Map(map.clone())))
             } else if map.value_field.field_type.is_struct() {
-                let projected_struct =
-                    PruneColumn::project_selected_struct(Some(value.unwrap())).unwrap();
+                // Java `projectSelectedStruct(valueResult)` is null-tolerant (None -> empty struct);
+                // pass `value` straight through rather than unwrapping it (which panicked when a
+                // struct-typed map value was selected with no selected descendant). Mirrors the
+                // list() arm above.
+                let projected_struct = PruneColumn::project_selected_struct(value)?;
                 Ok(Some(Type::Map(PruneColumn::project_map(
                     map,
                     Type::Struct(projected_struct),
@@ -804,5 +831,65 @@ mod tests {
                 NestedField::required(1, "id", Primitive(PrimitiveType::Long)).into(),
             ]))
         );
+    }
+
+    // RISK: a struct-typed MAP VALUE selected by id alone (no descendant selected) in project mode
+    // must yield an EMPTY struct value, NOT panic. Java `projectSelectedStruct(null)` returns an
+    // empty StructType; the map() arm previously did `Some(value.unwrap())` which panicked when
+    // `value` was None. Ground-truthed against live Java 1.10.0: `project(schema, {4}) =
+    // map<string, struct<>>`. This pins the null-tolerant fix (finding LOW #5).
+    #[test]
+    fn test_prune_columns_map_struct_value_selected_alone_is_empty_struct() {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "m",
+                    Type::Map(MapType {
+                        key_field: NestedField::map_key_element(
+                            3,
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        value_field: NestedField::map_value_element(
+                            4,
+                            Type::Struct(StructType::new(vec![
+                                NestedField::required(5, "a", Primitive(PrimitiveType::Int)).into(),
+                            ])),
+                            true,
+                        )
+                        .into(),
+                    }),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        // Select only the map VALUE struct id 4 (no descendant).
+        let selected: HashSet<i32> = HashSet::from([4]);
+        let result = prune_columns(&schema, selected, false).expect("must not panic");
+        let expected = Type::Struct(StructType::new(vec![
+            NestedField::optional(
+                2,
+                "m",
+                Type::Map(MapType {
+                    key_field: NestedField::map_key_element(
+                        3,
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    value_field: NestedField::map_value_element(
+                        4,
+                        Type::Struct(StructType::default()),
+                        true,
+                    )
+                    .into(),
+                }),
+            )
+            .into(),
+        ]));
+        assert_eq!(result, expected);
     }
 }
