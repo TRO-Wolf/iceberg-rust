@@ -533,6 +533,37 @@ fails as a corrupt-Parquet-footer error). Statuses live ONLY in [GAP_MATRIX](../
 Sequencing (done): U1 (reader core + offline goldens, 117 stayed ❌, #90) → merge → rebase → U2 (scan wiring + interop,
 117 ❌→🟡). Census 34✅/26🟡/8❌ → **34✅/27🟡/7❌**.
 
+## BLOCK 7 (Avro data-file WRITE, 2026-06-18, Opus, signed off) — 2 sequential AC·OO PRs → completes row 117 🟡→✅
+
+Mirrors the U1/U2 read cadence. Deep-scope workflow decoded the Java 1.10.0 Avro write contract (DataWriter /
+ValueWriters / GenericWriters / AvroSchemaUtil / AvroMetrics) from ~/.m2 jars and mapped it onto the writer seam.
+The honest flip REQUIRES a real production writer (the row-117 residue literally names "there is NO Avro DataFileWriter"),
+so a test-only encode would be an overclaim — W1 builds the engine, W2 proves it with Direction-2 interop + flips.
+
+- [x] **W1 — production `AvroWriter` (engine; no matrix flip)** — **DONE 2026-06-18.** AC·OO converged cycle 2 (cycle 1
+      CONVERGED with 2 MEDIUM test-strength findings; cycle 2 closed them). NEW `writer/file_writer/avro_writer.rs`
+      (`AvroWriterBuilder`/`AvroWriter`) implementing the `FileWriterBuilder`/`FileWriter` RPITIT seam, mirroring
+      `parquet_writer.rs`, slotting into `DataFileWriter`/`RollingFileWriter` with a 2-line `mod.rs` seam only. Encoder
+      reuses the proven `arrow_struct_to_literal` → `RawLiteral` → `schema_to_avro_schema` path (field-ids stamped).
+      **Metrics = record_count + file_size ONLY** (Java `AvroMetrics.fromWriter` = `Metrics(rowCount,null,null,null,null)`;
+      all six column maps EMPTY — positively asserted, the false-parity mutation-bait). Codec default null, deflate
+      supported; variant/unknown rejected (reader-symmetric); empty-input deletes file + returns vec![]. 11 module tests
+      (all-types + nested + nested-optional U1 round-trips, raw-byte union/decimal-width pin, metrics-empty, via-DataFileWriter,
+      empty, variant-reject, deflate, live-size). Critic re-decoded Java per-type encoding byte-faithful + mutation-tested
+      all 5 traps (union-flip / decimal-width / populated-metric / dropped-field-id / tz-shift — each bit a test) + re-ran
+      gate. **Orchestrator-verified:** renamed placeholder `AvroWriter1`→`AvroWriter` (inner `apache_avro::Writer` aliased
+      `OcfWriter`) + explicit re-export; re-ran gate MYSELF — lib **2501** passed/0, clippy 0 warnings, fmt + typos clean;
+      Cargo/lock/GAP_MATRIX untouched; ASF header present. **3 LOW (named, none in W1 new code):** `arrow/value.rs:59`
+      required-child-under-null-parent (pre-existing shared reader converter — carry to W2/future); `current_written_size`
+      uncompressed underestimate (sound roll signal, disclosed); `decimal_required_bytes` log10 `-1` nuance (pre-existing
+      shared spec fn, no divergence in tested precisions). NO matrix flip (engine only).
+- [ ] **W2 — Direction-2 interop + flip → row 117 🟡→✅** — Rust GEN test writes `00000-rust-data.avro` THROUGH the W1
+      production writer; Java reads the raw file via `Avro.read(InputFile).project(schema).createReaderFunc(s →
+      PlannedDataReader.create(schema))` and asserts row-identity vs hand-declared expected (two-anchor anti-circular, flat
+      fixture matching D1, no delete). Fail-closed sabotage (HARD-FAIL never SKIP). New: `AvroWriteOracle` +
+      `verify-interop-avro-write` dispatch, `run-interop-avro-write.sh`, `tests/interop_avro_write.rs`. Flip 117 🟡→✅ +
+      reword residue (writer now exists; remaining = read-side deferred items + nested bounded by Java's GenericAppenderFactory).
+
   _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
       tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
       action (rewrites the metadata graph into staging + emits a `(source,target)` copy-plan; does NOT copy data).

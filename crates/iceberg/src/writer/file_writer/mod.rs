@@ -24,6 +24,8 @@ use super::CurrentFileStatus;
 use crate::Result;
 use crate::spec::DataFileBuilder;
 
+mod avro_writer;
+pub use avro_writer::{AvroWriter, AvroWriterBuilder};
 mod parquet_writer;
 pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
 
