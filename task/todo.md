@@ -472,6 +472,51 @@ CSV serialization + parallelism are the Spark "shell" the Rust port supplies). S
 > (geometry/geography 87, ORC 116, Avro 117, SessionCatalog 126 deferred, LockManager 127, encryption 128, events 142,
 > SnapshotTable/MigrateTable 137-residue).
 
+## BLOCK 6 (Avro data-file READ, 2026-06-18, Opus, signed off) — 2 sequential AC·OO PRs
+
+Grounded by a 3-agent scoping pass. **Row 117 is ❌ on the live matrix** (the memory's "🟡" was WRONG — zero Avro
+data code; `avro/` is manifest-schema only). Java data path = `PlannedDataReader` (id-based partner-visitor read
+plan: id→pos in FILE order, null pos → skip, missing ids → constant/initial-default/IS_DELETED=false/ROW_POSITION/
+optional=null/else error; read-time int→long & float→double promotion; logical types date=int-days/time+ts(tz)-micros=
+long/ts(tz)-nanos=long/decimal=BE-two's-complement+scale/uuid=fixed16/fixed[L]/binary=bytes; optional=union[null,T]).
+**Reuse:** `avro/schema.rs` already converts Avro↔Iceberg by field-id; `apache_avro::Reader` is a row Iterator<Value>
+(NO Cargo edit); `RecordBatchTransformer` + delete-filter are format-agnostic. **Missing:** an Avro-Value→Arrow-array
+builder + a `FileFormat` dispatch (today `arrow/reader.rs::process_file_scan_task` is Parquet-ONLY — an Avro file
+fails as a corrupt-Parquet-footer error). Statuses live ONLY in [GAP_MATRIX](../docs/parity/GAP_MATRIX.md).
+
+- [x] **U1 — Avro-`Value`→Arrow reader CORE + offline goldens (no matrix flip; engine only)** — **DONE 2026-06-18.**
+      AC·OO converged 3 cycles. **Cycle-1 Critic caught a HIGH** (nested structs resolved POSITIONALLY not by
+      field-id — would break on any reordered/projected/defaulted nested struct); Actor rebuilt the read-plan
+      RECURSIVELY (by-field-id at EVERY struct level) + added 4 nested-by-id tests (subset/reorder/skip-extra+missing-
+      optional/list-of-struct/map-of-struct-value); cycles 2-3 cleared a V3-row-lineage MEDIUM down to named residue.
+      `arrow/avro_reader.rs` (`read_avro_data_file`/`read_avro_data_bytes`) + `_tests.rs` (29 offline goldens) +
+      `arrow/mod.rs`. 6-rung missing-default priority + int→long/float→double promotion + decimal-BE-two's-complement +
+      uuid-fixed16 + all logical types, bytecode-verified. Critic mutation-tested decimal-sign-ext/projection-skip/
+      missing-default → each reds. Orchestrator re-ran offline gate (29 module + 2484 lib, fmt, clippy), confirmed NO
+      Cargo edit + NO scan-path edit (pure module) + matrix UNTOUCHED. **Reconciled:** `read_data_file_stream` is
+      Parquet-only → the Avro reader is a justified disjoint path, not a parallel reader. **3 LOW (named):** timestamp
+      tz-by-expected-type (parity-correct, re-prove at U2 interop); positional list/map element (parity-faithful);
+      Enum-as-string liberality. **DEFERRED to U2/later:** name-mapping fallback, V3 row-lineage present-field readers,
+      variant read. **Row 117 STAYS ❌** (engine not scan-wired — U2 flips it).
+  _Delivered spec (reference):_ `apache_avro::Reader` datum stream → field-id read-plan (projection/skip/missing-defaults via `avro_schema_to_schema`)
+      → Arrow `RecordBatch`es (via `schema_to_arrow_schema` + array builders). ALL primitives + logical types + nested
+      struct/list/map + null/union + int→long/float→double promotion. Offline tests: checked-in GOLDEN Avro files +
+      hand-declared expected rows + mutation baits. Pure module, no scan dependency. **RECONCILE with
+      `convert_equality_delete_files.rs` `read_data_file_stream`** (scope flagged it may already touch the data-read
+      path — do NOT build a parallel reader). Row 117 STAYS ❌ (engine not scan-wired yet — honest, like BatchScan U1).
+- [ ] **U2 — scan read-path wiring + interop → row 117 ❌→🟡** (~2.5-3.5h, MEDIUM; gates on U1). Dispatch
+      `process_file_scan_task` on `task.data_file_format` (Parquet keeps its body; Avro → U1 reader; **ORC errors
+      CLEANLY** vs today's silent wrong-format read as Parquet); integrate delete-filter/projection (Avro can't push down →
+      materialize-then-filter, matching Parquet delete semantics). **Interop (real read-parity):** `AvroDataOracle` —
+      Java `iceberg-data` writes an Avro data file (every primitive + logical + nested + optional + a skip column + a
+      missing-with-default column), Rust scan READS → row-identity vs hand-declared expected; `run-interop-avro-data.sh`
+      + `tests/interop_avro_data.rs`; hard-fail sabotage. **HONEST FLIP 117 ❌→🟡** (the row is "Read/write"; WRITE half
+      = an Avro `DataFileWriter` + the Rust-writes/Java-reads direction is the named residue → a separate block does
+      🟡→✅). **Name-mapping fallback** (files lacking field-ids) deferred — Iceberg files always carry ids.
+
+Sequencing: U1 (reader core + offline goldens, 117 stays ❌) → merge → rebase → U2 (scan wiring + interop, 117 ❌→🟡).
+Census 34✅/26🟡/8❌ → **34✅/27🟡/7❌** at end of U2. ~6-8h total.
+
   _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
       tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
       action (rewrites the metadata graph into staging + emits a `(source,target)` copy-plan; does NOT copy data).
