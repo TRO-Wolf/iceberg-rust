@@ -30,7 +30,7 @@ use super::*;
 use crate::io::LocalFsStorageFactory;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, ManifestContentType,
+    DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal, ManifestContentType,
     NestedField, PartitionSpec, PrimitiveType, Schema as IcebergSchema, Struct, Transform, Type,
 };
 use crate::transaction::{ApplyTransactionAction, Transaction};

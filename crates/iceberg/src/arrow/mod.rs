@@ -31,6 +31,7 @@ pub(crate) mod delete_filter;
 
 mod int96;
 mod reader;
+pub(crate) mod record_batch_predicate;
 /// RecordBatch projection utilities
 pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;
