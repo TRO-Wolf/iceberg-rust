@@ -613,6 +613,38 @@ SnapshotTable/MigrateTable (137) was SCOPED then TABLED — the actions are Spar
 > bytecode), so the ✅ is honest. LESSON: the 3-cycle cap + an adversarial Critic that runs live Java is what catches a
 > plausible-but-wrong port; never trust the Actor's "all green" self-report over the final Critic verdict.
 
+## BLOCK 9 (ORC data-file READ, 2026-06-18, Opus, signed off) — 2 sequential AC·OO PRs → row 116 ❌→🟡 (read-only)
+
+Scoped first: orc-rust crate compat (0.8=arrow58 INCOMPATIBLE → pin **0.7.0 = arrow 57.3**, unifies with workspace 57.1, Apache-2.0)
++ iceberg-orc 1.10.0 fetchable (interop unblocked). **Make-or-break:** orc-rust 0.7 DISCARDS the ORC `iceberg.id` type
+attributes (mod proto private, from_proto drops them) → Iceberg's by-field-id read isn't directly available. **User chose
+FIELD-ID-CORRECT (parse the ORC footer ourselves)** over name-based (silent-misread on optional renamed cols) or a vendored
+fork. User approved the orc-rust crate; the zlib-decode (deflate) dep was already present.
+
+- [x] **U1 — field-id-correct ORC reader core (engine; no flip)** — **DONE 2026-06-18.** AC·OO converged cycle 2 (cycle 1
+      CONVERGED + 4 findings, cycle 2 closed the MEDIUM/LOW). NEW `arrow/orc_reader.rs` + `orc_reader/footer.rs` (hand-rolled
+      minimal ORC footer protobuf parser — PostScript→Footer.types[].attributes for `iceberg.id`; NONE + ZLIB=raw-deflate
+      with the 3-byte ORC compression-chunk framing; other footer codecs → clear FeatureUnsupported, named residue) →
+      field-id→ORC-index map → by-id projection mirroring Java `buildOrcProjection` (promotion int→long/float→double/
+      decimal-precision-at-same-scale; missing required-no-default = hard error; optional = null-fill; reorder) → orc-rust
+      decode (sync under spawn_blocking) → ORC→Iceberg Arrow mapping (ts **ns→µs** + tz None/UTC by resolved type, decimal
+      scale, uuid/fixed→FixedSizeBinary, **LONG-vs-TIME**/BINARY-three-way by resolved Iceberg type), stamping
+      PARQUET_FIELD_ID_META_KEY. API `read_orc_data_file`/`read_orc_data_bytes` (mirrors Avro U1). Committed a REAL
+      Java-Iceberg-1.10.0 ORC golden fixture (`testdata/orc/iceberg_primitives.orc`, 1.7KB) → 21 tests incl. field-id-correct
+      reads of every primitive+logical+null, projection/reorder, missing-optional/required, promotions, batch-size, nested→
+      FeatureUnsupported. **Critic validated the footer parser against TWO real Java ORC files (committed + a scrambled-id
+      one, no overfit) via a real Java org.apache.orc.Reader as ground truth; all 5 mutations bit.** **Orchestrator-verified:**
+      re-ran gate MYSELF (lib **2565** passed/0, clippy 0, fmt+typos clean); Cargo edit = **orc-rust only** (the zlib-decode crate pre-existing),
+      **arrow single-major 57 (no v58 leak)**; GAP_MATRIX + scan reader.rs untouched (U2 wires them); `.orc` fixture is
+      license-eye-auto-skipped (binary, like the existing `.avro`/`.bin` fixtures). 2 LOW (named, unreachable on Iceberg ORC):
+      CHAR/VARCHAR + ns-timestamp convert arms untested; int-narrowing + decimal-scale-strict are deliberate safe-direction
+      guards (Java accepts then setScale-to-file-scale, a latent Java mismatch) — documented vs bytecode. NO matrix flip (engine).
+- [ ] **U2 — scan wiring + Direction-1 interop + flip → row 116 ❌→🟡** — replace the `Orc` FeatureUnsupported arm at
+      `reader.rs:352` with `process_orc_file_scan_task` (verbatim clone of the Avro path — same RecordBatchTransformer +
+      DeleteVector/predicate machinery). `OrcDataOracle` (Java `GenericAppenderFactory` FileFormat.ORC) + `run-interop-orc-data.sh`
+      + `interop_orc_data.rs` + the pom `iceberg-orc` test dep. Direction-1, anti-circular, fail-closed sabotage, incl. a
+      renamed-column case to prove field-id correctness. Flip row 116 ❌→🟡 (WRITE absent = residue, like Avro).
+
   _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
       tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
       action (rewrites the metadata graph into staging + emits a `(source,target)` copy-plan; does NOT copy data).
