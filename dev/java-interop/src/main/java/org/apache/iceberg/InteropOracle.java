@@ -72,6 +72,7 @@ import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.JsonUtil;
+import org.apache.iceberg.util.Pair;
 
 /**
  * Java reference oracle for the UpdateSchema, UpdatePartitionSpec, AND ManageSnapshots interop suites.
@@ -1300,6 +1301,34 @@ public final class InteropOracle {
         System.out.println(
             "verify-interop-delete-reachable: " + deleteReachableFailures + " failures");
         if (deleteReachableFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
+      case "generate-interop-rewrite-table-path":
+        // REWRITE-TABLE-PATH interop (GAP_MATRIX row 137). Java builds a V2 fixture (data + a parquet
+        // POSITION-delete + an EQUALITY-delete) at <dir>/table, DRIVES the REAL engine-agnostic
+        // RewriteTablePathUtil (replacePaths/rewriteManifestList/rewriteDataManifest/rewriteDeleteManifest)
+        // with hand-declared source/target prefixes (anti-circular), and emits two PATH-INDEPENDENT
+        // descriptors: java_graph.json (the SET of rewritten TARGET locations, relativized to the target)
+        // and java_copy_plan.json (the (fromTag,toTag) pairs with the per-class STAGED-vs-SOURCE direction
+        // encoded) + final.metadata.json. The dir is via -Dinterop.rewrite_table_path.dir.
+        Path rewriteTablePathGenDir = requireFixturesDir("interop.rewrite_table_path.dir");
+        RewriteTablePathOracle.generate(rewriteTablePathGenDir);
+        break;
+      case "verify-interop-rewrite-table-path":
+        // REWRITE-TABLE-PATH interop, DIRECTION 1 — "Java judges what RUST computed." The Rust GEN test
+        // (ICEBERG_INTEROP_REWRITE_TABLE_PATH_DIR) read Java's table, ran the Rust RewriteTablePath with
+        // the SAME prefixes, and emitted rust_graph.json + rust_copy_plan.json. Here Java asserts the Rust
+        // graph + copy-plan (order-independent) EQUAL Java's own descriptors. A divergence is a REAL
+        // rewrite incompatibility (a leaked source prefix, a miswired copy-plan direction, or a dropped
+        // entry). NOTE: `mvn exec:java` does not reliably propagate System.exit —
+        // run-interop-rewrite-table-path.sh greps the sentinel.
+        Path rewriteTablePathVerifyDir = requireFixturesDir("interop.rewrite_table_path.dir");
+        int rewriteTablePathFailures = RewriteTablePathOracle.verify(rewriteTablePathVerifyDir);
+        System.out.println(
+            "verify-interop-rewrite-table-path: " + rewriteTablePathFailures + " failures");
+        if (rewriteTablePathFailures > 0) {
           System.exit(1);
         }
         break;
@@ -19955,5 +19984,454 @@ public final class InteropOracle {
 
   private static String readString(Path path) throws IOException {
     return new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
+  }
+
+  // ===========================================================================================
+  // RewriteTablePathOracle — REWRITE-TABLE-PATH interop (GAP_MATRIX row 137).
+  //
+  // Proves the Rust `RewriteTablePath` action (FULL-rewrite mode) agrees with Java 1.10.0's
+  // engine-agnostic iceberg-CORE `RewriteTablePathUtil` (replacePaths / rewriteManifestList /
+  // rewriteDataManifest / rewriteDeleteManifest) on a fixture carrying data + a POSITION-delete + an
+  // EQUALITY-delete (every branch). `RewriteTablePathUtil` is CORE (not Spark), so Java DRIVES the real
+  // rewrite — a fully BIDIRECTIONAL oracle.
+  //
+  // THE ANTI-CIRCULAR ORACLE. Both sides hand-declare the SAME source/target prefixes (the source is
+  // the table's own on-disk location; the target is a fixed `s3://relocated-bucket/...` string declared
+  // identically in the Rust test). The cross-engine comparison NEVER copies the other engine's absolute
+  // output paths. Two PATH-INDEPENDENT descriptors cross engines:
+  //   - GRAPH: the SET of every rewritten TARGET location (the copy-plan targets), each RELATIVIZED to
+  //     the target prefix (so it is comparable across temp roots).
+  //   - COPY-PLAN: the SET of (fromTag, toTag) pairs, where toTag = relativize(to, target) and fromTag =
+  //     `STAGED:<rel>` if `from` is under the staging location else `SOURCE:<rel>` — so the per-class
+  //     direction (STAGED vs SOURCE) is part of the cross-engine token (a flipped direction diverges).
+  // ===========================================================================================
+
+  static final class RewriteTablePathOracle {
+    private RewriteTablePathOracle() {}
+
+    /** `{1 id long, 2 cat string, 3 y long}` — the fixture schema (cat is the partition column). */
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "cat", Types.StringType.get()),
+            Types.NestedField.required(3, "y", Types.LongType.get()));
+
+    /** Must equal the Rust test's TARGET_PREFIX byte-for-byte (hand-declared, anti-circular). */
+    private static final String TARGET_PREFIX = "s3://relocated-bucket/warehouse/db/table";
+
+    static void generate(Path dir) throws IOException {
+      Path tableDir = dir.resolve("table");
+      Files.createDirectories(tableDir);
+      BaseTable table = buildFixture(tableDir.toFile());
+
+      String source = table.operations().current().location();
+      String staging = dir.resolve("java_staging").toAbsolutePath().toString();
+
+      // Drive the REAL RewriteTablePathUtil over the fixture and collect the copy-plan (FULL rewrite).
+      Set<Pair<String, String>> copyPlan = computeCopyPlan(table, source, TARGET_PREFIX, staging);
+
+      // GRAPH descriptor: every rewritten TARGET location, relativized to the target prefix.
+      java.util.TreeSet<String> graph = new java.util.TreeSet<>();
+      for (Pair<String, String> pair : copyPlan) {
+        graph.add(relativizeTo(pair.second(), TARGET_PREFIX));
+      }
+
+      // COPY-PLAN descriptor: (fromTag, toTag) with the per-class direction encoded.
+      java.util.TreeSet<List<String>> copyPlanTokens = new java.util.TreeSet<>(RewriteTablePathOracle::compareTokens);
+      for (Pair<String, String> pair : copyPlan) {
+        String from = pair.first();
+        String to = pair.second();
+        String toTag = relativizeTo(to, TARGET_PREFIX);
+        String fromTag;
+        if (from.startsWith(staging + "/")) {
+          fromTag = "STAGED:" + relativizeTo(from, staging);
+        } else if (from.startsWith(source + "/")) {
+          fromTag = "SOURCE:" + relativizeTo(from, source);
+        } else {
+          throw new IllegalStateException(
+              "copy-plan `from` is neither under staging nor source: " + from);
+        }
+        copyPlanTokens.add(List.of(fromTag, toTag));
+      }
+
+      writeJson(dir.resolve("java_graph.json"), toJsonStringArray(graph));
+      writeJson(dir.resolve("java_copy_plan.json"), toJsonPairArray(copyPlanTokens));
+
+      // Land final.metadata.json at the known path for the Rust side to read.
+      Path finalMetadata = tableDir.resolve("metadata").resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(table.operations().current(), finalOut);
+
+      System.out.println(
+          "generate-interop-rewrite-table-path: graph="
+              + graph.size()
+              + " entries, copy_plan="
+              + copyPlanTokens.size()
+              + " pairs; wrote table + descriptors to "
+              + dir);
+    }
+
+    /**
+     * Build the V2 fixture at {@code <tableDir>}:
+     *
+     * <ul>
+     *   <li>s1 fast-append data file {@code d1} (cat=a)
+     *   <li>s2 row-delta: a real PARQUET POSITION-delete on {@code d1} (cat=a) + a real EQUALITY-delete
+     *       on cat=b
+     * </ul>
+     *
+     * Every branch of `RewriteTablePathUtil` is exercised: data-manifest rewrite, delete-manifest
+     * POSITION_DELETES branch (path + bounds + staged copy-plan), and EQUALITY_DELETES branch
+     * (path-only + source copy-plan).
+     */
+    private static BaseTable buildFixture(File tableDir) throws IOException {
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      File dataDir = new File(tableDir, "data");
+
+      PartitionSpec spec = PartitionSpec.builderFor(SCHEMA).identity("cat").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      // V2: classic parquet position + equality deletes (not V3 DVs — the action's content rewrite is
+      // parquet-pos-delete only).
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              SCHEMA, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_rewrite_table_path");
+
+      // s1: data file d1 (cat=a).
+      DataFile d1 =
+          writeData(
+              table,
+              spec,
+              "a",
+              new File(dataDir, "cat=a/00000-d1.parquet"),
+              new long[] {100, 110},
+              new long[] {10, 20});
+      table.newFastAppend().appendFile(d1).commit();
+
+      // s2: a PARQUET POSITION-delete on d1 (cat=a) + an EQUALITY-delete on cat=b.
+      DeleteFile posDelete =
+          writePosDelete(
+              table, spec, "a", new File(dataDir, "cat=a/00000-pos-deletes.parquet"), d1.location(), 0L);
+      DeleteFile eqDelete =
+          writeEqDelete(table, spec, "b", new File(dataDir, "cat=b/00000-eq-deletes.parquet"), 20L);
+      RowDelta s2 = table.newRowDelta();
+      s2.addDeletes(posDelete);
+      s2.addDeletes(eqDelete);
+      s2.commit();
+
+      return table;
+    }
+
+    /**
+     * Drive the REAL `RewriteTablePathUtil` over EVERY snapshot's manifest-list + manifests (FULL
+     * rewrite — all live files, no snapshot-id filter), and union the {@code RewriteResult.copyPlan()}
+     * sets. This is exactly the composition the Spark `RewriteTablePathSparkAction` performs for the
+     * full-rewrite path, but built directly over the CORE util (no Spark).
+     */
+    static Set<Pair<String, String>> computeCopyPlan(
+        BaseTable table, String source, String target, String staging) throws IOException {
+      FileIO io = new LocalFileIO();
+      TableMetadata metadata = table.operations().current();
+      Map<Integer, PartitionSpec> specsById = metadata.specsById();
+      int formatVersion = metadata.formatVersion();
+
+      // FULL rewrite: the snapshot-id set is ALL snapshot ids (so every live entry's content file is
+      // added to the copy-plan — the 8-arg rewriteDataManifest/rewriteDeleteManifest path. The 7-arg
+      // overloads pass Set.of() and add NO content copy entries.)
+      Set<Long> allSnapshotIds = new java.util.LinkedHashSet<>();
+      for (Snapshot snapshot : table.snapshots()) {
+        allSnapshotIds.add(snapshot.snapshotId());
+      }
+
+      Set<Pair<String, String>> copyPlan = new java.util.LinkedHashSet<>();
+
+      for (Snapshot snapshot : table.snapshots()) {
+        // The manifest-list rewrite: the manifestsToRewrite set is ALL the snapshot's manifest paths
+        // (FULL rewrite). The output path is the staged manifest-list path.
+        Set<String> manifestsToRewrite = new java.util.LinkedHashSet<>();
+        for (ManifestFile manifest : snapshot.allManifests(io)) {
+          manifestsToRewrite.add(manifest.path());
+        }
+        String stagedManifestListPath =
+            RewriteTablePathUtil.stagingPath(snapshot.manifestListLocation(), source, staging);
+        RewriteTablePathUtil.RewriteResult<ManifestFile> listResult =
+            RewriteTablePathUtil.rewriteManifestList(
+                snapshot, io, metadata, manifestsToRewrite, source, target, staging, stagedManifestListPath);
+        copyPlan.addAll(listResult.copyPlan());
+
+        // The manifest-list itself is a STAGED file: copy FROM stagingPath(origManifestList) TO
+        // newPath(origManifestList). (The Spark driver adds this when it writes the staged list; we add
+        // it explicitly to mirror the full copy-plan.)
+        copyPlan.add(
+            Pair.of(
+                stagedManifestListPath,
+                RewriteTablePathUtil.newPath(snapshot.manifestListLocation(), source, target)));
+
+        // Each manifest: rewrite the data/delete entries (this is where the per-content-file copy-plan
+        // entries are produced).
+        for (ManifestFile manifest : snapshot.allManifests(io)) {
+          String stagedManifestPath =
+              RewriteTablePathUtil.stagingPath(manifest.path(), source, staging);
+          OutputFile manifestOut = io.newOutputFile(stagedManifestPath);
+          RewriteTablePathUtil.RewriteResult<? extends ContentFile<?>> manifestResult;
+          if (manifest.content() == ManifestContent.DATA) {
+            // 8-arg overload with the ALL-snapshots set: adds the data-file content copy entries.
+            manifestResult =
+                RewriteTablePathUtil.rewriteDataManifest(
+                    manifest, allSnapshotIds, manifestOut, io, formatVersion, specsById, source, target);
+          } else {
+            // 8-arg overload with the ALL-snapshots set: adds the delete-file content copy entries.
+            manifestResult =
+                RewriteTablePathUtil.rewriteDeleteManifest(
+                    manifest,
+                    allSnapshotIds,
+                    manifestOut,
+                    io,
+                    formatVersion,
+                    specsById,
+                    source,
+                    target,
+                    staging);
+          }
+          copyPlan.addAll(manifestResult.copyPlan());
+
+          // The manifest itself is a STAGED file: copy FROM stagingPath(origManifest) TO
+          // newPath(origManifest).
+          copyPlan.add(
+              Pair.of(
+                  stagedManifestPath,
+                  RewriteTablePathUtil.newPath(manifest.path(), source, target)));
+        }
+      }
+
+      return copyPlan;
+    }
+
+    /** Returns the number of failures (0 ⇒ Java agrees with the Rust-computed graph + copy-plan). */
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      String tag = "rewrite-table-path";
+
+      Path javaGraphPath = dir.resolve("java_graph.json");
+      Path javaPlanPath = dir.resolve("java_copy_plan.json");
+      Path rustGraphPath = dir.resolve("rust_graph.json");
+      Path rustPlanPath = dir.resolve("rust_copy_plan.json");
+
+      if (!Files.exists(rustGraphPath) || !Files.exists(rustPlanPath)) {
+        System.out.println(
+            "FAIL " + tag + ": missing Rust descriptors (" + rustGraphPath + " / " + rustPlanPath
+                + ") — run the Rust GEN path first");
+        return 1;
+      }
+
+      String javaGraph = readString(javaGraphPath);
+      String rustGraph = readString(rustGraphPath);
+      if (!normalizeJsonStringSet(javaGraph).equals(normalizeJsonStringSet(rustGraph))) {
+        System.out.println(
+            "FAIL " + tag + ": rewritten-path graphs differ\n  java=" + javaGraph + "\n  rust=" + rustGraph);
+        failures++;
+      }
+
+      String javaPlan = readString(javaPlanPath);
+      String rustPlan = readString(rustPlanPath);
+      if (!normalizeJsonPairSet(javaPlan).equals(normalizeJsonPairSet(rustPlan))) {
+        System.out.println(
+            "FAIL " + tag + ": copy-PLANs differ\n  java=" + javaPlan + "\n  rust=" + rustPlan);
+        failures++;
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-rewrite-table-path OK — the Rust rewritten-path GRAPH + the copy-plan "
+                + "(with per-class STAGED-vs-SOURCE direction) are IDENTICAL to Java's real "
+                + "RewriteTablePathUtil rewrite over the same source/target prefixes.");
+      }
+      return failures;
+    }
+
+    // ---- descriptor helpers ----
+
+    /** Relativize `path` to `prefix` (strip prefix + separator). */
+    private static String relativizeTo(String path, String prefix) {
+      String withSep = prefix.endsWith("/") ? prefix : prefix + "/";
+      if (!path.startsWith(withSep)) {
+        throw new IllegalStateException("path " + path + " is not under prefix " + prefix);
+      }
+      return path.substring(withSep.length());
+    }
+
+    private static int compareTokens(List<String> a, List<String> b) {
+      int c = a.get(0).compareTo(b.get(0));
+      return c != 0 ? c : a.get(1).compareTo(b.get(1));
+    }
+
+    /** A sorted JSON string array `["a","b",...]`. */
+    private static String toJsonStringArray(java.util.Collection<String> values) {
+      StringBuilder sb = new StringBuilder("[");
+      boolean first = true;
+      for (String v : values) {
+        if (!first) {
+          sb.append(",");
+        }
+        sb.append("\"").append(jsonEscape(v)).append("\"");
+        first = false;
+      }
+      return sb.append("]").toString();
+    }
+
+    /** A sorted JSON array of two-element arrays `[["from","to"],...]`. */
+    private static String toJsonPairArray(java.util.Collection<List<String>> pairs) {
+      StringBuilder sb = new StringBuilder("[");
+      boolean first = true;
+      for (List<String> p : pairs) {
+        if (!first) {
+          sb.append(",");
+        }
+        sb.append("[\"").append(jsonEscape(p.get(0))).append("\",\"").append(jsonEscape(p.get(1))).append("\"]");
+        first = false;
+      }
+      return sb.append("]").toString();
+    }
+
+    private static String jsonEscape(String s) {
+      return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    /** Parse a JSON string array into a normalized sorted set (order-independent comparison). */
+    private static java.util.TreeSet<String> normalizeJsonStringSet(String json) {
+      java.util.TreeSet<String> out = new java.util.TreeSet<>();
+      for (String token : splitJsonStrings(json)) {
+        out.add(token);
+      }
+      return out;
+    }
+
+    /** Parse a JSON array of two-element arrays into a normalized sorted set of "from to" tokens. */
+    private static java.util.TreeSet<String> normalizeJsonPairSet(String json) {
+      java.util.TreeSet<String> out = new java.util.TreeSet<>();
+      // Each pair is `["from","to"]`; collect the quoted strings two at a time.
+      List<String> strings = splitJsonStrings(json);
+      for (int i = 0; i + 1 < strings.size(); i += 2) {
+        out.add(strings.get(i) + " " + strings.get(i + 1));
+      }
+      return out;
+    }
+
+    /** Extract every double-quoted string literal from a flat JSON array (handles \\" escapes). */
+    private static List<String> splitJsonStrings(String json) {
+      List<String> out = new ArrayList<>();
+      StringBuilder current = null;
+      boolean escaped = false;
+      for (int i = 0; i < json.length(); i++) {
+        char ch = json.charAt(i);
+        if (current == null) {
+          if (ch == '"') {
+            current = new StringBuilder();
+          }
+          continue;
+        }
+        if (escaped) {
+          current.append(ch);
+          escaped = false;
+        } else if (ch == '\\') {
+          escaped = true;
+        } else if (ch == '"') {
+          out.add(current.toString());
+          current = null;
+        } else {
+          current.append(ch);
+        }
+      }
+      return out;
+    }
+
+    // ---- fixture writers (mirror the delete-reachable / rewrite-pos oracle helpers) ----
+
+    private static DataFile writeData(
+        BaseTable table, PartitionSpec spec, String cat, File file, long[] ids, long[] ys)
+        throws IOException {
+      mkdirs(file.getParentFile());
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, cat);
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", ids[i]);
+        record.setField("cat", cat);
+        record.setField("y", ys[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static DeleteFile writePosDelete(
+        BaseTable table, PartitionSpec spec, String cat, File file, CharSequence referencedPath, long pos)
+        throws IOException {
+      mkdirs(file.getParentFile());
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, cat);
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(referencedPath, pos, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    private static DeleteFile writeEqDelete(
+        BaseTable table, PartitionSpec spec, String cat, File file, long deleteY) throws IOException {
+      mkdirs(file.getParentFile());
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, cat);
+      Schema eqDeleteRowSchema = SCHEMA.select("y");
+      int[] equalityFieldIds =
+          eqDeleteRowSchema.columns().stream().mapToInt(Types.NestedField::fieldId).toArray();
+      GenericRecord delete = GenericRecord.create(eqDeleteRowSchema);
+      delete.setField("y", deleteY);
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(SCHEMA, spec, equalityFieldIds, eqDeleteRowSchema, null);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      EqualityDeleteWriter<Record> writer =
+          factory.newEqDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(List.of(delete));
+      }
+      return writer.toDeleteFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
+    }
   }
 }

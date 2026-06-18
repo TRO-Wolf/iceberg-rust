@@ -36,7 +36,7 @@
 //! | `rewritePositionDeletes(Table)` | table | [`Actions::rewrite_position_deletes`] |
 //! | `computeTableStats(Table)` | table | [`Actions::compute_table_stats`] |
 //! | `computePartitionStats(Table)` | table | [`Actions::compute_partition_stats`] |
-//! | `rewriteTablePath(Table)` | table | unsupported (no Rust action) |
+//! | `rewriteTablePath(Table)` | table | [`Actions::rewrite_table_path`] |
 //! | `removeDanglingDeleteFiles(Table)` | table | [`Actions::remove_dangling_delete_files`] |
 //!
 //! # Two construction idioms, one factory
@@ -61,19 +61,20 @@
 //!
 //! # Unsupported actions — surfaced honestly, never faked
 //!
-//! Three Java methods have no Rust action behind them (`snapshotTable`, `migrateTable`,
-//! `rewriteTablePath`). Rather than fabricate them, the [`ActionsProvider`]
-//! trait mirrors Java's *throw-by-default* shape: each unsupported method has a default that returns a
-//! typed [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error naming the gap
-//! (the Rust analog of Java's `UnsupportedOperationException`). The concrete [`Actions`] factory
-//! overrides exactly the nine methods Rust can actually run, and leaves the rest at the unsupported
-//! default. The gap is tracked in `docs/parity/GAP_MATRIX.md` row 151.
+//! Two Java methods have no Rust action behind them (`snapshotTable`, `migrateTable` — both require an
+//! external source table this engine-agnostic library has no surface for). Rather than fabricate them,
+//! the [`ActionsProvider`] trait mirrors Java's *throw-by-default* shape: each unsupported method has a
+//! default that returns a typed
+//! [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error naming the gap (the
+//! Rust analog of Java's `UnsupportedOperationException`). The concrete [`Actions`] factory overrides
+//! exactly the ten methods Rust can actually run, and leaves the rest at the unsupported default. The
+//! gap is tracked in `docs/parity/GAP_MATRIX.md` row 151.
 
 use crate::Result;
 use crate::error::Error;
 use crate::maintenance::{
     ComputePartitionStats, ComputeTableStats, DeleteOrphanFiles, DeleteReachableFiles,
-    RemoveDanglingDeleteFiles, RewriteDataFiles, RewritePositionDeleteFiles,
+    RemoveDanglingDeleteFiles, RewriteDataFiles, RewritePositionDeleteFiles, RewriteTablePath,
 };
 use crate::table::Table;
 use crate::transaction::{ExpireSnapshotsAction, RewriteManifestsAction};
@@ -172,10 +173,12 @@ pub trait ActionsProvider {
         ))
     }
 
-    /// Mirrors Java `rewriteTablePath(Table)`. **Unsupported in this crate** (no Rust
-    /// `RewriteTablePath` action): returns
-    /// [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported).
-    fn rewrite_table_path(&self, table: Table) -> Result<NoAction> {
+    /// Mirrors Java `rewriteTablePath(Table)`. **Unsupported by default**; the concrete [`Actions`]
+    /// factory overrides it to return [`RewriteTablePath::new`]. Configure it with
+    /// [`RewriteTablePath::rewrite_location_prefix`] / [`RewriteTablePath::staging_location`] and run it
+    /// with [`RewriteTablePath::execute`] — it stages the rewritten metadata graph and returns the
+    /// `(source, target)` copy-plan (FULL-rewrite mode).
+    fn rewrite_table_path(&self, table: Table) -> Result<RewriteTablePath> {
         let _ = table;
         Err(unsupported("rewrite_table_path", "RewriteTablePath"))
     }
@@ -214,8 +217,8 @@ fn unsupported(method: &str, java_action: &str) -> Error {
 }
 
 /// The engine-agnostic concrete [`ActionsProvider`] for this crate: a zero-state factory that hands
-/// out the eight table-maintenance actions Rust has built, leaving the other four Java methods at
-/// their unsupported default.
+/// out the ten table-maintenance actions Rust has built, leaving the other two Java methods
+/// (`snapshot_table` / `migrate_table`) at their unsupported default.
 ///
 /// This is the Rust analog of a Java engine's `ActionsProvider` implementation
 /// (`SparkActions.get()` / `FlinkActions.get()`), minus any engine binding — these actions are
@@ -319,6 +322,16 @@ impl ActionsProvider for Actions {
     fn rewrite_position_deletes(&self, table: Table) -> Result<RewritePositionDeleteFiles> {
         Ok(RewritePositionDeleteFiles::new(table))
     }
+
+    /// Returns a [`RewriteTablePath`] action for `table` (Java `rewriteTablePath(Table)`). Configure it
+    /// with [`RewriteTablePath::rewrite_location_prefix`] (the source → target absolute path prefixes)
+    /// and [`RewriteTablePath::staging_location`] (where the rewritten metadata graph is staged), and run
+    /// it with [`RewriteTablePath::execute`] — it stages the rewritten metadata + emits the `(source,
+    /// target)` copy-plan (FULL-rewrite mode). **This action STAGES rewritten metadata + emits a
+    /// copy-plan; it does NOT physically copy data files.**
+    fn rewrite_table_path(&self, table: Table) -> Result<RewriteTablePath> {
+        Ok(RewriteTablePath::new(table))
+    }
 }
 
 #[cfg(test)]
@@ -340,9 +353,9 @@ mod tests {
 
     /// The exact set of factory methods the concrete [`Actions`] supports (overrides off the
     /// unsupported default). Pins the supported surface so a wiring that silently drops or adds an
-    /// override fails this test. The nine map 1:1 to Java `ActionsProvider` methods with a built
+    /// override fails this test. The ten map 1:1 to Java `ActionsProvider` methods with a built
     /// Rust action.
-    const SUPPORTED_METHODS: [&str; 9] = [
+    const SUPPORTED_METHODS: [&str; 10] = [
         "delete_orphan_files",
         "delete_reachable_files",
         "rewrite_manifests",
@@ -352,12 +365,12 @@ mod tests {
         "compute_partition_stats",
         "remove_dangling_delete_files",
         "rewrite_position_deletes",
+        "rewrite_table_path",
     ];
 
     /// The Java `ActionsProvider` methods with NO Rust action behind them — the factory honestly
     /// reports these as unsupported.
-    const UNSUPPORTED_METHODS: [&str; 3] =
-        ["snapshot_table", "migrate_table", "rewrite_table_path"];
+    const UNSUPPORTED_METHODS: [&str; 2] = ["snapshot_table", "migrate_table"];
 
     // ---- self-contained test fixtures (a local-fs MemoryCatalog) ------------------------------
 
@@ -551,30 +564,24 @@ mod tests {
         assert!(actions.compute_partition_stats(table.clone()).is_ok());
         assert!(actions.remove_dangling_delete_files(table.clone()).is_ok());
         assert!(actions.rewrite_position_deletes(table.clone()).is_ok());
+        assert!(actions.rewrite_table_path(table.clone()).is_ok());
     }
 
     #[tokio::test]
     async fn unsupported_methods_return_typed_feature_unsupported() {
         let (catalog, _file_io, _tmp) = local_fs_catalog().await;
-        let table = create_unpartitioned_table(&catalog).await;
+        let _table = create_unpartitioned_table(&catalog).await;
         let actions = Actions::get();
 
-        // String-arg unsupported methods.
+        // The only two unsupported methods left are the String-arg `snapshot_table` / `migrate_table`
+        // (both need an external source table this engine-agnostic library has no surface for). After
+        // `rewrite_table_path` flipped to supported, NO Table-arg method is unsupported.
         for err in [
             actions.snapshot_table("db.src").unwrap_err(),
             actions.migrate_table("db.src").unwrap_err(),
         ] {
             assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
         }
-        // Table-arg unsupported method (`rewrite_table_path` is the only one left after
-        // `rewrite_position_deletes` flipped to supported).
-        assert_eq!(
-            actions
-                .rewrite_table_path(table.clone())
-                .unwrap_err()
-                .kind(),
-            ErrorKind::FeatureUnsupported
-        );
     }
 
     /// Smoke test: a `DeleteOrphanFiles` handed out by the factory actually RUNS (deletes a planted

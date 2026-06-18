@@ -85,6 +85,18 @@
 //!   [`UpdateStatisticsAction`](crate::transaction::Transaction::update_statistics). The Rust port of
 //!   Java's `ComputeTableStats` action; each value is fed to the sketch in Iceberg single-value
 //!   serialization form (`Conversions.toByteBuffer`). See [`compute_table_stats`].
+//! - [`RewriteTablePath`] — FULL-rewrite mode: rewrite every absolute path prefix in a table's metadata
+//!   graph (metadata.json + manifest-lists + manifests + position-delete CONTENT) from `source` to
+//!   `target`, STAGING the rewritten metadata at a caller-chosen location and emitting a `(source,
+//!   target)` COPY-PLAN ([`RewriteTablePathResult`]). The Rust port of Java 1.10.0's engine-agnostic
+//!   core `RewriteTablePathUtil` (`replacePaths` / `rewriteManifestList` / `rewriteDataManifest` /
+//!   `rewriteDeleteManifest` / `rewritePositionDeleteFile`). Mirrors the 1.10.0 divergences EXACTLY:
+//!   `location` via regex `replaceFirst`; `partition_statistics` PASSED THROUGH un-rewritten;
+//!   `referenced_data_file` rewritten; position-delete content is the ONLY rewritten payload (+
+//!   `replacePathBounds`); copy-plan direction differs by class (STAGED files copy FROM staging, VERBATIM
+//!   files copy FROM source). One of the twelve `ActionsProvider` methods (`rewrite_table_path(Table)`).
+//!   Incremental mode + version-hint are DEFERRED. **This action STAGES rewritten metadata + emits a
+//!   copy-plan; it does NOT physically copy data files.**
 //! - [`Actions`](crate::maintenance::Actions) / [`ActionsProvider`](crate::maintenance::ActionsProvider)
 //!   — the factory surface mirroring Java's `org.apache.iceberg.actions.ActionsProvider` (1.10.0): one
 //!   entry point that hands out the maintenance actions above (constructed `X::new(table)`) AND the
@@ -113,6 +125,7 @@ pub mod partition_stats;
 mod remove_dangling_delete_files;
 mod rewrite_data_files;
 mod rewrite_position_delete_files;
+mod rewrite_table_path;
 
 #[cfg(test)]
 mod tests;
@@ -139,3 +152,4 @@ pub use rewrite_data_files::{FileGroupRewriteResult, RewriteDataFiles, RewriteDa
 pub use rewrite_position_delete_files::{
     RewritePositionDeleteFiles, RewritePositionDeleteFilesResult,
 };
+pub use rewrite_table_path::{RewriteTablePath, RewriteTablePathResult};
