@@ -419,6 +419,26 @@ public final class InteropOracle {
         Path avroDataDir = requireFixturesDir("interop.avro_data.dir");
         AvroDataOracle.generate(avroDataDir);
         break;
+      case "verify-interop-avro-write":
+        // AVRO DATA-FILE WRITE, DIRECTION 2 — "Java reads what RUST writes" (GAP_MATRIX row 117). The
+        // INVERSION of generate-interop-avro-data. The Rust GEN test (env
+        // ICEBERG_INTEROP_AVRO_WRITE_DIR, tests/interop_avro_write.rs) wrote 00000-rust-data.avro
+        // THROUGH THE W1 PRODUCTION Avro data writer (AvroWriterBuilder/AvroWriter) over the SAME flat
+        // fixture AvroDataOracle uses, plus rust_avro_rows.json = the rows HAND-DECLARED from the Rust
+        // constants. Here Java reads that RAW .avro file (Avro.read(...).project(schema)
+        // .createReaderFunc(PlannedDataReader::create).build(), the production Avro data read route —
+        // no table/manifest needed) and asserts row-identity against TWO anchors: Java's OWN
+        // hand-declared constants AND rust_avro_rows.json. A FAIL is a real write-incompatibility
+        // finding (Rust wrote an Avro data file Java cannot read). `mvn exec:java` swallows
+        // System.exit(1), so the run script greps the "0 failures" sentinel. Dir via
+        // -Dinterop.avro_write.dir.
+        Path avroWriteVerifyDir = requireFixturesDir("interop.avro_write.dir");
+        int avroWriteFailures = AvroWriteOracle.verify(avroWriteVerifyDir);
+        System.out.println("verify-interop-avro-write: " + avroWriteFailures + " failures");
+        if (avroWriteFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-write-actions":
         // METADATA-LEVEL rewrite-family interop fixture (E2): the five-commit
         // fast-append/delete/overwrite/replace-partitions/rewrite chain on a partitioned V2
@@ -6035,6 +6055,233 @@ public final class InteropOracle {
             (byte) ((Character.digit(hex.charAt(i), 16) << 4) + Character.digit(hex.charAt(i + 1), 16));
       }
       return out;
+    }
+  }
+
+  // ===========================================================================================
+  // AVRO DATA-FILE WRITE oracle — GAP_MATRIX row 117 (Direction 2: "Java reads what Rust writes").
+  //
+  // The INVERSION of AvroDataOracle (Direction 1). The Rust GEN test
+  // (crates/iceberg/tests/interop_avro_write.rs, env ICEBERG_INTEROP_AVRO_WRITE_DIR) wrote
+  // 00000-rust-data.avro THROUGH THE W1 PRODUCTION Avro data writer (AvroWriterBuilder/AvroWriter) over
+  // the SAME flat fixture AvroDataOracle uses (every Iceberg primitive + logical type + an
+  // optional/null column, 5 rows id 10..50, NO delete), plus rust_avro_rows.json = the rows
+  // HAND-DECLARED from the Rust literal constants.
+  //
+  // Here Java READS the raw 00000-rust-data.avro via the production Avro data read route
+  // (Avro.read(LocalFileIO.newInputFile(path)).project(schema).createReaderFunc(avroSchema ->
+  // PlannedDataReader.create(schema)).build() → CloseableIterable<Record>, no table/manifest needed)
+  // and asserts ROW-IDENTITY against TWO INDEPENDENT ANCHORS (anti-circular):
+  //   (a) Java's OWN hand-declared expected — reuses AvroDataOracle's schema()/constants, rendered to
+  //       the canonical JSON shape (so this oracle never reads Rust's JSON to build its truth), and
+  //   (b) the Rust-emitted rust_avro_rows.json (normalized through the same Jackson mapper).
+  // A FAIL on (a) means the W1 writer wrote the wrong bytes; a FAIL on (b) means the two sides
+  // hand-declared different expecteds. Either way Java's read is the cross-engine evidence.
+  // ===========================================================================================
+
+  static final class AvroWriteOracle {
+    private AvroWriteOracle() {}
+
+    static int verify(Path dir) {
+      int failures = 0;
+      Path avroFile = dir.resolve("00000-rust-data.avro");
+      Path rustRowsJson = dir.resolve("rust_avro_rows.json");
+
+      if (!Files.exists(avroFile)) {
+        System.out.println(
+            "FAIL avro-write-d2: missing " + avroFile + " (run the Rust GEN path first)");
+        return 1;
+      }
+      if (!Files.exists(rustRowsJson)) {
+        System.out.println(
+            "FAIL avro-write-d2: missing " + rustRowsJson + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      // Reuse the Direction-1 fixture schema/constants — the SAME hand-declared truth, no nested cols.
+      Schema schema = AvroDataOracle.schema();
+
+      // Read the RAW Rust-written .avro via the production Avro data read route. No table/manifest —
+      // just the on-disk file, projected to the fixture schema, decoded by PlannedDataReader.
+      List<Record> read = new ArrayList<>();
+      try (CloseableIterable<Record> records =
+          org.apache.iceberg.avro.Avro.read(
+                  new LocalFileIO().newInputFile(avroFile.toAbsolutePath().toString()))
+              .project(schema)
+              .createReaderFunc(
+                  avroSchema ->
+                      org.apache.iceberg.data.avro.PlannedDataReader.create(schema))
+              .build()) {
+        for (Record record : records) {
+          read.add(record);
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL avro-write-d2: Java could not READ the Rust-written .avro via the production Avro "
+                + "data read route (write-incompatibility): "
+                + readError);
+        return 1;
+      }
+
+      // Exactly 5 rows must be read (no delete).
+      if (read.size() != 5) {
+        System.out.println(
+            "FAIL avro-write-d2: expected 5 rows read from the Rust-written .avro, got " + read.size());
+        failures++;
+      } else {
+        System.out.println("PASS avro-write-d2: read 5 rows from the Rust-written .avro");
+      }
+
+      read.sort((a, b) -> Long.compare((Long) a.getField("id"), (Long) b.getField("id")));
+      String readJson = JsonUtil.generate(gen -> renderRows(gen, read, AvroWriteOracle::renderRecord), true);
+
+      // ANCHOR (a): Java's OWN hand-declared expected (all 5 fixture rows, no delete).
+      String javaExpectedJson = expectedRowsJson();
+      if (!javaExpectedJson.equals(readJson)) {
+        System.out.println(
+            "FAIL avro-write-d2: Java's read of the Rust .avro != Java's OWN hand-declared expected.\n"
+                + "  java-expected="
+                + javaExpectedJson
+                + "\n  java-read="
+                + readJson);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS avro-write-d2: Java's read == Java's OWN hand-declared expected (anchor a)");
+      }
+
+      // ANCHOR (b): the Rust-emitted rust_avro_rows.json (normalized through the same mapper, so a
+      // pure formatting difference is not a divergence — only a VALUE difference is).
+      try {
+        String rustNormalized = normalizeRows(readString(rustRowsJson));
+        String readNormalized = normalizeRows(readJson);
+        if (!rustNormalized.equals(readNormalized)) {
+          System.out.println(
+              "FAIL avro-write-d2: Java's read of the Rust .avro != the Rust-emitted "
+                  + "rust_avro_rows.json.\n  rust-json="
+                  + rustNormalized
+                  + "\n  java-read="
+                  + readNormalized);
+          failures++;
+        } else {
+          System.out.println(
+              "PASS avro-write-d2: Java's read == the Rust-emitted rust_avro_rows.json (anchor b)");
+        }
+      } catch (IOException | RuntimeException jsonError) {
+        System.out.println(
+            "FAIL avro-write-d2: could not normalize/compare rust_avro_rows.json: " + jsonError);
+        failures++;
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-avro-write OK — Java READ the RUST-written .avro (W1 production Avro data "
+                + "writer), all 5 rows {10,20,30,40,50} identical to BOTH anchors (Java's own "
+                + "hand-declared constants AND rust_avro_rows.json), every column value/type/null");
+      }
+      return failures;
+    }
+
+    /** The hand-declared expected rows (all 5 fixture rows, no delete), in the canonical JSON shape. */
+    private static String expectedRowsJson() {
+      List<Integer> indices = new ArrayList<>();
+      for (int i = 0; i < AvroDataOracle.IDS.length; i++) {
+        indices.add(i);
+      }
+      return JsonUtil.generate(
+          gen -> renderRows(gen, indices, AvroWriteOracle::renderExpected), true);
+    }
+
+    private static <T> void renderRows(
+        JsonGenerator gen, List<T> items, AvroDataOracle.RowRenderer<T> renderer) throws IOException {
+      gen.writeStartArray();
+      for (T item : items) {
+        gen.writeStartObject();
+        renderer.render(gen, item);
+        gen.writeEndObject();
+      }
+      gen.writeEndArray();
+    }
+
+    /** Render one Java-read {@link Record} to the canonical column shape (mirror of AvroDataOracle). */
+    private static void renderRecord(JsonGenerator gen, Record rec) throws IOException {
+      gen.writeNumberField("id", (Long) rec.getField("id"));
+      Object name = rec.getField("name");
+      if (name == null) {
+        gen.writeNullField("name");
+      } else {
+        gen.writeStringField("name", name.toString());
+      }
+      gen.writeNumberField("i32", ((Number) rec.getField("i32")).intValue());
+      gen.writeNumberField("f64", ((Number) rec.getField("f64")).doubleValue());
+      gen.writeBooleanField("flag", (Boolean) rec.getField("flag"));
+      gen.writeNumberField("dt", ((LocalDate) rec.getField("dt")).toEpochDay());
+      gen.writeNumberField("ts", tsToMicros(rec.getField("ts")));
+      gen.writeStringField("dec", ((BigDecimal) rec.getField("dec")).setScale(2).toPlainString());
+      gen.writeStringField("bin", AvroDataOracle.bytesToHex((ByteBuffer) rec.getField("bin")));
+    }
+
+    /**
+     * Read the `ts` (timestamptz) field to epoch-MICROS, accepting EITHER representation.
+     *
+     * NAMED DIVERGENCE (the W1 writer, not this oracle): the Rust crate's `schema_to_avro_schema`
+     * maps BOTH `timestamp` and `timestamptz` to the bare Avro `timestamp-micros` logicalType WITHOUT
+     * the `adjust-to-utc=true` property that Java's `AvroSchemaUtil`/`TypeToSchema` stamp on a
+     * `timestamptz`. When Java reads the raw Rust-written .avro, `PlannedDataReader` therefore
+     * resolves the field as a NON-adjusted timestamp and hands back a `LocalDateTime` (UTC wall-clock)
+     * rather than an `OffsetDateTime`. The on-disk INSTANT VALUE is identical either way (UTC), so we
+     * normalize to epoch-micros and the row-identity proof holds on the value; the tz-attribute
+     * round-trip is the named residue tracked on GAP_MATRIX row 117. (The Direction-1 oracle reads
+     * via `IcebergGenerics`, which knows the table schema's tz-ness, so it gets `OffsetDateTime` —
+     * hence this defensive path is specific to the raw-file read route Direction 2 uses.)
+     */
+    private static long tsToMicros(Object ts) {
+      if (ts instanceof OffsetDateTime) {
+        return AvroDataOracle.instantToMicros((OffsetDateTime) ts);
+      }
+      if (ts instanceof java.time.LocalDateTime) {
+        Instant instant = ((java.time.LocalDateTime) ts).toInstant(ZoneOffset.UTC);
+        return instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1_000L;
+      }
+      throw new IllegalStateException(
+          "unexpected ts representation: " + (ts == null ? "null" : ts.getClass().getName()));
+    }
+
+    /** Render the hand-declared expected row at fixture index `i` (reusing AvroDataOracle constants). */
+    private static void renderExpected(JsonGenerator gen, Integer i) throws IOException {
+      gen.writeNumberField("id", AvroDataOracle.IDS[i]);
+      if (AvroDataOracle.NAMES[i] == null) {
+        gen.writeNullField("name");
+      } else {
+        gen.writeStringField("name", AvroDataOracle.NAMES[i]);
+      }
+      gen.writeNumberField("i32", AvroDataOracle.I32[i]);
+      gen.writeNumberField("f64", AvroDataOracle.F64[i]);
+      gen.writeBooleanField("flag", AvroDataOracle.FLAG[i]);
+      gen.writeNumberField("dt", (long) AvroDataOracle.DT_DAYS[i]);
+      gen.writeNumberField("ts", AvroDataOracle.TS_MICROS[i]);
+      gen.writeStringField("dec", new BigDecimal(AvroDataOracle.DEC[i]).setScale(2).toPlainString());
+      gen.writeStringField("bin", AvroDataOracle.BIN_HEX[i]);
+    }
+
+    /**
+     * Normalize a rows-JSON string through the shared Jackson mapper (sorted-by-id array of objects),
+     * so a pure whitespace/layout difference between the Rust emitter and Jackson is not flagged — only
+     * a VALUE (or null) difference is. Decimal strings stay strings; numeric `ts`/`dt`/`id` stay
+     * numbers; the f64 `1.5` etc. round-trip exactly.
+     */
+    private static String normalizeRows(String json) throws IOException {
+      ArrayNode array = (ArrayNode) JsonUtil.mapper().readTree(json);
+      List<ObjectNode> rows = new ArrayList<>();
+      for (com.fasterxml.jackson.databind.JsonNode node : array) {
+        rows.add((ObjectNode) node);
+      }
+      rows.sort((a, b) -> Long.compare(a.get("id").asLong(), b.get("id").asLong()));
+      ArrayNode sorted = JsonUtil.mapper().createArrayNode();
+      for (ObjectNode row : rows) {
+        sorted.add(row);
+      }
+      return JsonUtil.mapper().writeValueAsString(sorted);
     }
   }
 

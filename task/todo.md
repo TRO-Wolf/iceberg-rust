@@ -557,12 +557,28 @@ so a test-only encode would be an overclaim — W1 builds the engine, W2 proves 
       required-child-under-null-parent (pre-existing shared reader converter — carry to W2/future); `current_written_size`
       uncompressed underestimate (sound roll signal, disclosed); `decimal_required_bytes` log10 `-1` nuance (pre-existing
       shared spec fn, no divergence in tested precisions). NO matrix flip (engine only).
-- [ ] **W2 — Direction-2 interop + flip → row 117 🟡→✅** — Rust GEN test writes `00000-rust-data.avro` THROUGH the W1
-      production writer; Java reads the raw file via `Avro.read(InputFile).project(schema).createReaderFunc(s →
-      PlannedDataReader.create(schema))` and asserts row-identity vs hand-declared expected (two-anchor anti-circular, flat
-      fixture matching D1, no delete). Fail-closed sabotage (HARD-FAIL never SKIP). New: `AvroWriteOracle` +
-      `verify-interop-avro-write` dispatch, `run-interop-avro-write.sh`, `tests/interop_avro_write.rs`. Flip 117 🟡→✅ +
-      reword residue (writer now exists; remaining = read-side deferred items + nested bounded by Java's GenericAppenderFactory).
+- [x] **W2 — Direction-2 interop (row 117 STAYS 🟡 — tz-fix parked, user decision)** — **DONE 2026-06-18.** AC·OO
+      converged 1 cycle (Critic CONVERGED, 3 LOW). Rust GEN test (`tests/interop_avro_write.rs`) writes
+      `00000-rust-data.avro` THROUGH the W1 production writer; Java (`AvroWriteOracle` + `verify-interop-avro-write` +
+      `run-interop-avro-write.sh`) reads the RAW file via `Avro.read(...).project(schema).createReaderFunc(PlannedDataReader::create)`
+      and asserts row-identity vs TWO anchors (Java's OWN constants AND the Rust JSON — anti-circular, .avro the only crossing
+      artifact, Rust never reads its own write). Flat fixture, no delete. Fail-closed sabotage (corrupt one decimal → anchor (b)
+      diverges, anchor (a) still passes; HARD-FAIL never SKIP, scratch-copy restored). **Orchestrator-verified:** re-ran the live
+      oracle MYSELF (RC=0, Java reads all 5 rows = both anchors, sabotage diverged) + offline gate (GEN no-op, lib 2501,
+      clippy 0, fmt, typos); diff scoped to 4 files; Cargo untouched. **The oracle SURFACED a real divergence** → brought to
+      the user, who chose **keep 🟡 + PARK the fix**: Rust's shared `avro/schema.rs::schema_to_avro_schema` maps both
+      `timestamp` and `timestamptz` to Avro `timestamp-micros` WITHOUT `adjust-to-utc=true`, so Java reads a Rust `timestamptz`
+      as `LocalDateTime` not `OffsetDateTime` (INSTANT value identical, tz-attribute does not round-trip → not yet 1:1). Named
+      as THE 🟡-blocker in row 117; emitting `adjust-to-utc` is a separate on-disk-format unit deliberately not pursued. Census
+      UNCHANGED **34✅/27🟡/7❌** (117 was already 🟡 from U2). Note: the strict `| ✅ |` grep UNDERCOUNTS (~7 status cells
+      carry extra content) — the robust column-2 tally is 34✅/27🟡/7❌.
+
+> **BLOCK 7 COMPLETE (2026-06-18).** Avro data-file WRITE in 2 sequential AC·OO PRs: W1 production `AvroWriter` (engine, no
+> flip, #92) → W2 Direction-2 interop (Rust-writes-Java-reads value-identity proven). **Row 117 STAYS 🟡** (user parked the
+> `adjust-to-utc` tz-fix — value crosses identically but Java reads `timestamptz` as the wrong type `LocalDateTime`). The Avro read+write
+> engine + BOTH-direction interop now exist; the only remaining 1:1 gap is the tz-attribute (+ exotic read-side deferrals).
+> Census **34✅/27🟡/7❌**. NEXT (user: move to a fresh capability): ORC read (116, own block) · SnapshotTable/MigrateTable
+> (137 residue, external sources) · the parked Avro tz-fix (on-disk-format unit, needs approval) if revisited.
 
   _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
       tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
