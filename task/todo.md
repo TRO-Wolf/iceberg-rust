@@ -444,6 +444,60 @@ bin-pack(`largestBinFirst=true`). Props: `read.split.target-size`(128MiB)/`plann
 Sequencing (done): U1 (146 ❌→🟡) → merge #87 → rebase → U2 (146 🟡→✅ + 122 ❌→✅). Both interop-proven.
 Parity after block 4: **34✅, ❌ 9** (U1: ❌ 11→10 via 146→🟡; U2: 122 ❌→✅ + 146 🟡→✅).
 
+## BLOCK 5 (RewriteTablePath, 2026-06-17, Opus, signed off) — 1 AC·OO PR
+
+Grounded by a 3-agent scoping pass. **Key finding: `org.apache.iceberg.RewriteTablePathUtil` is engine-agnostic
+iceberg-core (no Spark dep) — ~95% portable 1:1 with a REAL bidirectional oracle** (only version-diff walking +
+CSV serialization + parallelism are the Spark "shell" the Rust port supplies). Statuses live ONLY in
+[GAP_MATRIX](../docs/parity/GAP_MATRIX.md).
+
+- [x] **RewriteTablePath (FULL-rewrite) → row 137 ❌→🟡, provider 9/3→10/2** — **DONE 2026-06-17.** AC·OO
+      converged 1 cycle, Critic refutation FAILED (re-decoded the bytecode — partition_statistics passthrough at
+      offset 142, location=replaceFirst; mutation-tested un-rewritten-path + copy-plan-direction-flip +
+      partition-stats-symmetric-rewrite → each reds its test). `maintenance/rewrite_table_path.rs` +
+      `_tests.rs` (15 offline) + provider 9/3→10/2 (lockstep) + bidirectional `RewriteTablePathOracle` (Java
+      DRIVES real `RewriteTablePathUtil`; D2 graph=7/plan=7 == Java, D1 0 failures, direction-flip sabotage
+      fails closed). Orchestrator re-ran the oracle + offline gate, verified format-stability (only path strings;
+      add_existing_file preserves seq/snapshot ids), Cargo untouched. **3 LOW residues (all named, non-blocking):**
+      pos-delete `col2` (optional `row`) dropped — fork's writer is (file_path,pos); `location` literal-vs-regex
+      (identical for absolute path prefixes; `regex` is dev-only, no Cargo edit); Puffin-DV pos-delete →
+      FeatureUnsupported. **DEFERRED:** incremental (startVersion/endVersion + version-diff + version-hint) + the
+      Spark CSV file-list. **HONEST FLIP 137 ❌→🟡** (SnapshotTable/MigrateTable stay ❌ — external sources).
+
+> **BLOCK 5 COMPLETE (2026-06-17).** RewriteTablePath in 1 AC·OO PR: FULL-rewrite port of core `RewriteTablePathUtil`
+> + copy-plan + provider **9/3→10/2** + real bidirectional oracle. **Row 137 ❌→🟡** (1 of 3 bundled — SnapshotTable/
+> MigrateTable need external sources, stay ❌). Census **34✅/26🟡/8❌**. NEXT-BLOCK options: Avro-data-READ (117 🟡,
+> own ~6.5h) · the SnapshotTable/MigrateTable pair (137, need external Hive/fs source ingest — bigger sprint) ·
+> incremental RewriteTablePath (additive follow-up). Easy ✅-flips long spent; remaining ❌ (8) are the big surfaces
+> (geometry/geography 87, ORC 116, Avro 117, SessionCatalog 126 deferred, LockManager 127, encryption 128, events 142,
+> SnapshotTable/MigrateTable 137-residue).
+
+  _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
+      tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
+      action (rewrites the metadata graph into staging + emits a `(source,target)` copy-plan; does NOT copy data).
+      Ports `RewriteTablePathUtil`:
+      - **metadata** (`replace_paths`): `location` (Java uses regex `replaceFirst` — the ONE asymmetry vs `newPath`),
+        snapshots' `manifest_list`, metadata-log, the 4 `write.*.path` props, `statistics` (Puffin). **Mirror the
+        divergences: `partition_statistics` PASSED THROUGH un-rewritten in 1.10.0**; refs/schemas/specs/sort-orders verbatim.
+      - **manifest-list/manifests**: rewrite each `manifest_path`, each entry `file_path` + `referenced_data_file`;
+        re-emit via `add_existing_file` (preserve seq/snapshot ids — SEMANTIC round-trip, not byte-identical; thread
+        format_version). Precondition: path not under `sourcePrefix` → typed error (no panic).
+      - **pos-deletes** are the ONLY content-rewritten payload (rewrite col-0 file_path + `replacePathBounds`);
+        **eq-deletes verbatim**. **copy-plan DIRECTION differs by class**: staged→target (manifests/lists/pos-deletes)
+        vs source→target (data/eq-deletes).
+      - **ActionsProvider**: override `rewrite_table_path`→real action, move UNSUPPORTED→SUPPORTED (9/3→10/2), update
+        arrays + doc table + partition-12 test IN LOCKSTEP.
+      - **Interop (real bidirectional, NOT no-Spark):** `RewriteTablePathOracle` drives core `RewriteTablePathUtil`;
+        compare the rewritten path GRAPH + the copy-plan `(source,target)` set+count, both directions; anti-circular
+        prefixes; fail-closed sabotage (un-rewritten path / dropped plan entry / wrong copy direction → red). Offline
+        unit tests (prefix boundary, idempotence, no-double-rewrite, the 4 props, partition-stats pass-through,
+        pos-delete content+bounds, referenced_data_file, copy-plan direction, precondition errors) + mutation baits.
+      - **DEFER (named residue):** incremental `startVersion`/`endVersion` + version-diff + version-hint write
+        (additive via the core overloads, not a redesign).
+      - **HONEST FLIP: 137 ❌→🟡 not ✅** — 137 bundles `SnapshotTable`/`MigrateTable` which ingest an EXTERNAL
+        Hive/filesystem source the Rust core has no path for → they stay ❌ (1 of 3 delivered). Census 34✅/25🟡/9❌ →
+        **34✅/26🟡/8❌**.
+
 Block-3 stretch / deferred: BatchScan-U1 (ScanTaskGroup/bin-pack, 146 🟡, offline) · RewriteTablePath
 (137 🟡, provider 10/2, 4.5h — full TableMetadata rebuild) · Avro-data-READ (own ~6.5h block, 117 🟡).
 
