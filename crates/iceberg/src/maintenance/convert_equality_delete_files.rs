@@ -88,32 +88,22 @@
 //! that matches none, the action commits NOTHING and returns a zero-count result (Java commits only when
 //! there is work).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Datum as ArrowDatum, Int64Array, RecordBatch, StringArray,
-};
-use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_schema::ArrowError;
-use arrow_string::like::starts_with;
-use fnv::FnvHashSet;
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use futures::StreamExt;
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
-use crate::arrow::{ArrowReader, ParquetReadOptions, get_arrow_datum, try_cast_literal};
-use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
+use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
+use crate::arrow::{ArrowReader, ParquetReadOptions};
 use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
 use crate::expr::visitors::inclusive_projection::InclusiveProjection;
-use crate::expr::{Bind, BoundPredicate, BoundReference, Predicate};
+use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::scan::ArrowRecordBatchStream;
-use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, Datum, PartitionKey, Schema, Snapshot,
-};
+use crate::spec::{DataContentType, DataFile, DataFileFormat, PartitionKey, Schema, Snapshot};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
@@ -452,9 +442,11 @@ impl ConvertEqualityDeleteFiles {
             // Evaluate the SURVIVAL predicate to a BooleanArray. A DELETED row is one where survival is
             // false. A NULL survival (the row matched a tuple and the negation produced null under
             // three-valued logic) is treated conservatively as NOT deleted so the conversion never
-            // over-masks beyond what the eq-delete's read path drops.
-            let mut evaluator = MatchingPositionEvaluator::new(&batch)?;
-            let survives = visit(&mut evaluator, bound_survival)?;
+            // over-masks beyond what the eq-delete's read path drops. The shared field-id evaluator
+            // (`arrow::record_batch_predicate`) is the same machinery the Avro scan read path uses to
+            // apply equality deletes post-materialization — one delete-application implementation, not a
+            // fork.
+            let survives = evaluate_predicate_to_mask(bound_survival, &batch)?;
             for row in 0..num_rows {
                 let deleted = !survives.is_null(row) && !survives.value(row);
                 if deleted {
@@ -629,252 +621,6 @@ async fn read_data_file_stream(
     .map(|res| res.map_err(|e| Error::new(ErrorKind::Unexpected, format!("{e}"))));
 
     Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
-}
-
-// =================================================================================================
-// The matching-position evaluator: a BoundPredicateVisitor that evaluates the eq-delete SURVIVAL
-// predicate against ONE RecordBatch to a BooleanArray, mapping each BoundReference to a column by its
-// field-id (PARQUET_FIELD_ID_META_KEY) metadata. Mirrors the read path's `PredicateConverter` arrow
-// kernels, but resolves columns by field id (the batch is already schema-evolved) rather than by a
-// parquet projection-mask leaf index.
-// =================================================================================================
-
-struct MatchingPositionEvaluator<'a> {
-    /// field id -> column index in the batch.
-    field_id_to_col: HashMap<i32, usize>,
-    batch: &'a RecordBatch,
-}
-
-impl<'a> MatchingPositionEvaluator<'a> {
-    fn new(batch: &'a RecordBatch) -> Result<Self> {
-        let mut field_id_to_col = HashMap::new();
-        for (idx, field) in batch.schema().fields().iter().enumerate() {
-            if let Some(id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY)
-                && let Ok(id) = id_str.parse::<i32>()
-            {
-                field_id_to_col.insert(id, idx);
-            }
-        }
-        Ok(Self {
-            field_id_to_col,
-            batch,
-        })
-    }
-
-    /// The batch column for a reference, by field id (None when the column is absent — schema
-    /// evolution).
-    fn column_for(&self, reference: &BoundReference) -> Option<ArrayRef> {
-        self.field_id_to_col
-            .get(&reference.field().id)
-            .map(|idx| self.batch.column(*idx).clone())
-    }
-
-    fn all_true(&self) -> Result<BooleanArray> {
-        Ok(BooleanArray::from(vec![true; self.batch.num_rows()]))
-    }
-
-    fn all_false(&self) -> Result<BooleanArray> {
-        Ok(BooleanArray::from(vec![false; self.batch.num_rows()]))
-    }
-
-    /// Cast the literal to the column's arrow type (the read-side `try_cast_literal`) and run `kernel`.
-    fn binary_cmp(
-        &self,
-        reference: &BoundReference,
-        literal: &Datum,
-        on_missing_true: bool,
-        kernel: impl Fn(&ArrayRef, &dyn ArrowDatum) -> std::result::Result<BooleanArray, ArrowError>,
-    ) -> Result<BooleanArray> {
-        match self.column_for(reference) {
-            Some(col) => {
-                let lit = get_arrow_datum(literal)?;
-                let cast = try_cast_literal(&lit, col.data_type()).map_err(arrow_err)?;
-                kernel(&col, cast.as_ref()).map_err(arrow_err)
-            }
-            None if on_missing_true => self.all_true(),
-            None => self.all_false(),
-        }
-    }
-}
-
-fn arrow_err(e: ArrowError) -> Error {
-    Error::new(
-        ErrorKind::Unexpected,
-        "Failed to evaluate equality-delete predicate over a data-file batch",
-    )
-    .with_source(e)
-}
-
-impl BoundPredicateVisitor for MatchingPositionEvaluator<'_> {
-    type T = BooleanArray;
-
-    fn always_true(&mut self) -> Result<BooleanArray> {
-        self.all_true()
-    }
-
-    fn always_false(&mut self) -> Result<BooleanArray> {
-        self.all_false()
-    }
-
-    fn and(&mut self, lhs: BooleanArray, rhs: BooleanArray) -> Result<BooleanArray> {
-        and_kleene(&lhs, &rhs).map_err(arrow_err)
-    }
-
-    fn or(&mut self, lhs: BooleanArray, rhs: BooleanArray) -> Result<BooleanArray> {
-        or_kleene(&lhs, &rhs).map_err(arrow_err)
-    }
-
-    fn not(&mut self, inner: BooleanArray) -> Result<BooleanArray> {
-        not(&inner).map_err(arrow_err)
-    }
-
-    fn is_null(&mut self, reference: &BoundReference, _p: &BoundPredicate) -> Result<BooleanArray> {
-        match self.column_for(reference) {
-            Some(col) => is_null(&col).map_err(arrow_err),
-            None => self.all_true(),
-        }
-    }
-
-    fn not_null(
-        &mut self,
-        reference: &BoundReference,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        match self.column_for(reference) {
-            Some(col) => is_not_null(&col).map_err(arrow_err),
-            None => self.all_false(),
-        }
-    }
-
-    fn is_nan(&mut self, reference: &BoundReference, _p: &BoundPredicate) -> Result<BooleanArray> {
-        if self.column_for(reference).is_some() {
-            self.all_true()
-        } else {
-            self.all_false()
-        }
-    }
-
-    fn not_nan(&mut self, reference: &BoundReference, _p: &BoundPredicate) -> Result<BooleanArray> {
-        if self.column_for(reference).is_some() {
-            self.all_false()
-        } else {
-            self.all_true()
-        }
-    }
-
-    fn less_than(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        self.binary_cmp(reference, literal, true, |c, l| lt(c, l))
-    }
-
-    fn less_than_or_eq(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        self.binary_cmp(reference, literal, true, |c, l| lt_eq(c, l))
-    }
-
-    fn greater_than(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        self.binary_cmp(reference, literal, false, |c, l| gt(c, l))
-    }
-
-    fn greater_than_or_eq(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        self.binary_cmp(reference, literal, false, |c, l| gt_eq(c, l))
-    }
-
-    fn eq(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        self.binary_cmp(reference, literal, false, |c, l| eq(c, l))
-    }
-
-    fn not_eq(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        self.binary_cmp(reference, literal, false, |c, l| neq(c, l))
-    }
-
-    fn starts_with(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        self.binary_cmp(reference, literal, false, |c, l| starts_with(c, l))
-    }
-
-    fn not_starts_with(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        self.binary_cmp(reference, literal, true, |c, l| not(&starts_with(c, l)?))
-    }
-
-    fn r#in(
-        &mut self,
-        reference: &BoundReference,
-        literals: &FnvHashSet<Datum>,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        match self.column_for(reference) {
-            Some(col) => {
-                let mut acc = BooleanArray::from(vec![false; col.len()]);
-                for literal in literals {
-                    let lit = get_arrow_datum(literal)?;
-                    let cast = try_cast_literal(&lit, col.data_type()).map_err(arrow_err)?;
-                    let matches = eq(&col, cast.as_ref()).map_err(arrow_err)?;
-                    acc = or(&acc, &matches).map_err(arrow_err)?;
-                }
-                Ok(acc)
-            }
-            None => self.all_false(),
-        }
-    }
-
-    fn not_in(
-        &mut self,
-        reference: &BoundReference,
-        literals: &FnvHashSet<Datum>,
-        _p: &BoundPredicate,
-    ) -> Result<BooleanArray> {
-        match self.column_for(reference) {
-            Some(col) => {
-                let mut acc = BooleanArray::from(vec![true; col.len()]);
-                for literal in literals {
-                    let lit = get_arrow_datum(literal)?;
-                    let cast = try_cast_literal(&lit, col.data_type()).map_err(arrow_err)?;
-                    let nonmatch = neq(&col, cast.as_ref()).map_err(arrow_err)?;
-                    acc = and(&acc, &nonmatch).map_err(arrow_err)?;
-                }
-                Ok(acc)
-            }
-            None => self.all_true(),
-        }
-    }
 }
 
 #[cfg(test)]

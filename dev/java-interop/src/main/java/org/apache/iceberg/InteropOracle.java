@@ -32,11 +32,16 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -400,6 +405,19 @@ public final class InteropOracle {
         if (eqDeleteFailures > 0) {
           System.exit(1);
         }
+        break;
+      case "generate-interop-avro-data":
+        // AVRO DATA-FILE READ, DIRECTION 1 — "Rust reads what JAVA writes" (GAP_MATRIX row 117). The
+        // sibling of generate-interop-scan-exec, but the DATA FILE is written in the AVRO format
+        // (GenericAppenderFactory.newDataWriter(..., FileFormat.AVRO, null), routed to iceberg-data's
+        // DataWriter over org.apache.iceberg.data.avro.DataWriter) rather than parquet. The fixture covers
+        // every Iceberg primitive + logical type + a nested struct/list/map + an optional column, over 5
+        // rows; a real parquet POSITION-delete removes one row (position 1) so merge-on-read over an AVRO
+        // data file is exercised end-to-end. Java materializes its OWN IcebergGenerics read into
+        // java_avro_rows.json (the GROUND TRUTH the Rust scan→Arrow must equal). The dir is supplied via
+        // -Dinterop.avro_data.dir.
+        Path avroDataDir = requireFixturesDir("interop.avro_data.dir");
+        AvroDataOracle.generate(avroDataDir);
         break;
       case "generate-interop-write-actions":
         // METADATA-LEVEL rewrite-family interop fixture (E2): the five-commit
@@ -5724,6 +5742,299 @@ public final class InteropOracle {
                 + "Rust equality-delete), merge-on-read live rows = {10,30,50}");
       }
       return failures;
+    }
+  }
+
+  // ===========================================================================================
+  // AVRO DATA-FILE READ oracle — GAP_MATRIX row 117 (Direction 1: "Rust reads what Java writes").
+  //
+  // The first AVRO-data-file interop. Java writes a V2 table whose DATA file is in the AVRO format
+  // (GenericAppenderFactory.newDataWriter(..., FileFormat.AVRO, null) → iceberg-data's
+  // org.apache.iceberg.data.avro.DataWriter, the production Avro data writer) over a fixture that
+  // covers EVERY Iceberg primitive + logical type + an OPTIONAL column, across 5 rows. A real parquet
+  // POSITION-delete removes ONE row (position 1) so merge-on-read over an AVRO data file is proven
+  // end-to-end.
+  //
+  // NESTED struct/list/map are deliberately NOT in this interop fixture: Iceberg-1.10.0's
+  // `GenericAppenderFactory` AVRO data writer + `PlannedDataReader` do NOT round-trip a nested record
+  // here — Java's OWN IcebergGenerics read of its OWN nested-Avro write throws
+  // `IllegalArgumentException: Missing required field` from `ValueReaders.createMissingFieldReader`
+  // (a Java-side generic-Avro limitation, independent of the Rust reader). Nested struct/list/map READ
+  // is proven instead by the U1 OFFLINE tests (`crates/iceberg/src/arrow/avro_reader_tests.rs`), which
+  // decode by-field-id nested/list/map Avro directly.
+  //
+  // THE TABLE (under <dir>/table). Unpartitioned V2, schema (field ids in parens):
+  //   id(1) long, name(2) string?, i32(3) int, f64(4) double, flag(5) boolean, dt(6) date,
+  //   ts(7) timestamptz, dec(8) decimal(9,2), bin(9) binary.
+  //   data file 00000-data.avro: 5 rows (id 10..50) at positions 0..4.
+  //   position-delete 00000-data-deletes.parquet: deletes position 1 (the id=20 row).
+  //   live rows after merge-on-read = ids {10, 30, 40, 50}.
+  //
+  // THE GROUND TRUTH (anti-circular). The expected rows are HAND-DECLARED here AND, identically, in the
+  // Rust test (interop_avro_data.rs). Java asserts its OWN IcebergGenerics read of the AVRO table equals
+  // the hand-declared expected (so a Java-side mistake fails here), then emits the expected as
+  // java_avro_rows.json. The Rust test reads the SAME table via scan→Arrow, extracts the same columns,
+  // and asserts equality against the hand-declared expected it loads from that JSON.
+  // ===========================================================================================
+
+  static final class AvroDataOracle {
+    private AvroDataOracle() {}
+
+    // Fixed logical-type fixture values, hand-declared. Row i (0-based) carries id = 10*(i+1).
+    private static final long[] IDS = {10L, 20L, 30L, 40L, 50L};
+    // name is optional: row index 2 (id=30) is NULL to exercise the optional/null path.
+    private static final String[] NAMES = {"alpha", "bravo", null, "delta", "echo"};
+    private static final int[] I32 = {1, 2, 3, 4, 5};
+    private static final double[] F64 = {1.5, 2.5, 3.5, 4.5, 5.5};
+    private static final boolean[] FLAG = {true, false, true, false, true};
+    // dt: days since epoch (LocalDate). ts: micros since epoch (OffsetDateTime, UTC).
+    private static final int[] DT_DAYS = {0, 100, 19000, 19001, 19002};
+    private static final long[] TS_MICROS = {0L, 1_000_000L, 1_600_000_000_000_000L, 1_600_000_000_000_001L, 1_600_000_000_000_002L};
+    // dec: decimal(9,2) unscaled values (so 1.23, 4.56, ...).
+    private static final String[] DEC = {"1.23", "-4.56", "78.90", "0.01", "-0.99"};
+    private static final String[] BIN_HEX = {"00", "01ff", "deadbeef", "", "7f"};
+    // The deleted position (id=20 at position 1).
+    private static final long DELETED_POSITION = 1L;
+
+    // The interop fixture covers every Iceberg PRIMITIVE + LOGICAL type + an OPTIONAL column. Nested
+    // struct / list / map are NOT in the interop fixture: Iceberg-1.10.0's `GenericAppenderFactory`
+    // AVRO data writer + `PlannedDataReader` do NOT round-trip a nested record here (Java's OWN read of
+    // its OWN nested-Avro write throws "Missing required field" — a Java-side generic-Avro limitation,
+    // independent of the Rust reader). Nested struct/list/map READ is instead proven by the U1 offline
+    // tests (`arrow/avro_reader_tests.rs`), which decode by-field-id nested/list/map Avro directly.
+    static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.optional(2, "name", Types.StringType.get()),
+          Types.NestedField.required(3, "i32", Types.IntegerType.get()),
+          Types.NestedField.required(4, "f64", Types.DoubleType.get()),
+          Types.NestedField.required(5, "flag", Types.BooleanType.get()),
+          Types.NestedField.required(6, "dt", Types.DateType.get()),
+          Types.NestedField.required(7, "ts", Types.TimestampType.withZone()),
+          Types.NestedField.required(8, "dec", Types.DecimalType.of(9, 2)),
+          Types.NestedField.required(9, "bin", Types.BinaryType.get()));
+    }
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema = schema();
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_avro_data");
+
+      // The DATA file is AVRO. The position-delete is parquet (delete file format is independent of the
+      // data file format; the parity point under test is reading the AVRO DATA file).
+      String dataPath = new File(dataDir, "00000-data.avro").getAbsolutePath();
+      DataFile dataFile = writeAvroDataFile(table, schema, spec, dataPath);
+
+      String deletePath = new File(dataDir, "00000-data-deletes.parquet").getAbsolutePath();
+      DeleteFile deleteFile = writePosDeleteFile(table, schema, spec, deletePath, dataFile.path());
+
+      table.newAppend().appendFile(dataFile).commit();
+      table.newRowDelta().addDeletes(deleteFile).commit();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // Anti-circular check: Java's OWN IcebergGenerics read of the AVRO table MUST equal the
+      // hand-declared expected (a Java-side mistake fails right here, before any Rust runs).
+      String expectedJson = expectedRowsJson();
+      String javaReadJson = readLiveRowsToJson(table);
+      if (!expectedJson.equals(javaReadJson)) {
+        throw new RuntimeException(
+            "AvroDataOracle self-check FAILED: Java's IcebergGenerics read of the AVRO table does not "
+                + "match the hand-declared expected.\n  expected="
+                + expectedJson
+                + "\n  java-read="
+                + javaReadJson);
+      }
+
+      writeJson(dir.resolve("java_avro_rows.json"), expectedJson);
+      System.out.println(
+          "generated AVRO-data table + java_avro_rows.json to "
+              + dir
+              + " (Java self-check PASSED: IcebergGenerics read == hand-declared expected)");
+    }
+
+    private static DataFile writeAvroDataFile(
+        BaseTable table, Schema schema, PartitionSpec spec, String path) throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < IDS.length; i++) {
+        rows.add(record(schema, i));
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.AVRO,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static Record record(Schema schema, int i) {
+      GenericRecord rec = GenericRecord.create(schema);
+      rec.setField("id", IDS[i]);
+      rec.setField("name", NAMES[i]);
+      rec.setField("i32", I32[i]);
+      rec.setField("f64", F64[i]);
+      rec.setField("flag", FLAG[i]);
+      rec.setField("dt", LocalDate.ofEpochDay(DT_DAYS[i]));
+      rec.setField(
+          "ts", OffsetDateTime.ofInstant(microsToInstant(TS_MICROS[i]), ZoneOffset.UTC));
+      rec.setField("dec", new BigDecimal(DEC[i]).setScale(2));
+      rec.setField("bin", ByteBuffer.wrap(hexToBytes(BIN_HEX[i])));
+      return rec;
+    }
+
+    private static Instant microsToInstant(long micros) {
+      long secs = Math.floorDiv(micros, 1_000_000L);
+      long microRem = Math.floorMod(micros, 1_000_000L);
+      return Instant.ofEpochSecond(secs, microRem * 1_000L);
+    }
+
+    /** Write a real parquet position-delete deleting {@link #DELETED_POSITION} of the data file. */
+    private static DeleteFile writePosDeleteFile(
+        BaseTable table, Schema schema, PartitionSpec spec, String path, CharSequence dataPath)
+        throws IOException {
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(dataPath, DELETED_POSITION, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    /** Read the table via IcebergGenerics and render the live rows to the canonical JSON shape. */
+    private static String readLiveRowsToJson(BaseTable table) {
+      List<Record> live = new ArrayList<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          live.add(record);
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+      live.sort((a, b) -> Long.compare((Long) a.getField("id"), (Long) b.getField("id")));
+      return JsonUtil.generate(gen -> renderRows(gen, live, AvroDataOracle::renderRecord), true);
+    }
+
+    /** The hand-declared expected rows (anti-circular ground truth), with position 1 deleted. */
+    private static String expectedRowsJson() {
+      List<Integer> liveIndices = new ArrayList<>();
+      for (int i = 0; i < IDS.length; i++) {
+        if (i != (int) DELETED_POSITION) {
+          liveIndices.add(i);
+        }
+      }
+      return JsonUtil.generate(gen -> renderRows(gen, liveIndices, AvroDataOracle::renderExpected),
+          true);
+    }
+
+    private static <T> void renderRows(
+        JsonGenerator gen, List<T> items, RowRenderer<T> renderer) throws IOException {
+      gen.writeStartArray();
+      for (T item : items) {
+        gen.writeStartObject();
+        renderer.render(gen, item);
+        gen.writeEndObject();
+      }
+      gen.writeEndArray();
+    }
+
+    private interface RowRenderer<T> {
+      void render(JsonGenerator gen, T item) throws IOException;
+    }
+
+    /** Render one Java-read {@link Record} to the canonical column shape. */
+    private static void renderRecord(JsonGenerator gen, Record rec) throws IOException {
+      gen.writeNumberField("id", (Long) rec.getField("id"));
+      Object name = rec.getField("name");
+      if (name == null) {
+        gen.writeNullField("name");
+      } else {
+        gen.writeStringField("name", name.toString());
+      }
+      gen.writeNumberField("i32", ((Number) rec.getField("i32")).intValue());
+      gen.writeNumberField("f64", ((Number) rec.getField("f64")).doubleValue());
+      gen.writeBooleanField("flag", (Boolean) rec.getField("flag"));
+      gen.writeNumberField("dt", ((LocalDate) rec.getField("dt")).toEpochDay());
+      gen.writeNumberField("ts", instantToMicros((OffsetDateTime) rec.getField("ts")));
+      gen.writeStringField("dec", ((BigDecimal) rec.getField("dec")).setScale(2).toPlainString());
+      gen.writeStringField("bin", bytesToHex((ByteBuffer) rec.getField("bin")));
+    }
+
+    /** Render the hand-declared expected row at fixture index `i` to the canonical column shape. */
+    private static void renderExpected(JsonGenerator gen, Integer i) throws IOException {
+      gen.writeNumberField("id", IDS[i]);
+      if (NAMES[i] == null) {
+        gen.writeNullField("name");
+      } else {
+        gen.writeStringField("name", NAMES[i]);
+      }
+      gen.writeNumberField("i32", I32[i]);
+      gen.writeNumberField("f64", F64[i]);
+      gen.writeBooleanField("flag", FLAG[i]);
+      gen.writeNumberField("dt", (long) DT_DAYS[i]);
+      gen.writeNumberField("ts", TS_MICROS[i]);
+      gen.writeStringField("dec", new BigDecimal(DEC[i]).setScale(2).toPlainString());
+      gen.writeStringField("bin", BIN_HEX[i]);
+    }
+
+    private static long instantToMicros(OffsetDateTime odt) {
+      Instant instant = odt.toInstant();
+      return instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1_000L;
+    }
+
+    private static String bytesToHex(ByteBuffer buffer) {
+      ByteBuffer dup = buffer.duplicate();
+      StringBuilder hex = new StringBuilder(dup.remaining() * 2);
+      while (dup.hasRemaining()) {
+        hex.append(String.format("%02x", dup.get() & 0xff));
+      }
+      return hex.toString();
+    }
+
+    private static byte[] hexToBytes(String hex) {
+      int len = hex.length();
+      byte[] out = new byte[len / 2];
+      for (int i = 0; i < len; i += 2) {
+        out[i / 2] =
+            (byte) ((Character.digit(hex.charAt(i), 16) << 4) + Character.digit(hex.charAt(i + 1), 16));
+      }
+      return out;
     }
   }
 

@@ -23,9 +23,10 @@
 //!
 //! This is the **engine core** for reading Iceberg data files written in Avro. It is a *pure*
 //! module: given the raw bytes of an Avro Object Container File plus the **expected** Iceberg
-//! schema (the projection), it produces Arrow record batches. It deliberately does **not** touch
-//! the scan / Parquet read path — wiring this into [`crate::scan`] (with the `FileFormat`
-//! dispatch and the Java-written interop oracle) is a separate change.
+//! schema (the projection), it produces Arrow record batches. The scan read path wires it in via
+//! [`crate::arrow::reader`]'s `process_avro_file_scan_task` (U2): that path feeds the batches
+//! produced here through the same `RecordBatchTransformer` the Parquet path uses (schema evolution
+//! + `_file` / partition constants) and applies merge-on-read deletes post-materialization.
 //!
 //! # The read plan (parity with `ValueReaders.buildReadPlan`)
 //!
@@ -85,9 +86,12 @@
 //! - The `variant` type read is deferred (the Avro→Iceberg schema converter rejects variant on the
 //!   read path anyway).
 
-// This is a pure engine module with no production caller yet: the scan-path wiring (the
-// `FileFormat::Avro` dispatch) is a follow-up change (U2). The public(crate) API and its helpers
-// are exercised by the offline tests below; the `dead_code` allow is removed when U2 wires it in.
+// U2 (scan-path wiring) consumes `read_avro_data_file` from `arrow::reader`'s
+// `process_avro_file_scan_task`. `read_avro_data_bytes` (the sync core) + `ReadPlanInput`'s
+// `id_to_constant` rung remain exercised only by the offline tests below — the scan supplies its
+// partition constants through the `RecordBatchTransformer` (as the Parquet path does), not through
+// the reader's id→constant map — so the bytes entry point and that field keep a narrow `dead_code`
+// allow rather than the whole-module blanket the pre-U2 core carried.
 #![allow(dead_code)]
 
 use std::collections::HashMap;

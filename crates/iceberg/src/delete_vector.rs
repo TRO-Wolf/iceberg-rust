@@ -133,6 +133,13 @@ impl DeleteVector {
         self.inner.is_empty()
     }
 
+    /// Returns `true` if `pos` is marked deleted (set membership). Used by the Avro scan read path
+    /// to apply positional deletes post-materialization (the Parquet path applies them via a
+    /// `RowSelection` built from the same bitmap); membership is the row-by-row analogue.
+    pub fn contains(&self, pos: u64) -> bool {
+        self.inner.contains(pos)
+    }
+
     /// Deserializes a Puffin `deletion-vector-v1` blob payload into a [`DeleteVector`].
     ///
     /// `blob` must be exactly the blob bytes the Puffin footer (and the `DeleteFile`'s

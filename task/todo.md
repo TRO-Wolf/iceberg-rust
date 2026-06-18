@@ -504,18 +504,34 @@ fails as a corrupt-Parquet-footer error). Statuses live ONLY in [GAP_MATRIX](../
       hand-declared expected rows + mutation baits. Pure module, no scan dependency. **RECONCILE with
       `convert_equality_delete_files.rs` `read_data_file_stream`** (scope flagged it may already touch the data-read
       path — do NOT build a parallel reader). Row 117 STAYS ❌ (engine not scan-wired yet — honest, like BatchScan U1).
-- [ ] **U2 — scan read-path wiring + interop → row 117 ❌→🟡** (~2.5-3.5h, MEDIUM; gates on U1). Dispatch
-      `process_file_scan_task` on `task.data_file_format` (Parquet keeps its body; Avro → U1 reader; **ORC errors
-      CLEANLY** vs today's silent wrong-format read as Parquet); integrate delete-filter/projection (Avro can't push down →
-      materialize-then-filter, matching Parquet delete semantics). **Interop (real read-parity):** `AvroDataOracle` —
-      Java `iceberg-data` writes an Avro data file (every primitive + logical + nested + optional + a skip column + a
-      missing-with-default column), Rust scan READS → row-identity vs hand-declared expected; `run-interop-avro-data.sh`
-      + `tests/interop_avro_data.rs`; hard-fail sabotage. **HONEST FLIP 117 ❌→🟡** (the row is "Read/write"; WRITE half
-      = an Avro `DataFileWriter` + the Rust-writes/Java-reads direction is the named residue → a separate block does
-      🟡→✅). **Name-mapping fallback** (files lacking field-ids) deferred — Iceberg files always carry ids.
+- [x] **U2 — scan read-path wiring + interop → row 117 ❌→🟡** — **DONE 2026-06-18.** AC·OO converged 1 cycle,
+      Critic refutation FAILED (mutation-tested dispatch-break → 5/6 Avro tests RED as corrupt-Parquet-footer, and
+      delete-disable → 3 MoR tests RED). `process_file_scan_task` dispatches on `task.data_file_format`: Parquet body
+      byte-UNCHANGED (moved verbatim into `process_parquet_file_scan_task`), Avro → U1 `read_avro_data_file` + the SAME
+      `RecordBatchTransformer` + MoR deletes POST-materialization (positional via new `DeleteVector::contains`, equality+
+      residual via a survival mask), **ORC errors CLEANLY** (fixes the latent silent wrong-format read, row 116). **De-forked** the
+      field-id predicate evaluator into shared `arrow/record_batch_predicate.rs`, now used by BOTH the Avro path AND
+      `ConvertEqualityDeleteFiles` (one impl). 6 scan tests + mutation baits. **Interop ✅ D1** (`AvroDataOracle`: Java
+      `GenericAppenderFactory.newDataWriter(FileFormat.AVRO)` writes a V2 table, MoR pos-delete removes id=20; Rust scan →
+      row-identity over every primitive+logical+optional/null; sabotage fail-closed exit 101). Orchestrator FULLY
+      re-verified after a Critic git-checkout incident (it reconstructed `reader.rs` mid-mutation): full compile + 6 avro
+      scan + 29 U1 decode + **9 de-forked ConvertEq** + 29 delete_vector + Parquet 40 + datafusion-lib 80 + interop all
+      GREEN; clippy/fmt clean; Cargo untouched; row 117 🟡 pipe-5 census 34✅/27🟡/7❌; fixed 2 stale "nested" comments.
+      **NAMED residue (🟡): WRITE half** (no Avro DataFileWriter → D2 absent → later 🟡→✅) + name-mapping fallback + V3
+      row-lineage + variant-read + nested-not-in-oracle (Java's own AVRO+PlannedDataReader can't round-trip nested; nested
+      READ proven by U1 offline tests). **Pre-existing (disclosed, NOT introduced):** an iceberg-datafusion DOCTEST in the
+      untouched `table_provider_factory.rs` fails on clean main (tokio rt-multi-thread feature); datafusion lib/integration
+      tests pass.
 
-Sequencing: U1 (reader core + offline goldens, 117 stays ❌) → merge → rebase → U2 (scan wiring + interop, 117 ❌→🟡).
-Census 34✅/26🟡/8❌ → **34✅/27🟡/7❌** at end of U2. ~6-8h total.
+> **BLOCK 6 COMPLETE (2026-06-18).** Avro data-file READ in 2 sequential AC·OO PRs: U1 reader core (no flip, #90) → U2
+> scan wiring + interop (row 117 ❌→🟡). **1 flip (117 ❌→🟡)**; READ interop-proven D1 (Java writes Avro, Rust scans,
+> row-identity + MoR delete). Census **34✅/27🟡/7❌**. WRITE half (Avro DataFileWriter + D2) is the residue for a later
+> 🟡→✅ block. NEXT options: the Avro WRITE half (completes 117→✅) · ORC read (116, own block) · SnapshotTable/MigrateTable
+> (137 residue, need external sources). Remaining ❌ (7): geometry/geography 87, ORC 116, SessionCatalog 126 (deferred),
+> LockManager 127, encryption 128, events/listeners 142, SnapshotTable/MigrateTable 137-residue.
+
+Sequencing (done): U1 (reader core + offline goldens, 117 stayed ❌, #90) → merge → rebase → U2 (scan wiring + interop,
+117 ❌→🟡). Census 34✅/26🟡/8❌ → **34✅/27🟡/7❌**.
 
   _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
       tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
