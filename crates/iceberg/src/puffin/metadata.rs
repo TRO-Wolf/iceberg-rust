@@ -198,7 +198,21 @@ impl FileMetadata {
         file_read: &dyn FileRead,
         input_file_length: u64,
     ) -> Result<u32> {
-        let start = input_file_length - FileMetadata::FOOTER_STRUCT_LENGTH as u64;
+        // A file shorter than the fixed footer struct cannot hold a footer at all; subtracting
+        // here would underflow (panic in debug, wrap to a huge offset in release) on hostile or
+        // truncated input. Reject it with a clean `DataInvalid` like the sibling guards do.
+        let start = input_file_length
+            .checked_sub(FileMetadata::FOOTER_STRUCT_LENGTH as u64)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Input file is too small to be a Puffin file: {} bytes is shorter than the {}-byte footer struct",
+                        input_file_length,
+                        FileMetadata::FOOTER_STRUCT_LENGTH
+                    ),
+                )
+            })?;
         let end = start + FileMetadata::FOOTER_STRUCT_PAYLOAD_LENGTH_LENGTH as u64;
         let footer_payload_length_bytes = file_read.read(start..end).await?;
         let mut buf = [0; 4];
@@ -215,7 +229,20 @@ impl FileMetadata {
         let footer_length = footer_payload_length as u64
             + FileMetadata::FOOTER_STRUCT_LENGTH as u64
             + FileMetadata::MAGIC_LENGTH as u64;
-        let start = input_file_length - footer_length;
+        // `footer_payload_length` is read straight from the file, so `footer_length` is
+        // attacker-controlled (e.g. `u32::MAX` declares a ~4 GiB footer). Validate it fits within
+        // the file before subtracting; an unguarded `input_file_length - footer_length` underflows.
+        let start = input_file_length
+            .checked_sub(footer_length)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Declared footer length {} exceeds input file length {}",
+                        footer_length, input_file_length
+                    ),
+                )
+            })?;
         let end = input_file_length;
         file_read.read(start..end).await
     }
@@ -294,10 +321,27 @@ impl FileMetadata {
         .await?;
 
         let magic_length = FileMetadata::MAGIC_LENGTH as usize;
+        // Guard the leading/trailing magic slices: an undersized read (hostile bytes or a short
+        // file) must surface a `DataInvalid` error, never an out-of-bounds slice panic.
+        let leading_magic = footer_bytes.get(..magic_length).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Footer is too short to contain the leading magic bytes",
+            )
+        })?;
         // check first four bytes of footer
-        FileMetadata::check_magic(&footer_bytes[..magic_length])?;
+        FileMetadata::check_magic(leading_magic)?;
+        let trailing_start = footer_bytes
+            .len()
+            .checked_sub(magic_length)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Footer is too short to contain the trailing magic bytes",
+                )
+            })?;
         // check last four bytes of footer
-        FileMetadata::check_magic(&footer_bytes[footer_bytes.len() - magic_length..])?;
+        FileMetadata::check_magic(&footer_bytes[trailing_start..])?;
 
         let footer_payload_str =
             FileMetadata::extract_footer_payload_as_str(&footer_bytes, footer_payload_length)?;
@@ -329,11 +373,27 @@ impl FileMetadata {
             let end = input_file_length;
             let footer_bytes = file_read.read(start..end).await?;
 
-            let payload_length_start =
-                footer_bytes.len() - (FileMetadata::FOOTER_STRUCT_LENGTH as usize);
+            // The prefetched slice must be at least one footer struct long before we can locate
+            // the payload-length field within it; otherwise this subtraction underflows.
+            let payload_length_start = footer_bytes
+                .len()
+                .checked_sub(FileMetadata::FOOTER_STRUCT_LENGTH as usize)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Prefetched footer is shorter than the footer struct",
+                    )
+                })?;
             let payload_length_end =
                 payload_length_start + (FileMetadata::FOOTER_STRUCT_PAYLOAD_LENGTH_LENGTH as usize);
-            let payload_length_bytes = &footer_bytes[payload_length_start..payload_length_end];
+            let payload_length_bytes = footer_bytes
+                .get(payload_length_start..payload_length_end)
+                .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Prefetched footer is too short to contain the payload-length field",
+                )
+            })?;
 
             let mut buf = [0; 4];
             buf.copy_from_slice(payload_length_bytes);
@@ -349,16 +409,41 @@ impl FileMetadata {
                 return FileMetadata::read(input_file).await;
             }
 
-            // Read footer bytes
-            let footer_start = footer_bytes.len() - footer_length;
+            // Read footer bytes. `footer_length <= prefetch_hint` was checked above, but the
+            // prefetched read may have returned fewer bytes than the hint, so locate the footer
+            // with a checked subtraction rather than trusting `footer_bytes.len()`.
+            let footer_start = footer_bytes
+                .len()
+                .checked_sub(footer_length)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Prefetched footer is shorter than the declared footer length",
+                    )
+                })?;
             let footer_end = footer_bytes.len();
             let footer_bytes = &footer_bytes[footer_start..footer_end];
 
             let magic_length = FileMetadata::MAGIC_LENGTH as usize;
+            let leading_magic = footer_bytes.get(..magic_length).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Footer is too short to contain the leading magic bytes",
+                )
+            })?;
             // check first four bytes of footer
-            FileMetadata::check_magic(&footer_bytes[..magic_length])?;
+            FileMetadata::check_magic(leading_magic)?;
+            let trailing_start = footer_bytes
+                .len()
+                .checked_sub(magic_length)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Footer is too short to contain the trailing magic bytes",
+                    )
+                })?;
             // check last four bytes of footer
-            FileMetadata::check_magic(&footer_bytes[footer_bytes.len() - magic_length..])?;
+            FileMetadata::check_magic(&footer_bytes[trailing_start..])?;
 
             let footer_payload_str =
                 FileMetadata::extract_footer_payload_as_str(footer_bytes, footer_payload_length)?;
@@ -956,6 +1041,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(file_metadata, zstd_compressed_metric_file_metadata());
+    }
+
+    #[tokio::test]
+    async fn test_file_shorter_than_footer_struct_returns_error() {
+        // Regression for SEC-01: an input file shorter than FOOTER_STRUCT_LENGTH (12 bytes)
+        // previously underflowed `input_file_length - FOOTER_STRUCT_LENGTH` (panic in debug,
+        // a giant wrapped read in release). It must now surface a clean DataInvalid error.
+        let temp_dir = TempDir::new().unwrap();
+
+        // Start with the magic so the leading check passes; total length is 4 < 12.
+        let bytes = FileMetadata::MAGIC.to_vec();
+        assert!((bytes.len() as u8) < FileMetadata::FOOTER_STRUCT_LENGTH);
+
+        let input_file = input_file_with_bytes(&temp_dir, &bytes).await;
+
+        let err = FileMetadata::read(&input_file)
+            .await
+            .expect_err("a file shorter than the footer struct must error, not panic");
+        assert!(
+            err.to_string()
+                .contains("shorter than the 12-byte footer struct"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_footer_payload_length_u32_max_returns_error() {
+        // Regression for SEC-01: a footer declaring footer_payload_length = u32::MAX makes the
+        // derived footer_length ~4 GiB, which previously underflowed
+        // `input_file_length - footer_length`. It must now surface a clean DataInvalid error.
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut bytes = vec![];
+        bytes.extend(FileMetadata::MAGIC.to_vec());
+        bytes.extend(FileMetadata::MAGIC.to_vec());
+        bytes.extend(empty_footer_payload_bytes());
+        // Hostile declared payload length.
+        bytes.extend(u32::to_le_bytes(u32::MAX));
+        bytes.extend(vec![0, 0, 0, 0]);
+        bytes.extend(FileMetadata::MAGIC);
+
+        let input_file = input_file_with_bytes(&temp_dir, &bytes).await;
+
+        let err = FileMetadata::read(&input_file)
+            .await
+            .expect_err("a u32::MAX declared footer length must error, not panic");
+        assert!(
+            err.to_string().contains("exceeds input file length"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

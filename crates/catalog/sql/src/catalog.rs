@@ -256,20 +256,47 @@ impl SqlCatalog {
         let fileio = FileIOBuilder::new(factory).build();
 
         install_default_drivers();
+        // Operator-supplied pool config is untrusted: a malformed value (e.g. "ten") must surface a
+        // typed `DataInvalid` error carrying the parse failure as its source, never a bare-unwrap
+        // panic. An absent key keeps the default.
         let max_connections: u32 = config
             .props
             .get("pool.max-connections")
-            .map(|v| v.parse().unwrap())
+            .map(|v| v.parse::<u32>())
+            .transpose()
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "invalid pool.max-connections config value",
+                )
+                .with_source(e)
+            })?
             .unwrap_or(MAX_CONNECTIONS);
         let idle_timeout: u64 = config
             .props
             .get("pool.idle-timeout")
-            .map(|v| v.parse().unwrap())
+            .map(|v| v.parse::<u64>())
+            .transpose()
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "invalid pool.idle-timeout config value",
+                )
+                .with_source(e)
+            })?
             .unwrap_or(IDLE_TIMEOUT);
         let test_before_acquire: bool = config
             .props
             .get("pool.test-before-acquire")
-            .map(|v| v.parse().unwrap())
+            .map(|v| v.parse::<bool>())
+            .transpose()
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "invalid pool.test-before-acquire config value",
+                )
+                .with_source(e)
+            })?
             .unwrap_or(TEST_BEFORE_ACQUIRE);
 
         let pool = AnyPoolOptions::new()
@@ -1605,6 +1632,32 @@ mod tests {
             )
             .await;
         assert!(catalog.is_err());
+    }
+
+    /// Regression for SEC-03: a non-numeric `pool.max-connections` must yield a typed
+    /// `DataInvalid` error during construction, not a bare-unwrap panic.
+    #[tokio::test]
+    async fn test_builder_non_numeric_pool_max_connections_returns_error() {
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+        let warehouse_location = temp_path();
+
+        let result = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .uri(sql_lite_uri)
+            .warehouse_location(warehouse_location)
+            .load(
+                "iceberg",
+                HashMap::from_iter([("pool.max-connections".to_string(), "ten".to_string())]),
+            )
+            .await;
+
+        let err = result.expect_err("non-numeric pool.max-connections must error, not panic");
+        assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("pool.max-connections"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Even when an invalid URI is specified in a builder method,
