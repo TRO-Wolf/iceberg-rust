@@ -30,6 +30,7 @@ pub mod delete_file_loader;
 pub(crate) mod delete_filter;
 
 mod int96;
+pub(crate) mod orc_reader;
 mod reader;
 pub(crate) mod record_batch_predicate;
 /// RecordBatch projection utilities
