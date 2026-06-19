@@ -35,6 +35,14 @@
 //! each `Type`'s `subtypes` (field 2, packed `uint32`) are the column indices of its children. Each
 //! `Type` may carry `attributes` (field 7, repeated `StringPair{ key=1, value=2 }`); the one keyed
 //! `iceberg.id` gives the column's Iceberg field id.
+//!
+//! **Retirement tracking (why we own this).** This hand-rolled parser exists ONLY because `orc-rust`
+//! drops ORC type attributes (its proto module is private and `RootDataType::from_proto` discards
+//! them), so it is the only way to resolve by field id today. If a future `orc-rust` exposes type
+//! attributes upstream, this file can be retired in favour of the upstream decode — revisit on the
+//! next `orc-rust` bump. v1 scope is deliberately narrow: NONE/ZLIB footer codecs and top-level
+//! primitive structs (nested struct/list/map by-id evolution is not yet covered — see GAP_MATRIX
+//! row "Read: ORC data files").
 
 use std::collections::HashMap;
 use std::io::Read;

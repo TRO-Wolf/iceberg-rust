@@ -15,6 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Schema type-utilities ported from Java `TypeUtil`.
+//!
+//! Note for readers: `join`, `estimate_size`, and `index_quoted_name_by_id` are parity-complete and
+//! unit-tested but have **no in-tree caller yet** — they mirror Java `TypeUtil` and will be wired
+//! when the create-table / metadata-join consumers land. They are pure and safe; do not assume they
+//! are load-bearing. (Status is tracked in `docs/parity/GAP_MATRIX.md`, row "Type utilities".)
+
 use std::collections::{HashMap, HashSet};
 
 use super::prune_columns::prune_columns_struct;

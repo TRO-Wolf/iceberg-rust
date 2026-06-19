@@ -15,6 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Fresh field-id (re)assignment ported from Java `TypeUtil` / `AssignFreshIds`.
+//!
+//! Note for readers: `assign_fresh_ids_with_base` and `reassign_doc` are parity-complete and
+//! unit-tested but have **no in-tree caller yet** — they will be wired when the create-table /
+//! metadata-join consumers land. Do not assume they are load-bearing. (Status is tracked in
+//! `docs/parity/GAP_MATRIX.md`, row "Type utilities".)
+
 use std::cell::Cell;
 
 use super::utils::try_insert_field;
