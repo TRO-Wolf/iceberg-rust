@@ -131,12 +131,14 @@ approved a hardening sprint **before further parity work**. Live plan + checkbox
 > **Corrected 2026-06-13** (post R1/R2/R3 audit); **prose refreshed 2026-06-16** (`caseSensitive` /
 > `deleteFromRowFilter` builders built #51; conflict-validation interop proven for all 5 write actions
 > #64-#69); **resynced 2026-06-17** (blocks 1-3 landings + the `validateAppendOnly` interop — 16 stale
-> prose under-claims corrected against the matrix). Per-capability status lives ONLY in the
+> prose under-claims corrected against the matrix); **resynced 2026-06-19** (`BatchScan` ✅, ORC+Avro
+> DATA READ 🟡, `RewriteTablePath` 🟡, events/listeners ✅ reflected; audit P1 panic-hardening + QUAL-01
+> tracing landed). Per-capability status lives ONLY in the
 > [GAP_MATRIX](docs/parity/GAP_MATRIX.md); this screen is a one-paragraph orientation that links there.
 
-**Base:** upstream `iceberg` 0.9.1 (datafusion 52.2 / arrow 57.1 / parquet 57.1, MSRV 1.92), owned
-fork on `main` since 2026-06-07. No Python layers. Offline lib suite green (**2,238 `#[test]`/`#[tokio::test]`
-in the `iceberg` crate `src/`; ≈2,720 workspace-wide** — measured 2026-06-13, not the stale ~1,640);
+**Base:** upstream `iceberg` 0.9.1 (datafusion 52.2 / arrow 57.3 / parquet 57.3, MSRV 1.92), owned
+fork on `main` since 2026-06-07. No Python layers. Offline lib suite green (**2,593 `#[test]`/`#[tokio::test]`
+in the `iceberg` crate `src/`; ≈3,125 workspace-wide** — measured 2026-06-19);
 Docker suites via `make test`; `sqllogictest` needs `protoc`.
 
 **Interop-proven ✅:** the Phase-1 evolution surface (`UpdateSchema`, `UpdatePartitionSpec`,
@@ -156,17 +158,20 @@ chain); their **conflict validations are now interop-proven both directions (202
 DELETE-file-rewrite interop slices, not conflict validation; residual evaluation;
 scan-metrics model + emission; views (memory + REST + SQL landed, interop'd I2 — Glue/S3Tables view
 ops are parity-correct-unsupported, NOT a gap — rows 124/125); `variant` (binary read+write byte-exact
-both sides; shredded-parquet FILE I/O externally blocked by the parquet 57.1 pin). Per-row status +
-residue: the matrix.
+both sides; shredded-parquet FILE I/O externally blocked by the parquet 57.3 pin); **ORC + Avro
+DATA-file READ** (landed + Java→Rust interop-proven — rows 116/117; the WRITE half is the 🟡 residue).
+Per-row status + residue: the matrix.
 
-**Missing ❌:** ORC/Avro DATA files, `geometry`/`geography` types, encryption, `SessionCatalog`
-(assessed-deferred dead surface — row 126), `LockManager` (ZERO code), `BatchScan`, the maintenance
-residue (`SnapshotTable`/`MigrateTable`/`RewriteTablePath` only — they need external sources), and
+**Missing ❌:** ORC/Avro DATA-file **write** (READ landed 🟡 — rows 116/117), `geometry`/`geography`
+types, encryption, `SessionCatalog` (assessed-deferred dead surface — row 126), `LockManager` (ZERO
+code), the maintenance residue (`SnapshotTable`/`MigrateTable` only — they need external sources), and
 `commitTransaction(List<TableCommit>)` (REST multi-table commit, split out). *(No longer missing —
-all flipped 2026-06-17: `RewritePositionDeleteFiles` ✅ (134); `ComputePartitionStats` action +
+flipped 2026-06-17: `RewritePositionDeleteFiles` ✅ (134); `ComputePartitionStats` action +
 `UpdatePartitionStatistics` ✅ (138); the `unknown` V3 type ✅ (89); `validateAppendOnly` ✅ (144); the
-Catalog accessors `name()`/`properties()`/`invalidate*` 🟡 (149). The `conflictDetectionFilter`-on-
-`DeleteFiles`/`ReplacePartitions` items are VOID — `javap`-proven not in Java 1.10.0. See GAP_MATRIX.)*
+Catalog accessors `name()`/`properties()`/`invalidate*` 🟡 (149); the `conflictDetectionFilter`-on-
+`DeleteFiles`/`ReplacePartitions` items are VOID — `javap`-proven not in Java 1.10.0. And flipped
+2026-06-19: `BatchScan` ✅ (122); ORC+Avro DATA **read** 🟡 (116/117); `RewriteTablePath` 🟡 built+interop
+(137); events/listeners ✅ (142). See GAP_MATRIX.)*
 
 **Row-by-row truth:** [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
 
@@ -251,8 +256,9 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 - **Where it stands:** inspection tables COMPLETE and interop-proven; data-level scan execution
   interop-proven both directions; residual evaluation wired into planning; incremental append +
   changelog scans interop-proven both directions (✅ 2026-06-17, rows 120/121; row-level CDC is named
-  residue); metrics model + opt-in emission landed. Remaining: `BatchScan`, CDC-merge (row-level),
-  split planning, strict-evaluator completion (per-row status: GAP_MATRIX).
+  residue); `BatchScan` ✅ (row 122, interop-proven 2026-06-17); metrics model + opt-in emission landed.
+  Remaining: CDC-merge (row-level), split planning (row 146), strict-evaluator completion (per-row
+  status: GAP_MATRIX).
 - **Exit criteria:** scans match Java result-for-result with reporting parity. Narratives:
   [task/todo-archive/phase3.md](task/todo-archive/phase3.md).
 
@@ -335,12 +341,13 @@ format-sensitive work front-loads into the frontier window; well-templated bread
 2. **Maintenance actions — LANDED:** `ExpireSnapshots`, `DeleteOrphanFiles`, `RewriteDataFiles`,
    `RewritePositionDeleteFiles` (✅), `RemoveDanglingDeleteFiles` (✅), `DeleteReachableFiles`,
    `ConvertEqualityDeleteFiles`, `Compute{Table,Partition}Stats` (built, interop-proven). Remaining
-   ❌: `SnapshotTable`/`MigrateTable`/`RewriteTablePath` (need external sources) — rows 134/135/136/137/138.
+   ❌: `SnapshotTable`/`MigrateTable` (need external sources); `RewriteTablePath` is 🟡 (built + interop — row 137).
 3. **Format & type breadth:** variant (incl. shredding — frontier; exact-byte class) and
    geometry/geography (`unknown` is ✅ at the metadata level — row 89); ORC + Avro data files
-   (templated breadth → Opus).
-4. **Scan completion:** `BatchScan`, CDC-merge (row-level), split planning (row 146), strict-evaluator
-   completion (incremental-scan interop is DONE — ✅ rows 120/121, 2026-06-17; mostly templated → Opus).
+   (READ landed 🟡 — rows 116/117; the WRITE half remains; templated breadth → Opus).
+4. **Scan completion:** CDC-merge (row-level), split planning (row 146), strict-evaluator
+   completion (`BatchScan` ✅ row 122 and incremental-scan interop DONE — ✅ rows 120/121, 2026-06-17;
+   mostly templated → Opus).
 5. **`LockManager`** (ZERO code — the genuine remaining catalog CRUD work) + the `ViewCatalog`
    byte-exact round-trip residue (row 125). Glue/S3 Tables view ops are parity-correct-unsupported
    (rows 124/125, NOT owed); `SessionCatalog` is assessed-deferred as a dead surface (row 126).

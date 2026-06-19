@@ -134,7 +134,7 @@ metadata and data, expression/predicate handling, partition transforms, snapshot
 evolution, and pluggable catalogs and object storage. It is a **library workspace**, not an
 application — most code is library crates consumed by downstream projects. **Rust** edition 2024, MSRV
 **1.92** (see [Cargo.toml](Cargo.toml) `rust-version`). Base synced to upstream **0.9.1** (datafusion
-52.2 / arrow 57.1 / parquet 57.1).
+52.2 / arrow 57.3 / parquet 57.3 — `orc-rust` 0.7 unified the patch level, #95).
 
 ## Big-picture architecture
 
