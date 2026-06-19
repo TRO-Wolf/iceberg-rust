@@ -52,6 +52,7 @@ use futures::{SinkExt, StreamExt, TryStreamExt};
 
 use super::context::{ManifestEntryContext, PlanContext};
 use crate::delete_file_index::DeleteFileIndex;
+use crate::events::{self, IncrementalScanEvent};
 use crate::expr::{Bind, Predicate};
 use crate::io::FileIO;
 use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
@@ -198,6 +199,11 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
     pub fn build(self) -> Result<IncrementalAppendScan> {
         let metadata = self.table.metadata();
 
+        // Captured once for the `IncrementalScanEvent` fired at plan time (Java's shared
+        // `BaseIncrementalScan` reads `table().name()`). Both the empty and the normal scan
+        // carry it.
+        let table_name = self.table.identifier().to_string();
+
         // Resolve the inclusive `to` snapshot (Java `toSnapshotIdInclusive()`): explicit
         // id if set, else the current snapshot. With no current snapshot and no explicit
         // `to`, the scan is empty.
@@ -219,6 +225,7 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
                         file_io: self.table.file_io().clone(),
                         concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+                        table_name,
                     });
                 };
                 current_snapshot
@@ -356,6 +363,7 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
             from_snapshot_id_exclusive,
             to_snapshot_id: Some(to_snapshot_id),
             plan_context: Some(plan_context),
+            table_name,
             column_names: self.column_names,
             batch_size: self.batch_size,
             file_io: self.table.file_io().clone(),
@@ -385,6 +393,10 @@ pub struct IncrementalAppendScan {
     file_io: FileIO,
     concurrency_limit_manifest_entries: usize,
     concurrency_limit_manifest_files: usize,
+    /// The fully-qualified table name, captured at [`build`](IncrementalAppendScanBuilder::build)
+    /// time for the [`IncrementalScanEvent`] fired from [`plan_files`](Self::plan_files) (Java's
+    /// shared `BaseIncrementalScan` reads `table().name()`).
+    table_name: String,
 }
 
 impl IncrementalAppendScan {
@@ -404,6 +416,12 @@ impl IncrementalAppendScan {
         let Some(to_snapshot_id) = self.to_snapshot_id else {
             return Ok(Box::pin(futures::stream::empty()));
         };
+
+        // Fire the `IncrementalScanEvent` (Java's shared `BaseIncrementalScan.planFiles` fires it
+        // before `doPlanFiles`). Placed AFTER the snapshotless / no-`to` guards, so a scan with
+        // no resolvable range fires nothing; fired BEFORE the empty-range check below, matching
+        // Java (which fires for a valid `to` regardless of whether the range turns out empty).
+        self.notify_incremental_scan_event(plan_context, to_snapshot_id);
 
         // Compute the APPEND snapshots in the range (Java `appendsBetween`). If there are
         // none, the scan is empty.
@@ -496,6 +514,60 @@ impl IncrementalAppendScan {
         });
 
         Ok(file_scan_task_rx.boxed())
+    }
+
+    /// Fires the [`IncrementalScanEvent`] for this scan over `(from, to]`.
+    ///
+    /// Mirrors the shared `BaseIncrementalScan.planFiles` event, which resolves the `from`
+    /// bound into the event two ways:
+    /// - an explicit exclusive `from` → `(from, inclusive = false)`;
+    /// - an absent `from` → `(oldestAncestorOf(to), inclusive = true)` — the whole lineage of
+    ///   `to`, whose lower edge is the history root.
+    ///
+    /// The Rust builder collapsed Java's two `from` selectors into a single
+    /// `Option<i64>` exclusive bound, so it is RE-RESOLVED here. The filter is the UNBOUND row
+    /// filter (`plan_context.predicate`, defaulting to `AlwaysTrue`); the projection is the
+    /// scan's schema. Like the snapshot-scan event, the call is unguarded.
+    fn notify_incremental_scan_event(&self, plan_context: &PlanContext, to_snapshot_id: i64) {
+        let (from_snapshot_id, from_inclusive) = match self.from_snapshot_id_exclusive {
+            Some(from_exclusive) => (from_exclusive, false),
+            None => (
+                Self::oldest_ancestor_id_of(plan_context, to_snapshot_id),
+                true,
+            ),
+        };
+
+        let filter = plan_context
+            .predicate
+            .as_ref()
+            .map(|p| p.as_ref().clone())
+            .unwrap_or(Predicate::AlwaysTrue);
+
+        events::notify_all(&IncrementalScanEvent::new(
+            self.table_name.clone(),
+            from_snapshot_id,
+            to_snapshot_id,
+            filter,
+            plan_context.snapshot_schema.clone(),
+            from_inclusive,
+        ));
+    }
+
+    /// Returns the id of the OLDEST ancestor of `to_snapshot_id` (the history root reachable by
+    /// walking `parent_snapshot_id`), Java `SnapshotUtil.oldestAncestorOf(to).snapshotId()`.
+    /// Falls back to `to_snapshot_id` itself if `to` is not found (it always is at this point).
+    fn oldest_ancestor_id_of(plan_context: &PlanContext, to_snapshot_id: i64) -> i64 {
+        let metadata = &plan_context.table_metadata;
+        let mut oldest = to_snapshot_id;
+        let mut current = metadata.snapshot_by_id(to_snapshot_id).cloned();
+        while let Some(snapshot) = current {
+            oldest = snapshot.snapshot_id();
+            current = match snapshot.parent_snapshot_id() {
+                Some(parent_id) => metadata.snapshot_by_id(parent_id).cloned(),
+                None => None,
+            };
+        }
+        oldest
     }
 
     /// Returns the APPEND snapshots in `(from_snapshot_id_exclusive, to_snapshot_id]`,
@@ -824,6 +896,13 @@ impl IncrementalChangelogScan {
         let Some(to_snapshot_id) = self.append_scan.to_snapshot_id() else {
             return Ok(Box::pin(futures::stream::empty()));
         };
+
+        // Fire the `IncrementalScanEvent` here too: Java fires it from the SHARED
+        // `BaseIncrementalScan.planFiles`, which both the append scan and the changelog scan
+        // inherit. Reuse the append scan's emit (same range bounds / plan context / table name),
+        // placed after the same guards so an unresolvable range fires nothing.
+        self.append_scan
+            .notify_incremental_scan_event(plan_context, to_snapshot_id);
 
         // Step 1: the changelog snapshots in the range, oldest-first, excluding Replace,
         // guarding delete manifests.
@@ -2062,5 +2141,136 @@ mod tests {
         assert_eq!(tasks[0].operation(), ChangelogOperation::Insert);
         assert_eq!(tasks[0].change_ordinal(), 0);
         assert_eq!(tasks[0].commit_snapshot_id(), s1);
+    }
+
+    // ===== Event listeners: a REAL incremental scan genuinely fires an `IncrementalScanEvent` =====
+
+    struct IncEventRecorder {
+        sink: std::sync::Arc<std::sync::Mutex<Vec<crate::events::IncrementalScanEvent>>>,
+    }
+    impl crate::events::Listener<crate::events::IncrementalScanEvent> for IncEventRecorder {
+        fn notify(&self, event: &crate::events::IncrementalScanEvent) {
+            self.sink.lock().unwrap().push(event.clone());
+        }
+    }
+
+    /// Risk: the incremental emit is wired but never fires, or resolves the `from` bound wrong.
+    /// Pins that a REAL incremental APPEND scan with an EXPLICIT exclusive `from` fires one
+    /// `IncrementalScanEvent` with `from = that id`, `inclusive = false`, the inclusive `to`, and
+    /// the table name.
+    #[tokio::test]
+    async fn test_real_incremental_append_from_present_fires_exclusive_event() {
+        let _guard = crate::events::test_support::lock();
+
+        let catalog = new_memory_catalog().await;
+        let table = make_minimal_table(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("s0.parquet", 1)]).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let table = append_files(&catalog, &table, vec![data_file("s1.parquet", 1)]).await;
+        let s1 = table.metadata().current_snapshot_id().unwrap();
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::events::register::<crate::events::IncrementalScanEvent>(std::sync::Arc::new(
+            IncEventRecorder { sink: sink.clone() },
+        ));
+
+        let scan = table
+            .incremental_append_scan()
+            .from_snapshot_id_exclusive(s0)
+            .to_snapshot_id(s1)
+            .build()
+            .unwrap();
+        let _paths = planned_paths(&scan).await;
+
+        let events = sink.lock().unwrap();
+        assert_eq!(events.len(), 1, "one IncrementalScanEvent per plan");
+        let event = &events[0];
+        assert_eq!(event.from_snapshot_id(), s0);
+        assert_eq!(event.to_snapshot_id(), s1);
+        assert!(
+            !event.is_from_snapshot_inclusive(),
+            "an explicit exclusive `from` is NOT inclusive"
+        );
+        assert_eq!(event.table_name(), &table.identifier().to_string());
+    }
+
+    /// Risk: an ABSENT `from` resolves to the wrong lower bound or the wrong inclusive flag.
+    /// Java: absent `from` → `(oldestAncestorOf(to), inclusive = true)`. Pins `from` is the
+    /// OLDEST ancestor (the history root S0) and `inclusive = true`.
+    #[tokio::test]
+    async fn test_real_incremental_append_from_absent_fires_oldest_ancestor_inclusive() {
+        let _guard = crate::events::test_support::lock();
+
+        let catalog = new_memory_catalog().await;
+        let table = make_minimal_table(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("s0.parquet", 1)]).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let table = append_files(&catalog, &table, vec![data_file("s1.parquet", 1)]).await;
+        let s1 = table.metadata().current_snapshot_id().unwrap();
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::events::register::<crate::events::IncrementalScanEvent>(std::sync::Arc::new(
+            IncEventRecorder { sink: sink.clone() },
+        ));
+
+        // No `from`: the whole lineage of `to`.
+        let scan = table
+            .incremental_append_scan()
+            .to_snapshot_id(s1)
+            .build()
+            .unwrap();
+        let _paths = planned_paths(&scan).await;
+
+        let events = sink.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            event.from_snapshot_id(),
+            s0,
+            "absent `from` resolves to the oldest ancestor (history root)"
+        );
+        assert_eq!(event.to_snapshot_id(), s1);
+        assert!(
+            event.is_from_snapshot_inclusive(),
+            "absent `from` is inclusive of the oldest ancestor"
+        );
+    }
+
+    /// Risk: the CHANGELOG scan does NOT fire the `IncrementalScanEvent` even though Java fires
+    /// it from the SHARED `BaseIncrementalScan.planFiles` (so both planners fire). Pins that a
+    /// real changelog scan fires the event too.
+    #[tokio::test]
+    async fn test_real_changelog_scan_fires_incremental_event() {
+        let _guard = crate::events::test_support::lock();
+
+        let catalog = new_memory_catalog().await;
+        let table = make_minimal_table(&catalog).await;
+        let table = append_files(&catalog, &table, vec![data_file("a.parquet", 1)]).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let table = append_files(&catalog, &table, vec![data_file("b.parquet", 1)]).await;
+        let s1 = table.metadata().current_snapshot_id().unwrap();
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::events::register::<crate::events::IncrementalScanEvent>(std::sync::Arc::new(
+            IncEventRecorder { sink: sink.clone() },
+        ));
+
+        let scan = table
+            .incremental_changelog_scan()
+            .from_snapshot_id_exclusive(s0)
+            .to_snapshot_id(s1)
+            .build()
+            .unwrap();
+        let _tasks = changelog_tasks(&scan).await;
+
+        let events = sink.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the changelog scan fires the shared IncrementalScanEvent too"
+        );
+        assert_eq!(events[0].from_snapshot_id(), s0);
+        assert_eq!(events[0].to_snapshot_id(), s1);
+        assert!(!events[0].is_from_snapshot_inclusive());
     }
 }

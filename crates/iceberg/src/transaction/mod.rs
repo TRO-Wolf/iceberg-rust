@@ -90,7 +90,8 @@ use std::time::Duration;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
 
 use crate::error::Result;
-use crate::spec::TableProperties;
+use crate::events::{self, CreateSnapshotEvent};
+use crate::spec::{Snapshot, TableProperties};
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
@@ -426,6 +427,20 @@ impl Transaction {
             )?;
         }
 
+        // Capture, BEFORE `existing_updates` is moved into the commit, the snapshots added by
+        // this commit — one `CreateSnapshotEvent` is fired per `AddSnapshot` AFTER the commit
+        // succeeds (Java `SnapshotProducer.notifyListeners`, called from `commit()` once
+        // `ops.commit` returns). A property/schema-only commit adds no `AddSnapshot`, so it fires
+        // nothing; a commit may add more than one. The table name is captured for the same reason.
+        let table_name = self.table.identifier().to_string();
+        let added_snapshots: Vec<Snapshot> = existing_updates
+            .iter()
+            .filter_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot.clone()),
+                _ => None,
+            })
+            .collect();
+
         let table_commit = TableCommit::builder()
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
@@ -437,7 +452,38 @@ impl Transaction {
             .base_metadata_location(self.table.metadata_location().map(str::to_string))
             .build();
 
-        catalog.update_table(table_commit).await
+        let committed = catalog.update_table(table_commit).await?;
+
+        // Notify listeners ONLY after the commit succeeded (Java fires from `commit()` after
+        // `ops.commit`). BEST-EFFORT: a notification failure must NEVER fail a committed
+        // transaction (Java wraps the call in a try/catch that only logs). Each per-snapshot
+        // dispatch is isolated with `catch_unwind`, so a panicking listener is swallowed and the
+        // commit still returns `Ok`. (No logging facade in this crate yet — a `tracing::warn`
+        // belongs here once the dependency is approved; see the `events` module docs.)
+        for snapshot in &added_snapshots {
+            let operation = snapshot.summary().operation.as_str().to_string();
+            // Java's `CreateSnapshotEvent.summary()` is the in-memory `snapshot.summary()` map,
+            // which EXCLUDES the `operation` key: `SnapshotProducer.summary(TableMetadata)` /
+            // `SnapshotSummary.Builder.build()` build only the `total-*` / `added-*` /
+            // `changed-partition-count` keys (no `operation` put), and `SnapshotParser.fromJson`
+            // extracts `operation` to a separate field, skipping the summary `ImmutableMap`. Java
+            // carries `operation` only via the separate `CreateSnapshotEvent.operation()` accessor.
+            // Rust mirrors this exactly: `additional_properties` is that operation-free map, and the
+            // typed `operation` field is the `operation()` accessor — so pass it through unchanged.
+            let summary = snapshot.summary().additional_properties.clone();
+            let event = CreateSnapshotEvent::new(
+                table_name.clone(),
+                operation,
+                snapshot.snapshot_id(),
+                snapshot.sequence_number(),
+                summary,
+            );
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                events::notify_all(&event);
+            }));
+        }
+
+        Ok(committed)
     }
 }
 
@@ -829,5 +875,144 @@ mod test_row_lineage {
         assert_eq!(manifest_list.entries().len(), 2);
         let manifest_file = &manifest_list.entries()[1];
         assert_eq!(manifest_file.first_row_id, Some(30));
+    }
+}
+
+#[cfg(test)]
+mod test_create_snapshot_event {
+    //! A REAL commit genuinely fires a `CreateSnapshotEvent` — and only after success, only per
+    //! added snapshot, and best-effort (a panicking listener never fails the commit).
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::events::{self, CreateSnapshotEvent, Listener};
+    use crate::memory::tests::new_memory_catalog;
+    use crate::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct,
+    };
+    use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+    use crate::transaction::{ApplyTransactionAction, Transaction};
+
+    fn file_with_rows(record_count: u64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(format!("test/{record_count}.parquet"))
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(record_count)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition_spec_id(0)
+            .build()
+            .unwrap()
+    }
+
+    struct Recorder {
+        sink: Arc<Mutex<Vec<CreateSnapshotEvent>>>,
+    }
+    impl Listener<CreateSnapshotEvent> for Recorder {
+        fn notify(&self, event: &CreateSnapshotEvent) {
+            self.sink.lock().unwrap().push(event.clone());
+        }
+    }
+
+    /// Risk: the commit emit is wired but never fires on a real commit, OR fires the wrong
+    /// fields. Pins that a REAL `fast_append` commit fires exactly one `CreateSnapshotEvent`
+    /// carrying the committed snapshot's operation / id / sequence number / summary, with the
+    /// table name.
+    #[tokio::test]
+    async fn test_real_commit_fires_create_snapshot_event() {
+        let _guard = events::test_support::lock();
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        events::register::<CreateSnapshotEvent>(Arc::new(Recorder { sink: sink.clone() }));
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![file_with_rows(10)]);
+        let tx = action.apply(tx).unwrap();
+        let committed = tx.commit(&catalog).await.unwrap();
+
+        let snapshot = committed.metadata().current_snapshot().unwrap();
+        let events = sink.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one CreateSnapshotEvent per added snapshot"
+        );
+        let event = &events[0];
+        assert_eq!(event.table_name(), &table.identifier().to_string());
+        assert_eq!(event.operation(), "append");
+        assert_eq!(event.snapshot_id(), snapshot.snapshot_id());
+        assert_eq!(event.sequence_number(), snapshot.sequence_number());
+        // The event summary IS the snapshot's `additional_properties` map — Java's
+        // `snapshot.summary()` map (`SnapshotProducer.summary` / `SnapshotSummary.Builder.build`)
+        // EXCLUDES the `operation` key, carrying it only via the separate `operation()` accessor
+        // (already asserted above). Pin byte-for-byte equality AND that `operation` is absent, so a
+        // regression that re-injects `operation` into the map FAILS.
+        assert_eq!(event.summary(), &snapshot.summary().additional_properties);
+        assert!(
+            !event.summary().contains_key("operation"),
+            "Java's CreateSnapshotEvent.summary() excludes the `operation` key (it is the \
+             operation()-free snapshot.summary() map); operation is the separate operation() accessor"
+        );
+    }
+
+    /// Risk: a property-only commit (no `AddSnapshot`) still fires a `CreateSnapshotEvent`,
+    /// diverging from Java (`SnapshotProducer.notifyListeners` only fires when a snapshot is
+    /// produced). Pins that a property-only commit fires NOTHING.
+    #[tokio::test]
+    async fn test_property_only_commit_fires_no_event() {
+        let _guard = events::test_support::lock();
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        events::register::<CreateSnapshotEvent>(Arc::new(Recorder { sink: sink.clone() }));
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("a.key".to_string(), "a.value".to_string())
+            .apply(tx)
+            .unwrap();
+        let _committed = tx.commit(&catalog).await.unwrap();
+
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "a property-only commit adds no snapshot and must fire no CreateSnapshotEvent"
+        );
+    }
+
+    /// Risk: a panicking commit listener turns a SUCCESSFUL commit into an `Err` (or aborts the
+    /// process), diverging from Java's best-effort `try/catch`. Pins that the commit still
+    /// returns `Ok` and the snapshot is durably committed despite the panic.
+    #[tokio::test]
+    async fn test_panicking_commit_listener_does_not_fail_commit() {
+        let _guard = events::test_support::lock();
+
+        struct Panicker;
+        impl Listener<CreateSnapshotEvent> for Panicker {
+            fn notify(&self, _event: &CreateSnapshotEvent) {
+                panic!("commit listener boom");
+            }
+        }
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        events::register::<CreateSnapshotEvent>(Arc::new(Panicker));
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![file_with_rows(7)]);
+        let tx = action.apply(tx).unwrap();
+        let committed = tx
+            .commit(&catalog)
+            .await
+            .expect("a panicking listener must NOT fail a successful commit");
+
+        // The snapshot is durably committed despite the listener panic.
+        assert!(committed.metadata().current_snapshot().is_some());
     }
 }

@@ -662,6 +662,41 @@ fork. User approved the orc-rust crate; the zlib-decode (deflate) dep was alread
 > TWICE: Avro U2 + ORC U2) — orchestrator MUST independently re-verify the reconstruction, never trust "tree is coherent now".
 > NEXT (fresh capability): LockManager (127 ❌→✅, bounded util, no deps) · Events/listeners (142 ❌→✅, +emit wiring).
 
+## BLOCK 10 (Events / listeners, 2026-06-19, Opus, signed off) — 1 AC·OO PR → row 142 ❌→✅
+
+Scoped: Java events package = exactly 5 classes (`Listener<E>`, `Listeners` with `register`+`notifyAll` only — NO `notify`/no-arg;
+keyed by EXACT event.getClass(), no try/catch in notifyAll), `ScanEvent`/`IncrementalScanEvent` (api) + `CreateSnapshotEvent`
+(core). Honest ✅ requires the EMIT WIRING (registry alone = dead 🟡).
+
+- [x] **Events/listeners → row 142 ❌→✅** — **DONE 2026-06-19.** NEW `events/mod.rs`: `Listener<E>: Send+Sync` trait + global
+      `register<E>`/`notify_all<E>` over `LazyLock<RwLock<HashMap<TypeId, Vec<Box<dyn Any+Send+Sync>>>>>` (clone the matching
+      Arcs + DROP the read guard BEFORE calling listeners → re-entrant-safe, no-lock-across-callback; reentrant test passes) +
+      the 3 event structs (Java-exact fields). **Wired all 3 emit sites** (the real-✅ part): ScanEvent @ `scan/mod.rs`
+      plan_files (after the snapshotless guard, UNBOUND filter default AlwaysTrue, table_name threaded from `identifier()`);
+      CreateSnapshotEvent @ `transaction/mod.rs` do_commit AFTER `catalog.update_table` Ok (ONE per AddSnapshot; BEST-EFFORT
+      via `catch_unwind` so a panicking listener never fails the commit; scan site propagates — matching Java's
+      catch-on-commit / no-catch-on-scan); IncrementalScanEvent @ `scan/incremental.rs` plan_files from BOTH append (present→
+      inclusive=false, absent→oldest-ancestor+inclusive=true) AND the changelog scan (shared helper). Emit-fire tests prove
+      events GENUINELY fire on real scans/commits (empty scan fires none; property-only commit fires none). **AC·OO 3 cycles —
+      cycle 2 INTRODUCED a contract bug** (injected `operation` into CreateSnapshotEvent.summary; Java's in-memory
+      `snapshot.summary()` EXCLUDES operation — it's a SEPARATE field/accessor; `SnapshotSummary.Builder` builds only
+      total-*/added-*/changed-partition-count); cycle-3 Critic caught it + reverted (summary = `additional_properties`,
+      operation-free; test asserts `!contains_key("operation")`). **Orchestrator-verified:** re-ran gate MYSELF (lib **2584**/0,
+      clippy 0, fmt+typos clean); confirmed the summary contract vs bytecode; Cargo untouched (std LazyLock, NO dep); only row
+      142 changed (pipe-5); census **35✅/27🟡/6❌ → 36✅/27🟡/5❌**. **The Critic-git-checkout-clobber did NOT recur** — the
+      hardening worked (Critic instructed to revert mutations via surgical inverse Edits, never git checkout). 3 LOW residue
+      (named, accepted): table_name = `namespace.name` (TableIdent) vs Java catalog-qualified `table.name()`; best-effort swallow
+      is SILENT (the iceberg crate does NOT declare `tracing` — it's a workspace dep only; metrics/mod.rs defers it identically;
+      a `tracing::warn` would need a Cargo edit + approval); a multi_thread event test would need explicit registry-arming.
+
+> **BLOCK 10 COMPLETE (2026-06-19).** Events/listeners ported 1:1 (global `Listeners` registry + `Listener` trait + 3 event
+> types) AND wired to fire on real scans/commits/incremental+changelog scans — row 142 ❌→✅, the honest (not-dead-registry)
+> flip. Census **36✅/27🟡/5❌** (down to 5 reds). LESSON: cycle 2 introduced a plausible-but-wrong contract (operation-in-summary)
+> that cycle 3 caught — the adversarial Critic earns its cost even on a "simple" port. The mutation-revert-via-surgical-Edit
+> hardening STOPPED the recurring git-checkout-clobber. NEXT remaining ❌ (5): geometry/geography 87 + encryption 128 (frontier-
+> parked), SessionCatalog 126 (dead surface), SnapshotTable/MigrateTable 137 (Spark/HMS-coupled, tabled), LOW-backlog 152.
+> LockManager (127) is now the last clean red→green (bounded util, available-but-unwired caveat). Many 🟡→✅ completions remain.
+
   _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
       tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
       action (rewrites the metadata graph into staging + emits a `(source,target)` copy-plan; does NOT copy data).

@@ -79,6 +79,7 @@ pub mod view;
 mod avro;
 pub mod cache;
 pub mod compression;
+pub mod events;
 pub mod io;
 pub mod spec;
 
