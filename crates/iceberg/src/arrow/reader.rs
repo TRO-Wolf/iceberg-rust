@@ -701,7 +701,7 @@ impl ArrowReader {
         // to the projected field ids that are NOT reserved metadata columns (those don't exist in
         // the data file — the Parquet path strips them from its projection mask the same way; the
         // transformer re-adds `_file` / partition constants afterwards).
-        let expected = Self::build_avro_expected_schema(&task)?;
+        let expected = Self::build_expected_schema(&task)?;
 
         // Avro decode is whole-block; the U1 reader requires a positive batch size. Fall back to the
         // arrow-rs default (1024) when the scan left it unset, matching the Parquet reader's default.
@@ -709,6 +709,73 @@ impl ArrowReader {
         let input_file = file_io.new_input(&task.data_file_path)?;
         let batches = read_avro_data_file(&input_file, expected, avro_batch_size).await?;
 
+        // Everything after the format-specific decode is identical to the ORC path: build the SAME
+        // RecordBatchTransformer the Parquet path feeds, resolve the deletes, and apply merge-on-read
+        // deletes + the scan residual post-materialization.
+        Self::finish_whole_file_scan_task(task, batches, delete_filter_rx).await
+    }
+
+    /// Read one **ORC** data-file scan task into an [`ArrowRecordBatchStream`].
+    ///
+    /// Structurally identical to [`Self::process_avro_file_scan_task`]: the ONLY difference is the
+    /// step-(1) materialization, which calls the U1 ORC reader ([`read_orc_data_file`], Java
+    /// `GenericOrcReader`) instead of the Avro reader. Everything after the decode — the projected
+    /// expected schema, the SAME [`RecordBatchTransformer`] the Parquet / Avro paths feed (`_file` +
+    /// identity-partition constants, schema evolution, reorder), and the merge-on-read delete
+    /// machinery (positional via [`DeleteVector`] membership over the absolute row position, plus the
+    /// equality and scan-residual masks) — is FORMAT-AGNOSTIC and lives in the shared
+    /// [`Self::finish_whole_file_scan_task`] tail. ORC is materialized whole-file (this reader does
+    /// not push predicates into the ORC stripe metadata), so, like Avro, every filter is applied
+    /// POST-materialization.
+    async fn process_orc_file_scan_task(
+        task: FileScanTask,
+        batch_size: Option<usize>,
+        file_io: FileIO,
+        delete_file_loader: CachingDeleteFileLoader,
+    ) -> Result<ArrowRecordBatchStream> {
+        // Kick off delete loading concurrently with the file read (as the Parquet path does).
+        let delete_filter_rx =
+            delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
+
+        // The projected Iceberg schema the ORC reader resolves against: the scan schema restricted to
+        // the projected file-present (non-reserved-metadata) field ids — identical to the Avro path.
+        let expected = Self::build_expected_schema(&task)?;
+
+        // ORC decode is whole-file; the U1 reader requires a positive batch size. Fall back to the
+        // arrow-rs default (1024) when the scan left it unset, matching the Parquet/Avro readers.
+        let orc_batch_size = batch_size.unwrap_or(1024).max(1);
+        let input_file = file_io.new_input(&task.data_file_path)?;
+        let batches = read_orc_data_file(&input_file, expected, orc_batch_size).await?;
+
+        // Identical format-agnostic tail to the Avro path (see [`Self::finish_whole_file_scan_task`]).
+        Self::finish_whole_file_scan_task(task, batches, delete_filter_rx).await
+    }
+
+    /// The format-agnostic tail shared by [`Self::process_avro_file_scan_task`] and
+    /// [`Self::process_orc_file_scan_task`]: everything after a whole-file reader has MATERIALIZED
+    /// `batches` (the decoded data columns, by field id, in projection order). Given the in-flight
+    /// `delete_filter_rx` (delete loading kicked off concurrently with the read), it:
+    ///
+    /// 1. builds the SAME [`RecordBatchTransformer`] the Parquet path feeds (type promotion, column
+    ///    reorder, `_file` + identity-partition constants, virtual fields);
+    /// 2. resolves the deletes and AND-s the equality-delete predicate with the scan `task.predicate`
+    ///    residual into one per-batch survival predicate (the single predicate the Parquet path forms
+    ///    before pushing it into the `RowFilter`);
+    /// 3. applies merge-on-read deletes post-materialization — a POSITIONAL delete drops rows whose
+    ///    absolute file position (tracked across batches) is in the [`DeleteVector`]; an EQUALITY
+    ///    delete + residual keeps rows the predicate proves TRUE — via the same
+    ///    [`evaluate_predicate_to_mask`] / [`filter_record_batch`] kernels the Parquet
+    ///    `RowFilter`/`RowSelection` use.
+    ///
+    /// This is the ONE copy of the whole-file delete-application logic; the two callers differ only
+    /// in which U1 reader decoded `batches`.
+    async fn finish_whole_file_scan_task(
+        task: FileScanTask,
+        batches: Vec<RecordBatch>,
+        delete_filter_rx: tokio::sync::oneshot::Receiver<
+            Result<crate::arrow::delete_filter::DeleteFilter>,
+        >,
+    ) -> Result<ArrowRecordBatchStream> {
         // Build the SAME RecordBatchTransformer the Parquet path uses (schema evolution + reorder +
         // `_file` / identity-partition constants).
         let mut record_batch_transformer_builder =
@@ -765,7 +832,7 @@ impl ArrowReader {
                 }
             };
 
-            let mask = match Self::avro_survival_mask(
+            let mask = match Self::survival_mask(
                 &transformed,
                 row_count,
                 absolute_pos,
@@ -788,7 +855,7 @@ impl ArrowReader {
                     let filtered = filter_record_batch(&transformed, &mask).map_err(|e| {
                         Error::new(
                             ErrorKind::Unexpected,
-                            "Failed to apply merge-on-read deletes to an Avro data batch",
+                            "Failed to apply merge-on-read deletes to a materialized data batch",
                         )
                         .with_source(e)
                     });
@@ -800,134 +867,12 @@ impl ArrowReader {
         Ok(Box::pin(futures::stream::iter(output)) as ArrowRecordBatchStream)
     }
 
-    /// Read one **ORC** data-file scan task into an [`ArrowRecordBatchStream`].
-    ///
-    /// A VERBATIM structural clone of [`Self::process_avro_file_scan_task`]: the ONLY difference is
-    /// the step-(1) materialization, which calls the U1 ORC reader
-    /// ([`read_orc_data_file`], Java `GenericOrcReader`) instead of the Avro reader. Everything after
-    /// the decode — the projected expected schema, the SAME [`RecordBatchTransformer`] the Parquet /
-    /// Avro paths feed (`_file` + identity-partition constants, schema evolution, reorder), and the
-    /// merge-on-read delete machinery (positional via [`DeleteVector`] membership over the absolute
-    /// row position, equality + scan residual via the shared survival mask) — is FORMAT-AGNOSTIC and
-    /// reused unchanged ([`Self::build_avro_expected_schema`] / [`Self::avro_survival_mask`]). ORC is
-    /// materialized whole-file (this reader does not push predicates into the ORC stripe metadata),
-    /// so, like Avro, every filter is applied POST-materialization.
-    async fn process_orc_file_scan_task(
-        task: FileScanTask,
-        batch_size: Option<usize>,
-        file_io: FileIO,
-        delete_file_loader: CachingDeleteFileLoader,
-    ) -> Result<ArrowRecordBatchStream> {
-        // Kick off delete loading concurrently with the file read (as the Parquet path does).
-        let delete_filter_rx =
-            delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
-
-        // The projected Iceberg schema the ORC reader resolves against: the scan schema restricted to
-        // the projected file-present (non-reserved-metadata) field ids — identical to the Avro path.
-        let expected = Self::build_avro_expected_schema(&task)?;
-
-        // ORC decode is whole-file; the U1 reader requires a positive batch size. Fall back to the
-        // arrow-rs default (1024) when the scan left it unset, matching the Parquet/Avro readers.
-        let orc_batch_size = batch_size.unwrap_or(1024).max(1);
-        let input_file = file_io.new_input(&task.data_file_path)?;
-        let batches = read_orc_data_file(&input_file, expected, orc_batch_size).await?;
-
-        // Build the SAME RecordBatchTransformer the Parquet/Avro paths use (schema evolution + reorder
-        // + `_file` / identity-partition constants).
-        let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
-        if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
-            let file_datum = Datum::string(task.data_file_path.clone());
-            record_batch_transformer_builder =
-                record_batch_transformer_builder.with_constant(RESERVED_FIELD_ID_FILE, file_datum);
-        }
-        if let (Some(partition_spec), Some(partition_data)) =
-            (task.partition_spec.clone(), task.partition.clone())
-        {
-            record_batch_transformer_builder =
-                record_batch_transformer_builder.with_partition(partition_spec, partition_data)?;
-        }
-        let mut record_batch_transformer = record_batch_transformer_builder.build();
-
-        // Resolve the deletes (positional vector + the equality-delete predicate), then AND the
-        // equality-delete predicate with the scan residual into one per-batch survival predicate —
-        // the same single predicate the Parquet/Avro paths form.
-        let delete_filter = delete_filter_rx.await.map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                "delete-file loader dropped before delivering the delete filter",
-            )
-            .with_source(e)
-        })??;
-        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
-        let survival_predicate = match (&task.predicate, delete_predicate) {
-            (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(predicate)) => Some(predicate),
-            (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
-            }
-        };
-
-        // The positional-delete vector for this data file (cloned out so the stream owns it).
-        let positional_deletes = delete_filter.get_delete_vector(&task);
-
-        // Materialize every transformed + delete-filtered batch eagerly: the file is already fully
-        // decoded in memory, so there is no streaming benefit to a lazy adapter, and the absolute
-        // row-position counter for positional deletes is simplest to thread over an owned loop.
-        let mut output: Vec<Result<RecordBatch>> = Vec::with_capacity(batches.len());
-        let mut absolute_pos: u64 = 0;
-        for batch in batches {
-            let row_count = batch.num_rows();
-
-            let transformed = match record_batch_transformer.process_record_batch(batch) {
-                Ok(b) => b,
-                Err(e) => {
-                    output.push(Err(e));
-                    break;
-                }
-            };
-
-            let mask = match Self::avro_survival_mask(
-                &transformed,
-                row_count,
-                absolute_pos,
-                positional_deletes.as_ref(),
-                survival_predicate.as_ref(),
-            ) {
-                Ok(mask) => mask,
-                Err(e) => {
-                    output.push(Err(e));
-                    break;
-                }
-            };
-
-            absolute_pos = absolute_pos.saturating_add(row_count as u64);
-
-            match mask {
-                // No deletes / residual touch this batch: emit it unchanged.
-                None => output.push(Ok(transformed)),
-                Some(mask) => {
-                    let filtered = filter_record_batch(&transformed, &mask).map_err(|e| {
-                        Error::new(
-                            ErrorKind::Unexpected,
-                            "Failed to apply merge-on-read deletes to an ORC data batch",
-                        )
-                        .with_source(e)
-                    });
-                    output.push(filtered);
-                }
-            }
-        }
-
-        Ok(Box::pin(futures::stream::iter(output)) as ArrowRecordBatchStream)
-    }
-
-    /// The projected Iceberg [`Schema`] the Avro data reader resolves the file against: `task.schema`
-    /// restricted to the projected field ids that exist in the data file (reserved metadata columns
-    /// like `_file` / `_pos` are excluded — they are supplied as constants by the transformer / the
-    /// positional-delete path, never read from the file). Field order follows the projection order.
-    fn build_avro_expected_schema(task: &FileScanTask) -> Result<Arc<Schema>> {
+    /// The projected Iceberg [`Schema`] a whole-file (Avro / ORC) data reader resolves the file
+    /// against: `task.schema` restricted to the projected field ids that exist in the data file
+    /// (reserved metadata columns like `_file` / `_pos` are excluded — they are supplied as constants
+    /// by the transformer / the positional-delete path, never read from the file). Field order
+    /// follows the projection order. Format-agnostic: both the Avro and ORC paths share it.
+    fn build_expected_schema(task: &FileScanTask) -> Result<Arc<Schema>> {
         let mut fields = Vec::new();
         for &field_id in task.project_field_ids() {
             if is_metadata_field(field_id) {
@@ -937,8 +882,8 @@ impl ArrowReader {
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Projected field id {field_id} is not present in the scan schema for Avro \
-                         data file '{}'",
+                        "Projected field id {field_id} is not present in the scan schema for data \
+                         file '{}'",
                         task.data_file_path
                     ),
                 )
@@ -952,12 +897,12 @@ impl ArrowReader {
         Ok(Arc::new(schema))
     }
 
-    /// Build the per-row survival mask for a transformed Avro batch, combining positional deletes
-    /// (rows whose absolute file position `[batch_base, batch_base + num_rows)` falls in
-    /// `positional_deletes`) with the equality-delete + residual `survival_predicate`. Returns
-    /// `None` when neither applies (the caller emits the batch unchanged), else a [`BooleanArray`]
-    /// where `true` ⇒ keep the row.
-    fn avro_survival_mask(
+    /// Build the per-row survival mask for a transformed whole-file (Avro / ORC) batch, combining
+    /// positional deletes (rows whose absolute file position `[batch_base, batch_base + num_rows)`
+    /// falls in `positional_deletes`) with the equality-delete + residual `survival_predicate`.
+    /// Returns `None` when neither applies (the caller emits the batch unchanged), else a
+    /// [`BooleanArray`] where `true` ⇒ keep the row. Format-agnostic: shared by both readers.
+    fn survival_mask(
         batch: &RecordBatch,
         num_rows: usize,
         batch_base: u64,
@@ -1002,7 +947,7 @@ impl ArrowReader {
             (Some(pos), Some(pred)) => Ok(Some(and(&pos, &pred).map_err(|e| {
                 Error::new(
                     ErrorKind::Unexpected,
-                    "Failed to combine positional and equality delete masks for an Avro batch",
+                    "Failed to combine positional and equality delete masks for a data batch",
                 )
                 .with_source(e)
             })?)),
