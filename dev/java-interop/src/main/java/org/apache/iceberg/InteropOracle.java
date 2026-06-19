@@ -419,6 +419,19 @@ public final class InteropOracle {
         Path avroDataDir = requireFixturesDir("interop.avro_data.dir");
         AvroDataOracle.generate(avroDataDir);
         break;
+      case "generate-interop-orc-data":
+        // ORC DATA-FILE READ, DIRECTION 1 — "Rust reads what JAVA writes" (GAP_MATRIX row 116). The
+        // ORC sibling of generate-interop-avro-data: the DATA FILE is written in the ORC format
+        // (GenericAppenderFactory.newDataWriter(..., FileFormat.ORC, null), routed to iceberg-orc's
+        // GenericOrcWriter — which stamps the `iceberg.id` ORC type attributes the Rust by-field-id
+        // reader resolves on) rather than parquet/avro. The fixture covers every Iceberg primitive +
+        // logical type + an optional/null column, over 5 rows; a real parquet POSITION-delete removes
+        // one row (position 1) so merge-on-read over an ORC data file is exercised end-to-end. Java
+        // materializes its OWN IcebergGenerics read into java_orc_rows.json (the GROUND TRUTH the Rust
+        // scan→Arrow must equal). The dir is supplied via -Dinterop.orc_data.dir.
+        Path orcDataDir = requireFixturesDir("interop.orc_data.dir");
+        OrcDataOracle.generate(orcDataDir);
+        break;
       case "verify-interop-avro-write":
         // AVRO DATA-FILE WRITE, DIRECTION 2 — "Java reads what RUST writes" (GAP_MATRIX row 117). The
         // INVERSION of generate-interop-avro-data. The Rust GEN test (env
@@ -5980,6 +5993,277 @@ public final class InteropOracle {
         }
       }
       return JsonUtil.generate(gen -> renderRows(gen, liveIndices, AvroDataOracle::renderExpected),
+          true);
+    }
+
+    private static <T> void renderRows(
+        JsonGenerator gen, List<T> items, RowRenderer<T> renderer) throws IOException {
+      gen.writeStartArray();
+      for (T item : items) {
+        gen.writeStartObject();
+        renderer.render(gen, item);
+        gen.writeEndObject();
+      }
+      gen.writeEndArray();
+    }
+
+    private interface RowRenderer<T> {
+      void render(JsonGenerator gen, T item) throws IOException;
+    }
+
+    /** Render one Java-read {@link Record} to the canonical column shape. */
+    private static void renderRecord(JsonGenerator gen, Record rec) throws IOException {
+      gen.writeNumberField("id", (Long) rec.getField("id"));
+      Object name = rec.getField("name");
+      if (name == null) {
+        gen.writeNullField("name");
+      } else {
+        gen.writeStringField("name", name.toString());
+      }
+      gen.writeNumberField("i32", ((Number) rec.getField("i32")).intValue());
+      gen.writeNumberField("f64", ((Number) rec.getField("f64")).doubleValue());
+      gen.writeBooleanField("flag", (Boolean) rec.getField("flag"));
+      gen.writeNumberField("dt", ((LocalDate) rec.getField("dt")).toEpochDay());
+      gen.writeNumberField("ts", instantToMicros((OffsetDateTime) rec.getField("ts")));
+      gen.writeStringField("dec", ((BigDecimal) rec.getField("dec")).setScale(2).toPlainString());
+      gen.writeStringField("bin", bytesToHex((ByteBuffer) rec.getField("bin")));
+    }
+
+    /** Render the hand-declared expected row at fixture index `i` to the canonical column shape. */
+    private static void renderExpected(JsonGenerator gen, Integer i) throws IOException {
+      gen.writeNumberField("id", IDS[i]);
+      if (NAMES[i] == null) {
+        gen.writeNullField("name");
+      } else {
+        gen.writeStringField("name", NAMES[i]);
+      }
+      gen.writeNumberField("i32", I32[i]);
+      gen.writeNumberField("f64", F64[i]);
+      gen.writeBooleanField("flag", FLAG[i]);
+      gen.writeNumberField("dt", (long) DT_DAYS[i]);
+      gen.writeNumberField("ts", TS_MICROS[i]);
+      gen.writeStringField("dec", new BigDecimal(DEC[i]).setScale(2).toPlainString());
+      gen.writeStringField("bin", BIN_HEX[i]);
+    }
+
+    private static long instantToMicros(OffsetDateTime odt) {
+      Instant instant = odt.toInstant();
+      return instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1_000L;
+    }
+
+    private static String bytesToHex(ByteBuffer buffer) {
+      ByteBuffer dup = buffer.duplicate();
+      StringBuilder hex = new StringBuilder(dup.remaining() * 2);
+      while (dup.hasRemaining()) {
+        hex.append(String.format("%02x", dup.get() & 0xff));
+      }
+      return hex.toString();
+    }
+
+    private static byte[] hexToBytes(String hex) {
+      int len = hex.length();
+      byte[] out = new byte[len / 2];
+      for (int i = 0; i < len; i += 2) {
+        out[i / 2] =
+            (byte) ((Character.digit(hex.charAt(i), 16) << 4) + Character.digit(hex.charAt(i + 1), 16));
+      }
+      return out;
+    }
+  }
+
+  // ===========================================================================================
+  // ORC DATA-FILE READ oracle — GAP_MATRIX row 116 (Direction 1: "Rust reads what Java writes").
+  //
+  // The ORC sibling of AvroDataOracle. Java writes a V2 Iceberg table whose DATA file is in the ORC
+  // format (GenericAppenderFactory.newDataWriter(..., FileFormat.ORC, null) → iceberg-orc's
+  // GenericOrcWriter, which stamps the `iceberg.id` ORC type attributes the Rust by-field-id reader
+  // resolves on) over the SAME flat primitive + logical + optional/null fixture (5 rows id 10..50); a
+  // real parquet POSITION-delete removes position 1 (id=20). Java ASSERTS its OWN IcebergGenerics read
+  // == the hand-declared expected before emitting java_orc_rows.json (the ground truth the Rust
+  // scan→Arrow over the ORC data file must equal). Anti-circular: the expected rows are hand-declared
+  // identically on the Rust side too.
+  // ===========================================================================================
+  static final class OrcDataOracle {
+    private OrcDataOracle() {}
+
+    // Fixed fixture values, hand-declared. Row i (0-based) carries id = 10*(i+1). Identical in shape
+    // to AvroDataOracle's fixture (the ONLY difference between the two oracles is the data-FILE format).
+    private static final long[] IDS = {10L, 20L, 30L, 40L, 50L};
+    // name is optional: row index 2 (id=30) is NULL to exercise the optional/null path.
+    private static final String[] NAMES = {"alpha", "bravo", null, "delta", "echo"};
+    private static final int[] I32 = {1, 2, 3, 4, 5};
+    private static final double[] F64 = {1.5, 2.5, 3.5, 4.5, 5.5};
+    private static final boolean[] FLAG = {true, false, true, false, true};
+    // dt: days since epoch (LocalDate). ts: micros since epoch (OffsetDateTime, UTC).
+    private static final int[] DT_DAYS = {0, 100, 19000, 19001, 19002};
+    private static final long[] TS_MICROS = {0L, 1_000_000L, 1_600_000_000_000_000L, 1_600_000_000_000_001L, 1_600_000_000_000_002L};
+    // dec: decimal(9,2) unscaled values (so 1.23, 4.56, ...).
+    private static final String[] DEC = {"1.23", "-4.56", "78.90", "0.01", "-0.99"};
+    private static final String[] BIN_HEX = {"00", "01ff", "deadbeef", "", "7f"};
+    // The deleted position (id=20 at position 1).
+    private static final long DELETED_POSITION = 1L;
+
+    // Flat fixture only (no nested struct/list/map): the parity point under test is READING the ORC
+    // DATA file by field-id. Nested ORC read-by-id is deferred (the U1 reader rejects nested top-level
+    // fields loudly); flat primitive + logical + optional/null is the full cross-engine surface here.
+    static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.optional(2, "name", Types.StringType.get()),
+          Types.NestedField.required(3, "i32", Types.IntegerType.get()),
+          Types.NestedField.required(4, "f64", Types.DoubleType.get()),
+          Types.NestedField.required(5, "flag", Types.BooleanType.get()),
+          Types.NestedField.required(6, "dt", Types.DateType.get()),
+          Types.NestedField.required(7, "ts", Types.TimestampType.withZone()),
+          Types.NestedField.required(8, "dec", Types.DecimalType.of(9, 2)),
+          Types.NestedField.required(9, "bin", Types.BinaryType.get()));
+    }
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema = schema();
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_orc_data");
+
+      // The DATA file is ORC. The position-delete is parquet (delete-file format is independent of the
+      // data-file format; the parity point under test is reading the ORC DATA file).
+      String dataPath = new File(dataDir, "00000-data.orc").getAbsolutePath();
+      DataFile dataFile = writeOrcDataFile(table, schema, spec, dataPath);
+
+      String deletePath = new File(dataDir, "00000-data-deletes.parquet").getAbsolutePath();
+      DeleteFile deleteFile = writePosDeleteFile(table, schema, spec, deletePath, dataFile.path());
+
+      table.newAppend().appendFile(dataFile).commit();
+      table.newRowDelta().addDeletes(deleteFile).commit();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // Anti-circular check: Java's OWN IcebergGenerics read of the ORC table MUST equal the
+      // hand-declared expected (a Java-side mistake fails right here, before any Rust runs).
+      String expectedJson = expectedRowsJson();
+      String javaReadJson = readLiveRowsToJson(table);
+      if (!expectedJson.equals(javaReadJson)) {
+        throw new RuntimeException(
+            "OrcDataOracle self-check FAILED: Java's IcebergGenerics read of the ORC table does not "
+                + "match the hand-declared expected.\n  expected="
+                + expectedJson
+                + "\n  java-read="
+                + javaReadJson);
+      }
+
+      writeJson(dir.resolve("java_orc_rows.json"), expectedJson);
+      System.out.println(
+          "generated ORC-data table + java_orc_rows.json to "
+              + dir
+              + " (Java self-check PASSED: IcebergGenerics read == hand-declared expected)");
+    }
+
+    private static DataFile writeOrcDataFile(
+        BaseTable table, Schema schema, PartitionSpec spec, String path) throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < IDS.length; i++) {
+        rows.add(record(schema, i));
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.ORC,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static Record record(Schema schema, int i) {
+      GenericRecord rec = GenericRecord.create(schema);
+      rec.setField("id", IDS[i]);
+      rec.setField("name", NAMES[i]);
+      rec.setField("i32", I32[i]);
+      rec.setField("f64", F64[i]);
+      rec.setField("flag", FLAG[i]);
+      rec.setField("dt", LocalDate.ofEpochDay(DT_DAYS[i]));
+      rec.setField(
+          "ts", OffsetDateTime.ofInstant(microsToInstant(TS_MICROS[i]), ZoneOffset.UTC));
+      rec.setField("dec", new BigDecimal(DEC[i]).setScale(2));
+      rec.setField("bin", ByteBuffer.wrap(hexToBytes(BIN_HEX[i])));
+      return rec;
+    }
+
+    private static Instant microsToInstant(long micros) {
+      long secs = Math.floorDiv(micros, 1_000_000L);
+      long microRem = Math.floorMod(micros, 1_000_000L);
+      return Instant.ofEpochSecond(secs, microRem * 1_000L);
+    }
+
+    /** Write a real parquet position-delete deleting {@link #DELETED_POSITION} of the data file. */
+    private static DeleteFile writePosDeleteFile(
+        BaseTable table, Schema schema, PartitionSpec spec, String path, CharSequence dataPath)
+        throws IOException {
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(dataPath, DELETED_POSITION, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    /** Read the table via IcebergGenerics and render the live rows to the canonical JSON shape. */
+    private static String readLiveRowsToJson(BaseTable table) {
+      List<Record> live = new ArrayList<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          live.add(record);
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+      live.sort((a, b) -> Long.compare((Long) a.getField("id"), (Long) b.getField("id")));
+      return JsonUtil.generate(gen -> renderRows(gen, live, OrcDataOracle::renderRecord), true);
+    }
+
+    /** The hand-declared expected rows (anti-circular ground truth), with position 1 deleted. */
+    private static String expectedRowsJson() {
+      List<Integer> liveIndices = new ArrayList<>();
+      for (int i = 0; i < IDS.length; i++) {
+        if (i != (int) DELETED_POSITION) {
+          liveIndices.add(i);
+        }
+      }
+      return JsonUtil.generate(gen -> renderRows(gen, liveIndices, OrcDataOracle::renderExpected),
           true);
     }
 

@@ -49,6 +49,7 @@ use typed_builder::TypedBuilder;
 use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
+use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
@@ -317,10 +318,11 @@ impl ArrowReader {
     /// * [`Avro`](DataFileFormat::Avro) → [`Self::process_avro_file_scan_task`]: the Avro data file
     ///   is MATERIALIZED via the [`crate::arrow::avro_reader`] core (Java `PlannedDataReader`), then
     ///   schema-evolved + delete-filtered post-hoc (Avro cannot push down).
-    /// * [`Orc`](DataFileFormat::Orc) → a clean [`FeatureUnsupported`](ErrorKind::FeatureUnsupported)
-    ///   error. Before this dispatch existed an ORC data file was silently fed to the Parquet reader
-    ///   and failed as a corrupt-footer error; it now fails loudly and accurately (ORC read is GAP
-    ///   row 116).
+    /// * [`Orc`](DataFileFormat::Orc) → [`Self::process_orc_file_scan_task`]: the ORC data file is
+    ///   MATERIALIZED via the [`crate::arrow::orc_reader`] core (Java `GenericOrcReader`), then
+    ///   schema-evolved + delete-filtered post-hoc exactly as the Avro path is (ORC has footer
+    ///   structure but this reader materializes whole-file; deletes are applied post-decode — GAP
+    ///   row 116, READ-only).
     /// * [`Puffin`](DataFileFormat::Puffin) → a clean `FeatureUnsupported` error: a Puffin file is a
     ///   stats/deletion-vector sidecar, never a scannable DATA file, so it must never reach here.
     async fn process_file_scan_task(
@@ -349,14 +351,10 @@ impl ArrowReader {
                 Self::process_avro_file_scan_task(task, batch_size, file_io, delete_file_loader)
                     .await
             }
-            DataFileFormat::Orc => Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "Reading ORC data files is not supported yet (file '{}'); only Parquet and \
-                     Avro data files are scannable",
-                    task.data_file_path
-                ),
-            )),
+            DataFileFormat::Orc => {
+                Self::process_orc_file_scan_task(task, batch_size, file_io, delete_file_loader)
+                    .await
+            }
             DataFileFormat::Puffin => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 format!(
@@ -791,6 +789,129 @@ impl ArrowReader {
                         Error::new(
                             ErrorKind::Unexpected,
                             "Failed to apply merge-on-read deletes to an Avro data batch",
+                        )
+                        .with_source(e)
+                    });
+                    output.push(filtered);
+                }
+            }
+        }
+
+        Ok(Box::pin(futures::stream::iter(output)) as ArrowRecordBatchStream)
+    }
+
+    /// Read one **ORC** data-file scan task into an [`ArrowRecordBatchStream`].
+    ///
+    /// A VERBATIM structural clone of [`Self::process_avro_file_scan_task`]: the ONLY difference is
+    /// the step-(1) materialization, which calls the U1 ORC reader
+    /// ([`read_orc_data_file`], Java `GenericOrcReader`) instead of the Avro reader. Everything after
+    /// the decode — the projected expected schema, the SAME [`RecordBatchTransformer`] the Parquet /
+    /// Avro paths feed (`_file` + identity-partition constants, schema evolution, reorder), and the
+    /// merge-on-read delete machinery (positional via [`DeleteVector`] membership over the absolute
+    /// row position, equality + scan residual via the shared survival mask) — is FORMAT-AGNOSTIC and
+    /// reused unchanged ([`Self::build_avro_expected_schema`] / [`Self::avro_survival_mask`]). ORC is
+    /// materialized whole-file (this reader does not push predicates into the ORC stripe metadata),
+    /// so, like Avro, every filter is applied POST-materialization.
+    async fn process_orc_file_scan_task(
+        task: FileScanTask,
+        batch_size: Option<usize>,
+        file_io: FileIO,
+        delete_file_loader: CachingDeleteFileLoader,
+    ) -> Result<ArrowRecordBatchStream> {
+        // Kick off delete loading concurrently with the file read (as the Parquet path does).
+        let delete_filter_rx =
+            delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
+
+        // The projected Iceberg schema the ORC reader resolves against: the scan schema restricted to
+        // the projected file-present (non-reserved-metadata) field ids — identical to the Avro path.
+        let expected = Self::build_avro_expected_schema(&task)?;
+
+        // ORC decode is whole-file; the U1 reader requires a positive batch size. Fall back to the
+        // arrow-rs default (1024) when the scan left it unset, matching the Parquet/Avro readers.
+        let orc_batch_size = batch_size.unwrap_or(1024).max(1);
+        let input_file = file_io.new_input(&task.data_file_path)?;
+        let batches = read_orc_data_file(&input_file, expected, orc_batch_size).await?;
+
+        // Build the SAME RecordBatchTransformer the Parquet/Avro paths use (schema evolution + reorder
+        // + `_file` / identity-partition constants).
+        let mut record_batch_transformer_builder =
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+        if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
+            let file_datum = Datum::string(task.data_file_path.clone());
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_constant(RESERVED_FIELD_ID_FILE, file_datum);
+        }
+        if let (Some(partition_spec), Some(partition_data)) =
+            (task.partition_spec.clone(), task.partition.clone())
+        {
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_partition(partition_spec, partition_data)?;
+        }
+        let mut record_batch_transformer = record_batch_transformer_builder.build();
+
+        // Resolve the deletes (positional vector + the equality-delete predicate), then AND the
+        // equality-delete predicate with the scan residual into one per-batch survival predicate —
+        // the same single predicate the Parquet/Avro paths form.
+        let delete_filter = delete_filter_rx.await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "delete-file loader dropped before delivering the delete filter",
+            )
+            .with_source(e)
+        })??;
+        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let survival_predicate = match (&task.predicate, delete_predicate) {
+            (None, None) => None,
+            (Some(predicate), None) => Some(predicate.clone()),
+            (None, Some(predicate)) => Some(predicate),
+            (Some(filter_predicate), Some(delete_predicate)) => {
+                Some(filter_predicate.clone().and(delete_predicate))
+            }
+        };
+
+        // The positional-delete vector for this data file (cloned out so the stream owns it).
+        let positional_deletes = delete_filter.get_delete_vector(&task);
+
+        // Materialize every transformed + delete-filtered batch eagerly: the file is already fully
+        // decoded in memory, so there is no streaming benefit to a lazy adapter, and the absolute
+        // row-position counter for positional deletes is simplest to thread over an owned loop.
+        let mut output: Vec<Result<RecordBatch>> = Vec::with_capacity(batches.len());
+        let mut absolute_pos: u64 = 0;
+        for batch in batches {
+            let row_count = batch.num_rows();
+
+            let transformed = match record_batch_transformer.process_record_batch(batch) {
+                Ok(b) => b,
+                Err(e) => {
+                    output.push(Err(e));
+                    break;
+                }
+            };
+
+            let mask = match Self::avro_survival_mask(
+                &transformed,
+                row_count,
+                absolute_pos,
+                positional_deletes.as_ref(),
+                survival_predicate.as_ref(),
+            ) {
+                Ok(mask) => mask,
+                Err(e) => {
+                    output.push(Err(e));
+                    break;
+                }
+            };
+
+            absolute_pos = absolute_pos.saturating_add(row_count as u64);
+
+            match mask {
+                // No deletes / residual touch this batch: emit it unchanged.
+                None => output.push(Ok(transformed)),
+                Some(mask) => {
+                    let filtered = filter_record_batch(&transformed, &mask).map_err(|e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Failed to apply merge-on-read deletes to an ORC data batch",
                         )
                         .with_source(e)
                     });
@@ -5828,11 +5949,12 @@ message schema {
 
 #[cfg(test)]
 mod avro_scan_tests {
-    //! Scan-level tests for the Avro data-file READ path (`process_avro_file_scan_task`): a real
-    //! Avro OCF on disk, scanned through `ArrowReader::read`, with projection + merge-on-read
-    //! positional/equality deletes applied post-materialization, the ORC-errors-cleanly dispatch,
-    //! and mutation baits. These exercise the U2 wiring end-to-end; the U1 `avro_reader_tests.rs`
-    //! cover the decode core in isolation.
+    //! Scan-level tests for the Avro AND ORC data-file READ paths
+    //! (`process_avro_file_scan_task` / `process_orc_file_scan_task`): a real Avro OCF / the committed
+    //! golden Java-Iceberg ORC fixture on disk, scanned through `ArrowReader::read`, with projection +
+    //! merge-on-read positional/equality deletes applied post-materialization, the by-field-id
+    //! (rename) proof, and mutation baits. These exercise the U2 wiring end-to-end; the U1
+    //! `avro_reader_tests.rs` / `orc_reader_tests.rs` cover the decode cores in isolation.
 
     use std::collections::HashMap;
     use std::fs::File;
@@ -5849,7 +5971,6 @@ mod avro_scan_tests {
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
-    use crate::ErrorKind;
     use crate::arrow::ArrowReaderBuilder;
     use crate::avro::schema_to_avro_schema;
     use crate::io::FileIO;
@@ -6037,6 +6158,89 @@ mod avro_scan_tests {
         }
     }
 
+    // -- ORC scan helpers: the committed Java-Iceberg golden fixture (the ONLY ORC source with the
+    //    `iceberg.id` footer attributes the by-field-id reader requires — orc-rust's writer does not
+    //    stamp them, so a generated ORC file would be rejected loudly). The fixture is 3 rows / 14
+    //    columns; the ORC scan tests project field ids 1 (`id` long [1,2,3]) and 6 (`string_col`). ---
+
+    /// The committed Java-Iceberg 1.10.0 golden ORC file (ZLIB, 14 columns, 3 rows).
+    const ORC_FIXTURE: &[u8] = include_bytes!("../../testdata/orc/iceberg_primitives.orc");
+
+    /// Write the golden ORC fixture into `tmp` and return its path (the scan reads via `FileIO`).
+    fn orc_fixture_on_disk(tmp: &TempDir) -> String {
+        let path = tmp.path().join("fixture.orc").to_string_lossy().to_string();
+        std::fs::write(&path, ORC_FIXTURE).expect("write orc fixture");
+        path
+    }
+
+    /// The two-field projection schema over the fixture: `{1 id long required, 6 string_col string
+    /// optional}` — the fixture's field ids 1 and 6, used by the read-all / projection tests.
+    fn orc_fixture_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(6, "string_col", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .expect("build orc fixture schema"),
+        )
+    }
+
+    /// Build a whole-file [`FileScanTask`] for an ORC data file (`DataFileFormat::Orc`) at `path`.
+    fn orc_task(
+        path: &str,
+        schema: SchemaRef,
+        project_field_ids: Vec<i32>,
+        deletes: Vec<FileScanTaskDeleteFile>,
+    ) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: std::fs::metadata(path).expect("stat orc file").len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: path.to_string(),
+            data_file_format: DataFileFormat::Orc,
+            schema,
+            project_field_ids,
+            predicate: None,
+            deletes,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: true,
+            split_offsets: None,
+        }
+    }
+
+    /// Extract `(id, string_col)` rows from the ORC fixture scan, sorted by id.
+    fn orc_id_string_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<String>)> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let id = batch
+                .column_by_name("id")
+                .expect("id column")
+                .as_primitive::<Int64Type>();
+            let s = batch.column_by_name("string_col").expect("string_col");
+            for i in 0..batch.num_rows() {
+                let v = if s.is_null(i) {
+                    None
+                } else {
+                    match s.data_type() {
+                        DataType::Utf8 => Some(s.as_string::<i32>().value(i).to_string()),
+                        DataType::LargeUtf8 => Some(s.as_string::<i64>().value(i).to_string()),
+                        other => panic!("unexpected string_col arrow type {other:?}"),
+                    }
+                };
+                out.push((id.value(i), v));
+            }
+        }
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
     // -- End-to-end Avro scan (no deletes). -----------------------------------------------------------
 
     #[tokio::test]
@@ -6153,33 +6357,148 @@ mod avro_scan_tests {
         ]);
     }
 
-    // -- ORC dispatch fails CLEANLY (the latent silent-misread bug is fixed). -------------------------
+    // -- ORC dispatch now SCANS the file (U2): the golden Java-Iceberg fixture, by field-id. ---------
+    //
+    // The pre-U2 `orc_data_file_errors_cleanly` (which asserted the OLD FeatureUnsupported behavior)
+    // is RETARGETED here to a REAL ORC scan: dispatching `DataFileFormat::Orc` now routes through
+    // `process_orc_file_scan_task` → the U1 ORC reader → the SAME transformer + delete machinery the
+    // Avro path uses. A file failing to materialize (or a wrong format dispatch) RED-s this test.
 
     #[tokio::test]
-    async fn orc_data_file_errors_cleanly() {
+    async fn orc_scan_reads_fixture_rows() {
         let tmp = TempDir::new().unwrap();
-        let schema = test_schema();
-        // The path doesn't even need to be ORC bytes: dispatch must reject the FORMAT before any read.
-        let path = tmp.path().join("data.orc").to_string_lossy().to_string();
-        std::fs::write(&path, b"not really orc").unwrap();
-        let mut task = avro_task(&path, schema, vec![1, 2], vec![]);
-        task.data_file_format = DataFileFormat::Orc;
+        let path = orc_fixture_on_disk(&tmp);
+        // The golden fixture's field 1 (`id` long) carries [1, 2, 3]; field 6 (`string_col`) carries
+        // ["hello", null, ""]. Project both and scan through the full reader.
+        let task = orc_task(&path, orc_fixture_schema(), vec![1, 6], vec![]);
+        let batches = run_scan(FileIO::new_with_fs(), task).await;
 
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
-        let tasks =
-            Box::pin(futures::stream::iter(vec![Ok(task)].into_iter())) as FileScanTaskStream;
-        let result = reader
-            .read(tasks)
-            .expect("build scan stream")
-            .try_collect::<Vec<RecordBatch>>()
-            .await;
+        assert_eq!(orc_id_string_rows(&batches), vec![
+            (1, Some("hello".to_string())),
+            (2, None),
+            (3, Some(String::new())),
+        ]);
+    }
 
-        let err = result.expect_err("ORC data file must fail");
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            err.to_string().contains("ORC"),
-            "the ORC error must name ORC, got: {err}"
+    // -- ORC projection: only the projected field id materializes (by field-id, not position). -------
+
+    #[tokio::test]
+    async fn orc_scan_projects_single_column() {
+        let tmp = TempDir::new().unwrap();
+        let path = orc_fixture_on_disk(&tmp);
+        // Project only `id` (field 1). The output batch must have exactly one column.
+        let task = orc_task(&path, orc_fixture_schema(), vec![1], vec![]);
+        let batches = run_scan(FileIO::new_with_fs(), task).await;
+
+        assert_eq!(batches[0].num_columns(), 1, "only `id` is projected");
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .expect("id col")
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    // -- ORC MoR positional deletes applied post-materialization (the SAME DeleteVector path). --------
+
+    #[tokio::test]
+    async fn orc_scan_applies_positional_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let path = orc_fixture_on_disk(&tmp);
+        // Delete position 1 (the id=2 row). The delete file references the ORC data path.
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let pos_del = write_pos_delete_file(&del_path, &path, &[1]);
+
+        let task = orc_task(&path, orc_fixture_schema(), vec![1], vec![pos_del]);
+        let batches = run_scan(FileIO::new_with_fs(), task).await;
+
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .expect("id col")
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        // Survivors are exactly {1, 3} — position 1 (id=2) deleted via the absolute-position vector.
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    // -- ORC MoR equality deletes applied by VALUE (the SAME shared survival evaluator). --------------
+
+    #[tokio::test]
+    async fn orc_scan_applies_equality_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let path = orc_fixture_on_disk(&tmp);
+        // Equality-delete id value {2} by VALUE on field id 1.
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[2]);
+
+        let task = orc_task(&path, orc_fixture_schema(), vec![1], vec![eq_del]);
+        let batches = run_scan(FileIO::new_with_fs(), task).await;
+
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .expect("id col")
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        // id=2 is removed by value; {1, 3} survive.
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    // -- ORC FIELD-ID PROOF (load-bearing): read a Java-written ORC file with a RENAMED expected
+    //    field (SAME field id 1, DIFFERENT name "renamed_id"). The value MUST land in the renamed
+    //    column. A NAME-BASED reader would look up "id" in the file and either miss or wrongly
+    //    resolve — this proves resolution is by `iceberg.id`, never by ORC column name.
+
+    #[tokio::test]
+    async fn orc_scan_resolves_by_field_id_not_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = orc_fixture_on_disk(&tmp);
+        // The file's field 1 is named "id"; the EXPECTED schema renames field-id 1 to "renamed_id".
+        let renamed_schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "renamed_id", Type::Primitive(PrimitiveType::Long))
+                        .into(),
+                ])
+                .build()
+                .expect("build renamed schema"),
         );
+        let task = orc_task(&path, renamed_schema, vec![1], vec![]);
+        let batches = run_scan(FileIO::new_with_fs(), task).await;
+
+        // The output column is named "renamed_id" (the EXPECTED name, not the file name "id") and
+        // carries the file's field-1 values — proving by-field-id resolution.
+        assert!(
+            batches[0].column_by_name("id").is_none(),
+            "the file's ORC name 'id' must NOT appear; resolution is by field-id"
+        );
+        let renamed = batches[0]
+            .column_by_name("renamed_id")
+            .expect("renamed_id column (by field-id 1)");
+        assert_eq!(renamed.as_primitive::<Int64Type>().values(), &[1, 2, 3]);
     }
 
     // -- MUTATION BAIT: a positional-delete keep-mask that did NOT drop the deleted rows would let
@@ -6212,5 +6531,36 @@ mod avro_scan_tests {
             (20, Some("b".to_string())),
             (30, Some("c".to_string())),
         ]);
+    }
+
+    // -- MUTATION BAIT (ORC): a positional-delete keep-mask that did NOT drop the deleted row would
+    //    let id=1 (position 0) survive. This pins the absolute-position membership test on the ORC
+    //    path (the SAME `DeleteVector`/survival-mask machinery the Avro/Parquet paths use).
+    #[tokio::test]
+    async fn orc_positional_delete_mutation_bait() {
+        let tmp = TempDir::new().unwrap();
+        let path = orc_fixture_on_disk(&tmp);
+        // Delete only position 0 (id=1).
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let pos_del = write_pos_delete_file(&del_path, &path, &[0]);
+        let task = orc_task(&path, orc_fixture_schema(), vec![1], vec![pos_del]);
+        let batches = run_scan(FileIO::new_with_fs(), task).await;
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .expect("id col")
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        // id=1 MUST be gone; 2 and 3 survive. A reader ignoring the delete vector would keep 1.
+        assert!(!ids.contains(&1), "position-0 row (id=1) must be deleted");
+        assert_eq!(ids, vec![2, 3]);
     }
 }

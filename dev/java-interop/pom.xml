@@ -78,6 +78,19 @@
       <artifactId>iceberg-parquet</artifactId>
       <version>${iceberg.version}</version>
     </dependency>
+    <!--
+      ORC DATA-FILE interop (GAP_MATRIX row 116): iceberg-orc provides the ORC writer
+      GenericAppenderFactory.newDataWriter(..., FileFormat.ORC, null) routes to (GenericOrcWriter /
+      ORC.write(...)), which stamps the `iceberg.id` ORC type attributes the Rust by-field-id reader
+      resolves on. It pulls org.apache.orc:orc-core (the physical ORC encoder) transitively. A
+      TEST-ORACLE dep ONLY — mirrors the iceberg-parquet dep above; the Rust crate's Cargo files are
+      untouched.
+    -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-orc</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-client-runtime</artifactId>

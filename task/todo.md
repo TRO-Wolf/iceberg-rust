@@ -639,11 +639,28 @@ fork. User approved the orc-rust crate; the zlib-decode (deflate) dep was alread
       license-eye-auto-skipped (binary, like the existing `.avro`/`.bin` fixtures). 2 LOW (named, unreachable on Iceberg ORC):
       CHAR/VARCHAR + ns-timestamp convert arms untested; int-narrowing + decimal-scale-strict are deliberate safe-direction
       guards (Java accepts then setScale-to-file-scale, a latent Java mismatch) — documented vs bytecode. NO matrix flip (engine).
-- [ ] **U2 — scan wiring + Direction-1 interop + flip → row 116 ❌→🟡** — replace the `Orc` FeatureUnsupported arm at
-      `reader.rs:352` with `process_orc_file_scan_task` (verbatim clone of the Avro path — same RecordBatchTransformer +
-      DeleteVector/predicate machinery). `OrcDataOracle` (Java `GenericAppenderFactory` FileFormat.ORC) + `run-interop-orc-data.sh`
-      + `interop_orc_data.rs` + the pom `iceberg-orc` test dep. Direction-1, anti-circular, fail-closed sabotage, incl. a
-      renamed-column case to prove field-id correctness. Flip row 116 ❌→🟡 (WRITE absent = residue, like Avro).
+- [x] **U2 — scan wiring + Direction-1 interop → row 116 ❌→🟡** — **DONE 2026-06-18.** AC·OO converged 1 cycle. Added
+      `process_orc_file_scan_task` (verbatim clone of the Avro arm — materialize via U1 `read_orc_data_file`, SAME
+      `RecordBatchTransformer` + `build_avro_expected_schema`/`avro_survival_mask` positional+equality delete machinery);
+      replaced the `Orc` FeatureUnsupported arm. `OrcDataOracle` (Java `GenericAppenderFactory` FileFormat.ORC writes a real
+      Apache ORC data file + parquet pos-delete, self-checks) + `run-interop-orc-data.sh` + `interop_orc_data.rs` + the pom
+      `iceberg-orc` test dep. **FIELD-ID PROOF (load-bearing):** `orc_scan_resolves_by_field_id_not_name` reads a Java ORC file
+      (col named `id`, field-id 1) with an expected schema renaming id-1 to `renamed_id` and asserts the values land there — a
+      name-based reader FAILS it (Critic mutation-confirmed: name-resolution → "Missing required field: renamed_id"). Deletes
+      mutation-confirmed (invert keep-mask → both delete tests RED). **Orchestrator-verified:** re-ran the LIVE oracle MYSELF
+      (step-3 clean: 4 rows {10,30,40,50} id=20 deleted column-identical; step-4 sabotage diverged exit 101; RC=0) + offline
+      gate (lib **2570**/0, clippy 0, fmt+typos clean, interop no-op); Cargo untouched; row 116 pipe-5; only row 116 changed;
+      census **35✅/26🟡/7❌ → 35✅/27🟡/6❌**. **Critic git-checkout-clobbered the Actor's uncommitted reader.rs + reconstructed
+      it** (same incident as Avro U2) — I re-verified the reconstruction MYSELF (full compile + all 6 ORC scan tests + live
+      oracle green) before trusting it. Flip row 116 ❌→🟡 (WRITE absent = residue, like Avro).
+
+> **BLOCK 9 COMPLETE (2026-06-18).** ORC data-file READ in 2 sequential AC·OO PRs: U1 field-id-correct reader core (footer-parse
+> for `iceberg.id`, engine, #95) → U2 scan wiring + Direction-1 interop (row 116 ❌→🟡). **1 flip (116 ❌→🟡)**; field-id-correct
+> READ interop-proven (Java writes real Apache ORC, Rust scans, row-identity + MoR delete + a renamed-column proof). Solved the
+> orc-rust `iceberg.id`-discard blocker by parsing the ORC footer ourselves. Census **35✅/27🟡/6❌**. WRITE half (no ORC writer)
+> + footer-codecs-beyond-ZLIB + nested/V3 = named residue keeping it 🟡. PROCESS: the Critic-git-checkout-clobber recurred (now
+> TWICE: Avro U2 + ORC U2) — orchestrator MUST independently re-verify the reconstruction, never trust "tree is coherent now".
+> NEXT (fresh capability): LockManager (127 ❌→✅, bounded util, no deps) · Events/listeners (142 ❌→✅, +emit wiring).
 
   _Delivered spec (reference):_ `maintenance/rewrite_table_path.rs`: `Table::rewrite_table_path().rewrite_location_prefix(src,
       tgt).staging_location(dir).execute(io)` → `Result{staging_location, copy_plan, latest_version}`, a STAGE-AND-PLAN
