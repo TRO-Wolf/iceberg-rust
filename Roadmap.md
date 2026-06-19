@@ -321,9 +321,20 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 
 ## Headline gap AREAS (ranked by effort × value — statuses live in the GAP_MATRIX)
 
-Sequenced for the near-full-parity directive (2026-06-11), with the model-tier handoff
-(frontier sessions until 2026-06-22, then Opus) deciding WHO does each: judgment-heavy /
-format-sensitive work front-loads into the frontier window; well-templated breadth follows.
+Sequenced for the near-full-parity directive (2026-06-11); **re-steered 2026-06-19 (PAR-05) to a
+two-track hybrid** now that the post-audit backlog is cleared and the work is Opus-paced (Fable
+parked). **Track 1 (now — zero/low on-disk-format risk, ✅ momentum):** `LockManager` (the one owed
+Opus-cheap ❌ — pure catalog CRUD, no format risk, unblocks Phase-5 catalog completeness), then scan
+completion (`BatchScan` + split planning, row 146), then ORC + Avro **read** completion — draining
+the cheap closeouts moves the census ≈ 36→40 ✅. **Track 2 (deliberate, format-risk-gated):** open
+**encryption** (`EncryptionManager` / KMS / encrypted FileIO + manifests + data) as a scheduled
+multi-block effort under the "do not break the on-disk format" approval + Java↔Rust interop
+discipline, then geometry/geography + geospatial predicates, then ORC/Avro data-file **write**.
+**Parked / not owed (do not "sequence" these):** variant shredding (externally blocked by the
+parquet pin — binary format already byte-exact both sides), `SnapshotTable`/`MigrateTable` (need an
+external source-table surface this library does not expose), `SessionCatalog` (dead surface),
+Glue/S3 Tables views (parity-correct-unsupported). Within each track, judgment-heavy /
+format-sensitive work still leads; well-templated breadth follows.
 
 1. **Phase-2/3 closeout (frontier-first):** the conflict-detection + `caseSensitive` builder surfaces on
    `DeleteFiles`/`OverwriteFiles`/`RowDelta`/`ReplacePartitions` are now mostly ported, and their
