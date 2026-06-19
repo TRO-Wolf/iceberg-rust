@@ -123,9 +123,12 @@
 //! # Failure posture
 //!
 //! Java logs-and-continues through cleanup failures (`Tasks.suppressFailureWhenFinished` +
-//! SLF4J warnings). The `iceberg` crate has no logging-facade dependency (adding one needs
-//! approval), and silent swallowing is unacceptable for a deletion sweep — so failures are
-//! **collected and returned** in the [`CleanupReport`] instead:
+//! SLF4J warnings). Silent swallowing is unacceptable for a deletion sweep, so every failure is
+//! **collected and returned** in the [`CleanupReport`] — the caller gets a structured, complete
+//! record of what failed. In ADDITION (and matching Java's SLF4J warnings), each failure is also
+//! emitted as a `tracing::warn!` carrying the file path and the funnel kind, so an operator gets a
+//! live signal without waiting for the returned report. The collect-and-return remains the
+//! authoritative contract; the warn is purely additive observability:
 //!
 //! - A **manifest-list read failure** (either side) aborts with `Err` BEFORE any deletion —
 //!   Java's `readManifests`/`pruneReferencedManifests` use `throwFailureWhenFinished` and run
@@ -387,11 +390,21 @@ impl ExpireSnapshotsCleanup {
                             }
                         }
                     }
-                    Err(error) => report.failures.push(CleanupFailure {
-                        path: path.clone(),
-                        kind: CleanupFailureKind::ReadCandidateManifest,
-                        error,
-                    }),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path,
+                            kind = ?CleanupFailureKind::ReadCandidateManifest,
+                            ?error,
+                            "expire-snapshots cleanup: failed to read a candidate manifest; its \
+                             content files are skipped (under-deletion) — the manifest itself is \
+                             still deleted"
+                        );
+                        report.failures.push(CleanupFailure {
+                            path: path.clone(),
+                            kind: CleanupFailureKind::ReadCandidateManifest,
+                            error,
+                        });
+                    }
                 }
             }
             if !content_files_to_delete.is_empty() {
@@ -407,6 +420,14 @@ impl ExpireSnapshotsCleanup {
                         Err(error) => {
                             // Java catches any Throwable here and returns the EMPTY set: when
                             // the live file set cannot be proven, no content file may die.
+                            tracing::warn!(
+                                path = %path,
+                                kind = ?CleanupFailureKind::ReadRetainedManifest,
+                                ?error,
+                                "expire-snapshots cleanup: failed to read a retained manifest; \
+                                 clearing the entire content-file deletion set (liveness cannot \
+                                 be proven, so no content file may die)"
+                            );
                             report.failures.push(CleanupFailure {
                                 path: path.clone(),
                                 kind: CleanupFailureKind::ReadRetainedManifest,
@@ -507,7 +528,16 @@ impl ExpireSnapshotsCleanup {
         for path in paths {
             match (self.delete_function)(path.clone()).await {
                 Ok(()) => deleted.push(path),
-                Err(error) => failures.push(CleanupFailure { path, kind, error }),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path,
+                        kind = ?kind,
+                        ?error,
+                        "expire-snapshots cleanup: failed to delete a file; collecting the \
+                         failure and continuing the sweep"
+                    );
+                    failures.push(CleanupFailure { path, kind, error });
+                }
             }
         }
         deleted
@@ -531,10 +561,15 @@ fn statistics_locations(metadata: &TableMetadata) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
 
     use bytes::Bytes;
     use futures::future::BoxFuture;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
 
     use super::{CleanupFailureKind, ExpireSnapshotsCleanup};
     use crate::error::Result;
@@ -546,6 +581,35 @@ mod tests {
     use crate::table::Table;
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind};
+
+    /// A `tracing` [`Layer`] that formats each event (message + fields) into one line and pushes
+    /// it onto a shared sink, so a test can assert on emitted log events.
+    struct CapturingLayer {
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Formats an event's message and structured fields into a single string.
+    #[derive(Default)]
+    struct StringVisitor(String);
+
+    impl Visit for StringVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    impl<S> Layer<S> for CapturingLayer
+    where S: Subscriber + for<'a> LookupSpan<'a>
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = StringVisitor::default();
+            event.record(&mut visitor);
+            self.sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(visitor.0);
+        }
+    }
 
     /// =======================================================================
     /// Fixture helpers — real tables in a memory catalog, real manifest /
@@ -1210,7 +1274,16 @@ mod tests {
                 })
             },
         );
-        let (_, report) = expire_and_clean(&catalog, &table3, &cleanup).await;
+        // Capture log events while the sweep runs: the failure must be BOTH collected-returned
+        // (asserted below, unchanged) AND warn-logged (the additive QUAL-01 Site-3 signal).
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer { sink: logs.clone() });
+        let (report, captured) = {
+            let _log_guard = tracing::subscriber::set_default(subscriber);
+            let (_, report) = expire_and_clean(&catalog, &table3, &cleanup).await;
+            let captured = logs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            (report, captured)
+        };
 
         assert_eq!(
             report.deleted_manifest_lists,
@@ -1225,6 +1298,15 @@ mod tests {
         );
         assert!(exists(&table3, &s1_list).await);
         assert!(!exists(&table3, &s2_list).await);
+
+        // The additive warn fired for the failed path (collect-and-return is unchanged above).
+        // Removing the `warn!` in `delete_all` makes this fail, so the assertion is non-vacuous.
+        assert!(
+            captured.iter().any(|line| {
+                line.contains("failed to delete a file") && line.contains(&s1_list)
+            }),
+            "the collected delete failure must ALSO be warn-logged with the path: {captured:?}"
+        );
     }
 
     /// Risk pinned: an UNREADABLE RETAINED manifest must clear the ENTIRE content-file deletion

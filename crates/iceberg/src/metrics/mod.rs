@@ -18,10 +18,10 @@
 //! Metrics reporting for table operations.
 //!
 //! This module ports the self-contained core of Java's `org.apache.iceberg.metrics`
-//! package: the immutable metrics-report data model, the [`MetricsReporter`] API, and
-//! the [`InMemoryMetricsReporter`]. It is also the wire contract for the REST catalog's
-//! `report-metrics` endpoint. (Java's `tracing`-based `LoggingMetricsReporter` is a
-//! trivial follow-up deferred until a logging-facade dependency is approved.)
+//! package: the immutable metrics-report data model, the [`MetricsReporter`] API, the
+//! [`InMemoryMetricsReporter`], and the [`LoggingMetricsReporter`] (which logs each
+//! received report through `tracing`, mirroring Java's SLF4J-based reporter). It is also
+//! the wire contract for the REST catalog's `report-metrics` endpoint.
 //!
 //! # Java parity
 //!
@@ -547,12 +547,6 @@ pub trait MetricsReporter: Send + Sync {
     fn report(&self, report: MetricsReport);
 }
 
-// NOTE: Java's `LoggingMetricsReporter` (a `tracing`-based reporter) is intentionally NOT ported
-// in this increment — the `iceberg` crate has no logging-facade dependency, and adding one
-// (`tracing`) is a dependency change that needs explicit approval. It is a trivial follow-up once
-// the `tracing` dep is approved: a unit `MetricsReporter` whose `report` emits a `tracing::info!`.
-// The reporter trait + `InMemoryMetricsReporter` below are the dependency-free core.
-
 /// A [`MetricsReporter`] that retains the most recently reported [`MetricsReport`].
 ///
 /// Mirrors Java's `InMemoryMetricsReporter` (`report` stores; `scanReport()` reads). Useful
@@ -602,11 +596,82 @@ impl MetricsReporter for InMemoryMetricsReporter {
     }
 }
 
+/// A [`MetricsReporter`] that logs each received report through `tracing`.
+///
+/// Mirrors Java's `org.apache.iceberg.metrics.LoggingMetricsReporter`, whose `report` emits
+/// `LOG.info("Received metrics report: {}", report)`. Like Java it is a zero-state, side-effect-
+/// only reporter — useful as a default reporter or composed alongside another. The log is emitted
+/// at INFO with the same "Received metrics report" wording; the report's salient identifiers (the
+/// table name and snapshot id of a scan report) are attached as structured fields so an operator
+/// can filter without parsing the message, and nothing sensitive (e.g. the filter expression) is
+/// included.
+///
+/// =====================================================================================
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LoggingMetricsReporter;
+
+impl LoggingMetricsReporter {
+    /// Creates a new logging reporter. Mirrors Java's no-arg `LoggingMetricsReporter()`.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl MetricsReporter for LoggingMetricsReporter {
+    fn report(&self, report: MetricsReport) {
+        match report {
+            MetricsReport::Scan(scan_report) => tracing::info!(
+                report_kind = "scan",
+                table_name = %scan_report.table_name,
+                snapshot_id = scan_report.snapshot_id,
+                "Received metrics report"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+    use std::sync::Arc;
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+
     use super::*;
     use crate::expr::Reference;
     use crate::spec::Datum;
+
+    /// A `tracing` [`Layer`] that formats each event (message + fields) into one line and pushes
+    /// it onto a shared sink, so a test can assert on emitted log events.
+    struct CapturingLayer {
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Formats an event's message and structured fields into a single string.
+    #[derive(Default)]
+    struct StringVisitor(String);
+
+    impl Visit for StringVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    impl<S> Layer<S> for CapturingLayer
+    where S: Subscriber + for<'a> LookupSpan<'a>
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = StringVisitor::default();
+            event.record(&mut visitor);
+            self.sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(visitor.0);
+        }
+    }
 
     /// Builds a `ScanMetricsResult` with a populated planning timer and a couple of counters,
     /// leaving the rest absent — the shape a real (partial) scan produces.
@@ -831,5 +896,40 @@ mod tests {
 
         let restored: ScanReport = serde_json::from_value(json).expect("deserialize");
         assert_eq!(restored, report);
+    }
+
+    /// Risk: the `LoggingMetricsReporter` does not actually log the received report (or logs the
+    /// wrong message), so the Java `LOG.info("Received metrics report: {}", report)` parity is
+    /// silently lost. Pins that `report` emits a captured event carrying the "Received metrics
+    /// report" message and the report's identifiers. Removing the `tracing::info!` in `report`
+    /// makes this fail, so the assertion is non-vacuous.
+    #[test]
+    fn test_logging_metrics_reporter_logs_the_report() {
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer { sink: logs.clone() });
+
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let reporter = LoggingMetricsReporter::new();
+            reporter.report(MetricsReport::Scan(sample_report()));
+        }
+
+        let captured = logs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            captured
+                .iter()
+                .any(|line| line.contains("Received metrics report")),
+            "the reporter must log Java's \"Received metrics report\" message: {captured:?}"
+        );
+        // The salient identifiers ride along as structured fields.
+        assert!(
+            captured.iter().any(|line| {
+                line.contains("Received metrics report")
+                    && line.contains("table_name=")
+                    && line.contains("db.table")
+                    && line.contains("snapshot_id=42")
+            }),
+            "the report's table name and snapshot id must be attached as fields: {captured:?}"
+        );
     }
 }

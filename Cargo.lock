@@ -3318,6 +3318,8 @@ dependencies = [
  "strum",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "typed-builder",
  "typetag",
  "url",
