@@ -641,29 +641,54 @@ impl Literal {
                 (PrimitiveType::Date, PrimitiveLiteral::Int(val)) => {
                     Ok(JsonValue::String(date::days_to_date(val).to_string()))
                 }
-                (PrimitiveType::Time, PrimitiveLiteral::Long(val)) => Ok(JsonValue::String(
-                    time::microseconds_to_time(val).to_string(),
-                )),
-                (PrimitiveType::Timestamp, PrimitiveLiteral::Long(val)) => Ok(JsonValue::String(
-                    timestamp::microseconds_to_datetime(val)
-                        .format("%Y-%m-%dT%H:%M:%S%.f")
-                        .to_string(),
-                )),
-                (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(val)) => Ok(JsonValue::String(
-                    timestamptz::microseconds_to_datetimetz(val)
-                        .format("%Y-%m-%dT%H:%M:%S%.f+00:00")
-                        .to_string(),
-                )),
+                // The temporal converters return `None` for an out-of-range stored value; in this
+                // fallible JSON path that is a `DataInvalid` error (never a panic), unlike the
+                // infallible `Display` path which renders a placeholder. Valid values are unchanged.
+                (PrimitiveType::Time, PrimitiveLiteral::Long(val)) => {
+                    let time = time::microseconds_to_time(val).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Time value {val} is out of the representable range"),
+                        )
+                    })?;
+                    Ok(JsonValue::String(time.to_string()))
+                }
+                (PrimitiveType::Timestamp, PrimitiveLiteral::Long(val)) => {
+                    let ts = timestamp::microseconds_to_datetime(val).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Timestamp value {val} is out of the representable range"),
+                        )
+                    })?;
+                    Ok(JsonValue::String(
+                        ts.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+                    ))
+                }
+                (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(val)) => {
+                    let ts = timestamptz::microseconds_to_datetimetz(val).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Timestamptz value {val} is out of the representable range"),
+                        )
+                    })?;
+                    Ok(JsonValue::String(
+                        ts.format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string(),
+                    ))
+                }
                 (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(val)) => Ok(JsonValue::String(
                     timestamp::nanoseconds_to_datetime(val)
                         .format("%Y-%m-%dT%H:%M:%S%.f")
                         .to_string(),
                 )),
                 (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(val)) => {
+                    let ts = timestamptz::nanoseconds_to_datetimetz(val).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("TimestamptzNs value {val} is out of the representable range"),
+                        )
+                    })?;
                     Ok(JsonValue::String(
-                        timestamptz::nanoseconds_to_datetimetz(val)
-                            .format("%Y-%m-%dT%H:%M:%S%.f+00:00")
-                            .to_string(),
+                        ts.format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string(),
                     ))
                 }
                 (PrimitiveType::String, PrimitiveLiteral::String(val)) => {

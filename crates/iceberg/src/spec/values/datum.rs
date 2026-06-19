@@ -301,20 +301,35 @@ impl Display for Datum {
             (PrimitiveType::Date, PrimitiveLiteral::Int(val)) => {
                 write!(f, "{}", date::days_to_date(*val))
             }
+            // The temporal converters return `None` for an out-of-range stored value (which can
+            // arrive from corrupt/hostile on-disk bytes). Formatting must never panic, so render a
+            // clearly-marked placeholder instead of unwrapping; valid values format unchanged.
             (PrimitiveType::Time, PrimitiveLiteral::Long(val)) => {
-                write!(f, "{}", time::microseconds_to_time(*val))
+                match time::microseconds_to_time(*val) {
+                    Some(time) => write!(f, "{time}"),
+                    None => write!(f, "<invalid time: {val}>"),
+                }
             }
             (PrimitiveType::Timestamp, PrimitiveLiteral::Long(val)) => {
-                write!(f, "{}", timestamp::microseconds_to_datetime(*val))
+                match timestamp::microseconds_to_datetime(*val) {
+                    Some(ts) => write!(f, "{ts}"),
+                    None => write!(f, "<invalid timestamp: {val}>"),
+                }
             }
             (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(val)) => {
-                write!(f, "{}", timestamptz::microseconds_to_datetimetz(*val))
+                match timestamptz::microseconds_to_datetimetz(*val) {
+                    Some(ts) => write!(f, "{ts}"),
+                    None => write!(f, "<invalid timestamptz: {val}>"),
+                }
             }
             (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(val)) => {
                 write!(f, "{}", timestamp::nanoseconds_to_datetime(*val))
             }
             (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(val)) => {
-                write!(f, "{}", timestamptz::nanoseconds_to_datetimetz(*val))
+                match timestamptz::nanoseconds_to_datetimetz(*val) {
+                    Some(ts) => write!(f, "{ts}"),
+                    None => write!(f, "<invalid timestamptz_ns: {val}>"),
+                }
             }
             (_, PrimitiveLiteral::String(val)) => write!(f, r#""{val}""#),
             (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(val)) => {
@@ -1205,5 +1220,62 @@ impl Datum {
             PrimitiveLiteral::String(s) => s.to_string(),
             _ => self.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for SEC-02: a temporal `Datum` carrying an out-of-range stored value (which can
+    // arrive from corrupt/hostile on-disk bytes — min/max stats, partition values, manifest
+    // entries) must format via a placeholder rather than panicking in `Display`/`to_string`.
+    // `Datum::new` bypasses the range-checked constructors, mirroring how a corrupt value bypasses
+    // validation when read straight off disk.
+
+    #[test]
+    fn test_display_time_out_of_range_does_not_panic() {
+        // Negative microseconds-of-day previously wrapped via `as u32` and unwrapped a `None`.
+        let negative = Datum::new(PrimitiveType::Time, PrimitiveLiteral::Long(-1));
+        assert_eq!(negative.to_string(), "<invalid time: -1>");
+
+        // 86_400_000_001us is one microsecond past 24h (the largest valid value is < 86_400_000_000).
+        let past_midnight = Datum::new(PrimitiveType::Time, PrimitiveLiteral::Long(86_400_000_001));
+        assert_eq!(past_midnight.to_string(), "<invalid time: 86400000001>");
+    }
+
+    #[test]
+    fn test_display_valid_time_unchanged() {
+        // One second after midnight; valid values must still render normally.
+        let valid = Datum::new(PrimitiveType::Time, PrimitiveLiteral::Long(1_000_000));
+        assert_eq!(valid.to_string(), "00:00:01");
+    }
+
+    #[test]
+    fn test_display_timestamp_out_of_range_does_not_panic() {
+        // i64::MAX microseconds is far past chrono's representable range.
+        let datum = Datum::new(PrimitiveType::Timestamp, PrimitiveLiteral::Long(i64::MAX));
+        let rendered = datum.to_string();
+        assert_eq!(rendered, format!("<invalid timestamp: {}>", i64::MAX));
+    }
+
+    #[test]
+    fn test_display_timestamptz_out_of_range_does_not_panic() {
+        // i64::MIN microseconds: previously the negative sub-second remainder wrapped via `as u32`
+        // into a giant nanosecond count and the unwrap panicked.
+        let datum = Datum::new(PrimitiveType::Timestamptz, PrimitiveLiteral::Long(i64::MIN));
+        let rendered = datum.to_string();
+        assert_eq!(rendered, format!("<invalid timestamptz: {}>", i64::MIN));
+    }
+
+    #[test]
+    fn test_display_timestamptz_ns_negative_remainder_does_not_panic() {
+        // A small negative nanosecond value previously wrapped the negative sub-second remainder
+        // via `as u32` into a >1e9 nanos count, which made `from_timestamp` return `None` and the
+        // unwrap panic. The euclidean split now produces a valid sub-second instant. Every i64
+        // nanosecond value is within chrono's range (≈ years 1677..2262), so this renders normally
+        // rather than as a placeholder; the regression is simply that it does not panic.
+        let datum = Datum::new(PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(-1));
+        assert_eq!(datum.to_string(), "1969-12-31 23:59:59.999999999 UTC");
     }
 }

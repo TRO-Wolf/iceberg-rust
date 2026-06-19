@@ -60,10 +60,21 @@ pub(crate) mod time {
         .unwrap()
     }
 
-    pub(crate) fn microseconds_to_time(micros: i64) -> NaiveTime {
+    /// Converts a microsecond-of-day `Time` value into a [`NaiveTime`].
+    ///
+    /// Returns `None` for an out-of-range stored value (negative, or `>= 86_400_000_000`, i.e. at
+    /// or past 24h). Such a value can reach us from on-disk bytes (min/max stats, partition values,
+    /// manifest entries) on a corrupt or hostile file, so this must not panic — callers render a
+    /// placeholder rather than unwrapping. The previous `secs as u32` / `rem as u32` casts wrapped
+    /// silently on a negative input, which is corrected here by rejecting it via checked conversion.
+    pub(crate) fn microseconds_to_time(micros: i64) -> Option<NaiveTime> {
         let (secs, rem) = (micros / 1_000_000, micros % 1_000_000);
 
-        NaiveTime::from_num_seconds_from_midnight_opt(secs as u32, rem as u32 * 1_000).unwrap()
+        // A negative `micros` yields a negative `secs`/`rem`; `u32::try_from` rejects it instead of
+        // wrapping. `rem` is in `0..1_000_000`, so `* 1_000` (nanoseconds) cannot overflow `u32`.
+        let secs = u32::try_from(secs).ok()?;
+        let nanos = u32::try_from(rem).ok()? * 1_000;
+        NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
     }
 }
 
@@ -74,9 +85,13 @@ pub(crate) mod timestamp {
         time.and_utc().timestamp_micros()
     }
 
-    pub(crate) fn microseconds_to_datetime(micros: i64) -> NaiveDateTime {
-        // This shouldn't fail until the year 262000
-        DateTime::from_timestamp_micros(micros).unwrap().naive_utc()
+    /// Converts a microsecond `Timestamp` value into a [`NaiveDateTime`].
+    ///
+    /// Returns `None` for a value outside chrono's representable range. This shouldn't happen until
+    /// roughly the year 262000, but the value originates from on-disk bytes, so a corrupt/hostile
+    /// stored value must produce a placeholder via the caller rather than a panic.
+    pub(crate) fn microseconds_to_datetime(micros: i64) -> Option<NaiveDateTime> {
+        Some(DateTime::from_timestamp_micros(micros)?.naive_utc())
     }
 
     pub(crate) fn nanoseconds_to_datetime(nanos: i64) -> NaiveDateTime {
@@ -91,15 +106,28 @@ pub(crate) mod timestamptz {
         time.timestamp_micros()
     }
 
-    pub(crate) fn microseconds_to_datetimetz(micros: i64) -> DateTime<Utc> {
-        let (secs, rem) = (micros / 1_000_000, micros % 1_000_000);
-
-        DateTime::from_timestamp(secs, rem as u32 * 1_000).unwrap()
+    /// Converts a microsecond `Timestamptz` value into a UTC [`DateTime`].
+    ///
+    /// Returns `None` for a value outside chrono's representable range. The previous `rem as u32`
+    /// cast wrapped a negative sub-second remainder into a giant nanosecond count (which then
+    /// failed the unwrap and panicked); here `from_timestamp` is fed a normalized non-negative
+    /// remainder and the `None` is propagated instead of unwrapped.
+    pub(crate) fn microseconds_to_datetimetz(micros: i64) -> Option<DateTime<Utc>> {
+        // Euclidean division keeps the remainder in `0..1_000_000` even for negative inputs, so the
+        // `secs`/`nanos` pair is the correct (floored) split and the `u32` nanos cannot overflow.
+        let secs = micros.div_euclid(1_000_000);
+        let nanos = micros.rem_euclid(1_000_000) as u32 * 1_000;
+        DateTime::from_timestamp(secs, nanos)
     }
 
-    pub(crate) fn nanoseconds_to_datetimetz(nanos: i64) -> DateTime<Utc> {
-        let (secs, rem) = (nanos / 1_000_000_000, nanos % 1_000_000_000);
-
-        DateTime::from_timestamp(secs, rem as u32).unwrap()
+    /// Converts a nanosecond `TimestamptzNs` value into a UTC [`DateTime`].
+    ///
+    /// Returns `None` for a value outside chrono's representable range. As with the microsecond
+    /// converter, euclidean division yields a non-negative sub-second remainder so the `u32` nanos
+    /// cast is safe and a negative input no longer wraps into a panic.
+    pub(crate) fn nanoseconds_to_datetimetz(nanos: i64) -> Option<DateTime<Utc>> {
+        let secs = nanos.div_euclid(1_000_000_000);
+        let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+        DateTime::from_timestamp(secs, sub_nanos)
     }
 }
