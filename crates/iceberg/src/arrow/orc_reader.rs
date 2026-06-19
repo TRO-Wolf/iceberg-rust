@@ -80,10 +80,10 @@
 //!   `RecordBatchTransformer`'s job (as for the Parquet/Avro paths); this reader only supplies file
 //!   columns and optional-missing nulls.
 
-// U2 (scan-path wiring) consumes `read_orc_data_file`; `read_orc_data_bytes` (the sync core) is the
-// offline-test entry point. Both stay `pub(crate)`; the narrow `dead_code` allow mirrors the Avro
-// reader's pre-U2 stance.
-#![allow(dead_code)]
+// U2 (scan-path wiring) is DONE: `arrow::reader`'s `process_orc_file_scan_task` consumes
+// `read_orc_data_file` in the production scan path, and `read_orc_data_bytes` (the sync core) is
+// called both by `read_orc_data_file` and by the offline tests. Both stay `pub(crate)`; this file
+// carries no module-level `dead_code` allow — the compiler is left to flag any genuinely-dead item.
 
 use std::collections::HashMap;
 use std::sync::Arc;

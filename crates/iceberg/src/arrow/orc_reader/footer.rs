@@ -114,7 +114,9 @@ pub(crate) struct OrcFileType {
     /// Decimal scale (0 if not a decimal).
     pub(crate) scale: u32,
     /// The `iceberg.required` attribute, if present (informational; the projection drives off the
-    /// *expected* schema's required flag, matching Java).
+    /// *expected* schema's required flag, matching Java). Parsed and asserted by `footer_tests`,
+    /// but never read by the production projection — hence the targeted `dead_code` allow.
+    #[allow(dead_code)]
     pub(crate) required: Option<bool>,
 }
 

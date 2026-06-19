@@ -86,13 +86,13 @@
 //! - The `variant` type read is deferred (the Avro→Iceberg schema converter rejects variant on the
 //!   read path anyway).
 
-// U2 (scan-path wiring) consumes `read_avro_data_file` from `arrow::reader`'s
-// `process_avro_file_scan_task`. `read_avro_data_bytes` (the sync core) + `ReadPlanInput`'s
-// `id_to_constant` rung remain exercised only by the offline tests below — the scan supplies its
-// partition constants through the `RecordBatchTransformer` (as the Parquet path does), not through
-// the reader's id→constant map — so the bytes entry point and that field keep a narrow `dead_code`
-// allow rather than the whole-module blanket the pre-U2 core carried.
-#![allow(dead_code)]
+// U2 (scan-path wiring) is DONE: `arrow::reader`'s `process_avro_file_scan_task` consumes
+// `read_avro_data_file` in the production scan path, and `read_avro_data_bytes` (the sync core) is
+// called both by `read_avro_data_file` and by the offline tests. `ReadPlanInput`'s `id_to_constant`
+// rung is exercised only by the offline tests below — the scan supplies its partition constants
+// through the `RecordBatchTransformer` (as the Parquet path does), not through the reader's
+// id→constant map. This file carries no module-level `dead_code` allow; any genuinely-dead item is
+// flagged at the item with a targeted allow and a one-line reason.
 
 use std::collections::HashMap;
 use std::io::Cursor;
