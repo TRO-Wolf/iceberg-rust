@@ -163,15 +163,15 @@ DATA-file READ** (landed + Java→Rust interop-proven — rows 116/117; the WRIT
 Per-row status + residue: the matrix.
 
 **Missing ❌:** ORC/Avro DATA-file **write** (READ landed 🟡 — rows 116/117), `geometry`/`geography`
-types, encryption, `SessionCatalog` (assessed-deferred dead surface — row 126), `LockManager` (ZERO
-code), the maintenance residue (`SnapshotTable`/`MigrateTable` only — they need external sources), and
+types, encryption, `SessionCatalog` (assessed-deferred dead surface — row 126), the maintenance
+residue (`SnapshotTable`/`MigrateTable` only — they need external sources), and
 `commitTransaction(List<TableCommit>)` (REST multi-table commit, split out). *(No longer missing —
 flipped 2026-06-17: `RewritePositionDeleteFiles` ✅ (134); `ComputePartitionStats` action +
 `UpdatePartitionStatistics` ✅ (138); the `unknown` V3 type ✅ (89); `validateAppendOnly` ✅ (144); the
 Catalog accessors `name()`/`properties()`/`invalidate*` 🟡 (149); the `conflictDetectionFilter`-on-
 `DeleteFiles`/`ReplacePartitions` items are VOID — `javap`-proven not in Java 1.10.0. And flipped
 2026-06-19: `BatchScan` ✅ (122); ORC+Avro DATA **read** 🟡 (116/117); `RewriteTablePath` 🟡 built+interop
-(137); events/listeners ✅ (142). See GAP_MATRIX.)*
+(137); events/listeners ✅ (142); `LockManager` ❌→🟡 in-memory impl + tests (129). See GAP_MATRIX.)*
 
 **Row-by-row truth:** [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
 
@@ -280,12 +280,12 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 - **Goal:** view support + catalog completeness, Glue + S3 Tables first.
 - **Gates on:** Phase 1.
 - **Key deliverables:** `ViewCatalog` + view operations (create/replace/drop/list, view
-  versions/representations) on Glue + S3 Tables, then REST; `SessionCatalog`; `LockManager` (from
-  scratch — ZERO code exists today, ❌ not "in progress"); Glue + S3 Tables hardening.
+  versions/representations) on Glue + S3 Tables, then REST; `SessionCatalog`; `LockManager`
+  (in-memory impl + tests landed 2026-06-19; JVM-conformance interop is the ✅ gate); Glue + S3 Tables hardening.
 - **Where it stands:** view ops landed + interop'd on memory + REST + SQL (I2); Glue + S3 Tables expose
   `FeatureUnsupported` view stubs, which is PARITY-CORRECT, not a gap (verified 2026-06-17 — Java
   `GlueCatalog` does not implement `ViewCatalog` (issue #12488, an OPEN feature request) and the S3
-  Tables service has no view API; rows 124/125). `LockManager` is ❌ (ZERO code); `SessionCatalog` is ❌
+  Tables service has no view API; rows 124/125). `LockManager`: in-memory impl + tests landed (row 129 — see GAP_MATRIX); `SessionCatalog` is ❌
   but assessed-deferred as a dead surface (row 126 — revisit only for a multi-tenant single-instance
   use-case). Per-row status: GAP_MATRIX.
 - **Exit criteria:** view lifecycle works on the priority catalogs with interop tests; session/lock gaps
@@ -348,7 +348,7 @@ format-sensitive work front-loads into the frontier window; well-templated bread
 4. **Scan completion:** CDC-merge (row-level), split planning (row 146), strict-evaluator
    completion (`BatchScan` ✅ row 122 and incremental-scan interop DONE — ✅ rows 120/121, 2026-06-17;
    mostly templated → Opus).
-5. **`LockManager`** (ZERO code — the genuine remaining catalog CRUD work) + the `ViewCatalog`
+5. **`LockManager`** (in-memory impl + tests landed 2026-06-19 — JVM-conformance interop is the ✅ gate) + the `ViewCatalog`
    byte-exact round-trip residue (row 125). Glue/S3 Tables view ops are parity-correct-unsupported
    (rows 124/125, NOT owed); `SessionCatalog` is assessed-deferred as a dead surface (row 126).
 6. **Encryption** (`EncryptionManager`, KMS, encrypted FileIO / manifests — frontier-grade format

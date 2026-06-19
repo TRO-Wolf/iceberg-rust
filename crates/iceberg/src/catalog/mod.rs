@@ -17,6 +17,7 @@
 
 //! Catalog API for Apache Iceberg
 
+pub mod lock;
 pub mod memory;
 mod metadata_location;
 
@@ -30,6 +31,7 @@ use std::sync::Arc;
 
 use _serde::{deserialize_snapshot, serialize_snapshot};
 use async_trait::async_trait;
+pub use lock::{InMemoryLockManager, LockConfig, LockManager, LockManagers};
 pub use memory::MemoryCatalog;
 pub use metadata_location::*;
 #[cfg(test)]
