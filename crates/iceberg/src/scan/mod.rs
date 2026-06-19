@@ -43,6 +43,7 @@ pub use task_group::*;
 
 use crate::arrow::ArrowReaderBuilder;
 use crate::delete_file_index::DeleteFileIndex;
+use crate::events::{self, ScanEvent};
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
@@ -344,6 +345,11 @@ impl<'a> TableScanBuilder<'a> {
     pub fn build(self) -> Result<TableScan> {
         let split_config = self.resolve_split_config();
 
+        // Capture the table name once, for the `ScanEvent` fired at plan time (Java
+        // `SnapshotScan` reads `table().name()`). Captured here so both the snapshotless and
+        // the normal `TableScan` carry it.
+        let table_name = self.table.identifier().to_string();
+
         // Resolve a branch/tag reference (`use_ref`) to a concrete snapshot id,
         // honoring BOTH selectors (Java `SnapshotScan.useRef` L116-128):
         //   - a ref AND an explicit snapshot id are contradictory selectors
@@ -399,6 +405,7 @@ impl<'a> TableScanBuilder<'a> {
                         column_names: self.column_names,
                         file_io: self.table.file_io().clone(),
                         plan_context: None,
+                        table_name,
                         concurrency_limit_data_files: self.concurrency_limit_data_files,
                         concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
@@ -525,6 +532,7 @@ impl<'a> TableScanBuilder<'a> {
             column_names: self.column_names,
             file_io: self.table.file_io().clone(),
             plan_context: Some(plan_context),
+            table_name,
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
@@ -553,6 +561,11 @@ pub struct TableScan {
     ///
     /// If this is None, then the scan contains no rows.
     plan_context: Option<PlanContext>,
+    /// The fully-qualified table name (`identifier().to_string()`), captured at
+    /// [`build`](TableScanBuilder::build) time. Threaded in solely so [`plan_files`] can
+    /// construct the [`ScanEvent`] without re-deriving it (Java `SnapshotScan` reads
+    /// `table().name()`). `TableScan` no longer holds the `Table` itself.
+    table_name: String,
     batch_size: Option<usize>,
     file_io: FileIO,
     column_names: Option<Vec<String>>,
@@ -625,6 +638,23 @@ impl TableScan {
         let Some(plan_context) = self.plan_context.as_ref() else {
             return Ok(Box::pin(futures::stream::empty()));
         };
+
+        // Fire the `ScanEvent` (Java `SnapshotScan.planFiles` fires it when `snapshot != null`,
+        // before `doPlanFiles`). Placed AFTER the snapshotless guard above, so an empty scan
+        // fires nothing. The filter is the UNBOUND row filter (Java fires `context.rowFilter()`,
+        // the unbound expression — NOT the snapshot-bound one), defaulting to `AlwaysTrue` when
+        // the scan has no filter. Like Java, the call is unguarded: a panicking listener
+        // propagates out of `plan_files`.
+        events::notify_all(&ScanEvent::new(
+            self.table_name.clone(),
+            plan_context.snapshot.snapshot_id(),
+            plan_context
+                .predicate
+                .as_ref()
+                .map(|p| p.as_ref().clone())
+                .unwrap_or(Predicate::AlwaysTrue),
+            plan_context.snapshot_schema.clone(),
+        ));
 
         // Start the planning timer when (and only when) metrics are enabled — Java
         // `SnapshotScan.planFiles` starts `scanMetrics().totalPlanningDuration()` before
@@ -5083,6 +5113,159 @@ pub mod tests {
             snapshot.snapshot_id(),
             TAG_TEST_SNAPSHOT_ID,
             "use_ref(main) must neither conflict nor override the earlier pin"
+        );
+    }
+
+    // ===== Event listeners: a REAL scan genuinely fires a `ScanEvent` =====
+
+    /// A `ScanEvent` listener that records every event into a shared sink.
+    struct ScanEventRecorder {
+        sink: Arc<std::sync::Mutex<Vec<crate::events::ScanEvent>>>,
+    }
+
+    impl crate::events::Listener<crate::events::ScanEvent> for ScanEventRecorder {
+        fn notify(&self, event: &crate::events::ScanEvent) {
+            self.sink.lock().unwrap().push(event.clone());
+        }
+    }
+
+    /// Risk: the `ScanEvent` emit is wired but never actually fires on a real plan (a registry
+    /// nothing fires is only a partial port). Pins that running `plan_files` over a REAL fixture
+    /// table fires exactly one `ScanEvent` carrying the scanned snapshot id, the UNBOUND filter,
+    /// the table name, and the projection schema id.
+    #[tokio::test]
+    async fn test_real_scan_fires_scan_event() {
+        let _guard = crate::events::test_support::lock();
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::events::register::<crate::events::ScanEvent>(Arc::new(ScanEventRecorder {
+            sink: sink.clone(),
+        }));
+
+        let predicate = Reference::new("y").greater_than(Datum::long(3));
+        let scan = fixture
+            .table
+            .scan()
+            .with_filter(predicate.clone())
+            .select(["x", "y"])
+            .build()
+            .unwrap();
+        let _tasks: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let events = sink.lock().unwrap();
+        assert_eq!(events.len(), 1, "a real scan fires exactly one ScanEvent");
+        let event = &events[0];
+        assert_eq!(event.snapshot_id(), CURRENT_SNAPSHOT_ID);
+        assert_eq!(event.table_name(), "db.table1");
+        // The filter is the UNBOUND row filter (after the builder's `rewrite_not` normalization),
+        // NOT the snapshot-bound predicate.
+        assert_eq!(event.filter(), &predicate);
+        assert_eq!(
+            event.projection().schema_id(),
+            fixture
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .schema(fixture.table.metadata())
+                .unwrap()
+                .schema_id()
+        );
+    }
+
+    /// Risk: a scan with NO filter fires an event whose filter is something other than the
+    /// `AlwaysTrue` default (Java `BaseScan.filter()` defaults to `alwaysTrue`). Pins the default.
+    #[tokio::test]
+    async fn test_real_scan_no_filter_fires_always_true() {
+        let _guard = crate::events::test_support::lock();
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::events::register::<crate::events::ScanEvent>(Arc::new(ScanEventRecorder {
+            sink: sink.clone(),
+        }));
+
+        let scan = fixture.table.scan().build().unwrap();
+        let _tasks: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let events = sink.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].filter(), &Predicate::AlwaysTrue);
+    }
+
+    /// Risk: an EMPTY (snapshotless) scan still fires a `ScanEvent`, diverging from Java
+    /// `SnapshotScan.planFiles`, which returns empty BEFORE firing when there is no snapshot.
+    /// Pins that a snapshotless scan fires NOTHING.
+    #[tokio::test]
+    async fn test_empty_scan_fires_no_event() {
+        let _guard = crate::events::test_support::lock();
+
+        let fixture = TableTestFixture::new_empty();
+
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::events::register::<crate::events::ScanEvent>(Arc::new(ScanEventRecorder {
+            sink: sink.clone(),
+        }));
+
+        let scan = fixture.table.scan().build().unwrap();
+        let tasks: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(tasks.is_empty(), "snapshotless scan yields no tasks");
+
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "a snapshotless scan must fire no ScanEvent"
+        );
+    }
+
+    /// Risk: the scan emit silently swallows a panicking listener (Java `SnapshotScan.planFiles`
+    /// has NO guard — a throwing listener propagates). Pins that a panicking scan listener
+    /// propagates out of `plan_files`.
+    #[tokio::test]
+    async fn test_scan_listener_panic_propagates() {
+        let _guard = crate::events::test_support::lock();
+
+        struct Panicker;
+        impl crate::events::Listener<crate::events::ScanEvent> for Panicker {
+            fn notify(&self, _event: &crate::events::ScanEvent) {
+                panic!("scan listener boom");
+            }
+        }
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        crate::events::register::<crate::events::ScanEvent>(Arc::new(Panicker));
+
+        let scan = fixture.table.scan().build().unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            let _ = scan.plan_files().await;
+        });
+        let outcome = futures::FutureExt::catch_unwind(result).await;
+        assert!(
+            outcome.is_err(),
+            "a panicking scan listener must propagate out of plan_files (Java has no guard)"
         );
     }
 }
