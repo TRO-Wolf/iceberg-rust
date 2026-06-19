@@ -49,10 +49,12 @@
 //!   `SnapshotProducer.notifyListeners` wraps the call in a best-effort try/catch); the *scan*
 //!   emit site does not isolate, matching Java `SnapshotScan.planFiles`, which fires inside the
 //!   planning call with no guard.
-//! - **No logging facade.** Java's commit-site catch logs a `LOG.warn`. The `iceberg` crate has
-//!   no logging-facade dependency (adding one needs approval — see the `metrics` module's same
-//!   deferral), so the best-effort isolation swallows the panic silently. Wiring a `tracing::warn`
-//!   is a trivial follow-up once the dependency is approved.
+//! - **Commit-site panic is logged, not swallowed.** Java's commit-site catch logs a `LOG.warn`.
+//!   The commit emit site (`Transaction::do_commit`) mirrors that: when a listener panics, the
+//!   `catch_unwind` contains it (the committed transaction still returns `Ok`) and a
+//!   `tracing::warn!` records the failure with the snapshot id / sequence number / operation /
+//!   table name. The panic payload itself is never logged (it could carry caller data), so the
+//!   message is generic and only the non-sensitive identifiers are structured fields.
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;

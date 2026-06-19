@@ -457,9 +457,9 @@ impl Transaction {
         // Notify listeners ONLY after the commit succeeded (Java fires from `commit()` after
         // `ops.commit`). BEST-EFFORT: a notification failure must NEVER fail a committed
         // transaction (Java wraps the call in a try/catch that only logs). Each per-snapshot
-        // dispatch is isolated with `catch_unwind`, so a panicking listener is swallowed and the
-        // commit still returns `Ok`. (No logging facade in this crate yet — a `tracing::warn`
-        // belongs here once the dependency is approved; see the `events` module docs.)
+        // dispatch is isolated with `catch_unwind`, so a panicking listener is contained and the
+        // commit still returns `Ok` — but the panic is NOT swallowed silently: a `tracing::warn`
+        // records it (Java's best-effort `LOG.warn`). See the `events` module docs.
         for snapshot in &added_snapshots {
             let operation = snapshot.summary().operation.as_str().to_string();
             // Java's `CreateSnapshotEvent.summary()` is the in-memory `snapshot.summary()` map,
@@ -478,9 +478,23 @@ impl Transaction {
                 snapshot.sequence_number(),
                 summary,
             );
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 events::notify_all(&event);
             }));
+            if dispatch.is_err() {
+                // A listener panicked. The commit already succeeded and MUST still return `Ok`
+                // (Java's best-effort try/catch); we only record the failure. The panic payload is
+                // deliberately NOT logged — it could carry caller data — so the message is generic
+                // and the structured fields are the (non-sensitive) snapshot identifiers.
+                tracing::warn!(
+                    snapshot_id = snapshot.snapshot_id(),
+                    sequence_number = snapshot.sequence_number(),
+                    operation = %event.operation(),
+                    table_name = %table_name,
+                    "a listener panicked during CreateSnapshotEvent dispatch; the commit still \
+                     succeeded (best-effort notification, panic contained)"
+                );
+            }
         }
 
         Ok(committed)
@@ -883,7 +897,13 @@ mod test_create_snapshot_event {
     //! A REAL commit genuinely fires a `CreateSnapshotEvent` — and only after success, only per
     //! added snapshot, and best-effort (a panicking listener never fails the commit).
 
+    use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
 
     use crate::events::{self, CreateSnapshotEvent, Listener};
     use crate::memory::tests::new_memory_catalog;
@@ -892,6 +912,35 @@ mod test_create_snapshot_event {
     };
     use crate::transaction::tests::make_v2_minimal_table_in_catalog;
     use crate::transaction::{ApplyTransactionAction, Transaction};
+
+    /// A `tracing` [`Layer`] that formats each event (message + fields) into one line and pushes
+    /// it onto a shared sink, so a test can assert on emitted log events.
+    struct CapturingLayer {
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Formats an event's message and structured fields into a single string.
+    #[derive(Default)]
+    struct StringVisitor(String);
+
+    impl Visit for StringVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    impl<S> Layer<S> for CapturingLayer
+    where S: Subscriber + for<'a> LookupSpan<'a>
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = StringVisitor::default();
+            event.record(&mut visitor);
+            self.sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(visitor.0);
+        }
+    }
 
     fn file_with_rows(record_count: u64) -> DataFile {
         DataFileBuilder::default()
@@ -988,7 +1037,10 @@ mod test_create_snapshot_event {
 
     /// Risk: a panicking commit listener turns a SUCCESSFUL commit into an `Err` (or aborts the
     /// process), diverging from Java's best-effort `try/catch`. Pins that the commit still
-    /// returns `Ok` and the snapshot is durably committed despite the panic.
+    /// returns `Ok` and the snapshot is durably committed despite the panic — AND that the
+    /// contained panic is NOT swallowed silently: a `tracing::warn` records it (the QUAL-01
+    /// Site-1 fix). Removing the `warn!` in `do_commit` makes the log-assertion below fail, so
+    /// the assertion is non-vacuous.
     #[tokio::test]
     async fn test_panicking_commit_listener_does_not_fail_commit() {
         let _guard = events::test_support::lock();
@@ -1004,15 +1056,46 @@ mod test_create_snapshot_event {
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
         events::register::<CreateSnapshotEvent>(Arc::new(Panicker));
 
-        let tx = Transaction::new(&table);
-        let action = tx.fast_append().add_data_files(vec![file_with_rows(7)]);
-        let tx = action.apply(tx).unwrap();
-        let committed = tx
-            .commit(&catalog)
-            .await
-            .expect("a panicking listener must NOT fail a successful commit");
+        // Capture emitted log events for the duration of this commit (scoped to this thread).
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer { sink: logs.clone() });
+        let (captured, snapshot_id) = {
+            let _log_guard = tracing::subscriber::set_default(subscriber);
 
-        // The snapshot is durably committed despite the listener panic.
-        assert!(committed.metadata().current_snapshot().is_some());
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(vec![file_with_rows(7)]);
+            let tx = action.apply(tx).unwrap();
+            let committed = tx
+                .commit(&catalog)
+                .await
+                .expect("a panicking listener must NOT fail a successful commit");
+
+            // The snapshot is durably committed despite the listener panic.
+            let snapshot = committed
+                .metadata()
+                .current_snapshot()
+                .expect("a snapshot was committed")
+                .snapshot_id();
+
+            (
+                logs.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+                snapshot,
+            )
+        };
+
+        assert!(
+            captured.iter().any(|line| {
+                line.contains("a listener panicked during CreateSnapshotEvent dispatch")
+                    && line.contains(&format!("snapshot_id={snapshot_id}"))
+            }),
+            "the contained listener panic must be warn-logged with the snapshot id: {captured:?}"
+        );
+        // The panic payload must NOT be logged (it could carry caller data).
+        assert!(
+            !captured
+                .iter()
+                .any(|line| line.contains("commit listener boom")),
+            "the panic payload must not be logged: {captured:?}"
+        );
     }
 }
