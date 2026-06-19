@@ -42,17 +42,19 @@
 
 ## Audit provenance
 
-- **Rust base audited:** owned fork on upstream **`iceberg` 0.9.1** (datafusion 52.2, arrow 57.1,
-  parquet 57.1, MSRV 1.92), **re-audited 2026-06-07** after the Phase 0 sync, **resynced to reality
-  2026-06-13** (post R1/R2/R3): status flips (`merge_append` 🟡→✅ data-level interop both directions;
+- **Rust base audited:** owned fork on upstream **`iceberg` 0.9.1** (datafusion 52.2, arrow 57.3,
+  parquet 57.3 — `orc-rust` 0.7 unified the patch level, #95; MSRV 1.92), **re-audited 2026-06-07** after
+  the Phase 0 sync, **resynced to reality 2026-06-13** (post R1/R2/R3), **last refreshed 2026-06-19**
+  (audit P1 panic-hardening + QUAL-01 tracing landed; the `BatchScan` ✅, ORC+Avro READ 🟡,
+  `RewriteTablePath` 🟡, and events ✅ rows are reflected): status flips (`merge_append` 🟡→✅ data-level interop both directions;
   `LockManager` 🟡→❌ ZERO code; `Catalogs` umbrella 🟡 — Glue/S3Tables view ops + Catalog accessors
   residue surfaced), partition-stats de-dup (one home on the Maintenance row), and 10 new rows for
   previously-untracked Java capabilities (conflict-detection/`caseSensitive` builders,
   `deleteFromRowFilter`, `ScanTaskGroup`/`planTasks`, `ExpressionParser` JSON, aggregate expressions,
   Catalog accessors, `RewriteFiles` add-delete, `ActionsProvider`+actions, a consolidated LOW backlog).
-  Test count measured 2026-06-13: **2,238** `#[test]`/`#[tokio::test]` in `crates/iceberg/src`, **2,332**
-  incl. `crates/iceberg/tests`, **≈2,721** workspace-wide (`grep -rho '#\[\(tokio::\)\?test\]'`). Source
-  of truth: `crates/iceberg/src/{spec,expr,scan,transaction,writer,arrow,io,inspect,puffin,catalog,maintenance,variant}`
+  Test count measured 2026-06-19: **2,593** `#[test]`/`#[tokio::test]` in `crates/iceberg/src`, **2,721**
+  incl. `crates/iceberg/tests`, **≈3,125** workspace-wide (`grep -rho '#\[\(tokio::\)\?test\]'`). Source
+  of truth: `crates/iceberg/src/{spec,expr,scan,transaction,writer,arrow,io,inspect,puffin,catalog,maintenance,variant,events,metrics}`
   plus the `crates/storage/opendal` FileIO crate and `crates/catalog/{glue,s3tables}`.
 - **Java reference:** `apache/iceberg` `main`, modules `api/` + `core/` + `data/` + `orc/` +
   `parquet/` + `arrow/`.
