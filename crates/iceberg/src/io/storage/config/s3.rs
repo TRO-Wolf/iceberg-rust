@@ -20,12 +20,20 @@
 //! This module provides configuration constants and types for Amazon S3 storage.
 //! These are based on the [Iceberg S3 FileIO configuration](https://py.iceberg.apache.org/configuration/#s3).
 
+use std::fmt::{self, Debug, Formatter};
+
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use super::StorageConfig;
 use crate::io::is_truthy;
 use crate::{Error, ErrorKind, Result};
+
+/// Renders an optional secret for `Debug`: `Some(_)` becomes the redaction marker
+/// `"***"` (preserving presence) and `None` stays `None` (the value is never printed).
+fn redact_secret(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "***")
+}
 
 /// S3 endpoint URL.
 pub const S3_ENDPOINT: &str = "s3.endpoint";
@@ -70,7 +78,7 @@ pub const S3_DISABLE_CONFIG_LOAD: &str = "s3.disable-config-load";
 /// This struct contains all the configuration options for connecting to Amazon S3.
 /// Use the builder pattern via `S3Config::builder()` to construct instances.
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
 pub struct S3Config {
     /// S3 endpoint URL.
     #[builder(default, setter(strip_option, into))]
@@ -123,6 +131,45 @@ pub struct S3Config {
     /// Disable config load.
     #[builder(default)]
     pub disable_config_load: bool,
+}
+
+impl Debug for S3Config {
+    /// Hand-written so the secret fields (`secret_access_key`, `session_token`,
+    /// `server_side_encryption_customer_key`, `server_side_encryption_customer_key_md5`)
+    /// are redacted: their presence is preserved as `"***"` but the value is never printed.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &redact_secret(&self.secret_access_key))
+            .field("session_token", &redact_secret(&self.session_token))
+            .field("region", &self.region)
+            .field("enable_virtual_host_style", &self.enable_virtual_host_style)
+            .field("server_side_encryption", &self.server_side_encryption)
+            .field(
+                "server_side_encryption_aws_kms_key_id",
+                &self.server_side_encryption_aws_kms_key_id,
+            )
+            .field(
+                "server_side_encryption_customer_algorithm",
+                &self.server_side_encryption_customer_algorithm,
+            )
+            .field(
+                "server_side_encryption_customer_key",
+                &redact_secret(&self.server_side_encryption_customer_key),
+            )
+            .field(
+                "server_side_encryption_customer_key_md5",
+                &redact_secret(&self.server_side_encryption_customer_key_md5),
+            )
+            .field("role_arn", &self.role_arn)
+            .field("external_id", &self.external_id)
+            .field("role_session_name", &self.role_session_name)
+            .field("allow_anonymous", &self.allow_anonymous)
+            .field("disable_ec2_metadata", &self.disable_ec2_metadata)
+            .field("disable_config_load", &self.disable_config_load)
+            .finish()
+    }
 }
 
 impl TryFrom<&StorageConfig> for S3Config {
@@ -299,5 +346,33 @@ mod tests {
         let s3_config = S3Config::try_from(&storage_config).unwrap();
 
         assert!(s3_config.allow_anonymous);
+    }
+
+    #[test]
+    fn test_s3_config_debug_redacts_secrets() {
+        let secret = "SECRET_VALUE_DO_NOT_LEAK";
+        let config = S3Config::builder()
+            .region("us-east-1")
+            .access_key_id("AKIA_VISIBLE_ID")
+            .secret_access_key(secret)
+            .session_token(secret)
+            .server_side_encryption_customer_key(secret)
+            .server_side_encryption_customer_key_md5(secret)
+            .build();
+
+        let debug = format!("{config:?}");
+
+        // No secret field value may appear.
+        assert!(
+            !debug.contains(secret),
+            "Debug output leaked a secret value: {debug}"
+        );
+        // Presence of each secret is still signalled via the redaction marker.
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        // Non-secret fields stay visible for diagnostics.
+        assert!(
+            debug.contains("us-east-1") && debug.contains("AKIA_VISIBLE_ID"),
+            "Debug dropped non-secret fields: {debug}"
+        );
     }
 }
