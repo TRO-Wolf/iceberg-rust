@@ -20,12 +20,20 @@
 //! This module provides configuration constants and types for Google Cloud Storage.
 //! Reference: https://github.com/apache/iceberg/blob/main/gcp/src/main/java/org/apache/iceberg/gcp/GCPProperties.java
 
+use std::fmt::{self, Debug, Formatter};
+
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use super::StorageConfig;
 use crate::Result;
 use crate::io::is_truthy;
+
+/// Renders an optional secret for `Debug`: `Some(_)` becomes the redaction marker
+/// `"***"` (preserving presence) and `None` stays `None` (the value is never printed).
+fn redact_secret(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "***")
+}
 
 /// Google Cloud Project ID.
 pub const GCS_PROJECT_ID: &str = "gcs.project-id";
@@ -53,7 +61,7 @@ pub const GCS_DISABLE_CONFIG_LOAD: &str = "gcs.disable-config-load";
 /// This struct contains all the configuration options for connecting to Google Cloud Storage.
 /// Use the builder pattern via `GcsConfig::builder()` to construct instances.
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
 pub struct GcsConfig {
     /// Google Cloud Project ID.
     #[builder(default, setter(strip_option, into))]
@@ -79,6 +87,23 @@ pub struct GcsConfig {
     /// Disable config load.
     #[builder(default)]
     pub disable_config_load: bool,
+}
+
+impl Debug for GcsConfig {
+    /// Hand-written so the secret fields (`credential`, `token`) are redacted:
+    /// their presence is preserved as `"***"` but the value is never printed.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsConfig")
+            .field("project_id", &self.project_id)
+            .field("endpoint", &self.endpoint)
+            .field("user_project", &self.user_project)
+            .field("credential", &redact_secret(&self.credential))
+            .field("token", &redact_secret(&self.token))
+            .field("allow_anonymous", &self.allow_anonymous)
+            .field("disable_vm_metadata", &self.disable_vm_metadata)
+            .field("disable_config_load", &self.disable_config_load)
+            .finish()
+    }
 }
 
 impl TryFrom<&StorageConfig> for GcsConfig {
@@ -185,5 +210,27 @@ mod tests {
 
         assert!(gcs_config.allow_anonymous);
         assert!(!gcs_config.disable_vm_metadata);
+    }
+
+    #[test]
+    fn test_gcs_config_debug_redacts_secrets() {
+        let secret = "SECRET_VALUE_DO_NOT_LEAK";
+        let config = GcsConfig::builder()
+            .project_id("my-project")
+            .credential(secret)
+            .token(secret)
+            .build();
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(secret),
+            "Debug output leaked a secret value: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        assert!(
+            debug.contains("my-project"),
+            "Debug dropped non-secret fields: {debug}"
+        );
     }
 }

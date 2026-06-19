@@ -19,11 +19,19 @@
 //!
 //! This module provides configuration constants and types for Alibaba Cloud OSS storage.
 
+use std::fmt::{self, Debug, Formatter};
+
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use super::StorageConfig;
 use crate::Result;
+
+/// Renders an optional secret for `Debug`: `Some(_)` becomes the redaction marker
+/// `"***"` (preserving presence) and `None` stays `None` (the value is never printed).
+fn redact_secret(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "***")
+}
 
 /// Aliyun OSS endpoint.
 pub const OSS_ENDPOINT: &str = "oss.endpoint";
@@ -37,7 +45,7 @@ pub const OSS_ACCESS_KEY_SECRET: &str = "oss.access-key-secret";
 /// This struct contains all the configuration options for connecting to Alibaba Cloud OSS.
 /// Use the builder pattern via `OssConfig::builder()` to construct instances.
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
 pub struct OssConfig {
     /// OSS endpoint URL.
     #[builder(default, setter(strip_option, into))]
@@ -48,6 +56,19 @@ pub struct OssConfig {
     /// OSS access key secret.
     #[builder(default, setter(strip_option, into))]
     pub access_key_secret: Option<String>,
+}
+
+impl Debug for OssConfig {
+    /// Hand-written so the secret field (`access_key_secret`) is redacted: its presence
+    /// is preserved as `"***"` but the value is never printed. `access_key_id` is an ID,
+    /// not a secret, so it stays visible.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OssConfig")
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field("access_key_secret", &redact_secret(&self.access_key_secret))
+            .finish()
+    }
 }
 
 impl TryFrom<&StorageConfig> for OssConfig {
@@ -120,5 +141,28 @@ mod tests {
         assert_eq!(oss_config.endpoint, None);
         assert_eq!(oss_config.access_key_id, None);
         assert_eq!(oss_config.access_key_secret, None);
+    }
+
+    #[test]
+    fn test_oss_config_debug_redacts_secrets() {
+        let secret = "SECRET_VALUE_DO_NOT_LEAK";
+        let config = OssConfig::builder()
+            .endpoint("https://oss-cn-hangzhou.aliyuncs.com")
+            .access_key_id("VISIBLE_KEY_ID")
+            .access_key_secret(secret)
+            .build();
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(secret),
+            "Debug output leaked a secret value: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        // access_key_id is an ID, not a secret, and must stay visible.
+        assert!(
+            debug.contains("VISIBLE_KEY_ID"),
+            "Debug dropped non-secret fields: {debug}"
+        );
     }
 }

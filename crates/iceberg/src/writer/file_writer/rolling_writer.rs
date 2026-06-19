@@ -243,15 +243,29 @@ impl<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> CurrentFi
     for RollingFileWriter<B, L, F>
 {
     fn current_file_path(&self) -> String {
-        self.inner.as_ref().unwrap().current_file_path()
+        // No file has been started yet (no record written): report an empty path
+        // rather than panicking on a status query against a freshly-built writer.
+        self.inner
+            .as_ref()
+            .map(|inner| inner.current_file_path())
+            .unwrap_or_default()
     }
 
     fn current_row_num(&self) -> usize {
-        self.inner.as_ref().unwrap().current_row_num()
+        // No file started yet -> zero rows written.
+        self.inner
+            .as_ref()
+            .map(|inner| inner.current_row_num())
+            .unwrap_or(0)
     }
 
     fn current_written_size(&self) -> usize {
-        self.inner.as_ref().unwrap().current_written_size()
+        // No file started yet -> zero bytes written. This also keeps `should_roll`
+        // correct before the first write (a fresh writer never needs to roll).
+        self.inner
+            .as_ref()
+            .map(|inner| inner.current_written_size())
+            .unwrap_or(0)
     }
 }
 
@@ -355,6 +369,39 @@ mod tests {
 
         // Verify file content
         check_parquet_data_file(&file_io, &data_files[0], &batch).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rolling_writer_status_before_first_write() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = make_test_schema()?;
+        let parquet_writer_builder =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), Arc::new(schema));
+
+        let rolling_file_writer_builder = RollingFileWriterBuilder::new(
+            parquet_writer_builder,
+            1024 * 1024,
+            file_io,
+            location_gen,
+            file_name_gen,
+        );
+
+        // Fresh writer: `inner` is None because no record has been written yet.
+        let writer = rolling_file_writer_builder.build();
+
+        // The status accessors must return defaults WITHOUT panicking.
+        assert_eq!(writer.current_file_path(), String::new());
+        assert_eq!(writer.current_row_num(), 0);
+        assert_eq!(writer.current_written_size(), 0);
 
         Ok(())
     }

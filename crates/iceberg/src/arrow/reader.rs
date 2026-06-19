@@ -523,7 +523,13 @@ impl ArrowReader {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
         }
 
-        let delete_filter = delete_filter_rx.await.unwrap()?;
+        let delete_filter = delete_filter_rx.await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "delete-filter task was dropped before sending the filter",
+            )
+            .with_source(e)
+        })??;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
         // In addition to the optional predicate supplied in the `FileScanTask`,
@@ -620,7 +626,9 @@ impl ArrowReader {
 
         if let Some(positional_delete_indexes) = positional_delete_indexes {
             let delete_row_selection = {
-                let positional_delete_indexes = positional_delete_indexes.lock().unwrap();
+                let positional_delete_indexes = positional_delete_indexes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 Self::build_deletes_row_selection(
                     record_batch_stream_builder.metadata().row_groups(),

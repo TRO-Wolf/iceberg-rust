@@ -19,11 +19,19 @@
 //!
 //! This module provides configuration constants and types for Azure Data Lake Storage.
 
+use std::fmt::{self, Debug, Formatter};
+
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use super::StorageConfig;
 use crate::Result;
+
+/// Renders an optional secret for `Debug`: `Some(_)` becomes the redaction marker
+/// `"***"` (preserving presence) and `None` stays `None` (the value is never printed).
+fn redact_secret(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "***")
+}
 
 /// A connection string.
 ///
@@ -52,7 +60,7 @@ pub const ADLS_AUTHORITY_HOST: &str = "adls.authority-host";
 /// This struct contains all the configuration options for connecting to Azure Data Lake Storage.
 /// Use the builder pattern via `AzdlsConfig::builder()` to construct instances.
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, TypedBuilder)]
 pub struct AzdlsConfig {
     /// Connection string.
     #[builder(default, setter(strip_option, into))]
@@ -84,6 +92,26 @@ pub struct AzdlsConfig {
     /// Filesystem name.
     #[builder(default, setter(into))]
     pub filesystem: String,
+}
+
+impl Debug for AzdlsConfig {
+    /// Hand-written so the secret fields are redacted: their presence is preserved as
+    /// `"***"` but the value is never printed. The connection string is treated as a
+    /// secret because it embeds the account key and/or SAS token.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzdlsConfig")
+            .field("connection_string", &redact_secret(&self.connection_string))
+            .field("account_name", &self.account_name)
+            .field("account_key", &redact_secret(&self.account_key))
+            .field("sas_token", &redact_secret(&self.sas_token))
+            .field("tenant_id", &self.tenant_id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &redact_secret(&self.client_secret))
+            .field("authority_host", &self.authority_host)
+            .field("endpoint", &self.endpoint)
+            .field("filesystem", &self.filesystem)
+            .finish()
+    }
 }
 
 impl TryFrom<&StorageConfig> for AzdlsConfig {
@@ -176,5 +204,30 @@ mod tests {
         assert_eq!(azdls_config.tenant_id.as_deref(), Some("my-tenant"));
         assert_eq!(azdls_config.client_id.as_deref(), Some("my-client"));
         assert_eq!(azdls_config.client_secret.as_deref(), Some("my-secret"));
+    }
+
+    #[test]
+    fn test_azdls_config_debug_redacts_secrets() {
+        let secret = "SECRET_VALUE_DO_NOT_LEAK";
+        let config = AzdlsConfig::builder()
+            .account_name("myaccount")
+            .account_key(secret)
+            .sas_token(secret)
+            .client_secret(secret)
+            .connection_string(secret)
+            .build();
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(secret),
+            "Debug output leaked a secret value: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        // account_name is NOT secret and must stay visible for diagnostics.
+        assert!(
+            debug.contains("myaccount"),
+            "Debug dropped non-secret fields: {debug}"
+        );
     }
 }
