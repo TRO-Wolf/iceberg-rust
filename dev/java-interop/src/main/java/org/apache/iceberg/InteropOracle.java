@@ -390,6 +390,14 @@ public final class InteropOracle {
         Path eqDeleteDir = requireFixturesDir("interop.eq_delete.dir");
         EqDeleteOracle.generate(eqDeleteDir);
         break;
+      case "generate-interop-aggregate":
+        // AGGREGATE pushdown conformance (G1) — Java's AggregateEvaluator.result() over a hand-declared
+        // fixture (3 data files with explicit metrics) for count(*)/count/min/max, emitted as
+        // java_aggregate.json; the Rust in-crate test folds the SAME fixture and asserts equality. A
+        // second fixture (java_aggregate_not_pushable.json) drops a value-count so count(id) is not
+        // pushable, proving both engines latch all_valid=false.
+        AggregateOracle.generate(requireFixturesDir("interop.aggregate.dir"));
+        break;
       case "verify-interop-eq-delete":
         // EQUALITY-DELETE merge-on-read, DIRECTION 2 — "Java reads what RUST writes". The Rust GEN path
         // (env ICEBERG_INTEROP_EQ_SCAN_GEN_DIR) wrote a REAL on-disk table to <dir>/rust_table via its
@@ -5496,6 +5504,181 @@ public final class InteropOracle {
    * committed at sequence 2 via {@link RowDelta}), writes {@code final.metadata.json}, and emits Java's OWN
    * merge-on-read read (via {@link IcebergGenerics}) as {@code java_eq_scan_rows.json}.
    */
+  /**
+   * AGGREGATE-pushdown oracle (G1). Builds {@link DataFile}s with explicit {@link Metrics} (no real
+   * parquet needed — the fold is a pure function of metrics), runs Java {@link
+   * org.apache.iceberg.expressions.AggregateEvaluator}, and emits its {@code result()} as JSON. The
+   * Rust in-crate test (`expr::visitors::aggregate_evaluator::tests::interop_aggregate_matches_java`)
+   * hand-declares the SAME fixture and asserts equality (anti-circular).
+   */
+  static final class AggregateOracle {
+    private AggregateOracle() {}
+
+    // The fixed aggregate list + per-aggregate {op, col, kind, type} metadata — MUST match the order
+    // the Rust test declares.
+    private static final String[][] META = {
+      {"count_star", "", "count", ""},
+      {"count", "id", "count", ""},
+      {"count", "name", "count", ""},
+      {"count", "score", "count", ""},
+      {"min", "id", "bound", "long"},
+      {"max", "id", "bound", "long"},
+      {"min", "name", "bound", "string"},
+      {"max", "name", "bound", "string"},
+      {"min", "score", "bound", "double"},
+      {"max", "score", "bound", "double"},
+    };
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.optional(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "name", Types.StringType.get()),
+              Types.NestedField.optional(3, "score", Types.DoubleType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      // Pushable fixture: 3 files, full metrics (mirrors the Rust in-crate fixture exactly).
+      List<DataFile> files = new ArrayList<>();
+      files.add(
+          dataFile(spec, "f1", 3L, counts(3, 3, 3), counts(0, 1, 0),
+              lower(10L, "apple", 1.5), upper(40L, "mango", 9.5)));
+      files.add(
+          dataFile(spec, "f2", 2L, counts(2, 2, 2), counts(0, 0, 1),
+              lower(5L, "banana", 2.0), upper(50L, "cherry", 8.0)));
+      files.add(
+          dataFile(spec, "f3", 4L, counts(4, 4, 4), counts(1, 2, 0),
+              lower(1L, "avocado", 0.5), upper(90L, "zucchini", 7.0)));
+      writeJson(dir.resolve("java_aggregate.json"), foldToJson(schema, files));
+
+      // Not-pushable fixture: f2 has NO value-count for id (field 1) ⇒ count(id) un-foldable.
+      Map<Integer, Long> vcNoId = new LinkedHashMap<>();
+      vcNoId.put(2, 2L);
+      vcNoId.put(3, 2L);
+      DataFile f2NoId =
+          DataFiles.builder(spec)
+              .withPath("/f2-np.parquet")
+              .withFormat(FileFormat.PARQUET)
+              .withFileSizeInBytes(1L)
+              .withMetrics(new Metrics(2L, null, vcNoId, counts(0, 0, 1), null, null, null))
+              .build();
+      List<DataFile> notPushable = Arrays.asList(files.get(0), f2NoId, files.get(2));
+      writeJson(dir.resolve("java_aggregate_not_pushable.json"), foldToJson(schema, notPushable));
+
+      System.out.println(
+          "generated java_aggregate.json + java_aggregate_not_pushable.json to " + dir);
+    }
+
+    private static Map<Integer, Long> counts(long a, long b, long c) {
+      Map<Integer, Long> m = new LinkedHashMap<>();
+      m.put(1, a);
+      m.put(2, b);
+      m.put(3, c);
+      return m;
+    }
+
+    private static Map<Integer, ByteBuffer> lower(long id, String name, double score) {
+      return boundsMap(id, name, score);
+    }
+
+    private static Map<Integer, ByteBuffer> upper(long id, String name, double score) {
+      return boundsMap(id, name, score);
+    }
+
+    private static Map<Integer, ByteBuffer> boundsMap(long id, String name, double score) {
+      Map<Integer, ByteBuffer> m = new LinkedHashMap<>();
+      m.put(1, Conversions.toByteBuffer(Types.LongType.get(), id));
+      m.put(2, Conversions.toByteBuffer(Types.StringType.get(), name));
+      m.put(3, Conversions.toByteBuffer(Types.DoubleType.get(), score));
+      return m;
+    }
+
+    private static DataFile dataFile(
+        PartitionSpec spec,
+        String name,
+        long recordCount,
+        Map<Integer, Long> valueCounts,
+        Map<Integer, Long> nullCounts,
+        Map<Integer, ByteBuffer> lowerBounds,
+        Map<Integer, ByteBuffer> upperBounds) {
+      Metrics metrics =
+          new Metrics(recordCount, null, valueCounts, nullCounts, null, lowerBounds, upperBounds);
+      return DataFiles.builder(spec)
+          .withPath("/" + name + ".parquet")
+          .withFormat(FileFormat.PARQUET)
+          .withFileSizeInBytes(1L)
+          .withMetrics(metrics)
+          .build();
+    }
+
+    private static String foldToJson(Schema schema, List<DataFile> files) {
+      List<Expression> aggregates =
+          Arrays.asList(
+              Expressions.countStar(),
+              Expressions.count("id"),
+              Expressions.count("name"),
+              Expressions.count("score"),
+              Expressions.min("id"),
+              Expressions.max("id"),
+              Expressions.min("name"),
+              Expressions.max("name"),
+              Expressions.min("score"),
+              Expressions.max("score"));
+      org.apache.iceberg.expressions.AggregateEvaluator evaluator =
+          org.apache.iceberg.expressions.AggregateEvaluator.create(schema, aggregates);
+      for (DataFile file : files) {
+        evaluator.update(file);
+      }
+      boolean allValid = evaluator.allAggregatorsValid();
+
+      StringBuilder sb = new StringBuilder();
+      sb.append("{\n  \"all_valid\": ").append(allValid).append(",\n  \"results\": [");
+      if (allValid) {
+        StructLike result = evaluator.result();
+        sb.append("\n");
+        for (int i = 0; i < META.length; i++) {
+          String op = META[i][0];
+          String col = META[i][1];
+          String kind = META[i][2];
+          String type = META[i][3];
+          sb.append("    {\"op\": \"").append(op).append("\"");
+          if (!col.isEmpty()) {
+            sb.append(", \"col\": \"").append(col).append("\"");
+          }
+          sb.append(", \"kind\": \"").append(kind).append("\"");
+          if (kind.equals("count")) {
+            Long v = result.get(i, Long.class);
+            sb.append(", \"value\": ").append(v == null ? "null" : v.toString());
+          } else {
+            sb.append(", \"type\": \"").append(type).append("\"");
+            sb.append(", \"value\": ").append(boundValue(result, i, type));
+          }
+          sb.append("}").append(i == META.length - 1 ? "\n" : ",\n");
+        }
+        sb.append("  ");
+      }
+      sb.append("]\n}\n");
+      return sb.toString();
+    }
+
+    private static String boundValue(StructLike result, int i, String type) {
+      switch (type) {
+        case "long":
+          Long l = result.get(i, Long.class);
+          return l == null ? "null" : l.toString();
+        case "double":
+          Double d = result.get(i, Double.class);
+          return d == null ? "null" : d.toString();
+        case "string":
+          CharSequence s = result.get(i, CharSequence.class);
+          return s == null ? "null" : ("\"" + s + "\"");
+        default:
+          return "null";
+      }
+    }
+  }
+
   static final class EqDeleteOracle {
     private EqDeleteOracle() {}
 

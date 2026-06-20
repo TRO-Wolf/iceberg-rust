@@ -929,4 +929,189 @@ mod tests {
         let err = eval.update(&file);
         assert!(err.is_err(), "null > value must be a hard metrics error");
     }
+
+    /// Cross-impl interop (G1) — the metrics fold against Java 1.10.0
+    /// `AggregateEvaluator.result()`. Skipped in the offline gate; the harness
+    /// `dev/java-interop/run-interop-aggregate.sh` sets `ICEBERG_INTEROP_AGGREGATE_DIR`.
+    ///
+    /// The fixture metrics + the aggregate order are hand-declared identically
+    /// here and in `InteropOracle.generateAggregate` (anti-circular). Java emits
+    /// its OWN fold as `java_aggregate.json`; this asserts the Rust fold matches
+    /// BOTH the hand-computed expected AND Java's emitted values.
+    #[test]
+    fn interop_aggregate_matches_java() {
+        let Ok(dir) = std::env::var("ICEBERG_INTEROP_AGGREGATE_DIR") else {
+            return; // offline gate: no Java fixture present, nothing to compare
+        };
+
+        // --- the shared fixture (must mirror InteropOracle.generateAggregate) ---
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "score", Type::Primitive(PrimitiveType::Double))
+                        .into(),
+                ])
+                .build()
+                .expect("schema builds"),
+        );
+
+        let files = vec![
+            data_file(
+                3,
+                HashMap::from([(1, 3), (2, 3), (3, 3)]),
+                HashMap::from([(1, 0), (2, 1), (3, 0)]),
+                HashMap::from([
+                    (1, Datum::long(10)),
+                    (2, Datum::string("apple")),
+                    (3, Datum::double(1.5)),
+                ]),
+                HashMap::from([
+                    (1, Datum::long(40)),
+                    (2, Datum::string("mango")),
+                    (3, Datum::double(9.5)),
+                ]),
+            ),
+            data_file(
+                2,
+                HashMap::from([(1, 2), (2, 2), (3, 2)]),
+                HashMap::from([(1, 0), (2, 0), (3, 1)]),
+                HashMap::from([
+                    (1, Datum::long(5)),
+                    (2, Datum::string("banana")),
+                    (3, Datum::double(2.0)),
+                ]),
+                HashMap::from([
+                    (1, Datum::long(50)),
+                    (2, Datum::string("cherry")),
+                    (3, Datum::double(8.0)),
+                ]),
+            ),
+            data_file(
+                4,
+                HashMap::from([(1, 4), (2, 4), (3, 4)]),
+                HashMap::from([(1, 1), (2, 2), (3, 0)]),
+                HashMap::from([
+                    (1, Datum::long(1)),
+                    (2, Datum::string("avocado")),
+                    (3, Datum::double(0.5)),
+                ]),
+                HashMap::from([
+                    (1, Datum::long(90)),
+                    (2, Datum::string("zucchini")),
+                    (3, Datum::double(7.0)),
+                ]),
+            ),
+        ];
+
+        // Aggregate order — MUST match the Java emit order.
+        let aggs: Vec<BoundAggregate> = [
+            UnboundAggregate::count_star(),
+            UnboundAggregate::count(Reference::new("id")),
+            UnboundAggregate::count(Reference::new("name")),
+            UnboundAggregate::count(Reference::new("score")),
+            UnboundAggregate::min(Reference::new("id")),
+            UnboundAggregate::max(Reference::new("id")),
+            UnboundAggregate::min(Reference::new("name")),
+            UnboundAggregate::max(Reference::new("name")),
+            UnboundAggregate::min(Reference::new("score")),
+            UnboundAggregate::max(Reference::new("score")),
+        ]
+        .iter()
+        .map(|a| a.bind(schema.clone(), true).expect("aggregate binds"))
+        .collect();
+
+        let eval = run(&aggs, &files);
+        assert!(eval.all_valid(), "all metrics present ⇒ pushable");
+        let results = eval.results();
+
+        // --- anchor 1: hand-computed expected (anti-circular) ---
+        let expected = vec![
+            Some(AggregateValue::Count(9)),                    // count(*)  = 3+2+4
+            Some(AggregateValue::Count(8)),                    // count(id) = (3-0)+(2-0)+(4-1)
+            Some(AggregateValue::Count(6)),                    // count(name) = (3-1)+(2-0)+(4-2)
+            Some(AggregateValue::Count(8)),                    // count(score) = (3-0)+(2-1)+(4-0)
+            Some(AggregateValue::Bound(Some(Datum::long(1)))), // min(id)
+            Some(AggregateValue::Bound(Some(Datum::long(90)))), // max(id)
+            Some(AggregateValue::Bound(Some(Datum::string("apple")))), // min(name)
+            Some(AggregateValue::Bound(Some(Datum::string("zucchini")))), // max(name)
+            Some(AggregateValue::Bound(Some(Datum::double(0.5)))), // min(score)
+            Some(AggregateValue::Bound(Some(Datum::double(9.5)))), // max(score)
+        ];
+        assert_eq!(
+            results, expected,
+            "Rust fold must match the hand-computed expected"
+        );
+
+        // --- anchor 2: Java's own fold over the same fixture (cross-impl) ---
+        let java_path = std::path::Path::new(&dir).join("java_aggregate.json");
+        let java_raw = std::fs::read_to_string(&java_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", java_path.display()));
+        let java: serde_json::Value = serde_json::from_str(&java_raw).expect("valid java json");
+        assert_eq!(
+            java["all_valid"],
+            serde_json::json!(true),
+            "Java agrees: pushable"
+        );
+        let java_results = java["results"].as_array().expect("results array");
+        assert_eq!(java_results.len(), results.len(), "same aggregate count");
+
+        for (i, (rust, jr)) in results.iter().zip(java_results).enumerate() {
+            let rust = rust
+                .as_ref()
+                .unwrap_or_else(|| panic!("aggregate {i} unexpectedly invalid"));
+            match jr["kind"].as_str().expect("kind") {
+                "count" => {
+                    let jv = jr["value"].as_u64().expect("count value");
+                    assert_eq!(
+                        *rust,
+                        AggregateValue::Count(jv),
+                        "count aggregate {i} == Java"
+                    );
+                }
+                "bound" => {
+                    let datum = match jr["type"].as_str().expect("bound type") {
+                        "long" => Datum::long(jr["value"].as_i64().expect("long")),
+                        "string" => Datum::string(jr["value"].as_str().expect("string")),
+                        "double" => Datum::double(jr["value"].as_f64().expect("double")),
+                        other => panic!("unhandled bound type {other}"),
+                    };
+                    assert_eq!(
+                        *rust,
+                        AggregateValue::Bound(Some(datum)),
+                        "bound aggregate {i} == Java"
+                    );
+                }
+                other => panic!("unhandled result kind {other}"),
+            }
+        }
+
+        // --- the not-pushable path: drop value_counts[id] on one file ⇒ count(id) un-foldable ---
+        let not_pushable = vec![
+            files[0].clone(),
+            data_file(
+                2,
+                HashMap::from([(2, 2), (3, 2)]), // no id (field 1) value-count
+                HashMap::from([(1, 0), (2, 0), (3, 1)]),
+                HashMap::new(),
+                HashMap::new(),
+            ),
+            files[2].clone(),
+        ];
+        assert!(
+            !run(&aggs, &not_pushable).all_valid(),
+            "a missing metric ⇒ not pushable (engine must scan)"
+        );
+        let np_path = std::path::Path::new(&dir).join("java_aggregate_not_pushable.json");
+        let np_raw = std::fs::read_to_string(&np_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", np_path.display()));
+        let np: serde_json::Value = serde_json::from_str(&np_raw).expect("valid java json");
+        assert_eq!(
+            np["all_valid"],
+            serde_json::json!(false),
+            "Java also reports the fixture not pushable"
+        );
+    }
 }
