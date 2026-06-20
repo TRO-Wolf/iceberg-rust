@@ -1498,6 +1498,16 @@ public final class InteropOracle {
         }
         break;
 
+      case "generate-interop-lock":
+        // LOCK MANAGER behavioral-conformance (GAP_MATRIX row 129). Drives the REAL Java
+        // InMemoryLockManager (the default singleton, reconfigured to small acquire-timeouts) through a
+        // deterministic 7-step acquire/release sequence and emits java_lock_outcomes.json. The Rust test
+        // (crates/iceberg/tests/interop_lock.rs) runs the SAME sequence against its InMemoryLockManager
+        // and asserts FULL outcome-equivalence (no divergence — Java `acquire` internally catches the
+        // acquire-timeout IllegalStateException and returns false, identical to Rust; see LockOracle).
+        LockOracle.generate(requireFixturesDir("interop.lock.dir"));
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -21036,6 +21046,110 @@ public final class InteropOracle {
   // ===========================================================================================
   // IO helpers
   // ===========================================================================================
+
+  // ===========================================================================================
+  // LockOracle — LOCK MANAGER behavioral-conformance interop (GAP_MATRIX row 129).
+  //
+  // The Java InMemoryLockManager is an IN-PROCESS primitive (no on-disk artifact), so "interop" here is
+  // OUTCOME-CONFORMANCE: both impls run the identical deterministic acquire/release sequence and their
+  // observable boolean outcomes must agree. We drive the REAL Java org.apache.iceberg.util.LockManagers
+  // default manager (an InMemoryLockManager) reconfigured via initialize(...) to small acquire-timeouts so
+  // the "acquire while held" step fails fast instead of blocking for the 180s default. (The package-private
+  // InMemoryLockManager constructor is unreachable from package org.apache.iceberg, and LockManagers.from
+  // with no lock-impl returns this same default singleton — so reconfiguring it is the public-API path.)
+  //
+  // NO BEHAVIORAL DIVERGENCE (acquire-while-held): Java InMemoryLockManager.acquire wraps its retry loop in
+  // a try/catch for the IllegalStateException that Tasks.throwFailureWhenFinished() raises on acquire-timeout
+  // exhaustion, and RETURNS false (1.10.0 bytecode: exception table [0,52)->53 => iconst_0/ireturn) — it does
+  // NOT throw to the caller. Rust's acquire likewise returns false on timeout, so both sides return the
+  // identical observable boolean and the conformance is exact.
+  // ===========================================================================================
+
+  /** The LockManager behavioral-conformance half of the oracle (GAP_MATRIX row 129). */
+  static final class LockOracle {
+    private LockOracle() {}
+
+    // The fixed property knobs — MUST match the Rust test's declaration (same keys ⇒ same config). Keys
+    // are the org.apache.iceberg.CatalogProperties lock-* constants (verified identical to the Rust
+    // LOCK_* consts in catalog/lock.rs).
+    static Map<String, String> props() {
+      Map<String, String> p = new LinkedHashMap<>();
+      p.put("lock.acquire-timeout-ms", "100"); // small ⇒ "acquire while held" fails fast (vs 180000 default)
+      p.put("lock.acquire-interval-ms", "10");
+      p.put("lock.heartbeat-timeout-ms", "60000"); // large ⇒ a held lock will NOT expire mid-test
+      p.put("lock.heartbeat-interval-ms", "5000"); // large ⇒ heartbeat will NOT fire mid-test
+      p.put("lock.heartbeat-threads", "1");
+      return p;
+    }
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      String e = "tableX";
+      String ghost = "ghostEntity";
+      String o1 = "owner-alpha";
+      String o2 = "owner-beta";
+
+      org.apache.iceberg.LockManager lm = org.apache.iceberg.util.LockManagers.defaultLockManager();
+      lm.initialize(props());
+
+      boolean[] outcomes = new boolean[7];
+      try {
+        outcomes[0] = lm.acquire(e, o1); //        free          -> true
+        outcomes[1] = lm.acquire(e, o2); //        held by o1    -> false (Java returns false via internal catch)
+        outcomes[2] = lm.release(e, o2); //        wrong owner   -> false
+        outcomes[3] = lm.release(ghost, o1); //    never locked  -> false
+        outcomes[4] = lm.release(e, o1); //        owner         -> true
+        outcomes[5] = lm.acquire(e, o2); //        now free      -> true
+        outcomes[6] = lm.release(e, o2); //        owner         -> true
+      } finally {
+        // Shut the shared scheduler so mvn exec:java's JVM exits cleanly (non-daemon scheduler threads).
+        try {
+          ((AutoCloseable) lm).close();
+        } catch (Exception ignore) {
+          // best-effort cleanup
+        }
+      }
+
+      // Java self-check vs the hand-declared expected (anti-circular anchor #1 — Java is not echoing Rust).
+      boolean[] expected = {true, false, false, false, true, true, true};
+      int failures = 0;
+      for (int i = 0; i < expected.length; i++) {
+        if (outcomes[i] != expected[i]) {
+          failures++;
+        }
+      }
+
+      writeJson(dir.resolve("java_lock_outcomes.json"), outcomesToJson(outcomes));
+      System.out.println("generate-interop-lock: " + failures + " failures");
+      if (failures > 0) {
+        System.exit(1);
+      }
+    }
+
+    private static String outcomesToJson(boolean[] outcomes) {
+      String[] ops = {"acquire", "acquire", "release", "release", "release", "acquire", "release"};
+      String[] ent = {"tableX", "tableX", "tableX", "ghostEntity", "tableX", "tableX", "tableX"};
+      String[] own = {
+        "owner-alpha", "owner-beta", "owner-beta", "owner-alpha", "owner-alpha", "owner-beta", "owner-beta"
+      };
+      StringBuilder sb = new StringBuilder();
+      sb.append("{\n  \"steps\": [\n");
+      for (int i = 0; i < outcomes.length; i++) {
+        sb.append("    {\"op\": \"")
+            .append(ops[i])
+            .append("\", \"entity\": \"")
+            .append(ent[i])
+            .append("\", \"owner\": \"")
+            .append(own[i])
+            .append("\", \"result\": ")
+            .append(outcomes[i])
+            .append("}")
+            .append(i == outcomes.length - 1 ? "\n" : ",\n");
+      }
+      sb.append("  ]\n}\n");
+      return sb.toString();
+    }
+  }
 
   private static void writeJson(Path path, String json) throws IOException {
     Files.write(path, json.getBytes(StandardCharsets.UTF_8));
