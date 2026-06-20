@@ -612,6 +612,12 @@ SnapshotTable/MigrateTable (137) was SCOPED then TABLED — the actions are Spar
 > inverted check-compat wiring + a wrong estimate_size map formula; orchestrator remediated (each fix re-verified vs 1.10.0
 > bytecode), so the ✅ is honest. LESSON: the 3-cycle cap + an adversarial Critic that runs live Java is what catches a
 > plausible-but-wrong port; never trust the Actor's "all green" self-report over the final Critic verdict.
+>
+> **ADDENDUM 2026-06-20 — DEMOTED ✅→🟡.** Post-merge audit confirmed the port is genuine (unit-tested + real consumer,
+> no dead code) but it was flipped ✅ on unit-tests-only, missing the **bidirectional Java interop round-trip** the matrix
+> legend demands of a fork-flipped green. Per the legend's strict bar (and a user decision 2026-06-20), the row is now 🟡
+> with that interop named as the residue. The historical ✅ flip above is left as the record of what BLOCK 8 did; the
+> authoritative live status is the GAP_MATRIX (`Type utilities` row). The interop round-trip is the remaining ✅ gate.
 
 ## BLOCK 9 (ORC data-file READ, 2026-06-18, Opus, signed off) — 2 sequential AC·OO PRs → row 116 ❌→🟡 (read-only)
 
