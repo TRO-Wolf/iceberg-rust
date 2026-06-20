@@ -1464,6 +1464,40 @@ public final class InteropOracle {
         }
         break;
 
+      case "generate-interop-rewrite-manifests":
+        // REWRITE-MANIFESTS DATA-LEVEL interop, DIRECTION 1 — "Java writes, Rust reorganizes, Java
+        // verifies rows" (GAP_MATRIX row 100). Java builds an UNPARTITIONED V2 table under
+        // <dir>/table, writes THREE REAL parquet data files (ids 10+20, ids 30+40, ids 50+60) via
+        // GenericAppenderFactory.newDataWriter (the same "write records → DataFile" template as
+        // ScanExecOracle / EqDeleteOracle), appends each in a SEPARATE newAppend commit so the
+        // table starts with exactly THREE data manifests. Emits java_rows.json (Java's OWN
+        // IcebergGenerics read — sorted live rows: 10/20/30/40/50/60) + final.metadata.json. The
+        // Rust GEN test (env ICEBERG_INTEROP_RWM_DIR) loads this table, runs rewrite_manifests with
+        // a constant cluster_by key (3 → 1 manifest), scans to verify rows unchanged, and writes
+        // the rewritten table at <dir>/rust_rewritten/metadata/final.metadata.json. The Java verify
+        // step (verify-interop-rewrite-manifests) reads that Rust-rewritten table, materializes its
+        // live rows via IcebergGenerics, and asserts they equal java_rows.json AND that the
+        // data-manifest count dropped below 3 (the re-clustering proof).
+        Path rwmGenDir = requireFixturesDir("interop.rewrite_manifests.dir");
+        RewriteManifestsOracle.generate(rwmGenDir);
+        break;
+
+      case "verify-interop-rewrite-manifests":
+        // REWRITE-MANIFESTS DATA-LEVEL interop, DIRECTION 1 verify — "Java reads what RUST
+        // rewrote" (GAP_MATRIX row 100). The Rust GEN test (env ICEBERG_INTEROP_RWM_DIR) ran
+        // rewrite_manifests on the Java-written table and wrote the rewritten table to
+        // <dir>/rust_rewritten/metadata/final.metadata.json. Here Java loads that RUST-rewritten
+        // table, reads via IcebergGenerics, and asserts (a) the live rows equal java_rows.json and
+        // (b) the data-manifest count in the rewritten snapshot < 3 (proving the re-clustering
+        // actually fired). Prints "verify-interop-rewrite-manifests: 0 failures" on success.
+        Path rwmVerifyDir = requireFixturesDir("interop.rewrite_manifests.dir");
+        int rwmFailures = RewriteManifestsOracle.verify(rwmVerifyDir);
+        System.out.println("verify-interop-rewrite-manifests: " + rwmFailures + " failures");
+        if (rwmFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -21457,6 +21491,257 @@ public final class InteropOracle {
       if (!directory.isDirectory() && !directory.mkdirs()) {
         throw new IOException("failed to create dir " + directory);
       }
+    }
+  }
+
+  // ===========================================================================================
+  // RewriteManifestsOracle — GAP_MATRIX row 100, DATA-LEVEL interop.
+  //
+  // Java writes an UNPARTITIONED V2 table under <dir>/table with THREE real parquet data files,
+  // each appended in its own commit so the table starts with 3 data manifests. Java emits
+  // java_rows.json (IcebergGenerics live-row read, ground truth). The Rust GEN step (env
+  // ICEBERG_INTEROP_RWM_DIR) loads this table, runs rewrite_manifests with a constant cluster_by
+  // key (3→1 manifest), writes the rewritten table at <dir>/rust_rewritten/metadata/final.metadata.json,
+  // and asserts data preserved. The verify step here reads that Rust-rewritten table, asserts rows
+  // equal java_rows.json AND manifest count < 3 (the re-clustering proof).
+  // ===========================================================================================
+
+  /**
+   * Oracle for the {@code RewriteManifests} DATA-LEVEL interop (GAP_MATRIX row 100).
+   *
+   * <p>{@link #generate} builds an unpartitioned V2 table under {@code <dir>/table} with THREE real
+   * parquet data files (file-A: ids 10/20; file-B: ids 30/40; file-C: ids 50/60), each committed in a
+   * SEPARATE {@code newAppend} so the initial manifest list has exactly 3 data manifests. It emits
+   * {@code java_rows.json} (Java's OWN {@link IcebergGenerics} live-row read, sorted: ids 10..60) and
+   * {@code final.metadata.json}.
+   *
+   * <p>{@link #verify} loads the RUST-rewritten table at
+   * {@code <dir>/rust_rewritten/metadata/final.metadata.json}, reads via {@link IcebergGenerics},
+   * and asserts (a) live rows equal {@code java_rows.json} AND (b) the data-manifest count in the
+   * rewritten snapshot is fewer than 3 (the re-clustering fired).
+   */
+  static final class RewriteManifestsOracle {
+    private RewriteManifestsOracle() {}
+
+    /** Schema: {1 id long required, 2 data string optional}. Same as EqDeleteOracle. */
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()));
+
+    /** The 3 data files: (ids, data-values) pairs, one per separate append commit. */
+    private static final long[][] FILE_IDS = {{10L, 20L}, {30L, 40L}, {50L, 60L}};
+    private static final String[][] FILE_DATA = {{"a", "b"}, {"c", "d"}, {"e", "f"}};
+    private static final String[] FILE_NAMES = {
+      "00000-rwm-file-a.parquet", "00000-rwm-file-b.parquet", "00000-rwm-file-c.parquet"
+    };
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the unpartitioned V2 table on local disk under <dir>/table.
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              SCHEMA, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_rewrite_manifests");
+
+      // 2. Write THREE real parquet data files, each in a SEPARATE newAppend commit → 3 manifests.
+      for (int i = 0; i < FILE_NAMES.length; i++) {
+        String dataPath = new File(dataDir, FILE_NAMES[i]).getAbsolutePath();
+        DataFile dataFile = writeDataFile(table, spec, dataPath, FILE_IDS[i], FILE_DATA[i]);
+        table.newAppend().appendFile(dataFile).commit();
+      }
+
+      // 3. Write the FINAL metadata (3-manifest baseline the Rust GEN loads).
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 4. Java materializes its OWN live-row read (IcebergGenerics — no deletes here, so it is
+      //    simply all 6 rows: 10/20/30/40/50/60 sorted by id). This is the ground truth the Rust
+      //    GEN step and the verify step compare against.
+      writeJson(dir.resolve("java_rows.json"), readLiveRowsToJson(table, "data"));
+      System.out.println("generated rewrite-manifests table (3 manifests) + java_rows.json to " + dir);
+    }
+
+    /**
+     * Write a REAL parquet data file with the given {@code ids} + {@code dataValues} and return its
+     * {@link DataFile} built from the appender's REAL metrics (the same "write records → DataFile"
+     * template as {@link ScanExecOracle} / {@link EqDeleteOracle}).
+     */
+    private static DataFile writeDataFile(
+        BaseTable table, PartitionSpec spec, String path, long[] ids, String[] dataValues)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", ids[i]);
+        record.setField("data", dataValues[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * Verify — "Java reads what RUST rewrote". Loads
+     * {@code <dir>/rust_rewritten/metadata/final.metadata.json}, reads via {@link IcebergGenerics},
+     * asserts (a) live rows equal {@code java_rows.json} AND (b) data-manifest count {@code < 3}.
+     *
+     * @return number of failures (0 ⇒ success, caller prints the sentinel and returns).
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_rewritten").resolve("metadata").resolve("final.metadata.json");
+
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL rewrite-manifests-verify: missing "
+                + finalMetadata
+                + " (run the Rust GEN step first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL rewrite-manifests-verify: Java could not parse the Rust-rewritten "
+                + "final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table =
+          new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_rewritten");
+
+      // (a) Live rows must equal java_rows.json.
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL rewrite-manifests-verify: Java could not READ the Rust-rewritten table via "
+                + "IcebergGenerics: "
+                + readError);
+        return 1;
+      }
+
+      Path javaRowsPath = dir.resolve("java_rows.json");
+      String expectedJson;
+      try {
+        expectedJson = new String(Files.readAllBytes(javaRowsPath), StandardCharsets.UTF_8);
+      } catch (IOException readError) {
+        System.out.println(
+            "FAIL rewrite-manifests-verify: could not read java_rows.json: " + readError);
+        return 1;
+      }
+
+      // Build the Rust-read sorted JSON in the same {id, data} shape as java_rows.json.
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+      String actualJson =
+          JsonUtil.generate(
+              gen -> {
+                gen.writeStartArray();
+                for (Long id : liveIds) {
+                  gen.writeStartObject();
+                  gen.writeNumberField("id", id);
+                  String data = dataById.get(id);
+                  if (data == null) {
+                    gen.writeNullField("data");
+                  } else {
+                    gen.writeStringField("data", data);
+                  }
+                  gen.writeEndObject();
+                }
+                gen.writeEndArray();
+              },
+              true);
+
+      if (!actualJson.equals(expectedJson.trim())) {
+        System.out.println(
+            "FAIL rewrite-manifests-verify: live rows mismatch. "
+                + "Expected (java_rows.json): "
+                + expectedJson.trim()
+                + " Got (IcebergGenerics read of Rust-rewritten table): "
+                + actualJson);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS rewrite-manifests-verify: live rows == java_rows.json ("
+                + liveIds.size()
+                + " rows: "
+                + liveIds
+                + ")");
+      }
+
+      // (b) The rewritten snapshot must have FEWER than 3 data manifests (re-clustering fired).
+      Snapshot currentSnapshot = metadata.currentSnapshot();
+      if (currentSnapshot == null) {
+        System.out.println("FAIL rewrite-manifests-verify: Rust-rewritten table has no current snapshot");
+        failures++;
+      } else {
+        long dataManifestCount =
+            currentSnapshot.allManifests(io).stream()
+                .filter(m -> m.content() == ManifestContent.DATA)
+                .count();
+        if (dataManifestCount >= 3) {
+          System.out.println(
+              "FAIL rewrite-manifests-verify: expected data-manifest count < 3 (re-clustering proof), "
+                  + "got "
+                  + dataManifestCount
+                  + " — the rewrite_manifests action may not have fired");
+          failures++;
+        } else {
+          System.out.println(
+              "PASS rewrite-manifests-verify: data-manifest count = "
+                  + dataManifestCount
+                  + " < 3 (re-clustering confirmed)");
+        }
+      }
+
+      return failures;
+    }
+
+    /** Read the full text of a UTF-8 file into a String. */
+    private static String readString(Path path) throws IOException {
+      return new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
     }
   }
 }
