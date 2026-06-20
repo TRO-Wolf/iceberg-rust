@@ -323,10 +323,13 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 
 Sequenced for the near-full-parity directive (2026-06-11); **re-steered 2026-06-19 (PAR-05) to a
 two-track hybrid** now that the post-audit backlog is cleared and the work is Opus-paced (Fable
-parked). **Track 1 (now — zero/low on-disk-format risk, ✅ momentum):** `LockManager` (the one owed
-Opus-cheap ❌ — pure catalog CRUD, no format risk, unblocks Phase-5 catalog completeness), then scan
-completion (`BatchScan` + split planning, row 146), then ORC + Avro **read** completion — draining
-the cheap closeouts moves the census ≈ 36→40 ✅. **Track 2 (deliberate, format-risk-gated):** open
+parked). **Track 1 (now — zero/low on-disk-format risk, ✅ momentum):** `LockManager` JVM
+behavioral-conformance interop (in-memory impl + tests landed 2026-06-19 #109 — now 🟡; the
+conformance test is the ✅ gate — pure catalog code, no format risk, unblocks Phase-5 catalog
+completeness), then the ORC + Avro **read** merge-on-read residue (multi-file-per-partition /
+non-identity transforms) — draining these cheap closeouts lifts the census from its live 38 ✅ floor.
+*(Scan completion — `BatchScan` + split planning — already landed ✅ 2026-06-17 #87/#88; no longer
+Track-1 work.)* **Track 2 (deliberate, format-risk-gated):** open
 **encryption** (`EncryptionManager` / KMS / encrypted FileIO + manifests + data) as a scheduled
 multi-block effort under the "do not break the on-disk format" approval + Java↔Rust interop
 discipline, then geometry/geography + geospatial predicates, then ORC/Avro data-file **write**.
@@ -356,9 +359,9 @@ format-sensitive work still leads; well-templated breadth follows.
 3. **Format & type breadth:** variant (incl. shredding — frontier; exact-byte class) and
    geometry/geography (`unknown` is ✅ at the metadata level — row 89); ORC + Avro data files
    (READ landed 🟡 — rows 116/117; the WRITE half remains; templated breadth → Opus).
-4. **Scan completion:** CDC-merge (row-level), split planning (row 146), strict-evaluator
-   completion (`BatchScan` ✅ row 122 and incremental-scan interop DONE — ✅ rows 120/121, 2026-06-17;
-   mostly templated → Opus).
+4. **Scan completion:** CDC-merge (row-level) is the remaining open slice; split planning (row 146),
+   `BatchScan` (row 122), and incremental-scan interop (rows 120/121) all LANDED ✅ 2026-06-17;
+   strict-evaluator completion mostly templated → Opus.
 5. **`LockManager`** (in-memory impl + tests landed 2026-06-19 — JVM-conformance interop is the ✅ gate) + the `ViewCatalog`
    byte-exact round-trip residue (row 125). Glue/S3 Tables view ops are parity-correct-unsupported
    (rows 124/125, NOT owed); `SessionCatalog` is assessed-deferred as a dead surface (row 126).
