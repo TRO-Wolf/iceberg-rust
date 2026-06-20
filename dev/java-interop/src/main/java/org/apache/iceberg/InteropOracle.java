@@ -1498,6 +1498,36 @@ public final class InteropOracle {
         }
         break;
 
+      case "generate-interop-rfds":
+        // RewriteFiles DELETE-file-surface interop, GENERATE step (GAP_MATRIX row 152).
+        // Builds a LOCKED V2 UNPARTITIONED fixture under <dir>/table:
+        //   S1 newAppend(D)         → data file D, seq 1
+        //   S2 newRowDelta(DF0)     → seed position-delete DF0, seq 2
+        //   S3 newRewrite: deleteFile(DF0) + addFile(DF_inherited) + addFile(DF_explicit, 2L) → seq 3
+        // DF_inherited inherits seq 3 (== S3 snapshot seq); DF_explicit is stamped with explicit seq 2.
+        // Emits final.metadata.json + java_delete_seqs.json (the two added-delete paths + expected seqs).
+        // Java SELF-CHECKS its seqs against the hand-declared expected and System.exit(1) on mismatch.
+        {
+          Path rfdsGenDir = requireFixturesDir("interop.rfds.dir");
+          RewriteFilesDeleteSurfaceOracle.generate(rfdsGenDir);
+        }
+        break;
+
+      case "verify-interop-rfds":
+        // RewriteFiles DELETE-file-surface interop, VERIFY step (GAP_MATRIX row 152).
+        // Loads <dir>/rust_rewritten/metadata/final.metadata.json (Rust-written table), finds the two
+        // ADDED delete files in the rewrite snapshot, and asserts their data sequence numbers match
+        // java_delete_seqs.json AND the hand-declared expected (inherited==snapshot seq, explicit==2).
+        {
+          Path rfdsVerifyDir = requireFixturesDir("interop.rfds.dir");
+          int rfdsFailures = RewriteFilesDeleteSurfaceOracle.verify(rfdsVerifyDir);
+          System.out.println("verify-interop-rfds: " + rfdsFailures + " failures");
+          if (rfdsFailures > 0) {
+            System.exit(1);
+          }
+        }
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -21742,6 +21772,367 @@ public final class InteropOracle {
     /** Read the full text of a UTF-8 file into a String. */
     private static String readString(Path path) throws IOException {
       return new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
+    }
+  }
+
+  // ===========================================================================================
+  // RewriteFilesDeleteSurfaceOracle — DELETE-file rewrite surface interop (GAP_MATRIX row 152).
+  //
+  // Proves the two Java seq overloads for added delete files in a RewriteFiles commit:
+  //   Java addFile(DeleteFile)        → INHERITS the new snapshot's data seq (seq 3).
+  //   Java addFile(DeleteFile, 2L)    → STAMPED with the explicit value 2 (stays seq 2).
+  //
+  // LOCKED FIXTURE (V2 unpartitioned):
+  //   S1 newAppend(D)             → data file D,   seq 1
+  //   S2 newRowDelta(DF0)         → seed pos-del,  seq 2
+  //   S3 newRewrite: deleteFile(DF0) + addFile(DF_inherited) + addFile(DF_exp, 2L)  → seq 3
+  //      DF_inherited expected data seq = 3   (inherited from S3)
+  //      DF_exp expected data seq = 2   (explicit stamp)
+  //
+  // The generate step emits final.metadata.json + java_delete_seqs.json so the Rust test can
+  // (a) load the Java table and assert it reads the same seqs, and (b) build the same fixture
+  // independently in Rust, write it back, and the verify step checks the Rust-written seqs.
+  // ===========================================================================================
+
+  /**
+   * Oracle for the {@code RewriteFiles} DELETE-file rewrite surface interop (GAP_MATRIX row 152).
+   *
+   * <p>{@link #generate} builds the LOCKED UNPARTITIONED V2 fixture under {@code <dir>/table}:
+   * S1 {@code newAppend(D)}, S2 {@code newRowDelta(DF0)}, S3 {@code newRewrite: deleteFile(DF0) +
+   * addFile(DF_inherited) + addFile(DF_exp, 2L)}. Emits {@code final.metadata.json} and
+   * {@code java_delete_seqs.json} ({@code {"inherited":{"path":"...","seq":3},"explicit":{"path":"...","seq":2}}}).
+   * Java SELF-CHECKS its own seqs against the hand-declared expected and exits 1 on mismatch.
+   *
+   * <p>{@link #verify} loads {@code <dir>/rust_rewritten/metadata/final.metadata.json} (the
+   * Rust-written table after it builds the SAME fixture independently), finds the two ADDED delete
+   * files in the rewrite snapshot's delete manifests, and asserts their data sequence numbers match
+   * the hand-declared expected (inherited == that snapshot's seq, explicit == 2).
+   */
+  static final class RewriteFilesDeleteSurfaceOracle {
+    private RewriteFilesDeleteSurfaceOracle() {}
+
+    // Hand-declared expected seqs (the "spec" this test proves).
+    // DF_inherited must carry the S3 snapshot's seq (3 in the locked fixture).
+    // DF_explicit  must carry the stamped value 2.
+    private static final long EXPECTED_EXPLICIT_SEQ = 2L;
+
+    // File-name constants (deterministic paths so the Rust test can match by path).
+    private static final String DATA_FILE_NAME = "00000-rfds-data.parquet";
+    private static final String SEED_DEL_NAME = "00000-rfds-seed-del.parquet";
+    private static final String INHERITED_DEL_NAME = "00000-rfds-inherited-del.parquet";
+    private static final String EXPLICIT_DEL_NAME = "00000-rfds-exp-del.parquet";
+
+    /**
+     * Build the LOCKED FIXTURE and emit final.metadata.json + java_delete_seqs.json.
+     * Self-checks the generated seqs and calls System.exit(1) if any mismatch.
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      // 1. Build the UNPARTITIONED V2 table on local disk under <dir>/table.
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_rfds");
+
+      // 2. S1: newAppend(D) — data file D (metadata-only; the parquet need not physically exist
+      //    because this is a METADATA-LEVEL seq proof; we never read delete content).
+      String dataPath = new File(dataDir, DATA_FILE_NAME).getAbsolutePath();
+      DataFile dataFile =
+          DataFiles.builder(spec)
+              .withPath(dataPath)
+              .withFileSizeInBytes(512L)
+              .withRecordCount(1L)
+              .build();
+      table.newAppend().appendFile(dataFile).commit();
+
+      // 3. S2: newRowDelta(DF0) — seed position-delete (metadata-only; not physically written).
+      String seedDelPath = new File(dataDir, SEED_DEL_NAME).getAbsolutePath();
+      DeleteFile seedDel =
+          FileMetadata.deleteFileBuilder(spec)
+              .ofPositionDeletes()
+              .withPath(seedDelPath)
+              .withFileSizeInBytes(128L)
+              .withRecordCount(1L)
+              .build();
+      table.newRowDelta().addDeletes(seedDel).commit();
+
+      // 4. S3: newRewrite — deleteFile(DF0) + addFile(DF_inherited) + addFile(DF_exp, 2L).
+      //    Precondition (addsDeleteFiles ⇒ deletesDeleteFiles) is satisfied because we delete DF0.
+      String inheritedDelPath = new File(dataDir, INHERITED_DEL_NAME).getAbsolutePath();
+      DeleteFile inheritedDel =
+          FileMetadata.deleteFileBuilder(spec)
+              .ofPositionDeletes()
+              .withPath(inheritedDelPath)
+              .withFileSizeInBytes(128L)
+              .withRecordCount(1L)
+              .build();
+      String expDelPath = new File(dataDir, EXPLICIT_DEL_NAME).getAbsolutePath();
+      DeleteFile expDel =
+          FileMetadata.deleteFileBuilder(spec)
+              .ofPositionDeletes()
+              .withPath(expDelPath)
+              .withFileSizeInBytes(128L)
+              .withRecordCount(1L)
+              .build();
+
+      table
+          .newRewrite()
+          .deleteFile(seedDel)
+          .addFile(inheritedDel)
+          .addFile(expDel, EXPECTED_EXPLICIT_SEQ)
+          .commit();
+
+      // 5. Write final.metadata.json.
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      // 6. Read the actual added-delete seqs from the manifests and SELF-CHECK.
+      Snapshot s3 = table.currentSnapshot();
+      long s3Seq = s3.sequenceNumber();
+
+      long actualInheritedSeq = -1L;
+      long actualExpSeq = -1L;
+      FileIO io = table.io();
+      for (ManifestFile manifest : s3.deleteManifests(io)) {
+        try (ManifestReader<DeleteFile> reader =
+            ManifestFiles.readDeleteManifest(manifest, io, ops.current().specsById())) {
+          for (ManifestEntry<DeleteFile> entry : reader.entries()) {
+            if (entry.status() == ManifestEntry.Status.ADDED) {
+              String entryPath = entry.file().location();
+              if (entryPath.equals(inheritedDelPath)) {
+                actualInheritedSeq = entry.dataSequenceNumber();
+              } else if (entryPath.equals(expDelPath)) {
+                actualExpSeq = entry.dataSequenceNumber();
+              }
+            }
+          }
+        }
+      }
+
+      int selfCheckFailures = 0;
+      if (actualInheritedSeq != s3Seq) {
+        System.out.println(
+            "FAIL generate-interop-rfds SELF-CHECK: inherited del seq = "
+                + actualInheritedSeq
+                + ", expected == S3 snapshot seq "
+                + s3Seq);
+        selfCheckFailures++;
+      }
+      if (actualExpSeq != EXPECTED_EXPLICIT_SEQ) {
+        System.out.println(
+            "FAIL generate-interop-rfds SELF-CHECK: explicit del seq = "
+                + actualExpSeq
+                + ", expected "
+                + EXPECTED_EXPLICIT_SEQ);
+        selfCheckFailures++;
+      }
+      if (actualInheritedSeq == actualExpSeq) {
+        System.out.println(
+            "FAIL generate-interop-rfds SELF-CHECK: both seqs are equal ("
+                + actualInheritedSeq
+                + ") — the test would prove nothing (inherited vs explicit divergence must be visible)");
+        selfCheckFailures++;
+      }
+
+      if (selfCheckFailures > 0) {
+        System.out.println("generate-interop-rfds: " + selfCheckFailures + " failures");
+        System.exit(1);
+      }
+
+      // 7. Emit java_delete_seqs.json — read by the Rust test Direction-1.
+      //    Capture in effectively-final locals for the lambda (Java 8 lambda capture rule).
+      final long finalInheritedSeq = actualInheritedSeq;
+      final long finalExpSeq = actualExpSeq;
+      final String finalInheritedPath = inheritedDelPath;
+      final String finalExpPath = expDelPath;
+      String deleteSeqsJson =
+          JsonUtil.generate(
+              gen -> {
+                gen.writeStartObject();
+                gen.writeObjectFieldStart("inherited");
+                gen.writeStringField("path", finalInheritedPath);
+                gen.writeNumberField("seq", finalInheritedSeq);
+                gen.writeEndObject();
+                gen.writeObjectFieldStart("explicit");
+                gen.writeStringField("path", finalExpPath);
+                gen.writeNumberField("seq", finalExpSeq);
+                gen.writeEndObject();
+                gen.writeEndObject();
+              },
+              true);
+      writeJson(dir.resolve("java_delete_seqs.json"), deleteSeqsJson);
+
+      System.out.println(
+          "generate-interop-rfds: 0 failures (S3 seq="
+              + s3Seq
+              + ", inherited-del seq="
+              + actualInheritedSeq
+              + ", exp-del seq="
+              + actualExpSeq
+              + ")");
+    }
+
+    /**
+     * Verify step — "Java reads what RUST wrote".
+     *
+     * <p>Loads {@code <dir>/rust_rewritten/metadata/final.metadata.json}, finds the two ADDED
+     * delete files in the rewrite snapshot's delete manifests, and asserts their data sequence
+     * numbers equal the hand-declared expected (inherited == snapshot seq, explicit == 2).
+     *
+     * @return number of failures (0 means success).
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+
+      // 1. Load java_delete_seqs.json to get the paths Rust used for the two added delete files.
+      //    The paths are absolute and Rust generates them with the SAME names in its own tmp dir.
+      //    We do NOT rely on the paths from java_delete_seqs.json for the Rust table (Rust uses its
+      //    own location); instead we match by FILE NAME (the last path segment).
+      Path rustMetadata =
+          dir.resolve("rust_rewritten").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(rustMetadata)) {
+        System.out.println(
+            "FAIL verify-interop-rfds: missing " + rustMetadata + " (run the Rust GEN step first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        String json = new String(Files.readAllBytes(rustMetadata), StandardCharsets.UTF_8);
+        metadata = TableMetadataParser.fromJson(rustMetadata.toString(), json);
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL verify-interop-rfds: Java could not parse Rust final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      Snapshot rewriteSnapshot = metadata.currentSnapshot();
+      if (rewriteSnapshot == null) {
+        System.out.println("FAIL verify-interop-rfds: Rust table has no current snapshot");
+        return 1;
+      }
+      long rustSnapshotSeq = rewriteSnapshot.sequenceNumber();
+
+      // 2. Enumerate ADDED delete entries in the rewrite snapshot's delete manifests.
+      //    Match by file-name suffix (INHERITED_DEL_NAME / EXPLICIT_DEL_NAME).
+      long rustInheritedSeq = Long.MIN_VALUE;
+      long rustExpSeq = Long.MIN_VALUE;
+      try {
+        for (ManifestFile manifest : rewriteSnapshot.deleteManifests(io)) {
+          try (ManifestReader<DeleteFile> reader =
+              ManifestFiles.readDeleteManifest(manifest, io, metadata.specsById())) {
+            for (ManifestEntry<DeleteFile> entry : reader.entries()) {
+              if (entry.status() == ManifestEntry.Status.ADDED) {
+                String entryPath = entry.file().location();
+                if (entryPath.endsWith(INHERITED_DEL_NAME)) {
+                  rustInheritedSeq = entry.dataSequenceNumber();
+                } else if (entryPath.endsWith(EXPLICIT_DEL_NAME)) {
+                  rustExpSeq = entry.dataSequenceNumber();
+                }
+              }
+            }
+          }
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL verify-interop-rfds: error reading Rust delete manifests: " + readError);
+        return 1;
+      }
+
+      if (rustInheritedSeq == Long.MIN_VALUE) {
+        System.out.println(
+            "FAIL verify-interop-rfds: ADDED entry for inherited delete ("
+                + INHERITED_DEL_NAME
+                + ") not found in Rust rewrite snapshot delete manifests");
+        failures++;
+      } else if (rustInheritedSeq != rustSnapshotSeq) {
+        System.out.println(
+            "FAIL verify-interop-rfds: inherited del seq = "
+                + rustInheritedSeq
+                + ", expected == Rust snapshot seq "
+                + rustSnapshotSeq
+                + " (add_delete_file must inherit the snapshot seq)");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS verify-interop-rfds: inherited del seq = "
+                + rustInheritedSeq
+                + " == Rust snapshot seq "
+                + rustSnapshotSeq);
+      }
+
+      if (rustExpSeq == Long.MIN_VALUE) {
+        System.out.println(
+            "FAIL verify-interop-rfds: ADDED entry for explicit delete ("
+                + EXPLICIT_DEL_NAME
+                + ") not found in Rust rewrite snapshot delete manifests");
+        failures++;
+      } else if (rustExpSeq != EXPECTED_EXPLICIT_SEQ) {
+        System.out.println(
+            "FAIL verify-interop-rfds: explicit del seq = "
+                + rustExpSeq
+                + ", expected "
+                + EXPECTED_EXPLICIT_SEQ
+                + " (add_delete_file_with_sequence_number must stamp the explicit seq)");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS verify-interop-rfds: explicit del seq = "
+                + rustExpSeq
+                + " == "
+                + EXPECTED_EXPLICIT_SEQ
+                + " (explicit stamp preserved)");
+      }
+
+      // 3. Relational invariant: inherited != explicit (if both found).
+      if (rustInheritedSeq != Long.MIN_VALUE && rustExpSeq != Long.MIN_VALUE
+          && rustInheritedSeq == rustExpSeq) {
+        System.out.println(
+            "FAIL verify-interop-rfds: inherited seq == explicit seq ("
+                + rustInheritedSeq
+                + ") — the test proves nothing if both equal; seq semantics not distinguished");
+        failures++;
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS verify-interop-rfds: Rust rewrite snapshot seq="
+                + rustSnapshotSeq
+                + "; inherited-del seq="
+                + rustInheritedSeq
+                + " (==snapshot); explicit-del seq="
+                + rustExpSeq
+                + " (=="
+                + EXPECTED_EXPLICIT_SEQ
+                + "); seq semantics BIDIRECTIONALLY PROVEN");
+      }
+      return failures;
     }
   }
 }
