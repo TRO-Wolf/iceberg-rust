@@ -82,7 +82,7 @@ pub struct ManageSnapshotsAction {
 }
 
 impl ManageSnapshotsAction {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         ManageSnapshotsAction { ops: vec![] }
     }
 
