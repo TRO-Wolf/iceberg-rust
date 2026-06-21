@@ -109,7 +109,8 @@ approved a hardening sprint **before further parity work**. Live plan + checkbox
 4. **Interop-debt budget (sprint increment E).** The 🟡-with-deferred-interop pattern is accepted,
    but the debt is paid down in risk order (RowDelta metadata semantics → the rewrite-family four →
    inspection tables) rather than accumulating indefinitely.
-5. **Platform cut line — RESOLVED-AS-TABLED (2026-06-11).** The user tabled the downstream
+5. **Platform cut line — RESOLVED-AS-TABLED (2026-06-11); RE-OPENED & SUPERSEDED 2026-06-20 (see
+   "Direction re-anchor" below).** The user tabled the downstream
    platform / DataFusion-SQL (RePark) direction to think it over, and redirected this fork's
    mission to **near-full 1:1 Java `iceberg-core`/`iceberg-api` replacement** — the phases run to
    completion in dependency-then-value order, NOT re-ranked by platform need. Maintenance actions
@@ -122,6 +123,49 @@ approved a hardening sprint **before further parity work**. Live plan + checkbox
 > **Sprint status (2026-06-10):** A (maps), B (lessons compaction), C (todo archival), D (this
 > de-triplication), and E3 (inspection interop) are DONE; E1/E2 (write-action metadata interop)
 > remain. The size warnings above are resolved; the one-home-per-fact rule below is now in force.
+
+---
+---
+
+## Direction re-anchor (2026-06-20) — the named consumer  ·  **engine-first closeout (2026-06-21)**
+
+**Supersedes the "Platform cut line — RESOLVED-AS-TABLED (2026-06-11)" item above.** On 2026-06-20 the
+user re-opened and resolved the platform direction: the terminal goal is no longer near-full 1:1 Java
+parity *for its own sake* but **"be the Rust Iceberg core a named consumer pulls."** The named consumer
+(option A) is a **downstream Apache DataFusion-wrapped custom query engine** issuing row-level
+DELETE/UPDATE/MERGE. **Seam:** the `iceberg` CORE crate is the stable engine-facing contract — the
+downstream builds its OWN DataFusion `TableProvider` over it; `crates/integrations/datafusion` is a
+reference impl, not the product.
+
+**DML foundation — DELIVERED & PROVEN (2026-06-21), through the PUBLIC surface, offline AND vs Java:**
+#114 nameable write/commit action types · #115 the reserved `_pos` row-position column on Parquet scans ·
+#116 the engine-boundary proof (scan `_file`/`_pos` → write position-delete → `RowDelta` → re-scan omits
+exactly those rows) · #117 the public `iceberg::arrow::DeleteFilter` (mirrors Java
+`org.apache.iceberg.data.DeleteFilter`) · the custom-scan **equivalence proof**
+(`test/engine-mor-equivalence`): an engine's OWN raw read + `DeleteFilter::apply` reproduces the built-in
+`to_arrow()` merge-on-read scan EXACTLY (position / equality / combined). A downstream engine can BYO
+physical scan and get iceberg-correct rows. (These are engine-integration surface, not GAP_MATRIX parity
+rows — no capability status changed.)
+
+**Engine-first closeout (chosen 2026-06-21) — the new priority order.** The engine-serving core is now
+substantively done (scan: `BatchScan` / `plan_tasks` / MoR deletes / `_pos` / `DeleteFilter`; write: the
+full commit surface). Remaining parity work is re-ranked by **what the query engine actually pulls**:
+- **Harden next (engine-relevant), in priority order:** (1) the **merge-on-read DELETE-apply residue** —
+  multi-file-per-partition + non-identity partition transforms (the delete-application correctness the
+  engine's own scan + `DeleteFilter` depend on; the "Read: merge-on-read apply" 🟡 row); directly extends
+  the 2026-06-21 equivalence proof to realistic layouts. (2) **CDC row-level changelog** —
+  `UpdateBefore`/`UpdateAfter` + accepting ranges that carry row-level DELETE manifests
+  (`IncrementalChangelogScan` is whole-data-file-level only today). (3) the **ORC/Avro DATA-read residue**
+  (footer codec / nested + V3 types / the Avro `timestamptz` mapping) — only if the engine queries
+  non-parquet tables.
+- **PULL-BASED (only on a concrete engine need):** `TransactionAction` made `pub` (custom commit actions);
+  the transaction-side DV-on-DV auto-merge; the `iceberg-datafusion` `InsertOp` reference impl.
+- **DEMOTED to opportunistic (a query engine does not pull these):** encryption, geometry/geography,
+  ORC/Avro data **write**, `SnapshotTable`/`MigrateTable`. The PAR-05 near-full-parity march below is
+  PAUSED in favor of this lens.
+
+This changes SEQUENCING and PRIORITY only — the phase plan, the Definition of Done (interop bar), and
+every GAP_MATRIX capability status are unchanged.
 
 ---
 ---
@@ -320,6 +364,12 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 
 
 ## Headline gap AREAS (ranked by effort × value — statuses live in the GAP_MATRIX)
+
+> **Priority superseded 2026-06-21 — see "Direction re-anchor (2026-06-20)" above.** Under the
+> engine-first closeout, this list is re-ranked by **what the named DataFusion consumer pulls**: harden
+> CDC row-level (row 121) + the ORC/Avro **read** residue next; encryption / geometry / ORC-Avro **write**
+> / `SnapshotTable`/`MigrateTable` are DEMOTED to opportunistic. The PAR-05 two-track text below is
+> retained for its per-item detail but no longer sets the priority order.
 
 Sequenced for the near-full-parity directive (2026-06-11); **re-steered 2026-06-19 (PAR-05) to a
 two-track hybrid** now that the post-audit backlog is cleared and the work is Opus-paced (Fable
