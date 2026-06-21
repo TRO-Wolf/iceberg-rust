@@ -286,6 +286,16 @@ impl DataFile {
     pub fn content_size_in_bytes(&self) -> Option<i64> {
         self.content_size_in_bytes
     }
+    /// Get the id of the partition spec this file's [`partition`](Self::partition) tuple was produced
+    /// from.
+    ///
+    /// This is the in-memory partition-spec id carried alongside the file; it is NOT a field in the
+    /// Iceberg manifest spec (Java resolves a file's spec id from the manifest the entry lives in).
+    /// An engine assembling a multi-spec commit uses it to group added files by their owning
+    /// [`PartitionSpec`](crate::spec::PartitionSpec).
+    pub fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
 }
 
 /// Convert data files to avro bytes and write to writer.

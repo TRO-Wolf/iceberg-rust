@@ -47,15 +47,36 @@
 //!     .await
 //!     .unwrap();
 //! ```
+//!
+//! # Engine-facing action types
+//!
+//! Every [`Transaction`] factory method hands out a concrete action builder — [`FastAppendAction`],
+//! [`MergeAppendAction`], [`OverwriteFilesAction`], [`DeleteFilesAction`], [`ReplacePartitionsAction`],
+//! [`RewriteFilesAction`], [`RowDeltaAction`], [`ManageSnapshotsAction`], [`CherryPickAction`] — and
+//! each is re-exported from this module so an external engine can NAME it (store it in a field, pass
+//! it to a helper, use it as a trait bound), not merely chain methods off the factory call.
+//!
+//! For row-level DML (`DELETE` / `UPDATE` / `MERGE`), the merge-on-read commit is
+//! [`Transaction::row_delta`]: an engine produces position/equality delete files or deletion vectors
+//! with the [`writer`](crate::writer) builders, then commits them via [`RowDeltaAction::add_deletes`]
+//! in a single snapshot. See [`RowDeltaAction`] for the format-version gating and conflict-validation
+//! contract.
 
 /// The `ApplyTransactionAction` trait provides an `apply` method
 /// that allows users to apply a transaction action to a `Transaction`.
 mod action;
 
 pub use action::*;
+// The write / snapshot-management action builders are re-exported next to their (private) modules so
+// each type is NAMEABLE by an external engine — stored in a field, returned from a helper, or used as
+// a trait bound — not merely usable via type inference off the `Transaction` factory that hands it
+// out. Same rationale as the `ExpireSnapshotsAction` / `RewriteManifestsAction` re-exports below.
 mod append;
+pub use append::FastAppendAction;
 mod cherry_pick;
+pub use cherry_pick::CherryPickAction;
 mod delete_files;
+pub use delete_files::DeleteFilesAction;
 mod expire_cleanup;
 mod expire_snapshots;
 pub use expire_cleanup::{
@@ -65,15 +86,21 @@ pub use expire_cleanup::{
 // `Transaction::expire_snapshots()` and `maintenance::Actions::expire_snapshots()`.
 pub use expire_snapshots::ExpireSnapshotsAction;
 mod manage_snapshots;
+pub use manage_snapshots::ManageSnapshotsAction;
 mod merge_append;
+pub use merge_append::MergeAppendAction;
 mod overwrite_files;
+pub use overwrite_files::OverwriteFilesAction;
 mod replace_partitions;
+pub use replace_partitions::ReplacePartitionsAction;
 mod rewrite_files;
+pub use rewrite_files::RewriteFilesAction;
 mod rewrite_manifests;
 // Re-exported so the action type is nameable as a return type — it is handed out by both
 // `Transaction::rewrite_manifests()` and `maintenance::Actions::rewrite_manifests()`.
 pub use rewrite_manifests::RewriteManifestsAction;
 mod row_delta;
+pub use row_delta::RowDeltaAction;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -94,15 +121,6 @@ use crate::events::{self, CreateSnapshotEvent};
 use crate::spec::{Snapshot, TableProperties};
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
-use crate::transaction::append::FastAppendAction;
-use crate::transaction::cherry_pick::CherryPickAction;
-use crate::transaction::delete_files::DeleteFilesAction;
-use crate::transaction::manage_snapshots::ManageSnapshotsAction;
-use crate::transaction::merge_append::MergeAppendAction;
-use crate::transaction::overwrite_files::OverwriteFilesAction;
-use crate::transaction::replace_partitions::ReplacePartitionsAction;
-use crate::transaction::rewrite_files::RewriteFilesAction;
-use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
