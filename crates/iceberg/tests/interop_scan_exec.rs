@@ -68,6 +68,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
+use iceberg::arrow::DeleteFilter;
 use iceberg::io::{FileIO, LocalFsStorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
@@ -91,6 +92,7 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Deserialize;
 
 // ===========================================================================================
@@ -923,69 +925,12 @@ async fn test_engine_boundary_scan_pos_then_row_delta() {
 // When `ICEBERG_INTEROP_EQ_SCAN_GEN_DIR` is UNSET this is a clean no-op — the offline gate stays green.
 // ===========================================================================================
 
-/// Write a REAL parquet EQUALITY-delete file (via the production `EqualityDeleteFileWriter`) keyed on field
-/// id 1 (the `id` column), deleting rows id=20 and id=40, unpartitioned. The writer projects the table
-/// schema down to the single `id` column and stamps the delete file with content `EqualityDeletes` +
-/// `equality_ids = [1]`. Reuses the crown-jewel machinery — no hand-rolled parquet.
+/// Write a REAL parquet EQUALITY-delete file (via the production `EqualityDeleteFileWriter`) keyed on
+/// field id 1 (the `id` column), deleting rows id=20 and id=40, unpartitioned, stamped with content
+/// `EqualityDeletes` + `equality_ids = [1]`. The Java-readable fixture's specific case of the general
+/// [`write_equality_delete_for_ids`] (the `data` column is projected away, so only `id` lands on disk).
 async fn write_gen_equality_delete_file(table: &Table) -> DataFile {
-    use iceberg::arrow::schema_to_arrow_schema;
-
-    let schema = table.metadata().current_schema();
-    // equality_ids = [1] (the `id` field). The config builds a projector from the FULL table schema down to
-    // just the `id` column, so we feed it a FULL-schema (id, data) batch and it extracts the `id` values.
-    let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
-        .expect("equality-delete writer config (equality_ids = [1])");
-
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
-    let file_name_gen = DefaultFileNameGenerator::new(
-        "eq-del".to_string(),
-        Some(uuid::Uuid::now_v7().to_string()),
-        iceberg::spec::DataFileFormat::Parquet,
-    );
-    // The parquet writer must use the PROJECTED schema (just `id`), since that is what lands on disk.
-    let projected_iceberg_schema = Arc::new(
-        iceberg::arrow::arrow_schema_to_schema(config.projected_arrow_schema_ref())
-            .expect("projected arrow schema → iceberg schema"),
-    );
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
-        projected_iceberg_schema,
-    );
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-
-    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
-        .build(None)
-        .await
-        .expect("build equality-delete writer");
-
-    // A FULL-schema (id, data) batch carrying the two delete keys (id=20, id=40); the writer's projector
-    // keeps only the `id` column. The `data` values are irrelevant (projected away) but the batch must match
-    // the full table schema so the column-index projection resolves.
-    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema → arrow"));
-    let ids = Int64Array::from(vec![20_i64, 40]);
-    let data = StringArray::from(vec!["b", "d"]);
-    let batch = RecordBatch::try_new(arrow_schema, vec![
-        Arc::new(ids) as ArrayRef,
-        Arc::new(data) as ArrayRef,
-    ])
-    .expect("build the equality-delete key batch");
-    writer
-        .write(batch)
-        .await
-        .expect("write equality-delete batch");
-    writer
-        .close()
-        .await
-        .expect("close equality-delete writer")
-        .into_iter()
-        .next()
-        .expect("one equality-delete file")
+    write_equality_delete_for_ids(table, &[20, 40]).await
 }
 
 #[tokio::test]
@@ -1395,5 +1340,377 @@ async fn test_part_scan_exec_gen_rust_writes_java_readable_partitioned_table() {
         "interop_scan_exec partitioned GEN OK — Rust wrote {table_location} (per-partition parquet data + \
          partition-scoped position-delete + final.metadata.json); Rust scan = {{10,30,40,50}}. Java \
          verify-interop-part-scan reads it next."
+    );
+}
+
+// ===========================================================================================
+// ENGINE CUSTOM-SCAN EQUIVALENCE — the public `DeleteFilter` (engine-facing merge-on-read delete
+// application, mirroring Java `org.apache.iceberg.data.DeleteFilter`) reproduces the built-in scan
+// EXACTLY. A downstream DataFusion-wrapped engine plans the files, does its OWN physical parquet read
+// of each data file (the `parquet` crate directly — what a DataFusion `ParquetExec` does, NOT
+// iceberg's delete-applying reader), then reuses iceberg's delete resolution via
+// `DeleteFilter::{load, equality_delete_predicate, apply}` to drop deleted rows. These OFFLINE tests
+// (no Java/Maven) prove that path yields rows IDENTICAL to `table.scan().to_arrow()` (which applies the
+// same deletes internally, via the reader's `survival_mask`) across position deletes, equality deletes,
+// and the two combined.
+//
+// This is the compose-equivalence the in-`delete_filter.rs` unit test does not reach: that test proves
+// `load` + `apply` in isolation; here the SAME deletes, committed to a REAL table, are resolved two ways
+// — the engine `DeleteFilter` over a raw read vs the built-in scan — and asserted equal. That equality IS
+// the seam's contract: an engine can BYO physical scan and still get iceberg-correct merge-on-read rows.
+//
+// Non-vacuity: the equality-delete predicate resolves the `id` column by Iceberg field id from the raw
+// parquet's `PARQUET_FIELD_ID_META_KEY` metadata. If that metadata did NOT round-trip, the column would
+// read as absent, the predicate would keep every row, and the engine path would diverge from ground
+// truth — so these assertions FAIL LOUDLY rather than pass vacuously if the round-trip ever breaks.
+// ===========================================================================================
+
+/// Strip a `file://` scheme so a `FileScanTask` data-file path opens as a local filesystem path (the
+/// `MemoryCatalog` over `LocalFsStorageFactory` writes absolute local paths; tolerate either form).
+fn strip_file_scheme(path: &str) -> &str {
+    path.strip_prefix("file://").unwrap_or(path)
+}
+
+/// Write a REAL parquet EQUALITY-delete file keyed on field id 1 (the `id` column), deleting the given
+/// `ids`, unpartitioned, via the production `EqualityDeleteFileWriter`. The writer projects the table
+/// schema down to the single `id` column, so the `data` values are placeholders (projected away — only
+/// `id` lands on disk) and the stamped delete carries content `EqualityDeletes` + `equality_ids = [1]`.
+async fn write_equality_delete_for_ids(table: &Table, ids: &[i64]) -> DataFile {
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    // equality_ids = [1] (the `id` field). The config builds a projector from the FULL table schema down to
+    // just the `id` column, so we feed it a FULL-schema (id, data) batch and it extracts the `id` values.
+    let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
+        .expect("equality-delete writer config (equality_ids = [1])");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "eq-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    // The parquet writer must use the PROJECTED schema (just `id`), since that is what lands on disk.
+    let projected_iceberg_schema = Arc::new(
+        iceberg::arrow::arrow_schema_to_schema(config.projected_arrow_schema_ref())
+            .expect("projected arrow schema → iceberg schema"),
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        projected_iceberg_schema,
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+
+    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .build(None)
+        .await
+        .expect("build equality-delete writer");
+
+    // A FULL-schema (id, data) batch carrying the delete keys; the writer's projector keeps only `id`. The
+    // `data` values are projected away, but the batch must match the full table schema so the column-index
+    // projection resolves.
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema → arrow"));
+    let data: Vec<&str> = std::iter::repeat_n("x", ids.len()).collect();
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+        Arc::new(StringArray::from(data)) as ArrayRef,
+    ])
+    .expect("build the equality-delete key batch");
+    writer
+        .write(batch)
+        .await
+        .expect("write equality-delete batch");
+    writer
+        .close()
+        .await
+        .expect("close equality-delete writer")
+        .into_iter()
+        .next()
+        .expect("one equality-delete file")
+}
+
+/// The DOWNSTREAM-ENGINE custom-scan path, end to end through the PUBLIC surface: plan the files, do the
+/// engine's OWN physical parquet read of each data file (the `parquet` crate directly — what a DataFusion
+/// `ParquetExec` does, NOT iceberg's delete-applying reader), then reuse iceberg's merge-on-read delete
+/// resolution via the public [`DeleteFilter`] to drop deleted rows. Returns the surviving `(id, data)`
+/// rows — which MUST equal the built-in `to_arrow()` scan.
+async fn engine_custom_scan_rows(table: &Table) -> Vec<ScanRow> {
+    let tasks: Vec<_> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .plan_files()
+        .await
+        .expect("plan files")
+        .try_collect()
+        .await
+        .expect("collect scan tasks");
+
+    let mut rows = Vec::new();
+    for task in &tasks {
+        // Resolve the task's deletes once (position deletes + DVs eagerly; the equality predicate lazily).
+        let deletes = DeleteFilter::load(task, table.file_io().clone())
+            .await
+            .expect("load DeleteFilter");
+        let equality_predicate = deletes
+            .equality_delete_predicate(task)
+            .await
+            .expect("resolve equality-delete predicate");
+
+        // The engine's OWN read of the data file: every physical row, in file order, NO deletes applied.
+        let file = fs::File::open(strip_file_scheme(task.data_file_path()))
+            .expect("open data-file parquet for the engine's own read");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("parquet reader builder")
+            .build()
+            .expect("build parquet record-batch reader");
+
+        // Apply the deletes batch by batch, tracking the absolute file position of each batch's row 0.
+        let mut row_base = 0u64;
+        for batch in reader {
+            let batch = batch.expect("read a data batch");
+            let row_count = batch.num_rows() as u64;
+            let survivors = deletes
+                .apply(task, batch, row_base, equality_predicate.as_ref())
+                .expect("apply merge-on-read deletes");
+            rows.extend(extract_rows(&survivors));
+            row_base += row_count;
+        }
+    }
+    rows
+}
+
+/// The BUILT-IN scan (the ground truth): `table.scan().to_arrow()` applies the SAME merge-on-read deletes
+/// internally (the reader's `survival_mask`). Returns the surviving `(id, data)` rows.
+async fn builtin_scan_rows(table: &Table) -> Vec<ScanRow> {
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+    batches.iter().flat_map(extract_rows).collect()
+}
+
+/// Build a fresh unpartitioned 5-row table {(10,a)..(50,e)} in `catalog` at `table_location` and
+/// `fast_append` it (sequence 1). Returns the committed table + the data file's path — the shared setup
+/// for the equivalence scenarios below.
+async fn append_5row_table(catalog: &impl Catalog, table_location: &str) -> (Table, String) {
+    let table = create_rust_table(catalog, table_location).await;
+    let data_file = write_gen_data_file(&table).await;
+    let data_file_path = data_file.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![data_file])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(catalog).await.expect("commit fast append");
+    (table, data_file_path)
+}
+
+#[tokio::test]
+async fn test_engine_deletefilter_equivalence_position_deletes() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "equivalence_pos",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let (table, data_file_path) = append_5row_table(&catalog, &table_location).await;
+
+    // Commit a POSITION delete of ids 20/40 (positions 1/3), discovered the way an engine would.
+    let mut pairs = discover_row_identities(&table, &[20, 40]).await;
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            (data_file_path.clone(), 1_i64),
+            (data_file_path.clone(), 3_i64),
+        ],
+        "ids 20/40 sit at file positions 1/3"
+    );
+    let delete_file = write_pos_delete_from_pairs(&table, &pairs).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // The public `deleted_row_positions` (≈ Java `deletedRowPositions()`) reports exactly {1, 3}.
+    {
+        let tasks: Vec<_> = table
+            .scan()
+            .build()
+            .expect("build scan")
+            .plan_files()
+            .await
+            .expect("plan files")
+            .try_collect()
+            .await
+            .expect("collect tasks");
+        let deletes = DeleteFilter::load(&tasks[0], table.file_io().clone())
+            .await
+            .expect("load DeleteFilter");
+        let positions = deletes
+            .deleted_row_positions(&tasks[0])
+            .expect("a positional delete vector is present");
+        let guard = positions.lock().expect("lock the delete vector");
+        assert_eq!(guard.len(), 2, "exactly two positions are deleted");
+        assert!(
+            guard.contains(1) && guard.contains(3),
+            "positions 1 and 3 (ids 20, 40) are the deleted positions"
+        );
+    }
+
+    // The equivalence: engine custom-scan DeleteFilter path == built-in MoR scan == {10, 30, 50}.
+    let ground_truth = sorted_by_id(builtin_scan_rows(&table).await);
+    let engine = sorted_by_id(engine_custom_scan_rows(&table).await);
+    assert_eq!(
+        engine, ground_truth,
+        "engine DeleteFilter (raw read + apply) must equal the built-in delete-applying scan"
+    );
+    let live_ids: Vec<i64> = engine.iter().map(|row| row.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 50],
+        "position-delete survivors are exactly {{10, 30, 50}}"
+    );
+}
+
+#[tokio::test]
+async fn test_engine_deletefilter_equivalence_equality_deletes() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "equivalence_eq",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let (table, _data_file_path) = append_5row_table(&catalog, &table_location).await;
+
+    // Commit an EQUALITY delete of ids 20/40 (delete-by-VALUE, keyed on field id 1) at sequence 2.
+    let delete_file = write_equality_delete_for_ids(&table, &[20, 40]).await;
+    assert_eq!(delete_file.content_type(), DataContentType::EqualityDeletes);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // The public accessors: an equality-delete predicate is present (≈ Java `eqDeletedRowFilter()`), and
+    // there are no positional deletes for an equality-only task.
+    {
+        let tasks: Vec<_> = table
+            .scan()
+            .build()
+            .expect("build scan")
+            .plan_files()
+            .await
+            .expect("plan files")
+            .try_collect()
+            .await
+            .expect("collect tasks");
+        let deletes = DeleteFilter::load(&tasks[0], table.file_io().clone())
+            .await
+            .expect("load DeleteFilter");
+        assert!(
+            deletes
+                .equality_delete_predicate(&tasks[0])
+                .await
+                .expect("resolve equality-delete predicate")
+                .is_some(),
+            "an equality-delete predicate is present"
+        );
+        let positions = deletes.deleted_row_positions(&tasks[0]);
+        assert!(
+            positions.is_none_or(|dv| dv.lock().expect("lock the delete vector").is_empty()),
+            "an equality-only task has no positional deletes"
+        );
+    }
+
+    // The equivalence: engine equality-DeleteFilter path == built-in equality MoR scan == {10, 30, 50}.
+    let ground_truth = sorted_by_id(builtin_scan_rows(&table).await);
+    let engine = sorted_by_id(engine_custom_scan_rows(&table).await);
+    assert_eq!(
+        engine, ground_truth,
+        "engine equality DeleteFilter (raw read + predicate apply) must equal the built-in equality scan"
+    );
+    let live_ids: Vec<i64> = engine.iter().map(|row| row.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 50],
+        "equality-delete survivors are exactly {{10, 30, 50}}"
+    );
+}
+
+#[tokio::test]
+async fn test_engine_deletefilter_equivalence_position_and_equality_deletes() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "equivalence_combined",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let (table, data_file_path) = append_5row_table(&catalog, &table_location).await;
+
+    // Commit BOTH a position delete (position 0 = id 10) AND an equality delete (id 30) in ONE row_delta
+    // at sequence 2 — this exercises DeleteFilter::apply's combined positional-AND-equality mask path.
+    let pos_delete = write_pos_delete_from_pairs(&table, &[(data_file_path.clone(), 0)]).await;
+    let eq_delete = write_equality_delete_for_ids(&table, &[30]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![pos_delete, eq_delete])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // The equivalence: engine combined-DeleteFilter path == built-in combined MoR scan == {20, 40, 50}.
+    let ground_truth = sorted_by_id(builtin_scan_rows(&table).await);
+    let engine = sorted_by_id(engine_custom_scan_rows(&table).await);
+    assert_eq!(
+        engine, ground_truth,
+        "engine combined DeleteFilter (positional AND equality mask) must equal the built-in scan"
+    );
+    let live_ids: Vec<i64> = engine.iter().map(|row| row.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![20, 40, 50],
+        "combined survivors are exactly {{20, 40, 50}} (position 0 = id 10, and id 30, deleted)"
     );
 }
