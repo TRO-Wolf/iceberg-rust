@@ -617,56 +617,6 @@ async fn write_gen_data_file(table: &Table) -> DataFile {
         .expect("build unpartitioned data file")
 }
 
-/// Write a REAL parquet POSITION-DELETE file (via the production `PositionDeleteFileWriter`) deleting
-/// positions {1, 3} of `data_file_path` (ids 20 and 40), unpartitioned. Reuses the crown-jewel machinery.
-async fn write_gen_position_delete_file(table: &Table, data_file_path: &str) -> DataFile {
-    let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
-
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
-    let file_name_gen = DefaultFileNameGenerator::new(
-        "pos-del".to_string(),
-        Some(uuid::Uuid::now_v7().to_string()),
-        iceberg::spec::DataFileFormat::Parquet,
-    );
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
-        config.schema().clone(),
-    );
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-
-    // Unpartitioned table ⇒ no partition key (the delete-file index keys by partition + spec id; an
-    // unpartitioned table has the empty partition for every file).
-    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
-        .build(None)
-        .await
-        .expect("build position-delete writer");
-
-    let paths = StringArray::from(vec![data_file_path, data_file_path]);
-    let positions = Int64Array::from(vec![1_i64, 3]);
-    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
-        Arc::new(paths) as ArrayRef,
-        Arc::new(positions) as ArrayRef,
-    ])
-    .expect("build the position-delete batch");
-    writer
-        .write(batch)
-        .await
-        .expect("write position-delete batch");
-    writer
-        .close()
-        .await
-        .expect("close position-delete writer")
-        .into_iter()
-        .next()
-        .expect("one position-delete file")
-}
-
 #[tokio::test]
 async fn test_scan_exec_gen_rust_writes_java_readable_table() {
     let Some(gen_dir) = scan_gen_dir() else {
@@ -701,8 +651,20 @@ async fn test_scan_exec_gen_rust_writes_java_readable_table() {
         .expect("apply fast append");
     let table = tx.commit(&catalog).await.expect("commit fast append");
 
-    // 3. row_delta a REAL position-delete deleting positions {1,3} (ids 20/40).
-    let delete_file = write_gen_position_delete_file(&table, &data_file_path).await;
+    // 3. ENGINE STEP — scan (_file, _pos) to DISCOVER the (file, pos) of ids 20/40 (so this
+    //    Java-verified scenario exercises the `_pos` row-identity column round-tripping into the
+    //    position-delete Java reads back), then row_delta a REAL position-delete built from the pairs.
+    let mut pairs = discover_row_identities(&table, &[20, 40]).await;
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            (data_file_path.clone(), 1_i64),
+            (data_file_path.clone(), 3_i64),
+        ],
+        "scan(_file,_pos) discovered ids 20/40 at their true positions 1/3 in the committed data file"
+    );
+    let delete_file = write_pos_delete_from_pairs(&table, &pairs).await;
     assert_eq!(delete_file.content_type(), DataContentType::PositionDeletes);
     let tx = Transaction::new(&table);
     let tx = tx
@@ -823,8 +785,8 @@ async fn discover_row_identities(table: &Table, target_ids: &[i64]) -> Vec<(Stri
 }
 
 /// Write a REAL parquet position-delete file from discovered `(data_file_path, position)` pairs (the
-/// sibling of [`write_gen_position_delete_file`], but taking pairs a scan discovered rather than
-/// hard-coding them). The pairs MUST already be sorted by `(file_path, pos)` per the spec.
+/// pairs a scan discovered) via the production `PositionDeleteFileWriter`. The pairs MUST already be
+/// sorted by `(file_path, pos)` per the spec.
 async fn write_pos_delete_from_pairs(table: &Table, pairs: &[(String, i64)]) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
     let location_gen =
