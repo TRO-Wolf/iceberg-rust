@@ -60,7 +60,7 @@ use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
-use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
+use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{DataFileFormat, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
@@ -496,6 +496,29 @@ impl ArrowReader {
 
         record_batch_stream_builder =
             record_batch_stream_builder.with_projection(projection_mask.clone());
+
+        // `_pos` (row position) requested: a row-identity scan needs each row's TRUE physical
+        // ordinal in the data file (to build position deletes). Parquet applies positional deletes
+        // and the scan predicate via `RowSelection`, which SKIPS rows at the decode layer, making
+        // the surviving rows' physical positions unrecoverable. So when `_pos` is projected we
+        // decode the file in order with NO row-skipping (no RowFilter / RowSelection / row-group
+        // pruning) and route the batches through the shared whole-file tail
+        // (`finish_whole_file_scan_task`, also used by the Avro / ORC paths), which applies the
+        // predicate + merge-on-read deletes post-decode via a survival mask while the transformer
+        // assigns `_pos` = 0-based file ordinal. Pushdown is unaffected for scans that do not
+        // request `_pos`.
+        if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS) {
+            if let Some(batch_size) = batch_size {
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_batch_size(batch_size);
+            }
+            let batches: Vec<RecordBatch> = record_batch_stream_builder
+                .build()?
+                .map(|batch| batch.map_err(Error::from))
+                .try_collect()
+                .await?;
+            return Self::finish_whole_file_scan_task(task, batches, delete_filter_rx).await;
+        }
 
         // RecordBatchTransformer performs any transformations required on the RecordBatches
         // that come back from the file, such as type promotion, default column insertion,
@@ -3222,6 +3245,97 @@ message schema {
         assert!(col_b.is_null(0));
         assert!(col_b.is_null(1));
         assert!(col_b.is_null(2));
+    }
+
+    #[tokio::test]
+    async fn test_scan_projects_pos_metadata_column() {
+        use arrow_array::{Array, Int32Array, Int64Array};
+
+        // Table schema: a single `id` column (field id 1).
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        // Write a single Parquet file with 5 rows.
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::new_with_fs();
+
+        let to_write =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(vec![
+                10, 20, 30, 40, 50,
+            ])) as ArrayRef])
+            .unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(format!("{table_location}/data.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        // Scan projecting the data column AND the reserved `_pos` metadata column.
+        let reader = ArrowReaderBuilder::new(file_io).build();
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask {
+                file_size_in_bytes: std::fs::metadata(format!("{table_location}/data.parquet"))
+                    .unwrap()
+                    .len(),
+                start: 0,
+                length: 0,
+                record_count: None,
+                data_file_path: format!("{table_location}/data.parquet"),
+                data_file_format: DataFileFormat::Parquet,
+                schema: schema.clone(),
+                project_field_ids: vec![1, crate::metadata_columns::RESERVED_FIELD_ID_POS],
+                predicate: None,
+                deletes: vec![],
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
+                case_sensitive: false,
+                split_offsets: None,
+            })]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let batch = &result[0];
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.num_rows(), 5);
+
+        let id_col = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(id_col.values(), &[10, 20, 30, 40, 50]);
+
+        // `_pos` is the 0-based physical ordinal of each row in the data file.
+        let pos_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(pos_col.values(), &[0, 1, 2, 3, 4]);
     }
 
     /// Test for bug where position deletes in later row groups are not applied correctly.
