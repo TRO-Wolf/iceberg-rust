@@ -1714,3 +1714,222 @@ async fn test_engine_deletefilter_equivalence_position_and_equality_deletes() {
         "combined survivors are exactly {{20, 40, 50}} (position 0 = id 10, and id 30, deleted)"
     );
 }
+
+// ===========================================================================================
+// MULTI-FILE-PER-PARTITION merge-on-read — the delete-apply residue the engine-first closeout flags
+// (GAP_MATRIX "Read: merge-on-read apply" 🟡). When a single partition holds MORE THAN ONE data file,
+// a partition-scoped position-delete file (routed to EVERY data-file task in that partition by the
+// `DeleteFileIndex` partition keying) must apply ONLY to the rows of the data file it REFERENCES BY
+// PATH — its siblings in the same partition must be untouched. This is the correctness property the
+// existing one-file-per-partition interop never exercised; the path-keyed loader
+// (`parse_positional_deletes_record_batch_stream` groups positions into a `HashMap<file_path, _>`)
+// is what makes it hold. This OFFLINE test proves it at the scan AND engine-`DeleteFilter` level over
+// a REAL committed two-files-in-one-partition table. If the loader ever partition-broadcast positions
+// instead of path-keying them, the sibling row would wrongly vanish and this assertion would FAIL.
+// ===========================================================================================
+
+#[tokio::test]
+async fn test_engine_deletefilter_multifile_partition_position_delete_spares_sibling() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "equivalence_multifile",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_partitioned_rust_table(&catalog, &table_location).await;
+
+    let schema = table.metadata().current_schema().clone();
+    let spec = table.metadata().default_partition_spec().as_ref().clone();
+    let key_a = category_partition_key(schema.clone(), spec.clone(), "a");
+
+    // TWO data files in the SAME partition (category=a): file1 ids {10,20,30} @ positions 0..2,
+    // file2 ids {40,50,60} @ positions 0..2. Both stamped category=a (spec id 0).
+    let file1 =
+        write_partitioned_gen_data_file(&table, &key_a, "a", vec![10, 20, 30], vec!["x", "y", "z"])
+            .await;
+    let file2 =
+        write_partitioned_gen_data_file(&table, &key_a, "a", vec![40, 50, 60], vec!["p", "q", "r"])
+            .await;
+    let file1_path = file1.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file1, file2])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // A partition-scoped position delete referencing FILE1 at position 1 (id 20). The DeleteFileIndex
+    // routes it to BOTH data-file tasks (same partition), so correctness hinges on the loader applying
+    // it ONLY to file1 by path — file2's position 1 (id 50) must be SPARED.
+    let delete_file = write_partitioned_gen_position_delete_file(&table, &key_a, &file1_path).await;
+    assert_eq!(delete_file.content_type(), DataContentType::PositionDeletes);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // Built-in scan and the engine DeleteFilter path must agree, and both must drop ONLY file1's id 20.
+    let ground_truth = sorted_by_id(builtin_scan_rows(&table).await);
+    let engine = sorted_by_id(engine_custom_scan_rows(&table).await);
+    assert_eq!(
+        engine, ground_truth,
+        "engine DeleteFilter path == built-in scan for a multi-file partition"
+    );
+    let live_ids: Vec<i64> = engine.iter().map(|row| row.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40, 50, 60],
+        "only file1's position 1 (id 20) is deleted; file2's same-ordinal position 1 (id 50) is SPARED"
+    );
+    assert!(
+        engine.iter().any(|row| row.id == 50),
+        "id 50 (file2 position 1) MUST survive — position deletes are path-keyed, not partition-broadcast"
+    );
+    assert!(
+        !engine.iter().any(|row| row.id == 20),
+        "id 20 (file1 position 1) must be deleted"
+    );
+}
+
+/// Write a REAL parquet PARTITION-SCOPED EQUALITY-delete file (via the production
+/// `EqualityDeleteFileWriter` built WITH `partition_key`) keyed on field id 1 (`id`), deleting the given
+/// `ids`, for the `{id, category, data}` partitioned schema. The writer stamps the partition `Struct` +
+/// spec id onto the delete file (so the `DeleteFileIndex` routes it to that partition's data-file tasks)
+/// and projects the batch down to just `id` (category/data are placeholders, projected away).
+async fn write_partitioned_equality_delete_for_ids(
+    table: &Table,
+    partition_key: &PartitionKey,
+    category: &str,
+    ids: &[i64],
+) -> DataFile {
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
+        .expect("equality-delete writer config (equality_ids = [1])");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "eq-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let projected_iceberg_schema = Arc::new(
+        iceberg::arrow::arrow_schema_to_schema(config.projected_arrow_schema_ref())
+            .expect("projected arrow schema → iceberg schema"),
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        projected_iceberg_schema,
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    // Build WITH the partition key so the eq delete is partition-scoped (carries the partition Struct + spec id).
+    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .build(Some(partition_key.clone()))
+        .await
+        .expect("build partition-scoped equality-delete writer");
+
+    // A FULL-schema {id, category, data} batch carrying the delete keys; the projector keeps only `id`.
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema → arrow"));
+    let categories: Vec<&str> = std::iter::repeat_n(category, ids.len()).collect();
+    let data: Vec<&str> = std::iter::repeat_n("x", ids.len()).collect();
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+        Arc::new(StringArray::from(categories)) as ArrayRef,
+        Arc::new(StringArray::from(data)) as ArrayRef,
+    ])
+    .expect("build the partition-scoped equality-delete key batch");
+    writer
+        .write(batch)
+        .await
+        .expect("write equality-delete batch");
+    writer
+        .close()
+        .await
+        .expect("close equality-delete writer")
+        .into_iter()
+        .next()
+        .expect("one equality-delete file")
+}
+
+#[tokio::test]
+async fn test_engine_deletefilter_multifile_partition_equality_delete_applies_across_files() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "equivalence_multifile_eq",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_partitioned_rust_table(&catalog, &table_location).await;
+
+    let schema = table.metadata().current_schema().clone();
+    let spec = table.metadata().default_partition_spec().as_ref().clone();
+    let key_a = category_partition_key(schema.clone(), spec.clone(), "a");
+
+    // TWO data files in the SAME partition (category=a): file1 ids {10,20,30}, file2 ids {40,50,60}.
+    let file1 =
+        write_partitioned_gen_data_file(&table, &key_a, "a", vec![10, 20, 30], vec!["x", "y", "z"])
+            .await;
+    let file2 =
+        write_partitioned_gen_data_file(&table, &key_a, "a", vec![40, 50, 60], vec!["p", "q", "r"])
+            .await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file1, file2])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // A partition-scoped equality delete keyed on `id` for {20, 50} — id 20 lives in file1, id 50 in
+    // file2. It must apply to BOTH data files in partition a (the index returns a partition's eq deletes
+    // for every data-file task in it), dropping id 20 from file1 AND id 50 from file2.
+    let delete_file =
+        write_partitioned_equality_delete_for_ids(&table, &key_a, "a", &[20, 50]).await;
+    assert_eq!(delete_file.content_type(), DataContentType::EqualityDeletes);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // Built-in scan and the engine DeleteFilter path must agree, dropping id 20 (file1) AND id 50 (file2).
+    let ground_truth = sorted_by_id(builtin_scan_rows(&table).await);
+    let engine = sorted_by_id(engine_custom_scan_rows(&table).await);
+    assert_eq!(
+        engine, ground_truth,
+        "engine equality DeleteFilter path == built-in scan across a multi-file partition"
+    );
+    let live_ids: Vec<i64> = engine.iter().map(|row| row.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40, 60],
+        "the partition eq-delete drops id 20 (file1) AND id 50 (file2) — it applies to BOTH files"
+    );
+}
