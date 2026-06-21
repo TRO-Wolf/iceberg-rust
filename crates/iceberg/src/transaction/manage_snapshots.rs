@@ -214,12 +214,6 @@ impl ManageSnapshotsAction {
     }
 }
 
-impl Default for ManageSnapshotsAction {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Returns true if `ancestor_id` is `descendant_id` or any snapshot reachable from it by following
 /// `parent_snapshot_id`.
 fn is_ancestor_of(metadata: &TableMetadata, ancestor_id: i64, descendant_id: i64) -> bool {
