@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array as ArrowArray, ArrayRef, Int32Array, RecordBatch, RecordBatchOptions, RunArray,
+    Array as ArrowArray, ArrayRef, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
+    RunArray,
 };
 use arrow_cast::cast;
 use arrow_schema::{
@@ -29,7 +30,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
-use crate::metadata_columns::get_metadata_field;
+use crate::metadata_columns::{RESERVED_FIELD_ID_POS, get_metadata_field};
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
 };
@@ -163,6 +164,13 @@ pub(crate) enum ColumnSource {
         target_type: DataType,
         value: Option<PrimitiveLiteral>,
     },
+
+    // The reserved `_pos` metadata column: a new Int64 column holding each row's absolute
+    // physical ordinal in the data file (0-based). The values are threaded from the read
+    // position by `process_record_batch`, not read from the file, so the read path MUST feed
+    // batches in file order with no rows skipped (no Parquet `RowSelection` / row-group pruning)
+    // for the positions to be correct — enforced by the callers that project `_pos`.
+    RowPosition,
     // The iceberg spec refers to other permissible schema evolution actions
     // (see https://iceberg.apache.org/spec/#schema-evolution):
     // renaming fields, deleting fields and reordering fields.
@@ -269,6 +277,7 @@ impl RecordBatchTransformerBuilder {
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
             batch_transform: None,
+            next_row_position: 0,
         }
     }
 }
@@ -315,6 +324,11 @@ pub(crate) struct RecordBatchTransformer {
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
     batch_transform: Option<BatchTransform>,
+
+    // The absolute physical row position (0-based) of the NEXT row to process, advanced by each
+    // batch's row count. Sourced into the reserved `_pos` column (`ColumnSource::RowPosition`)
+    // when projected. Correct only under an in-order, no-skip decode — see that variant.
+    next_row_position: u64,
 }
 
 impl RecordBatchTransformer {
@@ -322,42 +336,63 @@ impl RecordBatchTransformer {
         &mut self,
         record_batch: RecordBatch,
     ) -> Result<RecordBatch> {
-        Ok(match &self.batch_transform {
-            Some(BatchTransform::PassThrough) => record_batch,
-            Some(BatchTransform::Modify {
+        // Lazily build the transform from the first batch's schema.
+        if self.batch_transform.is_none() {
+            let transform = Self::generate_batch_transform(
+                record_batch.schema_ref(),
+                self.snapshot_schema.as_ref(),
+                &self.projected_iceberg_field_ids,
+                &self.constant_fields,
+            )?;
+            self.batch_transform = Some(transform);
+        }
+
+        // The absolute physical position of this batch's first row (for `_pos`), captured before
+        // the immutable borrow of `batch_transform` below.
+        let start_row_position = self.next_row_position;
+        let row_count = record_batch.num_rows();
+
+        let result = match self
+            .batch_transform
+            .as_ref()
+            .expect("batch_transform was just initialized")
+        {
+            BatchTransform::PassThrough => record_batch,
+            BatchTransform::Modify {
                 target_schema,
                 operations,
-            }) => {
+            } => {
                 let options = RecordBatchOptions::default()
                     .with_match_field_names(false)
-                    .with_row_count(Some(record_batch.num_rows()));
+                    .with_row_count(Some(row_count));
                 RecordBatch::try_new_with_options(
                     Arc::clone(target_schema),
-                    self.transform_columns(record_batch.columns(), operations)?,
+                    Self::transform_columns(
+                        record_batch.columns(),
+                        operations,
+                        row_count,
+                        start_row_position,
+                    )?,
                     &options,
                 )?
             }
-            Some(BatchTransform::ModifySchema { target_schema }) => {
+            BatchTransform::ModifySchema { target_schema } => {
                 let options = RecordBatchOptions::default()
                     .with_match_field_names(false)
-                    .with_row_count(Some(record_batch.num_rows()));
+                    .with_row_count(Some(row_count));
                 RecordBatch::try_new_with_options(
                     Arc::clone(target_schema),
                     record_batch.columns().to_vec(),
                     &options,
                 )?
             }
-            None => {
-                self.batch_transform = Some(Self::generate_batch_transform(
-                    record_batch.schema_ref(),
-                    self.snapshot_schema.as_ref(),
-                    &self.projected_iceberg_field_ids,
-                    &self.constant_fields,
-                )?);
+        };
 
-                self.process_record_batch(record_batch)?
-            }
-        })
+        // Advance the running position by the FULL batch (before any later delete / predicate mask
+        // filters rows out) so the next batch's `_pos` continues from the correct physical ordinal.
+        self.next_row_position = self.next_row_position.saturating_add(row_count as u64);
+
+        Ok(result)
     }
 
     // Compare the schema of the incoming RecordBatches to the schema of
@@ -417,6 +452,19 @@ impl RecordBatchTransformer {
                             .0
                             .clone())
                     }
+                } else if *field_id == RESERVED_FIELD_ID_POS {
+                    // `_pos` reserved metadata column: not a value constant and absent from the
+                    // table schema (so the regular lookup below would fail). Build its Arrow field
+                    // from the reserved-column definition (Iceberg `long` => Arrow Int64); the
+                    // values are synthesized from the read position by `ColumnSource::RowPosition`.
+                    let pos_meta = get_metadata_field(*field_id)?;
+                    Ok(Arc::new(
+                        Field::new(&pos_meta.name, DataType::Int64, !pos_meta.required)
+                            .with_metadata(HashMap::from([(
+                                PARQUET_FIELD_ID_META_KEY.to_string(),
+                                pos_meta.id.to_string(),
+                            )])),
+                    ))
                 } else {
                     // Regular field - use schema as-is
                     Ok(field_id_to_mapped_schema_map
@@ -559,6 +607,19 @@ impl RecordBatchTransformer {
                     });
                 }
 
+                // `_pos` reserved metadata column. Absent from the table schema, so the lookup
+                // below would fail. If the file carries `_pos` (the Avro reader emits it as a
+                // running counter) pass it through; otherwise (Parquet / ORC) synthesize it from
+                // the read position via `RowPosition`.
+                if *field_id == RESERVED_FIELD_ID_POS {
+                    return Ok(match field_id_to_source_schema_map.get(field_id) {
+                        Some((_, source_index)) => ColumnSource::PassThrough {
+                            source_index: *source_index,
+                        },
+                        None => ColumnSource::RowPosition,
+                    });
+                }
+
                 let (target_field, _) =
                     field_id_to_mapped_schema_map
                         .get(field_id)
@@ -658,15 +719,11 @@ impl RecordBatchTransformer {
     }
 
     fn transform_columns(
-        &self,
         columns: &[Arc<dyn ArrowArray>],
         operations: &[ColumnSource],
+        num_rows: usize,
+        start_row_position: u64,
     ) -> Result<Vec<Arc<dyn ArrowArray>>> {
-        if columns.is_empty() {
-            return Ok(columns.to_vec());
-        }
-        let num_rows = columns[0].len();
-
         operations
             .iter()
             .map(|op| {
@@ -680,6 +737,14 @@ impl RecordBatchTransformer {
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
+                    }
+
+                    ColumnSource::RowPosition => {
+                        // Each row's absolute physical ordinal: [start, start + num_rows).
+                        let end = start_row_position.saturating_add(num_rows as u64);
+                        Arc::new(Int64Array::from_iter_values(
+                            (start_row_position..end).map(|p| p as i64),
+                        ))
                     }
                 })
             })
@@ -908,6 +973,68 @@ mod test {
         assert!(date_column.is_null(0));
         assert!(date_column.is_null(1));
         assert!(date_column.is_null(2));
+    }
+
+    #[test]
+    fn row_position_metadata_column_counts_physical_ordinal_across_batches() {
+        // Projecting the reserved `_pos` column must inject an Int64 column of each row's absolute
+        // physical ordinal in the data file (0-based), and the counter must CONTINUE across batches
+        // — it is the contract a downstream engine relies on to write position deletes.
+        use arrow_array::Int64Array;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        // Project the data column plus the reserved `_pos` metadata column.
+        let projected_iceberg_field_ids = [1, crate::metadata_columns::RESERVED_FIELD_ID_POS];
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
+                .build();
+
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "id",
+            DataType::Int32,
+            false,
+            "1",
+        )]));
+
+        // First batch (3 rows) => _pos 0, 1, 2.
+        let batch1 =
+            RecordBatch::try_new(file_schema.clone(), vec![Arc::new(Int32Array::from(vec![
+                10, 20, 30,
+            ]))])
+            .unwrap();
+        let out1 = transformer.process_record_batch(batch1).unwrap();
+        assert_eq!(out1.num_columns(), 2);
+        assert_eq!(
+            out1.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[0, 1, 2]
+        );
+
+        // Second batch (2 rows) => _pos 3, 4 — the counter continues, it does NOT restart.
+        let batch2 =
+            RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![40, 50]))])
+                .unwrap();
+        let out2 = transformer.process_record_batch(batch2).unwrap();
+        assert_eq!(
+            out2.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[3, 4]
+        );
     }
 
     #[test]
