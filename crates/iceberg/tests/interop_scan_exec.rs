@@ -617,56 +617,6 @@ async fn write_gen_data_file(table: &Table) -> DataFile {
         .expect("build unpartitioned data file")
 }
 
-/// Write a REAL parquet POSITION-DELETE file (via the production `PositionDeleteFileWriter`) deleting
-/// positions {1, 3} of `data_file_path` (ids 20 and 40), unpartitioned. Reuses the crown-jewel machinery.
-async fn write_gen_position_delete_file(table: &Table, data_file_path: &str) -> DataFile {
-    let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
-
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
-    let file_name_gen = DefaultFileNameGenerator::new(
-        "pos-del".to_string(),
-        Some(uuid::Uuid::now_v7().to_string()),
-        iceberg::spec::DataFileFormat::Parquet,
-    );
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
-        config.schema().clone(),
-    );
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-
-    // Unpartitioned table ⇒ no partition key (the delete-file index keys by partition + spec id; an
-    // unpartitioned table has the empty partition for every file).
-    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
-        .build(None)
-        .await
-        .expect("build position-delete writer");
-
-    let paths = StringArray::from(vec![data_file_path, data_file_path]);
-    let positions = Int64Array::from(vec![1_i64, 3]);
-    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
-        Arc::new(paths) as ArrayRef,
-        Arc::new(positions) as ArrayRef,
-    ])
-    .expect("build the position-delete batch");
-    writer
-        .write(batch)
-        .await
-        .expect("write position-delete batch");
-    writer
-        .close()
-        .await
-        .expect("close position-delete writer")
-        .into_iter()
-        .next()
-        .expect("one position-delete file")
-}
-
 #[tokio::test]
 async fn test_scan_exec_gen_rust_writes_java_readable_table() {
     let Some(gen_dir) = scan_gen_dir() else {
@@ -701,8 +651,20 @@ async fn test_scan_exec_gen_rust_writes_java_readable_table() {
         .expect("apply fast append");
     let table = tx.commit(&catalog).await.expect("commit fast append");
 
-    // 3. row_delta a REAL position-delete deleting positions {1,3} (ids 20/40).
-    let delete_file = write_gen_position_delete_file(&table, &data_file_path).await;
+    // 3. ENGINE STEP — scan (_file, _pos) to DISCOVER the (file, pos) of ids 20/40 (so this
+    //    Java-verified scenario exercises the `_pos` row-identity column round-tripping into the
+    //    position-delete Java reads back), then row_delta a REAL position-delete built from the pairs.
+    let mut pairs = discover_row_identities(&table, &[20, 40]).await;
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            (data_file_path.clone(), 1_i64),
+            (data_file_path.clone(), 3_i64),
+        ],
+        "scan(_file,_pos) discovered ids 20/40 at their true positions 1/3 in the committed data file"
+    );
+    let delete_file = write_pos_delete_from_pairs(&table, &pairs).await;
     assert_eq!(delete_file.content_type(), DataContentType::PositionDeletes);
     let tx = Transaction::new(&table);
     let tx = tx
@@ -748,6 +710,201 @@ async fn test_scan_exec_gen_rust_writes_java_readable_table() {
     println!(
         "interop_scan_exec GEN OK — Rust wrote {table_location} (parquet data + position-delete + \
          final.metadata.json); Rust scan = {{10,30,50}}. Java verify-interop-scan-exec reads it next."
+    );
+}
+
+// ===========================================================================================
+// ENGINE-BOUNDARY OFFLINE PROOF — play the downstream engine's role using ONLY the public core-crate
+// surface: scan `(_file, _pos)` to discover row identity, write a position-delete file from the
+// discovered pairs, commit it via `RowDelta`, and confirm merge-on-read omits exactly those rows.
+// Unlike the GEN test above this needs NO Java/Maven — it runs in the offline `cargo test` gate, and
+// is the executable contract a DataFusion-wrapped engine builds its DELETE/UPDATE/MERGE on.
+// ===========================================================================================
+
+/// Decode the reserved `_file` column at row `i`. The scan emits `_file` as a per-file constant, which
+/// the transformer materializes as a Run-End-Encoded `Utf8` column; tolerate both the REE and plain
+/// `Utf8` forms.
+fn decode_file_path(col: &ArrayRef, i: usize) -> String {
+    use arrow_array::RunArray;
+    use arrow_array::types::Int32Type;
+
+    if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
+        return plain.value(i).to_string();
+    }
+    if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
+        let physical = run.get_physical_index(i);
+        return run
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("_file REE values are Utf8")
+            .value(physical)
+            .to_string();
+    }
+    panic!("unexpected _file column type: {:?}", col.data_type());
+}
+
+/// Scan the committed table selecting `[id, _file, _pos]` and return the `(data_file_path, position)`
+/// of every row whose id is in `target_ids` — i.e. discover row identity exactly the way a downstream
+/// engine would, to write position deletes. Exercises the `_file` and `_pos` reserved metadata columns.
+async fn discover_row_identities(table: &Table, target_ids: &[i64]) -> Vec<(String, i64)> {
+    use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .select(["id", RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS])
+        .build()
+        .expect("build identity scan")
+        .to_arrow()
+        .await
+        .expect("identity scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect identity batches");
+
+    let mut pairs = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_primitive::<Int64Type>();
+        let file_col = batch
+            .column_by_name(RESERVED_COL_NAME_FILE)
+            .expect("_file column");
+        let pos_col = batch
+            .column_by_name(RESERVED_COL_NAME_POS)
+            .expect("_pos column")
+            .as_primitive::<Int64Type>();
+        for i in 0..batch.num_rows() {
+            if target_ids.contains(&id_col.value(i)) {
+                pairs.push((decode_file_path(file_col, i), pos_col.value(i)));
+            }
+        }
+    }
+    pairs
+}
+
+/// Write a REAL parquet position-delete file from discovered `(data_file_path, position)` pairs (the
+/// pairs a scan discovered) via the production `PositionDeleteFileWriter`. The pairs MUST already be
+/// sorted by `(file_path, pos)` per the spec.
+async fn write_pos_delete_from_pairs(table: &Table, pairs: &[(String, i64)]) -> DataFile {
+    let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "pos-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        config.schema().clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .build(None)
+        .await
+        .expect("build position-delete writer");
+
+    let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
+    let positions: Vec<i64> = pairs.iter().map(|(_, pos)| *pos).collect();
+    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(StringArray::from(paths)) as ArrayRef,
+        Arc::new(Int64Array::from(positions)) as ArrayRef,
+    ])
+    .expect("build position-delete batch");
+    writer
+        .write(batch)
+        .await
+        .expect("write position-delete batch");
+    writer
+        .close()
+        .await
+        .expect("close position-delete writer")
+        .into_iter()
+        .next()
+        .expect("one position-delete file")
+}
+
+#[tokio::test]
+async fn test_engine_boundary_scan_pos_then_row_delta() {
+    use tempfile::TempDir;
+
+    // 1. A MemoryCatalog over the local FS into a throwaway temp dir — fully offline, no Java.
+    let tmp = TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "engine_boundary",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_rust_table(&catalog, &table_location).await;
+
+    // 2. fast_append a real 5-row parquet data file: (10,a)..(50,e) at positions 0..4.
+    let data_file = write_gen_data_file(&table).await;
+    let data_file_path = data_file.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![data_file])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // 3. ENGINE STEP — scan `(_file, _pos)` to discover the row identity of the rows to delete
+    //    (ids 20 and 40). This is exactly what a downstream engine does to build position deletes,
+    //    and it asserts `_pos` reports the TRUE physical ordinal (20 and 40 sit at positions 1 and 3).
+    let mut pairs = discover_row_identities(&table, &[20, 40]).await;
+    pairs.sort(); // spec: position deletes sorted by (file_path, pos)
+    assert_eq!(
+        pairs,
+        vec![
+            (data_file_path.clone(), 1_i64),
+            (data_file_path.clone(), 3_i64),
+        ],
+        "scan(_file,_pos) must report ids 20/40 at their TRUE physical positions 1 and 3"
+    );
+
+    // 4. Write a position-delete file from the DISCOVERED pairs and commit it via RowDelta.
+    let delete_file = write_pos_delete_from_pairs(&table, &pairs).await;
+    assert_eq!(delete_file.content_type(), DataContentType::PositionDeletes);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // 5. Re-scan: merge-on-read must omit exactly the targeted rows → {10, 30, 50}.
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rows = Vec::new();
+    for batch in &batches {
+        rows.extend(extract_rows(batch));
+    }
+    let live_ids: Vec<i64> = sorted_by_id(rows).iter().map(|row| row.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 50],
+        "after committing the scan-discovered position deletes, ids 20/40 must be gone"
     );
 }
 
