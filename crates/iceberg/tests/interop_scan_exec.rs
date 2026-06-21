@@ -170,6 +170,28 @@ fn read_java_part_rows(dir: &std::path::Path) -> Vec<ScanRow> {
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
+/// The temp dir the Java oracle wrote the MULTI-FILE-PER-PARTITION table + JSON rows into (Direction 1).
+/// `None` when `ICEBERG_INTEROP_MULTIFILE_SCAN_DIR` is unset (the multi-file read test is then a no-op).
+fn multifile_scan_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_MULTIFILE_SCAN_DIR").map(PathBuf::from)
+}
+
+/// The temp dir into which the DIRECTION-2 multi-file GEN path writes a Rust-authored table (two data
+/// files in one partition + a partition-scoped position-delete on file1) for Java to read. `None` when
+/// `ICEBERG_INTEROP_MULTIFILE_SCAN_GEN_DIR` is unset (then a clean no-op).
+fn multifile_scan_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_MULTIFILE_SCAN_GEN_DIR").map(PathBuf::from)
+}
+
+/// Load + parse the Java ground-truth MULTI-FILE rows from `<dir>/java_multifile_scan_rows.json`.
+fn read_java_multifile_rows(dir: &std::path::Path) -> Vec<ScanRow> {
+    let path = dir.join("java_multifile_scan_rows.json");
+    let json = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str::<Vec<ScanRow>>(&json)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+}
+
 /// Load + parse the Java ground-truth EQUALITY-delete rows from `<dir>/java_eq_scan_rows.json`.
 fn read_java_eq_rows(dir: &std::path::Path) -> Vec<ScanRow> {
     let path = dir.join("java_eq_scan_rows.json");
@@ -1931,5 +1953,168 @@ async fn test_engine_deletefilter_multifile_partition_equality_delete_applies_ac
         live_ids,
         vec![10, 30, 40, 60],
         "the partition eq-delete drops id 20 (file1) AND id 50 (file2) — it applies to BOTH files"
+    );
+}
+
+// ===========================================================================================
+// MULTI-FILE-PER-PARTITION merge-on-read INTEROP — the bidirectional Java↔Rust proof that flips the
+// GAP_MATRIX "Read: merge-on-read apply" 🟡 residue (multi-file-per-partition slice). Direction 1
+// (`ICEBERG_INTEROP_MULTIFILE_SCAN_DIR`, driver run-interop-multifile-scan.sh): Java writes a table
+// with TWO data files in ONE partition + a partition-scoped position-delete on file1; Rust scans it and
+// asserts the live rows equal Java's own IcebergGenerics read — id 20 (file1 pos 1) gone, id 50 (file2's
+// SAME ordinal) SPARED. Direction 2 (`ICEBERG_INTEROP_MULTIFILE_SCAN_GEN_DIR`, run-interop-multifile-scan-d2.sh):
+// Rust GEN-writes the same shape, Java reads it back. Both are clean no-ops offline (gate stays green).
+// ===========================================================================================
+
+#[tokio::test]
+async fn test_multifile_scan_exec_matches_java_read() {
+    let Some(dir) = multifile_scan_dir() else {
+        println!(
+            "skipping interop_scan_exec multi-file — set ICEBERG_INTEROP_MULTIFILE_SCAN_DIR \
+             (run dev/java-interop/run-interop-multifile-scan.sh)"
+        );
+        return;
+    };
+
+    let table = load_table(&dir);
+
+    // Rust's scan → Arrow applies the partition-scoped position delete path-keyed to file1 only.
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let java_rows = sorted_by_id(read_java_multifile_rows(&dir));
+
+    // 5 live rows (6 written across two files in one partition, file1's position 1 deleted).
+    assert_eq!(
+        rust_rows.len(),
+        5,
+        "exactly 5 rows survive (6 written in 2 files, file1 position 1 deleted)"
+    );
+    // file1's id 20 (position 1) is deleted; file2's id 50 (its OWN position 1) is the sibling — SPARED.
+    assert!(
+        !rust_rows.iter().any(|r| r.id == 20),
+        "id 20 (file1 position 1) must be ABSENT"
+    );
+    assert!(
+        rust_rows.iter().any(|r| r.id == 50),
+        "id 50 (file2 position 1, the SIBLING) must be PRESENT — the delete is path-keyed, not broadcast"
+    );
+    // Field-for-field equality with Java's own merge-on-read read.
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust multi-file scan→Arrow rows must equal Java's IcebergGenerics read"
+    );
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40, 50, 60],
+        "the live id set after multi-file merge-on-read is exactly {{10, 30, 40, 50, 60}}"
+    );
+
+    println!(
+        "interop_scan_exec multi-file OK — Rust scan = Java read: 5 live rows {{10,30,40,50,60}}, \
+         file1 id 20 deleted, file2 sibling id 50 spared"
+    );
+}
+
+#[tokio::test]
+async fn test_multifile_scan_exec_gen_rust_writes_java_readable_table() {
+    let Some(gen_dir) = multifile_scan_gen_dir() else {
+        println!(
+            "skipping interop_scan_exec multi-file GEN — set ICEBERG_INTEROP_MULTIFILE_SCAN_GEN_DIR \
+             (run dev/java-interop/run-interop-multifile-scan-d2.sh)"
+        );
+        return;
+    };
+
+    // A MemoryCatalog over the LOCAL FS, table pinned to <gen_dir>/rust_table, partitioned identity(category).
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_multifile_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_partitioned_rust_table(&catalog, &table_location).await;
+
+    let schema = table.metadata().current_schema().clone();
+    let spec = table.metadata().default_partition_spec().as_ref().clone();
+    let key_a = category_partition_key(schema.clone(), spec.clone(), "a");
+
+    // TWO data files in the SAME partition (category=a): file1 ids {10,20,30}, file2 ids {40,50,60}.
+    let file1 =
+        write_partitioned_gen_data_file(&table, &key_a, "a", vec![10, 20, 30], vec!["x", "y", "z"])
+            .await;
+    let file2 =
+        write_partitioned_gen_data_file(&table, &key_a, "a", vec![40, 50, 60], vec!["p", "q", "r"])
+            .await;
+    let file1_path = file1.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file1, file2])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // A partition-scoped position-delete on file1 (position 1 = id 20); file2's id 50 is SPARED.
+    let delete_file = write_partitioned_gen_position_delete_file(&table, &key_a, &file1_path).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // Sanity: Rust's own scan already reads {10,30,40,50,60} before handing to Java.
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let live_ids: Vec<i64> = sorted_by_id(rust_rows).iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40, 50, 60],
+        "Rust's own scan of the written multi-file table must be {{10,30,40,50,60}} (file1 id 20 deleted)"
+    );
+
+    // Write the FINAL metadata to a KNOWN path so Java loads it deterministically.
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_scan_exec multi-file GEN OK — Rust wrote {table_location} (two data files in one \
+         partition + partition-scoped position-delete + final.metadata.json); Rust scan = \
+         {{10,30,40,50,60}}. Java verify-interop-multifile-scan reads it next."
     );
 }
