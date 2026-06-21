@@ -2118,3 +2118,284 @@ async fn test_multifile_scan_exec_gen_rust_writes_java_readable_table() {
          {{10,30,40,50,60}}. Java verify-interop-multifile-scan reads it next."
     );
 }
+
+// ===========================================================================================
+// NON-IDENTITY TRANSFORM merge-on-read INTEROP — the bidirectional Java↔Rust proof that flips the
+// GAP_MATRIX "Read: merge-on-read apply" 🟡 residue's LAST slice (non-identity partition transforms).
+// The table is partitioned by `truncate[10](id)`, so the partition VALUE (10 / 20) is a TRANSFORMED value
+// no raw id equals — the proof that the `DeleteFileIndex` matches a partition-scoped delete to the
+// transformed partition `Struct`, not by raw column value. Partition truncate=10 holds ids 11/13/15,
+// truncate=20 holds 21/23; a partition-scoped position-delete in partition 10 deletes position 1 (id 13);
+// partition 20 is intact. Live = {11,15,21,23}. Direction 1 (`ICEBERG_INTEROP_NONIDENTITY_SCAN_DIR`,
+// run-interop-nonidentity-scan.sh) Java writes / Rust reads; Direction 2 (`..._GEN_DIR`,
+// run-interop-nonidentity-scan-d2.sh) Rust writes / Java reads. Both clean no-ops offline.
+// ===========================================================================================
+
+/// The temp dir the Java oracle wrote the NON-IDENTITY-TRANSFORM (truncate[10](id)) table + JSON rows
+/// into (Direction 1). `None` when `ICEBERG_INTEROP_NONIDENTITY_SCAN_DIR` is unset (then a no-op).
+fn nonidentity_scan_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_NONIDENTITY_SCAN_DIR").map(PathBuf::from)
+}
+
+/// The temp dir into which the DIRECTION-2 non-identity GEN path writes a Rust-authored truncate[10](id)-
+/// partitioned table for Java to read. `None` when `ICEBERG_INTEROP_NONIDENTITY_SCAN_GEN_DIR` is unset.
+fn nonidentity_scan_gen_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_NONIDENTITY_SCAN_GEN_DIR").map(PathBuf::from)
+}
+
+/// Load + parse the Java ground-truth NON-IDENTITY rows from `<dir>/java_nonidentity_scan_rows.json`.
+fn read_java_nonidentity_rows(dir: &std::path::Path) -> Vec<ScanRow> {
+    let path = dir.join("java_nonidentity_scan_rows.json");
+    let json = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str::<Vec<ScanRow>>(&json)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+}
+
+/// The `truncate[10](id)` unbound partition spec (spec id 0) — a NON-IDENTITY transform over the `{id,
+/// data}` [`gen_schema`], the sibling of [`part_gen_unbound_spec`]'s identity(category).
+fn truncate_gen_unbound_spec() -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(1, "id_trunc".to_string(), Transform::Truncate(10))
+        .expect("add truncate[10](id) partition field")
+        .build()
+}
+
+/// Create the `{id, data}` V2 table at `<gen_dir>/rust_table` partitioned by `truncate[10](id)`.
+async fn create_truncate_partitioned_rust_table(
+    catalog: &impl Catalog,
+    table_location: &str,
+) -> Table {
+    let namespace = NamespaceIdent::new("interop".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let creation = TableCreation::builder()
+        .name("rust_table".to_string())
+        .location(table_location.to_string())
+        .schema(gen_schema())
+        .partition_spec(truncate_gen_unbound_spec())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+
+    catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create truncate-partitioned rust_table")
+}
+
+/// Build the `PartitionKey` for a single `truncate[10](id)` partition `value` (10 or 20). The bound spec
+/// is the table's default; the partition `Struct` carries the single truncated long.
+fn truncate_partition_key(schema: SchemaRef, spec: PartitionSpec, value: i64) -> PartitionKey {
+    PartitionKey::new(
+        spec,
+        schema,
+        Struct::from_iter([Some(Literal::long(value))]),
+    )
+}
+
+/// Write a REAL parquet DATA file for ONE `truncate[10](id)` partition via the production `DataFileWriter`
+/// built with the partition's `PartitionKey` (the `{id, data}` sibling of `write_partitioned_gen_data_file`).
+/// The writer stamps the (transformed) partition value onto the `DataFile`; the caller must pass `ids`
+/// that all truncate to the key's value so the on-disk data is consistent with the stamp.
+async fn write_truncate_gen_data_file(
+    table: &Table,
+    partition_key: &PartitionKey,
+    ids: Vec<i64>,
+    data_values: Vec<&str>,
+) -> DataFile {
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema → arrow"));
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from(ids)) as ArrayRef,
+        Arc::new(StringArray::from(data_values)) as ArrayRef,
+    ])
+    .expect("build the per-partition data batch");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "rust-data".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        schema.clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(Some(partition_key.clone()))
+        .await
+        .expect("build truncate-partitioned data file writer");
+    writer
+        .write(batch)
+        .await
+        .expect("write per-partition batch");
+    writer
+        .close()
+        .await
+        .expect("close truncate-partitioned data file writer")
+        .into_iter()
+        .next()
+        .expect("one data file per partition")
+}
+
+#[tokio::test]
+async fn test_nonidentity_scan_exec_matches_java_read() {
+    let Some(dir) = nonidentity_scan_dir() else {
+        println!(
+            "skipping interop_scan_exec non-identity — set ICEBERG_INTEROP_NONIDENTITY_SCAN_DIR \
+             (run dev/java-interop/run-interop-nonidentity-scan.sh)"
+        );
+        return;
+    };
+
+    let table = load_table(&dir);
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let java_rows = sorted_by_id(read_java_nonidentity_rows(&dir));
+
+    // 4 live rows (5 written across two truncate partitions, truncate=10's position 1 deleted).
+    assert_eq!(
+        rust_rows.len(),
+        4,
+        "exactly 4 rows survive (5 written, truncate=10 position 1 deleted)"
+    );
+    // truncate=10's id 13 is deleted; truncate=20 (ids 21, 23) is intact.
+    assert!(
+        !rust_rows.iter().any(|r| r.id == 13),
+        "id 13 (truncate=10 partition, position 1) must be ABSENT"
+    );
+    assert!(
+        rust_rows.iter().any(|r| r.id == 21) && rust_rows.iter().any(|r| r.id == 23),
+        "the truncate=20 partition (ids 21, 23) must be intact — the delete matched only truncate=10"
+    );
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust non-identity (truncate) scan→Arrow rows must equal Java's IcebergGenerics read"
+    );
+    let live_ids: Vec<i64> = rust_rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![11, 15, 21, 23],
+        "the live id set after truncate-partition merge-on-read is exactly {{11, 15, 21, 23}}"
+    );
+
+    println!(
+        "interop_scan_exec non-identity OK — Rust scan = Java read: {{11,15,21,23}}, \
+         truncate=10 id 13 deleted, truncate=20 intact"
+    );
+}
+
+#[tokio::test]
+async fn test_nonidentity_scan_exec_gen_rust_writes_java_readable_table() {
+    let Some(gen_dir) = nonidentity_scan_gen_dir() else {
+        println!(
+            "skipping interop_scan_exec non-identity GEN — set ICEBERG_INTEROP_NONIDENTITY_SCAN_GEN_DIR \
+             (run dev/java-interop/run-interop-nonidentity-scan-d2.sh)"
+        );
+        return;
+    };
+
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_nonidentity_gen",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_truncate_partitioned_rust_table(&catalog, &table_location).await;
+
+    let schema = table.metadata().current_schema().clone();
+    let spec = table.metadata().default_partition_spec().as_ref().clone();
+    let key_10 = truncate_partition_key(schema.clone(), spec.clone(), 10);
+    let key_20 = truncate_partition_key(schema.clone(), spec.clone(), 20);
+
+    // truncate=10 holds ids 11/13/15 (all truncate to 10); truncate=20 holds 21/23.
+    let file_10 =
+        write_truncate_gen_data_file(&table, &key_10, vec![11, 13, 15], vec!["x", "y", "z"]).await;
+    let file_20 = write_truncate_gen_data_file(&table, &key_20, vec![21, 23], vec!["p", "q"]).await;
+    let file_10_path = file_10.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_10, file_20])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // A partition-scoped position-delete in partition truncate=10 (position 1 = id 13).
+    let delete_file =
+        write_partitioned_gen_position_delete_file(&table, &key_10, &file_10_path).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![delete_file])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // Sanity: Rust's own scan already reads {11,15,21,23} before handing to Java.
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let live_ids: Vec<i64> = sorted_by_id(rust_rows).iter().map(|r| r.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![11, 15, 21, 23],
+        "Rust's own scan of the written truncate-partitioned table must be {{11,15,21,23}} (id 13 deleted)"
+    );
+
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_scan_exec non-identity GEN OK — Rust wrote {table_location} (truncate[10](id) \
+         partitioned + partition-scoped position-delete on truncate=10 + final.metadata.json); Rust \
+         scan = {{11,15,21,23}}. Java verify-interop-nonidentity-scan reads it next."
+    );
+}
