@@ -18,12 +18,18 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+use arrow_arith::boolean::and;
+use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_select::filter::filter_record_batch;
 use tokio::sync::Notify;
 use tokio::sync::oneshot::Receiver;
 
+use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
 use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::io::FileIO;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::DataContentType;
 use crate::{Error, ErrorKind, Result};
@@ -53,8 +59,33 @@ struct DeleteFileFilterState {
     positional_deletes: HashMap<String, PosDelState>,
 }
 
+/// The resolved merge-on-read deletes for a scan — position deletes, deletion vectors, and equality
+/// deletes — plus the logic to apply them to Arrow batches.
+///
+/// This is the engine-facing analogue of Java `org.apache.iceberg.data.DeleteFilter`: a downstream
+/// query engine that builds its OWN physical scan (its own Parquet read / `ExecutionPlan`) uses it to
+/// REUSE Iceberg's delete resolution instead of reimplementing it (and its sequence-number,
+/// DV-supersedes-position, and null-coercion rules). The typical loop, per [`FileScanTask`] obtained
+/// from [`TableScan::plan_files`](crate::scan::TableScan::plan_files):
+///
+/// ```ignore
+/// let deletes = DeleteFilter::load(&task, file_io).await?;
+/// let eq_predicate = deletes.equality_delete_predicate(&task).await?;
+/// let mut row_base = 0u64;
+/// for batch in your_own_data_file_reader {     // batches of `task`'s data file, in file order
+///     let n = batch.num_rows() as u64;
+///     let surviving = deletes.apply(&task, batch, row_base, eq_predicate.as_ref())?;
+///     row_base += n;
+///     emit(surviving);
+/// }
+/// ```
+///
+/// A columnar engine that prefers to fold deletes into its own pushdown can instead read
+/// [`deleted_row_positions`](Self::deleted_row_positions) (the position bitmap, ≈ Java
+/// `deletedRowPositions()`) and [`equality_delete_predicate`](Self::equality_delete_predicate)
+/// (≈ Java `eqDeletedRowFilter()`) directly and skip [`apply`](Self::apply).
 #[derive(Clone, Debug, Default)]
-pub(crate) struct DeleteFilter {
+pub struct DeleteFilter {
     state: Arc<RwLock<DeleteFileFilterState>>,
 }
 
@@ -256,6 +287,132 @@ impl DeleteFilter {
             notify.notify_waiters();
         });
     }
+}
+
+/// Engine-facing API — the stable public surface mirroring Java `org.apache.iceberg.data.DeleteFilter`.
+impl DeleteFilter {
+    /// Load and resolve every merge-on-read delete (position deletes, deletion vectors, and equality
+    /// deletes) that applies to `task`, reading the delete files via `file_io`. Run this concurrently
+    /// with your own data-file read (e.g. `tokio::join!`): position deletes and deletion vectors are
+    /// fully resolved when this returns; equality-delete predicates resolve lazily on the first
+    /// [`equality_delete_predicate`](Self::equality_delete_predicate) call. Hides the internal
+    /// caching delete-file loader.
+    pub async fn load(task: &FileScanTask, file_io: FileIO) -> Result<Self> {
+        let loader = CachingDeleteFileLoader::new(file_io, task.deletes.len().max(1));
+        loader
+            .load_deletes(&task.deletes, task.schema_ref())
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "the delete-file loader was dropped before delivering the delete filter",
+                )
+                .with_source(e)
+            })?
+    }
+
+    /// The positional deletes that apply to `task`'s data file — the bitmap of deleted 0-based file
+    /// positions (parquet position deletes and/or a deletion vector, already merged) — or `None`.
+    /// Mirrors Java `DeleteFilter.deletedRowPositions()`. Synchronous: fully populated once
+    /// [`load`](Self::load) returns.
+    pub fn deleted_row_positions(&self, task: &FileScanTask) -> Option<Arc<Mutex<DeleteVector>>> {
+        self.get_delete_vector(task)
+    }
+
+    /// The combined equality-delete predicate for `task`, bound to the task schema — a row SURVIVES
+    /// iff it evaluates TRUE (the predicate is the negation of the delete condition). `None` when the
+    /// task has no equality deletes. Mirrors Java `DeleteFilter.eqDeletedRowFilter()`.
+    pub async fn equality_delete_predicate(
+        &self,
+        task: &FileScanTask,
+    ) -> Result<Option<BoundPredicate>> {
+        self.build_equality_delete_predicate(task).await
+    }
+
+    /// Apply `task`'s deletes to one Arrow `batch` of its data file, returning the surviving rows.
+    ///
+    /// `row_base` is the absolute 0-based position of `batch`'s first row within the data file — i.e.
+    /// the `_pos` of row 0 (see
+    /// [`RESERVED_COL_NAME_POS`](crate::metadata_columns::RESERVED_COL_NAME_POS)). Batches MUST be
+    /// supplied in file order with no rows skipped, so positions stay aligned. `equality_predicate` is
+    /// the once-resolved result of [`equality_delete_predicate`](Self::equality_delete_predicate);
+    /// pass `None` if the task has no equality deletes. To apply equality deletes, `batch` must carry
+    /// the equality-delete columns (resolved by Iceberg field id).
+    ///
+    /// Mirrors Java `DeleteFilter.filter(...)`: combines the positional keep-mask
+    /// (`!deleted(row_base + i)`) with the equality/​residual predicate mask (NULLs coerced to `false`,
+    /// matching the Parquet `RowFilter`) and filters the batch. This is the public counterpart of the
+    /// reader's internal `survival_mask`.
+    pub fn apply(
+        &self,
+        task: &FileScanTask,
+        batch: RecordBatch,
+        row_base: u64,
+        equality_predicate: Option<&BoundPredicate>,
+    ) -> Result<RecordBatch> {
+        let num_rows = batch.num_rows();
+
+        // Positional deletes → a keep-mask of `!deleted` over [row_base, row_base + num_rows).
+        let positional_mask: Option<BooleanArray> = match self.get_delete_vector(task) {
+            Some(deletes) => {
+                let deletes = deletes.lock().map_err(|_| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "positional delete vector mutex was poisoned",
+                    )
+                })?;
+                if deletes.is_empty() {
+                    None
+                } else {
+                    Some(BooleanArray::from(
+                        (0..num_rows)
+                            .map(|i| !deletes.contains(row_base + i as u64))
+                            .collect::<Vec<bool>>(),
+                    ))
+                }
+            }
+            None => None,
+        };
+
+        // Equality-delete predicate → a keep-mask (true ⇒ survives). A NULL under three-valued logic
+        // is NOT a survivor (matches the Parquet RowFilter), so coerce nulls to false.
+        let predicate_mask: Option<BooleanArray> = match equality_predicate {
+            Some(predicate) => Some(coerce_nulls_to_false(&evaluate_predicate_to_mask(
+                predicate, &batch,
+            )?)),
+            None => None,
+        };
+
+        let mask = match (positional_mask, predicate_mask) {
+            (None, None) => return Ok(batch),
+            (Some(mask), None) | (None, Some(mask)) => mask,
+            (Some(pos), Some(pred)) => and(&pos, &pred).map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to combine positional and equality delete masks",
+                )
+                .with_source(e)
+            })?,
+        };
+
+        filter_record_batch(&batch, &mask).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Failed to apply merge-on-read deletes to a data batch",
+            )
+            .with_source(e)
+        })
+    }
+}
+
+/// Coerce a three-valued keep-mask to two-valued: every NULL becomes `false` (drop the row), matching
+/// the Parquet `RowFilter` (which never keeps a null result). Mirrors the reader's
+/// `coerce_nulls_to_false`.
+fn coerce_nulls_to_false(mask: &BooleanArray) -> BooleanArray {
+    if mask.null_count() == 0 {
+        return mask.clone();
+    }
+    BooleanArray::from_iter((0..mask.len()).map(|i| Some(mask.is_valid(i) && mask.value(i))))
 }
 
 pub(crate) fn is_equality_delete(f: &FileScanTaskDeleteFile) -> bool {
@@ -567,5 +724,53 @@ pub(crate) mod tests {
             result.is_err(),
             "case_sensitive=true should fail when column case mismatches"
         );
+    }
+
+    /// The public engine-facing surface: `DeleteFilter::load` (hiding the loader) -> the position
+    /// accessor -> `apply` on a batch the engine read itself. Same fixture as
+    /// `test_delete_file_filter_load_deletes`.
+    #[tokio::test]
+    async fn test_public_delete_filter_load_and_apply() {
+        use arrow_array::Array;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path();
+        let file_io = FileIO::new_with_fs();
+        let tasks = setup(table_location);
+
+        // Public constructor — resolves the task's deletes without touching CachingDeleteFileLoader.
+        let filter = DeleteFilter::load(&tasks[0], file_io).await.unwrap();
+
+        // Positional deletes for data file 1: {0,1,3,5,6,8,20,21,22,23,1022,1023} = 12 distinct.
+        let positions = filter.deleted_row_positions(&tasks[0]).unwrap();
+        assert_eq!(positions.lock().unwrap().len(), 12);
+        // The fixture has no equality deletes.
+        assert!(
+            filter
+                .equality_delete_predicate(&tasks[0])
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Apply to a 10-row batch (file positions 0..9). Deleted in that window: {0,1,3,5,6,8} =>
+        // survivors {2,4,7,9}.
+        let field =
+            arrow_schema::Field::new("x", arrow_schema::DataType::Int64, false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            );
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(
+            0i64..10,
+        ))])
+        .unwrap();
+
+        let surviving = filter.apply(&tasks[0], batch, 0, None).unwrap();
+        let col = surviving
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.values(), &[2, 4, 7, 9]);
     }
 }
