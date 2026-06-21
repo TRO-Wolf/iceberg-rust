@@ -281,6 +281,24 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-multifile-scan":
+        // MULTI-FILE-PER-PARTITION merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes". One
+        // partition (category=a) holds TWO data files; a partition-scoped position-delete references
+        // file1 only (id 20). file2's same-ordinal id 50 must be SPARED (path-keyed, not broadcast).
+        // Closes the multi-file slice of the GAP_MATRIX "Read: merge-on-read apply" residue.
+        PartScanExecOracle.generateMultiFile(requireFixturesDir("interop.multifile_scan.dir"));
+        break;
+      case "verify-interop-multifile-scan":
+        // MULTI-FILE-PER-PARTITION merge-on-read, DIRECTION 2 — "Java reads what RUST writes". The Rust
+        // GEN path wrote <dir>/rust_table with two data files in one partition + a partition-scoped
+        // position-delete on file1; Java reads via IcebergGenerics and asserts {10,30,40,50,60}.
+        int multifileFailures =
+            PartScanExecOracle.verifyMultiFile(requireFixturesDir("interop.multifile_scan.dir"));
+        System.out.println("verify-interop-multifile-scan: " + multifileFailures + " failures");
+        if (multifileFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-dv":
         // DELETION-VECTOR merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes" (Increment
         // D1). Writes an unpartitioned V3 table (DVs require format version 3) with TWO real
@@ -7178,6 +7196,191 @@ public final class InteropOracle {
             "verify-interop-part-scan OK — Java read the RUST-written PARTITIONED table (real per-partition "
                 + "parquet data + Rust partition-scoped position-delete), merge-on-read live rows = "
                 + "{10,30,40,50}");
+      }
+      return failures;
+    }
+
+    /**
+     * DIRECTION 1 — MULTI-FILE-PER-PARTITION merge-on-read ("Rust reads what JAVA writes"). Like
+     * {@link #generate} but ONE partition (category=a) holds TWO data files; a partition-scoped
+     * position-delete references file1 only (deleting its position 1 = id 20). The DeleteFileIndex
+     * routes that partition-scoped delete to BOTH data files of partition a, so correctness hinges on
+     * the reader applying it ONLY to file1 by PATH — file2's same-ordinal position 1 (id 50) MUST be
+     * SPARED. Live merge-on-read rows = {10,30,40,50,60}. Emits java_multifile_scan_rows.json +
+     * final.metadata.json the Rust D1 test compares against. This closes the multi-file slice of the
+     * GAP_MATRIX "Read: merge-on-read apply" residue.
+     */
+    static void generateMultiFile(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("category").build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_multifile_scan_exec");
+
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partitionA = new PartitionData(partitionType);
+      partitionA.set(0, "a");
+
+      // TWO data files in the SAME partition (category=a): file1 ids 10/20/30 @ pos 0..2, file2 ids
+      // 40/50/60 @ pos 0..2. Both stamped category=a.
+      String dataPath1 = new File(dataDir, "category=a/00000-a.parquet").getAbsolutePath();
+      DataFile dataFile1 =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionA,
+              dataPath1,
+              new long[] {10L, 20L, 30L},
+              new String[] {"x", "y", "z"});
+      String dataPath2 = new File(dataDir, "category=a/00001-a.parquet").getAbsolutePath();
+      DataFile dataFile2 =
+          writePartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partitionA,
+              dataPath2,
+              new long[] {40L, 50L, 60L},
+              new String[] {"p", "q", "r"});
+
+      // A partition-scoped position-delete referencing FILE1 (deletes its position 1 = id 20). file2's
+      // own position 1 (id 50) must be SPARED — the delete is path-keyed, not partition-broadcast.
+      String deletePath = new File(dataDir, "category=a/00000-a-deletes.parquet").getAbsolutePath();
+      DeleteFile deleteFile1 =
+          writePartitionedPosDeleteFile(table, schema, spec, partitionA, deletePath, dataFile1.path());
+
+      table.newAppend().appendFile(dataFile1).appendFile(dataFile2).commit();
+      table.newRowDelta().addDeletes(deleteFile1).commit();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      writeJson(dir.resolve("java_multifile_scan_rows.json"), readLiveRowsToJson(table));
+      System.out.println(
+          "generated multi-file-per-partition scan-exec table + java_multifile_scan_rows.json to " + dir);
+    }
+
+    /**
+     * DIRECTION 2 — read the RUST-written MULTI-FILE-PER-PARTITION table and assert the merge-on-read
+     * rows {10,30,40,50,60} (file1's id 20 deleted; file2's same-ordinal id 50 SPARED). A failure means
+     * Rust wrote a multi-file partition / path-keyed delete Java cannot read, or the sibling row leaked.
+     */
+    static int verifyMultiFile(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL multifile-scan-d2: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL multifile-scan-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL multifile-scan-d2: Java could not READ the Rust-written multi-file table: "
+                + readError);
+        return 1;
+      }
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+
+      if (liveIds.size() != 5) {
+        System.out.println(
+            "FAIL multifile-scan-d2: expected 5 live rows, got " + liveIds.size() + " " + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS multifile-scan-d2: 5 live rows survive");
+      }
+      if (liveIds.contains(20L)) {
+        System.out.println(
+            "FAIL multifile-scan-d2: file1's deleted id 20 must be ABSENT, live set is " + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS multifile-scan-d2: file1's id 20 is absent (Rust's path-keyed delete applied)");
+      }
+      if (!liveIds.contains(50L)) {
+        System.out.println(
+            "FAIL multifile-scan-d2: file2's SIBLING id 50 (same ordinal) must be SPARED, live set is "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS multifile-scan-d2: file2's sibling id 50 is spared (delete is path-keyed, not partition-broadcast)");
+      }
+
+      Map<Long, String> expected = new LinkedHashMap<>();
+      expected.put(10L, "x");
+      expected.put(30L, "z");
+      expected.put(40L, "p");
+      expected.put(50L, "q");
+      expected.put(60L, "r");
+      boolean valuesMatch = liveIds.equals(new ArrayList<>(expected.keySet()));
+      for (Long id : liveIds) {
+        String want = expected.get(id);
+        if (want == null || !want.equals(dataById.get(id))) {
+          valuesMatch = false;
+        }
+      }
+      if (!valuesMatch) {
+        System.out.println(
+            "FAIL multifile-scan-d2: live (id,data) mismatch: java-read="
+                + dataById
+                + " expected={10=x, 30=z, 40=p, 50=q, 60=r}");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS multifile-scan-d2: Java read the Rust-written multi-file table → {(10,x),(30,z),(40,p),(50,q),(60,r)}");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-multifile-scan OK — Java read the RUST-written MULTI-FILE-PER-PARTITION table, "
+                + "merge-on-read live rows = {10,30,40,50,60} (file1 id 20 deleted, file2 sibling id 50 spared)");
       }
       return failures;
     }
