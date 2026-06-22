@@ -7021,11 +7021,12 @@ public final class InteropOracle {
 
     /**
      * Write a REAL parquet POSITION-DELETE file for ONE partition via the generic position-delete writer,
-     * deleting position 1 of {@code referencedDataPath} (row id=20), and return its {@link DeleteFile} built
-     * from the writer's REAL metrics + the partition value (the {@code FileHelpers.writePosDeleteFile(table,
-     * out, partition, deletes)} template). The delete is PARTITION-SCOPED: it carries {@code partition} (the
-     * category=a Struct) and references the cat=a data file path, so a real merge-on-read reader masks
-     * exactly that one row in that one partition.
+     * deleting position 1 of {@code referencedDataPath}, and return its {@link DeleteFile} built from the
+     * writer's REAL metrics + the partition value (the {@code FileHelpers.writePosDeleteFile(table, out,
+     * partition, deletes)} template). The delete is PARTITION-SCOPED: it carries the caller's {@code
+     * partition} Struct and references the given data file path, so a real merge-on-read reader masks
+     * exactly position 1 of that one file in that one partition. Shared by the identity part-scan,
+     * multi-file, and non-identity (truncate) fixtures — which row position 1 is depends on the caller.
      */
     private static DeleteFile writePartitionedPosDeleteFile(
         BaseTable table,
@@ -7045,7 +7046,7 @@ public final class InteropOracle {
               partition);
       PositionDelete<Record> posDelete = PositionDelete.create();
       try (Closeable toClose = writer) {
-        // Delete position 1 (the 2nd row of the cat=a data file: id 20). No row data is carried.
+        // Delete position 1 (the 2nd row of the referenced data file). No row data is carried.
         writer.write(posDelete.set(referencedDataPath, 1L, null));
       }
       return writer.toDeleteFile();
@@ -7055,9 +7056,11 @@ public final class InteropOracle {
      * Materialize Java's OWN merge-on-read READ of the partitioned table via {@link IcebergGenerics} (which
      * plans the scan across both partitions, opens the parquet, AND applies the partition-scoped position
      * delete), collect the live rows, SORT by id, and serialize them to a JSON array of {@code {id, data}}.
-     * This is the GROUND TRUTH = [{10,x},{30,z},{40,p},{50,q}] (id=20 deleted, both partitions otherwise
-     * intact). Note: the emitted {@code data} column is field 3 (the optional string), NOT category — the
-     * Rust test compares on (id, data) exactly as the unpartitioned oracle does.
+     * This is the GROUND TRUTH for whichever fixture called it (identity part-scan =
+     * [{10,x},{30,z},{40,p},{50,q}], id=20 deleted; non-identity truncate fixture =
+     * [{11,x},{15,z},{21,p},{23,q}], id=13 deleted). The {@code data} column is resolved BY NAME
+     * ({@code getField("data")}) — the optional string field, NOT category — so the one reader serves both
+     * the {id, category, data} and {id, data} schemas; the Rust test compares on (id, data).
      */
     private static String readLiveRowsToJson(BaseTable table) {
       Map<Long, String> dataById = new LinkedHashMap<>();

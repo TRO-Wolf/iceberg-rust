@@ -1213,8 +1213,9 @@ async fn write_partitioned_gen_position_delete_file(
         file_name_gen,
     );
 
-    // Build WITH the cat=a partition key so the delete is partition-scoped (carries the cat=a Struct + spec
-    // id 0). This is the partition-handling proof for the WRITE side.
+    // Build WITH the caller's partition key so the delete is partition-scoped (carries that partition
+    // Struct + spec id 0). This is the partition-handling proof for the WRITE side. Reused by the
+    // identity(category), multi-file, and non-identity (truncate) fixtures.
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
         .build(Some(partition_key.clone()))
         .await
