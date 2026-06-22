@@ -299,6 +299,23 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-nonidentity-scan":
+        // NON-IDENTITY TRANSFORM merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes". A
+        // truncate[10](id)-partitioned table; the partition VALUE is the truncate of id (10/20), a
+        // transformed value no raw id equals. A partition-scoped position-delete in partition 10 deletes
+        // id 13; partition 20 intact. Closes the non-identity slice of "Read: merge-on-read apply".
+        PartScanExecOracle.generateNonIdentity(requireFixturesDir("interop.nonidentity_scan.dir"));
+        break;
+      case "verify-interop-nonidentity-scan":
+        // NON-IDENTITY TRANSFORM merge-on-read, DIRECTION 2 — "Java reads what RUST writes". Java reads
+        // the Rust-written truncate[10](id)-partitioned table via IcebergGenerics and asserts {11,15,21,23}.
+        int nonidentityFailures =
+            PartScanExecOracle.verifyNonIdentity(requireFixturesDir("interop.nonidentity_scan.dir"));
+        System.out.println("verify-interop-nonidentity-scan: " + nonidentityFailures + " failures");
+        if (nonidentityFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-dv":
         // DELETION-VECTOR merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes" (Increment
         // D1). Writes an unpartitioned V3 table (DVs require format version 3) with TWO real
@@ -7004,11 +7021,12 @@ public final class InteropOracle {
 
     /**
      * Write a REAL parquet POSITION-DELETE file for ONE partition via the generic position-delete writer,
-     * deleting position 1 of {@code referencedDataPath} (row id=20), and return its {@link DeleteFile} built
-     * from the writer's REAL metrics + the partition value (the {@code FileHelpers.writePosDeleteFile(table,
-     * out, partition, deletes)} template). The delete is PARTITION-SCOPED: it carries {@code partition} (the
-     * category=a Struct) and references the cat=a data file path, so a real merge-on-read reader masks
-     * exactly that one row in that one partition.
+     * deleting position 1 of {@code referencedDataPath}, and return its {@link DeleteFile} built from the
+     * writer's REAL metrics + the partition value (the {@code FileHelpers.writePosDeleteFile(table, out,
+     * partition, deletes)} template). The delete is PARTITION-SCOPED: it carries the caller's {@code
+     * partition} Struct and references the given data file path, so a real merge-on-read reader masks
+     * exactly position 1 of that one file in that one partition. Shared by the identity part-scan,
+     * multi-file, and non-identity (truncate) fixtures — which row position 1 is depends on the caller.
      */
     private static DeleteFile writePartitionedPosDeleteFile(
         BaseTable table,
@@ -7028,7 +7046,7 @@ public final class InteropOracle {
               partition);
       PositionDelete<Record> posDelete = PositionDelete.create();
       try (Closeable toClose = writer) {
-        // Delete position 1 (the 2nd row of the cat=a data file: id 20). No row data is carried.
+        // Delete position 1 (the 2nd row of the referenced data file). No row data is carried.
         writer.write(posDelete.set(referencedDataPath, 1L, null));
       }
       return writer.toDeleteFile();
@@ -7038,9 +7056,11 @@ public final class InteropOracle {
      * Materialize Java's OWN merge-on-read READ of the partitioned table via {@link IcebergGenerics} (which
      * plans the scan across both partitions, opens the parquet, AND applies the partition-scoped position
      * delete), collect the live rows, SORT by id, and serialize them to a JSON array of {@code {id, data}}.
-     * This is the GROUND TRUTH = [{10,x},{30,z},{40,p},{50,q}] (id=20 deleted, both partitions otherwise
-     * intact). Note: the emitted {@code data} column is field 3 (the optional string), NOT category — the
-     * Rust test compares on (id, data) exactly as the unpartitioned oracle does.
+     * This is the GROUND TRUTH for whichever fixture called it (identity part-scan =
+     * [{10,x},{30,z},{40,p},{50,q}], id=20 deleted; non-identity truncate fixture =
+     * [{11,x},{15,z},{21,p},{23,q}], id=13 deleted). The {@code data} column is resolved BY NAME
+     * ({@code getField("data")}) — the optional string field, NOT category — so the one reader serves both
+     * the {id, category, data} and {id, data} schemas; the Rust test compares on (id, data).
      */
     private static String readLiveRowsToJson(BaseTable table) {
       Map<Long, String> dataById = new LinkedHashMap<>();
@@ -7381,6 +7401,226 @@ public final class InteropOracle {
         System.out.println(
             "verify-interop-multifile-scan OK — Java read the RUST-written MULTI-FILE-PER-PARTITION table, "
                 + "merge-on-read live rows = {10,30,40,50,60} (file1 id 20 deleted, file2 sibling id 50 spared)");
+      }
+      return failures;
+    }
+
+    /**
+     * DIRECTION 1 — NON-IDENTITY TRANSFORM merge-on-read ("Rust reads what JAVA writes"). The transform
+     * slice of the GAP_MATRIX "Read: merge-on-read apply" residue. A V2 table {id long, data string}
+     * partitioned by truncate[10](id) — the partition VALUE is floor(id/10)*10 (10 / 20), a TRANSFORMED
+     * value that no raw id equals. Partition 10 holds ids 11/13/15 @ pos 0..2; partition 20 holds ids
+     * 21/23 @ pos 0..1. A partition-scoped position-delete in partition 10 deletes position 1 (id 13).
+     * Live = {11,15,21,23} (id 13 deleted; partition 20 intact). Proves the DeleteFileIndex matches the
+     * delete to the TRANSFORMED partition Struct, not by raw column value. Emits
+     * java_nonidentity_scan_rows.json + final.metadata.json.
+     */
+    static void generateNonIdentity(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      // Partition by truncate[10](id): the partition value is floor(id/10)*10, a TRANSFORMED value.
+      PartitionSpec spec = PartitionSpec.builderFor(schema).truncate("id", 10).build();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_nonidentity_scan_exec");
+
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partition10 = new PartitionData(partitionType);
+      partition10.set(0, 10L);
+      PartitionData partition20 = new PartitionData(partitionType);
+      partition20.set(0, 20L);
+
+      // Partition truncate=10 holds ids 11/13/15 (all truncate to 10); partition truncate=20 holds 21/23.
+      String dataPath10 = new File(dataDir, "id_trunc=10/00000.parquet").getAbsolutePath();
+      DataFile dataFile10 =
+          writeIdDataPartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partition10,
+              dataPath10,
+              new long[] {11L, 13L, 15L},
+              new String[] {"x", "y", "z"});
+      String dataPath20 = new File(dataDir, "id_trunc=20/00000.parquet").getAbsolutePath();
+      DataFile dataFile20 =
+          writeIdDataPartitionedDataFile(
+              table,
+              schema,
+              spec,
+              partition20,
+              dataPath20,
+              new long[] {21L, 23L},
+              new String[] {"p", "q"});
+
+      // A partition-scoped position-delete in partition truncate=10, deleting position 1 (id 13).
+      // partition truncate=20 is untouched.
+      String deletePath = new File(dataDir, "id_trunc=10/00000-deletes.parquet").getAbsolutePath();
+      DeleteFile deleteFile10 =
+          writePartitionedPosDeleteFile(table, schema, spec, partition10, deletePath, dataFile10.path());
+
+      table.newAppend().appendFile(dataFile10).appendFile(dataFile20).commit();
+      table.newRowDelta().addDeletes(deleteFile10).commit();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      writeJson(dir.resolve("java_nonidentity_scan_rows.json"), readLiveRowsToJson(table));
+      System.out.println(
+          "generated non-identity-transform (truncate[10](id)) scan-exec table + java_nonidentity_scan_rows.json to "
+              + dir);
+    }
+
+    /**
+     * Write a REAL parquet data file for ONE partition of a {@code {id, data}} table (no category field —
+     * the sibling of {@link #writePartitionedDataFile} for the truncate(id) non-identity fixture).
+     */
+    private static DataFile writeIdDataPartitionedDataFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        long[] ids,
+        String[] dataValues)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("data", dataValues[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * DIRECTION 2 — read the RUST-written NON-IDENTITY-TRANSFORM (truncate[10](id)) table and assert the
+     * merge-on-read rows {11,15,21,23} (truncate=10's id 13 deleted; truncate=20 intact). A failure means
+     * Rust wrote a transform-partitioned table / transform-partition-scoped delete Java cannot read.
+     */
+    static int verifyNonIdentity(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL nonidentity-scan-d2: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL nonidentity-scan-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL nonidentity-scan-d2: Java could not READ the Rust-written truncate-partitioned table: "
+                + readError);
+        return 1;
+      }
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+
+      if (liveIds.size() != 4) {
+        System.out.println(
+            "FAIL nonidentity-scan-d2: expected 4 live rows, got " + liveIds.size() + " " + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS nonidentity-scan-d2: 4 live rows survive");
+      }
+      if (liveIds.contains(13L)) {
+        System.out.println(
+            "FAIL nonidentity-scan-d2: deleted id 13 (truncate=10 partition) must be ABSENT, live set is "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS nonidentity-scan-d2: id 13 absent (Rust's transform-partition-scoped delete applied)");
+      }
+      if (!liveIds.contains(21L) || !liveIds.contains(23L)) {
+        System.out.println(
+            "FAIL nonidentity-scan-d2: truncate=20 partition (ids 21,23) must be intact, live set is "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS nonidentity-scan-d2: truncate=20 partition intact (ids 21,23)");
+      }
+
+      Map<Long, String> expected = new LinkedHashMap<>();
+      expected.put(11L, "x");
+      expected.put(15L, "z");
+      expected.put(21L, "p");
+      expected.put(23L, "q");
+      boolean valuesMatch = liveIds.equals(new ArrayList<>(expected.keySet()));
+      for (Long id : liveIds) {
+        String want = expected.get(id);
+        if (want == null || !want.equals(dataById.get(id))) {
+          valuesMatch = false;
+        }
+      }
+      if (!valuesMatch) {
+        System.out.println(
+            "FAIL nonidentity-scan-d2: live (id,data) mismatch: java-read="
+                + dataById
+                + " expected={11=x, 15=z, 21=p, 23=q}");
+        failures++;
+      } else {
+        System.out.println(
+            "PASS nonidentity-scan-d2: Java read the Rust-written truncate-partitioned table → {(11,x),(15,z),(21,p),(23,q)}");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-nonidentity-scan OK — Java read the RUST-written truncate[10](id)-partitioned "
+                + "table, merge-on-read live rows = {11,15,21,23} (id 13 deleted, truncate=20 intact)");
       }
       return failures;
     }
