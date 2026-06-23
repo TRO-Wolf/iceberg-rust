@@ -17,11 +17,64 @@
   ~ under the License.
 -->
 
-# Apache Iceberg™ Rust
+# Apache Iceberg™ Rust — owned parity fork
 
+> **This is an owned fork** of [Apache Iceberg™ Rust](https://github.com/apache/iceberg-rust) — the
+> upstream Rust implementation of [Apache Iceberg™](https://iceberg.apache.org/). We maintain it to
+> reach **1:1 capability parity with the Java `iceberg-core` / `iceberg-api` library** — the
+> engine-agnostic *table-format* core, **not** the Spark engine surface. Upstream is a **sync baseline
+> we cherry-pick from, not a mergeability constraint**: we diverge freely in service of parity. The
+> deliverable is a **Rust-native library** (Python / PySpark is deferred). **AWS Glue + S3 Tables** are
+> the first-priority catalogs.
+>
+> The original upstream project lives at **[apache/iceberg-rust](https://github.com/apache/iceberg-rust)**,
+> and its README is preserved verbatim further down this file (from [Components](#components) onward).
 
+## What this fork adds — a consolidated story
 
-Rust implementation of [Apache Iceberg™](https://iceberg.apache.org/).
+This fork started by syncing the workspace to upstream **`iceberg` 0.9.1** and removing the Python /
+PySpark layers, leaving a Rust-only library. From there, parity work has proceeded in small
+**Actor-Critic** increments — every change lands with unit tests, and every capability that touches the
+on-disk format or the read/write seam lands with a **bidirectional Java ↔ Rust interop round-trip**
+(read tables Java wrote; prove Java reads what we write). What has gone in so far:
+
+- **Table-maintenance & write actions** (via the maintenance layer — an opened `ActionsProvider`, plus
+  free-standing actions and write-action builder flags) — remove dangling delete files,
+  delete-reachable-files drop-table purge, rewrite position-delete files, convert equality deletes to
+  positional, compute / update partition statistics, and replace-partitions append-only validation.
+- **Scans** — incremental-append and changelog (CDC) scans; JSON expression parsing; and an aggregate
+  evaluator (count / min / max over data-file metrics — the scan-planner push-down consumer is
+  follow-up work).
+- **Spec & types** — the V3 `unknown` primitive type.
+- **Merge-on-read** — full delete *application* across position **and** equality deletes, multiple
+  delete files per partition, and non-identity partition transforms, interop-proven in both directions
+  (the equality × non-identity-transform combination is code-proven by mechanism identity, not
+  separately round-tripped).
+- **A DataFusion engine reference for the full DML loop** — `INSERT OVERWRITE`, `DELETE`, and `UPDATE`
+  through the in-repo `iceberg-datafusion` `TableProvider`, with **both** merge-on-read and
+  copy-on-write `DELETE` / `UPDATE` paths selectable via the standard `write.delete.mode` /
+  `write.update.mode` table properties. `INSERT OVERWRITE` works on partitioned tables; `DELETE` and
+  `UPDATE` are currently scoped to unpartitioned tables (merge-on-read additionally requires a V2
+  table) — partition-aware rewrite and V3 deletion-vector writes are follow-ups. Row-level mutation
+  evaluates the exact engine predicate per row (never an inexact push-down), so it never over-deletes.
+- **Catalogs** — REST, Hive Metastore, **Glue + S3 Tables (the parity priority)**, and SQL-backed, plus
+  a config-driven loader; OpenDAL-backed FileIO and a Moka object/metadata cache.
+
+**How the work is governed.** This is an owned fork (mergeability with upstream is not a constraint);
+the Java repository is the spec-by-example; tests ship with the code; and each change passes an
+independent adversarial review before it merges. The authoritative plan and the live, per-capability
+status are tracked in-repo — read them rather than relying on this summary, which is intentionally
+high-level:
+
+- **[Roadmap.md](Roadmap.md)** — the phase plan and sequencing toward full parity.
+- **[docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md)** — the single source of truth for each
+  capability's status (✅ / 🟡 / ❌), re-audited after every sync and phase.
+- **[CLAUDE.md](CLAUDE.md)** — repository intent, prohibitions, and conventions.
+
+---
+
+> **Everything below is the upstream Apache Iceberg™ Rust README, preserved as-is.** It documents the
+> base project this fork builds on; for fork-specific status and direction, see the links above.
 
 ## Components
 
