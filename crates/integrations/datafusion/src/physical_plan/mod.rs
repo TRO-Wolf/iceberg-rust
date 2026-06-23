@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod commit;
+pub(crate) mod delete;
 pub(crate) mod expr_to_predicate;
 pub(crate) mod metadata_scan;
 pub(crate) mod project;

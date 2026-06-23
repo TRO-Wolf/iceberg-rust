@@ -25,12 +25,14 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
 use iceberg::Catalog;
+use iceberg::expr::Predicate;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -46,6 +48,9 @@ pub(crate) struct IcebergCommitExec {
     catalog: Arc<dyn Catalog>,
     input: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
+    /// The DML write operation: `Append` commits via `fast_append`; `Overwrite` (`INSERT OVERWRITE`)
+    /// replaces ALL existing data via `overwrite_files().overwrite_by_row_filter(AlwaysTrue)`.
+    insert_op: InsertOp,
     count_schema: ArrowSchemaRef,
     plan_properties: PlanProperties,
 }
@@ -56,6 +61,7 @@ impl IcebergCommitExec {
         catalog: Arc<dyn Catalog>,
         input: Arc<dyn ExecutionPlan>,
         schema: ArrowSchemaRef,
+        insert_op: InsertOp,
     ) -> Self {
         let count_schema = Self::make_count_schema();
 
@@ -66,6 +72,7 @@ impl IcebergCommitExec {
             catalog,
             input,
             schema,
+            insert_op,
             count_schema,
             plan_properties,
         }
@@ -165,6 +172,7 @@ impl ExecutionPlan for IcebergCommitExec {
             self.catalog.clone(),
             children[0].clone(),
             self.schema.clone(),
+            self.insert_op,
         )))
     }
 
@@ -190,6 +198,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let current_schema = self.table.metadata().current_schema().clone();
 
         let catalog = Arc::clone(&self.catalog);
+        let insert_op = self.insert_op;
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -245,17 +254,39 @@ impl ExecutionPlan for IcebergCommitExec {
                 return Ok(RecordBatch::new_empty(count_schema));
             }
 
-            // Create a transaction and commit the data files
+            // Create a transaction and commit the data files per the DML write operation.
             let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(data_files);
-
-            // Apply the action and commit the transaction
-            let _updated_table = action
-                .apply(tx)
-                .map_err(to_datafusion_error)?
-                .commit(catalog.as_ref())
-                .await
-                .map_err(to_datafusion_error)?;
+            let committed = match insert_op {
+                // INSERT INTO — append the new data files.
+                InsertOp::Append => {
+                    tx.fast_append()
+                        .add_data_files(data_files)
+                        .apply(tx)
+                        .map_err(to_datafusion_error)?
+                        .commit(catalog.as_ref())
+                        .await
+                }
+                // INSERT OVERWRITE — replace ALL existing data: delete every live row (an
+                // always-true overwrite filter removes all current data files) and add the new files
+                // in one atomic snapshot.
+                InsertOp::Overwrite => {
+                    tx.overwrite_files()
+                        .overwrite_by_row_filter(Predicate::AlwaysTrue)
+                        .add_files(data_files)
+                        .apply(tx)
+                        .map_err(to_datafusion_error)?
+                        .commit(catalog.as_ref())
+                        .await
+                }
+                // `Replace` (upsert/ON CONFLICT) has no single Iceberg commit primitive — out of scope.
+                InsertOp::Replace => {
+                    return Err(DataFusionError::NotImplemented(
+                        "INSERT ... Replace (upsert) is not supported for Iceberg tables"
+                            .to_string(),
+                    ));
+                }
+            };
+            committed.map_err(to_datafusion_error)?;
 
             Self::make_count_batch(total_record_count)
         })
@@ -470,8 +501,13 @@ mod tests {
             false,
         )]));
 
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(
+            table.clone(),
+            catalog.clone(),
+            input_exec,
+            arrow_schema,
+            InsertOp::Append,
+        );
 
         // Verify Execution Plan schema matches the count schema
         assert_eq!(commit_exec.schema(), IcebergCommitExec::make_count_schema());
