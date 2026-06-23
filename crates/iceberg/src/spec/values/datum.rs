@@ -1170,7 +1170,103 @@ impl Datum {
                         Datum::timestamptz_from_str(val)
                     }
 
-                    // TODO: implement more type conversions
+                    // ===== Additive numeric / temporal / identity promotions =====
+                    // 1:1 port of the Java `Literals.*Literal.to(Type)` accept-set
+                    // (`api/.../expressions/Literals.java`). Deferred as NAMED residue (GAP_MATRIX
+                    // row 154): every value-level `→ decimal` conversion (rust_decimal's 96-bit /
+                    // scale-28 bound vs Java `BigDecimal`'s unbounded `setScale(_, HALF_UP)`),
+                    // `timestamp[tz] → date` and `long → time` (Java does not range-check; Rust's
+                    // constructors do), all `timestamp_nano` arms (kept parked per the upstream
+                    // note above), and `string → {fixed,binary}` hex decode.
+
+                    // IntegerLiteral.to: FLOAT / DOUBLE
+                    (PrimitiveLiteral::Int(val), _, PrimitiveType::Float) => {
+                        Ok(Datum::float(*val as f32))
+                    }
+                    (PrimitiveLiteral::Int(val), _, PrimitiveType::Double) => {
+                        Ok(Datum::double(*val))
+                    }
+
+                    // LongLiteral.to: FLOAT / DOUBLE / DATE (DATE bounds-checked to int range, like
+                    // Java's `aboveMax()`/`belowMin()` sentinels)
+                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Float) => {
+                        Ok(Datum::float(*val as f32))
+                    }
+                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Double) => {
+                        Ok(Datum::double(*val as f64))
+                    }
+                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Date) => {
+                        Ok(if *val > INT_MAX as i64 {
+                            Datum::new(PrimitiveType::Date, PrimitiveLiteral::AboveMax)
+                        } else if *val < INT_MIN as i64 {
+                            Datum::new(PrimitiveType::Date, PrimitiveLiteral::BelowMin)
+                        } else {
+                            Datum::date(*val as i32)
+                        })
+                    }
+
+                    // FloatLiteral.to: DOUBLE
+                    (PrimitiveLiteral::Float(val), _, PrimitiveType::Double) => {
+                        Ok(Datum::double(f64::from(val.0)))
+                    }
+
+                    // DoubleLiteral.to: FLOAT (bounds-checked to ±Float.MAX_VALUE)
+                    (PrimitiveLiteral::Double(val), _, PrimitiveType::Float) => {
+                        Ok(if val.0 > f32::MAX as f64 {
+                            Datum::new(PrimitiveType::Float, PrimitiveLiteral::AboveMax)
+                        } else if val.0 < -(f32::MAX as f64) {
+                            Datum::new(PrimitiveType::Float, PrimitiveLiteral::BelowMin)
+                        } else {
+                            Datum::float(val.0 as f32)
+                        })
+                    }
+
+                    // DecimalLiteral.to: DECIMAL — Java returns `this`; the stored scale is
+                    // unchanged regardless of the target decimal's scale/precision.
+                    (
+                        PrimitiveLiteral::Int128(_),
+                        PrimitiveType::Decimal { .. },
+                        PrimitiveType::Decimal { .. },
+                    ) => Ok(self),
+
+                    // FixedLiteral.to: BINARY  /  BinaryLiteral.to: FIXED (length-checked; a
+                    // mismatch is Java's `null`, i.e. a reject)
+                    (
+                        PrimitiveLiteral::Binary(val),
+                        PrimitiveType::Fixed(_),
+                        PrimitiveType::Binary,
+                    ) => Ok(Datum::binary(val.clone())),
+                    (
+                        PrimitiveLiteral::Binary(val),
+                        PrimitiveType::Binary,
+                        PrimitiveType::Fixed(len),
+                    ) => {
+                        if val.len() as u64 == *len {
+                            Ok(Datum::fixed(val.clone()))
+                        } else {
+                            Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Can't convert binary of {} bytes to fixed[{len}].",
+                                    val.len()
+                                ),
+                            ))
+                        }
+                    }
+
+                    // StringLiteral.to: UUID / DATE / TIME (a parse failure is `DataInvalid`,
+                    // mirroring Java returning `null`)
+                    (PrimitiveLiteral::String(val), _, PrimitiveType::Uuid) => {
+                        Datum::uuid_from_str(val)
+                    }
+                    (PrimitiveLiteral::String(val), _, PrimitiveType::Date) => {
+                        Datum::date_from_str(val)
+                    }
+                    (PrimitiveLiteral::String(val), _, PrimitiveType::Time) => {
+                        Datum::time_from_str(val)
+                    }
+
+                    // Identity (same primitive type).
                     (_, self_type, target_type) if self_type == target_type => Ok(self),
                     _ => Err(Error::new(
                         ErrorKind::DataInvalid,

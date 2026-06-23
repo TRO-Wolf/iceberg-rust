@@ -1252,6 +1252,207 @@ fn test_datum_string_convert_to_timestamptz() {
     assert_eq!(result, expected);
 }
 
+// ===== Additive `Datum::to` promotions (Java `Literals.*Literal.to`) =====
+// One assertion per new arm: accept, boundary/sentinel, and reject, each baited so flipping a
+// rule reds a test.
+
+#[test]
+fn test_datum_int_convert_to_float_and_double() {
+    assert_eq!(
+        Datum::int(7).to(&Primitive(PrimitiveType::Float)).unwrap(),
+        Datum::float(7.0)
+    );
+    assert_eq!(
+        Datum::int(7).to(&Primitive(PrimitiveType::Double)).unwrap(),
+        Datum::double(7.0)
+    );
+}
+
+#[test]
+fn test_datum_long_convert_to_float_and_double() {
+    assert_eq!(
+        Datum::long(7).to(&Primitive(PrimitiveType::Float)).unwrap(),
+        Datum::float(7.0)
+    );
+    assert_eq!(
+        Datum::long(7)
+            .to(&Primitive(PrimitiveType::Double))
+            .unwrap(),
+        Datum::double(7.0)
+    );
+}
+
+#[test]
+fn test_datum_long_convert_to_date() {
+    let result = Datum::long(12345)
+        .to(&Primitive(PrimitiveType::Date))
+        .unwrap();
+    assert_eq!(result, Datum::date(12345));
+}
+
+#[test]
+fn test_datum_long_convert_to_date_above_max() {
+    // One past Integer.MAX_VALUE must yield the `aboveMax` sentinel, typed as Date.
+    let result = Datum::long(INT_MAX as i64 + 1)
+        .to(&Primitive(PrimitiveType::Date))
+        .unwrap();
+    assert_eq!(
+        result,
+        Datum::new(PrimitiveType::Date, PrimitiveLiteral::AboveMax)
+    );
+}
+
+#[test]
+fn test_datum_long_convert_to_date_below_min() {
+    let result = Datum::long(INT_MIN as i64 - 1)
+        .to(&Primitive(PrimitiveType::Date))
+        .unwrap();
+    assert_eq!(
+        result,
+        Datum::new(PrimitiveType::Date, PrimitiveLiteral::BelowMin)
+    );
+}
+
+#[test]
+fn test_datum_float_convert_to_double() {
+    let result = Datum::float(1.5)
+        .to(&Primitive(PrimitiveType::Double))
+        .unwrap();
+    assert_eq!(result, Datum::double(1.5));
+}
+
+#[test]
+fn test_datum_double_convert_to_float() {
+    let result = Datum::double(1.5)
+        .to(&Primitive(PrimitiveType::Float))
+        .unwrap();
+    assert_eq!(result, Datum::float(1.5));
+}
+
+#[test]
+fn test_datum_double_convert_to_float_above_max() {
+    // Beyond Float.MAX_VALUE (~3.4e38) must yield the `aboveMax` sentinel, typed as Float.
+    let result = Datum::double(1.0e40)
+        .to(&Primitive(PrimitiveType::Float))
+        .unwrap();
+    assert_eq!(
+        result,
+        Datum::new(PrimitiveType::Float, PrimitiveLiteral::AboveMax)
+    );
+}
+
+#[test]
+fn test_datum_double_convert_to_float_below_min() {
+    let result = Datum::double(-1.0e40)
+        .to(&Primitive(PrimitiveType::Float))
+        .unwrap();
+    assert_eq!(
+        result,
+        Datum::new(PrimitiveType::Float, PrimitiveLiteral::BelowMin)
+    );
+}
+
+// At-exact-boundary cases: a value EQUAL to the sentinel threshold must keep the value, not
+// trip the sentinel. These red a `>`→`>=` (or `<`→`<=`) mutation of the bound, which the
+// `+1`/`-1` tests above do not catch.
+#[test]
+fn test_datum_long_convert_to_date_at_int_max() {
+    let result = Datum::long(INT_MAX as i64)
+        .to(&Primitive(PrimitiveType::Date))
+        .unwrap();
+    assert_eq!(result, Datum::date(INT_MAX));
+}
+
+#[test]
+fn test_datum_long_convert_to_date_at_int_min() {
+    let result = Datum::long(INT_MIN as i64)
+        .to(&Primitive(PrimitiveType::Date))
+        .unwrap();
+    assert_eq!(result, Datum::date(INT_MIN));
+}
+
+#[test]
+fn test_datum_double_convert_to_float_at_max() {
+    let result = Datum::double(f32::MAX as f64)
+        .to(&Primitive(PrimitiveType::Float))
+        .unwrap();
+    assert_eq!(result, Datum::float(f32::MAX));
+}
+
+#[test]
+fn test_datum_decimal_convert_to_decimal_preserves_scale() {
+    // Java DecimalLiteral.to(DECIMAL) returns `this` — the source value/scale is unchanged even
+    // when the target decimal type declares a different scale.
+    let datum = Datum::decimal(decimal_new(12345, 2)).unwrap();
+    let expected = datum.clone();
+    let result = datum
+        .to(&Primitive(PrimitiveType::Decimal {
+            precision: 10,
+            scale: 4,
+        }))
+        .unwrap();
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_datum_fixed_convert_to_binary() {
+    let result = Datum::fixed(vec![1u8, 2, 3])
+        .to(&Primitive(PrimitiveType::Binary))
+        .unwrap();
+    assert_eq!(result, Datum::binary(vec![1u8, 2, 3]));
+}
+
+#[test]
+fn test_datum_binary_convert_to_fixed_matching_length() {
+    let result = Datum::binary(vec![1u8, 2, 3])
+        .to(&Primitive(PrimitiveType::Fixed(3)))
+        .unwrap();
+    assert_eq!(result, Datum::fixed(vec![1u8, 2, 3]));
+}
+
+#[test]
+fn test_datum_binary_convert_to_fixed_length_mismatch_rejected() {
+    // Java BinaryLiteral.to(FIXED) returns null on a length mismatch — a reject here.
+    let result = Datum::binary(vec![1u8, 2, 3]).to(&Primitive(PrimitiveType::Fixed(4)));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_datum_string_convert_to_uuid() {
+    let datum = Datum::string("550e8400-e29b-41d4-a716-446655440000");
+    let result = datum.to(&Primitive(PrimitiveType::Uuid)).unwrap();
+    let expected = Datum::uuid_from_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_datum_string_convert_to_uuid_invalid_rejected() {
+    let result = Datum::string("not-a-uuid").to(&Primitive(PrimitiveType::Uuid));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_datum_string_convert_to_date() {
+    let datum = Datum::string("2017-11-16");
+    let result = datum.to(&Primitive(PrimitiveType::Date)).unwrap();
+    assert_eq!(result, Datum::date_from_str("2017-11-16").unwrap());
+}
+
+#[test]
+fn test_datum_string_convert_to_time() {
+    let datum = Datum::string("22:31:08");
+    let result = datum.to(&Primitive(PrimitiveType::Time)).unwrap();
+    assert_eq!(result, Datum::time_from_str("22:31:08").unwrap());
+}
+
+#[test]
+fn test_datum_boolean_convert_to_int_rejected() {
+    // Java BooleanLiteral.to only accepts BOOLEAN; everything else is null (a reject). Guards
+    // against an accidentally over-permissive arm.
+    let result = Datum::bool(true).to(&Primitive(PrimitiveType::Int));
+    assert!(result.is_err());
+}
+
 #[test]
 fn test_iceberg_float_order() {
     // Test float ordering
