@@ -95,6 +95,30 @@ fn get_table_creation(
     Ok(creation)
 }
 
+/// A `{foo1 int, foo2 string}` table creation with `write.delete.mode` and `write.update.mode` both set
+/// to `merge-on-read`, so `DELETE`/`UPDATE` use the position-delete (`RowDelta`) path.
+fn get_merge_on_read_table_creation(
+    location: impl ToString,
+    name: impl ToString,
+) -> Result<TableCreation> {
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "foo1", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "foo2", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+    Ok(TableCreation::builder()
+        .location(location.to_string())
+        .name(name.to_string())
+        .properties(HashMap::from([
+            ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+            ("write.update.mode".to_string(), "merge-on-read".to_string()),
+        ]))
+        .schema(schema)
+        .build())
+}
+
 #[tokio::test]
 async fn test_provider_plan_stream_schema() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -536,6 +560,660 @@ async fn test_insert_into() -> Result<()> {
         Some("foo1"),
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_overwrite() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_insert_overwrite".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Seed the table with two rows via INSERT INTO (append).
+    ctx.sql("INSERT INTO catalog.test_insert_overwrite.my_table VALUES (1, 'alan'), (2, 'turing')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // INSERT OVERWRITE replaces ALL existing data with the new rows (DataFusion maps the
+    // `overwrite` flag to `InsertOp::Overwrite`, which `IcebergCommitExec` commits via
+    // `overwrite_files().overwrite_by_row_filter(AlwaysTrue)` — delete-all + add-new in one snapshot).
+    let df = ctx
+        .sql(
+            "INSERT OVERWRITE catalog.test_insert_overwrite.my_table VALUES (9, 'replaced'), (10, 'fresh')",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let rows_written = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        rows_written.value(0),
+        2,
+        "INSERT OVERWRITE reports the 2 rows it wrote"
+    );
+
+    // SELECT * must return ONLY the overwrite rows — the original (1,alan),(2,turing) are GONE.
+    // (An append would leave 4 rows; a correct overwrite leaves exactly the 2 new ones.)
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_insert_overwrite.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        "INSERT OVERWRITE must REPLACE all data: exactly the 2 new rows remain, not 4 (append)"
+    );
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              9,
+              10,
+            ],
+            foo2: StringArray
+            [
+              "replaced",
+              "fresh",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_from_merge_on_read() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_merge_read".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Create the table in MERGE-ON-READ delete mode (the default is copy-on-write).
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_merge_read.my_table VALUES (1, 'alan'), (2, 'turing'), (3, 'ALAN')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // DELETE WHERE foo1 > 0 AND lower(foo2) = 'alan'. The `lower(foo2)` branch is NOT convertible to an
+    // Iceberg predicate, so a buggy delete relying on inexact pushdown would LOOSEN the filter to
+    // `foo1 > 0` and OVER-DELETE all three rows. Our exact-filter delete removes only rows 1 and 3
+    // (foo2 case-insensitively equal to "alan"), leaving (2, 'turing').
+    let df = ctx
+        .sql("DELETE FROM catalog.test_delete_merge_read.my_table WHERE foo1 > 0 AND lower(foo2) = 'alan'")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        deleted.value(0),
+        2,
+        "exactly the 2 rows matching the EXACT filter (rows 1 and 3) are deleted"
+    );
+
+    // Row (2, 'turing') MUST survive — the inexact-pushdown bug would have wrongly deleted it.
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_delete_merge_read.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let total: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(
+        total, 1,
+        "row (2,'turing') must SURVIVE: the exact filter deletes only foo2~='alan' (rows 1,3), not all"
+    );
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              2,
+            ],
+            foo2: StringArray
+            [
+              "turing",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_all_rows_no_where() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_all".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_delete_all.my_table VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // `DELETE FROM t` with no WHERE (predicate = None) deletes every row.
+    let df = ctx
+        .sql("DELETE FROM catalog.test_delete_all.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        deleted.value(0),
+        3,
+        "DELETE FROM t (no WHERE) deletes every row"
+    );
+
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_delete_all.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let total: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(total, 0, "the table is empty after DELETE FROM t");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_across_data_files() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_multifile".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Two separate INSERT statements → two separate data files; each row's `_pos` is file-local (0,1 in each).
+    ctx.sql("INSERT INTO catalog.test_delete_multifile.my_table VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO catalog.test_delete_multifile.my_table VALUES (3, 'c'), (4, 'd')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // DELETE one row from EACH file (foo1=2 lives in file 1 at pos 1; foo1=3 in file 2 at pos 0). The
+    // position deletes must be PATH-keyed per file — a bug that confused per-file `_pos` would delete the
+    // wrong rows. Survivors must be exactly {1, 4}.
+    let df = ctx
+        .sql("DELETE FROM catalog.test_delete_multifile.my_table WHERE foo1 = 2 OR foo1 = 3")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        deleted.value(0),
+        2,
+        "one row deleted from each of the two data files"
+    );
+
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_delete_multifile.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let total: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(total, 2, "exactly two rows survive across the two files");
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              1,
+              4,
+            ],
+            foo2: StringArray
+            [
+              "a",
+              "d",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_from_copy_on_write() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_cow".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    // A default table (no write.delete.mode property) resolves to copy-on-write.
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql(
+        "INSERT INTO catalog.test_delete_cow.my_table VALUES (1, 'alan'), (2, 'turing'), (3, 'ALAN')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // The SAME discriminating filter as the MoR test: `lower(foo2)` is unconvertible, so an inexact
+    // pushdown would over-delete. Copy-on-write must rewrite the data file keeping ONLY (2,'turing').
+    let df = ctx
+        .sql("DELETE FROM catalog.test_delete_cow.my_table WHERE foo1 > 0 AND lower(foo2) = 'alan'")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        deleted.value(0),
+        2,
+        "copy-on-write deletes exactly rows 1 and 3 (the EXACT filter, not the loosened pushdown)"
+    );
+
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_delete_cow.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let total: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(
+        total, 1,
+        "copy-on-write rewrote the data file keeping only the surviving row (2,'turing')"
+    );
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              2,
+            ],
+            foo2: StringArray
+            [
+              "turing",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    // COW `DELETE FROM t` (no WHERE) on the last row → empty table (the survivors-empty / replace-all-
+    // with-no-files path).
+    let df = ctx
+        .sql("DELETE FROM catalog.test_delete_cow.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        deleted.value(0),
+        1,
+        "COW DELETE FROM t deletes the last remaining row"
+    );
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_delete_cow.my_table")
+        .await
+        .unwrap();
+    let total: usize = df
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum();
+    assert_eq!(
+        total, 0,
+        "the table is empty after copy-on-write DELETE FROM t"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_merge_on_read() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_merge_read".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql(
+        "INSERT INTO catalog.test_update_merge_read.my_table VALUES (1, 'alan'), (2, 'turing'), (3, 'ALAN')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // The discriminating filter again: only rows with foo2 case-insensitively 'alan' (rows 1, 3) are
+    // updated; row 2 is untouched. `foo1 = foo1 + 100` proves the assignment expression reads the OLD
+    // value. Merge-on-read writes the new rows + position-deletes the old in one RowDelta.
+    let df = ctx
+        .sql(
+            "UPDATE catalog.test_update_merge_read.my_table SET foo2 = 'X', foo1 = foo1 + 100 \
+             WHERE foo1 > 0 AND lower(foo2) = 'alan'",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(updated.value(0), 2, "exactly rows 1 and 3 are updated");
+
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_update_merge_read.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    // Row 2 (2,'turing') is unchanged; rows 1,3 become (101,'X'),(103,'X').
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              2,
+              101,
+              103,
+            ],
+            foo2: StringArray
+            [
+              "turing",
+              "X",
+              "X",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_copy_on_write() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_cow".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    // Default table (no write.update.mode) → copy-on-write UPDATE.
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql(
+        "INSERT INTO catalog.test_update_cow.my_table VALUES (1, 'alan'), (2, 'turing'), (3, 'ALAN')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Same SET + discriminating WHERE; copy-on-write rewrites the data file (matching rows take the new
+    // values via `zip`, non-matching keep the old).
+    let df = ctx
+        .sql(
+            "UPDATE catalog.test_update_cow.my_table SET foo2 = 'X', foo1 = foo1 + 100 \
+             WHERE foo1 > 0 AND lower(foo2) = 'alan'",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(updated.value(0), 2, "exactly rows 1 and 3 are updated");
+
+    let df = ctx
+        .sql("SELECT * FROM catalog.test_update_cow.my_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              2,
+              101,
+              103,
+            ],
+            foo2: StringArray
+            [
+              "turing",
+              "X",
+              "X",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_no_where_updates_all_rows() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_all".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_update_all.my_table VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // UPDATE with no WHERE (predicate = None) updates every row.
+    let df = ctx
+        .sql("UPDATE catalog.test_update_all.my_table SET foo1 = foo1 + 10")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(updated.value(0), 3, "UPDATE with no WHERE updates all rows");
+
+    let total: usize = ctx
+        .sql("SELECT * FROM catalog.test_update_all.my_table WHERE foo1 IN (11, 12, 13)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum();
+    assert_eq!(total, 3, "every row's foo1 was incremented by 10");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_zero_match_is_noop() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_noop".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_update_noop.my_table VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // UPDATE matching zero rows is a no-op (count 0, no commit, table unchanged).
+    let df = ctx
+        .sql("UPDATE catalog.test_update_noop.my_table SET foo2 = 'z' WHERE foo1 = 999")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        updated.value(0),
+        0,
+        "UPDATE matching no rows reports 0 updated"
+    );
+    let total: usize = ctx
+        .sql("SELECT * FROM catalog.test_update_noop.my_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum();
+    assert_eq!(total, 2, "the table is unchanged after a zero-match UPDATE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_null_into_required_is_rejected() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_null".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_update_null.my_table VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // `foo1` is a REQUIRED column; assigning NULL must be rejected (not silently written).
+    let outcome = ctx
+        .sql("UPDATE catalog.test_update_null.my_table SET foo1 = NULL WHERE foo2 = 'a'")
+        .await;
+    let errored = match outcome {
+        Err(_) => true,
+        Ok(df) => df.collect().await.is_err(),
+    };
+    assert!(
+        errored,
+        "UPDATE assigning NULL to the required column foo1 must error, not write a null"
+    );
     Ok(())
 }
 

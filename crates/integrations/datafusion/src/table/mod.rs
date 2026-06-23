@@ -35,7 +35,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
-use datafusion::common::DataFusionError;
+use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
@@ -51,6 +51,9 @@ use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
+use crate::physical_plan::delete::{
+    IcebergDeleteExec, IcebergUpdateExec, WRITE_DELETE_MODE, WRITE_UPDATE_MODE, WriteMode,
+};
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
@@ -159,7 +162,7 @@ impl TableProvider for IcebergTableProvider {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
+        insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Load fresh table metadata from catalog
         let table = self
@@ -230,6 +233,85 @@ impl TableProvider for IcebergTableProvider {
             table,
             self.catalog.clone(),
             coalesce_partitions,
+            self.schema.clone(),
+            insert_op,
+        )))
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Load fresh table metadata from the catalog.
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+        let mode = WriteMode::from_property(&table, WRITE_DELETE_MODE);
+
+        // Build the EXACT row filter as a `PhysicalExpr` (the `WHERE` clause, AND-combined). We
+        // evaluate this ourselves against the scanned rows rather than relying on Iceberg predicate
+        // pushdown, which is INEXACT and would over-delete (see `physical_plan::delete`). An empty
+        // filter set means `DELETE FROM t` — delete every row.
+        let predicate = match filters.into_iter().reduce(Expr::and) {
+            None => None,
+            Some(combined) => {
+                let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+                Some(state.create_physical_expr(combined, &df_schema)?)
+            }
+        };
+
+        Ok(Arc::new(IcebergDeleteExec::new(
+            table,
+            self.catalog.clone(),
+            predicate,
+            mode,
+            self.schema.clone(),
+        )))
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+        let mode = WriteMode::from_property(&table, WRITE_UPDATE_MODE);
+
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+
+        // The WHERE clause as an EXACT `PhysicalExpr` (see `delete_from` on why Iceberg pushdown is
+        // unsafe for a row-level mutation). `None` means update every row.
+        let predicate = match filters.into_iter().reduce(Expr::and) {
+            None => None,
+            Some(combined) => Some(state.create_physical_expr(combined, &df_schema)?),
+        };
+
+        // Resolve each `SET col = expr` to `(table-column index, value PhysicalExpr)`.
+        let mut physical_assignments = Vec::with_capacity(assignments.len());
+        for (column, expr) in assignments {
+            let col_idx = self.schema.index_of(&column).map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "UPDATE assignment to unknown column '{column}': {e}"
+                ))
+            })?;
+            let value = state.create_physical_expr(expr, &df_schema)?;
+            physical_assignments.push((col_idx, value));
+        }
+
+        Ok(Arc::new(IcebergUpdateExec::new(
+            table,
+            self.catalog.clone(),
+            predicate,
+            physical_assignments,
+            mode,
             self.schema.clone(),
         )))
     }
