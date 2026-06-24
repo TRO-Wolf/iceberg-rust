@@ -30,7 +30,7 @@ use crate::avro::schema_to_avro_schema;
 use crate::spec::Schema;
 use crate::spec::Type::Primitive;
 use crate::spec::datatypes::{ListType, MapType, NestedField, PrimitiveType, StructType, Type};
-use crate::spec::values::datum::{INT_MAX, INT_MIN, LONG_MAX, LONG_MIN};
+use crate::spec::values::datum::{INT_MAX, INT_MIN};
 use crate::spec::values::serde::_serde;
 use crate::spec::values::{Datum, Literal, Map, PrimitiveLiteral, RawLiteral, Struct};
 
@@ -1164,37 +1164,29 @@ fn test_datum_long_convert_to_timestamptz() {
     assert_eq!(result, expected);
 }
 
+// Java `DecimalLiteral.to` has NO LONG case — `default: return null` rejects Decimal→Long (only
+// `case DECIMAL: return this` is accepted). These pin the strict-parity reject across the value
+// range (in-range + over/under the i64 bounds); re-introducing the removed `Int128→Long` arm flips
+// them from `is_err()` back to `is_ok()`.
 #[test]
-fn test_datum_decimal_convert_to_long() {
+fn test_datum_decimal_convert_to_long_rejected() {
     let datum = Datum::decimal(decimal_new(12345, 0)).unwrap();
-
-    let result = datum.to(&Primitive(PrimitiveType::Long)).unwrap();
-
-    let expected = Datum::long(12345);
-
-    assert_eq!(result, expected);
+    let result = datum.to(&Primitive(PrimitiveType::Long));
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_datum_decimal_convert_to_long_above_max() {
-    let datum = Datum::decimal(decimal_from_i128_with_scale(LONG_MAX as i128 + 1, 0)).unwrap();
-
-    let result = datum.to(&Primitive(PrimitiveType::Long)).unwrap();
-
-    let expected = Datum::new(PrimitiveType::Long, PrimitiveLiteral::AboveMax);
-
-    assert_eq!(result, expected);
+fn test_datum_decimal_convert_to_long_above_i64_max_rejected() {
+    let datum = Datum::decimal(decimal_from_i128_with_scale(i64::MAX as i128 + 1, 0)).unwrap();
+    let result = datum.to(&Primitive(PrimitiveType::Long));
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_datum_decimal_convert_to_long_below_min() {
-    let datum = Datum::decimal(decimal_from_i128_with_scale(LONG_MIN as i128 - 1, 0)).unwrap();
-
-    let result = datum.to(&Primitive(PrimitiveType::Long)).unwrap();
-
-    let expected = Datum::new(PrimitiveType::Long, PrimitiveLiteral::BelowMin);
-
-    assert_eq!(result, expected);
+fn test_datum_decimal_convert_to_long_below_i64_min_rejected() {
+    let datum = Datum::decimal(decimal_from_i128_with_scale(i64::MIN as i128 - 1, 0)).unwrap();
+    let result = datum.to(&Primitive(PrimitiveType::Long));
+    assert!(result.is_err());
 }
 
 // Java `StringLiteral.to` has NO BOOLEAN/INTEGER/LONG case — all three fall to `default: null`
