@@ -46,8 +46,6 @@ pub(crate) const MAX_TIME_VALUE: i64 = 24 * 60 * 60 * 1_000_000i64 - 1;
 
 pub(crate) const INT_MAX: i32 = 2147483647;
 pub(crate) const INT_MIN: i32 = -2147483648;
-pub(crate) const LONG_MAX: i64 = 9223372036854775807;
-pub(crate) const LONG_MIN: i64 = -9223372036854775808;
 
 /// Literal associated with its type. The value and type pair is checked when construction, so the type and value is
 /// guaranteed to be correct when used.
@@ -1106,16 +1104,6 @@ impl Datum {
         }
     }
 
-    fn i128_to_i64<T: Into<i128> + PartialOrd<i128>>(val: T) -> Datum {
-        if val > LONG_MAX as i128 {
-            Datum::new(PrimitiveType::Long, PrimitiveLiteral::AboveMax)
-        } else if val < LONG_MIN as i128 {
-            Datum::new(PrimitiveType::Long, PrimitiveLiteral::BelowMin)
-        } else {
-            Datum::long(val.into() as i64)
-        }
-    }
-
     /// Convert the datum to `target_type`.
     pub fn to(self, target_type: &Type) -> Result<Datum> {
         match target_type {
@@ -1133,10 +1121,14 @@ impl Datum {
                     (PrimitiveLiteral::Long(val), _, PrimitiveType::Timestamptz) => {
                         Ok(Datum::timestamptz_micros(*val))
                     }
-                    // Let's wait with nano's until this clears up: https://github.com/apache/iceberg/pull/11775
-                    (PrimitiveLiteral::Int128(val), _, PrimitiveType::Long) => {
-                        Ok(Datum::i128_to_i64(*val))
-                    }
+
+                    // NB: Java `DecimalLiteral.to` has ONLY `case DECIMAL: return this` —
+                    // `default: return null` rejects everything else, INCLUDING LONG. A
+                    // `PrimitiveLiteral::Int128` is exclusively the unscaled-mantissa storage of a
+                    // decimal literal, so there is deliberately NO `Int128 → Long` arm: a Decimal→Long
+                    // request falls through to the catch-all `Err`, matching Java exactly. (The old
+                    // arm also returned a wrong value for any non-zero scale by long-casting the
+                    // raw mantissa.)
 
                     // NB: Java `StringLiteral.to` has NO case for BOOLEAN / INTEGER / LONG — those
                     // fall through to `default: return null`, i.e. a reject. We deliberately do NOT

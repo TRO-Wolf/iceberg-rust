@@ -99,7 +99,7 @@ fn constants_map(
                     //
                     // `Datum::to(field_type)` is the canonical Iceberg coercion (the same table used
                     // throughout `arrow/`): `Int->Long`, `Int->Date`, `Long->Timestamp/Timestamptz`,
-                    // `Int128->Long`, with equal types passing through. This mirrors Java
+                    // with equal types passing through. This mirrors Java
                     // `IdentityPartitionConverters.convertConstant(partitionType.field(pos).type(),
                     // value)`, where the TYPE comes from the (schema-derived) partition type, not the
                     // literal's stored representation.
