@@ -1106,16 +1106,6 @@ impl Datum {
         }
     }
 
-    fn i128_to_i32<T: Into<i128> + PartialOrd<i128>>(val: T) -> Datum {
-        if val > INT_MAX as i128 {
-            Datum::new(PrimitiveType::Int, PrimitiveLiteral::AboveMax)
-        } else if val < INT_MIN as i128 {
-            Datum::new(PrimitiveType::Int, PrimitiveLiteral::BelowMin)
-        } else {
-            Datum::int(val.into() as i32)
-        }
-    }
-
     fn i128_to_i64<T: Into<i128> + PartialOrd<i128>>(val: T) -> Datum {
         if val > LONG_MAX as i128 {
             Datum::new(PrimitiveType::Long, PrimitiveLiteral::AboveMax)
@@ -1124,12 +1114,6 @@ impl Datum {
         } else {
             Datum::long(val.into() as i64)
         }
-    }
-
-    fn string_to_i128<S: AsRef<str>>(s: S) -> Result<i128> {
-        s.as_ref().parse::<i128>().map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Can't parse string to i128.").with_source(e)
-        })
     }
 
     /// Convert the datum to `target_type`.
@@ -1154,15 +1138,12 @@ impl Datum {
                         Ok(Datum::i128_to_i64(*val))
                     }
 
-                    (PrimitiveLiteral::String(val), _, PrimitiveType::Boolean) => {
-                        Datum::bool_from_str(val)
-                    }
-                    (PrimitiveLiteral::String(val), _, PrimitiveType::Int) => {
-                        Datum::string_to_i128(val).map(Datum::i128_to_i32)
-                    }
-                    (PrimitiveLiteral::String(val), _, PrimitiveType::Long) => {
-                        Datum::string_to_i128(val).map(Datum::i128_to_i64)
-                    }
+                    // NB: Java `StringLiteral.to` has NO case for BOOLEAN / INTEGER / LONG — those
+                    // fall through to `default: return null`, i.e. a reject. We deliberately do NOT
+                    // provide `string → {boolean,int,long}` arms so that a parse fall-through hits
+                    // the catch-all `Err` below, matching the Java contract exactly. (The accepted
+                    // string targets — TIMESTAMP/TIMESTAMP_TZ/DATE/TIME/UUID — are the arms here and
+                    // just below.)
                     (PrimitiveLiteral::String(val), _, PrimitiveType::Timestamp) => {
                         Datum::timestamp_from_str(val)
                     }

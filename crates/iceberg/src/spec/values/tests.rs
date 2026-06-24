@@ -1197,37 +1197,26 @@ fn test_datum_decimal_convert_to_long_below_min() {
     assert_eq!(result, expected);
 }
 
+// Java `StringLiteral.to` has NO BOOLEAN/INTEGER/LONG case — all three fall to `default: null`
+// (a reject). The inputs below are well-formed (`"true"` / `"12345"`), so these pin the *type
+// contract*, not a parse failure: re-introducing any of the removed over-permissive arms flips
+// these from `is_err()` back to `is_ok()`.
 #[test]
-fn test_datum_string_convert_to_boolean() {
-    let datum = Datum::string("true");
-
-    let result = datum.to(&Primitive(PrimitiveType::Boolean)).unwrap();
-
-    let expected = Datum::bool(true);
-
-    assert_eq!(result, expected);
+fn test_datum_string_convert_to_boolean_rejected() {
+    let result = Datum::string("true").to(&Primitive(PrimitiveType::Boolean));
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_datum_string_convert_to_int() {
-    let datum = Datum::string("12345");
-
-    let result = datum.to(&Primitive(PrimitiveType::Int)).unwrap();
-
-    let expected = Datum::int(12345);
-
-    assert_eq!(result, expected);
+fn test_datum_string_convert_to_int_rejected() {
+    let result = Datum::string("12345").to(&Primitive(PrimitiveType::Int));
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_datum_string_convert_to_long() {
-    let datum = Datum::string("12345");
-
-    let result = datum.to(&Primitive(PrimitiveType::Long)).unwrap();
-
-    let expected = Datum::long(12345);
-
-    assert_eq!(result, expected);
+fn test_datum_string_convert_to_long_rejected() {
+    let result = Datum::string("12345").to(&Primitive(PrimitiveType::Long));
+    assert!(result.is_err());
 }
 
 #[test]
