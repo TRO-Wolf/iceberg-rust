@@ -1636,3 +1636,662 @@ async fn test_insert_into_partitioned() -> Result<()> {
 
     Ok(())
 }
+
+/// Helper that builds a partitioned `{id int, category string, value string}` table partitioned by
+/// identity(category), registers it in a fresh `SessionContext`, and returns the context + catalog
+/// client so tests can issue SQL and inspect the catalog. The table namespace and name are supplied
+/// by the caller so multiple tests can coexist without namespace collisions.
+async fn make_partitioned_delete_ctx(
+    ns: &str,
+    tbl: &str,
+) -> Result<(SessionContext, Arc<MemoryCatalog>)> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new(ns.to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name(tbl.to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    Ok((ctx, client))
+}
+
+/// COW DELETE on a partitioned table: delete rows in ONE partition, verify the other is untouched.
+///
+/// Table: `{id int, category string, value string}` partitioned by `identity(category)`.
+/// Two partitions: `electronics` (ids 1,2) and `books` (ids 3,4).
+/// DELETE removes all rows WHERE category = 'electronics'.
+/// Post-DELETE: only the `books` rows remain.
+#[tokio::test]
+async fn test_delete_cow_partitioned() -> Result<()> {
+    let (ctx, _client) = make_partitioned_delete_ctx("test_del_cow_part", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.test_del_cow_part.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel'), \
+         (4, 'books', 'textbook')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // DELETE all electronics rows — only the books partition must survive.
+    let batches = ctx
+        .sql("DELETE FROM catalog.test_del_cow_part.items WHERE category = 'electronics'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(deleted, 2, "exactly 2 electronics rows deleted");
+
+    // SELECT must return ONLY the books rows.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_del_cow_part.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 2, "two books rows survive");
+
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
+        expect![[r#"
+            id: PrimitiveArray<Int32>
+            [
+              3,
+              4,
+            ],
+            category: StringArray
+            [
+              "books",
+              "books",
+            ],
+            value: StringArray
+            [
+              "novel",
+              "textbook",
+            ]"#]],
+        &[],
+        Some("id"),
+    );
+
+    Ok(())
+}
+
+/// COW DELETE FROM (no WHERE) on a partitioned table empties it.
+#[tokio::test]
+async fn test_delete_cow_partitioned_delete_from_all() -> Result<()> {
+    let (ctx, _client) = make_partitioned_delete_ctx("test_del_cow_part_all", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.test_del_cow_part_all.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'books', 'novel')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let batches = ctx
+        .sql("DELETE FROM catalog.test_del_cow_part_all.items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(deleted, 2, "both rows deleted");
+
+    let total: usize = ctx
+        .sql("SELECT * FROM catalog.test_del_cow_part_all.items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(total, 0, "table is empty after DELETE FROM");
+
+    Ok(())
+}
+
+/// Confirm the existing unpartitioned COW test still passes under the new file-level path.
+/// The discriminating `lower(foo2) = 'alan'` filter is unconvertible — an inexact pushdown
+/// would over-delete (also remove row 2 'turing'). The exact PhysicalExpr eval must be preserved.
+#[tokio::test]
+async fn test_delete_cow_unpartitioned_exact_filter_preserved() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_del_cow_exact".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql(
+        "INSERT INTO catalog.test_del_cow_exact.my_table VALUES \
+         (1, 'alan'), (2, 'turing'), (3, 'ALAN')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let batches = ctx
+        .sql(
+            "DELETE FROM catalog.test_del_cow_exact.my_table \
+             WHERE foo1 > 0 AND lower(foo2) = 'alan'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        deleted, 2,
+        "exact filter deletes rows 1 and 3 only, not 2 ('turing')"
+    );
+
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_del_cow_exact.my_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "only (2,'turing') survives");
+
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              2,
+            ],
+            foo2: StringArray
+            [
+              "turing",
+            ]"#]],
+        &[],
+        Some("foo1"),
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// CRITIC PROBE TESTS — U1 COW DELETE adversarial verification
+// ============================================================================
+
+/// CRITIC PROBE 1: Verify affected-path matching at the manifest level.
+/// After COW DELETE, inspect the post-commit snapshot's manifest data files
+/// directly (not just SELECT row counts). Confirm:
+/// a) The deleted source file is gone from the live manifest set.
+/// b) A new rewritten file was added (distinct path).
+/// c) The unaffected file is still present with its ORIGINAL path.
+/// This distinguishes silent no-op (old file stays + new file added = DUPLICATE rows)
+/// from correct behavior.
+#[tokio::test]
+async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
+    let (ctx, client) = make_partitioned_delete_ctx("critic_probe1", "items").await?;
+
+    // Insert two batches into two separate transactions to get TWO distinct data files.
+    ctx.sql("INSERT INTO catalog.critic_probe1.items VALUES (1, 'electronics', 'laptop')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    ctx.sql("INSERT INTO catalog.critic_probe1.items VALUES (2, 'books', 'novel')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Load the table BEFORE delete to record existing file paths.
+    let ns = NamespaceIdent::new("critic_probe1".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
+    let table_before = client.load_table(&tbl_id).await?;
+    let snap_before = table_before.metadata().current_snapshot().unwrap();
+    let ml_before = snap_before
+        .load_manifest_list(table_before.file_io(), table_before.metadata())
+        .await?;
+    let mut paths_before: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mf in ml_before.entries() {
+        let m = mf.load_manifest(table_before.file_io()).await?;
+        for entry in m.entries() {
+            if entry.is_alive() {
+                paths_before.insert(entry.file_path().to_string());
+            }
+        }
+    }
+    assert_eq!(
+        paths_before.len(),
+        2,
+        "should have exactly 2 source files before DELETE"
+    );
+
+    // DELETE electronics row — only that file is affected.
+    let batches = ctx
+        .sql("DELETE FROM catalog.critic_probe1.items WHERE category = 'electronics'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(deleted, 1, "1 row deleted");
+
+    // Load the table AFTER delete; inspect the live manifest set.
+    let table_after = client.load_table(&tbl_id).await?;
+    let snap_after = table_after.metadata().current_snapshot().unwrap();
+    let ml_after = snap_after
+        .load_manifest_list(table_after.file_io(), table_after.metadata())
+        .await?;
+    let mut paths_after: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mf in ml_after.entries() {
+        let m = mf.load_manifest(table_after.file_io()).await?;
+        for entry in m.entries() {
+            if entry.is_alive() {
+                paths_after.insert(entry.file_path().to_string());
+            }
+        }
+    }
+
+    // CRITICAL assertions:
+    // 1. Exactly ONE live file after (the books file, untouched, plus a rewritten... wait:
+    //    the electronics file had 1 row deleted (all rows), so the rewrite produces NO survivors
+    //    for that file. The books file was unaffected and stays. So exactly 1 live file.
+    assert_eq!(
+        paths_after.len(),
+        1,
+        "after full-file DELETE, live set must be exactly 1 (unaffected books file); got {paths_after:?}"
+    );
+
+    // 2. The surviving file MUST be the original books file (unchanged path).
+    // We can't distinguish paths before delete by content alone, so we check that the surviving
+    // path is one of the original paths (i.e., it is the unaffected original books file).
+    let rows = ctx
+        .sql("SELECT id, category FROM catalog.critic_probe1.items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "exactly 1 row survives");
+
+    // 3. No path in paths_after should be the SAME as any path_before AND also the electronics path.
+    //    The unaffected books file must still be present with its original path.
+    let surviving_path = paths_after.iter().next().unwrap().clone();
+    assert!(
+        paths_before.contains(&surviving_path),
+        "the surviving file must be the original unaffected books file (same path); \
+         surviving={surviving_path}; paths_before={paths_before:?}"
+    );
+
+    Ok(())
+}
+
+/// CRITIC PROBE 2: Multi-file-per-partition — DELETE hits only FILE A; FILE B must be untouched.
+/// Partition has 2 data files (two INSERT transactions into the same partition).
+/// DELETE predicate matches rows in file A only.
+/// After commit: file A is gone, file B has its ORIGINAL path (not rewritten).
+#[tokio::test]
+async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> Result<()> {
+    let (ctx, client) = make_partitioned_delete_ctx("critic_probe2", "items").await?;
+
+    // Two separate INSERT statements into the SAME partition → two distinct data files for 'electronics'.
+    ctx.sql("INSERT INTO catalog.critic_probe2.items VALUES (1, 'electronics', 'laptop')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO catalog.critic_probe2.items VALUES (2, 'electronics', 'tablet')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ns = NamespaceIdent::new("critic_probe2".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
+    let table_before = client.load_table(&tbl_id).await?;
+
+    // Collect paths before
+    let snap_before = table_before.metadata().current_snapshot().unwrap();
+    let ml_before = snap_before
+        .load_manifest_list(table_before.file_io(), table_before.metadata())
+        .await?;
+    let mut paths_before: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mf in ml_before.entries() {
+        let m = mf.load_manifest(table_before.file_io()).await?;
+        for entry in m.entries() {
+            if entry.is_alive() {
+                paths_before.insert(entry.file_path().to_string());
+            }
+        }
+    }
+    assert_eq!(paths_before.len(), 2, "two files before delete");
+
+    // DELETE WHERE id = 1 — only file A (containing id=1) is affected.
+    // File B (containing id=2) must be left untouched.
+    ctx.sql("DELETE FROM catalog.critic_probe2.items WHERE id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Inspect post-commit live paths.
+    let table_after = client.load_table(&tbl_id).await?;
+    let snap_after = table_after.metadata().current_snapshot().unwrap();
+    let ml_after = snap_after
+        .load_manifest_list(table_after.file_io(), table_after.metadata())
+        .await?;
+    let mut paths_after: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mf in ml_after.entries() {
+        let m = mf.load_manifest(table_after.file_io()).await?;
+        for entry in m.entries() {
+            if entry.is_alive() {
+                paths_after.insert(entry.file_path().to_string());
+            }
+        }
+    }
+
+    // After deleting id=1 (which was the only row in file A, fully deleted):
+    // - file A: fully deleted, no survivors → 0 rewritten files for A
+    // - file B: unaffected → still has original path
+    // Expected: exactly 1 live file, and it must be file B's original path.
+    assert_eq!(
+        paths_after.len(),
+        1,
+        "one file must survive (file B, untouched); got {paths_after:?}"
+    );
+    let survivor_path = paths_after.iter().next().unwrap();
+    assert!(
+        paths_before.contains(survivor_path),
+        "file B must retain its ORIGINAL path (not rewritten); got {survivor_path}"
+    );
+
+    // Row content: only id=2 survives.
+    let rows = ctx
+        .sql("SELECT id FROM catalog.critic_probe2.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = rows
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![2i32], "only id=2 survives");
+
+    Ok(())
+}
+
+/// CRITIC PROBE 3: Non-identity partition transform (truncate[4] on category string).
+/// This tests PartitionValueCalculator with a real transform, not identity.
+/// If the partition column calculation is wrong, the rewritten file would be assigned
+/// to the wrong partition → DataFile.partition() would carry the wrong value.
+#[tokio::test]
+async fn test_delete_cow_non_identity_transform_truncate() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("critic_probe3".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Table: {id int, category string, value int} partitioned by truncate[4](category)
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category_trunc", Transform::Truncate(4))?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("trunc_table".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert: "electronics" truncates to "elec", "books" truncates to "book"
+    ctx.sql(
+        "INSERT INTO catalog.critic_probe3.trunc_table VALUES \
+         (1, 'electronics', 100), \
+         (2, 'electronics', 200), \
+         (3, 'books', 300), \
+         (4, 'books', 400)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // DELETE rows where id = 1 — file containing electronics rows affected.
+    // After DELETE: rows 2,3,4 survive; file must be correctly placed in 'elec' partition.
+    let batches = ctx
+        .sql("DELETE FROM catalog.critic_probe3.trunc_table WHERE id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(deleted, 1);
+
+    // Verify surviving rows include id=2 (rewritten in electronics/elec partition) and 3,4.
+    let rows = ctx
+        .sql("SELECT id FROM catalog.critic_probe3.trunc_table ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = rows
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![2i32, 3, 4],
+        "rows 2,3,4 survive after truncate-partitioned DELETE"
+    );
+
+    // Inspect post-commit DataFile.partition() for the rewritten file to confirm the transform
+    // was applied correctly (category_trunc should be "elec" for the rewritten electronics file).
+    let tbl_id = iceberg::TableIdent::new(namespace, "trunc_table".to_string());
+    let table = client.load_table(&tbl_id).await?;
+    let snap = table.metadata().current_snapshot().unwrap();
+    let ml = snap
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+    let mut partition_values: Vec<String> = Vec::new();
+    for mf in ml.entries() {
+        let m = mf.load_manifest(table.file_io()).await?;
+        for entry in m.entries() {
+            if entry.is_alive() {
+                let pv = entry.data_file().partition();
+                // partition struct has one field: category_trunc (String, truncated to 4 chars)
+                let field = pv.fields()[0].as_ref();
+                if let Some(lit) = field
+                    && let iceberg::spec::Literal::Primitive(
+                        iceberg::spec::PrimitiveLiteral::String(s),
+                    ) = lit
+                {
+                    partition_values.push(s.clone());
+                }
+            }
+        }
+    }
+    partition_values.sort();
+    // Two files survive: 1 file for "book" partition (ids 3,4), 1 file for "elec" partition (id=2
+    // rewritten). After DELETE, the affected file is rewritten (dropping id=1), producing 1 new
+    // "elec"-keyed file. The "book" file is unaffected (or, if both partitions were in a single
+    // source file, both get correctly routed on rewrite).
+    assert_eq!(
+        partition_values,
+        vec!["book".to_string(), "elec".to_string()],
+        "rewritten file must be in 'elec' partition; all partition values: {partition_values:?}"
+    );
+
+    Ok(())
+}
+
+/// CRITIC PROBE 4: Verify a DELETE WHERE predicate that hits NO rows is a no-op (no new snapshot).
+#[tokio::test]
+async fn test_delete_cow_no_match_is_noop() -> Result<()> {
+    let (ctx, client) = make_partitioned_delete_ctx("critic_probe4", "items").await?;
+
+    ctx.sql("INSERT INTO catalog.critic_probe4.items VALUES (1, 'electronics', 'laptop')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ns = NamespaceIdent::new("critic_probe4".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns, "items".to_string());
+    let table_before = client.load_table(&tbl_id).await?;
+    let snap_id_before = table_before
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+
+    // DELETE where nothing matches.
+    let batches = ctx
+        .sql("DELETE FROM catalog.critic_probe4.items WHERE category = 'books'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(deleted, 0, "no rows deleted");
+
+    let table_after = client.load_table(&tbl_id).await?;
+    let snap_id_after = table_after
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+    assert_eq!(
+        snap_id_before, snap_id_after,
+        "no-op DELETE must not create a new snapshot"
+    );
+
+    Ok(())
+}
