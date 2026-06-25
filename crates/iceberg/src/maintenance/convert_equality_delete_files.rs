@@ -103,7 +103,9 @@ use crate::expr::visitors::inclusive_projection::InclusiveProjection;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::scan::ArrowRecordBatchStream;
-use crate::spec::{DataContentType, DataFile, DataFileFormat, PartitionKey, Schema, Snapshot};
+use crate::spec::{
+    DataContentType, DataFile, DataFileFormat, MetricsConfig, PartitionKey, Schema, Snapshot,
+};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
@@ -500,10 +502,14 @@ impl ConvertEqualityDeleteFiles {
             Some(uuid::Uuid::now_v7().to_string()),
             DataFileFormat::Parquet,
         );
+        // The converted position-delete files keep `file_path`/`pos` bounds FULL (Java
+        // `MetricsConfig.forPositionDelete`) so delete-file path pruning stays precise — the default
+        // `truncate(16)` would widen the path range.
         let parquet_builder = ParquetWriterBuilder::new(
             parquet::file::properties::WriterProperties::builder().build(),
             config.schema().clone(),
-        );
+        )
+        .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.table.file_io().clone(),

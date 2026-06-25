@@ -114,7 +114,7 @@ use crate::metadata_columns::{
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder,
-    PrimitiveLiteral, Snapshot, TableMetadata,
+    MetricsConfig, PrimitiveLiteral, Snapshot, TableMetadata,
 };
 use crate::table::Table;
 use crate::writer::base_writer::position_delete_writer::{
@@ -574,10 +574,14 @@ impl RewriteTablePath {
             None,
             DataFileFormat::Parquet,
         );
+        // The rewritten position-delete content keeps `file_path`/`pos` bounds FULL (Java
+        // `MetricsConfig.forPositionDelete`) so delete-file path pruning stays precise — the default
+        // `truncate(16)` would widen the path range.
         let parquet_builder = ParquetWriterBuilder::new(
             parquet::file::properties::WriterProperties::builder().build(),
             config.schema().clone(),
-        );
+        )
+        .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.table.file_io().clone(),
