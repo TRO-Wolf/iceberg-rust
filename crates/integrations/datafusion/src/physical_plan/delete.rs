@@ -62,7 +62,6 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::TryStreamExt;
 use iceberg::Catalog;
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator};
-use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig};
 use iceberg::table::Table;
@@ -1119,9 +1118,16 @@ async fn merge_on_read_update(
     Ok(updated)
 }
 
-/// Copy-on-write UPDATE: rewrite ALL rows (matching rows take the new values, the rest unchanged) into
-/// new data files and replace all data via `OverwriteFiles`. Returns the number of rows updated.
-/// Unpartitioned tables only for now.
+/// Copy-on-write UPDATE: **file-level** rewrite — scan every live row projecting the table columns
+/// PLUS the reserved `_file` path, identify which source data files contain at least one updated row
+/// (the "affected" set), rewrite only those files in full (matched rows take the new values; rows of
+/// the same file that did NOT match are carried unchanged), and commit a `OverwriteFiles` that deletes
+/// the affected source paths and adds the rewritten files. Unaffected data files are left completely
+/// untouched.
+///
+/// Works for BOTH partitioned and unpartitioned tables. When the SET expression changes a
+/// partition-key column, the rewritten row is routed to its NEW partition automatically because
+/// `write_partitioned_data_files` computes partition values from the post-assignment column values.
 async fn copy_on_write_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -1129,17 +1135,16 @@ async fn copy_on_write_update(
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
 ) -> DFResult<u64> {
-    if !table.metadata().default_partition_spec().is_unpartitioned() {
-        return Err(DataFusionError::NotImplemented(
-            "UPDATE on a partitioned table is not yet supported".to_string(),
-        ));
-    }
-
-    let projection: Vec<String> = table_schema
+    // 1. Scan EVERY live row projecting the table columns PLUS `_file` (not `_pos` — COW does not
+    //    need positions). We do NOT push the filter into the scan — Iceberg pushdown is inexact (see
+    //    the module note); the exact `PhysicalExpr` evaluation here is the correctness contract.
+    let mut projection: Vec<String> = table_schema
         .fields()
         .iter()
         .map(|field| field.name().clone())
         .collect();
+    projection.push(RESERVED_COL_NAME_FILE.to_string());
+
     let batches: Vec<RecordBatch> = table
         .scan()
         .select(projection)
@@ -1152,30 +1157,96 @@ async fn copy_on_write_update(
         .await
         .map_err(to_datafusion_error)?;
 
-    let mut output_batches: Vec<RecordBatch> = Vec::new();
+    // 2. Pass 1 — affected-file detection. A source file is AFFECTED iff at least one of its rows
+    //    matches the predicate (or the predicate is None → all rows match → all files affected).
+    //    Also counts total updated rows for the return value.
     let mut updated: u64 = 0;
+    let mut affected: HashSet<String> = HashSet::new();
+
     for batch in &batches {
+        let num_rows = batch.num_rows();
+        let file_col = batch
+            .column_by_name(RESERVED_COL_NAME_FILE)
+            .ok_or_else(|| {
+                DataFusionError::Internal("update scan missing _file column".to_string())
+            })?;
         let table_batch = table_column_batch(batch, table_schema)?;
         let mask = match_mask(&predicate, &table_batch)?;
-        updated += mask.true_count() as u64;
-        // Per-row select: matching rows take the new value, the rest keep the old.
-        output_batches.push(apply_assignments(
-            &table_batch,
-            assignments,
-            table_schema,
-            Some(&mask),
-        )?);
+
+        for row in 0..num_rows {
+            // A row is updated iff the predicate is TRUE (NULL → SQL three-valued logic → NOT updated).
+            if mask.is_valid(row) && mask.value(row) {
+                updated += 1;
+                affected.insert(decode_file_path(file_col, row)?);
+            }
+        }
     }
 
-    // No matching rows → no-op (avoid a pointless rewrite of unchanged data).
+    // 3. No updated rows → no-op (avoid a pointless rewrite of unchanged data).
     if updated == 0 {
         return Ok(0);
     }
 
-    let new_files = write_survivor_data_files(table, &output_batches).await?;
+    // 4. Pass 2 — build rewrite content for affected files only.
+    //    For each batch: filter down to rows whose source file is in the affected set, then apply
+    //    the assignments with the per-row match mask so that:
+    //      * matched rows (WHERE = TRUE) take the new SET values
+    //      * other rows of the SAME affected file keep their original values (carried unchanged)
+    //    Rows from unaffected files are NOT included — their source files are untouched.
+    let mut rewritten_batches: Vec<RecordBatch> = Vec::new();
+
+    for batch in &batches {
+        let num_rows = batch.num_rows();
+        let file_col = batch
+            .column_by_name(RESERVED_COL_NAME_FILE)
+            .ok_or_else(|| {
+                DataFusionError::Internal("update scan missing _file column".to_string())
+            })?;
+
+        // Build table-column sub-batch (rows from the FULL batch including unaffected-file rows).
+        let table_batch = table_column_batch(batch, table_schema)?;
+
+        // Keep-mask: only rows whose source file is in the affected set.
+        let keep_affected: BooleanArray = (0..num_rows)
+            .map(|row| -> DFResult<bool> {
+                let path = decode_file_path(file_col, row)?;
+                Ok(affected.contains(&path))
+            })
+            .collect::<DFResult<Vec<bool>>>()?
+            .into_iter()
+            .collect();
+
+        // Filter down to affected-file rows (table columns only, no _file).
+        let affected_batch = filter_record_batch(&table_batch, &keep_affected)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        if affected_batch.num_rows() == 0 {
+            continue;
+        }
+
+        // Re-evaluate the WHERE predicate over the affected-file sub-batch to get the per-row
+        // match mask within those rows.
+        let affected_match_mask = match_mask(&predicate, &affected_batch)?;
+
+        // Apply assignments: matched rows take new values; non-matched rows keep old values.
+        let rewritten = apply_assignments(
+            &affected_batch,
+            assignments,
+            table_schema,
+            Some(&affected_match_mask),
+        )?;
+        rewritten_batches.push(rewritten);
+    }
+
+    // 5. Write rewritten content via the partition-aware TaskWriter. Routes each row to its correct
+    //    partition by the POST-assignment column values — a partition-key-changing UPDATE automatically
+    //    moves the row to the new partition file.
+    let new_files = write_partitioned_data_files(table, &rewritten_batches).await?;
+
+    // 6. Commit: delete the affected source files by path, add the rewritten files.
+    //    Use delete_files (NOT overwrite_by_row_filter) so unaffected files are left in place.
     let tx = Transaction::new(table);
     tx.overwrite_files()
-        .overwrite_by_row_filter(Predicate::AlwaysTrue)
+        .delete_files(affected.iter().cloned())
         .add_files(new_files)
         .apply(tx)
         .map_err(to_datafusion_error)?
