@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{Array, StringArray, UInt64Array};
+use datafusion::arrow::array::{Array, Int32Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -2169,10 +2169,10 @@ async fn test_delete_cow_unpartitioned_exact_filter_preserved() -> Result<()> {
 }
 
 // ============================================================================
-// CRITIC PROBE TESTS — U1 COW DELETE adversarial verification
+// ADDITIONAL EDGE-CASE PROBES — U1 COW DELETE adversarial verification
 // ============================================================================
 
-/// CRITIC PROBE 1: Verify affected-path matching at the manifest level.
+/// EDGE-CASE PROBE 1: Verify affected-path matching at the manifest level.
 /// After COW DELETE, inspect the post-commit snapshot's manifest data files
 /// directly (not just SELECT row counts). Confirm:
 /// a) The deleted source file is gone from the live manifest set.
@@ -2182,17 +2182,17 @@ async fn test_delete_cow_unpartitioned_exact_filter_preserved() -> Result<()> {
 /// from correct behavior.
 #[tokio::test]
 async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
-    let (ctx, client) = make_partitioned_delete_ctx("critic_probe1", "items").await?;
+    let (ctx, client) = make_partitioned_delete_ctx("dml_probe1", "items").await?;
 
     // Insert two batches into two separate transactions to get TWO distinct data files.
-    ctx.sql("INSERT INTO catalog.critic_probe1.items VALUES (1, 'electronics', 'laptop')")
+    ctx.sql("INSERT INTO catalog.dml_probe1.items VALUES (1, 'electronics', 'laptop')")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
 
-    ctx.sql("INSERT INTO catalog.critic_probe1.items VALUES (2, 'books', 'novel')")
+    ctx.sql("INSERT INTO catalog.dml_probe1.items VALUES (2, 'books', 'novel')")
         .await
         .unwrap()
         .collect()
@@ -2200,7 +2200,7 @@ async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
         .unwrap();
 
     // Load the table BEFORE delete to record existing file paths.
-    let ns = NamespaceIdent::new("critic_probe1".to_string());
+    let ns = NamespaceIdent::new("dml_probe1".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
     let table_before = client.load_table(&tbl_id).await?;
     let snap_before = table_before.metadata().current_snapshot().unwrap();
@@ -2224,7 +2224,7 @@ async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
 
     // DELETE electronics row — only that file is affected.
     let batches = ctx
-        .sql("DELETE FROM catalog.critic_probe1.items WHERE category = 'electronics'")
+        .sql("DELETE FROM catalog.dml_probe1.items WHERE category = 'electronics'")
         .await
         .unwrap()
         .collect()
@@ -2268,7 +2268,7 @@ async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
     // We can't distinguish paths before delete by content alone, so we check that the surviving
     // path is one of the original paths (i.e., it is the unaffected original books file).
     let rows = ctx
-        .sql("SELECT id, category FROM catalog.critic_probe1.items")
+        .sql("SELECT id, category FROM catalog.dml_probe1.items")
         .await
         .unwrap()
         .collect()
@@ -2289,29 +2289,29 @@ async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
     Ok(())
 }
 
-/// CRITIC PROBE 2: Multi-file-per-partition — DELETE hits only FILE A; FILE B must be untouched.
+/// EDGE-CASE PROBE 2: Multi-file-per-partition — DELETE hits only FILE A; FILE B must be untouched.
 /// Partition has 2 data files (two INSERT transactions into the same partition).
 /// DELETE predicate matches rows in file A only.
 /// After commit: file A is gone, file B has its ORIGINAL path (not rewritten).
 #[tokio::test]
 async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> Result<()> {
-    let (ctx, client) = make_partitioned_delete_ctx("critic_probe2", "items").await?;
+    let (ctx, client) = make_partitioned_delete_ctx("dml_probe2", "items").await?;
 
     // Two separate INSERT statements into the SAME partition → two distinct data files for 'electronics'.
-    ctx.sql("INSERT INTO catalog.critic_probe2.items VALUES (1, 'electronics', 'laptop')")
+    ctx.sql("INSERT INTO catalog.dml_probe2.items VALUES (1, 'electronics', 'laptop')")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
-    ctx.sql("INSERT INTO catalog.critic_probe2.items VALUES (2, 'electronics', 'tablet')")
+    ctx.sql("INSERT INTO catalog.dml_probe2.items VALUES (2, 'electronics', 'tablet')")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
 
-    let ns = NamespaceIdent::new("critic_probe2".to_string());
+    let ns = NamespaceIdent::new("dml_probe2".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
     let table_before = client.load_table(&tbl_id).await?;
 
@@ -2333,7 +2333,7 @@ async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> R
 
     // DELETE WHERE id = 1 — only file A (containing id=1) is affected.
     // File B (containing id=2) must be left untouched.
-    ctx.sql("DELETE FROM catalog.critic_probe2.items WHERE id = 1")
+    ctx.sql("DELETE FROM catalog.dml_probe2.items WHERE id = 1")
         .await
         .unwrap()
         .collect()
@@ -2373,7 +2373,7 @@ async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> R
 
     // Row content: only id=2 survives.
     let rows = ctx
-        .sql("SELECT id FROM catalog.critic_probe2.items ORDER BY id")
+        .sql("SELECT id FROM catalog.dml_probe2.items ORDER BY id")
         .await
         .unwrap()
         .collect()
@@ -2395,14 +2395,14 @@ async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> R
     Ok(())
 }
 
-/// CRITIC PROBE 3: Non-identity partition transform (truncate[4] on category string).
+/// EDGE-CASE PROBE 3: Non-identity partition transform (truncate[4] on category string).
 /// This tests PartitionValueCalculator with a real transform, not identity.
 /// If the partition column calculation is wrong, the rewritten file would be assigned
 /// to the wrong partition → DataFile.partition() would carry the wrong value.
 #[tokio::test]
 async fn test_delete_cow_non_identity_transform_truncate() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
-    let namespace = NamespaceIdent::new("critic_probe3".to_string());
+    let namespace = NamespaceIdent::new("dml_probe3".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
 
     // Table: {id int, category string, value int} partitioned by truncate[4](category)
@@ -2437,7 +2437,7 @@ async fn test_delete_cow_non_identity_transform_truncate() -> Result<()> {
 
     // Insert: "electronics" truncates to "elec", "books" truncates to "book"
     ctx.sql(
-        "INSERT INTO catalog.critic_probe3.trunc_table VALUES \
+        "INSERT INTO catalog.dml_probe3.trunc_table VALUES \
          (1, 'electronics', 100), \
          (2, 'electronics', 200), \
          (3, 'books', 300), \
@@ -2452,7 +2452,7 @@ async fn test_delete_cow_non_identity_transform_truncate() -> Result<()> {
     // DELETE rows where id = 1 — file containing electronics rows affected.
     // After DELETE: rows 2,3,4 survive; file must be correctly placed in 'elec' partition.
     let batches = ctx
-        .sql("DELETE FROM catalog.critic_probe3.trunc_table WHERE id = 1")
+        .sql("DELETE FROM catalog.dml_probe3.trunc_table WHERE id = 1")
         .await
         .unwrap()
         .collect()
@@ -2468,7 +2468,7 @@ async fn test_delete_cow_non_identity_transform_truncate() -> Result<()> {
 
     // Verify surviving rows include id=2 (rewritten in electronics/elec partition) and 3,4.
     let rows = ctx
-        .sql("SELECT id FROM catalog.critic_probe3.trunc_table ORDER BY id")
+        .sql("SELECT id FROM catalog.dml_probe3.trunc_table ORDER BY id")
         .await
         .unwrap()
         .collect()
@@ -2531,19 +2531,19 @@ async fn test_delete_cow_non_identity_transform_truncate() -> Result<()> {
     Ok(())
 }
 
-/// CRITIC PROBE 4: Verify a DELETE WHERE predicate that hits NO rows is a no-op (no new snapshot).
+/// EDGE-CASE PROBE 4: Verify a DELETE WHERE predicate that hits NO rows is a no-op (no new snapshot).
 #[tokio::test]
 async fn test_delete_cow_no_match_is_noop() -> Result<()> {
-    let (ctx, client) = make_partitioned_delete_ctx("critic_probe4", "items").await?;
+    let (ctx, client) = make_partitioned_delete_ctx("dml_probe4", "items").await?;
 
-    ctx.sql("INSERT INTO catalog.critic_probe4.items VALUES (1, 'electronics', 'laptop')")
+    ctx.sql("INSERT INTO catalog.dml_probe4.items VALUES (1, 'electronics', 'laptop')")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
 
-    let ns = NamespaceIdent::new("critic_probe4".to_string());
+    let ns = NamespaceIdent::new("dml_probe4".to_string());
     let tbl_id = iceberg::TableIdent::new(ns, "items".to_string());
     let table_before = client.load_table(&tbl_id).await?;
     let snap_id_before = table_before
@@ -2553,7 +2553,7 @@ async fn test_delete_cow_no_match_is_noop() -> Result<()> {
 
     // DELETE where nothing matches.
     let batches = ctx
-        .sql("DELETE FROM catalog.critic_probe4.items WHERE category = 'books'")
+        .sql("DELETE FROM catalog.dml_probe4.items WHERE category = 'books'")
         .await
         .unwrap()
         .collect()
@@ -2581,10 +2581,10 @@ async fn test_delete_cow_no_match_is_noop() -> Result<()> {
 }
 
 // ============================================================================
-// CRITIC PROBE TESTS — U2 COW UPDATE adversarial verification
+// ADDITIONAL EDGE-CASE PROBES — U2 COW UPDATE adversarial verification
 // ============================================================================
 
-/// CRITIC PROBE U2-1: Row-conservation + manifest-level inspection for COW UPDATE.
+/// COW UPDATE PROBE 1: Row-conservation + manifest-level inspection for COW UPDATE.
 ///
 /// Two files: file_A (id=1 matches, id=2 does not — in the same file because they're inserted
 /// together) and file_B (id=3, unaffected partition).
@@ -2764,7 +2764,7 @@ async fn test_update_cow_row_conservation_and_manifest_inspection() -> Result<()
     Ok(())
 }
 
-/// CRITIC PROBE U2-2: Multi-file-per-partition UPDATE — only the affected file is rewritten;
+/// COW UPDATE PROBE 2: Multi-file-per-partition UPDATE — only the affected file is rewritten;
 /// the second file in the same partition is untouched (verified at manifest path level).
 ///
 /// Partition 'electronics' has 2 files: file_A (id=1) and file_B (id=2).
@@ -2910,7 +2910,7 @@ async fn test_update_cow_multi_file_per_partition_only_affected_rewritten() -> R
     Ok(())
 }
 
-/// CRITIC PROBE U2-3: COW UPDATE with no WHERE on a PARTITIONED table.
+/// COW UPDATE PROBE 3: COW UPDATE with no WHERE on a PARTITIONED table.
 ///
 /// `predicate = None` path in a partitioned table — all files are affected and all rows updated.
 /// Table: 2 partitions, 2 rows each. UPDATE SET value='ALL' (no WHERE).
@@ -3017,7 +3017,7 @@ async fn test_update_cow_partitioned_no_where_updates_all() -> Result<()> {
     Ok(())
 }
 
-/// CRITIC PROBE U2-4: COW UPDATE zero-match is a no-op (no snapshot created).
+/// COW UPDATE PROBE 4: COW UPDATE zero-match is a no-op (no snapshot created).
 ///
 /// UPDATE WHERE predicate matches zero rows → updated=0, no snapshot.
 /// This verifies the no-op early-exit path.
@@ -3069,7 +3069,7 @@ async fn test_update_cow_partitioned_no_match_is_noop() -> Result<()> {
     Ok(())
 }
 
-/// CRITIC PROBE U2-5: Partition-move verified at manifest/DataFile level, not just SELECT.
+/// COW UPDATE PROBE 5: Partition-move verified at manifest/DataFile level, not just SELECT.
 ///
 /// File in partition 'electronics' with rows r1 (id=1, moves to 'books') and r2 (id=2, stays in
 /// 'electronics'). After UPDATE SET category='books' WHERE id=1:
@@ -3082,11 +3082,11 @@ async fn test_update_cow_partitioned_no_match_is_noop() -> Result<()> {
 /// test, verifying that the file-level partition metadata is correct, not just query results.
 #[tokio::test]
 async fn test_update_cow_partition_move_manifest_level_verification() -> Result<()> {
-    let (ctx, client) = make_partitioned_delete_ctx("upd_probe_u2_5", "items").await?;
+    let (ctx, client) = make_partitioned_delete_ctx("cow_update_move_probe", "items").await?;
 
     // Single file in 'electronics' with 2 rows.
     ctx.sql(
-        "INSERT INTO catalog.upd_probe_u2_5.items VALUES \
+        "INSERT INTO catalog.cow_update_move_probe.items VALUES \
          (1, 'electronics', 'laptop'), (2, 'electronics', 'phone')",
     )
     .await
@@ -3095,13 +3095,13 @@ async fn test_update_cow_partition_move_manifest_level_verification() -> Result<
     .await
     .unwrap();
 
-    let ns = NamespaceIdent::new("upd_probe_u2_5".to_string());
+    let ns = NamespaceIdent::new("cow_update_move_probe".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
 
     // UPDATE: move id=1 to 'books' partition; id=2 stays in 'electronics'.
     let batches = ctx
         .sql(
-            "UPDATE catalog.upd_probe_u2_5.items \
+            "UPDATE catalog.cow_update_move_probe.items \
              SET category = 'books' WHERE id = 1",
         )
         .await
@@ -3162,7 +3162,7 @@ async fn test_update_cow_partition_move_manifest_level_verification() -> Result<
 
     // Verify via SELECT that row content is also correct.
     let batches = ctx
-        .sql("SELECT * FROM catalog.upd_probe_u2_5.items ORDER BY id")
+        .sql("SELECT * FROM catalog.cow_update_move_probe.items ORDER BY id")
         .await
         .unwrap()
         .collect()
@@ -3552,10 +3552,10 @@ async fn test_update_mread_partitioned_moves_partition() -> Result<()> {
 }
 
 // ============================================================================
-// CRITIC PROBES — U3 manifest-level partition-stamp verification
+// MoR PARTITION PROBES — manifest-level position-delete partition-stamp verification
 // ============================================================================
 
-/// CRITIC PROBE U3-P1: cross-partition MoR DELETE — both partitions.
+/// MoR PARTITION PROBE 1: cross-partition MoR DELETE — both partitions.
 ///
 /// DELETE WHERE id > 0 matches rows in BOTH partitions.  The implementation
 /// must produce TWO position-delete files (one per partition) each stamped
@@ -3566,10 +3566,10 @@ async fn test_update_mread_partitioned_moves_partition() -> Result<()> {
 /// either be rejected at commit time or silently scope the deletes incorrectly.
 #[tokio::test]
 async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
-    let (ctx, client) = make_partitioned_mread_ctx("critic_u3_p1", "items").await?;
+    let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe1", "items").await?;
 
     ctx.sql(
-        "INSERT INTO catalog.critic_u3_p1.items VALUES \
+        "INSERT INTO catalog.mread_partition_probe1.items VALUES \
          (1, 'electronics', 'laptop'), \
          (2, 'electronics', 'phone'), \
          (3, 'books', 'novel'), \
@@ -3584,12 +3584,12 @@ async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
     // Single INSERT creates ONE data file (all 4 rows in one batch) but the
     // partition-aware writer will split it into two files (one per partition).
     // Record the data-file partition structs so we can compare against delete files.
-    let ns = NamespaceIdent::new("critic_u3_p1".to_string());
+    let ns = NamespaceIdent::new("mread_partition_probe1".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
 
     // DELETE all rows — hits every partition.
     let batches = ctx
-        .sql("DELETE FROM catalog.critic_u3_p1.items WHERE id > 0")
+        .sql("DELETE FROM catalog.mread_partition_probe1.items WHERE id > 0")
         .await
         .unwrap()
         .collect()
@@ -3673,7 +3673,7 @@ async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
 
     // Post-delete SELECT must be empty.
     let batches = ctx
-        .sql("SELECT COUNT(*) as c FROM catalog.critic_u3_p1.items")
+        .sql("SELECT COUNT(*) as c FROM catalog.mread_partition_probe1.items")
         .await
         .unwrap()
         .collect()
@@ -3690,7 +3690,7 @@ async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
     Ok(())
 }
 
-/// CRITIC PROBE U3-P2: MoR UPDATE — manifest-level partition stamp on delete files.
+/// MoR PARTITION PROBE 2: MoR UPDATE — manifest-level partition stamp on delete files.
 ///
 /// The position-delete files committed by a MoR UPDATE must be stamped with
 /// the EXACT `(spec_id, partition Struct)` of the data file they delete from.
@@ -3699,10 +3699,10 @@ async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
 /// here even if the scan happens to still resolve correctly in some engine.
 #[tokio::test]
 async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
-    let (ctx, client) = make_partitioned_mread_ctx("critic_u3_p2", "items").await?;
+    let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe2", "items").await?;
 
     ctx.sql(
-        "INSERT INTO catalog.critic_u3_p2.items VALUES \
+        "INSERT INTO catalog.mread_partition_probe2.items VALUES \
          (1, 'electronics', 'laptop'), \
          (2, 'electronics', 'phone'), \
          (3, 'books', 'novel')",
@@ -3716,7 +3716,7 @@ async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
     // UPDATE electronics rows only.
     let batches = ctx
         .sql(
-            "UPDATE catalog.critic_u3_p2.items \
+            "UPDATE catalog.mread_partition_probe2.items \
              SET value = 'UPDATED' WHERE category = 'electronics'",
         )
         .await
@@ -3733,7 +3733,7 @@ async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
     assert_eq!(upd_count, 2, "2 electronics rows updated");
 
     // Inspect delete-file partition stamps in the post-UPDATE snapshot.
-    let ns = NamespaceIdent::new("critic_u3_p2".to_string());
+    let ns = NamespaceIdent::new("mread_partition_probe2".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
     let table_after = client.load_table(&tbl_id).await?;
     let snap_after = table_after.metadata().current_snapshot().unwrap();
@@ -3777,7 +3777,7 @@ async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
 
     // Verify the SELECT result as a second sanity check.
     let batches = ctx
-        .sql("SELECT * FROM catalog.critic_u3_p2.items ORDER BY id")
+        .sql("SELECT * FROM catalog.mread_partition_probe2.items ORDER BY id")
         .await
         .unwrap()
         .collect()
@@ -3789,7 +3789,7 @@ async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
     Ok(())
 }
 
-/// CRITIC PROBE U3-P3: MoR UPDATE spanning two partitions — two delete files, each correctly stamped.
+/// MoR PARTITION PROBE 3: MoR UPDATE spanning two partitions — two delete files, each correctly stamped.
 ///
 /// UPDATE touches rows in BOTH partitions (updates the `value` column).
 /// The implementation must produce two delete files (one per partition),
@@ -3797,10 +3797,10 @@ async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
 /// delete file would fail here.
 #[tokio::test]
 async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
-    let (ctx, client) = make_partitioned_mread_ctx("critic_u3_p3", "items").await?;
+    let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe3", "items").await?;
 
     ctx.sql(
-        "INSERT INTO catalog.critic_u3_p3.items VALUES \
+        "INSERT INTO catalog.mread_partition_probe3.items VALUES \
          (1, 'electronics', 'laptop'), \
          (2, 'books', 'novel')",
     )
@@ -3812,7 +3812,7 @@ async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
 
     // UPDATE all rows (both partitions).
     let batches = ctx
-        .sql("UPDATE catalog.critic_u3_p3.items SET value = 'UPDATED' WHERE id > 0")
+        .sql("UPDATE catalog.mread_partition_probe3.items SET value = 'UPDATED' WHERE id > 0")
         .await
         .unwrap()
         .collect()
@@ -3826,7 +3826,7 @@ async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
         .value(0);
     assert_eq!(upd_count, 2, "both rows updated");
 
-    let ns = NamespaceIdent::new("critic_u3_p3".to_string());
+    let ns = NamespaceIdent::new("mread_partition_probe3".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
     let table_after = client.load_table(&tbl_id).await?;
     let snap_after = table_after.metadata().current_snapshot().unwrap();
@@ -3871,7 +3871,7 @@ async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
 
     // SELECT must show updated values for both rows.
     let batches = ctx
-        .sql("SELECT * FROM catalog.critic_u3_p3.items ORDER BY id")
+        .sql("SELECT * FROM catalog.mread_partition_probe3.items ORDER BY id")
         .await
         .unwrap()
         .collect()
@@ -3883,7 +3883,7 @@ async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
     Ok(())
 }
 
-/// CRITIC PROBE U3-P4: MoR UPDATE on a partitioned table where rows in one
+/// MoR PARTITION PROBE 4: MoR UPDATE on a partitioned table where rows in one
 /// partition come from TWO distinct data files — confirm both sets of positions
 /// are grouped into a SINGLE delete file for that partition (same Struct → same group).
 ///
@@ -3893,17 +3893,17 @@ async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
 /// partition.
 #[tokio::test]
 async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()> {
-    let (ctx, client) = make_partitioned_mread_ctx("critic_u3_p4", "items").await?;
+    let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe4", "items").await?;
 
     // Two separate INSERT statements → two data files, both in 'electronics' partition.
-    ctx.sql("INSERT INTO catalog.critic_u3_p4.items VALUES (1, 'electronics', 'laptop')")
+    ctx.sql("INSERT INTO catalog.mread_partition_probe4.items VALUES (1, 'electronics', 'laptop')")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
 
-    ctx.sql("INSERT INTO catalog.critic_u3_p4.items VALUES (2, 'electronics', 'phone')")
+    ctx.sql("INSERT INTO catalog.mread_partition_probe4.items VALUES (2, 'electronics', 'phone')")
         .await
         .unwrap()
         .collect()
@@ -3913,7 +3913,7 @@ async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()
     // UPDATE both rows (both files, same partition).
     let batches = ctx
         .sql(
-            "UPDATE catalog.critic_u3_p4.items \
+            "UPDATE catalog.mread_partition_probe4.items \
              SET value = 'UPDATED' WHERE category = 'electronics'",
         )
         .await
@@ -3929,7 +3929,7 @@ async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()
         .value(0);
     assert_eq!(upd_count, 2, "2 rows updated");
 
-    let ns = NamespaceIdent::new("critic_u3_p4".to_string());
+    let ns = NamespaceIdent::new("mread_partition_probe4".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
     let table_after = client.load_table(&tbl_id).await?;
     let snap_after = table_after.metadata().current_snapshot().unwrap();
@@ -3978,7 +3978,7 @@ async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()
 
     // Both rows must survive with updated value.
     let batches = ctx
-        .sql("SELECT * FROM catalog.critic_u3_p4.items ORDER BY id")
+        .sql("SELECT * FROM catalog.mread_partition_probe4.items ORDER BY id")
         .await
         .unwrap()
         .collect()
@@ -3988,4 +3988,197 @@ async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()
     assert_eq!(total, 2, "both rows survive");
 
     Ok(())
+}
+
+// =================================================================================================
+// NULL three-valued-logic — a predicate evaluating to NULL is NOT a match (the row is neither
+// deleted nor updated). The implementation enforces this with `mask.is_valid(row) && mask.value(row)`
+// in every DML path; these tests make that guard load-bearing (inverting it goes RED here).
+// =================================================================================================
+
+/// Copy-on-write DELETE: `foo2 = 'alan'` is NULL for the NULL-`foo2` row, so that row must SURVIVE.
+#[tokio::test]
+async fn test_delete_cow_null_predicate_three_valued_logic() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_cow_null".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", Some(nullable_foo_schema()))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_delete_cow_null.my_table VALUES (1, 'alan'), (2, NULL), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let df = ctx
+        .sql("DELETE FROM catalog.test_delete_cow_null.my_table WHERE foo2 = 'alan'")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        deleted.value(0),
+        1,
+        "only the foo2='alan' row is deleted; the NULL-foo2 row is NOT a match (NULL != TRUE)"
+    );
+
+    let ids = select_foo1_sorted(&ctx, "catalog.test_delete_cow_null.my_table").await;
+    assert_eq!(
+        ids,
+        vec![2, 3],
+        "the NULL-foo2 row (foo1=2) SURVIVES — a NULL predicate result is not a delete match"
+    );
+    Ok(())
+}
+
+/// Merge-on-read DELETE: same three-valued-logic contract on the position-delete path.
+#[tokio::test]
+async fn test_delete_mread_null_predicate_three_valued_logic() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_delete_mread_null".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = nullable_merge_on_read_table_creation(temp_path(), "my_table");
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_delete_mread_null.my_table VALUES (1, 'alan'), (2, NULL), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let df = ctx
+        .sql("DELETE FROM catalog.test_delete_mread_null.my_table WHERE foo2 = 'alan'")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        deleted.value(0),
+        1,
+        "only foo2='alan' deleted; NULL-foo2 row is not a match"
+    );
+
+    let ids = select_foo1_sorted(&ctx, "catalog.test_delete_mread_null.my_table").await;
+    assert_eq!(
+        ids,
+        vec![2, 3],
+        "the NULL-foo2 row (foo1=2) SURVIVES the merge-on-read delete"
+    );
+    Ok(())
+}
+
+/// Copy-on-write UPDATE (exercises `match_mask`, shared by both UPDATE modes): the NULL-`foo2` row
+/// must NOT be updated — its `foo1` stays 2, not 99.
+#[tokio::test]
+async fn test_update_cow_null_predicate_three_valued_logic() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_cow_null".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", Some(nullable_foo_schema()))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_update_cow_null.my_table VALUES (1, 'alan'), (2, NULL), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let df = ctx
+        .sql("UPDATE catalog.test_update_cow_null.my_table SET foo1 = 99 WHERE foo2 = 'alan'")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(
+        updated.value(0),
+        1,
+        "only foo2='alan' updated; NULL-foo2 row is not a match"
+    );
+
+    // Rows are now (99,'alan'), (2,NULL), (3,'bob'); the NULL row's foo1 must be UNCHANGED at 2.
+    let ids = select_foo1_sorted(&ctx, "catalog.test_update_cow_null.my_table").await;
+    assert_eq!(
+        ids,
+        vec![2, 3, 99],
+        "the NULL-foo2 row keeps foo1=2 (not updated to 99) — NULL predicate is not an update match"
+    );
+    Ok(())
+}
+
+/// Collect `foo1` from a table, ascending, as a plain `Vec<i32>` for order-independent assertions.
+async fn select_foo1_sorted(ctx: &SessionContext, table: &str) -> Vec<i32> {
+    let df = ctx
+        .sql(&format!("SELECT foo1 FROM {table} ORDER BY foo1"))
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let mut ids: Vec<i32> = Vec::new();
+    for batch in &batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            ids.push(col.value(row));
+        }
+    }
+    ids
+}
+
+/// `{foo1 required int, foo2 OPTIONAL string}` — a nullable `foo2` so a row can carry a NULL operand
+/// for the three-valued-logic tests above.
+fn nullable_foo_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "foo1", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "foo2", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .unwrap()
+}
+
+/// A merge-on-read `{foo1, foo2-nullable}` table creation for the NULL three-valued-logic test.
+fn nullable_merge_on_read_table_creation(
+    location: impl ToString,
+    name: impl ToString,
+) -> TableCreation {
+    TableCreation::builder()
+        .location(location.to_string())
+        .name(name.to_string())
+        .properties(HashMap::from([
+            ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+            ("write.update.mode".to_string(), "merge-on-read".to_string()),
+        ]))
+        .schema(nullable_foo_schema())
+        .build()
 }
