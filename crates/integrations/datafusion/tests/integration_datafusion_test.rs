@@ -3199,3 +3199,793 @@ async fn test_update_cow_partition_move_manifest_level_verification() -> Result<
 
     Ok(())
 }
+
+// ============================================================================
+// MoR UPDATE — partitioned table tests (U3)
+// ============================================================================
+
+/// Helper that builds a partitioned V2 `{id int, category string, value string}` table with
+/// `write.delete.mode = merge-on-read` and `write.update.mode = merge-on-read`, partitioned by
+/// `identity(category)`. The format version defaults to V2 (required for MoR position deletes).
+async fn make_partitioned_mread_ctx(
+    ns: &str,
+    tbl: &str,
+) -> Result<(SessionContext, Arc<MemoryCatalog>)> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new(ns.to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name(tbl.to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::from([
+            ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+            ("write.update.mode".to_string(), "merge-on-read".to_string()),
+        ]))
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    Ok((ctx, client))
+}
+
+/// Prerequisite: confirm that partitioned MoR DELETE already works (no guard exists for DELETE).
+///
+/// Table: `{id int, category string, value string}` partitioned by `identity(category)`,
+/// `write.delete.mode = merge-on-read`, V2.
+/// Two partitions: `electronics` (ids 1,2) and `books` (ids 3,4).
+/// DELETE rows WHERE category = 'electronics'.
+/// Post-DELETE: only the books rows survive (confirms the position-delete RowDelta path works
+/// partitioned — the prerequisite for the MoR UPDATE path).
+#[tokio::test]
+async fn test_delete_mread_partitioned() -> Result<()> {
+    let (ctx, _client) = make_partitioned_mread_ctx("test_del_mread_part", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.test_del_mread_part.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel'), \
+         (4, 'books', 'textbook')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // MoR DELETE: write position-delete file covering both electronics rows; commit RowDelta.
+    let batches = ctx
+        .sql("DELETE FROM catalog.test_del_mread_part.items WHERE category = 'electronics'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        deleted, 2,
+        "MoR DELETE must remove exactly the 2 electronics rows"
+    );
+
+    // The books rows must survive untouched.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_del_mread_part.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 2,
+        "exactly 2 books rows survive after MoR DELETE on partitioned table"
+    );
+
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
+        expect![[r#"
+            id: PrimitiveArray<Int32>
+            [
+              3,
+              4,
+            ],
+            category: StringArray
+            [
+              "books",
+              "books",
+            ],
+            value: StringArray
+            [
+              "novel",
+              "textbook",
+            ]"#]],
+        &[],
+        Some("id"),
+    );
+
+    Ok(())
+}
+
+/// MoR UPDATE on a partitioned table: update a non-partition column WHERE matches rows in one
+/// partition; assert updated values, untouched rows in the other partition survive unchanged.
+///
+/// Table: `{id int, category string, value string}` partitioned by `identity(category)`,
+/// `write.update.mode = merge-on-read`, V2.
+/// Two partitions: `electronics` (ids 1,2) and `books` (ids 3,4).
+/// UPDATE sets `value = 'UPDATED'` WHERE `category = 'electronics'`.
+/// MoR: position-deletes for old rows + new data file with updated rows, in one RowDelta.
+/// Post-UPDATE: electronics rows have the new value; books rows are unchanged.
+#[tokio::test]
+async fn test_update_mread_partitioned() -> Result<()> {
+    let (ctx, _client) = make_partitioned_mread_ctx("test_upd_mread_part", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.test_upd_mread_part.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel'), \
+         (4, 'books', 'textbook')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // MoR UPDATE: update only the electronics rows' value column.
+    let batches = ctx
+        .sql(
+            "UPDATE catalog.test_upd_mread_part.items \
+             SET value = 'UPDATED' WHERE category = 'electronics'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let upd_count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(upd_count, 2, "exactly 2 electronics rows updated via MoR");
+
+    // All 4 rows survive; electronics have new value; books unchanged.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_upd_mread_part.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 4,
+        "all 4 rows survive after MoR UPDATE (only values changed)"
+    );
+
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
+        expect![[r#"
+            id: PrimitiveArray<Int32>
+            [
+              1,
+              2,
+              3,
+              4,
+            ],
+            category: StringArray
+            [
+              "electronics",
+              "electronics",
+              "books",
+              "books",
+            ],
+            value: StringArray
+            [
+              "UPDATED",
+              "UPDATED",
+              "novel",
+              "textbook",
+            ]"#]],
+        &[],
+        Some("id"),
+    );
+
+    Ok(())
+}
+
+/// MoR UPDATE that changes the partition-key column: the old row is position-deleted (in the
+/// original partition's data file) and the new row is inserted into the NEW partition's data file,
+/// all in one RowDelta.
+///
+/// Table: `{id int, category string, value string}` partitioned by `identity(category)`,
+/// `write.update.mode = merge-on-read`, V2.
+/// `UPDATE … SET category = 'books' WHERE id = 1` moves id=1 from `electronics` to `books`.
+/// Post-UPDATE: id=1 appears with category='books'; id=2 stays in electronics unchanged.
+#[tokio::test]
+async fn test_update_mread_partitioned_moves_partition() -> Result<()> {
+    let (ctx, _client) = make_partitioned_mread_ctx("test_upd_mread_move", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.test_upd_mread_move.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // MoR UPDATE changes the partition-key column for id=1.
+    let batches = ctx
+        .sql(
+            "UPDATE catalog.test_upd_mread_move.items \
+             SET category = 'books' WHERE id = 1",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let upd_count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(upd_count, 1, "exactly 1 row updated (partition-move)");
+
+    // All 3 rows survive; id=1 now has category='books'.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_upd_mread_move.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 3,
+        "all 3 rows survive after MoR partition-move UPDATE"
+    );
+
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
+        expect![[r#"
+            id: PrimitiveArray<Int32>
+            [
+              1,
+              2,
+              3,
+            ],
+            category: StringArray
+            [
+              "books",
+              "electronics",
+              "books",
+            ],
+            value: StringArray
+            [
+              "laptop",
+              "phone",
+              "novel",
+            ]"#]],
+        &[],
+        Some("id"),
+    );
+
+    // Verify via a partition-filtered query that id=1 is now in the books partition.
+    let batches = ctx
+        .sql(
+            "SELECT id FROM catalog.test_upd_mread_move.items \
+             WHERE category = 'books' ORDER BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert!(
+        ids.contains(&1),
+        "id=1 must now be in the books partition after MoR partition-move UPDATE"
+    );
+    assert!(
+        !ids.contains(&2),
+        "id=2 must stay in the electronics partition"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// CRITIC PROBES — U3 manifest-level partition-stamp verification
+// ============================================================================
+
+/// CRITIC PROBE U3-P1: cross-partition MoR DELETE — both partitions.
+///
+/// DELETE WHERE id > 0 matches rows in BOTH partitions.  The implementation
+/// must produce TWO position-delete files (one per partition) each stamped
+/// with the correct `(spec_id, partition Struct)` of their data file.
+///
+/// This is the hardest case for `write_position_deletes`: cross-partition
+/// grouping.  A single delete file stamped with the wrong partition would
+/// either be rejected at commit time or silently scope the deletes incorrectly.
+#[tokio::test]
+async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
+    let (ctx, client) = make_partitioned_mread_ctx("critic_u3_p1", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.critic_u3_p1.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel'), \
+         (4, 'books', 'textbook')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // Single INSERT creates ONE data file (all 4 rows in one batch) but the
+    // partition-aware writer will split it into two files (one per partition).
+    // Record the data-file partition structs so we can compare against delete files.
+    let ns = NamespaceIdent::new("critic_u3_p1".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
+
+    // DELETE all rows — hits every partition.
+    let batches = ctx
+        .sql("DELETE FROM catalog.critic_u3_p1.items WHERE id > 0")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(deleted, 4, "all 4 rows deleted");
+
+    // Inspect delete-file manifests.
+    let table_after = client.load_table(&tbl_id).await?;
+    let snap_after = table_after.metadata().current_snapshot().unwrap();
+    let ml_after = snap_after
+        .load_manifest_list(table_after.file_io(), table_after.metadata())
+        .await?;
+
+    let mut del_partitions: Vec<String> = Vec::new();
+    let mut data_partitions: Vec<String> = Vec::new();
+    for mf in ml_after.entries() {
+        let m = mf.load_manifest(table_after.file_io()).await?;
+        for entry in m.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let df = entry.data_file();
+            let pv = df.partition();
+            match df.content_type() {
+                iceberg::spec::DataContentType::Data => {
+                    if let Some(iceberg::spec::Literal::Primitive(
+                        iceberg::spec::PrimitiveLiteral::String(s),
+                    )) = pv.fields().first().and_then(|f| f.as_ref())
+                    {
+                        data_partitions.push(s.clone());
+                    }
+                }
+                iceberg::spec::DataContentType::PositionDeletes => {
+                    // Each delete file must carry a non-empty partition struct (identity spec).
+                    assert!(
+                        !pv.fields().is_empty(),
+                        "delete file partition struct must not be empty for a partitioned table; \
+                         delete_file={:?}",
+                        df.file_path()
+                    );
+                    // The partition_spec_id must point to the table's partitioned spec.
+                    assert_ne!(
+                        df.partition_spec_id(),
+                        -1,
+                        "delete file must have a valid partition_spec_id"
+                    );
+                    if let Some(iceberg::spec::Literal::Primitive(
+                        iceberg::spec::PrimitiveLiteral::String(s),
+                    )) = pv.fields().first().and_then(|f| f.as_ref())
+                    {
+                        del_partitions.push(s.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Data files: both partitions present.
+    data_partitions.sort();
+    assert_eq!(
+        data_partitions,
+        vec!["books".to_string(), "electronics".to_string()],
+        "expected data files in both partitions; got {data_partitions:?}"
+    );
+
+    // Delete files: one per partition, matching data-file partitions exactly.
+    del_partitions.sort();
+    assert_eq!(
+        del_partitions,
+        vec!["books".to_string(), "electronics".to_string()],
+        "expected exactly one delete file per partition; got {del_partitions:?}"
+    );
+
+    // Post-delete SELECT must be empty.
+    let batches = ctx
+        .sql("SELECT COUNT(*) as c FROM catalog.critic_u3_p1.items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count: i64 = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 0, "all rows deleted; SELECT must return 0");
+
+    Ok(())
+}
+
+/// CRITIC PROBE U3-P2: MoR UPDATE — manifest-level partition stamp on delete files.
+///
+/// The position-delete files committed by a MoR UPDATE must be stamped with
+/// the EXACT `(spec_id, partition Struct)` of the data file they delete from.
+/// This test inspects the committed delete files at the manifest level — not
+/// just the SELECT result — so a wrong stamp (e.g. empty Struct) would fail
+/// here even if the scan happens to still resolve correctly in some engine.
+#[tokio::test]
+async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
+    let (ctx, client) = make_partitioned_mread_ctx("critic_u3_p2", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.critic_u3_p2.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // UPDATE electronics rows only.
+    let batches = ctx
+        .sql(
+            "UPDATE catalog.critic_u3_p2.items \
+             SET value = 'UPDATED' WHERE category = 'electronics'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let upd_count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(upd_count, 2, "2 electronics rows updated");
+
+    // Inspect delete-file partition stamps in the post-UPDATE snapshot.
+    let ns = NamespaceIdent::new("critic_u3_p2".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
+    let table_after = client.load_table(&tbl_id).await?;
+    let snap_after = table_after.metadata().current_snapshot().unwrap();
+    let ml_after = snap_after
+        .load_manifest_list(table_after.file_io(), table_after.metadata())
+        .await?;
+
+    let mut del_partitions: Vec<String> = Vec::new();
+    for mf in ml_after.entries() {
+        let m = mf.load_manifest(table_after.file_io()).await?;
+        for entry in m.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let df = entry.data_file();
+            if df.content_type() != iceberg::spec::DataContentType::PositionDeletes {
+                continue;
+            }
+            let pv = df.partition();
+            assert!(
+                !pv.fields().is_empty(),
+                "delete file partition struct must not be empty; file={:?} partition={:?}",
+                df.file_path(),
+                pv
+            );
+            if let Some(iceberg::spec::Literal::Primitive(
+                iceberg::spec::PrimitiveLiteral::String(s),
+            )) = pv.fields().first().and_then(|f| f.as_ref())
+            {
+                del_partitions.push(s.clone());
+            }
+        }
+    }
+
+    // The UPDATE touched only electronics rows → delete file must be in 'electronics' partition.
+    assert_eq!(
+        del_partitions,
+        vec!["electronics".to_string()],
+        "delete file must be stamped with the 'electronics' partition; got {del_partitions:?}"
+    );
+
+    // Verify the SELECT result as a second sanity check.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.critic_u3_p2.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "all 3 rows survive; 2 updated + 1 unchanged");
+
+    Ok(())
+}
+
+/// CRITIC PROBE U3-P3: MoR UPDATE spanning two partitions — two delete files, each correctly stamped.
+///
+/// UPDATE touches rows in BOTH partitions (updates the `value` column).
+/// The implementation must produce two delete files (one per partition),
+/// each stamped with its partition's `category` value.  A merged or incorrectly-stamped
+/// delete file would fail here.
+#[tokio::test]
+async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
+    let (ctx, client) = make_partitioned_mread_ctx("critic_u3_p3", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.critic_u3_p3.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'books', 'novel')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // UPDATE all rows (both partitions).
+    let batches = ctx
+        .sql("UPDATE catalog.critic_u3_p3.items SET value = 'UPDATED' WHERE id > 0")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let upd_count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(upd_count, 2, "both rows updated");
+
+    let ns = NamespaceIdent::new("critic_u3_p3".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
+    let table_after = client.load_table(&tbl_id).await?;
+    let snap_after = table_after.metadata().current_snapshot().unwrap();
+    let ml_after = snap_after
+        .load_manifest_list(table_after.file_io(), table_after.metadata())
+        .await?;
+
+    let mut del_partitions: Vec<String> = Vec::new();
+    for mf in ml_after.entries() {
+        let m = mf.load_manifest(table_after.file_io()).await?;
+        for entry in m.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let df = entry.data_file();
+            if df.content_type() != iceberg::spec::DataContentType::PositionDeletes {
+                continue;
+            }
+            let pv = df.partition();
+            assert!(
+                !pv.fields().is_empty(),
+                "delete file partition struct must not be empty for a partitioned table; \
+                 file={:?} partition={:?}",
+                df.file_path(),
+                pv
+            );
+            if let Some(iceberg::spec::Literal::Primitive(
+                iceberg::spec::PrimitiveLiteral::String(s),
+            )) = pv.fields().first().and_then(|f| f.as_ref())
+            {
+                del_partitions.push(s.clone());
+            }
+        }
+    }
+
+    del_partitions.sort();
+    assert_eq!(
+        del_partitions,
+        vec!["books".to_string(), "electronics".to_string()],
+        "must have one delete file per partition; got {del_partitions:?}"
+    );
+
+    // SELECT must show updated values for both rows.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.critic_u3_p3.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 2, "both rows survive after UPDATE");
+
+    Ok(())
+}
+
+/// CRITIC PROBE U3-P4: MoR UPDATE on a partitioned table where rows in one
+/// partition come from TWO distinct data files — confirm both sets of positions
+/// are grouped into a SINGLE delete file for that partition (same Struct → same group).
+///
+/// This probes `Struct` equality/hashing: two data files with the same partition
+/// value must produce identical `Struct` keys, collapsing into one group and one
+/// delete file.  A hash/equality bug would produce two delete files for the same
+/// partition.
+#[tokio::test]
+async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()> {
+    let (ctx, client) = make_partitioned_mread_ctx("critic_u3_p4", "items").await?;
+
+    // Two separate INSERT statements → two data files, both in 'electronics' partition.
+    ctx.sql("INSERT INTO catalog.critic_u3_p4.items VALUES (1, 'electronics', 'laptop')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    ctx.sql("INSERT INTO catalog.critic_u3_p4.items VALUES (2, 'electronics', 'phone')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // UPDATE both rows (both files, same partition).
+    let batches = ctx
+        .sql(
+            "UPDATE catalog.critic_u3_p4.items \
+             SET value = 'UPDATED' WHERE category = 'electronics'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let upd_count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(upd_count, 2, "2 rows updated");
+
+    let ns = NamespaceIdent::new("critic_u3_p4".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
+    let table_after = client.load_table(&tbl_id).await?;
+    let snap_after = table_after.metadata().current_snapshot().unwrap();
+    let ml_after = snap_after
+        .load_manifest_list(table_after.file_io(), table_after.metadata())
+        .await?;
+
+    let mut del_files: Vec<(String, String)> = Vec::new(); // (file_path, partition_val)
+    for mf in ml_after.entries() {
+        let m = mf.load_manifest(table_after.file_io()).await?;
+        for entry in m.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let df = entry.data_file();
+            if df.content_type() != iceberg::spec::DataContentType::PositionDeletes {
+                continue;
+            }
+            let pv = df.partition();
+            assert!(
+                !pv.fields().is_empty(),
+                "delete file partition struct must not be empty; file={:?}",
+                df.file_path()
+            );
+            if let Some(iceberg::spec::Literal::Primitive(
+                iceberg::spec::PrimitiveLiteral::String(s),
+            )) = pv.fields().first().and_then(|f| f.as_ref())
+            {
+                del_files.push((df.file_path().to_string(), s.clone()));
+            }
+        }
+    }
+
+    // Both data files are in 'electronics' → must collapse to exactly ONE delete file.
+    assert_eq!(
+        del_files.len(),
+        1,
+        "two data files in the SAME partition must produce exactly ONE delete file; \
+         got {del_files:?}"
+    );
+    assert_eq!(
+        del_files[0].1, "electronics",
+        "the single delete file must be stamped with 'electronics'; got {:?}",
+        del_files[0].1
+    );
+
+    // Both rows must survive with updated value.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.critic_u3_p4.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 2, "both rows survive");
+
+    Ok(())
+}

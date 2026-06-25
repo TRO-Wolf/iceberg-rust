@@ -43,7 +43,7 @@
 //! The plan emits a single `UInt64` `count` row (rows affected), per DataFusion's DML contract.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -63,7 +63,7 @@ use futures::TryStreamExt;
 use iceberg::Catalog;
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator};
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
-use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig};
+use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Struct};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -679,56 +679,118 @@ async fn write_partitioned_data_files(
     writer.close().await.map_err(to_datafusion_error)
 }
 
-/// Write surviving rows to new parquet data file(s) via the production `DataFileWriter` (unpartitioned),
-/// matching columns to the table schema BY NAME. Returns every file produced (the writer may roll).
-///
-/// Used by the UPDATE paths (merge-on-read and copy-on-write), which still operate on unpartitioned
-/// tables only. For DELETE, the partition-aware [`write_partitioned_data_files`] is used instead.
-async fn write_survivor_data_files(
-    table: &Table,
-    batches: &[RecordBatch],
-) -> DFResult<Vec<DataFile>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    let schema = table.metadata().current_schema().clone();
-    let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
-        parquet::file::properties::WriterProperties::default(),
-        schema,
-        FieldMatchMode::Name,
-    );
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
-    let file_name_gen = DefaultFileNameGenerator::new(
-        uuid::Uuid::now_v7().to_string(),
-        None,
-        DataFileFormat::Parquet,
-    );
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-    let mut writer = DataFileWriterBuilder::new(rolling)
-        .build(None)
-        .await
-        .map_err(to_datafusion_error)?;
-    for batch in batches {
-        writer
-            .write(batch.clone())
-            .await
-            .map_err(to_datafusion_error)?;
-    }
-    writer.close().await.map_err(to_datafusion_error)
-}
-
 /// Write REAL parquet position-delete file(s) from sorted `(data_file_path, position)` pairs via the
 /// production `PositionDeleteFileWriter`. Returns EVERY file the (rolling) writer produced — a large
 /// DELETE may roll into more than one file, and ALL of them must be committed or the deletes in the
 /// dropped files would be silently lost (rows resurrected on the next scan).
+///
+/// **Partition-aware.** Position-delete files are associated with the `(spec_id, partition)` of the
+/// DATA file they delete from — the Iceberg commit validates that the delete file's partition matches the
+/// registered spec for `partition_spec_id`. For UNPARTITIONED tables the partition key is `None`
+/// (existing behavior). For PARTITIONED tables:
+///
+/// 1. The current snapshot manifests are scanned once to build a `path → (spec_id, Struct)` map.
+/// 2. The `(path, pos)` pairs are grouped by their data file's `(spec_id, Struct)`.
+/// 3. One position-delete file is written per group, stamped with that group's `PartitionKey`.
+///
+/// This mirrors Java `PositionDeleteWriter` which always carries a per-data-file `PartitionKey` and
+/// `RewritePositionDeleteFiles` which groups delete files by `(spec_id, partition)`.
 async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFResult<Vec<DataFile>> {
     let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
+    let metadata = table.metadata();
+    let default_spec = metadata.default_partition_spec();
+    let schema = metadata.current_schema();
+
+    // For unpartitioned tables, write a single delete file with no partition key — the fast path.
+    if default_spec.is_unpartitioned() {
+        return write_position_deletes_for_partition(table, &config, pairs, None).await;
+    }
+
+    // Partitioned: build path → (spec_id, partition Struct) from the current snapshot manifests.
+    // This lets us stamp each delete file with the SAME spec + partition as the data file it deletes.
+    let mut path_to_partition: HashMap<String, (i32, Struct)> = HashMap::new();
+
+    if let Some(snapshot) = metadata.current_snapshot() {
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), metadata)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        for manifest_entry in manifest_list.entries() {
+            // Skip delete-file manifests — we only need data file partitions.
+            if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_entry
+                .load_manifest(table.file_io())
+                .await
+                .map_err(to_datafusion_error)?;
+            for entry in manifest.entries() {
+                if entry.is_alive()
+                    && entry.data_file().content_type() == iceberg::spec::DataContentType::Data
+                {
+                    let df = entry.data_file();
+                    path_to_partition
+                        .entry(df.file_path().to_string())
+                        .or_insert_with(|| (df.partition_spec_id(), df.partition().clone()));
+                }
+            }
+        }
+    }
+
+    // Group pairs by (spec_id, partition). Pairs whose data file path is not found in the manifest
+    // (shouldn't happen in practice) are grouped under the default spec with an empty partition as a
+    // safe fallback — the validation will reject them if the spec is partitioned, exposing the bug.
+    let mut groups: HashMap<(i32, Struct), Vec<(String, i64)>> = HashMap::new();
+    for pair in pairs {
+        let key = path_to_partition
+            .get(&pair.0)
+            .cloned()
+            .unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()));
+        groups.entry(key).or_default().push(pair.clone());
+    }
+
+    // Write one position-delete file per (spec_id, partition) group.
+    let mut all_delete_files: Vec<DataFile> = Vec::new();
+    for ((spec_id, partition), mut group_pairs) in groups {
+        // Maintain the per-file (path, pos) sort order within each group.
+        group_pairs.sort();
+
+        let spec = metadata
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "position-delete: data file references unknown partition spec {spec_id}"
+                ))
+            })?
+            .as_ref()
+            .clone();
+        let partition_key = if spec.is_unpartitioned() {
+            None
+        } else {
+            Some(PartitionKey::new(spec, schema.clone(), partition))
+        };
+
+        let files =
+            write_position_deletes_for_partition(table, &config, &group_pairs, partition_key)
+                .await?;
+        all_delete_files.extend(files);
+    }
+
+    // Each group above is non-empty and `write_position_deletes_for_partition` guarantees it
+    // produced at least one file, so `all_delete_files` is non-empty whenever `pairs` was.
+    Ok(all_delete_files)
+}
+
+/// Write one position-delete file for a SINGLE `(spec_id, partition)` group. When `partition_key`
+/// is `None` the file is unpartitioned (spec_id 0, empty struct). The caller must have pre-sorted
+/// `pairs` by `(path, pos)`.
+async fn write_position_deletes_for_partition(
+    table: &Table,
+    config: &PositionDeleteWriterConfig,
+    pairs: &[(String, i64)],
+    partition_key: Option<PartitionKey>,
+) -> DFResult<Vec<DataFile>> {
     let location_gen =
         DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
     let file_name_gen = DefaultFileNameGenerator::new(
@@ -750,7 +812,7 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         file_name_gen,
     );
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
-        .build(None)
+        .build(partition_key)
         .await
         .map_err(to_datafusion_error)?;
 
@@ -767,13 +829,16 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         )
     })?;
     writer.write(batch).await.map_err(to_datafusion_error)?;
-    let delete_files = writer.close().await.map_err(to_datafusion_error)?;
-    if delete_files.is_empty() {
+    let files = writer.close().await.map_err(to_datafusion_error)?;
+    // A non-empty group of pairs MUST produce at least one delete file — otherwise the deletes
+    // would be silently lost (rows resurrected on re-scan). Guard both the unpartitioned fast-path
+    // and every partitioned group here so the check can never be skipped.
+    if files.is_empty() {
         return Err(DataFusionError::Internal(
-            "position-delete writer produced no file".to_string(),
+            "position-delete writer produced no file for a non-empty pair group".to_string(),
         ));
     }
-    Ok(delete_files)
+    Ok(files)
 }
 
 /// Decode the reserved `_file` column at `row`. The scan emits `_file` as a per-file constant, which the
@@ -1021,7 +1086,10 @@ fn apply_assignments(
 }
 
 /// Merge-on-read UPDATE: position-delete the OLD matching rows and insert NEW rows carrying the updated
-/// values, in one `RowDelta`. Returns the number of rows updated. Unpartitioned tables only for now.
+/// values, in one `RowDelta`. Returns the number of rows updated. Works for both partitioned and
+/// unpartitioned tables: the NEW rows are routed through the partition-aware [`write_partitioned_data_files`]
+/// helper, which computes partition values from the POST-assignment column values. Position deletes are
+/// keyed by (data-file path, position) and are partition-agnostic, so the delete side is unchanged.
 async fn merge_on_read_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -1029,11 +1097,6 @@ async fn merge_on_read_update(
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
 ) -> DFResult<u64> {
-    if !table.metadata().default_partition_spec().is_unpartitioned() {
-        return Err(DataFusionError::NotImplemented(
-            "UPDATE on a partitioned table is not yet supported".to_string(),
-        ));
-    }
     require_v2_for_merge_on_read(table)?;
 
     let mut projection: Vec<String> = table_schema
@@ -1103,7 +1166,7 @@ async fn merge_on_read_update(
 
     pairs.sort();
     let delete_files = write_position_deletes(table, &pairs).await?;
-    let data_files = write_survivor_data_files(table, &new_rows).await?;
+    let data_files = write_partitioned_data_files(table, &new_rows).await?;
 
     let tx = Transaction::new(table);
     tx.row_delta()
