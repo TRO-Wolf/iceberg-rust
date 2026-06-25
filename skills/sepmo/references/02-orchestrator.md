@@ -209,7 +209,7 @@ The Orchestrator's routing responsibilities at each stage:
 4. **Receive Critic output** — read `CRITIC_FINDINGS`:
    - `convergence: CONVERGED`, no MEDIUM+ open → `PR_READINESS_AUDIT`.
    - `convergence: NOT_YET` or MEDIUM+ open → remediation path.
-   - Suspicious `NO_FINDINGS` (too-clean, especially in single-agent mode) →
+   - Suspicious `NO_FINDINGS` (too-clean — scrutinize regardless of mode) →
      re-run with a fresh Critic pass before accepting (per `05-critic.md`
      *Convergence — the Critic's call*).
 5. **`PR_READINESS_AUDIT`** — on convergence, run the readiness audit (see

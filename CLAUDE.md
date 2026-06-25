@@ -267,13 +267,26 @@ The full engineering contract lives in the [skills/](skills/) manuals and — fo
 
 ## Agent orchestration — current policy
 
-**Single agent by default — do the work in the main thread.** Favor cost control and determinism.
-Do **not** spawn sub-agents (`Agent` / Task fan-out, `Workflow` orchestration, plan-mode
-`Explore` / `Plan` helpers) unless the user explicitly asks. Need to search or read broadly? Use
-the read/search tools inline. The two heavy parity phases — **Phase 2 (write engine)** and
-**Phase 4 (formats & V3 types)** — are the natural fan-out candidates **if** the user lifts this
-policy; everything else is comfortably single-agent. When the user *does* ask for sub-agents, default
-them to Sonnet or Haiku; only run an Opus sub-agent on a direct, explicit instruction naming Opus.
+**Single agent for the small stuff; Actor–Critic for anything that ships.** Do searches, reads,
+and trivial mechanical edits inline in the main thread — don't spawn for those. But any change that
+lands as a PR goes through an **Actor–Critic cycle with an *independent* Critic** (a separate
+agent, fresh context — see the cadence memories and SEPMO `references/05-critic.md`). The
+independent Critic per PR is **non-negotiable**; convergence is the Critic's call.
+
+**Default both roles to Opus — "OO" means Opus–Opus.** Whenever you spawn an Actor and/or a Critic,
+**both default to Opus** (`model: "opus"`) at high reasoning effort. This is the project's concrete
+realization of SEPMO's "frontier–frontier (FF)" pair: **`OO AC` = Opus–Opus Actor–Critic, the
+default.** Opus Critics are materially stronger at the part that matters most — non-vacuity and
+coverage refutation: on 2026-06-25 two Opus Critics caught (and mutation-proved) a NULL-three-valued-
+logic coverage gap that *every* Sonnet Critic in the same effort — including a dedicated "final"
+bundle Critic — had missed. Never turn the **Critic** below Opus on a correctness-bearing review.
+You may turn the **Actor** down to Sonnet/Haiku only for genuinely rote sub-work (large mechanical
+renames, log scraping) — and say so explicitly when you do.
+
+(Cost note: OO is the most expensive mode and is nonetheless the default, because correctness on a
+table-format library *is* the product. `Workflow` fan-out and plan-mode `Explore`/`Plan` helpers
+stay opt-in; the heavy parity phases — **Phase 2 (write engine)**, **Phase 4 (formats & V3 types)** —
+are the natural fan-out candidates when the user asks for scale.)
 
 </subagent_policy>
 

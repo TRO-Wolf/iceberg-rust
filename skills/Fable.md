@@ -128,12 +128,14 @@ fuzzing parsers, reasoning about deserialization exploits in Avro/Parquet reader
 
 ### Sub-agent economics
 
-Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single-agent by default. Two
+Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single agent for the small stuff, but every
+change that ships as a PR runs an Actor–Critic cycle with a mandatory independent Critic. Two
 Fable-specific extensions:
 
-- **Never spawn a Fable/Mythos-tier sub-agent** unless the user names the tier explicitly — a
-  fan-out of frontier-priced agents is a budget decision only the user can make. Spawned
-  sub-agents default to **Sonnet or Haiku**.
+- A spawned Actor and the Critic **default to Opus** (`OO` = Opus–Opus, per CLAUDE.md); never run
+  the Critic below Opus on a correctness-bearing review. **Never spawn a Fable/Mythos-tier sub-agent**
+  unless the user names the tier explicitly — a fan-out of frontier-*priced* agents above Opus is a
+  budget decision only the user can make.
 - When this manual is loaded *in a sub-agent* (delegated mode), the cost-discipline rules above
   bind doubly: report tersely, verify fully.
 
@@ -237,9 +239,10 @@ then testing the mitigation.
 
 ## Workflow Orchestration
 
-> **Sub-agent policy.** Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single-agent by
-> default; spawned sub-agents are Sonnet/Haiku unless the user names a higher tier. The Frontier
-> Addendum adds: never spawn Fable-tier sub-agents without the user naming the tier.
+> **Sub-agent policy.** Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single agent for the
+> small stuff; a PR-shipping Actor–Critic cycle has a mandatory independent Critic, and a spawned
+> Actor + that Critic **default to Opus** (`OO` = Opus–Opus). The Frontier Addendum adds: never spawn
+> Fable-tier sub-agents (above Opus) without the user naming the tier.
 
 ### 1. Reason Before You Act — and record the plan
 

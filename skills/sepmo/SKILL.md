@@ -46,14 +46,15 @@ to "looks done." **"FF" / "frontier–frontier"** denotes an Actor–Critic pair
 choice, resolved by the binding manifest, not fixed in this portable shell.
 
 How that aspiration is *governed* is **not restated here** (one home per fact):
-when frontier is required, when tier may be turned down, single-agent default
+when frontier is required, when tier may be turned down, single-agent fallback
 versus literal multi-agent fan-out, and the cost discipline that bounds it all
 live in the project's sub-agent & tier policy and its frontier operating notes —
-see [binding-manifest.md](binding-manifest.md) (*Sub-agent / tier policy*). For
-**this** repo that resolves to a **single-agent default**: one session runs the
-Actor phase, then deliberately shifts into the Critic phase, sequentially; a
-literal separate-agent FF pair is opt-in, used only when the user lifts that
-policy.
+see [binding-manifest.md](binding-manifest.md) (*Sub-agent / tier policy*). The
+concrete resolution for **this** repo — whether the FF pair runs as separate
+agents and at which model — lives there, not in this portable shell: it binds
+**FF → OO** with a **mandatory independent Critic** per PR. (The single-agent
+Actor-phase-then-Critic-phase role-shift is the fallback for trivial work that
+never reaches a PR.)
 
 ---
 

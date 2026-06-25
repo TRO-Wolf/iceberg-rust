@@ -53,7 +53,7 @@ does not restate it.
 | **Memory / lessons** | [task/lessons.md](../../task/lessons.md) (active) + [skills/compaction.md](../compaction.md) (lifecycle) + `lessons-archive/` | Retrospective **runs a compaction pass** |
 | **Navigation** | the `map.md` convention — [CLAUDE.md](../../CLAUDE.md) `<map_md_navigation>` | every SEPMO directory **carries one** |
 | **Prohibitions** | [CLAUDE.md](../../CLAUDE.md) *Absolute prohibitions* | all agents **obey**; SEPMO adds none |
-| **Sub-agent / tier policy** | [CLAUDE.md](../../CLAUDE.md) `<subagent_policy>` + `Fable.md` *Frontier Addendum* | Orchestrator's AC-execution mode **follows** it (single-agent default; literal OO is opt-in) |
+| **Sub-agent / tier policy** | [CLAUDE.md](../../CLAUDE.md) `<subagent_policy>` + `Fable.md` *Frontier Addendum* | Orchestrator's AC-execution mode **follows** it. SEPMO's **frontier–frontier (FF)** pair is realized here as **OO = Opus–Opus**: a spawned Actor and the independent Critic **default to Opus**; the per-PR independent Critic is mandatory (never below Opus on correctness review). |
 | **Mode handling** (interactive vs. delegated) | the tier manuals' *Mode Handling* section | Orchestrator + all agents **adopt** both modes |
 | **Debugging protocol** | `Opus.md` §8 + each directory's `map.md#debug` | Actor/Critic **follow** it on failure |
 

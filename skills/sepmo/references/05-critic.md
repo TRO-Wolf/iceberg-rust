@@ -110,10 +110,16 @@ the two passes that surface does not own (these are SEPMO-original):
 
 ---
 
-## Single-agent mode — the Critic's angle
+## Single-agent mode — the Critic's angle (fallback only)
 
-In the default single-agent configuration, one session runs the Actor phase then
-shifts into the Critic phase sequentially (the single-agent default is described
+> **In this repo, the Critic is a mandatory *independent* agent on Opus** (`OO` =
+> Opus–Opus; [binding-manifest.md](../binding-manifest.md) *Sub-agent / tier policy*;
+> [CLAUDE.md](../../CLAUDE.md) `<subagent_policy>`). The single-agent role-shift below is
+> the fallback for trivial work that never reaches a PR — do **not** use it in place of
+> the independent Critic for anything that ships.
+
+In a single-agent configuration, one session runs the Actor phase then
+shifts into the Critic phase sequentially (this mode is described
 in `../SKILL.md` *Model assumption* and governed by the binding manifest
 `../binding-manifest.md`, row *Sub-agent / tier policy*). **Convergence is still
 the Critic phase's call and yours alone** — the single-agent constraint changes
