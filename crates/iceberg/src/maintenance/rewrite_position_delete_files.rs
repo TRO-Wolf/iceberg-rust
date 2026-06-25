@@ -106,7 +106,8 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, PartitionKey, Schema, Snapshot, Struct,
+    DataContentType, DataFile, DataFileFormat, MetricsConfig, PartitionKey, Schema, Snapshot,
+    Struct,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -463,10 +464,13 @@ impl RewritePositionDeleteFiles {
             Some(uuid::Uuid::now_v7().to_string()),
             DataFileFormat::Parquet,
         );
+        // Position-delete files keep `file_path`/`pos` bounds FULL (Java `MetricsConfig.forPositionDelete`)
+        // so delete-file path pruning stays precise — the default `truncate(16)` would widen the path range.
         let parquet_builder = ParquetWriterBuilder::new(
             parquet::file::properties::WriterProperties::builder().build(),
             config.schema().clone(),
-        );
+        )
+        .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.table.file_io().clone(),

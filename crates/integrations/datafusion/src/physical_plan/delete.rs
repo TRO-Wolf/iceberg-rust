@@ -62,7 +62,7 @@ use iceberg::Catalog;
 use iceberg::arrow::FieldMatchMode;
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
-use iceberg::spec::{DataFile, DataFileFormat, FormatVersion};
+use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -556,10 +556,13 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
+    // Keep the position-delete `file_path` / `pos` bounds FULL (Java `MetricsConfig.forPositionDelete`)
+    // so delete-file path pruning stays precise — the default `truncate(16)` would widen the path range.
     let parquet_builder = ParquetWriterBuilder::new(
         parquet::file::properties::WriterProperties::builder().build(),
         config.schema().clone(),
-    );
+    )
+    .with_metrics_config(MetricsConfig::for_position_delete());
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),

@@ -33,16 +33,25 @@
 //! falls back (to the table default for a column, or to `truncate(16)` for the default
 //! itself) rather than failing — matching Java's warn-and-continue behavior.
 //!
+//! The bound-truncation primitives ([`MetricsMode::truncate_lower_bound`] /
+//! [`MetricsMode::truncate_upper_bound`]) port Java `ParquetMetrics.truncateLowerBound` /
+//! `truncateUpperBound` together with `UnicodeUtil`/`BinaryUtil`'s string/binary truncation;
+//! the Parquet writer applies them per column (see `writer::file_writer::parquet_writer`).
+//!
 //! NAMED residue (deferred — both need a schema / sort-order the config alone does not
 //! carry): the wide-schema `write.metadata.metrics.max-inferred-column-defaults` inference
 //! (Java caps how many columns receive the default, the rest becoming [`MetricsMode::None`])
 //! and the sorted-column auto-promotion (a `none`/`counts` default is upgraded to
-//! `truncate(16)` for sort-key columns). Wiring the resolved mode into the Parquet writer's
-//! bound collection is a separate change (it alters the bounds written to every table) and
-//! is intentionally not done here.
+//! `truncate(16)` for sort-key columns). Threading a table's *resolved* config through the
+//! data-file writer construction (so non-default `write.metadata.metrics.*` is honored on
+//! data files, not just the built-in `truncate(16)` default) is a further plumbing pass.
 
 use std::collections::HashMap;
 
+use super::{Datum, PrimitiveLiteral, PrimitiveType};
+use crate::metadata_columns::{
+    RESERVED_COL_NAME_DELETE_FILE_PATH, RESERVED_COL_NAME_DELETE_FILE_POS,
+};
 use crate::{Error, ErrorKind, Result};
 
 /// Table property naming the default metrics mode for all columns.
@@ -128,6 +137,155 @@ impl MetricsMode {
             }
         }
     }
+
+    /// Whether this mode persists lower/upper bounds at all.
+    ///
+    /// Bounds are kept for [`MetricsMode::Truncate`] and [`MetricsMode::Full`]; [`MetricsMode::None`]
+    /// and [`MetricsMode::Counts`] persist no bounds. Mirrors Java
+    /// `ParquetMetrics.truncateLength(mode) > 0` (`None`/`Counts` → 0).
+    pub fn collects_bounds(&self) -> bool {
+        matches!(self, MetricsMode::Truncate(_) | MetricsMode::Full)
+    }
+
+    /// Whether this mode persists counts (`value_counts`, `null_value_counts`, `nan_value_counts`)
+    /// and column sizes. Everything except [`MetricsMode::None`] does; `None` persists nothing for
+    /// the column (Java skips the column entirely when its mode is `None`).
+    pub fn collects_counts(&self) -> bool {
+        !matches!(self, MetricsMode::None)
+    }
+
+    /// Truncate a column's lower bound for this mode, mirroring Java
+    /// `ParquetMetrics.truncateLowerBound`.
+    ///
+    /// Returns `None` when this mode persists no bounds ([`MetricsMode::None`]/[`MetricsMode::Counts`]).
+    /// For [`MetricsMode::Full`] the bound is returned unchanged. For [`MetricsMode::Truncate`] only
+    /// `string` and `binary` values are truncated (to the first `N` Unicode code points / bytes via
+    /// `UnicodeUtil.truncateStringMin` / `BinaryUtil.truncateBinaryMin`); every other type — including
+    /// `fixed`, `uuid`, and the numeric/decimal types — is returned unchanged, matching Java's
+    /// `switch` whose `default` returns the value as-is.
+    pub fn truncate_lower_bound(&self, datum: &Datum) -> Option<Datum> {
+        let length = match self {
+            MetricsMode::None | MetricsMode::Counts => return None,
+            MetricsMode::Full => return Some(datum.clone()),
+            MetricsMode::Truncate(length) => *length,
+        };
+        match (datum.data_type(), datum.literal()) {
+            (PrimitiveType::String, PrimitiveLiteral::String(value)) => {
+                Some(Datum::string(truncate_string_min(value, length)))
+            }
+            (PrimitiveType::Binary, PrimitiveLiteral::Binary(value)) => {
+                Some(Datum::binary(truncate_binary_min(value, length)))
+            }
+            _ => Some(datum.clone()),
+        }
+    }
+
+    /// Truncate a column's upper bound for this mode, mirroring Java
+    /// `ParquetMetrics.truncateUpperBound`.
+    ///
+    /// Like [`MetricsMode::truncate_lower_bound`], but for `string`/`binary` under
+    /// [`MetricsMode::Truncate`] it truncates *up* (`UnicodeUtil.truncateStringMax` /
+    /// `BinaryUtil.truncateBinaryMax`): the prefix is incremented so it remains a valid upper bound.
+    /// When no valid upper bound exists (every truncated code point / byte is at its maximum) Java
+    /// returns `null` and drops the bound — here that is `None` even though the mode collects bounds.
+    pub fn truncate_upper_bound(&self, datum: &Datum) -> Option<Datum> {
+        let length = match self {
+            MetricsMode::None | MetricsMode::Counts => return None,
+            MetricsMode::Full => return Some(datum.clone()),
+            MetricsMode::Truncate(length) => *length,
+        };
+        match (datum.data_type(), datum.literal()) {
+            (PrimitiveType::String, PrimitiveLiteral::String(value)) => {
+                truncate_string_max(value, length).map(Datum::string)
+            }
+            (PrimitiveType::Binary, PrimitiveLiteral::Binary(value)) => {
+                truncate_binary_max(value, length).map(Datum::binary)
+            }
+            _ => Some(datum.clone()),
+        }
+    }
+}
+
+/// Java `BinaryUtil.truncateBinaryMin`: the first `length` bytes, or the input unchanged when it is
+/// already no longer than `length`.
+fn truncate_binary_min(input: &[u8], length: u32) -> Vec<u8> {
+    let length = length as usize;
+    if length >= input.len() {
+        input.to_vec()
+    } else {
+        input[..length].to_vec()
+    }
+}
+
+/// Java `BinaryUtil.truncateBinaryMax`: truncate to `length` bytes, then increment from the last
+/// byte backward; the first byte that does not wrap past `0xFF` is incremented and the result cut
+/// there. Returns `None` when every truncated byte is `0xFF` (no valid upper bound — Java returns
+/// `null`).
+fn truncate_binary_max(input: &[u8], length: u32) -> Option<Vec<u8>> {
+    let length = length as usize;
+    if length >= input.len() {
+        return Some(input.to_vec());
+    }
+    let mut truncated = input[..length].to_vec();
+    for i in (0..length).rev() {
+        if truncated[i] != 0xFF {
+            truncated[i] += 1;
+            truncated.truncate(i + 1);
+            return Some(truncated);
+        }
+    }
+    None
+}
+
+/// Java `UnicodeUtil.truncateString`: the first `length` Unicode code points, or the input unchanged
+/// when it has no more than `length`. A Rust `&str` is well-formed UTF-8 with no surrogates, so its
+/// `char`s are exactly Java's code points.
+fn truncate_string_min(input: &str, length: u32) -> String {
+    let length = length as usize;
+    match input.char_indices().nth(length) {
+        Some((byte_idx, _)) => input[..byte_idx].to_string(),
+        // Fewer than `length + 1` code points → no truncation.
+        None => input.to_string(),
+    }
+}
+
+/// Java `UnicodeUtil.truncateStringMax` / `internalTruncateMax`: truncate to `length` code points,
+/// then increment the last code point that can be incremented. Returns `None` when no code point can
+/// be incremented (Java returns `null`).
+fn truncate_string_max(input: &str, length: u32) -> Option<String> {
+    let truncated = truncate_string_min(input, length);
+    // No truncation happened → the exact value is already a valid upper bound (Java compares the
+    // pre/post lengths; an untruncated prefix has the same byte length as the input).
+    if truncated.len() == input.len() {
+        return Some(truncated);
+    }
+    let mut chars: Vec<char> = truncated.chars().collect();
+    for i in (0..chars.len()).rev() {
+        if let Some(next) = increment_code_point(chars[i]) {
+            chars.truncate(i);
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// Java `UnicodeUtil.incrementCodePoint`: the next code point, skipping the UTF-16 surrogate gap, or
+/// `None` when incrementing the maximum code point would overflow (Java returns `0` to signal this).
+fn increment_code_point(c: char) -> Option<char> {
+    let code_point = c as u32;
+    if code_point == char::MAX as u32 {
+        // Java: `Character.MAX_CODE_POINT` → 0 (overflow).
+        return None;
+    }
+    // Java jumps from `MIN_SURROGATE - 1` (0xD7FF) straight to `MAX_SURROGATE + 1` (0xE000); a Rust
+    // `char` is never a surrogate so 0xD7FF is the only value whose successor lands in the gap.
+    let next = if code_point == 0xD7FF {
+        0xE000
+    } else {
+        code_point + 1
+    };
+    char::from_u32(next)
 }
 
 impl std::fmt::Display for MetricsMode {
@@ -200,6 +358,26 @@ impl MetricsConfig {
             default_mode,
             column_modes,
         }
+    }
+
+    /// The metrics config for a position-delete file, mirroring `MetricsConfig.forPositionDelete`.
+    ///
+    /// Starts from the built-in default (`truncate(16)`) but forces the reserved position-delete
+    /// columns `file_path` and `pos` to [`MetricsMode::Full`], so a delete file's path/position
+    /// bounds are kept exact — delete-file pruning relies on them. (Java overlays this on the
+    /// *table's* resolved config; threading the table config in is part of the writer-plumbing
+    /// residue noted in the module docs.)
+    pub fn for_position_delete() -> Self {
+        let mut config = Self::default();
+        config.column_modes.insert(
+            RESERVED_COL_NAME_DELETE_FILE_PATH.to_string(),
+            MetricsMode::Full,
+        );
+        config.column_modes.insert(
+            RESERVED_COL_NAME_DELETE_FILE_POS.to_string(),
+            MetricsMode::Full,
+        );
+        config
     }
 
     /// The resolved metrics mode for a column: its explicit override if present, else the
@@ -406,5 +584,138 @@ mod tests {
         assert_eq!(config.column_mode(""), MetricsMode::Full);
         // A real column name still falls back to the table default.
         assert_eq!(config.column_mode("id"), MetricsMode::Counts);
+    }
+
+    // ---- bound truncation (Java UnicodeUtil / BinaryUtil / ParquetMetrics parity) -------------
+
+    #[test]
+    fn truncate_binary_min_takes_prefix_or_input() {
+        // Longer than the limit → first `length` bytes.
+        assert_eq!(truncate_binary_min(&[1, 2, 3, 4, 5], 3), vec![1, 2, 3]);
+        // length >= len → unchanged (no copy of a longer prefix).
+        assert_eq!(truncate_binary_min(&[1, 2], 5), vec![1, 2]);
+        assert_eq!(truncate_binary_min(&[1, 2, 3], 3), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn truncate_binary_max_increments_last_non_ff_byte() {
+        // Truncate to 2 bytes then increment the last byte.
+        assert_eq!(
+            truncate_binary_max(&[1, 2, 3, 4], 2),
+            Some(vec![1, 3]),
+            "last truncated byte 0x02 → 0x03"
+        );
+        // Trailing 0xFF bytes wrap; carry to the first byte that can increment, then cut there.
+        assert_eq!(
+            truncate_binary_max(&[1, 0xFF, 0xFF, 9], 3),
+            Some(vec![2]),
+            "0xFF,0xFF wrap → byte 0 (0x01) increments to 0x02 and the result is cut to length 1"
+        );
+        // length >= len → unchanged, never None.
+        assert_eq!(truncate_binary_max(&[1, 2], 5), Some(vec![1, 2]));
+        // Every truncated byte is 0xFF → no valid upper bound.
+        assert_eq!(truncate_binary_max(&[0xFF, 0xFF, 0x00], 2), None);
+    }
+
+    #[test]
+    fn truncate_string_min_counts_code_points_not_bytes() {
+        assert_eq!(truncate_string_min("hello world", 5), "hello");
+        // Shorter than the limit → unchanged.
+        assert_eq!(truncate_string_min("hi", 5), "hi");
+        assert_eq!(truncate_string_min("hello", 5), "hello");
+        // Multi-byte code points: "é" (2 bytes) + "猫" (3 bytes) each count as ONE code point, so a
+        // byte-based truncation would slice mid-character; the code-point count must not.
+        assert_eq!(truncate_string_min("é猫x", 2), "é猫");
+        assert_eq!(truncate_string_min("😀😀😀", 2), "😀😀");
+    }
+
+    #[test]
+    fn truncate_string_max_increments_last_code_point() {
+        assert_eq!(
+            truncate_string_max("hello world", 5),
+            Some("hellp".to_string())
+        );
+        // No truncation → unchanged, never incremented.
+        assert_eq!(truncate_string_max("hi", 5), Some("hi".to_string()));
+        // Multi-byte: increment the last retained code point.
+        assert_eq!(truncate_string_max("aé猫", 2), Some("aê".to_string()));
+        // Max code point at the tail wraps; carry to the previous code point.
+        let max = char::MAX; // U+10FFFF
+        let input: String = ['a', max, max].iter().collect();
+        assert_eq!(truncate_string_max(&input, 2), Some("b".to_string()));
+        // Every retained code point is the max → no valid upper bound.
+        let all_max: String = [max, max, 'z'].iter().collect();
+        assert_eq!(truncate_string_max(&all_max, 2), None);
+    }
+
+    #[test]
+    fn increment_code_point_skips_surrogate_gap_and_overflows_at_max() {
+        // 0xD7FF jumps the UTF-16 surrogate gap to 0xE000.
+        assert_eq!(
+            increment_code_point(char::from_u32(0xD7FF).unwrap()),
+            char::from_u32(0xE000)
+        );
+        assert_eq!(increment_code_point('a'), Some('b'));
+        // The maximum code point overflows.
+        assert_eq!(increment_code_point(char::MAX), None);
+    }
+
+    #[test]
+    fn mode_truncate_only_touches_string_and_binary() {
+        let mode = MetricsMode::Truncate(2);
+        // String/binary truncate.
+        assert_eq!(
+            mode.truncate_lower_bound(&Datum::string("hello")),
+            Some(Datum::string("he"))
+        );
+        assert_eq!(
+            mode.truncate_upper_bound(&Datum::string("hello")),
+            Some(Datum::string("hf"))
+        );
+        assert_eq!(
+            mode.truncate_lower_bound(&Datum::binary(vec![1, 2, 3, 4])),
+            Some(Datum::binary(vec![1, 2]))
+        );
+        // Non-string/binary (the Java `default` arm) is returned unchanged even under Truncate.
+        let long = Datum::long(1234567890);
+        assert_eq!(mode.truncate_lower_bound(&long), Some(long.clone()));
+        assert_eq!(mode.truncate_upper_bound(&long), Some(long));
+    }
+
+    #[test]
+    fn mode_full_never_truncates_none_and_counts_drop_bounds() {
+        let s = Datum::string("a very long string value");
+        // Full keeps the bound exactly.
+        assert_eq!(MetricsMode::Full.truncate_lower_bound(&s), Some(s.clone()));
+        assert_eq!(MetricsMode::Full.truncate_upper_bound(&s), Some(s.clone()));
+        // None / Counts persist no bounds.
+        assert_eq!(MetricsMode::None.truncate_lower_bound(&s), None);
+        assert_eq!(MetricsMode::None.truncate_upper_bound(&s), None);
+        assert_eq!(MetricsMode::Counts.truncate_lower_bound(&s), None);
+        assert_eq!(MetricsMode::Counts.truncate_upper_bound(&s), None);
+    }
+
+    #[test]
+    fn collects_bounds_and_counts_match_mode_semantics() {
+        assert!(!MetricsMode::None.collects_bounds());
+        assert!(!MetricsMode::None.collects_counts());
+        assert!(!MetricsMode::Counts.collects_bounds());
+        assert!(MetricsMode::Counts.collects_counts());
+        assert!(MetricsMode::Truncate(16).collects_bounds());
+        assert!(MetricsMode::Truncate(16).collects_counts());
+        assert!(MetricsMode::Full.collects_bounds());
+        assert!(MetricsMode::Full.collects_counts());
+    }
+
+    #[test]
+    fn for_position_delete_forces_path_and_pos_to_full() {
+        let config = MetricsConfig::for_position_delete();
+        assert_eq!(config.column_mode("file_path"), MetricsMode::Full);
+        assert_eq!(config.column_mode("pos"), MetricsMode::Full);
+        // Every other column keeps the default truncate(16).
+        assert_eq!(
+            config.column_mode("anything_else"),
+            MetricsMode::Truncate(16)
+        );
     }
 }
