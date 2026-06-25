@@ -23,10 +23,11 @@
 //!   * **`merge-on-read`** — find the matching rows' reserved `_file`/`_pos` identity, write a
 //!     position-delete file, and commit a `RowDelta`. Data files are untouched; the next scan applies
 //!     the deletes. This is the engine-facing seam the core was built for.
-//!   * **`copy-on-write`** (the Iceberg default when unset) — rewrite the surviving (non-matching) rows
-//!     into new data files and replace ALL data via `OverwriteFiles`. Unpartitioned tables only for now;
-//!     a partitioned table errors (partition-aware rewrite, routing survivors to their partitions, is a
-//!     follow-up).
+//!   * **`copy-on-write`** (the Iceberg default when unset) — file-level rewrite: only the data files
+//!     that contain at least one deleted row are rewritten; unaffected files are left in place. Survivors
+//!     from affected files are routed through the partition-aware `TaskWriter`, so both partitioned and
+//!     unpartitioned tables are supported. The commit is a `OverwriteFiles` that deletes the affected
+//!     paths and adds the rewritten files.
 //!
 //! **Correctness — why we evaluate the filter ourselves.** The matching rows are identified by
 //! evaluating the *original* DataFusion `WHERE` filters (as a [`PhysicalExpr`]) against the scanned
@@ -42,6 +43,7 @@
 //! The plan emits a single `UInt64` `count` row (rows affected), per DataFusion's DML contract.
 
 use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -59,10 +61,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::TryStreamExt;
 use iceberg::Catalog;
-use iceberg::arrow::FieldMatchMode;
-use iceberg::expr::Predicate;
+use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator};
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
-use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig};
+use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Struct};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -76,6 +77,7 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 
+use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
 
 /// The Iceberg row-level write-mode properties and the `merge-on-read` value.
@@ -391,33 +393,33 @@ async fn merge_on_read_delete(
     Ok(deleted)
 }
 
-/// Copy-on-write DELETE: rewrite the surviving (non-matching) rows into new data files and replace ALL
-/// existing data in one atomic `OverwriteFiles` snapshot. Returns the number of rows deleted.
+/// Copy-on-write DELETE: **file-level** rewrite — scan every live row projecting the table columns
+/// PLUS the reserved `_file` path, identify which source data files contain at least one deleted row
+/// (the "affected" set), rewrite only those files' surviving rows through the partition-aware
+/// [`TaskWriter`], and commit a `OverwriteFiles` that deletes the affected source paths and adds the
+/// rewritten files. Unaffected data files are left completely untouched.
 ///
-/// Partition-aware rewrite (routing survivors back to their partitions) is not yet supported, so a
-/// partitioned table errors with guidance to use merge-on-read.
+/// Works for BOTH partitioned and unpartitioned tables. A single Iceberg data file is always
+/// single-partition, but the survivor set spans every affected file and therefore many partitions,
+/// and a scan batch may interleave rows from several files — so the rewrite routes through a
+/// `TaskWriter` with `fanout_enabled = true`, which sends each row to its correct partition writer
+/// without requiring the survivors to be pre-sorted by partition.
 async fn copy_on_write_delete(
     table: &Table,
     catalog: &dyn Catalog,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     table_schema: &SchemaRef,
 ) -> DFResult<u64> {
-    if !table.metadata().default_partition_spec().is_unpartitioned() {
-        return Err(DataFusionError::NotImplemented(
-            "copy-on-write DELETE on a partitioned table is not yet supported; set the table property \
-             'write.delete.mode' = 'merge-on-read' to enable DELETE on this table"
-                .to_string(),
-        ));
-    }
-
-    // Scan EVERY live row (the scan applies any existing merge-on-read deletes), projecting the table
-    // columns. We rewrite the survivors; we do not push the filter into the scan (Iceberg pushdown is
-    // inexact — see the module note).
-    let projection: Vec<String> = table_schema
+    // 1. Scan EVERY live row, projecting the table columns PLUS `_file` (not `_pos` — COW doesn't need
+    //    positions). We do NOT push the filter into the scan — Iceberg pushdown is inexact (see the
+    //    module note); the exact `PhysicalExpr` evaluation here is the correctness contract.
+    let mut projection: Vec<String> = table_schema
         .fields()
         .iter()
         .map(|field| field.name().clone())
         .collect();
+    projection.push(RESERVED_COL_NAME_FILE.to_string());
+
     let batches: Vec<RecordBatch> = table
         .scan()
         .select(projection)
@@ -430,12 +432,23 @@ async fn copy_on_write_delete(
         .await
         .map_err(to_datafusion_error)?;
 
-    let mut survivors: Vec<RecordBatch> = Vec::new();
+    // 2. Collect all batches into memory (documented: full-table buffer, fits in executor memory).
+
+    // 3. Pass 1 — affected-file detection. A source file is AFFECTED iff at least one of its rows
+    //    matches the predicate (or the predicate is None → all rows deleted → all files affected).
+    //    Also counts total deleted rows for the return value.
     let mut deleted: u64 = 0;
+    let mut affected: HashSet<String> = HashSet::new();
+
     for batch in &batches {
         let num_rows = batch.num_rows();
-        // Rebuild the table-column batch BY NAME — the schema the predicate is bound to and the writer
-        // matches against (robust to the scan's output column ordering).
+        let file_col = batch
+            .column_by_name(RESERVED_COL_NAME_FILE)
+            .ok_or_else(|| {
+                DataFusionError::Internal("delete scan missing _file column".to_string())
+            })?;
+
+        // Build a table-column-only sub-batch for predicate evaluation (by name, robust to ordering).
         let columns: Vec<ArrayRef> = table_schema
             .fields()
             .iter()
@@ -452,8 +465,13 @@ async fn copy_on_write_delete(
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
         match &predicate {
-            // `DELETE FROM t` — every row deleted; no survivors.
-            None => deleted += num_rows as u64,
+            None => {
+                // DELETE FROM t — every row is deleted; every source file is affected.
+                deleted += num_rows as u64;
+                for row in 0..num_rows {
+                    affected.insert(decode_file_path(file_col, row)?);
+                }
+            }
             Some(physical_expr) => {
                 let evaluated = physical_expr.evaluate(&table_batch)?;
                 let array = evaluated.into_array(num_rows)?;
@@ -464,34 +482,100 @@ async fn copy_on_write_delete(
                         DataFusionError::Internal(
                             "DELETE filter did not evaluate to a boolean".to_string(),
                         )
-                    })?;
-                // Keep a row iff the WHERE predicate is NOT TRUE for it (a NULL result keeps the row,
-                // per SQL three-valued logic).
-                let keep: BooleanArray = (0..num_rows)
-                    .map(|row| !(mask.is_valid(row) && mask.value(row)))
-                    .collect();
-                let surviving = filter_record_batch(&table_batch, &keep)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                deleted += (num_rows - surviving.num_rows()) as u64;
-                if surviving.num_rows() > 0 {
-                    survivors.push(surviving);
+                    })?
+                    .clone();
+
+                for row in 0..num_rows {
+                    // A row is deleted iff the predicate is TRUE (NULL → SQL three-valued logic → NOT deleted).
+                    let is_deleted = mask.is_valid(row) && mask.value(row);
+                    if is_deleted {
+                        deleted += 1;
+                        affected.insert(decode_file_path(file_col, row)?);
+                    }
                 }
             }
         }
     }
 
-    // No matching rows → no-op.
+    // 4. No deleted rows → no-op (avoid a pointless snapshot).
     if deleted == 0 {
         return Ok(0);
     }
 
-    // Rewrite the survivors and replace ALL data (delete every existing data file + add the rewrites) in
-    // one atomic OverwriteFiles snapshot. When every row was deleted, `survivors` is empty → no files are
-    // added → the table is left empty.
-    let new_files = write_survivor_data_files(table, &survivors).await?;
+    // 5. Pass 2 — collect survivor rows from AFFECTED files only. Rows from unaffected files are left
+    //    in place (their source files are unchanged). For each batch, build a keep-mask for rows that
+    //    are (a) NOT deleted AND (b) from an affected file (those are the rows that need a new home).
+    let mut survivors_to_rewrite: Vec<RecordBatch> = Vec::new();
+
+    for batch in &batches {
+        let num_rows = batch.num_rows();
+        let file_col = batch
+            .column_by_name(RESERVED_COL_NAME_FILE)
+            .ok_or_else(|| {
+                DataFusionError::Internal("delete scan missing _file column".to_string())
+            })?;
+
+        let columns: Vec<ArrayRef> = table_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "delete scan is missing table column '{}'",
+                        field.name()
+                    ))
+                })
+            })
+            .collect::<DFResult<_>>()?;
+        let table_batch = RecordBatch::try_new(Arc::clone(table_schema), columns)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+        // Determine the delete-mask for this batch (same logic as pass 1, recomputed).
+        let delete_mask: Vec<bool> = match &predicate {
+            None => vec![true; num_rows],
+            Some(physical_expr) => {
+                let evaluated = physical_expr.evaluate(&table_batch)?;
+                let array = evaluated.into_array(num_rows)?;
+                let mask = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "DELETE filter did not evaluate to a boolean".to_string(),
+                        )
+                    })?
+                    .clone();
+                (0..num_rows)
+                    .map(|row| mask.is_valid(row) && mask.value(row))
+                    .collect()
+            }
+        };
+
+        // Keep a row iff: it is NOT deleted AND its source file is in the affected set.
+        let keep: BooleanArray = (0..num_rows)
+            .map(|row| -> DFResult<bool> {
+                let file_path = decode_file_path(file_col, row)?;
+                Ok(!delete_mask[row] && affected.contains(&file_path))
+            })
+            .collect::<DFResult<Vec<bool>>>()?
+            .into_iter()
+            .collect();
+
+        let surviving = filter_record_batch(&table_batch, &keep)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        if surviving.num_rows() > 0 {
+            survivors_to_rewrite.push(surviving);
+        }
+    }
+
+    // 6. Write survivors through the partition-aware TaskWriter. When there are no survivors-to-rewrite
+    //    (e.g. every affected file was fully deleted), this produces an empty Vec — correct.
+    let new_files = write_partitioned_data_files(table, &survivors_to_rewrite).await?;
+
+    // 7. Commit: delete the affected source files by path, add the rewritten files.
     let tx = Transaction::new(table);
     tx.overwrite_files()
-        .overwrite_by_row_filter(Predicate::AlwaysTrue)
+        .delete_files(affected.iter().cloned())
         .add_files(new_files)
         .apply(tx)
         .map_err(to_datafusion_error)?
@@ -502,19 +586,31 @@ async fn copy_on_write_delete(
     Ok(deleted)
 }
 
-/// Write surviving rows to new parquet data file(s) via the production `DataFileWriter` (unpartitioned),
-/// matching columns to the table schema BY NAME. Returns every file produced (the writer may roll).
-async fn write_survivor_data_files(
+/// Write data file(s) partition-correctly through the production `TaskWriter`. Works for BOTH
+/// partitioned and unpartitioned tables.
+///
+/// For partitioned tables, each batch must contain only table-schema columns (no `_file` or other
+/// reserved columns). The `PartitionValueCalculator` is used internally to compute and inject the
+/// `_partition` struct column that `TaskWriter`'s splitter reads. `fanout_enabled = true` because the
+/// `batches` vector may contain rows from multiple affected files belonging to different partitions
+/// (and a single scan batch may interleave them); the `FanoutWriter` routes each row to its correct
+/// partition writer without requiring pre-sorting.
+///
+/// Returns every `DataFile` the (possibly rolling) writer produced — correctly partitioned.
+async fn write_partitioned_data_files(
     table: &Table,
     batches: &[RecordBatch],
 ) -> DFResult<Vec<DataFile>> {
     if batches.is_empty() {
         return Ok(Vec::new());
     }
+
     let schema = table.metadata().current_schema().clone();
+    let partition_spec = table.metadata().default_partition_spec().clone();
+
     let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
         parquet::file::properties::WriterProperties::default(),
-        schema,
+        schema.clone(),
         FieldMatchMode::Name,
     );
     let location_gen =
@@ -530,16 +626,56 @@ async fn write_survivor_data_files(
         location_gen,
         file_name_gen,
     );
-    let mut writer = DataFileWriterBuilder::new(rolling)
-        .build(None)
-        .await
+    let builder = DataFileWriterBuilder::new(rolling);
+
+    // fanout_enabled = true: survivors may be unsorted across partitions.
+    let mut writer = TaskWriter::try_new(builder, true, schema.clone(), partition_spec.clone())
         .map_err(to_datafusion_error)?;
-    for batch in batches {
-        writer
-            .write(batch.clone())
-            .await
+
+    if partition_spec.is_unpartitioned() {
+        // Unpartitioned: TaskWriter writes directly; no partition column needed.
+        for batch in batches {
+            writer
+                .write(batch.clone())
+                .await
+                .map_err(to_datafusion_error)?;
+        }
+    } else {
+        // Partitioned: compute the `_partition` struct column for each batch and append it so
+        // the TaskWriter's partition splitter can route rows to the correct partition writer.
+        let calculator = PartitionValueCalculator::try_new(&partition_spec, &schema)
             .map_err(to_datafusion_error)?;
+
+        for batch in batches {
+            let partition_array = calculator.calculate(batch).map_err(to_datafusion_error)?;
+
+            // Extend the batch's schema with the `_partition` struct field.
+            let partition_field = datafusion::arrow::datatypes::Field::new(
+                PROJECTED_PARTITION_VALUE_COLUMN,
+                partition_array.data_type().clone(),
+                false,
+            );
+            let extended_schema = Arc::new(ArrowSchema::new(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(Arc::new(partition_field)))
+                    .collect::<Vec<_>>(),
+            ));
+            let mut extended_columns: Vec<ArrayRef> = batch.columns().to_vec();
+            extended_columns.push(partition_array);
+            let extended_batch = RecordBatch::try_new(extended_schema, extended_columns)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+            writer
+                .write(extended_batch)
+                .await
+                .map_err(to_datafusion_error)?;
+        }
     }
+
     writer.close().await.map_err(to_datafusion_error)
 }
 
@@ -547,8 +683,114 @@ async fn write_survivor_data_files(
 /// production `PositionDeleteFileWriter`. Returns EVERY file the (rolling) writer produced — a large
 /// DELETE may roll into more than one file, and ALL of them must be committed or the deletes in the
 /// dropped files would be silently lost (rows resurrected on the next scan).
+///
+/// **Partition-aware.** Position-delete files are associated with the `(spec_id, partition)` of the
+/// DATA file they delete from — the Iceberg commit validates that the delete file's partition matches the
+/// registered spec for `partition_spec_id`. For UNPARTITIONED tables the partition key is `None`
+/// (existing behavior). For PARTITIONED tables:
+///
+/// 1. The current snapshot manifests are scanned once to build a `path → (spec_id, Struct)` map.
+/// 2. The `(path, pos)` pairs are grouped by their data file's `(spec_id, Struct)`.
+/// 3. One position-delete file is written per group, stamped with that group's `PartitionKey`.
+///
+/// This mirrors Java `PositionDeleteWriter` which always carries a per-data-file `PartitionKey` and
+/// `RewritePositionDeleteFiles` which groups delete files by `(spec_id, partition)`.
 async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFResult<Vec<DataFile>> {
     let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
+    let metadata = table.metadata();
+    let default_spec = metadata.default_partition_spec();
+    let schema = metadata.current_schema();
+
+    // For unpartitioned tables, write a single delete file with no partition key — the fast path.
+    if default_spec.is_unpartitioned() {
+        return write_position_deletes_for_partition(table, &config, pairs, None).await;
+    }
+
+    // Partitioned: build path → (spec_id, partition Struct) from the current snapshot manifests.
+    // This lets us stamp each delete file with the SAME spec + partition as the data file it deletes.
+    let mut path_to_partition: HashMap<String, (i32, Struct)> = HashMap::new();
+
+    if let Some(snapshot) = metadata.current_snapshot() {
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), metadata)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        for manifest_entry in manifest_list.entries() {
+            // Skip delete-file manifests — we only need data file partitions.
+            if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_entry
+                .load_manifest(table.file_io())
+                .await
+                .map_err(to_datafusion_error)?;
+            for entry in manifest.entries() {
+                if entry.is_alive()
+                    && entry.data_file().content_type() == iceberg::spec::DataContentType::Data
+                {
+                    let df = entry.data_file();
+                    path_to_partition
+                        .entry(df.file_path().to_string())
+                        .or_insert_with(|| (df.partition_spec_id(), df.partition().clone()));
+                }
+            }
+        }
+    }
+
+    // Group pairs by (spec_id, partition). Pairs whose data file path is not found in the manifest
+    // (shouldn't happen in practice) are grouped under the default spec with an empty partition as a
+    // safe fallback — the validation will reject them if the spec is partitioned, exposing the bug.
+    let mut groups: HashMap<(i32, Struct), Vec<(String, i64)>> = HashMap::new();
+    for pair in pairs {
+        let key = path_to_partition
+            .get(&pair.0)
+            .cloned()
+            .unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()));
+        groups.entry(key).or_default().push(pair.clone());
+    }
+
+    // Write one position-delete file per (spec_id, partition) group.
+    let mut all_delete_files: Vec<DataFile> = Vec::new();
+    for ((spec_id, partition), mut group_pairs) in groups {
+        // Maintain the per-file (path, pos) sort order within each group.
+        group_pairs.sort();
+
+        let spec = metadata
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "position-delete: data file references unknown partition spec {spec_id}"
+                ))
+            })?
+            .as_ref()
+            .clone();
+        let partition_key = if spec.is_unpartitioned() {
+            None
+        } else {
+            Some(PartitionKey::new(spec, schema.clone(), partition))
+        };
+
+        let files =
+            write_position_deletes_for_partition(table, &config, &group_pairs, partition_key)
+                .await?;
+        all_delete_files.extend(files);
+    }
+
+    // Each group above is non-empty and `write_position_deletes_for_partition` guarantees it
+    // produced at least one file, so `all_delete_files` is non-empty whenever `pairs` was.
+    Ok(all_delete_files)
+}
+
+/// Write one position-delete file for a SINGLE `(spec_id, partition)` group. When `partition_key`
+/// is `None` the file is unpartitioned (spec_id 0, empty struct). The caller must have pre-sorted
+/// `pairs` by `(path, pos)`.
+async fn write_position_deletes_for_partition(
+    table: &Table,
+    config: &PositionDeleteWriterConfig,
+    pairs: &[(String, i64)],
+    partition_key: Option<PartitionKey>,
+) -> DFResult<Vec<DataFile>> {
     let location_gen =
         DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
     let file_name_gen = DefaultFileNameGenerator::new(
@@ -570,7 +812,7 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         file_name_gen,
     );
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
-        .build(None)
+        .build(partition_key)
         .await
         .map_err(to_datafusion_error)?;
 
@@ -587,13 +829,16 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         )
     })?;
     writer.write(batch).await.map_err(to_datafusion_error)?;
-    let delete_files = writer.close().await.map_err(to_datafusion_error)?;
-    if delete_files.is_empty() {
+    let files = writer.close().await.map_err(to_datafusion_error)?;
+    // A non-empty group of pairs MUST produce at least one delete file — otherwise the deletes
+    // would be silently lost (rows resurrected on re-scan). Guard both the unpartitioned fast-path
+    // and every partitioned group here so the check can never be skipped.
+    if files.is_empty() {
         return Err(DataFusionError::Internal(
-            "position-delete writer produced no file".to_string(),
+            "position-delete writer produced no file for a non-empty pair group".to_string(),
         ));
     }
-    Ok(delete_files)
+    Ok(files)
 }
 
 /// Decode the reserved `_file` column at `row`. The scan emits `_file` as a per-file constant, which the
@@ -841,7 +1086,10 @@ fn apply_assignments(
 }
 
 /// Merge-on-read UPDATE: position-delete the OLD matching rows and insert NEW rows carrying the updated
-/// values, in one `RowDelta`. Returns the number of rows updated. Unpartitioned tables only for now.
+/// values, in one `RowDelta`. Returns the number of rows updated. Works for both partitioned and
+/// unpartitioned tables: the NEW rows are routed through the partition-aware [`write_partitioned_data_files`]
+/// helper, which computes partition values from the POST-assignment column values. Position deletes are
+/// keyed by (data-file path, position) and are partition-agnostic, so the delete side is unchanged.
 async fn merge_on_read_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -849,11 +1097,6 @@ async fn merge_on_read_update(
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
 ) -> DFResult<u64> {
-    if !table.metadata().default_partition_spec().is_unpartitioned() {
-        return Err(DataFusionError::NotImplemented(
-            "UPDATE on a partitioned table is not yet supported".to_string(),
-        ));
-    }
     require_v2_for_merge_on_read(table)?;
 
     let mut projection: Vec<String> = table_schema
@@ -923,7 +1166,7 @@ async fn merge_on_read_update(
 
     pairs.sort();
     let delete_files = write_position_deletes(table, &pairs).await?;
-    let data_files = write_survivor_data_files(table, &new_rows).await?;
+    let data_files = write_partitioned_data_files(table, &new_rows).await?;
 
     let tx = Transaction::new(table);
     tx.row_delta()
@@ -938,9 +1181,16 @@ async fn merge_on_read_update(
     Ok(updated)
 }
 
-/// Copy-on-write UPDATE: rewrite ALL rows (matching rows take the new values, the rest unchanged) into
-/// new data files and replace all data via `OverwriteFiles`. Returns the number of rows updated.
-/// Unpartitioned tables only for now.
+/// Copy-on-write UPDATE: **file-level** rewrite — scan every live row projecting the table columns
+/// PLUS the reserved `_file` path, identify which source data files contain at least one updated row
+/// (the "affected" set), rewrite only those files in full (matched rows take the new values; rows of
+/// the same file that did NOT match are carried unchanged), and commit a `OverwriteFiles` that deletes
+/// the affected source paths and adds the rewritten files. Unaffected data files are left completely
+/// untouched.
+///
+/// Works for BOTH partitioned and unpartitioned tables. When the SET expression changes a
+/// partition-key column, the rewritten row is routed to its NEW partition automatically because
+/// `write_partitioned_data_files` computes partition values from the post-assignment column values.
 async fn copy_on_write_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -948,17 +1198,16 @@ async fn copy_on_write_update(
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
 ) -> DFResult<u64> {
-    if !table.metadata().default_partition_spec().is_unpartitioned() {
-        return Err(DataFusionError::NotImplemented(
-            "UPDATE on a partitioned table is not yet supported".to_string(),
-        ));
-    }
-
-    let projection: Vec<String> = table_schema
+    // 1. Scan EVERY live row projecting the table columns PLUS `_file` (not `_pos` — COW does not
+    //    need positions). We do NOT push the filter into the scan — Iceberg pushdown is inexact (see
+    //    the module note); the exact `PhysicalExpr` evaluation here is the correctness contract.
+    let mut projection: Vec<String> = table_schema
         .fields()
         .iter()
         .map(|field| field.name().clone())
         .collect();
+    projection.push(RESERVED_COL_NAME_FILE.to_string());
+
     let batches: Vec<RecordBatch> = table
         .scan()
         .select(projection)
@@ -971,30 +1220,96 @@ async fn copy_on_write_update(
         .await
         .map_err(to_datafusion_error)?;
 
-    let mut output_batches: Vec<RecordBatch> = Vec::new();
+    // 2. Pass 1 — affected-file detection. A source file is AFFECTED iff at least one of its rows
+    //    matches the predicate (or the predicate is None → all rows match → all files affected).
+    //    Also counts total updated rows for the return value.
     let mut updated: u64 = 0;
+    let mut affected: HashSet<String> = HashSet::new();
+
     for batch in &batches {
+        let num_rows = batch.num_rows();
+        let file_col = batch
+            .column_by_name(RESERVED_COL_NAME_FILE)
+            .ok_or_else(|| {
+                DataFusionError::Internal("update scan missing _file column".to_string())
+            })?;
         let table_batch = table_column_batch(batch, table_schema)?;
         let mask = match_mask(&predicate, &table_batch)?;
-        updated += mask.true_count() as u64;
-        // Per-row select: matching rows take the new value, the rest keep the old.
-        output_batches.push(apply_assignments(
-            &table_batch,
-            assignments,
-            table_schema,
-            Some(&mask),
-        )?);
+
+        for row in 0..num_rows {
+            // A row is updated iff the predicate is TRUE (NULL → SQL three-valued logic → NOT updated).
+            if mask.is_valid(row) && mask.value(row) {
+                updated += 1;
+                affected.insert(decode_file_path(file_col, row)?);
+            }
+        }
     }
 
-    // No matching rows → no-op (avoid a pointless rewrite of unchanged data).
+    // 3. No updated rows → no-op (avoid a pointless rewrite of unchanged data).
     if updated == 0 {
         return Ok(0);
     }
 
-    let new_files = write_survivor_data_files(table, &output_batches).await?;
+    // 4. Pass 2 — build rewrite content for affected files only.
+    //    For each batch: filter down to rows whose source file is in the affected set, then apply
+    //    the assignments with the per-row match mask so that:
+    //      * matched rows (WHERE = TRUE) take the new SET values
+    //      * other rows of the SAME affected file keep their original values (carried unchanged)
+    //    Rows from unaffected files are NOT included — their source files are untouched.
+    let mut rewritten_batches: Vec<RecordBatch> = Vec::new();
+
+    for batch in &batches {
+        let num_rows = batch.num_rows();
+        let file_col = batch
+            .column_by_name(RESERVED_COL_NAME_FILE)
+            .ok_or_else(|| {
+                DataFusionError::Internal("update scan missing _file column".to_string())
+            })?;
+
+        // Build table-column sub-batch (rows from the FULL batch including unaffected-file rows).
+        let table_batch = table_column_batch(batch, table_schema)?;
+
+        // Keep-mask: only rows whose source file is in the affected set.
+        let keep_affected: BooleanArray = (0..num_rows)
+            .map(|row| -> DFResult<bool> {
+                let path = decode_file_path(file_col, row)?;
+                Ok(affected.contains(&path))
+            })
+            .collect::<DFResult<Vec<bool>>>()?
+            .into_iter()
+            .collect();
+
+        // Filter down to affected-file rows (table columns only, no _file).
+        let affected_batch = filter_record_batch(&table_batch, &keep_affected)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        if affected_batch.num_rows() == 0 {
+            continue;
+        }
+
+        // Re-evaluate the WHERE predicate over the affected-file sub-batch to get the per-row
+        // match mask within those rows.
+        let affected_match_mask = match_mask(&predicate, &affected_batch)?;
+
+        // Apply assignments: matched rows take new values; non-matched rows keep old values.
+        let rewritten = apply_assignments(
+            &affected_batch,
+            assignments,
+            table_schema,
+            Some(&affected_match_mask),
+        )?;
+        rewritten_batches.push(rewritten);
+    }
+
+    // 5. Write rewritten content via the partition-aware TaskWriter. Routes each row to its correct
+    //    partition by the POST-assignment column values — a partition-key-changing UPDATE automatically
+    //    moves the row to the new partition file.
+    let new_files = write_partitioned_data_files(table, &rewritten_batches).await?;
+
+    // 6. Commit: delete the affected source files by path, add the rewritten files.
+    //    Use delete_files (NOT overwrite_by_row_filter) so unaffected files are left in place.
     let tx = Transaction::new(table);
     tx.overwrite_files()
-        .overwrite_by_row_filter(Predicate::AlwaysTrue)
+        .delete_files(affected.iter().cloned())
         .add_files(new_files)
         .apply(tx)
         .map_err(to_datafusion_error)?
