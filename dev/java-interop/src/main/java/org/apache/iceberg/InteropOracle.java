@@ -1563,6 +1563,23 @@ public final class InteropOracle {
         }
         break;
 
+      case "verify-interop-part-dml":
+        // PARTITIONED COW DELETE, DIRECTION 2 — "Java reads what RUST writes via DataFusion SQL DML"
+        // (U4 interop). The Rust GEN test (env ICEBERG_INTEROP_PART_DML_GEN_DIR) used DataFusion SQL
+        // to INSERT 4 rows into a partitioned V2 table (identity(category): electronics ids 1/2;
+        // books ids 3/4), ran SQL DELETE WHERE category='electronics' (copy-on-write), and wrote
+        // <dir>/rust_table with final.metadata.json. Here Java loads that RUST-written metadata,
+        // reads via IcebergGenerics, and asserts the surviving rows are EXACTLY ids {3,4} in the
+        // books partition (electronics removed by COW). A failure is a REAL DataFusion-DML
+        // write-incompatibility finding. The dir is via -Dinterop.part_dml.dir.
+        int partDmlFailures =
+            PartScanExecOracle.verifyPartDml(requireFixturesDir("interop.part_dml.dir"));
+        System.out.println("verify-interop-part-dml: " + partDmlFailures + " failures");
+        if (partDmlFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -7623,6 +7640,134 @@ public final class InteropOracle {
                 + "table, merge-on-read live rows = {11,15,21,23} (id 13 deleted, truncate=20 intact)");
       }
       return failures;
+    }
+
+    /**
+     * U4 PARTITIONED COW DELETE verify — "Java reads what RUST writes via DataFusion SQL DML."
+     *
+     * <p>The Rust GEN test (env {@code ICEBERG_INTEROP_PART_DML_GEN_DIR}) built a V2 partitioned
+     * {@code {id int, category string, value string}} table (identity(category) partition), INSERT
+     * four rows into two partitions (electronics: ids 1/2; books: ids 3/4), ran a SQL {@code DELETE
+     * FROM … WHERE category = 'electronics'} in copy-on-write mode, then wrote the mutated table to
+     * {@code <dir>/rust_table} with a {@code final.metadata.json}.
+     *
+     * <p>Here Java loads that RUST-written metadata, reads via {@code IcebergGenerics}, and asserts
+     * the surviving rows are EXACTLY ids {3, 4} in the books partition — the electronics partition
+     * data file has been removed by COW, and the books partition file is untouched.
+     *
+     * <p>A failure here is a REAL DataFusion-DML write-incompatibility finding.
+     */
+    static int verifyPartDml(Path dir) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL part-dml-d2: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL part-dml-d2: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      // Read all surviving rows via IcebergGenerics (applies any merge-on-read deletes).
+      // Schema: {1 id int, 2 category string, 3 value string}.
+      Map<Integer, String[]> rowsById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Integer id = (Integer) record.getField("id");
+          String category = (String) record.getField("category");
+          String value = (String) record.getField("value");
+          rowsById.put(id, new String[] {category, value});
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL part-dml-d2: Java could not READ the Rust-written partitioned COW-DELETE table: "
+                + readError);
+        return 1;
+      }
+
+      List<Integer> liveIds = new ArrayList<>(rowsById.keySet());
+      liveIds.sort(Integer::compareTo);
+
+      // ASSERTION 1: exactly 2 rows survive (the books partition only).
+      if (liveIds.size() != 2) {
+        System.out.println(
+            "FAIL part-dml-d2: expected 2 surviving rows (books partition), got "
+                + liveIds.size()
+                + " "
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS part-dml-d2: 2 rows survive (books partition)");
+      }
+
+      // ASSERTION 2: the deleted electronics rows (ids 1 and 2) must be ABSENT.
+      if (rowsById.containsKey(1) || rowsById.containsKey(2)) {
+        System.out.println(
+            "FAIL part-dml-d2: electronics ids 1/2 must be ABSENT after COW DELETE; live="
+                + liveIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS part-dml-d2: electronics ids 1/2 absent (COW DELETE removed the partition file)");
+      }
+
+      // ASSERTION 3: surviving ids must be exactly {3, 4} (books partition).
+      if (!liveIds.equals(Arrays.asList(3, 4))) {
+        System.out.println(
+            "FAIL part-dml-d2: expected surviving ids=[3,4], got " + liveIds);
+        failures++;
+      } else {
+        System.out.println("PASS part-dml-d2: surviving ids = [3, 4]");
+      }
+
+      // ASSERTION 4: column values must match the inserted books rows exactly.
+      boolean valuesOk = true;
+      String[] row3 = rowsById.get(3);
+      String[] row4 = rowsById.get(4);
+      if (row3 == null || !"books".equals(row3[0]) || !"novel".equals(row3[1])) {
+        System.out.println(
+            "FAIL part-dml-d2: id=3 expected (books,novel) got "
+                + (row3 == null ? "null" : Arrays.toString(row3)));
+        valuesOk = false;
+        failures++;
+      }
+      if (row4 == null || !"books".equals(row4[0]) || !"textbook".equals(row4[1])) {
+        System.out.println(
+            "FAIL part-dml-d2: id=4 expected (books,textbook) got "
+                + (row4 == null ? "null" : Arrays.toString(row4)));
+        valuesOk = false;
+        failures++;
+      }
+      if (valuesOk) {
+        System.out.println(
+            "PASS part-dml-d2: id=3 → (books,novel); id=4 → (books,textbook)");
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-part-dml OK — Java read the RUST-written partitioned COW-DELETE table; "
+                + "survivor ids = {3,4} (books partition: novel/textbook); "
+                + "electronics ids 1/2 absent (COW removed the partition file)");
+      }
+      return failures;
+    }
+
+    /** Read a UTF-8 file to a String. */
+    private static String readString(Path path) throws IOException {
+      return new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
     }
   }
 
