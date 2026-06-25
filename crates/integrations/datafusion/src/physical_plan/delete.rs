@@ -37,8 +37,18 @@
 //! exact filter is the contract; pushdown is only ever a (future) pruning optimization layered under it.
 //!
 //! **Memory.** Every path buffers the full live row set (the table scan is collected before any write
-//! begins) — intended for tables that fit in executor memory; streaming + partition-aware rewrites are a
-//! follow-up.
+//! begins) — intended for tables that fit in executor memory; streaming is a follow-up.
+//!
+//! **Scope / limitations (out of scope here, named honestly):**
+//!   * **Concurrency** — the commits use snapshot isolation; we do **not** set
+//!     `validate_no_conflicting_data`/`validate_no_conflicting_deletes`/`validate_from_snapshot`, so a
+//!     concurrent writer can be lost (this matches Java's *default*, where serializable validation is
+//!     opt-in). Layering the validations on is a follow-up.
+//!   * **Partition evolution / multi-spec tables** — copy-on-write rewrites survivors under the table's
+//!     *current* partition spec (as Java does) and merge-on-read stamps each position-delete file with
+//!     its target data file's *own* `(spec_id, partition)`; both are exercised on single-spec tables but
+//!     a table whose specs have evolved is not yet covered by a test.
+//!   * **Streaming** — see *Memory* above.
 //!
 //! The plan emits a single `UInt64` `count` row (rows affected), per DataFusion's DML contract.
 
