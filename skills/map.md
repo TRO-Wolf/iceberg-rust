@@ -53,7 +53,7 @@ The four manuals are variants of the same contract; **the rules are identical** 
 | Find the `map.md` convention spec | any of the four (Navigation section) — but the repo's authoritative rule is in [CLAUDE.md](../CLAUDE.md) `<map_md_navigation>` |
 | Find the testing-discipline contract (mandatory before any code change) | [docs/testing.md](../docs/testing.md) (referenced from each manual's verification gate) |
 | Resolve a manual-vs-repo conflict | [CLAUDE.md](../CLAUDE.md) (it wins) |
-| Know the sub-agent / parallelism policy | [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single-agent by default; spawned sub-agents are Sonnet/Haiku only (each manual's Workflow Orchestration section points here; `Fable.md`'s Frontier Addendum adds: never spawn Fable-tier sub-agents unless the user names the tier) |
+| Know the sub-agent / parallelism policy | [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single agent for small stuff; a PR-shipping Actor–Critic cycle has a mandatory independent Critic, and a spawned Actor + Critic **default to Opus** (`OO` = Opus–Opus). (Each manual's Workflow Orchestration section points here; `Fable.md`'s Frontier Addendum adds: never spawn Fable-tier sub-agents above Opus unless the user names the tier.) |
 | Find the plan / lessons workflow | [task/todo.md](../task/todo.md) + [task/lessons.md](../task/lessons.md) (each manual's Workflow Storage section) |
 | Compact the lessons file / decide what to archive | [compaction.md](compaction.md) — its own scoped change, interactive-approval-only |
 | Find an old archived lesson | [task/lessons-archive/map.md](../task/lessons-archive/map.md) (archives are read on demand, never by default — see [compaction.md](compaction.md)) |

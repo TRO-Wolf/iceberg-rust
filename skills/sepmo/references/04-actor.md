@@ -56,13 +56,18 @@ The Orchestrator mediates everything between Actor and Critic. **The Actor only
 ever talks to the Orchestrator.** The role prompt below therefore contains no
 mention of the Critic, review, or audit. That omission is a feature, not a gap.
 
-### Blindness under the single-agent default (Actor-phase → Critic-phase)
+### Blindness under the single-agent fallback (Actor-phase → Critic-phase)
 
-When the project's sub-agent policy sets a **single-agent default** — as this
-repo's does ([binding-manifest.md](../binding-manifest.md) *Sub-agent / tier
-policy*; [SKILL.md](../SKILL.md) *Model assumption*) — the Actor and Critic are not
-separate agents: one frontier session runs the **Actor phase** and later the
-**Critic phase**. There, "blind to the Critic" becomes a **build-phase
+> **This repo's binding selects the multi-agent path:** the per-PR Critic is a
+> **mandatory independent agent** (fresh context), and a spawned Actor + that Critic
+> **default to Opus** — `OO` = Opus–Opus ([binding-manifest.md](../binding-manifest.md)
+> *Sub-agent / tier policy*; [CLAUDE.md](../../CLAUDE.md) `<subagent_policy>`). The
+> single-agent role-shift below is the **fallback** for trivial work that never reaches
+> a PR, not the default for anything that ships.
+
+When a project's sub-agent policy sets a **single-agent default** — the Actor and
+Critic are not separate agents: one frontier session runs the **Actor phase** and
+later the **Critic phase**. There, "blind to the Critic" becomes a **build-phase
 discipline** — while in the Actor phase you build the slice purely on its merits
 and do not look ahead to how you will later attack it; only after honestly
 concluding the build do you switch hats and attack what you built as if a stranger
@@ -70,8 +75,10 @@ wrote it. The independence is earned by *sequencing*, not separation, and it is
 **weaker** than two genuinely separate agents — self-review is less independent
 than a fresh adversary, and the Critic's "too-clean → re-run" guard only partly
 compensates. SEPMO names that tradeoff rather than hiding it. The literal
-separate-agent Actor/Critic pair (the opt-in stronger form) applies only when the
-user lifts the single-agent policy.
+separate-agent Actor/Critic pair is the stronger form SEPMO prefers wherever a
+project binds it; **this repo binds it as the per-PR default** (the mandatory
+independent Opus Critic — see the box above), reserving the single-agent role-shift
+for trivial work that never reaches a PR.
 
 ---
 

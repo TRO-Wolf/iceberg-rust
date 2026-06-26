@@ -135,7 +135,7 @@ Ask it before writing code (it shapes the design), while writing code (it shapes
 
 ## Workflow Orchestration
 
-> **Sub-agent policy.** Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` ("Agent orchestration — current policy") if it is present — this repo's default is **single-agent**. Do **not** spawn sub-agents (`Agent` / Task, `Workflow`, plan-mode `Explore` / `Plan`) unless the user explicitly asks; when they do, the spawned agents must run as **Sonnet or Haiku, never Opus**, unless the user names Opus. CLAUDE.md wins on any conflict.
+> **Sub-agent policy.** Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` ("Agent orchestration — current policy") if it is present — single agent for searches/reads/trivial edits, but **any change that ships as a PR runs an Actor–Critic cycle with a mandatory independent Critic**. A spawned Actor and the Critic **default to Opus** — this repo's `OO` (Opus–Opus); never run the Critic below Opus on a correctness-bearing review. `Workflow` fan-out and plan-mode `Explore`/`Plan` helpers stay opt-in. CLAUDE.md wins on any conflict.
 
 ### 1. Reason Before You Act — and record the plan
 
