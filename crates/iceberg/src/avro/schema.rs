@@ -2073,6 +2073,13 @@ mod tests {
         let err = visit(&deep, &mut converter)
             .expect_err("over-deep avro schema must error, not overflow");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        // A programmatically nested array ALSO errors on a missing element-id, so a bare
+        // `DataInvalid` check is vacuous (it passes even with the depth bound disabled). Require
+        // the depth-SPECIFIC message so disabling the bound makes this test go RED.
+        assert!(
+            format!("{err}").contains("nesting exceeds maximum depth"),
+            "expected the depth-bound error, got: {err}"
+        );
 
         // A shallow array still descends past the (absent) bound; it will fail later on the
         // missing element-id, but NOT with a depth error — proving the bound does not over-fire.

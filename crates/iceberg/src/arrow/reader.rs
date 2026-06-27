@@ -2971,6 +2971,30 @@ message schema {
         Arc::new(SchemaDescriptor::new(Arc::new(schema)))
     }
 
+    /// FIX (reader): `filter_row_groups_by_byte_range` guards `start + length` with
+    /// `checked_add`; a split descriptor with `start = u64::MAX, length = 1` must return a typed
+    /// `DataInvalid` error rather than overflowing `u64`. (The negative-`compressed_size` branch
+    /// stays untested here — it needs fabricated row-group metadata with a negative size, which
+    /// the public `RowGroupMetaData` builder does not let us construct.)
+    #[test]
+    fn test_filter_row_groups_by_byte_range_start_plus_length_overflow() {
+        use parquet::file::metadata::{FileMetaData, ParquetMetaData};
+
+        let schema_descr = get_test_schema_descr();
+        // An empty file metadata suffices: the overflow guard fires before any row group is
+        // examined, and a corrupt split must not even begin iterating.
+        let file_metadata = FileMetaData::new(1, 0, None, None, schema_descr, None);
+        let parquet_metadata = Arc::new(ParquetMetaData::new(file_metadata, Vec::new()));
+
+        let err = ArrowReader::filter_row_groups_by_byte_range(&parquet_metadata, u64::MAX, 1)
+            .expect_err("start + length overflowing u64 must error, not overflow");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "an overflowing byte range must be a typed DataInvalid error, got: {err}"
+        );
+    }
+
     /// Verifies that file splits respect byte ranges and only read specific row groups.
     #[tokio::test]
     async fn test_file_splits_respect_byte_ranges() {
