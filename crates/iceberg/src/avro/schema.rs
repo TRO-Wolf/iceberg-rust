@@ -460,8 +460,33 @@ pub(crate) trait AvroSchemaVisitor {
     }
 }
 
+/// Maximum nesting depth of the Avro schema the visitor will descend.
+///
+/// A manifest is Avro and may be partner/attacker-influenced; without a bound a deeply-nested
+/// (record/array/map) schema would overflow the thread stack on this recursive walk. Mirrors the
+/// variant parser's [`crate::variant::MAX_NESTING_DEPTH`] (`128`) — far above any real Iceberg
+/// schema's nesting, matching the common JSON-parser default.
+const MAX_AVRO_SCHEMA_DEPTH: usize = 128;
+
 /// Visit avro schema in post order visitor.
 pub(crate) fn visit<V: AvroSchemaVisitor>(schema: &AvroSchema, visitor: &mut V) -> Result<V::T> {
+    visit_at_depth(schema, visitor, 0)
+}
+
+/// Depth-bounded body of [`visit`]. `depth` is the current nesting level (root at `0`); every
+/// nested record/array/map child recurses at `depth + 1`, and exceeding [`MAX_AVRO_SCHEMA_DEPTH`]
+/// returns a typed error instead of overflowing the stack.
+fn visit_at_depth<V: AvroSchemaVisitor>(
+    schema: &AvroSchema,
+    visitor: &mut V,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_AVRO_SCHEMA_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Avro schema nesting exceeds maximum depth {MAX_AVRO_SCHEMA_DEPTH}"),
+        ));
+    }
     match schema {
         AvroSchema::Record(record) => {
             // A record carrying the `variant` logical type is the schema of an Iceberg variant
@@ -492,7 +517,7 @@ pub(crate) fn visit<V: AvroSchemaVisitor>(schema: &AvroSchema, visitor: &mut V) 
             let field_results = record
                 .fields
                 .iter()
-                .map(|f| visit(&f.schema, visitor))
+                .map(|f| visit_at_depth(&f.schema, visitor, depth + 1))
                 .collect::<Result<Vec<V::T>>>()?;
 
             visitor.record(record, field_results)
@@ -501,7 +526,7 @@ pub(crate) fn visit<V: AvroSchemaVisitor>(schema: &AvroSchema, visitor: &mut V) 
             let option_results = union
                 .variants()
                 .iter()
-                .map(|f| visit(f, visitor))
+                .map(|f| visit_at_depth(f, visitor, depth + 1))
                 .collect::<Result<Vec<V::T>>>()?;
 
             visitor.union(union, option_results)
@@ -514,8 +539,23 @@ pub(crate) fn visit<V: AvroSchemaVisitor>(schema: &AvroSchema, visitor: &mut V) 
             {
                 if logical_type == MAP_LOGICAL_TYPE {
                     if let AvroSchema::Record(record_schema) = &*item.items {
-                        let key = visit(&record_schema.fields[0].schema, visitor)?;
-                        let value = visit(&record_schema.fields[1].schema, visitor)?;
+                        // A `logicalType:"map"` array's item record must have exactly the two
+                        // (key, value) fields; a corrupt/hostile manifest may carry fewer, which
+                        // would otherwise panic on `fields[0]` / `fields[1]`.
+                        let key_field = record_schema.fields.first().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "Avro map record must have exactly 2 fields, missing key field.",
+                            )
+                        })?;
+                        let value_field = record_schema.fields.get(1).ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "Avro map record must have exactly 2 fields, missing value field.",
+                            )
+                        })?;
+                        let key = visit_at_depth(&key_field.schema, visitor, depth + 1)?;
+                        let value = visit_at_depth(&value_field.schema, visitor, depth + 1)?;
                         return visitor.map_array(record_schema, key, value);
                     } else {
                         return Err(Error::new(
@@ -532,11 +572,11 @@ pub(crate) fn visit<V: AvroSchemaVisitor>(schema: &AvroSchema, visitor: &mut V) 
                     ));
                 }
             }
-            let item_result = visit(&item.items, visitor)?;
+            let item_result = visit_at_depth(&item.items, visitor, depth + 1)?;
             visitor.array(item, item_result)
         }
         AvroSchema::Map(inner) => {
-            let item_result = visit(&inner.types, visitor)?;
+            let item_result = visit_at_depth(&inner.types, visitor, depth + 1)?;
             visitor.map(inner, item_result)
         }
         schema => visitor.primitive(schema),
@@ -593,8 +633,13 @@ impl AvroSchemaVisitor for AvroSchemaToSchema {
 
             let optional = is_avro_optional(&avro_field.schema);
 
-            let mut field =
-                NestedField::new(field_id, &avro_field.name, field_type.unwrap(), !optional);
+            let field_type = field_type.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "null is not a valid Iceberg field type",
+                )
+            })?;
+            let mut field = NestedField::new(field_id, &avro_field.name, field_type, !optional);
 
             if let Some(doc) = &avro_field.doc {
                 field = field.with_doc(doc);
@@ -625,21 +670,31 @@ impl AvroSchemaVisitor for AvroSchemaToSchema {
             );
         }
 
-        if options.len() == 1 {
-            Ok(Some(options.remove(0).unwrap()))
+        let resolved = if options.len() == 1 {
+            options.remove(0)
         } else {
-            Ok(Some(options.remove(1).unwrap()))
-        }
+            options.remove(1)
+        };
+        let resolved = resolved.ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "null is not a valid Iceberg union member type",
+            )
+        })?;
+        Ok(Some(resolved))
     }
 
     fn array(&mut self, array: &ArraySchema, item: Option<Type>) -> Result<Self::T> {
         let element_field_id = Self::get_element_id_from_attributes(&array.attributes, ELEMENT_ID)?;
-        let element_field = NestedField::list_element(
-            element_field_id,
-            item.unwrap(),
-            !is_avro_optional(&array.items),
-        )
-        .into();
+        let item = item.ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "null is not a valid Iceberg list element type",
+            )
+        })?;
+        let element_field =
+            NestedField::list_element(element_field_id, item, !is_avro_optional(&array.items))
+                .into();
         Ok(Some(Type::List(ListType { element_field })))
     }
 
@@ -648,11 +703,14 @@ impl AvroSchemaVisitor for AvroSchemaToSchema {
         let key_field =
             NestedField::map_key_element(key_field_id, Type::Primitive(PrimitiveType::String));
         let value_field_id = Self::get_element_id_from_attributes(&map.attributes, VALUE_ID)?;
-        let value_field = NestedField::map_value_element(
-            value_field_id,
-            value.unwrap(),
-            !is_avro_optional(&map.types),
-        );
+        let value = value.ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "null is not a valid Iceberg map value type",
+            )
+        })?;
+        let value_field =
+            NestedField::map_value_element(value_field_id, value, !is_avro_optional(&map.types));
         Ok(Some(Type::Map(MapType {
             key_field: key_field.into(),
             value_field: value_field.into(),
@@ -713,19 +771,30 @@ impl AvroSchemaVisitor for AvroSchemaToSchema {
                 "Can't convert avro map schema, missing value schema.",
             )
         })?;
-        let key_id = Self::get_element_id_from_attributes(
-            &array.fields[0].custom_attributes,
-            FIELD_ID_PROP,
-        )?;
+        // Guard the (key, value) field accesses: a corrupt map record may have < 2 fields.
+        let key_avro_field = array.fields.first().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Avro map record must have exactly 2 fields, missing key field.",
+            )
+        })?;
+        let value_avro_field = array.fields.get(1).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Avro map record must have exactly 2 fields, missing value field.",
+            )
+        })?;
+        let key_id =
+            Self::get_element_id_from_attributes(&key_avro_field.custom_attributes, FIELD_ID_PROP)?;
         let value_id = Self::get_element_id_from_attributes(
-            &array.fields[1].custom_attributes,
+            &value_avro_field.custom_attributes,
             FIELD_ID_PROP,
         )?;
         let key_field = NestedField::map_key_element(key_id, key);
         let value_field = NestedField::map_value_element(
             value_id,
             value,
-            !is_avro_optional(&array.fields[1].schema),
+            !is_avro_optional(&value_avro_field.schema),
         );
         Ok(Some(Type::Map(MapType {
             key_field: key_field.into(),
@@ -1922,6 +1991,98 @@ mod tests {
         assert_eq!(
             iceberg_type,
             converter.primitive(&avro_schema).unwrap().unwrap()
+        );
+    }
+
+    /// FIX 3a: a `logicalType:"map"` array whose item record has != 2 fields must yield a typed
+    /// `DataInvalid` error rather than panicking on `fields[0]` / `fields[1]`.
+    #[test]
+    fn test_map_record_with_wrong_field_count_is_data_invalid() {
+        let avro_schema = AvroSchema::parse_str(
+            r#"
+            {
+                "type": "array",
+                "logicalType": "map",
+                "items": {
+                    "type": "record",
+                    "name": "k_v",
+                    "fields": [
+                        {"name": "key", "type": "string", "field-id": 1}
+                    ]
+                }
+            }
+            "#,
+        )
+        .expect("crafted avro schema must parse");
+
+        let mut converter = AvroSchemaToSchema;
+        let err = visit(&avro_schema, &mut converter)
+            .expect_err("a 1-field map record must error, not panic");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    /// FIX 3b: a bare Avro `null` field type (which Iceberg never emits but the Avro parser
+    /// accepts) must yield a typed `DataInvalid` error rather than `.unwrap()`-panicking on the
+    /// visitor's `Option<Type>`.
+    #[test]
+    fn test_bare_null_field_type_is_data_invalid() {
+        let avro_schema = AvroSchema::parse_str(
+            r#"
+            {
+                "type": "record",
+                "name": "with_null_field",
+                "fields": [
+                    {"name": "n", "type": "null", "field-id": 1}
+                ]
+            }
+            "#,
+        )
+        .expect("crafted avro schema must parse");
+
+        let mut converter = AvroSchemaToSchema;
+        let err = visit(&avro_schema, &mut converter)
+            .expect_err("a bare-null field type must error, not panic");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    /// FIX 5 (avro): an Avro schema nested deeper than [`MAX_AVRO_SCHEMA_DEPTH`] must return a
+    /// typed error at the bound instead of overflowing the stack; a normally-nested schema still
+    /// converts.
+    #[test]
+    fn test_avro_schema_depth_limit() {
+        use std::collections::BTreeMap;
+
+        use apache_avro::schema::ArraySchema;
+
+        // Build the nested schema PROGRAMMATICALLY (apache_avro's JSON parser has its own,
+        // lower, recursion limit, so a deep `parse_str` would fail before our visitor runs).
+        // Wrap an int leaf in `MAX_AVRO_SCHEMA_DEPTH + 5` arrays.
+        fn nested_array(depth: usize) -> AvroSchema {
+            let mut schema = AvroSchema::Int;
+            for _ in 0..depth {
+                schema = AvroSchema::Array(ArraySchema {
+                    items: Box::new(schema),
+                    attributes: BTreeMap::new(),
+                });
+            }
+            schema
+        }
+
+        let deep = nested_array(MAX_AVRO_SCHEMA_DEPTH + 5);
+        let mut converter = AvroSchemaToSchema;
+        let err = visit(&deep, &mut converter)
+            .expect_err("over-deep avro schema must error, not overflow");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+        // A shallow array still descends past the (absent) bound; it will fail later on the
+        // missing element-id, but NOT with a depth error — proving the bound does not over-fire.
+        let shallow = nested_array(4);
+        let mut converter = AvroSchemaToSchema;
+        let shallow_err = visit(&shallow, &mut converter)
+            .expect_err("shallow array lacks element-id, so conversion still errors");
+        assert!(
+            !format!("{shallow_err}").contains("nesting exceeds maximum depth"),
+            "a shallow schema must not hit the depth bound, got: {shallow_err}"
         );
     }
 }

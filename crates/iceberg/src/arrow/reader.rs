@@ -1473,14 +1473,34 @@ impl ArrowReader {
     ) -> Result<Vec<usize>> {
         let row_groups = parquet_metadata.row_groups();
         let mut selected = Vec::new();
-        let end = start + length;
+        // `start + length` can overflow `u64` on a hostile/corrupt split descriptor.
+        let end = start.checked_add(length).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Row-group byte range start + length overflows u64",
+            )
+        })?;
 
         // Row groups are stored sequentially after the 4-byte magic header.
         let mut current_byte_offset = 4u64;
 
         for (idx, row_group) in row_groups.iter().enumerate() {
-            let row_group_size = row_group.compressed_size() as u64;
-            let row_group_end = current_byte_offset + row_group_size;
+            // `compressed_size()` is an `i64`; a corrupt negative size must not wrap when cast.
+            let row_group_size = u64::try_from(row_group.compressed_size()).map_err(|_| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Row-group compressed size is negative",
+                )
+            })?;
+            let row_group_end =
+                current_byte_offset
+                    .checked_add(row_group_size)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "Row-group byte offset overflows u64",
+                        )
+                    })?;
 
             if current_byte_offset < end && start < row_group_end {
                 selected.push(idx);

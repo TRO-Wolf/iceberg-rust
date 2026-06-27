@@ -431,12 +431,10 @@ pub(crate) fn update_snapshot_summaries(
 
     let mut summary = match previous_summary {
         Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
-            truncate_table_summary(summary, prev_summary)
-                .map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
-                        .with_source(err)
-                })
-                .unwrap()
+            truncate_table_summary(summary, prev_summary).map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
+                    .with_source(err)
+            })?
         }
         _ => summary,
     };
@@ -492,13 +490,15 @@ pub(crate) fn update_snapshot_summaries(
 }
 
 #[allow(dead_code)]
-fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i32> {
+fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i64> {
+    // Java `SnapshotSummary` carries every `total-*` as a `long`; parse the same width here so a
+    // table exceeding `i32::MAX` records / files-size does not spuriously error (was `i32`).
     let value_str = previous_summary
         .additional_properties
         .get(prop)
         .map(String::as_str)
         .unwrap_or("0");
-    value_str.parse::<i32>().map_err(|err| {
+    value_str.parse::<i64>().map_err(|err| {
         Error::new(
             ErrorKind::Unexpected,
             "Failed to parse value from previous summary property.",
@@ -564,6 +564,18 @@ fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> R
     Ok(summary)
 }
 
+/// Recompute a single `total-*` property as `previousTotal + added - removed`, mirroring Java
+/// `SnapshotSummary.updateTotal` (1.10.0).
+///
+/// Java contract: it parses the previous total as a `long`; if the previous value is **absent or
+/// unparsable** it leaves the total **invalidated** (the property is dropped), and otherwise
+/// computes `newTotal = previousTotal + added - removed` and writes it back **only when
+/// `newTotal >= 0`** — a negative result also invalidates (drops) the property. It never panics
+/// and never persists a wrapped/negative value.
+///
+/// This Rust port matches that exactly: all arithmetic is done in checked `i64` (the Java `long`
+/// width — see [`get_prop`]); a missing/non-numeric previous total, a non-numeric added/removed
+/// value, an overflow, or a `< 0` result all drop (do not insert) the total property.
 #[allow(dead_code)]
 fn update_totals(
     summary: &mut Summary,
@@ -572,31 +584,60 @@ fn update_totals(
     added_property: &str,
     removed_property: &str,
 ) {
-    let previous_total = previous_summary.map_or(0, |previous_summary| {
-        previous_summary
-            .additional_properties
-            .get(total_property)
-            .map_or(0, |value| value.parse::<u64>().unwrap())
+    // Added/removed counters are produced by this collector and are always numeric; default an
+    // absent or (defensively) non-numeric value to 0 so it does not affect the total.
+    fn previous_added_or_removed(props: &HashMap<String, String>, key: &str) -> i64 {
+        props
+            .get(key)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+
+    // Parse a numeric summary property as the Java `long` width, distinguishing the three cases
+    // Java's `updateTotal` treats differently:
+    //   * `None`        → the key is ABSENT: defaults to 0 (a fresh/first snapshot has no prior
+    //                     total yet, so the count accumulates from zero).
+    //   * `Some(Some)`  → present and parsable.
+    //   * `Some(None)`  → present but NON-NUMERIC: triggers Java's invalidation of the total.
+    fn parse_total(props: &HashMap<String, String>, key: &str) -> Option<Option<i64>> {
+        props.get(key).map(|value| value.parse::<i64>().ok())
+    }
+
+    // Added/removed are written by this same collector and are always numeric; an absent or
+    // (defensively) non-numeric value contributes 0.
+    let added = previous_added_or_removed(&summary.additional_properties, added_property);
+    let removed = previous_added_or_removed(&summary.additional_properties, removed_property);
+
+    // Resolve the previous total. An absent total prop means 0; a present-but-non-numeric value
+    // means "invalidate" (mirrors Java's `NumberFormatException` catch path).
+    let previous_total = match previous_summary.and_then(|previous_summary| {
+        parse_total(&previous_summary.additional_properties, total_property)
+    }) {
+        // Present and parsable.
+        Some(Some(value)) => Some(value),
+        // Present but non-numeric → invalidate.
+        Some(None) => None,
+        // Absent (or no previous summary at all) → start from 0.
+        None => Some(0),
+    };
+
+    let new_total = previous_total.and_then(|previous_total| {
+        // Checked arithmetic so a stale/hostile previous summary can never wrap or panic.
+        previous_total.checked_add(added)?.checked_sub(removed)
     });
 
-    let mut new_total = previous_total;
-    if let Some(value) = summary
-        .additional_properties
-        .get(added_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
-        new_total += value;
+    match new_total {
+        // Java writes back only when the total resolved and `newTotal >= 0`.
+        Some(new_total) if new_total >= 0 => {
+            summary
+                .additional_properties
+                .insert(total_property.to_string(), new_total.to_string());
+        }
+        // Non-numeric previous, overflow, or negative result → invalidate (drop) the total.
+        _ => {
+            summary.additional_properties.remove(total_property);
+        }
     }
-    if let Some(value) = summary
-        .additional_properties
-        .get(removed_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
-        new_total -= value;
-    }
-    summary
-        .additional_properties
-        .insert(total_property.to_string(), new_total.to_string());
 }
 
 #[cfg(test)]
@@ -795,6 +836,130 @@ mod tests {
                 .get(REMOVED_EQUALITY_DELETES)
                 .unwrap(),
             "2"
+        );
+    }
+
+    #[test]
+    fn test_update_totals_invalidates_when_removed_exceeds_previous_plus_added() {
+        // Java `SnapshotSummary.updateTotal`: a `newTotal < 0` invalidates (drops) the property.
+        // A stale/hand-edited previous summary whose `removed-*` exceeds `previous + added` must
+        // NOT panic (debug overflow) or wrap (release) — the total key is simply omitted.
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(TOTAL_RECORDS.to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [
+                (ADDED_RECORDS.to_string(), "5".to_string()),
+                // 100 + 5 - 1000 = -895 → invalidate.
+                (DELETED_RECORDS.to_string(), "1000".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false)
+            .expect("update_snapshot_summaries must not error on a stale previous summary");
+
+        assert!(
+            !updated.additional_properties.contains_key(TOTAL_RECORDS),
+            "negative computed total must invalidate (drop) the total-records property, got {:?}",
+            updated.additional_properties.get(TOTAL_RECORDS)
+        );
+    }
+
+    #[test]
+    fn test_update_totals_invalidates_on_non_numeric_previous_total() {
+        // Java parses the previous total as a `long`; an unparsable previous value leaves the
+        // total invalidated. The old Rust code `.unwrap()`-ed the parse and panicked here.
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(TOTAL_RECORDS.to_string(), "not-a-number".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(ADDED_RECORDS.to_string(), "10".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false)
+            .expect("non-numeric previous total must not panic");
+
+        assert!(
+            !updated.additional_properties.contains_key(TOTAL_RECORDS),
+            "non-numeric previous total must invalidate (drop) the total-records property"
+        );
+    }
+
+    #[test]
+    fn test_update_totals_normal_case_still_computes() {
+        // Guard against the invalidation path over-firing: a valid previous + added - removed
+        // must still produce the correct positive total.
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(TOTAL_RECORDS.to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [
+                (ADDED_RECORDS.to_string(), "40".to_string()),
+                (DELETED_RECORDS.to_string(), "10".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false)
+            .expect("normal case must succeed");
+
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(TOTAL_RECORDS)
+                .map(String::as_str),
+            Some("130"),
+            "100 + 40 - 10 = 130"
+        );
+    }
+
+    #[test]
+    fn test_total_value_above_i32_max_round_trips() {
+        // FIX 2: `total-*` is a Java `long`; a value > i32::MAX must flow through the
+        // get_prop / truncate_table_summary path without error (the old `i32` parse errored).
+        let big: i64 = i64::from(i32::MAX) + 1; // 2_147_483_648
+        let previous_summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: [(TOTAL_RECORDS.to_string(), big.to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        // Direct get_prop must parse the wide value.
+        let parsed = get_prop(&previous_summary, TOTAL_RECORDS).expect("wide total must parse");
+        assert_eq!(parsed, big);
+
+        // And it must round-trip through truncate_table_summary into the removed-* counter.
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::new(),
+        };
+        let truncated =
+            truncate_table_summary(summary, &previous_summary).expect("truncate must not error");
+        assert_eq!(
+            truncated
+                .additional_properties
+                .get(DELETED_RECORDS)
+                .map(String::as_str),
+            Some(big.to_string().as_str()),
+            "the > i32::MAX previous total must round-trip into deleted-records"
         );
     }
 

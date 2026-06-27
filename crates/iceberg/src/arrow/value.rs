@@ -35,6 +35,40 @@ use crate::spec::{
 };
 use crate::{Error, ErrorKind, Result};
 
+/// Reassemble per-row list literals from a flat `elements` buffer and an Arrow offset buffer,
+/// with every offset bounds-checked.
+///
+/// arrow-rs guarantees its own offsets are monotonic and in-range, but a custom (non-arrow-rs)
+/// FileIO producer could feed a degenerate buffer: empty offsets (`len() - 1` would underflow to
+/// `usize::MAX` and abort `with_capacity`), `end < start`, or `end > elements.len()` (a slice
+/// panic). Each of those is turned into a typed `DataInvalid` error here.
+fn slice_list_by_offsets<O: arrow_array::OffsetSizeTrait>(
+    offsets: &[O],
+    elements: &[Option<Literal>],
+) -> Result<Vec<Option<Literal>>> {
+    // `saturating_sub` so an empty offset buffer yields capacity 0 instead of underflowing.
+    let row_count = offsets.len().saturating_sub(1);
+    let mut result = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let start = offsets[i].as_usize();
+        let end = offsets[i + 1].as_usize();
+        if start > end {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "List offsets are not monotonically increasing",
+            ));
+        }
+        let slice = elements.get(start..end).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "List offset slice is out of bounds for the element buffer",
+            )
+        })?;
+        result.push(Some(Literal::List(slice.to_vec())));
+    }
+    Ok(result)
+}
+
 struct ArrowArrayToIcebergStructConverter;
 
 impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
@@ -125,14 +159,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                         Error::new(ErrorKind::DataInvalid, "The partner is not a list array")
                     })?
                     .offsets();
-                // combine the result according to the offset
-                let mut result = Vec::with_capacity(offset.len() - 1);
-                for i in 0..offset.len() - 1 {
-                    let start = offset[i] as usize;
-                    let end = offset[i + 1] as usize;
-                    result.push(Some(Literal::List(elements[start..end].to_vec())));
-                }
-                Ok(result)
+                slice_list_by_offsets(offset, &elements)
             }
             DataType::LargeList(_) => {
                 let offset = array
@@ -145,21 +172,32 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                         )
                     })?
                     .offsets();
-                // combine the result according to the offset
-                let mut result = Vec::with_capacity(offset.len() - 1);
-                for i in 0..offset.len() - 1 {
-                    let start = offset[i] as usize;
-                    let end = offset[i + 1] as usize;
-                    result.push(Some(Literal::List(elements[start..end].to_vec())));
-                }
-                Ok(result)
+                slice_list_by_offsets(offset, &elements)
             }
             DataType::FixedSizeList(_, len) => {
-                let mut result = Vec::with_capacity(elements.len() / *len as usize);
-                for i in 0..elements.len() / *len as usize {
-                    let start = i * *len as usize;
-                    let end = (i + 1) * *len as usize;
-                    result.push(Some(Literal::List(elements[start..end].to_vec())));
+                // A zero-width FixedSizeList would divide-by-zero below; arrow-rs forbids it but a
+                // custom (non-arrow-rs) FileIO producer could feed one in.
+                let width = usize::try_from(*len).map_err(|_| {
+                    Error::new(ErrorKind::DataInvalid, "FixedSizeList width is negative")
+                })?;
+                if width == 0 {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "FixedSizeList width must be greater than zero",
+                    ));
+                }
+                let count = elements.len() / width;
+                let mut result = Vec::with_capacity(count);
+                for i in 0..count {
+                    let start = i * width;
+                    let end = (i + 1) * width;
+                    let slice = elements.get(start..end).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "FixedSizeList slice is out of bounds for the element buffer",
+                        )
+                    })?;
+                    result.push(Some(Literal::List(slice.to_vec())));
                 }
                 Ok(result)
             }
@@ -190,14 +228,38 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
             .downcast_ref::<MapArray>()
             .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "The partner is not a map array"))?
             .offsets();
-        // combine the result according to the offset
-        let mut result = Vec::with_capacity(offsets.len() - 1);
-        for i in 0..offsets.len() - 1 {
+        // combine the result according to the offset; bounds-check every access so a degenerate
+        // offset buffer from a custom FileIO producer yields a typed error, not a panic/abort.
+        let row_count = offsets.len().saturating_sub(1);
+        let mut result = Vec::with_capacity(row_count);
+        for i in 0..row_count {
             let start = offsets[i] as usize;
             let end = offsets[i + 1] as usize;
+            if start > end {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Map offsets are not monotonically increasing",
+                ));
+            }
+            let key_slice = key_values.get(start..end).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Map key offset slice is out of bounds",
+                )
+            })?;
+            let value_slice = values.get(start..end).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Map value offset slice is out of bounds",
+                )
+            })?;
             let mut map = Map::new();
-            for (key, value) in key_values[start..end].iter().zip(values[start..end].iter()) {
-                map.insert(key.clone().unwrap(), value.clone());
+            for (key, value) in key_slice.iter().zip(value_slice.iter()) {
+                // A map key is non-nullable in Iceberg; reject a null key instead of unwrapping.
+                let key = key.clone().ok_or_else(|| {
+                    Error::new(ErrorKind::DataInvalid, "Map key must not be null")
+                })?;
+                map.insert(key, value.clone());
             }
             result.push(Some(Literal::Map(map)));
         }
@@ -1904,5 +1966,74 @@ mod test {
 
         assert_eq!(array.data_type(), &target_type);
         assert_eq!(array.len(), num_rows);
+    }
+
+    // FIX 4: the list/map offset slicing must turn degenerate buffers into typed errors, never
+    // panic. `slice_list_by_offsets` is the shared core of the List / LargeList / Map paths.
+
+    #[test]
+    fn test_slice_list_by_offsets_empty_buffer_does_not_underflow() {
+        // An empty offset buffer: `len() - 1` would underflow to usize::MAX (→ with_capacity
+        // abort) without the `saturating_sub` guard. Must return an empty result, no panic.
+        let offsets: Vec<i32> = Vec::new();
+        let elements: Vec<Option<Literal>> = Vec::new();
+        let result =
+            slice_list_by_offsets(&offsets, &elements).expect("empty offsets must not panic");
+        assert!(result.is_empty(), "empty offsets must yield no rows");
+    }
+
+    #[test]
+    fn test_slice_list_by_offsets_non_monotonic_errors() {
+        // end < start must error rather than slice-panic.
+        let offsets: Vec<i32> = vec![5, 2];
+        let elements: Vec<Option<Literal>> = vec![
+            Some(Literal::int(0)),
+            Some(Literal::int(1)),
+            Some(Literal::int(2)),
+        ];
+        let err = slice_list_by_offsets(&offsets, &elements)
+            .expect_err("non-monotonic offsets must error");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_slice_list_by_offsets_out_of_bounds_errors() {
+        // end > elements.len() must error rather than slice-panic.
+        let offsets: Vec<i32> = vec![0, 10];
+        let elements: Vec<Option<Literal>> = vec![Some(Literal::int(0))];
+        let err = slice_list_by_offsets(&offsets, &elements)
+            .expect_err("out-of-bounds offsets must error");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_slice_list_by_offsets_valid() {
+        // A well-formed buffer still reassembles correctly (no regression).
+        let offsets: Vec<i32> = vec![0, 2, 3];
+        let elements: Vec<Option<Literal>> = vec![
+            Some(Literal::int(10)),
+            Some(Literal::int(20)),
+            Some(Literal::int(30)),
+        ];
+        let result =
+            slice_list_by_offsets(&offsets, &elements).expect("valid offsets must convert");
+        assert_eq!(result.len(), 2, "two rows expected from 3 offsets");
+    }
+
+    #[test]
+    fn test_fixed_size_list_zero_width_errors() {
+        use arrow_array::FixedSizeListArray;
+        // A zero-width FixedSizeList would divide-by-zero in the conversion; build one via
+        // `new_null` (which does not validate width > 0) and assert a typed error.
+        let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let array: ArrayRef = Arc::new(FixedSizeListArray::new_null(element_field, 0, 0));
+        let list_type = ListType {
+            element_field: NestedField::list_element(1, Type::Primitive(PrimitiveType::Int), false)
+                .into(),
+        };
+        let mut converter = ArrowArrayToIcebergStructConverter;
+        let err = SchemaWithPartnerVisitor::list(&mut converter, &list_type, &array, Vec::new())
+            .expect_err("zero-width FixedSizeList must error, not divide-by-zero");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
     }
 }
