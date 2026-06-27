@@ -110,7 +110,7 @@ impl HttpClient {
         self.token.lock().await.clone()
     }
 
-    async fn exchange_credential_for_token(&self) -> Result<String> {
+    pub(crate) async fn exchange_credential_for_token(&self) -> Result<String> {
         // Credential must exist here.
         let (client_id, client_secret) = self.credential.as_ref().ok_or_else(|| {
             Error::new(
@@ -150,13 +150,17 @@ impl HttpClient {
                 .await
                 .map_err(|err| err.with_url(auth_url.clone()))?;
             Ok(serde_json::from_slice(&text).map_err(|e| {
+                // SECURITY: the token-endpoint 200-OK body contains the OAuth
+                // `access_token`. Never attach the raw body to the error context — it
+                // would be rendered by `Error`'s `Display` and leak the token into any
+                // `tracing::error!(?e)` / `{e}` log. Attach only the safe byte length.
                 Error::new(
                     ErrorKind::Unexpected,
                     "Failed to parse response from rest catalog server!",
                 )
                 .with_context("operation", "auth")
                 .with_context("url", auth_url.to_string())
-                .with_context("json", String::from_utf8_lossy(&text))
+                .with_context("response_body_len", text.len().to_string())
                 .with_source(e)
             })?)
         } else {
@@ -166,11 +170,14 @@ impl HttpClient {
                 .await
                 .map_err(|err| err.with_url(auth_url.clone()))?;
             let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
+                // SECURITY: this is still the token endpoint — a non-2xx body may echo
+                // submitted credentials or a partial grant. Keep the token path airtight
+                // by never attaching the raw body; surface only its byte length.
                 Error::new(ErrorKind::Unexpected, "Received unexpected response")
                     .with_context("code", code.to_string())
                     .with_context("operation", "auth")
                     .with_context("url", auth_url.to_string())
-                    .with_context("json", String::from_utf8_lossy(&text))
+                    .with_context("response_body_len", text.len().to_string())
                     .with_source(e)
             })?;
             Err(Error::from(e))
