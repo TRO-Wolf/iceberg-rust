@@ -23,7 +23,7 @@ use arrow_select::filter::filter_record_batch;
 
 use super::arrow_struct_to_literal;
 use super::partition_value_calculator::PartitionValueCalculator;
-use crate::spec::{Literal, PartitionKey, PartitionSpecRef, SchemaRef, StructType};
+use crate::spec::{Literal, PartitionKey, PartitionSpecRef, SchemaRef, Struct, StructType};
 use crate::{Error, ErrorKind, Result};
 
 /// Column name for the projected partition values struct
@@ -176,18 +176,28 @@ impl RecordBatchPartitionSplitter {
                 .collect::<Result<Vec<_>>>()?
         };
 
-        // Group the batch by row value.
-        let mut group_ids = HashMap::new();
+        // Group the batch by row value. Key the group map by a BORROW of each partition struct (and
+        // remember the first row at which the group appears) so we clone a `Struct` only ONCE per
+        // distinct partition value — used as the `PartitionKey` below — instead of once per row. The
+        // grouping is identical to cloning every key: the same `Struct` `Hash`/`Eq` decides
+        // membership, only the owned-clone count changes (R → G distinct partitions).
+        let mut group_ids: HashMap<&Struct, (usize, Vec<usize>)> = HashMap::new();
         partition_structs
             .iter()
             .enumerate()
             .for_each(|(row_id, row)| {
-                group_ids.entry(row.clone()).or_insert(vec![]).push(row_id);
+                group_ids
+                    .entry(row)
+                    .or_insert_with(|| (row_id, vec![]))
+                    .1
+                    .push(row_id);
             });
 
         // Partition the batch with same partition partition_values
         let mut partition_batches = Vec::with_capacity(group_ids.len());
-        for (row, row_ids) in group_ids.into_iter() {
+        for (representative_row, row_ids) in group_ids.into_values() {
+            // Clone the partition struct ONCE per group (the representative first-occurrence row).
+            let row = partition_structs[representative_row].clone();
             // generate the bool filter array from column_ids
             let filter_array: BooleanArray = {
                 let mut filter = vec![false; batch.num_rows()];

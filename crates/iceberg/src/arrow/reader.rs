@@ -48,6 +48,7 @@ use typed_builder::TypedBuilder;
 
 use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
@@ -834,15 +835,16 @@ impl ArrowReader {
             )
             .with_source(e)
         })??;
-        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
-        let survival_predicate = match (&task.predicate, delete_predicate) {
-            (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(predicate)) => Some(predicate),
-            (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
-            }
-        };
+        // Equality-delete fast path: if EVERY eq-delete file for this task is type-eligible and they
+        // share one key schema, the deletes can be applied via hashed set membership (O(R)) instead
+        // of the E-leaf predicate tree (O(E·R)). The set is used per-batch only when it is safe for
+        // that batch (no NULL in a key column — see `EqDeleteKeySet::delete_mask`); otherwise the
+        // eq-delete predicate is the fallback. The scan residual (`task.predicate`) and the eq-delete
+        // predicate are kept available for the predicate path; the set only accelerates the common
+        // case. `eq_delete_predicate` is `None` when the task has no eq-deletes.
+        let eq_delete_sets = delete_filter.collect_equality_delete_keysets(&task).await;
+        let eq_delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let residual_predicate = task.predicate.clone();
 
         // The positional-delete vector for this data file (cloned out so the stream owns it).
         let positional_deletes = delete_filter.get_delete_vector(&task);
@@ -868,7 +870,9 @@ impl ArrowReader {
                 row_count,
                 absolute_pos,
                 positional_deletes.as_ref(),
-                survival_predicate.as_ref(),
+                residual_predicate.as_ref(),
+                eq_delete_predicate.as_ref(),
+                eq_delete_sets.as_deref(),
             ) {
                 Ok(mask) => mask,
                 Err(e) => {
@@ -930,15 +934,27 @@ impl ArrowReader {
 
     /// Build the per-row survival mask for a transformed whole-file (Avro / ORC) batch, combining
     /// positional deletes (rows whose absolute file position `[batch_base, batch_base + num_rows)`
-    /// falls in `positional_deletes`) with the equality-delete + residual `survival_predicate`.
-    /// Returns `None` when neither applies (the caller emits the batch unchanged), else a
-    /// [`BooleanArray`] where `true` ⇒ keep the row. Format-agnostic: shared by both readers.
+    /// falls in `positional_deletes`), the scan `residual_predicate` (`task.predicate`), and the
+    /// equality deletes — applied via the O(R) `eq_delete_sets` fast path when present and safe for
+    /// the batch, else via `eq_delete_predicate`. Returns `None` when nothing applies (the caller
+    /// emits the batch unchanged), else a [`BooleanArray`] where `true` ⇒ keep the row.
+    /// Format-agnostic: shared by both readers.
+    ///
+    /// Equality-delete routing: `eq_delete_sets`, when `Some`, is the hashed key sets for the task's
+    /// eq-delete files (all type-eligible, shared key schema). A row is dropped iff it matches ANY
+    /// set's delete tuple — byte-identical to the eq-delete predicate for batches with no NULL in a
+    /// key column (proven in `delete_filter.rs`'s harness). If ANY set reports a key-column NULL in
+    /// this batch (`delete_mask` → `None`), the WHOLE batch's eq-deletes fall back to
+    /// `eq_delete_predicate` (the proven 3VL-correct path). When `eq_delete_sets` is `None`, the
+    /// eq-deletes are always applied via `eq_delete_predicate`.
     fn survival_mask(
         batch: &RecordBatch,
         num_rows: usize,
         batch_base: u64,
         positional_deletes: Option<&Arc<std::sync::Mutex<DeleteVector>>>,
-        survival_predicate: Option<&BoundPredicate>,
+        residual_predicate: Option<&BoundPredicate>,
+        eq_delete_predicate: Option<&BoundPredicate>,
+        eq_delete_sets: Option<&[EqDeleteKeySet]>,
     ) -> Result<Option<BooleanArray>> {
         // Positional deletes → a keep-mask of `!deleted` over this batch's absolute position window.
         let positional_mask: Option<BooleanArray> = match positional_deletes {
@@ -961,28 +977,73 @@ impl ArrowReader {
             None => None,
         };
 
-        // Equality-delete + residual predicate → a keep-mask (true ⇒ row survives the predicate).
-        // A NULL under three-valued logic is NOT a survivor (Java drops a row the delete predicate
-        // does not prove TRUE), matching the Parquet RowFilter, so nulls are coerced to false.
-        let predicate_mask: Option<BooleanArray> = match survival_predicate {
-            Some(predicate) => {
-                let mask = evaluate_predicate_to_mask(predicate, batch)?;
-                Some(coerce_nulls_to_false(&mask))
-            }
+        // Helper: a keep-mask from a bound predicate (true ⇒ row survives; NULL coerced to false).
+        let predicate_keep = |predicate: &BoundPredicate| -> Result<BooleanArray> {
+            Ok(coerce_nulls_to_false(&evaluate_predicate_to_mask(
+                predicate, batch,
+            )?))
+        };
+
+        // Scan residual (`task.predicate`) → always via the predicate path (NULL coerced to false).
+        let residual_mask: Option<BooleanArray> = match residual_predicate {
+            Some(predicate) => Some(predicate_keep(predicate)?),
             None => None,
         };
 
-        match (positional_mask, predicate_mask) {
-            (None, None) => Ok(None),
-            (Some(mask), None) | (None, Some(mask)) => Ok(Some(mask)),
-            (Some(pos), Some(pred)) => Ok(Some(and(&pos, &pred).map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to combine positional and equality delete masks for a data batch",
-                )
-                .with_source(e)
-            })?)),
-        }
+        // Equality-delete keep-mask. Prefer the O(R) set fast path; if any set reports a key-column
+        // NULL in this batch, fall back to the eq-delete predicate for the whole batch.
+        let eq_delete_mask: Option<BooleanArray> = {
+            let mut from_sets: Option<BooleanArray> = None;
+            if let Some(sets) = eq_delete_sets.filter(|s| !s.is_empty()) {
+                let mut keep = vec![true; num_rows];
+                let mut all_sets_safe = true;
+                for set in sets {
+                    if set.is_empty() {
+                        continue;
+                    }
+                    match set.delete_mask(batch)? {
+                        Some(deleted) => {
+                            for (k, d) in keep.iter_mut().zip(deleted.iter()) {
+                                *k &= !*d;
+                            }
+                        }
+                        None => {
+                            all_sets_safe = false;
+                            break;
+                        }
+                    }
+                }
+                if all_sets_safe {
+                    from_sets = Some(BooleanArray::from(keep));
+                }
+            }
+            match from_sets {
+                Some(mask) => Some(mask),
+                // No set path (absent, empty, or a key-column NULL forced fallback) → predicate.
+                None => match eq_delete_predicate {
+                    Some(predicate) => Some(predicate_keep(predicate)?),
+                    None => None,
+                },
+            }
+        };
+
+        // AND the present keep-masks together.
+        let combine =
+            |a: Option<BooleanArray>, b: Option<BooleanArray>| -> Result<Option<BooleanArray>> {
+                match (a, b) {
+                    (None, None) => Ok(None),
+                    (Some(m), None) | (None, Some(m)) => Ok(Some(m)),
+                    (Some(x), Some(y)) => Ok(Some(and(&x, &y).map_err(|e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Failed to combine merge-on-read delete masks for a data batch",
+                        )
+                        .with_source(e)
+                    })?)),
+                }
+            };
+        let combined = combine(positional_mask, residual_mask)?;
+        combine(combined, eq_delete_mask)
     }
 
     /// Opens a Parquet file and loads its metadata, returning both the reader and metadata.
