@@ -1369,6 +1369,12 @@ pub(crate) mod tests {
             scale: 2
         }));
         assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Unknown));
+        // Time and Fixed are excluded NOT because their equality diverges, but because the predicate
+        // fallback (`get_arrow_datum`) has no arm for them: admitting them would let the fast path
+        // succeed on non-null batches yet crash the scan on a key-null batch that bails to the
+        // predicate path. They must route uniformly to the predicate path (which errors for them).
+        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Time));
+        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Fixed(16)));
         // Eligible representatives.
         assert!(EqDeleteKeySet::is_eligible_type(&PrimitiveType::Long));
         assert!(EqDeleteKeySet::is_eligible_type(&PrimitiveType::String));

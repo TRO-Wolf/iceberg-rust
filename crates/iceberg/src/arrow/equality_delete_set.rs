@@ -34,12 +34,15 @@
 //! path would delete a `-0.0` row that the predicate path keeps. That divergence is proven by
 //! `delete_filter::tests::test_h6_naive_set_diverges_on_negative_zero`.
 //!
-//! Therefore [`EqDeleteKeySet::is_eligible_type`] admits ONLY the non-float primitive types whose
-//! [`Datum`] equality is byte-identical to the Arrow `eq` kernel — every integer/temporal/string/
-//! binary/boolean type. `Float`, `Double`, `Decimal` (a cast-rescale hazard when the delete-file and
-//! data-file scales differ), and `Unknown` are EXCLUDED; an eq-delete file with ANY excluded key
-//! column routes the whole task back to the untouched predicate path. The matrix of admitted types
-//! is proven identical to the predicate path in `delete_filter.rs`'s harness.
+//! Therefore [`EqDeleteKeySet::is_eligible_type`] admits ONLY the primitive types that satisfy BOTH
+//! (a) [`Datum`] equality byte-identical to the Arrow `eq` kernel AND (b) evaluability by the
+//! predicate fallback (`get_arrow_datum`) — so a per-batch bail to the predicate path can never land
+//! on an unsupported-type error. `Float`, `Double`, `Decimal` (a cast-rescale hazard when the
+//! delete-file and data-file scales differ), and `Unknown` fail (a); `Time` and `Fixed` fail (b)
+//! (`get_arrow_datum` has no arm for them, so they route uniformly to the predicate path exactly as
+//! before this fast path existed). An eq-delete file with ANY excluded key column routes the whole
+//! task back to the untouched predicate path. The matrix of admitted types is proven identical to
+//! the predicate path in `delete_filter.rs`'s harness.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -74,31 +77,39 @@ pub(crate) struct EqDeleteKeySet {
 }
 
 impl EqDeleteKeySet {
-    /// Whether `ty` may participate in the hashed fast path: `true` iff [`Datum`] equality for this
-    /// type is byte-identical to the Arrow `eq` kernel the predicate path uses. Floats are excluded
-    /// (total-ordering / signed-zero divergence — proven), `Decimal` is excluded (the predicate
-    /// path's `try_cast_literal` may rescale a literal to the column scale, which a raw-`i128` key
-    /// does not), and `Unknown` is not a real value type. Every admitted type compares as an
-    /// integer, byte string, or UTF-8 string under both Arrow `eq` and `Datum` `Eq`.
+    /// Whether `ty` may participate in the hashed fast path: `true` iff (a) [`Datum`] equality for
+    /// this type is byte-identical to the Arrow `eq` kernel the predicate path uses, AND (b) the
+    /// predicate fallback (`get_arrow_datum`) can actually evaluate the type — so a per-batch bail
+    /// to the predicate path (e.g. on a key-column NULL) never lands on an unsupported-type error.
+    /// Floats are excluded (total-ordering / signed-zero divergence — proven), `Decimal` is excluded
+    /// (the predicate path's `try_cast_literal` may rescale a literal to the column scale, which a
+    /// raw-`i128` key does not), and `Unknown` is not a real value type. `Time` and `Fixed(_)` are
+    /// excluded for reason (b): `get_arrow_datum` has no arm for them, so they must route uniformly
+    /// to the predicate path (which errors `FeatureUnsupported` for them, exactly as before this fast
+    /// path existed) rather than succeed on non-null batches and crash on a key-null batch. Every
+    /// admitted type compares as an integer, byte string, or UTF-8 string under both Arrow `eq` and
+    /// `Datum` `Eq`, and is convertible by `get_arrow_datum`.
     pub(crate) fn is_eligible_type(ty: &PrimitiveType) -> bool {
         match ty {
             PrimitiveType::Boolean
             | PrimitiveType::Int
             | PrimitiveType::Long
             | PrimitiveType::Date
-            | PrimitiveType::Time
             | PrimitiveType::Timestamp
             | PrimitiveType::Timestamptz
             | PrimitiveType::TimestampNs
             | PrimitiveType::TimestamptzNs
             | PrimitiveType::String
             | PrimitiveType::Uuid
-            | PrimitiveType::Fixed(_)
             | PrimitiveType::Binary => true,
+            // Excluded: equality diverges (Float/Double/Decimal), not a value type (Unknown), or the
+            // predicate fallback cannot evaluate the type (Time, Fixed) — see the doc above.
             PrimitiveType::Float
             | PrimitiveType::Double
             | PrimitiveType::Decimal { .. }
-            | PrimitiveType::Unknown => false,
+            | PrimitiveType::Unknown
+            | PrimitiveType::Time
+            | PrimitiveType::Fixed(_) => false,
         }
     }
 
