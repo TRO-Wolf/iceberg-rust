@@ -22,7 +22,7 @@
 //! scenarios where tests need to read/write files on the local filesystem.
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -326,45 +326,99 @@ impl Storage for LocalFsStorage {
 }
 
 /// File reader for local filesystem storage.
+///
+/// # Concurrency
+///
+/// The file handle is held behind an [`Arc`] (no [`Mutex`](std::sync::Mutex), no shared seek
+/// cursor) and every read is a *positioned* read — `read_exact_at` on unix, `seek_read` on
+/// Windows — so any number of ranges can be read concurrently from the same handle without
+/// serializing on a lock or racing a shared cursor. Each blocking syscall runs inside
+/// [`tokio::task::spawn_blocking`] so it never stalls a tokio worker thread.
 #[derive(Debug)]
 pub struct LocalFsFileRead {
-    file: std::sync::Mutex<fs::File>,
+    file: Arc<fs::File>,
 }
 
 impl LocalFsFileRead {
     /// Create a new `LocalFsFileRead` with the given file.
     pub fn new(file: fs::File) -> Self {
         Self {
-            file: std::sync::Mutex::new(file),
+            file: Arc::new(file),
         }
     }
+}
+
+/// Perform a positioned `read_exact` at `offset` for `len` bytes without disturbing any shared
+/// file cursor.
+///
+/// This is the synchronous, blocking core shared by every range read; callers invoke it from
+/// inside [`tokio::task::spawn_blocking`]. On unix it uses
+/// [`std::os::unix::fs::FileExt::read_exact_at`]; on Windows it loops over
+/// [`std::os::windows::fs::FileExt::seek_read`] (which performs a positioned read and does not
+/// move the handle's cursor) until the buffer is full, surfacing the same `UnexpectedEof`-class
+/// short-read error as `read_exact`.
+fn read_exact_at(file: &fs::File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut buffer = vec![0u8; len];
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut buffer, offset)?;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut filled = 0usize;
+        while filled < len {
+            match file.seek_read(&mut buffer[filled..], offset + filled as u64) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "failed to fill whole buffer",
+                    ));
+                }
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    Ok(buffer)
 }
 
 #[async_trait]
 impl FileRead for LocalFsFileRead {
     async fn read(&self, range: Range<u64>) -> Result<Bytes> {
-        let mut file = self.file.lock().map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("Failed to acquire file lock: {e}"),
-            )
-        })?;
-
-        file.seek(SeekFrom::Start(range.start)).map_err(|e| {
+        let len = usize::try_from(range.end - range.start).map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
-                format!("Failed to seek to position {}: {}", range.start, e),
+                format!(
+                    "Read length {} does not fit in usize: {e}",
+                    range.end - range.start
+                ),
             )
         })?;
+        let offset = range.start;
+        let file = Arc::clone(&self.file);
 
-        let len = (range.end - range.start) as usize;
-        let mut buffer = vec![0u8; len];
-        file.read_exact(&mut buffer).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to read {len} bytes: {e}"),
-            )
-        })?;
+        // Run the blocking positioned read off the async executor so the tokio worker is not
+        // stalled by the `pread`/`seek_read` syscall.
+        let buffer = tokio::task::spawn_blocking(move || read_exact_at(&file, offset, len))
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to join blocking read task: {e}"),
+                )
+            })?
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to read {len} bytes at offset {offset}: {e}"),
+                )
+            })?;
 
         Ok(Bytes::from(buffer))
     }
@@ -600,6 +654,83 @@ mod tests {
         // Test partial read
         let partial = reader.read(0..5).await.unwrap();
         assert_eq!(partial, Bytes::from("Hello"));
+    }
+
+    /// Risk: the positioned-read rewrite (no shared cursor, no `Mutex`) must return byte-exact
+    /// results for arbitrary, overlapping ranges issued CONCURRENTLY against one shared reader —
+    /// a regression to a shared-cursor seek-then-read would corrupt interleaved reads, and the
+    /// old `Mutex<File>` would serialize them. Reads run via concurrently spawned tasks (the
+    /// iceberg crate's tokio default is current-thread, so this also proves the spawned blocking
+    /// reads make progress and join without deadlock); every slice is checked against the source
+    /// bytes.
+    #[tokio::test]
+    async fn test_local_fs_concurrent_positioned_reads_are_byte_exact() {
+        let tmp_dir = TempDir::new().unwrap();
+        let storage = LocalFsStorage::new();
+        let path = tmp_dir.path().join("ranges.bin");
+        let path_str = path.to_str().unwrap();
+
+        // Deterministic, non-uniform content so a wrong offset/length is detectable.
+        let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        storage
+            .write(path_str, Bytes::from(content.clone()))
+            .await
+            .unwrap();
+
+        let reader: Arc<dyn FileRead> = storage.reader(path_str).await.unwrap().into();
+
+        // A mix of overlapping, adjacent, full-span and single-byte ranges.
+        let ranges: Vec<Range<u64>> = vec![
+            0..4096,
+            0..1,
+            10..20,
+            15..25, // overlaps 10..20
+            100..2100,
+            2000..4096, // overlaps 100..2100
+            4095..4096,
+            512..512, // empty range
+        ];
+
+        let mut handles = Vec::new();
+        for range in ranges.clone() {
+            let reader = Arc::clone(&reader);
+            handles.push(tokio::spawn(async move {
+                let bytes = reader.read(range.clone()).await.unwrap();
+                (range, bytes)
+            }));
+        }
+
+        for handle in handles {
+            let (range, bytes) = handle.await.unwrap();
+            let start = range.start as usize;
+            let end = range.end as usize;
+            assert_eq!(
+                bytes.as_ref(),
+                &content[start..end],
+                "range {range:?} returned wrong bytes"
+            );
+        }
+    }
+
+    /// Risk: short-read / out-of-bounds behavior must remain a loud error (matching the prior
+    /// `read_exact` contract), not a silent truncation or a panic — a range past EOF must fail.
+    #[tokio::test]
+    async fn test_local_fs_read_past_eof_errors() {
+        let tmp_dir = TempDir::new().unwrap();
+        let storage = LocalFsStorage::new();
+        let path = tmp_dir.path().join("small.bin");
+        let path_str = path.to_str().unwrap();
+
+        storage
+            .write(path_str, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+
+        let reader = storage.reader(path_str).await.unwrap();
+        // Request more bytes than exist.
+        let result = reader.read(0..100).await;
+        let error = result.expect_err("reading past EOF must error, not truncate");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 
     #[tokio::test]

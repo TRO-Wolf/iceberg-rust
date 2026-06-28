@@ -29,6 +29,7 @@ pub(crate) mod caching_delete_file_loader;
 pub mod delete_file_loader;
 pub(crate) mod delete_filter;
 pub use delete_filter::DeleteFilter;
+pub(crate) mod equality_delete_set;
 
 mod int96;
 pub(crate) mod orc_reader;

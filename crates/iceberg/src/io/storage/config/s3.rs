@@ -134,13 +134,15 @@ pub struct S3Config {
 }
 
 impl Debug for S3Config {
-    /// Hand-written so the secret fields (`secret_access_key`, `session_token`,
-    /// `server_side_encryption_customer_key`, `server_side_encryption_customer_key_md5`)
-    /// are redacted: their presence is preserved as `"***"` but the value is never printed.
+    /// Hand-written so the secret fields (`access_key_id`, `secret_access_key`,
+    /// `session_token`, `server_side_encryption_customer_key`,
+    /// `server_side_encryption_customer_key_md5`) are redacted: their presence is preserved
+    /// as `"***"` but the value is never printed. AWS treats the access-key id as sensitive
+    /// because it identifies the principal, so it is redacted alongside the secret.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("S3Config")
             .field("endpoint", &self.endpoint)
-            .field("access_key_id", &self.access_key_id)
+            .field("access_key_id", &redact_secret(&self.access_key_id))
             .field("secret_access_key", &redact_secret(&self.secret_access_key))
             .field("session_token", &redact_secret(&self.session_token))
             .field("region", &self.region)
@@ -371,7 +373,32 @@ mod tests {
         assert!(debug.contains("***"), "expected redaction marker: {debug}");
         // Non-secret fields stay visible for diagnostics.
         assert!(
-            debug.contains("us-east-1") && debug.contains("AKIA_VISIBLE_ID"),
+            debug.contains("us-east-1"),
+            "Debug dropped non-secret fields: {debug}"
+        );
+    }
+
+    #[test]
+    fn test_s3_config_debug_redacts_access_key_id() {
+        let access_key_id = "AKIA_ACCESS_KEY_ID_DO_NOT_LEAK";
+        let config = S3Config::builder()
+            .region("us-east-1")
+            .access_key_id(access_key_id)
+            .build();
+
+        let debug = format!("{config:?}");
+
+        // AWS treats the access-key id as sensitive (it identifies the principal),
+        // so it must be redacted just like the secret key.
+        assert!(
+            !debug.contains(access_key_id),
+            "Debug output leaked the access_key_id: {debug}"
+        );
+        // Presence is still signalled via the redaction marker.
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        // Non-secret fields stay visible for diagnostics.
+        assert!(
+            debug.contains("us-east-1"),
             "Debug dropped non-secret fields: {debug}"
         );
     }

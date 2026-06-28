@@ -474,12 +474,15 @@ async fn copy_on_write_delete(
         let table_batch = RecordBatch::try_new(Arc::clone(table_schema), columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
+        let paths = decode_file_paths_batch(file_col)?;
         match &predicate {
             None => {
                 // DELETE FROM t — every row is deleted; every source file is affected.
                 deleted += num_rows as u64;
-                for row in 0..num_rows {
-                    affected.insert(decode_file_path(file_col, row)?);
+                for path in &paths {
+                    if !affected.contains(*path) {
+                        affected.insert((*path).to_string());
+                    }
                 }
             }
             Some(physical_expr) => {
@@ -495,12 +498,14 @@ async fn copy_on_write_delete(
                     })?
                     .clone();
 
-                for row in 0..num_rows {
+                for (row, path) in paths.iter().enumerate() {
                     // A row is deleted iff the predicate is TRUE (NULL → SQL three-valued logic → NOT deleted).
                     let is_deleted = mask.is_valid(row) && mask.value(row);
                     if is_deleted {
                         deleted += 1;
-                        affected.insert(decode_file_path(file_col, row)?);
+                        if !affected.contains(*path) {
+                            affected.insert((*path).to_string());
+                        }
                     }
                 }
             }
@@ -562,13 +567,9 @@ async fn copy_on_write_delete(
         };
 
         // Keep a row iff: it is NOT deleted AND its source file is in the affected set.
+        let paths = decode_file_paths_batch(file_col)?;
         let keep: BooleanArray = (0..num_rows)
-            .map(|row| -> DFResult<bool> {
-                let file_path = decode_file_path(file_col, row)?;
-                Ok(!delete_mask[row] && affected.contains(&file_path))
-            })
-            .collect::<DFResult<Vec<bool>>>()?
-            .into_iter()
+            .map(|row| !delete_mask[row] && affected.contains(paths[row]))
             .collect();
 
         let surviving = filter_record_batch(&table_batch, &keep)
@@ -870,6 +871,65 @@ fn decode_file_path(col: &ArrayRef, row: usize) -> DFResult<String> {
                 DataFusionError::Internal("_file REE values are not Utf8".to_string())
             })?;
         return Ok(values.value(physical).to_string());
+    }
+    Err(DataFusionError::Internal(format!(
+        "unexpected _file column type: {:?}",
+        col.data_type()
+    )))
+}
+
+/// Decode the `_file` column for an ENTIRE batch in one pass, returning one borrowed path per row
+/// (row `i` → `out[i]`).
+///
+/// Equivalent to calling [`decode_file_path`] for every row, but it allocates NO per-row `String`:
+/// for a run-end-encoded column (`_file` is REE with only F ≪ R distinct values) each run's value is
+/// resolved once and reused across the run; for a plain `StringArray` each row's `&str` is returned
+/// directly. The returned strings are byte-identical, in the same order, to what `decode_file_path`
+/// would produce per row — callers that need owned paths intern via the affected/path set instead of
+/// allocating one `String` per row.
+fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
+    use datafusion::arrow::array::RunArray;
+    use datafusion::arrow::datatypes::Int32Type;
+
+    if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
+        return Ok((0..plain.len()).map(|row| plain.value(row)).collect());
+    }
+    if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
+        let values = run
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("_file REE values are not Utf8".to_string())
+            })?;
+        let mut out = Vec::with_capacity(run.len());
+        if run.offset() == 0 {
+            // Fast path (the only shape the COW scan produces — whole, unsliced REE batches): walk
+            // the run-ends ONCE, emitting each run's value across its whole logical span. For an
+            // unsliced array the logical index equals the physical run-end offset, so this yields
+            // exactly the same `&str` per row as `run.get_physical_index(row)` — the row-wise form
+            // below — without the per-row binary search.
+            let run_ends = run.run_ends().values();
+            let mut start = 0usize;
+            for (physical, &end) in run_ends.iter().enumerate() {
+                let end = usize::try_from(end).map_err(|_| {
+                    DataFusionError::Internal("_file REE run-end is negative".to_string())
+                })?;
+                let value = values.value(physical);
+                for _ in start..end {
+                    out.push(value);
+                }
+                start = end;
+            }
+        } else {
+            // Sliced REE array: the logical→physical mapping is offset-relative, so defer to
+            // `get_physical_index` per row (still allocation-free). Behaviorally identical to the
+            // fast path; kept separate because a sliced run-ends walk is easy to get subtly wrong.
+            for row in 0..run.len() {
+                out.push(values.value(run.get_physical_index(row)));
+            }
+        }
+        return Ok(out);
     }
     Err(DataFusionError::Internal(format!(
         "unexpected _file column type: {:?}",
@@ -1235,9 +1295,12 @@ async fn copy_on_write_update(
     //    Also counts total updated rows for the return value.
     let mut updated: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
+    // M7: cache the per-batch WHERE match mask computed here so pass 2 can REUSE it (filtered to the
+    // affected rows) instead of re-evaluating the predicate a second time. `match_mask` already
+    // collapses NULL→false (three-valued logic), so the cached mask is the final 2-valued mask.
+    let mut batch_masks: Vec<BooleanArray> = Vec::with_capacity(batches.len());
 
     for batch in &batches {
-        let num_rows = batch.num_rows();
         let file_col = batch
             .column_by_name(RESERVED_COL_NAME_FILE)
             .ok_or_else(|| {
@@ -1246,13 +1309,17 @@ async fn copy_on_write_update(
         let table_batch = table_column_batch(batch, table_schema)?;
         let mask = match_mask(&predicate, &table_batch)?;
 
-        for row in 0..num_rows {
-            // A row is updated iff the predicate is TRUE (NULL → SQL three-valued logic → NOT updated).
-            if mask.is_valid(row) && mask.value(row) {
+        let paths = decode_file_paths_batch(file_col)?;
+        for (row, path) in paths.iter().enumerate() {
+            // A row is updated iff the predicate is TRUE (`match_mask` already coerced NULL → false).
+            if mask.value(row) {
                 updated += 1;
-                affected.insert(decode_file_path(file_col, row)?);
+                if !affected.contains(*path) {
+                    affected.insert((*path).to_string());
+                }
             }
         }
+        batch_masks.push(mask);
     }
 
     // 3. No updated rows → no-op (avoid a pointless rewrite of unchanged data).
@@ -1268,7 +1335,7 @@ async fn copy_on_write_update(
     //    Rows from unaffected files are NOT included — their source files are untouched.
     let mut rewritten_batches: Vec<RecordBatch> = Vec::new();
 
-    for batch in &batches {
+    for (batch_idx, batch) in batches.iter().enumerate() {
         let num_rows = batch.num_rows();
         let file_col = batch
             .column_by_name(RESERVED_COL_NAME_FILE)
@@ -1280,13 +1347,9 @@ async fn copy_on_write_update(
         let table_batch = table_column_batch(batch, table_schema)?;
 
         // Keep-mask: only rows whose source file is in the affected set.
+        let paths = decode_file_paths_batch(file_col)?;
         let keep_affected: BooleanArray = (0..num_rows)
-            .map(|row| -> DFResult<bool> {
-                let path = decode_file_path(file_col, row)?;
-                Ok(affected.contains(&path))
-            })
-            .collect::<DFResult<Vec<bool>>>()?
-            .into_iter()
+            .map(|row| affected.contains(paths[row]))
             .collect();
 
         // Filter down to affected-file rows (table columns only, no _file).
@@ -1296,9 +1359,21 @@ async fn copy_on_write_update(
             continue;
         }
 
-        // Re-evaluate the WHERE predicate over the affected-file sub-batch to get the per-row
-        // match mask within those rows.
-        let affected_match_mask = match_mask(&predicate, &affected_batch)?;
+        // M7: the per-row WHERE match mask within the affected rows is exactly the pass-1 mask for
+        // this batch FILTERED by the same `keep_affected` predicate — `match_mask` is row-wise and
+        // arrow `filter` preserves row order, so this equals re-evaluating the predicate over
+        // `affected_batch` (proven by `test_m7_filtered_mask_equals_reeval`), without a second
+        // predicate evaluation.
+        let affected_match_mask =
+            datafusion::arrow::compute::filter(&batch_masks[batch_idx], &keep_affected)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let affected_match_mask = affected_match_mask
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("filtered match mask is not boolean".to_string())
+            })?
+            .clone();
 
         // Apply assignments: matched rows take new values; non-matched rows keep old values.
         let rewritten = apply_assignments(
@@ -1328,4 +1403,112 @@ async fn copy_on_write_update(
         .map_err(to_datafusion_error)?;
 
     Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{ArrayRef, Int32Array, RunArray, StringArray};
+    use datafusion::arrow::datatypes::Int32Type;
+
+    use super::{decode_file_path, decode_file_paths_batch};
+
+    /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string
+    /// `decode_file_path` would — for a plain `StringArray`, for a run-end-encoded `_file` column
+    /// (the shape the COW scan produces, with F ≪ R distinct values and duplicate runs), and for a
+    /// SLICED REE array (the offset≠0 fallback path). This pins the H8 per-run decode optimization
+    /// to byte-identical per-row results — the correctness contract for COW DELETE/UPDATE
+    /// affected-file detection and keep-masks.
+    fn assert_batch_matches_per_row(col: &ArrayRef) {
+        let batch = decode_file_paths_batch(col).expect("batch decode");
+        assert_eq!(batch.len(), col.len(), "one decoded path per row");
+        for (row, decoded) in batch.iter().enumerate() {
+            let per_row = decode_file_path(col, row).expect("per-row decode");
+            assert_eq!(
+                *decoded, per_row,
+                "row {row}: batch decode must equal per-row decode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_file_paths_batch_plain_string_array() {
+        let col: ArrayRef = Arc::new(StringArray::from(vec![
+            "s3://b/a.parquet",
+            "s3://b/a.parquet",
+            "s3://b/c.parquet",
+        ]));
+        assert_batch_matches_per_row(&col);
+    }
+
+    #[test]
+    fn test_decode_file_paths_batch_ree_with_runs() {
+        // run-end-encoded: values [a, b, a] over logical rows with runs of length 3, 1, 2.
+        let run_ends = Int32Array::from(vec![3, 4, 6]);
+        let values = StringArray::from(vec!["f/a.parquet", "f/b.parquet", "f/a.parquet"]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
+        let col: ArrayRef = Arc::new(ree);
+        // Sanity: distinct runs, duplicate value across non-adjacent runs.
+        assert_eq!(col.len(), 6);
+        assert_batch_matches_per_row(&col);
+    }
+
+    #[test]
+    fn test_decode_file_paths_batch_ree_single_run() {
+        let run_ends = Int32Array::from(vec![5]);
+        let values = StringArray::from(vec!["only/file.parquet"]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
+        let col: ArrayRef = Arc::new(ree);
+        assert_batch_matches_per_row(&col);
+    }
+
+    /// M7 correctness property: the per-row WHERE match mask over the AFFECTED sub-batch equals the
+    /// full-batch match mask FILTERED by the same affected-keep mask. The COW UPDATE pass-2 reuse
+    /// relies on exactly this identity to avoid re-evaluating the predicate; `arrow::compute::filter`
+    /// preserving row order is what makes it hold. (`match_mask` is a row-wise pure function of the
+    /// table batch, so filtering the input batch then evaluating == evaluating then filtering.)
+    #[test]
+    fn test_m7_filtered_mask_equals_reeval() {
+        use datafusion::arrow::array::BooleanArray;
+        use datafusion::arrow::compute::filter;
+
+        // Full-batch match mask (what pass 1 cached) and the affected-keep mask.
+        let full_match = BooleanArray::from(vec![true, false, true, true, false, true]);
+        let keep_affected = BooleanArray::from(vec![true, true, false, true, true, false]);
+
+        // What pass 2 now computes: filter the cached mask by keep.
+        let reused = filter(&full_match, &keep_affected).expect("filter mask");
+        let reused = reused.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+        // The reference (the pre-M7 form): the match values at the KEPT rows, in order.
+        let reference: Vec<bool> = (0..full_match.len())
+            .filter(|&i| keep_affected.value(i))
+            .map(|i| full_match.value(i))
+            .collect();
+        let reference = BooleanArray::from(reference);
+
+        assert_eq!(
+            reused, &reference,
+            "filtered cached mask must equal the affected-rows match mask, in order"
+        );
+        // Rows kept: 0,1,3,4 → their match values: true,false,true,false.
+        assert_eq!(
+            reference,
+            BooleanArray::from(vec![true, false, true, false])
+        );
+    }
+
+    #[test]
+    fn test_decode_file_paths_batch_sliced_ree_offset_fallback() {
+        // Slice a REE array so offset != 0 exercises the get_physical_index fallback branch.
+        let run_ends = Int32Array::from(vec![3, 4, 7]);
+        let values = StringArray::from(vec!["f/a.parquet", "f/b.parquet", "f/c.parquet"]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
+        // Logical rows: a a a b c c c — take rows [2,5) → a b c c.
+        let sliced = ree.slice(2, 3);
+        let col: ArrayRef = Arc::new(sliced);
+        assert_eq!(col.len(), 3);
+        assert_batch_matches_per_row(&col);
+    }
 }

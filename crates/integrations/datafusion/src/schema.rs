@@ -184,42 +184,38 @@ impl SchemaProvider for IcebergSchemaProvider {
         let tables = self.tables.clone();
         let name_clone = name.clone();
 
-        // Use tokio's spawn_blocking to handle the async work on a blocking thread pool
-        let result = tokio::task::spawn_blocking(move || {
-            // Create a new runtime handle to execute the async work
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async move {
-                // Verify the input table is empty - CREATE TABLE only accepts schema definition
-                ensure_table_is_empty(&table)
-                    .await
-                    .map_err(to_datafusion_error)?;
-
-                catalog
-                    .create_table(&namespace, table_creation)
-                    .await
-                    .map_err(to_datafusion_error)?;
-
-                // Create a new table provider using the catalog reference
-                let table_provider = IcebergTableProvider::try_new(
-                    catalog.clone(),
-                    namespace.clone(),
-                    name_clone.clone(),
-                )
+        // Run the async catalog work on a runtime the *caller* does not own (see
+        // `block_on_off_caller_runtime`). The `SchemaProvider` trait method is synchronous but must
+        // do async catalog I/O; the previous `spawn_blocking` bridge panics ("no reactor running")
+        // when called outside a runtime, and nesting a `block_on` on the caller's `current_thread`
+        // runtime risks deadlock. Executing on a separate OS thread with its own runtime is robust
+        // across every caller context.
+        block_on_off_caller_runtime(async move {
+            // Verify the input table is empty - CREATE TABLE only accepts schema definition
+            ensure_table_is_empty(&table)
                 .await
                 .map_err(to_datafusion_error)?;
 
-                // Store the new table provider
-                tables.insert(name_clone, Arc::new(table_provider));
+            catalog
+                .create_table(&namespace, table_creation)
+                .await
+                .map_err(to_datafusion_error)?;
 
-                Ok(None)
-            })
-        });
+            // Create a new table provider using the catalog reference
+            let table_provider = IcebergTableProvider::try_new(
+                catalog.clone(),
+                namespace.clone(),
+                name_clone.clone(),
+            )
+            .await
+            .map_err(to_datafusion_error)?;
 
-        // Block on the spawned task to get the result
-        // This is safe because spawn_blocking moves the blocking to a dedicated thread pool
-        futures::executor::block_on(result).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to create Iceberg table: {e}"))
-        })?
+            // Store the new table provider
+            tables.insert(name_clone, Arc::new(table_provider));
+
+            Ok(None)
+        })
+        .map_err(|e| DataFusionError::Execution(format!("Failed to create Iceberg table: {e}")))?
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
@@ -233,30 +229,80 @@ impl SchemaProvider for IcebergSchemaProvider {
         let tables = self.tables.clone();
         let table_name = name.to_string();
 
-        // Use tokio's spawn_blocking to handle the async work on a blocking thread pool
-        let result = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async move {
-                let table_ident = TableIdent::new(namespace, table_name.clone());
+        // Run on a runtime the caller does not own — see `register_table` and
+        // `block_on_off_caller_runtime` for why running on the caller's runtime is unsafe (the old
+        // bridge panics with no ambient runtime; nesting a `block_on` risks deadlock).
+        block_on_off_caller_runtime(async move {
+            let table_ident = TableIdent::new(namespace, table_name.clone());
 
-                // Drop the table from the Iceberg catalog
-                catalog
-                    .drop_table(&table_ident)
-                    .await
-                    .map_err(to_datafusion_error)?;
+            // Drop the table from the Iceberg catalog
+            catalog
+                .drop_table(&table_ident)
+                .await
+                .map_err(to_datafusion_error)?;
 
-                // Remove from local cache and return the removed provider
-                let removed = tables
-                    .remove(&table_name)
-                    .map(|(_, table)| table as Arc<dyn TableProvider>);
+            // Remove from local cache and return the removed provider
+            let removed = tables
+                .remove(&table_name)
+                .map(|(_, table)| table as Arc<dyn TableProvider>);
 
-                Ok(removed)
-            })
+            Ok(removed)
+        })
+        .map_err(|e| DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}")))?
+    }
+}
+
+/// Drive `future` to completion on a Tokio runtime that the *calling* thread does not own, and
+/// block the caller until it resolves.
+///
+/// # Why a separate OS thread
+///
+/// The two `SchemaProvider` mutators above are synchronous trait methods that must perform async
+/// catalog I/O. They may be called from many caller contexts — from inside DataFusion's (typically
+/// `current_thread`) runtime, from a `#[tokio::test]` (also `current_thread`), or from no runtime at
+/// all. The previous bridge (`spawn_blocking` + `Handle::current().block_on` + an outer
+/// `futures::executor::block_on`) is unsafe across that range:
+///
+/// * **No-ambient-runtime panic (the observed old-code failure)** — `spawn_blocking` /
+///   `Handle::current()` panic with "there is no reactor running, must be called from the context
+///   of a Tokio 1.x runtime" when the mutator is invoked outside any runtime. This is the concrete
+///   bug this helper fixes (witnessed by `tests::..._work_without_caller_runtime`).
+/// * **Nested-runtime deadlock/panic (the hazard this design also forecloses)** — driving an inner
+///   future on the *caller's* `current_thread` runtime by parking its single worker can deadlock,
+///   and `Handle::current().block_on(..)` / `Runtime::block_on` while already inside a runtime
+///   panics ("Cannot start a runtime from within a runtime"). `tokio::task::block_in_place` is no
+///   escape — it panics on a `current_thread` runtime.
+///
+/// Spawning a fresh OS thread (which has *no* ambient runtime) and building a small
+/// `current_thread` runtime there lets us `block_on` safely from ANY caller context: the work runs
+/// entirely off the caller's runtime, so the caller's thread merely waits on a `JoinHandle` and no
+/// runtime is nested. The cost is one short-lived thread + runtime per DDL call, which is acceptable
+/// for `register_table`/`deregister_table` (rare, schema-level operations, not a hot path).
+///
+/// Errors building the runtime or joining the thread are surfaced as a typed
+/// [`DataFusionError`]; there are no `unwrap`/`expect` on the join or the channel.
+fn block_on_off_caller_runtime<F>(future: F) -> DFResult<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to build runtime for Iceberg catalog operation: {e}"
+                    ))
+                })?;
+            Ok(runtime.block_on(future))
         });
 
-        futures::executor::block_on(result)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}")))?
-    }
+        handle.join().map_err(|_| {
+            DataFusionError::Execution("Iceberg catalog operation thread panicked".to_string())
+        })?
+    })
 }
 
 /// Verifies that a table provider contains no data by scanning with LIMIT 1.
@@ -451,5 +497,96 @@ mod tests {
         let result = schema_provider.deregister_table("nonexistent");
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    /// FIX 1 — the synchronous `SchemaProvider` mutators must complete when invoked from inside a
+    /// `current_thread` runtime, which is DataFusion's default and the `#[tokio::test]` default (the
+    /// common production path). The off-caller-runtime helper runs the async catalog work on a
+    /// separate OS thread, so the caller's single runtime worker is never the one that must drive
+    /// the inner future. The `tokio::time::timeout` is a safety net: should a future regression
+    /// reintroduce a nested-`block_on` that parks the only driving thread, the bound trips and the
+    /// test fails loudly instead of hanging CI. (The genuine old-code failure mode this PR fixes is
+    /// the no-ambient-runtime panic, witnessed by `..._work_without_caller_runtime` below; the old
+    /// `spawn_blocking` bridge happened to complete on a `current_thread` runtime, so this test is a
+    /// forward-looking positive/guard test, not a witness that the old code hung.)
+    #[tokio::test]
+    async fn test_register_and_deregister_succeed_on_current_thread_runtime() {
+        let (schema_provider, _temp_dir) = create_test_schema_provider().await;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let empty_batch = RecordBatch::new_empty(arrow_schema.clone());
+        let mem_table = MemTable::try_new(arrow_schema, vec![vec![empty_batch]]).unwrap();
+
+        // register_table from within a current-thread runtime must complete (no hang, no panic).
+        let registered = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            // The body is synchronous, but running it under `timeout` lets a regression that parks
+            // the driving thread blow the bound rather than hang the test process.
+            async { schema_provider.register_table("registered".to_string(), Arc::new(mem_table)) },
+        )
+        .await
+        .expect("register_table did not complete on a current_thread runtime (FIX 1 regression)");
+        assert!(
+            registered.is_ok(),
+            "register_table returned an error: {registered:?}"
+        );
+        assert!(schema_provider.table_exist("registered"));
+
+        // deregister_table likewise must complete on the same current-thread runtime.
+        let deregistered = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            schema_provider.deregister_table("registered")
+        })
+        .await
+        .expect("deregister_table did not complete on a current_thread runtime (FIX 1 regression)");
+        assert!(
+            deregistered.expect("deregister_table errored").is_some(),
+            "expected the dropped provider to be returned"
+        );
+        assert!(!schema_provider.table_exist("registered"));
+    }
+
+    /// Companion to the current-thread witness: the same path must also work when there is NO
+    /// ambient caller runtime at all (a plain synchronous caller), proving the off-caller-runtime
+    /// strategy does not depend on being invoked from inside a runtime. (A multi-thread
+    /// `#[tokio::test]` would be the ideal third case, but the `iceberg-datafusion` crate does not
+    /// enable tokio's `rt-multi-thread` feature for tests, and enabling it is a `Cargo.toml`
+    /// change out of scope here; the helper itself builds its OWN runtime, so caller-runtime
+    /// flavor is irrelevant to correctness — this no-runtime case exercises that directly.)
+    #[test]
+    fn test_register_and_deregister_work_without_caller_runtime() {
+        // Build the provider on a throwaway current-thread runtime, then drop that runtime so the
+        // synchronous trait calls below run with NO ambient runtime on the calling thread.
+        let setup_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build setup runtime");
+        let (schema_provider, _temp_dir) = setup_rt.block_on(create_test_schema_provider());
+        drop(setup_rt);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let empty_batch = RecordBatch::new_empty(arrow_schema.clone());
+        let mem_table = MemTable::try_new(arrow_schema, vec![vec![empty_batch]]).unwrap();
+
+        let result = schema_provider.register_table("no_rt_table".to_string(), Arc::new(mem_table));
+        assert!(
+            result.is_ok(),
+            "register without an ambient runtime: {result:?}"
+        );
+        assert!(schema_provider.table_exist("no_rt_table"));
+
+        let dropped = schema_provider.deregister_table("no_rt_table");
+        assert!(
+            dropped.expect("deregister errored").is_some(),
+            "expected dropped provider"
+        );
+        assert!(!schema_provider.table_exist("no_rt_table"));
     }
 }

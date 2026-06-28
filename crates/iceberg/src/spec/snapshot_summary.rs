@@ -431,12 +431,10 @@ pub(crate) fn update_snapshot_summaries(
 
     let mut summary = match previous_summary {
         Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
-            truncate_table_summary(summary, prev_summary)
-                .map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
-                        .with_source(err)
-                })
-                .unwrap()
+            truncate_table_summary(summary, prev_summary).map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
+                    .with_source(err)
+            })?
         }
         _ => summary,
     };
@@ -492,13 +490,15 @@ pub(crate) fn update_snapshot_summaries(
 }
 
 #[allow(dead_code)]
-fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i32> {
+fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i64> {
+    // Java `SnapshotSummary` carries every `total-*` as a `long`; parse the same width here so a
+    // table exceeding `i32::MAX` records / files-size does not spuriously error (was `i32`).
     let value_str = previous_summary
         .additional_properties
         .get(prop)
         .map(String::as_str)
         .unwrap_or("0");
-    value_str.parse::<i32>().map_err(|err| {
+    value_str.parse::<i64>().map_err(|err| {
         Error::new(
             ErrorKind::Unexpected,
             "Failed to parse value from previous summary property.",
@@ -564,6 +564,29 @@ fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> R
     Ok(summary)
 }
 
+/// Recompute a single `total-*` property as `previousTotal + added - removed`, mirroring Java
+/// `SnapshotProducer.updateTotal` (private static helper in `SnapshotProducer`, iceberg-core
+/// 1.10.0 — NOT `SnapshotSummary`).
+///
+/// Java contract (decompiled `SnapshotProducer.updateTotal`):
+///   1. If the **previous summary lacks the total key** (`previousSummary.get(key) == null`) it
+///      returns WITHOUT writing — the property is omitted. Invalidation is **sticky**: once a
+///      prior snapshot dropped a total, every subsequent snapshot keeps dropping it.
+///   2. Otherwise it parses `previousTotal` as a `long` and applies a PER-STEP `>= 0`
+///      short-circuit: `if (newTotal >= 0 && added != null) newTotal += added;` then
+///      `if (newTotal >= 0 && removed != null) newTotal -= removed;`. A NEGATIVE previous total
+///      therefore skips BOTH the add and the subtract and stays negative.
+///   3. It writes the result back **only when `newTotal >= 0`**; a `< 0` final value is omitted.
+///
+/// Java's CALLER (`SnapshotProducer.summary(TableMetadata)`) synthesizes an all-zeros previous
+/// summary when there is **no parent snapshot**, which is why a first snapshot still accrues
+/// totals from 0. This Rust port distinguishes the three previous-summary states accordingly:
+///   * `previous_summary == None`            → first snapshot → accumulate from 0;
+///   * real parent that LACKS the key        → omit (do not re-seed from 0 — invalidation sticks);
+///   * present                               → parse; non-numeric → invalidate (drop).
+///
+/// All arithmetic is checked `i64` (the Java `long` width — see [`get_prop`]) so a stale/hostile
+/// previous summary can never wrap or panic; overflow drops the total.
 #[allow(dead_code)]
 fn update_totals(
     summary: &mut Summary,
@@ -572,31 +595,58 @@ fn update_totals(
     added_property: &str,
     removed_property: &str,
 ) {
-    let previous_total = previous_summary.map_or(0, |previous_summary| {
-        previous_summary
-            .additional_properties
-            .get(total_property)
-            .map_or(0, |value| value.parse::<u64>().unwrap())
+    // Added/removed counters are produced by this collector and are always numeric; default an
+    // absent or (defensively) non-numeric value to 0 so it does not affect the total.
+    fn previous_added_or_removed(props: &HashMap<String, String>, key: &str) -> i64 {
+        props
+            .get(key)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+
+    // Added/removed are written by this same collector and are always numeric; an absent or
+    // (defensively) non-numeric value contributes 0.
+    let added = previous_added_or_removed(&summary.additional_properties, added_property);
+    let removed = previous_added_or_removed(&summary.additional_properties, removed_property);
+
+    // Resolve the previous total, distinguishing Java's three states:
+    //   * no parent summary at all (first snapshot) → Java's caller seeds zeros → accumulate from 0;
+    //   * a real parent summary that LACKS the key → Java returns without writing (omit; invalidation
+    //     is sticky once a prior snapshot dropped it);
+    //   * present → Some(n); present-but-non-numeric → invalidate.
+    let previous_total: Option<i64> = match previous_summary {
+        None => Some(0),
+        Some(previous) => match previous.additional_properties.get(total_property) {
+            None => None, // absent in a real parent → omit, do not re-seed from 0
+            Some(value) => value.parse::<i64>().ok(), // non-numeric → None → invalidate
+        },
+    };
+
+    // Java's per-step `>= 0` short-circuit: a negative running total skips add and sub and is
+    // dropped. Checked arithmetic so a stale/hostile previous summary can never wrap or panic.
+    let new_total = previous_total.and_then(|previous_total| {
+        let mut total = previous_total;
+        if total >= 0 {
+            total = total.checked_add(added)?;
+        }
+        if total >= 0 {
+            total = total.checked_sub(removed)?;
+        }
+        Some(total)
     });
 
-    let mut new_total = previous_total;
-    if let Some(value) = summary
-        .additional_properties
-        .get(added_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
-        new_total += value;
+    match new_total {
+        // Java writes back only when the total resolved and `newTotal >= 0`.
+        Some(new_total) if new_total >= 0 => {
+            summary
+                .additional_properties
+                .insert(total_property.to_string(), new_total.to_string());
+        }
+        // Absent-in-real-parent, non-numeric previous, overflow, or negative result → omit (drop).
+        _ => {
+            summary.additional_properties.remove(total_property);
+        }
     }
-    if let Some(value) = summary
-        .additional_properties
-        .get(removed_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
-        new_total -= value;
-    }
-    summary
-        .additional_properties
-        .insert(total_property.to_string(), new_total.to_string());
 }
 
 #[cfg(test)]
@@ -795,6 +845,217 @@ mod tests {
                 .get(REMOVED_EQUALITY_DELETES)
                 .unwrap(),
             "2"
+        );
+    }
+
+    #[test]
+    fn test_update_totals_invalidates_when_removed_exceeds_previous_plus_added() {
+        // Java `SnapshotSummary.updateTotal`: a `newTotal < 0` invalidates (drops) the property.
+        // A stale/hand-edited previous summary whose `removed-*` exceeds `previous + added` must
+        // NOT panic (debug overflow) or wrap (release) — the total key is simply omitted.
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(TOTAL_RECORDS.to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [
+                (ADDED_RECORDS.to_string(), "5".to_string()),
+                // 100 + 5 - 1000 = -895 → invalidate.
+                (DELETED_RECORDS.to_string(), "1000".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false)
+            .expect("update_snapshot_summaries must not error on a stale previous summary");
+
+        assert!(
+            !updated.additional_properties.contains_key(TOTAL_RECORDS),
+            "negative computed total must invalidate (drop) the total-records property, got {:?}",
+            updated.additional_properties.get(TOTAL_RECORDS)
+        );
+    }
+
+    #[test]
+    fn test_update_totals_invalidates_on_non_numeric_previous_total() {
+        // Java parses the previous total as a `long`; an unparsable previous value leaves the
+        // total invalidated. The old Rust code `.unwrap()`-ed the parse and panicked here.
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(TOTAL_RECORDS.to_string(), "not-a-number".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(ADDED_RECORDS.to_string(), "10".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false)
+            .expect("non-numeric previous total must not panic");
+
+        assert!(
+            !updated.additional_properties.contains_key(TOTAL_RECORDS),
+            "non-numeric previous total must invalidate (drop) the total-records property"
+        );
+    }
+
+    #[test]
+    fn test_update_totals_normal_case_still_computes() {
+        // Guard against the invalidation path over-firing: a valid previous + added - removed
+        // must still produce the correct positive total.
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(TOTAL_RECORDS.to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [
+                (ADDED_RECORDS.to_string(), "40".to_string()),
+                (DELETED_RECORDS.to_string(), "10".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false)
+            .expect("normal case must succeed");
+
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(TOTAL_RECORDS)
+                .map(String::as_str),
+            Some("130"),
+            "100 + 40 - 10 = 130"
+        );
+    }
+
+    #[test]
+    fn test_update_totals_omits_when_key_absent_in_real_previous() {
+        // Java `SnapshotProducer.updateTotal`: if the (real, non-empty) previous summary LACKS the
+        // total key, it returns WITHOUT writing — invalidation is sticky and the total stays
+        // omitted. It must NOT be re-seeded from 0 (that was the pre-fix Rust bug).
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            // A real parent summary that carries SOME totals but not total-records (e.g. a prior
+            // snapshot already invalidated it).
+            additional_properties: [(TOTAL_DATA_FILES.to_string(), "10".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(ADDED_RECORDS.to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false)
+            .expect("absent total key in a real previous summary must not error");
+
+        assert!(
+            !updated.additional_properties.contains_key(TOTAL_RECORDS),
+            "an absent total key in a REAL previous summary must stay omitted, not re-seed from 0; \
+             got {:?}",
+            updated.additional_properties.get(TOTAL_RECORDS)
+        );
+    }
+
+    #[test]
+    fn test_update_totals_negative_previous_total_is_dropped() {
+        // Java's per-step `>= 0` short-circuit: a NEGATIVE previous total skips both the add and
+        // the subtract and stays negative, so the final `< 0` value is omitted. It must NOT
+        // compute through to `-5 + 100 = 95`.
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(TOTAL_RECORDS.to_string(), "-5".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [(ADDED_RECORDS.to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false)
+            .expect("negative previous total must not error");
+
+        assert!(
+            !updated.additional_properties.contains_key(TOTAL_RECORDS),
+            "a negative previous total must skip add/sub and be dropped (Java per-step guard), \
+             not compute to 95; got {:?}",
+            updated.additional_properties.get(TOTAL_RECORDS)
+        );
+    }
+
+    #[test]
+    fn test_update_totals_first_snapshot_accumulates_from_zero() {
+        // Java's caller synthesizes an all-zeros previous summary when there is NO parent snapshot
+        // (`previous_summary == None` here), so a first snapshot still accrues totals from 0.
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [
+                (ADDED_RECORDS.to_string(), "40".to_string()),
+                (DELETED_RECORDS.to_string(), "10".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let updated =
+            update_snapshot_summaries(summary, None, false).expect("first snapshot must not error");
+
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(TOTAL_RECORDS)
+                .map(String::as_str),
+            Some("30"),
+            "first snapshot (no parent) must accumulate from 0: 0 + 40 - 10 = 30"
+        );
+    }
+
+    #[test]
+    fn test_total_value_above_i32_max_round_trips() {
+        // FIX 2: `total-*` is a Java `long`; a value > i32::MAX must flow through the
+        // get_prop / truncate_table_summary path without error (the old `i32` parse errored).
+        let big: i64 = i64::from(i32::MAX) + 1; // 2_147_483_648
+        let previous_summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: [(TOTAL_RECORDS.to_string(), big.to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        // Direct get_prop must parse the wide value.
+        let parsed = get_prop(&previous_summary, TOTAL_RECORDS).expect("wide total must parse");
+        assert_eq!(parsed, big);
+
+        // And it must round-trip through truncate_table_summary into the removed-* counter.
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::new(),
+        };
+        let truncated =
+            truncate_table_summary(summary, &previous_summary).expect("truncate must not error");
+        assert_eq!(
+            truncated
+                .additional_properties
+                .get(DELETED_RECORDS)
+                .map(String::as_str),
+            Some(big.to_string().as_str()),
+            "the > i32::MAX previous total must round-trip into deleted-records"
         );
     }
 

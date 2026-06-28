@@ -84,44 +84,84 @@ pub trait SchemaVisitor {
     }
 }
 
+/// Maximum schema-type nesting depth either `visit_type` walk will descend.
+///
+/// A schema can come from a partner/attacker-influenced metadata file; without a bound a
+/// deeply-nested type (struct/list/map-within-…) would overflow the thread stack on this
+/// recursive post-order walk. Mirrors the variant parser's
+/// [`crate::variant::MAX_NESTING_DEPTH`] (`128`) — far above any real Iceberg schema's nesting.
+const MAX_SCHEMA_NESTING_DEPTH: usize = 128;
+
 /// Visiting a type in post order.
 pub(crate) fn visit_type<V: SchemaVisitor>(r#type: &Type, visitor: &mut V) -> Result<V::T> {
+    visit_type_at_depth(r#type, visitor, 0)
+}
+
+/// Depth-bounded body of [`visit_type`]. `depth` is the current nesting level (root at `0`); each
+/// nested element/key/value/field recurses at `depth + 1`, and exceeding
+/// [`MAX_SCHEMA_NESTING_DEPTH`] returns a typed error instead of overflowing the stack.
+fn visit_type_at_depth<V: SchemaVisitor>(
+    r#type: &Type,
+    visitor: &mut V,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_SCHEMA_NESTING_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Schema type nesting exceeds maximum depth {MAX_SCHEMA_NESTING_DEPTH}"),
+        ));
+    }
     match r#type {
         Type::Primitive(p) => visitor.primitive(p),
         Type::Variant => visitor.variant(),
         Type::List(list) => {
             visitor.before_list_element(&list.element_field)?;
-            let value = visit_type(&list.element_field.field_type, visitor)?;
+            let value = visit_type_at_depth(&list.element_field.field_type, visitor, depth + 1)?;
             visitor.after_list_element(&list.element_field)?;
             visitor.list(list, value)
         }
         Type::Map(map) => {
             let key_result = {
                 visitor.before_map_key(&map.key_field)?;
-                let ret = visit_type(&map.key_field.field_type, visitor)?;
+                let ret = visit_type_at_depth(&map.key_field.field_type, visitor, depth + 1)?;
                 visitor.after_map_key(&map.key_field)?;
                 ret
             };
 
             let value_result = {
                 visitor.before_map_value(&map.value_field)?;
-                let ret = visit_type(&map.value_field.field_type, visitor)?;
+                let ret = visit_type_at_depth(&map.value_field.field_type, visitor, depth + 1)?;
                 visitor.after_map_value(&map.value_field)?;
                 ret
             };
 
             visitor.map(map, key_result, value_result)
         }
-        Type::Struct(s) => visit_struct(s, visitor),
+        Type::Struct(s) => visit_struct_at_depth(s, visitor, depth),
     }
 }
 
 /// Visit struct type in post order.
 pub fn visit_struct<V: SchemaVisitor>(s: &StructType, visitor: &mut V) -> Result<V::T> {
+    visit_struct_at_depth(s, visitor, 0)
+}
+
+/// Depth-bounded body of [`visit_struct`]; see [`visit_type_at_depth`].
+fn visit_struct_at_depth<V: SchemaVisitor>(
+    s: &StructType,
+    visitor: &mut V,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_SCHEMA_NESTING_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Schema type nesting exceeds maximum depth {MAX_SCHEMA_NESTING_DEPTH}"),
+        ));
+    }
     let mut results = Vec::with_capacity(s.fields().len());
     for field in s.fields() {
         visitor.before_struct_field(field)?;
-        let result = visit_type(&field.field_type, visitor)?;
+        let result = visit_type_at_depth(&field.field_type, visitor, depth + 1)?;
         visitor.after_struct_field(field)?;
         let result = visitor.field(field, result)?;
         results.push(result);
@@ -235,17 +275,38 @@ pub(crate) fn visit_type_with_partner<P, V: SchemaWithPartnerVisitor<P>, A: Part
     visitor: &mut V,
     accessor: &A,
 ) -> Result<V::T> {
+    visit_type_with_partner_at_depth(r#type, partner, visitor, accessor, 0)
+}
+
+/// Depth-bounded body of [`visit_type_with_partner`]. Mirrors [`visit_type_at_depth`]: `depth` is
+/// the current nesting level (root at `0`), each nested element/key/value/field recurses at
+/// `depth + 1`, and exceeding [`MAX_SCHEMA_NESTING_DEPTH`] returns a typed error instead of
+/// overflowing the stack on a partner-influenced (and thus possibly hostile) schema.
+fn visit_type_with_partner_at_depth<P, V: SchemaWithPartnerVisitor<P>, A: PartnerAccessor<P>>(
+    r#type: &Type,
+    partner: &P,
+    visitor: &mut V,
+    accessor: &A,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_SCHEMA_NESTING_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Schema type nesting exceeds maximum depth {MAX_SCHEMA_NESTING_DEPTH}"),
+        ));
+    }
     match r#type {
         Type::Primitive(p) => visitor.primitive(p, partner),
         Type::Variant => visitor.variant(partner),
         Type::List(list) => {
             let list_element_partner = accessor.list_element_partner(partner)?;
             visitor.before_list_element(&list.element_field, list_element_partner)?;
-            let element_results = visit_type_with_partner(
+            let element_results = visit_type_with_partner_at_depth(
                 &list.element_field.field_type,
                 list_element_partner,
                 visitor,
                 accessor,
+                depth + 1,
             )?;
             visitor.after_list_element(&list.element_field, list_element_partner)?;
             visitor.list(list, partner, element_results)
@@ -253,23 +314,29 @@ pub(crate) fn visit_type_with_partner<P, V: SchemaWithPartnerVisitor<P>, A: Part
         Type::Map(map) => {
             let key_partner = accessor.map_key_partner(partner)?;
             visitor.before_map_key(&map.key_field, key_partner)?;
-            let key_result =
-                visit_type_with_partner(&map.key_field.field_type, key_partner, visitor, accessor)?;
+            let key_result = visit_type_with_partner_at_depth(
+                &map.key_field.field_type,
+                key_partner,
+                visitor,
+                accessor,
+                depth + 1,
+            )?;
             visitor.after_map_key(&map.key_field, key_partner)?;
 
             let value_partner = accessor.map_value_partner(partner)?;
             visitor.before_map_value(&map.value_field, value_partner)?;
-            let value_result = visit_type_with_partner(
+            let value_result = visit_type_with_partner_at_depth(
                 &map.value_field.field_type,
                 value_partner,
                 visitor,
                 accessor,
+                depth + 1,
             )?;
             visitor.after_map_value(&map.value_field, value_partner)?;
 
             visitor.map(map, partner, key_result, value_result)
         }
-        Type::Struct(s) => visit_struct_with_partner(s, partner, visitor, accessor),
+        Type::Struct(s) => visit_struct_with_partner_at_depth(s, partner, visitor, accessor, depth),
     }
 }
 
@@ -280,11 +347,34 @@ pub fn visit_struct_with_partner<P, V: SchemaWithPartnerVisitor<P>, A: PartnerAc
     visitor: &mut V,
     accessor: &A,
 ) -> Result<V::T> {
+    visit_struct_with_partner_at_depth(s, partner, visitor, accessor, 0)
+}
+
+/// Depth-bounded body of [`visit_struct_with_partner`]; see [`visit_type_with_partner_at_depth`].
+fn visit_struct_with_partner_at_depth<P, V: SchemaWithPartnerVisitor<P>, A: PartnerAccessor<P>>(
+    s: &StructType,
+    partner: &P,
+    visitor: &mut V,
+    accessor: &A,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_SCHEMA_NESTING_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Schema type nesting exceeds maximum depth {MAX_SCHEMA_NESTING_DEPTH}"),
+        ));
+    }
     let mut results = Vec::with_capacity(s.fields().len());
     for field in s.fields() {
         let field_partner = accessor.field_partner(partner, field)?;
         visitor.before_struct_field(field, field_partner)?;
-        let result = visit_type_with_partner(&field.field_type, field_partner, visitor, accessor)?;
+        let result = visit_type_with_partner_at_depth(
+            &field.field_type,
+            field_partner,
+            visitor,
+            accessor,
+            depth + 1,
+        )?;
         visitor.after_struct_field(field, field_partner)?;
         let result = visitor.field(field, field_partner, result)?;
         results.push(result);
@@ -307,4 +397,166 @@ pub fn visit_schema_with_partner<P, V: SchemaWithPartnerVisitor<P>, A: PartnerAc
         accessor,
     )?;
     visitor.schema(schema, partner, result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trivial leaf-counting visitor: it asserts the walk reaches primitives and does no
+    /// allocation, so the depth-limit error (raised before any visitor call past the bound) is
+    /// the only thing under test.
+    struct CountingVisitor;
+
+    impl SchemaVisitor for CountingVisitor {
+        type T = ();
+
+        fn schema(&mut self, _schema: &Schema, _value: ()) -> Result<()> {
+            Ok(())
+        }
+        fn field(&mut self, _field: &NestedFieldRef, _value: ()) -> Result<()> {
+            Ok(())
+        }
+        fn r#struct(&mut self, _struct: &StructType, _results: Vec<()>) -> Result<()> {
+            Ok(())
+        }
+        fn list(&mut self, _list: &ListType, _value: ()) -> Result<()> {
+            Ok(())
+        }
+        fn map(&mut self, _map: &MapType, _key: (), _value: ()) -> Result<()> {
+            Ok(())
+        }
+        fn primitive(&mut self, _p: &PrimitiveType) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Wrap `inner` in `depth` nested single-element lists.
+    fn nested_list(depth: usize) -> Type {
+        let mut ty = Type::Primitive(PrimitiveType::Int);
+        for _ in 0..depth {
+            ty = Type::List(ListType {
+                element_field: NestedField::list_element(1, ty, true).into(),
+            });
+        }
+        ty
+    }
+
+    #[test]
+    fn test_visit_type_depth_limit_errors() {
+        // Deeper than the bound must error (typed) rather than overflow the stack.
+        let deep = nested_list(MAX_SCHEMA_NESTING_DEPTH + 5);
+        let mut visitor = CountingVisitor;
+        let err = visit_type(&deep, &mut visitor)
+            .expect_err("over-deep type must error, not overflow the stack");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_visit_type_normal_nesting_succeeds() {
+        // A normally-nested type still visits cleanly (behavior unchanged for valid inputs).
+        let shallow = nested_list(8);
+        let mut visitor = CountingVisitor;
+        visit_type(&shallow, &mut visitor).expect("normally-nested type must visit successfully");
+    }
+
+    /// A trivial unit-partner visitor mirroring [`CountingVisitor`] for the partner walk. The
+    /// partner is `()`; the accessor below hands the same unit partner to every child, which is
+    /// enough to drive the recursion through struct fields, list elements, and map key/value.
+    struct UnitPartnerVisitor;
+
+    impl SchemaWithPartnerVisitor<()> for UnitPartnerVisitor {
+        type T = ();
+
+        fn schema(&mut self, _schema: &Schema, _partner: &(), _value: ()) -> Result<()> {
+            Ok(())
+        }
+        fn field(&mut self, _field: &NestedFieldRef, _partner: &(), _value: ()) -> Result<()> {
+            Ok(())
+        }
+        fn r#struct(
+            &mut self,
+            _struct: &StructType,
+            _partner: &(),
+            _results: Vec<()>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn list(&mut self, _list: &ListType, _partner: &(), _value: ()) -> Result<()> {
+            Ok(())
+        }
+        fn map(&mut self, _map: &MapType, _partner: &(), _key: (), _value: ()) -> Result<()> {
+            Ok(())
+        }
+        fn primitive(&mut self, _p: &PrimitiveType, _partner: &()) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Hands the same `&()` partner to every child of the walk.
+    struct UnitPartnerAccessor;
+
+    impl PartnerAccessor<()> for UnitPartnerAccessor {
+        fn struct_partner<'a>(&self, schema_partner: &'a ()) -> Result<&'a ()> {
+            Ok(schema_partner)
+        }
+        fn field_partner<'a>(
+            &self,
+            struct_partner: &'a (),
+            _field: &NestedField,
+        ) -> Result<&'a ()> {
+            Ok(struct_partner)
+        }
+        fn list_element_partner<'a>(&self, list_partner: &'a ()) -> Result<&'a ()> {
+            Ok(list_partner)
+        }
+        fn map_key_partner<'a>(&self, map_partner: &'a ()) -> Result<&'a ()> {
+            Ok(map_partner)
+        }
+        fn map_value_partner<'a>(&self, map_partner: &'a ()) -> Result<&'a ()> {
+            Ok(map_partner)
+        }
+    }
+
+    /// Wrap `inner` in `depth` nested single-key/value maps, so the bound must thread through BOTH
+    /// the map key AND value child recursions of the partner walk (a list only exercises one
+    /// child).
+    fn nested_map(depth: usize) -> Type {
+        let mut ty = Type::Primitive(PrimitiveType::Int);
+        for _ in 0..depth {
+            ty = Type::Map(MapType {
+                key_field: NestedField::map_key_element(1, Type::Primitive(PrimitiveType::String))
+                    .into(),
+                value_field: NestedField::map_value_element(2, ty, true).into(),
+            });
+        }
+        ty
+    }
+
+    #[test]
+    fn test_visit_type_with_partner_depth_limit_errors() {
+        // The partner walk must apply the SAME bound: deeper than the limit errors (typed) instead
+        // of overflowing the stack on a partner-influenced schema.
+        let deep = nested_list(MAX_SCHEMA_NESTING_DEPTH + 5);
+        let mut visitor = UnitPartnerVisitor;
+        let err = visit_type_with_partner(&deep, &(), &mut visitor, &UnitPartnerAccessor)
+            .expect_err("over-deep partner walk must error, not overflow the stack");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+        // Also prove the bound threads through the map key AND value child recursions.
+        let deep_map = nested_map(MAX_SCHEMA_NESTING_DEPTH + 5);
+        let mut visitor = UnitPartnerVisitor;
+        let err = visit_type_with_partner(&deep_map, &(), &mut visitor, &UnitPartnerAccessor)
+            .expect_err("over-deep partner map walk must error, not overflow the stack");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_visit_type_with_partner_normal_nesting_succeeds() {
+        // A normally-nested type with a valid partner still visits cleanly (behavior unchanged).
+        let shallow = nested_list(8);
+        let mut visitor = UnitPartnerVisitor;
+        visit_type_with_partner(&shallow, &(), &mut visitor, &UnitPartnerAccessor)
+            .expect("normally-nested partner walk must visit successfully");
+    }
 }

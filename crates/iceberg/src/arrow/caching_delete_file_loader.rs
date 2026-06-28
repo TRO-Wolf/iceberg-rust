@@ -25,6 +25,7 @@ use tokio::sync::oneshot::{Receiver, channel};
 
 use super::delete_filter::{DeleteFilter, PosDelLoadAction};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
+use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
@@ -68,7 +69,7 @@ enum DeleteFileContext {
     FreshEqDel {
         batch_stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
-        sender: tokio::sync::oneshot::Sender<Predicate>,
+        sender: tokio::sync::oneshot::Sender<(Predicate, Option<EqDeleteKeySet>)>,
     },
 }
 
@@ -461,13 +462,12 @@ impl CachingDeleteFileLoader {
                 batch_stream,
                 equality_ids,
             } => {
-                let predicate =
-                    Self::parse_equality_deletes_record_batch_stream(batch_stream, equality_ids)
-                        .await?;
+                let predicate_and_set =
+                    Self::parse_equality_deletes_with_keyset(batch_stream, equality_ids).await?;
 
                 sender
-                    .send(predicate)
-                    .map_err(|err| {
+                    .send(predicate_and_set)
+                    .map_err(|_| {
                         Error::new(
                             ErrorKind::Unexpected,
                             "Could not send eq delete predicate to state",
@@ -504,6 +504,15 @@ impl CachingDeleteFileLoader {
                 ));
             };
 
+            // Position-delete files are sorted by (path, pos), so equal paths arrive in CONTIGUOUS
+            // runs. Cache the delete vector for the LAST-SEEN path and only re-resolve the map entry
+            // (allocating an owned `String` key) when the path changes — instead of allocating a
+            // `String` and hashing the map for EVERY row. The resulting map is identical to the
+            // per-row form: same keys, same positions inserted in the same order (a sorted file has
+            // one run per path; an unsorted file still lands every position in the right entry, it
+            // just re-resolves on each path change). `current` holds the path string and its vector;
+            // we splice the vector back into the map on each change and at end-of-batch.
+            let mut current: Option<(&str, DeleteVector)> = None;
             for (file_path, pos) in file_paths.iter().zip(positions.iter()) {
                 let (Some(file_path), Some(pos)) = (file_path, pos) else {
                     return Err(Error::new(
@@ -512,10 +521,26 @@ impl CachingDeleteFileLoader {
                     ));
                 };
 
-                result
-                    .entry(file_path.to_string())
-                    .or_default()
-                    .insert(pos as u64);
+                match &mut current {
+                    Some((path, vector)) if *path == file_path => {
+                        vector.insert(pos as u64);
+                    }
+                    _ => {
+                        // Flush the previous run's vector back into the map (merging if the path
+                        // recurs in a later, non-contiguous run), then start the new path's run from
+                        // whatever positions the map already holds for it.
+                        if let Some((path, vector)) = current.take() {
+                            *result.entry(path.to_string()).or_default() |= vector;
+                        }
+                        let mut vector =
+                            std::mem::take(result.entry(file_path.to_string()).or_default());
+                        vector.insert(pos as u64);
+                        current = Some((file_path, vector));
+                    }
+                }
+            }
+            if let Some((path, vector)) = current.take() {
+                *result.entry(path.to_string()).or_default() |= vector;
             }
         }
 
@@ -527,18 +552,45 @@ impl CachingDeleteFileLoader {
     /// predicate false). `pub(crate)` so the `ConvertEqualityDeleteFiles` maintenance action can reuse
     /// the exact read-side parse to build the same predicate it inverts to find matching positions.
     pub(crate) async fn parse_equality_deletes_record_batch_stream(
-        mut stream: ArrowRecordBatchStream,
+        stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
     ) -> Result<Predicate> {
+        Ok(
+            Self::parse_equality_deletes_with_keyset(stream, equality_ids)
+                .await?
+                .0,
+        )
+    }
+
+    /// Like [`parse_equality_deletes_record_batch_stream`], but ALSO returns the hashed
+    /// [`EqDeleteKeySet`] accelerator when (and only when) every key column's type is eligible for
+    /// the O(R) set fast path (`EqDeleteKeySet::is_eligible_type`). The predicate is built EXACTLY as
+    /// before — it remains the authoritative oracle and the fallback — so a `None` set simply means
+    /// "apply via the predicate path." The set's delete tuples and the predicate's per-row leaves are
+    /// produced from the SAME decoded [`Datum`]s, so they encode the identical delete condition.
+    ///
+    /// [`parse_equality_deletes_record_batch_stream`]: Self::parse_equality_deletes_record_batch_stream
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn parse_equality_deletes_with_keyset(
+        mut stream: ArrowRecordBatchStream,
+        equality_ids: HashSet<i32>,
+    ) -> Result<(Predicate, Option<EqDeleteKeySet>)> {
         let mut row_predicates = Vec::new();
         let mut batch_schema_iceberg: Option<Schema> = None;
         let accessor = EqDelRecordBatchPartnerAccessor;
+
+        // Parallel set-path collection: the ordered key columns (captured once, from the first batch
+        // that yields columns) and every delete-key tuple. `set_eligible` latches false the moment a
+        // key column type is ineligible, so a float (etc.) key disables the fast path for this file.
+        let mut key_columns: Option<Vec<(i32, String, PrimitiveType)>> = None;
+        let mut delete_tuples: Vec<Vec<Option<Datum>>> = Vec::new();
+        let mut set_eligible = true;
 
         while let Some(record_batch) = stream.next().await {
             let record_batch = record_batch?;
 
             if record_batch.num_columns() == 0 {
-                return Ok(AlwaysTrue);
+                return Ok((AlwaysTrue, None));
             }
 
             let schema = match &batch_schema_iceberg {
@@ -560,23 +612,50 @@ impl CachingDeleteFileLoader {
                 continue;
             }
 
+            // Capture the ordered key columns once, and check eligibility for the fast path.
+            if key_columns.is_none() {
+                let columns: Vec<(i32, String, PrimitiveType)> = datum_columns_with_names
+                    .iter()
+                    .map(|(_, field_id, field_name, primitive_type)| {
+                        (*field_id, field_name.clone(), primitive_type.clone())
+                    })
+                    .collect();
+                set_eligible &= columns
+                    .iter()
+                    .all(|(_, _, ty)| EqDeleteKeySet::is_eligible_type(ty));
+                key_columns = Some(columns);
+            }
+
             // Process the collected columns in lockstep
             #[allow(clippy::len_zero)]
             while datum_columns_with_names[0].0.len() > 0 {
                 let mut row_predicate = AlwaysTrue;
-                for &mut (ref mut column, ref field_name) in &mut datum_columns_with_names {
+                let mut tuple: Vec<Option<Datum>> =
+                    Vec::with_capacity(datum_columns_with_names.len());
+                for &mut (ref mut column, _, ref field_name, _) in &mut datum_columns_with_names {
                     if let Some(item) = column.next() {
-                        let cell_predicate = if let Some(datum) = item? {
+                        let cell = item?;
+                        let cell_predicate = if let Some(datum) = &cell {
                             Reference::new(field_name.clone()).equal_to(datum.clone())
                         } else {
                             Reference::new(field_name.clone()).is_null()
                         };
-                        row_predicate = row_predicate.and(cell_predicate)
+                        row_predicate = row_predicate.and(cell_predicate);
+                        tuple.push(cell);
                     }
                 }
                 row_predicates.push(row_predicate.not().rewrite_not());
+                delete_tuples.push(tuple);
             }
         }
+
+        // Build the set accelerator iff every key column was eligible. `try_build` re-checks the
+        // gate (defence in depth) and returns `None` for an empty / ineligible key schema.
+        let key_set = if set_eligible {
+            key_columns.and_then(|columns| EqDeleteKeySet::try_build(columns, delete_tuples))
+        } else {
+            None
+        };
 
         // All row predicates are combined to a single predicate by creating a balanced binary tree.
         // Using a simple fold would result in a deeply nested predicate that can cause a stack overflow.
@@ -593,16 +672,17 @@ impl CachingDeleteFileLoader {
             row_predicates = next_level;
         }
 
-        match row_predicates.pop() {
-            Some(p) => Ok(p),
-            None => Ok(AlwaysTrue),
-        }
+        let predicate = match row_predicates.pop() {
+            Some(p) => p,
+            None => AlwaysTrue,
+        };
+        Ok((predicate, key_set))
     }
 }
 
 struct EqDelColumnProcessor<'a> {
     equality_ids: &'a HashSet<i32>,
-    collected_columns: Vec<(ArrayRef, String, Type)>,
+    collected_columns: Vec<(ArrayRef, i32, String, Type)>,
 }
 
 impl<'a> EqDelColumnProcessor<'a> {
@@ -619,12 +699,14 @@ impl<'a> EqDelColumnProcessor<'a> {
     ) -> Result<
         Vec<(
             Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>>,
+            i32,
             String,
+            PrimitiveType,
         )>,
     > {
         self.collected_columns
             .into_iter()
-            .map(|(array, field_name, field_type)| {
+            .map(|(array, field_id, field_name, field_type)| {
                 let primitive_type = field_type
                     .as_primitive_type()
                     .ok_or_else(|| {
@@ -633,13 +715,14 @@ impl<'a> EqDelColumnProcessor<'a> {
                     .clone();
 
                 let lit_vec = arrow_primitive_to_literal(&array, &field_type)?;
+                let datum_primitive_type = primitive_type.clone();
                 let datum_iterator: Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>> =
                     Box::new(lit_vec.into_iter().map(move |c| {
                         c.map(|literal| {
                             literal
                                 .as_primitive_literal()
                                 .map(|primitive_literal| {
-                                    Datum::new(primitive_type.clone(), primitive_literal)
+                                    Datum::new(datum_primitive_type.clone(), primitive_literal)
                                 })
                                 .ok_or(Error::new(
                                     ErrorKind::Unexpected,
@@ -649,7 +732,7 @@ impl<'a> EqDelColumnProcessor<'a> {
                         .transpose()
                     }));
 
-                Ok((datum_iterator, field_name))
+                Ok((datum_iterator, field_id, field_name, primitive_type))
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -666,6 +749,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
         if self.equality_ids.contains(&field.id) && field.field_type.as_primitive_type().is_some() {
             self.collected_columns.push((
                 partner.clone(),
+                field.id,
                 field.name.clone(),
                 field.field_type.as_ref().clone(),
             ));
@@ -806,6 +890,93 @@ mod tests {
         let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (sa != 5)) OR (b IS NOT NULL))".to_string();
 
         assert_eq!(parsed_eq_delete.to_string(), expected);
+    }
+
+    /// M5 equivalence: the interned `parse_positional_deletes_record_batch_stream` must build the
+    /// EXACT same `HashMap<path, DeleteVector>` as a straightforward per-row reference, including the
+    /// edge cases the run-cache must get right: contiguous runs of one path, MULTIPLE positions for a
+    /// path, a path that RECURS in a later non-contiguous run (forcing the merge-back branch), and
+    /// positions split across two batches. A `DeleteVector` is a set, so duplicate positions collapse
+    /// — both paths must agree on the final position set per file.
+    #[tokio::test]
+    async fn test_parse_positional_deletes_interning_matches_per_row_reference() {
+        use futures::stream;
+
+        // Reference per-row implementation (the pre-M5 form): one map entry resolved per row.
+        fn reference(batches: &[RecordBatch]) -> HashMap<String, Vec<u64>> {
+            let mut out: HashMap<String, DeleteVector> = HashMap::default();
+            for batch in batches {
+                let paths = batch.column(0).as_string::<i32>();
+                let positions = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for (p, pos) in paths.iter().zip(positions.iter()) {
+                    out.entry(p.unwrap().to_string())
+                        .or_default()
+                        .insert(pos.unwrap() as u64);
+                }
+            }
+            out.into_iter()
+                .map(|(k, v)| (k, v.iter().collect()))
+                .collect()
+        }
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ]));
+
+        let mk = |paths: Vec<&str>, pos: Vec<i64>| {
+            RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(StringArray::from(paths)) as ArrayRef,
+                Arc::new(Int64Array::from(pos)) as ArrayRef,
+            ])
+            .unwrap()
+        };
+
+        // Batch 1: a, b, a, b, a — "a" and "b" each RECUR in non-contiguous runs, so the SECOND
+        // flush of each merges onto a map entry that is already non-empty (exercises the `|=`
+        // merge-back, not just insert-into-empty). Includes a duplicate position for "a".
+        let b1 = mk(
+            vec![
+                "a.parquet",
+                "a.parquet",
+                "b.parquet",
+                "a.parquet",
+                "b.parquet",
+                "a.parquet",
+            ],
+            vec![10, 20, 5, 10, 6, 30],
+        );
+        // Batch 2: b again (split across batches) and a fresh c.
+        let b2 = mk(vec!["b.parquet", "c.parquet", "c.parquet"], vec![5, 1, 2]);
+        let batches = vec![b1, b2];
+
+        let expected = reference(&batches);
+
+        let stream_batches: Vec<crate::Result<RecordBatch>> =
+            batches.iter().cloned().map(Ok).collect();
+        let stream = Box::pin(stream::iter(stream_batches)) as ArrowRecordBatchStream;
+        let actual_map =
+            CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(stream)
+                .await
+                .expect("parse positional deletes");
+
+        let actual: HashMap<String, Vec<u64>> = actual_map
+            .into_iter()
+            .map(|(k, v)| (k, v.iter().collect()))
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "interned positional-delete parse must match the per-row reference map exactly"
+        );
+        // Pin the exact sets so a silent regression in either path is caught.
+        assert_eq!(expected.get("a.parquet").unwrap().as_slice(), &[10, 20, 30]);
+        assert_eq!(expected.get("b.parquet").unwrap().as_slice(), &[5, 6]);
+        assert_eq!(expected.get("c.parquet").unwrap().as_slice(), &[1, 2]);
     }
 
     /// Create a simple field with metadata.

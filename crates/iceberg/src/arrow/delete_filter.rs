@@ -25,6 +25,7 @@ use tokio::sync::Notify;
 use tokio::sync::oneshot::Receiver;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
@@ -37,7 +38,10 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Debug)]
 enum EqDelState {
     Loading(Arc<Notify>),
-    Loaded(Predicate),
+    /// The resolved equality-delete file: its authoritative survival [`Predicate`] (always present —
+    /// the oracle and the fallback) and, when every key column is type-eligible, the hashed
+    /// [`EqDeleteKeySet`] accelerator for the O(R) apply fast path.
+    Loaded(Predicate, Option<EqDeleteKeySet>),
 }
 
 /// State tracking for positional delete files.
@@ -188,7 +192,7 @@ impl DeleteFilter {
             match self.state.read().unwrap().equality_deletes.get(file_path) {
                 None => return None,
                 Some(EqDelState::Loading(notifier)) => notifier.clone(),
-                Some(EqDelState::Loaded(predicate)) => {
+                Some(EqDelState::Loaded(predicate, _)) => {
                     return Some(predicate.clone());
                 }
             }
@@ -197,9 +201,64 @@ impl DeleteFilter {
         notifier.notified().await;
 
         match self.state.read().unwrap().equality_deletes.get(file_path) {
-            Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
+            Some(EqDelState::Loaded(predicate, _)) => Some(predicate.clone()),
             _ => unreachable!("Cannot be any other state than loaded"),
         }
+    }
+
+    /// Retrieve the hashed [`EqDeleteKeySet`] accelerator for an eq-delete file, awaiting its load.
+    /// `Some(set)` means the file is fast-path-eligible (all key columns are type-eligible);
+    /// `Some(None)`-style absence is folded into `None` here — the caller then uses the predicate
+    /// path. Returns `None` if the file is unknown.
+    pub(crate) async fn get_equality_delete_keyset_for_delete_file_path(
+        &self,
+        file_path: &str,
+    ) -> Option<EqDeleteKeySet> {
+        let notifier = {
+            match self.state.read().unwrap().equality_deletes.get(file_path) {
+                None => return None,
+                Some(EqDelState::Loading(notifier)) => notifier.clone(),
+                Some(EqDelState::Loaded(_, key_set)) => {
+                    return key_set.clone();
+                }
+            }
+        };
+
+        notifier.notified().await;
+
+        match self.state.read().unwrap().equality_deletes.get(file_path) {
+            Some(EqDelState::Loaded(_, key_set)) => key_set.clone(),
+            _ => unreachable!("Cannot be any other state than loaded"),
+        }
+    }
+
+    /// Collect the hashed key sets for ALL of `task`'s equality-delete files — `Some(sets)` only if
+    /// EVERY eq-delete file is fast-path-eligible and they share one key-column schema (so their
+    /// per-file delete masks can be OR-combined under one tuple shape). Returns `None` (use the
+    /// predicate path for the whole task) if the task has no eq-deletes, any file is ineligible, or
+    /// the files disagree on key columns. This is the routing gate for the O(R) fast path.
+    pub(crate) async fn collect_equality_delete_keysets(
+        &self,
+        task: &FileScanTask,
+    ) -> Option<Vec<EqDeleteKeySet>> {
+        let mut sets: Vec<EqDeleteKeySet> = Vec::new();
+        let mut shared_key_ids: Option<Vec<i32>> = None;
+        for delete in &task.deletes {
+            if !is_equality_delete(delete) {
+                continue;
+            }
+            // Any eq-delete file without a key set (ineligible type) disables the fast path.
+            let set = self
+                .get_equality_delete_keyset_for_delete_file_path(&delete.file_path)
+                .await?;
+            match &shared_key_ids {
+                None => shared_key_ids = Some(set.key_field_ids()),
+                Some(ids) if *ids != set.key_field_ids() => return None,
+                Some(_) => {}
+            }
+            sets.push(set);
+        }
+        if sets.is_empty() { None } else { Some(sets) }
     }
 
     /// Builds eq delete predicate for the provided task.
@@ -263,7 +322,7 @@ impl DeleteFilter {
     pub(crate) fn insert_equality_delete(
         &self,
         delete_file_path: &str,
-        eq_del: Receiver<Predicate>,
+        eq_del: Receiver<(Predicate, Option<EqDeleteKeySet>)>,
     ) {
         let notify = Arc::new(Notify::new());
         {
@@ -277,12 +336,12 @@ impl DeleteFilter {
         let state = self.state.clone();
         let delete_file_path = delete_file_path.to_string();
         crate::runtime::spawn(async move {
-            let eq_del = eq_del.await.unwrap();
+            let (predicate, key_set) = eq_del.await.unwrap();
             {
                 let mut state = state.write().unwrap();
                 state
                     .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                    .insert(delete_file_path, EqDelState::Loaded(predicate, key_set));
             }
             notify.notify_waiters();
         });
@@ -422,10 +481,11 @@ pub(crate) fn is_equality_delete(f: &FileScanTaskDeleteFile) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::fs::File;
+    use std::ops::Not;
     use std::path::Path;
     use std::sync::Arc;
 
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
@@ -434,9 +494,9 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
-    use crate::expr::Reference;
+    use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
-    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
+    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
 
     type ArrowSchemaRef = Arc<ArrowSchema>;
 
@@ -715,7 +775,8 @@ pub(crate) mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete("eq-del.parquet", rx);
 
-        tx.send(pred).unwrap();
+        // No key set (predicate-only path) for this case-sensitivity test.
+        tx.send((pred, None)).unwrap();
 
         // ---------- should FAIL ----------
         let result = filter.build_equality_delete_predicate(&task).await;
@@ -772,5 +833,599 @@ pub(crate) mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(col.values(), &[2, 4, 7, 9]);
+    }
+
+    // =============================================================================================
+    // H6 equivalence harness — eq-delete SET membership vs the production PREDICATE path.
+    //
+    // The production equality-delete application builds, per delete row, a leaf predicate
+    // (`col = v` for a non-null cell, `col IS NULL` for a null cell), AND-folds the cells, negates
+    // per row, AND-folds the rows, binds, evaluates the bound predicate over the data batch with the
+    // arrow comparison kernels, and coerces NULL results to `false`. A data row is DELETED iff that
+    // evaluation makes the survival predicate FALSE — i.e. iff the row matches some delete tuple
+    // under ARROW `eq` semantics.
+    //
+    // These tests pin the EXACT semantics any O(R) set-membership rewrite (the H6 optimization) would
+    // have to reproduce byte-for-byte, and demonstrate WHERE a naive `HashSet<Datum>` set diverges
+    // from that oracle — the evidence behind deferring H6 (see the build summary).
+    // =============================================================================================
+
+    /// The production "deleted" mask oracle for a single-column eq-delete: build the survival
+    /// predicate exactly as `parse_equality_deletes_record_batch_stream` does, bind it, evaluate it
+    /// over `data_batch`, coerce nulls to false, and return `deleted[i] = !survives[i]`.
+    fn oracle_deleted_mask(
+        col_name: &str,
+        schema: SchemaRef,
+        delete_cells: &[Option<Datum>],
+        data_batch: &RecordBatch,
+    ) -> Vec<bool> {
+        // Per-delete-row survival predicate: NOT(col = v) / NOT(col IS NULL), exactly as production.
+        let mut row_predicates: Vec<Predicate> = Vec::new();
+        for cell in delete_cells {
+            let leaf = match cell {
+                Some(datum) => Reference::new(col_name).equal_to(datum.clone()),
+                None => Reference::new(col_name).is_null(),
+            };
+            row_predicates.push(leaf.not().rewrite_not());
+        }
+        // Balanced AND-fold of the survival predicates (matches production's tree builder).
+        while row_predicates.len() > 1 {
+            let mut next = Vec::with_capacity(row_predicates.len().div_ceil(2));
+            let mut it = row_predicates.into_iter();
+            while let Some(p1) = it.next() {
+                match it.next() {
+                    Some(p2) => next.push(p1.and(p2)),
+                    None => next.push(p1),
+                }
+            }
+            row_predicates = next;
+        }
+        let survival = row_predicates.pop().unwrap_or(AlwaysTrue);
+        let bound = survival
+            .bind(schema, false)
+            .expect("bind survival predicate");
+        let survives = coerce_nulls_to_false(
+            &evaluate_predicate_to_mask(&bound, data_batch).expect("evaluate survival mask"),
+        );
+        (0..survives.len()).map(|i| !survives.value(i)).collect()
+    }
+
+    /// Candidate O(R) set path for a SINGLE column: insert each non-null delete value into a
+    /// `HashSet<Datum>` (and remember whether any delete cell is null); a data row is deleted iff its
+    /// value is in the set, or it is null and a null delete cell exists. This is the obvious
+    /// set-membership rewrite — the tests below show exactly when it agrees with the oracle and when
+    /// it does NOT.
+    fn candidate_set_deleted_mask(
+        delete_cells: &[Option<Datum>],
+        data_cells: &[Option<Datum>],
+    ) -> Vec<bool> {
+        let mut set: std::collections::HashSet<Datum> = std::collections::HashSet::new();
+        let mut has_null_delete = false;
+        for cell in delete_cells {
+            match cell {
+                Some(d) => {
+                    set.insert(d.clone());
+                }
+                None => has_null_delete = true,
+            }
+        }
+        data_cells
+            .iter()
+            .map(|cell| match cell {
+                Some(d) => set.contains(d),
+                None => has_null_delete,
+            })
+            .collect()
+    }
+
+    fn long_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "v", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn double_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "v", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn long_batch(values: &[Option<i64>]) -> RecordBatch {
+        let field =
+            arrow_schema::Field::new("v", arrow_schema::DataType::Int64, true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            );
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let col = Int64Array::from(values.to_vec());
+        RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap()
+    }
+
+    fn double_batch(values: &[Option<f64>]) -> RecordBatch {
+        use arrow_array::Float64Array;
+        let field =
+            arrow_schema::Field::new("v", arrow_schema::DataType::Float64, true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            );
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let col = Float64Array::from(values.to_vec());
+        RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap()
+    }
+
+    /// PROVABLE-SAFE case: integers, including NULL delete and NULL data rows, duplicate delete keys,
+    /// all-match, none-match. The set path agrees with the oracle EXACTLY here — integers have no
+    /// NaN/-0.0 hazard, and the production path's `col IS NULL` leaf coincides with set null
+    /// handling. (This is the slice of inputs an H6 fast path COULD safely cover.)
+    #[test]
+    fn test_h6_equivalence_long_with_nulls_and_dups_matches() {
+        let schema = long_schema();
+        // delete tuples: 3, 3 (dup), 7, NULL
+        let delete_cells = vec![
+            Some(Datum::long(3)),
+            Some(Datum::long(3)),
+            Some(Datum::long(7)),
+            None,
+        ];
+        // data rows: 3, 7, 9, NULL, 100
+        let data_vals = vec![Some(3i64), Some(7), Some(9), None, Some(100)];
+        let data_cells: Vec<Option<Datum>> = data_vals.iter().map(|v| v.map(Datum::long)).collect();
+        let batch = long_batch(&data_vals);
+
+        let oracle = oracle_deleted_mask("v", schema, &delete_cells, &batch);
+        let candidate = candidate_set_deleted_mask(&delete_cells, &data_cells);
+
+        assert_eq!(
+            oracle, candidate,
+            "integer eq-delete: set path must match the predicate oracle exactly"
+        );
+        // Pin the expected mask too (3 deleted, 7 deleted, 9 kept, NULL deleted by NULL delete, 100 kept).
+        assert_eq!(oracle, vec![true, true, false, true, false]);
+    }
+
+    /// DIVERGENCE PROOF — `-0.0` / `+0.0` (the H6 deferral evidence): the production path compares
+    /// floats via `arrow_ord::cmp::eq`, whose float kernels use TOTAL ordering — `-0.0` and `+0.0`
+    /// are DISTINCT, so a `+0.0` delete deletes `+0.0` but NOT `-0.0`. A `HashSet<Datum>` keyed on
+    /// `OrderedFloat` instead COLLAPSES `-0.0` and `+0.0` into one key (they hash and compare equal),
+    /// so the naive set path would ALSO delete the `-0.0` row. The masks differ on row 0. This is the
+    /// concrete reason a naive `HashSet<Datum>` set rewrite is UNSOUND vs the current predicate path:
+    /// it would change which rows are deleted on signed-zero float keys.
+    #[test]
+    fn test_h6_naive_set_diverges_on_negative_zero() {
+        let schema = double_schema();
+        let delete_cells = vec![Some(Datum::double(0.0f64))]; // delete value +0.0
+        let data_vals = vec![Some(-0.0f64), Some(0.0f64), Some(1.0f64)];
+        let data_cells: Vec<Option<Datum>> =
+            data_vals.iter().map(|v| v.map(Datum::double)).collect();
+        let batch = double_batch(&data_vals);
+
+        let oracle = oracle_deleted_mask("v", schema, &delete_cells, &batch);
+        let candidate = candidate_set_deleted_mask(&delete_cells, &data_cells);
+
+        // Oracle (arrow total-ordering eq): only +0.0 is deleted; -0.0 is a distinct value (kept).
+        assert_eq!(
+            oracle,
+            vec![false, true, false],
+            "total-ordering eq distinguishes -0.0 from +0.0: only +0.0 deleted"
+        );
+        // Naive set (OrderedFloat collapses ±0.0): -0.0 AND +0.0 both deleted — the divergence.
+        assert_eq!(candidate, vec![true, true, false]);
+        assert_ne!(
+            oracle, candidate,
+            "the naive HashSet<Datum> set path MUST diverge from the predicate oracle on signed \
+             zero; this proves H6 cannot ship a naive set without matching arrow's total-ordering \
+             float equality exactly"
+        );
+    }
+
+    /// EQUIVALENCE — `NaN`: `arrow_ord::cmp::eq`'s total-ordering float kernel treats `NaN == NaN` as
+    /// TRUE (every NaN bit-pattern collapses to the canonical NaN under total ordering), so a `NaN`
+    /// delete DOES delete a `NaN` data row. A `HashSet<Datum>` keyed on `OrderedFloat` also treats
+    /// `NaN == NaN`, so the paths agree. (Both differ from Java `StructLikeSet`, which is bit-wise —
+    /// but the prompt's oracle is the CURRENT Rust path, which these tests pin.)
+    #[test]
+    fn test_h6_set_matches_predicate_on_nan() {
+        let schema = double_schema();
+        let delete_cells = vec![Some(Datum::double(f64::NAN))];
+        let data_vals = vec![Some(f64::NAN), Some(1.0f64)];
+        let data_cells: Vec<Option<Datum>> =
+            data_vals.iter().map(|v| v.map(Datum::double)).collect();
+        let batch = double_batch(&data_vals);
+
+        let oracle = oracle_deleted_mask("v", schema, &delete_cells, &batch);
+        let candidate = candidate_set_deleted_mask(&delete_cells, &data_cells);
+
+        // Both paths: the NaN row IS deleted by a NaN delete (total ordering: NaN == NaN).
+        assert_eq!(
+            oracle,
+            vec![true, false],
+            "total-ordering eq matches NaN == NaN, so a NaN delete deletes the NaN row"
+        );
+        assert_eq!(
+            oracle, candidate,
+            "the HashSet<Datum> set path matches the predicate oracle on NaN"
+        );
+    }
+
+    // =============================================================================================
+    // SOUND H6 — the REAL `EqDeleteKeySet` fast path proven byte-identical to the predicate ORACLE
+    // across the full NON-FLOAT type matrix (single- and multi-column), and the type GATE proven to
+    // route Float/Double back to the (untouched) predicate path.
+    //
+    // Each test builds a data batch + schema, a set of delete tuples, runs BOTH:
+    //   * the predicate oracle (`multi_col_oracle_deleted_mask`) — production's per-delete-row
+    //     survival predicate, bound, evaluated, nulls-coerced, negated → the deleted mask, and
+    //   * the production `EqDeleteKeySet::delete_mask` (the fast path),
+    // and asserts the masks are IDENTICAL. The delete tuples and the predicate leaves are produced
+    // from the SAME `Datum`s, and `delete_mask` decodes the data column with the SAME
+    // `arrow_primitive_to_literal` conversion the predicate path's columns use — so the only thing
+    // under test is that `Datum` equality matches the Arrow `eq` kernel for the admitted types.
+    // =============================================================================================
+
+    /// Multi-column predicate oracle: a row is DELETED iff it matches some delete tuple under the
+    /// production survival predicate `AND over files NOT(AND over cols col_i = v_i / col_i IS NULL)`.
+    /// Builds exactly the predicate `parse_equality_deletes_record_batch_stream` builds for one file.
+    fn multi_col_oracle_deleted_mask(
+        col_names: &[&str],
+        schema: SchemaRef,
+        delete_rows: &[Vec<Option<Datum>>],
+        data_batch: &RecordBatch,
+    ) -> Vec<bool> {
+        let mut row_predicates: Vec<Predicate> = Vec::new();
+        for row in delete_rows {
+            let mut row_pred = AlwaysTrue;
+            for (cell, name) in row.iter().zip(col_names.iter()) {
+                let leaf = match cell {
+                    Some(datum) => Reference::new(*name).equal_to(datum.clone()),
+                    None => Reference::new(*name).is_null(),
+                };
+                row_pred = row_pred.and(leaf);
+            }
+            row_predicates.push(row_pred.not().rewrite_not());
+        }
+        while row_predicates.len() > 1 {
+            let mut next = Vec::with_capacity(row_predicates.len().div_ceil(2));
+            let mut it = row_predicates.into_iter();
+            while let Some(p1) = it.next() {
+                match it.next() {
+                    Some(p2) => next.push(p1.and(p2)),
+                    None => next.push(p1),
+                }
+            }
+            row_predicates = next;
+        }
+        let survival = row_predicates.pop().unwrap_or(AlwaysTrue);
+        let bound = survival
+            .bind(schema, false)
+            .expect("bind survival predicate");
+        let survives = coerce_nulls_to_false(
+            &evaluate_predicate_to_mask(&bound, data_batch).expect("evaluate survival mask"),
+        );
+        (0..survives.len()).map(|i| !survives.value(i)).collect()
+    }
+
+    /// Build a `RecordBatch` whose columns carry the `PARQUET_FIELD_ID_META_KEY` metadata
+    /// (`field_id = position + 1`) so both the predicate evaluator and `EqDeleteKeySet::delete_mask`
+    /// resolve the same columns.
+    fn batch_with_field_ids(fields: Vec<(&str, ArrayRef)>) -> RecordBatch {
+        let arrow_fields: Vec<arrow_schema::Field> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, (name, arr))| {
+                arrow_schema::Field::new(*name, arr.data_type().clone(), true).with_metadata(
+                    HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        (i as i32 + 1).to_string(),
+                    )]),
+                )
+            })
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(arrow_fields));
+        let columns: Vec<ArrayRef> = fields.into_iter().map(|(_, arr)| arr).collect();
+        RecordBatch::try_new(schema, columns).expect("build data batch")
+    }
+
+    /// Drive the equivalence for a batch with NO NULL in any key column: assert
+    /// `EqDeleteKeySet::delete_mask` returns `Some(mask)` byte-identical to the predicate oracle, and
+    /// return the agreed mask so the caller can also pin its exact value.
+    fn assert_set_matches_oracle(
+        iceberg_schema: SchemaRef,
+        key_columns: Vec<(i32, String, PrimitiveType)>,
+        col_names: &[&str],
+        delete_rows: Vec<Vec<Option<Datum>>>,
+        data_fields: Vec<(&str, ArrayRef)>,
+    ) -> Vec<bool> {
+        let batch = batch_with_field_ids(data_fields);
+        let oracle = multi_col_oracle_deleted_mask(col_names, iceberg_schema, &delete_rows, &batch);
+
+        let set = EqDeleteKeySet::try_build(key_columns, delete_rows)
+            .expect("non-float key columns must build a set");
+        let set_mask = set
+            .delete_mask(&batch)
+            .expect("set delete_mask")
+            .expect("a batch with no key-column NULL must take the set fast path");
+
+        assert_eq!(
+            set_mask, oracle,
+            "EqDeleteKeySet fast path must equal the predicate oracle, byte-for-byte"
+        );
+        oracle
+    }
+
+    fn opt_schema(fields: Vec<(i32, &str, PrimitiveType)>) -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(
+                    fields
+                        .into_iter()
+                        .map(|(id, name, ty)| {
+                            NestedField::optional(id, name, Type::Primitive(ty)).into()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Long key — duplicates, all-match, none-match, NULL DELETE tuple (which deletes nothing among
+    /// non-null data rows). Data has no key-column NULL → the set fast path is taken.
+    #[test]
+    fn test_h6_set_long_matches_oracle() {
+        let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Long)];
+        let delete_rows = vec![
+            vec![Some(Datum::long(3))],
+            vec![Some(Datum::long(3))], // duplicate
+            vec![Some(Datum::long(7))],
+            vec![None], // NULL delete tuple
+        ];
+        let data: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(3i64),
+            Some(7),
+            Some(9),
+            Some(100),
+        ]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["v"], delete_rows, vec![("v", data)]);
+        assert_eq!(mask, vec![true, true, false, false]);
+    }
+
+    /// String key — empty string, no-match. (Non-null data → set path.)
+    #[test]
+    fn test_h6_set_string_matches_oracle() {
+        use arrow_array::StringArray;
+        let schema = opt_schema(vec![(1, "s", PrimitiveType::String)]);
+        let key_columns = vec![(1, "s".to_string(), PrimitiveType::String)];
+        let delete_rows = vec![vec![Some(Datum::string("a"))], vec![Some(Datum::string(
+            "",
+        ))]];
+        let data: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), Some(""), Some("z")]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["s"], delete_rows, vec![("s", data)]);
+        assert_eq!(mask, vec![true, true, false]);
+    }
+
+    /// Boolean key.
+    #[test]
+    fn test_h6_set_bool_matches_oracle() {
+        use arrow_array::BooleanArray as ArrowBool;
+        let schema = opt_schema(vec![(1, "b", PrimitiveType::Boolean)]);
+        let key_columns = vec![(1, "b".to_string(), PrimitiveType::Boolean)];
+        let delete_rows = vec![vec![Some(Datum::bool(true))]];
+        let data: ArrayRef = Arc::new(ArrowBool::from(vec![Some(true), Some(false)]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["b"], delete_rows, vec![("b", data)]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// Date key (Int32-backed temporal) — confirms temporal types compare as their integer backing.
+    #[test]
+    fn test_h6_set_date_matches_oracle() {
+        use arrow_array::Date32Array;
+        let schema = opt_schema(vec![(1, "d", PrimitiveType::Date)]);
+        let key_columns = vec![(1, "d".to_string(), PrimitiveType::Date)];
+        let delete_rows = vec![vec![Some(Datum::date(100))]];
+        let data: ArrayRef = Arc::new(Date32Array::from(vec![Some(100), Some(200)]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["d"], delete_rows, vec![("d", data)]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// Binary key — byte-string equality.
+    #[test]
+    fn test_h6_set_binary_matches_oracle() {
+        use arrow_array::BinaryArray;
+        let schema = opt_schema(vec![(1, "bin", PrimitiveType::Binary)]);
+        let key_columns = vec![(1, "bin".to_string(), PrimitiveType::Binary)];
+        let delete_rows = vec![vec![Some(Datum::binary(vec![1u8, 2, 3]))]];
+        let data: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(&[1u8, 2, 3][..]),
+            Some(&[9u8][..]),
+        ]));
+        let mask = assert_set_matches_oracle(schema, key_columns, &["bin"], delete_rows, vec![(
+            "bin", data,
+        )]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// MULTI-COLUMN key — membership on the full tuple == AND of per-column equality, with a partial
+    /// match (one col matches, other doesn't → NOT deleted), a NULL DELETE cell (deletes nothing
+    /// among non-null data), and a duplicate tuple. Data is non-null in both key columns → set path.
+    #[test]
+    fn test_h6_set_multi_column_matches_oracle() {
+        use arrow_array::StringArray;
+        let schema = opt_schema(vec![
+            (1, "id", PrimitiveType::Long),
+            (2, "name", PrimitiveType::String),
+        ]);
+        let key_columns = vec![
+            (1, "id".to_string(), PrimitiveType::Long),
+            (2, "name".to_string(), PrimitiveType::String),
+        ];
+        let delete_rows = vec![
+            vec![Some(Datum::long(1)), Some(Datum::string("a"))],
+            vec![Some(Datum::long(2)), None], // NULL in second cell — no non-null data matches it
+            vec![Some(Datum::long(1)), Some(Datum::string("a"))], // duplicate
+        ];
+        let id: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(1i64),
+            Some(1),
+            Some(2),
+            Some(2),
+        ]));
+        let name: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a"), // (1,a) → deleted
+            Some("b"), // (1,b) → partial, NOT deleted
+            Some("y"), // (2,y) → NOT deleted (delete tuple 2 has NULL name)
+            Some("x"), // (2,x) → NOT deleted
+        ]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["id", "name"], delete_rows, vec![
+                ("id", id),
+                ("name", name),
+            ]);
+        assert_eq!(mask, vec![true, false, false, false]);
+    }
+
+    /// Empty delete set deletes nothing; none-match leaves everything (non-null data → set path).
+    #[test]
+    fn test_h6_set_empty_and_none_match() {
+        let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Long)];
+        // none-match: a delete value absent from the data.
+        let delete_rows = vec![vec![Some(Datum::long(999))]];
+        let data: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), Some(2)]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["v"], delete_rows, vec![("v", data)]);
+        assert_eq!(mask, vec![false, false]);
+
+        // empty delete set: nothing is deleted (try_build with zero rows still gates by type).
+        let empty =
+            EqDeleteKeySet::try_build(vec![(1, "v".to_string(), PrimitiveType::Long)], vec![])
+                .expect("eligible type builds even with zero rows");
+        assert!(empty.is_empty());
+        let batch = batch_with_field_ids(vec![(
+            "v",
+            Arc::new(Int64Array::from(vec![Some(1i64), Some(2)])) as ArrayRef,
+        )]);
+        assert_eq!(empty.delete_mask(&batch).unwrap(), Some(vec![false, false]));
+    }
+
+    /// THE NULL-DATA SOUNDNESS BOUNDARY: a batch with a NULL in a key column makes `delete_mask`
+    /// return `None` (route this batch to the predicate fallback). The predicate path deletes such a
+    /// NULL row via 3VL + null-coercion EVEN WITHOUT a matching NULL delete tuple — which set
+    /// membership would NOT reproduce — so the fallback is mandatory. This pins that exact contract.
+    #[test]
+    fn test_h6_set_returns_none_when_key_column_has_null() {
+        let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Long)];
+        let delete_rows = vec![vec![Some(Datum::long(3))]]; // no NULL delete tuple
+        let set =
+            EqDeleteKeySet::try_build(key_columns, delete_rows.clone()).expect("Long set builds");
+
+        // Data row 2 is NULL in the key column.
+        let data: ArrayRef = Arc::new(Int64Array::from(vec![Some(3i64), Some(9), None]));
+        let batch = batch_with_field_ids(vec![("v", data)]);
+
+        // Fast path bails → None (must use the predicate path for this batch).
+        assert_eq!(
+            set.delete_mask(&batch).expect("delete_mask"),
+            None,
+            "a key-column NULL must force the predicate fallback"
+        );
+
+        // And the predicate oracle for that same batch deletes the NULL row (3VL + null-coercion):
+        // survival(NULL) = (NULL != 3) = NULL → coerced false → deleted.
+        let oracle = multi_col_oracle_deleted_mask(&["v"], schema, &delete_rows, &batch);
+        assert_eq!(
+            oracle,
+            vec![true, false, true],
+            "predicate path deletes the NULL key-column row even without a NULL delete tuple — the \
+             reason the set path must defer"
+        );
+    }
+
+    /// THE GATE: Float / Double key columns must NOT build a set (route to the predicate fallback),
+    /// and Decimal / Unknown are likewise excluded. This is what keeps the proven-divergent float
+    /// case on the untouched predicate path.
+    #[test]
+    fn test_h6_gate_excludes_float_double_decimal_unknown() {
+        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Float));
+        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Double));
+        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2
+        }));
+        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Unknown));
+        // Time and Fixed are excluded NOT because their equality diverges, but because the predicate
+        // fallback (`get_arrow_datum`) has no arm for them: admitting them would let the fast path
+        // succeed on non-null batches yet crash the scan on a key-null batch that bails to the
+        // predicate path. They must route uniformly to the predicate path (which errors for them).
+        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Time));
+        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Fixed(16)));
+        // Eligible representatives.
+        assert!(EqDeleteKeySet::is_eligible_type(&PrimitiveType::Long));
+        assert!(EqDeleteKeySet::is_eligible_type(&PrimitiveType::String));
+
+        // A Double key column → try_build returns None (no fast path).
+        assert!(
+            EqDeleteKeySet::try_build(vec![(1, "d".to_string(), PrimitiveType::Double)], vec![
+                vec![Some(Datum::double(0.0))]
+            ],)
+            .is_none(),
+            "Double key must not build a fast-path set"
+        );
+        // A MIXED key (one eligible, one float) → None: the whole file falls back.
+        assert!(
+            EqDeleteKeySet::try_build(
+                vec![
+                    (1, "id".to_string(), PrimitiveType::Long),
+                    (2, "d".to_string(), PrimitiveType::Double),
+                ],
+                vec![vec![Some(Datum::long(1)), Some(Datum::double(0.0))]],
+            )
+            .is_none(),
+            "a key with any float column must not build a fast-path set"
+        );
+    }
+
+    /// THE FALLBACK STILL CORRECT: with the gate routing Double to the predicate path, the
+    /// `-0.0`/`+0.0` case the naive set got wrong is handled correctly — only `+0.0` is deleted by a
+    /// `+0.0` delete (total-ordering eq), proving the float fallback preserves the old behavior.
+    #[test]
+    fn test_h6_float_fallback_preserves_predicate_semantics() {
+        let schema = double_schema();
+        let delete_cells = vec![Some(Datum::double(0.0f64))];
+        let data_vals = vec![Some(-0.0f64), Some(0.0f64), Some(1.0f64)];
+        let batch = double_batch(&data_vals);
+
+        // The predicate path (the route the gate forces for Double) deletes only +0.0.
+        let oracle = oracle_deleted_mask("v", schema, &delete_cells, &batch);
+        assert_eq!(
+            oracle,
+            vec![false, true, false],
+            "Double fallback via the predicate path keeps -0.0 and deletes only +0.0"
+        );
+
+        // And the gate indeed refuses a Double set, so this case CANNOT take the fast path.
+        assert!(
+            EqDeleteKeySet::try_build(
+                vec![(1, "v".to_string(), PrimitiveType::Double)],
+                delete_cells.into_iter().map(|c| vec![c]).collect(),
+            )
+            .is_none()
+        );
     }
 }

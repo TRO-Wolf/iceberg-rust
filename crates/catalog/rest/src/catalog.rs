@@ -141,8 +141,20 @@ impl RestCatalogBuilder {
     }
 }
 
+/// Property keys whose values are secret-bearing and must be redacted from `Debug`.
+///
+/// `credential` holds the OAuth `client_id:client_secret`, `token` holds a bearer token,
+/// and `client_secret` is the raw secret. Their presence is preserved as `"***"` but the
+/// value is never printed.
+const SECRET_PROP_KEYS: &[&str] = &["credential", "token", "client_secret"];
+
+/// Returns true if a property key holds a secret value that must be redacted from `Debug`.
+fn is_secret_prop_key(key: &str) -> bool {
+    SECRET_PROP_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+}
+
 /// Rest catalog configuration.
-#[derive(Clone, Debug, TypedBuilder)]
+#[derive(Clone, TypedBuilder)]
 pub(crate) struct RestCatalogConfig {
     #[builder(default, setter(strip_option))]
     name: Option<String>,
@@ -157,6 +169,35 @@ pub(crate) struct RestCatalogConfig {
 
     #[builder(default)]
     client: Option<Client>,
+}
+
+impl std::fmt::Debug for RestCatalogConfig {
+    /// Hand-written so that secret-bearing entries in `props` (e.g. the OAuth `credential`
+    /// holding `client_id:client_secret`, and `token`) are redacted to `"***"` instead of
+    /// being printed in clear. Without this, any `tracing`/`{:?}` of the config — or of a
+    /// struct that embeds it and derives `Debug` (e.g. `RestContext`, `RestCatalog`) —
+    /// would leak the credentials.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_props: HashMap<&str, &str> = self
+            .props
+            .iter()
+            .map(|(k, v)| {
+                if is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("RestCatalogConfig")
+            .field("name", &self.name)
+            .field("uri", &self.uri)
+            .field("warehouse", &self.warehouse)
+            .field("props", &redacted_props)
+            .field("client", &self.client)
+            .finish()
+    }
 }
 
 impl RestCatalogConfig {
@@ -342,9 +383,41 @@ impl RestCatalogConfig {
             self.uri = uri;
         }
 
+        // SECURITY: `disable-header-redaction` is a CLIENT-ONLY setting. It controls
+        // whether this client's own outgoing headers (including `Authorization: Bearer …`)
+        // are redacted from error context/logs. The server-supplied `defaults`/`overrides`
+        // come from `/v1/config` and are fully server-controlled; allowing a compromised or
+        // malicious catalog server to set/flip this key would silently disable redaction and
+        // leak the client's credentials. So we strip it from both server maps and let the
+        // user's own value win. (Server overriding `uri` and other props stays intentional.)
+        let user_redaction = self
+            .props
+            .get(REST_CATALOG_PROP_DISABLE_HEADER_REDACTION)
+            .cloned();
+        config
+            .defaults
+            .remove(REST_CATALOG_PROP_DISABLE_HEADER_REDACTION);
+        config
+            .overrides
+            .remove(REST_CATALOG_PROP_DISABLE_HEADER_REDACTION);
+
         let mut props = config.defaults;
         props.extend(self.props);
         props.extend(config.overrides);
+
+        // Restore the user's own value (or its absence) as the authoritative setting,
+        // overriding anything the merge may have reintroduced.
+        match user_redaction {
+            Some(value) => {
+                props.insert(
+                    REST_CATALOG_PROP_DISABLE_HEADER_REDACTION.to_string(),
+                    value,
+                );
+            }
+            None => {
+                props.remove(REST_CATALOG_PROP_DISABLE_HEADER_REDACTION);
+            }
+        }
 
         self.props = props;
         self
@@ -1520,6 +1593,112 @@ mod tests {
         assert_eq!(token, Some("ey000000000000".to_string()));
     }
 
+    /// SECURITY (Fix 1): the OAuth token-endpoint 200-OK body literally contains the
+    /// `access_token`. If the body parse fails, the constructed error must NOT carry the
+    /// raw body in its context — otherwise `{e}` / `tracing::error!(?e)` would leak the
+    /// token. This test feeds a 200 body that contains a token sentinel but is invalid as a
+    /// `TokenResponse` (forcing the parse error path) and asserts the sentinel never appears
+    /// in the rendered error or its debug context. RED-able: reattaching the body to the
+    /// error (the pre-fix `.with_context("json", …)`) makes this fail.
+    #[tokio::test]
+    async fn test_oauth_token_body_not_leaked_in_error() {
+        const TOKEN_SENTINEL: &str = "SUPER_SECRET_ACCESS_TOKEN_DO_NOT_LEAK";
+
+        let mut server = Server::new_async().await;
+        // 200 OK, but the JSON shape is wrong for TokenResponse (access_token is a number),
+        // so deserialization fails while the secret sentinel is present in the body.
+        let oauth_mock = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"access_token": 12345, "note": "{TOKEN_SENTINEL}"}}"#
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+
+        let client = HttpClient::new(
+            &RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        )
+        .unwrap();
+
+        let err = client
+            .exchange_credential_for_token()
+            .await
+            .expect_err("malformed token response must yield an error");
+
+        oauth_mock.assert_async().await;
+
+        let rendered = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !rendered.contains(TOKEN_SENTINEL),
+            "token-response body leaked into Display: {rendered}"
+        );
+        assert!(
+            !debug.contains(TOKEN_SENTINEL),
+            "token-response body leaked into Debug context: {debug}"
+        );
+    }
+
+    /// SECURITY (Fix 1, non-2xx branch): the token endpoint's error path is equally
+    /// sensitive — a non-2xx body may echo submitted credentials or a partial grant. When
+    /// that body fails to parse as an `ErrorResponse`, the constructed error must NOT carry
+    /// the raw body. This drives the `else` (non-200) branch of `exchange_credential_for_token`
+    /// with a 400 whose body is valid JSON but the wrong shape (forcing the parse-error path)
+    /// and a credential sentinel present. RED-able: reattaching the body (`.with_context("json",
+    /// …)`) on that branch makes this fail.
+    #[tokio::test]
+    async fn test_oauth_token_error_body_not_leaked_in_error() {
+        const CRED_SENTINEL: &str = "SUBMITTED_CLIENT_SECRET_DO_NOT_LEAK";
+
+        let mut server = Server::new_async().await;
+        // 400, valid JSON but not a valid `ErrorResponse` (no `error` object), so parsing
+        // fails while the secret sentinel is present in the body.
+        let oauth_mock = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(400)
+            .with_body(format!(r#"{{"echoed_credential": "{CRED_SENTINEL}"}}"#))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+
+        let client = HttpClient::new(
+            &RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        )
+        .unwrap();
+
+        let err = client
+            .exchange_credential_for_token()
+            .await
+            .expect_err("malformed token error response must yield an error");
+
+        oauth_mock.assert_async().await;
+
+        let rendered = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !rendered.contains(CRED_SENTINEL),
+            "token error body leaked into Display: {rendered}"
+        );
+        assert!(
+            !debug.contains(CRED_SENTINEL),
+            "token error body leaked into Debug context: {debug}"
+        );
+    }
+
     #[tokio::test]
     async fn test_oauth_with_optional_param() {
         let mut props = HashMap::new();
@@ -1842,6 +2021,114 @@ mod tests {
 
         config_mock.assert_async().await;
         list_ns_mock.assert_async().await;
+    }
+
+    /// SECURITY (Fix 2): `disable-header-redaction` is client-only. A malicious/compromised
+    /// catalog server returning it in `/v1/config` `overrides` (or `defaults`) must NOT be
+    /// able to flip the client's redaction OFF. RED-able: dropping the client-only guard in
+    /// `merge_with_config` lets the server `overrides` value win and this fails.
+    #[test]
+    fn test_server_cannot_disable_header_redaction() {
+        // User did NOT opt into disabling redaction (so redaction is ON by default).
+        let user = RestCatalogConfig::builder()
+            .uri("http://localhost".to_string())
+            .build();
+        assert!(!user.disable_header_redaction());
+
+        // Hostile server tries to disable redaction via both override channels.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            REST_CATALOG_PROP_DISABLE_HEADER_REDACTION.to_string(),
+            "true".to_string(),
+        );
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            REST_CATALOG_PROP_DISABLE_HEADER_REDACTION.to_string(),
+            "true".to_string(),
+        );
+        let server_config = CatalogConfig {
+            overrides,
+            defaults,
+        };
+
+        let merged = user.merge_with_config(server_config);
+
+        // Redaction must remain ON — the server's flip is rejected.
+        assert!(
+            !merged.disable_header_redaction(),
+            "server overrides/defaults must not be able to disable header redaction"
+        );
+    }
+
+    /// SECURITY (Fix 2): the legitimate case — when the *user's own* config opts in, the
+    /// setting is honoured (and the server cannot un-set it either).
+    #[test]
+    fn test_user_can_disable_header_redaction() {
+        let mut props = HashMap::new();
+        props.insert(
+            REST_CATALOG_PROP_DISABLE_HEADER_REDACTION.to_string(),
+            "true".to_string(),
+        );
+        let user = RestCatalogConfig::builder()
+            .uri("http://localhost".to_string())
+            .props(props)
+            .build();
+        assert!(user.disable_header_redaction());
+
+        // Server tries to silently re-enable redaction; the user's choice still wins.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            REST_CATALOG_PROP_DISABLE_HEADER_REDACTION.to_string(),
+            "false".to_string(),
+        );
+        let server_config = CatalogConfig {
+            overrides,
+            defaults: HashMap::new(),
+        };
+
+        let merged = user.merge_with_config(server_config);
+
+        assert!(
+            merged.disable_header_redaction(),
+            "the user's own disable-header-redaction choice must be honoured"
+        );
+    }
+
+    /// SECURITY (Fix 4): `RestCatalogConfig`'s `Debug` must redact secret-bearing props
+    /// (`credential`, `token`) instead of printing them. RED-able: the previous
+    /// `#[derive(Debug)]` printed the raw `props` map and this fails.
+    #[test]
+    fn test_rest_catalog_config_debug_redacts_credential() {
+        const CREDENTIAL_SENTINEL: &str = "client_id_DO_NOT_LEAK:client_secret_DO_NOT_LEAK";
+        const TOKEN_SENTINEL: &str = "BEARER_TOKEN_DO_NOT_LEAK";
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), CREDENTIAL_SENTINEL.to_string());
+        props.insert("token".to_string(), TOKEN_SENTINEL.to_string());
+        props.insert("warehouse-style".to_string(), "visible-value".to_string());
+
+        let config = RestCatalogConfig::builder()
+            .uri("http://localhost".to_string())
+            .props(props)
+            .build();
+
+        let debug = format!("{config:?}");
+
+        // Secret prop values must never appear.
+        assert!(
+            !debug.contains(CREDENTIAL_SENTINEL),
+            "Debug leaked the credential: {debug}"
+        );
+        assert!(
+            !debug.contains(TOKEN_SENTINEL),
+            "Debug leaked the token: {debug}"
+        );
+        // Presence is signalled via the redaction marker, and non-secret props stay visible.
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        assert!(
+            debug.contains("visible-value"),
+            "Debug dropped non-secret props: {debug}"
+        );
     }
 
     #[tokio::test]
