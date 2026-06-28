@@ -37,10 +37,12 @@
 //! Therefore [`EqDeleteKeySet::is_eligible_type`] admits ONLY the primitive types that satisfy BOTH
 //! (a) [`Datum`] equality byte-identical to the Arrow `eq` kernel AND (b) evaluability by the
 //! predicate fallback (`get_arrow_datum`) — so a per-batch bail to the predicate path can never land
-//! on an unsupported-type error. `Float`, `Double`, `Decimal` (a cast-rescale hazard when the
-//! delete-file and data-file scales differ), and `Unknown` fail (a); `Time` and `Fixed` fail (b)
-//! (`get_arrow_datum` has no arm for them, so they route uniformly to the predicate path exactly as
-//! before this fast path existed). An eq-delete file with ANY excluded key column routes the whole
+//! on an unsupported-type error. Only `Float`, `Double`, `Decimal` (a cast-rescale hazard when the
+//! delete-file and data-file scales differ), and `Unknown` are excluded: the floats fail (a), and
+//! `Unknown` is not a real value type. `Time` (compared as its `i64` micros-from-midnight backing)
+//! and `Fixed` (compared as a fixed-width byte string) BOTH satisfy (a) — their equality is integer-
+//! / byte-identical under the two kernels — AND, since `get_arrow_datum` now has arms for them,
+//! satisfy (b); they are admitted. An eq-delete file with ANY excluded key column routes the whole
 //! task back to the untouched predicate path. The matrix of admitted types is proven identical to
 //! the predicate path in `delete_filter.rs`'s harness.
 
@@ -83,33 +85,33 @@ impl EqDeleteKeySet {
     /// to the predicate path (e.g. on a key-column NULL) never lands on an unsupported-type error.
     /// Floats are excluded (total-ordering / signed-zero divergence — proven), `Decimal` is excluded
     /// (the predicate path's `try_cast_literal` may rescale a literal to the column scale, which a
-    /// raw-`i128` key does not), and `Unknown` is not a real value type. `Time` and `Fixed(_)` are
-    /// excluded for reason (b): `get_arrow_datum` has no arm for them, so they must route uniformly
-    /// to the predicate path (which errors `FeatureUnsupported` for them, exactly as before this fast
-    /// path existed) rather than succeed on non-null batches and crash on a key-null batch. Every
-    /// admitted type compares as an integer, byte string, or UTF-8 string under both Arrow `eq` and
-    /// `Datum` `Eq`, and is convertible by `get_arrow_datum`.
+    /// raw-`i128` key does not), and `Unknown` is not a real value type. `Time` is admitted (it
+    /// compares as its `i64` micros-from-midnight backing — integer-identical under both kernels) and
+    /// `Fixed(_)` is admitted (a fixed-width byte string — byte-identical under both kernels); both
+    /// gained a `get_arrow_datum` arm, so a key-null bail to the predicate path now succeeds rather
+    /// than erroring. Every admitted type compares as an integer, byte string, or UTF-8 string under
+    /// both Arrow `eq` and `Datum` `Eq`, and is convertible by `get_arrow_datum`.
     pub(crate) fn is_eligible_type(ty: &PrimitiveType) -> bool {
         match ty {
             PrimitiveType::Boolean
             | PrimitiveType::Int
             | PrimitiveType::Long
             | PrimitiveType::Date
+            | PrimitiveType::Time
             | PrimitiveType::Timestamp
             | PrimitiveType::Timestamptz
             | PrimitiveType::TimestampNs
             | PrimitiveType::TimestamptzNs
             | PrimitiveType::String
             | PrimitiveType::Uuid
-            | PrimitiveType::Binary => true,
-            // Excluded: equality diverges (Float/Double/Decimal), not a value type (Unknown), or the
-            // predicate fallback cannot evaluate the type (Time, Fixed) — see the doc above.
+            | PrimitiveType::Binary
+            | PrimitiveType::Fixed(_) => true,
+            // Excluded: equality diverges (Float/Double — total-ordering / signed-zero), a rescale
+            // hazard (Decimal), or not a value type (Unknown) — see the doc above.
             PrimitiveType::Float
             | PrimitiveType::Double
             | PrimitiveType::Decimal { .. }
-            | PrimitiveType::Unknown
-            | PrimitiveType::Time
-            | PrimitiveType::Fixed(_) => false,
+            | PrimitiveType::Unknown => false,
         }
     }
 
