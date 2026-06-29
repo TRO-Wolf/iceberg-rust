@@ -489,7 +489,7 @@ pub(crate) fn is_equality_delete(f: &FileScanTaskDeleteFile) -> bool {
 ///
 /// ## The prime / conditional-`advance_to` / refresh dance (do not reorder)
 ///
-/// [`DeleteVectorIterator::advance_to`] has four sharp edges this routine must respect:
+/// [`DeleteVectorIterator::advance_to`] has three sharp edges this routine must respect:
 ///
 /// 1. It is a **no-op until the iterator has been primed** with at least one `next()` — it returns
 ///    early while `inner` is `None`. So we call `next()` once *before* any `advance_to`.
@@ -497,26 +497,25 @@ pub(crate) fn is_equality_delete(f: &FileScanTaskDeleteFile) -> bool {
 ///    local `cached`. So a primed `cached` that is already a **legitimate in-window** position
 ///    (`>= base`) must NOT be dropped — `advance_to` cannot rewind, so discarding it would lose a
 ///    real delete.
-/// 3. `advance_to(target)` is only safe to drive **forward**: its inner loop is
-///    `while inner.high_bits < hi`, so if the prime already pulled a value from a *higher* high-bits
-///    group than `target`'s (the 2^32-straddle case — a window whose first delete sits above the
-///    boundary while `base` sits below it), the loop is skipped and the call instead corrupts the
-///    inner bitmap-iterator position via `bitmap_iter.advance_to(lo)`, silently dropping later
-///    in-group deletes. (This latent edge does not bite the Parquet `build_deletes_row_selection`
-///    path, which only ever advances to *monotonically increasing* targets.)
-/// 4. `advance_to(base)` is a **hint, not a guarantee** of landing in-window: when *no* delete
+/// 3. `advance_to(base)` is a **hint, not a guarantee** of landing in-window: when *no* delete
 ///    reaches `base`'s high-bits group (every remaining delete is below the window), it walks
 ///    `outer` to exhaustion and returns, leaving the iterator on a still-below-window value. So the
 ///    post-advance `next()` may still yield `pos < base`.
 ///
-/// We therefore call `advance_to(base)` **only when the primed `cached` is below the window**
-/// (`cached < base`) — exactly the case where skipping is needed and `advance_to` is driven forward
-/// (edge 3) — and refresh `cached` afterward. When `cached` is already `>= base` (or `None`), the
-/// iterator is already positioned and we leave it untouched. Because of edge 4, the walk loop then
-/// re-checks each `pos` against `base` and only flips when `base <= pos < end`, silently skipping any
-/// residual below-window delete `advance_to` could not get past. This is a strict superset of
-/// `build_deletes_row_selection`'s stale-cache refresh, hardened to be correct regardless of how far
-/// `advance_to` actually managed to skip.
+/// (`advance_to`'s postcondition — the next yielded position is the smallest delete `>= base` — now
+/// holds across "gap groups", a high-bits group absent from the treemap between `base`'s group and a
+/// present higher group; its gap-group/overshoot contract is documented on the method. An earlier
+/// revision of this routine had to dodge a gap-overshoot bug in `advance_to`; that root cause is now
+/// fixed, so the guard below is defense-in-depth rather than a correctness requirement.)
+///
+/// We call `advance_to(base)` **only when the primed `cached` is below the window** (`cached < base`)
+/// — exactly the case where skipping is needed — and refresh `cached` afterward. When `cached` is
+/// already `>= base` (or `None`), the iterator is already positioned and we leave it untouched.
+/// Because of edge 3, the walk loop then re-checks each `pos` against `base` and only flips when
+/// `base <= pos < end`, silently skipping any residual below-window delete `advance_to` could not get
+/// past — a backstop that keeps the mask correct even if `advance_to` ever regresses. This is a
+/// strict superset of `build_deletes_row_selection`'s stale-cache refresh, hardened to be correct
+/// regardless of how far `advance_to` actually managed to skip.
 ///
 /// `base + num_rows` is computed with `saturating_add` so a window abutting `u64::MAX` cannot wrap;
 /// the `(pos - base) as usize` index is bounded by `pos < end <= base + num_rows`, so `pos - base <
@@ -1752,6 +1751,58 @@ pub(crate) mod tests {
             KEY_BOUNDARY,
             5,
             "stale-cache-below-boundary-deletes-above",
+        );
+
+        // ---- GAP GROUPS (a high-bits group absent between two present groups) ----
+        // The exact silent-corruption repro: group 0 = {KB-2}, group 2 = {0}; group 1 ABSENT.
+        // base = 2*KB-2 with a 3-row window [2*KB-2, 2*KB+1). advance_to(base) hits hi=1 (the absent
+        // group), so the outer walk overshoots to group 2; the FIXED iterator must leave group 2 at
+        // its start so the in-window delete at 2*KB is still yielded. The old code consumed it →
+        // mask wrongly all-true.
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY],
+            2 * KEY_BOUNDARY - 2,
+            3,
+            "gap-group-repro-deleted-row-survives",
+        );
+        // Variant: in-window delete at the FIRST index of the window (overshoot lands exactly on it).
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY],
+            2 * KEY_BOUNDARY,
+            4,
+            "gap-group-in-window-delete-at-index-0",
+        );
+        // Variant: in-window delete at a LATER index within the overshot group.
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY + 3],
+            2 * KEY_BOUNDARY - 1,
+            8,
+            "gap-group-in-window-delete-at-later-index",
+        );
+        // Variant: MULTIPLE consecutive gap groups (groups 1 and 2 absent; below in group 0, in-window
+        // in group 3). The outer walk must skip both gaps and not consume the in-window delete.
+        assert_equiv(
+            &[KEY_BOUNDARY - 1, 3 * KEY_BOUNDARY],
+            3 * KEY_BOUNDARY - 1,
+            3,
+            "two-consecutive-gap-groups",
+        );
+        // Variant: base sits IN a gap group (group 1) with deletes BOTH below (groups 0/1-low) and
+        // above (group 2), and the window straddles the gap into the present higher group. base is
+        // placed just below group 2 so a small window reaches the higher group's deletes.
+        assert_equiv(
+            &[5, KEY_BOUNDARY - 3, 2 * KEY_BOUNDARY, 2 * KEY_BOUNDARY + 1],
+            2 * KEY_BOUNDARY - 2,
+            5, // window [2*KB-2, 2*KB+3): reaches 2*KB and 2*KB+1 in the present higher group
+            "base-in-gap-group-deletes-below-and-above",
+        );
+        // Variant: gap group but window ends BEFORE the overshot group's delete (in-window mask must
+        // stay all-true even though a higher delete exists past the window).
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY + 100],
+            2 * KEY_BOUNDARY - 2,
+            5,
+            "gap-group-higher-delete-past-window-no-flip",
         );
     }
 

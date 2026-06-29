@@ -504,8 +504,26 @@ impl Iterator for DeleteVectorIterator<'_> {
 }
 
 impl DeleteVectorIterator<'_> {
-    /// Fast-forwards the iterator so the next yielded position is `>= pos`, skipping over any
-    /// positions below it (used by the scan to align the delete stream to a data-row position).
+    /// Fast-forwards the iterator so the next yielded position is the smallest delete `>= pos`,
+    /// skipping over any positions below it (used by the scan to align the delete stream to a
+    /// data-row position).
+    ///
+    /// `pos` splits into `hi = pos >> 32` (the roaring high-bits group) and `lo = pos as u32` (the
+    /// position within that group). The outer walk steps groups until the current group is `>= hi`,
+    /// then — *only when it landed EXACTLY on `hi`'s group* — skips within that group's bitmap to the
+    /// first low value `>= lo`.
+    ///
+    /// **Gap-group / overshoot contract.** When `hi`'s group is ABSENT from the treemap (a "gap
+    /// group"), the outer walk overshoots into the next PRESENT higher group (`inner.high_bits > hi`).
+    /// Every position in that higher group is already `> pos`, so we must NOT run the inner
+    /// `advance_to(lo)` on it — doing so would skip within the wrong group and silently consume an
+    /// in-range position that should still be yielded. We therefore leave the iterator at that higher
+    /// group's START. This preserves the postcondition (next yielded position is the smallest delete
+    /// `>= pos`) across gap groups, and keeps the O(D) fast-skip for the present-group case.
+    ///
+    /// `advance_to` is a no-op until the iterator has been primed with at least one `next()` (it
+    /// returns early while `inner` is `None`), and it only ever moves the iterator forward — calling
+    /// it with a `pos` already behind the current position does nothing.
     pub fn advance_to(&mut self, pos: u64) {
         let hi = (pos >> 32) as u32;
         let lo = pos as u32;
@@ -525,7 +543,12 @@ impl DeleteVectorIterator<'_> {
             }
         }
 
-        inner.bitmap_iter.advance_to(lo);
+        // Only skip within the bitmap when we landed exactly on `hi`'s group. On overshoot
+        // (`inner.high_bits > hi`, because `hi`'s group is absent), every position in this higher
+        // group is already `> pos`, so we leave `bitmap_iter` at the group's start.
+        if inner.high_bits == hi {
+            inner.bitmap_iter.advance_to(lo);
+        }
     }
 }
 
@@ -1215,5 +1238,92 @@ pub(crate) mod tests {
         let positions = vec![1, 3, 5, 5];
         let res = dv.insert_positions(&positions);
         assert!(res.is_err());
+    }
+
+    const KEY_BOUNDARY: u64 = 1 << 32;
+
+    /// Builds a [`DeleteVector`] from explicit positions (deterministic, no RNG).
+    fn dv_with(positions: &[u64]) -> DeleteVector {
+        let mut dv = DeleteVector::new(RoaringTreemap::new());
+        for &p in positions {
+            dv.insert(p);
+        }
+        dv
+    }
+
+    /// `advance_to` postcondition pinned across a GAP GROUP: a high-bits group absent between the
+    /// target's group and a present higher group. `deletes = {KB-2, 2*KB}` → group 0 = {KB-2},
+    /// group 2 = {0}; group 1 ABSENT. Advancing to a target in the absent group 1 must leave the
+    /// next yielded position as the smallest delete `>= pos` — i.e. `2*KB` — NOT skip it.
+    ///
+    /// This pins the overshoot contract: the outer walk overshoots group 1 into group 2, and the
+    /// iterator must be left at group 2's START rather than running `bitmap_iter.advance_to(lo)` on
+    /// it (which, with `lo = 0xFFFFFFFE`, would consume group 2's only element `0` and yield `None`).
+    #[test]
+    fn test_advance_to_across_gap_group_yields_next_higher_delete() {
+        let dv = dv_with(&[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY]);
+
+        // Target sits in the absent group 1, with a low value larger than group 2's only element.
+        let mut iter = dv.iter();
+        assert_eq!(iter.next(), Some(KEY_BOUNDARY - 2), "prime yields group 0");
+        iter.advance_to(2 * KEY_BOUNDARY - 2);
+        assert_eq!(
+            iter.next(),
+            Some(2 * KEY_BOUNDARY),
+            "across a gap group, advance_to must leave the higher group's first delete unconsumed"
+        );
+        assert_eq!(iter.next(), None, "no deletes beyond 2*KB");
+    }
+
+    /// Two consecutive gap groups (groups 1 and 2 absent; deletes in group 0 and group 3): the outer
+    /// walk skips both gaps and still yields the in-range delete in group 3. The target's low bits
+    /// (`0xFFFFFFFE`) are LARGER than group 3's only element low bits (`7`), so the buggy
+    /// unconditional `bitmap_iter.advance_to(lo)` would consume group 3's element — pinning RED-ability.
+    #[test]
+    fn test_advance_to_across_multiple_gap_groups() {
+        let dv = dv_with(&[KEY_BOUNDARY - 1, 3 * KEY_BOUNDARY + 7]);
+
+        let mut iter = dv.iter();
+        assert_eq!(iter.next(), Some(KEY_BOUNDARY - 1));
+        // Target in absent group 2 with a high low-bits value (KB-2 = 0xFFFFFFFE).
+        iter.advance_to(2 * KEY_BOUNDARY + (KEY_BOUNDARY - 2));
+        assert_eq!(
+            iter.next(),
+            Some(3 * KEY_BOUNDARY + 7),
+            "advance_to must skip multiple absent groups without consuming the next delete"
+        );
+        assert_eq!(iter.next(), None);
+    }
+
+    /// Non-gap case (target's group is PRESENT): `advance_to` must still skip WITHIN the group to
+    /// the first low value `>= lo`, preserving the O(D) fast-skip.
+    #[test]
+    fn test_advance_to_within_present_group_skips_lower_positions() {
+        // Single group 0 with several positions.
+        let dv = dv_with(&[3, 7, 11, 19]);
+
+        let mut iter = dv.iter();
+        assert_eq!(iter.next(), Some(3), "prime");
+        iter.advance_to(10); // present group, skip past 3 and 7
+        assert_eq!(
+            iter.next(),
+            Some(11),
+            "within a present group, advance_to skips to the first position >= target"
+        );
+        assert_eq!(iter.next(), Some(19));
+        assert_eq!(iter.next(), None);
+
+        // Present higher group: target lands exactly on an existing position.
+        let dv2 = dv_with(&[5, KEY_BOUNDARY + 4, KEY_BOUNDARY + 8]);
+        let mut iter2 = dv2.iter();
+        assert_eq!(iter2.next(), Some(5));
+        iter2.advance_to(KEY_BOUNDARY + 4);
+        assert_eq!(
+            iter2.next(),
+            Some(KEY_BOUNDARY + 4),
+            "advance_to lands exactly on an existing position in a present higher group"
+        );
+        assert_eq!(iter2.next(), Some(KEY_BOUNDARY + 8));
+        assert_eq!(iter2.next(), None);
     }
 }
