@@ -24,7 +24,7 @@ use arrow_array::types::{Decimal128Type, validate_decimal_precision_and_scale};
 use arrow_array::{
     BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, Scalar, StringArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -785,6 +785,27 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
         (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(value)) => {
             let bytes = Uuid::from_u128(*value).into_bytes();
             let array = FixedSizeBinaryArray::try_from_iter(vec![bytes].into_iter()).unwrap();
+            Ok(Arc::new(Scalar::new(array)))
+        }
+        (PrimitiveType::Time, PrimitiveLiteral::Long(value)) => {
+            Ok(Arc::new(Time64MicrosecondArray::new_scalar(*value)))
+        }
+        (PrimitiveType::Fixed(_), PrimitiveLiteral::Binary(value)) => {
+            // A 1-element `FixedSizeBinaryArray` whose width is `value.len()` — the data column for a
+            // `Fixed(n)` field is `FixedSizeBinary(n)`, and Arrow's `eq` kernel compares the scalar's
+            // byte buffer against each row's fixed-width bytes. `try_from_iter` derives the width from
+            // the single element, so a width mismatch with the column is surfaced by the kernel, not
+            // here. Unlike the `Uuid` arm (whose `[u8; 16]` width is statically known and cannot fail),
+            // this width is data-derived, so the `Result` is mapped to a typed error rather than
+            // `.unwrap()`ed (AGENTS.md: no bare unwrap in production paths).
+            let array =
+                FixedSizeBinaryArray::try_from_iter([value.clone()].into_iter()).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Failed to build a FixedSizeBinary scalar from a Fixed literal",
+                    )
+                    .with_source(e)
+                })?;
             Ok(Arc::new(Scalar::new(array)))
         }
 
@@ -2247,6 +2268,31 @@ mod tests {
                 .unwrap();
             assert!(is_scalar);
             assert_eq!(array.value(0), [66u8; 16]);
+        }
+        {
+            // Time → Time64(Microsecond) scalar carrying the i64 micros-from-midnight backing.
+            let datum = Datum::time_micros(3_661_000_000).expect("valid time-of-day micros");
+            let arrow_datum = get_arrow_datum(&datum).expect("Time datum must convert");
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .expect("Time scalar must be a Time64MicrosecondArray");
+            assert!(is_scalar);
+            assert_eq!(array.value(0), 3_661_000_000);
+        }
+        {
+            // Fixed(n) → FixedSizeBinary(n) scalar carrying the exact byte buffer.
+            let datum = Datum::fixed(vec![0xDEu8, 0xAD, 0xBE, 0xEF]);
+            let arrow_datum = get_arrow_datum(&datum).expect("Fixed datum must convert");
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("Fixed scalar must be a FixedSizeBinaryArray");
+            assert!(is_scalar);
+            assert_eq!(array.value_length(), 4);
+            assert_eq!(array.value(0), &[0xDEu8, 0xAD, 0xBE, 0xEF]);
         }
     }
 

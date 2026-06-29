@@ -1260,6 +1260,115 @@ pub(crate) mod tests {
         assert_eq!(mask, vec![true, false]);
     }
 
+    /// Time key (Int64-backed temporal, micros from midnight) — the fast-path mask must equal the
+    /// predicate oracle, proving the new `get_arrow_datum` Time arm and the re-admitted gate agree.
+    /// Before this change a Time-keyed eq-delete errored `FeatureUnsupported` in the predicate path.
+    #[test]
+    fn test_h6_set_time_matches_oracle() {
+        use arrow_array::Time64MicrosecondArray;
+        let schema = opt_schema(vec![(1, "t", PrimitiveType::Time)]);
+        let key_columns = vec![(1, "t".to_string(), PrimitiveType::Time)];
+        // 01:01:01 = 3_661_000_000 micros; 12:00:00 = 43_200_000_000 micros.
+        let delete_rows = vec![vec![Some(Datum::time_micros(3_661_000_000).unwrap())]];
+        let data: ArrayRef = Arc::new(Time64MicrosecondArray::from(vec![
+            Some(3_661_000_000i64),
+            Some(43_200_000_000),
+        ]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["t"], delete_rows, vec![("t", data)]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// Fixed(n) key (FixedSizeBinary(n), fixed-width byte string) — fast-path mask must equal the
+    /// predicate oracle, proving the new `get_arrow_datum` Fixed arm and the re-admitted gate agree.
+    /// Before this change a Fixed-keyed eq-delete errored `FeatureUnsupported` in the predicate path.
+    #[test]
+    fn test_h6_set_fixed_matches_oracle() {
+        use arrow_array::FixedSizeBinaryArray;
+        let schema = opt_schema(vec![(1, "f", PrimitiveType::Fixed(4))]);
+        let key_columns = vec![(1, "f".to_string(), PrimitiveType::Fixed(4))];
+        let delete_rows = vec![vec![Some(Datum::fixed(vec![0xDEu8, 0xAD, 0xBE, 0xEF]))]];
+        let data: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(
+                vec![vec![0xDEu8, 0xAD, 0xBE, 0xEF], vec![
+                    0x00u8, 0x01, 0x02, 0x03,
+                ]]
+                .into_iter(),
+            )
+            .expect("build Fixed(4) data column"),
+        );
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["f"], delete_rows, vec![("f", data)]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// THE KEY-NULL BAIL FOR THE NEW TYPES: a Time / Fixed batch with a NULL in the key column makes
+    /// the fast path return `None`, and the predicate fallback — which previously ERRORED for
+    /// Time/Fixed — now SUCCEEDS (the new `get_arrow_datum` arms) and deletes the NULL row via 3VL +
+    /// null-coercion even without a matching NULL delete tuple. This pins the (b)-leg of the gate
+    /// admission: re-admitting Time/Fixed is sound only because the bail target no longer errors.
+    #[test]
+    fn test_h6_time_fixed_key_null_bails_to_predicate_without_error() {
+        use arrow_array::{FixedSizeBinaryArray, Time64MicrosecondArray};
+
+        // --- Time ---
+        let schema = opt_schema(vec![(1, "t", PrimitiveType::Time)]);
+        let key_columns = vec![(1, "t".to_string(), PrimitiveType::Time)];
+        let delete_rows = vec![vec![Some(Datum::time_micros(3_661_000_000).unwrap())]];
+        let set = EqDeleteKeySet::try_build(key_columns, delete_rows.clone())
+            .expect("Time key column must build a set (now eligible)");
+        let data: ArrayRef = Arc::new(Time64MicrosecondArray::from(vec![
+            Some(3_661_000_000i64),
+            Some(43_200_000_000),
+            None, // key-column NULL → forces the predicate fallback
+        ]));
+        let batch = batch_with_field_ids(vec![("t", data)]);
+        assert_eq!(
+            set.delete_mask(&batch).expect("delete_mask"),
+            None,
+            "a key-column NULL must force the predicate fallback for Time"
+        );
+        // The predicate oracle for that batch must SUCCEED (no FeatureUnsupported) and delete the
+        // NULL row: survival(NULL) = (NULL != t) = NULL → coerced false → deleted.
+        let oracle = multi_col_oracle_deleted_mask(&["t"], schema, &delete_rows, &batch);
+        assert_eq!(
+            oracle,
+            vec![true, false, true],
+            "predicate fallback must now evaluate a Time key (it errored before this change)"
+        );
+
+        // --- Fixed ---
+        let schema = opt_schema(vec![(1, "f", PrimitiveType::Fixed(4))]);
+        let key_columns = vec![(1, "f".to_string(), PrimitiveType::Fixed(4))];
+        let delete_rows = vec![vec![Some(Datum::fixed(vec![0xDEu8, 0xAD, 0xBE, 0xEF]))]];
+        let set = EqDeleteKeySet::try_build(key_columns, delete_rows.clone())
+            .expect("Fixed key column must build a set (now eligible)");
+        let data: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                vec![
+                    Some(vec![0xDEu8, 0xAD, 0xBE, 0xEF]),
+                    Some(vec![0x00u8, 0x01, 0x02, 0x03]),
+                    None, // key-column NULL → forces the predicate fallback
+                ]
+                .into_iter(),
+                4,
+            )
+            .expect("build Fixed(4) data column with a null"),
+        );
+        let batch = batch_with_field_ids(vec![("f", data)]);
+        assert_eq!(
+            set.delete_mask(&batch).expect("delete_mask"),
+            None,
+            "a key-column NULL must force the predicate fallback for Fixed"
+        );
+        let oracle = multi_col_oracle_deleted_mask(&["f"], schema, &delete_rows, &batch);
+        assert_eq!(
+            oracle,
+            vec![true, false, true],
+            "predicate fallback must now evaluate a Fixed key (it errored before this change)"
+        );
+    }
+
     /// MULTI-COLUMN key — membership on the full tuple == AND of per-column equality, with a partial
     /// match (one col matches, other doesn't → NOT deleted), a NULL DELETE cell (deletes nothing
     /// among non-null data), and a duplicate tuple. Data is non-null in both key columns → set path.
@@ -1359,7 +1468,9 @@ pub(crate) mod tests {
 
     /// THE GATE: Float / Double key columns must NOT build a set (route to the predicate fallback),
     /// and Decimal / Unknown are likewise excluded. This is what keeps the proven-divergent float
-    /// case on the untouched predicate path.
+    /// case on the untouched predicate path. (Time and Fixed are NOT excluded — they gained a
+    /// `get_arrow_datum` arm and their equality is integer-/byte-identical; see the eligible-type
+    /// assertions below and `test_h6_set_time_matches_oracle` / `test_h6_set_fixed_matches_oracle`.)
     #[test]
     fn test_h6_gate_excludes_float_double_decimal_unknown() {
         assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Float));
@@ -1369,12 +1480,12 @@ pub(crate) mod tests {
             scale: 2
         }));
         assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Unknown));
-        // Time and Fixed are excluded NOT because their equality diverges, but because the predicate
-        // fallback (`get_arrow_datum`) has no arm for them: admitting them would let the fast path
-        // succeed on non-null batches yet crash the scan on a key-null batch that bails to the
-        // predicate path. They must route uniformly to the predicate path (which errors for them).
-        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Time));
-        assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Fixed(16)));
+        // Time and Fixed are now ADMITTED: `get_arrow_datum` evaluates them (so a key-null bail to the
+        // predicate path succeeds rather than erroring) and their equality is integer- (Time, i64
+        // micros) / byte- (Fixed, fixed-width bytes) identical under both the Arrow `eq` kernel and
+        // `Datum` `Eq`.
+        assert!(EqDeleteKeySet::is_eligible_type(&PrimitiveType::Time));
+        assert!(EqDeleteKeySet::is_eligible_type(&PrimitiveType::Fixed(16)));
         // Eligible representatives.
         assert!(EqDeleteKeySet::is_eligible_type(&PrimitiveType::Long));
         assert!(EqDeleteKeySet::is_eligible_type(&PrimitiveType::String));
