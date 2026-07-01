@@ -98,7 +98,7 @@ The engine-boundary proof (#116): scan `_file`/`_pos` → write position-delete 
 
 ## 5. Isolation level → validation recipes  ·  **DRAFT — verify each cell before relying on it**
 
-Rust builder methods, verbatim from `transaction/{row_delta,overwrite_files}.rs`. **Base for every
+Rust builder methods, verbatim from `transaction/{row_delta,overwrite_files,replace_partitions}.rs`. **Base for every
 row-level op, both modes:** `validate_from_snapshot(scan_snapshot_id)` +
 `conflict_detection_filter(command_condition)` + `case_sensitive(engine_setting)`.
 

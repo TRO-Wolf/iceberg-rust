@@ -158,6 +158,11 @@
 
 ## Headline gaps (ranked by effort × value)
 
+> **Superseded as a ranking (2026-07-01):** the live ranked queue is
+> [task/todo.md](../../task/todo.md) §"ACTIVE (2026-07-01)" — one home for PRIORITY. This section
+> is retained as per-gap NARRATIVE detail only; several items below record capabilities that have
+> since landed (statuses live in the matrix rows above).
+
 1. **Write engine** — everything beyond fast-append (`RowDelta`, `RewriteManifests`, merge append).
    **Started 2026-06-07: `DeleteFiles` 🟡 + `OverwriteFiles` 🟡 + `ReplacePartitions` 🟡 + `RewriteFiles` 🟡.**
    `DeleteFiles` delete-by-path/reference + the foundational manifest-filter / rewrite machinery in
