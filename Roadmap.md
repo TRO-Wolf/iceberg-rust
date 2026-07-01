@@ -142,7 +142,7 @@ reference impl, not the product.
 #116 the engine-boundary proof (scan `_file`/`_pos` → write position-delete → `RowDelta` → re-scan omits
 exactly those rows) · #117 the public `iceberg::arrow::DeleteFilter` (mirrors Java
 `org.apache.iceberg.data.DeleteFilter`) · the custom-scan **equivalence proof**
-(`test/engine-mor-equivalence`): an engine's OWN raw read + `DeleteFilter::apply` reproduces the built-in
+(`crates/iceberg/tests/interop_scan_exec.rs` — path corrected 2026-07-01): an engine's OWN raw read + `DeleteFilter::apply` reproduces the built-in
 `to_arrow()` merge-on-read scan EXACTLY (position / equality / combined). A downstream engine can BYO
 physical scan and get iceberg-correct rows. (These are engine-integration surface, not GAP_MATRIX parity
 rows — no capability status changed.)
@@ -151,9 +151,10 @@ rows — no capability status changed.)
 substantively done (scan: `BatchScan` / `plan_tasks` / MoR deletes / `_pos` / `DeleteFilter`; write: the
 full commit surface). Remaining parity work is re-ranked by **what the query engine actually pulls**:
 - **Harden next (engine-relevant), in priority order:** (1) the **merge-on-read DELETE-apply residue** —
-  multi-file-per-partition + non-identity partition transforms (the delete-application correctness the
-  engine's own scan + `DeleteFilter` depend on; the "Read: merge-on-read apply" 🟡 row); directly extends
-  the 2026-06-21 equivalence proof to realistic layouts. (2) **CDC row-level changelog** —
+  **CLOSED 2026-06-21** *(corrected 2026-07-01 — this item pre-dated its own landing)*: both axes
+  (multi-file-per-partition AND non-identity partition transforms) interop-proven both directions and
+  the "Read: merge-on-read apply" row flipped ✅ (eq-key coverage extended 2026-06-28 #138;
+  `advance_to` gap-group hardening #139) — see the GAP_MATRIX cell. (2) **CDC row-level changelog** —
   `UpdateBefore`/`UpdateAfter` + accepting ranges that carry row-level DELETE manifests
   (`IncrementalChangelogScan` is whole-data-file-level only today). (3) the **ORC/Avro DATA-read residue**
   (footer codec / nested + V3 types / the Avro `timestamptz` mapping) — only if the engine queries
@@ -167,6 +168,11 @@ full commit surface). Remaining parity work is re-ranked by **what the query eng
 This changes SEQUENCING and PRIORITY only — the phase plan, the Definition of Done (interop bar), and
 every GAP_MATRIX capability status are unchanged.
 
+> **Priority home (2026-07-01):** the live ranked queue now lives ONLY in
+> [task/todo.md](task/todo.md) §"ACTIVE (2026-07-01)" — one home for PRIORITY, mirroring the
+> one-home-per-fact rule for status. This section remains the direction RECORD; do not grow a
+> second ranked list here.
+
 ---
 ---
 
@@ -177,7 +183,12 @@ every GAP_MATRIX capability status are unchanged.
 > #64-#69); **resynced 2026-06-17** (blocks 1-3 landings + the `validateAppendOnly` interop — 16 stale
 > prose under-claims corrected against the matrix); **resynced 2026-06-19** (`BatchScan` ✅, ORC+Avro
 > DATA READ 🟡, `RewriteTablePath` 🟡, events/listeners ✅ reflected; audit P1 panic-hardening + QUAL-01
-> tracing landed). Per-capability status lives ONLY in the
+> tracing landed); **corrections pass 2026-07-01** (review: stale re-anchor item 1 / Phase-3
+> split-planning / `LockManager` prose fixed against the matrix; the dead `test/engine-mor-equivalence`
+> pointer re-aimed at `crates/iceberg/tests/interop_scan_exec.rs`; stray agent-output tags stripped from
+> both parity docs; commit-outcome-taxonomy row added at the matrix TAIL — row 157 — so existing row
+> numbers are untouched; priority re-homed to `task/todo.md` §"ACTIVE (2026-07-01)"). Per-capability
+> status lives ONLY in the
 > [GAP_MATRIX](docs/parity/GAP_MATRIX.md); this screen is a one-paragraph orientation that links there.
 
 **Base:** upstream `iceberg` 0.9.1 (datafusion 52.2 / arrow 57.3 / parquet 57.3, MSRV 1.92), owned
@@ -301,8 +312,9 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   interop-proven both directions; residual evaluation wired into planning; incremental append +
   changelog scans interop-proven both directions (✅ 2026-06-17, rows 120/121; row-level CDC is named
   residue); `BatchScan` ✅ (row 122, interop-proven 2026-06-17); metrics model + opt-in emission landed.
-  Remaining: CDC-merge (row-level), split planning (row 146), strict-evaluator completion (per-row
-  status: GAP_MATRIX).
+  Remaining: CDC-merge (row-level) + strict-evaluator completion (per-row status: GAP_MATRIX).
+  *(Corrected 2026-07-01: the stale "split planning (row 146)" entry removed — it landed ✅
+  2026-06-17, as headline item 4 below already records.)*
 - **Exit criteria:** scans match Java result-for-result with reporting parity. Narratives:
   [task/todo-archive/phase3.md](task/todo-archive/phase3.md).
 
@@ -325,11 +337,12 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 - **Gates on:** Phase 1.
 - **Key deliverables:** `ViewCatalog` + view operations (create/replace/drop/list, view
   versions/representations) on Glue + S3 Tables, then REST; `SessionCatalog`; `LockManager`
-  (in-memory impl + tests landed 2026-06-19; JVM-conformance interop is the ✅ gate); Glue + S3 Tables hardening.
+  (✅ — behavioral-conformance interop landed, row 129 / #136); Glue + S3 Tables hardening.
 - **Where it stands:** view ops landed + interop'd on memory + REST + SQL (I2); Glue + S3 Tables expose
   `FeatureUnsupported` view stubs, which is PARITY-CORRECT, not a gap (verified 2026-06-17 — Java
   `GlueCatalog` does not implement `ViewCatalog` (issue #12488, an OPEN feature request) and the S3
-  Tables service has no view API; rows 124/125). `LockManager`: in-memory impl + tests landed (row 129 — see GAP_MATRIX); `SessionCatalog` is ❌
+  Tables service has no view API; rows 124/125). `LockManager` ✅ (row 129 — behavioral-conformance
+  interop landed 2026-06-20, merged #136; corrected 2026-07-01); `SessionCatalog` is ❌
   but assessed-deferred as a dead surface (row 126 — revisit only for a multi-tenant single-instance
   use-case). Per-row status: GAP_MATRIX.
 - **Exit criteria:** view lifecycle works on the priority catalogs with interop tests; session/lock gaps
@@ -412,7 +425,8 @@ format-sensitive work still leads; well-templated breadth follows.
 4. **Scan completion:** CDC-merge (row-level) is the remaining open slice; split planning (row 146),
    `BatchScan` (row 122), and incremental-scan interop (rows 120/121) all LANDED ✅ 2026-06-17;
    strict-evaluator completion mostly templated → Opus.
-5. **`LockManager`** (in-memory impl + tests landed 2026-06-19 — JVM-conformance interop is the ✅ gate) + the `ViewCatalog`
+5. **`LockManager` — CLOSED** (row 129 ✅; behavioral-conformance interop landed, #136 — corrected
+   2026-07-01). Remaining here: the `ViewCatalog`
    byte-exact round-trip residue (row 125). Glue/S3 Tables view ops are parity-correct-unsupported
    (rows 124/125, NOT owed); `SessionCatalog` is assessed-deferred as a dead surface (row 126).
 6. **Encryption** (`EncryptionManager`, KMS, encrypted FileIO / manifests — frontier-grade format
@@ -429,6 +443,8 @@ format-sensitive work still leads; well-templated breadth follows.
 | GAP_MATRIX drifts from reality as work lands or Java evolves | One home per fact (statuses ONLY in the matrix); re-audit after every sync and every phase; Phase 7 automates Java-release tracking. |
 | Parity claimed without true 1:1 evidence | Definition of Done requires an interop test (Java↔Rust round-trip) before a row flips to ✅. |
 | Status narratives regrow in this file | The de-triplication rule in [CLAUDE.md](CLAUDE.md): never write a capability's status outside the matrix — link instead. Archived narrative: [task/todo-archive/](task/todo-archive/). |
+| Dependency treadmill: the arrow / parquet / datafusion cadence (a fork-and-own cost) | Named policy (2026-07-01): evaluate each upstream FAMILY bump on a schedule — the parquet 57 pin already blocks variant shredding, and the downstream engine will eventually drag a newer DataFusion (⇒ arrow major) through the core. Budget one sync-spike per family release; record the take/skip decision per crate in `task/todo.md`. |
+| Upstream `apache/iceberg-rust` divergence compounds (cherry-pick cost grows superlinearly, worst on the write path) | Scheduled upstream-evaluation cadence: on each upstream minor, take io / catalog / reader fixes, skip write-path changes unless load-bearing — and record a DATED take/skip decision per release. Deciding not to sync is also a decision; leaving it implicit is how the option silently expires. |
 
 ---
 
@@ -446,4 +462,6 @@ compatibility with Java in both directions where applicable.
   roadmap drives).
 - [CLAUDE.md](CLAUDE.md) — repository intent, prohibitions, conventions, read order, sub-agent policy.
 - [docs/testing.md](docs/testing.md) — the testing contract (tests-with-code + interop tests).
+- [docs/ENGINE_CONTRACT.md](docs/ENGINE_CONTRACT.md) — the engine-facing integration contract
+  (DRAFT 2026-07-01: isolation-level → validation recipes pending bytecode verification).
 - [README.md](README.md) — project front door.
