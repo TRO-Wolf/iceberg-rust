@@ -70,6 +70,17 @@ surfaced two new items. Statuses live ONLY in
 - [ ] **6. Real-catalog hardening (credentialed)** — Glue + S3 Tables conflict/retry conformance
       + item 1's real-catalog classification slice; scheduled with the user (needs AWS creds).
 
+**In-flight (off-matrix, user-gated — staged work, not ranked above): H7 DML
+streaming/pushdown** on the DataFusion reference impl (scope converged 2026-06-30; engine-first
+hardening of the #124 DML loop, flips no matrix row). **H7-S1** (MoR DELETE/UPDATE streaming) is
+PUSHED — branch `parity/h7-s1-mor-streaming` (d2fecef6), gate green, all Critics/audits
+converged — awaiting user merge. Remaining stages, each its own ladder when the user resumes:
+**H7-S2** (COW streaming — the two `copy_on_write_*` fns, two-pass→bounded refactor) and
+**H7-P1** (pushdown pruning — must FIRST thread the raw `Vec<Expr>` through both exec structs,
+and resolve the `NOT`-over-dropped-conjunct under-delete footgun before any
+`with_filter(convert_filters_to_predicate)`; pushdown may ONLY prune, never replace the exact
+post-scan filter).
+
 PULL-BASED / DEMOTED: unchanged from the Roadmap re-anchor — link, do not restate.
 
 ---
