@@ -423,11 +423,9 @@ impl DeleteFilter {
                 if deletes.is_empty() {
                     None
                 } else {
-                    Some(BooleanArray::from(
-                        (0..num_rows)
-                            .map(|i| !deletes.contains(row_base + i as u64))
-                            .collect::<Vec<bool>>(),
-                    ))
+                    // Range-walk the delete window — byte-identical to the per-row `!contains` probe,
+                    // O(D_window) instead of O(num_rows). See `positional_delete_keep_mask`.
+                    Some(positional_delete_keep_mask(&deletes, row_base, num_rows))
                 }
             }
             None => None,
@@ -476,6 +474,93 @@ fn coerce_nulls_to_false(mask: &BooleanArray) -> BooleanArray {
 
 pub(crate) fn is_equality_delete(f: &FileScanTaskDeleteFile) -> bool {
     matches!(f.file_type, DataContentType::EqualityDeletes)
+}
+
+/// Builds a positional-delete keep-mask for the absolute row window `[base, base + num_rows)`:
+/// index `i` is `false` iff position `base + i` is a deleted position, `true` otherwise.
+///
+/// This is byte-identical to the naive per-row probe
+/// `BooleanArray::from((0..num_rows).map(|i| !deletes.contains(base + i as u64)))`, but runs in
+/// `O(D_window)` (the number of deletes falling inside the window) instead of `O(num_rows)` membership
+/// probes, by range-walking the ascending [`DeleteVectorIterator`] rather than calling
+/// [`DeleteVector::contains`] once per row. This is the same range-walk the Parquet path uses in
+/// `ArrowReader::build_deletes_row_selection`; here it serves the Avro/ORC whole-file decode path,
+/// which applies deletes post-materialization to an already-decoded batch.
+///
+/// ## The prime / conditional-`advance_to` / refresh dance (do not reorder)
+///
+/// [`DeleteVectorIterator::advance_to`] has three sharp edges this routine must respect:
+///
+/// 1. It is a **no-op until the iterator has been primed** with at least one `next()` — it returns
+///    early while `inner` is `None`. So we call `next()` once *before* any `advance_to`.
+/// 2. It repositions the *underlying* iterator but cannot un-yield a value already pulled into our
+///    local `cached`. So a primed `cached` that is already a **legitimate in-window** position
+///    (`>= base`) must NOT be dropped — `advance_to` cannot rewind, so discarding it would lose a
+///    real delete.
+/// 3. `advance_to(base)` is a **hint, not a guarantee** of landing in-window: when *no* delete
+///    reaches `base`'s high-bits group (every remaining delete is below the window), it walks
+///    `outer` to exhaustion and returns, leaving the iterator on a still-below-window value. So the
+///    post-advance `next()` may still yield `pos < base`.
+///
+/// (`advance_to`'s postcondition — the next yielded position is the smallest delete `>= base` — now
+/// holds across "gap groups", a high-bits group absent from the treemap between `base`'s group and a
+/// present higher group; its gap-group/overshoot contract is documented on the method. An earlier
+/// revision of this routine had to dodge a gap-overshoot bug in `advance_to`; that root cause is now
+/// fixed, so the guard below is defense-in-depth rather than a correctness requirement.)
+///
+/// We call `advance_to(base)` **only when the primed `cached` is below the window** (`cached < base`)
+/// — exactly the case where skipping is needed — and refresh `cached` afterward. When `cached` is
+/// already `>= base` (or `None`), the iterator is already positioned and we leave it untouched.
+/// Because of edge 3, the walk loop then re-checks each `pos` against `base` and only flips when
+/// `base <= pos < end`, silently skipping any residual below-window delete `advance_to` could not get
+/// past — a backstop that keeps the mask correct even if `advance_to` ever regresses. This is a
+/// strict superset of `build_deletes_row_selection`'s stale-cache refresh, hardened to be correct
+/// regardless of how far `advance_to` actually managed to skip.
+///
+/// `base + num_rows` is computed with `saturating_add` so a window abutting `u64::MAX` cannot wrap;
+/// the `(pos - base) as usize` index is bounded by `pos < end <= base + num_rows`, so `pos - base <
+/// num_rows` and the cast cannot truncate.
+pub(crate) fn positional_delete_keep_mask(
+    deletes: &DeleteVector,
+    base: u64,
+    num_rows: usize,
+) -> BooleanArray {
+    let mut keep = vec![true; num_rows];
+    if num_rows == 0 {
+        return BooleanArray::from(keep);
+    }
+    let end = base.saturating_add(num_rows as u64);
+
+    let mut iter = deletes.iter();
+    // PRIME: advance_to is a no-op until the iterator has yielded at least once.
+    let mut cached = iter.next();
+    // Best-effort fast-skip past deletes below the window — but ONLY when the primed value predates
+    // the window, which keeps advance_to driven strictly forward (edge 3 above). advance_to is a
+    // *hint*, not a guarantee: when no delete reaches `base`'s high-bits group it leaves the iterator
+    // on a still-below-window value, so the loop below re-checks `pos < base` and never trusts
+    // advance_to to land us in-window. An in-window (>= base) primed value is the first real delete
+    // and is left untouched (advance_to cannot rewind).
+    if let Some(pos) = cached
+        && pos < base
+    {
+        iter.advance_to(base);
+        cached = iter.next();
+    }
+
+    while let Some(pos) = cached {
+        if pos >= end {
+            break;
+        }
+        if pos >= base {
+            // pos is in [base, end); pos - base < num_rows, so the index is in bounds.
+            keep[(pos - base) as usize] = false;
+        }
+        // else pos < base: a residual below-window delete advance_to could not skip past — drop it
+        // (it does not belong to this window) and keep walking; the iterator is ascending.
+        cached = iter.next();
+    }
+
+    BooleanArray::from(keep)
 }
 
 #[cfg(test)]
@@ -1537,6 +1622,255 @@ pub(crate) mod tests {
                 delete_cells.into_iter().map(|c| vec![c]).collect(),
             )
             .is_none()
+        );
+    }
+
+    // -- positional_delete_keep_mask range-walk vs naive `!contains` byte-identity ----------------
+
+    use crate::delete_vector::DeleteVector;
+
+    /// Builds a [`DeleteVector`] from explicit positions (deterministic; no RNG/clock).
+    fn dv_from(positions: &[u64]) -> DeleteVector {
+        let mut dv = DeleteVector::new(roaring::RoaringTreemap::new());
+        for &p in positions {
+            dv.insert(p);
+        }
+        dv
+    }
+
+    /// The naive oracle: the exact mask the range-walk must reproduce byte-for-byte.
+    fn naive_keep_mask(dv: &DeleteVector, base: u64, num_rows: usize) -> BooleanArray {
+        BooleanArray::from(
+            (0..num_rows)
+                .map(|i| !dv.contains(base + i as u64))
+                .collect::<Vec<bool>>(),
+        )
+    }
+
+    /// Asserts the range-walk helper is byte-identical to the naive `!contains` probe for one shape.
+    fn assert_equiv(positions: &[u64], base: u64, num_rows: usize, label: &str) {
+        let dv = dv_from(positions);
+        let fast = positional_delete_keep_mask(&dv, base, num_rows);
+        let naive = naive_keep_mask(&dv, base, num_rows);
+        assert_eq!(
+            fast, naive,
+            "range-walk mask diverged from naive !contains for case `{label}` \
+             (positions={positions:?}, base={base}, num_rows={num_rows})"
+        );
+        assert_eq!(
+            fast.len(),
+            num_rows,
+            "mask length must equal num_rows for case `{label}`"
+        );
+    }
+
+    /// The 2^32 high-bits boundary — the roaring-treemap inner/outer split. A window straddling it
+    /// exercises the trap that `advance_to` walks `outer` when `high_bits < hi`.
+    const KEY_BOUNDARY: u64 = 1 << 32;
+
+    #[test]
+    fn test_positional_keep_mask_equivalence_explicit_shapes() {
+        // Empty window: num_rows == 0 (helper returns an empty mask, never indexes).
+        assert_equiv(&[], 0, 0, "empty-window-no-deletes");
+        assert_equiv(&[5, 10], 0, 0, "empty-window-with-deletes");
+        assert_equiv(&[5, 10], 7, 0, "empty-window-base-nonzero");
+
+        // Zero deletes over a real window.
+        assert_equiv(&[], 0, 16, "no-deletes-base0");
+        assert_equiv(&[], 100, 16, "no-deletes-base100");
+
+        // No rows deleted because every delete is out of the window.
+        assert_equiv(&[0, 1, 2], 10, 5, "deletes-entirely-below-window");
+        assert_equiv(&[20, 21, 22], 10, 5, "deletes-entirely-above-window");
+
+        // All rows deleted (dense contiguous run exactly covering the window).
+        assert_equiv(&[0, 1, 2, 3, 4, 5, 6, 7], 0, 8, "all-rows-deleted-base0");
+        assert_equiv(
+            &[10, 11, 12, 13, 14],
+            10,
+            5,
+            "all-rows-deleted-base-nonzero",
+        );
+
+        // Sparse deletes inside the window.
+        assert_equiv(&[2, 5, 9], 0, 12, "sparse-base0");
+        assert_equiv(&[103, 107, 111], 100, 16, "sparse-base100");
+
+        // Dense contiguous run inside a larger window (some survivors on each side).
+        assert_equiv(&[4, 5, 6, 7, 8], 0, 16, "dense-run-interior-base0");
+        assert_equiv(&[54, 55, 56, 57], 50, 20, "dense-run-interior-base50");
+
+        // Window-edge deletes: exactly at base, exactly at base+num_rows-1 (last row), and exactly
+        // at base+num_rows (one past — must NOT flip any row).
+        assert_equiv(&[10], 10, 5, "delete-exactly-at-base");
+        assert_equiv(&[14], 10, 5, "delete-exactly-at-last-row");
+        assert_equiv(&[15], 10, 5, "delete-exactly-one-past-window-must-not-flip");
+        assert_equiv(
+            &[9, 10, 14, 15],
+            10,
+            5,
+            "edges-combined-below-at-base-at-last-one-past",
+        );
+
+        // A primed cache value that is itself the first in-window delete (cached >= base): the
+        // refresh-only-if-stale branch must KEEP it. base==first delete with nothing below.
+        assert_equiv(&[10, 12], 10, 5, "primed-cache-is-first-in-window-delete");
+
+        // Stale primed cache: a delete strictly below base must be skipped by advance_to + refresh.
+        assert_equiv(&[3, 12, 13], 10, 5, "stale-primed-cache-below-window");
+
+        // base == 0 with deletes only at and after 0 (prime yields 0, in-window, must be kept).
+        assert_equiv(&[0, 3, 7], 0, 8, "base0-prime-zero-in-window");
+
+        // ---- the 2^32 high-bits boundary ----
+        // Window straddling the boundary: base just below 1<<32, spanning above it.
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, KEY_BOUNDARY, KEY_BOUNDARY + 3],
+            KEY_BOUNDARY - 4,
+            8,
+            "window-straddles-2^32-with-deletes-on-both-sides",
+        );
+        // Delete exactly AT the boundary, window starting below it.
+        assert_equiv(
+            &[KEY_BOUNDARY],
+            KEY_BOUNDARY - 2,
+            5,
+            "delete-exactly-at-2^32-boundary",
+        );
+        // Entirely above the boundary (high_bits == 1) — exercises advance_to walking outer.
+        assert_equiv(
+            &[KEY_BOUNDARY + 5, KEY_BOUNDARY + 9],
+            KEY_BOUNDARY + 2,
+            12,
+            "window-entirely-above-2^32",
+        );
+        // Stale primed cache below the boundary, real deletes above it (advance_to must walk outer
+        // AND the refresh must drop the stale low-bits value).
+        assert_equiv(
+            &[7, KEY_BOUNDARY + 1, KEY_BOUNDARY + 2],
+            KEY_BOUNDARY,
+            5,
+            "stale-cache-below-boundary-deletes-above",
+        );
+
+        // ---- GAP GROUPS (a high-bits group absent between two present groups) ----
+        // The exact silent-corruption repro: group 0 = {KB-2}, group 2 = {0}; group 1 ABSENT.
+        // base = 2*KB-2 with a 3-row window [2*KB-2, 2*KB+1). advance_to(base) hits hi=1 (the absent
+        // group), so the outer walk overshoots to group 2; the FIXED iterator must leave group 2 at
+        // its start so the in-window delete at 2*KB is still yielded. The old code consumed it →
+        // mask wrongly all-true.
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY],
+            2 * KEY_BOUNDARY - 2,
+            3,
+            "gap-group-repro-deleted-row-survives",
+        );
+        // Variant: in-window delete at the FIRST index of the window (overshoot lands exactly on it).
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY],
+            2 * KEY_BOUNDARY,
+            4,
+            "gap-group-in-window-delete-at-index-0",
+        );
+        // Variant: in-window delete at a LATER index within the overshot group.
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY + 3],
+            2 * KEY_BOUNDARY - 1,
+            8,
+            "gap-group-in-window-delete-at-later-index",
+        );
+        // Variant: MULTIPLE consecutive gap groups (groups 1 and 2 absent; below in group 0, in-window
+        // in group 3). The outer walk must skip both gaps and not consume the in-window delete.
+        assert_equiv(
+            &[KEY_BOUNDARY - 1, 3 * KEY_BOUNDARY],
+            3 * KEY_BOUNDARY - 1,
+            3,
+            "two-consecutive-gap-groups",
+        );
+        // Variant: base sits IN a gap group (group 1) with deletes BOTH below (groups 0/1-low) and
+        // above (group 2), and the window straddles the gap into the present higher group. base is
+        // placed just below group 2 so a small window reaches the higher group's deletes.
+        assert_equiv(
+            &[5, KEY_BOUNDARY - 3, 2 * KEY_BOUNDARY, 2 * KEY_BOUNDARY + 1],
+            2 * KEY_BOUNDARY - 2,
+            5, // window [2*KB-2, 2*KB+3): reaches 2*KB and 2*KB+1 in the present higher group
+            "base-in-gap-group-deletes-below-and-above",
+        );
+        // Variant: gap group but window ends BEFORE the overshot group's delete (in-window mask must
+        // stay all-true even though a higher delete exists past the window).
+        assert_equiv(
+            &[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY + 100],
+            2 * KEY_BOUNDARY - 2,
+            5,
+            "gap-group-higher-delete-past-window-no-flip",
+        );
+    }
+
+    #[test]
+    fn test_positional_keep_mask_equivalence_generated() {
+        // Deterministic LCG (Numerical Recipes constants) — reproducible, no clock/RNG dependency.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+
+        // Sweep many (base, num_rows, delete-density) shapes, including ones crossing 2^32.
+        let bases = [
+            0u64,
+            1,
+            63,
+            1000,
+            KEY_BOUNDARY - 10,
+            KEY_BOUNDARY,
+            KEY_BOUNDARY + 100,
+        ];
+        let widths = [1usize, 2, 7, 64, 200];
+
+        let mut checked = 0usize;
+        for &base in &bases {
+            for &num_rows in &widths {
+                for density_sel in 0..4u64 {
+                    // Generate deletes spread across [base-8, base+num_rows+8) so windows see
+                    // below/in/above-window positions, plus occasional far-away deletes.
+                    let span_lo = base.saturating_sub(8);
+                    let span_hi = base.saturating_add(num_rows as u64).saturating_add(8);
+                    let span = (span_hi - span_lo).max(1);
+                    let count = match density_sel {
+                        0 => 0,
+                        1 => 1 + (next() % 3),
+                        2 => 3 + (next() % 7),
+                        _ => span / 2,
+                    };
+                    let mut positions: Vec<u64> =
+                        (0..count).map(|_| span_lo + (next() % span)).collect();
+                    // Occasionally inject a far-below and far-above delete.
+                    if next() % 2 == 0 {
+                        positions.push(span_hi.saturating_add(1000));
+                    }
+                    if base > 1000 && next() % 2 == 0 {
+                        positions.push(base.saturating_sub(1000));
+                    }
+                    positions.sort_unstable();
+                    positions.dedup();
+
+                    assert_equiv(
+                        &positions,
+                        base,
+                        num_rows,
+                        &format!(
+                            "generated[base={base},num_rows={num_rows},density={density_sel}]"
+                        ),
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked >= bases.len() * widths.len() * 4,
+            "generator must have exercised every (base, width, density) combination"
         );
     }
 }

@@ -48,6 +48,7 @@ use typed_builder::TypedBuilder;
 
 use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::delete_filter::positional_delete_keep_mask;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::orc_reader::read_orc_data_file;
@@ -968,10 +969,9 @@ impl ArrowReader {
                 if deletes.is_empty() {
                     None
                 } else {
-                    let keep: Vec<bool> = (0..num_rows)
-                        .map(|i| !deletes.contains(batch_base + i as u64))
-                        .collect();
-                    Some(BooleanArray::from(keep))
+                    // Range-walk the delete window — byte-identical to the per-row `!contains` probe,
+                    // O(D_window) instead of O(num_rows). See `positional_delete_keep_mask`.
+                    Some(positional_delete_keep_mask(&deletes, batch_base, num_rows))
                 }
             }
             None => None,
