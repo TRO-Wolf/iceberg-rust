@@ -216,5 +216,3 @@
 4. **Views in catalogs** (`ViewCatalog` + view operations).
 5. **Maintenance actions** (expire/orphan/compaction/rewrite-deletes/compute-stats/migrate).
 6. **Encryption** (`EncryptionManager`, KMS, encrypted FileIO/manifests).
-</content>
-</invoke>
