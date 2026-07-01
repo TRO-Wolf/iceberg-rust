@@ -39,7 +39,46 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
-## ACTIVE (2026-06-13): Near-full-parity direction — open queue (ranked next-work)
+## ACTIVE (2026-07-01): Engine-first closeout — re-ranked open queue
+
+Supersedes the 2026-06-13 queue below. **One home for PRIORITY: this list** (the Roadmap's
+re-anchor carries a "Priority home" pointer here; do not grow ranked lists elsewhere). Re-ranked
+after the 2026-07-01 review pass, which reconciled the old queue (most items had landed) and
+surfaced two new items. Statuses live ONLY in
+[docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md).
+
+- [ ] **1. Commit-outcome taxonomy (`CommitStateUnknown`)** — NEW, GAP_MATRIX row 157. An
+      unknown-outcome `ErrorKind` (or flag) honored by the retry gate + sent-vs-unsent
+      transport-error classification in the Glue / S3 Tables / REST / SQL catalogs +
+      surfaced-no-retry-no-cleanup semantics matching Java + mock-catalog tests. Buildable
+      WITHOUT AWS creds. Slots ahead of CDC: the named consumer commits continuously against
+      S3 Tables, whose service-side maintenance ALSO commits concurrently — an ambiguous outcome
+      today risks a duplicate commit (see the row cell). The credentialed conformance slice
+      stays with item 6.
+- [ ] **2. CDC row-level changelog** (re-anchor item 2) — `UpdateBefore`/`UpdateAfter` + accepting
+      ranges that carry row-level DELETE manifests (`IncrementalChangelogScan` is
+      whole-data-file-level today).
+- [ ] **3. ORC/Avro DATA-read residue** (re-anchor item 3) — footer codec / nested + V3 types /
+      the Avro `timestamptz` mapping — pull only if the engine queries non-parquet tables.
+- [ ] **4. ENGINE_CONTRACT.md recipes → NORMATIVE** — bytecode/oracle-verify the
+      isolation-level → validation table (DRAFT landed 2026-07-01,
+      [docs/ENGINE_CONTRACT.md](../docs/ENGINE_CONTRACT.md)) against Java 1.10.0
+      `SparkWrite` / `SparkCopyOnWriteOperation` / `SparkPositionDeltaWrite`, one interop
+      conflict scenario per cell.
+- [ ] **5. Nightly interop CI** — run the `dev/java-interop/` suites on a schedule. The oracle is
+      the model-tier equalizer only if it runs unprompted; this is the cheap 80% of Phase 7.
+- [ ] **6. Real-catalog hardening (credentialed)** — Glue + S3 Tables conflict/retry conformance
+      + item 1's real-catalog classification slice; scheduled with the user (needs AWS creds).
+
+PULL-BASED / DEMOTED: unchanged from the Roadmap re-anchor — link, do not restate.
+
+---
+
+## SUPERSEDED 2026-07-01 — was ACTIVE (2026-06-13): Near-full-parity open queue
+
+> Priority now lives ONLY in the 2026-07-01 queue above. This section is retained as the
+> reconciliation record; landed items are flipped below with pointers (per this file's own
+> flip-the-checkbox rule) — statuses live ONLY in the GAP_MATRIX.
 
 Directive (user, 2026-06-11): run this fork's Roadmap to **almost the full 1:1 Java replacement**.
 Waves 3–7 landed PRs #28–#47 (write-engine closeout; maintenance actions end-to-end incl.
@@ -58,21 +97,30 @@ end-to-end; SQL-catalog CAS; and the theta/view/WAP/partition-stats interop chai
 
 Ranked, highest-value first:
 
-- [ ] **1. Conflict-validation interop** — prove the `validateNoConflictingData` /
-      `validateNewDeletes` / `validateDataFilesExist` family on real concurrent-commit Java↔Rust
-      scenarios (Rust rejects exactly when Java rejects). Gates rows 91-95. **Start: OverwriteFiles**
-      (the C1 active increment below), then DeleteFiles / RowDelta / ReplacePartitions / RewriteFiles.
-- [ ] **2. Multi-spec write interop** — the merging actions (overwrite / replace / row-delta) under
-      more than one partition spec; `fast_append` multi-spec is already ✅ (Z2 — the template).
-- [ ] **3. Builder-surface interop flips** — `case_sensitive` (row 134) + `delete_from_row_filter`
-      (row 135): code landed 2026-06-13, interop deferred → flip to proven.
-- [ ] **4. `unknown` → geometry / geography types** — the V3 type-breadth follow-on.
-- [ ] **5. `RewritePositionDeleteFiles` + the cheap `ActionsProvider` maintenance wrappers.**
-- [ ] **6. `BatchScan` / `ScanTaskGroup` + `ExpressionParser` JSON** — scan-completion (task-group /
-      `planTasks` split planning) and the JSON expression (de)serializer.
-- [ ] **7. [FRONTIER — parked until Fable returns] Glue / S3Tables views + encryption** — the
-      credentialed real-catalog view surface (needs AWS creds) and frontier-grade encryption. Held
-      out of the Opus queue per the 2026-06-15 tier decision (Fable off limits).
+- [x] **1. Conflict-validation interop** — DONE 2026-06-15/16 (PRs #64–#69): proven BOTH
+      directions for all 5 write actions (C1 OverwriteFiles first, then DeleteFiles / RowDelta /
+      ReplacePartitions / RewriteFiles). Reconciled 2026-07-01 — the checkbox had never been
+      flipped.
+- [ ] **2. Multi-spec write interop** — STILL OPEN (reconciled 2026-07-01). The residue: the
+      writer-layer multi-spec threading (`MergeManifestProcess` is not routed into the non-append
+      merging actions — the Roadmap's row-94 WIRING gap) + the multi-spec-DATA interop slices on
+      the merging actions; `fast_append` multi-spec is ✅ (Z2 — the template).
+- [x] **3. Builder-surface interop flips** — DONE 2026-06-16: `case_sensitive` +
+      `delete_from_row_filter` interop-proven ✅ (the rows this queue numbered 134/135 under the
+      2026-06-13 line numbering). Reconciled 2026-07-01.
+- [ ] **4. geometry / geography types** — HALF DONE (reconciled 2026-07-01): `unknown` landed ✅
+      2026-06-17 (interop-proven); geometry/geography remain ❌ and are DEMOTED to opportunistic
+      by the 2026-06-21 engine-first re-anchor (a query engine does not pull them).
+- [x] **5. `RewritePositionDeleteFiles` + the `ActionsProvider` maintenance wrappers** — DONE
+      2026-06-17 (✅ per the Maintenance rows; `DeleteReachableFiles` + `ConvertEqualityDeleteFiles`
+      interop-proven). Reconciled 2026-07-01.
+- [x] **6. `BatchScan` / `ScanTaskGroup` + `ExpressionParser` JSON** — DONE 2026-06-17 (all
+      three ✅, interop-proven: `BatchScan`, `planTasks` split planning, the JSON expression
+      (de)serializer). Reconciled 2026-07-01.
+- [ ] **7. [PARKED] encryption** — reconciled 2026-07-01: the Glue / S3Tables VIEWS half is
+      RESOLVED as parity-correct-unsupported (rows 124/125, verified 2026-06-17 — NOT owed);
+      encryption remains ❌ and is DEMOTED to opportunistic by the engine-first re-anchor. The
+      credentialed real-catalog hardening piece moved to the 2026-07-01 queue (item 6).
 
 Recently landed (2026-06-11 → 06-13) — status lives in the GAP_MATRIX rows; pointers only:
 
