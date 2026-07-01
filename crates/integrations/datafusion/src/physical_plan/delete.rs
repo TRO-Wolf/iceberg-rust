@@ -36,8 +36,13 @@
 //! alone) — which is harmless for a SELECT (DataFusion re-filters) but would **over-delete** here. The
 //! exact filter is the contract; pushdown is only ever a (future) pruning optimization layered under it.
 //!
-//! **Memory.** Every path buffers the full live row set (the table scan is collected before any write
-//! begins) — intended for tables that fit in executor memory; streaming is a follow-up.
+//! **Memory.** The **merge-on-read** DELETE/UPDATE paths STREAM the live scan batch-by-batch (H7-S1):
+//! they never hold the whole live row set. MoR DELETE buffers only the matched `(path, pos)` pairs
+//! (two small fields per deleted row); MoR UPDATE additionally streams the new data rows straight into
+//! the writer. The floor is O(matched rows), not O(1) — `write_position_deletes` must group + sort the
+//! whole pair set before writing (the default scan interleaves files unordered). The **copy-on-write**
+//! paths still buffer the full live row set (their two-pass affected-file rewrite) — streaming COW is a
+//! follow-up (H7-S2).
 //!
 //! **Scope / limitations (out of scope here, named honestly):**
 //!   * **Concurrency** — the commits use snapshot isolation; we do **not** set
@@ -48,7 +53,7 @@
 //!     *current* partition spec (as Java does) and merge-on-read stamps each position-delete file with
 //!     its target data file's *own* `(spec_id, partition)`; both are exercised on single-spec tables but
 //!     a table whose specs have evolved is not yet covered by a test.
-//!   * **Streaming** — see *Memory* above.
+//!   * **Streaming** — merge-on-read streams (see *Memory* above); copy-on-write does not yet.
 //!
 //! The plan emits a single `UInt64` `count` row (rows affected), per DataFusion's DML contract.
 
@@ -283,9 +288,26 @@ fn require_v2_for_merge_on_read(table: &Table) -> DFResult<()> {
     Ok(())
 }
 
+/// Sort position-delete `(file_path, pos)` pairs into the ascending `(file_path, pos)` order the
+/// Iceberg spec requires for every position-delete file (Java `PositionDeleteWriter`). The default
+/// concurrent scan interleaves files unordered, so the collected pairs are NOT sorted at scan time —
+/// this restores the spec order before the pairs are written. Extracted as a named seam so the
+/// ordering guarantee can be pinned by a deterministic unit test independent of scan interleaving.
+fn sort_position_delete_pairs(pairs: &mut [(String, i64)]) {
+    pairs.sort();
+}
+
 /// Merge-on-read DELETE: identify the matching rows' `_file`/`_pos`, write a position-delete file, and
-/// commit a `RowDelta`. Returns the number of rows deleted. **Buffers the full live row set in memory**
-/// (the scan is collected before writing) — intended for tables that fit in executor memory.
+/// commit a `RowDelta`. Returns the number of rows deleted.
+///
+/// **Streaming.** The live-row scan is consumed batch-by-batch (never the whole live row set is held in
+/// RAM). For each batch we evaluate the exact `PhysicalExpr` and accumulate ONLY the matched
+/// `(path, pos)` pairs — two small fields per deleted row — into `pairs`. This drops the previous
+/// full-column `Vec<RecordBatch>` buffer. The memory floor is O(matched rows), NOT O(1): the position
+/// deletes must be grouped by `(spec_id, partition)` and sorted `(path, pos)` before writing (the
+/// default scan interleaves files unordered), so `write_position_deletes` still consumes the whole
+/// `pairs` vector — see `task/h7-dml-streaming-scope.md` MEDIUM-1. For a whole-table DELETE this
+/// degenerates to O(table rows × 2 fields), still far below the full-column buffer.
 async fn merge_on_read_delete(
     table: &Table,
     catalog: &dyn Catalog,
@@ -304,20 +326,19 @@ async fn merge_on_read_delete(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    let batches: Vec<RecordBatch> = table
+    // Stream the scan batch-by-batch. Awaiting `stream.try_next()` polls the scan only as we consume
+    // batches, so the scan is naturally back-pressured — no unbounded producer.
+    let mut stream = table
         .scan()
         .select(projection)
         .build()
         .map_err(to_datafusion_error)?
         .to_arrow()
         .await
-        .map_err(to_datafusion_error)?
-        .try_collect()
-        .await
         .map_err(to_datafusion_error)?;
 
     let mut pairs: Vec<(String, i64)> = Vec::new();
-    for batch in &batches {
+    while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
         // Build the table-column-only sub-batch (matching the schema the predicate is bound to) by
         // resolving each table field BY NAME — robust to the scan's output column ordering.
         let keep_mask = match &predicate {
@@ -385,7 +406,7 @@ async fn merge_on_read_delete(
     }
 
     // Position deletes MUST be sorted by (path, pos) per the spec.
-    pairs.sort();
+    sort_position_delete_pairs(&mut pairs);
     let deleted = pairs.len() as u64;
 
     // Write ALL position-delete files the (rolling) writer produced and commit EVERY one of them.
@@ -597,68 +618,123 @@ async fn copy_on_write_delete(
     Ok(deleted)
 }
 
-/// Write data file(s) partition-correctly through the production `TaskWriter`. Works for BOTH
-/// partitioned and unpartitioned tables.
+/// A streaming, partition-correct data-file writer. Each call to [`Self::write_batch`] feeds one
+/// table-column batch through the production `TaskWriter` without buffering it — so a caller can drain
+/// a scan stream into it batch-by-batch and never hold the whole row set in memory.
 ///
-/// For partitioned tables, each batch must contain only table-schema columns (no `_file` or other
-/// reserved columns). The `PartitionValueCalculator` is used internally to compute and inject the
-/// `_partition` struct column that `TaskWriter`'s splitter reads. `fanout_enabled = true` because the
-/// `batches` vector may contain rows from multiple affected files belonging to different partitions
-/// (and a single scan batch may interleave them); the `FanoutWriter` routes each row to its correct
-/// partition writer without requiring pre-sorting.
+/// Works for BOTH partitioned and unpartitioned tables. Each batch must contain only table-schema
+/// columns (no `_file` or other reserved columns). For partitioned tables the internal
+/// `PartitionValueCalculator` computes and injects the `_partition` struct column that `TaskWriter`'s
+/// splitter reads. `fanout_enabled = true` because successive batches may carry rows from different
+/// partitions (and a single scan batch may interleave them); the `FanoutWriter` routes each row to its
+/// correct partition writer without requiring pre-sorting.
 ///
-/// Returns every `DataFile` the (possibly rolling) writer produced — correctly partitioned.
-async fn write_partitioned_data_files(
-    table: &Table,
-    batches: &[RecordBatch],
-) -> DFResult<Vec<DataFile>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
+/// The underlying `TaskWriter` is created lazily on the FIRST batch, so a writer that is finished
+/// without ever receiving a batch produces zero files (matching the previous "empty input → empty Vec"
+/// contract) — no empty data file is committed.
+/// The concrete data-file writer builder the DML paths use: a `DataFileWriter` over a rolling Parquet
+/// writer with the default location / file-name generators. Aliased so the `StreamingDataFileWriter`
+/// field types stay readable.
+type DmlDataFileWriterBuilder =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+struct StreamingDataFileWriter {
+    writer: Option<TaskWriter<DmlDataFileWriterBuilder>>,
+    schema: iceberg::spec::SchemaRef,
+    partition_spec: iceberg::spec::PartitionSpecRef,
+    /// Present only for partitioned tables; computes the `_partition` struct column per batch.
+    calculator: Option<PartitionValueCalculator>,
+    /// The builder used to lazily create the `TaskWriter` on the first batch.
+    builder: Option<DmlDataFileWriterBuilder>,
+}
+
+impl StreamingDataFileWriter {
+    /// Prepare a streaming writer for `table`. No `TaskWriter` (and therefore no output file) is
+    /// created until the first [`Self::write_batch`] call.
+    fn try_new(table: &Table) -> DFResult<Self> {
+        let schema = table.metadata().current_schema().clone();
+        let partition_spec = table.metadata().default_partition_spec().clone();
+
+        let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
+            parquet::file::properties::WriterProperties::default(),
+            schema.clone(),
+            FieldMatchMode::Name,
+        );
+        let location_gen =
+            DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
+        let file_name_gen = DefaultFileNameGenerator::new(
+            uuid::Uuid::now_v7().to_string(),
+            None,
+            DataFileFormat::Parquet,
+        );
+        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_builder,
+            table.file_io().clone(),
+            location_gen,
+            file_name_gen,
+        );
+        let builder = DataFileWriterBuilder::new(rolling);
+
+        let calculator = if partition_spec.is_unpartitioned() {
+            None
+        } else {
+            Some(
+                PartitionValueCalculator::try_new(&partition_spec, &schema)
+                    .map_err(to_datafusion_error)?,
+            )
+        };
+
+        Ok(Self {
+            writer: None,
+            schema,
+            partition_spec,
+            calculator,
+            builder: Some(builder),
+        })
     }
 
-    let schema = table.metadata().current_schema().clone();
-    let partition_spec = table.metadata().default_partition_spec().clone();
-
-    let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
-        parquet::file::properties::WriterProperties::default(),
-        schema.clone(),
-        FieldMatchMode::Name,
-    );
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
-    let file_name_gen = DefaultFileNameGenerator::new(
-        uuid::Uuid::now_v7().to_string(),
-        None,
-        DataFileFormat::Parquet,
-    );
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-    let builder = DataFileWriterBuilder::new(rolling);
-
-    // fanout_enabled = true: survivors may be unsorted across partitions.
-    let mut writer = TaskWriter::try_new(builder, true, schema.clone(), partition_spec.clone())
-        .map_err(to_datafusion_error)?;
-
-    if partition_spec.is_unpartitioned() {
-        // Unpartitioned: TaskWriter writes directly; no partition column needed.
-        for batch in batches {
-            writer
-                .write(batch.clone())
-                .await
-                .map_err(to_datafusion_error)?;
-        }
-    } else {
-        // Partitioned: compute the `_partition` struct column for each batch and append it so
-        // the TaskWriter's partition splitter can route rows to the correct partition writer.
-        let calculator = PartitionValueCalculator::try_new(&partition_spec, &schema)
+    /// Lazily construct the underlying `TaskWriter` on first use.
+    fn ensure_writer(&mut self) -> DFResult<&mut TaskWriter<DmlDataFileWriterBuilder>> {
+        if self.writer.is_none() {
+            let builder = self.builder.take().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "StreamingDataFileWriter builder already consumed".to_string(),
+                )
+            })?;
+            // fanout_enabled = true: successive batches may be unsorted across partitions.
+            let writer = TaskWriter::try_new(
+                builder,
+                true,
+                self.schema.clone(),
+                self.partition_spec.clone(),
+            )
             .map_err(to_datafusion_error)?;
+            self.writer = Some(writer);
+        }
+        // Just-initialized above, so the writer is present.
+        self.writer.as_mut().ok_or_else(|| {
+            DataFusionError::Internal("StreamingDataFileWriter not initialized".into())
+        })
+    }
 
-        for batch in batches {
-            let partition_array = calculator.calculate(batch).map_err(to_datafusion_error)?;
+    /// Feed ONE table-column batch to the writer, injecting the `_partition` struct column for
+    /// partitioned tables. Awaiting the inner `write` naturally back-pressures the upstream scan.
+    async fn write_batch(&mut self, batch: RecordBatch) -> DFResult<()> {
+        if self.partition_spec.is_unpartitioned() {
+            // Unpartitioned: TaskWriter writes directly; no partition column needed.
+            self.ensure_writer()?
+                .write(batch)
+                .await
+                .map_err(to_datafusion_error)
+        } else {
+            // Partitioned: compute the `_partition` struct column and append it so the TaskWriter's
+            // partition splitter can route rows to the correct partition writer.
+            let calculator = self.calculator.as_ref().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "StreamingDataFileWriter partition calculator missing".to_string(),
+                )
+            })?;
+            let partition_array = calculator.calculate(&batch).map_err(to_datafusion_error)?;
 
             // Extend the batch's schema with the `_partition` struct field.
             let partition_field = datafusion::arrow::datatypes::Field::new(
@@ -680,14 +756,40 @@ async fn write_partitioned_data_files(
             let extended_batch = RecordBatch::try_new(extended_schema, extended_columns)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
-            writer
+            self.ensure_writer()?
                 .write(extended_batch)
                 .await
-                .map_err(to_datafusion_error)?;
+                .map_err(to_datafusion_error)
         }
     }
 
-    writer.close().await.map_err(to_datafusion_error)
+    /// Close the writer and return every `DataFile` produced. If no batch was ever written, the
+    /// `TaskWriter` was never created and this returns an empty `Vec` — no empty file is committed.
+    async fn finish(self) -> DFResult<Vec<DataFile>> {
+        match self.writer {
+            None => Ok(Vec::new()),
+            Some(writer) => writer.close().await.map_err(to_datafusion_error),
+        }
+    }
+}
+
+/// Write data file(s) partition-correctly through the production `TaskWriter`, buffering-slice form.
+/// Retained for the copy-on-write paths (which pre-buffer their survivor/rewrite batches); the
+/// merge-on-read UPDATE path streams via [`StreamingDataFileWriter`] instead.
+///
+/// Returns every `DataFile` the (possibly rolling) writer produced — correctly partitioned.
+async fn write_partitioned_data_files(
+    table: &Table,
+    batches: &[RecordBatch],
+) -> DFResult<Vec<DataFile>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut writer = StreamingDataFileWriter::try_new(table)?;
+    for batch in batches {
+        writer.write_batch(batch.clone()).await?;
+    }
+    writer.finish().await
 }
 
 /// Write REAL parquet position-delete file(s) from sorted `(data_file_path, position)` pairs via the
@@ -765,7 +867,7 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
     let mut all_delete_files: Vec<DataFile> = Vec::new();
     for ((spec_id, partition), mut group_pairs) in groups {
         // Maintain the per-file (path, pos) sort order within each group.
-        group_pairs.sort();
+        sort_position_delete_pairs(&mut group_pairs);
 
         let spec = metadata
             .partition_spec_by_id(spec_id)
@@ -1177,22 +1279,25 @@ async fn merge_on_read_update(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    let batches: Vec<RecordBatch> = table
+    // Stream the scan batch-by-batch. Awaiting `try_next` / the data writer's `write` back-pressures
+    // the scan (single-threaded poll) — no unbounded producer.
+    let mut stream = table
         .scan()
         .select(projection)
         .build()
         .map_err(to_datafusion_error)?
         .to_arrow()
         .await
-        .map_err(to_datafusion_error)?
-        .try_collect()
-        .await
         .map_err(to_datafusion_error)?;
 
+    // The delete side still buffers the matched `(path, pos)` pairs (two small fields per updated row),
+    // because `write_position_deletes` must group by `(spec_id, partition)` and sort `(path, pos)` and
+    // the default scan interleaves files unordered — see MEDIUM-1. The NEW-row (data-file) side, by
+    // contrast, streams straight into the writer per batch — its rows are never buffered.
     let mut pairs: Vec<(String, i64)> = Vec::new();
-    let mut new_rows: Vec<RecordBatch> = Vec::new();
-    for batch in &batches {
-        let table_batch = table_column_batch(batch, table_schema)?;
+    let mut data_writer = StreamingDataFileWriter::try_new(table)?;
+    while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
+        let table_batch = table_column_batch(&batch, table_schema)?;
         let mask = match_mask(&predicate, &table_batch)?;
         if mask.true_count() == 0 {
             continue;
@@ -1219,24 +1324,28 @@ async fn merge_on_read_update(
         }
 
         // The matching rows, with the assignments applied (all of them match → no per-row mask).
+        // Stream them straight into the data-file writer rather than buffering `new_rows`.
         let matching = filter_record_batch(&table_batch, &mask)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        new_rows.push(apply_assignments(
-            &matching,
-            assignments,
-            table_schema,
-            None,
-        )?);
+        let new_rows_batch = apply_assignments(&matching, assignments, table_schema, None)?;
+        data_writer.write_batch(new_rows_batch).await?;
     }
 
     let updated = pairs.len() as u64;
     if updated == 0 {
+        // No rows matched: no position deletes and no new data. The data writer was never fed a batch
+        // (every batch had `true_count() == 0`), so `finish` produces no file — nothing to commit.
+        let empty = data_writer.finish().await?;
+        debug_assert!(empty.is_empty());
         return Ok(0);
     }
 
-    pairs.sort();
+    // Position deletes MUST be grouped + sorted (path, pos) before writing — the whole `pairs` set is
+    // required up front (MEDIUM-1). The data files, in contrast, were already streamed above; `finish`
+    // just closes the writer. Both complete BEFORE the single commit below (commit-once atomicity).
+    sort_position_delete_pairs(&mut pairs);
     let delete_files = write_position_deletes(table, &pairs).await?;
-    let data_files = write_partitioned_data_files(table, &new_rows).await?;
+    let data_files = data_writer.finish().await?;
 
     let tx = Transaction::new(table);
     tx.row_delta()
@@ -1412,7 +1521,7 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, Int32Array, RunArray, StringArray};
     use datafusion::arrow::datatypes::Int32Type;
 
-    use super::{decode_file_path, decode_file_paths_batch};
+    use super::{decode_file_path, decode_file_paths_batch, sort_position_delete_pairs};
 
     /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string
     /// `decode_file_path` would — for a plain `StringArray`, for a run-end-encoded `_file` column
@@ -1510,5 +1619,49 @@ mod tests {
         let col: ArrayRef = Arc::new(sliced);
         assert_eq!(col.len(), 3);
         assert_batch_matches_per_row(&col);
+    }
+
+    /// MEDIUM-1 (H-ORDER), deterministic seam test: `sort_position_delete_pairs` — the sort applied at
+    /// every MoR position-delete write site (`merge_on_read_delete`, `merge_on_read_update`, and the
+    /// per-partition-group path in `write_position_deletes`) — MUST produce ascending `(file_path,
+    /// pos)` order for ANY input. The default concurrent scan interleaves files unordered, so the
+    /// collected pairs arrive out of order; this pins the spec-required order independent of scan
+    /// interleaving (which an integration test cannot pin deterministically).
+    ///
+    /// MUTATION PROOF: turn `sort_position_delete_pairs` into a no-op (delete the `pairs.sort()`) → this
+    /// test goes RED (the deliberately-unsorted input stays unsorted).
+    #[test]
+    fn test_sort_position_delete_pairs_orders_by_path_then_pos() {
+        // Deliberately unsorted: files interleaved (b before a), positions descending within a file —
+        // exactly the shape a concurrent, cross-file scan produces before the sort restores order.
+        let mut pairs: Vec<(String, i64)> = vec![
+            ("s3://b/file_b.parquet".to_string(), 5),
+            ("s3://b/file_a.parquet".to_string(), 2),
+            ("s3://b/file_b.parquet".to_string(), 1),
+            ("s3://b/file_a.parquet".to_string(), 0),
+            ("s3://b/file_a.parquet".to_string(), 10),
+        ];
+        sort_position_delete_pairs(&mut pairs);
+        let expected: Vec<(String, i64)> = vec![
+            ("s3://b/file_a.parquet".to_string(), 0),
+            ("s3://b/file_a.parquet".to_string(), 2),
+            ("s3://b/file_a.parquet".to_string(), 10),
+            ("s3://b/file_b.parquet".to_string(), 1),
+            ("s3://b/file_b.parquet".to_string(), 5),
+        ];
+        assert_eq!(
+            pairs, expected,
+            "position-delete pairs must be sorted ascending by (file_path, pos) — spec order"
+        );
+        // Independent, form-agnostic check that it is globally non-decreasing (catches any sort that
+        // is not a true (path, pos) ascending order).
+        for window in pairs.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "pairs must be non-decreasing by (file_path, pos): {:?} then {:?}",
+                window[0],
+                window[1]
+            );
+        }
     }
 }

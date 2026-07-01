@@ -4182,3 +4182,636 @@ fn nullable_merge_on_read_table_creation(
         .schema(nullable_foo_schema())
         .build()
 }
+
+// =================================================================================================
+// H7-S1 — merge-on-read DML STREAMING regression coverage
+//
+// The `merge_on_read_delete` / `merge_on_read_update` executors were refactored to consume the live
+// scan batch-by-batch instead of `try_collect`-ing the whole live row set. These tests pin the
+// invariants a streaming refactor must NOT break: (1) the deleted/updated survivor set is unchanged
+// across multi-file tables whose scan interleaves batches (output-equivalent behavior — H-ORDER/H-MEM),
+// (2) commit-once-after-close atomicity: a failure at the commit leaves ZERO new snapshots (H-COMMIT),
+// (3) SQL three-valued logic on the MoR UPDATE side: a NULL predicate result is not a match (H-3VL).
+// =================================================================================================
+
+use std::fmt::Debug;
+
+use iceberg::{Namespace, TableCommit};
+
+/// A [`Catalog`] wrapper that delegates every operation to an inner catalog EXCEPT `update_table`,
+/// which unconditionally fails. Used to prove H-COMMIT: the DML executors write all delete/data files
+/// and then attempt exactly one commit; when that commit fails the table must be left untouched (no new
+/// snapshot), with the staged files simply orphaned.
+#[derive(Debug)]
+struct FailingCommitCatalog {
+    inner: Arc<dyn Catalog>,
+}
+
+#[async_trait::async_trait]
+impl Catalog for FailingCommitCatalog {
+    async fn list_namespaces(
+        &self,
+        parent: Option<&NamespaceIdent>,
+    ) -> Result<Vec<NamespaceIdent>> {
+        self.inner.list_namespaces(parent).await
+    }
+
+    async fn create_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> Result<Namespace> {
+        self.inner.create_namespace(namespace, properties).await
+    }
+
+    async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
+        self.inner.get_namespace(namespace).await
+    }
+
+    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
+        self.inner.namespace_exists(namespace).await
+    }
+
+    async fn update_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> Result<()> {
+        self.inner.update_namespace(namespace, properties).await
+    }
+
+    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
+        self.inner.drop_namespace(namespace).await
+    }
+
+    async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        self.inner.list_tables(namespace).await
+    }
+
+    async fn create_table(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<iceberg::table::Table> {
+        self.inner.create_table(namespace, creation).await
+    }
+
+    async fn load_table(&self, table: &TableIdent) -> Result<iceberg::table::Table> {
+        self.inner.load_table(table).await
+    }
+
+    async fn drop_table(&self, table: &TableIdent) -> Result<()> {
+        self.inner.drop_table(table).await
+    }
+
+    async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
+        self.inner.table_exists(table).await
+    }
+
+    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
+        self.inner.rename_table(src, dest).await
+    }
+
+    async fn register_table(
+        &self,
+        table: &TableIdent,
+        metadata_location: String,
+    ) -> Result<iceberg::table::Table> {
+        self.inner.register_table(table, metadata_location).await
+    }
+
+    /// The injected fault: the single commit at the end of every MoR DML op fails here.
+    async fn update_table(&self, _commit: TableCommit) -> Result<iceberg::table::Table> {
+        Err(iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "injected commit failure (H-COMMIT fault injection)",
+        ))
+    }
+}
+
+/// H-ORDER / H-MEM streaming output-equivalence: a MoR DELETE over a MULTI-FILE table (four separate
+/// inserts ⇒ four data files, whose scan interleaves batches unordered under the default concurrency)
+/// must delete EXACTLY the predicate-matched rows and leave EXACTLY the oracle survivor set. The
+/// streaming refactor changes only how rows reach the writer, never which rows are deleted.
+#[tokio::test]
+async fn test_delete_mread_streaming_multifile_survivor_set() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_mread_stream_del".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Four separate inserts ⇒ four data files; the default scan interleaves their batches.
+    for chunk in [
+        "(1, 'a'), (2, 'b')",
+        "(3, 'c'), (4, 'd')",
+        "(5, 'e'), (6, 'f')",
+        "(7, 'g'), (8, 'h')",
+    ] {
+        ctx.sql(&format!(
+            "INSERT INTO catalog.test_mread_stream_del.my_table VALUES {chunk}"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    }
+
+    // Delete the even foo1 rows (spread across every data file) — the oracle survivors are the odds.
+    let batches = ctx
+        .sql("DELETE FROM catalog.test_mread_stream_del.my_table WHERE foo1 % 2 = 0")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(deleted, 4, "exactly the 4 even-foo1 rows are deleted");
+
+    let survivors = select_foo1_sorted(&ctx, "catalog.test_mread_stream_del.my_table").await;
+    assert_eq!(
+        survivors,
+        vec![1, 3, 5, 7],
+        "streaming MoR DELETE leaves EXACTLY the odd-foo1 oracle survivor set across all files"
+    );
+    Ok(())
+}
+
+/// H-ORDER / H-MEM streaming output-equivalence for MoR UPDATE over a multi-file table: the new-row data
+/// side streams into the writer per batch, the delete side buffers only the matched pairs. The updated
+/// values and the untouched rows must both match the oracle exactly.
+#[tokio::test]
+async fn test_update_mread_streaming_multifile_survivor_set() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_mread_stream_upd".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    for chunk in [
+        "(1, 'a'), (2, 'b')",
+        "(3, 'c'), (4, 'd')",
+        "(5, 'e'), (6, 'f')",
+    ] {
+        ctx.sql(&format!(
+            "INSERT INTO catalog.test_mread_stream_upd.my_table VALUES {chunk}"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    }
+
+    // Set foo1 = foo1 + 100 for the even rows (2,4,6) — spread across every file.
+    let batches = ctx
+        .sql("UPDATE catalog.test_mread_stream_upd.my_table SET foo1 = foo1 + 100 WHERE foo1 % 2 = 0")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(updated, 3, "exactly the 3 even-foo1 rows are updated");
+
+    let ids = select_foo1_sorted(&ctx, "catalog.test_mread_stream_upd.my_table").await;
+    assert_eq!(
+        ids,
+        vec![1, 3, 5, 102, 104, 106],
+        "odd rows unchanged; even rows +100 — streaming MoR UPDATE matches the oracle exactly"
+    );
+    Ok(())
+}
+
+/// H-COMMIT for MoR DELETE: with a catalog whose commit fails, the DELETE must return an error and the
+/// table's `current_snapshot_id` and snapshot COUNT must be unchanged — the position-delete file was
+/// staged then orphaned, never referenced by a snapshot.
+#[tokio::test]
+async fn test_delete_mread_commit_failure_leaves_snapshot_unchanged() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_mread_del_fault".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+
+    // First seed data through a WORKING catalog provider so there is a baseline snapshot.
+    let good_provider = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let good_ctx = SessionContext::new();
+    good_ctx.register_catalog("catalog", good_provider);
+    good_ctx
+        .sql(
+            "INSERT INTO catalog.test_mread_del_fault.my_table VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let tbl_id = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let before = client.load_table(&tbl_id).await?;
+    let snapshot_id_before = before.metadata().current_snapshot_id();
+    let snapshot_count_before = before.metadata().snapshots().count();
+
+    // Now run the DELETE through a catalog whose commit ALWAYS fails.
+    let failing: Arc<dyn Catalog> = Arc::new(FailingCommitCatalog {
+        inner: client.clone(),
+    });
+    let failing_provider = Arc::new(IcebergCatalogProvider::try_new(failing).await?);
+    let bad_ctx = SessionContext::new();
+    bad_ctx.register_catalog("catalog", failing_provider);
+
+    let result = bad_ctx
+        .sql("DELETE FROM catalog.test_mread_del_fault.my_table WHERE foo1 >= 1")
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    let err = result.expect_err("the DELETE must surface the injected commit failure as an error");
+    // Non-vacuity: the error is OUR injected commit fault (the executor reached the single commit
+    // after writing the position-delete file), not an incidental earlier failure.
+    assert!(
+        err.to_string().contains("injected commit failure"),
+        "the error must be the injected commit fault, got: {err}"
+    );
+
+    // Reload from the REAL catalog: the commit failed AFTER files were written, so no snapshot moved.
+    let after = client.load_table(&tbl_id).await?;
+    assert_eq!(
+        after.metadata().current_snapshot_id(),
+        snapshot_id_before,
+        "commit failure must NOT advance current_snapshot_id (commit-once-after-close atomicity)"
+    );
+    assert_eq!(
+        after.metadata().snapshots().count(),
+        snapshot_count_before,
+        "commit failure must NOT create a new snapshot — staged delete file is orphaned, not committed"
+    );
+
+    // And the data is fully intact — no rows were actually deleted.
+    let good_ctx2 = SessionContext::new();
+    good_ctx2.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
+    );
+    let survivors = select_foo1_sorted(&good_ctx2, "catalog.test_mread_del_fault.my_table").await;
+    assert_eq!(
+        survivors,
+        vec![1, 2, 3],
+        "all rows survive the failed DELETE — the table is not torn"
+    );
+    Ok(())
+}
+
+/// H-COMMIT for MoR UPDATE: identical invariant on the UPDATE path, which additionally writes new data
+/// files before the single commit. A commit failure must leave the table's snapshot untouched.
+#[tokio::test]
+async fn test_update_mread_commit_failure_leaves_snapshot_unchanged() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_mread_upd_fault".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+
+    let good_provider = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let good_ctx = SessionContext::new();
+    good_ctx.register_catalog("catalog", good_provider);
+    good_ctx
+        .sql(
+            "INSERT INTO catalog.test_mread_upd_fault.my_table VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let tbl_id = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let before = client.load_table(&tbl_id).await?;
+    let snapshot_id_before = before.metadata().current_snapshot_id();
+    let snapshot_count_before = before.metadata().snapshots().count();
+
+    let failing: Arc<dyn Catalog> = Arc::new(FailingCommitCatalog {
+        inner: client.clone(),
+    });
+    let failing_provider = Arc::new(IcebergCatalogProvider::try_new(failing).await?);
+    let bad_ctx = SessionContext::new();
+    bad_ctx.register_catalog("catalog", failing_provider);
+
+    let result = bad_ctx
+        .sql("UPDATE catalog.test_mread_upd_fault.my_table SET foo2 = 'z' WHERE foo1 >= 1")
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    let err = result.expect_err("the UPDATE must surface the injected commit failure as an error");
+    // Non-vacuity: the error is OUR injected commit fault (the executor reached the single commit
+    // after writing the delete + new data files), not an incidental earlier failure.
+    assert!(
+        err.to_string().contains("injected commit failure"),
+        "the error must be the injected commit fault, got: {err}"
+    );
+
+    let after = client.load_table(&tbl_id).await?;
+    assert_eq!(
+        after.metadata().current_snapshot_id(),
+        snapshot_id_before,
+        "commit failure must NOT advance current_snapshot_id on the UPDATE path"
+    );
+    assert_eq!(
+        after.metadata().snapshots().count(),
+        snapshot_count_before,
+        "commit failure must NOT create a new snapshot — staged delete + data files are orphaned"
+    );
+
+    let good_ctx2 = SessionContext::new();
+    good_ctx2.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
+    );
+    let ids = select_foo1_sorted(&good_ctx2, "catalog.test_mread_upd_fault.my_table").await;
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "the failed UPDATE left the table exactly as before (no torn state)"
+    );
+    Ok(())
+}
+
+/// H-3VL for the MoR UPDATE path: `UPDATE ... WHERE nullable_col = X` must NOT update rows whose
+/// predicate operand is NULL (SQL three-valued logic — NULL is not a match). Guards the `match_mask`
+/// NULL-collapse that the streaming refactor preserves on the update path.
+#[tokio::test]
+async fn test_update_mread_null_predicate_three_valued_logic() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_mread_null".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = nullable_merge_on_read_table_creation(temp_path(), "my_table");
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_update_mread_null.my_table VALUES (1, 'alan'), (2, NULL), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = ctx
+        .sql("UPDATE catalog.test_update_mread_null.my_table SET foo1 = 99 WHERE foo2 = 'alan'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        updated, 1,
+        "only foo2='alan' updated; the NULL-foo2 row is NOT a match (three-valued logic)"
+    );
+
+    let ids = select_foo1_sorted(&ctx, "catalog.test_update_mread_null.my_table").await;
+    assert_eq!(
+        ids,
+        vec![2, 3, 99],
+        "MoR UPDATE: the NULL-foo2 row keeps foo1=2 — NULL predicate is not an update match"
+    );
+    Ok(())
+}
+
+// =================================================================================================
+// H7-S1 — Critic-round hardening: NON-VACUOUS 3VL, zero-file, and (path,pos)-sort coverage
+//
+// The `=`-only NULL tests above are VACUOUS against dropping the `is_valid` guard: for `=`, an Arrow
+// comparison on a NULL operand yields (valid=false, value=false), so `is_valid` is redundant. A `<>`
+// predicate on a NULL operand yields (valid=false, value=TRUE) — there the `is_valid` guard is
+// LOAD-BEARING (without it a NULL row is wrongly matched). The tests below use `<>` so the guard is
+// pinned, plus the zero-batch⇒zero-file contract and the spec-required `(file_path, pos)` sort.
+// =================================================================================================
+
+/// H-3VL (LOW-1) — MoR DELETE with a `<>` predicate over a NULL operand. The NULL-`foo2` row yields
+/// (valid=false, value=TRUE); the delete-loop guard `mask.is_valid(row) && mask.value(row)`
+/// (delete.rs) must therefore NOT delete it. MUTATION PROOF: dropping `is_valid` from that guard makes
+/// this test RED (the NULL row is wrongly deleted).
+#[tokio::test]
+async fn test_delete_mread_null_neq_predicate_isvalid_guard() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_del_mread_null_neq".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = nullable_merge_on_read_table_creation(temp_path(), "my_table");
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_del_mread_null_neq.my_table VALUES (1, 'alan'), (2, NULL), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // `foo2 <> 'zzz'` is TRUE for 'alan' and 'bob' (both deleted) and UNKNOWN for the NULL row. Under
+    // three-valued logic the NULL row is NOT a match. The value-bit for the NULL row is TRUE, so only
+    // the `is_valid` guard keeps it alive — a vacuous `=`-test would not catch its removal.
+    let batches = ctx
+        .sql("DELETE FROM catalog.test_del_mread_null_neq.my_table WHERE foo2 <> 'zzz'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        deleted, 2,
+        "only the two non-NULL rows ('alan','bob') are deleted; the NULL row is UNKNOWN, not a match"
+    );
+
+    let survivors = select_foo1_sorted(&ctx, "catalog.test_del_mread_null_neq.my_table").await;
+    assert_eq!(
+        survivors,
+        vec![2],
+        "the NULL-foo2 row (foo1=2) SURVIVES a `<>` MoR DELETE — the `is_valid` guard is load-bearing"
+    );
+    Ok(())
+}
+
+/// H-3VL (HIGH-1) — MoR UPDATE with a `<>` predicate over a NULL operand. Same load-bearing `is_valid`
+/// guard, this time in `match_mask` (delete.rs). MUTATION PROOF: dropping `is_valid` from `match_mask`
+/// makes this test RED (the NULL row is wrongly updated).
+#[tokio::test]
+async fn test_update_mread_null_neq_predicate_isvalid_guard() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_upd_mread_null_neq".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = nullable_merge_on_read_table_creation(temp_path(), "my_table");
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_upd_mread_null_neq.my_table VALUES (1, 'alan'), (2, NULL), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // `foo2 <> 'zzz'` matches 'alan' and 'bob' (updated to foo1=99); the NULL row is UNKNOWN and must
+    // NOT be updated. Its value-bit is TRUE, so only the `is_valid` guard in `match_mask` spares it.
+    let batches = ctx
+        .sql("UPDATE catalog.test_upd_mread_null_neq.my_table SET foo1 = 99 WHERE foo2 <> 'zzz'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        updated, 2,
+        "only the two non-NULL rows are updated; the NULL row is UNKNOWN, not an update match"
+    );
+
+    let ids = select_foo1_sorted(&ctx, "catalog.test_upd_mread_null_neq.my_table").await;
+    assert_eq!(
+        ids,
+        vec![2, 99, 99],
+        "the NULL-foo2 row keeps foo1=2 (NOT updated to 99) under a `<>` MoR UPDATE — `is_valid` guards it"
+    );
+    Ok(())
+}
+
+/// MEDIUM-2 — the zero-match no-op contract on the streaming MoR-UPDATE path. A MoR UPDATE whose WHERE
+/// matches NO rows must add NO new data file and create NO new snapshot. MUTATION PROOF (verified):
+/// disabling the `updated == 0` no-op guard in `merge_on_read_update` (so the streamed `data_writer`
+/// is finished and a RowDelta is committed on a no-op) makes this test RED.
+///
+/// Note on the `StreamingDataFileWriter::finish()`-opens-writer mutation the review named: it is
+/// benign, because a `TaskWriter` opened but never fed a batch emits ZERO files on `close()` — the
+/// zero-file guarantee is enforced by the underlying writer, and the lazy-init only additionally
+/// avoids constructing it. So the observable regression this test pins is the no-op guard above.
+#[tokio::test]
+async fn test_update_mread_zero_match_writes_no_file_no_snapshot() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_upd_mread_zero".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_merge_on_read_table_creation(temp_path(), "my_table")?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_upd_mread_zero.my_table VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let tbl_id = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let before = client.load_table(&tbl_id).await?;
+    let snapshot_id_before = before.metadata().current_snapshot_id();
+    let snapshot_count_before = before.metadata().snapshots().count();
+
+    // WHERE foo1 > 1000 matches no rows.
+    let batches = ctx
+        .sql("UPDATE catalog.test_upd_mread_zero.my_table SET foo2 = 'z' WHERE foo1 > 1000")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(updated, 0, "no rows match WHERE foo1 > 1000 — zero updated");
+
+    // No new snapshot: a zero-match UPDATE is a no-op, so no empty data file and no RowDelta commit.
+    let after = client.load_table(&tbl_id).await?;
+    assert_eq!(
+        after.metadata().current_snapshot_id(),
+        snapshot_id_before,
+        "a zero-match MoR UPDATE must NOT advance the snapshot (no empty data file, no commit)"
+    );
+    assert_eq!(
+        after.metadata().snapshots().count(),
+        snapshot_count_before,
+        "a zero-match MoR UPDATE must NOT create a new snapshot"
+    );
+
+    // Belt-and-braces: walk the latest snapshot's manifests and assert NO position-delete file and NO
+    // extra data file were added by the no-op (there is exactly one data file — the seed insert).
+    let snap = after.metadata().current_snapshot().unwrap();
+    let ml = snap
+        .load_manifest_list(after.file_io(), after.metadata())
+        .await?;
+    let mut data_files = 0usize;
+    let mut delete_files = 0usize;
+    for mf in ml.entries() {
+        let m = mf.load_manifest(after.file_io()).await?;
+        for entry in m.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            match entry.data_file().content_type() {
+                iceberg::spec::DataContentType::Data => data_files += 1,
+                iceberg::spec::DataContentType::PositionDeletes
+                | iceberg::spec::DataContentType::EqualityDeletes => delete_files += 1,
+            }
+        }
+    }
+    assert_eq!(
+        data_files, 1,
+        "exactly one data file (the seed) — the zero-match UPDATE added none"
+    );
+    assert_eq!(
+        delete_files, 0,
+        "the zero-match UPDATE added no position-delete file"
+    );
+    Ok(())
+}
