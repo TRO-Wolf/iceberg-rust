@@ -47,15 +47,21 @@
 
 Two supported paths, proven equivalent:
 
-1. **Built-in:** `Table::scan()` / `Table::batch_scan()` → `plan_tasks()` (split planning /
-   `ScanTaskGroup`) → `to_arrow()`. Merge-on-read position/equality deletes and V3 deletion
-   vectors are applied internally.
+1. **Built-in:** `Table::scan().to_arrow()` is the all-in-one read — merge-on-read
+   position/equality deletes and V3 deletion vectors are applied internally. When the engine
+   drives per-task reading instead, use `Table::scan()` / `Table::batch_scan()` → `plan_tasks()`
+   (split planning / `ScanTaskGroup`) and feed the task groups to your own reader — `to_arrow()`
+   is a method on `TableScan`, not on the `plan_tasks()` output. *(Corrected 2026-07-01: the two
+   chains were previously drawn as one pipeline.)*
 2. **BYO physical scan:** the engine reads data files itself and applies
    `iceberg::arrow::DeleteFilter` (public since #117; mirrors Java
    `org.apache.iceberg.data.DeleteFilter`). The equivalence proof
    (`crates/iceberg/tests/interop_scan_exec.rs`, `test_engine_deletefilter_*`) shows a raw read +
    `DeleteFilter::apply` reproduces the built-in merge-on-read scan EXACTLY — position, equality,
-   and combined; multi-file-per-partition; non-identity transforms.
+   and combined; multi-file-per-partition (identity-partitioned tables). Non-identity partition
+   transforms are proven for the BUILT-IN scan only (`test_nonidentity_scan_exec_*` vs the Java
+   oracle); a `DeleteFilter`-equivalence test over a non-identity layout is still owed
+   *(corrected 2026-07-01 — previously over-claimed as deletefilter coverage)*.
 
 Incremental reads: `IncrementalAppendScan` / `IncrementalChangelogScan` (whole-data-file level;
 row-level CDC is an open queue item). Branch/tag reads via `use_ref`.
@@ -72,8 +78,8 @@ request by field id through `project_field_ids`). The DML-critical set:
 | `_deleted` | `RESERVED_FIELD_ID_DELETED` | changelog / deleted-row exposure |
 | `_spec_id` | `RESERVED_FIELD_ID_SPEC_ID` | partition-spec provenance |
 | `_partition` | `RESERVED_FIELD_ID_PARTITION` | partition struct (routing; delete-file stamping) |
-| changelog trio | `RESERVED_FIELD_ID_CHANGE_TYPE` / `_ORDINAL` / `_COMMIT_SNAPSHOT_ID` | CDC reads |
-| delete-file schema | `RESERVED_FIELD_ID_DELETE_FILE_PATH` (`file_path`) / `_POS` (`pos`) | writing position-delete files (2147483546 / 2147483545) |
+| changelog trio | `RESERVED_FIELD_ID_CHANGE_TYPE` / `RESERVED_FIELD_ID_CHANGE_ORDINAL` / `RESERVED_FIELD_ID_COMMIT_SNAPSHOT_ID` (columns `_change_type` / `_change_ordinal` / `_commit_snapshot_id`) | CDC reads |
+| delete-file schema | `RESERVED_FIELD_ID_DELETE_FILE_PATH` (`file_path`) / `RESERVED_FIELD_ID_DELETE_FILE_POS` (`pos`) — NOT `RESERVED_FIELD_ID_POS`, which is the different `_pos` metadata column | writing position-delete files (2147483546 / 2147483545) |
 
 The engine-boundary proof (#116): scan `_file`/`_pos` → write position-delete → `RowDelta` commit
 → re-scan omits exactly those rows.
@@ -106,7 +112,7 @@ row-level op, both modes:** `validate_from_snapshot(scan_snapshot_id)` +
 | UPDATE / MERGE | COW | serializable | above + `validate_no_conflicting_data()` |
 | UPDATE / MERGE | MoR | snapshot | `validate_data_files_exist(...)` + `validate_deleted_files()` + `validate_no_conflicting_delete_files()` — the op READ rows to produce output; concurrent deletes of those rows conflict |
 | UPDATE / MERGE | MoR | serializable | above + `validate_no_conflicting_data_files()` |
-| INSERT OVERWRITE | `ReplacePartitions` | append-only guard | `validate_append_only()` where the engine requires it (landed 2026-06-17, row 144) |
+| INSERT OVERWRITE | `ReplacePartitions` | append-only guard | `validate_append_only()` where the engine requires it (landed 2026-06-17, row 146) |
 
 Provenance note: this table is reconstructed from the Java Spark row-level-operation builders (the
 logic deliberately OUT of `iceberg-core` scope, hence out of the GAP_MATRIX) — it is exactly the
@@ -121,15 +127,17 @@ DataFusion at the pinned family (52.x) plans DELETE and UPDATE but has **no MERG
 The engine therefore owns the MERGE rewrite end-to-end: source↔target join, the
 matched / not-matched / not-matched-by-source clause application, row-splitting into
 (position-deletes + inserted rows) for MoR or (rewritten files) for COW, and the **cardinality
-check** (error when >1 source row matches a target row — Spark's `MERGE_CARDINALITY_CHECK`).
+check** (error when >1 source row matches a target row — Spark's `MERGE_CARDINALITY_VIOLATION`
+error condition).
 Core's contribution is §4/§5: `RowDelta`/`OverwriteFiles` + validations. Do not wait for core to
 grow MERGE semantics; it will not (out of parity scope).
 
 ## 7. Distribution & ordering expectations
 
-- Cluster or fan out rows by partition before writing: the partition-aware `TaskWriter`
-  (reference impl `task_writer.rs`) computes `_partition` via `PartitionValueCalculator` and
-  routes per row; clustered input may use the cheaper clustered writer.
+- Cluster or fan out rows by partition before writing: the projection stage (reference impl
+  `physical_plan/project.rs`) computes `_partition` via `PartitionValueCalculator`; the
+  partition-aware `TaskWriter` (`task_writer.rs`) consumes the precomputed `_partition` column
+  and routes per row. Clustered input may use the cheaper clustered writer.
 - Position-delete files: **one file per `(spec_id, partition)` group**, stamped with the matching
   `PartitionKey` (see #131 U3 — an unstamped delete file on a partitioned table fails
   `validate_partition_value` at commit). Keep `MetricsConfig::for_position_delete` so

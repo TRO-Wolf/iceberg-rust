@@ -108,14 +108,18 @@ end-to-end; SQL-catalog CAS; and the theta/view/WAP/partition-stats interop chai
 
 Ranked, highest-value first:
 
-- [x] **1. Conflict-validation interop** — DONE 2026-06-15/16 (PRs #64–#69): proven BOTH
+- [x] **1. Conflict-validation interop** — DONE 2026-06-15/16 (PRs #64–#68; #69 was the
+      multi-spec Wave-2 slice, item 2 — range corrected 2026-07-01): proven BOTH
       directions for all 5 write actions (C1 OverwriteFiles first, then DeleteFiles / RowDelta /
       ReplacePartitions / RewriteFiles). Reconciled 2026-07-01 — the checkbox had never been
       flipped.
-- [ ] **2. Multi-spec write interop** — STILL OPEN (reconciled 2026-07-01). The residue: the
-      writer-layer multi-spec threading (`MergeManifestProcess` is not routed into the non-append
-      merging actions — the Roadmap's row-94 WIRING gap) + the multi-spec-DATA interop slices on
-      the merging actions; `fast_append` multi-spec is ✅ (Z2 — the template).
+- [ ] **2. Multi-spec write interop** — STILL OPEN (reconciled 2026-07-01; citations corrected
+      same day). TWO distinct residues: (a) the manifest-merge LAYOUT gap —
+      `MergeManifestProcess` is not routed into the non-append merging actions (the `RowDelta`
+      row, currently row 106 — the old "row 94" pointer was dead); (b) the writer-layer spec
+      threading — `DataFileWriter`/`DeletionVectorWriter` stamp the table default spec (row 110)
+      — plus the multi-spec-DATA interop slices on the merging actions (one slice landed: #69,
+      multi-spec RowDelta DELETE-commit); `fast_append` multi-spec is ✅ (Z2 — the template).
 - [x] **3. Builder-surface interop flips** — DONE 2026-06-16: `case_sensitive` +
       `delete_from_row_filter` interop-proven ✅ (the rows this queue numbered 134/135 under the
       2026-06-13 line numbering). Reconciled 2026-07-01.
@@ -129,7 +133,7 @@ Ranked, highest-value first:
       three ✅, interop-proven: `BatchScan`, `planTasks` split planning, the JSON expression
       (de)serializer). Reconciled 2026-07-01.
 - [ ] **7. [PARKED] encryption** — reconciled 2026-07-01: the Glue / S3Tables VIEWS half is
-      RESOLVED as parity-correct-unsupported (rows 124/125, verified 2026-06-17 — NOT owed);
+      RESOLVED as parity-correct-unsupported (rows 126/127, verified 2026-06-17 — NOT owed);
       encryption remains ❌ and is DEMOTED to opportunistic by the engine-first re-anchor. The
       credentialed real-catalog hardening piece moved to the 2026-07-01 queue (item 6).
 
