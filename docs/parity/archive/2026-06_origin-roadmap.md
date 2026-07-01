@@ -110,4 +110,3 @@ to this north star in Phase 0.
 A row in [GAP_MATRIX.md](GAP_MATRIX.md) flips to ✅ only when: (1) the Rust API matches the Java
 contract's behavior, (2) unit tests ship with it, and (3) an interop test proves byte-level table
 compatibility with Java in both directions where applicable.
-</content>
