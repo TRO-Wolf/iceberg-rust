@@ -83,6 +83,35 @@ post-scan filter).
 
 PULL-BASED / DEMOTED: unchanged from the Roadmap re-anchor — link, do not restate.
 
+## ACTIVE UNIT (2026-07-01b): review follow-ups 1+2 — gate needles + stable row anchors
+
+User-directed (2026-07-01, post-merge of #140/#141/#142): implement follow-ups 1 and 2 from the
+review-series closeout. One PR, branch `infra/review-followups-2026-07-01`. Also carries the
+user's seam-status decision record (datafusion integration promoted to supported product surface —
+ENGINE_CONTRACT §1 + Roadmap, committed first as its own decision commit).
+
+- [ ] **1. Broaden the artifact gate** (`scripts/check_agent_artifacts.sh`) — Critic LOW-1:
+      add the function_results tag family + bare opening tags (`invoke name=` / `parameter name=`,
+      concatenation-assembled as before); case-insensitive matching (uppercase variants);
+      `<result>`/`<output>` deliberately EXCLUDED as too generic (false-positive risk — document);
+      built-in SELF-TEST that plants every needle via a TEMP-COPY index (`GIT_INDEX_FILE`) and
+      hard-fails if any needle goes undetected (a gate that cannot detect its own probe is
+      vacuous — the sabotage-must-hard-fail doctrine). Red/green re-proof per new needle class.
+- [ ] **2. Stable matrix row anchors** — the durable fix for [citation drift]. Stamp every
+      capability row's first cell with a permanent ID: `| R<n> · <name> |` where n = the row's
+      file line number at stamping time (so every live citation just renumbered 2026-07-01 maps
+      1:1). New rows take the next unused ID (R158+), insertable anywhere; IDs never reused.
+      New `scripts/check_matrix_anchors.sh` (make target + CI step, mirroring the artifacts gate):
+      (a) every data row anchored exactly once, (b) IDs unique, (c) every `row R<n>` citation in
+      the live docs resolves to an existing anchor, (d) the 5-pipe audit AUTOMATED (was manual
+      per CLAUDE.md). Convention note added BELOW the table (zero row-line movement). Sabotage
+      proofs: duplicate ID / unstamped row / dead citation / 6-pipe row each proven RED.
+- [ ] **3. Citation migration** — live docs (Roadmap.md, docs/, todo ACTIVE + the 2026-07-01
+      reconciliation lines, CLAUDE.md convention bullet) move to `row R<n>` form; quoted-historical
+      spots and dated archives deliberately stay bare-N (they cite historical numbering epochs).
+- [ ] **4. Verify + Critic** — verification fan-out (gate probes incl. new classes; anchor +
+      migration correctness) → independent Critic → push on CONVERGED (user merges).
+
 ---
 
 ## SUPERSEDED 2026-07-01 — was ACTIVE (2026-06-13): Near-full-parity open queue
