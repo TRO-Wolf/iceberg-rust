@@ -41,6 +41,12 @@
 # Check 4 scans TRACKED files (git grep): a citation in a not-yet-added file
 # is only caught once the file is staged/committed — CI always sees committed
 # state, so the gate holds where it matters.
+#
+# KNOWN LIMITS of the line-based citation regex (no instance exists today,
+# verified 2026-07-01): a citation WRAPPED across a line break validates only
+# its first line's anchors, and separators outside the supported set
+# (',' '/' '-' '–' 'and') leave trailing anchors unchecked — keep list
+# citations on one line and use the supported separators.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -67,7 +73,9 @@ if [ -n "$unanchored" ]; then
 fi
 
 ids_file="$(mktemp)"
-trap 'rm -f "$ids_file"' EXIT
+cites_raw="$(mktemp)"
+err_file="$(mktemp)"
+trap 'rm -f "$ids_file" "$cites_raw" "$err_file"' EXIT
 grep -oE '^\| R[0-9]+ · ' "$MATRIX" | grep -oE '[0-9]+' | sort -n >"$ids_file" || true
 
 # --- 3. anchor IDs unique ----------------------------------------------------
@@ -85,10 +93,28 @@ fi
 # (or line start) before 'row' so prose like 'sparrow R6' cannot false-match,
 # and follows list/range continuations ('R122/R123', 'R122, R123',
 # 'R122-R124', 'R122 and R123') so a dead TRAILING anchor cannot hide.
+# A renamed/deleted scan target would silently drop out of a bare git-grep
+# pathspec (exit 1, indistinguishable from no-match), so assert each first.
+for f in Roadmap.md CLAUDE.md task/todo.md docs; do
+  if [ ! -e "$f" ]; then
+    echo "ERROR: live-doc scan target '$f' does not exist — update this script's scan set" >&2
+    exit 1
+  fi
+done
 CONT='(, ?| ?/ ?| and | ?- ?| ?– ?)'
-citations="$(git grep -hoiE "(^|[^[:alnum:]])[Rr]ows? R[0-9]+(${CONT}R[0-9]+)*" -- \
+# git grep exit 0 = citations found, 1 = none, >= 2 = git itself failed —
+# a hard error, NOT "zero citations" (the false-green class the artifact
+# gate's v3 hardening closed; same doctrine here).
+rc=0
+git grep -hoiE "(^|[^[:alnum:]])[Rr]ows? R[0-9]+(${CONT}R[0-9]+)*" -- \
   'Roadmap.md' 'CLAUDE.md' 'task/todo.md' 'docs' ':(exclude)docs/parity/archive' \
-  2>/dev/null | grep -oiE 'R[0-9]+' | tr '[:lower:]' '[:upper:]' | sort -u || true)"
+  >"$cites_raw" 2>"$err_file" || rc=$?
+if [ "$rc" -ge 2 ]; then
+  echo "ERROR: git grep failed (exit $rc) while scanning citations — cannot certify:" >&2
+  cat "$err_file" >&2
+  exit 1
+fi
+citations="$(grep -oiE 'R[0-9]+' "$cites_raw" | tr '[:lower:]' '[:upper:]' | sort -u || true)"
 for tok in $citations; do
   if ! grep -qx "${tok:1}" "$ids_file"; then
     echo "ERROR: citation 'row $tok' does not resolve to any GAP_MATRIX anchor" >&2

@@ -20,7 +20,8 @@
 # tracked files.
 #
 # Motivation (2026-07-01 review): literal tool-call wrapper tags were found
-# committed at the tails of docs/parity/GAP_MATRIX.md and docs/parity/ROADMAP.md.
+# committed at the tails of docs/parity/GAP_MATRIX.md and docs/parity/ROADMAP.md
+# (the latter since archived to docs/parity/archive/2026-06_origin-roadmap.md).
 # Agent-written files are the norm in this repo; this gate makes that class of
 # leak impossible to merge. Wired into `make check-agent-artifacts` and CI.
 #

@@ -112,6 +112,12 @@ ENGINE_CONTRACT §1 + Roadmap, committed first as its own decision commit).
 - [ ] **4. Verify + Critic** — verification fan-out (gate probes incl. new classes; anchor +
       migration correctness) → independent Critic → push on CONVERGED (user merges).
 
+NAMED FOLLOW-UP (Critic LOW, 2026-07-01 — not this PR): ~20 stale bare `GAP_MATRIX row N`
+citations live in `crates/` source/test comments (e.g. `scan/task_group.rs`,
+`tests/interop_scan_plan.rs`, `aggregate_evaluator.rs`), most drifted under current numbering —
+migrate them to `row R<n>` form and add `crates/` to the anchor checker's scan pathspec (touches
+Rust files, so it rides a code PR, not this docs/CI one).
+
 ---
 
 ## SUPERSEDED 2026-07-01 — was ACTIVE (2026-06-13): Near-full-parity open queue
