@@ -109,8 +109,9 @@ ENGINE_CONTRACT §1 + Roadmap, committed first as its own decision commit).
 - [x] **3. Citation migration** — live docs (Roadmap.md, docs/, todo ACTIVE + the 2026-07-01
       reconciliation lines, CLAUDE.md convention bullet) move to `row R<n>` form; quoted-historical
       spots and dated archives deliberately stay bare-N (they cite historical numbering epochs).
-- [ ] **4. Verify + Critic** — verification fan-out (gate probes incl. new classes; anchor +
-      migration correctness) → independent Critic → push on CONVERGED (user merges).
+- [x] **4. Verify + Critic** — DONE 2026-07-01: 2-auditor fan-out (287 claims; found the 4th
+      drift wave + 8 hardening findings, all fixed) → independent Critic CHANGES REQUIRED
+      (1 MEDIUM: check-4 git-grep false-green — fixed c195b616) → re-review CONVERGED. Pushed.
 
 NAMED FOLLOW-UP (Critic LOW, 2026-07-01 — not this PR): ~20 stale bare `GAP_MATRIX row N`
 citations live in `crates/` source/test comments (e.g. `scan/task_group.rs`,
