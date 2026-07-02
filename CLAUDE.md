@@ -302,9 +302,18 @@ are the natural fan-out candidates when the user asks for scale.)
   check && git add -A && git commit …` — never put `git commit` on a separate line from the gate: a
   failed gate on its own line still lets the commit run. (Promoted 2026-06-09 from a twice-repeated
   lessons entry.)
-- **Pipe-count-audit the GAP_MATRIX after any matrix-wide edit** — every `^|` row must carry
-  exactly 5 `|` characters (raw pipes inside code spans split cells silently; the de-triplication
-  pass once stranded half a cell as a phantom column). _Promoted 2026-06-11 from lessons._
+- **Run `make check-matrix-anchors` after any GAP_MATRIX edit** — it enforces the 5-pipe row
+  audit (raw pipes inside code spans split cells silently; the de-triplication pass once stranded
+  half a cell as a phantom column), the row anchors below, and citation resolution. It runs in CI
+  and the aggregate `make check`. _Promoted 2026-06-11 from lessons as a manual pipe-count sweep;
+  automated 2026-07-01._
+- **Cite GAP_MATRIX rows by permanent anchor — `row R<id>` — never by file line number.** Line
+  numbers shift on any row insertion and silently break every citation below the insertion (a +2
+  drift broke ~25 citations between 2026-06-17 and 2026-07-01, in three separate waves). Every
+  capability row's first cell carries its anchor (`R<id> ·`); a NEW row takes the next unused ID
+  and may be inserted anywhere; IDs are never reused. Bare-number citations in dated archives are
+  historical epochs — leave them. Enforced by `scripts/check_matrix_anchors.sh`. _Added
+  2026-07-01._
 - **A sabotage step that cannot be applied must HARD-FAIL, never SKIP.** A negative/sabotage test
   that did not actually corrupt anything has proven nothing — a SKIP branch is a false-green. When
   the corruption cannot be applied (e.g. the target byte pattern is absent), exit non-zero and abort

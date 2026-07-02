@@ -47,7 +47,7 @@ after the 2026-07-01 review pass, which reconciled the old queue (most items had
 surfaced two new items. Statuses live ONLY in
 [docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md).
 
-- [ ] **1. Commit-outcome taxonomy (`CommitStateUnknown`)** — NEW, GAP_MATRIX row 157. An
+- [ ] **1. Commit-outcome taxonomy (`CommitStateUnknown`)** — NEW, GAP_MATRIX row R157. An
       unknown-outcome `ErrorKind` (or flag) honored by the retry gate + sent-vs-unsent
       transport-error classification in the Glue / S3 Tables / REST / SQL catalogs +
       surfaced-no-retry-no-cleanup semantics matching Java + mock-catalog tests. Buildable
@@ -90,14 +90,14 @@ review-series closeout. One PR, branch `infra/review-followups-2026-07-01`. Also
 user's seam-status decision record (datafusion integration promoted to supported product surface —
 ENGINE_CONTRACT §1 + Roadmap, committed first as its own decision commit).
 
-- [ ] **1. Broaden the artifact gate** (`scripts/check_agent_artifacts.sh`) — Critic LOW-1:
+- [x] **1. Broaden the artifact gate** (`scripts/check_agent_artifacts.sh`) — Critic LOW-1:
       add the function_results tag family + bare opening tags (`invoke name=` / `parameter name=`,
       concatenation-assembled as before); case-insensitive matching (uppercase variants);
       `<result>`/`<output>` deliberately EXCLUDED as too generic (false-positive risk — document);
       built-in SELF-TEST that plants every needle via a TEMP-COPY index (`GIT_INDEX_FILE`) and
       hard-fails if any needle goes undetected (a gate that cannot detect its own probe is
       vacuous — the sabotage-must-hard-fail doctrine). Red/green re-proof per new needle class.
-- [ ] **2. Stable matrix row anchors** — the durable fix for [citation drift]. Stamp every
+- [x] **2. Stable matrix row anchors** — the durable fix for [citation drift]. Stamp every
       capability row's first cell with a permanent ID: `| R<n> · <name> |` where n = the row's
       file line number at stamping time (so every live citation just renumbered 2026-07-01 maps
       1:1). New rows take the next unused ID (R158+), insertable anywhere; IDs never reused.
@@ -106,7 +106,7 @@ ENGINE_CONTRACT §1 + Roadmap, committed first as its own decision commit).
       the live docs resolves to an existing anchor, (d) the 5-pipe audit AUTOMATED (was manual
       per CLAUDE.md). Convention note added BELOW the table (zero row-line movement). Sabotage
       proofs: duplicate ID / unstamped row / dead citation / 6-pipe row each proven RED.
-- [ ] **3. Citation migration** — live docs (Roadmap.md, docs/, todo ACTIVE + the 2026-07-01
+- [x] **3. Citation migration** — live docs (Roadmap.md, docs/, todo ACTIVE + the 2026-07-01
       reconciliation lines, CLAUDE.md convention bullet) move to `row R<n>` form; quoted-historical
       spots and dated archives deliberately stay bare-N (they cite historical numbering epochs).
 - [ ] **4. Verify + Critic** — verification fan-out (gate probes incl. new classes; anchor +
@@ -145,8 +145,8 @@ Ranked, highest-value first:
 - [ ] **2. Multi-spec write interop** — STILL OPEN (reconciled 2026-07-01; citations corrected
       same day). TWO distinct residues: (a) the manifest-merge LAYOUT gap —
       `MergeManifestProcess` is not routed into the non-append merging actions (the `RowDelta`
-      row, currently row 106 — the old "row 94" pointer was dead); (b) the writer-layer spec
-      threading — `DataFileWriter`/`DeletionVectorWriter` stamp the table default spec (row 110)
+      row, currently row R106 — the old "row 94" pointer was dead); (b) the writer-layer spec
+      threading — `DataFileWriter`/`DeletionVectorWriter` stamp the table default spec (row R110)
       — plus the multi-spec-DATA interop slices on the merging actions (one slice landed: #69,
       multi-spec RowDelta DELETE-commit); `fast_append` multi-spec is ✅ (Z2 — the template).
 - [x] **3. Builder-surface interop flips** — DONE 2026-06-16: `case_sensitive` +
@@ -162,7 +162,7 @@ Ranked, highest-value first:
       three ✅, interop-proven: `BatchScan`, `planTasks` split planning, the JSON expression
       (de)serializer). Reconciled 2026-07-01.
 - [ ] **7. [PARKED] encryption** — reconciled 2026-07-01: the Glue / S3Tables VIEWS half is
-      RESOLVED as parity-correct-unsupported (rows 126/127, verified 2026-06-17 — NOT owed);
+      RESOLVED as parity-correct-unsupported (rows R126/R127, verified 2026-06-17 — NOT owed);
       encryption remains ❌ and is DEMOTED to opportunistic by the engine-first re-anchor. The
       credentialed real-catalog hardening piece moved to the 2026-07-01 queue (item 6).
 

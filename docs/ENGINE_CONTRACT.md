@@ -123,7 +123,7 @@ row-level op, both modes:** `validate_from_snapshot(scan_snapshot_id)` +
 | UPDATE / MERGE | COW | serializable | above + `validate_no_conflicting_data()` |
 | UPDATE / MERGE | MoR | snapshot | `validate_data_files_exist(...)` + `validate_deleted_files()` + `validate_no_conflicting_delete_files()` — the op READ rows to produce output; concurrent deletes of those rows conflict |
 | UPDATE / MERGE | MoR | serializable | above + `validate_no_conflicting_data_files()` |
-| INSERT OVERWRITE | `ReplacePartitions` | append-only guard | `validate_append_only()` where the engine requires it (landed 2026-06-17, row 146) |
+| INSERT OVERWRITE | `ReplacePartitions` | append-only guard | `validate_append_only()` where the engine requires it (landed 2026-06-17, row R146) |
 
 Provenance note: this table is reconstructed from the Java Spark row-level-operation builders (the
 logic deliberately OUT of `iceberg-core` scope, hence out of the GAP_MATRIX) — it is exactly the
@@ -162,7 +162,7 @@ grow MERGE semantics; it will not (out of parity scope).
   `total-timeout-ms`), retrying only `Error::retryable()`. Each attempt REFRESHES the table,
   re-runs every action's `validate` against the refreshed base (non-retryable on failure), then
   re-applies.
-- **KNOWN GAP — ambiguous commit outcome (GAP_MATRIX row 157, ❌).** There is no
+- **KNOWN GAP — ambiguous commit outcome (GAP_MATRIX row R157, ❌).** There is no
   `CommitStateUnknown` class: a catalog failure AFTER the update request may have durably landed
   (timeout, 5xx) is unsafe on both branches — retryable ⇒ possible duplicate commit of the same
   DataFiles; terminal ⇒ the engine cannot distinguish safe-to-rerun from may-have-landed. Until
@@ -179,6 +179,6 @@ grow MERGE semantics; it will not (out of parity scope).
 ## 9. Open items (tracked in `task/todo.md` §"ACTIVE (2026-07-01)")
 
 - [ ] Bytecode-verify §5 against Java 1.10.0 + one interop conflict scenario per cell → NORMATIVE.
-- [ ] Commit-outcome taxonomy lands (row 157) → rewrite §8's mitigation as the real contract.
+- [ ] Commit-outcome taxonomy lands (row R157) → rewrite §8's mitigation as the real contract.
 - [ ] `TransactionAction` `pub` (pull-based, per the re-anchor) → document custom commit actions.
 - [ ] Row-level CDC changelog lands → extend §2/§3 changelog guidance.
