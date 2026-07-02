@@ -42,6 +42,17 @@
   (2026-07-01): it is currently ahead of this document — partitioned copy-on-write DELETE/UPDATE
   and partitioned merge-on-read DELETE/UPDATE landed there (#131, #133) with a partition-aware
   `TaskWriter`. Treat its `physical_plan/{delete,write,commit}.rs` as worked examples of §4–§7.
+- **Status change (2026-07-01, decided with the named consumer):** `crates/integrations/datafusion`
+  is **promoted from reference implementation to a supported product surface**. RePark consumes it
+  directly (rev-pinned `[patch.crates-io]`; RePark ADR-0003 mirrors this decision): scan + INSERT +
+  DELETE + UPDATE flow through `IcebergCatalogProvider` / `IcebergTableProvider`'s standard
+  DataFusion `TableProvider` methods rather than being re-implemented downstream — the H7 ladder
+  already treats this crate as load-bearing. Consequences: public-API changes in this crate are
+  **consumer-breaking** (the DML exec types stay `pub(crate)`, crossing the boundary only as opaque
+  `ExecutionPlan`s); the ownership split above is UNCHANGED — the MERGE rewrite, COW-vs-MoR mode
+  policy, and isolation-level selection remain engine-owned (§5–§6). The boundary rule: anything
+  provable by the Java interop oracle lives in this fork (including engine-generic DataFusion
+  execs); anything Spark-flavored lives in the consumer.
 
 ## 2. Read surface
 

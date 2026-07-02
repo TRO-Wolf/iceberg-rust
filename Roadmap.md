@@ -135,7 +135,12 @@ parity *for its own sake* but **"be the Rust Iceberg core a named consumer pulls
 (option A) is a **downstream Apache DataFusion-wrapped custom query engine** issuing row-level
 DELETE/UPDATE/MERGE. **Seam:** the `iceberg` CORE crate is the stable engine-facing contract — the
 downstream builds its OWN DataFusion `TableProvider` over it; `crates/integrations/datafusion` is a
-reference impl, not the product.
+reference impl, not the product. *(Status change 2026-07-01: `crates/integrations/datafusion` is
+promoted to a **supported product surface** consumed directly by RePark — see
+[docs/ENGINE_CONTRACT.md](docs/ENGINE_CONTRACT.md) §1, the one home for the seam. This supersedes
+BOTH clauses of the preceding sentence for the named consumer: the downstream MAY consume this
+crate's `TableProvider` instead of building its own. What stands unchanged: the `iceberg` CORE
+crate remains the stable engine-facing contract underneath either path.)*
 
 **DML foundation — DELIVERED & PROVEN (2026-06-21), through the PUBLIC surface, offline AND vs Java:**
 #114 nameable write/commit action types · #115 the reserved `_pos` row-position column on Parquet scans ·
