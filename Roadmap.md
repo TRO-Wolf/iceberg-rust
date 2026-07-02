@@ -226,12 +226,14 @@ Per-row status + residue: the matrix.
 types, encryption, `SessionCatalog` (assessed-deferred dead surface — row R128), the maintenance
 residue (`SnapshotTable`/`MigrateTable` only — they need external sources), and
 `commitTransaction(List<TableCommit>)` (REST multi-table commit, split out). *(No longer missing —
-flipped 2026-06-17: `RewritePositionDeleteFiles` ✅ (134); `ComputePartitionStats` action +
-`UpdatePartitionStatistics` ✅ (138); the `unknown` V3 type ✅ (89); `validateAppendOnly` ✅ (144); the
-Catalog accessors `name()`/`properties()`/`invalidate*` 🟡 (149); the `conflictDetectionFilter`-on-
-`DeleteFiles`/`ReplacePartitions` items are VOID — `javap`-proven not in Java 1.10.0. And flipped
-2026-06-19: `BatchScan` ✅ (122); ORC+Avro DATA **read** 🟡 (116/117); `RewriteTablePath` 🟡 built+interop
-(137); events/listeners ✅ (142); `LockManager` ❌→🟡 in-memory impl + tests (129). See GAP_MATRIX.)*
+flipped 2026-06-17: `RewritePositionDeleteFiles` ✅ (row R136); `ComputePartitionStats` action +
+`UpdatePartitionStatistics` ✅ (row R140); the `unknown` V3 type ✅ (row R91); `validateAppendOnly` ✅
+(row R146); the Catalog accessors `name()`/`properties()`/`invalidate*` 🟡 (row R151); the
+`conflictDetectionFilter`-on-`DeleteFiles`/`ReplacePartitions` items are VOID — `javap`-proven not
+in Java 1.10.0. And flipped 2026-06-19: `BatchScan` ✅ (row R124); ORC+Avro DATA **read** 🟡
+(rows R118/R119); `RewriteTablePath` 🟡 built+interop (row R139); events/listeners ✅ (row R144);
+`LockManager` ❌→🟡 in-memory impl + tests (row R129). See GAP_MATRIX. Anchored 2026-07-01 — the
+bare parenthesized numbers had drifted stale, 10 of 11 resolving to the wrong row.)*
 
 **Row-by-row truth:** [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
 

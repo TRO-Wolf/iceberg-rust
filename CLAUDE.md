@@ -308,8 +308,9 @@ are the natural fan-out candidates when the user asks for scale.)
   and the aggregate `make check`. _Promoted 2026-06-11 from lessons as a manual pipe-count sweep;
   automated 2026-07-01._
 - **Cite GAP_MATRIX rows by permanent anchor — `row R<id>` — never by file line number.** Line
-  numbers shift on any row insertion and silently break every citation below the insertion (a +2
-  drift broke ~25 citations between 2026-06-17 and 2026-07-01, in three separate waves). Every
+  numbers shift when ANY line is inserted above them — the +2 drift that broke ~45 citations
+  between 2026-06-17 and 2026-07-01 (discovered in four separate waves) came from two PROSE lines
+  added above the table, not from row insertions; prose edits are not safe either. Every
   capability row's first cell carries its anchor (`R<id> ·`); a NEW row takes the next unused ID
   and may be inserted anywhere; IDs are never reused. Bare-number citations in dated archives are
   historical epochs — leave them. Enforced by `scripts/check_matrix_anchors.sh`. _Added

@@ -20,10 +20,12 @@
 # anchors.
 #
 # Motivation (2026-07-01, review follow-up 2): "row N" citations used to be
-# raw file line numbers; two row insertions between 2026-06-17 and 2026-07-01
-# shifted every downstream citation by +2 and silently broke ~25 of them.
-# Every capability row now carries a PERMANENT anchor in its first cell
-# ('| R<id> · ...') and live docs cite "row R<id>". This gate enforces:
+# raw file line numbers. Two PROSE lines added ABOVE the table (the 2026-06-19
+# provenance refresh) shifted every row by +2 and silently broke ~45 downstream
+# citations, discovered in four separate waves — ANY line inserted above a row
+# breaks its line-number citations, row or prose. Every capability row now
+# carries a PERMANENT anchor in its first cell ('| R<id> · ...') and live docs
+# cite "row R<id>". This gate enforces:
 #   1. the 5-pipe row audit (was a manual CLAUDE.md convention);
 #   2. every data row anchored exactly once ('| R<id> · ');
 #   3. anchor IDs unique (they are permanent and never reused);
@@ -32,7 +34,13 @@
 # reference historical epochs. If a row is ever DELETED, citations to its
 # anchor fail here by design: retarget or annotate them, then delete.
 #
-# Wired into `make check-matrix-anchors` and CI.
+# ASSUMPTION: GAP_MATRIX.md contains exactly ONE table (header '| Area |...').
+# Checks 1-2 apply to every '^|' line in the file; adding a second table
+# requires updating this script first (scope the checks to the table's range).
+#
+# Check 4 scans TRACKED files (git grep): a citation in a not-yet-added file
+# is only caught once the file is staged/committed — CI always sees committed
+# state, so the gate holds where it matters.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -52,7 +60,8 @@ fi
 # --- 2. every data row anchored ('| R<id> · '); header/separator exempt -----
 unanchored="$(grep -nE '^\|' "$MATRIX" | grep -vE '^[0-9]+:\|---' | grep -vE '^[0-9]+:\| Area \|' | grep -vE '^[0-9]+:\| R[0-9]+ · ' || true)"
 if [ -n "$unanchored" ]; then
-  echo "ERROR: unanchored GAP_MATRIX data rows (first cell must start 'R<id> · '):" >&2
+  echo "ERROR: unanchored GAP_MATRIX data rows (first cell must start 'R<id> · ';" >&2
+  echo "       if you are adding a SECOND table to the file, update this script first):" >&2
   echo "$unanchored" | cut -c1-120 >&2
   fail=1
 fi
@@ -72,12 +81,16 @@ fi
 
 # --- 4. every 'row R<n>' citation in the live docs resolves ------------------
 # Live doc set: the plan, the conventions, the live task file, and docs/
-# (minus the dated archives). Tracked files only (git grep, worktree content).
-citations="$(git grep -hoiE 'rows? R[0-9]+([/,] ?R[0-9]+)*' -- \
+# (minus the dated archives). The span regex requires a non-alphanumeric char
+# (or line start) before 'row' so prose like 'sparrow R6' cannot false-match,
+# and follows list/range continuations ('R122/R123', 'R122, R123',
+# 'R122-R124', 'R122 and R123') so a dead TRAILING anchor cannot hide.
+CONT='(, ?| ?/ ?| and | ?- ?| ?– ?)'
+citations="$(git grep -hoiE "(^|[^[:alnum:]])[Rr]ows? R[0-9]+(${CONT}R[0-9]+)*" -- \
   'Roadmap.md' 'CLAUDE.md' 'task/todo.md' 'docs' ':(exclude)docs/parity/archive' \
-  2>/dev/null | grep -oE 'R[0-9]+' | sort -u || true)"
+  2>/dev/null | grep -oiE 'R[0-9]+' | tr '[:lower:]' '[:upper:]' | sort -u || true)"
 for tok in $citations; do
-  if ! grep -qx "${tok#R}" "$ids_file"; then
+  if ! grep -qx "${tok:1}" "$ids_file"; then
     echo "ERROR: citation 'row $tok' does not resolve to any GAP_MATRIX anchor" >&2
     fail=1
   fi
