@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java interop for the SCAN-PLAN layer (`plan_tasks`) — GAP_MATRIX row 146.
+//! Java interop for the SCAN-PLAN layer (`plan_tasks`) — GAP_MATRIX row R148.
 //!
 //! Proves Rust `TableScan::plan_tasks` produces the SAME bin-packed `CombinedScanTask` GROUPS as Java's
 //! REAL `table.newScan().option(SPLIT_SIZE/LOOKBACK/OPEN_FILE_COST, ...).planTasks()`, in BOTH directions,
@@ -177,7 +177,7 @@ async fn rust_plan_multiset(
     groups_to_multiset(&groups)
 }
 
-/// Run the typed [`BatchScan`] `plan_tasks` (row 122) and collect the canonical plan multiset, with the
+/// Run the typed [`BatchScan`] `plan_tasks` (row R124) and collect the canonical plan multiset, with the
 /// SAME hand-declared knobs set via the BatchScan builder. The BatchScan adapter delegates to the same
 /// pipeline as [`rust_plan_multiset`], so the two multisets MUST be equal — the tests assert exactly that.
 async fn rust_batch_plan_multiset(
@@ -403,7 +403,7 @@ async fn test_scan_plan_d1_rust_plans_java_table() {
          member-key sets + group count)"
     );
 
-    // BatchScan leg (row 122): Rust `BatchScan::plan_tasks` over the SAME Java table must equal
+    // BatchScan leg (row R124): Rust `BatchScan::plan_tasks` over the SAME Java table must equal
     //   (a) Java's `newBatchScan().planTasks()` plan (java_batch_scan_plan.json), AND
     //   (b) the plain scan plan (proving the Rust adapter delegates to the same pipeline).
     let rust_batch = rust_batch_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
@@ -515,7 +515,7 @@ async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
     let plan_path = format!("{table_location}/rust_scan_plan.json");
     fs::write(&plan_path, plan_json).expect("write rust_scan_plan.json");
 
-    // Emit the BatchScan plan for the Java verify's BatchScan leg (row 122).
+    // Emit the BatchScan plan for the Java verify's BatchScan leg (row R124).
     let batch_plan_json = rust_plan_to_json(&rust_batch);
     let batch_plan_path = format!("{table_location}/rust_batch_scan_plan.json");
     fs::write(&batch_plan_path, batch_plan_json).expect("write rust_batch_scan_plan.json");

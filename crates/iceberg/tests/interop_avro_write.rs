@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! AVRO DATA-FILE WRITE interop (GAP_MATRIX row 117, Direction 2 — "Java reads what Rust writes").
+//! AVRO DATA-FILE WRITE interop (GAP_MATRIX row R119, Direction 2 — "Java reads what Rust writes").
 //!
 //! The mirror-image (and INVERSION) of [`interop_avro_data`] (Direction 1, where Java writes the Avro
 //! data file and Rust reads it). HERE the **W1 production Avro data writer**

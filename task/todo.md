@@ -39,6 +39,59 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-08): queue item 1 — commit-outcome taxonomy (row R157)
+
+User-directed 2026-07-08 ("proceed with your recommendation"). One PR, branch
+`parity/commit-state-unknown`. Ladder: parity-increment workflow (builder → tailored adversarial
+critic, mutation-gated → verification gate → bounded remediation), then the independent SEPMO
+Critic before push. Status flips live ONLY in the GAP_MATRIX (row R157).
+
+- [x] **1. Unknown-outcome error class** — `ErrorKind::CommitStateUnknown` (`error.rs`) +
+      `Transaction::commit`'s gate refuses the KIND regardless of the `retryable` flag (Java
+      1.10.0 bytecode: `onlyRetryOn(CommitFailedException.class)` + dedicated
+      `CommitStateUnknownException` rethrow ahead of the cleanup catch). Gate mutation-proven
+      BOTH directions (flag-only gate + unknown-retried gate each turn a pin red).
+- [x] **2. Sent-vs-unsent transport classification** — REST (`query_catalog_for_commit`
+      transport split + 500/502/503/504 ⇒ unknown + 200-with-lost-response ⇒ unknown, tables
+      AND views), SQL (`from_sqlx_commit_error`: Io/Protocol/WorkerCrashed ⇒ unknown; CAS
+      conflict stays retryable; NOTE — the previously-DISCARDED SQL-transaction `COMMIT` error
+      now propagates for all statements), Glue + S3 Tables (`SdkError` dispatch classification
+      + `InternalService`/`OperationTimeout`/`InternalServerError` ⇒ unknown;
+      `ConcurrentModification`/`Conflict` stay retryable). REST/SQL/Glue classifiers
+      mutation-proven.
+- [x] **3. Mock-catalog tests** — crown jewel (`transaction/mod.rs`): durably-landed-but-
+      unacknowledged commit against a real in-memory catalog ⇒ surfaced intact, exactly 1
+      `update_table` call, exactly 1 snapshot, file appears ONCE, manifests NOT cleaned up;
+      + flag-defense test (unknown-with-retryable-flag still not retried); + Error API
+      kind-survives-wrapping test; existing retryable/terminal tests unchanged (control pins).
+- [x] **4. Rider: crates/ citation migration** — 26 bare-citation sites migrated across ~24
+      files (each target row VERIFIED by cell content — drift was NOT uniformly +2: e.g.
+      93/94/95→R105/R106/R107, 100→R100, 129→R129, 152→R152, builder-flips 134/135→R146
+      merged row); `crates` added to check-4's pathspec AND the asserted scan-target list;
+      anchor grep made case-sensitive on the `R` (test prose "rows r1" false-positive);
+      red-proof: planted a dead `R9999` anchor citation in a crates/ comment ⇒ gate exits
+      non-zero; removed ⇒ green.
+- [x] **5. Matrix + docs** — row R157 flipped ❌→🟡 (2026-07-08; residue named:
+      reconciliation-by-refresh `checkCommitStatus` NOT ported, credentialed slice with queue
+      item 6); ENGINE_CONTRACT §8 rewritten around catching `ErrorKind::CommitStateUnknown`
+      (mitigation (a)-(c) stands until reconciliation lands); `make check-matrix-anchors`
+      green (71 rows).
+- [x] **R1. Remediation rounds 1–2 (2026-07-08)** — (a) typos: round 1 reworded 7
+      typos-cli-1.47.2 false-positives in the untracked scratch briefs
+      `task/a1-cow-partition-brief.md` + `task/h7-dml-streaming-scope.md`; round 2 REVERTED
+      that as out-of-scope (user scratch, not increment files). RESOLUTION: the commit gate
+      runs `typos` over TRACKED files (exactly what CI certifies on a clean checkout — the
+      untracked briefs never enter any commit); a `.typos.toml` exclude vs rewording the
+      briefs is the user's call (flagged in the PR); (b) the REST 200-with-unparsable-body
+      OK arms are now PINNED:
+      `test_update_table_200_unparsable_body_maps_to_commit_state_unknown` (full
+      `Transaction::commit` stack, POST `expect(1)`) +
+      `test_update_view_200_unparsable_body_maps_to_commit_state_unknown` — both
+      mutation-proven RED on OK-arm kind → `Unexpected`, green restored (REST lib 64→66).
+- [ ] **6. Gate + independent Critic → push** — house chain (typos && fmt && clippy && tests in
+      ONE chain with the commit), independent OO Critic, push on CONVERGED (merge stays the
+      user's).
+
 ## ACTIVE (2026-07-01): Engine-first closeout — re-ranked open queue
 
 Supersedes the 2026-06-13 queue below. **One home for PRIORITY: this list** (the Roadmap's

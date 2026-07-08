@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! AVRO DATA-FILE READ interop (GAP_MATRIX row 117, Direction 1 — "Rust reads what Java writes").
+//! AVRO DATA-FILE READ interop (GAP_MATRIX row R119, Direction 1 — "Rust reads what Java writes").
 //!
 //! Java's `generate-interop-avro-data` mode (`AvroDataOracle`) writes a V2 Iceberg table whose DATA
 //! file is in the **AVRO** format (`GenericAppenderFactory.newDataWriter(..., FileFormat.AVRO, null)`

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! ExpressionParser-JSON interop (GAP_MATRIX row 147).
+//! ExpressionParser-JSON interop (GAP_MATRIX row R149).
 //!
 //! The REAL Java `org.apache.iceberg.expressions.ExpressionParser` is the oracle; the shared
 //! contract is the SCHEMA (Java `SchemaParser.toJson` ⇄ Rust serde [`Schema`]). The battery of

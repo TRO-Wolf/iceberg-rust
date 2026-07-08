@@ -69,6 +69,27 @@ pub enum ErrorKind {
 
     /// Catalog commit failed due to outdated metadata
     CatalogCommitConflicts,
+
+    /// A commit failed in a way that leaves its outcome UNKNOWN: the update request may or may
+    /// not have durably landed in the catalog (e.g. a timeout awaiting the response, a 5xx after
+    /// the request was sent, or a connection reset mid-response).
+    ///
+    /// Mirrors Java `org.apache.iceberg.exceptions.CommitStateUnknownException` (iceberg-api
+    /// 1.10.0): "Cannot determine whether the commit was successful or not ... Retrying an
+    /// already successful operation will result in duplicate records or unintentional
+    /// modifications." The contract (Java `SnapshotProducer.commit()`, iceberg-core 1.10.0
+    /// bytecode: `Tasks.foreach(...).onlyRetryOn(CommitFailedException.class)` plus the dedicated
+    /// `catch (CommitStateUnknownException) { throw }` ahead of the cleanup catch):
+    ///
+    /// - **never auto-retried** — re-applying the actions on a refreshed base that already
+    ///   contains the first attempt's snapshot appends the same files twice (duplicate rows);
+    /// - **no file/metadata cleanup** — the files written for the attempt may be live;
+    /// - **surfaced to the caller**, who must reconcile (refresh and check whether the commit
+    ///   landed) before re-running.
+    ///
+    /// [`Transaction::commit`](crate::transaction::Transaction::commit) honors this kind in its
+    /// retry gate regardless of the [`Error::retryable`] flag.
+    CommitStateUnknown,
 }
 
 impl ErrorKind {
@@ -92,6 +113,7 @@ impl From<ErrorKind> for &'static str {
             ErrorKind::NamespaceNotFound => "NamespaceNotFound",
             ErrorKind::PreconditionFailed => "PreconditionFailed",
             ErrorKind::CatalogCommitConflicts => "CatalogCommitConflicts",
+            ErrorKind::CommitStateUnknown => "CommitStateUnknown",
         }
     }
 }
@@ -532,6 +554,37 @@ Context:
 Source: networking error
 "#
         )
+    }
+
+    /// Risk: the unknown-outcome commit class is silently LOST when a caller decorates the error
+    /// (context / retryable flag / source) — a downstream `kind()` check would then misroute a
+    /// may-have-landed commit onto the retry or terminal branch (the duplicate-commit footgun,
+    /// GAP_MATRIX row R157). Pins that `CommitStateUnknown` survives `with_context` +
+    /// `with_retryable` + `with_source`, and that the source chain stays reachable through
+    /// `std::error::Error::source()`.
+    #[test]
+    fn test_commit_state_unknown_kind_survives_wrapping() {
+        let inner = anyhow!("connection reset by peer mid-response");
+        let error = Error::new(
+            ErrorKind::CommitStateUnknown,
+            "commit outcome unknown for table ns.t",
+        )
+        .with_context("table", "ns.t".to_string())
+        .with_retryable(false)
+        .with_source(inner);
+
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert_eq!(error.kind().into_static(), "CommitStateUnknown");
+        assert!(!error.retryable(), "unknown outcome must not be retryable");
+        // The source chain survives: the transport cause is reachable via the std Error trait.
+        let source = std::error::Error::source(&error)
+            .expect("the wrapped transport cause must survive as the source");
+        assert!(
+            source
+                .to_string()
+                .contains("connection reset by peer mid-response"),
+            "source chain must carry the original transport failure, got: {source}"
+        );
     }
 
     /// Backtrace contains build information, so we just assert the header of error content.

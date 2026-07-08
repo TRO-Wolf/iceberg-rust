@@ -159,18 +159,21 @@ grow MERGE semantics; it will not (out of parity scope).
 
 - Retry: `Transaction::commit` wraps `do_commit` in `backon` exponential backoff driven by the
   `commit.retry.*` table properties (`num-retries`, `min-wait-ms`, `max-wait-ms`,
-  `total-timeout-ms`), retrying only `Error::retryable()`. Each attempt REFRESHES the table,
+  `total-timeout-ms`), retrying only `Error::retryable()` — and NEVER an
+  `ErrorKind::CommitStateUnknown`, regardless of the flag. Each attempt REFRESHES the table,
   re-runs every action's `validate` against the refreshed base (non-retryable on failure), then
   re-applies.
-- **KNOWN GAP — ambiguous commit outcome (GAP_MATRIX row R157, ❌).** There is no
-  `CommitStateUnknown` class: a catalog failure AFTER the update request may have durably landed
-  (timeout, 5xx) is unsafe on both branches — retryable ⇒ possible duplicate commit of the same
-  DataFiles; terminal ⇒ the engine cannot distinguish safe-to-rerun from may-have-landed. Until
-  the row closes, the engine-side mitigation is: **(a)** stamp every commit with a unique summary
-  property (e.g. `engine.operation-id`) via the snapshot-summary surface; **(b)** on any
-  transport-ambiguous failure, reload the table and scan recent snapshots' summaries for that id
-  BEFORE re-running; **(c)** never delete the files a failed attempt wrote until (b) confirms the
-  commit is truly absent.
+- **Ambiguous commit outcome (GAP_MATRIX row R157, 🟡 since 2026-07-08).** A catalog failure
+  AFTER the update request may have durably landed (timeout awaiting the response, 5xx,
+  connection reset mid-response) now surfaces as **`ErrorKind::CommitStateUnknown`** — never
+  auto-retried, no cleanup, surfaced (Java `CommitStateUnknownException` semantics). All four
+  catalogs (REST, SQL, Glue, S3 Tables) classify commit-path transport failures sent-vs-unsent.
+  **The engine MUST catch this kind and reconcile before re-running** — the library does not yet
+  port Java's reconciliation-by-refresh (`checkCommitStatus`), so the mitigation stands:
+  **(a)** stamp every commit with a unique summary property (e.g. `engine.operation-id`) via the
+  snapshot-summary surface; **(b)** on `CommitStateUnknown`, reload the table and scan recent
+  snapshots' summaries for that id BEFORE re-running; **(c)** never delete the files a failed
+  attempt wrote until (b) confirms the commit is truly absent.
 - S3 Tables runs **service-side maintenance** (compaction, snapshot expiry) that commits
   concurrently with the engine — treat `CommitFailed` requirement mismatches as routine there,
   and expect `validate_data_files_exist` trips when service compaction rewrites files referenced
@@ -179,6 +182,8 @@ grow MERGE semantics; it will not (out of parity scope).
 ## 9. Open items (tracked in `task/todo.md` §"ACTIVE (2026-07-01)")
 
 - [ ] Bytecode-verify §5 against Java 1.10.0 + one interop conflict scenario per cell → NORMATIVE.
-- [ ] Commit-outcome taxonomy lands (row R157) → rewrite §8's mitigation as the real contract.
+- [ ] Commit-outcome taxonomy (row R157): the unknown-outcome class LANDED 2026-07-08 (🟡, §8
+      updated); the remaining rewrite waits on reconciliation-by-refresh + the credentialed
+      real-catalog slice.
 - [ ] `TransactionAction` `pub` (pull-based, per the re-anchor) → document custom commit actions.
 - [ ] Row-level CDC changelog lands → extend §2/§3 changelog guidance.

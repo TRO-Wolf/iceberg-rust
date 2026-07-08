@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SAME-COMMIT append-only ASSERTION interop (GAP_MATRIX row 144) — `ReplacePartitions`'
+//! SAME-COMMIT append-only ASSERTION interop (GAP_MATRIX row R146) — `ReplacePartitions`'
 //! `validate_append_only()` proven 1:1 against Java `BaseReplacePartitions.validateAppendOnly()`.
 //!
 //! ## Why this is a behavior-equivalence (not a byte-level) interop

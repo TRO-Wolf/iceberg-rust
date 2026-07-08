@@ -270,10 +270,57 @@ impl HttpClient {
         self.execute(request).await
     }
 
+    /// [`Self::query_catalog`] for COMMIT requests (table / view update): transport failures
+    /// are classified sent-vs-unsent.
+    ///
+    /// A failure that may have occurred AFTER the request reached the service (timeout awaiting
+    /// the response, connection reset mid-response) maps to [`ErrorKind::CommitStateUnknown`] —
+    /// the commit may have durably landed, so retrying could apply it twice. A request that
+    /// provably never left the client (pre-send authentication failure, connect failure) keeps
+    /// today's terminal mapping. See [`commit_transport_failure_may_have_reached_service`].
+    pub async fn query_catalog_for_commit(&self, mut request: Request) -> Result<Response> {
+        // Pre-send: an authentication failure means the commit request was never sent — the
+        // existing (non-unknown) mapping stands.
+        self.authenticate(&mut request).await?;
+        request.headers_mut().extend(self.extra_headers.clone());
+        self.client.execute(request).await.map_err(|error| {
+            if commit_transport_failure_may_have_reached_service(&error) {
+                Error::new(
+                    ErrorKind::CommitStateUnknown,
+                    "Transport failure after the commit request may have reached the service; \
+                     the commit state is unknown. Check whether the commit landed before \
+                     retrying: retrying an already-successful commit duplicates its changes.",
+                )
+                .with_source(error)
+            } else {
+                Error::from(error)
+            }
+        })
+    }
+
     /// Returns whether header redaction is disabled for this client.
     pub(crate) fn disable_header_redaction(&self) -> bool {
         self.disable_header_redaction
     }
+}
+
+/// True when a transport-level failure on a COMMIT request may have occurred AFTER the request
+/// reached the service — a timeout awaiting the response, a connection reset mid-response, a
+/// lost/truncated body. False only when the request provably never left the client: the request
+/// could not be BUILT, or the CONNECTION could not be established (connect refused / connect
+/// timeout — reqwest reports connect-phase timeouts with `is_connect()`).
+///
+/// Java analogue: once a response arrives, `ErrorHandlers$CommitErrorHandler` (iceberg-core
+/// 1.10.0, `ErrorHandlers.java` L88-104) classifies by HTTP status — 409 →
+/// `CommitFailedException` (retryable), 500/502/503/504 → `CommitStateUnknownException`. For
+/// CLIENT-side transport failures Java's `HTTPClient.execute` (L358-359) collapses everything
+/// into `RESTException` (with an acknowledged `TODO` in `RESTTableOperations.commit` to feed
+/// client errors to the error handler), which `SnapshotProducer.commit()` then neither retries
+/// nor cleans up. This fork names the post-send ambiguity explicitly as
+/// [`ErrorKind::CommitStateUnknown`] — the same observable no-retry / no-cleanup / surfaced
+/// semantics, with the unknown outcome distinguishable by the caller.
+pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest::Error) -> bool {
+    !(error.is_builder() || error.is_connect())
 }
 
 /// Deserializes a catalog response into the given [`DeserializedOwned`] type.
@@ -367,6 +414,116 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Risk (GAP_MATRIX row R157): a NEVER-SENT transport failure (connection refused — the TCP
+    /// connection was never established, so the commit request cannot have reached the service)
+    /// is classified as unknown-outcome, sending the caller into needless commit reconciliation
+    /// on every transient connectivity blip. Pins the sent-vs-unsent split's UNSENT side with a
+    /// real reqwest connect error.
+    #[tokio::test]
+    async fn test_connect_refused_commit_failure_is_not_post_send() {
+        // Bind to an ephemeral port, then drop the listener: connecting to it is refused.
+        let port = {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+            listener
+                .local_addr()
+                .expect("read the bound address")
+                .port()
+        };
+        let error = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/tables"))
+            .send()
+            .await
+            .expect_err("connecting to a dropped listener must fail");
+        assert!(
+            error.is_connect(),
+            "precondition: the failure must be a connect-phase error, got: {error:?}"
+        );
+        assert!(
+            !commit_transport_failure_may_have_reached_service(&error),
+            "a connect-refused request never reached the service — it must NOT classify as \
+             post-send ambiguous (unknown outcome)"
+        );
+    }
+
+    /// Risk (GAP_MATRIX row R157): a connection reset AFTER the commit request was written —
+    /// the server read the request and died before responding, so the commit MAY have durably
+    /// landed — is classified as never-sent/terminal, letting a caller (or an outer loop)
+    /// re-run the commit and duplicate its changes. Pins the sent-vs-unsent split's SENT side
+    /// with a real mid-exchange connection drop.
+    #[tokio::test]
+    async fn test_connection_reset_after_send_is_post_send_ambiguous() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read the bound address");
+        // Accept one connection, read the request bytes, then drop the socket WITHOUT
+        // responding — the client observes the connection closing after the request was sent.
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the commit request");
+            let mut buffer = [0u8; 1024];
+            use tokio::io::AsyncReadExt as _;
+            let _ = socket.read(&mut buffer).await;
+            drop(socket);
+        });
+        let error = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/tables"))
+            .body("{}")
+            .send()
+            .await
+            .expect_err("a connection dropped before any response must fail");
+        server.await.expect("the stub server task must finish");
+        assert!(
+            !error.is_connect(),
+            "precondition: the connection WAS established, got: {error:?}"
+        );
+        assert!(
+            commit_transport_failure_may_have_reached_service(&error),
+            "a reset after the request was written may have reached the service — it MUST \
+             classify as post-send ambiguous (unknown outcome)"
+        );
+    }
+
+    /// Risk (GAP_MATRIX row R157): a timeout AWAITING THE RESPONSE (request sent, server
+    /// processing — the commit may complete server-side after the client gives up) is
+    /// classified as never-sent/terminal. Pins that a post-send timeout classifies as
+    /// post-send ambiguous.
+    #[tokio::test]
+    async fn test_timeout_awaiting_response_is_post_send_ambiguous() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read the bound address");
+        // Accept, read the request, then stall past the client timeout without responding.
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the commit request");
+            let mut buffer = [0u8; 1024];
+            use tokio::io::AsyncReadExt as _;
+            let _ = socket.read(&mut buffer).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            drop(socket);
+        });
+        let error = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .expect("build a short-timeout client")
+            .post(format!("http://{addr}/v1/tables"))
+            .body("{}")
+            .send()
+            .await
+            .expect_err("the stalled response must time out");
+        server.await.expect("the stub server task must finish");
+        assert!(
+            error.is_timeout(),
+            "precondition: the failure must be a timeout, got: {error:?}"
+        );
+        assert!(
+            commit_transport_failure_may_have_reached_service(&error),
+            "a timeout awaiting the response may have reached the service — it MUST classify \
+             as post-send ambiguous (unknown outcome)"
+        );
+    }
 
     #[test]
     fn test_format_headers_redacted_empty() {

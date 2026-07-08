@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn float_residue_is_jdk_nonminimal() {
-        // NAMED RESIDUE GUARD (scoped OUT of row 147 ✅): JDK 11 `Double.toString` is non-minimal —
+        // NAMED RESIDUE GUARD (scoped OUT of row R149 ✅): JDK 11 `Double.toString` is non-minimal —
         // for some large-magnitude / long-mantissa values it prints MORE significant digits than
         // the true shortest round-trip. Rust prints the MINIMAL form (matching JDK 19+), so the
         // bytes differ from the JDK 11 oracle for this narrow class. This test PINS Rust's

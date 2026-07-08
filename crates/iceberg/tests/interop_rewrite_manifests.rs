@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java interop for `RewriteManifests` DATA-LEVEL (GAP_MATRIX row 100).
+//! Java interop for `RewriteManifests` DATA-LEVEL (GAP_MATRIX row R100).
 //!
 //! The Java oracle (`generate-interop-rewrite-manifests`) writes an UNPARTITIONED V2 table under
 //! `<dir>/table` with THREE REAL parquet data files (ids 10/20, 30/40, 50/60) each committed in a

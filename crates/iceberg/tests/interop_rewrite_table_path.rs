@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! REWRITE-TABLE-PATH interop (GAP_MATRIX row 137) — proving the Rust
+//! REWRITE-TABLE-PATH interop (GAP_MATRIX row R139) — proving the Rust
 //! [`RewriteTablePath`](iceberg::maintenance::RewriteTablePath) action agrees with Java 1.10.0's
 //! engine-agnostic iceberg-CORE `RewriteTablePathUtil` (`replacePaths` / `rewriteManifestList` /
 //! `rewriteDataManifest` / `rewriteDeleteManifest` / `rewritePositionDeleteFile`) on a fixture table

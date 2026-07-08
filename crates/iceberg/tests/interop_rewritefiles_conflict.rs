@@ -19,7 +19,7 @@
 //! (`validate_no_new_deletes_for_data_files`, run automatically in `validate()`, gated by the preserved
 //! `data_sequence_number`) proven against Java `BaseRewriteFiles.validate` on the conflict DECISION
 //! (ACCEPT vs REJECT) over a concurrent-commit history. `RewriteFiles` is the MECHANICALLY most complex
-//! conflict unit (GAP_MATRIX row 95): the seq-preservation + position-vs-equality-delete nuance.
+//! conflict unit (GAP_MATRIX row R107): the seq-preservation + position-vs-equality-delete nuance.
 //!
 //! ## The rule (Java `BaseRewriteFiles.validate` L135-142, the shared `validateNoNewDeletesForDataFiles`)
 //!

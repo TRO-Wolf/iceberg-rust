@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! ORC DATA-FILE READ interop (GAP_MATRIX row 116, Direction 1 — "Rust reads what Java writes").
+//! ORC DATA-FILE READ interop (GAP_MATRIX row R118, Direction 1 — "Rust reads what Java writes").
 //!
 //! Java's `generate-interop-orc-data` mode (`OrcDataOracle`) writes a V2 Iceberg table whose DATA
 //! file is in the **ORC** format (`GenericAppenderFactory.newDataWriter(..., FileFormat.ORC, null)`

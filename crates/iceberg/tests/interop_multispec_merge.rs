@@ -28,7 +28,7 @@
 //! SYMMETRIC per-spec DELETE-manifest grouping (`SnapshotProducer::write_added_delete_manifests`,
 //! Java `MergingSnapshotProducer.newDeleteFilesAsManifests`) was never reached cross-language. This
 //! fixture closes that gap by adding a multi-spec DELETE commit driven by the `RowDelta` merging
-//! action (GAP_MATRIX row 94's named residue: "multi-spec delete commits").
+//! action (GAP_MATRIX row R106's named residue: "multi-spec delete commits").
 //!
 //! # The chain (both sides, identical logical constants; V2 table; NO parquet)
 //!

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java behavioral-conformance interop for `LockManager` / `InMemoryLockManager` (GAP_MATRIX row 129).
+//! Java behavioral-conformance interop for `LockManager` / `InMemoryLockManager` (GAP_MATRIX row R129).
 //!
 //! `InMemoryLockManager` is an IN-PROCESS primitive with no on-disk artifact, so "interop" here is
 //! OUTCOME-CONFORMANCE rather than a byte round-trip: both impls run the IDENTICAL deterministic

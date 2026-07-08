@@ -82,7 +82,7 @@
 //! This action compacts V2 PARQUET position-delete files only. V3 Puffin DELETION VECTORS are
 //! file-scoped (one DV per data file, never bin-packed across files) and are SKIPPED here — a DV is never
 //! "compacted" by this action. (Java's V3 DV maintenance is a separate concern.) This divergence is
-//! documented on `docs/parity/GAP_MATRIX.md` row 134.
+//! documented on `docs/parity/GAP_MATRIX.md` row R136.
 //!
 //! # No-op
 //!

@@ -657,25 +657,41 @@ impl Catalog for S3TablesCatalog {
             .version_token(version_token)
             .metadata_location(staged_metadata_location);
 
-        let _ = builder.send().await.map_err(|e| {
-            let error = e.into_service_error();
-            match error {
-                UpdateTableMetadataLocationError::ConflictException(_) => Error::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    format!("Commit conflicted for table: {table_ident}"),
+        // Sent-vs-unsent classification of the commit call (GAP_MATRIX row R157): a failure
+        // that may have occurred AFTER the request reached S3 Tables maps to
+        // `CommitStateUnknown`; a never-sent failure keeps the terminal mapping; a modeled
+        // service response classifies per `map_update_table_metadata_location_service_error`.
+        // S3 Tables runs service-side maintenance that commits concurrently with any writer,
+        // so ambiguous outcomes here are not rare — blindly retrying one duplicates rows.
+        let _ = builder
+            .send()
+            .await
+            .map_err(|e| match classify_commit_send_disposition(&e) {
+                CommitSendDisposition::MaybeSent => Error::new(
+                    ErrorKind::CommitStateUnknown,
+                    format!(
+                        "Commit outcome unknown for table {table_ident}: the update request \
+                         may have reached S3 Tables before the failure. Verify whether the \
+                         commit landed before retrying: retrying an already-applied commit \
+                         duplicates its changes."
+                    ),
                 )
-                .with_retryable(true),
-                UpdateTableMetadataLocationError::NotFoundException(_) => Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("Table {table_ident} is not found"),
-                ),
-                _ => Error::new(
+                .with_source(anyhow::Error::msg(format!("aws sdk error: {e:?}"))),
+                CommitSendDisposition::NeverSent => Error::new(
                     ErrorKind::Unexpected,
-                    "Operation failed for hitting aws sdk error",
-                ),
-            }
-            .with_source(anyhow::Error::msg(format!("aws sdk error: {error:?}")))
-        })?;
+                    format!(
+                        "Operation failed for table: {table_ident} before the update request \
+                         was sent"
+                    ),
+                )
+                .with_source(anyhow::Error::msg(format!("aws sdk error: {e:?}"))),
+                CommitSendDisposition::ResponseReceived => {
+                    map_update_table_metadata_location_service_error(
+                        e.into_service_error(),
+                        &table_ident,
+                    )
+                }
+            })?;
 
         Ok(staged_table)
     }
@@ -690,12 +706,184 @@ where T: std::fmt::Debug {
     )
 }
 
+/// Where a failed AWS SDK COMMIT call stopped, classified sent-vs-unsent (GAP_MATRIX row R157).
+/// Same doctrine as the Glue catalog's classifier (`iceberg-catalog-glue::error`): the two AWS
+/// SDK crates re-export the same smithy `SdkError` shape but share no common crate to host one
+/// copy.
+enum CommitSendDisposition {
+    /// The request provably never left the client — the failure keeps its terminal mapping.
+    NeverSent,
+    /// The request MAY have reached the service: the commit outcome is ambiguous.
+    MaybeSent,
+    /// The service definitively responded with a modeled error.
+    ResponseReceived,
+}
+
+/// Classify the transport layer of a failed SDK call on the COMMIT path
+/// (`update_table_metadata_location`).
+///
+/// Java analogue: `CommitStateUnknownException` (iceberg-api 1.10.0) is surfaced whenever a
+/// commit failure cannot be confirmed as not-applied (`BaseMetastoreTableOperations.
+/// checkCommitStatus` → `CommitStatus.UNKNOWN`); `SnapshotProducer.commit()` then neither
+/// retries nor cleans up. An `is_user()`/`is_other()` dispatch failure is client-side setup
+/// (never sent); `is_io()`/`is_timeout()` dispatch failures, operation timeouts, and
+/// unparsable responses may have reached the service (the SDK cannot distinguish
+/// connect-refused from reset-after-send, so the ambiguous side is chosen — needless
+/// reconciliation is safe, a duplicate commit is not).
+fn classify_commit_send_disposition<E, R>(
+    error: &aws_sdk_s3tables::error::SdkError<E, R>,
+) -> CommitSendDisposition {
+    use aws_sdk_s3tables::error::SdkError;
+    match error {
+        SdkError::ConstructionFailure(_) => CommitSendDisposition::NeverSent,
+        SdkError::DispatchFailure(dispatch) if dispatch.is_user() || dispatch.is_other() => {
+            CommitSendDisposition::NeverSent
+        }
+        SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,
+        _ => CommitSendDisposition::MaybeSent,
+    }
+}
+
+/// Map a modeled S3 Tables `UpdateTableMetadataLocationError` (the service RESPONDED) on the
+/// commit path. `ConflictException` is the version-token CAS conflict → retryable
+/// `CatalogCommitConflicts` (Java's `CommitFailedException` class); `InternalServerErrorException`
+/// is the 5xx class → the update may have been applied before the failure →
+/// `CommitStateUnknown` (Java `ErrorHandlers$CommitErrorHandler` maps 500 →
+/// `CommitStateUnknownException`); definite rejections keep their terminal mappings.
+fn map_update_table_metadata_location_service_error(
+    error: UpdateTableMetadataLocationError,
+    table_ident: &TableIdent,
+) -> Error {
+    match error {
+        UpdateTableMetadataLocationError::ConflictException(_) => Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            format!("Commit conflicted for table: {table_ident}"),
+        )
+        .with_retryable(true),
+        UpdateTableMetadataLocationError::NotFoundException(_) => Error::new(
+            ErrorKind::TableNotFound,
+            format!("Table {table_ident} is not found"),
+        ),
+        UpdateTableMetadataLocationError::InternalServerErrorException(_) => Error::new(
+            ErrorKind::CommitStateUnknown,
+            format!(
+                "Commit outcome unknown for table {table_ident}: S3 Tables failed while \
+                 processing the update — it may have been applied. Verify before retrying: \
+                 retrying an already-applied commit duplicates its changes."
+            ),
+        ),
+        _ => Error::new(
+            ErrorKind::Unexpected,
+            "Operation failed for hitting aws sdk error",
+        ),
+    }
+    .with_source(anyhow::Error::msg(format!("aws sdk error: {error:?}")))
+}
+
 #[cfg(test)]
 mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
     use super::*;
+
+    fn test_table_ident() -> TableIdent {
+        TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")
+    }
+
+    /// Risk (GAP_MATRIX row R157): the version-token CAS conflict (`ConflictException`) —
+    /// ROUTINE on S3 Tables, whose service-side maintenance commits concurrently with every
+    /// writer — is reclassified unknown-outcome, so the retry loop stops absorbing plain
+    /// concurrency and every maintenance race surfaces to the caller. Pins that the conflict
+    /// stays `CatalogCommitConflicts` + retryable.
+    #[test]
+    fn test_conflict_exception_stays_retryable_conflict() {
+        let error = map_update_table_metadata_location_service_error(
+            UpdateTableMetadataLocationError::ConflictException(
+                aws_sdk_s3tables::types::error::ConflictException::builder().build(),
+            ),
+            &test_table_ident(),
+        );
+        assert_eq!(error.kind(), iceberg::ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable(), "a CAS conflict is safely retryable");
+    }
+
+    /// Risk (GAP_MATRIX row R157): S3 Tables' 5xx (`InternalServerErrorException`) keeps the
+    /// terminal `Unexpected` mapping — the caller cannot tell may-have-landed from
+    /// safe-to-rerun (Java maps 500 → `CommitStateUnknownException`,
+    /// `ErrorHandlers$CommitErrorHandler`). Pins the unknown-outcome mapping, non-retryable,
+    /// and that a definite rejection (`NotFoundException`) stays terminal (the over-broadening
+    /// direction).
+    #[test]
+    fn test_internal_server_error_maps_to_unknown_outcome_but_not_found_stays_terminal() {
+        let unknown = map_update_table_metadata_location_service_error(
+            UpdateTableMetadataLocationError::InternalServerErrorException(
+                aws_sdk_s3tables::types::error::InternalServerErrorException::builder().build(),
+            ),
+            &test_table_ident(),
+        );
+        assert_eq!(unknown.kind(), iceberg::ErrorKind::CommitStateUnknown);
+        assert!(
+            !unknown.retryable(),
+            "an unknown-outcome commit error must not advertise retryability"
+        );
+
+        let not_found = map_update_table_metadata_location_service_error(
+            UpdateTableMetadataLocationError::NotFoundException(
+                aws_sdk_s3tables::types::error::NotFoundException::builder().build(),
+            ),
+            &test_table_ident(),
+        );
+        assert_eq!(not_found.kind(), iceberg::ErrorKind::TableNotFound);
+    }
+
+    /// Risk (GAP_MATRIX row R157): the transport split misroutes — a post-send ambiguous
+    /// failure (operation timeout, io dispatch failure, unparsable response) classifies
+    /// NeverSent (an outer re-run duplicates an applied commit), or a provably-unsent /
+    /// definitively-answered failure classifies MaybeSent (needless reconciliation). Pins both
+    /// sides of the S3 Tables classifier.
+    #[test]
+    fn test_commit_send_disposition_split() {
+        use aws_sdk_s3tables::error::ConnectorError;
+        type TestSdkError = aws_sdk_s3tables::error::SdkError<(), ()>;
+        fn boxed(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
+            msg.to_string().into()
+        }
+
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::timeout_error(boxed("timed out"))),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(ConnectorError::io(
+                boxed("reset mid-exchange")
+            ))),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::response_error(
+                boxed("unparsable response"),
+                ()
+            )),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::construction_failure(boxed(
+                "invalid request"
+            ))),
+            CommitSendDisposition::NeverSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
+                ConnectorError::user(boxed("client-side setup failure"))
+            )),
+            CommitSendDisposition::NeverSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), ())),
+            CommitSendDisposition::ResponseReceived
+        ));
+    }
 
     async fn load_s3tables_catalog_from_env() -> Result<Option<S3TablesCatalog>> {
         let table_bucket_arn = match std::env::var("TABLE_BUCKET_ARN").ok() {

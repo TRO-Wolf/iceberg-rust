@@ -61,7 +61,7 @@
 
 // This is parity scaffolding: the aggregate tree + evaluator are built and
 // unit-tested ahead of the scan-side push-down wiring that will consume them
-// (GAP_MATRIX row 148, 🟡). Until that wiring lands the public-to-crate surface
+// (GAP_MATRIX row R150, 🟡). Until that wiring lands the public-to-crate surface
 // has no in-crate caller, so the production graph reports dead code. The same
 // pattern is used by `strict_metrics_evaluator.rs`.
 #![allow(dead_code)]

@@ -324,7 +324,7 @@ impl ArrowReader {
     ///   MATERIALIZED via the [`crate::arrow::orc_reader`] core (Java `GenericOrcReader`), then
     ///   schema-evolved + delete-filtered post-hoc exactly as the Avro path is (ORC has footer
     ///   structure but this reader materializes whole-file; deletes are applied post-decode — GAP
-    ///   row 116, READ-only).
+    ///   row R118, READ-only).
     /// * [`Puffin`](DataFileFormat::Puffin) → a clean `FeatureUnsupported` error: a Puffin file is a
     ///   stats/deletion-vector sidecar, never a scannable DATA file, so it must never reach here.
     async fn process_file_scan_task(
