@@ -88,9 +88,14 @@ Critic before push. Status flips live ONLY in the GAP_MATRIX (row R157).
       `Transaction::commit` stack, POST `expect(1)`) +
       `test_update_view_200_unparsable_body_maps_to_commit_state_unknown` — both
       mutation-proven RED on OK-arm kind → `Unexpected`, green restored (REST lib 64→66).
-- [ ] **6. Gate + independent Critic → push** — house chain (typos && fmt && clippy && tests in
-      ONE chain with the commit), independent OO Critic, push on CONVERGED (merge stays the
-      user's).
+- [x] **6. Gate + independent Critic → push** — DONE 2026-07-08: gate green in ONE chain with
+      commit 4bffcc82 (typos·fmt·clippy -D warnings·lib tests 2706/66/74/23/26·both integrity
+      gates); independent SEPMO Critic (fresh context, Opus) **CONVERGED** — bytecode-verified
+      the Java contract (`onlyRetryOn(CommitFailedException.class)`; unknown rethrown ahead of
+      cleanup; 409→CommitFailed, 500/502/503/504→unknown), 6/6 mutations RED, ALL rider
+      citations content-verified, zero blocking findings (2 LOWs accepted: REST-test bare
+      unwraps house-consistent; 200-unparsable-body arm is a disclosed safer-than-Java
+      extension). Pushed; merge is the user's.
 
 ## ACTIVE (2026-07-01): Engine-first closeout — re-ranked open queue
 
