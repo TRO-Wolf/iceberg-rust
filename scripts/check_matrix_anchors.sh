@@ -88,14 +88,22 @@ if [ -n "$dups" ]; then
 fi
 
 # --- 4. every 'row R<n>' citation in the live docs resolves ------------------
-# Live doc set: the plan, the conventions, the live task file, and docs/
-# (minus the dated archives). The span regex requires a non-alphanumeric char
-# (or line start) before 'row' so prose like 'sparrow R6' cannot false-match,
-# and follows list/range continuations ('R122/R123', 'R122, R123',
-# 'R122-R124', 'R122 and R123') so a dead TRAILING anchor cannot hide.
+# Live doc set: the plan, the conventions, the live task file, docs/ (minus
+# the dated archives), and crates/ (source/test comments cite matrix rows too
+# — ~26 of them were migrated from stale bare line numbers on 2026-07-08).
+# The span regex requires a non-alphanumeric char (or line start) before
+# 'row' so prose like 'sparrow R6' cannot false-match, and follows
+# list/range continuations ('R122/R123', 'R122, R123', 'R122-R124',
+# 'R122 and R123') so a dead TRAILING anchor cannot hide. The anchor 'R' is
+# matched CASE-SENSITIVELY ('row R122' / 'Rows R122', never 'rows r1'):
+# widening the scan to crates/ surfaced test prose naming fixture rows
+# 'rows r1 (id=1...)' — a false positive under the old case-insensitive
+# grep. The citation convention is an uppercase 'R<id>'; a lowercase
+# 'row r122' is NOT a citation and is deliberately not validated.
 # A renamed/deleted scan target would silently drop out of a bare git-grep
-# pathspec (exit 1, indistinguishable from no-match), so assert each first.
-for f in Roadmap.md CLAUDE.md task/todo.md docs; do
+# pathspec (exit 1, indistinguishable from no-match), so assert each first —
+# this existence list and the git-grep pathspec below MUST stay in lockstep.
+for f in Roadmap.md CLAUDE.md task/todo.md docs crates; do
   if [ ! -e "$f" ]; then
     echo "ERROR: live-doc scan target '$f' does not exist — update this script's scan set" >&2
     exit 1
@@ -106,8 +114,9 @@ CONT='(, ?| ?/ ?| and | ?- ?| ?– ?)'
 # a hard error, NOT "zero citations" (the false-green class the artifact
 # gate's v3 hardening closed; same doctrine here).
 rc=0
-git grep -hoiE "(^|[^[:alnum:]])[Rr]ows? R[0-9]+(${CONT}R[0-9]+)*" -- \
-  'Roadmap.md' 'CLAUDE.md' 'task/todo.md' 'docs' ':(exclude)docs/parity/archive' \
+git grep -hoE "(^|[^[:alnum:]])[Rr]ows? R[0-9]+(${CONT}R[0-9]+)*" -- \
+  'Roadmap.md' 'CLAUDE.md' 'task/todo.md' 'docs' 'crates' \
+  ':(exclude)docs/parity/archive' \
   >"$cites_raw" 2>"$err_file" || rc=$?
 if [ "$rc" -ge 2 ]; then
   echo "ERROR: git grep failed (exit $rc) while scanning citations — cannot certify:" >&2

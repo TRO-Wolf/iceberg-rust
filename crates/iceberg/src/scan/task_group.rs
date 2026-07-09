@@ -30,7 +30,7 @@ use super::task::FileScanTask;
 ///
 /// The Java interface exposes `tasks()`, `sizeBytes()` (the combined weight), and `filesCount()`.
 /// The combined [`CombinedScanTask`] implements it over [`FileScanTask`]; the trait is kept so the
-/// future typed `BatchScan` surface (GAP_MATRIX row 122) and any other group realization can share
+/// future typed `BatchScan` surface (GAP_MATRIX row R124) and any other group realization can share
 /// one shape.
 pub trait ScanTaskGroup<T> {
     /// The tasks that make up this group, in packing order.

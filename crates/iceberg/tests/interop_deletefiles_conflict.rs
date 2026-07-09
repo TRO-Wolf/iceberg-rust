@@ -19,7 +19,7 @@
 //! `validate_files_exist`, proven against Java `StreamingDelete.validateFilesExist` →
 //! `MergingSnapshotProducer` / `ManifestFilterManager.failMissingDeletePaths` on the conflict DECISION
 //! (ACCEPT vs REJECT) over a concurrent-removal history. `DeleteFiles` is the SIMPLEST write-action
-//! conflict unit (GAP_MATRIX row 93): one axis, no conflict filter. This is the SAME concurrent-removal
+//! conflict unit (GAP_MATRIX row R105): one axis, no conflict filter. This is the SAME concurrent-removal
 //! shape as C3's files-exist axis (axis 3 of `interop_rowdelta_conflict.rs`), just driven through
 //! `DeleteFiles` instead of `RowDelta`.
 //!

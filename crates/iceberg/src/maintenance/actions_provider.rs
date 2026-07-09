@@ -68,7 +68,7 @@
 //! [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error naming the gap (the
 //! Rust analog of Java's `UnsupportedOperationException`). The concrete [`Actions`] factory overrides
 //! exactly the ten methods Rust can actually run, and leaves the rest at the unsupported default. The
-//! gap is tracked in `docs/parity/GAP_MATRIX.md` row 151.
+//! gap is tracked in `docs/parity/GAP_MATRIX.md` row R153.
 
 use crate::Result;
 use crate::error::Error;
@@ -211,7 +211,7 @@ fn unsupported(method: &str, java_action: &str) -> Error {
         crate::ErrorKind::FeatureUnsupported,
         format!(
             "ActionsProvider::{method} is not supported: this crate has no {java_action} action \
-             (see docs/parity/GAP_MATRIX.md row 151)"
+             (see docs/parity/GAP_MATRIX.md row R153)"
         ),
     )
 }

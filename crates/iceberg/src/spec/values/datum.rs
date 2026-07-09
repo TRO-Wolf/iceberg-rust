@@ -1146,7 +1146,7 @@ impl Datum {
                     // ===== Additive numeric / temporal / identity promotions =====
                     // 1:1 port of the Java `Literals.*Literal.to(Type)` accept-set
                     // (`api/.../expressions/Literals.java`). Deferred as NAMED residue (GAP_MATRIX
-                    // row 154): every value-level `→ decimal` conversion (rust_decimal's 96-bit /
+                    // row R154): every value-level `→ decimal` conversion (rust_decimal's 96-bit /
                     // scale-28 bound vs Java `BigDecimal`'s unbounded `setScale(_, HALF_UP)`),
                     // `timestamp[tz] → date` and `long → time` (Java does not range-check; Rust's
                     // constructors do), all `timestamp_nano` arms (kept parked per the upstream

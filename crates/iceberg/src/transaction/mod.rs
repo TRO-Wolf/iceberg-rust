@@ -391,7 +391,16 @@ impl Transaction {
         .retry(backoff)
         .sleep(tokio::time::sleep)
         .context(tx)
-        .when(|e| e.retryable())
+        // An UNKNOWN-outcome commit failure is NEVER retried, even if a catalog erroneously
+        // flags it retryable: retrying re-applies the actions on a refreshed base that may
+        // already CONTAIN the first attempt's snapshot — the same `DataFile`s appended twice,
+        // i.e. duplicate rows. The kind check (not the flag) decides, mirroring Java
+        // `SnapshotProducer.commit()` (iceberg-core 1.10.0 bytecode:
+        // `onlyRetryOn(CommitFailedException.class)` — class membership, not a flag — with
+        // `catch (CommitStateUnknownException) { throw }` ahead of the cleanup catch). No
+        // cleanup runs on this branch either: the commit path deletes nothing on failure, and
+        // Java's unknown branch explicitly SKIPS the `cleanAll` that plain failures trigger.
+        .when(|e| e.retryable() && e.kind() != crate::ErrorKind::CommitStateUnknown)
         .await
         .1
     }
@@ -799,6 +808,184 @@ mod tests {
             assert_eq!(err.message(), "Non-retryable error");
             assert!(!err.retryable(), "Error should not be retryable");
         }
+    }
+
+    /// CROWN JEWEL (GAP_MATRIX row R157). Risk: an UNKNOWN-outcome commit failure (the update
+    /// request durably LANDED but the response was lost) is auto-retried — `do_commit` then
+    /// re-applies the same action on a refreshed base that already CONTAINS attempt #1's
+    /// snapshot, appending the same `DataFile` twice (duplicate rows). Java contract:
+    /// `SnapshotProducer.commit()` retries ONLY `CommitFailedException`
+    /// (`onlyRetryOn(CommitFailedException.class)`) and rethrows `CommitStateUnknownException`
+    /// ahead of the cleanup catch — no retry, no cleanup, surfaced.
+    ///
+    /// Pins, on the OBSERVABLE post-commit state of a real in-memory catalog:
+    /// 1. the unknown-outcome error surfaces intact (kind + non-retryable) — no retry:
+    ///    exactly ONE `update_table` call;
+    /// 2. the table is NOT double-committed: exactly one new snapshot, and the appended file
+    ///    appears exactly ONCE in the live manifest set;
+    /// 3. NO cleanup ran on the unknown branch: the attempt's manifest list + manifest files
+    ///    are still readable (Java skips `cleanAll` for `CommitStateUnknownException`; this
+    ///    fork's commit path must not INTRODUCE deletion on this branch).
+    #[tokio::test]
+    async fn test_unknown_outcome_commit_not_retried_no_cleanup_no_double_commit() {
+        use crate::memory::tests::new_memory_catalog;
+        use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+
+        let memory_catalog = Arc::new(new_memory_catalog().await);
+        let table =
+            crate::transaction::tests::make_v2_minimal_table_in_catalog(memory_catalog.as_ref())
+                .await;
+
+        // Enable fast retries so a MUTATED gate (unknown treated as retryable) genuinely loops
+        // and turns assertions 1 and 2 red.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("commit.retry.num-retries".to_string(), "3".to_string())
+            .set("commit.retry.min-wait-ms".to_string(), "1".to_string())
+            .set("commit.retry.max-wait-ms".to_string(), "5".to_string())
+            .apply(tx)
+            .expect("apply retry properties");
+        let table = tx
+            .commit(memory_catalog.as_ref())
+            .await
+            .expect("commit retry properties");
+        let base_snapshot_count = table.metadata().snapshots().len();
+
+        // A mock catalog that DELEGATES to the real memory catalog: `update_table` durably
+        // applies the commit, then reports the outcome as UNKNOWN (the "response lost after the
+        // request landed" shape). `load_table` delegates so a (mutated-in) retry would refresh
+        // onto the already-committed base.
+        let mut mock_catalog = MockCatalog::new();
+        let load_delegate = Arc::clone(&memory_catalog);
+        mock_catalog.expect_load_table().returning_st(move |ident| {
+            let catalog = Arc::clone(&load_delegate);
+            let ident = ident.clone();
+            Box::pin(async move { catalog.load_table(&ident).await })
+        });
+        let update_calls = Arc::new(AtomicU32::new(0));
+        let update_calls_in_mock = Arc::clone(&update_calls);
+        let update_delegate = Arc::clone(&memory_catalog);
+        mock_catalog
+            .expect_update_table()
+            .returning_st(move |commit| {
+                let catalog = Arc::clone(&update_delegate);
+                let calls = Arc::clone(&update_calls_in_mock);
+                Box::pin(async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    // The update DURABLY LANDS in the catalog...
+                    let committed = catalog.update_table(commit).await?;
+                    if attempt == 1 {
+                        // ...but the response never reaches the client.
+                        Err(Error::new(
+                            ErrorKind::CommitStateUnknown,
+                            "connection reset after the update request was sent; the commit \
+                             state is unknown",
+                        ))
+                    } else {
+                        Ok(committed)
+                    }
+                })
+            });
+
+        let appended_file_path = "test/unknown-outcome-42.parquet".to_string();
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(appended_file_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(42)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![data_file]);
+        let tx = action.apply(tx).expect("apply fast append");
+        let error = tx
+            .commit(&mock_catalog)
+            .await
+            .expect_err("an unknown-outcome commit must surface, not be retried into success");
+
+        // 1. Surfaced intact, exactly one attempt.
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert!(
+            !error.retryable(),
+            "an unknown-outcome commit error must not advertise retryability"
+        );
+        assert_eq!(
+            update_calls.load(Ordering::SeqCst),
+            1,
+            "the unknown-outcome failure must NOT be retried (a retry would double-commit)"
+        );
+
+        // 2. + 3. The observable catalog state: the attempt landed exactly once, and its files
+        // were NOT cleaned up (the manifest list and manifest still load).
+        let committed_table = memory_catalog
+            .load_table(table.identifier())
+            .await
+            .expect("load committed table");
+        assert_eq!(
+            committed_table.metadata().snapshots().len(),
+            base_snapshot_count + 1,
+            "exactly ONE new snapshot: the durably-landed attempt, committed once"
+        );
+        let manifest_list = committed_table
+            .metadata()
+            .current_snapshot()
+            .expect("the durably-landed snapshot is current")
+            .load_manifest_list(committed_table.file_io(), committed_table.metadata())
+            .await
+            .expect("no cleanup may run on the unknown branch: the manifest list must survive");
+        assert_eq!(manifest_list.entries().len(), 1);
+        let manifest = manifest_list.entries()[0]
+            .load_manifest(committed_table.file_io())
+            .await
+            .expect("no cleanup may run on the unknown branch: the manifest must survive");
+        let appended_entry_count = manifest
+            .entries()
+            .iter()
+            .filter(|entry| entry.data_file().file_path() == appended_file_path)
+            .count();
+        assert_eq!(
+            appended_entry_count, 1,
+            "the appended file must appear exactly ONCE (twice = the duplicate-rows corruption)"
+        );
+    }
+
+    /// Risk (GAP_MATRIX row R157, defense-in-depth): the retry gate trusts the `retryable` FLAG
+    /// alone, so an unknown-outcome error a catalog erroneously marked retryable gets re-applied
+    /// (the duplicate-commit footgun). Java decides by CLASS (`onlyRetryOn(CommitFailedException
+    /// .class)`), never by a flag — the Rust gate must likewise refuse to retry on the KIND, even
+    /// when the flag says retryable. `.times(1)` makes a second attempt fail the test.
+    #[tokio::test]
+    async fn test_unknown_outcome_not_retried_even_if_flagged_retryable() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table);
+
+        let mut mock_catalog = MockCatalog::new();
+        mock_catalog
+            .expect_load_table()
+            .returning_st(|_| Box::pin(async move { Ok(make_v2_table()) }));
+        mock_catalog
+            .expect_update_table()
+            .times(1) // a retry (second call) fails the expectation
+            .returning_st(|_| {
+                Box::pin(async move {
+                    Err(Error::new(
+                        ErrorKind::CommitStateUnknown,
+                        "ambiguous outcome erroneously flagged retryable",
+                    )
+                    .with_retryable(true))
+                })
+            });
+
+        let error = tx
+            .commit(&mock_catalog)
+            .await
+            .expect_err("the unknown-outcome error must surface");
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
     }
 
     #[tokio::test]

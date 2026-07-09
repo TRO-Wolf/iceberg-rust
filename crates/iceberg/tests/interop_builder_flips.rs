@@ -17,7 +17,7 @@
 
 //! BUILDER-FLIPS write-action interop (Wave 3) — the two "builder flip" capabilities of `DeleteFiles`
 //! proven bidirectionally against Java `StreamingDelete` (1.10.0): `deleteFromRowFilter(Expression)`
-//! (GAP_MATRIX row 135) and `caseSensitive(boolean)` (row 134). Both ride the SAME builder vehicle —
+//! (GAP_MATRIX row R146) and `caseSensitive(boolean)` (row R146 — same row). Both ride the SAME builder vehicle —
 //! Java `DeleteFiles.deleteFromRowFilter(...).caseSensitive(...)` → `StreamingDelete` →
 //! `MergingSnapshotProducer.deleteByRowFilter` / `ManifestFilterManager.{caseSensitive,
 //! PartitionAndMetricsEvaluator}`, mirrored by Rust `DeleteFiles::delete_from_row_filter` /
@@ -58,7 +58,7 @@
 //! | `case_insensitive_match`  | `category == "a"`   | FALSE          | survivors = {b} (binds case-insensitively) |
 //! | `case_sensitive_reject`   | `category == "a"`   | true (default) | ERROR — wrong-case bind fails  |
 //!
-//! - `filter_delete_partition` is row 135's headline: DELETE the strictly-covered partition (residual
+//! - `filter_delete_partition` is row R146's conflict-filter headline: DELETE the strictly-covered partition (residual
 //!   `alwaysTrue` for cat=a), KEEP the disjoint partition (residual `alwaysFalse` for cat=b).
 //! - `filter_keep_complement` is the SYMMETRIC partition-residual proof: `Category == "b"` DELETES cat=b
 //!   (residual `alwaysTrue`), KEEPS cat=a (residual `alwaysFalse`). survivors = {a} — the complement of
@@ -67,9 +67,9 @@
 //! - `filter_partial_error` proves the PARTIAL→error path (Java's "some, but not all, rows match"). The
 //!   `y >= 55` filter against the straddling cat=b helper (y[40,60]: 40 < 55 ≤ 60) is some-but-not-all ⇒
 //!   non-retryable error; the helper is appended for THIS scenario only.
-//! - `case_insensitive_match` is row 134's load-bearing FALSE direction: a wrong-cased `category`
+//! - `case_insensitive_match` is row R146's case-sensitivity load-bearing FALSE direction: a wrong-cased `category`
 //!   binds to the schema's `Category` under `case_sensitive(false)` and deletes cat=a.
-//! - `case_sensitive_reject` is row 134's boundary: the SAME wrong-cased `category` under the DEFAULT
+//! - `case_sensitive_reject` is row R146's case-sensitivity boundary: the SAME wrong-cased `category` under the DEFAULT
 //!   (`case_sensitive(true)`) fails to bind ⇒ ERROR, nothing deleted.
 //!
 //! ## Named divergence NOT in the scenario set (live-oracle finding, 2026-06-16)
@@ -79,7 +79,7 @@
 //! `test_delete_from_row_filter_matching_nothing_is_rejected_and_deletes_nothing`), whereas Java's
 //! `StreamingDelete.deleteFromRowFilter` COMMITS a successful no-op Delete snapshot (nothing deleted).
 //! This was surfaced by the live D2 verify and is deliberately KEPT OUT of the bidirectional scenario
-//! set (it is an empty-commit edge case orthogonal to rows 134/135). The KEEP semantics are proven by
+//! set (it is an empty-commit edge case orthogonal to row R146). The KEEP semantics are proven by
 //! `filter_keep_complement` / `filter_delete_partition` (non-empty commits both engines agree on).
 //!
 //! ## DELETE/KEEP correctness signal (engine-independent)
@@ -154,7 +154,7 @@ enum Expected {
 #[derive(Debug, Clone)]
 struct Scenario {
     name: &'static str,
-    /// The column the equality row-filter references (mixed-case discriminator for row 134).
+    /// The column the equality row-filter references (mixed-case discriminator for row R146's case-sensitivity surface).
     filter_column: &'static str,
     /// The string literal the equality row-filter tests `filter_column == filter_value`. `None` ⇒ the
     /// `y >= 55` partial-probe filter is used instead (the partial-match scenario).
@@ -171,7 +171,7 @@ struct Scenario {
 /// filters, flags, expected outcomes).
 fn scenarios() -> Vec<Scenario> {
     vec![
-        // Row 135 headline: `Category == "a"` strictly covers cat=a (residual alwaysTrue) ⇒ DELETE;
+        // Row R146 conflict-filter headline: `Category == "a"` strictly covers cat=a (residual alwaysTrue) ⇒ DELETE;
         // cat=b residual is alwaysFalse ⇒ KEEP. Survivor = {b}.
         Scenario {
             name: "filter_delete_partition",
@@ -202,7 +202,7 @@ fn scenarios() -> Vec<Scenario> {
             with_partial_file: true,
             expected: Expected::Error,
         },
-        // Row 134 FALSE direction: wrong-cased `category` (schema column is `Category`) binds
+        // Row R146 case-sensitivity FALSE direction: wrong-cased `category` (schema column is `Category`) binds
         // case-insensitively under `case_sensitive(false)` ⇒ deletes cat=a. Survivor = {b}.
         Scenario {
             name: "case_insensitive_match",
@@ -212,7 +212,7 @@ fn scenarios() -> Vec<Scenario> {
             with_partial_file: false,
             expected: Expected::Survivors(&["b"]),
         },
-        // Row 134 boundary: the SAME wrong-cased `category` under the DEFAULT (`case_sensitive(true)`)
+        // Row R146 case-sensitivity boundary: the SAME wrong-cased `category` under the DEFAULT (`case_sensitive(true)`)
         // fails to bind ⇒ ERROR, nothing deleted.
         Scenario {
             name: "case_sensitive_reject",
@@ -246,7 +246,7 @@ fn validate_dir() -> Option<PathBuf> {
 // ===========================================================================================
 
 /// The fixture schema `{1 id long, 2 Category string, 3 y long}` — `Category` is MIXED-CASE on purpose
-/// (the case-sensitivity discriminator for row 134).
+/// (the case-sensitivity discriminator for row R146's case-sensitivity surface).
 fn flips_schema() -> Schema {
     Schema::builder()
         .with_schema_id(0)

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bidirectional Java interop for `RewriteFiles` DELETE-file ADD surface (GAP_MATRIX row 152).
+//! Bidirectional Java interop for `RewriteFiles` DELETE-file ADD surface (GAP_MATRIX row R152).
 //!
 //! Proves the two Java seq overloads for added delete files in a `RewriteFiles` commit:
 //!

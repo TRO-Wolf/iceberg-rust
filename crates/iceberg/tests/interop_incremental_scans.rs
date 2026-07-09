@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java interop test for the INCREMENTAL SCANS (rows 120/121) — the sole deferral on those rows.
+//! Java interop test for the INCREMENTAL SCANS (rows R122/R123) — the sole deferral on those rows.
 //!
 //! Two incremental read primitives over a snapshot RANGE `(from exclusive | inclusive, to inclusive]`:
 //!
@@ -62,7 +62,7 @@
 //! `dev/java-interop/run-interop-incremental-scans.sh` driver sets the vars and runs the REAL comparison
 //! (reset → Java gen → Rust gen → D2 → D1 → sabotage).
 //!
-//! RESIDUE (row 121, NAMED, not over-claimed). The changelog is DATA-FILE-level (whole-file added/deleted),
+//! RESIDUE (row R123, NAMED, not over-claimed). The changelog is DATA-FILE-level (whole-file added/deleted),
 //! matching Java's CURRENT `IncrementalDataTableScan` data-file changelog. It is NOT row-level CDC:
 //! `ChangelogOperation::{UpdateBefore, UpdateAfter}` net-row changes are NOT computed, and `BatchScan` is
 //! unimplemented. A range whose snapshots carry row-level DELETE manifests is rejected (`FeatureUnsupported`),

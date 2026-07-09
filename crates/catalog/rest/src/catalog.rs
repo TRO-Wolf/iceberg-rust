@@ -1121,10 +1121,27 @@ impl Catalog for RestCatalog {
             })
             .build()?;
 
-        let http_response = context.client.query_catalog(request).await?;
+        // Commit requests classify transport failures sent-vs-unsent: a post-send failure maps
+        // to `ErrorKind::CommitStateUnknown` (GAP_MATRIX row R157). See
+        // `HttpClient::query_catalog_for_commit`.
+        let http_response = context.client.query_catalog_for_commit(request).await?;
 
         let response: CommitTableResponse = match http_response.status() {
-            StatusCode::OK => deserialize_catalog_response(http_response).await?,
+            // A 200 means the commit LANDED; if its response body is then lost mid-read or
+            // unparsable, the caller still must not blindly re-run the commit — surface the
+            // unknown-outcome class (the commit is in fact durable server-side).
+            StatusCode::OK => {
+                deserialize_catalog_response(http_response)
+                    .await
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::CommitStateUnknown,
+                            "The commit request returned HTTP 200 but its response could not be \
+                         read; the commit almost certainly landed — verify before retrying.",
+                        )
+                        .with_source(error)
+                    })?
+            }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
                     ErrorKind::TableNotFound,
@@ -1138,21 +1155,30 @@ impl Catalog for RestCatalog {
                 )
                 .with_retryable(true));
             }
+            // Java `ErrorHandlers$CommitErrorHandler` (1.10.0, ErrorHandlers.java L88-104) maps
+            // 500/502/503/504 → `CommitStateUnknownException`: the service may have applied the
+            // update before failing. Never retryable — retrying a landed commit duplicates it.
             StatusCode::INTERNAL_SERVER_ERROR => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::CommitStateUnknown,
                     "An unknown server-side problem occurred; the commit state is unknown.",
                 ));
             }
             StatusCode::BAD_GATEWAY => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::CommitStateUnknown,
                     "A gateway or proxy received an invalid response from the upstream server; the commit state is unknown.",
+                ));
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                return Err(Error::new(
+                    ErrorKind::CommitStateUnknown,
+                    "The server is currently unavailable; the commit state is unknown.",
                 ));
             }
             StatusCode::GATEWAY_TIMEOUT => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::CommitStateUnknown,
                     "A server-side gateway timeout occurred; the commit state is unknown.",
                 ));
             }
@@ -1412,10 +1438,25 @@ impl Catalog for RestCatalog {
             })
             .build()?;
 
-        let http_response = context.client.query_catalog(request).await?;
+        // Commit requests classify transport failures sent-vs-unsent — mirror the table-side
+        // `update_table` posture exactly (GAP_MATRIX row R157).
+        let http_response = context.client.query_catalog_for_commit(request).await?;
 
         let response: LoadViewResult = match http_response.status() {
-            StatusCode::OK => deserialize_catalog_response(http_response).await?,
+            // 200 = the view commit LANDED; a lost/unparsable response body must still not
+            // send the caller into a blind re-run — surface the unknown-outcome class.
+            StatusCode::OK => {
+                deserialize_catalog_response(http_response)
+                    .await
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::CommitStateUnknown,
+                            "The view commit request returned HTTP 200 but its response could not \
+                         be read; the commit almost certainly landed — verify before retrying.",
+                        )
+                        .with_source(error)
+                    })?
+            }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
                     ErrorKind::ViewNotFound,
@@ -1429,31 +1470,32 @@ impl Catalog for RestCatalog {
                 )
                 .with_retryable(true));
             }
-            // Java `ErrorHandlers$ViewCommitErrorHandler` maps 500/502/503/504 to
-            // `CommitStateUnknownException` (the commit may or may not have landed) — distinct from
-            // a generic transport error. Mirror the table-side `update_table` posture exactly so a
-            // view commit reports the same "commit state is unknown" semantics as a table commit.
+            // Java `ErrorHandlers$ViewCommitErrorHandler` (1.10.0, ErrorHandlers.java L128-148)
+            // maps 500/502/503/504 to `CommitStateUnknownException` (the commit may or may not
+            // have landed) — distinct from a generic transport error. Mirror the table-side
+            // `update_table` posture exactly so a view commit reports the same
+            // "commit state is unknown" semantics as a table commit.
             StatusCode::INTERNAL_SERVER_ERROR => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::CommitStateUnknown,
                     "An unknown server-side problem occurred; the commit state is unknown.",
                 ));
             }
             StatusCode::BAD_GATEWAY => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::CommitStateUnknown,
                     "A gateway or proxy received an invalid response from the upstream server; the commit state is unknown.",
                 ));
             }
             StatusCode::SERVICE_UNAVAILABLE => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::CommitStateUnknown,
                     "The server is currently unavailable; the commit state is unknown.",
                 ));
             }
             StatusCode::GATEWAY_TIMEOUT => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::CommitStateUnknown,
                     "A server-side gateway timeout occurred; the commit state is unknown.",
                 ));
             }
@@ -3314,6 +3356,172 @@ mod tests {
         load_table_mock.assert_async().await
     }
 
+    // RISK (GAP_MATRIX row R157): a 5xx on the commit POST means the REST service may have
+    // applied the update before failing (Java `ErrorHandlers$CommitErrorHandler` maps
+    // 500/502/503/504 → `CommitStateUnknownException`). Classifying it retryable re-applies the
+    // same DataFiles on a base that may already contain them (duplicate rows); classifying it
+    // as a generic terminal error hides may-have-landed from the caller. Pins, through the FULL
+    // `Transaction::commit` stack: the unknown-outcome kind surfaces intact, is not marked
+    // retryable, and the commit POST fires EXACTLY ONCE (`expect(1)`) — a mutation that
+    // reclassifies 502 as retryable, or lets the retry gate retry the unknown kind, hits the
+    // mock more than once and fails the assert.
+    #[tokio::test]
+    async fn test_update_table_502_unknown_outcome_surfaces_without_retry() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "load_table_response.json"
+            ))
+            .expect_at_least(1) // a (mutated-in) retry re-loads; hits are asserted on the POST
+            .create_async()
+            .await;
+
+        let update_table_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1")
+            .with_status(502)
+            .with_body(
+                r#"{"error": {"message": "bad gateway", "type": "ServiceFailureException", "code": 502}}"#,
+            )
+            .expect(1) // the unknown-outcome commit must NOT be re-sent
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let table1 = {
+            let file = File::open(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "create_table_response.json"
+            ))
+            .unwrap();
+            let reader = BufReader::new(file);
+            let resp = serde_json::from_reader::<_, LoadTableResult>(reader).unwrap();
+
+            Table::builder()
+                .metadata(resp.metadata)
+                .metadata_location(resp.metadata_location.unwrap())
+                .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+                .file_io(FileIO::new_with_fs())
+                .build()
+                .unwrap()
+        };
+
+        let tx = Transaction::new(&table1);
+        let error = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V2)
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .expect_err("a 502 commit must surface the unknown outcome, not succeed");
+
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert!(error.to_string().contains("commit state is unknown"));
+        assert!(
+            !error.retryable(),
+            "an unknown-outcome commit error must not advertise retryability"
+        );
+
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
+        update_table_mock.assert_async().await;
+    }
+
+    // RISK (GAP_MATRIX row R157): an HTTP 200 means the commit LANDED server-side; if the
+    // response body is then lost or unparsable, folding that into a generic error (Java has no
+    // analogue arm — this is the Rust-side extension of `CommitStateUnknownException`'s
+    // "may have been applied" contract, ErrorHandlers.java L88-104) invites the caller to
+    // blindly re-run a commit that is already durable, duplicating it. Pins, through the FULL
+    // `Transaction::commit` stack: a 200-with-garbage-body surfaces
+    // `ErrorKind::CommitStateUnknown` (a mutation of the `update_table` OK-arm `map_err` kind
+    // to `Unexpected` fails the kind assert), is NOT retryable, and the commit POST fires
+    // EXACTLY ONCE (`expect(1)`).
+    #[tokio::test]
+    async fn test_update_table_200_unparsable_body_maps_to_commit_state_unknown() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "load_table_response.json"
+            ))
+            .expect_at_least(1) // a (mutated-in) retry re-loads; hits are asserted on the POST
+            .create_async()
+            .await;
+
+        // 200 with a body that is NOT a valid CommitTableResponse: the commit landed, but the
+        // outcome payload is unreadable (truncated proxy body, wrong content, etc.).
+        let update_table_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(r#"certainly-not-json{{{"#)
+            .expect(1) // the commit landed — it must NOT be re-sent
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let table1 = {
+            let file = File::open(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "create_table_response.json"
+            ))
+            .unwrap();
+            let reader = BufReader::new(file);
+            let resp = serde_json::from_reader::<_, LoadTableResult>(reader).unwrap();
+
+            Table::builder()
+                .metadata(resp.metadata)
+                .metadata_location(resp.metadata_location.unwrap())
+                .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+                .file_io(FileIO::new_with_fs())
+                .build()
+                .unwrap()
+        };
+
+        let tx = Transaction::new(&table1);
+        let error = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V2)
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .expect_err("a 200 with an unreadable body must surface the unknown outcome");
+
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert!(error.to_string().contains("returned HTTP 200"));
+        assert!(
+            !error.retryable(),
+            "a landed-but-unreadable commit must not advertise retryability"
+        );
+
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
+        update_table_mock.assert_async().await;
+    }
+
     #[tokio::test]
     async fn test_update_table_404() {
         let mut server = Server::new_async().await;
@@ -3903,10 +4111,61 @@ mod tests {
             .to_commit()
             .unwrap();
         let error = catalog.update_view(commit).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
         assert!(error.to_string().contains("commit state is unknown"));
         // A state-unknown commit must NOT be auto-retried.
         assert!(!error.retryable());
+
+        config_mock.assert_async().await;
+        load_view_mock.assert_async().await;
+        commit_mock.assert_async().await;
+    }
+
+    // RISK (GAP_MATRIX row R157): a view commit returning HTTP 200 LANDED; if the LoadViewResult
+    // body is then lost/unparsable, a generic error kind invites a blind re-run of a durable
+    // commit. Pins the `update_view` OK-arm `map_err`: kind is `CommitStateUnknown` (mutating it
+    // to `Unexpected` fails the kind assert), not retryable, POST fires exactly once.
+    #[tokio::test]
+    async fn test_update_view_200_unparsable_body_maps_to_commit_state_unknown() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let load_view_mock = server
+            .mock("GET", "/v1/namespaces/ns1/views/view1")
+            .with_status(200)
+            .with_body(view_metadata_body())
+            .create_async()
+            .await;
+        // 200 with a body that is NOT a valid LoadViewResult: the commit landed, but the
+        // outcome payload is unreadable.
+        let commit_mock = server
+            .mock("POST", "/v1/namespaces/ns1/views/view1")
+            .with_status(200)
+            .with_body(r#"certainly-not-json{{{"#)
+            .expect(1) // the commit landed — it must NOT be re-sent
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let view_ident =
+            TableIdent::new(NamespaceIdent::new("ns1".to_string()), "view1".to_string());
+        let view = catalog.load_view(&view_ident).await.unwrap();
+        let commit = view
+            .update_properties()
+            .set("comment", "daily")
+            .unwrap()
+            .to_commit()
+            .unwrap();
+        let error = catalog.update_view(commit).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert!(error.to_string().contains("returned HTTP 200"));
+        assert!(
+            !error.retryable(),
+            "a landed-but-unreadable view commit must not advertise retryability"
+        );
 
         config_mock.assert_async().await;
         load_view_mock.assert_async().await;

@@ -17,7 +17,7 @@
 
 //! CONFLICT-VALIDATION write-action interop (increment C3) — `RowDelta`'s THREE conflict axes proven
 //! against Java `BaseRowDelta` on the conflict DECISION (ACCEPT vs REJECT) over a concurrent-commit
-//! history. `RowDelta` is the RICHEST write-action conflict unit (GAP_MATRIX row 94): it is the
+//! history. `RowDelta` is the RICHEST write-action conflict unit (GAP_MATRIX row R106): it is the
 //! merge-on-read commit (adds DATA + DELETE files in one snapshot) and exposes three independent
 //! conflict checks. This slice proves all three agree with Java for the same S0→S1 history.
 //!

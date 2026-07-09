@@ -74,7 +74,7 @@
 //!   ID, concat + sort, write one compacted file, and commit ONE `RewriteFiles` STAMPING the compacted
 //!   file with the group MAX rewritten data seq (via `add_delete_file_with_sequence_number`, NOT inherit)
 //!   so it masks exactly the same data generation. Puffin V3 DELETION VECTORS are SKIPPED (file-scoped,
-//!   never bin-packed) — V2 PARQUET only (documented divergence, GAP_MATRIX row 134). A STRICT SUBSET of
+//!   never bin-packed) — V2 PARQUET only (documented divergence, GAP_MATRIX row R136). A STRICT SUBSET of
 //!   `ConvertEqualityDeleteFiles` (no row matching / predicate inversion / tuple parsing). One of the
 //!   twelve `ActionsProvider` methods (`rewrite_position_deletes(Table)`). Returns a
 //!   [`RewritePositionDeleteFilesResult`] mirroring Java `Result`'s four counts (rewritten/added file

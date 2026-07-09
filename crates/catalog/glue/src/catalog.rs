@@ -853,28 +853,76 @@ impl Catalog for GlueCatalog {
         }
 
         let builder = with_catalog_id!(builder, self.config);
-        let _ = builder.send().await.map_err(|e| {
-            let error = e.into_service_error();
-            match error {
-                UpdateTableError::EntityNotFoundException(_) => Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("Table {table_ident} is not found"),
-                ),
-                UpdateTableError::ConcurrentModificationException(_) => Error::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    format!("Commit failed for table: {table_ident}"),
-                )
-                .with_retryable(true),
-                _ => Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
-                ),
-            }
-            .with_source(anyhow!("aws sdk error: {error:?}"))
-        })?;
+        // Sent-vs-unsent classification of the commit call (GAP_MATRIX row R157): a failure
+        // that may have occurred AFTER the request reached Glue maps to `CommitStateUnknown`
+        // (Java `GlueTableOperations.doCommit` surfaces `CommitStateUnknownException` when the
+        // outcome cannot be confirmed); a never-sent failure keeps the terminal mapping; a
+        // modeled service response classifies per `map_update_table_service_error`.
+        let _ =
+            builder.send().await.map_err(
+                |e| match crate::error::classify_commit_send_disposition(&e) {
+                    crate::error::CommitSendDisposition::MaybeSent => Error::new(
+                        ErrorKind::CommitStateUnknown,
+                        format!(
+                            "Commit outcome unknown for table {table_ident}: the update request \
+                         may have reached Glue before the failure. Verify whether the commit \
+                         landed before retrying: retrying an already-applied commit \
+                         duplicates its changes."
+                        ),
+                    )
+                    .with_source(anyhow!("aws sdk error: {e:?}")),
+                    crate::error::CommitSendDisposition::NeverSent => Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "Operation failed for table: {table_ident} before the update request \
+                         was sent"
+                        ),
+                    )
+                    .with_source(anyhow!("aws sdk error: {e:?}")),
+                    crate::error::CommitSendDisposition::ResponseReceived => {
+                        map_update_table_service_error(e.into_service_error(), &table_ident)
+                    }
+                },
+            )?;
 
         Ok(staged_table)
     }
+}
+
+/// Map a modeled Glue `UpdateTableError` (the service RESPONDED) on the commit path.
+///
+/// Java `GlueTableOperations` (iceberg-aws 1.10.0): `ConcurrentModificationException` →
+/// `CommitFailedException` (retryable, `handleAWSExceptions` L354-356); `EntityNotFoundException`
+/// → `NotFoundException` (L363-365); a 5xx `AwsServiceException` that survives reconciliation →
+/// `CommitStateUnknownException` (L180-190 — Glue's `InternalServiceException` is the 5xx class,
+/// and `OperationTimeoutException` reports the operation timing out server-side, equally
+/// ambiguous). Everything else keeps the terminal mapping.
+fn map_update_table_service_error(error: UpdateTableError, table_ident: &TableIdent) -> Error {
+    match error {
+        UpdateTableError::EntityNotFoundException(_) => Error::new(
+            ErrorKind::TableNotFound,
+            format!("Table {table_ident} is not found"),
+        ),
+        UpdateTableError::ConcurrentModificationException(_) => Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            format!("Commit failed for table: {table_ident}"),
+        )
+        .with_retryable(true),
+        UpdateTableError::InternalServiceException(_)
+        | UpdateTableError::OperationTimeoutException(_) => Error::new(
+            ErrorKind::CommitStateUnknown,
+            format!(
+                "Commit outcome unknown for table {table_ident}: Glue failed (or timed out) \
+                 while processing the update — it may have been applied. Verify before \
+                 retrying: retrying an already-applied commit duplicates its changes."
+            ),
+        ),
+        _ => Error::new(
+            ErrorKind::Unexpected,
+            format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
+        ),
+    }
+    .with_source(anyhow!("aws sdk error: {error:?}"))
 }
 
 #[cfg(test)]
@@ -915,6 +963,75 @@ mod tests {
     async fn test_name_defaults_to_sentinel_when_unset() {
         let catalog = build_glue_catalog(None, HashMap::new()).await;
         assert_eq!(catalog.name(), UNNAMED_CATALOG);
+    }
+
+    fn test_table_ident() -> TableIdent {
+        TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")
+    }
+
+    /// Risk (GAP_MATRIX row R157): Glue's CAS conflict (`ConcurrentModificationException`) is
+    /// reclassified unknown-outcome — the commit retry loop then STOPS retrying plain
+    /// optimistic-concurrency conflicts, breaking every concurrent writer (Java maps it to the
+    /// retryable `CommitFailedException`, `GlueTableOperations.handleAWSExceptions` L354-356).
+    /// Pins that the conflict stays `CatalogCommitConflicts` + retryable.
+    #[test]
+    fn test_concurrent_modification_stays_retryable_conflict() {
+        let error = map_update_table_service_error(
+            UpdateTableError::ConcurrentModificationException(
+                aws_sdk_glue::types::error::ConcurrentModificationException::builder().build(),
+            ),
+            &test_table_ident(),
+        );
+        assert_eq!(error.kind(), iceberg::ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable(), "a CAS conflict is safely retryable");
+    }
+
+    /// Risk (GAP_MATRIX row R157): Glue's 5xx (`InternalServiceException`) or server-side
+    /// operation timeout keeps the terminal `Unexpected` mapping — the caller cannot tell
+    /// may-have-landed from safe-to-rerun, and an outer re-run duplicates an applied commit
+    /// (Java surfaces `CommitStateUnknownException` when reconciliation cannot confirm the
+    /// outcome, `GlueTableOperations.doCommit` L180-190). Pins the unknown-outcome mapping,
+    /// non-retryable.
+    #[test]
+    fn test_internal_service_and_operation_timeout_map_to_unknown_outcome() {
+        for error in [
+            UpdateTableError::InternalServiceException(
+                aws_sdk_glue::types::error::InternalServiceException::builder().build(),
+            ),
+            UpdateTableError::OperationTimeoutException(
+                aws_sdk_glue::types::error::OperationTimeoutException::builder().build(),
+            ),
+        ] {
+            let mapped = map_update_table_service_error(error, &test_table_ident());
+            assert_eq!(mapped.kind(), iceberg::ErrorKind::CommitStateUnknown);
+            assert!(
+                !mapped.retryable(),
+                "an unknown-outcome commit error must not advertise retryability"
+            );
+        }
+    }
+
+    /// Risk (GAP_MATRIX row R157, over-broadening): a DEFINITE service rejection (entity not
+    /// found, or any other modeled 4xx) classifies as unknown, hiding a plain terminal failure
+    /// behind reconciliation guidance. Pins the definite arms.
+    #[test]
+    fn test_definite_service_rejections_stay_terminal() {
+        let not_found = map_update_table_service_error(
+            UpdateTableError::EntityNotFoundException(
+                aws_sdk_glue::types::error::EntityNotFoundException::builder().build(),
+            ),
+            &test_table_ident(),
+        );
+        assert_eq!(not_found.kind(), iceberg::ErrorKind::TableNotFound);
+
+        let invalid_input = map_update_table_service_error(
+            UpdateTableError::InvalidInputException(
+                aws_sdk_glue::types::error::InvalidInputException::builder().build(),
+            ),
+            &test_table_ident(),
+        );
+        assert_eq!(invalid_input.kind(), iceberg::ErrorKind::Unexpected);
+        assert!(!invalid_input.retryable());
     }
 
     #[tokio::test]

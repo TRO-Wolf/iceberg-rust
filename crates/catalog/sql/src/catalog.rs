@@ -33,8 +33,8 @@ use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow, install_default_drivers}
 use sqlx::{Any, AnyPool, Row, Transaction};
 
 use crate::error::{
-    from_sqlx_error, no_such_namespace_err, no_such_table_err, no_such_view_err,
-    table_already_exists_err, table_with_same_name_err, view_already_exists_err,
+    from_sqlx_commit_error, from_sqlx_error, no_such_namespace_err, no_such_table_err,
+    no_such_view_err, table_already_exists_err, table_with_same_name_err, view_already_exists_err,
     view_with_same_name_err,
 };
 
@@ -387,6 +387,23 @@ impl SqlCatalog {
         args: Vec<Option<&str>>,
         transaction: Option<&mut Transaction<'_, Any>>,
     ) -> Result<AnyQueryResult> {
+        self.execute_mapping_errors(query, args, transaction, from_sqlx_error)
+            .await
+    }
+
+    /// [`Self::execute`] with a caller-chosen sqlx-error mapping for the STATEMENT execution and
+    /// the wrapping SQL-transaction `COMMIT` (the post-send window). Acquiring the connection /
+    /// `begin()` stays on [`from_sqlx_error`]: a failure there provably happened before anything
+    /// was sent, so no unknown-outcome classification may apply. The commit paths
+    /// (`update_table` / `update_view`) pass [`from_sqlx_commit_error`] (GAP_MATRIX row R157);
+    /// everything else goes through [`Self::execute`].
+    async fn execute_mapping_errors(
+        &self,
+        query: &str,
+        args: Vec<Option<&str>>,
+        transaction: Option<&mut Transaction<'_, Any>>,
+        map_sqlx_error: fn(sqlx::Error) -> Error,
+    ) -> Result<AnyQueryResult> {
         let query_with_placeholders = self.replace_placeholders(query);
 
         let mut sqlx_query = sqlx::query(&query_with_placeholders);
@@ -395,12 +412,18 @@ impl SqlCatalog {
         }
 
         match transaction {
-            Some(t) => sqlx_query.execute(&mut **t).await.map_err(from_sqlx_error),
+            Some(t) => sqlx_query.execute(&mut **t).await.map_err(map_sqlx_error),
             None => {
+                // Pre-send: nothing has been handed to the database yet.
                 let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
-                let result = sqlx_query.execute(&mut *tx).await.map_err(from_sqlx_error);
-                let _ = tx.commit().await.map_err(from_sqlx_error);
-                result
+                // Post-send: both the statement and the SQL-transaction `COMMIT` may have
+                // reached the database. A failed statement propagates first (dropping `tx`
+                // rolls back); a failed `COMMIT` now propagates too — it used to be silently
+                // DISCARDED (`let _ = tx.commit()...;`), reporting success for a transaction
+                // the database may have rolled back (a false green on the commit CAS).
+                let result = sqlx_query.execute(&mut *tx).await.map_err(map_sqlx_error)?;
+                tx.commit().await.map_err(map_sqlx_error)?;
+                Ok(result)
             }
         }
     }
@@ -1100,8 +1123,11 @@ impl Catalog for SqlCatalog {
 
         // SQL CAS bound to the BASE location (Java `JdbcUtil.updateTable` / `V1_DO_COMMIT_TABLE_SQL`:
         // `AND metadata_location = ?` with `base.metadataFileLocation()` as the bind value).
+        // Sqlx errors on this statement classify sent-vs-unsent via `from_sqlx_commit_error`:
+        // a connection-level failure after the CAS was handed to the database maps to
+        // `CommitStateUnknown` (GAP_MATRIX row R157).
         let update_result = self
-            .execute(
+            .execute_mapping_errors(
                 &format!(
                     "UPDATE {CATALOG_TABLE_NAME}
                      SET {CATALOG_FIELD_METADATA_LOCATION_PROP} = ?, {CATALOG_FIELD_PREVIOUS_METADATA_LOCATION_PROP} = ?
@@ -1123,6 +1149,7 @@ impl Catalog for SqlCatalog {
                     Some(cas_location.as_str()),
                 ],
                 None,
+                from_sqlx_commit_error,
             )
             .await?;
 
@@ -1394,9 +1421,11 @@ impl Catalog for SqlCatalog {
             .write_to(staged_view.file_io(), &staged_metadata_location)
             .await?;
 
-        // Java `JdbcUtil.V1_DO_COMMIT_VIEW_SQL` — SQL CAS bound to the BASE location.
+        // Java `JdbcUtil.V1_DO_COMMIT_VIEW_SQL` — SQL CAS bound to the BASE location. Post-send
+        // connection-level failures classify to `CommitStateUnknown` exactly like the
+        // table-side CAS (GAP_MATRIX row R157).
         let update_result = self
-            .execute(
+            .execute_mapping_errors(
                 &format!(
                     "UPDATE {CATALOG_TABLE_NAME}
                      SET {CATALOG_FIELD_METADATA_LOCATION_PROP} = ?, {CATALOG_FIELD_PREVIOUS_METADATA_LOCATION_PROP} = ?
@@ -1415,6 +1444,7 @@ impl Catalog for SqlCatalog {
                     Some(cas_location.as_str()),
                 ],
                 None,
+                from_sqlx_commit_error,
             )
             .await?;
 
