@@ -39,7 +39,47 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
-## ACTIVE UNIT (2026-07-08): queue item 1 — commit-outcome taxonomy (row R157)
+## ACTIVE UNIT (2026-07-09): OVERNIGHT Mode B bundle — G1→G4, one branch, one PR
+
+User-directed 2026-07-09 ("run G1 to G4 in sequential groups without needing a PR for each") —
+**Mode B** per [pr-per-work-cycle]: one bundle branch `parity/overnight-2026-07-09`, four
+SEQUENTIAL parity-increment ladders (each: builder → tailored Opus critic, mutation-gated →
+independent gate → bounded remediation), the orchestrator gates+commits after each unit, then ONE
+final independent SEPMO bundle Critic over the whole branch diff; push on CONVERGED; single PR
+for the user in the morning. Execution order **G1 → G2 → G4 → G3** (G3 last so the nightly
+workflow enumerates any interop suites G4 adds). Statuses live ONLY in the GAP_MATRIX.
+
+- [ ] **G1. CDC row-level changelog** (queue item 2; rows R122/R123 named residue) —
+      `ChangelogOperation::{UpdateBefore, UpdateAfter}` + handling ranges that carry row-level
+      DELETE manifests (today: `FeatureUnsupported`, matching Java's data-file changelog).
+      JAVA-FIRST scoping is mandatory: decode what 1.10.0 CORE (`BaseIncrementalChangelogScan`)
+      actually defines vs what lives Spark-side (`ChangelogIterator` net-change pairing is NOT
+      core) — parity claims only for the core surface; anything beyond is engine-first and
+      labeled so (DML-foundation direction). Done bar: partial (interop slice may defer).
+- [ ] **G2. Reconciliation-by-refresh** (R157 residue; `BaseMetastoreTableOperations.
+      checkCommitStatus` / `CommitStatus` SUCCESS·FAILURE·UNKNOWN) — on `CommitStateUnknown`,
+      re-read the catalog with bounded retries and decide landed (⇒ success) / absent (⇒ real
+      failure, re-thrown per Java) / still-unknown (⇒ surface unknown). Mock tests for all three
+      outcomes; the credentialed real-catalog slice stays with queue item 6.
+- [ ] **G4. ENGINE_CONTRACT §5 DRAFT→NORMATIVE** (queue item 4) — verify the isolation-level →
+      validation table against Java 1.10.0 `SparkWrite`/`SparkCopyOnWriteOperation`/
+      `SparkPositionDeltaWrite` (bytecode where jars exist, else the reference-checkout source —
+      cite which); one interop conflict scenario per cell; + the owed non-identity
+      DeleteFilter-equivalence test.
+- [ ] **G3. Nightly interop CI** (queue item 5) — scheduled workflow running the
+      `dev/java-interop/` suites unprompted (cron precedent: audit/codeql/stale.yml); enumerate
+      suites, doc the runner requirements (Java/protoc/docker), local one-shot proof of the
+      entry point; the "runs unprompted" proof is next night's run.
+- [ ] **G5. Bundle close** — final independent SEPMO Critic (fresh context, Opus) over
+      `main..HEAD`; remediate; push on CONVERGED; single PR body to scratchpad; morning report.
+
+CONTINGENCY (unattended): if a group's ladder cannot converge (workflow remediation exhausted +
+one orchestrator remediation), park its work on `parity/overnight-parked-G<n>`, reset the bundle
+branch to the last good unit commit (own unpushed branch; work preserved on the parked branch),
+continue the chain, and report the parked group in the morning. Gate note (2026-07-08): the
+typos step excludes the two untracked scratch briefs (`.typos.toml` decision still the user's).
+
+## DONE 2026-07-08 (merged #144): queue item 1 — commit-outcome taxonomy (row R157)
 
 User-directed 2026-07-08 ("proceed with your recommendation"). One PR, branch
 `parity/commit-state-unknown`. Ladder: parity-increment workflow (builder → tailored adversarial
