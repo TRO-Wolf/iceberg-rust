@@ -103,9 +103,50 @@ and the bundle resets to the last good commit; the bundle ships with the units t
       Flagged, not fixed (scope): L298 `task.equality_ids.clone().unwrap()` (production
       bare unwrap, eq-delete column — not a position/path column); Java's MAX_POSITION
       upper bound not mirrored (named in doc + test comments).
-- [ ] **A2 — Fixed/Binary single-value JSON** (BUG-004/OTH-007): implement both `todo!()` arms
+- [x] **A2 — Fixed/Binary single-value JSON** (BUG-004/OTH-007): implement both `todo!()` arms
   per Java `SingleValueParser`/spec Appendix D; verify emit case vs Java base16 (possible
   two-sided interop bug); Fixed length enforcement.
+  CLOSED: ladder SHIP, critic mutations 7/7, zero `todo!()` left in spec/values/ — details in
+  the builder notes below. Orchestrator notes: the round-trip test alone CANNOT catch an emit
+  case flip (parse is case-insensitive per Java) — the exact-emit-string test is the sole
+  case pin; round-2 remediation fired on the harness out-of-scope matcher false positive
+  (tests.rs vs the `spec/values/` directory allow entry) with an EMPTY issue list —
+  verification-only round, 2 mutations re-proven RED, no code changed after round 0.
+    - Builder outcome (2026-07-10, pre-critic): CONFIRMED two-sided — the old emit catch-all
+      was `{x:x}` (lowercase AND unpadded: 0x0A → "a", undecodable by Java's strict
+      `BaseEncoding.base16()`). Both `try_from_json` arms implemented (mixed-case accept per
+      Java `toUpperCase(Locale.ROOT)`, SingleValueParser.java L169/L175; Fixed pre-decode
+      string-length == 2·L check per L160-167); emit replaced with explicit Fixed
+      (length-enforced per L331-337) + Binary arms, UPPERCASE `{b:02X}`; other
+      (type, Binary) combos now fall to the DataInvalid catch-all (was: silently hex-encoded
+      under any type). 6 new tests incl. the crown-jewel Java-written schema-with-defaults
+      deserialization (previously PANICKED via `SerdeNestedField`); 7 mutations ALL
+      independently RED (error-arm, case-flip, pad-drop, parse+emit length-check drops,
+      odd-length accept, non-hex-as-0, over-broadened/inverted length guard — both
+      directions per testing.md). Java fixtures from `TestSingleValueParser` L53-54,
+      L117-123. Gate green: typos/fmt/clippy -D warnings/lib 2751×2 (+6 over A3's 2745).
+      Flagged, not fixed (scope): `SerdeNestedField→NestedField` swallows parse errors via
+      `.ok()` (malformed default hex now yields default=None silently, panic before —
+      pre-existing seam behavior for all types); `hex_str_to_bytes` duplicates
+      `expr/expression_parser.rs::hex_to_bytes` (out-of-scope file, dedup deferred);
+      interop round-trip vs a live Java oracle deferred (🟡 done-bar).
+    - Remediation r1 (2026-07-10): critic issue list parsed EMPTY and no report file found —
+      instead of guessing, independently re-verified the increment: all four hex arms
+      bytecode-confirmed against the 1.10.0 `SingleValueParser.class` line table (fromJson
+      FIXED length-precheck + `toUpperCase(Locale.ROOT)` decode at offsets 576-643, BINARY
+      644-678; toJson FIXED `remaining()==length()` check + `base16().encode` at 455-520,
+      BINARY 523-552); 3 spot mutations re-run RED (emit case-flip, emit + parse Fixed
+      length-check drops) with byte-identical restore; full gate re-run green (lib 2751×2).
+      No code changes this round.
+    - Remediation r2 (2026-07-10): issue list parsed EMPTY again; searched scratchpad +
+      task/ — no critic report file exists anywhere. Self-critique of the accumulated diff
+      found no open defect (no `todo!()` remains; non-Fixed/Binary `(type, Binary)` combos
+      fall to the DataInvalid catch-all; `is_multiple_of` is within MSRV 1.92). 2 mutations
+      re-run RED (emit case-flip → `json_binary_fixed_emit_uppercase_padded_java_compatible`
+      RED; parse-side Fixed length check disabled via `if false &&` →
+      `json_fixed_length_mismatch_is_data_invalid` RED), restored byte-identical (`cmp`
+      verified). Full gate re-run green (typos/fmt/clippy -D warnings/lib 2751×2). No code
+      changes this round.
 - [ ] **A4 — StrictMetricsEvaluator absent-NaN inversion** (found by our G4): absent NaN
   counts ⇒ CANNOT contain, matching Java cell-by-cell; over-loosening pin required; close the
   ENGINE_CONTRACT §9 open item in the same change.
