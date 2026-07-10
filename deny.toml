@@ -31,7 +31,7 @@ allow = [
   "Unicode-3.0",
   # Boost Software License Version 1.0 is allowed (Category-A):
   # https://www.apache.org/legal/resolved.html#category-a
-  "BSL-1.0"
+  "BSL-1.0",
 ]
 
 exceptions = [
@@ -40,4 +40,38 @@ exceptions = [
   { allow = ["MPL-2.0"], crate = "webpki-roots" },
   { allow = ["MPL-2.0"], crate = "generational-arena" },
   { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+[advisories]
+# Only unmaintained advisories on DIRECT workspace dependencies fail the gate; transitive
+# unmaintained crates (currently: paste, rustls-pemfile) are accepted — we cannot bump them
+# without a sanctioned dependency sync.
+unmaintained = "workspace"
+# Known advisories in the pinned 0.9.1-era lockfile, recorded 2026-07-10 (audit remediation
+# Tier 3). Dependency bumps are out of policy for routine work (see CLAUDE.md); each entry
+# below is a deliberate, dated acceptance — remove it when the next sanctioned dependency
+# sync clears the affected crate. New advisories NOT in this list fail the gate.
+ignore = [
+  # crossbeam-epoch: invalid pointer dereference in a Debug/Pointer impl; requires an already
+  # invalid pointer — not reachable from safe library use here.
+  "RUSTSEC-2026-0204",
+  # quick-xml (two locked versions): memory-exhaustion DoS via unbounded namespace
+  # declarations in NsReader — transitive, XML paths not exposed to untrusted input here.
+  "RUSTSEC-2026-0195",
+  # quick-xml: quadratic runtime on duplicate start-tag attribute names — same exposure.
+  "RUSTSEC-2026-0194",
+  # quinn-proto: remote memory exhaustion via out-of-order stream reassembly — transitive
+  # QUIC dependency; no QUIC listener in this workspace. (cargo-audit detects this one;
+  # like rkyv below it is absent from the HOST-resolved dependency graph, so cargo-deny
+  # emits a benign advisory-not-detected warning — kept so both tools stay clean.)
+  "RUSTSEC-2026-0185",
+  # anyhow: unsoundness in Error::downcast_mut(). anyhow IS on the library's production
+  # surface — it is the boxed `source` type inside `iceberg::Error` (error.rs) and is used
+  # in table-property parsing — but the vulnerable API is unreached: the only downcast_mut
+  # call in the tree is std::any::Any::downcast_mut, never anyhow::Error::downcast_mut.
+  "RUSTSEC-2026-0190",
+  # rkyv: potential use-after-free on panic in InlineVec/SerVec clear — transitive via the
+  # HMS thrift stack (volo/faststr); not on a data path we drive. Target-gated out of the
+  # host-resolved graph, so cargo-deny also reports advisory-not-detected for it (benign).
+  "RUSTSEC-2026-0122",
 ]
