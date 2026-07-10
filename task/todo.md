@@ -168,8 +168,21 @@ and the bundle resets to the last good commit; the bundle ships with the units t
       empty-map split); (2) Rust has NO `isNestedColumn` short-circuit (Java returns
       MIGHT_NOT_MATCH for nested columns in every arm). §9 bullet closed. Deferred: the
       cross-engine metrics-decided full-match interop sweep (done-bar 🟡).
-- [ ] **A5 — bundle close**: independent SEPMO bundle Critic over `main..HEAD` → on CONVERGED
+- [x] **A5 — bundle close**: independent SEPMO bundle Critic over `main..HEAD` → on CONVERGED
   flip this section, push, PR body to scratchpad.
+  - Outcome (2026-07-10): bundle Critic **CONVERGED**, ZERO findings, NO units parked. Gate
+    re-run in full by the Critic (typos/fmt/clippy/lib 2756/matrix-anchors/agent-artifacts);
+    4/4 cross-unit mutations re-proven RED with byte-identical restores; Java citations for
+    all four units re-verified against the 1.10.0 reference (incl. confirming `greater_than`
+    already had its NaN guard on main — A4 correctly added only the missing gtEq one);
+    behavioral-break sweep ruled the A2 emit change and A1 rejections corrections TOWARD the
+    Java-written format, not format breaks (no in-tree dependents of the old behavior). Two
+    accepted LOWs: the narrow pre-existing-in-kind serialize `.expect` surface in
+    datatypes.rs:691 for malformed in-memory defaults (the flagged `.ok()` seam's sibling —
+    future unit), and cosmetic `bind().unwrap()` in A4 test helpers matching module
+    convention. Pushed `fix/audit-tier1-2026-07`; PR body at scratchpad
+    `pr-body-audit-tier1-2026-07.md`. Tier 3 companion branch `infra/audit-ops-2026-07`
+    (Critic CONVERGED after 2 MEDIUM prose corrections) pushed earlier the same day.
 
 ## ACTIVE UNIT (2026-07-09): OVERNIGHT Mode B bundle — G1→G4, one branch, one PR
 
