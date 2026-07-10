@@ -165,15 +165,27 @@ grow MERGE semantics; it will not (out of parity scope).
   re-applies.
 - **Ambiguous commit outcome (GAP_MATRIX row R157, 🟡 since 2026-07-08).** A catalog failure
   AFTER the update request may have durably landed (timeout awaiting the response, 5xx,
-  connection reset mid-response) now surfaces as **`ErrorKind::CommitStateUnknown`** — never
-  auto-retried, no cleanup, surfaced (Java `CommitStateUnknownException` semantics). All four
-  catalogs (REST, SQL, Glue, S3 Tables) classify commit-path transport failures sent-vs-unsent.
-  **The engine MUST catch this kind and reconcile before re-running** — the library does not yet
-  port Java's reconciliation-by-refresh (`checkCommitStatus`), so the mitigation stands:
-  **(a)** stamp every commit with a unique summary property (e.g. `engine.operation-id`) via the
-  snapshot-summary surface; **(b)** on `CommitStateUnknown`, reload the table and scan recent
-  snapshots' summaries for that id BEFORE re-running; **(c)** never delete the files a failed
-  attempt wrote until (b) confirms the commit is truly absent.
+  connection reset mid-response) surfaces as **`ErrorKind::CommitStateUnknown`** — never
+  auto-retried, no cleanup (Java `CommitStateUnknownException` semantics). All four catalogs
+  (REST, SQL, Glue, S3 Tables) classify commit-path transport failures sent-vs-unsent.
+  **The library now reconciles this in-process** (since 2026-07-09, Java
+  `BaseMetastoreOperations.checkCommitStatus`): on an unknown outcome from a snapshot-producing
+  commit, `Transaction::commit` re-reads the catalog — bounded by the `commit.status-check.*`
+  table properties (`num-retries` default 3 ⇒ 4 read attempts, `min-wait-ms` 1000,
+  `max-wait-ms` 60000, `total-timeout-ms` 1800000; Java's names and defaults) — and searches the
+  reloaded snapshot history (not just the current pointer, so a commit buried under a concurrent
+  writer is still found). **Landed ⇒ `commit` returns `Ok`** with the reloaded table (nothing is
+  re-applied); **absent or still-unreadable ⇒ the original `CommitStateUnknown` surfaces**
+  (Java's production semantics: an absent-after-refresh commit is NOT declared failed — the
+  in-flight request may still land after the check, so re-running on "absent" is the
+  double-commit window; do not treat a surfaced unknown as a license to blindly re-run).
+  **Residual engine-side reconciliation** is needed only where the library cannot decide:
+  **(a)** metadata-only commits (no snapshot added — no client-visible marker; the operation-id
+  stamp is useless there too, since a summary property needs a snapshot) and **(b)** an unknown
+  that SURVIVES the in-library reconciliation (catalog unreadable for the whole budget) — for
+  (b) the prior manual recipe still applies: reload later, scan recent snapshot summaries for a
+  unique `engine.operation-id` stamp BEFORE re-running, and never delete the files a failed
+  attempt wrote until the commit is confirmed truly absent.
 - S3 Tables runs **service-side maintenance** (compaction, snapshot expiry) that commits
   concurrently with the engine — treat `CommitFailed` requirement mismatches as routine there,
   and expect `validate_data_files_exist` trips when service compaction rewrites files referenced

@@ -84,11 +84,29 @@ workflow enumerates any interop suites G4 adds). Statuses live ONLY in the GAP_M
       cannot plan those ranges; the existing data-file changelog interop stands as the
       control), DeletedRows Arrow projection (engine-side), UPDATE_BEFORE/UPDATE_AFTER
       pairing (Spark-side, not core parity).
-- [ ] **G2. Reconciliation-by-refresh** (R157 residue; `BaseMetastoreTableOperations.
+- [x] **G2. Reconciliation-by-refresh** (R157 residue; `BaseMetastoreTableOperations.
       checkCommitStatus` / `CommitStatus` SUCCESS·FAILURE·UNKNOWN) — on `CommitStateUnknown`,
       re-read the catalog with bounded retries and decide landed (⇒ success) / absent (⇒ real
       failure, re-thrown per Java) / still-unknown (⇒ surface unknown). Mock tests for all three
       outcomes; the credentialed real-catalog slice stays with queue item 6.
+      Outcome (2026-07-09): LANDED with one JAVA-FIRST rescope — the brief's "absent ⇒ re-thrown
+      CommitFailed" is NOT 1.10.0 production behavior: the only production callers (Glue L174,
+      DynamoDb L136) use the NON-strict `checkCommitStatus`, which converts strict-FAILURE ⇒
+      UNKNOWN (bytecode offsets 11-34; `checkCommitStatusStrict` has zero non-test callers)
+      because a pending in-flight request may still land after the check — declaring failure and
+      re-running is the double-commit corruption class. Shipped: `transaction/commit_status.rs`
+      (strict classifier, `commit.status-check.*` knobs with Java names/defaults, n+1 attempts,
+      2.0-factor clamped backoff) + `Transaction::reconcile_unknown_commit_outcome` (non-strict
+      conversion at the catalog-agnostic seam; snapshot-id evidence searched in the reloaded
+      snapshot SET — history-tolerant to concurrent writers). 11 new/updated tests (crown jewel
+      reconciles-to-success-without-reapply; buried-under-concurrent-writer; absent ⇒ unknown
+      never success/retry; bounded-by-property; CommitFailed-control never reconciles;
+      metadata-only skip; invalid-knob surfaces unknown; 4 unit pins) + 7 mutations ALL RED.
+      Named divergences (matrix cell + module docs): snapshot-id evidence vs Java's
+      metadata-location; metadata-only commits not reconciled; REST/SQL unknowns also reconciled
+      (Java's REST/JDBC ops never do — strictly outcome-improving, read-only). R157 stays 🟡
+      (credentialed slice remains); ENGINE_CONTRACT §8 manual reconciliation downgraded to the
+      two residual cases.
 - [ ] **G4. ENGINE_CONTRACT §5 DRAFT→NORMATIVE** (queue item 4) — verify the isolation-level →
       validation table against Java 1.10.0 `SparkWrite`/`SparkCopyOnWriteOperation`/
       `SparkPositionDeltaWrite` (bytecode where jars exist, else the reference-checkout source —
