@@ -39,7 +39,186 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
-## ACTIVE UNIT (2026-07-08): queue item 1 — commit-outcome taxonomy (row R157)
+## ACTIVE UNIT (2026-07-09): OVERNIGHT Mode B bundle — G1→G4, one branch, one PR
+
+User-directed 2026-07-09 ("run G1 to G4 in sequential groups without needing a PR for each") —
+**Mode B** per [pr-per-work-cycle]: one bundle branch `parity/overnight-2026-07-09`, four
+SEQUENTIAL parity-increment ladders (each: builder → tailored Opus critic, mutation-gated →
+independent gate → bounded remediation), the orchestrator gates+commits after each unit, then ONE
+final independent SEPMO bundle Critic over the whole branch diff; push on CONVERGED; single PR
+for the user in the morning. Execution order **G1 → G2 → G4 → G3** (G3 last so the nightly
+workflow enumerates any interop suites G4 adds). Statuses live ONLY in the GAP_MATRIX.
+
+- [x] **G1. CDC row-level changelog** (queue item 2; rows R122/R123 named residue) —
+      `ChangelogOperation::{UpdateBefore, UpdateAfter}` + handling ranges that carry row-level
+      DELETE manifests (today: `FeatureUnsupported`, matching Java's data-file changelog).
+      JAVA-FIRST scoping is mandatory: decode what 1.10.0 CORE (`BaseIncrementalChangelogScan`)
+      actually defines vs what lives Spark-side (`ChangelogIterator` net-change pairing is NOT
+      core) — parity claims only for the core surface; anything beyond is engine-first and
+      labeled so (DML-foundation direction). Done bar: partial (interop slice may defer).
+    - Builder plan (2026-07-09, bytecode-audited): 1.10.0 core REJECTS every delete-manifest
+      range (`javap` offsets 86–95) and never constructs `BaseDeletedRowsScanTask` — so
+      row-level acceptance is ENGINE-FIRST behind an opt-in builder flag
+      (`with_row_level_deletes`), default = exact Java rejection surface. Port the api
+      taxonomy as core parity: `ChangelogOperation` gains `UpdateBefore`/`UpdateAfter`
+      (declared, never emitted by the planner — pairing is Spark-side, DEFERRED);
+      `ChangelogScanTask` gains `kind` (AddedRows/DeletedDataFile/DeletedRows, operation()
+      derived) + `added_deletes`/`existing_deletes`. Row-level planning per snapshot: split
+      its delete manifests into added-in-S vs pre-existing `DeleteFileIndex`es; own-added
+      data entries → AddedRows (with added deletes)/DeletedDataFile (with existing deletes);
+      live NOT-added-in-S data files hit by added deletes → DeletedRows (added+existing
+      split). Tests: crown-jewel MoR chain mirroring the `DeletedDataFileScanTask` javadoc
+      example, added-vs-preexisting split, same-snapshot fold, pure-append control,
+      replace-consumes-no-ordinal, rejection unchanged. Arrow read: no core-defined
+      semantics (reading is engine-side) — AddedRows/DeletedDataFile tasks readable via the
+      existing MoR `FileScanTask.deletes` machinery; DeletedRows projection deferred.
+      Outcome (2026-07-09): LANDED as planned — `scan/task.rs` taxonomy (breaking:
+      `ChangelogScanTask.operation` field → `kind`, `operation()` now derived; 2 new enum
+      variants break downstream exhaustive matches), `scan/incremental.rs` planner
+      (opt-in row-level mode; default path output-identical, guard mutation-proven both
+      ways), 6 new/extended tests + 6 targeted mutations ALL RED
+      (guard-disable / added-existing-swap / fold-drop / ordinal-reverse / kind-swap /
+      commit-misstamp), R123 residue re-written (matrix gate green, 71 rows), R122
+      untouched (no row-level residue lives there), scan/map.md refreshed. Deferred:
+      interop slice (Java oracle for the row-level mode is meaningless — 1.10.0 core
+      cannot plan those ranges; the existing data-file changelog interop stands as the
+      control), DeletedRows Arrow projection (engine-side), UPDATE_BEFORE/UPDATE_AFTER
+      pairing (Spark-side, not core parity).
+- [x] **G2. Reconciliation-by-refresh** (R157 residue; `BaseMetastoreTableOperations.
+      checkCommitStatus` / `CommitStatus` SUCCESS·FAILURE·UNKNOWN) — on `CommitStateUnknown`,
+      re-read the catalog with bounded retries and decide landed (⇒ success) / absent (⇒ real
+      failure, re-thrown per Java) / still-unknown (⇒ surface unknown). Mock tests for all three
+      outcomes; the credentialed real-catalog slice stays with queue item 6.
+      Outcome (2026-07-09): LANDED with one JAVA-FIRST rescope — the brief's "absent ⇒ re-thrown
+      CommitFailed" is NOT 1.10.0 production behavior: the only production callers (Glue L174,
+      DynamoDb L136) use the NON-strict `checkCommitStatus`, which converts strict-FAILURE ⇒
+      UNKNOWN (bytecode offsets 11-34; `checkCommitStatusStrict` has zero non-test callers)
+      because a pending in-flight request may still land after the check — declaring failure and
+      re-running is the double-commit corruption class. Shipped: `transaction/commit_status.rs`
+      (strict classifier, `commit.status-check.*` knobs with Java names/defaults, n+1 attempts,
+      2.0-factor clamped backoff) + `Transaction::reconcile_unknown_commit_outcome` (non-strict
+      conversion at the catalog-agnostic seam; snapshot-id evidence searched in the reloaded
+      snapshot SET — history-tolerant to concurrent writers). 11 new/updated tests (crown jewel
+      reconciles-to-success-without-reapply; buried-under-concurrent-writer; absent ⇒ unknown
+      never success/retry; bounded-by-property; CommitFailed-control never reconciles;
+      metadata-only skip; invalid-knob surfaces unknown; 4 unit pins) + 7 mutations ALL RED.
+      Named divergences (matrix cell + module docs): snapshot-id evidence vs Java's
+      metadata-location; metadata-only commits not reconciled; REST/SQL unknowns also reconciled
+      (Java's REST/JDBC ops never do — strictly outcome-improving, read-only). R157 stays 🟡
+      (credentialed slice remains); ENGINE_CONTRACT §8 manual reconciliation downgraded to the
+      two residual cases.
+- [x] **G4. ENGINE_CONTRACT §5 DRAFT→NORMATIVE** (queue item 4) — verify the isolation-level →
+      validation table against Java 1.10.0 `SparkWrite`/`SparkCopyOnWriteOperation`/
+      `SparkPositionDeltaWrite` (bytecode where jars exist, else the reference-checkout source —
+      cite which); one interop conflict scenario per cell; + the owed non-identity
+      DeleteFilter-equivalence test.
+      Outcome (2026-07-09): §5 flipped NORMATIVE — every cell verified against the
+      `apache-iceberg-1.10.0` SOURCE (Spark jars absent from `~/.m2`; oracle form cited per
+      cell; api/core surfaces additionally javap-verified). TWO cells CORRECTED: (1) MoR DELETE
+      does NOT enable `validate_deleted_files` (UPDATE/MERGE-only, `SparkPositionDeltaWrite`
+      L251-254) — the draft prescribed it; (2) `case_sensitive` is NOT part of the Java base
+      recipe (neither Spark writer calls it — engine policy). Base clarified: MoR
+      `validate_data_files_exist` is unconditional (all commands, both isolation levels, L243);
+      scan==null ⇒ NO validation; static overwrite-by-filter rows ADDED (`OverwriteByFilter`).
+      Per-cell covering scenarios cited (C1-C5 interop arc + named unit tests); NEW
+      `engine_contract_isolation_recipes.rs` pins the serializable-vs-snapshot distinction
+      behaviorally for BOTH modes (snapshot leg COMMITS + post-commit live set; serializable leg
+      REJECTS naming the validation; 3 recipe mutations RED). Owed non-identity DeleteFilter
+      test LANDED (`test_engine_deletefilter_nonidentity_partition_equivalence`, offline
+      truncate[10](id) pos+eq deletes, production-mutation RED). §9 R157 bullet un-staled
+      (reconciliation-by-refresh landed G2). No matrix row touched.
+      Remediation 2 (2026-07-09): the unit-only residue CLOSED — NEW cross-engine suite
+      `interop_s5_isolation_conflict.rs` + `S5IsolationOracle` + `run-interop-s5-isolation.sh`
+      covers the three formerly unit-level cells (COW/snapshot deletes, dynamic-overwrite/
+      snapshot, static overwrite-by-filter snapshot+serializable): 8 scenarios (4 REJECT +
+      4 ACCEPT guards), BOTH directions green + sabotage fail-closed on the local Java 11 run;
+      4 recipe mutations RED (each cell's isolation-distinguishing validation dropped ⇒ GEN
+      self-check fails). FOUND + NAMED (out of increment file scope, ENGINE_CONTRACT §9 open
+      item): Rust `StrictMetricsEvaluator::may_contain_nan` treats ABSENT nan counts as
+      may-contain-NaN (Java `canContainNaNs` 1.10.0 L483-486: absent ⇒ CANNOT), so strict
+      inequalities never prove a full match on non-float columns —
+      `overwrite_by_row_filter`/`DeleteFiles`-by-filter rejects ("some, but not all, rows
+      match") files Java deletes cleanly; the serializable by-filter interop cell therefore
+      runs partition-scoped (`category = "a"`) to keep `validate_no_conflicting_data`
+      load-bearing. Follow-up: fix `expr/visitors/strict_metrics_evaluator.rs` L105-111 +
+      an interop pin on a metrics-decided full-match sweep.
+- [x] **G3. Nightly interop CI** (queue item 5) — scheduled workflow running the
+      `dev/java-interop/` suites unprompted (cron precedent: audit/codeql/stale.yml); enumerate
+      suites, doc the runner requirements (Java/protoc/docker), local one-shot proof of the
+      entry point; the "runs unprompted" proof is next night's run.
+      Outcome (2026-07-10): LANDED — `scripts/run_interop_suites.sh` (dynamic glob discovery,
+      floor 48 with ratchet-on-add rule, prereq HARD-FAIL never-skip, continue-across-suites
+      per-suite PASS/FAIL summary + step summary, `--only` local subset flag that logs every
+      exclusion, `--selftest` battery), `make interop`/`interop-selftest`,
+      `.github/workflows/nightly_interop.yml` (cron 06:43 UTC + workflow_dispatch; apt JDK 11 +
+      `/opt/maven` symlink because all 48 suites default to those paths — 47 hardcode them
+      outright, only `run-interop-aggregate.sh` reads `$MVN`/`$JAVA_HOME` — and must not be
+      modified; online `~/.m2` priming because 47 of 48 suites run `mvn -o` (only
+      `run-interop-scan-exec.sh` is online); full set only — no subset flag or env hook
+      reachable from the YAML), map.md/README rows. Proofs: selftest 9/9 green + 7 driver
+      mutations RED (exit-on-fail / floor / prereq / exclusion-log / empty-`--only` /
+      empty-run-set / fake-prereq-wiring guards each turn a case red); real-dir battery —
+      planted failing suite ⇒ exit 1 with the other suite still run+reported, renamed suite ⇒
+      floor error before running anything, PATH-without-cargo + void-mvn ⇒ prereq hard-fail,
+      YAML safe_load green + broken-copy red (non-vacuous); GREEN real-suite subset runs
+      exit 0, 48 discovered. Remediation R1 (2026-07-10; critic report unrecoverable ⇒
+      self-audit): (1) `--only ""` silently ran the FULL set (bounded request became
+      unbounded — reproduced live) ⇒ parse-time hard-fail + selftest ST7; (2) a zero-suite
+      run greened ("0 passed, 0 failed" ⇒ exit 0, reachable via the floor-0 test hooks) ⇒
+      empty-run-set guard in `run_suites` + ST8; (3) the selftest was NOT hermetic (needed a
+      real `/opt/maven` + JDK 11 on the machine) ⇒ fake prereqs wired through `drive()`,
+      ST3 now isolates ONE missing prereq per case, wiring mutation-proven (6 cases red when
+      the fake mvn path is broken); (4) `--help` used a hardcoded `sed '19,66p'` line range
+      that drifts on any header edit ⇒ marker-based awk; (5) corrected wrong counts shipped
+      in 5 places (was "29 hardcode / 19 offline"; measured truth: 48 default, 47 hardcode
+      outright, 47/48 offline). NAMED RESIDUE: the
+      "runs unprompted" proof is inherently NEXT night's live run (cron fires only once this
+      file is on the default branch); the CI-runner provisioning (apt/symlink/m2-priming +
+      the 350-min job bound vs the full 48-suite wall time) is NOT locally verifiable — first
+      nightly is the proof. Deferred: `run.sh` + `run-inspection-manifests.sh` (outside the
+      `run-interop-*.sh` glob, named in map.md/README); no log artifact upload (step summary
+      only — no pinned upload-artifact action precedent in this repo). Remediation R2
+      (2026-07-10; critic verdict SHIP — 5/5 mutations caught, zero bugs/over-claims; closed
+      its one named test-strength nit): ST1's failing fake sorted LAST, so a
+      bookkeeping-clean abort-on-first-failure mutation greened the whole battery 9/9
+      (reproduced live — worse than the critic's own summary-needle-caught variant); renamed
+      it `run-interop-aa-fail.sh` (sorts FIRST, before both passers), so the a/b `.ran`
+      marker check now pins continue-AFTER-failure directly, independent of summary wording;
+      the same mutation goes RED at 2 checks post-fix, clean battery 9/9 green. The critic's
+      two blind-spot claims were resolution:refuted by its own probes (bash>=4.4 empty-array
+      expansion; an independent sort-first continue-across probe against production).
+    - Builder plan (2026-07-10, live-audited): 48 `run-interop-*.sh` suites exist (the brief
+      said ~31 — floor set to the LIVE count 48); 29 hardcode `/opt/maven/bin/mvn` +
+      `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` and 19 run `mvn -o` (offline ⇒ CI must
+      prime `~/.m2`) [counts corrected in R1: those greps were style-narrow — truth is 48
+      default / 47 hardcode outright / 47 of 48 offline], so the workflow installs apt
+      `openjdk-11-jdk-headless` (noble carries
+      11.0.31) + `maven` and symlinks `/opt/maven` rather than setup-java (the suites must
+      not be modified). Deliverables: `scripts/run_interop_suites.sh` (dynamic glob discovery
+      + floor 48 + hard-fail prereqs + continue-across-suites + per-suite PASS/FAIL summary +
+      step summary + `--only` LOCAL subset flag that logs exclusions + `--selftest` sabotage
+      battery), `make interop`/`interop-selftest`, `.github/workflows/nightly_interop.yml`
+      (cron + workflow_dispatch, full set only — no subset flag reachable), map.md/README
+      rows, local green subset proof + sabotage battery RED proofs. No matrix row touched
+      (infra; no capability status changes).
+- [x] **G5. Bundle close** — DONE 2026-07-10: independent SEPMO bundle Critic (fresh context,
+      Opus) over `main..HEAD` **CONVERGED**, zero HIGH/MEDIUM findings ("Recommendation:
+      push"). Cross-unit checks all clean: G1's breaking `ChangelogScanTask` change has ZERO
+      external consumers (workspace-wide grep + build); G2's reconciliation composes correctly
+      with the #144 unknown-kind retry gate (absent ⇒ original error, Java non-strict); all 7
+      spot-checked §5 citations resolve; G3's floor (48) matches the live suite count incl.
+      G4's new suite; todo notes accurate. 3 cross-unit mutations re-proven RED. 2 LOWs
+      accepted (selftest count understated 9→10; interop coverage disclosed as
+      claim-of-existence pending Java/Maven + first nightly). Pushed; merge is the user's.
+      NO groups parked — the contingency was never needed.
+
+CONTINGENCY (unattended): if a group's ladder cannot converge (workflow remediation exhausted +
+one orchestrator remediation), park its work on `parity/overnight-parked-G<n>`, reset the bundle
+branch to the last good unit commit (own unpushed branch; work preserved on the parked branch),
+continue the chain, and report the parked group in the morning. Gate note (2026-07-08): the
+typos step excludes the two untracked scratch briefs (`.typos.toml` decision still the user's).
+
+## DONE 2026-07-08 (merged #144): queue item 1 — commit-outcome taxonomy (row R157)
 
 User-directed 2026-07-08 ("proceed with your recommendation"). One PR, branch
 `parity/commit-state-unknown`. Ladder: parity-increment workflow (builder → tailored adversarial

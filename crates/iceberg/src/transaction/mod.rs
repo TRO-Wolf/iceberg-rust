@@ -75,6 +75,7 @@ mod append;
 pub use append::FastAppendAction;
 mod cherry_pick;
 pub use cherry_pick::CherryPickAction;
+mod commit_status;
 mod delete_files;
 pub use delete_files::DeleteFilesAction;
 mod expire_cleanup;
@@ -116,7 +117,7 @@ use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::events::{self, CreateSnapshotEvent};
 use crate::spec::{Snapshot, TableProperties};
 use crate::table::Table;
@@ -144,6 +145,15 @@ pub struct Transaction {
     /// head). `None` means the table had no snapshots yet at transaction start.
     starting_snapshot_id: Option<i64>,
     actions: Vec<BoxedTransactionAction>,
+    /// The snapshot ids the MOST RECENT `do_commit` attempt handed to `Catalog::update_table`
+    /// (one per `AddSnapshot` update, client-generated before the request). This is the
+    /// reconciliation evidence for an `ErrorKind::CommitStateUnknown` outcome: the commit landed
+    /// iff any of these ids is present in a reloaded table's snapshot set (the Rust equivalent of
+    /// Java `checkCurrentMetadataLocation`'s current-or-`previousFiles()` search — see
+    /// [`commit_status`]). Cleared at the top of every attempt so a failure BEFORE `update_table`
+    /// can never leak a previous attempt's ids into reconciliation; empty means the attempt
+    /// carried no snapshot evidence (metadata-only commit) and is not reconciled.
+    latest_attempt_snapshot_ids: Vec<i64>,
 }
 
 impl Transaction {
@@ -153,6 +163,7 @@ impl Transaction {
             table: table.clone(),
             starting_snapshot_id: table.metadata().current_snapshot_id(),
             actions: vec![],
+            latest_attempt_snapshot_ids: vec![],
         }
     }
 
@@ -373,6 +384,17 @@ impl Transaction {
     }
 
     /// Commit transaction.
+    ///
+    /// An [`ErrorKind::CommitStateUnknown`](crate::ErrorKind::CommitStateUnknown) outcome (the
+    /// update request may have durably landed but the response was lost) is never retried;
+    /// instead it is RECONCILED by re-reading the catalog (Java
+    /// `BaseMetastoreOperations.checkCommitStatus`, see [`commit_status`]): if the attempted
+    /// commit is found in the reloaded metadata — even buried under later third-party commits —
+    /// the commit is treated as SUCCESS and the reloaded table is returned (no re-apply, no
+    /// duplicate); otherwise the original unknown-outcome error surfaces (Java's production
+    /// non-strict semantics: an absent-after-refresh commit stays UNKNOWN, because the in-flight
+    /// request may still land after the check). Commits that add no snapshot carry no
+    /// reconciliation evidence and surface the unknown outcome as-is.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
             // nothing to commit
@@ -384,7 +406,7 @@ impl Transaction {
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
 
-        (|mut tx: Transaction| async {
+        let (tx, result) = (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
             (tx, result)
         })
@@ -401,8 +423,101 @@ impl Transaction {
         // cleanup runs on this branch either: the commit path deletes nothing on failure, and
         // Java's unknown branch explicitly SKIPS the `cleanAll` that plain failures trigger.
         .when(|e| e.retryable() && e.kind() != crate::ErrorKind::CommitStateUnknown)
+        .await;
+
+        match result {
+            // ONLY the unknown-outcome kind is reconciled. A definite failure (e.g. a
+            // CommitFailed-class conflict) proves the commit did NOT land — Java rethrows it
+            // without ever invoking checkCommitStatus (`GlueTableOperations.doCommit` L162-163:
+            // `catch (CommitFailedException e) { throw e; }` ahead of the reconciling catch).
+            Err(error) if error.kind() == crate::ErrorKind::CommitStateUnknown => {
+                tx.reconcile_unknown_commit_outcome(catalog, error).await
+            }
+            other => other,
+        }
+    }
+
+    /// Resolve an [`ErrorKind::CommitStateUnknown`](crate::ErrorKind::CommitStateUnknown) commit
+    /// outcome by re-reading the catalog — the Java `checkCommitStatus` composition at this
+    /// fork's catalog-agnostic seam (`GlueTableOperations.doCommit` L164-191 hosts it per-catalog
+    /// in Java; here every catalog's unknown outcome funnels through `Transaction::commit`, so
+    /// REST/SQL unknowns are reconciled too — Java's REST/JDBC ops never reconcile, and this is
+    /// a strictly-outcome-improving, read-only divergence).
+    ///
+    /// - **Landed** ⇒ `Ok` with the reloaded table (Java `CommitStatus.SUCCESS` swallows the
+    ///   persist failure). No re-apply — the caller's commit already stands.
+    /// - **Absent after a successful refresh** ⇒ the original error surfaces UNCHANGED: Java's
+    ///   production path converts strict-`FAILURE` to `UNKNOWN`
+    ///   (`BaseMetastoreOperations.checkCommitStatus` L71-78, bytecode offsets 11-34) because the
+    ///   in-flight request may still land after the check — declaring failure here and letting
+    ///   the caller re-run is the double-commit corruption class.
+    /// - **Still unknown** (refreshes kept failing) ⇒ the original error surfaces unchanged
+    ///   (Java `CommitStateUnknownException(persistFailure)` — the original failure is the cause).
+    async fn reconcile_unknown_commit_outcome(
+        self,
+        catalog: &dyn Catalog,
+        original_error: Error,
+    ) -> Result<Table> {
+        if self.latest_attempt_snapshot_ids.is_empty() {
+            // No snapshot was attempted (metadata-only commit) — there is no client-visible
+            // marker to look for, so the outcome stays unknown. (Named divergence: Java's
+            // location-based check covers these; the metadata location is catalog-assigned and
+            // unknown to this seam. See the `commit_status` module docs.)
+            tracing::warn!(
+                table = %self.table.identifier(),
+                "commit outcome unknown and the attempt added no snapshot; skipping \
+                 reconciliation-by-refresh (no snapshot evidence to search for)"
+            );
+            return Err(original_error);
+        }
+
+        // Bounded divergence: the `commit.status-check.*` knobs are read from the transaction's
+        // BASE metadata, while Java reads `config.properties()` of the TO-BE-COMMITTED metadata
+        // (`BaseMetastoreTableOperations.checkCommitStatus` L297-301, invoked from
+        // `GlueTableOperations.doCommit` L174 with the new `TableMetadata`). Observable only when
+        // a single commit both mutates those properties AND fails with an unknown outcome — the
+        // check still runs, just under the pre-commit knobs.
+        let config = match commit_status::StatusCheckConfig::from_properties(
+            self.table.metadata().properties(),
+        ) {
+            Ok(config) => config,
+            Err(config_error) => {
+                // Surfacing the ORIGINAL unknown outcome is strictly safer than replacing it
+                // with a config-parse error (Java would throw the NumberFormatException,
+                // masking the may-have-landed state).
+                tracing::warn!(
+                    table = %self.table.identifier(),
+                    ?config_error,
+                    "invalid commit.status-check.* properties; surfacing the unknown commit \
+                     outcome unreconciled"
+                );
+                return Err(original_error);
+            }
+        };
+
+        match commit_status::check_commit_status_strict(
+            catalog,
+            self.table.identifier(),
+            &self.latest_attempt_snapshot_ids,
+            &config,
+        )
         .await
-        .1
+        {
+            commit_status::CommitStatus::Success(reloaded) => Ok(*reloaded),
+            commit_status::CommitStatus::Failure => {
+                // The non-strict conversion (Java `checkCommitStatus` L71-78 / bytecode offsets
+                // 11-34): strict FAILURE ⇒ UNKNOWN, "new metadata location is not current or in
+                // history" — surfaced as the original unknown outcome, never as a retryable
+                // failure (a pending in-flight request could still land the commit).
+                tracing::warn!(
+                    table = %self.table.identifier(),
+                    "commit status check: the ambiguous commit is not current or in history; \
+                     treating the commit state as unknown (a pending request may still land it)"
+                );
+                Err(original_error)
+            }
+            commit_status::CommitStatus::Unknown => Err(original_error),
+        }
     }
 
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
@@ -418,6 +533,11 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
+        // Drop any previous attempt's reconciliation evidence FIRST: if this attempt fails
+        // before its own `update_table` call, stale ids from an attempt that provably did not
+        // land (e.g. a requirement conflict) must not feed reconciliation.
+        self.latest_attempt_snapshot_ids.clear();
+
         let refreshed = catalog.load_table(self.table.identifier()).await?;
 
         if self.table.metadata() != refreshed.metadata()
@@ -466,6 +586,14 @@ impl Transaction {
                 TableUpdate::AddSnapshot { snapshot } => Some(snapshot.clone()),
                 _ => None,
             })
+            .collect();
+
+        // Capture the reconciliation evidence BEFORE the request goes out: on an
+        // `ErrorKind::CommitStateUnknown` outcome these ids are what `commit` searches the
+        // reloaded metadata for (see `reconcile_unknown_commit_outcome`).
+        self.latest_attempt_snapshot_ids = added_snapshots
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id())
             .collect();
 
         let table_commit = TableCommit::builder()
@@ -811,23 +939,30 @@ mod tests {
     }
 
     /// CROWN JEWEL (GAP_MATRIX row R157). Risk: an UNKNOWN-outcome commit failure (the update
-    /// request durably LANDED but the response was lost) is auto-retried — `do_commit` then
+    /// request durably LANDED but the response was lost) is either auto-RETRIED — `do_commit`
     /// re-applies the same action on a refreshed base that already CONTAINS attempt #1's
-    /// snapshot, appending the same `DataFile` twice (duplicate rows). Java contract:
-    /// `SnapshotProducer.commit()` retries ONLY `CommitFailedException`
+    /// snapshot, appending the same `DataFile` twice (duplicate rows) — or surfaced UNRESOLVED,
+    /// forcing the caller into manual reconciliation for a commit that in fact succeeded. Java
+    /// contract: `SnapshotProducer.commit()` retries ONLY `CommitFailedException`
     /// (`onlyRetryOn(CommitFailedException.class)`) and rethrows `CommitStateUnknownException`
-    /// ahead of the cleanup catch — no retry, no cleanup, surfaced.
+    /// ahead of the cleanup catch; the metastore ops layer then RECONCILES the unknown by
+    /// re-reading the catalog (`BaseMetastoreOperations.checkCommitStatus`, invoked from
+    /// `GlueTableOperations.doCommit` L174) and swallows the failure on `CommitStatus.SUCCESS`
+    /// — the commit stands, nothing is re-applied.
     ///
     /// Pins, on the OBSERVABLE post-commit state of a real in-memory catalog:
-    /// 1. the unknown-outcome error surfaces intact (kind + non-retryable) — no retry:
-    ///    exactly ONE `update_table` call;
+    /// 1. NO retry and NO re-apply: exactly ONE `update_table` call, and the commit resolves
+    ///    `Ok` via reconciliation (a mutated retry-on-unknown OR re-apply-on-landed makes the
+    ///    call count 2 and doubles the snapshot);
     /// 2. the table is NOT double-committed: exactly one new snapshot, and the appended file
-    ///    appears exactly ONCE in the live manifest set;
+    ///    appears exactly ONCE in the returned table's live manifest set;
     /// 3. NO cleanup ran on the unknown branch: the attempt's manifest list + manifest files
     ///    are still readable (Java skips `cleanAll` for `CommitStateUnknownException`; this
-    ///    fork's commit path must not INTRODUCE deletion on this branch).
+    ///    fork's commit path must not INTRODUCE deletion on this branch);
+    /// 4. the reconciliation is OBSERVABLE: exactly one extra `load_table` beyond `do_commit`'s
+    ///    refresh.
     #[tokio::test]
-    async fn test_unknown_outcome_commit_not_retried_no_cleanup_no_double_commit() {
+    async fn test_unknown_outcome_landed_commit_reconciles_to_success_without_reapply() {
         use crate::memory::tests::new_memory_catalog;
         use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
 
@@ -857,8 +992,11 @@ mod tests {
         // request landed" shape). `load_table` delegates so a (mutated-in) retry would refresh
         // onto the already-committed base.
         let mut mock_catalog = MockCatalog::new();
+        let load_calls = Arc::new(AtomicU32::new(0));
+        let load_calls_in_mock = Arc::clone(&load_calls);
         let load_delegate = Arc::clone(&memory_catalog);
         mock_catalog.expect_load_table().returning_st(move |ident| {
+            load_calls_in_mock.fetch_add(1, Ordering::SeqCst);
             let catalog = Arc::clone(&load_delegate);
             let ident = ident.clone();
             Box::pin(async move { catalog.load_table(&ident).await })
@@ -872,19 +1010,16 @@ mod tests {
                 let catalog = Arc::clone(&update_delegate);
                 let calls = Arc::clone(&update_calls_in_mock);
                 Box::pin(async move {
-                    let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    calls.fetch_add(1, Ordering::SeqCst);
                     // The update DURABLY LANDS in the catalog...
-                    let committed = catalog.update_table(commit).await?;
-                    if attempt == 1 {
-                        // ...but the response never reaches the client.
-                        Err(Error::new(
-                            ErrorKind::CommitStateUnknown,
-                            "connection reset after the update request was sent; the commit \
-                             state is unknown",
-                        ))
-                    } else {
-                        Ok(committed)
-                    }
+                    let _committed = catalog.update_table(commit).await?;
+                    // ...but the response NEVER reaches the client (every attempt, so a
+                    // mutated-in retry both double-commits observably and still ends unknown).
+                    Err(Error::new(
+                        ErrorKind::CommitStateUnknown,
+                        "connection reset after the update request was sent; the commit \
+                         state is unknown",
+                    ))
                 })
             });
 
@@ -903,21 +1038,30 @@ mod tests {
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![data_file]);
         let tx = action.apply(tx).expect("apply fast append");
-        let error = tx
-            .commit(&mock_catalog)
-            .await
-            .expect_err("an unknown-outcome commit must surface, not be retried into success");
-
-        // 1. Surfaced intact, exactly one attempt.
-        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
-        assert!(
-            !error.retryable(),
-            "an unknown-outcome commit error must not advertise retryability"
+        let returned_table = tx.commit(&mock_catalog).await.expect(
+            "a durably-landed unknown-outcome commit must reconcile to SUCCESS \
+             (Java CommitStatus.SUCCESS swallows the persist failure)",
         );
+
+        // 1. + 4. Exactly one attempt, resolved by reconciliation — not by a retry.
         assert_eq!(
             update_calls.load(Ordering::SeqCst),
             1,
-            "the unknown-outcome failure must NOT be retried (a retry would double-commit)"
+            "the unknown-outcome failure must NOT be retried or re-applied \
+             (a second update_table is the double-commit corruption)"
+        );
+        assert_eq!(
+            load_calls.load(Ordering::SeqCst),
+            2,
+            "reconciliation must be observable: do_commit's refresh + exactly ONE status-check \
+             re-read (a successful refresh DECIDES — Java Tasks retries only thrown failures)"
+        );
+
+        // The RETURNED table is the reloaded state proving the commit landed.
+        assert_eq!(
+            returned_table.metadata().snapshots().len(),
+            base_snapshot_count + 1,
+            "the caller must receive the committed table (one new snapshot, committed once)"
         );
 
         // 2. + 3. The observable catalog state: the attempt landed exactly once, and its files
@@ -959,6 +1103,8 @@ mod tests {
     /// (the duplicate-commit footgun). Java decides by CLASS (`onlyRetryOn(CommitFailedException
     /// .class)`), never by a flag — the Rust gate must likewise refuse to retry on the KIND, even
     /// when the flag says retryable. `.times(1)` makes a second attempt fail the test.
+    /// (The transaction is property-only, so reconciliation-by-refresh is skipped — no snapshot
+    /// evidence — and the unknown error surfaces directly; the pin here is the retry GATE.)
     #[tokio::test]
     async fn test_unknown_outcome_not_retried_even_if_flagged_retryable() {
         let table = setup_test_table("3");
@@ -986,6 +1132,509 @@ mod tests {
             .await
             .expect_err("the unknown-outcome error must surface");
         assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+    }
+
+    /// Shared fixture for the reconciliation scenarios: a fresh V2 table in a real in-memory
+    /// catalog, plus the data file the transaction under test appends.
+    async fn setup_reconciliation_table(
+        memory_catalog: &impl Catalog,
+    ) -> (Table, crate::spec::DataFile, String) {
+        use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+
+        let table = make_v2_minimal_table_in_catalog(memory_catalog).await;
+        let appended_file_path = "test/reconcile-me-7.parquet".to_string();
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(appended_file_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(7)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        (table, data_file, appended_file_path)
+    }
+
+    /// Risk (GAP_MATRIX row R157 reconciliation): the landed check compares only the CURRENT
+    /// snapshot pointer, so a commit that landed but was immediately BURIED under a third-party
+    /// commit reads as absent — the caller is told "unknown" (or worse, retries) for a commit
+    /// that succeeded. Java searches the metadata-log HISTORY for exactly this window
+    /// (`BaseMetastoreOperations.checkCommitStatus` javadoc: "all the previous locations must
+    /// also be searched on the chance that a second committer was able to successfully commit on
+    /// top of our commit"); the Rust equivalent searches the reloaded snapshot SET for the
+    /// attempted snapshot id.
+    ///
+    /// Shape: our `update_table` durably lands, then a CONCURRENT writer commits ANOTHER
+    /// fast-append on top (through the real catalog) before the lost response is reconciled. The
+    /// reloaded current pointer is the concurrent writer's snapshot, ours is its parent — and the
+    /// commit must still resolve LANDED with no re-apply.
+    #[tokio::test]
+    async fn test_unknown_outcome_commit_buried_by_concurrent_writer_still_reconciles_landed() {
+        use crate::memory::tests::new_memory_catalog;
+        use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+
+        let memory_catalog = Arc::new(new_memory_catalog().await);
+        let (table, data_file, appended_file_path) =
+            setup_reconciliation_table(memory_catalog.as_ref()).await;
+        let base_snapshot_count = table.metadata().snapshots().len();
+
+        let concurrent_file_path = "test/concurrent-writer-9.parquet".to_string();
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_delegate = Arc::clone(&memory_catalog);
+        mock_catalog.expect_load_table().returning_st(move |ident| {
+            let catalog = Arc::clone(&load_delegate);
+            let ident = ident.clone();
+            Box::pin(async move { catalog.load_table(&ident).await })
+        });
+        let update_calls = Arc::new(AtomicU32::new(0));
+        let update_calls_in_mock = Arc::clone(&update_calls);
+        let update_delegate = Arc::clone(&memory_catalog);
+        let concurrent_path_in_mock = concurrent_file_path.clone();
+        mock_catalog
+            .expect_update_table()
+            .returning_st(move |commit| {
+                let catalog = Arc::clone(&update_delegate);
+                let calls = Arc::clone(&update_calls_in_mock);
+                let concurrent_path = concurrent_path_in_mock.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // OUR update durably lands...
+                    let committed = catalog.update_table(commit).await?;
+                    // ...then a THIRD-PARTY writer commits on top of it (through the real
+                    // catalog), moving the current pointer past our snapshot...
+                    let concurrent_file = DataFileBuilder::default()
+                        .content(DataContentType::Data)
+                        .file_path(concurrent_path)
+                        .file_format(DataFileFormat::Parquet)
+                        .file_size_in_bytes(100)
+                        .record_count(9)
+                        .partition(Struct::from_iter([Some(Literal::long(0))]))
+                        .partition_spec_id(0)
+                        .build()
+                        .expect("build concurrent data file");
+                    let concurrent_tx = Transaction::new(&committed);
+                    let concurrent_tx = concurrent_tx
+                        .fast_append()
+                        .add_data_files(vec![concurrent_file])
+                        .apply(concurrent_tx)
+                        .expect("apply concurrent fast append");
+                    concurrent_tx
+                        .commit(catalog.as_ref())
+                        .await
+                        .expect("the concurrent writer's commit must succeed");
+                    // ...and only OUR response is lost.
+                    Err(Error::new(
+                        ErrorKind::CommitStateUnknown,
+                        "response lost after the update request landed",
+                    ))
+                })
+            });
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![data_file]);
+        let tx = action.apply(tx).expect("apply fast append");
+        let returned_table = tx.commit(&mock_catalog).await.expect(
+            "a landed commit buried under a concurrent writer must still reconcile LANDED \
+             (Java searches history, not only the current pointer)",
+        );
+
+        assert_eq!(
+            update_calls.load(Ordering::SeqCst),
+            1,
+            "resolving LANDED must not re-apply the transaction"
+        );
+        // The returned table is the CURRENT state: both commits present.
+        assert_eq!(
+            returned_table.metadata().snapshots().len(),
+            base_snapshot_count + 2,
+            "ours + the concurrent writer's snapshot must both be present"
+        );
+        // Live-set pin on the returned table's CURRENT snapshot: the appended file appears
+        // exactly once (no duplicate re-apply), alongside the concurrent writer's file — which
+        // also proves the current pointer moved PAST our snapshot.
+        let manifest_list = returned_table
+            .metadata()
+            .current_snapshot()
+            .expect("current snapshot")
+            .load_manifest_list(returned_table.file_io(), returned_table.metadata())
+            .await
+            .expect("load manifest list");
+        let mut our_file_count = 0usize;
+        let mut concurrent_file_count = 0usize;
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file
+                .load_manifest(returned_table.file_io())
+                .await
+                .expect("load manifest");
+            for entry in manifest.entries() {
+                if entry.data_file().file_path() == appended_file_path {
+                    our_file_count += 1;
+                } else if entry.data_file().file_path() == concurrent_file_path {
+                    concurrent_file_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            our_file_count, 1,
+            "our appended file must appear exactly ONCE in the live set"
+        );
+        assert_eq!(
+            concurrent_file_count, 1,
+            "the current snapshot must be the concurrent writer's (pointer moved past ours)"
+        );
+    }
+
+    /// Risk (GAP_MATRIX row R157 reconciliation): an ABSENT commit — the refresh succeeded and
+    /// the attempted snapshot is NOT in the reloaded metadata — is resolved as landed (silent
+    /// data loss reported as success) or as a retryable failure (the double-commit window: the
+    /// still-in-flight request may land AFTER the check, and a retry then applies the commit
+    /// twice). Java 1.10.0's production path (`BaseMetastoreOperations.checkCommitStatus`
+    /// L71-78, bytecode offsets 11-34 — the only variant called from `GlueTableOperations`/
+    /// `DynamoDbTableOperations`) converts strict-FAILURE to UNKNOWN: the outcome surfaces as
+    /// `CommitStateUnknownException(persistFailure)` with the ORIGINAL failure as cause.
+    ///
+    /// Pins: NOT Ok, kind stays `CommitStateUnknown` (never a retryable failure kind), the
+    /// ORIGINAL error message surfaces, and the deciding refresh happens exactly once (a
+    /// successful read DECIDES — no absent-polling).
+    #[tokio::test]
+    async fn test_unknown_outcome_absent_commit_surfaces_unknown_never_success_or_retry() {
+        use crate::memory::tests::new_memory_catalog;
+
+        let memory_catalog = Arc::new(new_memory_catalog().await);
+        let (table, data_file, _) = setup_reconciliation_table(memory_catalog.as_ref()).await;
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_calls = Arc::new(AtomicU32::new(0));
+        let load_calls_in_mock = Arc::clone(&load_calls);
+        let load_delegate = Arc::clone(&memory_catalog);
+        mock_catalog.expect_load_table().returning_st(move |ident| {
+            load_calls_in_mock.fetch_add(1, Ordering::SeqCst);
+            let catalog = Arc::clone(&load_delegate);
+            let ident = ident.clone();
+            Box::pin(async move { catalog.load_table(&ident).await })
+        });
+        mock_catalog
+            .expect_update_table()
+            .times(1) // definite absence must not turn into a retry
+            .returning_st(|_| {
+                Box::pin(async move {
+                    // The request never reached the catalog (nothing is applied), but the
+                    // client cannot know that — the transport classified it unknown.
+                    Err(Error::new(
+                        ErrorKind::CommitStateUnknown,
+                        "request timed out after send; the commit state is unknown",
+                    ))
+                })
+            });
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![data_file]);
+        let tx = action.apply(tx).expect("apply fast append");
+        let error = tx.commit(&mock_catalog).await.expect_err(
+            "an absent commit must NEVER resolve to success \
+             (that reports a lost write as committed)",
+        );
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::CommitStateUnknown,
+            "Java's production non-strict conversion: absent-after-refresh stays UNKNOWN \
+             (a pending in-flight request may still land it) — never a retryable failure kind"
+        );
+        assert_eq!(
+            error.message(),
+            "request timed out after send; the commit state is unknown",
+            "the ORIGINAL unknown-outcome error must surface (Java: \
+             CommitStateUnknownException(persistFailure))"
+        );
+        assert_eq!(
+            load_calls.load(Ordering::SeqCst),
+            2,
+            "do_commit's refresh + exactly ONE deciding status-check read: a SUCCESSFUL \
+             refresh decides immediately (Java Tasks retries only thrown failures)"
+        );
+    }
+
+    /// Risk (GAP_MATRIX row R157 reconciliation): the status-check loop is unbounded (hangs a
+    /// writer on a dead catalog forever) or ignores the `commit.status-check.num-retries`
+    /// property. With the property set to 2, the reconciliation budget is exactly 2 + 1 = 3
+    /// refresh attempts (Java `Tasks.Builder.retry(n)` ⇒ n+1, Tasks.java L163) and the ORIGINAL
+    /// `CommitStateUnknown` must then surface (Java `suppressFailureWhenFinished` ⇒ UNKNOWN ⇒
+    /// `CommitStateUnknownException(persistFailure)`). Also pins the property NAME end-to-end:
+    /// a renamed/ignored knob changes the observable attempt count.
+    #[tokio::test]
+    async fn test_unknown_outcome_status_checks_bounded_by_num_retries_property() {
+        use crate::memory::tests::new_memory_catalog;
+
+        let memory_catalog = Arc::new(new_memory_catalog().await);
+        let (table, data_file, _) = setup_reconciliation_table(memory_catalog.as_ref()).await;
+
+        // Commit the status-check knobs onto the REAL table first (reconciliation reads them
+        // from the transaction's base metadata, mirroring Java's `config.properties()`).
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set(
+                "commit.status-check.num-retries".to_string(),
+                "2".to_string(),
+            )
+            .set(
+                "commit.status-check.min-wait-ms".to_string(),
+                "1".to_string(),
+            )
+            .set(
+                "commit.status-check.max-wait-ms".to_string(),
+                "2".to_string(),
+            )
+            .apply(tx)
+            .expect("apply status-check properties");
+        let table = tx
+            .commit(memory_catalog.as_ref())
+            .await
+            .expect("commit status-check properties");
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_calls = Arc::new(AtomicU32::new(0));
+        let load_calls_in_mock = Arc::clone(&load_calls);
+        let load_delegate = Arc::clone(&memory_catalog);
+        mock_catalog.expect_load_table().returning_st(move |ident| {
+            let call = load_calls_in_mock.fetch_add(1, Ordering::SeqCst) + 1;
+            let catalog = Arc::clone(&load_delegate);
+            let ident = ident.clone();
+            Box::pin(async move {
+                if call == 1 {
+                    // do_commit's pre-update refresh succeeds...
+                    catalog.load_table(&ident).await
+                } else {
+                    // ...but the catalog is unreachable for every status-check read.
+                    Err(Error::new(
+                        ErrorKind::Unexpected,
+                        "catalog unreachable during the status check",
+                    ))
+                }
+            })
+        });
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(|_| {
+                Box::pin(async move {
+                    Err(Error::new(
+                        ErrorKind::CommitStateUnknown,
+                        "response lost; the commit state is unknown",
+                    ))
+                })
+            });
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![data_file]);
+        let tx = action.apply(tx).expect("apply fast append");
+        let error = tx
+            .commit(&mock_catalog)
+            .await
+            .expect_err("an unreconcilable outcome must surface as unknown");
+
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert_eq!(
+            load_calls.load(Ordering::SeqCst),
+            4,
+            "1 do_commit refresh + exactly 3 status-check attempts \
+             (commit.status-check.num-retries = 2 ⇒ 2+1 attempts, then give up)"
+        );
+    }
+
+    /// CONTROL (GAP_MATRIX row R157 reconciliation): a DEFINITE commit failure — the
+    /// CommitFailed-class conflict kind — must NEVER trigger reconciliation-by-refresh; it
+    /// retries through the normal loop exactly as before. Java rethrows
+    /// `CommitFailedException` without invoking `checkCommitStatus`
+    /// (`GlueTableOperations.doCommit` L162-163). Pin: with num-retries = 2, exactly 3
+    /// `update_table` attempts and exactly 3 `load_table` calls (one refresh per attempt,
+    /// ZERO reconciliation reads — a reconcile-on-every-error mutation adds a 4th load).
+    #[tokio::test]
+    async fn test_definite_commit_failed_never_triggers_reconciliation() {
+        use crate::memory::tests::new_memory_catalog;
+
+        let memory_catalog = Arc::new(new_memory_catalog().await);
+        let (table, data_file, _) = setup_reconciliation_table(memory_catalog.as_ref()).await;
+
+        // Fast retry schedule so 3 genuine attempts run.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("commit.retry.num-retries".to_string(), "2".to_string())
+            .set("commit.retry.min-wait-ms".to_string(), "1".to_string())
+            .set("commit.retry.max-wait-ms".to_string(), "5".to_string())
+            .apply(tx)
+            .expect("apply retry properties");
+        let table = tx
+            .commit(memory_catalog.as_ref())
+            .await
+            .expect("commit retry properties");
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_calls = Arc::new(AtomicU32::new(0));
+        let load_calls_in_mock = Arc::clone(&load_calls);
+        let load_delegate = Arc::clone(&memory_catalog);
+        mock_catalog.expect_load_table().returning_st(move |ident| {
+            load_calls_in_mock.fetch_add(1, Ordering::SeqCst);
+            let catalog = Arc::clone(&load_delegate);
+            let ident = ident.clone();
+            Box::pin(async move { catalog.load_table(&ident).await })
+        });
+        let update_calls = Arc::new(AtomicU32::new(0));
+        let update_calls_in_mock = Arc::clone(&update_calls);
+        mock_catalog.expect_update_table().returning_st(move |_| {
+            update_calls_in_mock.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Err(
+                    Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
+                        .with_retryable(true),
+                )
+            })
+        });
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![data_file]);
+        let tx = action.apply(tx).expect("apply fast append");
+        let error = tx
+            .commit(&mock_catalog)
+            .await
+            .expect_err("a definite conflict must fail after the retry budget");
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::CatalogCommitConflicts,
+            "a definite failure surfaces as-is — reconciliation must not rewrite it"
+        );
+        assert_eq!(
+            update_calls.load(Ordering::SeqCst),
+            3,
+            "definite failures retry exactly as before (num-retries = 2 ⇒ 3 attempts)"
+        );
+        assert_eq!(
+            load_calls.load(Ordering::SeqCst),
+            3,
+            "one refresh per attempt and ZERO reconciliation reads: a definite \
+             CommitFailed-class error must never trigger the status check"
+        );
+    }
+
+    /// Risk (GAP_MATRIX row R157 reconciliation): a metadata-only commit (no `AddSnapshot`)
+    /// carries NO client-visible marker to search a reloaded table for — reconciliation must be
+    /// SKIPPED (zero status-check reads), and the unknown outcome must surface unchanged rather
+    /// than being "resolved" from evidence that does not exist. (Named divergence: Java's
+    /// location-based `checkCurrentMetadataLocation` covers these; the metadata location is
+    /// catalog-assigned and unknown to this seam.)
+    #[tokio::test]
+    async fn test_unknown_outcome_metadata_only_commit_skips_reconciliation() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table); // property-only: no AddSnapshot
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_calls = Arc::new(AtomicU32::new(0));
+        let load_calls_in_mock = Arc::clone(&load_calls);
+        mock_catalog.expect_load_table().returning_st(move |_| {
+            load_calls_in_mock.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(make_v2_table()) })
+        });
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(|_| {
+                Box::pin(async move {
+                    Err(Error::new(
+                        ErrorKind::CommitStateUnknown,
+                        "response lost; the commit state is unknown",
+                    ))
+                })
+            });
+
+        let error = tx
+            .commit(&mock_catalog)
+            .await
+            .expect_err("without snapshot evidence the unknown outcome must surface");
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert_eq!(
+            load_calls.load(Ordering::SeqCst),
+            1,
+            "only do_commit's refresh: no snapshot evidence ⇒ no reconciliation reads"
+        );
+    }
+
+    /// Risk (GAP_MATRIX row R157 reconciliation): an unparsable `commit.status-check.*` property
+    /// replaces the may-have-landed unknown outcome with a config-parse error (masking the
+    /// ambiguity) or panics mid-recovery. The safe behavior: surface the ORIGINAL
+    /// `CommitStateUnknown` unreconciled, with zero status-check reads. (Named divergence:
+    /// Java's `PropertyUtil` would throw `NumberFormatException` out of `doCommit`, masking the
+    /// unknown state — the Rust seam deliberately keeps the unknown outcome visible.)
+    #[tokio::test]
+    async fn test_unknown_outcome_invalid_status_check_property_surfaces_unknown() {
+        use crate::memory::tests::new_memory_catalog;
+
+        let memory_catalog = Arc::new(new_memory_catalog().await);
+        let (table, data_file, _) = setup_reconciliation_table(memory_catalog.as_ref()).await;
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set(
+                "commit.status-check.num-retries".to_string(),
+                "not-a-number".to_string(),
+            )
+            .apply(tx)
+            .expect("apply the malformed status-check property");
+        let table = tx
+            .commit(memory_catalog.as_ref())
+            .await
+            .expect("commit the malformed status-check property");
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_calls = Arc::new(AtomicU32::new(0));
+        let load_calls_in_mock = Arc::clone(&load_calls);
+        let load_delegate = Arc::clone(&memory_catalog);
+        mock_catalog.expect_load_table().returning_st(move |ident| {
+            load_calls_in_mock.fetch_add(1, Ordering::SeqCst);
+            let catalog = Arc::clone(&load_delegate);
+            let ident = ident.clone();
+            Box::pin(async move { catalog.load_table(&ident).await })
+        });
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(|_| {
+                Box::pin(async move {
+                    Err(Error::new(
+                        ErrorKind::CommitStateUnknown,
+                        "response lost; the commit state is unknown",
+                    ))
+                })
+            });
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![data_file]);
+        let tx = action.apply(tx).expect("apply fast append");
+        let error = tx
+            .commit(&mock_catalog)
+            .await
+            .expect_err("a malformed status-check knob must not mask the unknown outcome");
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::CommitStateUnknown,
+            "the ORIGINAL unknown outcome surfaces — never the config-parse error"
+        );
+        assert_eq!(
+            error.message(),
+            "response lost; the commit state is unknown",
+            "the original error must surface unchanged"
+        );
+        assert_eq!(
+            load_calls.load(Ordering::SeqCst),
+            1,
+            "config parsing precedes any status-check read"
+        );
     }
 
     #[tokio::test]

@@ -122,10 +122,14 @@ fn expected_changelog_entries() -> Vec<(&'static str, &'static str)> {
 }
 
 /// Map a Rust [`ChangelogOperation`] to its wire token, matching Java's `ChangelogOperation.name()`.
+/// The update variants exist for API parity but are never emitted by the planner (net-change pairing
+/// is engine-side in Java too — Spark `ChangelogIterator`); they map for completeness.
 fn op_token(op: ChangelogOperation) -> &'static str {
     match op {
         ChangelogOperation::Insert => "INSERT",
         ChangelogOperation::Delete => "DELETE",
+        ChangelogOperation::UpdateBefore => "UPDATE_BEFORE",
+        ChangelogOperation::UpdateAfter => "UPDATE_AFTER",
     }
 }
 

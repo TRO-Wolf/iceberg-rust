@@ -55,36 +55,87 @@ pub type ChangelogScanTaskStream = BoxStream<'static, Result<ChangelogScanTask>>
 
 /// The kind of row-level change a [`ChangelogScanTask`] produces.
 ///
-/// Ports Java `org.apache.iceberg.ChangelogOperation`. Java's enum also declares
-/// `UPDATE_BEFORE` / `UPDATE_AFTER` for change-data-capture *merging* (collapsing a
-/// delete+insert at the same row key into an update pair) — those are produced by a
-/// higher-level CDC merge step, NOT by the data-file changelog scan, which only
-/// distinguishes whole-file additions from whole-file removals. This scan therefore
-/// models only the two operations it can emit; the update variants are intentionally
-/// omitted until a CDC-merge layer that needs them lands.
+/// Ports Java `org.apache.iceberg.ChangelogOperation`
+/// (`api/src/main/java/org/apache/iceberg/ChangelogOperation.java`: `INSERT, DELETE,
+/// UPDATE_BEFORE, UPDATE_AFTER`). The core changelog planner only ever produces
+/// [`Insert`](Self::Insert) / [`Delete`](Self::Delete) — Java 1.10.0's
+/// `BaseIncrementalChangelogScan` constructs only `BaseAddedRowsScanTask` /
+/// `BaseDeletedDataFileScanTask`, whose `operation()` defaults are INSERT / DELETE.
+/// `UpdateBefore` / `UpdateAfter` are declared for API parity and for downstream
+/// engines: collapsing a delete+insert at the same row key into an update pair is an
+/// ENGINE-side step in Java (Spark's `ChangelogIterator`; no such class exists in the
+/// `iceberg-core`/`iceberg-api` 1.10.0 jars), so this library declares the variants but
+/// never emits them from the planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangelogOperation {
     /// Rows were INSERTED — the task's data file was ADDED by its commit snapshot.
     Insert,
-    /// Rows were DELETED — the task's data file was REMOVED by its commit snapshot.
+    /// Rows were DELETED — removed with the whole data file, or marked deleted by
+    /// row-level delete files added by the commit snapshot.
     Delete,
+    /// The BEFORE image of an update pair (Java `UPDATE_BEFORE`). Never emitted by the
+    /// planner — produced only by an engine-side net-change pairing step.
+    UpdateBefore,
+    /// The AFTER image of an update pair (Java `UPDATE_AFTER`). Never emitted by the
+    /// planner — produced only by an engine-side net-change pairing step.
+    UpdateAfter,
+}
+
+/// Which Java changelog task type a [`ChangelogScanTask`] corresponds to.
+///
+/// Ports the Java `ChangelogScanTask` sub-interface split
+/// (`api/AddedRowsScanTask.java` / `api/DeletedDataFileScanTask.java` /
+/// `api/DeletedRowsScanTask.java`). The [`ChangelogScanTask::operation`] is DERIVED
+/// from this kind exactly as Java's per-interface `default ChangelogOperation
+/// operation()` methods do: `AddedRows → INSERT`, `DeletedDataFile → DELETE`,
+/// `DeletedRows → DELETE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangelogTaskKind {
+    /// The task's data file was ADDED by the commit snapshot (Java
+    /// `AddedRowsScanTask`). Reading the file with
+    /// [`added_deletes`](ChangelogScanTask::added_deletes) applied yields the NET
+    /// inserted rows (matching deletes committed in the same snapshot fold in here —
+    /// see the `AddedRowsScanTask` javadoc example).
+    AddedRows,
+    /// The task's data file was REMOVED (whole file) by the commit snapshot (Java
+    /// `DeletedDataFileScanTask`). Reading the file with
+    /// [`existing_deletes`](ChangelogScanTask::existing_deletes) applied yields the
+    /// rows that were still live when the file was removed — the rows this change
+    /// deletes.
+    DeletedDataFile,
+    /// The commit snapshot added row-level delete files that apply to this EXISTING
+    /// data file (Java `DeletedRowsScanTask`). The rows removed by
+    /// [`added_deletes`](ChangelogScanTask::added_deletes) — among the rows that
+    /// survive [`existing_deletes`](ChangelogScanTask::existing_deletes) — are the rows
+    /// this change deletes. **ENGINE-FIRST:** Java 1.10.0 core never constructs its
+    /// `BaseDeletedRowsScanTask`; this variant is produced only by the opt-in
+    /// [`with_row_level_deletes`](crate::scan::IncrementalChangelogScanBuilder::with_row_level_deletes)
+    /// mode.
+    DeletedRows,
 }
 
 /// A changelog scan task: the row-level changes (all inserts or all deletes) carried by
-/// a single data file that one snapshot in the changelog range added or removed.
+/// a single data file for one snapshot in the changelog range.
 ///
 /// Ports Java `ChangelogScanTask` + its `BaseAddedRowsScanTask` /
-/// `BaseDeletedDataFileScanTask` implementations. A task embeds the [`FileScanTask`]
-/// that reads the underlying data file (path, schema, projection, residual predicate)
-/// and tags it with the change metadata: the [`operation`](Self::operation) (insert vs
-/// delete), the [`change_ordinal`](Self::change_ordinal) (0 for the oldest snapshot in
-/// the range, incrementing — changes with a lower ordinal must be applied first), and
-/// the [`commit_snapshot_id`](Self::commit_snapshot_id) (the snapshot that committed the
-/// change).
+/// `BaseDeletedDataFileScanTask` / `BaseDeletedRowsScanTask` implementations, collapsed
+/// into one struct discriminated by [`kind`](Self::kind). A task embeds the
+/// [`FileScanTask`] that reads the underlying data file (path, schema, projection,
+/// residual predicate) and tags it with the change metadata: the
+/// [`kind`](Self::kind) (which Java task type it is), the derived
+/// [`operation`](Self::operation) (insert vs delete), the
+/// [`change_ordinal`](Self::change_ordinal) (0 for the oldest snapshot in the range,
+/// incrementing — changes with a lower ordinal must be applied first), the
+/// [`commit_snapshot_id`](Self::commit_snapshot_id) (the snapshot that committed the
+/// change), and the delete-file attachments
+/// ([`added_deletes`](Self::added_deletes) / [`existing_deletes`](Self::existing_deletes))
+/// mirroring `AddedRowsScanTask.deletes()` / `DeletedRowsScanTask.addedDeletes()` +
+/// `existingDeletes()` / `DeletedDataFileScanTask.existingDeletes()`.
 ///
-/// Like Java's current data-file changelog, a task carries NO delete files — the scan
-/// rejects a range that contains row-level delete manifests (see
-/// [`IncrementalChangelogScan`](super::IncrementalChangelogScan)).
+/// In the DEFAULT (Java-1.10.0-parity) mode both delete lists are always empty (Java
+/// passes `NO_DELETES`) and the scan rejects a range that contains row-level delete
+/// manifests (see [`IncrementalChangelogScan`](super::IncrementalChangelogScan)). The
+/// opt-in row-level mode populates them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangelogScanTask {
     /// The change ordinal: `0` for the oldest snapshot in the range, incrementing for
@@ -94,17 +145,61 @@ pub struct ChangelogScanTask {
     /// The id of the snapshot that committed this change (Java
     /// `ChangelogScanTask.commitSnapshotId()`).
     pub commit_snapshot_id: i64,
-    /// Whether this task's rows are insertions or deletions (Java
-    /// `ChangelogScanTask.operation()`).
-    pub operation: ChangelogOperation,
-    /// The underlying file scan task that reads the data file whose rows changed.
+    /// Which Java changelog task type this is; [`operation`](Self::operation) derives
+    /// from it (making a kind/operation mismatch unrepresentable).
+    pub kind: ChangelogTaskKind,
+    /// Delete files ADDED by the commit snapshot that apply to the task's data file:
+    /// Java `AddedRowsScanTask.deletes()` for [`ChangelogTaskKind::AddedRows`],
+    /// `DeletedRowsScanTask.addedDeletes()` for [`ChangelogTaskKind::DeletedRows`].
+    /// Always empty for [`ChangelogTaskKind::DeletedDataFile`] and in the default
+    /// data-file changelog mode.
+    pub added_deletes: Vec<FileScanTaskDeleteFile>,
+    /// Delete files that existed BEFORE the commit snapshot and apply to the task's
+    /// data file: Java `DeletedDataFileScanTask.existingDeletes()` /
+    /// `DeletedRowsScanTask.existingDeletes()` ("must be applied prior to determining
+    /// which records are deleted"). Always empty for
+    /// [`ChangelogTaskKind::AddedRows`] (a file added by the commit snapshot postdates
+    /// every pre-existing delete) and in the default data-file changelog mode.
+    pub existing_deletes: Vec<FileScanTaskDeleteFile>,
+    /// The underlying file scan task that reads the data file whose rows changed. Its
+    /// [`deletes`](FileScanTask::deletes) carry the delete files a plain MoR read of
+    /// this task should apply: `added_deletes` for an `AddedRows` task (⇒ the net
+    /// inserted rows) and `existing_deletes` for a `DeletedDataFile` or `DeletedRows`
+    /// task (⇒ the rows live before this change; for `DeletedRows` the engine then uses
+    /// `added_deletes` as the SELECTOR of which of those rows became deleted).
     pub file_scan_task: FileScanTask,
 }
 
 impl ChangelogScanTask {
-    /// Returns the kind of change (insert / delete) this task produces.
+    /// Returns the kind of change (insert / delete) this task produces, derived from
+    /// [`kind`](Self::kind) exactly as Java's per-task-interface `default operation()`
+    /// implementations: `AddedRowsScanTask → INSERT`, `DeletedDataFileScanTask` /
+    /// `DeletedRowsScanTask → DELETE`.
     pub fn operation(&self) -> ChangelogOperation {
-        self.operation
+        match self.kind {
+            ChangelogTaskKind::AddedRows => ChangelogOperation::Insert,
+            ChangelogTaskKind::DeletedDataFile | ChangelogTaskKind::DeletedRows => {
+                ChangelogOperation::Delete
+            }
+        }
+    }
+
+    /// Returns which Java changelog task type this task corresponds to.
+    pub fn kind(&self) -> ChangelogTaskKind {
+        self.kind
+    }
+
+    /// Delete files ADDED by the commit snapshot that apply to this task's data file
+    /// (Java `AddedRowsScanTask.deletes()` / `DeletedRowsScanTask.addedDeletes()`).
+    pub fn added_deletes(&self) -> &[FileScanTaskDeleteFile] {
+        &self.added_deletes
+    }
+
+    /// Delete files that existed before the commit snapshot and apply to this task's
+    /// data file (Java `DeletedDataFileScanTask.existingDeletes()` /
+    /// `DeletedRowsScanTask.existingDeletes()`).
+    pub fn existing_deletes(&self) -> &[FileScanTaskDeleteFile] {
+        &self.existing_deletes
     }
 
     /// Returns the change ordinal — changes with a lower ordinal must be applied first.

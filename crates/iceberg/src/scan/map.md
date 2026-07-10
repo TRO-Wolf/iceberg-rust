@@ -37,7 +37,7 @@ propagation, and opt-in scan-metrics reporting.
 | `task_group.rs` | `ScanTaskGroup` trait + `CombinedScanTask` (`Vec<FileScanTask>`; `size_bytes` = Σ lengths, `files_count`) — the `plan_tasks` group output (Java `ScanTaskGroup` / `CombinedScanTask`) |
 | `bin_pack.rs` | `PackingIterator` — a faithful Java `BinPacking.PackingIterable` port (FIFO `findBin`, `largestBinFirst` eviction, drain FIFO); self-contained + unit-testable |
 | `cache.rs` | object cache plumbing for manifest/manifest-list reads |
-| `incremental.rs` | incremental append scan (parity gap: changelog/batch scans missing) |
+| `incremental.rs` | `IncrementalAppendScan` (Java `BaseIncrementalAppendScan`: appended files in `(from, to]`, append-only walk) + `IncrementalChangelogScan` (Java `BaseIncrementalChangelogScan`: `ChangelogScanTask`s with oldest→0 ordinals; default = Java 1.10.0 data-file changelog, REJECTS delete-manifest ranges; opt-in ENGINE-FIRST `with_row_level_deletes(true)` emits the Java-api row-level taxonomy — AddedRows fold / DeletedDataFile / DeletedRows with added-vs-existing delete split — beyond what 1.10.0 core implements) |
 | `metrics_collector.rs` | `ScanMetricsCollector` (Arc'd `AtomicI64`) — opt-in; report emitted ONCE on full stream consumption |
 
 ## I want to...
@@ -49,6 +49,7 @@ propagation, and opt-in scan-metrics reporting.
 | Touch residual handling | `context.rs` — the residual is built per manifest from the file's spec, evaluated per partition, then **bound back to the snapshot schema** |
 | Add a scan metric | `metrics_collector.rs` + the count sites in `mod.rs`/`context.rs`; populated-vs-`None` counters are documented in `../metrics/mod.rs` |
 | Understand merge-on-read reads | `task.rs` delete attachments → applied in `../arrow/` (delete_file_index / delete_vector at crate root) |
+| Touch the changelog task taxonomy or row-level changelog mode | `task.rs` (`ChangelogScanTask` / `ChangelogTaskKind` / `ChangelogOperation` — Java api split, `operation()` derived from kind) + `incremental.rs` (`plan_snapshot_change_tasks` / `plan_deleted_rows_tasks` / `build_snapshot_delete_indexes`; the default-mode rejection guard lives in `ordered_changelog_snapshots` and must keep matching Java 1.10.0 — mutation-pinned) |
 
 ## Pointers
 

@@ -766,6 +766,32 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-s5-isolation":
+        // ENGINE_CONTRACT §5 isolation-recipe interop — the three §5 cells whose covering conflict
+        // scenario was previously Rust-unit-level only: COW/snapshot (OverwriteFiles rewrite +
+        // validateNoConflictingDeletes), dynamic-overwrite/snapshot (ReplacePartitions +
+        // validateNoConflictingDeletes), and static overwrite-by-filter (overwriteByRowFilter;
+        // snapshot = validateNoConflictingDeletes, serializable = + validateNoConflictingData with
+        // the ROW FILTER as the default conflict filter). For each scenario, writes the S0+S1 table
+        // under <dir>/<scenario>/table; the validating engine runs the cell's symmetric operation
+        // and its ACCEPT/REJECT must equal the hand-declared expected (same contract as Rust's
+        // interop_s5_isolation_conflict.rs).
+        Path s5IsolationDir = requireFixturesDir("interop.s5_isolation.dir");
+        S5IsolationOracle.generate(s5IsolationDir);
+        break;
+      case "verify-interop-s5-isolation":
+        // ENGINE_CONTRACT §5 isolation-recipe interop, DIRECTION 2 — "Java validates what RUST
+        // writes". The Rust GEN test (env ICEBERG_INTEROP_S5_ISOLATION_GEN_DIR) wrote each
+        // scenario's S0+S1 table to <dir>/<scenario>/rust_table. Java loads each, runs the cell's
+        // symmetric operation, and asserts the conflict decision matches the hand-declared
+        // expected outcome.
+        Path s5IsolationVerifyDir = requireFixturesDir("interop.s5_isolation.dir");
+        int s5IsolationFailures = S5IsolationOracle.verify(s5IsolationVerifyDir);
+        System.out.println("verify-interop-s5-isolation: " + s5IsolationFailures + " failures");
+        if (s5IsolationFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-deletefiles-conflict":
         // CONFLICT-VALIDATION DeleteFiles interop (increment C2) — the SIMPLEST write-action conflict
         // unit (GAP_MATRIX row 93): one axis, validateFilesExist(), no filter. For each scenario, writes
@@ -12467,6 +12493,607 @@ public final class InteropOracle {
         writer.write(rows);
       }
       return writer.toDataFile();
+    }
+
+    private static void mkdirs(File directory) throws IOException {
+      if (!directory.isDirectory() && !directory.mkdirs()) {
+        throw new IOException("failed to create dir " + directory);
+      }
+    }
+  }
+
+  // =============================================================================================
+  // S5IsolationOracle — ENGINE_CONTRACT §5 isolation-recipe interop (the DRAFT→NORMATIVE residue).
+  //
+  // Proves the three §5 cells whose covering conflict scenario was previously Rust-unit-level only
+  // agree with Java on the conflict DECISION (ACCEPT vs REJECT) over the SAME S0→S1 history:
+  //
+  //   1. COW/snapshot — OverwriteFiles rewrite + validateNoConflictingDeletes(): a concurrent
+  //      DELETE file applying to a REWRITTEN data file would be silently dropped with it
+  //      (BaseOverwriteFiles.validate → validateNoNewDeletesForDataFiles, L174-177 @ 1.10.0; the
+  //      SparkWrite.commitWithSnapshotIsolation recipe).
+  //   2. Dynamic-overwrite/snapshot — ReplacePartitions + validateNoConflictingDeletes(): a
+  //      concurrent DELETE file in a REPLACED partition (BaseReplacePartitions.validate →
+  //      validateNoNewDeleteFiles over replacedPartitions, L99-108; the
+  //      SparkWrite.DynamicOverwrite SNAPSHOT arm).
+  //   3. Static overwrite-by-filter — overwriteByRowFilter: snapshot =
+  //      validateNoConflictingDeletes() (the ROW FILTER scopes the delete check, L168-172);
+  //      serializable = + validateNoConflictingData() with the ROW FILTER as the DEFAULT
+  //      conflict-detection filter (dataConflictDetectionFilter(), L181-189 — deliberately NO
+  //      explicit conflictDetectionFilter here, pinning the default cross-engine). The
+  //      serializable rows run on the PARTITIONED shape with the partition-scoped filter
+  //      category = "a" so the validation is genuinely load-bearing (a metrics-strict full-match
+  //      sweep by the operation's own deleteByRowFilter would otherwise mask it in Rust — see
+  //      the Rust suite's named strict-metrics nan-count follow-up).
+  //
+  // Two fixture shapes, both V2: P (cells 1+2 + serializable by-filter) = {1 id long, 2 category
+  // string} PARTITIONED by identity(category) — S0 base cat=a (id=1) + cat=b (id=2), S1 a
+  // CONCURRENT rowDelta adding a partition-scoped EQUALITY delete (keyed on id) into ONE
+  // partition (cells 1+2) or a CONCURRENT fast-append DATA file into ONE partition (serializable
+  // by-filter). U (snapshot by-filter) = {1 id long, 2 y long} UNPARTITIONED — S0 base A0
+  // (y bounds [0,5]), S1 a CONCURRENT y-keyed eq-delete (bounds [lo,hi]).
+  //
+  //   scenario                 | cell                    | S1 concurrent            | expected
+  //   cow_delete_on_rewritten  | COW snapshot            | eq-delete in cat=a       | REJECT
+  //   cow_delete_on_other      | COW snapshot            | eq-delete in cat=b       | ACCEPT
+  //   dyn_delete_in_replaced   | dynamic snapshot        | eq-delete in cat=a       | REJECT
+  //   dyn_delete_in_other      | dynamic snapshot        | eq-delete in cat=b       | ACCEPT
+  //   byfilter_delete_matching | by-filter snapshot      | eq-delete keyed y[60,70] | REJECT
+  //   byfilter_delete_excluded | by-filter snapshot      | eq-delete keyed y[10,20] | ACCEPT
+  //   byfilter_data_matching   | by-filter serializable  | DATA file in cat=a       | REJECT
+  //   byfilter_data_excluded   | by-filter serializable  | DATA file in cat=b       | ACCEPT
+  //
+  // The symmetric operation per cell (the §5 recipe, verbatim; the COW cell's rewritten file is
+  // DERIVED from the loaded table — the single live cat=a data file — so there is no cross-engine
+  // path coupling):
+  //   COW:      newOverwrite().deleteFile(<derived cat=a file>).addFile(<fresh cat=a>)
+  //             .validateFromSnapshot(S0).validateNoConflictingDeletes()
+  //   dynamic:  newReplacePartitions().addFile(<fresh cat=a>)
+  //             .validateFromSnapshot(S0).validateNoConflictingDeletes()
+  //   by-filter snapshot:     newOverwrite().overwriteByRowFilter(y >= 50).addFile(<fresh y=1>)
+  //                           .validateFromSnapshot(S0).validateNoConflictingDeletes()
+  //   by-filter serializable: newOverwrite().overwriteByRowFilter(category = "a")
+  //                           .addFile(<fresh cat=a>).validateFromSnapshot(S0)
+  //                           .validateNoConflictingDeletes().validateNoConflictingData()
+  //
+  // This MUST mirror Rust's interop_s5_isolation_conflict.rs scenario set exactly (names, cells,
+  // partitions, bounds, expected outcomes). generate writes <dir>/<scenario>/table (Java) for
+  // Rust's D1; verify loads <dir>/<scenario>/rust_table (Rust's GEN) for Java's D2 and prints the
+  // "N failures" sentinel.
+  // =============================================================================================
+  static final class S5IsolationOracle {
+    private S5IsolationOracle() {}
+
+    private enum CellKind {
+      COW_SNAPSHOT,
+      DYNAMIC_SNAPSHOT,
+      BYFILTER_SNAPSHOT,
+      BYFILTER_SERIALIZABLE
+    }
+
+    private static final class Scenario {
+      final String name;
+      final CellKind cell;
+      final String concurrentCategory; // P-shape cells only
+      final long lo; // U-shape cells only
+      final long hi; // U-shape cells only
+      final boolean expectReject;
+
+      Scenario(
+          String name,
+          CellKind cell,
+          String concurrentCategory,
+          long lo,
+          long hi,
+          boolean expectReject) {
+        this.name = name;
+        this.cell = cell;
+        this.concurrentCategory = concurrentCategory;
+        this.lo = lo;
+        this.hi = hi;
+        this.expectReject = expectReject;
+      }
+
+      boolean isPartitioned() {
+        return cell == CellKind.COW_SNAPSHOT
+            || cell == CellKind.DYNAMIC_SNAPSHOT
+            || cell == CellKind.BYFILTER_SERIALIZABLE;
+      }
+    }
+
+    private static final List<Scenario> SCENARIOS =
+        List.of(
+            new Scenario("cow_delete_on_rewritten", CellKind.COW_SNAPSHOT, "a", 0L, 0L, true),
+            new Scenario("cow_delete_on_other", CellKind.COW_SNAPSHOT, "b", 0L, 0L, false),
+            new Scenario("dyn_delete_in_replaced", CellKind.DYNAMIC_SNAPSHOT, "a", 0L, 0L, true),
+            new Scenario("dyn_delete_in_other", CellKind.DYNAMIC_SNAPSHOT, "b", 0L, 0L, false),
+            new Scenario("byfilter_delete_matching", CellKind.BYFILTER_SNAPSHOT, "", 60L, 70L, true),
+            new Scenario(
+                "byfilter_delete_excluded", CellKind.BYFILTER_SNAPSHOT, "", 10L, 20L, false),
+            new Scenario(
+                "byfilter_data_matching", CellKind.BYFILTER_SERIALIZABLE, "a", 0L, 0L, true),
+            new Scenario(
+                "byfilter_data_excluded", CellKind.BYFILTER_SERIALIZABLE, "b", 0L, 0L, false));
+
+    private static final Schema SCHEMA_P =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "category", Types.StringType.get()));
+
+    private static final Schema SCHEMA_U =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "y", Types.LongType.get()));
+
+    static void generate(Path dir) throws IOException {
+      for (Scenario scenario : SCENARIOS) {
+        Path scenarioDir = dir.resolve(scenario.name);
+        File tableDir = scenarioDir.resolve("table").toFile();
+        File metadataDir = new File(tableDir, "metadata");
+        File dataDir = new File(tableDir, "data");
+        mkdirs(metadataDir);
+        mkdirs(dataDir);
+
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, "2");
+
+        LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+        if (scenario.isPartitioned()) {
+          PartitionSpec spec = PartitionSpec.builderFor(SCHEMA_P).identity("category").build();
+          TableMetadata seed =
+              TableMetadata.newTableMetadata(
+                  SCHEMA_P, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+          ops.commit(null, seed);
+          BaseTable table = new BaseTable(ops, "interop_s5_isolation_" + scenario.name);
+
+          // S0: base files cat=a (id=1) + cat=b (id=2).
+          DataFile baseA =
+              writePartitionedFile(
+                  table,
+                  spec,
+                  "a",
+                  new File(dataDir, "category=a/00000-a0.parquet"),
+                  new long[] {1L});
+          DataFile baseB =
+              writePartitionedFile(
+                  table,
+                  spec,
+                  "b",
+                  new File(dataDir, "category=b/00000-b0.parquet"),
+                  new long[] {2L});
+          table.newFastAppend().appendFile(baseA).appendFile(baseB).commit();
+
+          if (scenario.cell == CellKind.BYFILTER_SERIALIZABLE) {
+            // S1: a CONCURRENT fast-append of a DATA file (id=100) into the scenario's partition.
+            String cat = scenario.concurrentCategory;
+            DataFile concurrent =
+                writePartitionedFile(
+                    table,
+                    spec,
+                    cat,
+                    new File(dataDir, "category=" + cat + "/00001-concurrent.parquet"),
+                    new long[] {100L});
+            table.newFastAppend().appendFile(concurrent).commit();
+          } else {
+            // S1: a CONCURRENT rowDelta adds a partition-scoped eq-delete (keyed on id) deleting
+            // that partition's base row (id=1 in cat=a, id=2 in cat=b).
+            String cat = scenario.concurrentCategory;
+            long deletedId = "a".equals(cat) ? 1L : 2L;
+            DeleteFile eqDelete =
+                writePartitionedEqDelete(
+                    table,
+                    spec,
+                    cat,
+                    new File(dataDir, "category=" + cat + "/00001-eqdel.parquet"),
+                    new long[] {deletedId});
+            table.newRowDelta().addDeletes(eqDelete).commit();
+          }
+        } else {
+          TableMetadata seed =
+              TableMetadata.newTableMetadata(
+                  SCHEMA_U,
+                  PartitionSpec.unpartitioned(),
+                  SortOrder.unsorted(),
+                  tableDir.getAbsolutePath(),
+                  props);
+          ops.commit(null, seed);
+          BaseTable table = new BaseTable(ops, "interop_s5_isolation_" + scenario.name);
+
+          // S0: base file A0 — rows (1,0),(2,5) → y bounds [0,5].
+          DataFile a0 =
+              writeYidFile(
+                  table,
+                  new File(dataDir, "00000-a0.parquet").getAbsolutePath(),
+                  new long[] {1L, 2L},
+                  new long[] {0L, 5L});
+          table.newFastAppend().appendFile(a0).commit();
+
+          if (scenario.cell == CellKind.BYFILTER_SNAPSHOT) {
+            // S1: a CONCURRENT rowDelta adding an eq-delete keyed on y, bounds [lo,hi].
+            DeleteFile eqDelete =
+                writeYEqDeleteFile(
+                    table,
+                    new File(dataDir, "00001-eqdel.parquet").getAbsolutePath(),
+                    scenario.lo,
+                    scenario.hi);
+            table.newRowDelta().addDeletes(eqDelete).commit();
+          } else {
+            // S1: a CONCURRENT fast-append of a DATA file with y bounds [lo,hi].
+            DataFile concurrent =
+                writeYidFile(
+                    table,
+                    new File(dataDir, "00001-concurrent.parquet").getAbsolutePath(),
+                    new long[] {100L, 101L},
+                    new long[] {scenario.lo, scenario.hi});
+            table.newFastAppend().appendFile(concurrent).commit();
+          }
+        }
+
+        Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+        OutputFile finalOut =
+            new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+        TableMetadataParser.write(ops.current(), finalOut);
+
+        System.out.println(
+            "generated s5-isolation scenario "
+                + scenario.name
+                + " ("
+                + scenario.cell
+                + ", expected "
+                + (scenario.expectReject ? "REJECT" : "ACCEPT")
+                + ") to "
+                + scenarioDir);
+      }
+    }
+
+    /**
+     * DIRECTION 2 verify — for each scenario, load the RUST-written table and run the cell's
+     * symmetric operation; the ACCEPT/REJECT outcome must equal the hand-declared expected.
+     */
+    static int verify(Path dir) {
+      int failures = 0;
+      for (Scenario scenario : SCENARIOS) {
+        Path finalMetadata =
+            dir.resolve(scenario.name)
+                .resolve("rust_table")
+                .resolve("metadata")
+                .resolve("final.metadata.json");
+        if (!Files.exists(finalMetadata)) {
+          System.out.println(
+              "FAIL s5-isolation-d2["
+                  + scenario.name
+                  + "]: missing "
+                  + finalMetadata
+                  + " (run the Rust GEN path first)");
+          failures++;
+          continue;
+        }
+
+        try {
+          boolean rejected = runSymmetricAndDetect(finalMetadata, scenario);
+          if (rejected == scenario.expectReject) {
+            System.out.println(
+                "PASS s5-isolation-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " matches expected");
+          } else {
+            System.out.println(
+                "FAIL s5-isolation-d2["
+                    + scenario.name
+                    + "]: outcome "
+                    + (rejected ? "REJECT" : "ACCEPT")
+                    + " but expected "
+                    + (scenario.expectReject ? "REJECT" : "ACCEPT"));
+            failures++;
+          }
+        } catch (RuntimeException | IOException error) {
+          System.out.println(
+              "FAIL s5-isolation-d2["
+                  + scenario.name
+                  + "]: unexpected error running the symmetric operation: "
+                  + error);
+          failures++;
+        }
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-s5-isolation OK — Java's §5 isolation-recipe conflict decisions match "
+                + "Rust on all "
+                + SCENARIOS.size()
+                + " scenarios (COW/snapshot, dynamic/snapshot, by-filter snapshot+serializable)");
+      }
+      return failures;
+    }
+
+    /**
+     * Load the Rust-written {@code final.metadata.json} into a committable {@link
+     * LocalTableOperations} (seed via {@code commit(null, loaded)} — S0+S1 snapshot ids
+     * preserved), run the scenario's symmetric §5 operation, and return {@code true} when it was
+     * REJECTED (a {@code ValidationException}) or {@code false} when it committed (ACCEPT).
+     */
+    private static boolean runSymmetricAndDetect(Path rustFinalMetadata, Scenario scenario)
+        throws IOException {
+      File metadataDir = rustFinalMetadata.getParent().toFile();
+      File tableDir = metadataDir.getParentFile(); // .../rust_table
+      File dataDir = new File(tableDir, "data");
+      mkdirs(dataDir);
+
+      TableMetadata loaded =
+          TableMetadataParser.fromJson(rustFinalMetadata.toString(), readString(rustFinalMetadata));
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, loaded); // seed `current` with the Rust S0+S1 history
+      BaseTable table = new BaseTable(ops, "rust_s5_isolation_" + scenario.name);
+
+      long s0 = rootSnapshotId(table);
+      SnapshotUpdate<?> operation;
+      switch (scenario.cell) {
+        case COW_SNAPSHOT:
+          {
+            DataFile rewritten = findLiveCategoryAFile(table);
+            DataFile fresh =
+                writePartitionedFile(
+                    table,
+                    table.spec(),
+                    "a",
+                    new File(
+                        dataDir,
+                        "category=a/fresh-" + scenario.name + "-" + System.nanoTime() + ".parquet"),
+                    new long[] {999L});
+            operation =
+                table
+                    .newOverwrite()
+                    .deleteFile(rewritten)
+                    .addFile(fresh)
+                    .validateFromSnapshot(s0)
+                    .validateNoConflictingDeletes();
+            break;
+          }
+        case DYNAMIC_SNAPSHOT:
+          {
+            DataFile fresh =
+                writePartitionedFile(
+                    table,
+                    table.spec(),
+                    "a",
+                    new File(
+                        dataDir,
+                        "category=a/fresh-" + scenario.name + "-" + System.nanoTime() + ".parquet"),
+                    new long[] {999L});
+            operation =
+                table
+                    .newReplacePartitions()
+                    .addFile(fresh)
+                    .validateFromSnapshot(s0)
+                    .validateNoConflictingDeletes();
+            break;
+          }
+        case BYFILTER_SNAPSHOT:
+          {
+            DataFile fresh =
+                writeYidFile(
+                    table,
+                    new File(dataDir, "fresh-" + scenario.name + "-" + System.nanoTime() + ".parquet")
+                        .getAbsolutePath(),
+                    new long[] {999L},
+                    new long[] {1L});
+            operation =
+                table
+                    .newOverwrite()
+                    .overwriteByRowFilter(Expressions.greaterThanOrEqual("y", 50L))
+                    .addFile(fresh)
+                    .validateFromSnapshot(s0)
+                    .validateNoConflictingDeletes();
+            break;
+          }
+        case BYFILTER_SERIALIZABLE:
+        default:
+          {
+            DataFile fresh =
+                writePartitionedFile(
+                    table,
+                    table.spec(),
+                    "a",
+                    new File(
+                        dataDir,
+                        "category=a/fresh-" + scenario.name + "-" + System.nanoTime() + ".parquet"),
+                    new long[] {999L});
+            // Deliberately NO explicit conflictDetectionFilter — the ROW FILTER is the default
+            // conflict-detection filter (BaseOverwriteFiles.dataConflictDetectionFilter()).
+            operation =
+                table
+                    .newOverwrite()
+                    .overwriteByRowFilter(Expressions.equal("category", "a"))
+                    .addFile(fresh)
+                    .validateFromSnapshot(s0)
+                    .validateNoConflictingDeletes()
+                    .validateNoConflictingData();
+            break;
+          }
+      }
+      try {
+        operation.commit();
+        return false; // ACCEPT
+      } catch (org.apache.iceberg.exceptions.ValidationException validationFailure) {
+        return true; // REJECT
+      }
+    }
+
+    /** The ROOT snapshot (no parent) — after S0+S1 this is S0, so S1 is the concurrent commit. */
+    private static long rootSnapshotId(BaseTable table) {
+      for (Snapshot snapshot : table.snapshots()) {
+        if (snapshot.parentId() == null) {
+          return snapshot.snapshotId();
+        }
+      }
+      throw new IllegalStateException("no root snapshot (S0) found in the table history");
+    }
+
+    /**
+     * Derive the single LIVE cat=a DATA file from the loaded table — the file the COW cell's
+     * symmetric overwrite rewrites. A pure function of the table, so there is no cross-engine
+     * path coupling.
+     */
+    private static DataFile findLiveCategoryAFile(BaseTable table) throws IOException {
+      DataFile found = null;
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+        for (FileScanTask task : tasks) {
+          String category = task.file().partition().get(0, CharSequence.class).toString();
+          if ("a".equals(category)) {
+            if (found != null) {
+              throw new IllegalStateException(
+                  "expected exactly ONE live cat=a data file, found a second: "
+                      + task.file().location());
+            }
+            found = task.file();
+          }
+        }
+      }
+      if (found == null) {
+        throw new IllegalStateException("no live cat=a data file found (the S0 base file)");
+      }
+      return found;
+    }
+
+    /**
+     * Write a REAL parquet {id, category} file for ONE identity(category) partition; same idiom as
+     * {@link ReplacePartitionsConflictOracle#writePartitionedFile}.
+     */
+    private static DataFile writePartitionedFile(
+        BaseTable table, PartitionSpec spec, String category, File file, long[] ids)
+        throws IOException {
+      File parent = file.getParentFile();
+      if (!parent.isDirectory() && !parent.mkdirs()) {
+        throw new IOException("failed to create partition data dir " + parent);
+      }
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partition = new PartitionData(partitionType);
+      partition.set(0, category);
+
+      List<Record> rows = new ArrayList<>();
+      for (long id : ids) {
+        GenericRecord record = GenericRecord.create(SCHEMA_P);
+        record.setField("id", id);
+        record.setField("category", category);
+        rows.add(record);
+      }
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA_P, spec);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * Write a REAL parquet PARTITION-SCOPED EQUALITY-delete file keyed on {@code id}
+     * (equalityFieldIds=[1]) for the identity(category) P-shape, stamped with the partition —
+     * the routing key the delete-conflict validations index on. Same idiom as {@link
+     * EqDeleteOracle#writeEqDeleteFile} but partition-scoped.
+     */
+    private static DeleteFile writePartitionedEqDelete(
+        BaseTable table, PartitionSpec spec, String category, File file, long[] ids)
+        throws IOException {
+      File parent = file.getParentFile();
+      if (!parent.isDirectory() && !parent.mkdirs()) {
+        throw new IOException("failed to create partition data dir " + parent);
+      }
+      Schema eqDeleteRowSchema = SCHEMA_P.select("id");
+      int[] equalityFieldIds =
+          eqDeleteRowSchema.columns().stream().mapToInt(Types.NestedField::fieldId).toArray();
+
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData partition = new PartitionData(partitionType);
+      partition.set(0, category);
+
+      List<Record> deletes = new ArrayList<>();
+      for (long id : ids) {
+        GenericRecord delete = GenericRecord.create(eqDeleteRowSchema);
+        delete.setField("id", id);
+        deletes.add(delete);
+      }
+
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(SCHEMA_P, spec, equalityFieldIds, eqDeleteRowSchema, null);
+      OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
+      EqualityDeleteWriter<Record> writer =
+          factory.newEqDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(deletes);
+      }
+      return writer.toDeleteFile();
+    }
+
+    /** Write a REAL unpartitioned parquet {id, y} file; the y values become the column bounds. */
+    private static DataFile writeYidFile(BaseTable table, String path, long[] ids, long[] ys)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA_U);
+        record.setField("id", ids[i]);
+        record.setField("y", ys[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA_U);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null); // null partition = unpartitioned
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * Write a REAL unpartitioned parquet EQUALITY-delete file keyed on {@code y}
+     * (equalityFieldIds=[2]) carrying the keys {@code y=lo} and {@code y=hi}, so its parquet
+     * {@code y} bounds are {@code [lo,hi]} — the inclusive-metrics inputs the by-filter delete
+     * validation narrows on. Same idiom as {@link RowDeltaConflictOracle#writeYEqDeleteFile}.
+     */
+    private static DeleteFile writeYEqDeleteFile(BaseTable table, String path, long lo, long hi)
+        throws IOException {
+      Schema eqDeleteRowSchema = SCHEMA_U.select("y");
+      int[] equalityFieldIds =
+          eqDeleteRowSchema.columns().stream().mapToInt(Types.NestedField::fieldId).toArray();
+
+      List<Record> deletes = new ArrayList<>();
+      for (long y : new long[] {lo, hi}) {
+        GenericRecord delete = GenericRecord.create(eqDeleteRowSchema);
+        delete.setField("y", y);
+        deletes.add(delete);
+      }
+
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(
+              SCHEMA_U, PartitionSpec.unpartitioned(), equalityFieldIds, eqDeleteRowSchema, null);
+      OutputFile out = table.io().newOutputFile(path);
+      EqualityDeleteWriter<Record> writer =
+          factory.newEqDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(deletes);
+      }
+      return writer.toDeleteFile();
     }
 
     private static void mkdirs(File directory) throws IOException {

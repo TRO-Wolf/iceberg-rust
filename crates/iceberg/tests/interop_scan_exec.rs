@@ -2400,3 +2400,158 @@ async fn test_nonidentity_scan_exec_gen_rust_writes_java_readable_table() {
          scan = {{11,15,21,23}}. Java verify-interop-nonidentity-scan reads it next."
     );
 }
+
+/// Write a REAL parquet PARTITION-SCOPED EQUALITY-delete file for the `{id, data}` [`gen_schema`]
+/// (the truncate-partitioned sibling of [`write_equality_delete_for_ids`]): built WITH the caller's
+/// truncate-partition `PartitionKey`, keyed on field id 1 (`id`), deleting the given `ids`. The writer
+/// stamps the TRANSFORMED partition `Struct` + spec id onto the delete file, so the `DeleteFileIndex`
+/// routes it by the truncate value — the non-identity write-side scoping under test.
+async fn write_truncate_partitioned_equality_delete_for_ids(
+    table: &Table,
+    partition_key: &PartitionKey,
+    ids: &[i64],
+) -> DataFile {
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
+        .expect("equality-delete writer config (equality_ids = [1])");
+
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "eq-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let projected_iceberg_schema = Arc::new(
+        iceberg::arrow::arrow_schema_to_schema(config.projected_arrow_schema_ref())
+            .expect("projected arrow schema → iceberg schema"),
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        projected_iceberg_schema,
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    // Build WITH the truncate partition key so the eq delete carries the TRANSFORMED partition Struct.
+    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .build(Some(partition_key.clone()))
+        .await
+        .expect("build truncate-partition-scoped equality-delete writer");
+
+    // A FULL-schema {id, data} batch carrying the delete keys; the projector keeps only `id`.
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema → arrow"));
+    let data: Vec<&str> = std::iter::repeat_n("x", ids.len()).collect();
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+        Arc::new(StringArray::from(data)) as ArrayRef,
+    ])
+    .expect("build the truncate-scoped equality-delete key batch");
+    writer
+        .write(batch)
+        .await
+        .expect("write equality-delete batch");
+    writer
+        .close()
+        .await
+        .expect("close equality-delete writer")
+        .into_iter()
+        .next()
+        .expect("one equality-delete file")
+}
+
+/// The OWED non-identity `DeleteFilter`-equivalence proof (ENGINE_CONTRACT §2; recorded 2026-07-01 as
+/// "a `DeleteFilter`-equivalence test over a non-identity layout is still owed" — the built-in scan was
+/// proven over `truncate[10](id)` via `test_nonidentity_scan_exec_*`, but the engine BYO-scan
+/// `DeleteFilter` path was only proven on identity layouts). OFFLINE (no Java).
+///
+/// Layout: `truncate[10](id)` partitions — truncate=10 holds ids {11,13,15}, truncate=20 holds {21,23}.
+/// Deletes: a POSITION delete scoped to truncate=10 (file_10 position 1 ⇒ id 13) + an EQUALITY delete
+/// scoped to truncate=20 (key id=21). Risk pinned: the engine's raw-read + `DeleteFilter::apply` path
+/// must reproduce the built-in merge-on-read scan EXACTLY when delete routing is keyed on TRANSFORMED
+/// partition Structs — a divergence (e.g. the positional mask skipped, or transform-mismatched index
+/// routing) breaks the equivalence or the exact live set {11,15,23}.
+#[tokio::test]
+async fn test_engine_deletefilter_nonidentity_partition_equivalence() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "equivalence_nonidentity",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+    let table = create_truncate_partitioned_rust_table(&catalog, &table_location).await;
+
+    let schema = table.metadata().current_schema().clone();
+    let spec = table.metadata().default_partition_spec().as_ref().clone();
+    let key_10 = truncate_partition_key(schema.clone(), spec.clone(), 10);
+    let key_20 = truncate_partition_key(schema.clone(), spec.clone(), 20);
+
+    // truncate=10 holds ids 11/13/15; truncate=20 holds 21/23.
+    let file_10 =
+        write_truncate_gen_data_file(&table, &key_10, vec![11, 13, 15], vec!["x", "y", "z"]).await;
+    let file_20 = write_truncate_gen_data_file(&table, &key_20, vec![21, 23], vec!["p", "q"]).await;
+    let file_10_path = file_10.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_10, file_20])
+        .apply(tx)
+        .expect("apply fast append");
+    let table = tx.commit(&catalog).await.expect("commit fast append");
+
+    // A position delete scoped to truncate=10 (file_10 position 1 ⇒ id 13) AND an equality delete
+    // scoped to truncate=20 (key id=21) — both stamped with TRANSFORMED partition values.
+    let pos_delete =
+        write_partitioned_gen_position_delete_file(&table, &key_10, &file_10_path).await;
+    assert_eq!(pos_delete.content_type(), DataContentType::PositionDeletes);
+    let eq_delete =
+        write_truncate_partitioned_equality_delete_for_ids(&table, &key_20, &[21]).await;
+    assert_eq!(eq_delete.content_type(), DataContentType::EqualityDeletes);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .add_deletes(vec![pos_delete, eq_delete])
+        .apply(tx)
+        .expect("apply row delta");
+    let table = tx.commit(&catalog).await.expect("commit row delta");
+
+    // The equivalence pin: the engine BYO-scan DeleteFilter path == the built-in scan, over the
+    // non-identity layout.
+    let ground_truth = sorted_by_id(builtin_scan_rows(&table).await);
+    let engine = sorted_by_id(engine_custom_scan_rows(&table).await);
+    assert_eq!(
+        engine, ground_truth,
+        "engine DeleteFilter path == built-in scan over a truncate[10](id) (non-identity) layout"
+    );
+
+    // The observable live-set pin (catches a routing regression that breaks BOTH paths identically,
+    // which the equivalence assert alone would tolerate).
+    let live_ids: Vec<i64> = engine.iter().map(|row| row.id).collect();
+    assert_eq!(
+        live_ids,
+        vec![11, 15, 23],
+        "live set is exactly {{11, 15, 23}}: id 13 position-deleted (truncate=10), id 21 \
+         equality-deleted (truncate=20)"
+    );
+    assert!(
+        engine.iter().any(|row| row.id == 23),
+        "id 23 (truncate=20, position 1) MUST survive — the truncate=10 position delete is \
+         path-keyed, not broadcast across transform partitions"
+    );
+    assert!(
+        !engine.iter().any(|row| row.id == 21),
+        "id 21 must be equality-deleted via the TRANSFORMED (truncate=20) partition routing"
+    );
+}
