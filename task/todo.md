@@ -39,6 +39,34 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-10): AUDIT TIER 1 Mode B bundle — A1→A3→A2→A4, one branch, one PR
+
+User-approved 2026-07-10 triage of the external five-agent audit (run on the overnight branch;
+orchestrator spot-verified all four roots in-tree before scoping). Full ladder-ready briefs:
+[audit-2026-07-10-tier1-tier3-briefs.md](audit-2026-07-10-tier1-tier3-briefs.md) — the briefs
+file is the spec; this section is the tracker. **Mode B** per [pr-per-work-cycle]: one bundle
+branch `fix/audit-tier1-2026-07`, four SEQUENTIAL parity-increment ladders, orchestrator
+gates+commits after each unit, ONE final independent SEPMO bundle Critic over the whole branch
+diff; push on CONVERGED; single PR. Execution order **A1 → A3 → A2 → A4** (small corruption
+fixes first; A4 last — it loosens a must-match guard and deserves the freshest scrutiny).
+Tier 3 (ops) already landed separately as `infra/audit-ops-2026-07` (Critic CONVERGED, pushed).
+Contingency: a unit whose ladder cannot converge is parked on `fix/audit-tier1-parked-A<n>`
+and the bundle resets to the last good commit; the bundle ships with the units that converged.
+
+- [ ] **A1 — zero-width / oversized partition transforms** (BUG-001/SAF-001/BUG-013): reject
+  `bucket[N]`/`truncate[W]` outside `1..=i32::MAX` at parse per Java preconditions; kill the
+  `rem_euclid(0)` panic and the `mod_n as i32` wrap; defense-in-depth typed error at apply.
+- [ ] **A3 — negative/null position-delete positions** (BUG-005): fail closed with DataInvalid
+  at `caching_delete_file_loader.rs` (3 sites + a `.unwrap()`); checked `u64::try_from`.
+- [ ] **A2 — Fixed/Binary single-value JSON** (BUG-004/OTH-007): implement both `todo!()` arms
+  per Java `SingleValueParser`/spec Appendix D; verify emit case vs Java base16 (possible
+  two-sided interop bug); Fixed length enforcement.
+- [ ] **A4 — StrictMetricsEvaluator absent-NaN inversion** (found by our G4): absent NaN
+  counts ⇒ CANNOT contain, matching Java cell-by-cell; over-loosening pin required; close the
+  ENGINE_CONTRACT §9 open item in the same change.
+- [ ] **A5 — bundle close**: independent SEPMO bundle Critic over `main..HEAD` → on CONVERGED
+  flip this section, push, PR body to scratchpad.
+
 ## ACTIVE UNIT (2026-07-09): OVERNIGHT Mode B bundle — G1→G4, one branch, one PR
 
 User-directed 2026-07-09 ("run G1 to G4 in sequential groups without needing a PR for each") —
