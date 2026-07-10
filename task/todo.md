@@ -67,8 +67,42 @@ and the bundle resets to the last good commit; the bundle ships with the units t
     deserialization with DataInvalid (control `bucket[16]` parses). Argued deviation: the
     Java message text is asserted at the PartitionSpec serde door, not TableMetadata level
     (untagged-enum serde swallows inner messages; kind stays DataInvalid there).
-- [ ] **A3 — negative/null position-delete positions** (BUG-005): fail closed with DataInvalid
+- [x] **A3 — negative/null position-delete positions** (BUG-005): fail closed with DataInvalid
   at `caching_delete_file_loader.rs` (3 sites + a `.unwrap()`); checked `u64::try_from`.
+  CLOSED: ladder SHIP, 0 remediation rounds, critic mutations 5/5 — details in the builder
+  notes below (audit's :918 claim corrected: test-oracle code, not production).
+    - Builder plan (2026-07-10, live-audited): the audit's ":918 `.unwrap() as u64`" site is
+      INSIDE `#[cfg(test)]` (the M5 per-row reference oracle), NOT a production path — and the
+      production null guard already exists (L516-522, typed DataInvalid, but names neither the
+      delete file nor the column). Real production bugs = the two `pos as u64` wraps
+      (L526/L537). Java oracle (source + 1.10.0 jar bytecode): `BitmapPositionDeleteIndex.
+      delete(long)` → `RoaringPositionBitmap.set` → `validatePosition`
+      (RoaringPositionBitmap.java L311-316) throws IllegalArgumentException for pos < 0;
+      `pos` is a REQUIRED column (MetadataColumns.java L70-74) and Java NPEs unboxing a null
+      (Deletes.java L146). Plan: (1) thread `delete_file_path` into
+      `parse_positional_deletes_record_batch_stream` for error context; (2) split the null
+      let-else into per-column typed errors naming the delete file; (3) per-branch checked
+      conversion via a `checked_delete_position` helper (kept per-site so each brief-mandated
+      mutation stays independently RED); (4) fix the test-module reference oracle's bare
+      unwraps; (5) tests: negative-in-run (L526 pin), negative-first-row (L537 pin),
+      null-position via the FULL `load_deletes` production path, null-file-path direct-parse
+      pin, happy-path control including boundary pos=0 (over-broaden direction). Named
+      divergence to record in-test: Java also caps positions at MAX_POSITION
+      (0x7FFF_FFFE_8000_0000, roaring key-space); Rust RoaringTreemap takes full u64 — only
+      the negative bound is ported.
+    - Builder outcome (2026-07-10, pre-critic): LANDED as planned — per-site
+      `checked_delete_position` (both insert branches), split null let-else guards naming
+      the delete file + column, `delete_file_path` threaded, test-oracle unwraps fixed.
+      5 new tests (2 negative-site pins via the FULL `load_deletes` parquet path, null-pos
+      full-path, null-file-path direct-parse, pos=0 boundary control), 5 mutations ALL
+      independently RED (mutation 2's failure output showed the exact corruption:
+      RoaringTreemap<[18446744073709551611]>). Gate green: typos/fmt/clippy -D warnings/
+      lib 2745×2 (+5 over the A1 baseline 2740); `cargo test -p iceberg-datafusion` unit+
+      integration green (the one doc-test FAIL is a pre-existing `#[tokio::main]`
+      rt-multi-thread feature-unification artifact of `-p` isolation, untouched crate).
+      Flagged, not fixed (scope): L298 `task.equality_ids.clone().unwrap()` (production
+      bare unwrap, eq-delete column — not a position/path column); Java's MAX_POSITION
+      upper bound not mirrored (named in doc + test comments).
 - [ ] **A2 — Fixed/Binary single-value JSON** (BUG-004/OTH-007): implement both `todo!()` arms
   per Java `SingleValueParser`/spec Appendix D; verify emit case vs Java base16 (possible
   two-sided interop bug); Fixed length enforcement.
