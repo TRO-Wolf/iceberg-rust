@@ -201,8 +201,16 @@ workflow enumerates any interop suites G4 adds). Statuses live ONLY in the GAP_M
       (cron + workflow_dispatch, full set only — no subset flag reachable), map.md/README
       rows, local green subset proof + sabotage battery RED proofs. No matrix row touched
       (infra; no capability status changes).
-- [ ] **G5. Bundle close** — final independent SEPMO Critic (fresh context, Opus) over
-      `main..HEAD`; remediate; push on CONVERGED; single PR body to scratchpad; morning report.
+- [x] **G5. Bundle close** — DONE 2026-07-10: independent SEPMO bundle Critic (fresh context,
+      Opus) over `main..HEAD` **CONVERGED**, zero HIGH/MEDIUM findings ("Recommendation:
+      push"). Cross-unit checks all clean: G1's breaking `ChangelogScanTask` change has ZERO
+      external consumers (workspace-wide grep + build); G2's reconciliation composes correctly
+      with the #144 unknown-kind retry gate (absent ⇒ original error, Java non-strict); all 7
+      spot-checked §5 citations resolve; G3's floor (48) matches the live suite count incl.
+      G4's new suite; todo notes accurate. 3 cross-unit mutations re-proven RED. 2 LOWs
+      accepted (selftest count understated 9→10; interop coverage disclosed as
+      claim-of-existence pending Java/Maven + first nightly). Pushed; merge is the user's.
+      NO groups parked — the contingency was never needed.
 
 CONTINGENCY (unattended): if a group's ladder cannot converge (workflow remediation exhausted +
 one orchestrator remediation), park its work on `parity/overnight-parked-G<n>`, reset the bundle
