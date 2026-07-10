@@ -42,8 +42,17 @@
 //!   `BaseIncrementalChangelogScan`
 //!   (`core/src/main/java/org/apache/iceberg/BaseIncrementalChangelogScan.java`).
 //!   Like Java's current data-file changelog, a range whose snapshots carry row-level
-//!   DELETE manifests is rejected (`FeatureUnsupported`) — only whole-file changes are
-//!   supported.
+//!   DELETE manifests is rejected by default (`FeatureUnsupported`; Java 1.10.0 throws
+//!   `UnsupportedOperationException` — bytecode-verified). The opt-in **ENGINE-FIRST**
+//!   row-level mode
+//!   ([`with_row_level_deletes`](IncrementalChangelogScanBuilder::with_row_level_deletes))
+//!   goes beyond Java 1.10.0 core: it accepts such ranges and emits the Java-api task
+//!   taxonomy (`AddedRowsScanTask` with same-snapshot deletes folded in,
+//!   `DeletedDataFileScanTask` with pre-existing deletes, `DeletedRowsScanTask` for
+//!   existing files hit by the snapshot's ADDED delete files) — the task shapes Java's
+//!   api defines but whose emission 1.10.0 core does not yet implement. Net-change
+//!   UPDATE_BEFORE/UPDATE_AFTER pairing stays engine-side (Spark `ChangelogIterator`)
+//!   and is NOT performed here.
 
 use std::sync::Arc;
 
@@ -58,12 +67,13 @@ use crate::io::FileIO;
 use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::runtime::spawn;
 use crate::scan::{
-    BoundPredicates, ChangelogOperation, ChangelogScanTask, ChangelogScanTaskStream,
-    ExpressionEvaluatorCache, FileScanTask, FileScanTaskStream, ManifestEvaluatorCache,
-    PartitionFilterCache,
+    BoundPredicates, ChangelogScanTask, ChangelogScanTaskStream, ChangelogTaskKind,
+    DeleteFileContext, ExpressionEvaluatorCache, FileScanTask, FileScanTaskStream,
+    ManifestEvaluatorCache, PartitionFilterCache,
 };
 use crate::spec::{
-    DataContentType, ManifestContentType, ManifestStatus, Operation, SchemaRef, SnapshotRef,
+    DataContentType, ManifestContentType, ManifestFile, ManifestStatus, Operation, SchemaRef,
+    SnapshotRef,
 };
 use crate::table::Table;
 use crate::utils::available_parallelism;
@@ -725,6 +735,10 @@ pub struct IncrementalChangelogScanBuilder<'a> {
     /// builder's `with_concurrency_limit` (which sets both the manifest-file and
     /// manifest-entry limits together — the only public way to set them).
     concurrency_limit: usize,
+    /// Whether the ENGINE-FIRST row-level mode is enabled — see
+    /// [`Self::with_row_level_deletes`]. Defaults to `false` (exact Java 1.10.0 core
+    /// behavior).
+    include_row_level_deletes: bool,
 }
 
 impl<'a> IncrementalChangelogScanBuilder<'a> {
@@ -741,6 +755,7 @@ impl<'a> IncrementalChangelogScanBuilder<'a> {
             case_sensitive: true,
             filter: None,
             concurrency_limit: num_cpus,
+            include_row_level_deletes: false,
         }
     }
 
@@ -819,6 +834,28 @@ impl<'a> IncrementalChangelogScanBuilder<'a> {
         self
     }
 
+    /// **ENGINE-FIRST (beyond Java 1.10.0 core):** enables row-level changelog planning.
+    ///
+    /// Java 1.10.0's `BaseIncrementalChangelogScan.orderedChangelogSnapshots` throws
+    /// `UnsupportedOperationException` ("Delete files are currently not supported in
+    /// changelog scans") for ANY non-`replace` range snapshot whose manifest list carries
+    /// a delete manifest — the default (`false`) mirrors that rejection surface exactly.
+    ///
+    /// With `true`, such ranges are accepted and the scan emits the row-level task
+    /// taxonomy Java's *api* defines (`AddedRowsScanTask` / `DeletedDataFileScanTask` /
+    /// `DeletedRowsScanTask` — see [`ChangelogTaskKind`]) but whose emission 1.10.0
+    /// *core* does not implement: an existing data file that the commit snapshot's ADDED
+    /// delete files apply to yields a [`ChangelogTaskKind::DeletedRows`] task carrying
+    /// exactly those added deletes (plus the pre-existing deletes to apply first), and a
+    /// data file added in the same snapshot as deletes that match it folds them into its
+    /// [`ChangelogTaskKind::AddedRows`] task instead (the `AddedRowsScanTask` javadoc
+    /// contract). This is a Rust-side extension serving the downstream CDC engine (the
+    /// DML-foundation direction); it is NOT claimed as core parity.
+    pub fn with_row_level_deletes(mut self, include_row_level_deletes: bool) -> Self {
+        self.include_row_level_deletes = include_row_level_deletes;
+        self
+    }
+
     /// Build the incremental changelog scan.
     ///
     /// Resolves the range bounds, schema, projected field ids, and bound filter exactly
@@ -857,6 +894,7 @@ impl<'a> IncrementalChangelogScanBuilder<'a> {
         Ok(IncrementalChangelogScan {
             append_scan: append_builder.build()?,
             file_io: self.table.file_io().clone(),
+            include_row_level_deletes: self.include_row_level_deletes,
         })
     }
 }
@@ -874,6 +912,22 @@ pub struct IncrementalChangelogScan {
     /// snapshot selection + per-entry task construction in `plan_files`.
     append_scan: IncrementalAppendScan,
     file_io: FileIO,
+    /// Whether the ENGINE-FIRST row-level mode is enabled — see
+    /// [`IncrementalChangelogScanBuilder::with_row_level_deletes`].
+    include_row_level_deletes: bool,
+}
+
+/// The per-snapshot delete-file indexes the ENGINE-FIRST row-level changelog mode plans
+/// against (see [`IncrementalChangelogScan::build_snapshot_delete_indexes`]).
+struct SnapshotDeleteIndexes {
+    /// Delete files this snapshot ADDED (Java `DeletedRowsScanTask.addedDeletes()` /
+    /// `AddedRowsScanTask.deletes()`).
+    added: DeleteFileIndex,
+    /// Live delete files that pre-existed this snapshot (Java `existingDeletes()`).
+    existing: DeleteFileIndex,
+    /// Whether the snapshot added ANY delete file — `false` skips the DeletedRows
+    /// candidate pass entirely, keeping delete-free snapshots on the default plan shape.
+    has_added_deletes: bool,
 }
 
 impl IncrementalChangelogScan {
@@ -930,22 +984,83 @@ impl IncrementalChangelogScan {
                     "Too many changelog snapshots in range to assign a change ordinal",
                 )
             })?;
+            let snapshot_id = snapshot.snapshot_id();
 
-            let selected_manifests = self
-                .own_added_data_manifests(plan_context, snapshot)
+            // Load the snapshot's manifest list ONCE and split it three ways: the DATA
+            // manifests the snapshot itself added (`added_snapshot_id == snapshot_id` —
+            // its whole-file changes; a manifest carried forward from an older snapshot
+            // belongs to that older snapshot and is read for ITS ordinal, while a
+            // manifest this snapshot rewrote to delete a file carries this snapshot's
+            // id, so its `Deleted` tombstones are read here), ALL data manifests (the
+            // live-file candidates for row-level DeletedRows tasks), and the DELETE
+            // manifests (only reachable in row-level mode — the default mode already
+            // rejected any range carrying them).
+            let manifest_list = snapshot
+                .load_manifest_list(&self.file_io, &plan_context.table_metadata)
                 .await?;
-            if selected_manifests.is_empty() {
-                continue;
+            let mut own_added_data_manifests = Vec::new();
+            let mut all_data_manifests = Vec::new();
+            let mut delete_manifests = Vec::new();
+            for manifest_file in manifest_list.consume_entries() {
+                match manifest_file.content {
+                    ManifestContentType::Data => {
+                        if manifest_file.added_snapshot_id == snapshot_id {
+                            own_added_data_manifests.push(manifest_file.clone());
+                        }
+                        all_data_manifests.push(manifest_file);
+                    }
+                    ManifestContentType::Deletes => delete_manifests.push(manifest_file),
+                }
             }
 
-            let snapshot_tasks = Self::plan_snapshot_change_tasks(
-                plan_context,
-                selected_manifests,
-                change_ordinal,
-                snapshot.snapshot_id(),
-            )
-            .await?;
-            tasks.extend(snapshot_tasks);
+            // ENGINE-FIRST row-level mode: index this snapshot's delete files, split into
+            // the deletes it ADDED vs the live ones that pre-existed it (Java
+            // `DeletedRowsScanTask.addedDeletes()` vs `existingDeletes()`).
+            let row_level_indexes = if self.include_row_level_deletes {
+                Some(
+                    Self::build_snapshot_delete_indexes(
+                        plan_context,
+                        &delete_manifests,
+                        snapshot_id,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+
+            if !own_added_data_manifests.is_empty() {
+                let snapshot_tasks = Self::plan_snapshot_change_tasks(
+                    plan_context,
+                    own_added_data_manifests,
+                    change_ordinal,
+                    snapshot_id,
+                    row_level_indexes
+                        .as_ref()
+                        .map(|indexes| (indexes.added.clone(), indexes.existing.clone())),
+                )
+                .await?;
+                tasks.extend(snapshot_tasks);
+            }
+
+            // ENGINE-FIRST row-level mode: every LIVE data file NOT added by this snapshot
+            // that its ADDED delete files apply to yields a DeletedRows task. Skipped
+            // entirely when the snapshot added no delete files, so an append/overwrite
+            // snapshot plans identically with the flag on or off.
+            if let Some(indexes) = &row_level_indexes
+                && indexes.has_added_deletes
+            {
+                let deleted_rows_tasks = Self::plan_deleted_rows_tasks(
+                    plan_context,
+                    all_data_manifests,
+                    change_ordinal,
+                    snapshot_id,
+                    indexes.added.clone(),
+                    indexes.existing.clone(),
+                )
+                .await?;
+                tasks.extend(deleted_rows_tasks);
+            }
         }
 
         Ok(Box::pin(futures::stream::iter(tasks.into_iter().map(Ok))))
@@ -989,11 +1104,16 @@ impl IncrementalChangelogScan {
             // Exclude Replace snapshots (compaction): they rewrite files without changing
             // rows, so they contribute no row-level changes.
             if snapshot.summary().operation != Operation::Replace {
-                // Guard: a snapshot referencing a row-level DELETE manifest is out of
-                // scope for the data-file changelog (Java's current limitation).
-                if self
-                    .snapshot_has_delete_manifest(plan_context, &snapshot)
-                    .await?
+                // Guard (default mode only): a snapshot referencing a row-level DELETE
+                // manifest is out of scope for the data-file changelog — the exact Java
+                // 1.10.0 rejection surface (`BaseIncrementalChangelogScan.
+                // orderedChangelogSnapshots` throws `UnsupportedOperationException`).
+                // The ENGINE-FIRST row-level mode lifts the guard and plans the
+                // row-level task taxonomy instead.
+                if !self.include_row_level_deletes
+                    && self
+                        .snapshot_has_delete_manifest(plan_context, &snapshot)
+                        .await?
                 {
                     return Err(Error::new(
                         ErrorKind::FeatureUnsupported,
@@ -1031,44 +1151,85 @@ impl IncrementalChangelogScan {
             .any(|manifest_file| manifest_file.content == ManifestContentType::Deletes))
     }
 
-    /// Returns the DATA manifests `snapshot` itself ADDED (`added_snapshot_id ==
-    /// snapshot_id`) — Java `snapshot.dataManifests(io).filter(m -> snapshotIds.contains(
-    /// m.snapshotId()))` restricted to this one snapshot. A manifest carried forward from
-    /// an older snapshot belongs to that older snapshot and is read for ITS ordinal, not
-    /// this one's; a manifest this snapshot rewrote (because it deleted a file from it)
-    /// carries this snapshot's id, so its `Deleted` tombstones are read here.
-    async fn own_added_data_manifests(
-        &self,
+    /// Reads the DELETE manifests of one changelog snapshot's manifest list and builds
+    /// the two [`DeleteFileIndex`]es the ENGINE-FIRST row-level mode plans against: the
+    /// delete files the snapshot itself ADDED (status `Added`, committed by this
+    /// snapshot — Java `DeletedRowsScanTask.addedDeletes()`) and the LIVE delete files
+    /// that pre-existed it (an `Added` entry from an earlier snapshot carried forward,
+    /// or an `Existing` entry — Java `existingDeletes()`, "must be applied prior to
+    /// determining which records are deleted"). A `Deleted` tombstone (a delete file
+    /// removed by this snapshot) belongs to neither.
+    async fn build_snapshot_delete_indexes(
         plan_context: &PlanContext,
-        snapshot: &SnapshotRef,
-    ) -> Result<Vec<crate::spec::ManifestFile>> {
-        let manifest_list = snapshot
-            .load_manifest_list(&self.file_io, &plan_context.table_metadata)
-            .await?;
-        let mut selected = Vec::new();
-        for manifest_file in manifest_list.consume_entries() {
-            if manifest_file.content == ManifestContentType::Data
-                && manifest_file.added_snapshot_id == snapshot.snapshot_id()
-            {
-                selected.push(manifest_file);
+        delete_manifests: &[ManifestFile],
+        snapshot_id: i64,
+    ) -> Result<SnapshotDeleteIndexes> {
+        let (added, mut added_tx) = DeleteFileIndex::new();
+        let (existing, mut existing_tx) = DeleteFileIndex::new();
+        let mut has_added_deletes = false;
+
+        for manifest_file in delete_manifests {
+            let manifest = plan_context
+                .object_cache
+                .get_manifest(manifest_file)
+                .await?;
+            for entry in manifest.entries() {
+                if entry.status() == ManifestStatus::Deleted {
+                    continue;
+                }
+                // Manifest loading applies V2/V3 metadata inheritance
+                // (`ManifestEntry::inherit_data`), so `snapshot_id()` is populated for
+                // entries the manifest's own snapshot added; fall back to the manifest's
+                // adding snapshot defensively.
+                let entry_snapshot_id = entry
+                    .snapshot_id()
+                    .unwrap_or(manifest_file.added_snapshot_id);
+                let context = DeleteFileContext {
+                    manifest_entry: entry.clone(),
+                    partition_spec_id: manifest_file.partition_spec_id,
+                };
+                let added_by_this_snapshot =
+                    entry.status() == ManifestStatus::Added && entry_snapshot_id == snapshot_id;
+                let sender = if added_by_this_snapshot {
+                    has_added_deletes = true;
+                    &mut added_tx
+                } else {
+                    &mut existing_tx
+                };
+                sender
+                    .send(context)
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::Unexpected, "mpsc channel SendError"))?;
             }
         }
-        Ok(selected)
+        drop(added_tx);
+        drop(existing_tx);
+
+        Ok(SnapshotDeleteIndexes {
+            added,
+            existing,
+            has_added_deletes,
+        })
     }
 
     /// Plans the changelog tasks for ONE snapshot's own added DATA manifests, tagging each
     /// with the snapshot's `change_ordinal` and `commit_snapshot_id`. ADDED entries become
-    /// INSERT tasks, DELETED entries become DELETE tasks; `Existing` entries are skipped.
+    /// `AddedRows` (INSERT) tasks, DELETED entries become `DeletedDataFile` (DELETE)
+    /// tasks; `Existing` entries are skipped.
     ///
     /// Reuses the shared `PlanContext::build_manifest_file_contexts_from_files` (the same
     /// partition-filter pruning + residual evaluator the append + normal scans use) over
-    /// an EMPTY delete index (a changelog task carries no delete files), then converts the
-    /// surviving entries into `ChangelogScanTask`s.
+    /// an EMPTY delete index, then converts the surviving entries into
+    /// `ChangelogScanTask`s. In the default data-file mode (`row_level_indexes = None`)
+    /// every task carries empty delete lists — Java 1.10.0's `NO_DELETES`; in row-level
+    /// mode the `(added, existing)` indexes attach the applicable delete files per the
+    /// Java task taxonomy.
     async fn plan_snapshot_change_tasks(
         plan_context: &PlanContext,
-        selected_manifests: Vec<crate::spec::ManifestFile>,
+        selected_manifests: Vec<ManifestFile>,
         change_ordinal: i32,
         snapshot_id: i64,
+        row_level_indexes: Option<(DeleteFileIndex, DeleteFileIndex)>,
     ) -> Result<Vec<ChangelogScanTask>> {
         let manifest_count = selected_manifests.len().max(1);
         let (manifest_entry_data_ctx_tx, manifest_entry_data_ctx_rx) = channel(manifest_count);
@@ -1114,11 +1275,15 @@ impl IncrementalChangelogScan {
                 .map(Ok)
                 .try_for_each(|manifest_entry_context| {
                     let mut task_tx = task_tx.clone();
+                    // Clones of the two index handles (cheap `Arc` clones), moved into the
+                    // per-entry future.
+                    let row_level_indexes = row_level_indexes.clone();
                     async move {
                         let task = Self::changelog_task_from_entry(
                             manifest_entry_context,
                             change_ordinal,
                             snapshot_id,
+                            row_level_indexes,
                         )
                         .await;
                         match task {
@@ -1141,22 +1306,195 @@ impl IncrementalChangelogScan {
         task_rx.try_collect().await
     }
 
+    /// Plans the ENGINE-FIRST [`ChangelogTaskKind::DeletedRows`] tasks for ONE changelog
+    /// snapshot: every LIVE data file that was NOT added by this snapshot but is matched
+    /// by delete files the snapshot ADDED yields a task carrying exactly those added
+    /// deletes, plus the pre-existing deletes to apply first. Files the snapshot itself
+    /// added are excluded — their matching deletes fold into their `AddedRows` task
+    /// instead (the Java `AddedRowsScanTask` javadoc contract), and `Deleted` tombstones
+    /// are excluded — a file removed outright is a `DeletedDataFile` change.
+    ///
+    /// `all_data_manifests` is the snapshot's ENTIRE data-manifest list (own + carried
+    /// forward): the live files a delete can hit live anywhere in it. Uses the same
+    /// channel pipeline + partition-filter pruning as `plan_snapshot_change_tasks`.
+    async fn plan_deleted_rows_tasks(
+        plan_context: &PlanContext,
+        all_data_manifests: Vec<ManifestFile>,
+        change_ordinal: i32,
+        snapshot_id: i64,
+        added_index: DeleteFileIndex,
+        existing_index: DeleteFileIndex,
+    ) -> Result<Vec<ChangelogScanTask>> {
+        let manifest_count = all_data_manifests.len().max(1);
+        let (manifest_entry_data_ctx_tx, manifest_entry_data_ctx_rx) = channel(manifest_count);
+        // A never-fed delete-manifest channel (we only pass DATA manifests).
+        let (delete_ctx_tx, _delete_ctx_rx) = channel::<ManifestEntryContext>(1);
+        let (task_tx, task_rx) = channel::<Result<ChangelogScanTask>>(manifest_count);
+
+        // The pipeline's task-attachment index stays EMPTY: one pipeline index cannot
+        // represent the added/existing split, so both attachments are made explicitly in
+        // `deleted_rows_task_from_entry`.
+        let (empty_delete_index, empty_delete_tx) = DeleteFileIndex::new();
+        drop(empty_delete_tx);
+
+        let manifest_file_contexts = plan_context.build_manifest_file_contexts_from_files(
+            all_data_manifests,
+            manifest_entry_data_ctx_tx,
+            empty_delete_index,
+            delete_ctx_tx,
+        )?;
+
+        // Same producer/consumer split as `plan_snapshot_change_tasks` — see the deadlock
+        // note there.
+        let mut producer_error_tx = task_tx.clone();
+        spawn(async move {
+            let result = futures::stream::iter(manifest_file_contexts)
+                .try_for_each_concurrent(manifest_count, |ctx| async move {
+                    ctx.fetch_manifest_and_stream_manifest_entries().await
+                })
+                .await;
+            if let Err(error) = result {
+                let _ = producer_error_tx.send(Err(error)).await;
+            }
+        });
+
+        spawn(async move {
+            let result = manifest_entry_data_ctx_rx
+                .map(Ok)
+                .try_for_each(|manifest_entry_context| {
+                    let mut task_tx = task_tx.clone();
+                    let added_index = added_index.clone();
+                    let existing_index = existing_index.clone();
+                    async move {
+                        let task = Self::deleted_rows_task_from_entry(
+                            manifest_entry_context,
+                            change_ordinal,
+                            snapshot_id,
+                            added_index,
+                            existing_index,
+                        )
+                        .await;
+                        match task {
+                            Ok(Some(task)) => {
+                                let _ = task_tx.send(Ok(task)).await;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = task_tx.send(Err(error)).await;
+                            }
+                        }
+                        Ok(())
+                    }
+                })
+                .await;
+            // `try_for_each` over `map(Ok)` never yields an Err; bind to satisfy the type.
+            let _: Result<()> = result;
+        });
+
+        task_rx.try_collect().await
+    }
+
+    /// Converts a live, not-added-here data-manifest entry into a
+    /// [`ChangelogTaskKind::DeletedRows`] task, or `None` when the entry is out of scope
+    /// (a `Deleted` tombstone, a file added by this snapshot, pruned by the scan filter,
+    /// or matched by none of the snapshot's ADDED delete files).
+    async fn deleted_rows_task_from_entry(
+        manifest_entry_context: ManifestEntryContext,
+        change_ordinal: i32,
+        snapshot_id: i64,
+        added_index: DeleteFileIndex,
+        existing_index: DeleteFileIndex,
+    ) -> Result<Option<ChangelogScanTask>> {
+        // Only LIVE files can lose rows to added deletes: a `Deleted` tombstone's file
+        // was removed outright by this snapshot — that change is the `DeletedDataFile`
+        // task planned from the snapshot's own manifests, and it must not ALSO surface
+        // as row-level deletes.
+        if manifest_entry_context.manifest_entry.status() == ManifestStatus::Deleted {
+            return Ok(None);
+        }
+
+        // Only DATA manifests are fed to this planner, but guard the invariant the same
+        // way the other planners do.
+        if manifest_entry_context.manifest_entry.content_type() != DataContentType::Data {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Encountered an entry for a delete file in an incremental changelog scan",
+            ));
+        }
+
+        // A file ADDED by this snapshot folds its matching deletes into its `AddedRows`
+        // task (Java `AddedRowsScanTask` javadoc: "added data files may have matching
+        // delete files ... committed in the same snapshot") — never a separate
+        // DeletedRows task.
+        if manifest_entry_context.manifest_entry.snapshot_id() == Some(snapshot_id) {
+            return Ok(None);
+        }
+
+        if !Self::entry_matches_scan_filter(&manifest_entry_context)? {
+            return Ok(None);
+        }
+
+        let added_deletes = added_index
+            .get_deletes_for_data_file(
+                manifest_entry_context.manifest_entry.data_file(),
+                manifest_entry_context.manifest_entry.sequence_number(),
+            )
+            .await?;
+        if added_deletes.is_empty() {
+            return Ok(None);
+        }
+        let existing_deletes = existing_index
+            .get_deletes_for_data_file(
+                manifest_entry_context.manifest_entry.data_file(),
+                manifest_entry_context.manifest_entry.sequence_number(),
+            )
+            .await?;
+
+        let mut file_scan_task = manifest_entry_context.into_file_scan_task().await?;
+        // A plain MoR read of the embedded task yields the rows live BEFORE this change
+        // (Java `DeletedRowsScanTask.existingDeletes()` "must be applied prior to
+        // determining which records are deleted"); the engine then uses `added_deletes`
+        // as the SELECTOR of which of those rows became deleted.
+        file_scan_task.deletes = existing_deletes.clone();
+
+        Ok(Some(ChangelogScanTask {
+            change_ordinal,
+            // The change was committed by the snapshot that ADDED the deletes — not by
+            // the (older) snapshot that added the data file.
+            commit_snapshot_id: snapshot_id,
+            kind: ChangelogTaskKind::DeletedRows,
+            added_deletes,
+            existing_deletes,
+            file_scan_task,
+        }))
+    }
+
     /// Converts a single manifest entry into a [`ChangelogScanTask`], or `None` when the
     /// entry is `Existing` (no change) or pruned by the partition filter.
     ///
-    /// Mirrors Java `CreateDataFileChangeTasks.apply`: ADDED → INSERT, DELETED → DELETE,
-    /// each carrying the change ordinal + `commit_snapshot_id = entry.snapshotId()` (the
-    /// snapshot stamped on the entry, falling back to the snapshot id when an inherited
-    /// entry's snapshot id is not yet materialized). Applies the same partition-filter +
+    /// Mirrors Java `CreateDataFileChangeTasks.apply`: ADDED → `BaseAddedRowsScanTask`
+    /// (INSERT), DELETED → `BaseDeletedDataFileScanTask` (DELETE), each carrying the
+    /// change ordinal + `commit_snapshot_id = entry.snapshotId()` (the snapshot stamped
+    /// on the entry, falling back to the snapshot id when an inherited entry's snapshot
+    /// id is not yet materialized). Applies the same partition-filter +
     /// inclusive-metrics pruning as the append scan before emitting.
+    ///
+    /// In the default data-file mode (`row_level_indexes = None`) both delete lists are
+    /// empty (Java 1.10.0 passes `NO_DELETES` to both task constructors). In row-level
+    /// mode the `(added, existing)` indexes attach: the deletes ADDED with the file to
+    /// an `AddedRows` task (Java `AddedRowsScanTask.deletes()` — the same-snapshot fold),
+    /// and the PRE-EXISTING deletes to a `DeletedDataFile` task (Java
+    /// `DeletedDataFileScanTask.existingDeletes()` — so only rows live at removal are
+    /// output as deleted).
     async fn changelog_task_from_entry(
         manifest_entry_context: ManifestEntryContext,
         change_ordinal: i32,
         snapshot_id: i64,
+        row_level_indexes: Option<(DeleteFileIndex, DeleteFileIndex)>,
     ) -> Result<Option<ChangelogScanTask>> {
-        let operation = match manifest_entry_context.manifest_entry.status() {
-            ManifestStatus::Added => ChangelogOperation::Insert,
-            ManifestStatus::Deleted => ChangelogOperation::Delete,
+        let kind = match manifest_entry_context.manifest_entry.status() {
+            ManifestStatus::Added => ChangelogTaskKind::AddedRows,
+            ManifestStatus::Deleted => ChangelogTaskKind::DeletedDataFile,
             // `Existing` entries were added by an earlier snapshot and copied forward —
             // they are not a change committed by THIS snapshot. Java `ignoreExisting()`.
             ManifestStatus::Existing => return Ok(None),
@@ -1181,6 +1519,70 @@ impl IncrementalChangelogScan {
             .unwrap_or(snapshot_id);
 
         // Apply the same partition-filter + inclusive-metrics pruning as the append scan.
+        if !Self::entry_matches_scan_filter(&manifest_entry_context)? {
+            return Ok(None);
+        }
+
+        // Row-level mode: attach the applicable delete files per the Java task taxonomy.
+        let (added_deletes, existing_deletes) = match &row_level_indexes {
+            Some((added_index, existing_index)) => {
+                let data_file = manifest_entry_context.manifest_entry.data_file();
+                let sequence_number = manifest_entry_context.manifest_entry.sequence_number();
+                match kind {
+                    // Deletes committed with (or squashed onto) the added file. A
+                    // pre-existing delete can never apply to a file whose data sequence
+                    // number postdates it, so `existing` is structurally empty.
+                    ChangelogTaskKind::AddedRows => (
+                        added_index
+                            .get_deletes_for_data_file(data_file, sequence_number)
+                            .await?,
+                        Vec::new(),
+                    ),
+                    // The historical deletes to apply so only rows still live at removal
+                    // are output as deleted.
+                    ChangelogTaskKind::DeletedDataFile => (
+                        Vec::new(),
+                        existing_index
+                            .get_deletes_for_data_file(data_file, sequence_number)
+                            .await?,
+                    ),
+                    // Never produced by this converter — DeletedRows tasks come from
+                    // `deleted_rows_task_from_entry`.
+                    ChangelogTaskKind::DeletedRows => (Vec::new(), Vec::new()),
+                }
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
+        let mut file_scan_task = manifest_entry_context.into_file_scan_task().await?;
+        if row_level_indexes.is_some() {
+            // A plain MoR read of the task applies: the added deletes for an `AddedRows`
+            // task (yielding the NET inserted rows) and the existing deletes for a
+            // `DeletedDataFile` task (yielding the rows live at removal). In default mode
+            // the pipeline's empty index already left `deletes` empty — untouched.
+            file_scan_task.deletes = match kind {
+                ChangelogTaskKind::AddedRows => added_deletes.clone(),
+                ChangelogTaskKind::DeletedDataFile | ChangelogTaskKind::DeletedRows => {
+                    existing_deletes.clone()
+                }
+            };
+        }
+
+        Ok(Some(ChangelogScanTask {
+            change_ordinal,
+            commit_snapshot_id,
+            kind,
+            added_deletes,
+            existing_deletes,
+            file_scan_task,
+        }))
+    }
+
+    /// Applies the scan's partition-filter + inclusive-metrics pruning to one manifest
+    /// entry — the same two evaluator steps the append scan and the normal scan run —
+    /// returning whether the entry's data file can match the scan filter. Always `true`
+    /// for an unfiltered scan.
+    fn entry_matches_scan_filter(manifest_entry_context: &ManifestEntryContext) -> Result<bool> {
         if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
             let BoundPredicates {
                 snapshot_bound_predicate,
@@ -1197,7 +1599,7 @@ impl IncrementalChangelogScan {
 
             // skip any data file whose partition data indicates it can't match the filter
             if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
-                return Ok(None);
+                return Ok(false);
             }
 
             // skip any data file whose metrics don't match the filter
@@ -1206,18 +1608,11 @@ impl IncrementalChangelogScan {
                 manifest_entry_context.manifest_entry.data_file(),
                 false,
             )? {
-                return Ok(None);
+                return Ok(false);
             }
         }
 
-        let file_scan_task = manifest_entry_context.into_file_scan_task().await?;
-
-        Ok(Some(ChangelogScanTask {
-            change_ordinal,
-            commit_snapshot_id,
-            operation,
-            file_scan_task,
-        }))
+        Ok(true)
     }
 
     /// Returns the inclusive `to` snapshot id of this scan, if the table has snapshots.
@@ -1770,16 +2165,20 @@ mod tests {
     // IncrementalChangelogScan tests
     // ===================================================================================
 
-    use super::super::{ChangelogOperation, ChangelogScanTask};
+    use super::super::{ChangelogOperation, ChangelogScanTask, ChangelogTaskKind};
 
     /// A position-delete file routed to partition `x = part_value`, shaped as a DELETION
-    /// VECTOR (Puffin format + `referenced_data_file` + blob coordinates), used to create a
-    /// DELETE-content manifest in the range (NOT a real puffin file — manifest-only). A DV
-    /// rather than a parquet position delete because the fixture table is V3 and the D3
-    /// format-version gate rejects parquet position deletes on V3 ("Must use DVs for position
-    /// deletes in V3") — the test's subject (a DELETE manifest in the changelog range) is
-    /// content-format-agnostic.
-    fn synthetic_position_delete_file(path: &str, part_value: i64) -> DataFile {
+    /// VECTOR (Puffin format + `referenced_data_file` pointing at `referenced_path` + blob
+    /// coordinates), used to create a DELETE-content manifest in the range (NOT a real
+    /// puffin file — manifest-only). A DV rather than a parquet position delete because the
+    /// fixture table is V3 and the D3 format-version gate rejects parquet position deletes
+    /// on V3 ("Must use DVs for position deletes in V3") — the tests' subject (DELETE
+    /// manifests in the changelog range) is content-format-agnostic.
+    fn synthetic_position_delete_file(
+        path: &str,
+        referenced_path: &str,
+        part_value: i64,
+    ) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::PositionDeletes)
             .file_path(path.to_string())
@@ -1788,9 +2187,27 @@ mod tests {
             .record_count(1)
             .partition_spec_id(0)
             .partition(Struct::from_iter([Some(Literal::long(part_value))]))
-            .referenced_data_file(Some("a.parquet".to_string()))
+            .referenced_data_file(Some(referenced_path.to_string()))
             .content_offset(Some(4))
             .content_size_in_bytes(Some(40))
+            .build()
+            .unwrap()
+    }
+
+    /// An equality-delete file routed to partition `x = part_value` (equality field: `x`,
+    /// field id 1 in the V3 minimal fixture schema), used to pin the added-vs-preexisting
+    /// delete split — an eq delete is PARTITION-scoped (unlike the path-scoped DV), so two
+    /// of them on different snapshots both apply to the same data file.
+    fn synthetic_equality_delete_file(path: &str, part_value: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .equality_ids(Some(vec![1]))
             .build()
             .unwrap()
     }
@@ -1910,6 +2327,11 @@ mod tests {
             ChangelogOperation::Delete,
             "the removed file a is a DELETE change"
         );
+        assert_eq!(
+            deleted.kind(),
+            ChangelogTaskKind::DeletedDataFile,
+            "a whole-file removal is Java's DeletedDataFileScanTask"
+        );
         assert_eq!(deleted.commit_snapshot_id(), s1);
         assert_eq!(deleted.change_ordinal(), 0);
 
@@ -1918,6 +2340,11 @@ mod tests {
             added.operation(),
             ChangelogOperation::Insert,
             "the added file c is an INSERT change"
+        );
+        assert_eq!(
+            added.kind(),
+            ChangelogTaskKind::AddedRows,
+            "a whole-file addition is Java's AddedRowsScanTask"
         );
         assert_eq!(added.commit_snapshot_id(), s1);
     }
@@ -1987,7 +2414,11 @@ mod tests {
         let tx = Transaction::new(&table);
         let action = tx
             .row_delta()
-            .add_deletes(vec![synthetic_position_delete_file("a-pos-del.parquet", 1)]);
+            .add_deletes(vec![synthetic_position_delete_file(
+                "a-pos-del.puffin",
+                "a.parquet",
+                1,
+            )]);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
         let s1 = table.metadata().current_snapshot_id().unwrap();
@@ -2141,6 +2572,427 @@ mod tests {
         assert_eq!(tasks[0].operation(), ChangelogOperation::Insert);
         assert_eq!(tasks[0].change_ordinal(), 0);
         assert_eq!(tasks[0].commit_snapshot_id(), s1);
+    }
+
+    // ===================================================================================
+    // ENGINE-FIRST row-level changelog tests (`with_row_level_deletes(true)`)
+    // ===================================================================================
+
+    /// One comparable row per changelog task: `(data-file path, kind token, operation
+    /// token, ordinal, commit snapshot, added-delete paths, existing-delete paths,
+    /// embedded FileScanTask delete paths)` — sortable so whole plans compare as sets.
+    type TaskTuple = (
+        String,
+        &'static str,
+        &'static str,
+        i32,
+        i64,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+    );
+
+    fn task_tuple(task: &ChangelogScanTask) -> TaskTuple {
+        let kind_token = match task.kind() {
+            ChangelogTaskKind::AddedRows => "ADDED_ROWS",
+            ChangelogTaskKind::DeletedDataFile => "DELETED_DATA_FILE",
+            ChangelogTaskKind::DeletedRows => "DELETED_ROWS",
+        };
+        let op_token = match task.operation() {
+            ChangelogOperation::Insert => "INSERT",
+            ChangelogOperation::Delete => "DELETE",
+            ChangelogOperation::UpdateBefore => "UPDATE_BEFORE",
+            ChangelogOperation::UpdateAfter => "UPDATE_AFTER",
+        };
+        (
+            task.data_file_path().to_string(),
+            kind_token,
+            op_token,
+            task.change_ordinal(),
+            task.commit_snapshot_id(),
+            task.added_deletes()
+                .iter()
+                .map(|d| d.file_path.clone())
+                .collect(),
+            task.existing_deletes()
+                .iter()
+                .map(|d| d.file_path.clone())
+                .collect(),
+            task.file_scan_task()
+                .deletes
+                .iter()
+                .map(|d| d.file_path.clone())
+                .collect(),
+        )
+    }
+
+    fn sorted_task_tuples(tasks: &[ChangelogScanTask]) -> Vec<TaskTuple> {
+        let mut tuples: Vec<TaskTuple> = tasks.iter().map(task_tuple).collect();
+        tuples.sort();
+        tuples
+    }
+
+    /// CROWN JEWEL — the Java `DeletedDataFileScanTask` javadoc chain, end to end.
+    /// S0 appends a+b, S1 appends c, S2 is a merge-on-read DELETE (`RowDelta` adding a DV
+    /// that references the EXISTING file a), S3 overwrites (removes a, adds d). The
+    /// row-level changelog over (S0, S3] must emit the Java task taxonomy:
+    ///
+    /// - c → AddedRows/INSERT @ ordinal 0, commit S1, no deletes;
+    /// - a → DeletedRows/DELETE @ ordinal 1, commit S2 (the snapshot that ADDED the
+    ///   delete, NOT the one that added a), carrying EXACTLY the DV added in S2 as
+    ///   `added_deletes` and nothing pre-existing;
+    /// - a → DeletedDataFile/DELETE @ ordinal 2, commit S3, carrying the DV as
+    ///   `existing_deletes` (rows already deleted must not re-surface as deleted);
+    /// - d → AddedRows/INSERT @ ordinal 2, commit S3;
+    /// - b → NO task (the DV is path-scoped to a; b was never touched).
+    ///
+    /// Risks pinned: MoR-delete snapshots plan instead of rejecting (only with the
+    /// opt-in flag), the deleted-rows task carries ONLY the range snapshot's ADDED
+    /// deletes, commit ordinals stay oldest→0 across mixed snapshot types (a delete-only
+    /// snapshot consumes its own ordinal), and the DEFAULT mode still REJECTS this exact
+    /// range (the Java 1.10.0 rejection surface is unchanged by the feature).
+    #[tokio::test]
+    async fn test_changelog_row_level_merge_on_read_chain_emits_java_taxonomy_tasks() {
+        let catalog = new_memory_catalog().await;
+        let table = make_minimal_table(&catalog).await;
+
+        let table = append_files(&catalog, &table, vec![
+            data_file("a.parquet", 1),
+            data_file("b.parquet", 1),
+        ])
+        .await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let table = append_files(&catalog, &table, vec![data_file("c.parquet", 1)]).await;
+        let s1 = table.metadata().current_snapshot_id().unwrap();
+
+        // S2: merge-on-read DELETE — a DV referencing the EXISTING file a.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_position_delete_file(
+                "a-dv.puffin",
+                "a.parquet",
+                1,
+            )]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let s2 = table.metadata().current_snapshot_id().unwrap();
+
+        // S3: overwrite — remove a outright, add d.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .delete_file("a.parquet")
+            .add_file(data_file("d.parquet", 1));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let s3 = table.metadata().current_snapshot_id().unwrap();
+
+        // The DEFAULT mode must still REJECT this range — the Java 1.10.0 rejection
+        // surface does not vanish because the opt-in exists.
+        let default_scan = table
+            .incremental_changelog_scan()
+            .from_snapshot_id_exclusive(s0)
+            .to_snapshot_id(s3)
+            .build()
+            .unwrap();
+        let default_error = default_scan
+            .plan_files()
+            .await
+            .err()
+            .expect("the default data-file changelog must reject a MoR-delete range");
+        assert_eq!(
+            default_error.kind(),
+            ErrorKind::FeatureUnsupported,
+            "default-mode rejection classification must stay FeatureUnsupported"
+        );
+
+        let scan = table
+            .incremental_changelog_scan()
+            .from_snapshot_id_exclusive(s0)
+            .to_snapshot_id(s3)
+            .with_row_level_deletes(true)
+            .build()
+            .unwrap();
+        let tasks = changelog_tasks(&scan).await;
+
+        let dv = vec!["a-dv.puffin".to_string()];
+        let expected: Vec<TaskTuple> = {
+            let mut expected = vec![
+                (
+                    "c.parquet".to_string(),
+                    "ADDED_ROWS",
+                    "INSERT",
+                    0,
+                    s1,
+                    vec![],
+                    vec![],
+                    vec![],
+                ),
+                (
+                    "a.parquet".to_string(),
+                    "DELETED_ROWS",
+                    "DELETE",
+                    1,
+                    s2,
+                    dv.clone(),
+                    vec![],
+                    vec![],
+                ),
+                (
+                    "a.parquet".to_string(),
+                    "DELETED_DATA_FILE",
+                    "DELETE",
+                    2,
+                    s3,
+                    vec![],
+                    dv.clone(),
+                    dv.clone(),
+                ),
+                (
+                    "d.parquet".to_string(),
+                    "ADDED_ROWS",
+                    "INSERT",
+                    2,
+                    s3,
+                    vec![],
+                    vec![],
+                    vec![],
+                ),
+            ];
+            expected.sort();
+            expected
+        };
+
+        assert_eq!(
+            sorted_task_tuples(&tasks),
+            expected,
+            "the row-level changelog must emit exactly the Java taxonomy task split"
+        );
+    }
+
+    /// ADDED-vs-PREEXISTING SPLIT: a DeletedRows task carries ONLY the deletes ADDED by
+    /// its commit snapshot in `added_deletes`; a delete from an EARLIER snapshot lands in
+    /// `existing_deletes` (Java `DeletedRowsScanTask.addedDeletes()` vs
+    /// `existingDeletes()` — "records removed by [existing deletes] should not appear in
+    /// the changelog"). S0 appends a; S1 adds eq-delete E1; S2 adds eq-delete E2 (both
+    /// partition-scoped, so both apply to a). The (S1, S2] changelog holds ONE
+    /// DeletedRows task for a with added = [E2] and existing = [E1]. Mutation-pins the
+    /// split: routing pre-existing deletes into `added_deletes` (or dropping the
+    /// existing-index query) fails the exact-list assertions.
+    #[tokio::test]
+    async fn test_changelog_row_level_deleted_rows_splits_added_vs_preexisting_deletes() {
+        let catalog = new_memory_catalog().await;
+        let table = make_minimal_table(&catalog).await;
+
+        let table = append_files(&catalog, &table, vec![data_file("a.parquet", 1)]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_equality_delete_file("e1-eq-del.parquet", 1)]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let s1 = table.metadata().current_snapshot_id().unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_equality_delete_file("e2-eq-del.parquet", 1)]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let s2 = table.metadata().current_snapshot_id().unwrap();
+
+        let scan = table
+            .incremental_changelog_scan()
+            .from_snapshot_id_exclusive(s1)
+            .to_snapshot_id(s2)
+            .with_row_level_deletes(true)
+            .build()
+            .unwrap();
+        let tasks = changelog_tasks(&scan).await;
+
+        assert_eq!(
+            sorted_task_tuples(&tasks),
+            vec![(
+                "a.parquet".to_string(),
+                "DELETED_ROWS",
+                "DELETE",
+                0,
+                s2,
+                vec!["e2-eq-del.parquet".to_string()],
+                vec!["e1-eq-del.parquet".to_string()],
+                // The embedded FileScanTask applies the EXISTING deletes (rows already
+                // deleted before S2 must not re-surface); the added deletes are the
+                // engine's selector, carried separately.
+                vec!["e1-eq-del.parquet".to_string()],
+            )],
+            "added_deletes must carry ONLY the S2-added delete; the S1 delete is existing"
+        );
+    }
+
+    /// SAME-SNAPSHOT FOLD: deletes committed in the SAME snapshot as the data file they
+    /// match fold into that file's AddedRows task (Java `AddedRowsScanTask` javadoc:
+    /// `AddedRowsScanTask(file=F1, deletes=[D1], snapshot=S1)`) — they must NOT also
+    /// produce a spurious DeletedRows task for the file. Mutation-pins the
+    /// added-by-this-snapshot exclusion in the DeletedRows candidate walk: dropping it
+    /// emits a second task for f and fails the exact-plan assertion.
+    #[tokio::test]
+    async fn test_changelog_row_level_same_snapshot_deletes_fold_into_added_rows_task() {
+        let catalog = new_memory_catalog().await;
+        let table = make_minimal_table(&catalog).await;
+
+        let table = append_files(&catalog, &table, vec![data_file("base.parquet", 1)]).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+
+        // S1: one RowDelta committing BOTH the data file f AND a DV that references it.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .row_delta()
+            .add_data_files(vec![data_file("f.parquet", 1)])
+            .add_deletes(vec![synthetic_position_delete_file(
+                "f-dv.puffin",
+                "f.parquet",
+                1,
+            )]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let s1 = table.metadata().current_snapshot_id().unwrap();
+
+        let scan = table
+            .incremental_changelog_scan()
+            .from_snapshot_id_exclusive(s0)
+            .to_snapshot_id(s1)
+            .with_row_level_deletes(true)
+            .build()
+            .unwrap();
+        let tasks = changelog_tasks(&scan).await;
+
+        assert_eq!(
+            sorted_task_tuples(&tasks),
+            vec![(
+                "f.parquet".to_string(),
+                "ADDED_ROWS",
+                "INSERT",
+                0,
+                s1,
+                vec!["f-dv.puffin".to_string()],
+                vec![],
+                // Reading the AddedRows task applies the folded deletes → NET added rows.
+                vec!["f-dv.puffin".to_string()],
+            )],
+            "the same-snapshot DV folds into f's AddedRows task; no DeletedRows task, \
+             and base.parquet (untouched by the path-scoped DV) contributes nothing"
+        );
+    }
+
+    /// CONTROL — pure-append output is IDENTICAL with the row-level flag on or off: the
+    /// engine-first mode must not perturb the interop-pinned data-file changelog for
+    /// ranges without delete files. Mutation-pins the flag's blast radius: any change to
+    /// the append planning path (ordinals, commit ids, task kinds, delete attachments)
+    /// breaks the tuple-for-tuple equality.
+    #[tokio::test]
+    async fn test_changelog_row_level_flag_on_pure_append_range_matches_default_output() {
+        let catalog = new_memory_catalog().await;
+        let table = make_minimal_table(&catalog).await;
+
+        let table = append_files(&catalog, &table, vec![data_file("base.parquet", 1)]).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+        let table = append_files(&catalog, &table, vec![data_file("a.parquet", 1)]).await;
+        let table = append_files(&catalog, &table, vec![data_file("b.parquet", 1)]).await;
+        let s2 = table.metadata().current_snapshot_id().unwrap();
+
+        let default_scan = table
+            .incremental_changelog_scan()
+            .from_snapshot_id_exclusive(s0)
+            .to_snapshot_id(s2)
+            .build()
+            .unwrap();
+        let row_level_scan = table
+            .incremental_changelog_scan()
+            .from_snapshot_id_exclusive(s0)
+            .to_snapshot_id(s2)
+            .with_row_level_deletes(true)
+            .build()
+            .unwrap();
+
+        let default_tuples = sorted_task_tuples(&changelog_tasks(&default_scan).await);
+        let row_level_tuples = sorted_task_tuples(&changelog_tasks(&row_level_scan).await);
+
+        assert_eq!(
+            default_tuples.len(),
+            2,
+            "the control range must actually plan the two appended files"
+        );
+        assert_eq!(
+            default_tuples, row_level_tuples,
+            "a pure-append range must plan identically with the row-level flag on"
+        );
+        assert!(
+            row_level_tuples
+                .iter()
+                .all(|(_, kind, op, _, _, added, existing, task_deletes)| {
+                    *kind == "ADDED_ROWS"
+                        && *op == "INSERT"
+                        && added.is_empty()
+                        && existing.is_empty()
+                        && task_deletes.is_empty()
+                }),
+            "pure appends are AddedRows/INSERT tasks with no delete attachments"
+        );
+    }
+
+    /// ORDINALS SKIP EXCLUDED SNAPSHOTS: Java assigns change ordinals over the FILTERED
+    /// snapshot deque (`computeSnapshotOrdinals` runs AFTER `orderedChangelogSnapshots`
+    /// dropped REPLACE snapshots), so a compaction between two changes does NOT consume
+    /// an ordinal. S0 appends a; S1 compacts (Replace, excluded); S2 appends e. The
+    /// (S0, S2] changelog holds only e at ordinal 0 — NOT 1. Mutation-pins assigning
+    /// ordinals before the Replace exclusion.
+    #[tokio::test]
+    async fn test_changelog_replace_snapshot_consumes_no_ordinal() {
+        let catalog = new_memory_catalog().await;
+        let table = make_minimal_table(&catalog).await;
+
+        let file_a = data_file("a.parquet", 1);
+        let table = append_files(&catalog, &table, vec![file_a.clone()]).await;
+        let s0 = table.metadata().current_snapshot_id().unwrap();
+
+        // S1: compaction — Operation::Replace, excluded from the changelog.
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files(vec![file_a], vec![data_file("c.parquet", 1)]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .operation,
+            Operation::Replace,
+            "the rewrite must be a Replace for this test to be meaningful"
+        );
+
+        let table = append_files(&catalog, &table, vec![data_file("e.parquet", 1)]).await;
+        let s2 = table.metadata().current_snapshot_id().unwrap();
+
+        let scan = table
+            .incremental_changelog_scan()
+            .from_snapshot_id_exclusive(s0)
+            .to_snapshot_id(s2)
+            .build()
+            .unwrap();
+        let tasks = changelog_tasks(&scan).await;
+
+        assert_eq!(tasks.len(), 1, "only the S2 append is in the changelog");
+        assert_eq!(tasks[0].data_file_path(), "e.parquet");
+        assert_eq!(
+            tasks[0].change_ordinal(),
+            0,
+            "ordinals are assigned over the FILTERED snapshots — the excluded Replace \
+             consumes no ordinal"
+        );
+        assert_eq!(tasks[0].commit_snapshot_id(), s2);
     }
 
     // ===== Event listeners: a REAL incremental scan genuinely fires an `IncrementalScanEvent` =====

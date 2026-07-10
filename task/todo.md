@@ -49,13 +49,41 @@ final independent SEPMO bundle Critic over the whole branch diff; push on CONVER
 for the user in the morning. Execution order **G1 → G2 → G4 → G3** (G3 last so the nightly
 workflow enumerates any interop suites G4 adds). Statuses live ONLY in the GAP_MATRIX.
 
-- [ ] **G1. CDC row-level changelog** (queue item 2; rows R122/R123 named residue) —
+- [x] **G1. CDC row-level changelog** (queue item 2; rows R122/R123 named residue) —
       `ChangelogOperation::{UpdateBefore, UpdateAfter}` + handling ranges that carry row-level
       DELETE manifests (today: `FeatureUnsupported`, matching Java's data-file changelog).
       JAVA-FIRST scoping is mandatory: decode what 1.10.0 CORE (`BaseIncrementalChangelogScan`)
       actually defines vs what lives Spark-side (`ChangelogIterator` net-change pairing is NOT
       core) — parity claims only for the core surface; anything beyond is engine-first and
       labeled so (DML-foundation direction). Done bar: partial (interop slice may defer).
+    - Builder plan (2026-07-09, bytecode-audited): 1.10.0 core REJECTS every delete-manifest
+      range (`javap` offsets 86–95) and never constructs `BaseDeletedRowsScanTask` — so
+      row-level acceptance is ENGINE-FIRST behind an opt-in builder flag
+      (`with_row_level_deletes`), default = exact Java rejection surface. Port the api
+      taxonomy as core parity: `ChangelogOperation` gains `UpdateBefore`/`UpdateAfter`
+      (declared, never emitted by the planner — pairing is Spark-side, DEFERRED);
+      `ChangelogScanTask` gains `kind` (AddedRows/DeletedDataFile/DeletedRows, operation()
+      derived) + `added_deletes`/`existing_deletes`. Row-level planning per snapshot: split
+      its delete manifests into added-in-S vs pre-existing `DeleteFileIndex`es; own-added
+      data entries → AddedRows (with added deletes)/DeletedDataFile (with existing deletes);
+      live NOT-added-in-S data files hit by added deletes → DeletedRows (added+existing
+      split). Tests: crown-jewel MoR chain mirroring the `DeletedDataFileScanTask` javadoc
+      example, added-vs-preexisting split, same-snapshot fold, pure-append control,
+      replace-consumes-no-ordinal, rejection unchanged. Arrow read: no core-defined
+      semantics (reading is engine-side) — AddedRows/DeletedDataFile tasks readable via the
+      existing MoR `FileScanTask.deletes` machinery; DeletedRows projection deferred.
+      Outcome (2026-07-09): LANDED as planned — `scan/task.rs` taxonomy (breaking:
+      `ChangelogScanTask.operation` field → `kind`, `operation()` now derived; 2 new enum
+      variants break downstream exhaustive matches), `scan/incremental.rs` planner
+      (opt-in row-level mode; default path output-identical, guard mutation-proven both
+      ways), 6 new/extended tests + 6 targeted mutations ALL RED
+      (guard-disable / added-existing-swap / fold-drop / ordinal-reverse / kind-swap /
+      commit-misstamp), R123 residue re-written (matrix gate green, 71 rows), R122
+      untouched (no row-level residue lives there), scan/map.md refreshed. Deferred:
+      interop slice (Java oracle for the row-level mode is meaningless — 1.10.0 core
+      cannot plan those ranges; the existing data-file changelog interop stands as the
+      control), DeletedRows Arrow projection (engine-side), UPDATE_BEFORE/UPDATE_AFTER
+      pairing (Spark-side, not core parity).
 - [ ] **G2. Reconciliation-by-refresh** (R157 residue; `BaseMetastoreTableOperations.
       checkCommitStatus` / `CommitStatus` SUCCESS·FAILURE·UNKNOWN) — on `CommitStateUnknown`,
       re-read the catalog with bounded retries and decide landed (⇒ success) / absent (⇒ real
