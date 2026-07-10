@@ -53,9 +53,20 @@ Tier 3 (ops) already landed separately as `infra/audit-ops-2026-07` (Critic CONV
 Contingency: a unit whose ladder cannot converge is parked on `fix/audit-tier1-parked-A<n>`
 and the bundle resets to the last good commit; the bundle ships with the units that converged.
 
-- [ ] **A1 — zero-width / oversized partition transforms** (BUG-001/SAF-001/BUG-013): reject
+- [x] **A1 — zero-width / oversized partition transforms** (BUG-001/SAF-001/BUG-013): reject
   `bucket[N]`/`truncate[W]` outside `1..=i32::MAX` at parse per Java preconditions; kill the
   `rem_euclid(0)` panic and the `mod_n as i32` wrap; defense-in-depth typed error at apply.
+  - Outcome (ladder SHIP_WITH_NITS, 0 remediation rounds, mutations 5/5 RED, 16 tests): three
+    independent doors — `Transform::validate()` in FromStr (the ONLY serde route, so metadata/
+    spec/sort-order/manifest deserialization all covered), fallible `Bucket::new`/
+    `Truncate::new` at the apply door (deliberately duplicated guards), and both
+    partition-spec builders. `Bucket` now stores `mod_n: i32` (checked at construction;
+    `bucket_n` cast-free). Java precondition text pinned verbatim from 1.10.0 jar bytecode;
+    `Transforms.fromString` parses via Java int, confirming the 1..=i32::MAX parity bound.
+    Crown jewel: hostile table-metadata JSON with `bucket[0]`/`bucket[2147483648]` fails at
+    deserialization with DataInvalid (control `bucket[16]` parses). Argued deviation: the
+    Java message text is asserted at the PartitionSpec serde door, not TableMetadata level
+    (untagged-enum serde swallows inner messages; kind stays DataInvalid there).
 - [ ] **A3 — negative/null position-delete positions** (BUG-005): fail closed with DataInvalid
   at `caching_delete_file_loader.rs` (3 sites + a `.unwrap()`); checked `u64::try_from`.
 - [ ] **A2 — Fixed/Binary single-value JSON** (BUG-004/OTH-007): implement both `todo!()` arms
@@ -1261,7 +1272,47 @@ filter %s: %s" (verbatim string in the 1.10.0 jar). Scope: `crates/iceberg/src/t
   test). DEFERRED for the reviewer/orchestrator: flip the GAP_MATRIX `deleteFromRowFilter` row ❌→🟡
   (outside the explicit modify-list), and data-level Java↔Rust interop.
 
-## Carried-forward open items (full context in todo-archive/)
+## 2026-07-10 — Zero-width / oversized bucket-truncate transforms: reject at parse, never panic at apply (BUG-001/SAF-001/BUG-013)
+
+Plan (delegated BUILDER; done-bar 🟡 unit-tested, interop deferred):
+
+- [x] Java contract (bytecode-verified, 1.10.0 jar): `Bucket.get(int)` bytecode `<= 0` reject-branch + msg
+  `"Invalid number of buckets: %s (must be > 0)"` (Bucket.java:41-42); `Truncate.get(int)` bytecode
+  `<= 0` reject-branch + msg `"Invalid truncate width: %s (must be > 0)"` (Truncate.java:42);
+  `Transforms.fromString` parses via `Integer.parseInt` (Transforms.java:39,45) so values >
+  `Integer.MAX_VALUE` are unrepresentable ⇒ parity bound is `1..=i32::MAX` for both.
+- [x] `spec/transform.rs`: add `Transform::validate()` (Java-precondition messages); call it from
+  `FromStr` bucket/truncate arms (covers serde/Deserialize ⇒ table-metadata JSON, partition specs,
+  sort orders). Tests: reject 0 + `i32::MAX as u64 + 1` on both; boundary-legal 1 and `i32::MAX`
+  accepted (over-broaden pin); JSON serde rejection.
+- [x] `transform/bucket.rs`: `Bucket::new(u32) -> Result<Self>`, store `mod_n: i32` via zero-check +
+  `i32::try_from` (drops the lossy `as i32` in `bucket_n` — wrong-bucket wrap for N > i32::MAX).
+- [x] `transform/truncate.rs`: `Truncate::new(u32) -> Result<Self>` with the same 1..=i32::MAX guard
+  (division/modulo-by-zero in `truncate_i32/i64/decimal_i128` becomes unreachable).
+- [x] `transform/mod.rs`: `create_transform_function` propagates the fallible constructors (`?`) —
+  the apply-door defense; direct `Transform::Bucket(0)` (public enum payload, not blockable) now
+  errors instead of panicking.
+- [x] `spec/partition.rs`: `transform.validate()` in both builders (`add_partition_field_internal`
+  unbound + `add_unbound_field` bound) — the programmatic route Java rejects at construction.
+  Crown-jewel test: minimal V2 TableMetadata JSON, control (bucket[16]) parses, sabotage
+  (bucket[0] / truncate[0]) fails with `ErrorKind::DataInvalid` via the production
+  `serde_json → Error::from` conversion (`read_from` path).
+- [x] Gate: typos + fmt + clippy + `cargo test -p iceberg --lib` ×2; mutation-check the guards both
+  directions (disable ⇒ rejection tests red; over-broaden ⇒ boundary-legal tests red).
+- Outcome (2026-07-10): landed. Parse door = `Transform::validate()` called from `FromStr`
+  (covers Deserialize -> table metadata / partition specs / sort orders); apply door =
+  fallible `Bucket::new` / `Truncate::new` (independent guards) propagated by
+  `create_transform_function`; builder door = `validate()` in both partition-spec builders.
+  `bucket_n` now stores a construction-proven `i32` (lossy `as i32` removed). 16 new tests incl.
+  the crown-jewel TableMetadata fixture (control-first; Java-text pinned at the PartitionSpec
+  serde door - the untagged TableMetadataEnum swallows inner messages). Mutations M1 (parse bound
+  off: 6 tests RED, apply door stayed green - layer independence), M2 (apply guards off +
+  unchecked cast restored: 8 tests RED incl. the project-panic pin), M3 (over-broadened bounds:
+  3 boundary-legal tests RED) - all restored, full gate green (typos/fmt/clippy + lib 2740 x2).
+  Done-bar partial: interop (Java-side cross-validation of the rejection) deferred; GAP_MATRIX
+  untouched (hardening, no capability row).
+
+
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the
 user's trading platform vs continuous-parity backlog, incl. re-ordering maintenance actions ahead of

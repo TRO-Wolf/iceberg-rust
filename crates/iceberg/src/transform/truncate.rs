@@ -27,12 +27,37 @@ use crate::spec::{Datum, PrimitiveLiteral};
 
 #[derive(Debug)]
 pub struct Truncate {
+    /// Truncation width, proven at construction to lie in `1..=i32::MAX` (the Java `int`
+    /// contract — `Truncate.get(int)`, Truncate.java:42 in 1.10.0), so the modulo in
+    /// `truncate_i32`/`truncate_i64`/`truncate_decimal_i128` can never divide by zero.
     width: u32,
 }
 
 impl Truncate {
-    pub fn new(width: u32) -> Self {
-        Self { width }
+    /// Creates a truncate transform function with the given width.
+    ///
+    /// Rejects `width` outside `1..=i32::MAX` with [`crate::ErrorKind::DataInvalid`] —
+    /// a defense-in-depth guard independent of the parse-time bound in
+    /// `Transform::validate` (Java parity: `Preconditions.checkArgument(width > 0,
+    /// "Invalid truncate width: %s (must be > 0)")`, Truncate.java:42; widths above
+    /// `i32::MAX` are unrepresentable in Java's `int`).
+    pub fn new(width: u32) -> crate::Result<Self> {
+        if width == 0 {
+            return Err(Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Invalid truncate width: 0 (must be > 0)",
+            ));
+        }
+        if i32::try_from(width).is_err() {
+            return Err(Error::new(
+                crate::ErrorKind::DataInvalid,
+                format!(
+                    "Invalid truncate width: {width} (must be <= {}, the Java int maximum)",
+                    i32::MAX
+                ),
+            ));
+        }
+        Ok(Self { width })
     }
 
     #[inline]
@@ -703,12 +728,61 @@ mod test {
         Ok(())
     }
 
+    // RISK: Truncate { width: 0 } reaching truncate_i32/i64/decimal_i128 aborts the process with
+    // a divide/modulo-by-zero — the constructor is the defense-in-depth door (independent of the
+    // Transform parse bound) and must reject with the Java precondition message
+    // (Truncate.java:42, 1.10.0).
+    #[test]
+    fn test_truncate_new_rejects_zero_width() {
+        let error = super::Truncate::new(0).expect_err("truncate width 0 must be rejected");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Invalid truncate width: 0 (must be > 0)"),
+            "message must match the Java precondition text, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK: widths above i32::MAX are unrepresentable in Java's int (Transforms.java parses with
+    // Integer.parseInt) — accepting one here silently diverges from every Java-written table.
+    #[test]
+    fn test_truncate_new_rejects_width_above_java_int_max() {
+        let error = super::Truncate::new(2147483648)
+            .expect_err("truncate width above i32::MAX must be rejected");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("must be <= 2147483647"),
+            "message must name the Java int bound, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK (over-broadened guard + golden value at the legal maximum): truncate[i32::MAX] is the
+    // largest Java-representable width and must stay accepted AND produce the exact spec value
+    // (v - v.rem_euclid(W): 1 - 1 = 0 for W = 2147483647).
+    #[test]
+    fn test_truncate_at_java_int_max_accepted_and_produces_exact_value() {
+        let truncate = super::Truncate::new(2147483647).expect("truncate[i32::MAX] is legal");
+        assert_eq!(
+            truncate
+                .transform_literal(&Datum::int(1))
+                .expect("int is truncatable")
+                .expect("truncate of a non-null value is non-null"),
+            Datum::int(0)
+        );
+    }
+
     // Test case ref from: https://iceberg.apache.org/spec/#truncate-transform-details
     #[test]
     fn test_truncate_simple() {
         // test truncate int
         let input = Arc::new(Int32Array::from(vec![1, -1]));
-        let res = super::Truncate::new(10).transform(input).unwrap();
+        let res = super::Truncate::new(10)
+            .expect("truncate width is within 1..=i32::MAX")
+            .transform(input)
+            .unwrap();
         assert_eq!(
             res.as_any().downcast_ref::<Int32Array>().unwrap().value(0),
             0
@@ -720,7 +794,10 @@ mod test {
 
         // test truncate long
         let input = Arc::new(Int64Array::from(vec![1, -1]));
-        let res = super::Truncate::new(10).transform(input).unwrap();
+        let res = super::Truncate::new(10)
+            .expect("truncate width is within 1..=i32::MAX")
+            .transform(input)
+            .unwrap();
         assert_eq!(
             res.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
             0
@@ -736,7 +813,10 @@ mod test {
             .unwrap();
         builder.append_value(1065);
         let input = Arc::new(builder.finish());
-        let res = super::Truncate::new(50).transform(input).unwrap();
+        let res = super::Truncate::new(50)
+            .expect("truncate width is within 1..=i32::MAX")
+            .transform(input)
+            .unwrap();
         assert_eq!(
             res.as_any()
                 .downcast_ref::<Decimal128Array>()
@@ -747,7 +827,10 @@ mod test {
 
         // test string
         let input = Arc::new(arrow_array::StringArray::from(vec!["iceberg"]));
-        let res = super::Truncate::new(3).transform(input).unwrap();
+        let res = super::Truncate::new(3)
+            .expect("truncate width is within 1..=i32::MAX")
+            .transform(input)
+            .unwrap();
         assert_eq!(
             res.as_any()
                 .downcast_ref::<arrow_array::StringArray>()
@@ -758,7 +841,10 @@ mod test {
 
         // test large string
         let input = Arc::new(arrow_array::LargeStringArray::from(vec!["iceberg"]));
-        let res = super::Truncate::new(3).transform(input).unwrap();
+        let res = super::Truncate::new(3)
+            .expect("truncate width is within 1..=i32::MAX")
+            .transform(input)
+            .unwrap();
         assert_eq!(
             res.as_any()
                 .downcast_ref::<arrow_array::LargeStringArray>()
@@ -769,7 +855,10 @@ mod test {
 
         // test binary
         let input = Arc::new(arrow_array::BinaryArray::from_vec(vec![b"iceberg"]));
-        let res = super::Truncate::new(3).transform(input).unwrap();
+        let res = super::Truncate::new(3)
+            .expect("truncate width is within 1..=i32::MAX")
+            .transform(input)
+            .unwrap();
         assert_eq!(
             res.as_any()
                 .downcast_ref::<arrow_array::BinaryArray>()
@@ -804,6 +893,7 @@ mod test {
     fn test_literal_int() {
         let input = Datum::int(1);
         let res = super::Truncate::new(10)
+            .expect("truncate width is within 1..=i32::MAX")
             .transform_literal(&input)
             .unwrap()
             .unwrap();
@@ -811,6 +901,7 @@ mod test {
 
         let input = Datum::int(-1);
         let res = super::Truncate::new(10)
+            .expect("truncate width is within 1..=i32::MAX")
             .transform_literal(&input)
             .unwrap()
             .unwrap();
@@ -821,6 +912,7 @@ mod test {
     fn test_literal_long() {
         let input = Datum::long(1);
         let res = super::Truncate::new(10)
+            .expect("truncate width is within 1..=i32::MAX")
             .transform_literal(&input)
             .unwrap()
             .unwrap();
@@ -828,6 +920,7 @@ mod test {
 
         let input = Datum::long(-1);
         let res = super::Truncate::new(10)
+            .expect("truncate width is within 1..=i32::MAX")
             .transform_literal(&input)
             .unwrap()
             .unwrap();
@@ -838,6 +931,7 @@ mod test {
     fn test_decimal_literal() {
         let input = Datum::decimal(decimal_new(1065, 0)).unwrap();
         let res = super::Truncate::new(50)
+            .expect("truncate width is within 1..=i32::MAX")
             .transform_literal(&input)
             .unwrap()
             .unwrap();
@@ -848,6 +942,7 @@ mod test {
     fn test_string_literal() {
         let input = Datum::string("iceberg".to_string());
         let res = super::Truncate::new(3)
+            .expect("truncate width is within 1..=i32::MAX")
             .transform_literal(&input)
             .unwrap()
             .unwrap();
