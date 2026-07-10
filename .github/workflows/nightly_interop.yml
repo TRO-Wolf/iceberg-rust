@@ -1,0 +1,110 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Nightly Java-interop regression net (bundle unit G3, 2026-07-10).
+#
+# The Java oracle under dev/java-interop/ is the parity mandate's ground truth; this workflow
+# runs the FULL dynamically-discovered suite set unprompted every night, so a regression that
+# breaks cross-engine byte-level compatibility surfaces within a day instead of waiting for a
+# human to remember a manual run. The driver (scripts/run_interop_suites.sh) hard-fails on
+# missing prerequisites, fails if discovery drops below its floor, continues across failing
+# suites, and writes a per-suite PASS/FAIL table to the job step summary.
+#
+# INVOCATION CONTRACT: this workflow runs `make interop` with NO arguments and NO
+# ICEBERG_INTEROP_* environment overrides — the driver's local-only `--only` subset flag is
+# deliberately unreachable from here (the no-silent-caps doctrine).
+#
+# No `if: github.repository == ...` guard on purpose: this is an owned fork (the guard in
+# audit.yml is an upstream artifact that DISABLES that job here); the cron must actually fire.
+# Note GitHub disables cron schedules after ~60 days without repository activity, and a
+# scheduled workflow only fires once this file is on the default branch.
+
+name: Nightly Interop
+
+on:
+  schedule:
+    # 06:43 UTC — a quiet hour for this repo's workflows (audit/stale run at 00:00,
+    # codeql Mondays 04:16) and off the top of the hour, when GitHub delays cron jobs.
+    - cron: '43 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  nightly-interop:
+    name: Full java-interop suite set
+    runs-on: ubuntu-latest
+    # A hung suite is bounded ONLY here (the driver imposes no per-suite timeout — no silent
+    # caps); 350 minutes is just under the 6-hour hosted-runner job ceiling.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          # Reclaim ~25GB of preinstalled toolchains this run never uses (same rationale as
+          # ci.yml's tests job): the iceberg test-target builds + Maven repo need the room.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: nightly-interop
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install JDK 11 + Maven at the suites' hardcoded paths
+        run: |
+          # All 48 suites default to /opt/maven/bin/mvn and
+          # JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 (47 hardcode them outright; only
+          # run-interop-aggregate.sh reads $MVN/$JAVA_HOME), so we install the apt JDK 11
+          # (which owns exactly that JVM path on amd64) and symlink the apt Maven home to
+          # /opt/maven — the suites themselves are not modified. setup-java would install to
+          # a different path and NOT satisfy them.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openjdk-11-jdk-headless maven
+          sudo ln -sfn /usr/share/maven /opt/maven
+          /opt/maven/bin/mvn -version
+          /usr/lib/jvm/java-11-openjdk-amd64/bin/java -version
+
+      - name: Prime the local Maven repository (47 of 48 suites run `mvn -o`, offline)
+        run: |
+          # Resolve every dependency + the exec plugin ONLINE once, so the offline (`-o`)
+          # suite invocations find a fully-populated ~/.m2.
+          export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+          /opt/maven/bin/mvn -B -q -f dev/java-interop dependency:go-offline compile exec:help
+
+      - name: Driver self-test (discovery / floor / hard-fail mechanics)
+        run: make interop-selftest
+
+      - name: Run the FULL discovered interop suite set
+        run: make interop

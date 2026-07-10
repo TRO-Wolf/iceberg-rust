@@ -142,10 +142,65 @@ workflow enumerates any interop suites G4 adds). Statuses live ONLY in the GAP_M
       runs partition-scoped (`category = "a"`) to keep `validate_no_conflicting_data`
       load-bearing. Follow-up: fix `expr/visitors/strict_metrics_evaluator.rs` L105-111 +
       an interop pin on a metrics-decided full-match sweep.
-- [ ] **G3. Nightly interop CI** (queue item 5) — scheduled workflow running the
+- [x] **G3. Nightly interop CI** (queue item 5) — scheduled workflow running the
       `dev/java-interop/` suites unprompted (cron precedent: audit/codeql/stale.yml); enumerate
       suites, doc the runner requirements (Java/protoc/docker), local one-shot proof of the
       entry point; the "runs unprompted" proof is next night's run.
+      Outcome (2026-07-10): LANDED — `scripts/run_interop_suites.sh` (dynamic glob discovery,
+      floor 48 with ratchet-on-add rule, prereq HARD-FAIL never-skip, continue-across-suites
+      per-suite PASS/FAIL summary + step summary, `--only` local subset flag that logs every
+      exclusion, `--selftest` battery), `make interop`/`interop-selftest`,
+      `.github/workflows/nightly_interop.yml` (cron 06:43 UTC + workflow_dispatch; apt JDK 11 +
+      `/opt/maven` symlink because all 48 suites default to those paths — 47 hardcode them
+      outright, only `run-interop-aggregate.sh` reads `$MVN`/`$JAVA_HOME` — and must not be
+      modified; online `~/.m2` priming because 47 of 48 suites run `mvn -o` (only
+      `run-interop-scan-exec.sh` is online); full set only — no subset flag or env hook
+      reachable from the YAML), map.md/README rows. Proofs: selftest 9/9 green + 7 driver
+      mutations RED (exit-on-fail / floor / prereq / exclusion-log / empty-`--only` /
+      empty-run-set / fake-prereq-wiring guards each turn a case red); real-dir battery —
+      planted failing suite ⇒ exit 1 with the other suite still run+reported, renamed suite ⇒
+      floor error before running anything, PATH-without-cargo + void-mvn ⇒ prereq hard-fail,
+      YAML safe_load green + broken-copy red (non-vacuous); GREEN real-suite subset runs
+      exit 0, 48 discovered. Remediation R1 (2026-07-10; critic report unrecoverable ⇒
+      self-audit): (1) `--only ""` silently ran the FULL set (bounded request became
+      unbounded — reproduced live) ⇒ parse-time hard-fail + selftest ST7; (2) a zero-suite
+      run greened ("0 passed, 0 failed" ⇒ exit 0, reachable via the floor-0 test hooks) ⇒
+      empty-run-set guard in `run_suites` + ST8; (3) the selftest was NOT hermetic (needed a
+      real `/opt/maven` + JDK 11 on the machine) ⇒ fake prereqs wired through `drive()`,
+      ST3 now isolates ONE missing prereq per case, wiring mutation-proven (6 cases red when
+      the fake mvn path is broken); (4) `--help` used a hardcoded `sed '19,66p'` line range
+      that drifts on any header edit ⇒ marker-based awk; (5) corrected wrong counts shipped
+      in 5 places (was "29 hardcode / 19 offline"; measured truth: 48 default, 47 hardcode
+      outright, 47/48 offline). NAMED RESIDUE: the
+      "runs unprompted" proof is inherently NEXT night's live run (cron fires only once this
+      file is on the default branch); the CI-runner provisioning (apt/symlink/m2-priming +
+      the 350-min job bound vs the full 48-suite wall time) is NOT locally verifiable — first
+      nightly is the proof. Deferred: `run.sh` + `run-inspection-manifests.sh` (outside the
+      `run-interop-*.sh` glob, named in map.md/README); no log artifact upload (step summary
+      only — no pinned upload-artifact action precedent in this repo). Remediation R2
+      (2026-07-10; critic verdict SHIP — 5/5 mutations caught, zero bugs/over-claims; closed
+      its one named test-strength nit): ST1's failing fake sorted LAST, so a
+      bookkeeping-clean abort-on-first-failure mutation greened the whole battery 9/9
+      (reproduced live — worse than the critic's own summary-needle-caught variant); renamed
+      it `run-interop-aa-fail.sh` (sorts FIRST, before both passers), so the a/b `.ran`
+      marker check now pins continue-AFTER-failure directly, independent of summary wording;
+      the same mutation goes RED at 2 checks post-fix, clean battery 9/9 green. The critic's
+      two blind-spot claims were resolution:refuted by its own probes (bash>=4.4 empty-array
+      expansion; an independent sort-first continue-across probe against production).
+    - Builder plan (2026-07-10, live-audited): 48 `run-interop-*.sh` suites exist (the brief
+      said ~31 — floor set to the LIVE count 48); 29 hardcode `/opt/maven/bin/mvn` +
+      `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` and 19 run `mvn -o` (offline ⇒ CI must
+      prime `~/.m2`) [counts corrected in R1: those greps were style-narrow — truth is 48
+      default / 47 hardcode outright / 47 of 48 offline], so the workflow installs apt
+      `openjdk-11-jdk-headless` (noble carries
+      11.0.31) + `maven` and symlinks `/opt/maven` rather than setup-java (the suites must
+      not be modified). Deliverables: `scripts/run_interop_suites.sh` (dynamic glob discovery
+      + floor 48 + hard-fail prereqs + continue-across-suites + per-suite PASS/FAIL summary +
+      step summary + `--only` LOCAL subset flag that logs exclusions + `--selftest` sabotage
+      battery), `make interop`/`interop-selftest`, `.github/workflows/nightly_interop.yml`
+      (cron + workflow_dispatch, full set only — no subset flag reachable), map.md/README
+      rows, local green subset proof + sabotage battery RED proofs. No matrix row touched
+      (infra; no capability status changes).
 - [ ] **G5. Bundle close** — final independent SEPMO Critic (fresh context, Opus) over
       `main..HEAD`; remediate; push on CONVERGED; single PR body to scratchpad; morning report.
 

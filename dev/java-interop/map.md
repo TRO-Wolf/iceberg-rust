@@ -78,12 +78,24 @@ generate/verify flow; this map only routes.**
 Durable artifacts are the committed fixtures under `crates/iceberg/testdata/interop/` and the Rust
 tests in [crates/iceberg/tests/](../../crates/iceberg/tests/map.md) that read them.
 
+**Nightly CI (2026-07-10):** every `run-interop-*.sh` above is discovered DYNAMICALLY (glob at run
+time — a new suite is picked up with zero maintenance) and run unprompted every night by
+[`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh) (`make interop`) via
+[`.github/workflows/nightly_interop.yml`](../../.github/workflows/nightly_interop.yml). The driver
+hard-fails on missing prerequisites (never skips), fails if discovery drops below its suite-count
+FLOOR (`SUITE_FLOOR_DEFAULT`, 48 at authoring), continues across failing suites, and reports every
+suite's PASS/FAIL. **When you ADD a suite here, ratchet `SUITE_FLOOR_DEFAULT` up in the same
+change.** `run.sh` and `run-inspection-manifests.sh` do not match the glob and are OUTSIDE the
+nightly set (named deferral).
+
 ## I want to...
 
 | I want to... | go to |
 |---|---|
 | Flip a 🟡 row to ✅ | add scenarios on BOTH sides (Rust `apply_scenario_ops` + `InteropOracle` scenarios, identical names), `generate` fixtures, write the Rust test, run the `-d2` verify |
 | Regenerate fixtures after a contract change | the matching `run*.sh` (needs `mvn` + JDK; fixtures are committed so plain `cargo test` stays offline) |
+| Add a NEW interop suite | name it `run-interop-*.sh` (the nightly driver auto-discovers it) AND ratchet `SUITE_FLOOR_DEFAULT` in [`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh) in the same change |
+| Run the full suite set locally | `make interop` (or a bounded slice: `scripts/run_interop_suites.sh --only <a.sh,b.sh>` — logs what it drops; local use only) |
 | Write Rust output for Java to verify | run the Rust interop test with `ICEBERG_INTEROP_GEN=1`, then the `-d2` script |
 | Understand why comparison is structural | README "Comparison" — Jackson vs serde_json key order makes raw bytes meaningless; logical identity incl. field ids is the contract |
 
@@ -106,6 +118,8 @@ tests in [crates/iceberg/tests/](../../crates/iceberg/tests/map.md) that read th
 | A sabotage/mutation step passes on an uncorrupted artifact | False-green door: the corruption must land in the SOURCE artifact and be RE-DERIVED through the production reader (never post-edit an emitted view), and the pass test must distinguish the EXPECTED failure from ANY exception — a crash/collision BEFORE the read satisfies an absence-of-sentinel check vacuously. Run a clean-verify CONTROL per failure site. _Promoted 2026-06-12 from lessons (Z2/Z3)._ |
 | A data-level fixture passes while a partition/column divergence exists | Projection-completeness gap: the row compare must cover EVERY schema column (partition columns included) on BOTH language sides — a dumper reused from a narrower template inherits its projection, and the Java verify needs its own column assertion (an id-keyed map is blind to uncompared columns). _Promoted 2026-06-12 from lessons (S3/W1)._ |
 | `mvn` step fails offline | The oracle needs network for first dependency resolution; committed fixtures keep `cargo test` independent of it |
+| The nightly run fails with `discovery found N ... below the floor` | A suite was renamed/removed (restore it), or the glob broke — or a suite was DELIBERATELY removed, in which case lower `SUITE_FLOOR_DEFAULT` in `scripts/run_interop_suites.sh` in the same change. An emptied glob must never green |
+| A suite passes locally but fails in the nightly with a path error | All 48 suites default to `/opt/maven/bin/mvn` + `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` (47 hardcode them outright; only `run-interop-aggregate.sh` reads `$MVN`/`$JAVA_HOME`); the workflow provides EXACTLY those paths (apt JDK 11 + `/opt/maven` symlink) — a local machine must too, or the driver's prerequisite check fails first |
 | Scenario passes one direction only | Scenario op-sequences must be **identical and identically named** on both sides — diff `apply_scenario_ops` vs `InteropOracle.scenarios()` |
 | A Java code path silently doesn't run in the oracle | Drive REAL Java objects (`new BaseTable(ops, name).updateSpec()…commit()` over an in-memory `TableOperations`), NOT the `@VisibleForTesting` ctors — those set `base = null` and skip base-dependent paths (e.g. field-id recycling) |
 | Interop test passes but proves nothing | Mutation-prove BOTH directions by corrupting fixtures: edit a Java-written field (Dir-1 assertion must fail) and shrink a Rust-written value (Dir-2 `mvn verify` must exit 1). A harness comparing a file to itself passes tautologically |

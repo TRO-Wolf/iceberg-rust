@@ -53,6 +53,16 @@ check-agent-artifacts:
 check-matrix-anchors:
 	./scripts/check_matrix_anchors.sh
 
+# The nightly Java-interop regression net (dev/java-interop/, discovered dynamically).
+# Full set — what .github/workflows/nightly_interop.yml runs. Needs mvn + JDK 11 + cargo
+# (hard-fails if absent, never skips). See scripts/run_interop_suites.sh for the contract.
+interop:
+	./scripts/run_interop_suites.sh
+
+# Sabotage battery on the driver mechanics only (fake suites, seconds, no mvn/java run).
+interop-selftest:
+	./scripts/run_interop_suites.sh --selftest
+
 NIGHTLY_VERSION := $(shell awk -F'"' '/^channel/ {print $$2}' rust-toolchain.toml)
 MSRV_VERSION    := $(shell awk -F'"' '/^rust-version/ {print $$2}' Cargo.toml)
 
