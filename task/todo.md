@@ -107,11 +107,41 @@ workflow enumerates any interop suites G4 adds). Statuses live ONLY in the GAP_M
       (Java's REST/JDBC ops never do — strictly outcome-improving, read-only). R157 stays 🟡
       (credentialed slice remains); ENGINE_CONTRACT §8 manual reconciliation downgraded to the
       two residual cases.
-- [ ] **G4. ENGINE_CONTRACT §5 DRAFT→NORMATIVE** (queue item 4) — verify the isolation-level →
+- [x] **G4. ENGINE_CONTRACT §5 DRAFT→NORMATIVE** (queue item 4) — verify the isolation-level →
       validation table against Java 1.10.0 `SparkWrite`/`SparkCopyOnWriteOperation`/
       `SparkPositionDeltaWrite` (bytecode where jars exist, else the reference-checkout source —
       cite which); one interop conflict scenario per cell; + the owed non-identity
       DeleteFilter-equivalence test.
+      Outcome (2026-07-09): §5 flipped NORMATIVE — every cell verified against the
+      `apache-iceberg-1.10.0` SOURCE (Spark jars absent from `~/.m2`; oracle form cited per
+      cell; api/core surfaces additionally javap-verified). TWO cells CORRECTED: (1) MoR DELETE
+      does NOT enable `validate_deleted_files` (UPDATE/MERGE-only, `SparkPositionDeltaWrite`
+      L251-254) — the draft prescribed it; (2) `case_sensitive` is NOT part of the Java base
+      recipe (neither Spark writer calls it — engine policy). Base clarified: MoR
+      `validate_data_files_exist` is unconditional (all commands, both isolation levels, L243);
+      scan==null ⇒ NO validation; static overwrite-by-filter rows ADDED (`OverwriteByFilter`).
+      Per-cell covering scenarios cited (C1-C5 interop arc + named unit tests); NEW
+      `engine_contract_isolation_recipes.rs` pins the serializable-vs-snapshot distinction
+      behaviorally for BOTH modes (snapshot leg COMMITS + post-commit live set; serializable leg
+      REJECTS naming the validation; 3 recipe mutations RED). Owed non-identity DeleteFilter
+      test LANDED (`test_engine_deletefilter_nonidentity_partition_equivalence`, offline
+      truncate[10](id) pos+eq deletes, production-mutation RED). §9 R157 bullet un-staled
+      (reconciliation-by-refresh landed G2). No matrix row touched.
+      Remediation 2 (2026-07-09): the unit-only residue CLOSED — NEW cross-engine suite
+      `interop_s5_isolation_conflict.rs` + `S5IsolationOracle` + `run-interop-s5-isolation.sh`
+      covers the three formerly unit-level cells (COW/snapshot deletes, dynamic-overwrite/
+      snapshot, static overwrite-by-filter snapshot+serializable): 8 scenarios (4 REJECT +
+      4 ACCEPT guards), BOTH directions green + sabotage fail-closed on the local Java 11 run;
+      4 recipe mutations RED (each cell's isolation-distinguishing validation dropped ⇒ GEN
+      self-check fails). FOUND + NAMED (out of increment file scope, ENGINE_CONTRACT §9 open
+      item): Rust `StrictMetricsEvaluator::may_contain_nan` treats ABSENT nan counts as
+      may-contain-NaN (Java `canContainNaNs` 1.10.0 L483-486: absent ⇒ CANNOT), so strict
+      inequalities never prove a full match on non-float columns —
+      `overwrite_by_row_filter`/`DeleteFiles`-by-filter rejects ("some, but not all, rows
+      match") files Java deletes cleanly; the serializable by-filter interop cell therefore
+      runs partition-scoped (`category = "a"`) to keep `validate_no_conflicting_data`
+      load-bearing. Follow-up: fix `expr/visitors/strict_metrics_evaluator.rs` L105-111 +
+      an interop pin on a metrics-decided full-match sweep.
 - [ ] **G3. Nightly interop CI** (queue item 5) — scheduled workflow running the
       `dev/java-interop/` suites unprompted (cron precedent: audit/codeql/stale.yml); enumerate
       suites, doc the runner requirements (Java/protoc/docker), local one-shot proof of the

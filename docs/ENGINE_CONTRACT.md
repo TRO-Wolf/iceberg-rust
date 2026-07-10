@@ -19,15 +19,16 @@
 
 # Engine Integration Contract — the `iceberg` core ↔ downstream query engine
 
-> **Status: DRAFT (2026-07-01).** This is the written half of the seam the 2026-06-20 direction
-> re-anchor declared: *"the `iceberg` CORE crate is the stable engine-facing contract — the
-> downstream builds its OWN DataFusion `TableProvider` over it."* The equivalence proof
+> **Status: NORMATIVE for §5 since 2026-07-09** (DRAFT 2026-07-01 → §5 oracle-verified per the DoD
+> below). This is the written half of the seam the 2026-06-20 direction re-anchor declared: *"the
+> `iceberg` CORE crate is the stable engine-facing contract — the downstream builds its OWN
+> DataFusion `TableProvider` over it."* The equivalence proof
 > (`crates/iceberg/tests/interop_scan_exec.rs`) is the executable half; this file names everything
-> else a DELETE/UPDATE/MERGE engine must know. **DoD to flip DRAFT → NORMATIVE:** every row in
-> §5 bytecode-verified against Java 1.10.0 (`SparkWrite` / `SparkCopyOnWriteOperation` /
-> `SparkPositionDeltaWrite` / `SparkRowLevelOperationBuilder`) per the house `javap`/live-oracle
-> discipline, plus ONE interop conflict scenario per cell. Tracked in `task/todo.md`
-> §"ACTIVE (2026-07-01)".
+> else a DELETE/UPDATE/MERGE engine must know. **DoD (met 2026-07-09):** every §5 cell verified
+> against Java 1.10.0 (`SparkWrite` / `SparkCopyOnWriteOperation` / `SparkPositionDeltaWrite`),
+> each cell citing its oracle form + a named covering conflict scenario, and — since the
+> remediation the same day — every cell carries a CROSS-ENGINE interop scenario (see the §5
+> provenance note). Tracked in `task/todo.md` §"ACTIVE UNIT (2026-07-09)" G4.
 
 ---
 
@@ -71,8 +72,11 @@ Two supported paths, proven equivalent:
    `DeleteFilter::apply` reproduces the built-in merge-on-read scan EXACTLY — position, equality,
    and combined; multi-file-per-partition (identity-partitioned tables). Non-identity partition
    transforms are proven for the BUILT-IN scan only (`test_nonidentity_scan_exec_*` vs the Java
-   oracle); a `DeleteFilter`-equivalence test over a non-identity layout is still owed
-   *(corrected 2026-07-01 — previously over-claimed as deletefilter coverage)*.
+   oracle); the `DeleteFilter`-equivalence proof over a non-identity layout landed 2026-07-09
+   (`test_engine_deletefilter_nonidentity_partition_equivalence` — offline: `truncate[10](id)`
+   partitions, a transform-scoped position delete + a transform-scoped equality delete, engine
+   path == built-in scan, live set pinned exactly) *(2026-07-01 note: previously over-claimed as
+   deletefilter coverage, then recorded as owed; now landed)*.
 
 Incremental reads: `IncrementalAppendScan` / `IncrementalChangelogScan` (whole-data-file level;
 row-level CDC is an open queue item). Branch/tag reads via `use_ref`.
@@ -107,29 +111,64 @@ The engine-boundary proof (#116): scan `_file`/`_pos` → write position-delete 
 | INSERT OVERWRITE (dynamic) | — | `ReplacePartitions` |
 | compaction commit | — | `RewriteFiles` (the action layer's `RewriteDataFiles` wraps it) |
 
-## 5. Isolation level → validation recipes  ·  **DRAFT — verify each cell before relying on it**
+## 5. Isolation level → validation recipes  ·  **NORMATIVE (oracle-verified 2026-07-09)**
 
-Rust builder methods, verbatim from `transaction/{row_delta,overwrite_files,replace_partitions}.rs`. **Base for every
-row-level op, both modes:** `validate_from_snapshot(scan_snapshot_id)` +
-`conflict_detection_filter(command_condition)` + `case_sensitive(engine_setting)`.
+Rust builder methods, verbatim from `transaction/{row_delta,overwrite_files,replace_partitions}.rs`.
 
-| Command | Mode | Isolation | Enable (beyond base) |
-|---|---|---|---|
-| DELETE | COW (`OverwriteFiles`) | snapshot | `validate_no_conflicting_deletes()` — a concurrent delete file touching a rewritten data file would be silently dropped with it |
-| DELETE | COW | serializable | above + `validate_no_conflicting_data()` — a concurrent insert matching the condition violates serializability |
-| DELETE | MoR (`RowDelta`) | snapshot | `validate_data_files_exist(referenced_files)` + `validate_deleted_files()` — referenced files must not have been compacted away or deleted concurrently |
-| DELETE | MoR | serializable | above + `validate_no_conflicting_data_files()` |
-| UPDATE / MERGE | COW | snapshot | `validate_no_conflicting_deletes()` |
-| UPDATE / MERGE | COW | serializable | above + `validate_no_conflicting_data()` |
-| UPDATE / MERGE | MoR | snapshot | `validate_data_files_exist(...)` + `validate_deleted_files()` + `validate_no_conflicting_delete_files()` — the op READ rows to produce output; concurrent deletes of those rows conflict |
-| UPDATE / MERGE | MoR | serializable | above + `validate_no_conflicting_data_files()` |
-| INSERT OVERWRITE | `ReplacePartitions` | append-only guard | `validate_append_only()` where the engine requires it (landed 2026-06-17, row R146) |
+**Base for every row-level op (DELETE / UPDATE / MERGE), both modes, both isolation levels:**
 
-Provenance note: this table is reconstructed from the Java Spark row-level-operation builders (the
-logic deliberately OUT of `iceberg-core` scope, hence out of the GAP_MATRIX) — it is exactly the
-knowledge a downstream engine gets wrong without a written recipe. Each cell carries DRAFT weight
-until the §DoD verification lands. A validation failure is **non-retryable** by design (Java's
-`ValidationException`) and propagates out of the retry loop — the engine should surface it, not
+- `validate_from_snapshot(scan_snapshot_id)` — Java sets it only when the scan captured a snapshot
+  (`scan.snapshotId() != null`; a table that was empty at read time has none:
+  `SparkWrite.java` L470-472 / L493-495, `SparkPositionDeltaWrite.java` L246-249). When the
+  planner replaced the command's scan with an empty relation (`scan == null` — e.g. a `false`
+  condition), Java runs **NO validation at all** (`SparkWrite.java` L446-447,
+  `SparkPositionDeltaWrite.java` L236-238): the command never depended on table state.
+- `conflict_detection_filter(F)` where `F` = the AND of the scan's **pushed** filter expressions,
+  `alwaysTrue()` when none (`SparkWrite.CopyOnWriteOperation.conflictDetectionFilter()` L417-428,
+  `SparkPositionDeltaWrite` L284-292) — i.e. the command condition *as pushed to the scan*, not
+  necessarily the verbatim SQL predicate.
+- **MoR only:** `validate_data_files_exist(referenced_files)` for **all** commands, DELETE
+  included (`SparkPositionDeltaWrite.java` L243, unconditional when the scan exists) — the files
+  the position deltas reference must not have been compacted away or deleted concurrently.
+- *Correction (2026-07-09):* `case_sensitive(...)` is **not** part of the Java recipe — neither
+  Spark writer calls `caseSensitive(...)` (grep over both files at the 1.10.0 tag); binding uses
+  the operation default (case-sensitive). The Rust builders expose `case_sensitive()` for engines
+  whose SQL layer resolves names case-insensitively; calling it is engine policy, outside the
+  verified recipe. *(The previous DRAFT base row over-claimed it as base.)*
+
+| Command | Mode | Isolation | Enable (beyond base) | Java 1.10.0 oracle · covering conflict scenario |
+|---|---|---|---|---|
+| DELETE / UPDATE / MERGE (COW does not branch on command: the `switch` is on isolation level only, `SparkWrite.java` L448-456) | COW (`OverwriteFiles`) | snapshot | `validate_no_conflicting_deletes()` — a concurrent delete file touching a rewritten data file would be silently dropped with it | `SparkWrite.commitWithSnapshotIsolation` L490-509 (L499) · interop `interop_s5_isolation_conflict.rs` (`cow_delete_on_{rewritten,other}`, both directions) + unit `overwrite_files.rs::test_overwrite_rejects_concurrent_delete_for_removed_data_file` (+ legal case `test_overwrite_allows_concurrent_delete_in_other_partition`, NO-OVERRIDE `test_overwrite_rejects_concurrent_delete_using_tx_captured_starting_snapshot`); commit-leg observable in `engine_contract_isolation_recipes.rs` |
+| DELETE / UPDATE / MERGE | COW | serializable | above + `validate_no_conflicting_data()` — a concurrent insert matching the condition violates serializability | `SparkWrite.commitWithSerializableIsolation` L467-488 (L476-477) · interop `interop_overwrite_conflict.rs` (C1, both directions) + the serializable-vs-snapshot distinction pin `engine_contract_isolation_recipes.rs::test_s5_cow_serializable_rejects_concurrent_insert_snapshot_isolation_commits` |
+| DELETE | MoR (`RowDelta`) | snapshot | *base only* — **correction (2026-07-09): the previous draft prescribed `validate_deleted_files()` here; Java enables it for UPDATE/MERGE ONLY** (`command == UPDATE \|\| command == MERGE`, `SparkPositionDeltaWrite.java` L251-254). A MoR DELETE tolerates a concurrent DELETE-op removal of a referenced file being outside the `{OVERWRITE}` op set | `SparkPositionDeltaWrite.commit` L240-249 · interop `interop_rowdelta_conflict.rs` files-exist axis (`files_exist_{reject,accept}`) + unit `row_delta.rs::test_row_delta_files_exist_skip_deletes_default_excludes_delete_op_snapshot` (half A = the corrected no-`validate_deleted_files` behavior); commit-leg observable in `engine_contract_isolation_recipes.rs` |
+| DELETE | MoR | serializable | above + `validate_no_conflicting_data_files()` | `SparkPositionDeltaWrite.commit` L256-258 · interop `interop_rowdelta_conflict.rs` data-conflict axis (`data_conflict_{reject,accept}`) + the distinction pin `engine_contract_isolation_recipes.rs::test_s5_merge_on_read_delete_serializable_rejects_concurrent_insert_snapshot_isolation_commits` |
+| UPDATE / MERGE | MoR | snapshot | above (DELETE row) + `validate_deleted_files()` + `validate_no_conflicting_delete_files()` — the op READ rows to produce output; concurrent deletes of those rows conflict | `SparkPositionDeltaWrite.commit` L251-254 · interop `interop_rowdelta_conflict.rs` delete-conflict axis (`delete_conflict_{reject,accept}`) + unit `row_delta.rs::test_row_delta_files_exist_skip_deletes_default_excludes_delete_op_snapshot` (half B = `validate_deleted_files()` widens the op set) |
+| UPDATE / MERGE | MoR | serializable | above + `validate_no_conflicting_data_files()` | `SparkPositionDeltaWrite.commit` L256-258 · interop `interop_rowdelta_conflict.rs` data-conflict axis |
+| INSERT OVERWRITE (dynamic) | `ReplacePartitions` | snapshot | `validate_no_conflicting_deletes()`. NOT base-shaped: `validate_from_snapshot` only when the engine tracked one (Java guards on `isolationLevel != null && validateFromSnapshotId != null`, L322-324); there is NO `conflict_detection_filter` / `case_sensitive` on `ReplacePartitions` (absent from the interface — `javap` `iceberg-api-1.10.0.jar`) | `SparkWrite.DynamicOverwrite.commit` L318-331 (SNAPSHOT arm L329-330) · interop `interop_s5_isolation_conflict.rs` (`dyn_delete_in_{replaced,other}`, both directions) + unit `replace_partitions.rs::test_replace_partitions_rejects_concurrent_added_delete_in_replaced_partition` (+ legal case `..._allows_concurrent_added_delete_in_other_partition`, NO-OVERRIDE `..._rejects_concurrent_added_delete_using_tx_captured_start`) |
+| INSERT OVERWRITE (dynamic) | `ReplacePartitions` | serializable | above + `validate_no_conflicting_data()` | `SparkWrite.DynamicOverwrite.commit` L326-328 · interop `interop_replace_partitions_conflict.rs` (C4, both directions) |
+| INSERT OVERWRITE (by filter / static) | `OverwriteFiles` + `overwrite_by_row_filter(expr)` | snapshot | `validate_no_conflicting_deletes()` | `SparkWrite.OverwriteByFilter` (class L346-387; SNAPSHOT arm L374-375) · interop `interop_s5_isolation_conflict.rs` (`byfilter_delete_{matching,excluded}`, both directions) + unit `overwrite_files.rs::test_overwrite_row_filter_rejects_concurrent_added_delete_file_matching_filter` (+ legal/default-filter pins `test_row_filter_is_default_conflict_filter_{matching_add_conflicts,outside_add_does_not_conflict}`) |
+| INSERT OVERWRITE (by filter / static) | `OverwriteFiles` | serializable | above + `validate_no_conflicting_data()` — no explicit conflict filter is set; the row filter itself is the default conflict-detection filter | `SparkWrite.OverwriteByFilter.commit` L371-373 · interop `interop_s5_isolation_conflict.rs` (`byfilter_data_{matching,excluded}` — the row-filter-as-default-conflict-filter contract, both directions) + unit `overwrite_files.rs::test_row_filter_is_default_conflict_filter_matching_add_conflicts` |
+| INSERT OVERWRITE (dynamic) | `ReplacePartitions` | append-only guard | `validate_append_only()` where the engine requires it (landed 2026-06-17, row R146) — engine policy: the method is core API (`ReplacePartitions.java` L56; `javap` `iceberg-api-1.10.0.jar`) with NO `SparkWrite` caller at 1.10.0 | api interface + `core/BaseReplacePartitions.java` L59 · interop `interop_validate_append_only.rs::test_validate_append_only_mirror` |
+
+Provenance note (oracle form, 2026-07-09): the recipe logic lives in the Java **Spark** writers
+(deliberately OUT of `iceberg-core` scope, hence out of the GAP_MATRIX) — it is exactly the
+knowledge a downstream engine gets wrong without a written recipe. The Spark jars are not in the
+local `~/.m2` mirror, so all `SparkWrite.java` / `SparkPositionDeltaWrite.java` /
+`SparkCopyOnWriteOperation.java` citations above are **reference-checkout SOURCE at the
+`apache-iceberg-1.10.0` tag** (commit `2114bf6`, `/tmp/iceberg-java-ref`,
+`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/`); the core/api validation
+surfaces are additionally **`javap`-verified** from `iceberg-api-1.10.0.jar` /
+`iceberg-core-1.10.0.jar` (`ReplacePartitions` interface, `BaseRowDelta` validation fields +
+methods). Covering-scenario form is named per cell: `interop_*` = cross-engine (the 2026-06-15/16
+conflict-validation arc + the 2026-07-09 `interop_s5_isolation_conflict.rs` slice, driven by
+`dev/java-interop/run-interop-s5-isolation.sh` — 8 scenarios, both directions, sabotage
+fail-closed), `unit` = Rust-side. Since the 2026-07-09 remediation EVERY §5 cell carries a
+cross-engine interop scenario (the former unit-only residue — COW/snapshot deletes,
+dynamic-overwrite/snapshot, static overwrite-by-filter — is closed). A validation failure is
+**non-retryable** by design (Java's
+`ValidationException` ⇒ Rust non-retryable `DataInvalid`, message `Found conflicting files that
+can contain records matching ...` / `Found conflicting deleted files ...` / `Cannot commit,
+missing data files ...`) and propagates out of the retry loop — the engine should surface it, not
 loop.
 
 ## 6. MERGE is engine-owned
@@ -193,9 +232,24 @@ grow MERGE semantics; it will not (out of parity scope).
 
 ## 9. Open items (tracked in `task/todo.md` §"ACTIVE (2026-07-01)")
 
-- [ ] Bytecode-verify §5 against Java 1.10.0 + one interop conflict scenario per cell → NORMATIVE.
-- [ ] Commit-outcome taxonomy (row R157): the unknown-outcome class LANDED 2026-07-08 (🟡, §8
-      updated); the remaining rewrite waits on reconciliation-by-refresh + the credentialed
+- [x] Verify §5 against Java 1.10.0 + a covering conflict scenario per cell → **NORMATIVE
+      (2026-07-09)**. Oracle form + per-cell scenario names in the §5 provenance note. The
+      unit-only residue (COW/snapshot deletes-validation, dynamic-overwrite/snapshot, static
+      overwrite-by-filter) was CLOSED the same day by `interop_s5_isolation_conflict.rs` +
+      `dev/java-interop/run-interop-s5-isolation.sh` (8 scenarios, both directions, sabotage
+      fail-closed) — every §5 cell now has a cross-engine scenario.
+- [ ] **Strict-metrics NaN divergence (found by the §5 interop, 2026-07-09):** Rust
+      `StrictMetricsEvaluator::may_contain_nan` (`expr/visitors/strict_metrics_evaluator.rs`
+      L105-111) treats an ABSENT nan count as *may contain NaN*; Java `canContainNaNs`
+      (`api/.../expressions/StrictMetricsEvaluator.java` L483-486 @ 1.10.0) treats absent as
+      *CANNOT* ("nan counts might be null for early version writers"). Parquet writers only emit
+      nan counts for float/double, so Rust's strict inequalities can NEVER prove a full match on
+      long/string/date/... columns — `overwrite_by_row_filter` / `DeleteFiles`-by-filter then
+      fails non-retryably ("Cannot delete file where some, but not all, rows match filter") on a
+      file Java deletes cleanly. Engines should prefer partition-scoped filters until fixed.
+- [ ] Commit-outcome taxonomy (row R157): the unknown-outcome class LANDED 2026-07-08 and
+      **reconciliation-by-refresh LANDED 2026-07-09** (§8 updated — the library now decides
+      landed/absent/still-unknown in-process); the row stays 🟡 only for the credentialed
       real-catalog slice.
 - [ ] `TransactionAction` `pub` (pull-based, per the re-anchor) → document custom commit actions.
 - [ ] Row-level CDC changelog lands → extend §2/§3 changelog guidance.
