@@ -147,9 +147,27 @@ and the bundle resets to the last good commit; the bundle ships with the units t
       `json_fixed_length_mismatch_is_data_invalid` RED), restored byte-identical (`cmp`
       verified). Full gate re-run green (typos/fmt/clippy -D warnings/lib 2751×2). No code
       changes this round.
-- [ ] **A4 — StrictMetricsEvaluator absent-NaN inversion** (found by our G4): absent NaN
+- [x] **A4 — StrictMetricsEvaluator absent-NaN inversion** (found by our G4): absent NaN
   counts ⇒ CANNOT contain, matching Java cell-by-cell; over-loosening pin required; close the
   ENGINE_CONTRACT §9 open item in the same change.
+    - Outcome (2026-07-10): `may_contain_nan` absent arm flipped to CANNOT (Java
+      `canContainNaNs` 1.10.0 L483-486, jar-bytecode-verified: absent map/key ⇒ `iconst_0`);
+      the Java `gtEq` NaN-lower-bound guard (L285-291, bytecode offsets 93-105) that the
+      loosening makes REACHABLE ported in the same change — `Datum` orders NaN largest
+      (`total_cmp`), so without it `NaN >= x` would wrongly prove ROWS_MUST_MATCH (the
+      over-claim/data-loss direction). Every helper consumer matched cell-by-cell vs the Java
+      visitor (lt/ltEq/gt/gtEq/eq/in consult the pair guard; notEq/notIn/isNaN/notNaN use the
+      containsOnly helpers — all match). 5 new tests: crown-jewel int-column provable sweep
+      (RED pre-fix), eq+in absent-arm consumers, over-loosening guard across all 5 consumers
+      (nan_count>0 + bounds that would otherwise prove), float-absent Java-verdict pin
+      (MUST_MATCH, bytecode-provenance), NaN-poisoned-bounds never-prove pin. 3 mutations RED
+      (absent-arm revert / nan>0-arm drop / gtEq-guard drop), byte-identical restore.
+      NAMED findings (recorded, NOT fixed here): (1) `may_contain_null` diverges from Java
+      `canContainNulls` in the map-present-key-ABSENT case (Java: cannot; Rust: may —
+      conservative/under-fires; Rust's single HashMap cannot represent Java's null-map vs
+      empty-map split); (2) Rust has NO `isNestedColumn` short-circuit (Java returns
+      MIGHT_NOT_MATCH for nested columns in every arm). §9 bullet closed. Deferred: the
+      cross-engine metrics-decided full-match interop sweep (done-bar 🟡).
 - [ ] **A5 — bundle close**: independent SEPMO bundle Critic over `main..HEAD` → on CONVERGED
   flip this section, push, PR body to scratchpad.
 

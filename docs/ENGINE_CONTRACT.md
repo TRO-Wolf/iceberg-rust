@@ -238,15 +238,16 @@ grow MERGE semantics; it will not (out of parity scope).
       overwrite-by-filter) was CLOSED the same day by `interop_s5_isolation_conflict.rs` +
       `dev/java-interop/run-interop-s5-isolation.sh` (8 scenarios, both directions, sabotage
       fail-closed) — every §5 cell now has a cross-engine scenario.
-- [ ] **Strict-metrics NaN divergence (found by the §5 interop, 2026-07-09):** Rust
-      `StrictMetricsEvaluator::may_contain_nan` (`expr/visitors/strict_metrics_evaluator.rs`
-      L105-111) treats an ABSENT nan count as *may contain NaN*; Java `canContainNaNs`
-      (`api/.../expressions/StrictMetricsEvaluator.java` L483-486 @ 1.10.0) treats absent as
-      *CANNOT* ("nan counts might be null for early version writers"). Parquet writers only emit
-      nan counts for float/double, so Rust's strict inequalities can NEVER prove a full match on
-      long/string/date/... columns — `overwrite_by_row_filter` / `DeleteFiles`-by-filter then
-      fails non-retryably ("Cannot delete file where some, but not all, rows match filter") on a
-      file Java deletes cleanly. Engines should prefer partition-scoped filters until fixed.
+- [x] **Strict-metrics NaN divergence (found by the §5 interop, 2026-07-09) → FIXED
+      (2026-07-10):** `StrictMetricsEvaluator::may_contain_nan` now treats an ABSENT nan count
+      as *CANNOT contain NaN*, matching Java `canContainNaNs`
+      (`api/.../expressions/StrictMetricsEvaluator.java` L483-486 @ 1.10.0, bytecode-verified;
+      "nan counts might be null for early version writers"), and the Java `gtEq`
+      NaN-lower-bound guard (L285-291) that the loosening makes reachable was ported in the
+      same change. Strict inequalities/eq/in can now prove a full match on columns without nan
+      counts (every non-float/double column), so `overwrite_by_row_filter` /
+      `DeleteFiles`-by-filter no longer need partition-scoped filters. Unit + mutation pinned;
+      the cross-engine metrics-decided full-match sweep is the deferred interop slice.
 - [ ] Commit-outcome taxonomy (row R157): the unknown-outcome class LANDED 2026-07-08 and
       **reconciliation-by-refresh LANDED 2026-07-09** (§8 updated — the library now decides
       landed/absent/still-unknown in-process); the row stays 🟡 only for the credentialed

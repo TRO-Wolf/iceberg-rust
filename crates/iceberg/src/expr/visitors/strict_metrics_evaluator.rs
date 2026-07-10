@@ -102,12 +102,22 @@ impl<'a> StrictMetricsEvaluator<'a> {
         }
     }
 
+    /// Whether the file may contain NaN values for `field_id`.
+    ///
+    /// Mirrors Java `StrictMetricsEvaluator.MetricsEvalVisitor#canContainNaNs`
+    /// (`api/.../expressions/StrictMetricsEvaluator.java` L483-486 @ 1.10.0; bytecode
+    /// `ifnull`/`containsKey ifeq` both fall through to `iconst_0`): an ABSENT nan count
+    /// means the file CANNOT contain NaN — "nan counts might be null for early version
+    /// writers when nan counters are not populated". This is sound for non-float/double
+    /// columns, which can never hold NaN (writers only emit nan counts for floating
+    /// types); for float/double the Java contract is that a writer omitting nan counts
+    /// asserts none — we mirror the Java contract rather than invent a stricter one.
+    /// NaN-poisoned BOUNDS (the ORC unreliable-bounds case) are handled separately by
+    /// the explicit `is_nan()` lower-bound guards in the visitor arms, exactly as Java
+    /// does with `NaNUtil.isNaN(lower)`.
     fn may_contain_nan(&self, field_id: i32) -> bool {
-        if let Some(&nan_count) = self.nan_count(field_id) {
-            nan_count > 0
-        } else {
-            true
-        }
+        self.nan_count(field_id)
+            .is_some_and(|&nan_count| nan_count > 0)
     }
 
     fn visit_inequality(
@@ -273,6 +283,19 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
+        let field_id = reference.field().id;
+
+        // Java `gtEq` (StrictMetricsEvaluator.java L285-291 @ 1.10.0, bytecode offsets
+        // 93-105): a NaN lower bound indicates unreliable bounds (the ORC caveat in Java's
+        // class javadoc) and can never prove a strict match. Without this guard `Datum`'s
+        // total ordering (NaN largest) makes `NaN >= datum` true and would wrongly claim
+        // ROWS_MUST_MATCH — the over-claim/data-loss direction.
+        if let Some(lower) = self.lower_bound(field_id)
+            && lower.is_nan()
+        {
+            return ROWS_MIGHT_NOT_MATCH;
+        }
+
         self.visit_inequality(reference, datum, PartialOrd::ge, true)
     }
 
@@ -861,6 +884,56 @@ mod test {
             NotIn,
             Reference::new(reference),
             FnvHashSet::from_iter(int_literals.iter().copied().map(Datum::int)),
+        ));
+        filter.bind(schema.clone(), true).unwrap()
+    }
+
+    fn less_than_float(reference: &str, float_literal: f32) -> BoundPredicate {
+        let schema = create_test_schema();
+        let filter = Predicate::Binary(BinaryExpression::new(
+            LessThan,
+            Reference::new(reference),
+            Datum::float(float_literal),
+        ));
+        filter.bind(schema.clone(), true).unwrap()
+    }
+
+    fn greater_than_float(reference: &str, float_literal: f32) -> BoundPredicate {
+        let schema = create_test_schema();
+        let filter = Predicate::Binary(BinaryExpression::new(
+            GreaterThan,
+            Reference::new(reference),
+            Datum::float(float_literal),
+        ));
+        filter.bind(schema.clone(), true).unwrap()
+    }
+
+    fn greater_than_or_equal_float(reference: &str, float_literal: f32) -> BoundPredicate {
+        let schema = create_test_schema();
+        let filter = Predicate::Binary(BinaryExpression::new(
+            GreaterThanOrEq,
+            Reference::new(reference),
+            Datum::float(float_literal),
+        ));
+        filter.bind(schema.clone(), true).unwrap()
+    }
+
+    fn equal_float(reference: &str, float_literal: f32) -> BoundPredicate {
+        let schema = create_test_schema();
+        let filter = Predicate::Binary(BinaryExpression::new(
+            Eq,
+            Reference::new(reference),
+            Datum::float(float_literal),
+        ));
+        filter.bind(schema.clone(), true).unwrap()
+    }
+
+    fn in_float(reference: &str, float_literals: &[f32]) -> BoundPredicate {
+        let schema = create_test_schema();
+        let filter = Predicate::Set(SetExpression::new(
+            In,
+            Reference::new(reference),
+            FnvHashSet::from_iter(float_literals.iter().copied().map(Datum::float)),
         ));
         filter.bind(schema.clone(), true).unwrap()
     }
@@ -1550,6 +1623,306 @@ mod test {
         assert!(
             !result,
             "Strict eval: notInStr on column start with nan should be false"
+        );
+    }
+
+    /// A file whose int column (field 1 "id", bounds [30, 79]) and float column
+    /// (field 8 "some_nans", bounds [1.0, 5.0]) carry value/null counts and bounds but
+    /// have NO `nan_value_counts` entries — the shape EVERY non-float/double column has
+    /// in practice (writers only emit nan counts for floating types), and the
+    /// early-version-writer shape for float columns.
+    fn get_test_file_absent_nan_counts() -> DataFile {
+        DataFile {
+            content: DataContentType::Data,
+            file_path: "/test/absent_nan_counts".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: Struct::empty(),
+            record_count: 50,
+            file_size_in_bytes: 10,
+            value_counts: HashMap::from([(1, 50), (8, 50)]),
+            null_value_counts: HashMap::from([(1, 0), (8, 0)]),
+            nan_value_counts: HashMap::default(),
+            lower_bounds: HashMap::from([(1, Datum::int(INT_MIN_VALUE)), (8, Datum::float(1.0))]),
+            upper_bounds: HashMap::from([(1, Datum::int(INT_MAX_VALUE)), (8, Datum::float(5.0))]),
+            column_sizes: Default::default(),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            sort_order_id: None,
+            partition_spec_id: 0,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }
+    }
+
+    /// Like [`get_test_file_eq`] (id lower == upper == 42) but WITHOUT a
+    /// `nan_value_counts` entry for the column — the realistic int-column shape.
+    fn get_test_file_eq_absent_nan_counts() -> DataFile {
+        DataFile {
+            nan_value_counts: HashMap::default(),
+            file_path: "/test/eq_absent_nan_counts".to_string(),
+            ..get_test_file_eq()
+        }
+    }
+
+    /// A float column (field 8 "some_nans") with `nan_count > 0` and bounds that would
+    /// otherwise PROVE a strict match (lower == upper == 2.0, zero nulls). Only the
+    /// NaN guard stands between these metrics and a wrong ROWS_MUST_MATCH.
+    fn get_test_file_nan_count_positive() -> DataFile {
+        DataFile {
+            content: DataContentType::Data,
+            file_path: "/test/nan_count_positive".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: Struct::empty(),
+            record_count: 50,
+            file_size_in_bytes: 10,
+            value_counts: HashMap::from([(8, 50)]),
+            null_value_counts: HashMap::from([(8, 0)]),
+            nan_value_counts: HashMap::from([(8, 10)]),
+            lower_bounds: HashMap::from([(8, Datum::float(2.0))]),
+            upper_bounds: HashMap::from([(8, Datum::float(2.0))]),
+            column_sizes: Default::default(),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            sort_order_id: None,
+            partition_spec_id: 0,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }
+    }
+
+    /// The ORC unreliable-bounds shape: a float column (field 8) whose bounds are NaN
+    /// while nan counts are ABSENT and null count is 0 — reachable only now that absent
+    /// nan counts no longer block the bound checks.
+    fn get_test_file_nan_lower_bound() -> DataFile {
+        DataFile {
+            content: DataContentType::Data,
+            file_path: "/test/nan_lower_bound".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: Struct::empty(),
+            record_count: 50,
+            file_size_in_bytes: 10,
+            value_counts: HashMap::from([(8, 50)]),
+            null_value_counts: HashMap::from([(8, 0)]),
+            nan_value_counts: HashMap::default(),
+            lower_bounds: HashMap::from([(8, Datum::float(f32::NAN))]),
+            upper_bounds: HashMap::from([(8, Datum::float(f32::NAN))]),
+            column_sizes: Default::default(),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            sort_order_id: None,
+            partition_spec_id: 0,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }
+    }
+
+    /// CROWN JEWEL (the absent-NaN inversion bug pin — RED before the fix): an int
+    /// column never has nan counts, yet strict inequalities must still be provable from
+    /// its bounds. Java `canContainNaNs` (StrictMetricsEvaluator.java L483-486 @ 1.10.0;
+    /// bytecode: absent map/key falls through to `iconst_0`) treats absent as CANNOT
+    /// contain NaN; the pre-fix Rust absent arm returned `true` and made ROWS_MUST_MATCH
+    /// unprovable on every non-float column. Boundary values pin the comparisons ON the
+    /// boundary so the guard mutation, not the comparator, decides each verdict.
+    #[test]
+    fn test_absent_nan_counts_cannot_contain_nan_int_inequalities_provable() {
+        let file = get_test_file_absent_nan_counts();
+
+        // gt: lower bound 30 > 29 ⇒ MUST_MATCH (pre-fix: false, unprovable forever).
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_int("id", INT_MIN_VALUE - 1), &file)
+                .unwrap();
+        assert!(
+            result,
+            "Strict eval: id > {} must be provable on an int column without nan counts",
+            INT_MIN_VALUE - 1
+        );
+
+        // Boundary: 30 > 30 is false — MIGHT_NOT_MATCH regardless of the NaN guard.
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_int("id", INT_MIN_VALUE), &file).unwrap();
+        assert!(!result, "Strict eval: id > {INT_MIN_VALUE} must stay false");
+
+        // gtEq on the boundary: 30 >= 30 ⇒ MUST_MATCH.
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_or_equal_int("id", INT_MIN_VALUE), &file)
+                .unwrap();
+        assert!(
+            result,
+            "Strict eval: id >= {INT_MIN_VALUE} must be provable without nan counts"
+        );
+
+        // lt: upper bound 79 < 80 ⇒ MUST_MATCH.
+        let result =
+            StrictMetricsEvaluator::eval(&less_than_int("id", INT_MAX_VALUE + 1), &file).unwrap();
+        assert!(
+            result,
+            "Strict eval: id < {} must be provable without nan counts",
+            INT_MAX_VALUE + 1
+        );
+
+        // Boundary: 79 < 79 is false.
+        let result =
+            StrictMetricsEvaluator::eval(&less_than_int("id", INT_MAX_VALUE), &file).unwrap();
+        assert!(!result, "Strict eval: id < {INT_MAX_VALUE} must stay false");
+
+        // ltEq on the boundary: 79 <= 79 ⇒ MUST_MATCH.
+        let result =
+            StrictMetricsEvaluator::eval(&less_than_or_equal_int("id", INT_MAX_VALUE), &file)
+                .unwrap();
+        assert!(
+            result,
+            "Strict eval: id <= {INT_MAX_VALUE} must be provable without nan counts"
+        );
+    }
+
+    /// The eq and in consumers of `may_contain_nan` on the absent arm (mutation of the
+    /// shared helper must fail tests in EVERY consumer, not just `visit_inequality`).
+    #[test]
+    fn test_absent_nan_counts_cannot_contain_nan_eq_and_in_provable() {
+        let file = get_test_file_eq_absent_nan_counts();
+
+        let result = StrictMetricsEvaluator::eval(&equal_int("id", 42), &file).unwrap();
+        assert!(
+            result,
+            "Strict eval: eq must be provable (lower == upper == literal) without nan counts"
+        );
+
+        let result = StrictMetricsEvaluator::eval(&equal_int("id", 41), &file).unwrap();
+        assert!(
+            !result,
+            "Strict eval: eq on a non-matching literal stays false"
+        );
+
+        let result = StrictMetricsEvaluator::eval(&in_int("id", &[42]), &file).unwrap();
+        assert!(
+            result,
+            "Strict eval: in must be provable (both bounds in set, equal) without nan counts"
+        );
+
+        let result = StrictMetricsEvaluator::eval(&in_int("id", &[41]), &file).unwrap();
+        assert!(!result, "Strict eval: in on a non-matching set stays false");
+    }
+
+    /// OVER-LOOSENING GUARD (the data-loss direction): a float column WITH
+    /// `nan_count > 0` must stay BLOCKED from ROWS_MUST_MATCH in every consumer, even
+    /// when bounds and null counts would otherwise prove it. Breaking the
+    /// `nan_count > 0` arm turns each of these verdicts true.
+    #[test]
+    fn test_positive_nan_count_still_blocks_must_match_every_consumer() {
+        let file = get_test_file_nan_count_positive();
+
+        // visit_inequality consumers (bounds 2.0..2.0 would prove all four).
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_float("some_nans", 1.0), &file).unwrap();
+        assert!(
+            !result,
+            "Strict eval: gt must stay blocked when nan_count > 0"
+        );
+
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_or_equal_float("some_nans", 2.0), &file)
+                .unwrap();
+        assert!(
+            !result,
+            "Strict eval: gtEq must stay blocked when nan_count > 0"
+        );
+
+        let result =
+            StrictMetricsEvaluator::eval(&less_than_float("some_nans", 3.0), &file).unwrap();
+        assert!(
+            !result,
+            "Strict eval: lt must stay blocked when nan_count > 0"
+        );
+
+        // eq consumer (lower == upper == 2.0 would prove it).
+        let result = StrictMetricsEvaluator::eval(&equal_float("some_nans", 2.0), &file).unwrap();
+        assert!(
+            !result,
+            "Strict eval: eq must stay blocked when nan_count > 0"
+        );
+
+        // in consumer (both bounds in the set and equal would prove it).
+        let result = StrictMetricsEvaluator::eval(&in_float("some_nans", &[2.0]), &file).unwrap();
+        assert!(
+            !result,
+            "Strict eval: in must stay blocked when nan_count > 0"
+        );
+    }
+
+    /// A float column with ABSENT nan counts answers exactly what Java answers on
+    /// identical metrics: ROWS_MUST_MATCH. Provenance (jar bytecode, iceberg-api 1.10.0
+    /// `StrictMetricsEvaluator$MetricsEvalVisitor`): `gt` consults `canContainNulls`
+    /// (null count 0 present ⇒ false) then `canContainNaNs` (absent ⇒ `iconst_0`,
+    /// offsets 0-46 — "nan counts might be null for early version writers"), lower
+    /// bound 1.0 is not NaN, `compare(1.0, 0.5) > 0` ⇒ `iconst_1` (MUST_MATCH). Java's
+    /// contract: a writer omitting nan counts asserts none, even for float/double.
+    #[test]
+    fn test_float_absent_nan_counts_matches_java_writer_asserts_none() {
+        let file = get_test_file_absent_nan_counts();
+
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_float("some_nans", 0.5), &file).unwrap();
+        assert!(
+            result,
+            "Strict eval: float gt with absent nan counts must match Java's MUST_MATCH"
+        );
+
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_or_equal_float("some_nans", 1.0), &file)
+                .unwrap();
+        assert!(
+            result,
+            "Strict eval: float gtEq with absent nan counts must match Java's MUST_MATCH"
+        );
+    }
+
+    /// NaN-POISONED BOUNDS stay unprovable (Java gt/gtEq `NaNUtil.isNaN(lower)` guards,
+    /// StrictMetricsEvaluator.java L259-262 / L288-291 @ 1.10.0; gtEq bytecode offsets
+    /// 93-105). `Datum` orders NaN LARGEST (`total_cmp`), so without the explicit guard
+    /// `NaN >= x` / `NaN > x` would wrongly prove ROWS_MUST_MATCH the moment absent nan
+    /// counts stop blocking the bound checks — the ORC unreliable-bounds over-claim.
+    #[test]
+    fn test_nan_lower_bound_never_proves_must_match() {
+        let file = get_test_file_nan_lower_bound();
+
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_or_equal_float("some_nans", 0.5), &file)
+                .unwrap();
+        assert!(
+            !result,
+            "Strict eval: gtEq must never prove MUST_MATCH from a NaN lower bound"
+        );
+
+        let result =
+            StrictMetricsEvaluator::eval(&greater_than_float("some_nans", 0.5), &file).unwrap();
+        assert!(
+            !result,
+            "Strict eval: gt must never prove MUST_MATCH from a NaN lower bound"
+        );
+
+        let result = StrictMetricsEvaluator::eval(&equal_float("some_nans", 0.5), &file).unwrap();
+        assert!(
+            !result,
+            "Strict eval: eq must never prove MUST_MATCH from NaN bounds"
+        );
+
+        // lt/ltEq use the upper bound; NaN sorts largest so `NaN < x` is already false —
+        // pinned so a future ordering change cannot silently flip it (Java relies on the
+        // same comparator property in lt/ltEq, which carry no explicit NaN guard).
+        let result =
+            StrictMetricsEvaluator::eval(&less_than_float("some_nans", 10.0), &file).unwrap();
+        assert!(
+            !result,
+            "Strict eval: lt must never prove MUST_MATCH from a NaN upper bound"
         );
     }
 }
