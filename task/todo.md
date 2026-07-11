@@ -39,6 +39,151 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-10): AUDIT TIER 1 Mode B bundle — A1→A3→A2→A4, one branch, one PR
+
+User-approved 2026-07-10 triage of the external five-agent audit (run on the overnight branch;
+orchestrator spot-verified all four roots in-tree before scoping). Full ladder-ready briefs:
+[audit-2026-07-10-tier1-tier3-briefs.md](audit-2026-07-10-tier1-tier3-briefs.md) — the briefs
+file is the spec; this section is the tracker. **Mode B** per [pr-per-work-cycle]: one bundle
+branch `fix/audit-tier1-2026-07`, four SEQUENTIAL parity-increment ladders, orchestrator
+gates+commits after each unit, ONE final independent SEPMO bundle Critic over the whole branch
+diff; push on CONVERGED; single PR. Execution order **A1 → A3 → A2 → A4** (small corruption
+fixes first; A4 last — it loosens a must-match guard and deserves the freshest scrutiny).
+Tier 3 (ops) already landed separately as `infra/audit-ops-2026-07` (Critic CONVERGED, pushed).
+Contingency: a unit whose ladder cannot converge is parked on `fix/audit-tier1-parked-A<n>`
+and the bundle resets to the last good commit; the bundle ships with the units that converged.
+
+- [x] **A1 — zero-width / oversized partition transforms** (BUG-001/SAF-001/BUG-013): reject
+  `bucket[N]`/`truncate[W]` outside `1..=i32::MAX` at parse per Java preconditions; kill the
+  `rem_euclid(0)` panic and the `mod_n as i32` wrap; defense-in-depth typed error at apply.
+  - Outcome (ladder SHIP_WITH_NITS, 0 remediation rounds, mutations 5/5 RED, 16 tests): three
+    independent doors — `Transform::validate()` in FromStr (the ONLY serde route, so metadata/
+    spec/sort-order/manifest deserialization all covered), fallible `Bucket::new`/
+    `Truncate::new` at the apply door (deliberately duplicated guards), and both
+    partition-spec builders. `Bucket` now stores `mod_n: i32` (checked at construction;
+    `bucket_n` cast-free). Java precondition text pinned verbatim from 1.10.0 jar bytecode;
+    `Transforms.fromString` parses via Java int, confirming the 1..=i32::MAX parity bound.
+    Crown jewel: hostile table-metadata JSON with `bucket[0]`/`bucket[2147483648]` fails at
+    deserialization with DataInvalid (control `bucket[16]` parses). Argued deviation: the
+    Java message text is asserted at the PartitionSpec serde door, not TableMetadata level
+    (untagged-enum serde swallows inner messages; kind stays DataInvalid there).
+- [x] **A3 — negative/null position-delete positions** (BUG-005): fail closed with DataInvalid
+  at `caching_delete_file_loader.rs` (3 sites + a `.unwrap()`); checked `u64::try_from`.
+  CLOSED: ladder SHIP, 0 remediation rounds, critic mutations 5/5 — details in the builder
+  notes below (audit's :918 claim corrected: test-oracle code, not production).
+    - Builder plan (2026-07-10, live-audited): the audit's ":918 `.unwrap() as u64`" site is
+      INSIDE `#[cfg(test)]` (the M5 per-row reference oracle), NOT a production path — and the
+      production null guard already exists (L516-522, typed DataInvalid, but names neither the
+      delete file nor the column). Real production bugs = the two `pos as u64` wraps
+      (L526/L537). Java oracle (source + 1.10.0 jar bytecode): `BitmapPositionDeleteIndex.
+      delete(long)` → `RoaringPositionBitmap.set` → `validatePosition`
+      (RoaringPositionBitmap.java L311-316) throws IllegalArgumentException for pos < 0;
+      `pos` is a REQUIRED column (MetadataColumns.java L70-74) and Java NPEs unboxing a null
+      (Deletes.java L146). Plan: (1) thread `delete_file_path` into
+      `parse_positional_deletes_record_batch_stream` for error context; (2) split the null
+      let-else into per-column typed errors naming the delete file; (3) per-branch checked
+      conversion via a `checked_delete_position` helper (kept per-site so each brief-mandated
+      mutation stays independently RED); (4) fix the test-module reference oracle's bare
+      unwraps; (5) tests: negative-in-run (L526 pin), negative-first-row (L537 pin),
+      null-position via the FULL `load_deletes` production path, null-file-path direct-parse
+      pin, happy-path control including boundary pos=0 (over-broaden direction). Named
+      divergence to record in-test: Java also caps positions at MAX_POSITION
+      (0x7FFF_FFFE_8000_0000, roaring key-space); Rust RoaringTreemap takes full u64 — only
+      the negative bound is ported.
+    - Builder outcome (2026-07-10, pre-critic): LANDED as planned — per-site
+      `checked_delete_position` (both insert branches), split null let-else guards naming
+      the delete file + column, `delete_file_path` threaded, test-oracle unwraps fixed.
+      5 new tests (2 negative-site pins via the FULL `load_deletes` parquet path, null-pos
+      full-path, null-file-path direct-parse, pos=0 boundary control), 5 mutations ALL
+      independently RED (mutation 2's failure output showed the exact corruption:
+      RoaringTreemap<[18446744073709551611]>). Gate green: typos/fmt/clippy -D warnings/
+      lib 2745×2 (+5 over the A1 baseline 2740); `cargo test -p iceberg-datafusion` unit+
+      integration green (the one doc-test FAIL is a pre-existing `#[tokio::main]`
+      rt-multi-thread feature-unification artifact of `-p` isolation, untouched crate).
+      Flagged, not fixed (scope): L298 `task.equality_ids.clone().unwrap()` (production
+      bare unwrap, eq-delete column — not a position/path column); Java's MAX_POSITION
+      upper bound not mirrored (named in doc + test comments).
+- [x] **A2 — Fixed/Binary single-value JSON** (BUG-004/OTH-007): implement both `todo!()` arms
+  per Java `SingleValueParser`/spec Appendix D; verify emit case vs Java base16 (possible
+  two-sided interop bug); Fixed length enforcement.
+  CLOSED: ladder SHIP, critic mutations 7/7, zero `todo!()` left in spec/values/ — details in
+  the builder notes below. Orchestrator notes: the round-trip test alone CANNOT catch an emit
+  case flip (parse is case-insensitive per Java) — the exact-emit-string test is the sole
+  case pin; round-2 remediation fired on the harness out-of-scope matcher false positive
+  (tests.rs vs the `spec/values/` directory allow entry) with an EMPTY issue list —
+  verification-only round, 2 mutations re-proven RED, no code changed after round 0.
+    - Builder outcome (2026-07-10, pre-critic): CONFIRMED two-sided — the old emit catch-all
+      was `{x:x}` (lowercase AND unpadded: 0x0A → "a", undecodable by Java's strict
+      `BaseEncoding.base16()`). Both `try_from_json` arms implemented (mixed-case accept per
+      Java `toUpperCase(Locale.ROOT)`, SingleValueParser.java L169/L175; Fixed pre-decode
+      string-length == 2·L check per L160-167); emit replaced with explicit Fixed
+      (length-enforced per L331-337) + Binary arms, UPPERCASE `{b:02X}`; other
+      (type, Binary) combos now fall to the DataInvalid catch-all (was: silently hex-encoded
+      under any type). 6 new tests incl. the crown-jewel Java-written schema-with-defaults
+      deserialization (previously PANICKED via `SerdeNestedField`); 7 mutations ALL
+      independently RED (error-arm, case-flip, pad-drop, parse+emit length-check drops,
+      odd-length accept, non-hex-as-0, over-broadened/inverted length guard — both
+      directions per testing.md). Java fixtures from `TestSingleValueParser` L53-54,
+      L117-123. Gate green: typos/fmt/clippy -D warnings/lib 2751×2 (+6 over A3's 2745).
+      Flagged, not fixed (scope): `SerdeNestedField→NestedField` swallows parse errors via
+      `.ok()` (malformed default hex now yields default=None silently, panic before —
+      pre-existing seam behavior for all types); `hex_str_to_bytes` duplicates
+      `expr/expression_parser.rs::hex_to_bytes` (out-of-scope file, dedup deferred);
+      interop round-trip vs a live Java oracle deferred (🟡 done-bar).
+    - Remediation r1 (2026-07-10): critic issue list parsed EMPTY and no report file found —
+      instead of guessing, independently re-verified the increment: all four hex arms
+      bytecode-confirmed against the 1.10.0 `SingleValueParser.class` line table (fromJson
+      FIXED length-precheck + `toUpperCase(Locale.ROOT)` decode at offsets 576-643, BINARY
+      644-678; toJson FIXED `remaining()==length()` check + `base16().encode` at 455-520,
+      BINARY 523-552); 3 spot mutations re-run RED (emit case-flip, emit + parse Fixed
+      length-check drops) with byte-identical restore; full gate re-run green (lib 2751×2).
+      No code changes this round.
+    - Remediation r2 (2026-07-10): issue list parsed EMPTY again; searched scratchpad +
+      task/ — no critic report file exists anywhere. Self-critique of the accumulated diff
+      found no open defect (no `todo!()` remains; non-Fixed/Binary `(type, Binary)` combos
+      fall to the DataInvalid catch-all; `is_multiple_of` is within MSRV 1.92). 2 mutations
+      re-run RED (emit case-flip → `json_binary_fixed_emit_uppercase_padded_java_compatible`
+      RED; parse-side Fixed length check disabled via `if false &&` →
+      `json_fixed_length_mismatch_is_data_invalid` RED), restored byte-identical (`cmp`
+      verified). Full gate re-run green (typos/fmt/clippy -D warnings/lib 2751×2). No code
+      changes this round.
+- [x] **A4 — StrictMetricsEvaluator absent-NaN inversion** (found by our G4): absent NaN
+  counts ⇒ CANNOT contain, matching Java cell-by-cell; over-loosening pin required; close the
+  ENGINE_CONTRACT §9 open item in the same change.
+    - Outcome (2026-07-10): `may_contain_nan` absent arm flipped to CANNOT (Java
+      `canContainNaNs` 1.10.0 L483-486, jar-bytecode-verified: absent map/key ⇒ `iconst_0`);
+      the Java `gtEq` NaN-lower-bound guard (L285-291, bytecode offsets 93-105) that the
+      loosening makes REACHABLE ported in the same change — `Datum` orders NaN largest
+      (`total_cmp`), so without it `NaN >= x` would wrongly prove ROWS_MUST_MATCH (the
+      over-claim/data-loss direction). Every helper consumer matched cell-by-cell vs the Java
+      visitor (lt/ltEq/gt/gtEq/eq/in consult the pair guard; notEq/notIn/isNaN/notNaN use the
+      containsOnly helpers — all match). 5 new tests: crown-jewel int-column provable sweep
+      (RED pre-fix), eq+in absent-arm consumers, over-loosening guard across all 5 consumers
+      (nan_count>0 + bounds that would otherwise prove), float-absent Java-verdict pin
+      (MUST_MATCH, bytecode-provenance), NaN-poisoned-bounds never-prove pin. 3 mutations RED
+      (absent-arm revert / nan>0-arm drop / gtEq-guard drop), byte-identical restore.
+      NAMED findings (recorded, NOT fixed here): (1) `may_contain_null` diverges from Java
+      `canContainNulls` in the map-present-key-ABSENT case (Java: cannot; Rust: may —
+      conservative/under-fires; Rust's single HashMap cannot represent Java's null-map vs
+      empty-map split); (2) Rust has NO `isNestedColumn` short-circuit (Java returns
+      MIGHT_NOT_MATCH for nested columns in every arm). §9 bullet closed. Deferred: the
+      cross-engine metrics-decided full-match interop sweep (done-bar 🟡).
+- [x] **A5 — bundle close**: independent SEPMO bundle Critic over `main..HEAD` → on CONVERGED
+  flip this section, push, PR body to scratchpad.
+  - Outcome (2026-07-10): bundle Critic **CONVERGED**, ZERO findings, NO units parked. Gate
+    re-run in full by the Critic (typos/fmt/clippy/lib 2756/matrix-anchors/agent-artifacts);
+    4/4 cross-unit mutations re-proven RED with byte-identical restores; Java citations for
+    all four units re-verified against the 1.10.0 reference (incl. confirming `greater_than`
+    already had its NaN guard on main — A4 correctly added only the missing gtEq one);
+    behavioral-break sweep ruled the A2 emit change and A1 rejections corrections TOWARD the
+    Java-written format, not format breaks (no in-tree dependents of the old behavior). Two
+    accepted LOWs: the narrow pre-existing-in-kind serialize `.expect` surface in
+    datatypes.rs:691 for malformed in-memory defaults (the flagged `.ok()` seam's sibling —
+    future unit), and cosmetic `bind().unwrap()` in A4 test helpers matching module
+    convention. Pushed `fix/audit-tier1-2026-07`; PR body at scratchpad
+    `pr-body-audit-tier1-2026-07.md`. Tier 3 companion branch `infra/audit-ops-2026-07`
+    (Critic CONVERGED after 2 MEDIUM prose corrections) pushed earlier the same day.
+
 ## ACTIVE UNIT (2026-07-09): OVERNIGHT Mode B bundle — G1→G4, one branch, one PR
 
 User-directed 2026-07-09 ("run G1 to G4 in sequential groups without needing a PR for each") —
@@ -1233,7 +1378,47 @@ filter %s: %s" (verbatim string in the 1.10.0 jar). Scope: `crates/iceberg/src/t
   test). DEFERRED for the reviewer/orchestrator: flip the GAP_MATRIX `deleteFromRowFilter` row ❌→🟡
   (outside the explicit modify-list), and data-level Java↔Rust interop.
 
-## Carried-forward open items (full context in todo-archive/)
+## 2026-07-10 — Zero-width / oversized bucket-truncate transforms: reject at parse, never panic at apply (BUG-001/SAF-001/BUG-013)
+
+Plan (delegated BUILDER; done-bar 🟡 unit-tested, interop deferred):
+
+- [x] Java contract (bytecode-verified, 1.10.0 jar): `Bucket.get(int)` bytecode `<= 0` reject-branch + msg
+  `"Invalid number of buckets: %s (must be > 0)"` (Bucket.java:41-42); `Truncate.get(int)` bytecode
+  `<= 0` reject-branch + msg `"Invalid truncate width: %s (must be > 0)"` (Truncate.java:42);
+  `Transforms.fromString` parses via `Integer.parseInt` (Transforms.java:39,45) so values >
+  `Integer.MAX_VALUE` are unrepresentable ⇒ parity bound is `1..=i32::MAX` for both.
+- [x] `spec/transform.rs`: add `Transform::validate()` (Java-precondition messages); call it from
+  `FromStr` bucket/truncate arms (covers serde/Deserialize ⇒ table-metadata JSON, partition specs,
+  sort orders). Tests: reject 0 + `i32::MAX as u64 + 1` on both; boundary-legal 1 and `i32::MAX`
+  accepted (over-broaden pin); JSON serde rejection.
+- [x] `transform/bucket.rs`: `Bucket::new(u32) -> Result<Self>`, store `mod_n: i32` via zero-check +
+  `i32::try_from` (drops the lossy `as i32` in `bucket_n` — wrong-bucket wrap for N > i32::MAX).
+- [x] `transform/truncate.rs`: `Truncate::new(u32) -> Result<Self>` with the same 1..=i32::MAX guard
+  (division/modulo-by-zero in `truncate_i32/i64/decimal_i128` becomes unreachable).
+- [x] `transform/mod.rs`: `create_transform_function` propagates the fallible constructors (`?`) —
+  the apply-door defense; direct `Transform::Bucket(0)` (public enum payload, not blockable) now
+  errors instead of panicking.
+- [x] `spec/partition.rs`: `transform.validate()` in both builders (`add_partition_field_internal`
+  unbound + `add_unbound_field` bound) — the programmatic route Java rejects at construction.
+  Crown-jewel test: minimal V2 TableMetadata JSON, control (bucket[16]) parses, sabotage
+  (bucket[0] / truncate[0]) fails with `ErrorKind::DataInvalid` via the production
+  `serde_json → Error::from` conversion (`read_from` path).
+- [x] Gate: typos + fmt + clippy + `cargo test -p iceberg --lib` ×2; mutation-check the guards both
+  directions (disable ⇒ rejection tests red; over-broaden ⇒ boundary-legal tests red).
+- Outcome (2026-07-10): landed. Parse door = `Transform::validate()` called from `FromStr`
+  (covers Deserialize -> table metadata / partition specs / sort orders); apply door =
+  fallible `Bucket::new` / `Truncate::new` (independent guards) propagated by
+  `create_transform_function`; builder door = `validate()` in both partition-spec builders.
+  `bucket_n` now stores a construction-proven `i32` (lossy `as i32` removed). 16 new tests incl.
+  the crown-jewel TableMetadata fixture (control-first; Java-text pinned at the PartitionSpec
+  serde door - the untagged TableMetadataEnum swallows inner messages). Mutations M1 (parse bound
+  off: 6 tests RED, apply door stayed green - layer independence), M2 (apply guards off +
+  unchecked cast restored: 8 tests RED incl. the project-panic pin), M3 (over-broadened bounds:
+  3 boundary-legal tests RED) - all restored, full gate green (typos/fmt/clippy + lib 2740 x2).
+  Done-bar partial: interop (Java-side cross-validation of the rejection) deferred; GAP_MATRIX
+  untouched (hardening, no capability row).
+
+
 
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the
 user's trading platform vs continuous-parity backlog, incl. re-ordering maintenance actions ahead of

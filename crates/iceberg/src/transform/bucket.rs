@@ -25,12 +25,38 @@ use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType};
 
 #[derive(Debug)]
 pub struct Bucket {
-    mod_n: u32,
+    /// Number of buckets, proven at construction to lie in `1..=i32::MAX` (the Java `int`
+    /// contract — `Bucket.get(int)`, Bucket.java:41-42 in 1.10.0), so the modulo in
+    /// [`Bucket::bucket_n`] can never divide by zero or by a wrapped-negative count.
+    mod_n: i32,
 }
 
 impl Bucket {
-    pub fn new(mod_n: u32) -> Self {
-        Self { mod_n }
+    /// Creates a bucket transform function with `mod_n` buckets.
+    ///
+    /// Rejects `mod_n` outside `1..=i32::MAX` with [`crate::ErrorKind::DataInvalid`] —
+    /// a defense-in-depth guard independent of the parse-time bound in
+    /// `Transform::validate` (Java parity: `Preconditions.checkArgument(numBuckets > 0,
+    /// "Invalid number of buckets: %s (must be > 0)")`, Bucket.java:41-42; counts above
+    /// `i32::MAX` are unrepresentable in Java's `int` and pre-fix wrapped negative here,
+    /// producing silently WRONG bucket values).
+    pub fn new(mod_n: u32) -> crate::Result<Self> {
+        if mod_n == 0 {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Invalid number of buckets: 0 (must be > 0)",
+            ));
+        }
+        let mod_n = i32::try_from(mod_n).map_err(|_| {
+            crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                format!(
+                    "Invalid number of buckets: {mod_n} (must be <= {}, the Java int maximum)",
+                    i32::MAX
+                ),
+            )
+        })?;
+        Ok(Self { mod_n })
     }
 }
 
@@ -102,9 +128,12 @@ impl Bucket {
 
     /// def bucket_N(x) = (murmur3_x86_32_hash(x) & Integer.MAX_VALUE) % N
     /// ref: https://iceberg.apache.org/spec/#partitioning
+    ///
+    /// `self.mod_n` is positive by construction ([`Bucket::new`]), so the modulo can
+    /// neither panic (÷0) nor wrap negative.
     #[inline]
     fn bucket_n(&self, v: i32) -> i32 {
-        (v & i32::MAX) % (self.mod_n as i32)
+        (v & i32::MAX) % self.mod_n
     }
 
     #[inline]
@@ -826,9 +855,55 @@ mod test {
         );
     }
 
+    // RISK: Bucket { mod_n: 0 } reaching bucket_n aborts the process with a modulo-by-zero —
+    // the constructor is the defense-in-depth door (independent of the Transform parse bound)
+    // and must reject with the Java precondition message (Bucket.java:41-42, 1.10.0).
+    #[test]
+    fn test_bucket_new_rejects_zero_buckets() {
+        let error = Bucket::new(0).expect_err("bucket count 0 must be rejected");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Invalid number of buckets: 0 (must be > 0)"),
+            "message must match the Java precondition text, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK: pre-fix `mod_n as i32` wrapped 2147483648 to i32::MIN and bucket_n returned the
+    // masked hash unchanged — silently WRONG bucket values for every row (unrepresentable in
+    // Java's int, so any accepted value above i32::MAX is a partition-routing divergence).
+    #[test]
+    fn test_bucket_new_rejects_count_above_java_int_max() {
+        let error =
+            Bucket::new(2147483648).expect_err("bucket count above i32::MAX must be rejected");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("must be <= 2147483647"),
+            "message must name the Java int bound, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK (over-broadened guard + golden value at the legal maximum): bucket[i32::MAX] is the
+    // largest Java-representable count and must stay accepted AND produce the exact spec value
+    // (hash_int(34) = 2017239379, pinned by test_hash; 2017239379 % 2147483647 = 2017239379).
+    #[test]
+    fn test_bucket_at_java_int_max_accepted_and_produces_exact_value() {
+        let bucket = Bucket::new(2147483647).expect("bucket[i32::MAX] is legal");
+        assert_eq!(
+            bucket
+                .transform_literal(&Datum::int(34))
+                .expect("int is bucketable")
+                .expect("bucket of a non-null value is non-null"),
+            Datum::int(2017239379)
+        );
+    }
+
     #[test]
     fn test_int_literal() {
-        let bucket = Bucket::new(10);
+        let bucket = Bucket::new(10).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket.transform_literal(&Datum::int(34)).unwrap().unwrap(),
             Datum::int(9)
@@ -837,7 +912,7 @@ mod test {
 
     #[test]
     fn test_long_literal() {
-        let bucket = Bucket::new(10);
+        let bucket = Bucket::new(10).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket.transform_literal(&Datum::long(34)).unwrap().unwrap(),
             Datum::int(9)
@@ -846,7 +921,7 @@ mod test {
 
     #[test]
     fn test_decimal_literal() {
-        let bucket = Bucket::new(10);
+        let bucket = Bucket::new(10).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::decimal(decimal_new(1420, 0)).unwrap())
@@ -858,7 +933,7 @@ mod test {
 
     #[test]
     fn test_date_literal() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::date(17486))
@@ -870,7 +945,7 @@ mod test {
 
     #[test]
     fn test_time_literal() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::time_micros(81068000000).unwrap())
@@ -882,7 +957,7 @@ mod test {
 
     #[test]
     fn test_timestamp_literal() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::timestamp_micros(1510871468000000))
@@ -894,7 +969,7 @@ mod test {
 
     #[test]
     fn test_str_literal() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::string("iceberg"))
@@ -906,7 +981,7 @@ mod test {
 
     #[test]
     fn test_uuid_literal() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::uuid(
@@ -920,7 +995,7 @@ mod test {
 
     #[test]
     fn test_binary_literal() {
-        let bucket = Bucket::new(128);
+        let bucket = Bucket::new(128).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::binary(b"\x00\x01\x02\x03".to_vec()))
@@ -932,7 +1007,7 @@ mod test {
 
     #[test]
     fn test_fixed_literal() {
-        let bucket = Bucket::new(128);
+        let bucket = Bucket::new(128).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::fixed(b"foo".to_vec()))
@@ -944,7 +1019,7 @@ mod test {
 
     #[test]
     fn test_timestamptz_literal() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         assert_eq!(
             bucket
                 .transform_literal(&Datum::timestamptz_micros(1510871468000000))
@@ -956,7 +1031,7 @@ mod test {
 
     #[test]
     fn test_timestamp_ns_literal() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         let ns_value = 1510871468000000i64 * 1000;
         assert_eq!(
             bucket
@@ -969,7 +1044,7 @@ mod test {
 
     #[test]
     fn test_timestamptz_ns_literal() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         let ns_value = 1510871468000000i64 * 1000;
         assert_eq!(
             bucket
@@ -982,7 +1057,7 @@ mod test {
 
     #[test]
     fn test_transform_timestamp_nanos_and_micros_array_equivalence() {
-        let bucket = Bucket::new(100);
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
         let micros_value = 1510871468000000;
         let nanos_value = micros_value * 1000;
 

@@ -381,6 +381,11 @@ impl UnboundPartitionSpecBuilder {
     }
 
     fn add_partition_field_internal(mut self, field: UnboundPartitionField) -> Result<Self> {
+        // Java parity: an invalid transform parameter (bucket[0], truncate[0], counts above the
+        // Java int maximum) cannot exist in Java — `Bucket.get`/`Truncate.get` reject it at
+        // construction — so the builder is the earliest Rust door for programmatically built
+        // `Transform` values (the enum payload itself is public and cannot be guarded).
+        field.transform.validate()?;
         self.check_name_set_and_unique(&field.name)?;
         self.check_for_redundant_partitions(field.source_id, &field.transform)?;
         if let Some(partition_field_id) = field.field_id {
@@ -484,6 +489,9 @@ impl PartitionSpecBuilder {
     /// If partition field id is set, it is used as the field id.
     /// Otherwise, a new `field_id` is assigned.
     pub fn add_unbound_field(mut self, field: UnboundPartitionField) -> Result<Self> {
+        // Java parity: see `UnboundPartitionSpecBuilder::add_partition_field_internal` — an
+        // invalid bucket/truncate parameter is rejected before any other spec check.
+        field.transform.validate()?;
         self.check_name_set_and_unique(&field.name)?;
         self.check_for_redundant_partitions(field.source_id, &field.transform)?;
         Self::check_name_does_not_collide_with_schema(&field, &self.schema)?;
@@ -791,6 +799,175 @@ mod tests {
         assert_eq!(1002, partition_spec.fields[2].field_id);
         assert_eq!("id_truncate", partition_spec.fields[2].name);
         assert_eq!(Transform::Truncate(4), partition_spec.fields[2].transform);
+    }
+
+    // RISK (crown jewel, the realistic bytes-on-disk entry): a table-metadata JSON whose
+    // partition spec carries bucket[0] previously DESERIALIZED FINE and the process only crashed
+    // later — a divide/modulo-by-zero abort at partition-value computation, triggerable by any
+    // hostile or corrupt metadata file. It must fail AT DESERIALIZATION with DataInvalid,
+    // matching Java where TableMetadataParser -> Transforms.fromString -> Bucket.get throws
+    // (1.10.0 Bucket.java:41-42 / Truncate.java:42).
+    #[test]
+    fn test_table_metadata_with_invalid_transform_parameter_fails_deserialization() {
+        fn metadata_json(transform: &str) -> String {
+            format!(
+                r#"
+                {{
+                    "format-version": 2,
+                    "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+                    "location": "s3://bucket/test/location",
+                    "last-sequence-number": 1,
+                    "last-updated-ms": 1602638573590,
+                    "last-column-id": 1,
+                    "current-schema-id": 0,
+                    "schemas": [
+                        {{
+                            "type": "struct",
+                            "schema-id": 0,
+                            "fields": [
+                                {{
+                                    "id": 1,
+                                    "name": "x",
+                                    "required": true,
+                                    "type": "long"
+                                }}
+                            ]
+                        }}
+                    ],
+                    "default-spec-id": 0,
+                    "partition-specs": [
+                        {{
+                            "spec-id": 0,
+                            "fields": [
+                                {{
+                                    "source-id": 1,
+                                    "field-id": 1000,
+                                    "name": "x_partition",
+                                    "transform": "{transform}"
+                                }}
+                            ]
+                        }}
+                    ],
+                    "last-partition-id": 1000,
+                    "default-sort-order-id": 0,
+                    "sort-orders": [
+                        {{
+                            "order-id": 0,
+                            "fields": []
+                        }}
+                    ],
+                    "properties": {{}},
+                    "snapshots": [],
+                    "statistics": [],
+                    "snapshot-log": [],
+                    "metadata-log": []
+                }}
+                "#
+            )
+        }
+
+        // CONTROL first (docs/testing.md sabotage discipline): the identical metadata with a
+        // legal transform parses — proving the sabotaged variants below fail on the transform
+        // bound, not on an unrelated fixture defect.
+        let control =
+            serde_json::from_str::<crate::spec::TableMetadata>(&metadata_json("bucket[16]"))
+                .expect("control metadata with bucket[16] must deserialize");
+        assert_eq!(
+            control.default_partition_spec().fields()[0].transform,
+            Transform::Bucket(16)
+        );
+
+        for sabotaged in ["bucket[0]", "truncate[0]", "bucket[2147483648]"] {
+            let serde_error =
+                serde_json::from_str::<crate::spec::TableMetadata>(&metadata_json(sabotaged))
+                    .unwrap_err();
+            // Mirror the production conversion in TableMetadata::read_from
+            // (`serde_json::from_slice(...)?` routes through `Error::from`).
+            let error = Error::from(serde_error);
+            assert_eq!(error.kind(), ErrorKind::DataInvalid, "{sabotaged}");
+        }
+
+        // The Java precondition text is swallowed one level up by the untagged
+        // TableMetadataEnum (serde reports only "data did not match any variant of untagged
+        // enum"), so pin the message at the partition-spec JSON door — the identical
+        // bytes-on-disk shape the metadata carries.
+        let serde_error = serde_json::from_str::<PartitionSpec>(
+            r#"{
+                "spec-id": 0,
+                "fields": [
+                    {
+                        "source-id": 1,
+                        "field-id": 1000,
+                        "name": "x_partition",
+                        "transform": "bucket[0]"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(
+            serde_error
+                .to_string()
+                .contains("Invalid number of buckets: 0 (must be > 0)"),
+            "expected the Java precondition text, got: {serde_error}"
+        );
+    }
+
+    // RISK: the bound builder is the programmatic route into a PartitionSpec — Java can never
+    // hold a Bucket(0)/Truncate(0) instance (rejected at construction), so admitting one here
+    // builds a spec that later aborts the process at apply time.
+    #[test]
+    fn test_partition_spec_builder_rejects_zero_parameter_transforms() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .expect("valid schema");
+
+        let error = PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id_bucket", Transform::Bucket(0))
+            .expect_err("bucket[0] must be rejected by the bound builder");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Invalid number of buckets: 0 (must be > 0)"),
+            "message must match the Java precondition text, got: {}",
+            error.message()
+        );
+
+        let error = PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id_truncate", Transform::Truncate(0))
+            .expect_err("truncate[0] must be rejected by the bound builder");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+
+        // Over-broadened-guard pin: a legal parameter still passes every builder check.
+        PartitionSpec::builder(schema)
+            .add_partition_field("id", "id_bucket", Transform::Bucket(16))
+            .expect("bucket[16] is legal")
+            .build()
+            .expect("legal spec must build");
+    }
+
+    // RISK: the unbound builder feeds catalog create-table requests — same
+    // reject-at-construction contract as the bound builder.
+    #[test]
+    fn test_unbound_partition_spec_builder_rejects_zero_parameter_transforms() {
+        let error = UnboundPartitionSpec::builder()
+            .add_partition_field(1, "id_bucket", Transform::Bucket(0))
+            .expect_err("bucket[0] must be rejected by the unbound builder");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+
+        let error = UnboundPartitionSpec::builder()
+            .add_partition_field(1, "id_truncate", Transform::Truncate(0))
+            .expect_err("truncate[0] must be rejected by the unbound builder");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+
+        // Over-broadened-guard pin: a legal parameter is still accepted.
+        UnboundPartitionSpec::builder()
+            .add_partition_field(1, "id_bucket", Transform::Bucket(16))
+            .expect("bucket[16] is legal");
     }
 
     #[test]

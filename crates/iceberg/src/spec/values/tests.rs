@@ -324,6 +324,204 @@ fn json_map() {
     );
 }
 
+/// RISK PIN (from_json implemented): `try_from_json` for fixed/binary was `todo!()` — any
+/// Java-written metadata carrying a fixed/binary single value PANICKED the reader. Fixture
+/// strings are Java's own: `TestSingleValueParser.testValidDefaults` (1.10.0, L53-54) uses
+/// `fixed[2]` = `"111f"` and `binary` = `"0000ff"`. Re-introducing an unimplemented/error arm
+/// turns this RED. The lowercase fixtures also pin case-insensitive accept (Java decodes
+/// `text.toUpperCase(Locale.ROOT)`, SingleValueParser.java L169/L175).
+#[test]
+fn json_fixed_binary_from_json_java_fixtures() {
+    let fixed = Literal::try_from_json(
+        JsonValue::String("111f".to_string()),
+        &Type::Primitive(PrimitiveType::Fixed(2)),
+    )
+    .expect("Java fixed[2] fixture \"111f\" must parse")
+    .expect("non-null");
+    assert_eq!(fixed, Literal::fixed(vec![0x11u8, 0x1f]));
+
+    let binary = Literal::try_from_json(
+        JsonValue::String("0000ff".to_string()),
+        &Type::Primitive(PrimitiveType::Binary),
+    )
+    .expect("Java binary fixture \"0000ff\" must parse")
+    .expect("non-null");
+    assert_eq!(binary, Literal::binary(vec![0x00u8, 0x00, 0xff]));
+
+    // Case-insensitive accept, all three spellings decode to the same bytes.
+    for spelling in ["a1b2", "A1B2", "a1B2"] {
+        let lit = Literal::try_from_json(
+            JsonValue::String(spelling.to_string()),
+            &Type::Primitive(PrimitiveType::Binary),
+        )
+        .expect("mixed-case hex must parse (Java uppercases before decoding)")
+        .expect("non-null");
+        assert_eq!(lit, Literal::binary(vec![0xa1u8, 0xb2]), "{spelling}");
+    }
+}
+
+/// CROWN JEWEL — the realistic Java-written-metadata entry path: a schema JSON whose fields
+/// carry fixed/binary `initial-default` / `write-default` single values, exactly as Java's
+/// `SchemaParser` + `SingleValueParser.toJson` emit them (UPPERCASE base16 per Guava
+/// `BaseEncoding.base16()`; field shape per the spec "Appendix D: Single-value serialization").
+/// Before this change, deserializing this document PANICKED via the `todo!()` arms
+/// (`SerdeNestedField -> NestedField` calls `Literal::try_from_json`, datatypes.rs).
+#[test]
+fn json_schema_with_fixed_and_binary_defaults_from_java_metadata() {
+    let java_schema_json = r#"
+    {
+        "type": "struct",
+        "schema-id": 0,
+        "fields": [
+            {
+                "id": 1,
+                "name": "bin_col",
+                "required": true,
+                "type": "binary",
+                "initial-default": "000102FF",
+                "write-default": "0A"
+            },
+            {
+                "id": 2,
+                "name": "fixed_col",
+                "required": true,
+                "type": "fixed[2]",
+                "initial-default": "111F",
+                "write-default": "0BAD"
+            }
+        ]
+    }"#;
+    let schema: Schema = serde_json::from_str(java_schema_json)
+        .expect("a Java-written schema with fixed/binary defaults must deserialize");
+
+    let bin_field = schema.field_by_id(1).expect("bin_col present");
+    assert_eq!(
+        bin_field.initial_default,
+        Some(Literal::binary(vec![0x00u8, 0x01, 0x02, 0xff]))
+    );
+    assert_eq!(bin_field.write_default, Some(Literal::binary(vec![0x0au8])));
+
+    let fixed_field = schema.field_by_id(2).expect("fixed_col present");
+    assert_eq!(
+        fixed_field.initial_default,
+        Some(Literal::fixed(vec![0x11u8, 0x1f]))
+    );
+    assert_eq!(
+        fixed_field.write_default,
+        Some(Literal::fixed(vec![0x0bu8, 0xad]))
+    );
+}
+
+/// RISK PIN (emit case + padding Java-compatible): `try_into_json` used to emit `{x:x}` —
+/// lowercase AND unpadded, so byte 0x0A serialized as `"a"`: odd-length garbage no Java
+/// reader (`BaseEncoding.base16().decode`, strict) can parse. Java emits UPPERCASE with
+/// exactly two hex digits per byte (`BaseEncoding.base16().encode`; the Guava base16
+/// alphabet is `0123456789ABCDEF`). The expected strings below are byte-for-byte what Java
+/// `SingleValueParser.toJson` produces for these values. Flipping the emit case or dropping
+/// the zero-padding turns this RED.
+#[test]
+fn json_binary_fixed_emit_uppercase_padded_java_compatible() {
+    let json = Literal::binary(vec![0x00u8, 0x0a, 0x1b, 0xff])
+        .try_into_json(&Type::Primitive(PrimitiveType::Binary))
+        .expect("binary emit");
+    assert_eq!(json, JsonValue::String("000A1BFF".to_string()));
+
+    let json = Literal::fixed(vec![0x0bu8, 0xad])
+        .try_into_json(&Type::Primitive(PrimitiveType::Fixed(2)))
+        .expect("fixed emit");
+    assert_eq!(json, JsonValue::String("0BAD".to_string()));
+
+    // Empty binary is legal and emits the empty string (Java: base16().encode(new byte[0])).
+    let json = Literal::binary(vec![])
+        .try_into_json(&Type::Primitive(PrimitiveType::Binary))
+        .expect("empty binary emit");
+    assert_eq!(json, JsonValue::String(String::new()));
+}
+
+/// RISK PIN (round-trip): parse(emit(x)) == x byte-exact for both binary and fixed,
+/// including bytes below 0x10 (the class the old unpadded emitter corrupted) and 0x00/0xFF
+/// extremes.
+#[test]
+fn json_binary_fixed_round_trip_byte_exact() {
+    let bytes = vec![0x00u8, 0x01, 0x0a, 0x10, 0x7f, 0x80, 0xf0, 0xff];
+
+    let binary_type = Type::Primitive(PrimitiveType::Binary);
+    let json = Literal::binary(bytes.clone())
+        .try_into_json(&binary_type)
+        .expect("binary emit");
+    let back = Literal::try_from_json(json, &binary_type)
+        .expect("binary re-parse")
+        .expect("non-null");
+    assert_eq!(back, Literal::binary(bytes.clone()));
+
+    let fixed_type = Type::Primitive(PrimitiveType::Fixed(8));
+    let json = Literal::fixed(bytes.clone())
+        .try_into_json(&fixed_type)
+        .expect("fixed emit");
+    let back = Literal::try_from_json(json, &fixed_type)
+        .expect("fixed re-parse")
+        .expect("non-null");
+    assert_eq!(back, Literal::fixed(bytes));
+}
+
+/// RISK PIN (Fixed length enforcement, BOTH directions + ON the boundary): Java checks the
+/// hex-string length against `2 * L` on parse (SingleValueParser.java L160-167; its
+/// `testInvalidFixed` fixture is `"111ff"` on `fixed[2]`) and the byte length against `L`
+/// on emit (L331-337). Dropping either check turns this RED; the legal boundary case
+/// (exactly L bytes) is pinned by `json_fixed_binary_from_json_java_fixtures` /
+/// `json_binary_fixed_round_trip_byte_exact`, so over-broadening the guard also goes RED.
+#[test]
+fn json_fixed_length_mismatch_is_data_invalid() {
+    // Parse side — Java's own invalid fixture: 5 hex chars on fixed[2] (odd AND wrong length).
+    let err = Literal::try_from_json(
+        JsonValue::String("111ff".to_string()),
+        &Type::Primitive(PrimitiveType::Fixed(2)),
+    )
+    .expect_err("fixed[2] must reject a 5-char hex string");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+    // Parse side — even-length, valid hex, but 3 bytes against fixed[2]: only the length
+    // check (not the hex decoder) can reject this.
+    let err = Literal::try_from_json(
+        JsonValue::String("1122FF".to_string()),
+        &Type::Primitive(PrimitiveType::Fixed(2)),
+    )
+    .expect_err("fixed[2] must reject a 3-byte value");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+    // Emit side — a 3-byte literal against fixed[2].
+    let err = Literal::fixed(vec![0x11u8, 0x22, 0xff])
+        .try_into_json(&Type::Primitive(PrimitiveType::Fixed(2)))
+        .expect_err("fixed[2] must refuse to emit a 3-byte value");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+}
+
+/// RISK PIN (malformed-input fail-closed): odd-length hex, non-hex ASCII, and non-ASCII
+/// input must all be `DataInvalid` errors — never a panic, never silently accepted. Java's
+/// strict `BaseEncoding.base16().decode` throws `IllegalArgumentException` on each.
+#[test]
+fn json_binary_fixed_malformed_hex_is_data_invalid() {
+    let binary_type = Type::Primitive(PrimitiveType::Binary);
+    for bad in ["abc", "zz", "0g", "€€", "0x0A", " 0A"] {
+        let err = Literal::try_from_json(JsonValue::String(bad.to_string()), &binary_type)
+            .expect_err("malformed hex must fail closed");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid, "input: {bad:?}");
+    }
+
+    // The fixed door too: correct string length but non-hex content.
+    let err = Literal::try_from_json(
+        JsonValue::String("zz".to_string()),
+        &Type::Primitive(PrimitiveType::Fixed(1)),
+    )
+    .expect_err("fixed[1] must reject non-hex content of the right length");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+    // A non-string JSON value for binary is a type mismatch, not a panic.
+    let err = Literal::try_from_json(JsonValue::Number(7.into()), &binary_type)
+        .expect_err("a JSON number is not a binary single value");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+}
+
 #[test]
 fn avro_bytes_boolean() {
     let bytes = vec![1u8];

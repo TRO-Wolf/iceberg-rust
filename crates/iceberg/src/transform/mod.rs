@@ -62,8 +62,8 @@ pub fn create_transform_function(transform: &Transform) -> Result<BoxedTransform
         Transform::Month => Ok(Box::new(temporal::Month {})),
         Transform::Day => Ok(Box::new(temporal::Day {})),
         Transform::Hour => Ok(Box::new(temporal::Hour {})),
-        Transform::Bucket(mod_n) => Ok(Box::new(bucket::Bucket::new(*mod_n))),
-        Transform::Truncate(width) => Ok(Box::new(truncate::Truncate::new(*width))),
+        Transform::Bucket(mod_n) => Ok(Box::new(bucket::Bucket::new(*mod_n)?)),
+        Transform::Truncate(width) => Ok(Box::new(truncate::Truncate::new(*width)?)),
         Transform::Unknown => Err(crate::error::Error::new(
             crate::ErrorKind::FeatureUnsupported,
             "Transform Unknown is not implemented",
@@ -156,6 +156,53 @@ mod test {
         pub preserves_order: bool,
         pub satisfies_order_of: Vec<(Transform, bool)>,
         pub trans_types: Vec<(Type, Option<Type>)>,
+    }
+
+    // RISK: `Transform::Bucket(0)` / `Transform::Truncate(0)` can be constructed directly (the
+    // enum payload is public and cannot be guarded), and pre-fix the apply path panicked with a
+    // divide/modulo-by-zero — a hostile or corrupt table spec crashed the process. The apply door
+    // must return a typed error instead. In Java the instance cannot exist at all
+    // (Bucket.java:41-42 / Truncate.java:42, 1.10.0).
+    #[test]
+    fn test_create_transform_function_rejects_zero_parameter_transforms() {
+        for transform in [Transform::Bucket(0), Transform::Truncate(0)] {
+            let error = super::create_transform_function(&transform)
+                .expect_err("zero-parameter transform must not yield a transform function");
+            assert_eq!(error.kind(), crate::ErrorKind::DataInvalid, "{transform}");
+        }
+    }
+
+    // RISK: pre-fix `bucket_n` cast `mod_n as i32`, so 2147483648 (= i32::MAX + 1) wrapped to
+    // i32::MIN and `(v & i32::MAX) % i32::MIN` returned the masked hash itself — silently WRONG
+    // bucket values (partition-routing divergence vs Java, where such a count is unrepresentable).
+    #[test]
+    fn test_create_transform_function_rejects_parameters_above_java_int_max() {
+        for transform in [
+            Transform::Bucket(2147483648),
+            Transform::Truncate(2147483648),
+        ] {
+            let error = super::create_transform_function(&transform)
+                .expect_err("parameter above the Java int maximum must be rejected");
+            assert_eq!(error.kind(), crate::ErrorKind::DataInvalid, "{transform}");
+        }
+    }
+
+    // RISK (end-to-end, the original panic site): projecting a predicate through bucket[0]
+    // reached `% 0` via transform_literal. It must surface as Err, never a panic.
+    #[test]
+    fn test_project_with_zero_bucket_returns_error_instead_of_panicking() {
+        let fixture = TestProjectionFixture::new(
+            Transform::Bucket(0),
+            "name",
+            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Int)),
+        );
+        let error = Transform::Bucket(0)
+            .project(
+                "name",
+                &fixture.binary_predicate(PredicateOperator::Eq, Datum::int(10)),
+            )
+            .expect_err("projection through bucket[0] must fail, not panic");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
     }
 
     impl TestTransformFixture {

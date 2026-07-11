@@ -136,6 +136,49 @@ pub enum Transform {
 }
 
 impl Transform {
+    /// Validates the transform's parameters against the Java construction preconditions.
+    ///
+    /// Java 1.10.0 rejects non-positive parameters at construction —
+    /// `Bucket.get(int)` (`Bucket.java:41-42`): `checkArgument(numBuckets > 0, "Invalid number of
+    /// buckets: %s (must be > 0)", numBuckets)`; `Truncate.get(int)` (`Truncate.java:42`):
+    /// `checkArgument(width > 0, "Invalid truncate width: %s (must be > 0)", width)`. Both
+    /// parameters are a Java `int` parsed with `Integer.parseInt` (`Transforms.java:39,45`), so
+    /// values above `i32::MAX` are unrepresentable there and must be rejected here for parity —
+    /// pre-fix they wrapped negative through an `as i32` cast and produced silently WRONG bucket
+    /// values. The valid range for both parameters is `1..=i32::MAX`.
+    ///
+    /// Returns `Ok(())` for every parameterless transform.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Transform::Bucket(num_buckets) => {
+                Self::check_transform_parameter(*num_buckets, "number of buckets")
+            }
+            Transform::Truncate(width) => Self::check_transform_parameter(*width, "truncate width"),
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks that a bucket/truncate parameter lies in `1..=i32::MAX` (the Java `int` contract);
+    /// `label` names the parameter in the error message, matching the Java precondition text.
+    fn check_transform_parameter(value: u32, label: &str) -> Result<()> {
+        if value == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Invalid {label}: 0 (must be > 0)"),
+            ));
+        }
+        if i32::try_from(value).is_err() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid {label}: {value} (must be <= {}, the Java int maximum)",
+                    i32::MAX
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns a human-readable String representation of a transformed value.
     pub fn to_human_string(&self, field_type: &Type, value: Option<&Literal>) -> String {
         let Some(value) = value else {
@@ -1009,7 +1052,9 @@ impl FromStr for Transform {
                         .with_source(err)
                     })?;
 
-                Transform::Bucket(length)
+                let transform = Transform::Bucket(length);
+                transform.validate()?;
+                transform
             }
             v if v.starts_with("truncate") => {
                 let width = v
@@ -1026,7 +1071,9 @@ impl FromStr for Transform {
                         .with_source(err)
                     })?;
 
-                Transform::Truncate(width)
+                let transform = Transform::Truncate(width);
+                transform.validate()?;
+                transform
             }
             v => {
                 return Err(Error::new(
@@ -1091,6 +1138,110 @@ mod tests {
                 error.message().contains("variant"),
                 "{transform} rejection must name the variant input, got: {}",
                 error.message()
+            );
+        }
+    }
+
+    // RISK: bucket[0] / truncate[0] parsed fine from table-metadata JSON and later crashed the
+    // process with a divide/modulo-by-zero on the apply path. Java rejects them at construction
+    // (1.10.0 Bucket.java:41-42 / Truncate.java:42): checkArgument(n > 0, "Invalid number of
+    // buckets: %s (must be > 0)") / checkArgument(width > 0, "Invalid truncate width: %s
+    // (must be > 0)") — so acceptance here was a parity divergence, not just a hardening gap.
+    #[test]
+    fn test_from_str_rejects_zero_bucket_and_zero_truncate() {
+        let error = "bucket[0]"
+            .parse::<Transform>()
+            .expect_err("bucket[0] must be rejected at parse");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Invalid number of buckets: 0 (must be > 0)"),
+            "message must match the Java precondition text, got: {}",
+            error.message()
+        );
+
+        let error = "truncate[0]"
+            .parse::<Transform>()
+            .expect_err("truncate[0] must be rejected at parse");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Invalid truncate width: 0 (must be > 0)"),
+            "message must match the Java precondition text, got: {}",
+            error.message()
+        );
+    }
+
+    // RISK: Java parses both parameters with Integer.parseInt (1.10.0 Transforms.java:39,45), so
+    // values above Integer.MAX_VALUE are unrepresentable there and fail at parse. Pre-fix, an
+    // accepted u32 above i32::MAX wrapped negative through `as i32` in bucket_n and produced
+    // silently WRONG bucket values — a partition-routing divergence vs Java.
+    #[test]
+    fn test_from_str_rejects_parameters_above_java_int_max() {
+        // i32::MAX + 1 = 2147483648: fits in u32, so only the explicit bound rejects it.
+        // 4294967296 (> u32::MAX) exercises the integer-parse rejection of the same door.
+        for input in [
+            "bucket[2147483648]",
+            "truncate[2147483648]",
+            "bucket[4294967296]",
+            "truncate[4294967296]",
+        ] {
+            let error = input
+                .parse::<Transform>()
+                .expect_err("parameters above the Java int maximum must be rejected at parse");
+            assert_eq!(
+                error.kind(),
+                crate::ErrorKind::DataInvalid,
+                "input: {input}"
+            );
+        }
+    }
+
+    // RISK (over-broadened guard): the legal boundaries 1 and i32::MAX must stay accepted — a
+    // `> 0` check mutated to `> 1`, or `<= i32::MAX` mutated to `< i32::MAX`, would reject
+    // partition specs Java writes.
+    #[test]
+    fn test_from_str_accepts_boundary_legal_parameters() {
+        assert_eq!(
+            "bucket[1]"
+                .parse::<Transform>()
+                .expect("bucket[1] is legal"),
+            Transform::Bucket(1)
+        );
+        assert_eq!(
+            "bucket[2147483647]"
+                .parse::<Transform>()
+                .expect("bucket[i32::MAX] is legal"),
+            Transform::Bucket(2147483647)
+        );
+        assert_eq!(
+            "truncate[1]"
+                .parse::<Transform>()
+                .expect("truncate[1] is legal"),
+            Transform::Truncate(1)
+        );
+        assert_eq!(
+            "truncate[2147483647]"
+                .parse::<Transform>()
+                .expect("truncate[i32::MAX] is legal"),
+            Transform::Truncate(2147483647)
+        );
+    }
+
+    // RISK: serde is the bytes-on-disk entry (table metadata, partition specs, sort orders all
+    // carry transforms as JSON strings) — the FromStr bound must hold through Deserialize too.
+    #[test]
+    fn test_serde_rejects_zero_parameter_transforms() {
+        for json in [
+            r#""bucket[0]""#,
+            r#""truncate[0]""#,
+            r#""bucket[2147483648]""#,
+        ] {
+            assert!(
+                serde_json::from_str::<Transform>(json).is_err(),
+                "{json} must fail deserialization"
             );
         }
     }

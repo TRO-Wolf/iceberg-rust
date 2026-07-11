@@ -437,7 +437,8 @@ impl CachingDeleteFileLoader {
             DeleteFileContext::ExistingEqDel => Ok(ParsedDeleteFileContext::EqDel),
             DeleteFileContext::ExistingPosDel => Ok(ParsedDeleteFileContext::ExistingPosDel),
             DeleteFileContext::PosDels { file_path, stream } => {
-                let del_vecs = Self::parse_positional_deletes_record_batch_stream(stream).await?;
+                let del_vecs =
+                    Self::parse_positional_deletes_record_batch_stream(&file_path, stream).await?;
                 Ok(ParsedDeleteFileContext::DelVecs {
                     file_path,
                     results: del_vecs,
@@ -478,10 +479,45 @@ impl CachingDeleteFileLoader {
         }
     }
 
-    /// Parses a record batch stream coming from positional delete files
+    /// Checked conversion of one position-delete row's `pos` value (untrusted i64 from the
+    /// delete file) into a bitmap position.
+    ///
+    /// A corrupt delete file can carry a negative position; the old `pos as u64` wrapped it to
+    /// a huge position that matches no row, so the delete silently failed OPEN (deleted rows
+    /// resurrect) — the highest-severity silent-corruption class. Java fails loud on the same
+    /// input: `BitmapPositionDeleteIndex.delete(long)` (BitmapPositionDeleteIndex.java L66-68)
+    /// → `RoaringPositionBitmap.set(long)` (L73-74) → `validatePosition`
+    /// (RoaringPositionBitmap.java L311-316), which throws `IllegalArgumentException`
+    /// ("Bitmap supports positions that are >= 0 and <= %s: %s"). Parity nuance: Java's upper
+    /// bound `MAX_POSITION` (0x7FFF_FFFE_8000_0000, a roaring 32-bit key-space limit below
+    /// `i64::MAX`) is NOT mirrored — Rust's `RoaringTreemap` supports the full u64 position
+    /// range, so only the negative bound applies here.
+    ///
+    /// `delete_file_path` is the position-delete file being parsed; `data_file_path` is the
+    /// data file the row points at — both are named in the error so the corrupt file is
+    /// identifiable from logs alone.
+    fn checked_delete_position(
+        delete_file_path: &str,
+        data_file_path: &str,
+        pos: i64,
+    ) -> Result<u64> {
+        u64::try_from(pos).map_err(|_| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid position delete file '{delete_file_path}': negative position \
+                     {pos} for data file '{data_file_path}'"
+                ),
+            )
+        })
+    }
+
+    /// Parses a record batch stream coming from the positional delete file at
+    /// `delete_file_path` (named in errors so corrupt input is identifiable).
     ///
     /// Returns a map of data file path to a delete vector
     async fn parse_positional_deletes_record_batch_stream(
+        delete_file_path: &str,
         mut stream: ArrowRecordBatchStream,
     ) -> Result<HashMap<String, DeleteVector>> {
         let mut result: HashMap<String, DeleteVector> = HashMap::default();
@@ -514,16 +550,37 @@ impl CachingDeleteFileLoader {
             // we splice the vector back into the map on each change and at end-of-batch.
             let mut current: Option<(&str, DeleteVector)> = None;
             for (file_path, pos) in file_paths.iter().zip(positions.iter()) {
-                let (Some(file_path), Some(pos)) = (file_path, pos) else {
+                // Both columns are REQUIRED by the spec (Java `MetadataColumns.DELETE_FILE_POS`,
+                // MetadataColumns.java L70-74, is `NestedField.required`; Java's read path NPEs
+                // unboxing a null — `Deletes.toPositionIndexes`, Deletes.java L146). A null in
+                // either column is corrupt input: fail closed with a typed error naming the
+                // delete file, never panic and never skip the row.
+                let Some(file_path) = file_path else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        "null values in delete file",
+                        format!(
+                            "Invalid position delete file '{delete_file_path}': null file_path \
+                             value (the file_path column is required)"
+                        ),
+                    ));
+                };
+                let Some(pos) = pos else {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid position delete file '{delete_file_path}': null position \
+                             value for data file '{file_path}' (the pos column is required)"
+                        ),
                     ));
                 };
 
                 match &mut current {
                     Some((path, vector)) if *path == file_path => {
-                        vector.insert(pos as u64);
+                        vector.insert(Self::checked_delete_position(
+                            delete_file_path,
+                            file_path,
+                            pos,
+                        )?);
                     }
                     _ => {
                         // Flush the previous run's vector back into the map (merging if the path
@@ -534,7 +591,11 @@ impl CachingDeleteFileLoader {
                         }
                         let mut vector =
                             std::mem::take(result.entry(file_path.to_string()).or_default());
-                        vector.insert(pos as u64);
+                        vector.insert(Self::checked_delete_position(
+                            delete_file_path,
+                            file_path,
+                            pos,
+                        )?);
                         current = Some((file_path, vector));
                     }
                 }
@@ -913,9 +974,12 @@ mod tests {
                     .downcast_ref::<Int64Array>()
                     .unwrap();
                 for (p, pos) in paths.iter().zip(positions.iter()) {
-                    out.entry(p.unwrap().to_string())
+                    out.entry(p.expect("fixture file_path is non-null").to_string())
                         .or_default()
-                        .insert(pos.unwrap() as u64);
+                        .insert(
+                            u64::try_from(pos.expect("fixture pos is non-null"))
+                                .expect("fixture positions are non-negative"),
+                        );
                 }
             }
             out.into_iter()
@@ -959,10 +1023,12 @@ mod tests {
         let stream_batches: Vec<crate::Result<RecordBatch>> =
             batches.iter().cloned().map(Ok).collect();
         let stream = Box::pin(stream::iter(stream_batches)) as ArrowRecordBatchStream;
-        let actual_map =
-            CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(stream)
-                .await
-                .expect("parse positional deletes");
+        let actual_map = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+            "pos-dels.parquet",
+            stream,
+        )
+        .await
+        .expect("parse positional deletes");
 
         let actual: HashMap<String, Vec<u64>> = actual_map
             .into_iter()
@@ -977,6 +1043,251 @@ mod tests {
         assert_eq!(expected.get("a.parquet").unwrap().as_slice(), &[10, 20, 30]);
         assert_eq!(expected.get("b.parquet").unwrap().as_slice(), &[5, 6]);
         assert_eq!(expected.get("c.parquet").unwrap().as_slice(), &[1, 2]);
+    }
+
+    /// Write a REAL positional-delete parquet file with the spec's `file_path`/`pos` columns
+    /// (reserved field ids 2147483546 / 2147483545). `pos` is written as a NULLABLE Int64 so
+    /// corrupt fixtures (null positions) are expressible; conforming writers never emit nulls
+    /// there (the column is required by the spec).
+    fn write_pos_del_parquet(
+        dir: &std::path::Path,
+        file_name: &str,
+        rows: &[(&str, Option<i64>)],
+    ) -> String {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            simple_field("file_path", DataType::Utf8, false, "2147483546"),
+            simple_field("pos", DataType::Int64, true, "2147483545"),
+        ]));
+        let paths: Vec<&str> = rows.iter().map(|(path, _)| *path).collect();
+        let positions: Vec<Option<i64>> = rows.iter().map(|(_, pos)| *pos).collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(paths)) as ArrayRef,
+            Arc::new(Int64Array::from(positions)) as ArrayRef,
+        ])
+        .expect("build positional-delete batch");
+
+        let path = dir
+            .join(file_name)
+            .to_str()
+            .expect("utf-8 path")
+            .to_string();
+        let file = File::create(&path).expect("create positional-delete parquet");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(props)).expect("create parquet writer");
+        writer.write(&batch).expect("write positional-delete batch");
+        writer.close().expect("close parquet writer");
+        path
+    }
+
+    /// Build the delete-file task entry for a parquet positional-delete file.
+    fn parquet_pos_del_task(pos_del_path: &str) -> FileScanTaskDeleteFile {
+        FileScanTaskDeleteFile {
+            file_path: pos_del_path.to_string(),
+            file_size_in_bytes: std::fs::metadata(pos_del_path)
+                .map(|m| m.len())
+                .unwrap_or(0),
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: crate::spec::DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        }
+    }
+
+    /// Risk pinned (audit BUG-005, run-continuation insert site): a NEGATIVE position in a
+    /// position-delete file must fail CLOSED with a typed `DataInvalid` error naming the
+    /// delete file and the offending position — the pre-change `pos as u64` wrapped -1 to
+    /// u64::MAX, which matches no row, so the delete silently failed OPEN and the deleted row
+    /// RESURRECTED. The negative row is the SECOND row of a same-path run, so it is converted
+    /// by the run-continuation branch (restoring `pos as u64` at that site turns exactly this
+    /// test RED via a successful load). Java parity: `BitmapPositionDeleteIndex.delete(long)`
+    /// → `RoaringPositionBitmap.set` → `validatePosition` (RoaringPositionBitmap.java
+    /// L311-316, 1.10.0) throws IllegalArgumentException for pos < 0 — fail-loud in both
+    /// implementations. Named divergence: Java's upper bound MAX_POSITION
+    /// (0x7FFF_FFFE_8000_0000, a roaring key-space limit) is NOT mirrored; Rust's
+    /// RoaringTreemap supports the full u64 position range.
+    #[tokio::test]
+    async fn test_negative_position_in_run_fails_closed_with_data_invalid() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let file_io = FileIO::new_with_fs();
+
+        let data_file = format!("{}/data-1.parquet", tmp_dir.path().display());
+        let pos_del_path = write_pos_del_parquet(tmp_dir.path(), "neg-pos-run.parquet", &[
+            (&data_file, Some(0)),
+            (&data_file, Some(-1)),
+        ]);
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let error = loader
+            .load_deletes(
+                &[parquet_pos_del_task(&pos_del_path)],
+                Arc::new(Schema::builder().build().expect("empty schema")),
+            )
+            .await
+            .expect("loader channel")
+            .expect_err("a negative position must fail the load closed, not wrap to a huge u64");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains(&pos_del_path),
+            "error must name the delete file: {error}"
+        );
+        assert!(
+            error.to_string().contains("negative position -1"),
+            "error must name the offending position: {error}"
+        );
+    }
+
+    /// Risk pinned (audit BUG-005, new-path-run insert site): the same fail-closed bar when
+    /// the negative position is the FIRST row of a path's run, which is converted by the
+    /// new-path branch of the run cache (restoring `pos as u64` at that site turns exactly
+    /// this test RED, independently of the run-continuation site).
+    #[tokio::test]
+    async fn test_negative_first_position_of_path_run_fails_closed() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let file_io = FileIO::new_with_fs();
+
+        let data_file = format!("{}/data-1.parquet", tmp_dir.path().display());
+        let pos_del_path = write_pos_del_parquet(tmp_dir.path(), "neg-pos-first.parquet", &[(
+            &data_file,
+            Some(-5),
+        )]);
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let error = loader
+            .load_deletes(
+                &[parquet_pos_del_task(&pos_del_path)],
+                Arc::new(Schema::builder().build().expect("empty schema")),
+            )
+            .await
+            .expect("loader channel")
+            .expect_err("a negative first-of-run position must fail the load closed");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains(&pos_del_path),
+            "error must name the delete file: {error}"
+        );
+        assert!(
+            error.to_string().contains("negative position -5"),
+            "error must name the offending position: {error}"
+        );
+    }
+
+    /// Risk pinned (audit BUG-005): a NULL position reaching the production loader path must
+    /// surface as a typed `DataInvalid` error naming the delete file — never a panic and
+    /// never a silently skipped row. The `pos` column is REQUIRED by the spec (Java
+    /// `MetadataColumns.DELETE_FILE_POS`, MetadataColumns.java L70-74 is
+    /// `NestedField.required`); Java's reader fails loud unboxing the null
+    /// (`Deletes.toPositionIndexes`, Deletes.java L146 — NPE), typed here.
+    #[tokio::test]
+    async fn test_null_position_yields_typed_error_not_panic() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let file_io = FileIO::new_with_fs();
+
+        let data_file = format!("{}/data-1.parquet", tmp_dir.path().display());
+        let pos_del_path =
+            write_pos_del_parquet(tmp_dir.path(), "null-pos.parquet", &[(&data_file, None)]);
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let error = loader
+            .load_deletes(
+                &[parquet_pos_del_task(&pos_del_path)],
+                Arc::new(Schema::builder().build().expect("empty schema")),
+            )
+            .await
+            .expect("loader channel")
+            .expect_err("a null position must fail the load closed with a typed error");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains(&pos_del_path),
+            "error must name the delete file: {error}"
+        );
+        assert!(
+            error.to_string().contains("null position"),
+            "error must name the null position column: {error}"
+        );
+    }
+
+    /// Risk pinned: a NULL file_path row fails closed with a typed error naming the delete
+    /// file — the sibling required column of the null-position case (replacing the guard
+    /// with an unwrap panics this test). Built as an in-memory batch because the parquet
+    /// fixture writer declares file_path non-nullable.
+    #[tokio::test]
+    async fn test_null_file_path_yields_typed_error_not_panic() {
+        use futures::stream;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, true),
+            Field::new("pos", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![7i64])) as ArrayRef,
+        ])
+        .expect("build batch with null file_path");
+        let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
+
+        let error = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+            "corrupt-pos-dels.parquet",
+            stream,
+        )
+        .await
+        .expect_err("a null file_path must fail closed with a typed error");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains("corrupt-pos-dels.parquet"),
+            "error must name the delete file: {error}"
+        );
+        assert!(
+            error.to_string().contains("null file_path"),
+            "error must name the null file_path column: {error}"
+        );
+    }
+
+    /// Happy-path CONTROL for the fail-closed guards (over-broaden direction): the SAME
+    /// fixture shape with valid positions — including the BOUNDARY pos = 0, the smallest
+    /// legal position — must load and apply the delete correctly. An over-broadened guard
+    /// (e.g. rejecting `pos <= 0` instead of `pos < 0`) turns this test RED; the negative
+    /// tests alone cannot catch an over-firing guard.
+    #[tokio::test]
+    async fn test_valid_positions_including_zero_boundary_still_apply() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let file_io = FileIO::new_with_fs();
+
+        let data_file = format!("{}/data-1.parquet", tmp_dir.path().display());
+        let pos_del_path = write_pos_del_parquet(tmp_dir.path(), "valid-pos.parquet", &[
+            (&data_file, Some(0)),
+            (&data_file, Some(3)),
+        ]);
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let delete_filter = loader
+            .load_deletes(
+                &[parquet_pos_del_task(&pos_del_path)],
+                Arc::new(Schema::builder().build().expect("empty schema")),
+            )
+            .await
+            .expect("loader channel")
+            .expect("valid positions (including the 0 boundary) must load cleanly");
+
+        let vector = delete_filter
+            .get_delete_vector_for_path(&data_file)
+            .expect("delete vector installed under the data file");
+        let positions: Vec<u64> = vector.lock().expect("vector lock").iter().collect();
+        assert_eq!(
+            positions,
+            vec![0, 3],
+            "the valid delete positions must apply exactly (0 is the smallest legal position)"
+        );
     }
 
     /// Create a simple field with metadata.
