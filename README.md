@@ -53,9 +53,12 @@ on-disk format or the read/write seam lands with a **bidirectional Java ↔ Rust
 - **A DataFusion engine reference for the full DML loop** — `INSERT OVERWRITE`, `DELETE`, and `UPDATE`
   through the in-repo `iceberg-datafusion` `TableProvider`, with **both** merge-on-read and
   copy-on-write `DELETE` / `UPDATE` paths selectable via the standard `write.delete.mode` /
-  `write.update.mode` table properties. `INSERT OVERWRITE` works on partitioned tables; `DELETE` and
-  `UPDATE` are currently scoped to unpartitioned tables (merge-on-read additionally requires a V2
-  table) — partition-aware rewrite and V3 deletion-vector writes are follow-ups. Row-level mutation
+  `write.update.mode` table properties. `INSERT OVERWRITE`, `DELETE`, and `UPDATE` are
+  partition-aware on both paths (partitioned copy-on-write `DELETE` is additionally
+  interop-proven Rust→Java in `interop_partitioned_dml.rs`; merge-on-read requires a V2
+  table; V3 deletion-vector writes are a follow-up — see
+  [docs/ENGINE_CONTRACT.md](docs/ENGINE_CONTRACT.md) for the authoritative engine surface).
+  Row-level mutation
   evaluates the exact engine predicate per row (never an inexact push-down), so it never over-deletes.
 - **Catalogs** — REST, Hive Metastore, **Glue + S3 Tables (the parity priority)**, and SQL-backed, plus
   a config-driven loader; OpenDAL-backed FileIO and a Moka object/metadata cache.
