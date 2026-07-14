@@ -82,9 +82,17 @@ row.
       `environment_drift_events` candidate); refresh `skills/sepmo/map.md` in the same change.
       Fixed in passing (in-scope files): two pre-existing broken `../../CLAUDE.md` links in
       the refs 04/05 repo-note boxes (needed three levels up from `references/`).
-- [ ] **5. Gate + independent Critic → push** — unit gate green; independent SEPMO Critic
-      (fresh context, Opus) over the full branch diff; remediate; commit in one gate-chain;
-      push on CONVERGED (merge is the user's).
+- [x] **5. Gate + independent Critic → push** — DONE 2026-07-13: round-2 re-attestation
+      **CONVERGED** — the Critic independently re-ran all four gates green on b440629b,
+      re-executed the no-default-features compile itself (exit 0, byte-identical to
+      ci.yml:149), re-swept every `row *…*` citation to resolution, and re-falsified I-4
+      (now true). One NEW S3 advisory filed and accepted-open (F-SEPMO22-3: exception
+      entry 5 over-states the platform residual — CI's `tests` job is ubuntu-only, so the
+      gap belongs to build/no-default-features + check-on-macOS; conservative-direction
+      error, "never blocks" per the spine; tighten at the next touch of the row —
+      disclosed in the PR body). Pushed; merge is the user's. Meta-note worth keeping:
+      round 1's S1 was the new machinery catching a real binding defect in its own
+      install — the R7 silent-skip rule fired on the very unit that introduced it.
       - Round 1 (2026-07-13): Critic CHANGES_REQUIRED with 2 findings, both fixed same day —
         **F-SEPMO22-1 (S1, binding defect):** CI's `build_with_no_default_features` job was
         neither mirrored nor excepted; REMEDIATED by adding
