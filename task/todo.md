@@ -85,6 +85,16 @@ row.
 - [ ] **5. Gate + independent Critic → push** — unit gate green; independent SEPMO Critic
       (fresh context, Opus) over the full branch diff; remediate; commit in one gate-chain;
       push on CONVERGED (merge is the user's).
+      - Round 1 (2026-07-13): Critic CHANGES_REQUIRED with 2 findings, both fixed same day —
+        **F-SEPMO22-1 (S1, binding defect):** CI's `build_with_no_default_features` job was
+        neither mirrored nor excepted; REMEDIATED by adding
+        `cargo build -p iceberg --no-default-features` to the pre-merge gate (run live:
+        green, 20.8s) + a fifth exception entry (non-Linux runners platform residual).
+        **F-SEPMO22-2 (S2):** three reference citations still named the old manifest row
+        `Capability status (SSOT)` after the template-aligned rename; REMEDIATED to
+        `Status SSOT` (refs 02 ×1, 07 ×2; repo-wide grep now clean). Regression proof for
+        both is structural (grep + live command), not test-expressible — R5 justification.
+        Sent back for re-attestation.
 
 ## ACTIVE UNIT (2026-07-10): AUDIT TIER 1 Mode B bundle — A1→A3→A2→A4, one branch, one PR
 

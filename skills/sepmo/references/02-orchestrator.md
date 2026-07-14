@@ -66,8 +66,8 @@ charter is derived from it: the current phase, sequenced capabilities, phase exi
 criteria.
 
 For **capability status** — which rows are open and which are already done —
-the Orchestrator reads the capability status SSOT (binding row: *Capability
-status (SSOT)* in `../binding-manifest.md`).
+the Orchestrator reads the capability status SSOT (binding row: *Status SSOT*
+in `../binding-manifest.md`).
 It binds to that file and **restates none of its contents**. The Orchestrator
 references capabilities by their GAP_MATRIX row ID or anchor — never by copying
 cell content. If the same status would appear in two places, one of them is

@@ -97,7 +97,7 @@ conditional check machine-readable.
 When a PR's acceptance advances a capability row to done:
 
 1. Edit `../../../docs/parity/GAP_MATRIX.md` — the capability cell — and **nothing else**. Status
-   lives only in the GAP_MATRIX (binding-manifest row *Capability status (SSOT)*); the
+   lives only in the GAP_MATRIX (binding-manifest row *Status SSOT*); the
    de-triplication rule in `../../../CLAUDE.md` *Working conventions* forbids any other location.
 2. The flip requires both unit tests and an interop test — rule and rationale in
    `../../../CLAUDE.md` *Parity mandate*; read it there.
@@ -191,7 +191,7 @@ Partial delivery is not delivery.
   state 4)
 - The frozen charter — for clause-by-clause `success_condition` lookup
 - The project's Done gate — via `../binding-manifest.md` row *Done gate*
-- The GAP_MATRIX — via `../binding-manifest.md` row *Capability status (SSOT)*, for flip
+- The GAP_MATRIX — via `../binding-manifest.md` row *Status SSOT*, for flip
   eligibility and cell editing
 
 **Outputs:**
