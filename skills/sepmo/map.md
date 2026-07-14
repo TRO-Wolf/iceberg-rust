@@ -32,25 +32,28 @@ SEPMO governs *lifecycle*; it **cedes the engineering contract** to the tier man
 
 | File | For |
 |---|---|
-| `SKILL.md` | The spine: the Iron State Machine, the doctrines (thin — each points to its canonical home), the agent roster, and routing to the references below |
-| `binding-manifest.md` | The one project-specific file: maps SEPMO's abstractions → this repo's contract, plan, status SSOT, memory, and navigation. **Swap this to port SEPMO.** |
-| `references/01-scope-auditor.md` | Scope Auditor — the front-of-pipeline audit + the 100% gate |
-| `references/02-orchestrator.md` | Orchestrator — charter ← Roadmap+GAP_MATRIX, PR-grouping, AC-loop coordination, mode handling |
-| `references/03-self-logic-review.md` | The pre-action review every agent runs |
-| `references/04-actor.md` | Actor — builds under the tier manual (binds); blind to the Critic |
-| `references/05-critic.md` | Critic — attacks on the Risk-First lens (binds); convergence is its call |
-| `references/06-vigilance.md` | Runtime enforcer of rules the repo already defines |
-| `references/07-delivery.md` | Per-PR acceptance = the §4 Done gate + GAP_MATRIX flip discipline |
-| `references/08-retrospective.md` | A compaction pass + SEPMO feed-forward |
+| `SKILL.md` | The spine — **versioned canon, v2.2**: the Iron State Machine (T1–T12), the proposition-ledger gate, the AC sub-machine rules R1–R10, the S0–S3 severity scale, the LIGHT/STANDARD rubric, doctrines, roster, changelog. Never edited per-project. |
+| `binding-manifest.md` | The one project-specific file: role bindings + tunables (`spine_version`, `severity_floor`, `green_commands` two-tier + CI-exception record, `context_break_mechanics`, `s0_fresh_execution`, `metrics_ledger_location`, `taxonomy_extensions`). **Re-instantiate this to port SEPMO.** |
+| `binding-manifest.template.md` | The portable template the manifest instantiates from — ships with the canon; edit neither per-project. |
+| `references/01-scope-auditor.md` | Scope Auditor — the proposition ledger (PROVEN/OPEN/REJECTED), the enumeration obligation for quantified clauses, the approval gate |
+| `references/02-orchestrator.md` | Orchestrator — charter ← plan-of-record, PR carving + rubric, context-break enforcement (R3), AC-loop coordination, R7 readiness checklist |
+| `references/03-self-logic-review.md` | The pre-action review every agent runs; also the one-time PRE_EXECUTION_REVIEW format |
+| `references/04-actor.md` | Actor — R2 green exit + clause pinning (per-element for quantified clauses); R5/R6 dispositions; blind to the Critic |
+| `references/05-critic.md` | Critic — the attack taxonomy + coverage attestation (R4), the span check, the fresh-execution step; convergence is its call |
+| `references/06-vigilance.md` | Invariant V — watch items (incl. unledgered claims, silent gate skips), the alarm, T8 |
+| `references/07-delivery.md` | Per-PR acceptance = the §4 Done gate + R8 embedded evidence + GAP_MATRIX flip discipline |
+| `references/08-retrospective.md` | Learnings + the quantitative metrics ledger (incl. `environment_drift_events`), incident retrospectives, asymmetric feed-forward, compaction pass |
 
 ## I want to...
 
 | I want to... | go to |
 |---|---|
 | Understand the lifecycle / where I am in it | [SKILL.md](SKILL.md) — the Iron State Machine |
-| See how SEPMO binds to this repo | [binding-manifest.md](binding-manifest.md) |
+| See how SEPMO binds to this repo (incl. gates, floor, taxonomy) | [binding-manifest.md](binding-manifest.md) |
+| Port SEPMO to another repo | instantiate [binding-manifest.template.md](binding-manifest.template.md) there |
 | Audit a new brief / plan before any code | [references/01-scope-auditor.md](references/01-scope-auditor.md) |
 | Run the pre-action review | [references/03-self-logic-review.md](references/03-self-logic-review.md) |
+| File retrospective metrics / an incident retrospective | [references/08-retrospective.md](references/08-retrospective.md) → [task/sepmo-metrics.md](../../task/sepmo-metrics.md) |
 | Find the engineering contract (what to build under) | the tier manual in [skills/](../) — SEPMO does not restate it |
 | Find the plan / capability status | [Roadmap.md](../../Roadmap.md) + [docs/parity/GAP_MATRIX.md](../../docs/parity/GAP_MATRIX.md) (via the manifest) |
 | Resolve a SEPMO-vs-repo conflict | [CLAUDE.md](../../CLAUDE.md) `<precedence>` (it wins) |

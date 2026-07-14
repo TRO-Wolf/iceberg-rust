@@ -36,21 +36,23 @@ plans, or attack code — it *orchestrates* the agents that do.
 
 ## State ownership — across states 3 and 4
 
-**State 3 — `PAUSE_&_SELF_REVIEW`.** On handoff from the Scope Auditor
-(`01-scope-auditor.md`, `GO_DECISION: "Proceed to Orchestrator"`), every agent
-entering execution runs its own Self Logic Review (`03-self-logic-review.md`)
-per the SKILL.md state table (state 3 owner: "Every agent"). The Orchestrator's
-SLR at this point is scoped to the full charter — verifying that the
-`REFINED_CHARTER` is complete, that every clause has a checkable success
-condition, and that the plan-of-record and capability status SSOT are current.
-(Each agent entering state 4 also runs its own SLR per `03-self-logic-review.md`;
-what is described here is the Orchestrator's SLR on the charter as a whole.)
-The SLR is a logged, addressable artifact; the Orchestrator does not advance
-until its own SLR reads `verdict: PROCEED`.
+**State 3 — `PRE_EXECUTION_REVIEW` (sole owner).** On handoff from the Scope
+Auditor (`01-scope-auditor.md`, `GO_DECISION: "Proceed to Orchestrator"`), the
+Orchestrator logs **one single, one-time, whole-plan Self Logic Review**
+(format: `03-self-logic-review.md`) over the complete plan — distinct from the
+per-action SLRs D3 requires of every agent throughout the project. It confirms
+at minimum (canonical list: `../SKILL.md`, *PRE_EXECUTION_REVIEW — one review,
+one owner*): the charter (the frozen proposition ledger) is frozen; the PR
+carving is clause-complete — every clause maps to exactly one PR unit and
+every unit traces to clauses; each unit's LIGHT/STANDARD path assignment has a
+recorded rubric result; and the binding manifest resolves every open binding
+(models, tiers, green commands). A gap here routes backward via T6 — it never
+gets patched inline. The Orchestrator does not advance until this review reads
+`verdict: PROCEED`.
 
 **State 4 — `ORCHESTRATED_EXECUTION`.** The Orchestrator drives the full
 AC sub-machine for each PR-unit in dependency order until every PR in the
-charter set is assembled and handed to Delivery (state 6, `07-delivery.md`).
+charter set is assembled and handed to Delivery (state 5, `07-delivery.md`).
 
 No other agent enters state 4 without the Orchestrator's dispatch.
 
@@ -82,6 +84,9 @@ CHARTER:
   phase: <current Roadmap phase name>
   clauses:
     - id: CH-<id>.<n>
+      # The clause IS the frozen ledger's C-### proposition (ref 01) — CH-<id>.<n>
+      # namespaces it by charter so multi-charter projects stay addressable; the
+      # two forms are the same clause, and every charter_trace resolves to one.
       capability: <name as it appears in the plan-of-record or status SSOT>
       success_condition: <the one checkable statement of done for this clause>
       failure_modes:
@@ -113,8 +118,8 @@ Wave-specific additions (these are not in SKILL.md):
   so the Orchestrator can sequence and unblock parallelism where safe.
 - **Sizing rule — logical completeness over time-box.** A Wave ends at a natural
   seam. Smaller is safer: when unsure whether two changes belong together, split.
-- **Ceremony assignment.** The Orchestrator assigns `ceremony: FULL` to any Wave
-  touching the on-disk format, public API, or a security surface; see
+- **Path assignment.** The Orchestrator runs the six-criterion LIGHT rubric
+  (`../SKILL.md`, *Proportionality*) per Wave and records the result; see
   Proportionality below.
 
 ### PR_UNIT record
@@ -131,7 +136,10 @@ PR_UNIT:
     - <adjacent work explicitly NOT in this Wave>
   success_conditions:
     - <clause id>: <checkable outcome — pointer to GAP_MATRIX row if a status flip>
-  ceremony: FULL | LIGHTWEIGHT         # set by the Orchestrator per Proportionality
+  path: STANDARD | LIGHT               # per the spine's six-criterion rubric
+  rubric_result: >
+    # REQUIRED (spine PR_SCOPING exit guard): which criteria passed/failed;
+    # LIGHT only when ALL six hold — any failure OR uncertainty → STANDARD
   status: SCOPED | IN_FLIGHT | CONVERGED | ASSEMBLED | DELIVERED
 ```
 
@@ -184,14 +192,33 @@ charter-traced builds.
 
 The AC loop is bounded at **approximately 2–3 full cycles per PR-unit**, grounded
 in the tier manual's §8 Debugging Protocol (binding row: *Debugging protocol* in
-`../binding-manifest.md`) and its two-attempts-then-re-assess rule. Applied to the
-AC loop: reaching the cap with unresolved MEDIUM+ findings means the approach —
-not just the implementation — is likely wrong, so the Orchestrator stops and
-re-assesses rather than spinning more cycles; see Cycle-cap escalation below.
+`../binding-manifest.md`) and its two-attempts-then-re-assess rule. Applied to
+the AC loop: reaching the cap with unresolved findings at/above the severity
+floor means the approach — not just the implementation — is likely wrong, so the
+Orchestrator stops and re-assesses rather than spinning more cycles; see
+Cycle-cap escalation below.
 
-The cap counts cycles where a MEDIUM+ finding *persists* across both build and
-remediation. A trivial first finding resolved in one round does not count toward
-the cap.
+The cap counts cycles where a floor-or-above finding *persists* across both
+build and remediation. A trivial first finding resolved in one round does not
+count toward the cap.
+
+### The context break (R3) — the Orchestrator enforces it
+
+Before every `CRITIC_REVIEW`, the Orchestrator executes the Context Break
+(canonical rule: `../SKILL.md` R3; mechanics bound by `../binding-manifest.md`
+`context_break_mechanics`):
+
+- **Restrict the Critic's inputs** to: the unit's charter clauses, the diff and
+  artifacts, test results, and the attack taxonomy (ref 05). The Actor's
+  narrative and Self Logic Reviews are **excluded** from the dispatch package.
+- **Sequence the SLR read**: the Critic files its initial findings *before*
+  reading the Actor's self-review; the Orchestrator releases the SLR logs only
+  after that filing, and only for the undischarged-flag check (R3(b)).
+- **Declare the break on the record** — the stage's exit guard. Where the
+  runtime supports a fresh context or separate sub-agent, use one (the hard
+  break is always preferred). A procedural in-session break is named honestly
+  as procedural and carries R3's fresh-execution compensation for
+  silently-wrong-results claims (ref 05; manifest row `s0_fresh_execution`).
 
 ### Per-cycle routing
 
@@ -201,21 +228,30 @@ The Orchestrator's routing responsibilities at each stage:
 1. **Dispatch to Actor** — hand the complete PR-unit slice (see Dispatching
    above). No mention of Critic, review, or audit in the dispatch package.
 2. **Receive Actor output** — read `ACTOR_BUILD_SUMMARY` + SLR logs; verify
-   charter-trace completeness before any handoff to the Critic.
-3. **Dispatch to Critic** — hand the Actor's implementation, SLR logs, and
-   charter clauses. The Orchestrator enforces Actor blindness (D6) structurally:
-   the dispatch package contains no information about defect-fix routing or that
-   a named Actor wrote the code.
-4. **Receive Critic output** — read `CRITIC_FINDINGS`:
-   - `convergence: CONVERGED`, no MEDIUM+ open → `PR_READINESS_AUDIT`.
-   - `convergence: NOT_YET` or MEDIUM+ open → remediation path.
+   charter-trace completeness and the R2 exit (workspace green on the
+   manifest's unit gate; every clause pinned — quantified clauses per element)
+   before any handoff to the Critic.
+3. **Execute the context break, then dispatch to Critic** — hand the Actor's
+   implementation and charter clauses per the R3 input restriction above. The
+   Orchestrator enforces Actor blindness (D6) structurally: the dispatch
+   package contains no information about defect-fix routing or that a named
+   Actor wrote the code.
+4. **Receive Critic output** — read `CRITIC_FINDINGS` + the coverage
+   attestation (R4):
+   - Attestation complete ∧ no open or sustained-disputed findings at/above
+     the severity floor → `PR_READINESS_AUDIT`.
+   - Attestation incomplete → the review is not done — back to the Critic; an
+     incomplete attestation is never accepted as convergence.
+   - Open findings at/above the floor → remediation path.
    - Suspicious `NO_FINDINGS` (too-clean — scrutinize regardless of mode) →
      re-run with a fresh Critic pass before accepting (per `05-critic.md`
      *Convergence — the Critic's call*).
 5. **`PR_READINESS_AUDIT`** — on convergence, run the readiness audit (see
    *PR-readiness audit* below).
 6. **`ASSEMBLE_PR`** — on `READY_TO_ASSEMBLE`: compile the PR description,
-   diff, and charter-trace links; hand the assembled PR to the Delivery agent
+   diff, and charter-trace links, **embedding the unit's evidence per R8**
+   (clause-by-clause trace, attestation summary, findings ledger with
+   dispositions, shipped flags); hand the assembled PR to the Delivery agent
    (`07-delivery.md`).
 
 ### Remediation mediation
@@ -226,18 +262,24 @@ unique role here is the routing: it strips all Critic attribution from
 `required_fix` items before handing them to the Actor as a plain defect-fix
 slice, so the Actor's blindness remains intact.
 
-**Disputed findings:** see `05-critic.md` (*Disputed findings and remediation
-handoff*) — the Orchestrator's escalation posture for LOW vs MEDIUM+ disputes
-follows that section. The Orchestrator holds both arguments before acting:
+**Disputed findings:** R6 (`../SKILL.md`) is the canonical rule; conduct lives
+in `05-critic.md` (*Disputed findings and remediation handoff*). The
+Orchestrator holds both arguments and enforces termination — every dispute
+ends `WITHDRAWN` or sustained, never dangling:
 
-- Dispute on a **LOW** finding: may accept the Actor's resolution and log the
-  dispute for the Retrospective.
-- Dispute on **MEDIUM or above**: **escalates to the user** with both arguments
-  laid out — does not pick a side, override the Critic, or allow the PR to
-  advance with an unresolved material dispute.
+- Sustained dispute **below the severity floor**: may ship as
+  `ACCEPTED_FLAGGED`; the Orchestrator ensures the flag appears in the PR
+  description (R8) and the retrospective ledger.
+- Sustained dispute **at/above the severity floor**: a hard stop for the unit —
+  *interactive mode*: escalate to the user immediately with both arguments
+  laid out; *delegated mode*: the unit halts, the PR is **not** assembled, and
+  the dispute is flagged in the final report. The Orchestrator never picks a
+  side and never overrides the Critic.
 
-Convergence remains exclusively the Critic's declaration. The Orchestrator never
-overrides a `convergence: NOT_YET` verdict to advance a PR.
+Convergence remains exclusively the Critic's declaration — and it is checkable
+(R4): attestation complete ∧ no open or sustained-disputed findings at/above
+the floor. The Orchestrator never overrides a non-converged verdict to advance
+a PR.
 
 ### Cycle-cap escalation
 
@@ -252,11 +294,13 @@ When the cap is reached and the Critic has not converged:
 
 ---
 
-## PR-readiness audit
+## PR-readiness audit (R7)
 
-Before assembling a PR, the Orchestrator runs a **light frontier re-audit** of
-the completed PR-unit. This is not a re-run of the full scope audit — it
-confirms that *this slice* is internally complete, traceable, and mergeable.
+Before assembling a PR, a **light frontier re-audit** of the completed PR-unit
+runs — an independent frontier auditor on STANDARD units; the Orchestrator may
+self-run it on LIGHT units. This is not a re-run of the full scope audit — it
+confirms that *this slice* is internally complete, traceable, and mergeable,
+and **"mergeable" means CI green** (canonical rule: `../SKILL.md` R7).
 
 **How it runs:** the readiness audit reuses the Scope Auditor's discipline
 (`01-scope-auditor.md`) at PR scope — the same logic-completeness and
@@ -264,10 +308,26 @@ assumption-extermination lens, narrowed to this Wave's clauses and success
 conditions. The Scope Auditor proves the charter is sound; the readiness audit
 proves *this unit* is complete, traceable, and ready.
 
-**Done gate:** the audit also verifies your tier manual's §4 Verification Before
-Done gate (binding row: *Done gate* in `../binding-manifest.md` resolves the
-exact gate and verification commands for the running project). SEPMO adds nothing
-to that gate here — it invokes it.
+**The readiness checklist** — each item confirmed *with evidence*, never as a
+self-report:
+
+1. **The pre-merge gate is green** — the manifest's `green_commands` pre-merge
+   tier, the faithful local mirror of the CI this PR will face. Every
+   CI-enforced check either ran in that command or appears in the manifest's
+   **CI-only exception record** with its residual gap stated; a silent skip is
+   a **binding defect** (Invariant V raises it), because it would certify
+   "mergeable" against a surface CI does not run.
+2. **This unit's clauses are all `PROVEN` at unit scope** — quantified clauses
+   pinned per enumerated element.
+3. **The coverage attestation is attached and complete** (R4).
+4. **The findings ledger is closed at/above the severity floor**, regression
+   links present (R5); any `ACCEPTED_FLAGGED` items are disclosed for R8.
+5. **Traceability** — every change maps to a clause; no orphan work.
+
+**A red gate here triggers the R10 base-ref test** before any routing: run the
+same gate on the base ref without the unit's diff. Base red → environmental —
+remediate as its own unit and record an `environment_drift_event` (ref 08);
+base green → a unit defect — send back.
 
 **The audit can and does send a unit back.** A failed readiness audit routes a
 defect-fix slice back to the Actor — the same mediation path as a Critic
@@ -277,7 +337,13 @@ finding. It is not a rubber stamp.
 PR_READINESS_VERDICT:
   pr_unit: <PR-unit ID>
   charter_trace_complete: true | false    # every clause in PR_UNIT accounted for
-  done_gate_clean: true | false           # tier manual §4 gate passed
+  clauses_proven_at_unit_scope: true | false
+  pre_merge_gate_green: true | false      # manifest green_commands, pre-merge tier
+  ci_exception_record_verified: true | false
+    # every CI-enforced check mirrored or excepted-with-residual-gap; a silent
+    # skip is a binding defect — raise it, do not pass it
+  attestation_complete: true | false      # R4 coverage attestation attached
+  findings_closed_at_floor: true | false  # R5 regression links present
   open_issues:
     - <issue>: BLOCKING | NON_BLOCKING
   verdict: READY_TO_ASSEMBLE | SEND_BACK
@@ -311,18 +377,23 @@ safer direction.
 
 ## Proportionality
 
-Canonical proportionality rule: `../SKILL.md` (*Proportionality — ceremony
-scales with risk*). Orchestrator-specific application:
+Canonical proportionality rule: `../SKILL.md` (*Proportionality — two paths,
+one bar*) — the six-criterion LIGHT rubric, with thresholds bound by
+`../binding-manifest.md` (`light_thresholds`). Orchestrator-specific
+application:
 
-- **The mechanism is the `ceremony` field** in `PR_UNIT`. The Orchestrator sets
-  it per unit before dispatching the Actor.
-- **Triggers for `ceremony: FULL`:** any Wave touching the on-disk format, the
-  public API, or a security surface. When in doubt, assign `FULL` — under-scoping
-  ceremony is the riskier error.
-- **`ceremony: LIGHTWEIGHT`** provides: a single Actor build, a single Critic
-  pass, and a compressed readiness check. It never removes the 100%
-  charter-trace, the Done gate, or the Critic's attack — the standard does not
-  weaken, only the amount of ceremony.
+- **The mechanism is the `path` + `rubric_result` fields** in `PR_UNIT`. The
+  Orchestrator runs the rubric and records the result at PR_SCOPING — the
+  stage's exit guard requires it; an unrecorded rubric is a
+  proportionality-rubric violation Invariant V watches for.
+- **Any criterion failed — or uncertain — routes STANDARD.** Under-scoping
+  ceremony is the riskier error. (In this repo, criterion 5 alone routes every
+  on-disk-format, public-API, or security-surface Wave to STANDARD.)
+- **The LIGHT path** provides: a single AC cycle; attestation categories may be
+  marked `N/A` with the rubric as justification; the Orchestrator may self-run
+  the readiness audit. Nothing else changes — the ledger gate, a green
+  workspace, a complete attestation, and the severity floor hold on every
+  unit.
 
 ---
 
@@ -344,9 +415,10 @@ Orchestrator's enforcement posture at each decision point:
 - **D6 (→ `../SKILL.md`; Actor blindness → `04-actor.md` *Design note*):**
   Actor blindness is structural — enforced by ensuring the Actor's dispatch
   package never mentions the Critic or audit. This is not optional.
-- **Convergence authority:** the Orchestrator never overrides a `NOT_YET`
+- **Convergence authority:** the Orchestrator never overrides a non-converged
   verdict, never shortens the cycle cap to hit a deadline, and never advances a
-  PR with an unresolved MEDIUM+ finding without user sign-off.
+  PR with an unresolved finding at/above the severity floor without user
+  sign-off.
 
 ---
 
@@ -384,8 +456,9 @@ The Orchestrator's job ends when the last PR is delivered and the Retrospective
 has been handed its artifact set. It does not declare the charter fulfilled —
 that is Delivery's verdict, one PR at a time.
 
-Note: `CONSTANT_VIGILANCE` (state 5, `06-vigilance.md`) runs concurrently with
-state 4. When it alarms on scope change or drift, the Orchestrator halts the
-affected PR-unit and routes the changed scope back to state 1 for re-audit.
-The Orchestrator responds to vigilance alarms but does not run the monitor
-itself — that is the Vigilance Monitor's role.
+Note: Vigilance is **Invariant V, not a state** (`06-vigilance.md`) — active
+from the moment APPROVAL_GATE passes until RETROSPECTIVE files, observing every
+state. When it raises the drift alarm (T8), the Orchestrator halts the affected
+PR-unit and routes the changed scope back to state 1 for re-audit. The
+Orchestrator responds to vigilance alarms but does not run the monitor itself —
+that is the Vigilance Monitor's role.

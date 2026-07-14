@@ -61,7 +61,7 @@ mention of the Critic, review, or audit. That omission is a feature, not a gap.
 > **This repo's binding selects the multi-agent path:** the per-PR Critic is a
 > **mandatory independent agent** (fresh context), and a spawned Actor + that Critic
 > **default to Opus** — `OO` = Opus–Opus ([binding-manifest.md](../binding-manifest.md)
-> *Sub-agent / tier policy*; [CLAUDE.md](../../CLAUDE.md) `<subagent_policy>`). The
+> *Sub-agent / tier policy*; [CLAUDE.md](../../../CLAUDE.md) `<subagent_policy>`). The
 > single-agent role-shift below is the **fallback** for trivial work that never reaches
 > a PR, not the default for anything that ships.
 
@@ -160,6 +160,36 @@ Two scope rules are SEPMO's own, and they stay here:
 
 ---
 
+## Green is an exit condition, not a hope (R2)
+
+`ACTOR_BUILD` does not exit until the workspace is green: the project builds,
+the relevant test suite passes, and configured static checks pass — the
+concrete commands are the **unit gate** bound in `../binding-manifest.md`
+(`green_commands`), never assumed. Canonical rule: `../SKILL.md` R2.
+
+**Clause pinning.** Every charter clause implemented in the slice is pinned by
+at least one test before the Actor concludes — an unpinned clause is an
+automatic finding downstream (default S1), so treat it as a build failure now.
+
+**Per-element pinning for quantified clauses.** A clause that quantifies —
+"every", "all", "parity", "handled" — was only provable at audit because its
+domain was enumerated into a finite partition (ref 01, *enumeration
+obligation*). The pinning procedure follows the partition, not the prose:
+
+1. Open the clause's `enumeration.partition` in the frozen ledger.
+2. Write (or extend) the pinning tests so **each element has its own pin** —
+   one representative case is not the claim; every untested element is an
+   unpinned clause under R2.
+3. Keep the element→pin mapping explicit in the build summary
+   (`clause_pins` below), so the Critic's span check (ref 05) can verify
+   coverage mechanically instead of re-deriving it.
+4. **Domain growth inherits the obligation in the same slice.** If the build
+   adds a new entry point or a new divergence class to an enumerated domain,
+   the partition grows *and its pin lands in this slice* — the matrix grows
+   with the surface, or the growth is an unpinned clause.
+
+---
+
 ## Slice discipline — exactly the handed slice
 
 No more, no less.
@@ -184,8 +214,13 @@ ACTOR_BUILD_SUMMARY:
   pr_unit: <PR-unit ID>
   charter_trace: <clause IDs implemented>
   what_was_built: <concise description of the implementation>
+  unit_gate: GREEN            # the manifest's unit-gate command, run and green (R2)
   success_conditions_met:
     - <clause success condition>: <how satisfied / which test proves it>
+  clause_pins:
+    - <clause id>: <pinning test name(s)>
+      # quantified clauses list one pin PER partition element, keyed to the
+      # ledger's enumeration — the Critic's span check reads this mapping
   performance_notes: <key performance decisions and the scale they target>
   failure_modes_handled:
     - <charter failure mode>: <how handled>
@@ -212,6 +247,32 @@ concrete problems and required outcomes, to be fixed to best practice, reviewed
 its perspective they are simply requirements. This keeps the blindness intact
 while still letting the Actor's hands do the remediation, since it is the
 developer.
+
+### Dispositions and the regression-proof protocol (R5 / R6)
+
+Every item in a defect-fix slice ends in exactly one disposition, returned to
+the Orchestrator with the remediation summary — no item is ever silently
+dropped:
+
+- **`REMEDIATED`** — for any defect expressible as a test, this requires a
+  **regression proof**: a test that *failed before the fix and passes after
+  it*, committed with the fix and linked in the item's record. "Fixed" without
+  that proof is still `OPEN` (canonical rule: `../SKILL.md` R5). Items not
+  expressible as tests (documentation, naming) carry a one-line justification
+  instead.
+- **`DISPUTED`** — the Actor believes the item is not a defect: file the
+  disposition **with counter-evidence** (a passing pin, a spec citation, a
+  reproduction that contradicts the claim) and return it to the Orchestrator.
+  Whether the dispute is withdrawn or sustained is resolved above the Actor
+  (R6); the Actor's duty ends at honest counter-evidence — never a unilateral
+  dismissal, never a grudging fake fix.
+- **`ACCEPTED_FLAGGED`** — only where the Orchestrator's slice explicitly
+  offers it (below-floor items): the defect is acknowledged, not fixed in this
+  slice, and the flag is recorded for disclosure downstream.
+
+A remediation slice re-enters the full cycle: the unit gate runs green again,
+the SLR is re-logged, and the build summary is re-issued with the dispositions
+attached.
 
 ---
 

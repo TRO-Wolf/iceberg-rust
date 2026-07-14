@@ -39,6 +39,53 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-13): SEPMO canon v2.2 upgrade + manifest re-instantiation
+
+User-directed 2026-07-13 ("We have updated SEPMO rules we need to implement"): bring the repo's
+SEPMO installation (pre-ledger lineage, installed 2026-06-15/25) up to the new master canon
+**v2.2** the user supplied (spine + binding-manifest template). One branch
+`infra/sepmo-canon-v2.2`, one PR; STANDARD path (governance surface; >5 files and >150 lines —
+LIGHT criteria 1/3 fail; uncertain routes STANDARD anyway). Docs-only: no crate code, no matrix
+row.
+
+- [x] **1. Canon lands verbatim** — `skills/sepmo/SKILL.md` replaced with the v2.2 spine
+      (frontmatter `version: "2.2"`); NEW `skills/sepmo/binding-manifest.template.md` (the
+      portable template; ASF header prepended per the sibling convention — the one sanctioned
+      local touch, matching how every references/ file carries it).
+      - Caveat, disclosed for the PR: the canon text was transcribed from the user's message,
+        not copied from a master file — the user should eyeball the SKILL.md diff against the
+        master before merge. Canon defect FILED (manifest Debug): the spine's *Model
+        assumption* carries a "For this repo ... single-agent default" instantiation artifact;
+        not patched locally, does not bind (manifest + CLAUDE.md win).
+- [x] **2. Manifest re-instantiated** — `skills/sepmo/binding-manifest.md` rebuilt per the
+      template protocol: role rows all BIND (existing homes), `spine_version: v2.2`, tunables
+      bound (two-tier `green_commands` + CI-only exception record + parity-guard-absence
+      justification, `severity_floor: S2` raise with provenance, hard-break
+      `context_break_mechanics`, `s0_fresh_execution: N/A` per the standing hard break,
+      `metrics_ledger_location: task/sepmo-metrics.md`, `taxonomy_extensions: java-parity +
+      format-stability`), instantiation checklist I-1…I-10 proven.
+      - Note: `severity_floor: S2` is bar-PRESERVING (the old install blocked MEDIUM+ ≈ S2),
+        so it lands at instantiation under the asymmetric feed-forward rule rather than
+        waiting for a retrospective; provenance stamped in the row.
+- [x] **3. Reference amendments** (the v2.1 + v2.2 required sets + spine coherence): 01
+      proposition ledger + enumeration obligation + reworked examples; 02 PRE_EXECUTION_REVIEW
+      / states renumbered / S-scale / LIGHT-STANDARD rubric / R3 input restriction / R7
+      readiness incl. pre-merge gate + exception record; 03 doubles as the one-time
+      pre-execution review format; 04 per-element pinning + R5 regression proof + R6
+      dispositions; 05 canonical taxonomy + coverage attestation + span check + fresh-execution
+      step + S-scale; 06 Invariant V reframe + unledgered-claim/silent-gate-skip watch items;
+      07 state 5 + R8 embedded-evidence verification + flag disclosure; 08 metrics ledger
+      (incl. `environment_drift_events`) + incident retrospective + asymmetric feed-forward.
+- [x] **4. New artifacts + navigation** — CREATE `task/sepmo-metrics.md` (the bound metrics
+      ledger, ref-08 metric set, no sections yet — first one lands with the first
+      retrospective; the 2026-07-11 nightly-interop CI failure is pre-named as the first
+      `environment_drift_events` candidate); refresh `skills/sepmo/map.md` in the same change.
+      Fixed in passing (in-scope files): two pre-existing broken `../../CLAUDE.md` links in
+      the refs 04/05 repo-note boxes (needed three levels up from `references/`).
+- [ ] **5. Gate + independent Critic → push** — unit gate green; independent SEPMO Critic
+      (fresh context, Opus) over the full branch diff; remediate; commit in one gate-chain;
+      push on CONVERGED (merge is the user's).
+
 ## ACTIVE UNIT (2026-07-10): AUDIT TIER 1 Mode B bundle — A1→A3→A2→A4, one branch, one PR
 
 User-approved 2026-07-10 triage of the external five-agent audit (run on the overnight branch;
