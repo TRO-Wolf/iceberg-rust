@@ -230,6 +230,59 @@ grow MERGE semantics; it will not (out of parity scope).
   and expect `validate_data_files_exist` trips when service compaction rewrites files referenced
   by in-flight position deletes.
 
+
+## 8a. CTAS / CREATE OR REPLACE (staged table transaction)
+
+Engine recipe for atomic `CREATE [OR REPLACE] TABLE … AS SELECT` (GAP_MATRIX **R158**):
+
+1. Materialize or stream the SELECT into **data files** against a *staged* table handle from
+   `StagedTableTransaction::begin_create` (new table) or `begin_replace` (existing table —
+   original catalog pointer stays current).
+2. `add_data_files` + `commit(catalog)` — FileIO work completes first; the catalog pointer is
+   published in **one** step (`publish_create_table` / `publish_replace_table`).
+3. Failure **before** `commit` returns: create → no table; replace → original snapshot current.
+4. `MemoryCatalog` implements replace CAS against the base metadata location observed at
+   `begin_replace`. Other catalogs default `publish_replace_table` to FeatureUnsupported until
+   wired.
+5. Java interop battery for R158 is a follow-up (status 🟡).
+
+**Atomicity guarantee (create-publish):** create-publish is all-or-nothing, even when the reload
+fails. If publishing a staged create cannot reload the staged metadata (e.g. it was written through
+a `FileIO` the catalog cannot read), the catalog is left with **no** pointer for that identifier —
+`table_exists` stays false, so a retry / `CREATE TABLE IF NOT EXISTS` re-create of the same
+identifier succeeds. The `MemoryCatalog` default reads the metadata **before** inserting the pointer
+(`register_table`); any catalog overriding `publish_create_table` / `register_table` MUST preserve
+that ordering.
+
+**Replace contract (build-on-existing):** `begin_replace` builds the replacement metadata ON TOP OF
+the existing table's metadata (Java `TableMetadata.buildReplacement`), not from scratch. It
+**retains** the table UUID, the full snapshot history, and the metadata log (appended-to, never
+truncated); it **resets** the `main` branch ref (no current snapshot) and applies the
+`TableCreation`'s schema / partition spec / sort order / properties / location as the new current
+ones. The replace-schema field-ids are taken **from the caller as provided**; `last_column_id`
+advances monotonically (`max` of the existing value and the caller's highest id, never reduced).
+This diverges from Java `TypeUtil.assignFreshIds`, which reassigns fresh ids by **name-matching**
+the replacement schema against the base schema — a caller supplying field-ids misaligned with the
+base schema's names diverges from Java (**named residue**: a base-aware fresh-id helper is the
+follow-up; not corruption — per-snapshot schema binding keeps prior history readable). The format
+version is **preserved** across a replace unless the `TableCreation`'s properties carry an explicit
+`format-version` directive: absent ⇒ keep the existing version; a higher value ⇒ upgrade; equal ⇒
+no-op; a lower value ⇒ hard `DataInvalid` error (never downgraded); unparsable ⇒ hard `DataInvalid`.
+`creation.format_version` is **ignored** on the replace path (indistinguishable from the
+`TableCreation::builder()` V2 default), and the `format-version` key is consumed as a directive and
+not persisted (Java `persistedProperties` filters reserved properties out). Retaining the history
+keeps time-travel raw material intact, while `main` exposes only the latest replace's data.
+
+**Location guarantee (replace):** a published replace never relocates the table — it keeps the
+existing root `location()` (or the caller-provided `creation.location`), so repeated CREATE OR
+REPLACE leaves the location identical every time (no `__staged_replace` suffix drift, no compounding
+`…__staged_replace__staged_replace…`). Future writers therefore keep landing under the stable path.
+Data files already written under any other path stay readable (Iceberg manifests carry absolute
+paths); a replace does **not** move data.
+
+Do **not** drop-then-create-then-insert for OR REPLACE: that loses the original table if insert
+fails after drop.
+
 ## 9. Open items (tracked in `task/todo.md` §"ACTIVE (2026-07-01)")
 
 - [x] Verify §5 against Java 1.10.0 + a covering conflict scenario per cell → **NORMATIVE

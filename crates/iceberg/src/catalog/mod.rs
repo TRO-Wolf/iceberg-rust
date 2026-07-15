@@ -192,6 +192,44 @@ pub trait Catalog: Debug + Sync + Send {
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
 
+    /// Publish a fully staged **create** table (metadata already on FileIO).
+    ///
+    /// Default: [`Catalog::register_table`]. Used by
+    /// [`crate::transaction::StagedTableTransaction::commit`] for
+    /// [`crate::transaction::StagedTableMode::Create`].
+    ///
+    /// # Atomicity
+    ///
+    /// Publishing MUST be all-or-nothing: if any step fails — in particular reloading the staged
+    /// metadata, which fails when it was written through a `FileIO` this catalog cannot read — the
+    /// catalog MUST be left with **no** pointer for `table`'s identifier, so `table_exists` stays
+    /// `false` and a `CREATE TABLE IF NOT EXISTS` retry / re-create of the same identifier succeeds.
+    /// The default implementation satisfies this by reading the metadata before inserting the
+    /// pointer (see [`Catalog::register_table`]); an override MUST preserve the guarantee.
+    async fn publish_create_table(
+        &self,
+        table: crate::table::Table,
+    ) -> Result<crate::table::Table> {
+        let location = table.metadata_location_result()?.to_string();
+        self.register_table(table.identifier(), location).await
+    }
+
+    /// Atomically publish a fully staged **replace** table (swap metadata pointer).
+    ///
+    /// `expected_base_metadata_location` is the catalog pointer observed when the staged
+    /// transaction began (optimistic concurrency). Default: [`ErrorKind::FeatureUnsupported`].
+    /// [`crate::memory::MemoryCatalog`] implements the CAS under one lock.
+    async fn publish_replace_table(
+        &self,
+        _table: crate::table::Table,
+        _expected_base_metadata_location: Option<String>,
+    ) -> Result<crate::table::Table> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "publish_replace_table is not supported by this catalog",
+        ))
+    }
+
     /// List views from a namespace.
     ///
     /// Mirrors Java `ViewCatalog.listViews`. The default implementation returns

@@ -39,6 +39,52 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-15): fork-atomicity remediation (R158 staged create/replace) — branch `feat/replace-table-transaction`
+
+SEPMO Actor–Critic unit hardening the just-landed R158 staged transaction (tip 9280320b). Two
+findings, both correctness/atomicity, tests in the same commit as the fix; mutation-proved RED on
+revert. No `--all-features` (per unit charter); no push.
+
+- [x] **C1 (N1) — create-publish is not atomic.** `MemoryCatalog::register_table` (the
+  `publish_create_table` default) inserted the pointer THEN read the metadata; a reload failure
+  (staged metadata written through a FileIO the catalog cannot read) left `table_exists=true` +
+  `load_table` erroring — a half-created table breaking `IF NOT EXISTS` retry. Fix: read metadata
+  BEFORE inserting, under the one catalog lock. Guarantee documented on `publish_create_table` (for
+  other Catalog impls) + ENGINE_CONTRACT §8a. Pin: `create_publish_reload_failure_leaves_no_catalog_entry`.
+- [x] **C2 (N2) — CREATE OR REPLACE location drift.** `begin_replace` baked
+  `"{existing}__staged_replace"` into the new metadata's `location()` and never reset it, so every
+  replace relocated the table and compounded the suffix. Fix: keep the stable existing/caller
+  location (staging = deferring the pointer swap, not a separate dir). Pin:
+  `replace_cycle_keeps_location_stable_and_reads_latest` (triple cycle; location == original each
+  publish; reads expose the latest replace's data).
+
+CLOSED 2026-07-15 after a 4-cycle independent Opus Critic ladder (OO AC) over the full branch:
+
+- [x] **CF-1 (D1, MEDIUM) — replace built fresh metadata, inverting Java `buildReplacement`.**
+  `begin_replace` used `from_table_creation` (fresh UUID, empty snapshots/metadata-log). Fix
+  4b944152: seed `new_from_metadata` — UUID + snapshot history + metadata log retained, ONLY the
+  main ref removed, format version never downgraded. Pin:
+  `replace_retains_uuid_history_and_metadata_log` (mutation-proven vs fresh-UUID seed AND dropped
+  `remove_ref(MAIN)`).
+- [x] **CF-4 (D4, MEDIUM) — replace silently upgraded V1→V2** via `max(previous,
+  creation.format_version)` with the builder's V2 default. Fix 8c7d2c02: version derived ONLY from
+  the `format-version` property (popped before `set_properties`, mirroring Java
+  `persistedProperties`); absent ⇒ keep existing; downgrade/unparsable ⇒ DataInvalid;
+  `creation.format_version` ignored on replace. Pins:
+  `replace_default_creation_preserves_v1_format_version` (mutation-proven),
+  `replace_upgrades_format_version_by_property`, `replace_downgrade_attempt_errors_and_keeps_original`.
+- [x] **CF-5 (D5, LOW) — docs over-claimed `assignFreshIds` parity**: corrected to caller-ids-as-is
+  + named residue (base-aware fresh-id helper = follow-up); new pin
+  `replace_with_different_schema_keeps_caller_ids`.
+- [x] **F-1 (MEDIUM, found by cycle-3 Critic) — the "unparsable format-version ⇒ DataInvalid"
+  claim had ZERO tests** (silent-fallback mutation survived the suite). Fix 2e08a6e4 (test-only):
+  `replace_invalid_format_version_property_errors_and_keeps_original` over 8 invalid values incl.
+  `"2 "` (anti-trim), each pinning DataInvalid + original unchanged; mutation-proven RED.
+- CF-2/CF-3 (LOW) accepted as NAMED residue in the R158 cell: replace-publish lacks
+  read-before-swap validation (create has it); staged replace restarts metadata versioning at
+  v0/v1. Cycle-4 Critic **CONVERGED** (zero findings; gate 2769 lib green + fmt/clippy/anchors/
+  typos). Pushed for PR.
+
 ## ACTIVE UNIT (2026-07-13): SEPMO canon v2.2 upgrade + manifest re-instantiation
 
 User-directed 2026-07-13 ("We have updated SEPMO rules we need to implement"): bring the repo's
