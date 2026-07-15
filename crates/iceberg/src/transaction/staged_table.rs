@@ -1160,4 +1160,70 @@ mod tests {
         );
         assert!(s1_schema.field_by_id(2).is_some_and(|f| f.name == "name"));
     }
+
+    #[tokio::test]
+    async fn replace_invalid_format_version_property_errors_and_keeps_original() {
+        // F-1: an unparsable / out-of-range `format-version` property on a staged replace is a hard
+        // `DataInvalid` in `parse_format_version_property` — NEVER a silent fallback to the existing
+        // version. Without this pin, mutating the guard's invalid-value arm to
+        // `_ => Ok(FormatVersion::V2)` (silent fallback) survives the whole suite. Each invalid
+        // input must (a) fail `begin_replace` with `ErrorKind::DataInvalid` and (b) leave the
+        // original V2 table current & unchanged in the catalog (same guarantee the downgrade test
+        // pins). `"2 "` is included precisely because a naive `trim().parse()` would accept it as 2.
+        let tmp = TempDir::new().unwrap();
+        let warehouse = tmp.path().to_string_lossy().to_string();
+        let (catalog, _) = shared_fs_catalog(&warehouse).await;
+        let ns = NamespaceIdent::new("sales".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let table_location = format!("{warehouse}/sales/orders");
+        let original = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .location(table_location.clone())
+                    .schema(schema_id_name())
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let original_meta = original.metadata_location_result().unwrap().to_string();
+
+        for value in ["abc", "", "  ", "2 ", "0", "-1", "4", "256"] {
+            let creation = TableCreation::builder()
+                .name("orders".into())
+                .schema(schema_id_name())
+                .properties(HashMap::from([(
+                    TableProperties::PROPERTY_FORMAT_VERSION.to_string(),
+                    value.to_string(),
+                )]))
+                .build();
+            let err = match StagedTableTransaction::begin_replace(&original, creation).await {
+                Ok(_) => panic!(
+                    "invalid format-version property `{value}` must error, not succeed on replace"
+                ),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.kind(),
+                ErrorKind::DataInvalid,
+                "invalid format-version property `{value}` must be DataInvalid, got: {err}"
+            );
+
+            // The original table is still current & unchanged (V2, same metadata pointer) after the
+            // rejected replace of value `{value}`.
+            let still = catalog.load_table(original.identifier()).await.unwrap();
+            assert_eq!(
+                still.metadata_location_result().unwrap(),
+                original_meta.as_str(),
+                "rejected replace of `{value}` moved the catalog metadata pointer"
+            );
+            assert_eq!(
+                still.metadata().format_version(),
+                FormatVersion::V2,
+                "rejected replace of `{value}` changed the original format version"
+            );
+        }
+    }
 }
