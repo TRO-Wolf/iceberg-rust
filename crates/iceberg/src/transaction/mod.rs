@@ -103,6 +103,8 @@ pub use rewrite_manifests::RewriteManifestsAction;
 mod row_delta;
 pub use row_delta::RowDeltaAction;
 mod snapshot;
+mod staged_table;
+pub use staged_table::{StagedTableMode, StagedTableTransaction};
 mod sort_order;
 mod update_location;
 mod update_partition_spec;

@@ -230,6 +230,25 @@ grow MERGE semantics; it will not (out of parity scope).
   and expect `validate_data_files_exist` trips when service compaction rewrites files referenced
   by in-flight position deletes.
 
+
+## 8a. CTAS / CREATE OR REPLACE (staged table transaction)
+
+Engine recipe for atomic `CREATE [OR REPLACE] TABLE … AS SELECT` (GAP_MATRIX **R158**):
+
+1. Materialize or stream the SELECT into **data files** against a *staged* table handle from
+   `StagedTableTransaction::begin_create` (new table) or `begin_replace` (existing table —
+   original catalog pointer stays current).
+2. `add_data_files` + `commit(catalog)` — FileIO work completes first; the catalog pointer is
+   published in **one** step (`publish_create_table` / `publish_replace_table`).
+3. Failure **before** `commit` returns: create → no table; replace → original snapshot current.
+4. `MemoryCatalog` implements replace CAS against the base metadata location observed at
+   `begin_replace`. Other catalogs default `publish_replace_table` to FeatureUnsupported until
+   wired.
+5. Java interop battery for R158 is a follow-up (status 🟡).
+
+Do **not** drop-then-create-then-insert for OR REPLACE: that loses the original table if insert
+fails after drop.
+
 ## 9. Open items (tracked in `task/todo.md` §"ACTIVE (2026-07-01)")
 
 - [x] Verify §5 against Java 1.10.0 + a covering conflict scenario per cell → **NORMATIVE

@@ -445,6 +445,34 @@ impl Catalog for MemoryCatalog {
             .build()
     }
 
+    /// Atomically swap the table's metadata pointer to a fully staged replace (one lock).
+    async fn publish_replace_table(
+        &self,
+        table: Table,
+        expected_base_metadata_location: Option<String>,
+    ) -> Result<Table> {
+        let mut root_namespace_state = self.root_namespace_state.lock().await;
+        let ident = table.identifier().clone();
+        let stored = root_namespace_state
+            .get_existing_table_location(&ident)?
+            .clone();
+        if let Some(expected) = expected_base_metadata_location.as_deref() {
+            if stored != expected {
+                return Err(Error::new(
+                    ErrorKind::CatalogCommitConflicts,
+                    format!(
+                        "Cannot publish replace for table {ident}: concurrent modification \
+                         (expected base metadata location {expected}, found {stored})"
+                    ),
+                )
+                .with_retryable(true));
+            }
+        }
+        // `commit_table_update` requires the table already exists and overwrites the pointer.
+        let updated = root_namespace_state.commit_table_update(table)?;
+        Ok(updated)
+    }
+
     /// Update a table in the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let mut root_namespace_state = self.root_namespace_state.lock().await;
