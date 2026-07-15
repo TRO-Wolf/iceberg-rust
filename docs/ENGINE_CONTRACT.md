@@ -246,6 +246,14 @@ Engine recipe for atomic `CREATE [OR REPLACE] TABLE … AS SELECT` (GAP_MATRIX *
    wired.
 5. Java interop battery for R158 is a follow-up (status 🟡).
 
+**Atomicity guarantee (create-publish):** create-publish is all-or-nothing, even when the reload
+fails. If publishing a staged create cannot reload the staged metadata (e.g. it was written through
+a `FileIO` the catalog cannot read), the catalog is left with **no** pointer for that identifier —
+`table_exists` stays false, so a retry / `CREATE TABLE IF NOT EXISTS` re-create of the same
+identifier succeeds. The `MemoryCatalog` default reads the metadata **before** inserting the pointer
+(`register_table`); any catalog overriding `publish_create_table` / `register_table` MUST preserve
+that ordering.
+
 Do **not** drop-then-create-then-insert for OR REPLACE: that loses the original table if insert
 fails after drop.
 

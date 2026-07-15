@@ -427,15 +427,30 @@ impl Catalog for MemoryCatalog {
         Ok(())
     }
 
+    /// Register an existing table (also the default publish path for a staged **create** via
+    /// [`Catalog::publish_create_table`]).
+    ///
+    /// # Atomicity guarantee
+    ///
+    /// Registration is all-or-nothing: the metadata at `metadata_location` is read (and thereby
+    /// proven reachable by this catalog's [`FileIO`]) **before** the pointer is inserted, both under
+    /// the same lock. A read failure — e.g. staged metadata written through a `FileIO` this catalog
+    /// cannot read, the real staged-CTAS failure — therefore leaves catalog state unchanged:
+    /// `table_exists` stays `false` and a subsequent create of the same identifier succeeds.
+    /// Inserting first would leave a half-created table (pointer present, `load_table` failing) and
+    /// break `CREATE TABLE IF NOT EXISTS` idempotency on retry.
     async fn register_table(
         &self,
         table_ident: &TableIdent,
         metadata_location: String,
     ) -> Result<Table> {
         let mut root_namespace_state = self.root_namespace_state.lock().await;
-        root_namespace_state.insert_new_table(&table_ident.clone(), metadata_location.clone())?;
 
+        // Read (and validate reachability of) the metadata BEFORE claiming the pointer, so a reload
+        // failure cannot leave a half-created table. See the atomicity guarantee above.
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+
+        root_namespace_state.insert_new_table(&table_ident.clone(), metadata_location.clone())?;
 
         Table::builder()
             .file_io(self.file_io.clone())
@@ -456,17 +471,17 @@ impl Catalog for MemoryCatalog {
         let stored = root_namespace_state
             .get_existing_table_location(&ident)?
             .clone();
-        if let Some(expected) = expected_base_metadata_location.as_deref() {
-            if stored != expected {
-                return Err(Error::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    format!(
-                        "Cannot publish replace for table {ident}: concurrent modification \
-                         (expected base metadata location {expected}, found {stored})"
-                    ),
-                )
-                .with_retryable(true));
-            }
+        if let Some(expected) = expected_base_metadata_location.as_deref()
+            && stored != expected
+        {
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "Cannot publish replace for table {ident}: concurrent modification \
+                     (expected base metadata location {expected}, found {stored})"
+                ),
+            )
+            .with_retryable(true));
         }
         // `commit_table_update` requires the table already exists and overwrites the pointer.
         let updated = root_namespace_state.commit_table_update(table)?;

@@ -39,6 +39,25 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-15): fork-atomicity remediation (R158 staged create/replace) — branch `feat/replace-table-transaction`
+
+SEPMO Actor–Critic unit hardening the just-landed R158 staged transaction (tip 9280320b). Two
+findings, both correctness/atomicity, tests in the same commit as the fix; mutation-proved RED on
+revert. No `--all-features` (per unit charter); no push.
+
+- [x] **C1 (N1) — create-publish is not atomic.** `MemoryCatalog::register_table` (the
+  `publish_create_table` default) inserted the pointer THEN read the metadata; a reload failure
+  (staged metadata written through a FileIO the catalog cannot read) left `table_exists=true` +
+  `load_table` erroring — a half-created table breaking `IF NOT EXISTS` retry. Fix: read metadata
+  BEFORE inserting, under the one catalog lock. Guarantee documented on `publish_create_table` (for
+  other Catalog impls) + ENGINE_CONTRACT §8a. Pin: `create_publish_reload_failure_leaves_no_catalog_entry`.
+- [x] **C2 (N2) — CREATE OR REPLACE location drift.** `begin_replace` baked
+  `"{existing}__staged_replace"` into the new metadata's `location()` and never reset it, so every
+  replace relocated the table and compounded the suffix. Fix: keep the stable existing/caller
+  location (staging = deferring the pointer swap, not a separate dir). Pin:
+  `replace_cycle_keeps_location_stable_and_reads_latest` (triple cycle; location == original each
+  publish; reads expose the latest replace's data).
+
 ## ACTIVE UNIT (2026-07-10): AUDIT TIER 1 Mode B bundle — A1→A3→A2→A4, one branch, one PR
 
 User-approved 2026-07-10 triage of the external five-agent audit (run on the overnight branch;

@@ -245,15 +245,16 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use tempfile::TempDir;
+
     use super::*;
-    use crate::io::{FileIOBuilder, LocalFsStorageFactory};
+    use crate::io::{FileIOBuilder, LocalFsStorageFactory, MemoryStorageFactory};
     use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
         Struct, Type,
     };
     use crate::{Catalog, CatalogBuilder};
-    use tempfile::TempDir;
 
     fn schema_id_name() -> Schema {
         Schema::builder()
@@ -308,10 +309,7 @@ mod tests {
         let warehouse = tmp.path().to_string_lossy().to_string();
         let (catalog, file_io) = shared_fs_catalog(&warehouse).await;
         let ns = NamespaceIdent::new("sales".into());
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .unwrap();
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
         let ident = TableIdent::new(ns, "orders".into());
         let location = format!("{warehouse}/sales/orders");
         let creation = TableCreation::builder()
@@ -319,10 +317,9 @@ mod tests {
             .location(location)
             .schema(schema_id_name())
             .build();
-        let staged =
-            StagedTableTransaction::begin_create(file_io, ident.clone(), creation)
-                .await
-                .unwrap();
+        let staged = StagedTableTransaction::begin_create(file_io, ident.clone(), creation)
+            .await
+            .unwrap();
         assert_eq!(staged.mode(), StagedTableMode::Create);
         drop(staged);
         assert!(!catalog.table_exists(&ident).await.unwrap());
@@ -334,10 +331,7 @@ mod tests {
         let warehouse = tmp.path().to_string_lossy().to_string();
         let (catalog, file_io) = shared_fs_catalog(&warehouse).await;
         let ns = NamespaceIdent::new("sales".into());
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .unwrap();
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
         let ident = TableIdent::new(ns, "orders".into());
         let location = format!("{warehouse}/sales/orders");
         let creation = TableCreation::builder()
@@ -370,15 +364,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_publish_reload_failure_leaves_no_catalog_entry() {
+        // Finding N1: the catalog and the staged writer use SEPARATE in-memory stores
+        // (`MemoryStorageFactory` builds a fresh HashMap per FileIO), so the staged metadata is
+        // UNREADABLE by the catalog's FileIO — the real staged-CTAS reload failure during publish.
+        // Risk pinned: an insert-then-read publish leaves a half-created table (`table_exists`
+        // true, `load_table` errors) and breaks `IF NOT EXISTS` idempotency on retry.
+        let tmp = TempDir::new().unwrap();
+        let warehouse = tmp.path().to_string_lossy().to_string();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "mem",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+            )
+            .await
+            .expect("load catalog");
+        let staged_file_io = FileIOBuilder::new(Arc::new(MemoryStorageFactory)).build();
+
+        let ns = NamespaceIdent::new("sales".into());
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .expect("create namespace");
+        let ident = TableIdent::new(ns.clone(), "orders".into());
+        let location = format!("{warehouse}/sales/orders");
+        let creation = TableCreation::builder()
+            .name("orders".into())
+            .location(location.clone())
+            .schema(schema_id_name())
+            .build();
+
+        let staged = StagedTableTransaction::begin_create(staged_file_io, ident.clone(), creation)
+            .await
+            .expect("begin create");
+
+        // Publish MUST error: the catalog's FileIO cannot read the staged metadata.
+        staged
+            .commit(&catalog)
+            .await
+            .expect_err("publish must fail when the catalog cannot read the staged metadata");
+
+        // ... and MUST leave no catalog pointer behind (the atomicity guarantee).
+        assert!(
+            !catalog.table_exists(&ident).await.expect("table_exists"),
+            "a failed create-publish must leave no catalog entry (half-created table)"
+        );
+
+        // Idempotency intact: the identifier is free, so re-creating the SAME table succeeds
+        // (the pre-fix insert-then-read path fails here with TableAlreadyExists).
+        let recreated = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .location(location)
+                    .schema(schema_id_name())
+                    .build(),
+            )
+            .await
+            .expect("re-create of the same identifier after a failed publish must succeed");
+        assert_eq!(recreated.identifier(), &ident);
+        assert!(
+            catalog
+                .table_exists(&ident)
+                .await
+                .expect("table_exists after recreate"),
+            "the re-created table must be present"
+        );
+    }
+
+    #[tokio::test]
     async fn replace_abort_before_commit_keeps_original() {
         let tmp = TempDir::new().unwrap();
         let warehouse = tmp.path().to_string_lossy().to_string();
         let (catalog, _) = shared_fs_catalog(&warehouse).await;
         let ns = NamespaceIdent::new("sales".into());
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .unwrap();
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
         let original = catalog
             .create_table(
                 &ns,
@@ -398,10 +459,8 @@ mod tests {
         let staged = StagedTableTransaction::begin_replace(&original, creation)
             .await
             .unwrap();
-        let staged = staged.add_data_files(vec![data_file(
-            &format!("{warehouse}/stage/f.parquet"),
-            9,
-        )]);
+        let staged =
+            staged.add_data_files(vec![data_file(&format!("{warehouse}/stage/f.parquet"), 9)]);
         drop(staged);
 
         let still = catalog.load_table(original.identifier()).await.unwrap();
@@ -418,10 +477,7 @@ mod tests {
         let warehouse = tmp.path().to_string_lossy().to_string();
         let (catalog, _) = shared_fs_catalog(&warehouse).await;
         let ns = NamespaceIdent::new("sales".into());
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .unwrap();
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
         let original = catalog
             .create_table(
                 &ns,
@@ -442,10 +498,7 @@ mod tests {
             .await
             .unwrap();
         let published = staged
-            .add_data_files(vec![data_file(
-                &format!("{warehouse}/stage/f.parquet"),
-                2,
-            )])
+            .add_data_files(vec![data_file(&format!("{warehouse}/stage/f.parquet"), 2)])
             .commit(&catalog)
             .await
             .unwrap();
@@ -463,10 +516,7 @@ mod tests {
         let warehouse = tmp.path().to_string_lossy().to_string();
         let (catalog, _) = shared_fs_catalog(&warehouse).await;
         let ns = NamespaceIdent::new("sales".into());
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .unwrap();
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
         let original = catalog
             .create_table(
                 &ns,
