@@ -259,9 +259,19 @@ the existing table's metadata (Java `TableMetadata.buildReplacement`), not from 
 **retains** the table UUID, the full snapshot history, and the metadata log (appended-to, never
 truncated); it **resets** the `main` branch ref (no current snapshot) and applies the
 `TableCreation`'s schema / partition spec / sort order / properties / location as the new current
-ones (fresh IDs assigned on top of the existing metadata's ID space). The format version is upgraded
-to `max(existing, requested)` and is never downgraded. Retaining the history keeps time-travel raw
-material intact, while `main` exposes only the latest replace's data.
+ones. The replace-schema field-ids are taken **from the caller as provided**; `last_column_id`
+advances monotonically (`max` of the existing value and the caller's highest id, never reduced).
+This diverges from Java `TypeUtil.assignFreshIds`, which reassigns fresh ids by **name-matching**
+the replacement schema against the base schema — a caller supplying field-ids misaligned with the
+base schema's names diverges from Java (**named residue**: a base-aware fresh-id helper is the
+follow-up; not corruption — per-snapshot schema binding keeps prior history readable). The format
+version is **preserved** across a replace unless the `TableCreation`'s properties carry an explicit
+`format-version` directive: absent ⇒ keep the existing version; a higher value ⇒ upgrade; equal ⇒
+no-op; a lower value ⇒ hard `DataInvalid` error (never downgraded); unparsable ⇒ hard `DataInvalid`.
+`creation.format_version` is **ignored** on the replace path (indistinguishable from the
+`TableCreation::builder()` V2 default), and the `format-version` key is consumed as a directive and
+not persisted (Java `persistedProperties` filters reserved properties out). Retaining the history
+keeps time-travel raw material intact, while `main` exposes only the latest replace's data.
 
 **Location guarantee (replace):** a published replace never relocates the table — it keeps the
 existing root `location()` (or the caller-provided `creation.location`), so repeated CREATE OR

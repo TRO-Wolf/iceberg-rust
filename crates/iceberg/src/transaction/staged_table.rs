@@ -30,9 +30,17 @@
 //! snapshot history, and the metadata log (appended-to, never truncated), while **resetting** what
 //! a replace replaces — the `main` branch ref is removed (no current snapshot) and the schema /
 //! partition spec / sort order / properties / location from the `TableCreation` become the new
-//! current ones (fresh IDs assigned on top of the existing metadata's ID space). The format version
-//! is upgraded to `max(existing, requested)` and never downgraded. Retaining the history keeps
-//! time-travel raw material intact while the `main` branch exposes only the latest replace's data.
+//! current ones. The replace-schema field-ids are taken **from the caller as provided**;
+//! `last_column_id` only advances monotonically (`max` of the existing value and the caller's
+//! highest field-id, never reduced). This diverges from Java's `TypeUtil.assignFreshIds`, which
+//! reassigns fresh ids by **name-matching** the replacement schema against the base schema — a
+//! caller supplying field-ids misaligned with the base schema's names diverges from Java (named
+//! residue: a base-aware fresh-id helper is the follow-up). This is not corruption: per-snapshot
+//! schema binding keeps prior history readable via each snapshot's own schema-id.
+//! The format version is **preserved** across a replace unless the `TableCreation`'s properties
+//! carry an explicit `format-version` directive requesting an upgrade; it is never downgraded.
+//! Retaining the history keeps time-travel raw material intact while the `main` branch exposes only
+//! the latest replace's data.
 //!
 //! Java interop battery is a disclosed non-goal of the first unit (GAP_MATRIX 🟡).
 
@@ -41,7 +49,10 @@ use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::FileIO;
-use crate::spec::{DataFile, MAIN_BRANCH, SortOrder, TableMetadataBuilder, UnboundPartitionSpec};
+use crate::spec::{
+    DataFile, FormatVersion, MAIN_BRANCH, SortOrder, TableMetadataBuilder, TableProperties,
+    UnboundPartitionSpec,
+};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::{Catalog, MetadataLocation, NamespaceIdent, TableCreation, TableIdent};
@@ -119,9 +130,20 @@ impl StagedTableTransaction {
     /// caller-provided `creation.location`). The table UUID, snapshot history, and metadata log are
     /// **retained** (the log is appended-to, never truncated); the `main` branch ref is **reset**
     /// (no current snapshot) and the `TableCreation`'s schema / partition spec / sort order /
-    /// properties / location become the new current ones, with fresh IDs assigned on top of the
-    /// existing metadata's ID space. The format version is upgraded to `max(existing, requested)`
-    /// and never downgraded.
+    /// properties / location become the new current ones. The replace-schema field-ids are taken
+    /// **from the caller as provided** and `last_column_id` only advances monotonically (never
+    /// reduced below the base); this differs from Java's name-matching `TypeUtil.assignFreshIds`
+    /// (named residue).
+    ///
+    /// **Format version is preserved.** `creation.format_version` is **IGNORED** on the replace
+    /// path — it is indistinguishable from `TableCreation::builder()`'s V2 default, so honoring it
+    /// would silently upgrade a V1 table on a default-built replace. Matching Java
+    /// `buildReplacement`, the target version is derived ONLY from a `format-version` entry in
+    /// `creation.properties`: absent ⇒ the existing version is kept; a higher value ⇒ upgrade; an
+    /// equal value ⇒ no-op; a lower value ⇒ a hard `DataInvalid` error (never a silent downgrade);
+    /// an unparsable / out-of-range value ⇒ a hard `DataInvalid` error. The `format-version` key is
+    /// consumed as a directive and is NOT persisted into the table's property map (Java
+    /// `persistedProperties` filters reserved properties out).
     ///
     /// A replace never relocates the table, so repeated CREATE OR REPLACE cycles leave
     /// `metadata().location()` identical every time. The original catalog entry stays current until
@@ -170,14 +192,29 @@ impl StagedTableTransaction {
         // Passing the existing current metadata file as `current_file_location` appends it to the
         // metadata log (retained + extended, not reset).
         let previous = existing.metadata().clone();
-        let target_format_version = std::cmp::max(previous.format_version, creation.format_version);
+        let previous_format_version = previous.format_version;
         let TableCreation {
             schema,
             partition_spec,
             sort_order,
-            properties,
+            mut properties,
             ..
         } = creation;
+        // D4: derive the target format version ONLY from a `format-version` PROPERTY directive,
+        // mirroring Java `TableMetadata.buildReplacement` (TableMetadata.java ~730-742), which reads
+        // `PropertyUtil.propertyAsInt(updatedProperties, FORMAT_VERSION, formatVersion)` (absent ⇒
+        // keep the existing version) and then persists `persistedProperties(updatedProperties)` with
+        // the reserved `format-version` key filtered OUT of the persisted map. `creation.format_version`
+        // is intentionally IGNORED here (see the doc comment): honoring the `TableCreation::builder()`
+        // V2 default would silently upgrade a V1 table on a default-built replace. Pop the key BEFORE
+        // the map reaches `set_properties` (which hard-rejects reserved properties), matching Java's
+        // filtering; `upgrade_format_version` then enforces Java's upgrade-only domain (no-op on
+        // equal, `DataInvalid` on downgrade).
+        let target_format_version =
+            match properties.remove(TableProperties::PROPERTY_FORMAT_VERSION) {
+                None => previous_format_version,
+                Some(raw) => parse_format_version_property(&raw)?,
+            };
         let partition_spec = partition_spec.unwrap_or(UnboundPartitionSpec {
             spec_id: None,
             fields: vec![],
@@ -310,6 +347,26 @@ impl Transaction {
     }
 }
 
+/// Parse a `format-version` table-property value into a [`FormatVersion`], matching the domain of
+/// Java's `PropertyUtil.propertyAsInt` (`Integer.parseInt`) feeding `Builder.upgradeFormatVersion`
+/// (which caps at `SUPPORTED_TABLE_FORMAT_VERSION`): only `1`, `2`, and `3` are legal. Anything
+/// else — non-numeric, out of range, negative — is a hard [`ErrorKind::DataInvalid`], never a
+/// silent fallback to the existing version.
+fn parse_format_version_property(raw: &str) -> Result<FormatVersion> {
+    match raw.parse::<u8>() {
+        Ok(1) => Ok(FormatVersion::V1),
+        Ok(2) => Ok(FormatVersion::V2),
+        Ok(3) => Ok(FormatVersion::V3),
+        _ => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Invalid `{}` property value `{raw}` on replace: expected one of 1, 2, 3",
+                TableProperties::PROPERTY_FORMAT_VERSION
+            ),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -338,6 +395,26 @@ mod tests {
                     2,
                     "name",
                     Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    /// A genuinely different column set from [`schema_id_name`] with high, caller-chosen field-ids
+    /// (50/51) — used to prove that replace takes the caller's ids AS-IS (D5).
+    fn schema_sku_price() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    50,
+                    "sku",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    51,
+                    "price",
+                    Type::Primitive(PrimitiveType::Long),
                 )),
             ])
             .build()
@@ -819,5 +896,268 @@ mod tests {
              (after1={metadata_log_len_after1}, after2={})",
             after2.metadata().metadata_log().len()
         );
+    }
+
+    #[tokio::test]
+    async fn replace_default_creation_preserves_v1_format_version() {
+        // D4 regression pin: a CREATE OR REPLACE of a V1 table with a DEFAULT-built TableCreation
+        // (no `format-version` property; the builder defaults `format_version` to V2) must NOT
+        // upgrade the on-disk format version. Java `buildReplacement` derives the version ONLY from
+        // a `format-version` property directive — absent ⇒ keep the existing version. The prior
+        // `max(previous, creation.format_version)` derivation silently upgraded V1 → V2 here.
+        let tmp = TempDir::new().unwrap();
+        let warehouse = tmp.path().to_string_lossy().to_string();
+        let (catalog, _) = shared_fs_catalog(&warehouse).await;
+        let ns = NamespaceIdent::new("sales".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let table_location = format!("{warehouse}/sales/orders");
+        let original = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .location(table_location.clone())
+                    .schema(schema_id_name())
+                    .format_version(FormatVersion::V1)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(original.metadata().format_version(), FormatVersion::V1);
+
+        let creation = TableCreation::builder()
+            .name("orders".into())
+            .schema(schema_id_name())
+            .build();
+        // The default-built TableCreation carries the V2 default — this is precisely the trap: it is
+        // indistinguishable from an explicit request, so the replace path must ignore it.
+        assert_eq!(creation.format_version, FormatVersion::V2);
+
+        let published = StagedTableTransaction::begin_replace(&original, creation)
+            .await
+            .unwrap()
+            .add_data_files(vec![data_file(
+                &format!("{table_location}/data/f.parquet"),
+                3,
+            )])
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(
+            published.metadata().format_version(),
+            FormatVersion::V1,
+            "replace with a default TableCreation silently upgraded the format version V1 -> V2"
+        );
+        let reloaded = catalog.load_table(original.identifier()).await.unwrap();
+        assert_eq!(reloaded.metadata().format_version(), FormatVersion::V1);
+    }
+
+    #[tokio::test]
+    async fn replace_upgrades_format_version_by_property() {
+        // D4: an explicit `format-version` property directs the upgrade (V1 -> V2), and the key is
+        // consumed as a DIRECTIVE — it must NOT appear in the published property map (Java
+        // `persistedProperties` filters reserved properties out of the persisted map).
+        let tmp = TempDir::new().unwrap();
+        let warehouse = tmp.path().to_string_lossy().to_string();
+        let (catalog, _) = shared_fs_catalog(&warehouse).await;
+        let ns = NamespaceIdent::new("sales".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let table_location = format!("{warehouse}/sales/orders");
+        let original = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .location(table_location.clone())
+                    .schema(schema_id_name())
+                    .format_version(FormatVersion::V1)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let creation = TableCreation::builder()
+            .name("orders".into())
+            .schema(schema_id_name())
+            .properties(HashMap::from([(
+                TableProperties::PROPERTY_FORMAT_VERSION.to_string(),
+                "2".to_string(),
+            )]))
+            .build();
+        let published = StagedTableTransaction::begin_replace(&original, creation)
+            .await
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(
+            published.metadata().format_version(),
+            FormatVersion::V2,
+            "property-directed upgrade to V2 did not take"
+        );
+        assert!(
+            !published
+                .metadata()
+                .properties()
+                .contains_key(TableProperties::PROPERTY_FORMAT_VERSION),
+            "the format-version directive leaked into the persisted property map"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_downgrade_attempt_errors_and_keeps_original() {
+        // D4: an explicit LOWER `format-version` ("1" on a V2 table) is a hard `DataInvalid` error
+        // (Java `Builder.upgradeFormatVersion` throws on downgrade), and the failed `begin_replace`
+        // leaves the original table current & unchanged in the catalog.
+        let tmp = TempDir::new().unwrap();
+        let warehouse = tmp.path().to_string_lossy().to_string();
+        let (catalog, _) = shared_fs_catalog(&warehouse).await;
+        let ns = NamespaceIdent::new("sales".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let table_location = format!("{warehouse}/sales/orders");
+        let original = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .location(table_location.clone())
+                    .schema(schema_id_name())
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let original_meta = original.metadata_location_result().unwrap().to_string();
+
+        let creation = TableCreation::builder()
+            .name("orders".into())
+            .schema(schema_id_name())
+            .properties(HashMap::from([(
+                TableProperties::PROPERTY_FORMAT_VERSION.to_string(),
+                "1".to_string(),
+            )]))
+            .build();
+        let err = match StagedTableTransaction::begin_replace(&original, creation).await {
+            Ok(_) => panic!("explicit format-version downgrade must error, not succeed"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "explicit format-version downgrade must be DataInvalid: {err}"
+        );
+
+        // The original table is still current & unchanged (V2, same metadata pointer).
+        let still = catalog.load_table(original.identifier()).await.unwrap();
+        assert_eq!(
+            still.metadata_location_result().unwrap(),
+            original_meta.as_str()
+        );
+        assert_eq!(still.metadata().format_version(), FormatVersion::V2);
+    }
+
+    #[tokio::test]
+    async fn replace_with_different_schema_keeps_caller_ids() {
+        // D5: replace takes the caller's schema field-ids AS-IS (NOT Java's name-based
+        // `assignFreshIds`); `last_column_id` only advances monotonically (max, never reduced below
+        // the base). A replace with a genuinely different column set pins that the caller ids survive
+        // verbatim in the published current schema, and pre-replace snapshots stay readable via their
+        // own schema (per-snapshot schema binding).
+        let tmp = TempDir::new().unwrap();
+        let warehouse = tmp.path().to_string_lossy().to_string();
+        let (catalog, _) = shared_fs_catalog(&warehouse).await;
+        let ns = NamespaceIdent::new("sales".into());
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let table_location = format!("{warehouse}/sales/orders");
+        let original = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .location(table_location.clone())
+                    .schema(schema_id_name())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // Replace 1: establish snapshot S1 under the id/name schema.
+        StagedTableTransaction::begin_replace(
+            &original,
+            TableCreation::builder()
+                .name("orders".into())
+                .schema(schema_id_name())
+                .build(),
+        )
+        .await
+        .unwrap()
+        .add_data_files(vec![data_file(
+            &format!("{table_location}/data/r1.parquet"),
+            5,
+        )])
+        .commit(&catalog)
+        .await
+        .unwrap();
+        let after1 = catalog.load_table(original.identifier()).await.unwrap();
+        let s1_snapshot = after1
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot after replace 1");
+        let s1 = s1_snapshot.snapshot_id();
+        let s1_schema_id = s1_snapshot.schema_id();
+
+        // Replace 2: a genuinely DIFFERENT column set with high, caller-chosen ids (50/51).
+        let published = StagedTableTransaction::begin_replace(
+            &after1,
+            TableCreation::builder()
+                .name("orders".into())
+                .schema(schema_sku_price())
+                .build(),
+        )
+        .await
+        .unwrap()
+        .add_data_files(vec![data_file(
+            &format!("{table_location}/data/r2.parquet"),
+            7,
+        )])
+        .commit(&catalog)
+        .await
+        .unwrap();
+
+        // Caller ids preserved AS-IS in the published current schema (no name-based reassignment).
+        let current = published.metadata().current_schema();
+        assert!(
+            current.field_by_id(50).is_some_and(|f| f.name == "sku"),
+            "caller id 50 (sku) was not preserved as-is"
+        );
+        assert!(
+            current.field_by_id(51).is_some_and(|f| f.name == "price"),
+            "caller id 51 (price) was not preserved as-is"
+        );
+        // The genuinely different column set: base ids 1/2 are not part of the new current schema.
+        assert!(current.field_by_id(1).is_none() && current.field_by_id(2).is_none());
+
+        // last_column_id advanced to the caller's highest id, never reduced below the base.
+        assert_eq!(
+            published.metadata().last_column_id(),
+            51,
+            "last_column_id must advance to the caller's max field-id"
+        );
+        assert!(published.metadata().last_column_id() >= after1.metadata().last_column_id());
+
+        // Pre-replace snapshot S1 survives AND is still readable via its OWN schema (id/name),
+        // unaffected by the current-schema swap.
+        assert!(
+            published.metadata().snapshot_by_id(s1).is_some(),
+            "pre-replace snapshot S1 was lost"
+        );
+        let s1_schema = s1_schema_id
+            .and_then(|id| published.metadata().schema_by_id(id))
+            .expect("S1's schema must still be readable after the schema swap");
+        assert!(
+            s1_schema.field_by_id(1).is_some_and(|f| f.name == "id"),
+            "S1's schema is no longer readable as id/name"
+        );
+        assert!(s1_schema.field_by_id(2).is_some_and(|f| f.name == "name"));
     }
 }
