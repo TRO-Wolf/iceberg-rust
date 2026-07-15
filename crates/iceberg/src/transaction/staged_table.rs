@@ -25,6 +25,15 @@
 //! A published replace keeps the table's existing root location — it never relocates the
 //! table, so repeated CREATE OR REPLACE cycles do not drift the location.
 //!
+//! A **replace** is built ON TOP OF the existing table's metadata (Java
+//! `TableMetadata.buildReplacement`), not from scratch: it **retains** the table UUID, the full
+//! snapshot history, and the metadata log (appended-to, never truncated), while **resetting** what
+//! a replace replaces — the `main` branch ref is removed (no current snapshot) and the schema /
+//! partition spec / sort order / properties / location from the `TableCreation` become the new
+//! current ones (fresh IDs assigned on top of the existing metadata's ID space). The format version
+//! is upgraded to `max(existing, requested)` and never downgraded. Retaining the history keeps
+//! time-travel raw material intact while the `main` branch exposes only the latest replace's data.
+//!
 //! Java interop battery is a disclosed non-goal of the first unit (GAP_MATRIX 🟡).
 
 use std::str::FromStr;
@@ -32,7 +41,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::FileIO;
-use crate::spec::{DataFile, TableMetadataBuilder};
+use crate::spec::{DataFile, MAIN_BRANCH, SortOrder, TableMetadataBuilder, UnboundPartitionSpec};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::{Catalog, MetadataLocation, NamespaceIdent, TableCreation, TableIdent};
@@ -105,12 +114,20 @@ impl StagedTableTransaction {
 
     /// Begin a **replace** transaction against an existing catalog table.
     ///
-    /// Builds fresh empty table metadata that keeps the table's **existing root location** (or the
-    /// caller-provided `creation.location`). A replace never relocates the table, so repeated
-    /// CREATE OR REPLACE cycles leave `metadata().location()` identical every time. The original
-    /// catalog entry stays current until [`StagedTableTransaction::commit`]; isolation comes from
-    /// deferring the catalog pointer swap, not from a separate on-disk directory.
-    pub async fn begin_replace(existing: &Table, mut creation: TableCreation) -> Result<Self> {
+    /// Builds the replacement metadata ON TOP OF the existing table's metadata (Java
+    /// `TableMetadata.buildReplacement`), keeping the table's **existing root location** (or the
+    /// caller-provided `creation.location`). The table UUID, snapshot history, and metadata log are
+    /// **retained** (the log is appended-to, never truncated); the `main` branch ref is **reset**
+    /// (no current snapshot) and the `TableCreation`'s schema / partition spec / sort order /
+    /// properties / location become the new current ones, with fresh IDs assigned on top of the
+    /// existing metadata's ID space. The format version is upgraded to `max(existing, requested)`
+    /// and never downgraded.
+    ///
+    /// A replace never relocates the table, so repeated CREATE OR REPLACE cycles leave
+    /// `metadata().location()` identical every time. The original catalog entry stays current until
+    /// [`StagedTableTransaction::commit`]; isolation comes from deferring the catalog pointer swap,
+    /// not from a separate on-disk directory.
+    pub async fn begin_replace(existing: &Table, creation: TableCreation) -> Result<Self> {
         let ident = existing.identifier().clone();
         if creation.name != *ident.name() {
             return Err(Error::new(
@@ -138,11 +155,52 @@ impl StagedTableTransaction {
                 .trim_end_matches('/')
                 .to_string()
         });
-        creation.location = Some(table_location.clone());
 
-        let metadata = TableMetadataBuilder::from_table_creation(creation)?
-            .build()?
-            .metadata;
+        // D1: build the replacement ON TOP OF the existing metadata, mirroring Java
+        // `TableMetadata.buildReplacement`:
+        //   new Builder(this)                 -> new_from_metadata(previous, current_file_location):
+        //                                        retains UUID + snapshot history + metadata log
+        //     .upgradeFormatVersion(max)      -> max(existing, requested); never downgrades
+        //     .removeRef(MAIN_BRANCH)         -> drops the main ref => no current snapshot
+        //     .setCurrentSchema(fresh)        -> new schema as current, fresh IDs on the existing space
+        //     .setDefaultPartitionSpec(fresh) -> new default spec, id above the existing specs
+        //     .setDefaultSortOrder(fresh)     -> new default sort order, id above the existing orders
+        //     .setLocation(newLocation)       -> the STABLE location resolved above (N2)
+        //     .setProperties(...)
+        // Passing the existing current metadata file as `current_file_location` appends it to the
+        // metadata log (retained + extended, not reset).
+        let previous = existing.metadata().clone();
+        let target_format_version = std::cmp::max(previous.format_version, creation.format_version);
+        let TableCreation {
+            schema,
+            partition_spec,
+            sort_order,
+            properties,
+            ..
+        } = creation;
+        let partition_spec = partition_spec.unwrap_or(UnboundPartitionSpec {
+            spec_id: None,
+            fields: vec![],
+        });
+        let sort_order = sort_order.unwrap_or_else(SortOrder::unsorted_order);
+
+        let metadata =
+            TableMetadataBuilder::new_from_metadata(previous, Some(base_metadata_location.clone()))
+                .upgrade_format_version(target_format_version)?
+                .remove_ref(MAIN_BRANCH)
+                .add_current_schema(schema)?
+                .add_default_partition_spec(partition_spec)?
+                .add_sort_order(sort_order)?
+                .set_default_sort_order(TableMetadataBuilder::LAST_ADDED as i64)?
+                .set_location(table_location.clone())
+                .set_properties(properties)?
+                .build()?
+                .metadata;
+
+        // NOTE: the staged metadata file restarts version numbering at v0 under the stable
+        // location's `metadata/` dir (a fresh version+UUID filename). Continuing monotonically from
+        // the existing table's file version is deferred to the real-catalog wiring (GAP_MATRIX
+        // R158 residue).
         let metadata_location =
             MetadataLocation::new_with_table_location(&table_location).to_string();
         metadata
@@ -639,5 +697,127 @@ mod tests {
             );
             current = reloaded;
         }
+    }
+
+    #[tokio::test]
+    async fn replace_retains_uuid_history_and_metadata_log() {
+        // D1: a replace is built ON TOP OF the existing metadata (Java `buildReplacement`), not from
+        // scratch. Over a CREATE then two REPLACE cycles this pins that (a) the table UUID is
+        // retained, (b) the pre-replace snapshot survives in the published metadata (time-travel raw
+        // material) while the `main` branch exposes ONLY the latest replace's data, and (c) the
+        // metadata log grows (retained + appended) rather than being truncated.
+        let tmp = TempDir::new().unwrap();
+        let warehouse = tmp.path().to_string_lossy().to_string();
+        let (catalog, _) = shared_fs_catalog(&warehouse).await;
+        let ns = NamespaceIdent::new("sales".into());
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .expect("create namespace");
+
+        let table_location = format!("{warehouse}/sales/orders");
+        let original = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .location(table_location.clone())
+                    .schema(schema_id_name())
+                    .build(),
+            )
+            .await
+            .expect("create original");
+        let original_uuid = original.metadata().uuid();
+
+        // First replace: establishes snapshot S1 with 5 records.
+        let creation1 = TableCreation::builder()
+            .name("orders".into())
+            .schema(schema_id_name())
+            .build();
+        StagedTableTransaction::begin_replace(&original, creation1)
+            .await
+            .expect("begin replace 1")
+            .add_data_files(vec![data_file(
+                &format!("{table_location}/data/r1.parquet"),
+                5,
+            )])
+            .commit(&catalog)
+            .await
+            .expect("publish replace 1");
+        let after1 = catalog
+            .load_table(original.identifier())
+            .await
+            .expect("reload 1");
+        assert_eq!(
+            after1.metadata().uuid(),
+            original_uuid,
+            "replace 1 regenerated the table UUID"
+        );
+        let s1 = after1
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot after replace 1")
+            .snapshot_id();
+        let metadata_log_len_after1 = after1.metadata().metadata_log().len();
+
+        // Second replace: establishes snapshot S2 with 7 records.
+        let creation2 = TableCreation::builder()
+            .name("orders".into())
+            .schema(schema_id_name())
+            .build();
+        StagedTableTransaction::begin_replace(&after1, creation2)
+            .await
+            .expect("begin replace 2")
+            .add_data_files(vec![data_file(
+                &format!("{table_location}/data/r2.parquet"),
+                7,
+            )])
+            .commit(&catalog)
+            .await
+            .expect("publish replace 2");
+        let after2 = catalog
+            .load_table(original.identifier())
+            .await
+            .expect("reload 2");
+
+        // (a) UUID retained across BOTH replaces (from_table_creation would mint a fresh v7 UUID).
+        assert_eq!(
+            after2.metadata().uuid(),
+            original_uuid,
+            "replace 2 regenerated the table UUID"
+        );
+
+        // (b) the pre-replace snapshot S1 is still present (history retained) ...
+        assert!(
+            after2.metadata().snapshot_by_id(s1).is_some(),
+            "replace 2 truncated the snapshot history (S1 lost)"
+        );
+        assert!(
+            after2.metadata().snapshots().len() >= 2,
+            "history not retained: both snapshots should survive the replace"
+        );
+        // ... while `main` exposes ONLY the latest replace's data.
+        let current = after2
+            .metadata()
+            .current_snapshot()
+            .expect("current snapshot after replace 2");
+        assert_ne!(
+            current.snapshot_id(),
+            s1,
+            "main still points at the pre-replace snapshot"
+        );
+        assert_eq!(
+            current.summary().additional_properties.get("total-records"),
+            Some(&"7".to_string()),
+            "main did not expose exactly the latest replace's data"
+        );
+
+        // (c) the metadata log GREW (retained + appended), never truncated.
+        assert!(
+            after2.metadata().metadata_log().len() > metadata_log_len_after1,
+            "metadata log was truncated rather than appended-to across replace 2 \
+             (after1={metadata_log_len_after1}, after2={})",
+            after2.metadata().metadata_log().len()
+        );
     }
 }

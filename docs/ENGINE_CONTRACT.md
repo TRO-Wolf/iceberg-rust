@@ -254,6 +254,15 @@ identifier succeeds. The `MemoryCatalog` default reads the metadata **before** i
 (`register_table`); any catalog overriding `publish_create_table` / `register_table` MUST preserve
 that ordering.
 
+**Replace contract (build-on-existing):** `begin_replace` builds the replacement metadata ON TOP OF
+the existing table's metadata (Java `TableMetadata.buildReplacement`), not from scratch. It
+**retains** the table UUID, the full snapshot history, and the metadata log (appended-to, never
+truncated); it **resets** the `main` branch ref (no current snapshot) and applies the
+`TableCreation`'s schema / partition spec / sort order / properties / location as the new current
+ones (fresh IDs assigned on top of the existing metadata's ID space). The format version is upgraded
+to `max(existing, requested)` and is never downgraded. Retaining the history keeps time-travel raw
+material intact, while `main` exposes only the latest replace's data.
+
 **Location guarantee (replace):** a published replace never relocates the table — it keeps the
 existing root `location()` (or the caller-provided `creation.location`), so repeated CREATE OR
 REPLACE leaves the location identical every time (no `__staged_replace` suffix drift, no compounding
