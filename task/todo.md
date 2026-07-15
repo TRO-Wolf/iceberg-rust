@@ -58,6 +58,33 @@ revert. No `--all-features` (per unit charter); no push.
   `replace_cycle_keeps_location_stable_and_reads_latest` (triple cycle; location == original each
   publish; reads expose the latest replace's data).
 
+CLOSED 2026-07-15 after a 4-cycle independent Opus Critic ladder (OO AC) over the full branch:
+
+- [x] **CF-1 (D1, MEDIUM) — replace built fresh metadata, inverting Java `buildReplacement`.**
+  `begin_replace` used `from_table_creation` (fresh UUID, empty snapshots/metadata-log). Fix
+  4b944152: seed `new_from_metadata` — UUID + snapshot history + metadata log retained, ONLY the
+  main ref removed, format version never downgraded. Pin:
+  `replace_retains_uuid_history_and_metadata_log` (mutation-proven vs fresh-UUID seed AND dropped
+  `remove_ref(MAIN)`).
+- [x] **CF-4 (D4, MEDIUM) — replace silently upgraded V1→V2** via `max(previous,
+  creation.format_version)` with the builder's V2 default. Fix 8c7d2c02: version derived ONLY from
+  the `format-version` property (popped before `set_properties`, mirroring Java
+  `persistedProperties`); absent ⇒ keep existing; downgrade/unparsable ⇒ DataInvalid;
+  `creation.format_version` ignored on replace. Pins:
+  `replace_default_creation_preserves_v1_format_version` (mutation-proven),
+  `replace_upgrades_format_version_by_property`, `replace_downgrade_attempt_errors_and_keeps_original`.
+- [x] **CF-5 (D5, LOW) — docs over-claimed `assignFreshIds` parity**: corrected to caller-ids-as-is
+  + named residue (base-aware fresh-id helper = follow-up); new pin
+  `replace_with_different_schema_keeps_caller_ids`.
+- [x] **F-1 (MEDIUM, found by cycle-3 Critic) — the "unparsable format-version ⇒ DataInvalid"
+  claim had ZERO tests** (silent-fallback mutation survived the suite). Fix 2e08a6e4 (test-only):
+  `replace_invalid_format_version_property_errors_and_keeps_original` over 8 invalid values incl.
+  `"2 "` (anti-trim), each pinning DataInvalid + original unchanged; mutation-proven RED.
+- CF-2/CF-3 (LOW) accepted as NAMED residue in the R158 cell: replace-publish lacks
+  read-before-swap validation (create has it); staged replace restarts metadata versioning at
+  v0/v1. Cycle-4 Critic **CONVERGED** (zero findings; gate 2769 lib green + fmt/clippy/anchors/
+  typos). Pushed for PR.
+
 ## ACTIVE UNIT (2026-07-10): AUDIT TIER 1 Mode B bundle — A1→A3→A2→A4, one branch, one PR
 
 User-approved 2026-07-10 triage of the external five-agent audit (run on the overnight branch;
