@@ -85,6 +85,71 @@ CLOSED 2026-07-15 after a 4-cycle independent Opus Critic ladder (OO AC) over th
   v0/v1. Cycle-4 Critic **CONVERGED** (zero findings; gate 2769 lib green + fmt/clippy/anchors/
   typos). Pushed for PR.
 
+## ACTIVE UNIT (2026-07-13): SEPMO canon v2.2 upgrade + manifest re-instantiation
+
+User-directed 2026-07-13 ("We have updated SEPMO rules we need to implement"): bring the repo's
+SEPMO installation (pre-ledger lineage, installed 2026-06-15/25) up to the new master canon
+**v2.2** the user supplied (spine + binding-manifest template). One branch
+`infra/sepmo-canon-v2.2`, one PR; STANDARD path (governance surface; >5 files and >150 lines —
+LIGHT criteria 1/3 fail; uncertain routes STANDARD anyway). Docs-only: no crate code, no matrix
+row.
+
+- [x] **1. Canon lands verbatim** — `skills/sepmo/SKILL.md` replaced with the v2.2 spine
+      (frontmatter `version: "2.2"`); NEW `skills/sepmo/binding-manifest.template.md` (the
+      portable template; ASF header prepended per the sibling convention — the one sanctioned
+      local touch, matching how every references/ file carries it).
+      - Caveat, disclosed for the PR: the canon text was transcribed from the user's message,
+        not copied from a master file — the user should eyeball the SKILL.md diff against the
+        master before merge. Canon defect FILED (manifest Debug): the spine's *Model
+        assumption* carries a "For this repo ... single-agent default" instantiation artifact;
+        not patched locally, does not bind (manifest + CLAUDE.md win).
+- [x] **2. Manifest re-instantiated** — `skills/sepmo/binding-manifest.md` rebuilt per the
+      template protocol: role rows all BIND (existing homes), `spine_version: v2.2`, tunables
+      bound (two-tier `green_commands` + CI-only exception record + parity-guard-absence
+      justification, `severity_floor: S2` raise with provenance, hard-break
+      `context_break_mechanics`, `s0_fresh_execution: N/A` per the standing hard break,
+      `metrics_ledger_location: task/sepmo-metrics.md`, `taxonomy_extensions: java-parity +
+      format-stability`), instantiation checklist I-1…I-10 proven.
+      - Note: `severity_floor: S2` is bar-PRESERVING (the old install blocked MEDIUM+ ≈ S2),
+        so it lands at instantiation under the asymmetric feed-forward rule rather than
+        waiting for a retrospective; provenance stamped in the row.
+- [x] **3. Reference amendments** (the v2.1 + v2.2 required sets + spine coherence): 01
+      proposition ledger + enumeration obligation + reworked examples; 02 PRE_EXECUTION_REVIEW
+      / states renumbered / S-scale / LIGHT-STANDARD rubric / R3 input restriction / R7
+      readiness incl. pre-merge gate + exception record; 03 doubles as the one-time
+      pre-execution review format; 04 per-element pinning + R5 regression proof + R6
+      dispositions; 05 canonical taxonomy + coverage attestation + span check + fresh-execution
+      step + S-scale; 06 Invariant V reframe + unledgered-claim/silent-gate-skip watch items;
+      07 state 5 + R8 embedded-evidence verification + flag disclosure; 08 metrics ledger
+      (incl. `environment_drift_events`) + incident retrospective + asymmetric feed-forward.
+- [x] **4. New artifacts + navigation** — CREATE `task/sepmo-metrics.md` (the bound metrics
+      ledger, ref-08 metric set, no sections yet — first one lands with the first
+      retrospective; the 2026-07-11 nightly-interop CI failure is pre-named as the first
+      `environment_drift_events` candidate); refresh `skills/sepmo/map.md` in the same change.
+      Fixed in passing (in-scope files): two pre-existing broken `../../CLAUDE.md` links in
+      the refs 04/05 repo-note boxes (needed three levels up from `references/`).
+- [x] **5. Gate + independent Critic → push** — DONE 2026-07-13: round-2 re-attestation
+      **CONVERGED** — the Critic independently re-ran all four gates green on b440629b,
+      re-executed the no-default-features compile itself (exit 0, byte-identical to
+      ci.yml:149), re-swept every `row *…*` citation to resolution, and re-falsified I-4
+      (now true). One NEW S3 advisory filed and accepted-open (F-SEPMO22-3: exception
+      entry 5 over-states the platform residual — CI's `tests` job is ubuntu-only, so the
+      gap belongs to build/no-default-features + check-on-macOS; conservative-direction
+      error, "never blocks" per the spine; tighten at the next touch of the row —
+      disclosed in the PR body). Pushed; merge is the user's. Meta-note worth keeping:
+      round 1's S1 was the new machinery catching a real binding defect in its own
+      install — the R7 silent-skip rule fired on the very unit that introduced it.
+      - Round 1 (2026-07-13): Critic CHANGES_REQUIRED with 2 findings, both fixed same day —
+        **F-SEPMO22-1 (S1, binding defect):** CI's `build_with_no_default_features` job was
+        neither mirrored nor excepted; REMEDIATED by adding
+        `cargo build -p iceberg --no-default-features` to the pre-merge gate (run live:
+        green, 20.8s) + a fifth exception entry (non-Linux runners platform residual).
+        **F-SEPMO22-2 (S2):** three reference citations still named the old manifest row
+        `Capability status (SSOT)` after the template-aligned rename; REMEDIATED to
+        `Status SSOT` (refs 02 ×1, 07 ×2; repo-wide grep now clean). Regression proof for
+        both is structural (grep + live command), not test-expressible — R5 justification.
+        Sent back for re-attestation.
+
 ## ACTIVE UNIT (2026-07-10): AUDIT TIER 1 Mode B bundle — A1→A3→A2→A4, one branch, one PR
 
 User-approved 2026-07-10 triage of the external five-agent audit (run on the overnight branch;

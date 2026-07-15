@@ -21,11 +21,11 @@
 
 > One PR at a time. One verdict at a time. The charter is fulfilled only when every PR is accepted.
 
-The Delivery agent owns state 6 (`DELIVERY`). It receives a single assembled PR from the
-Orchestrator (`02-orchestrator.md`, *Handoff*), runs acceptance verification against the charter
-and the project's Done gate, issues a machine-readable verdict, and — on acceptance — hands off to
-the next step. It does not assemble PRs, drive remediation, or hold the full charter picture;
-those roles belong to states 4 and 3 respectively.
+The Delivery agent owns state 5 (`DELIVERY`), per-PR (spine R9). It receives a single assembled PR
+from the Orchestrator (`02-orchestrator.md`, *Handoff*), runs acceptance verification against the
+charter, the project's Done gate, and the PR's embedded evidence (R8), issues a machine-readable
+verdict, and — on acceptance — hands off to the next step. It does not assemble PRs, drive
+remediation, or hold the full charter picture; those roles belong to state 4's sub-machine.
 
 **DELIVERY is per-PR.** Each assembled PR runs through this state on its own. The charter is
 considered fulfilled only when every PR in the charter set is accepted. Delivery tracks that count
@@ -39,10 +39,13 @@ The Orchestrator hands Delivery one assembled PR at a time, in Wave order, after
 loop has converged, the readiness audit has passed, and the PR has been assembled. By the time
 Delivery sees a PR:
 
-- The Actor–Critic loop has converged (no open MEDIUM+ findings).
-- The readiness audit has passed (`charter_trace_complete: true`, slice internally coherent).
-- The PR description and diff are assembled with `charter_trace` clause IDs linking every change
-  to the frozen charter.
+- The Actor–Critic loop has converged (R4: coverage attestation complete; no open or
+  sustained-disputed findings at/above the severity floor).
+- The readiness audit has passed (R7: pre-merge gate green, exception record verified,
+  `charter_trace_complete: true`, slice internally coherent).
+- The PR description and diff are assembled with the R8 embedded evidence: the clause-by-clause
+  trace, the coverage attestation summary, the findings ledger with dispositions, and any
+  shipped `ACCEPTED_FLAGGED` flags.
 
 Delivery starts from this assembled state. It does not repeat the AC loop, the readiness audit,
 or the assembly — those concluded in state 4. Its job is acceptance verification and the
@@ -65,10 +68,18 @@ Every `charter_trace` clause the PR claims must be checked against its `success_
 frozen charter. A PR that passes the Done gate but leaves a chartered clause unaddressed is
 **not accepted** — the charter clause is the contract, not the code quality alone.
 
-Per `../SKILL.md` *How to use this skill*: "Never declare `DELIVERY` for a PR without
-charter-by-charter verification."
+Per `../SKILL.md` *How to use this skill* (point 4): never claim a delivery without attaching
+the artifact that proves it — here, the clause-by-clause verification against the frozen ledger.
 
-### 3 — Interop evidence for capability PRs
+### 3 — Embedded evidence and shipped flags (R8)
+
+The PR must be verifiable **from its description alone**: the clause trace, the attestation
+summary, the findings ledger with dispositions, and every shipped flag embedded (canonical rule:
+`../SKILL.md` R8). Delivery verifies presence and consistency — an `ACCEPTED_FLAGGED` finding
+that appears in the ledger but not in the PR description is a rejection (a silently-shipped
+flag), and any dispute that is neither `WITHDRAWN` nor terminated per R6 blocks acceptance.
+
+### 4 — Interop evidence for capability PRs
 
 For any PR that advances a parity capability, a byte-level interop round-trip is required (see
 `../../../CLAUDE.md` *Parity mandate* for the definition and rationale). Delivery applies that
@@ -86,7 +97,7 @@ conditional check machine-readable.
 When a PR's acceptance advances a capability row to done:
 
 1. Edit `../../../docs/parity/GAP_MATRIX.md` — the capability cell — and **nothing else**. Status
-   lives only in the GAP_MATRIX (binding-manifest row *Capability status (SSOT)*); the
+   lives only in the GAP_MATRIX (binding-manifest row *Status SSOT*); the
    de-triplication rule in `../../../CLAUDE.md` *Working conventions* forbids any other location.
 2. The flip requires both unit tests and an interop test — rule and rationale in
    `../../../CLAUDE.md` *Parity mandate*; read it there.
@@ -114,6 +125,11 @@ DELIVERY_VERDICT:
   done_gate_clean: true | false
     # true only when your tier manual's §4 gate passes
     # binding: ../binding-manifest.md row *Done gate*
+  embedded_evidence_verified: true | false
+    # R8: clause trace + attestation summary + findings ledger with dispositions
+    # present in the PR description itself
+  flags_disclosed: true | false | n/a
+    # every ACCEPTED_FLAGGED finding appears in the PR description; n/a when none shipped
   interop_evidence:
     required: true | false          # true when pr_type is capability
     provided: true | false | n/a    # n/a when required: false
@@ -175,7 +191,7 @@ Partial delivery is not delivery.
   state 4)
 - The frozen charter — for clause-by-clause `success_condition` lookup
 - The project's Done gate — via `../binding-manifest.md` row *Done gate*
-- The GAP_MATRIX — via `../binding-manifest.md` row *Capability status (SSOT)*, for flip
+- The GAP_MATRIX — via `../binding-manifest.md` row *Status SSOT*, for flip
   eligibility and cell editing
 
 **Outputs:**
