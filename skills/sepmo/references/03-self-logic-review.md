@@ -51,6 +51,15 @@ Before **every** discrete action that changes state or commits to a direction:
 If you cannot name the single action you are about to take, you are not ready to
 run the review — and not ready to act. Decompose until you can.
 
+**One special instance:** this format also serves the **one-time
+`PRE_EXECUTION_REVIEW`** (state 3) — the Orchestrator's single whole-plan review
+before any build begins (`../SKILL.md`, *PRE_EXECUTION_REVIEW — one review, one
+owner*). There, `action` is "enter ORCHESTRATED_EXECUTION on this charter" and
+the `preconditions` list carries at minimum: charter frozen; PR carving
+clause-complete (every clause → exactly one unit, every unit → clauses); every
+unit's LIGHT/STANDARD rubric result recorded; every manifest binding resolved.
+Any `UNVERIFIED` → `HALT` routes backward via T6, never an inline patch.
+
 ---
 
 ## The review format

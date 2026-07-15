@@ -87,26 +87,103 @@ make it only when your attack is genuinely exhausted.
 
 ---
 
-## Inputs
+## Inputs — restricted by the Context Break (R3)
 
-Via the Orchestrator, the Critic receives the Actor's implementation (the code
-for the PR unit), the Actor's **Self Logic Review logs and build summary**, and
-the charter clauses + success conditions the slice claims to satisfy. The SLR
-logs are a high-value attack surface: the Critic checks whether the Actor's
-*claimed* preconditions and success conditions actually hold in the code. A gap
-between claim and reality is a prime finding (`category: claim-gap`).
+The Critic pass opens with the declaration: **"Context break executed;
+attacking artifacts, not memory."**
+
+Via the Orchestrator, and per R3's input restriction (`../SKILL.md` R3;
+mechanics bound by `../binding-manifest.md` `context_break_mechanics`), the
+Critic's inputs are: the unit's **charter clauses** (including every quantified
+clause's enumeration), the **diff and artifacts**, **test results**, and the
+**attack taxonomy** below. The Actor's narrative and Self Logic Reviews are
+**excluded** from the initial pass — a Critic primed by the Actor's framing
+attacks the rationalization, not the code.
+
+**The SLR read comes second.** Only after filing its initial findings may the
+Critic read the Actor's SLR logs and build summary — and then specifically to
+check for undischarged flags and claim-gaps: whether the Actor's *claimed*
+preconditions and success conditions actually hold in the code. A gap between
+claim and reality is a prime finding (`category: claim-gap`).
+
+Every finding cites artifact evidence — file:line, failing input, trace.
+Findings justified by memory of the build are invalid.
+
+---
+
+## The attack taxonomy — canonical categories
+
+This is the coverage surface R4 requires the Critic to exhaust. Every category
+is attested `ATTACKED` (with evidence of what was tried) or `N/A` (with
+justification) on every unit; on LIGHT units, `N/A` may cite the rubric.
+
+| Category | What it attacks |
+|---|---|
+| `correctness` | Wrong results on realistic inputs; broken invariants |
+| `edge-case` | Empty/maximal/malformed inputs, boundaries, invalid states |
+| `concurrency` | Races, ordering, lock discipline, overlapping runs |
+| `error-handling` | Unreached failure paths, swallowed errors, wrong recovery |
+| `security` | Injection, trust-boundary breaks, secret exposure |
+| `data-integrity` | Loss, duplication, corruption, silent partial writes |
+| `resource-exhaustion` | Unbounded anything — memory, handles, retries, queues |
+| `claim-gap` | Actor claims (SLR/summary) the code does not honor |
+| `quantifier-span` | The span check below — enumerated domains vs. actual pins |
+
+The binding manifest may **extend** this list (`taxonomy_extensions` — e.g.
+project-specific categories like a parity oracle or a format-stability rule);
+extensions carry the same attestation duty. The manifest never removes a
+category.
+
+Work the categories through the project's **risk lens** (binding row: *Risk
+lens* in `../binding-manifest.md`) — the taxonomy says *what* to cover; the
+risk lens says *how this project fails*. Routine style and routine performance
+stay out: the bar is "breaks / exploits / loses data", and only
+**system-breaking** performance (failure-grade resource issues) counts.
+
+### The span check (`quantifier-span`)
+
+For every quantified clause in the unit's slice:
+
+1. Pull the clause's `enumeration.partition` from the frozen ledger and the
+   Actor's `clause_pins` mapping from the build summary.
+2. Verify **every partition element has a live pin** — run them. An untested
+   element is an unpinned clause (automatic finding, default S1 per R2).
+3. Attack the partition itself: does it still cover the domain, or did the
+   build grow the domain (new entry point, new divergence class) without
+   growing the partition? Un-grown growth is a finding on this unit.
+4. A lazy enumeration that collapsed a multi-class domain to one class at
+   audit is filed too — the gate should have caught it; execution is the last
+   net.
+
+### The fresh-execution step (procedural breaks only)
+
+When the context break is **procedural** (single-session Actor-phase →
+Critic-phase — see the manifest's `context_break_mechanics`), R3 requires
+compensation for every claim whose failure class is **silently wrong results**:
+the attestation must include at least one input the Critic **freshly executed
+through the public entry point during its own pass** — the Critic's own
+choice, **novel** (absent from the unit's committed tests, or targeting an
+untested element of an enumerated domain), cited with input, entry point, and
+observed-versus-expected output. Re-running the committed suite is independent
+green but does **not** satisfy novelty. The manifest's `s0_fresh_execution` row
+binds the public surface, the standing detector, and the masking paths (a
+`show`-style preview is never sole evidence). Under a standing sub-agent hard
+break this step is not mandatory — the manifest says which regime is bound —
+but a fresh adversarial execution remains the strongest single probe the
+Critic has.
 
 ---
 
 ## The systematic attack method
 
-The Critic is exhaustive, not vibes-based. Work the **Risk-First surface (your
-tier manual) systematically and exhaustively — a process, not a mood**, then add
-the two passes that surface does not own (these are SEPMO-original):
+The Critic is exhaustive, not vibes-based: exhaust the taxonomy above through
+the risk lens — a process, not a mood — then close with the two passes the
+taxonomy's table rows don't spell out:
 
-1. **Claim-vs-code audit.** For each Actor SLR claim, verify it in the code.
-2. **System-breaking performance only.** Failure-grade resource issues —
-   unbounded anything, leaks, exhaustion. Nothing below that line.
+1. **Claim-vs-code audit** (after initial findings are filed — see Inputs).
+   For each Actor SLR claim, verify it in the code.
+2. **Attack includes execution (D6).** Code that has not been built, run, and
+   tested has not been attacked, only read. Run the pins; try to break them.
 
 ---
 
@@ -114,7 +191,7 @@ the two passes that surface does not own (these are SEPMO-original):
 
 > **In this repo, the Critic is a mandatory *independent* agent on Opus** (`OO` =
 > Opus–Opus; [binding-manifest.md](../binding-manifest.md) *Sub-agent / tier policy*;
-> [CLAUDE.md](../../CLAUDE.md) `<subagent_policy>`). The single-agent role-shift below is
+> [CLAUDE.md](../../../CLAUDE.md) `<subagent_policy>`). The single-agent role-shift below is
 > the fallback for trivial work that never reaches a PR — do **not** use it in place of
 > the independent Critic for anything that ships.
 
@@ -133,68 +210,87 @@ Actor's perspective.
 
 ---
 
-## Findings format (machine-readable, addressable)
+## Findings + coverage attestation (machine-readable, addressable)
+
+The Critic files **two artifacts as one record**: the findings ledger and the
+**coverage attestation** (R4). The attestation is what makes a clean review
+checkable — a clean category is legitimate if and only if its evidence shows
+the attack.
 
 ```yaml
 CRITIC_FINDINGS:
   pr_unit: <PR-unit ID>
-  verdict: FINDINGS_FILED | NO_FINDINGS    # NO_FINDINGS requires an attack_record
+  context_break: "executed — <hard (fresh agent) | procedural (named honestly)>"
+  verdict: FINDINGS_FILED | NO_FINDINGS    # NO_FINDINGS still requires the full attestation
   findings:
-    - id: CF-<short-id>
-      severity: BLOCKER | HIGH | MEDIUM | LOW
-      category: correctness | edge-case | concurrency | error-handling |
-                security | data-integrity | resource-exhaustion | claim-gap
+    - id: F-<unit>-<n>                     # spine convention, e.g. F-PR4-1
+      severity: S0 | S1 | S2 | S3          # spine scale — one meaning everywhere
+      category: <a taxonomy category or a manifest extension>
       location: <file / function / line or region>
       scenario: "When <X>, then <Y> breaks because <Z>."
       proof: <how to reproduce, or why it necessarily holds>
       required_fix: <what must change for this to no longer break>
-  attack_record:        # REQUIRED when verdict is NO_FINDINGS
-    - <attack tried>: <why the code withstood it>
-  convergence: NOT_YET | CONVERGED   # CONVERGED only when the attack is exhausted
-                                     # AND no finding of MEDIUM+ remains open
+      disposition: OPEN                    # later: REMEDIATED | ACCEPTED_FLAGGED |
+                                           #   DISPUTED | WITHDRAWN (R5/R6)
+  coverage_attestation:                    # REQUIRED on every unit — R4
+    - category: <each taxonomy category + each manifest extension, one row each>
+      status: ATTACKED | N/A
+      evidence: >
+        # ATTACKED: what was tried and what it showed — the attack, not a vibe.
+        # N/A: the justification (on LIGHT units, the rubric may be it).
+    # fresh_execution: REQUIRED under a procedural break for any
+    # silently-wrong-results claim — input, entry point, observed vs expected.
+  convergence: NOT_YET | CONVERGED
+    # CONVERGED iff the attestation is complete over every applicable category
+    # AND no open or sustained-disputed finding at/above the severity floor
+    # (../binding-manifest.md, severity_floor) remains.
 ```
 
-**Severity scale**
-- **BLOCKER** — data loss, security breach, or system outage in a plausible
-  scenario.
-- **HIGH** — incorrect results or failure under realistic conditions.
-- **MEDIUM** — failure under uncommon-but-reachable conditions; must be fixed or
-  explicitly accepted by the user.
-- **LOW** — minor robustness gap. Filed, but below the "material" line for
-  convergence.
+**Severity** is the spine's global S0–S3 scale (`../SKILL.md`, *Severity
+scale*) — defined once there, consumed here. The **severity floor** — the
+level at/above which open findings block convergence — is bound by the
+manifest (`severity_floor`), raise-only from S1.
 
 ---
 
-## Convergence — the Critic's call
+## Convergence — the Critic's call, and now a checkable one
 
-The AC cycle ends only when the Critic declares `CONVERGED`, and it declares
-converged only when its attack is exhausted and no finding of **MEDIUM or above**
-remains open. Three hard rules:
+The AC cycle ends only when the Critic declares `CONVERGED`, and R4 makes the
+declaration checkable: **attestation complete over every applicable category ∧
+no open or sustained-disputed findings at/above the severity floor.**
+"Exhausted" means the attestation is complete, not that findings were found.
+Hard rules:
 
 - The **Actor never** declares convergence. Building is not judging.
 - The **Orchestrator never** overrides a non-converged Critic to push a PR
-  forward. The 100%-gate spirit applies inside execution too: not-converged means
-  not-ready.
-- The one check *on* the Critic runs the other direction: a too-easy `CONVERGED`
-  — especially a first-pass `NO_FINDINGS` — is itself scrutinized and may be
-  re-run with a fresh Critic. The Critic's leniency is the only thing SEPMO
-  distrusts more than its severity.
+  forward, and audits **attestations, not finding counts**. Not-converged
+  means not-ready.
+- Categories touched by remediation are **re-attested** before convergence.
+- The check *on* the Critic runs both directions: a too-easy `CONVERGED` —
+  especially a first-pass `NO_FINDINGS` — is scrutinized and may be re-run
+  with a fresh Critic; and a **padded** review is as much a failure as a lazy
+  one — the retrospective's **noise ratio** (findings later withdrawn ÷
+  findings filed, ref 08) holds the Critic to precision as well as recall.
 
 ---
 
-## Disputed findings and remediation handoff
+## Disputed findings and remediation handoff (R5 / R6)
 
 The Critic files findings to the Orchestrator and stops; it does not fix code
 (that is the Actor's hands). The Orchestrator mediates:
 
 - It routes the `required_fix` items back to an Actor as a **defect-fix slice** —
   the Actor sees defects to fix, never "the Critic." The Critic re-attacks the
-  remediated build on the next cycle.
-- If a finding is **disputed** — the Actor's side argues it is not-a-bug — the
-  Critic does not get to veto forever and the Actor does not get to dismiss a
-  finding unilaterally. An unresolved **material** dispute (MEDIUM+) escalates to
-  the user with both arguments laid out, per the Orchestrator's escalation policy
-  (`references/02-orchestrator.md`).
+  remediated build on the next cycle and verifies each `REMEDIATED` item's
+  **regression proof** (a test that failed before the fix and passes after —
+  R5): "fixed" without proof stays `OPEN`.
+- If a finding comes back **`DISPUTED`** with counter-evidence, the Critic
+  terminates the dispute — it never dangles (R6): either **`WITHDRAWN`**
+  (honestly, and counted in the noise ratio) or **sustained**. A sustained
+  dispute at/above the severity floor is a hard stop for the unit
+  (interactive: escalate to the user; delegated: halt, no PR, flag in the
+  final report). Sustained below the floor may ship as `ACCEPTED_FLAGGED`,
+  disclosed in the PR description and the retrospective ledger.
 
 ---
 
@@ -205,11 +301,12 @@ Against the earlier hourly-sync charter, reviewing the Actor's merge job:
 ```yaml
 CRITIC_FINDINGS:
   pr_unit: PR-3  # hourly user merge
+  context_break: "executed — hard (fresh agent)"
   verdict: FINDINGS_FILED
   findings:
-    - id: CF-19
-      severity: HIGH
-      category: data-integrity
+    - id: F-PR3-1
+      severity: S1
+      category: concurrency
       location: merge_job.py :: upsert_batch()
       scenario: "When two scheduled runs overlap (run N+1 starts before run N
         commits, possible because a run may exceed the 60-minute interval), both
@@ -217,9 +314,20 @@ CRITIC_FINDINGS:
         applying late-arriving updates."
       proof: "No run-level lock or snapshot fence exists, and the scheduler does
         not prevent overlap. The Actor's SLR (SLR-a3f) claimed idempotency for a
-        single run but made no claim across concurrent runs — a claim-gap."
+        single run but made no claim across concurrent runs — a claim-gap,
+        found on the post-filing SLR read."
       required_fix: "Add a single-flight guard (run lock or snapshot fence) so at
         most one merge operates on a given source snapshot at a time."
+      disposition: OPEN
+  coverage_attestation:
+    - {category: correctness, status: ATTACKED, evidence: "re-ran the merge on
+        identical input — zero row changes; checksum pin holds"}
+    - {category: concurrency, status: ATTACKED, evidence: "walked the overlap
+        schedule — found F-PR3-1"}
+    - {category: quantifier-span, status: ATTACKED, evidence: "C-002's 4-element
+        alert partition vs clause_pins: 4/4 fault-injection pins present, run,
+        red-green verified"}
+    # ...one row per remaining category and manifest extension...
   convergence: NOT_YET
 ```
 
