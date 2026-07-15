@@ -93,3 +93,27 @@ How to use it (see the manuals' §2):
   commits and replaying only the one SKILL.md commit — a clean one-file diff with no conflicts.)
   *Corollary:* when two pending PRs touch DISJOINT files, branch each independently off the trunk
   instead of stacking — they merge in any order and never hit this trap.
+
+### 2026-07-15 — Catalog publish must be all-or-nothing; a staged replace must not relocate the table
+
+- **DO order catalog-pointer mutations AFTER every fallible step (read/validate first, insert last)
+  under the one catalog lock.** `MemoryCatalog::register_table` (the `publish_create_table` default)
+  inserted the pointer THEN read the metadata; a reload failure — staged metadata written through a
+  FileIO the catalog cannot read — left a half-created table (`table_exists`=true, `load_table`
+  errors) and broke `CREATE TABLE IF NOT EXISTS` retry. *Why:* the in-memory catalog's whole
+  register/update body already runs under one lock, so reordering read-before-insert makes
+  create-publish atomic at zero concurrency cost. Pin the *during-commit* failure explicitly (a
+  publish whose reload fails), not just the pre-commit abort.
+- **DO NOT bake a transient stage path into a replace table's `metadata().location()`.**
+  `begin_replace` derived `"{existing_location}__staged_replace"` and never reset it, so every CREATE
+  OR REPLACE relocated the table and COMPOUNDED the suffix
+  (`orders__staged_replace__staged_replace…`), sending future writers to a drifted path. *Why:*
+  staging isolation comes from deferring the catalog pointer swap until `commit`, NOT from a separate
+  directory — keep `location()` equal to the stable existing/caller location; the new metadata gets a
+  fresh version+UUID under it and only becomes current at publish. Never move already-written data
+  (manifests carry absolute paths).
+- **DO re-run `cargo fmt`/`clippy` against a feature-branch tip before building on it** — tip
+  9280320b (the R158 commit) was committed without `make check` and failed both `cargo fmt --check`
+  and `cargo clippy -D warnings` (a `collapsible_if` in `publish_replace_table`). A remediation unit
+  that gates cleanly must normalize the pre-existing violations in the files it already touches and
+  disclose it.

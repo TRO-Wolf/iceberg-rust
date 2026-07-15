@@ -254,6 +254,13 @@ identifier succeeds. The `MemoryCatalog` default reads the metadata **before** i
 (`register_table`); any catalog overriding `publish_create_table` / `register_table` MUST preserve
 that ordering.
 
+**Location guarantee (replace):** a published replace never relocates the table — it keeps the
+existing root `location()` (or the caller-provided `creation.location`), so repeated CREATE OR
+REPLACE leaves the location identical every time (no `__staged_replace` suffix drift, no compounding
+`…__staged_replace__staged_replace…`). Future writers therefore keep landing under the stable path.
+Data files already written under any other path stay readable (Iceberg manifests carry absolute
+paths); a replace does **not** move data.
+
 Do **not** drop-then-create-then-insert for OR REPLACE: that loses the original table if insert
 fails after drop.
 

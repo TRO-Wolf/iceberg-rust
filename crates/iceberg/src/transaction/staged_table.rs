@@ -22,6 +22,8 @@
 //! [`StagedTableTransaction::commit`] publishes the table pointer into the catalog
 //! (create) or swaps it (replace). Failure before or during publish leaves no catalog
 //! create for the create path, and leaves the **original** table current for replace.
+//! A published replace keeps the table's existing root location — it never relocates the
+//! table, so repeated CREATE OR REPLACE cycles do not drift the location.
 //!
 //! Java interop battery is a disclosed non-goal of the first unit (GAP_MATRIX 🟡).
 
@@ -103,8 +105,11 @@ impl StagedTableTransaction {
 
     /// Begin a **replace** transaction against an existing catalog table.
     ///
-    /// Builds fresh empty table metadata at a stage location. The original catalog entry stays
-    /// current until [`StagedTableTransaction::commit`].
+    /// Builds fresh empty table metadata that keeps the table's **existing root location** (or the
+    /// caller-provided `creation.location`). A replace never relocates the table, so repeated
+    /// CREATE OR REPLACE cycles leave `metadata().location()` identical every time. The original
+    /// catalog entry stays current until [`StagedTableTransaction::commit`]; isolation comes from
+    /// deferring the catalog pointer swap, not from a separate on-disk directory.
     pub async fn begin_replace(existing: &Table, mut creation: TableCreation) -> Result<Self> {
         let ident = existing.identifier().clone();
         if creation.name != *ident.name() {
@@ -118,21 +123,28 @@ impl StagedTableTransaction {
             ));
         }
         let base_metadata_location = existing.metadata_location_result()?.to_string();
-        let stage_location = creation.location.clone().unwrap_or_else(|| {
-            let base = existing
+        // A replace keeps the table's root location STABLE: reuse the caller-provided location if
+        // any, else the existing table's current location. Do NOT derive a `__staged_replace`
+        // suffix — baking a stage suffix into the metadata relocated the table on every replace and
+        // compounded it (orders__staged_replace__staged_replace…), sending future writers to a
+        // drifted path and orphaning intent (finding N2). Staging isolation comes from NOT moving
+        // the catalog pointer until `commit`, not from a separate directory: the new metadata file
+        // gets a fresh version+UUID under the stable location's `metadata/` dir and only becomes
+        // current at publish. Data already written elsewhere stays readable — manifests are absolute.
+        let table_location = creation.location.clone().unwrap_or_else(|| {
+            existing
                 .metadata()
                 .location()
                 .trim_end_matches('/')
-                .to_string();
-            format!("{base}__staged_replace")
+                .to_string()
         });
-        creation.location = Some(stage_location.clone());
+        creation.location = Some(table_location.clone());
 
         let metadata = TableMetadataBuilder::from_table_creation(creation)?
             .build()?
             .metadata;
         let metadata_location =
-            MetadataLocation::new_with_table_location(&stage_location).to_string();
+            MetadataLocation::new_with_table_location(&table_location).to_string();
         metadata
             .write_to(existing.file_io(), &metadata_location)
             .await?;
@@ -548,5 +560,84 @@ mod tests {
         let err = staged_a.commit(&catalog).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
         assert!(err.retryable(), "stale replace must be retryable: {err}");
+    }
+
+    #[tokio::test]
+    async fn replace_cycle_keeps_location_stable_and_reads_latest() {
+        // Finding N2: a published replace must NOT relocate the table. Across repeated CREATE OR
+        // REPLACE cycles `metadata().location()` stays equal to the ORIGINAL location (no
+        // `__staged_replace` suffix, no compounding), and each replace's read surface reflects
+        // ONLY that replace's data (a replace builds fresh metadata, so `total-records` is this
+        // cycle's count, never an accumulation).
+        let tmp = TempDir::new().unwrap();
+        let warehouse = tmp.path().to_string_lossy().to_string();
+        let (catalog, _) = shared_fs_catalog(&warehouse).await;
+        let ns = NamespaceIdent::new("sales".into());
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .expect("create namespace");
+
+        let table_location = format!("{warehouse}/sales/orders");
+        let original = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("orders".into())
+                    .location(table_location.clone())
+                    .schema(schema_id_name())
+                    .build(),
+            )
+            .await
+            .expect("create original");
+        assert_eq!(original.metadata().location(), table_location.as_str());
+
+        let mut current = original;
+        for (cycle, records) in [11_u64, 22, 33].into_iter().enumerate() {
+            let creation = TableCreation::builder()
+                .name("orders".into())
+                .schema(schema_id_name())
+                .build();
+            let staged = StagedTableTransaction::begin_replace(&current, creation)
+                .await
+                .expect("begin replace");
+            let data_path = format!("{table_location}/data/cycle-{cycle}.parquet");
+            let published = staged
+                .add_data_files(vec![data_file(&data_path, records)])
+                .commit(&catalog)
+                .await
+                .expect("publish replace");
+
+            // The published table's root location is the ORIGINAL — every cycle, no drift.
+            assert_eq!(
+                published.metadata().location(),
+                table_location.as_str(),
+                "replace cycle {cycle} drifted the table location"
+            );
+
+            // The catalog read surface agrees, and exposes exactly THIS replace's data.
+            let reloaded = catalog
+                .load_table(current.identifier())
+                .await
+                .expect("reload after replace");
+            assert_eq!(
+                reloaded.metadata().location(),
+                table_location.as_str(),
+                "reloaded location drifted at cycle {cycle}"
+            );
+            let snapshot = reloaded
+                .metadata()
+                .current_snapshot()
+                .expect("current snapshot after replace");
+            assert_eq!(
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .get("total-records"),
+                Some(&records.to_string()),
+                "replace cycle {cycle} did not expose the latest data"
+            );
+            current = reloaded;
+        }
     }
 }
