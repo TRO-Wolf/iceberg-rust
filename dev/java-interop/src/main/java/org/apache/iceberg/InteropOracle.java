@@ -1159,6 +1159,31 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-staged-txn":
+        // R158 STAGED CREATE/REPLACE TABLE TRANSACTION interop, DIRECTION 1 — "Java builds, Rust
+        // verifies". Builds the create/replace/fmtv scenarios under <dir>/d1 via the engine-agnostic
+        // iceberg-core surface (`Transactions.createTableTransaction` /
+        // `replaceTableTransaction(ops, ops.current().buildReplacement(...))`) that
+        // `Catalog.newCreateTableTransaction` / `newReplaceTableTransaction` wrap. Emits per-cycle
+        // metadata + canonical views + live rows for the Rust D1 test (interop_staged_txn.rs).
+        StagedTxnOracle.generate(requireFixturesDir("interop.staged_txn.dir"));
+        break;
+      case "verify-interop-staged-txn":
+        // R158 interop, DIRECTION 2 — "Java verifies what RUST staged/created/replaced". The Rust GEN
+        // test (env ICEBERG_INTEROP_STAGED_TXN_GEN_DIR) built the SAME scenarios under <dir>/d2 via
+        // StagedTableTransaction::{begin_create,begin_replace,add_data_files,commit}. Java reads each
+        // Rust-produced table, asserts the create single-publish + row content, the replace E-INV set
+        // (1)-(7) per cycle (uuid retained, history retained, metadata_log grows, main reset + latest
+        // rows only, location stable, format version preserved, last_column_id monotonic), and the
+        // format-version directive contract (V1 preserved / V2 upgrade, directive not persisted).
+        // `mvn exec:java` does not propagate System.exit — run-interop-staged-txn.sh greps the
+        // "verify-interop-staged-txn: 0 failures" sentinel.
+        int stagedTxnFailures = StagedTxnOracle.verify(requireFixturesDir("interop.staged_txn.dir"));
+        System.out.println("verify-interop-staged-txn: " + stagedTxnFailures + " failures");
+        if (stagedTxnFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-theta":
         // THETA-BLOB PUFFIN interop (increment I1), DIRECTION 1 — "Rust writes, Java verifies".
         // Builds a fixture table (unpartitioned V2, schema {1 id long, 2 name string, 3 val long}),
@@ -18926,6 +18951,655 @@ public final class InteropOracle {
         count++;
       }
       return count;
+    }
+  }
+
+  // =============================================================================================
+  // StagedTxnOracle — R158 STAGED CREATE/REPLACE TABLE TRANSACTION interop.
+  //
+  // Proves the Rust `StagedTableTransaction::{begin_create,begin_replace,add_data_files,commit}` is
+  // bidirectionally 1:1 with Java `Catalog.newCreateTableTransaction` / `newReplaceTableTransaction`
+  // (GAP_MATRIX R158). Java drives the ENGINE-AGNOSTIC iceberg-core surface those catalog methods
+  // wrap — `Transactions.createTableTransaction(name, ops, seed)` /
+  // `replaceTableTransaction(name, ops, ops.current().buildReplacement(...))` over a local-fs
+  // `LocalTableOperations` (the harness precedent; `BaseMetastoreCatalog.newReplaceTableTransaction`
+  // literally builds the replacement via `ops.current().buildReplacement(...)` and hands it to
+  // `Transactions.replaceTableTransaction`). buildReplacement is the exact method the Rust port
+  // mirrors.
+  //
+  // TWO DIRECTIONS over ONE fixture tree ($TMP):
+  //   d1/  Java builds (generate)  — Rust reads + asserts (interop_staged_txn.rs D1).
+  //   d2/  Rust builds (GEN test)  — Java reads + asserts (this oracle's verify).
+  //
+  // SCENARIOS (identical logical inputs on both sides — anti-circular):
+  //   create/           create + REAL parquet [(10,a),(20,b),(30,c)]; one publish, one snapshot.
+  //   replace/          base schema {id,data,note} V2, two snapshots (meta-only S1 rc2 + S2 rc1);
+  //                     r1 = buildReplacement(schema {id,data}) + REAL [(30,x),(31,y)];
+  //                     r2 = buildReplacement(schema {id,data}) + REAL [(40,p),(41,q),(42,r)].
+  //                     Base last_column_id=3 (the dropped `note`) is NEVER reduced by a replace to
+  //                     the replacement-schema max (2) — the residue-3-adjacent monotonicity pin.
+  //   fmtv_preserve/    V1 create + default-props replace (NO append) -> STAYS V1, main ref reset.
+  //   fmtv_upgrade/     V1 create + `format-version=2` replace (NO append) -> V2, directive NOT
+  //                     persisted into the property map.
+  //
+  // The REPLACE INVARIANT SET (E-INV, asserted per cycle within each direction — Java over Rust's
+  // d2 here; Rust over Java's d1 in the test): (1) table_uuid identical across cycles; (2)
+  // pre-replace snapshots retained; (3) metadata_log grows (never truncated); (4) main ref reset —
+  // current snapshot is the replace's own new state (never a pre-replace snapshot; NONE before the
+  // first append, proven by the fmtv no-append replace) and reads through main expose ONLY the
+  // latest replace's rows; (5) location() stable; (6) format version preserved absent a directive;
+  // (7) last_column_id monotonic (never reduced below the base).
+  //
+  // The metadata-only base data files carry FAKE parquet paths (never scanned — base is off-main
+  // history); only the r1/r2 appends and the create append are REAL parquet, since only those are
+  // scanned (main exposes only the latest replace). The canonical SnapshotMetaOracle view reads
+  // MANIFESTS (real avro), never the parquet, so it is path-independent — the run script's
+  // cross-check diffs Java's view of the Rust table against Java's own (C-5, structural equivalence).
+  // =============================================================================================
+
+  static final class StagedTxnOracle {
+    private StagedTxnOracle() {}
+
+    // ---- LOCKED constants (identical to interop_staged_txn.rs; anti-circular) -----------------
+    static final long[] CREATE_IDS = {10L, 20L, 30L};
+    static final String[] CREATE_DATA = {"a", "b", "c"};
+    static final long[] R1_IDS = {30L, 31L};
+    static final String[] R1_DATA = {"x", "y"};
+    static final long[] R2_IDS = {40L, 41L, 42L};
+    static final String[] R2_DATA = {"p", "q", "r"};
+    /** Base last_column_id: {id,data,note} => 3. The dropped `note` id must survive as last_col. */
+    static final int BASE_LAST_COLUMN_ID = 3;
+
+    /** {1 id long req, 2 data string req} — the create + replacement schema (V2/V1). */
+    private static Schema schemaC() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "data", Types.StringType.get()));
+    }
+
+    /** {1 id long req, 2 data string req, 3 note string opt} — the replace-BASE schema (last_col=3). */
+    private static Schema schemaB() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "data", Types.StringType.get()),
+          Types.NestedField.optional(3, "note", Types.StringType.get()));
+    }
+
+    /** A metadata-only DataFile (no parquet on disk — off-main base history, never scanned). */
+    private static DataFile metaOnly(PartitionSpec spec, String path, long recordCount) {
+      return DataFiles.builder(spec)
+          .withPath(path)
+          .withFileSizeInBytes(recordCount * 100)
+          .withRecordCount(recordCount)
+          .withFormat(FileFormat.PARQUET)
+          .build();
+    }
+
+    /** Write a REAL unpartitioned parquet {id,data} file; return the DataFile with real metrics. */
+    private static DataFile writeReal(Schema schema, String path, long[] ids, String[] data)
+        throws IOException {
+      File parent = new File(path).getParentFile();
+      if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+        throw new IOException("failed to create data dir at " + parent);
+      }
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("data", data[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(schema, PartitionSpec.unpartitioned());
+      OutputFile out = new LocalFileIO().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /** Write {@code ops.current()} to {@code <metadataDir>/<name>} as a stable, known metadata file. */
+    private static Path writeMeta(TableOperations ops, File metadataDir, String name)
+        throws IOException {
+      Path out = new File(metadataDir, name).toPath();
+      OutputFile outFile = new LocalFileIO().newOutputFile(out.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), outFile);
+      return out;
+    }
+
+    /** Materialize Java's OWN merge-on-read read of {@code metadata} -> sorted {id -> data}. */
+    private static Map<Long, String> liveRows(TableMetadata metadata, FileIO io) {
+      BaseTable table =
+          new BaseTable(new InMemoryInspectionOperations(metadata, io), "interop_staged_txn_read");
+      Map<Long, String> byId = new TreeMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          byId.put(id, data == null ? null : data.toString());
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+      return byId;
+    }
+
+    private static List<Long> snapshotIds(TableMetadata metadata) {
+      List<Long> ids = new ArrayList<>();
+      for (Snapshot snap : metadata.snapshots()) {
+        ids.add(snap.snapshotId());
+      }
+      return ids;
+    }
+
+    // ---- generate (DIRECTION 1: Java builds $TMP/d1) ------------------------------------------
+
+    static void generate(Path root) throws IOException {
+      buildCreate(root.resolve("d1").resolve("create"));
+      buildReplace(root.resolve("d1").resolve("replace"));
+      buildFmtv(root.resolve("d1").resolve("fmtv_preserve"), false);
+      buildFmtv(root.resolve("d1").resolve("fmtv_upgrade"), true);
+      System.out.println("generate-interop-staged-txn: wrote d1 (create/replace/fmtv) to " + root);
+    }
+
+    /** C-1/C-3: create + REAL parquet, one publish. Emits table + canonical view + rows. */
+    private static void buildCreate(Path dir) throws IOException {
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      Schema schema = schemaC();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              tableDir.getAbsolutePath(),
+              props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      // createTableTransaction requires ops.current() == null (never pre-committed) — the STAGED
+      // create: appends accumulate in the transaction, one atomic publish at commitTransaction.
+      DataFile df =
+          writeReal(
+              schema,
+              new File(tableDir, "data/create-0.parquet").getAbsolutePath(),
+              CREATE_IDS,
+              CREATE_DATA);
+      Transaction txn = Transactions.createTableTransaction("interop_staged_txn_create", ops, seed);
+      txn.newFastAppend().appendFile(df).commit();
+      txn.commitTransaction();
+
+      Path finalMeta = writeMeta(ops, metadataDir, "final.metadata.json");
+      SnapshotMetaOracle.emit(finalMeta, dir.resolve("java_meta.json"));
+      writeJson(dir.resolve("java_rows.json"), rowsJson(liveRows(ops.current(), new LocalFileIO())));
+      System.out.println("generate-interop-staged-txn/create: table + java_meta.json + rows written");
+    }
+
+    /** C-2/C-4: base (2 snapshots) + two replace cycles. Emits base/r1/r2 metadata + per-cycle rows. */
+    private static void buildReplace(Path dir) throws IOException {
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      String dataDir = new File(tableDir, "data").getAbsolutePath();
+      PartitionSpec unpart = PartitionSpec.unpartitioned();
+
+      // base: schema {id,data,note}, V2, two metadata-only appends (S1 rc2, S2 rc1) => 2 snapshots.
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schemaB(), unpart, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_staged_txn_replace");
+      table.newFastAppend().appendFile(metaOnly(unpart, dataDir + "/base-s1.parquet", 2L)).commit();
+      table.newFastAppend().appendFile(metaOnly(unpart, dataDir + "/base-s2.parquet", 1L)).commit();
+      writeMeta(ops, metadataDir, "base.final.metadata.json");
+
+      // r1: buildReplacement(schema {id,data}) + REAL [(30,x),(31,y)] via a replace transaction.
+      replaceCycle(ops, unpart, dataDir + "/r1-0.parquet", "r1.final.metadata.json", R1_IDS, R1_DATA);
+      writeJson(
+          dir.resolve("java_r1_rows.json"),
+          rowsJson(liveRows(ops.current(), new LocalFileIO())));
+
+      // r2: buildReplacement(schema {id,data}) + REAL [(40,p),(41,q),(42,r)].
+      replaceCycle(ops, unpart, dataDir + "/r2-0.parquet", "r2.final.metadata.json", R2_IDS, R2_DATA);
+      writeJson(
+          dir.resolve("java_r2_rows.json"),
+          rowsJson(liveRows(ops.current(), new LocalFileIO())));
+
+      System.out.println("generate-interop-staged-txn/replace: base + r1 + r2 metadata + rows written");
+    }
+
+    /** One replace cycle: buildReplacement(schemaC) over ops.current() + REAL append + publish. */
+    private static void replaceCycle(
+        LocalTableOperations ops,
+        PartitionSpec unpart,
+        String parquetPath,
+        String metaName,
+        long[] ids,
+        String[] data)
+        throws IOException {
+      // The exact BaseMetastoreCatalog.newReplaceTableTransaction body: build the replacement ON
+      // TOP OF ops.current() (buildReplacement) and hand it to Transactions.replaceTableTransaction.
+      TableMetadata replacement =
+          ops.current()
+              .buildReplacement(
+                  schemaC(),
+                  unpart,
+                  SortOrder.unsorted(),
+                  ops.current().location(),
+                  new LinkedHashMap<>()); // no format-version directive => preserve V2
+      DataFile df = writeReal(schemaC(), parquetPath, ids, data);
+      Transaction rtxn =
+          Transactions.replaceTableTransaction("interop_staged_txn_replace", ops, replacement);
+      rtxn.newFastAppend().appendFile(df).commit();
+      rtxn.commitTransaction();
+      writeMeta(ops, new File(ops.current().location(), "metadata"), metaName);
+    }
+
+    /** C-6: V1 create + a NO-append replace. `upgrade` toggles the `format-version=2` directive. */
+    private static void buildFmtv(Path dir, boolean upgrade) throws IOException {
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      String dataDir = new File(tableDir, "data").getAbsolutePath();
+      PartitionSpec unpart = PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "1"); // create as V1.
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schemaC(), unpart, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_staged_txn_fmtv");
+      table.newFastAppend().appendFile(metaOnly(unpart, dataDir + "/fmtv-s1.parquet", 1L)).commit();
+      writeMeta(ops, metadataDir, "base.final.metadata.json");
+
+      // Replace with NO append (proves E-INV #4 "none before first append": main ref reset).
+      Map<String, String> replaceProps = new LinkedHashMap<>();
+      if (upgrade) {
+        replaceProps.put(TableProperties.FORMAT_VERSION, "2"); // directive => upgrade to V2.
+      }
+      TableMetadata replacement =
+          ops.current()
+              .buildReplacement(
+                  schemaC(), unpart, SortOrder.unsorted(), ops.current().location(), replaceProps);
+      Transaction rtxn =
+          Transactions.replaceTableTransaction("interop_staged_txn_fmtv", ops, replacement);
+      rtxn.commitTransaction();
+      writeMeta(ops, metadataDir, "replaced.final.metadata.json");
+      System.out.println(
+          "generate-interop-staged-txn/"
+              + dir.getFileName()
+              + ": base(V1) + replaced("
+              + (upgrade ? "V2 upgrade" : "V1 preserve")
+              + ") written");
+    }
+
+    // ---- verify (DIRECTION 2: Java reads $TMP/d2 = Rust-built) --------------------------------
+
+    static int verify(Path root) throws IOException {
+      int failures = 0;
+      FileIO io = new LocalFileIO();
+      failures += verifyCreate(root.resolve("d2").resolve("create"), io);
+      failures += verifyReplace(root.resolve("d2").resolve("replace"), io);
+      failures += verifyFmtv(root.resolve("d2").resolve("fmtv_preserve"), false, io);
+      failures += verifyFmtv(root.resolve("d2").resolve("fmtv_upgrade"), true, io);
+      return failures;
+    }
+
+    private static TableMetadata parse(Path metadataJson) throws IOException {
+      return TableMetadataParser.fromJson(metadataJson.toString(), readString(metadataJson));
+    }
+
+    private static int verifyCreate(Path dir, FileIO io) throws IOException {
+      Path meta = dir.resolve("table/metadata/final.metadata.json");
+      if (!Files.exists(meta)) {
+        System.out.println("FAIL staged-txn/create: missing " + meta);
+        return 1;
+      }
+      TableMetadata metadata;
+      try {
+        metadata = parse(meta);
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL staged-txn/create: Java could not parse Rust metadata: " + error);
+        return 1;
+      }
+      int failures = 0;
+      // Single publish => exactly ONE snapshot, current present, operation append.
+      if (snapshotIds(metadata).size() != 1 || metadata.currentSnapshot() == null) {
+        System.out.println(
+            "FAIL staged-txn/create: expected exactly 1 snapshot with a current snapshot, got "
+                + snapshotIds(metadata).size());
+        failures++;
+      }
+      // Schema {id,data} preserved.
+      Schema schema = metadata.schema();
+      if (schema.findField("id") == null
+          || schema.findField("data") == null
+          || schema.columns().size() != 2) {
+        System.out.println("FAIL staged-txn/create: schema is not {id,data}: " + schema);
+        failures++;
+      }
+      // Row content: [(10,a),(20,b),(30,c)].
+      Map<Long, String> rows = liveRows(metadata, io);
+      Map<Long, String> expected = new TreeMap<>();
+      for (int i = 0; i < CREATE_IDS.length; i++) {
+        expected.put(CREATE_IDS[i], CREATE_DATA[i]);
+      }
+      if (!rows.equals(expected)) {
+        System.out.println(
+            "FAIL staged-txn/create: live rows " + rows + " != expected " + expected);
+        failures++;
+      }
+      if (failures == 0) {
+        System.out.println("PASS staged-txn/create: one publish, schema {id,data}, rows " + rows);
+      }
+      return failures;
+    }
+
+    private static int verifyReplace(Path dir, FileIO io) throws IOException {
+      Path baseP = dir.resolve("table/metadata/base.final.metadata.json");
+      Path r1P = dir.resolve("table/metadata/r1.final.metadata.json");
+      Path r2P = dir.resolve("table/metadata/r2.final.metadata.json");
+      if (!Files.exists(baseP) || !Files.exists(r1P) || !Files.exists(r2P)) {
+        System.out.println("FAIL staged-txn/replace: missing base/r1/r2 metadata under " + dir);
+        return 1;
+      }
+      TableMetadata base;
+      TableMetadata r1;
+      TableMetadata r2;
+      try {
+        base = parse(baseP);
+        r1 = parse(r1P);
+        r2 = parse(r2P);
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL staged-txn/replace: parse error on Rust metadata: " + error);
+        return 1;
+      }
+      List<Long> r1Expected = new ArrayList<>();
+      for (long id : R1_IDS) {
+        r1Expected.add(id);
+      }
+      List<Long> r2Expected = new ArrayList<>();
+      for (long id : R2_IDS) {
+        r2Expected.add(id);
+      }
+      return assertReplaceInvariants("staged-txn/replace", base, r1, r2, io, r1Expected, r2Expected);
+    }
+
+    /**
+     * The E-INV replace invariant set (1)-(7), asserted over one (base, r1, r2) sequence. Returns the
+     * failure count. Called by BOTH directions (Java over Rust here; Rust mirrors it in the test).
+     */
+    static int assertReplaceInvariants(
+        String tag,
+        TableMetadata base,
+        TableMetadata r1,
+        TableMetadata r2,
+        FileIO io,
+        List<Long> r1Expected,
+        List<Long> r2Expected) {
+      int failures = 0;
+
+      // (1) table_uuid identical across every cycle.
+      if (!base.uuid().equals(r1.uuid()) || !base.uuid().equals(r2.uuid())) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + " E-INV#1 uuid: base="
+                + base.uuid()
+                + " r1="
+                + r1.uuid()
+                + " r2="
+                + r2.uuid());
+        failures++;
+      }
+
+      // (2) pre-replace snapshots retained: base ⊆ r1 ⊆ r2.
+      List<Long> baseIds = snapshotIds(base);
+      List<Long> r1Ids = snapshotIds(r1);
+      List<Long> r2Ids = snapshotIds(r2);
+      if (!r1Ids.containsAll(baseIds) || !r2Ids.containsAll(r1Ids)) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + " E-INV#2 history: base="
+                + baseIds
+                + " r1="
+                + r1Ids
+                + " r2="
+                + r2Ids);
+        failures++;
+      }
+      if (baseIds.size() < 2) {
+        System.out.println(
+            "FAIL " + tag + " E-INV#2: base must have >=2 snapshots, got " + baseIds.size());
+        failures++;
+      }
+
+      // (3) metadata_log grows (appended, never truncated): r1 > base, r2 > r1.
+      int baseLog = base.previousFiles().size();
+      int r1Log = r1.previousFiles().size();
+      int r2Log = r2.previousFiles().size();
+      if (!(r1Log > baseLog && r2Log > r1Log)) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + " E-INV#3 metadata_log did not grow: base="
+                + baseLog
+                + " r1="
+                + r1Log
+                + " r2="
+                + r2Log);
+        failures++;
+      }
+
+      // (4) main ref reset: current(r1)/current(r2) are NOT pre-replace snapshots, and reads through
+      // main expose ONLY the latest replace's rows.
+      failures += assertMainResetAndRows(tag, "r1", base, r1, io, r1Expected);
+      failures += assertMainResetAndRows(tag, "r2", base, r2, io, r2Expected);
+
+      // (5) location() stable across cycles.
+      if (!base.location().equals(r1.location()) || !base.location().equals(r2.location())) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + " E-INV#5 location: base="
+                + base.location()
+                + " r1="
+                + r1.location()
+                + " r2="
+                + r2.location());
+        failures++;
+      }
+
+      // (6) format version preserved absent a directive (all V2 here).
+      if (base.formatVersion() != r1.formatVersion()
+          || base.formatVersion() != r2.formatVersion()) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + " E-INV#6 format version: base="
+                + base.formatVersion()
+                + " r1="
+                + r1.formatVersion()
+                + " r2="
+                + r2.formatVersion());
+        failures++;
+      }
+
+      // (7) last_column_id monotonic — never reduced below the base (=3, the dropped `note`).
+      if (base.lastColumnId() != BASE_LAST_COLUMN_ID
+          || r1.lastColumnId() < base.lastColumnId()
+          || r2.lastColumnId() < r1.lastColumnId()) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + " E-INV#7 last_column_id (base must be "
+                + BASE_LAST_COLUMN_ID
+                + ", never reduced): base="
+                + base.lastColumnId()
+                + " r1="
+                + r1.lastColumnId()
+                + " r2="
+                + r2.lastColumnId());
+        failures++;
+      }
+
+      if (failures == 0) {
+        System.out.println(
+            "PASS "
+                + tag
+                + " E-INV(1-7): uuid retained, history "
+                + baseIds.size()
+                + "->"
+                + r2Ids.size()
+                + ", log "
+                + baseLog
+                + "->"
+                + r2Log
+                + ", main reset+rows, location stable, V"
+                + base.formatVersion()
+                + " preserved, last_col "
+                + base.lastColumnId());
+      }
+      return failures;
+    }
+
+    private static int assertMainResetAndRows(
+        String tag,
+        String cycle,
+        TableMetadata base,
+        TableMetadata replaced,
+        FileIO io,
+        List<Long> expectedIds) {
+      int failures = 0;
+      Snapshot current = replaced.currentSnapshot();
+      if (current == null) {
+        System.out.println("FAIL " + tag + " E-INV#4 " + cycle + ": no current snapshot after replace");
+        return 1;
+      }
+      if (snapshotIds(base).contains(current.snapshotId())) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + " E-INV#4 "
+                + cycle
+                + ": main still points at a pre-replace snapshot "
+                + current.snapshotId());
+        failures++;
+      }
+      List<Long> live = new ArrayList<>(liveRows(replaced, io).keySet());
+      if (!live.equals(expectedIds)) {
+        System.out.println(
+            "FAIL "
+                + tag
+                + " E-INV#4 "
+                + cycle
+                + ": main exposes "
+                + live
+                + " but expected ONLY the latest replace's rows "
+                + expectedIds);
+        failures++;
+      }
+      return failures;
+    }
+
+    private static int verifyFmtv(Path dir, boolean upgrade, FileIO io) throws IOException {
+      Path baseP = dir.resolve("table/metadata/base.final.metadata.json");
+      Path replacedP = dir.resolve("table/metadata/replaced.final.metadata.json");
+      if (!Files.exists(baseP) || !Files.exists(replacedP)) {
+        System.out.println("FAIL staged-txn/fmtv: missing base/replaced metadata under " + dir);
+        return 1;
+      }
+      TableMetadata base;
+      TableMetadata replaced;
+      try {
+        base = parse(baseP);
+        replaced = parse(replacedP);
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL staged-txn/fmtv: parse error on Rust metadata: " + error);
+        return 1;
+      }
+      int failures = 0;
+      String tag = "staged-txn/fmtv_" + (upgrade ? "upgrade" : "preserve");
+      if (base.formatVersion() != 1) {
+        System.out.println("FAIL " + tag + ": base was not created V1, got V" + base.formatVersion());
+        failures++;
+      }
+      int wantVersion = upgrade ? 2 : 1;
+      if (replaced.formatVersion() != wantVersion) {
+        System.out.println(
+            "FAIL " + tag + ": replaced format version V" + replaced.formatVersion() + " != V" + wantVersion);
+        failures++;
+      }
+      // The `format-version` directive is consumed, NEVER persisted into the property map.
+      if (replaced.properties().containsKey(TableProperties.FORMAT_VERSION)) {
+        System.out.println("FAIL " + tag + ": `format-version` directive leaked into properties");
+        failures++;
+      }
+      // Replace with NO append => main ref reset, NO current snapshot (E-INV#4 "none" branch).
+      if (replaced.currentSnapshot() != null) {
+        System.out.println(
+            "FAIL " + tag + ": no-append replace left a current snapshot (main ref not reset)");
+        failures++;
+      }
+      // History retained: the base's snapshot survives the replace.
+      if (!snapshotIds(replaced).containsAll(snapshotIds(base))) {
+        System.out.println("FAIL " + tag + ": base snapshot(s) lost across the replace");
+        failures++;
+      }
+      // UUID + location retained.
+      if (!base.uuid().equals(replaced.uuid()) || !base.location().equals(replaced.location())) {
+        System.out.println("FAIL " + tag + ": uuid/location not retained across the replace");
+        failures++;
+      }
+      if (failures == 0) {
+        System.out.println(
+            "PASS "
+                + tag
+                + ": base V1 -> replaced V"
+                + wantVersion
+                + " (directive filtered, main reset, history+uuid+location retained)");
+      }
+      return failures;
+    }
+
+    /** Render a sorted {id -> data} map to a JSON array of {@code {"id":..,"data":..}} objects. */
+    private static String rowsJson(Map<Long, String> byId) {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (Map.Entry<Long, String> entry : byId.entrySet()) {
+              gen.writeStartObject();
+              gen.writeNumberField("id", entry.getKey());
+              if (entry.getValue() == null) {
+                gen.writeNullField("data");
+              } else {
+                gen.writeStringField("data", entry.getValue());
+              }
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
     }
   }
 

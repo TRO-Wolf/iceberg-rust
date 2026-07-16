@@ -244,7 +244,16 @@ Engine recipe for atomic `CREATE [OR REPLACE] TABLE … AS SELECT` (GAP_MATRIX *
 4. `MemoryCatalog` implements replace CAS against the base metadata location observed at
    `begin_replace`. Other catalogs default `publish_replace_table` to FeatureUnsupported until
    wired.
-5. Java interop battery for R158 is a follow-up (status 🟡).
+5. Bidirectional Java 1.10.0 interop is PROVEN (R158 ✅, 2026-07-16):
+   `dev/java-interop/run-interop-staged-txn.sh` (`StagedTxnOracle` ⇄ `tests/interop_staged_txn.rs`)
+   drives the engine-agnostic core surface these catalog methods wrap
+   (`Transactions.createTableTransaction` / `replaceTableTransaction` over
+   `ops.current().buildReplacement(...)`) and asserts, in BOTH directions, create single-publish +
+   row content, the replace invariant set (uuid retained, history retained, `metadata_log` grows,
+   `main` reset to the latest replace's rows only, location stable, format version preserved,
+   `last_column_id` monotonic), a V1 table surviving a replace as V1 on both sides, and the
+   `format-version` directive contract — behind a structural cross-check and a fail-closed sabotage
+   battery.
 
 **Atomicity guarantee (create-publish):** create-publish is all-or-nothing, even when the reload
 fails. If publishing a staged create cannot reload the staged metadata (e.g. it was written through
