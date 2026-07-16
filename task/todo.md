@@ -39,6 +39,20 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-16): R158 Java interop battery (🟡→✅) — branch `parity/r158-staged-txn-interop`
+
+User-signed 2026-07-16: OO AC (Opus Actor / Opus Critic, both at MAX effort) via the Workflow
+ladder. Spec: [r158-staged-txn-interop-brief.md](r158-staged-txn-interop-brief.md) (C-1…C-9 +
+the E-INV replace-invariant enumeration); this section is the tracker.
+
+- [ ] **Build** — new suite `run-interop-staged-txn.sh` + oracle scenario + Rust interop test;
+      both directions (C-1…C-4), cross-check (C-5), format-version directive (C-6), sabotage
+      RED-proofs (C-7), floor 48→49 + maps (C-8).
+- [ ] **Critic ladder** — independent fresh-context Opus Critic per cycle, max 3 cycles;
+      convergence is the Critic's call (S2/MEDIUM+ blocks).
+- [ ] **Flip + close** — R158 ✅ (C-9), ENGINE_CONTRACT §8a item 5 done, push on CONVERGED,
+      single PR.
+
 ## ACTIVE UNIT (2026-07-15): fork-atomicity remediation (R158 staged create/replace) — branch `feat/replace-table-transaction`
 
 SEPMO Actor–Critic unit hardening the just-landed R158 staged transaction (tip 9280320b). Two
