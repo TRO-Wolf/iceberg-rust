@@ -39,7 +39,22 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
-## ACTIVE UNIT (2026-07-17b): G1 Glue type-string byte-parity — branch `fix/g1-glue-type-string-byte-parity`
+## ACTIVE UNIT (2026-07-17c): G2 incremental-scan name-mapping pin — branch `fix/g2-incremental-name-mapping-pin`
+
+User-signed 2026-07-17: **FF AC (Fable Actor / independent Fable Critic)** — the user's
+chosen mode for G2+G3. Test-only unit closing the #154 Critic's residue (incremental
+wiring correct but unpinned). Spec:
+[g2-incremental-name-mapping-pin-brief.md](g2-incremental-name-mapping-pin-brief.md)
+(C-1…C-5; escape hatch only for a proven-broken wiring).
+
+- [ ] **Build** (Fable Actor): C-1 plan-level pin · C-2 e2e contrast via incremental
+      stream · C-3 absent-property fallback pin · C-4 live mutation proof (incremental
+      site RED, snapshot pins GREEN) · C-5 reuse #154 fixtures/helpers.
+- [ ] **Critic** (independent Fable, fresh context) — convergence is the Critic's call.
+- [ ] **Close-out** — tracker flip, push, PR body delivered. G3 (HMS timestamptz, FF)
+      follows after merge.
+
+## DONE 2026-07-17 (merged #155): G1 Glue type-string byte-parity — was branch `fix/g1-glue-type-string-byte-parity`
 
 User-signed 2026-07-17 (the "G1→G2→G3" follow-up sequence after #152/#153/#154 merged;
 G2 = BUG-002 incremental-scan pin, G3 = HMS timestamptz design unit — queued next). OO AC.
