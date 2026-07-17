@@ -39,6 +39,24 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-17): BUG-002 name-mapping scan wiring — branch `fix/bug-002-name-mapping-scan-wiring`
+
+User-signed 2026-07-17: OO AC (Opus Actor / independent Opus Critic). Spec:
+[bug-002-name-mapping-scan-brief.md](bug-002-name-mapping-scan-brief.md) (C-1…C-7); this
+section is the tracker. The bug (external audit 2026-07-10, deferred backlog): the scan
+hardcodes `name_mapping: None` (`scan/context.rs` TODO) while the downstream
+(`FileScanTask.name_mapping` → ArrowReader `apply_name_mapping_to_arrow_schema`) is fully
+built — ID-less-Parquet tables with `schema.name-mapping.default` read via position
+fallback (wrong-data class) instead of the mapping (Java-divergent).
+
+- [ ] **Build** (Opus Actor): C-1 property constant · C-2 once-per-plan parse + thread to
+      every task · C-3 Java-faithful failure semantics · C-4 delete-file-task decision from
+      Java source · C-5 unit pins incl. the position-fallback-would-be-WRONG e2e contrast ·
+      C-6 interop suite + floor 49→50 + maps lockstep · C-7 R143 cell note.
+- [ ] **Critic** (independent Opus, fresh context) — convergence is the Critic's call;
+      MEDIUM+/S2+ blocks; mutation-proofs re-run live.
+- [ ] **Close-out** — tracker flip, push, PR body delivered.
+
 ## ACTIVE UNIT (2026-07-16): R158 Java interop battery (🟡→✅) — branch `parity/r158-staged-txn-interop`
 
 User-signed 2026-07-16: OO AC (Opus Actor / Opus Critic, both at MAX effort) via the Workflow
