@@ -119,7 +119,7 @@ The engine-boundary proof (#116): scan `_file`/`_pos` → write position-delete 
 | compaction commit | — | `RewriteFiles` (the action layer's `RewriteDataFiles` wraps it) |
 
 **Write-batch timezone coercion (F-A2-3).** The Parquet write funnel (`ParquetWriter::write`, the
-sole `FileWriter` impl every data / delete / partitioning writer routes through) normalizes a record
+sole **Parquet** `FileWriter` impl every parquet-format data / delete / partitioning writer routes through; Avro is a separate `FileWriter` seam not covered by this coercion) normalizes a record
 batch whose columns differ from the file (writer) schema ONLY by a UTC-alias timezone string on a
 **top-level** timestamp — `Timestamp(_, "UTC")` (as Spark tags Iceberg `timestamptz`) vs the crate's
 canonical `Timestamp(_, "+00:00")` (`arrow::schema` `UTC_TIME_ZONE`) — via a metadata-only relabel
