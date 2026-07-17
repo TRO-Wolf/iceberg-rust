@@ -118,6 +118,17 @@ The engine-boundary proof (#116): scan `_file`/`_pos` → write position-delete 
 | INSERT OVERWRITE (dynamic) | — | `ReplacePartitions` |
 | compaction commit | — | `RewriteFiles` (the action layer's `RewriteDataFiles` wraps it) |
 
+**Write-batch timezone coercion (F-A2-3).** The Parquet write funnel (`ParquetWriter::write`, the
+sole `FileWriter` impl every data / delete / partitioning writer routes through) normalizes a record
+batch whose columns differ from the file (writer) schema ONLY by a UTC-alias timezone string on a
+**top-level** timestamp — `Timestamp(_, "UTC")` (as Spark tags Iceberg `timestamptz`) vs the crate's
+canonical `Timestamp(_, "+00:00")` (`arrow::schema` `UTC_TIME_ZONE`) — via a metadata-only relabel
+(instants bit-identical), mirroring Java Iceberg's coercion of write batches to the file schema. The
+engine may therefore hand `"UTC"`-tagged batches directly. The alias set is CLOSED (`"UTC"` /
+`"+00:00"` only): a genuinely different timezone (`"+05:00"`), a naive-vs-`timestamptz` mismatch, or a
+**nested** alias mismatch (inside a struct/list) is NOT coerced and fails loud — nested normalization
+is a deferred fork follow-up.
+
 ## 5. Isolation level → validation recipes  ·  **NORMATIVE (oracle-verified 2026-07-09)**
 
 Rust builder methods, verbatim from `transaction/{row_delta,overwrite_files,replace_partitions}.rs`.
