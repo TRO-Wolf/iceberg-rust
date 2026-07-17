@@ -286,17 +286,31 @@ impl OpenDalStorage {
                 customized_credential_load,
             } => {
                 let op = s3_config_build(config, customized_credential_load, path)?;
-                let op_info = op.info();
+                // `s3_config_build` derives the operator's bucket from `path`.
+                let bucket = op.info().name().to_string();
 
-                // Check prefix of s3 path.
-                let prefix = format!("{}://{}/", configured_scheme, op_info.name());
-                if path.starts_with(&prefix) {
-                    (op, &path[prefix.len()..])
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid s3 url: {path}, should start with {prefix}"),
-                    ));
+                // `s3`, `s3a`, and `s3n` are aliases of the same object store
+                // (Java `S3FileIO` parity): a location for this bucket resolves
+                // under ANY alias, regardless of which alias the storage was
+                // configured with. The relative key is stripped using the matched
+                // alias's prefix length (see `s3_relative_path`).
+                match s3_relative_path(path, &bucket) {
+                    Some(relative_path) => (op, relative_path),
+                    None => {
+                        let accepted = S3_SCHEME_ALIASES
+                            .iter()
+                            .map(|&scheme| format!("{scheme}://{bucket}/"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Invalid s3 url: {path}, should start with one of \
+                                 [{accepted}] (storage configured for scheme \
+                                 {configured_scheme})"
+                            ),
+                        ));
+                    }
                 }
             }
             #[cfg(feature = "opendal-gcs")]
@@ -604,5 +618,141 @@ mod tests {
             known_millis,
             "a known recent value must round-trip exactly as milliseconds-since-epoch"
         );
+    }
+
+    /// S3 scheme aliasing (F-A2-1): `s3`/`s3a`/`s3n` are aliases of the same
+    /// storage (Java `S3FileIO` parity). Every pin builds an `OpenDalStorage::S3`
+    /// offline — a fixed region with ambient config/EC2 loads disabled — so the
+    /// opendal operator is constructed without any AWS contact.
+    #[cfg(feature = "opendal-s3")]
+    mod s3_scheme_alias {
+        use std::sync::Arc;
+
+        use iceberg::io::{
+            S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_REGION, StorageConfig,
+            StorageFactory,
+        };
+
+        use crate::{OpenDalStorage, OpenDalStorageFactory};
+
+        /// Offline S3 props: a fixed region plus disabled ambient config/EC2 loads
+        /// so the operator builds without any network or credential probe.
+        fn offline_s3_props() -> Vec<(&'static str, &'static str)> {
+            vec![
+                (S3_REGION, "us-east-1"),
+                (S3_DISABLE_CONFIG_LOAD, "true"),
+                (S3_DISABLE_EC2_METADATA, "true"),
+            ]
+        }
+
+        /// Build an `OpenDalStorage::S3` exactly as `OpenDalStorageFactory::S3`
+        /// does, for the given configured scheme. Offline: no AWS contact.
+        fn s3_storage(configured_scheme: &str) -> OpenDalStorage {
+            let props = offline_s3_props()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let config = crate::s3::s3_config_parse(props).expect("offline s3 config parses");
+            OpenDalStorage::S3 {
+                configured_scheme: configured_scheme.to_string(),
+                config: Arc::new(config),
+                customized_credential_load: None,
+            }
+        }
+
+        /// Assert a location resolves against a store configured with `configured`,
+        /// pinning both the operator's bucket and the exact operator-relative key.
+        fn assert_resolves(configured: &str, path: &str, bucket: &str, key: &str) {
+            let storage = s3_storage(configured);
+            let (op, relative_path) = storage
+                .create_operator(&path)
+                .unwrap_or_else(|e| panic!("{path} must resolve for configured {configured}: {e}"));
+            assert_eq!(relative_path, key, "relative key for {path}");
+            assert_eq!(op.info().name(), bucket, "bucket for {path}");
+        }
+
+        /// Element 1: the Glue default (configured `s3a`) accepts a canonical
+        /// `s3://` location — the exact acceptance-run failure being fixed.
+        #[test]
+        fn test_create_operator_configured_s3a_accepts_s3_scheme() {
+            assert_resolves("s3a", "s3://my-bucket/k", "my-bucket", "k");
+        }
+
+        /// Element 2 (regression): configured `s3a` still accepts `s3a://`.
+        #[test]
+        fn test_create_operator_configured_s3a_accepts_s3a_scheme_regression() {
+            assert_resolves("s3a", "s3a://my-bucket/k", "my-bucket", "k");
+        }
+
+        /// Element 3: configured `s3` accepts `s3a://`.
+        #[test]
+        fn test_create_operator_configured_s3_accepts_s3a_scheme() {
+            assert_resolves("s3", "s3a://my-bucket/k", "my-bucket", "k");
+        }
+
+        /// Element 4 (regression): configured `s3` still accepts `s3://`.
+        #[test]
+        fn test_create_operator_configured_s3_accepts_s3_scheme_regression() {
+            assert_resolves("s3", "s3://my-bucket/k", "my-bucket", "k");
+        }
+
+        /// Element 5: the `s3n` alias resolves too.
+        #[test]
+        fn test_create_operator_accepts_s3n_scheme() {
+            assert_resolves("s3a", "s3n://my-bucket/k", "my-bucket", "k");
+        }
+
+        /// Element 7: non-S3 schemes stay rejected by the S3 arm.
+        #[test]
+        fn test_create_operator_rejects_non_s3_schemes() {
+            let storage = s3_storage("s3a");
+            for path in ["gs://my-bucket/k", "file:///tmp/k", "my-bucket/k"] {
+                assert!(
+                    storage.create_operator(&path).is_err(),
+                    "{path} must be rejected by the S3 arm"
+                );
+            }
+            // A well-formed non-S3 scheme reaches the alias check; the error names
+            // the rejected location.
+            let err = storage
+                .create_operator(&"gs://my-bucket/k")
+                .expect_err("gs:// must be rejected");
+            assert!(
+                err.to_string().contains("gs://my-bucket/k"),
+                "error must name the rejected location, got: {err}"
+            );
+        }
+
+        /// Element 9 (end-to-end): the Glue catalog's default FileIO factory
+        /// (`configured_scheme: "s3a"`) composes with a real `s3://` metadata
+        /// location. Proves the catalog default + canonical metadata locations now
+        /// resolve together at the single funnel every `Storage` I/O routes through.
+        #[test]
+        fn test_glue_default_factory_composes_with_s3_metadata_location() {
+            // The Glue default, built through the real factory + StorageConfig path.
+            let factory = OpenDalStorageFactory::S3 {
+                configured_scheme: "s3a".to_string(),
+                customized_credential_load: None,
+            };
+            let config = StorageConfig::new().with_props(offline_s3_props());
+            let _built = factory
+                .build(&config)
+                .expect("Glue-default S3 factory must build from Glue-shaped props");
+
+            // `factory.build` yields an `Arc<dyn Storage>` (create_operator is not on
+            // the trait); the concrete store below is byte-identical to what the S3
+            // factory arm constructs, so the location is resolved on it.
+            let storage = s3_storage("s3a");
+            let location = "s3://warehouse-bucket/db/tbl/metadata/00001-1a2b-uuid.metadata.json";
+            let (op, relative_path) = storage
+                .create_operator(&location)
+                .expect("a real s3:// metadata location must compose with the s3a Glue default");
+            assert_eq!(
+                relative_path,
+                "db/tbl/metadata/00001-1a2b-uuid.metadata.json"
+            );
+            assert_eq!(op.info().name(), "warehouse-bucket");
+            assert_eq!(op.info().scheme().to_string(), "s3");
+        }
     }
 }

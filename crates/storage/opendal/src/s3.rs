@@ -145,6 +145,36 @@ pub(crate) fn s3_config_build(
     Ok(Operator::new(builder).map_err(from_opendal_error)?.finish())
 }
 
+/// S3 URI scheme aliases that address the same object store.
+///
+/// Java `S3FileIO` treats `s3`, `s3a`, and `s3n` as equivalent schemes for the
+/// same storage, so a location carrying any of them for the configured bucket
+/// refers to the same object. This fork's `DeleteOrphanFiles` action encodes the
+/// same equivalence in its `equal_schemes` default (`{s3n, s3a → s3}`).
+pub(crate) const S3_SCHEME_ALIASES: [&str; 3] = ["s3", "s3a", "s3n"];
+
+/// Resolve an absolute S3 location to its operator-relative key.
+///
+/// Accepts any of the [`S3_SCHEME_ALIASES`] for `bucket`, regardless of which
+/// alias the storage was configured with (Java `S3FileIO` parity): the Glue
+/// catalog default configures scheme `s3a` while real Iceberg metadata locations
+/// are canonically `s3://`, and both must resolve.
+///
+/// The relative key is stripped using the length of the **matched** alias's
+/// prefix. `s3://` and `s3a://` differ by one character, so stripping a
+/// fixed/mismatched length would silently corrupt every key. Returns `None` when
+/// the location is for a different bucket or carries a non-S3 scheme, so the
+/// caller can reject it loudly.
+pub(crate) fn s3_relative_path<'a>(path: &'a str, bucket: &str) -> Option<&'a str> {
+    for scheme in S3_SCHEME_ALIASES {
+        let prefix = format!("{scheme}://{bucket}/");
+        if let Some(relative_path) = path.strip_prefix(&prefix) {
+            return Some(relative_path);
+        }
+    }
+    None
+}
+
 /// Custom AWS credential loader.
 /// This can be used to load credentials from a custom source, such as the AWS SDK.
 ///
@@ -175,5 +205,53 @@ impl CustomAwsCredentialLoader {
 impl AwsCredentialLoad for CustomAwsCredentialLoader {
     async fn load_credential(&self, client: Client) -> anyhow::Result<Option<AwsCredential>> {
         self.0.load_credential(client).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{S3_SCHEME_ALIASES, s3_relative_path};
+
+    /// Element F-A2-1/6: a location whose bucket differs from the operator's
+    /// configured bucket must not resolve under ANY alias. `create_operator`
+    /// derives the operator bucket from the path, so this wrong-bucket guard is
+    /// only observable by exercising the resolver directly with a mismatched
+    /// bucket — pinning it here keeps the guard (and its loud rejection) honest.
+    #[test]
+    fn test_s3_relative_path_rejects_wrong_bucket() {
+        for scheme in S3_SCHEME_ALIASES {
+            let path = format!("{scheme}://other-bucket/some/key");
+            assert_eq!(
+                s3_relative_path(&path, "my-bucket"),
+                None,
+                "{path} must be rejected for configured bucket my-bucket"
+            );
+        }
+    }
+
+    /// Element F-A2-1/8 (the strip-length trap): the alias prefixes differ in
+    /// length (`s3://` vs `s3a://`/`s3n://`), so the relative key must be stripped
+    /// using the MATCHED alias's prefix length. Every alias must therefore yield
+    /// the byte-identical key — asserted on the returned relative path, not merely
+    /// "resolved". A fixed/off-by-one strip length would corrupt the key here.
+    #[test]
+    fn test_s3_relative_path_strips_matched_alias_length_exactly() {
+        let expected_key = "db/tbl/metadata/00001-1a2b-uuid.metadata.json";
+        for scheme in S3_SCHEME_ALIASES {
+            let path = format!("{scheme}://warehouse/{expected_key}");
+            assert_eq!(
+                s3_relative_path(&path, "warehouse"),
+                Some(expected_key),
+                "{scheme}:// must strip to the exact key via the matched prefix length"
+            );
+        }
+
+        // A single-character key makes an off-by-one strip visible as a leading
+        // slash rather than a dropped character.
+        assert_eq!(s3_relative_path("s3://warehouse/k", "warehouse"), Some("k"));
+        assert_eq!(
+            s3_relative_path("s3a://warehouse/k", "warehouse"),
+            Some("k")
+        );
     }
 }
