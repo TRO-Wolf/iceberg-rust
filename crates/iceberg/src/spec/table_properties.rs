@@ -128,6 +128,17 @@ impl TableProperties {
     /// Default value for total maximum retry time (ms).
     pub const PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT: u64 = 30 * 60 * 1000; // 30 minutes
 
+    /// Reserved table property naming the table's default name mapping — the JSON `NameMapping`
+    /// used to resolve Iceberg field ids for data files that lack embedded field ids (the
+    /// `add_files` migration pattern, where a plain Parquet/ORC file carries column names but no
+    /// ids). Java `TableProperties.DEFAULT_NAME_MAPPING` (`javap`-verified ==
+    /// `"schema.name-mapping.default"` vs `iceberg-core-1.10.0.jar`). During scan planning the value
+    /// is parsed once per plan (Java `NameMappingParser.fromJson`) and threaded onto every
+    /// `FileScanTask`; the arrow reader applies it when a data file is missing field ids. Equal to
+    /// the canonical [`DEFAULT_SCHEMA_NAME_MAPPING`](crate::spec::DEFAULT_SCHEMA_NAME_MAPPING) string
+    /// (pinned by `test_property_default_name_mapping_matches_canonical` below).
+    pub const PROPERTY_DEFAULT_NAME_MAPPING: &str = "schema.name-mapping.default";
+
     /// Default file format for data files
     pub const PROPERTY_DEFAULT_FILE_FORMAT: &str = "write.format.default";
     /// Default file format for delete files
@@ -248,6 +259,21 @@ impl TryFrom<&HashMap<String, String>> for TableProperties {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_property_default_name_mapping_matches_canonical() {
+        // C-1: the property key equals Java `TableProperties.DEFAULT_NAME_MAPPING`
+        // (javap-verified == "schema.name-mapping.default") AND stays in lockstep with the
+        // canonical spec constant so the value has a single home. If either drifts this fails.
+        assert_eq!(
+            TableProperties::PROPERTY_DEFAULT_NAME_MAPPING,
+            "schema.name-mapping.default"
+        );
+        assert_eq!(
+            TableProperties::PROPERTY_DEFAULT_NAME_MAPPING,
+            crate::spec::DEFAULT_SCHEMA_NAME_MAPPING
+        );
+    }
 
     #[test]
     fn test_table_properties_default() {

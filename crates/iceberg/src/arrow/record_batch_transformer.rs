@@ -548,6 +548,22 @@ impl RecordBatchTransformer {
                 return SchemaComparison::Different;
             }
 
+            // A positional FIELD-ID mismatch means the file's physical column order differs from
+            // the projected (target) order — e.g. a name-mapped `add_files` file whose columns
+            // are stored in a different order than the table schema, or a projection that reads a
+            // subset out of physical order. The `NameChangesOnly` / `Equivalent` fast paths relabel
+            // or pass columns THROUGH by position, which would MISLABEL them (hand back the wrong
+            // column under a field's name — the wrong-column class). When both fields carry a
+            // parseable field id and they differ, force the field-id-based `Modify` path
+            // (`generate_transform_operations`), which sources each output column by field id.
+            if let (Some(source_id), Some(target_id)) = (
+                Self::field_id_of(source_field),
+                Self::field_id_of(target_field),
+            ) && source_id != target_id
+            {
+                return SchemaComparison::Different;
+            }
+
             if source_field.name() != target_field.name() {
                 names_changed = true;
             }
@@ -693,6 +709,16 @@ impl RecordBatchTransformer {
                 Ok(column_source)
             })
             .collect()
+    }
+
+    /// The Iceberg field id stamped on an Arrow field (`PARQUET:field_id` metadata), parsed as an
+    /// `i32`, or `None` when the field carries no (parseable) id. Used by [`Self::compare_schemas`]
+    /// to detect a physical-vs-projected reordering.
+    fn field_id_of(field: &FieldRef) -> Option<i32> {
+        field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse().ok())
     }
 
     fn build_field_id_to_arrow_schema_map(

@@ -512,6 +512,12 @@ impl<'a> TableScanBuilder<'a> {
             }
         });
 
+        // Parse the table's default name mapping (property `schema.name-mapping.default`) ONCE per
+        // plan (Java `NameMappingParser.fromJson`); the shared `Arc` is threaded onto every
+        // produced `FileScanTask` so the arrow reader can resolve field ids by column name for
+        // id-less data files. An unparsable value is a loud typed error naming the property.
+        let name_mapping = parse_name_mapping(self.table.metadata())?;
+
         let plan_context = PlanContext {
             snapshot,
             table_metadata: self.table.metadata_ref(),
@@ -521,6 +527,7 @@ impl<'a> TableScanBuilder<'a> {
             snapshot_bound_predicate: snapshot_bound_predicate.map(Arc::new),
             object_cache: self.table.object_cache(),
             field_ids,
+            name_mapping,
             partition_filter_cache: Arc::new(PartitionFilterCache::new()),
             manifest_evaluator_cache: Arc::new(ManifestEvaluatorCache::new()),
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
@@ -1130,7 +1137,7 @@ pub mod tests {
         DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
         ManifestListWriter, ManifestStatus, ManifestWriterBuilder, NestedField, PartitionSpec,
         PrimitiveType, Schema, SnapshotReference, SnapshotRetention, Struct, StructType,
-        TableMetadata, Transform, Type, UnboundPartitionField,
+        TableMetadata, TableProperties, Transform, Type, UnboundPartitionField,
     };
     use crate::table::Table;
 
@@ -1265,6 +1272,64 @@ pub mod tests {
             table_metadata
                 .partition_specs
                 .insert(0, table_metadata.default_spec.clone());
+
+            let table = Table::builder()
+                .metadata(table_metadata)
+                .identifier(TableIdent::from_strs(["db", "table1"]).unwrap())
+                .file_io(file_io.clone())
+                .metadata_location(table_metadata1_location.to_str().unwrap())
+                .build()
+                .unwrap();
+
+            Self {
+                table_location: table_location.to_str().unwrap().to_string(),
+                table,
+            }
+        }
+
+        /// Builds an UNPARTITIONED V2 fixture (schema `x,y,z,a,dbl,i32,i64,bool`, ids 1..8) with the
+        /// `schema.name-mapping.default` property set to `name_mapping_json`. Used by the name-mapping
+        /// scan-wiring pins: an unpartitioned base is required so the reader does NOT materialize
+        /// identity-partition columns as constants (which would bypass the file for `x`), and the
+        /// property drives [`parse_name_mapping`] during `build()`. Pass a deliberately-invalid JSON
+        /// to pin the loud-failure path.
+        pub fn new_with_name_mapping_property(name_mapping_json: &str) -> Self {
+            let tmp_dir = TempDir::new().unwrap();
+            let table_location = tmp_dir.path().join("table1");
+            let manifest_list1_location = table_location.join("metadata/manifests_list_1.avro");
+            let manifest_list2_location = table_location.join("metadata/manifests_list_2.avro");
+            let table_metadata1_location = table_location.join("metadata/v1.json");
+
+            let file_io = FileIO::new_with_fs();
+
+            let mut table_metadata = {
+                let template_json_str = fs::read_to_string(format!(
+                    "{}/testdata/example_table_metadata_v2.json",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .unwrap();
+                let metadata_json = render_template(&template_json_str, context! {
+                    table_location => &table_location,
+                    manifest_list_1_location => &manifest_list1_location,
+                    manifest_list_2_location => &manifest_list2_location,
+                    table_metadata_1_location => &table_metadata1_location,
+                });
+                serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
+            };
+
+            // Unpartition (see the doc comment: keep `x` a file column, not a partition constant).
+            table_metadata.default_spec = Arc::new(PartitionSpec::unpartition_spec());
+            table_metadata.partition_specs.clear();
+            table_metadata.default_partition_type = StructType::new(vec![]);
+            table_metadata
+                .partition_specs
+                .insert(0, table_metadata.default_spec.clone());
+
+            // Set the name-mapping property the scan planner parses.
+            table_metadata.properties.insert(
+                TableProperties::PROPERTY_DEFAULT_NAME_MAPPING.to_string(),
+                name_mapping_json.to_string(),
+            );
 
             let table = Table::builder()
                 .metadata(table_metadata)
@@ -2223,6 +2288,97 @@ pub mod tests {
             let data_file_manifest = writer.write_manifest_file().await.unwrap();
 
             // Write to manifest list
+            let mut manifest_list_write = ManifestListWriter::v2(
+                self.table
+                    .file_io()
+                    .new_output(current_snapshot.manifest_list())
+                    .unwrap(),
+                current_snapshot.snapshot_id(),
+                current_snapshot.parent_snapshot_id(),
+                current_snapshot.sequence_number(),
+            );
+            manifest_list_write
+                .add_manifests(vec![data_file_manifest].into_iter())
+                .unwrap();
+            manifest_list_write.close().await.unwrap();
+        }
+
+        /// Writes `1.parquet` as an ID-LESS parquet (no `PARQUET:field_id` field metadata — the
+        /// `add_files` migration shape) whose PHYSICAL column order is REVERSED relative to the
+        /// table schema: physical column 0 is `y`, column 1 is `x`, both `Int64`. Values are
+        /// `x = [1, 1, 1, 1]` and `y = [20, 30, 40, 50]`, chosen so the two columns are trivially
+        /// distinguishable. A position-based fallback (which assigns physical col 0 → field id 1 =
+        /// `x`) would read `y`'s values into `x` — provably WRONG; only the name mapping (`x`→1,
+        /// `y`→2) recovers the correct columns. Returns the file size for the manifest entry.
+        fn write_id_less_reversed_parquet(&self) -> u64 {
+            std::fs::create_dir_all(&self.table_location).unwrap();
+
+            // NB: deliberately NO PARQUET_FIELD_ID_META_KEY on any field, so the reader takes its
+            // "missing field ids" branch (name mapping when present, positional fallback otherwise).
+            let schema = Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("y", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("x", arrow_schema::DataType::Int64, false),
+            ]));
+
+            let y = Arc::new(Int64Array::from_iter_values(vec![20, 30, 40, 50])) as ArrayRef;
+            let x = Arc::new(Int64Array::from_iter_values(vec![1, 1, 1, 1])) as ArrayRef;
+            let to_write = RecordBatch::try_new(schema.clone(), vec![y, x]).unwrap();
+
+            let props = WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build();
+            let file = File::create(format!("{}/1.parquet", &self.table_location)).unwrap();
+            let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+            writer.write(&to_write).expect("Writing batch");
+            writer.close().unwrap();
+
+            std::fs::metadata(format!("{}/1.parquet", &self.table_location))
+                .unwrap()
+                .len()
+        }
+
+        /// Sets up a single-entry unpartitioned manifest over the ID-less reversed
+        /// `1.parquet` written by [`Self::write_id_less_reversed_parquet`]. The end-to-end
+        /// name-mapping read pin plans this and asserts the columns land correctly.
+        pub async fn setup_name_mapping_manifest_files(&mut self) {
+            let current_snapshot = self.table.metadata().current_snapshot().unwrap();
+            let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
+            let current_partition_spec = Arc::new(PartitionSpec::unpartition_spec());
+
+            let parquet_file_size = self.write_id_less_reversed_parquet();
+
+            let mut writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                Some(current_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+            .build_v2_data();
+
+            writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(0)
+                                .content(DataContentType::Data)
+                                .file_path(format!("{}/1.parquet", &self.table_location))
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(parquet_file_size)
+                                .record_count(4)
+                                .partition(Struct::empty())
+                                .key_metadata(None)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .unwrap();
+
+            let data_file_manifest = writer.write_manifest_file().await.unwrap();
+
             let mut manifest_list_write = ManifestListWriter::v2(
                 self.table
                     .file_io()
@@ -3398,6 +3554,180 @@ pub mod tests {
         let batch_2: Vec<_> = batch_stream.try_collect().await.unwrap();
 
         assert_eq!(batch_1, batch_2);
+    }
+
+    // ---- name-mapping scan wiring (C-5) ----
+
+    /// The mapping used by the name-mapping pins: `x`→field id 1, `y`→field id 2, matching the
+    /// unpartitioned fixture schema. Kebab-case JSON, exactly as Java `NameMappingParser` emits.
+    const NAME_MAPPING_X1_Y2: &str =
+        r#"[{"field-id":1,"names":["x"]},{"field-id":2,"names":["y"]}]"#;
+
+    /// C-5(a): a valid `schema.name-mapping.default` property is parsed once per plan and threaded
+    /// onto EVERY produced task, with the parsed CONTENT (not merely `is_some`).
+    #[tokio::test]
+    async fn test_plan_threads_name_mapping_onto_every_task() {
+        let mut fixture = TableTestFixture::new_with_name_mapping_property(NAME_MAPPING_X1_Y2);
+        fixture.setup_unpartitioned_manifest_files().await;
+
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert!(!tasks.is_empty(), "fixture must produce at least one task");
+        for task in &tasks {
+            let mapping = task
+                .name_mapping
+                .as_ref()
+                .expect("every planned task carries the parsed name mapping");
+            let fields = mapping.fields();
+            assert_eq!(fields.len(), 2, "mapping must have both mapped fields");
+            assert_eq!(fields[0].field_id(), Some(1));
+            assert_eq!(fields[0].names().to_vec(), vec!["x".to_string()]);
+            assert_eq!(fields[1].field_id(), Some(2));
+            assert_eq!(fields[1].names().to_vec(), vec!["y".to_string()]);
+        }
+    }
+
+    /// C-5(b): with NO name-mapping property the tasks carry `None` (the position-fallback path is
+    /// left untouched).
+    #[tokio::test]
+    async fn test_plan_absent_name_mapping_property_yields_none() {
+        let mut fixture = TableTestFixture::new_unpartitioned();
+        fixture.setup_unpartitioned_manifest_files().await;
+
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert!(!tasks.is_empty(), "fixture must produce at least one task");
+        for task in &tasks {
+            assert!(
+                task.name_mapping.is_none(),
+                "an absent property must leave name_mapping None"
+            );
+        }
+    }
+
+    /// C-5(c): an unparsable name-mapping property is a LOUD typed error that NAMES the property
+    /// (Java `NameMappingParser.fromJson` throws `UncheckedIOException` on invalid/empty content —
+    /// never a silent `None`).
+    #[tokio::test]
+    async fn test_invalid_name_mapping_property_is_loud_typed_error() {
+        let mut fixture =
+            TableTestFixture::new_with_name_mapping_property("{ this is not a valid name mapping");
+        fixture.setup_unpartitioned_manifest_files().await;
+
+        let err = fixture
+            .table
+            .scan()
+            .build()
+            .expect_err("an unparsable name-mapping property must fail the scan build loudly");
+
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            err.to_string()
+                .contains(TableProperties::PROPERTY_DEFAULT_NAME_MAPPING),
+            "the error must name the offending property, got: {err}"
+        );
+    }
+
+    /// C-5(d): END-TO-END. An ID-less parquet whose physical column order is REVERSED relative to
+    /// the schema scans to the CORRECT columns via the name mapping. This exercises the full
+    /// `TableScan` → plan → arrow-read path (not just the reader-level unit), and the mapping is
+    /// NON-trivial: a positional fallback would read `y`'s values into `x`, so the exact-value
+    /// asserts below go RED if the wiring re-hardcodes `name_mapping: None`.
+    #[tokio::test]
+    async fn test_scan_applies_name_mapping_to_id_less_parquet() {
+        let mut fixture = TableTestFixture::new_with_name_mapping_property(NAME_MAPPING_X1_Y2);
+        fixture.setup_name_mapping_manifest_files().await;
+
+        let table_scan = fixture.table.scan().select(["x", "y"]).build().unwrap();
+
+        // Wiring: the single planned task carries the parsed mapping.
+        let tasks: Vec<FileScanTask> = table_scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1, "single-entry manifest yields one task");
+        assert!(
+            tasks[0].name_mapping.is_some(),
+            "the planned task must carry the name mapping"
+        );
+
+        // End-to-end read: the reversed ID-less parquet must map to the CORRECT columns.
+        let batches: Vec<RecordBatch> = table_scan
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(!batches.is_empty(), "scan must return at least one batch");
+
+        let x = decode_int64_column(batches[0].column_by_name("x").unwrap());
+        let y = decode_int64_column(batches[0].column_by_name("y").unwrap());
+
+        // Under the name mapping, `x` resolves to the physical `x` column (all 1s). Under a
+        // positional fallback `x` would read physical column 0 (`y` = 20,30,40,50) — that contrast
+        // is the pin: these exact-value asserts are what a re-hardcoded `None` breaks.
+        assert_eq!(
+            x.values(),
+            &[1, 1, 1, 1],
+            "x must be the mapped physical x column (all 1s), not the positional y column"
+        );
+        assert_eq!(
+            y.values(),
+            &[20, 30, 40, 50],
+            "y must be the mapped physical y column"
+        );
+    }
+
+    /// C-5(d), subset projection. Projecting ONLY `x` out of the reversed ID-less parquet must
+    /// still read the physical `x` column (all 1s), not physical column 0 (`y`). This pins the
+    /// FIELD-ID-based projection mask: a positional projection would select physical column 0 by
+    /// `field_id - 1`, reading `y` (or, after the transformer reorders by id, producing a NULL
+    /// `x`) — so this asserts the reader's projection resolves the subset by field id.
+    #[tokio::test]
+    async fn test_scan_name_mapping_subset_projection_reads_correct_physical_column() {
+        let mut fixture = TableTestFixture::new_with_name_mapping_property(NAME_MAPPING_X1_Y2);
+        fixture.setup_name_mapping_manifest_files().await;
+
+        let table_scan = fixture.table.scan().select(["x"]).build().unwrap();
+        let batches: Vec<RecordBatch> = table_scan
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(!batches.is_empty(), "scan must return at least one batch");
+
+        let x = decode_int64_column(batches[0].column_by_name("x").unwrap());
+        assert_eq!(
+            x.values(),
+            &[1, 1, 1, 1],
+            "subset-projected x must resolve to the physical x column by field id"
+        );
     }
 
     #[tokio::test]
