@@ -39,6 +39,37 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-17b): G1 Glue type-string byte-parity — branch `fix/g1-glue-type-string-byte-parity`
+
+User-signed 2026-07-17 (the "G1→G2→G3" follow-up sequence after #152/#153/#154 merged;
+G2 = BUG-002 incremental-scan pin, G3 = HMS timestamptz design unit — queued next). OO AC.
+Spec: [g1-glue-type-string-byte-parity-brief.md](g1-glue-type-string-byte-parity-brief.md)
+(C-1…C-7, oracle pre-decoded from `iceberg-aws-1.10.0.jar` bytecode). Closes the #153
+Fable-max Critic residues: struct-join separator (fork `", "` vs Java `","`), naive-nano
+string (`"timestamp_ns"` vs Java's uniform `"timestamp_nano"`), plus the newly-surfaced
+Unknown question (Java renders `"unknown"`, never throws; fork rejects).
+
+- [x] **Build** — DONE 2026-07-17 (0aa61074, Opus Actor): C-1 separator `", "`→`","` (all
+      struct pins updated) · C-2 both nano variants → `"timestamp_nano"` (freeze lifted) ·
+      C-3 Unknown flipped reject→`"unknown"` (branch (a): UNKNOWN absent from the
+      `$SwitchMap` → Java's lowercase default, never throws; no fork dependency on the
+      reject) · C-4 field lambda decoded (`%s:%s`, fork already matched; citation added) ·
+      C-5 citations bytecode-verified; #153 byte-false comment corrected · C-6 byte-exact
+      pins incl. two-depth struct-in-struct; 3 mutations proven · C-7 R91 cell corrected
+      (glue renders "unknown"; hms fact left to G3). 27 crate tests.
+- [x] **Critic** — CONVERGED 2026-07-17 (independent Opus, fresh context, zero findings at
+      the S2 floor). Third independent bytecode decode: zero string divergence, all comment
+      offsets byte-accurate. Re-ran M1–M3 + extra M4 (field-lambda format corrupt → 4 pins
+      RED — coverage confirmed). Duty-3 verdict: Java's `toColumns` reaches `toTypeString`
+      with NO pre-converter validation, so end-to-end behavior matches (an unknown column
+      publishes "unknown" on both sides; V2-vs-V3 gate identical both sides). Residue
+      (LOW): live-Glue acceptance of "unknown"/"timestamp_nano" strings unverifiable
+      offline (parity holds either way — both engines emit byte-identical strings); Java's
+      unescaped `name:type` ambiguity for colon-bearing field names is shared, not a fork
+      defect.
+- [x] **Close-out** — tracker flipped, pushed, PR body delivered. NEXT: G2 (BUG-002
+      incremental-scan pin) after this merges, then G3 (HMS timestamptz design unit).
+
 ## ACTIVE UNIT (2026-07-17): BUG-002 name-mapping scan wiring — branch `fix/bug-002-name-mapping-scan-wiring`
 
 User-signed 2026-07-17: OO AC (Opus Actor / independent Opus Critic). Spec:
