@@ -25,8 +25,8 @@ pub(crate) const ICEBERG_FIELD_CURRENT: &str = "iceberg.field.current";
 use std::collections::HashMap;
 
 use aws_sdk_glue::types::Column;
+use iceberg::Result;
 use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, visit_schema};
-use iceberg::{Error, ErrorKind, Result};
 
 use crate::error::from_aws_build_error;
 
@@ -97,7 +97,12 @@ impl SchemaVisitor for GlueSchemaBuilder {
         r#_struct: &iceberg::spec::StructType,
         results: Vec<String>,
     ) -> iceberg::Result<String> {
-        Ok(format!("struct<{}>", results.join(", ")))
+        // Java joins struct fields with a BARE comma, no space:
+        // `fields.stream().map(...).collect(Collectors.joining(","))` wrapped in
+        // `String.format("struct<%s>", ...)` — bytecode-verified (javap, iceberg-aws-1.10.0.jar):
+        // `IcebergToGlueConverter.toTypeString` offsets 190 (`ldc "," → Collectors.joining`) and
+        // 205 (`ldc "struct<%s>"`).
+        Ok(format!("struct<{}>", results.join(",")))
     }
 
     fn after_struct_field(&mut self, _field: &iceberg::spec::NestedFieldRef) -> Result<()> {
@@ -111,6 +116,11 @@ impl SchemaVisitor for GlueSchemaBuilder {
         value: String,
     ) -> iceberg::Result<String> {
         if self.is_inside_struct() {
+            // Java renders each struct field as `name:type` via the struct-field lambda
+            // `String.format("%s:%s", field.name(), toTypeString(field.type()))` — bytecode-verified
+            // (javap, iceberg-aws-1.10.0.jar): `IcebergToGlueConverter.lambda$toTypeString$2` (`ldc
+            // "%s:%s"`, `NestedField.name()`, recursive `toTypeString(field.type())`). The name is
+            // emitted verbatim (no case-folding) and the type is the recursive conversion of `value`.
             return Ok(format!("{}:{}", field.name, &value));
         }
 
@@ -163,36 +173,37 @@ impl SchemaVisitor for GlueSchemaBuilder {
             PrimitiveType::Float => "float".to_string(),
             PrimitiveType::Double => "double".to_string(),
             PrimitiveType::Date => "date".to_string(),
-            PrimitiveType::Timestamp => "timestamp".to_string(),
-            PrimitiveType::TimestampNs => "timestamp_ns".to_string(),
-            // `timestamptz` (micros, with zone) shares Java `Type.TypeID.TIMESTAMP` with the naive
-            // `timestamp` (`TimestampType.typeId()` returns TIMESTAMP for BOTH zone variants,
-            // `Types.java:271`), so Java's Glue converter maps it via `case TIMESTAMP: return
-            // "timestamp"` (`IcebergToGlueConverter.java:315-316`, tag apache-iceberg-1.10.0). The
-            // Glue column type is informational only — the Iceberg metadata JSON is the source of
-            // truth — so the with/without-zone distinction is not represented, exactly as in Java.
-            PrimitiveType::Timestamptz => "timestamp".to_string(),
-            // `timestamptz_ns` (nanos, with zone) is Java `Type.TypeID.TIMESTAMP_NANO`
-            // (`TimestampNanoType.typeId()`, `Types.java:325`), which has NO explicit case in
+            // Both micros timestamp variants share Java `Type.TypeID.TIMESTAMP`
+            // (`TimestampType.typeId()` returns TIMESTAMP for BOTH zone variants), so Java's Glue
+            // converter maps them via `case TIMESTAMP: return "timestamp"` — bytecode-verified
+            // (javap, iceberg-aws-1.10.0.jar): `IcebergToGlueConverter.toTypeString` tableswitch
+            // index 10 → offset 120 (`ldc "timestamp"`). The Glue column type is informational only
+            // — the Iceberg metadata JSON is the source of truth — so the with/without-zone
+            // distinction is not represented, exactly as in Java.
+            PrimitiveType::Timestamp | PrimitiveType::Timestamptz => "timestamp".to_string(),
+            // Both nanos timestamp variants share Java `Type.TypeID.TIMESTAMP_NANO`
+            // (`TimestampNanoType.typeId()`), which has NO explicit case in
             // `IcebergToGlueConverter.toTypeString`, so Java falls through to `default: return
-            // type.typeId().name().toLowerCase(Locale.ENGLISH)` (`IcebergToGlueConverter.java:337-338`)
-            // = "timestamp_nano" (`Type.java:41`) — Java does NOT throw for nano-with-zone. (The naive
-            // `TimestampNs => "timestamp_ns"` arm above is a pre-existing fork mapping the F-A2-4
-            // charter froze; strict Java parity would render both nano variants "timestamp_nano".)
-            PrimitiveType::TimestamptzNs => "timestamp_nano".to_string(),
+            // type.typeId().name().toLowerCase(Locale.ENGLISH)` = "timestamp_nano" — bytecode-verified
+            // (javap, iceberg-aws-1.10.0.jar): the `$SwitchMap` references exactly 16 TypeIDs and
+            // TIMESTAMP_NANO is not among them, so `toTypeString` hits the default at offsets
+            // 291-306 (`typeId().name().toLowerCase(ENGLISH)`); `Type$TypeID.TIMESTAMP_NANO.name()`
+            // is "TIMESTAMP_NANO" → "timestamp_nano". Java does NOT throw for either nano variant.
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
+                "timestamp_nano".to_string()
+            }
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
                 "string".to_string()
             }
             PrimitiveType::Binary | PrimitiveType::Fixed(_) => "binary".to_string(),
-            // `unknown` has no Hive/Glue column type (it is an always-null column with no physical
-            // storage). Java's Glue/Hive type conversion has no UNKNOWN mapping and throws; mirror
-            // that here rather than fabricate a column type.
-            PrimitiveType::Unknown => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    format!("Conversion from {p:?} is not supported"),
-                ));
-            }
+            // `unknown` has no explicit case in `IcebergToGlueConverter.toTypeString`, so Java falls
+            // through to the same `default: return typeId().name().toLowerCase(Locale.ENGLISH)` as
+            // the nano variants — bytecode-verified (javap, iceberg-aws-1.10.0.jar): UNKNOWN is not
+            // among the 16 `$SwitchMap` TypeIDs, and `Type$TypeID.UNKNOWN.name()` is "UNKNOWN" →
+            // "unknown". Java does NOT throw in `toTypeString`; strict byte-parity renders "unknown".
+            // (This is a display-only Glue column type — nothing in the crate parses it back — and
+            // `unknown` remains an always-null column with no physical storage, as in Java.)
+            PrimitiveType::Unknown => "unknown".to_string(),
             PrimitiveType::Decimal { precision, scale } => {
                 format!("decimal({precision},{scale})")
             }
@@ -394,7 +405,62 @@ mod tests {
 
         let expected = vec![create_column(
             "person",
-            "struct<name:string, age:int>",
+            "struct<name:string,age:int>",
+            "1",
+            false,
+        )?];
+
+        assert_eq!(result, expected);
+
+        Ok(())
+    }
+
+    // C-6: struct-directly-inside-struct full-string pin. The bare-comma separator is load-bearing
+    // at TWO nesting depths — between the outer struct's fields AND between the inner struct's
+    // fields. Java oracle (bytecode-verified, iceberg-aws-1.10.0.jar): `struct<%s>` with fields
+    // joined by `Collectors.joining(",")` and each field rendered `%s:%s` (name:type). Mutation
+    // proof (C-6): reverting the struct join to `", "` reds this pin at both depths.
+    #[test]
+    fn test_schema_with_struct_inside_struct() -> Result<()> {
+        let record = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "outer",
+                    "required": true,
+                    "type": {
+                        "type": "struct",
+                        "fields": [
+                            { "id": 2, "name": "a", "required": true, "type": "int" },
+                            {
+                                "id": 3,
+                                "name": "inner",
+                                "required": true,
+                                "type": {
+                                    "type": "struct",
+                                    "fields": [
+                                        { "id": 4, "name": "x", "required": true, "type": "string" },
+                                        { "id": 5, "name": "y", "required": false, "type": "long" }
+                                    ]
+                                }
+                            },
+                            { "id": 6, "name": "b", "required": false, "type": "double" }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let schema = serde_json::from_str::<Schema>(record)?;
+        let metadata = create_metadata(schema)?;
+
+        let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
+
+        let expected = vec![create_column(
+            "outer",
+            "struct<a:int,inner:struct<x:string,y:bigint>,b:double>",
             "1",
             false,
         )?];
@@ -449,7 +515,7 @@ mod tests {
 
         let expected = vec![create_column(
             "location",
-            "array<struct<latitude:float, longitude:float>>",
+            "array<struct<latitude:float,longitude:float>>",
             "1",
             false,
         )?];
@@ -542,20 +608,22 @@ mod tests {
         Ok(())
     }
 
-    // RISK: `unknown` has no Hive/Glue column type (it is an always-null column with no physical
-    // storage). Java's Glue/Hive type conversion has no UNKNOWN mapping and throws; the Rust
-    // converter must fail loudly with FeatureUnsupported rather than fabricate a column type.
+    // Byte-parity pin (C-3): Java `IcebergToGlueConverter.toTypeString` has NO explicit UNKNOWN case,
+    // so it falls to `default: typeId().name().toLowerCase(Locale.ENGLISH)` = "unknown" and NEVER
+    // throws — bytecode-verified (javap, iceberg-aws-1.10.0.jar): UNKNOWN is not among the 16
+    // `$SwitchMap` TypeIDs; `Type$TypeID.UNKNOWN.name()` = "UNKNOWN". The Glue column type is
+    // display-only (nothing parses it back), so the fork renders "unknown" for strict byte-parity
+    // rather than rejecting. Mutation proof (C-6): reverting this arm to a `FeatureUnsupported`
+    // reject reds this test.
     #[test]
-    fn test_unknown_type_conversion_is_rejected() {
+    fn test_unknown_type_maps_to_glue_unknown_string() -> Result<()> {
         let mut builder = GlueSchemaBuilder {
             schema: Vec::new(),
             is_current: true,
             depth: 0,
         };
-        let error = builder
-            .primitive(&PrimitiveType::Unknown)
-            .expect_err("unknown has no Glue type");
-        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        assert_eq!(builder.primitive(&PrimitiveType::Unknown)?, "unknown");
+        Ok(())
     }
 
     // ENTRY / REPRO PIN (F-A2-4). A Spark-written table carries `timestamptz` columns (Spark
@@ -594,18 +662,17 @@ mod tests {
         Ok(())
     }
 
-    // Java-oracle type strings for the WHOLE timestamp family, asserted at the primitive funnel
-    // (mirrors `test_unknown_type_conversion_is_rejected`'s direct-primitive style). Oracle:
-    // `IcebergToGlueConverter.toTypeString` @ apache-iceberg-1.10.0.
-    //   * micros, both zone variants → Java `Type.TypeID.TIMESTAMP` (`Types.java:271`) →
-    //     `case TIMESTAMP: return "timestamp"` (`IcebergToGlueConverter.java:315-316`).
-    //   * nanos, both zone variants → Java `Type.TypeID.TIMESTAMP_NANO` (`Types.java:325`), no
-    //     explicit case → `default: type.typeId().name().toLowerCase(Locale.ENGLISH)`
-    //     (`IcebergToGlueConverter.java:337-338`) = "timestamp_nano" (`Type.java:41`).
-    // The naive vs. tz nano asymmetry ("timestamp_ns" vs "timestamp_nano") is intentional &
-    // disclosed: the naive `TimestampNs => "timestamp_ns"` arm is a pre-existing fork mapping the
-    // F-A2-4 charter froze ("naive mappings unchanged"); strict Java parity maps both to
-    // "timestamp_nano". This pin locks BOTH the fixed tz mappings and the frozen naive mappings.
+    // Java-oracle type strings for the WHOLE timestamp family, asserted at the primitive funnel.
+    // Oracle: `IcebergToGlueConverter.toTypeString` — bytecode-verified (javap, iceberg-aws-1.10.0.jar).
+    //   * micros, both zone variants → Java `Type.TypeID.TIMESTAMP` → tableswitch index 10 → offset
+    //     120 (`ldc "timestamp"`).
+    //   * nanos, both zone variants → Java `Type.TypeID.TIMESTAMP_NANO`, which is NOT among the 16
+    //     `$SwitchMap` TypeIDs → `default: typeId().name().toLowerCase(Locale.ENGLISH)` (offsets
+    //     291-306) = "timestamp_nano" (`TIMESTAMP_NANO.name()` lowercased).
+    // C-2: both nano variants now render "timestamp_nano" (Java's shared `TypeID.TIMESTAMP_NANO`
+    // forces byte-identical output — `typeId()` has no zone/precision branch). This pin is
+    // separator-agnostic; it locks the exact primitive strings across the whole timestamp family.
+    // Mutation proof (C-6): reverting either nano arm to "timestamp_ns" reds this matrix.
     #[test]
     fn test_timestamp_family_glue_type_strings() -> Result<()> {
         let mut builder = GlueSchemaBuilder {
@@ -614,17 +681,15 @@ mod tests {
             depth: 0,
         };
 
-        // Fixed by F-A2-4 (were `FeatureUnsupported` rejects):
+        assert_eq!(builder.primitive(&PrimitiveType::Timestamp)?, "timestamp");
         assert_eq!(builder.primitive(&PrimitiveType::Timestamptz)?, "timestamp");
+        assert_eq!(
+            builder.primitive(&PrimitiveType::TimestampNs)?,
+            "timestamp_nano"
+        );
         assert_eq!(
             builder.primitive(&PrimitiveType::TimestamptzNs)?,
             "timestamp_nano"
-        );
-        // Naive regressions (charter-frozen, must stay unchanged):
-        assert_eq!(builder.primitive(&PrimitiveType::Timestamp)?, "timestamp");
-        assert_eq!(
-            builder.primitive(&PrimitiveType::TimestampNs)?,
-            "timestamp_ns"
         );
 
         Ok(())
@@ -634,8 +699,11 @@ mod tests {
     // double + long at top level, PLUS a nested struct carrying a `timestamptz` leaf AND a list
     // whose element is a `timestamptz` — round-trips the FULL `from_iceberg` create_table
     // schema-build path (not just the primitive fn), proving nested timestamptz leaves normalize.
-    // Matches Java `IcebergToGlueConverter.toTypeString`'s recursive struct/list handling
-    // (`IcebergToGlueConverter.java:323-336`): `struct<name:type,...>` / `array<type>`.
+    // Matches Java `IcebergToGlueConverter.toTypeString`'s recursive struct/list handling —
+    // bytecode-verified (javap, iceberg-aws-1.10.0.jar): the struct field lambda emits
+    // `String.format("%s:%s", name, toTypeString(type))` joined by a BARE comma
+    // (`Collectors.joining(",")`) inside `struct<%s>`, and lists render `array<%s>` — so the exact
+    // strings are `struct<name:type,...>` (no space) / `array<type>`.
     #[test]
     fn test_acceptance_shaped_schema_with_nested_timestamptz() -> Result<()> {
         let record = r#"{
@@ -684,7 +752,7 @@ mod tests {
             create_column("seq", "bigint", "4", false)?,
             create_column(
                 "meta",
-                "struct<created_at:timestamp, label:string>",
+                "struct<created_at:timestamp,label:string>",
                 "5",
                 false,
             )?,
