@@ -55,8 +55,16 @@ wiring correct but unpinned). Spec:
       promoted to `pub` in `scan/mod.rs` tests). Mutation RED set = exactly the 2 new
       C-1/C-2 pins; all 5 snapshot pins + C-3 stayed green; wiring proven correct — no
       production change, no matrix edit (R143 does not claim incremental coverage).*
-- [ ] **Critic** (independent Fable, fresh context) — convergence is the Critic's call.
-- [ ] **Close-out** — tracker flip, push, PR body delivered. G3 (HMS timestamptz, FF)
+- [x] **Critic** — CONVERGED 2026-07-17 (independent Fable, fresh context, zero blocking
+      findings). Test-only claim PROVEN (every hunk inside `#[cfg(test)]`; compiled crate
+      bit-for-bit unaffected). Re-ran the Actor's mutation (exact unique-guard RED set
+      confirmed) + 3 novel probes: expected-array swap (C-2 discriminates live values),
+      property-forced-onto-C-3-fixture (RED at the `is_none` assert — pins the fallback,
+      not "a read succeeded"), degenerate range (file-outside-range cannot pass). Reader-
+      path fidelity verified: test defaults byte-identical to `to_arrow`'s knobs. Residue
+      (LOW): value asserts read `batches[0]` only (safe at the 4-row fixture); the
+      to_arrow-path docstring holds for default-configured consumers.
+- [x] **Close-out** — tracker flipped, pushed, PR body delivered. G3 (HMS timestamptz, FF)
       follows after merge.
 
 ## DONE 2026-07-17 (merged #155): G1 Glue type-string byte-parity — was branch `fix/g1-glue-type-string-byte-parity`
