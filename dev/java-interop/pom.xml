@@ -79,6 +79,33 @@
       <version>${iceberg.version}</version>
     </dependency>
     <!--
+      NAME-MAPPING interop (GAP_MATRIX row R143): the oracle must write an ID-LESS parquet data file (a
+      plain Parquet file with NO Iceberg field ids — the add_files migration shape) so the Rust reader
+      exercises the `schema.name-mapping.default` path. Iceberg's own parquet writer always stamps field
+      ids, so we use parquet-avro's `AvroParquetWriter` over a plain Avro schema (no field ids). Version
+      1.16.0 matches the parquet `iceberg-parquet` 1.10.0 already resolves. A TEST-ORACLE dep ONLY —
+      mirrors the iceberg-parquet/iceberg-orc deps above; the Rust crate's Cargo files are untouched. The
+      writer uses parquet's `PlainParquetConfiguration` + `ParquetIO.file(OutputFile)` bridge, so no
+      hadoop-fs/hadoop-conf classes are referenced at compile time.
+    -->
+    <dependency>
+      <groupId>org.apache.parquet</groupId>
+      <artifactId>parquet-avro</artifactId>
+      <version>1.16.0</version>
+    </dependency>
+    <!--
+      `hadoop-client-api` supplies `org.apache.hadoop.fs.Path` / `org.apache.hadoop.conf.Configuration`
+      — the hadoop API classes the `AvroParquetWriter` builder references at BOTH compile and run time.
+      This is the standard hadoop-client pairing: `-api` (compile+runtime API classes) alongside the
+      already-present shaded `-runtime` (third-party runtime deps), designed to coexist. Self-contained
+      jar (only snappy-java transitively, already resolved). A TEST-ORACLE dep ONLY.
+    -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client-api</artifactId>
+      <version>3.3.6</version>
+    </dependency>
+    <!--
       ORC DATA-FILE interop (GAP_MATRIX row 116): iceberg-orc provides the ORC writer
       GenericAppenderFactory.newDataWriter(..., FileFormat.ORC, null) routes to (GenericOrcWriter /
       ORC.write(...)), which stamps the `iceberg.id` ORC type attributes the Rust by-field-id reader
