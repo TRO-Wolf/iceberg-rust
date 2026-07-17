@@ -3625,27 +3625,30 @@ pub mod tests {
         }
     }
 
-    /// C-5(c): an unparsable name-mapping property is a LOUD typed error that NAMES the property
-    /// (Java `NameMappingParser.fromJson` throws `UncheckedIOException` on invalid/empty content —
-    /// never a silent `None`).
+    /// C-5(c) / C-3: an unparsable name-mapping property is a LOUD typed error that NAMES the
+    /// property — never a silent `None`. Each partition element Java rejects is pinned: malformed
+    /// JSON, an EMPTY value, and a WHITESPACE-only value. Java `NameMappingParser.fromJson(String)`
+    /// delegates to `ObjectMapper.readValue`, which throws (wrapped as `UncheckedIOException`) on
+    /// all three — Jackson reports "no content" for empty/whitespace — so Rust must fail loud too.
     #[tokio::test]
     async fn test_invalid_name_mapping_property_is_loud_typed_error() {
-        let mut fixture =
-            TableTestFixture::new_with_name_mapping_property("{ this is not a valid name mapping");
-        fixture.setup_unpartitioned_manifest_files().await;
+        // `build()` parses the property (once per plan), so an unparsable value errors there.
+        for bad in ["{ this is not a valid name mapping", "", "   "] {
+            let fixture = TableTestFixture::new_with_name_mapping_property(bad);
 
-        let err = fixture
-            .table
-            .scan()
-            .build()
-            .expect_err("an unparsable name-mapping property must fail the scan build loudly");
+            let err = fixture.table.scan().build().err().unwrap_or_else(|| {
+                panic!(
+                    "an unparsable name-mapping property ({bad:?}) must fail the scan build loudly"
+                )
+            });
 
-        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
-        assert!(
-            err.to_string()
-                .contains(TableProperties::PROPERTY_DEFAULT_NAME_MAPPING),
-            "the error must name the offending property, got: {err}"
-        );
+            assert_eq!(err.kind(), crate::ErrorKind::DataInvalid, "value = {bad:?}");
+            assert!(
+                err.to_string()
+                    .contains(TableProperties::PROPERTY_DEFAULT_NAME_MAPPING),
+                "the error must name the offending property (value = {bad:?}), got: {err}"
+            );
+        }
     }
 
     /// C-5(d): END-TO-END. An ID-less parquet whose physical column order is REVERSED relative to
