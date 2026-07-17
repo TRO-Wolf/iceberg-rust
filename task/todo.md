@@ -39,6 +39,22 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-17b): G1 Glue type-string byte-parity — branch `fix/g1-glue-type-string-byte-parity`
+
+User-signed 2026-07-17 (the "G1→G2→G3" follow-up sequence after #152/#153/#154 merged;
+G2 = BUG-002 incremental-scan pin, G3 = HMS timestamptz design unit — queued next). OO AC.
+Spec: [g1-glue-type-string-byte-parity-brief.md](g1-glue-type-string-byte-parity-brief.md)
+(C-1…C-7, oracle pre-decoded from `iceberg-aws-1.10.0.jar` bytecode). Closes the #153
+Fable-max Critic residues: struct-join separator (fork `", "` vs Java `","`), naive-nano
+string (`"timestamp_ns"` vs Java's uniform `"timestamp_nano"`), plus the newly-surfaced
+Unknown question (Java renders `"unknown"`, never throws; fork rejects).
+
+- [ ] **Build** (Opus Actor): C-1 separator · C-2 nano · C-3 Unknown decision-from-evidence ·
+      C-4 struct-field lambda decode · C-5 citation upgrades · C-6 byte-exact pins +
+      mutation proofs · C-7 matrix check.
+- [ ] **Critic** (independent Opus, fresh context) — convergence is the Critic's call.
+- [ ] **Close-out** — tracker flip, push, PR body delivered.
+
 ## ACTIVE UNIT (2026-07-17): BUG-002 name-mapping scan wiring — branch `fix/bug-002-name-mapping-scan-wiring`
 
 User-signed 2026-07-17: OO AC (Opus Actor / independent Opus Critic). Spec:
