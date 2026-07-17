@@ -190,18 +190,19 @@ invokes the driver [`scripts/run_interop_suites.sh`](../../scripts/run_interop_s
 
 - **Dynamic discovery** — the suite set is globbed at run time, so a new `run-interop-*.sh`
   is picked up with zero maintenance. **Ratchet the driver's `SUITE_FLOOR_DEFAULT` (48 at
-  authoring, 2026-07-10) in the same change that adds a suite** — discovery below the floor
-  fails the run, so an accidentally-emptied glob cannot green.
+  authoring 2026-07-10; **49** since R158's `run-interop-staged-txn.sh`, 2026-07-16) in the
+  same change that adds a suite** — discovery below the floor fails the run, so an
+  accidentally-emptied glob cannot green.
 - **Missing prerequisites hard-fail** (mvn / the JDK-11 home / cargo) — never a skip.
 - **Continue-on-failure across suites** — one red suite cannot hide the others; the per-suite
   PASS/FAIL table lands in the job step summary.
 - The CI job always runs the **full discovered set**; the driver's `--only` subset flag is for
   local iteration only and logs every suite it drops.
-- Runner provisioning: all 48 suites default to `/opt/maven/bin/mvn` and
-  `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` (47 hardcode them outright; only
+- Runner provisioning: all 49 suites default to `/opt/maven/bin/mvn` and
+  `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` (48 hardcode them outright; only
   `run-interop-aggregate.sh` reads `$MVN`/`$JAVA_HOME`), so the workflow installs the apt
   `openjdk-11-jdk-headless` + `maven` and symlinks `/opt/maven` — and primes `~/.m2` online
-  once, because 47 of the 48 suites invoke `mvn -o` (offline).
+  once, because 48 of the 49 suites invoke `mvn -o` (offline).
 - Outside the nightly set (named deferral): `run.sh` (the metadata-evolution pass above) and
   `run-inspection-manifests.sh` do not match the `run-interop-*.sh` glob.
 

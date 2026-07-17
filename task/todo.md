@@ -39,6 +39,30 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-16): R158 Java interop battery (🟡→✅) — branch `parity/r158-staged-txn-interop`
+
+User-signed 2026-07-16: OO AC (Opus Actor / Opus Critic, both at MAX effort) via the Workflow
+ladder. Spec: [r158-staged-txn-interop-brief.md](r158-staged-txn-interop-brief.md) (C-1…C-9 +
+the E-INV replace-invariant enumeration); this section is the tracker.
+
+- [x] **Build** — DONE 2026-07-16 (9b421afa, Opus-max Actor): suite `run-interop-staged-txn.sh`
+      (7 steps: Java d1 gen → Rust d2 gen → C-5 cross-check → Java verify → Rust verify →
+      3 sabotages) + `InteropOracle.java` scenario (REAL `Transactions.create/replaceTableTransaction`
+      over a committable `LocalTableOperations`, mirroring `BaseMetastoreCatalog` — no hand-rolled
+      metadata) + `tests/interop_staged_txn.rs`; all C-1…C-9, E-INV(1–7) pinned per-cycle BOTH
+      directions; V1-stays-V1 + property-directed upgrade both directions; SB1–SB3 RED +
+      hard-fail-never-skip (pattern-absent ⇒ exit 3 ⇒ restore + exit 1); floor 48→49; zero
+      production-code change (no parity bug exposed — the D1/D4 fixes held against real Java).
+- [x] **Critic ladder** — CONVERGED cycle 1, ZERO findings at the S2 floor (Opus-max, fresh
+      context). Critic re-ran the full gate + suite + selftest + 49-discovery itself, and
+      mutation-tested SIX verifier assertions across BOTH directions (spliced UUID → Rust RED;
+      fmtv leak + last_column_id reduction → Java RED; committed SB1–SB3 observed RED) — proving
+      the cross-engine wiring non-tautological (mutating d1 flips only Rust, d2 only Java).
+      Java fidelity verified against /tmp/iceberg-java-ref source (buildReplacement,
+      persistedProperties, assignFreshIds seeding). Full taxonomy attestation in the run record.
+- [x] **Flip + close** — R158 ✅ (residues (1)–(3) retained verbatim; dated 2026-07-16),
+      ENGINE_CONTRACT §8a item 5 → PROVEN. Pushed for PR.
+
 ## ACTIVE UNIT (2026-07-15): fork-atomicity remediation (R158 staged create/replace) — branch `feat/replace-table-transaction`
 
 SEPMO Actor–Critic unit hardening the just-landed R158 staged transaction (tip 9280320b). Two
