@@ -26,7 +26,6 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
-use futures::future::try_join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::FormatVersion;
@@ -43,29 +42,35 @@ pub(crate) struct IcebergSchemaProvider {
     catalog: Arc<dyn Catalog>,
     /// The namespace this schema represents
     namespace: NamespaceIdent,
-    /// A concurrent map where keys are table names
-    /// and values are dynamic references to objects implementing the
-    /// [`TableProvider`] trait.
-    /// Wrapped in Arc to allow sharing across async boundaries in register_table.
-    tables: Arc<DashMap<String, Arc<IcebergTableProvider>>>,
+    /// Directory of the table names known in this namespace, captured from `list_tables` at
+    /// construction and updated by `register_table` / `deregister_table`.
+    ///
+    /// The value is the LAZILY-resolved provider: `None` until the table is first referenced,
+    /// `Some` once its metadata has been loaded. A key's presence means the table was *listed* —
+    /// it does NOT imply the table's metadata is loadable. The metadata read (an object-storage
+    /// round-trip) is deferred to [`SchemaProvider::table`] (see [`Self::resolve_table`]), matching
+    /// Java/Spark lazy-by-name resolution: a table that cannot load never fails registration nor any
+    /// query that does not reference it, and errors loud — by name — only at reference. Wrapped in
+    /// `Arc` to share across the async boundary in `register_table`.
+    tables: Arc<DashMap<String, Option<Arc<IcebergTableProvider>>>>,
 }
 
 impl IcebergSchemaProvider {
-    /// Asynchronously tries to construct a new [`IcebergSchemaProvider`]
-    /// using the given client to fetch and initialize table providers for
-    /// the provided namespace in the Iceberg [`Catalog`].
+    /// Asynchronously constructs a new [`IcebergSchemaProvider`] for the given namespace.
     ///
-    /// This method retrieves a list of table names
-    /// attempts to create a table provider for each table name, and
-    /// collects these providers into a `HashMap`.
+    /// Registration LISTS the namespace's table names only — it must NOT read any table's metadata.
+    /// Each listed name is recorded with an unresolved (`None`) provider; the metadata read is
+    /// deferred to [`SchemaProvider::table`] (see [`Self::resolve_table`]). This is Java/Spark
+    /// lazy-by-name parity: a foreign, unreadable, or IAM-blocked table never fails registration nor
+    /// any query that does not reference it (it errors loud, by name, only at reference), and
+    /// construction is O(#tables to *list*) rather than O(#tables to *load*).
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
     ) -> Result<Self> {
-        // TODO:
-        // Tables and providers should be cached based on table_name
-        // if we have a cache miss; we update our internal cache & check again
-        // As of right now; tables might become stale.
+        // The listed name set is captured once here; a table created/dropped in the catalog after
+        // construction is not reflected until the provider is rebuilt (the pre-existing staleness
+        // note). Resolution of each name to a provider is lazy — see `resolve_table`.
         let table_names: Vec<_> = client
             .list_tables(&namespace)
             .await?
@@ -73,17 +78,9 @@ impl IcebergSchemaProvider {
             .map(|tbl| tbl.name().to_string())
             .collect();
 
-        let providers = try_join_all(
-            table_names
-                .iter()
-                .map(|name| IcebergTableProvider::try_new(client.clone(), namespace.clone(), name))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-
         let tables = Arc::new(DashMap::new());
-        for (name, provider) in table_names.into_iter().zip(providers.into_iter()) {
-            tables.insert(name, Arc::new(provider));
+        for name in table_names {
+            tables.insert(name, None);
         }
 
         Ok(IcebergSchemaProvider {
@@ -91,6 +88,56 @@ impl IcebergSchemaProvider {
             namespace,
             tables,
         })
+    }
+
+    /// Lazily resolves a base table name to its catalog-backed provider, caching the result.
+    ///
+    /// - An unknown name (not in this namespace's listing) returns `Ok(None)` — never a metadata read.
+    /// - A known-but-unresolved name performs the ONE deferred `load_table` (the object-storage read)
+    ///   via [`IcebergTableProvider::try_new`], caches the provider, and returns it.
+    /// - A load failure is surfaced as a loud [`DataFusionError`] NAMING the table (propagated, never
+    ///   swallowed to `Ok(None)`), and is NOT cached — a later reference re-attempts the load.
+    ///
+    /// The DashMap guard is dropped before the `.await` (the state is copied out first), so a shard
+    /// lock is never held across the load.
+    async fn resolve_table(&self, name: &str) -> DFResult<Option<Arc<IcebergTableProvider>>> {
+        enum State {
+            Loaded(Arc<IcebergTableProvider>),
+            KnownUnresolved,
+            Unknown,
+        }
+
+        let state = match self.tables.get(name) {
+            Some(entry) => match entry.value() {
+                Some(provider) => State::Loaded(provider.clone()),
+                None => State::KnownUnresolved,
+            },
+            None => State::Unknown,
+        };
+
+        match state {
+            State::Loaded(provider) => Ok(Some(provider)),
+            State::Unknown => Ok(None),
+            State::KnownUnresolved => {
+                // The single deferred metadata read. A failure here is the loud, by-name error the
+                // lazy contract promises — propagate it; do NOT swallow to `Ok(None)`.
+                let provider = Arc::new(
+                    IcebergTableProvider::try_new(
+                        self.catalog.clone(),
+                        self.namespace.clone(),
+                        name,
+                    )
+                    .await
+                    .map_err(to_datafusion_error)?,
+                );
+                // Cache the resolved provider, but only while the name is still listed — a concurrent
+                // `deregister_table` must not be resurrected.
+                if let Some(mut entry) = self.tables.get_mut(name) {
+                    *entry.value_mut() = Some(provider.clone());
+                }
+                Ok(Some(provider))
+            }
+        }
     }
 }
 
@@ -129,21 +176,24 @@ impl SchemaProvider for IcebergSchemaProvider {
         if let Some((table_name, metadata_table_name)) = name.split_once('$') {
             let metadata_table_type =
                 MetadataTableType::try_from(metadata_table_name).map_err(DataFusionError::Plan)?;
-            if let Some(table) = self.tables.get(table_name) {
-                let metadata_table = table
-                    .metadata_table(metadata_table_type)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                return Ok(Some(Arc::new(metadata_table)));
-            } else {
-                return Ok(None);
-            }
+            // Lazily resolve the BASE table, then build the requested metadata table over it. An
+            // unloadable base errors loud (by name) here, exactly as a direct reference would.
+            return match self.resolve_table(table_name).await? {
+                Some(table) => {
+                    let metadata_table = table
+                        .metadata_table(metadata_table_type)
+                        .await
+                        .map_err(to_datafusion_error)?;
+                    Ok(Some(Arc::new(metadata_table)))
+                }
+                None => Ok(None),
+            };
         }
 
         Ok(self
-            .tables
-            .get(name)
-            .map(|entry| entry.value().clone() as Arc<dyn TableProvider>))
+            .resolve_table(name)
+            .await?
+            .map(|provider| provider as Arc<dyn TableProvider>))
     }
 
     fn register_table(
@@ -210,8 +260,8 @@ impl SchemaProvider for IcebergSchemaProvider {
             .await
             .map_err(to_datafusion_error)?;
 
-            // Store the new table provider
-            tables.insert(name_clone, Arc::new(table_provider));
+            // Store the new table provider (already resolved).
+            tables.insert(name_clone, Some(Arc::new(table_provider)));
 
             Ok(None)
         })
@@ -241,10 +291,12 @@ impl SchemaProvider for IcebergSchemaProvider {
                 .await
                 .map_err(to_datafusion_error)?;
 
-            // Remove from local cache and return the removed provider
+            // Remove from local cache and return the removed provider (if it had been resolved; a
+            // listed-but-never-loaded entry holds `None` and yields `None` here).
             let removed = tables
                 .remove(&table_name)
-                .map(|(_, table)| table as Arc<dyn TableProvider>);
+                .and_then(|(_, provider)| provider)
+                .map(|provider| provider as Arc<dyn TableProvider>);
 
             Ok(removed)
         })

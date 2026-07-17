@@ -54,6 +54,13 @@
   policy, and isolation-level selection remain engine-owned (§5–§6). The boundary rule: anything
   provable by the Java interop oracle lives in this fork (including engine-generic DataFusion
   execs); anything Spark-flavored lives in the consumer.
+- **Lazy, failure-tolerant catalog registration (2026-07-17).** `IcebergCatalogProvider::try_new`
+  lists namespaces and table *names* only — it reads **no** table metadata. Each table's metadata is
+  loaded on first reference in `SchemaProvider::table` (async), so a single foreign / unreadable /
+  IAM-blocked table cannot brick session construction (startup is O(#tables to *list*), not
+  O(#tables to *load*)); a good table queries while an unloadable one coexists; and the unloadable
+  table errors loud — **by name** — only when it is referenced. This mirrors Java/Spark lazy-by-name
+  resolution; `table_names()` / `table_exist()` report the full listing regardless of loadability.
 
 ## 2. Read surface
 
