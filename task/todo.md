@@ -47,9 +47,14 @@ wiring correct but unpinned). Spec:
 [g2-incremental-name-mapping-pin-brief.md](g2-incremental-name-mapping-pin-brief.md)
 (C-1…C-5; escape hatch only for a proven-broken wiring).
 
-- [ ] **Build** (Fable Actor): C-1 plan-level pin · C-2 e2e contrast via incremental
+- [x] **Build** (Fable Actor): C-1 plan-level pin · C-2 e2e contrast via incremental
       stream · C-3 absent-property fallback pin · C-4 live mutation proof (incremental
       site RED, snapshot pins GREEN) · C-5 reuse #154 fixtures/helpers.
+      *Done 2026-07-17: 3 pins beside the incremental tests (`scan/incremental.rs`),
+      reusing the #154 fixture/helpers (`NAME_MAPPING_X1_Y2` + `decode_int64_column`
+      promoted to `pub` in `scan/mod.rs` tests). Mutation RED set = exactly the 2 new
+      C-1/C-2 pins; all 5 snapshot pins + C-3 stayed green; wiring proven correct — no
+      production change, no matrix edit (R143 does not claim incremental coverage).*
 - [ ] **Critic** (independent Fable, fresh context) — convergence is the Critic's call.
 - [ ] **Close-out** — tracker flip, push, PR body delivered. G3 (HMS timestamptz, FF)
       follows after merge.

@@ -1152,8 +1152,9 @@ pub mod tests {
     /// identity-partitioned column (Java `PartitionUtil.constantsMap`). A plain
     /// `Int64Array` passes through unchanged. Used by the read tests so they assert
     /// on logical values regardless of whether a column is a materialized partition
-    /// constant or read from the data file.
-    fn decode_int64_column(column: &ArrayRef) -> Int64Array {
+    /// constant or read from the data file. `pub` because the incremental-scan
+    /// read pins (`incremental.rs`) reuse it.
+    pub fn decode_int64_column(column: &ArrayRef) -> Int64Array {
         arrow_cast::cast::cast(column, &arrow_schema::DataType::Int64)
             .expect("column is castable to Int64")
             .as_any()
@@ -3560,7 +3561,9 @@ pub mod tests {
 
     /// The mapping used by the name-mapping pins: `x`→field id 1, `y`→field id 2, matching the
     /// unpartitioned fixture schema. Kebab-case JSON, exactly as Java `NameMappingParser` emits.
-    const NAME_MAPPING_X1_Y2: &str =
+    /// `pub` because the incremental-scan pins (`incremental.rs`) reuse it against the same
+    /// fixture rather than duplicating the literal.
+    pub const NAME_MAPPING_X1_Y2: &str =
         r#"[{"field-id":1,"names":["x"]},{"field-id":2,"names":["y"]}]"#;
 
     /// C-5(a): a valid `schema.name-mapping.default` property is parsed once per plan and threaded
