@@ -1678,11 +1678,14 @@ mod tests {
     use std::fs::File;
     use std::io::BufReader;
 
+    use arrow_array::RecordBatch;
     use futures::TryStreamExt;
 
+    use crate::arrow::ArrowReaderBuilder;
     use crate::expr::Reference;
     use crate::memory::tests::new_memory_catalog;
     use crate::scan::FileScanTask;
+    use crate::scan::tests::{NAME_MAPPING_X1_Y2, TableTestFixture, decode_int64_column};
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
         Operation, Struct, TableMetadata,
@@ -2162,6 +2165,209 @@ mod tests {
             HashSet::from([format!("{}/1.parquet", &fixture.table_location)]),
             "only the Added entry (1.parquet) is returned; the Existing (3.parquet) and \
              Deleted (2.parquet) entries of the snapshot's own manifest are excluded"
+        );
+    }
+
+    // ---- incremental name-mapping wiring pins ----
+    //
+    // The `name_mapping: parse_name_mapping(...)` line in `IncrementalAppendScanBuilder::build`
+    // is a SEPARATE wiring site from the snapshot scan's (`TableScanBuilder::build`): the
+    // snapshot-scan pins in `scan/mod.rs` stay green if the incremental parse is dropped. The
+    // pins below uniquely guard the incremental site (mutation-proven: hardcoding
+    // `name_mapping: None` there reds exactly these while the snapshot pins stay green).
+
+    /// Resolves the incremental range `(parent, current]` over a [`TableTestFixture`]: the
+    /// fixture's single written manifest is added by the CURRENT snapshot, so this range
+    /// selects exactly that manifest (the same technique as
+    /// [`test_incremental_append_keeps_only_added_entries_of_own_manifest`]).
+    fn parent_to_current_range(table: &Table) -> (i64, i64) {
+        let metadata = table.metadata();
+        let current_snapshot = metadata
+            .current_snapshot()
+            .expect("fixture has a current snapshot");
+        let parent = current_snapshot
+            .parent_snapshot_id()
+            .expect("fixture's current snapshot has a parent");
+        (parent, current_snapshot.snapshot_id())
+    }
+
+    /// PLAN-LEVEL NAME MAPPING: an incremental append scan over a table whose metadata
+    /// carries `schema.name-mapping.default` yields tasks that ALL carry the parsed mapping
+    /// CONTENT (field ids + names, not merely `is_some`) — mirroring the snapshot-scan pin
+    /// `test_plan_threads_name_mapping_onto_every_task` in `scan/mod.rs`, but driving the
+    /// `IncrementalAppendScanBuilder::build` wiring site the snapshot pins never touch.
+    #[tokio::test]
+    async fn test_incremental_append_threads_name_mapping_onto_every_task() {
+        let mut fixture = TableTestFixture::new_with_name_mapping_property(NAME_MAPPING_X1_Y2);
+        fixture.setup_name_mapping_manifest_files().await;
+        let (parent, current) = parent_to_current_range(&fixture.table);
+
+        let scan = fixture
+            .table
+            .incremental_append_scan()
+            .from_snapshot_id_exclusive(parent)
+            .to_snapshot_id(current)
+            .build()
+            .expect("building the incremental scan over a name-mapped table should succeed");
+
+        let tasks: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .expect("plan_files should succeed")
+            .try_collect()
+            .await
+            .expect("collecting file scan tasks should succeed");
+
+        assert!(
+            !tasks.is_empty(),
+            "the name-mapping fixture must produce at least one incremental task"
+        );
+        for task in &tasks {
+            let mapping = task
+                .name_mapping
+                .as_ref()
+                .expect("every incremental task carries the parsed name mapping");
+            let fields = mapping.fields();
+            assert_eq!(fields.len(), 2, "mapping must have both mapped fields");
+            assert_eq!(fields[0].field_id(), Some(1));
+            assert_eq!(fields[0].names().to_vec(), vec!["x".to_string()]);
+            assert_eq!(fields[1].field_id(), Some(2));
+            assert_eq!(fields[1].names().to_vec(), vec!["y".to_string()]);
+        }
+    }
+
+    /// END-TO-END NAME MAPPING: an ID-less parquet whose physical column order is REVERSED
+    /// relative to the table schema, appended WITHIN the incremental range, reads to the
+    /// CORRECT columns through the incremental scan's stream. `IncrementalAppendScan` has no
+    /// `to_arrow`, so the planned stream feeds the same [`ArrowReaderBuilder`] path
+    /// `TableScan::to_arrow` uses — exactly as an engine would. The mapping is NON-trivial:
+    /// a positional fallback would read physical column 0 (`y` = 20,30,40,50) into `x`, so
+    /// the exact-value asserts below go RED if `IncrementalAppendScanBuilder::build`
+    /// re-hardcodes `name_mapping: None`.
+    #[tokio::test]
+    async fn test_incremental_append_applies_name_mapping_to_id_less_parquet() {
+        let mut fixture = TableTestFixture::new_with_name_mapping_property(NAME_MAPPING_X1_Y2);
+        fixture.setup_name_mapping_manifest_files().await;
+        let (parent, current) = parent_to_current_range(&fixture.table);
+
+        let scan = fixture
+            .table
+            .incremental_append_scan()
+            .from_snapshot_id_exclusive(parent)
+            .to_snapshot_id(current)
+            .select(["x", "y"])
+            .build()
+            .expect("building the incremental scan over a name-mapped table should succeed");
+
+        let batches: Vec<RecordBatch> = ArrowReaderBuilder::new(fixture.table.file_io().clone())
+            .build()
+            .read(scan.plan_files().await.expect("plan_files should succeed"))
+            .expect("reading the incremental task stream should succeed")
+            .try_collect()
+            .await
+            .expect("collecting record batches should succeed");
+        assert!(
+            !batches.is_empty(),
+            "the incremental read must return at least one batch"
+        );
+
+        let x = decode_int64_column(
+            batches[0]
+                .column_by_name("x")
+                .expect("batch must have column x"),
+        );
+        let y = decode_int64_column(
+            batches[0]
+                .column_by_name("y")
+                .expect("batch must have column y"),
+        );
+        assert_eq!(
+            x.values(),
+            &[1, 1, 1, 1],
+            "x must be the mapped physical x column (all 1s), not the positional y column"
+        );
+        assert_eq!(
+            y.values(),
+            &[20, 30, 40, 50],
+            "y must be the mapped physical y column"
+        );
+    }
+
+    /// ABSENT PROPERTY (positional fallback): the same ID-less reversed-parquet shape
+    /// WITHOUT `schema.name-mapping.default` plans every task with `name_mapping: None` and
+    /// still reads via the POSITIONAL fallback — physical column 0 is assigned field id 1
+    /// (= `x`), so `x` carries the physical first column's values (20,30,40,50). Regression
+    /// guard for the `None` path: the absent property must neither error nor accidentally
+    /// name-map.
+    #[tokio::test]
+    async fn test_incremental_append_absent_name_mapping_uses_positional_fallback() {
+        let mut fixture = TableTestFixture::new_unpartitioned();
+        fixture.setup_name_mapping_manifest_files().await;
+        let (parent, current) = parent_to_current_range(&fixture.table);
+
+        let scan = fixture
+            .table
+            .incremental_append_scan()
+            .from_snapshot_id_exclusive(parent)
+            .to_snapshot_id(current)
+            .select(["x", "y"])
+            .build()
+            .expect("building the incremental scan without a name mapping should succeed");
+
+        let tasks: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .expect("plan_files should succeed")
+            .try_collect()
+            .await
+            .expect("collecting file scan tasks should succeed");
+        assert!(
+            !tasks.is_empty(),
+            "the fixture must produce at least one incremental task"
+        );
+        for task in &tasks {
+            assert!(
+                task.name_mapping.is_none(),
+                "an absent property must leave name_mapping None on every incremental task"
+            );
+        }
+
+        // Re-plan and read end-to-end: with no mapping the reader falls back to positional
+        // field ids, so the schema's `x` (field id 1) resolves to PHYSICAL column 0 — the
+        // reversed file's `y` data. This is the documented fallback semantic (Java
+        // `ParquetSchemaUtil.addFallbackIds`), and the value-level CONTRAST with the
+        // name-mapped test above proves the property alone flips the outcome.
+        let batches: Vec<RecordBatch> = ArrowReaderBuilder::new(fixture.table.file_io().clone())
+            .build()
+            .read(scan.plan_files().await.expect("plan_files should succeed"))
+            .expect("reading the incremental task stream should succeed")
+            .try_collect()
+            .await
+            .expect("collecting record batches should succeed");
+        assert!(
+            !batches.is_empty(),
+            "the incremental fallback read must return at least one batch"
+        );
+
+        let x = decode_int64_column(
+            batches[0]
+                .column_by_name("x")
+                .expect("batch must have column x"),
+        );
+        let y = decode_int64_column(
+            batches[0]
+                .column_by_name("y")
+                .expect("batch must have column y"),
+        );
+        assert_eq!(
+            x.values(),
+            &[20, 30, 40, 50],
+            "without a mapping, x must be read positionally (physical column 0)"
+        );
+        assert_eq!(
+            y.values(),
+            &[1, 1, 1, 1],
+            "without a mapping, y must be read positionally (physical column 1)"
         );
     }
 

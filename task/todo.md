@@ -39,7 +39,35 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
-## ACTIVE UNIT (2026-07-17b): G1 Glue type-string byte-parity — branch `fix/g1-glue-type-string-byte-parity`
+## ACTIVE UNIT (2026-07-17c): G2 incremental-scan name-mapping pin — branch `fix/g2-incremental-name-mapping-pin`
+
+User-signed 2026-07-17: **FF AC (Fable Actor / independent Fable Critic)** — the user's
+chosen mode for G2+G3. Test-only unit closing the #154 Critic's residue (incremental
+wiring correct but unpinned). Spec:
+[g2-incremental-name-mapping-pin-brief.md](g2-incremental-name-mapping-pin-brief.md)
+(C-1…C-5; escape hatch only for a proven-broken wiring).
+
+- [x] **Build** (Fable Actor): C-1 plan-level pin · C-2 e2e contrast via incremental
+      stream · C-3 absent-property fallback pin · C-4 live mutation proof (incremental
+      site RED, snapshot pins GREEN) · C-5 reuse #154 fixtures/helpers.
+      *Done 2026-07-17: 3 pins beside the incremental tests (`scan/incremental.rs`),
+      reusing the #154 fixture/helpers (`NAME_MAPPING_X1_Y2` + `decode_int64_column`
+      promoted to `pub` in `scan/mod.rs` tests). Mutation RED set = exactly the 2 new
+      C-1/C-2 pins; all 5 snapshot pins + C-3 stayed green; wiring proven correct — no
+      production change, no matrix edit (R143 does not claim incremental coverage).*
+- [x] **Critic** — CONVERGED 2026-07-17 (independent Fable, fresh context, zero blocking
+      findings). Test-only claim PROVEN (every hunk inside `#[cfg(test)]`; compiled crate
+      bit-for-bit unaffected). Re-ran the Actor's mutation (exact unique-guard RED set
+      confirmed) + 3 novel probes: expected-array swap (C-2 discriminates live values),
+      property-forced-onto-C-3-fixture (RED at the `is_none` assert — pins the fallback,
+      not "a read succeeded"), degenerate range (file-outside-range cannot pass). Reader-
+      path fidelity verified: test defaults byte-identical to `to_arrow`'s knobs. Residue
+      (LOW): value asserts read `batches[0]` only (safe at the 4-row fixture); the
+      to_arrow-path docstring holds for default-configured consumers.
+- [x] **Close-out** — tracker flipped, pushed, PR body delivered. G3 (HMS timestamptz, FF)
+      follows after merge.
+
+## DONE 2026-07-17 (merged #155): G1 Glue type-string byte-parity — was branch `fix/g1-glue-type-string-byte-parity`
 
 User-signed 2026-07-17 (the "G1→G2→G3" follow-up sequence after #152/#153/#154 merged;
 G2 = BUG-002 incremental-scan pin, G3 = HMS timestamptz design unit — queued next). OO AC.
