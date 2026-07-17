@@ -39,6 +39,37 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## ACTIVE UNIT (2026-07-17): BUG-002 name-mapping scan wiring — branch `fix/bug-002-name-mapping-scan-wiring`
+
+User-signed 2026-07-17: OO AC (Opus Actor / independent Opus Critic). Spec:
+[bug-002-name-mapping-scan-brief.md](bug-002-name-mapping-scan-brief.md) (C-1…C-7); this
+section is the tracker. The bug (external audit 2026-07-10, deferred backlog): the scan
+hardcodes `name_mapping: None` (`scan/context.rs` TODO) while the downstream
+(`FileScanTask.name_mapping` → ArrowReader `apply_name_mapping_to_arrow_schema`) is fully
+built — ID-less-Parquet tables with `schema.name-mapping.default` read via position
+fallback (wrong-data class) instead of the mapping (Java-divergent).
+
+- [x] **Build** — DONE 2026-07-17 (8680f149 fix+pins+R143 cell, 3aaca2fa interop suite,
+      4d559190 empty/whitespace pins; Opus Actor). All 7 clauses landed, PLUS the e2e pin
+      exposed TWO further wrong-column bugs the brief's escape hatch authorized fixing, each
+      uniquely mutation-pinned: (a) `arrow/reader.rs` used the positional projection mask
+      even when a mapping applied; (b) `record_batch_transformer.rs::compare_schemas`
+      compared by position → reordered name-mapped files relabeled in place. C-4 decided
+      delete-task sites stay `None` (javap: Java `GenericReader`/`DeleteFilter`/
+      `BaseDeleteLoader` have zero name-mapping references — engine data reads only).
+      Deviation (flagged for merge): `dev/java-interop/pom.xml` +2 test-oracle deps
+      (parquet-avro 1.16.0, hadoop-client-api 3.3.6) to write ID-less parquet.
+- [x] **Critic** — CONVERGED 2026-07-17 (independent Opus, fresh context, zero findings at
+      the S2 floor). Re-decoded the Java jars itself (C-3/C-4 confirmed; novel non-array
+      probes matched Java beyond the enumerated partition), re-ran all 3 mutations (each fix
+      distinctly+uniquely pinned), blast-radius analysis: both downstream fixes are
+      no-op for embedded-id and no-mapping files. Interop: 50/50 discovery, D1 content-equal,
+      sabotage RED via the id-less differential (embedded ids would have made it vacuous-
+      green — RED proves the mapping is load-bearing). Residue (LOW): incremental-scan
+      wiring correct but untested (F-1); driver floor comment staleness (F-2, fixed in
+      close-out).
+- [x] **Close-out** — tracker flipped, floor comment refreshed, pushed, PR body delivered.
+
 ## ACTIVE UNIT (2026-07-16): R158 Java interop battery (🟡→✅) — branch `parity/r158-staged-txn-interop`
 
 User-signed 2026-07-16: OO AC (Opus Actor / Opus Critic, both at MAX effort) via the Workflow

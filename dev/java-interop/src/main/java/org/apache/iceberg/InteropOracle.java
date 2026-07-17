@@ -199,6 +199,22 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-name-mapping":
+        // NAME-MAPPING scan wiring, DIRECTION 1 — "Rust reads what JAVA wrote" (GAP_MATRIX row R143).
+        // Writes an ID-LESS parquet (no embedded field ids — the add_files migration shape) whose PHYSICAL
+        // column order is REVERSED relative to the schema ([val, id]), appends it as a DataFile, and sets
+        // `schema.name-mapping.default` (the core-API equivalent of Spark's add_files). It writes TWO
+        // fixtures under <dir>: `normal/` with the CORRECT mapping (id->1, val->2) and `sabotage/` with the
+        // two names SWAPPED (id->2, val->1). The Rust verifier reads `normal/` and asserts the mapped
+        // columns; the SABOTAGE leg reruns the SAME verifier over `sabotage/` and requires it to go RED
+        // (the swapped mapping reads the columns transposed). Java core's own reader cannot name-map an
+        // id-less file (iceberg-data GenericReader never calls withNameMapping), so the ground truth is by
+        // CONSTRUCTION (what we wrote), not a Java read.
+        Path nameMappingDir = requireFixturesDir("interop.name_mapping.dir");
+        NameMappingOracle.generate(nameMappingDir.resolve("normal"), NameMappingOracle.NORMAL_MAPPING);
+        NameMappingOracle.generate(
+            nameMappingDir.resolve("sabotage"), NameMappingOracle.SWAPPED_MAPPING);
+        break;
       case "generate-interop-incremental-scans":
         // INCREMENTAL SCANS, DIRECTION 1 — "Rust plans what JAVA wrote" (GAP_MATRIX rows 120/121). Writes a
         // 4-snapshot V2 table (S1 append a, S2 append b, S3 append c, S4 OVERWRITE delete-a/add-d) with
@@ -4642,6 +4658,145 @@ public final class InteropOracle {
                 + "Rust position-delete), merge-on-read live rows = {10,30,50}");
       }
       return failures;
+    }
+  }
+
+  // ===========================================================================================
+  // NAME-MAPPING oracle — GAP_MATRIX row R143 (schema.name-mapping.default scan wiring).
+  //
+  // Writes a V2 UNPARTITIONED table {1: id long, 2: val long} over a single ID-LESS parquet data file
+  // (written via parquet-avro's AvroParquetWriter, so NO Iceberg field ids are stamped — the add_files
+  // migration shape) whose PHYSICAL column order is REVERSED relative to the schema: physical column 0
+  // is `val`, column 1 is `id`. Rows: id=[10,20,30], val=[100,200,300]. The table's
+  // `schema.name-mapping.default` maps NAMES to field ids; only a field-id-by-name read recovers the
+  // correct columns. A positional fallback (or the swapped sabotage mapping) reads them TRANSPOSED.
+  // ===========================================================================================
+  static final class NameMappingOracle {
+    private NameMappingOracle() {}
+
+    /** Correct mapping: `id`->field 1, `val`->field 2 (recovers the right columns). */
+    static final String NORMAL_MAPPING =
+        "[{\"field-id\":1,\"names\":[\"id\"]},{\"field-id\":2,\"names\":[\"val\"]}]";
+
+    /** Sabotage mapping: the two names SWAPPED (`id`->2, `val`->1) — reads the columns transposed. */
+    static final String SWAPPED_MAPPING =
+        "[{\"field-id\":2,\"names\":[\"id\"]},{\"field-id\":1,\"names\":[\"val\"]}]";
+
+    private static final long[] IDS = {10L, 20L, 30L};
+    private static final long[] VALS = {100L, 200L, 300L};
+
+    /**
+     * Build the table under {@code <dir>/table} over an ID-less reversed parquet, set {@code
+     * schema.name-mapping.default} = {@code mappingJson}, write {@code final.metadata.json}, and emit the
+     * ground-truth rows (by construction) to {@code java_name_mapping_rows.json}.
+     */
+    static void generate(Path dir, String mappingJson) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "val", Types.LongType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_name_mapping");
+
+      // Write the ID-less reversed parquet, then register it as a DataFile (path + format + size + count;
+      // no metrics needed for an unfiltered scan). This mirrors `add_files` registering a plain Hive file.
+      String dataPath = new File(dataDir, "00000-idless.parquet").getAbsolutePath();
+      long recordCount = writeIdLessReversedParquet(dataPath);
+      DataFile dataFile =
+          DataFiles.builder(spec)
+              .withPath(dataPath)
+              .withFormat(FileFormat.PARQUET)
+              .withFileSizeInBytes(new File(dataPath).length())
+              .withRecordCount(recordCount)
+              .build();
+      table.newAppend().appendFile(dataFile).commit();
+
+      // Set the name-mapping property (core-API equivalent of the Spark `add_files` procedure).
+      table.updateProperties().set(TableProperties.DEFAULT_NAME_MAPPING, mappingJson).commit();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      writeJson(dir.resolve("java_name_mapping_rows.json"), groundTruthRowsJson());
+      System.out.println(
+          "generated name-mapping table (mapping=" + mappingJson + ") + ground truth to " + dir);
+    }
+
+    /**
+     * Write an ID-LESS parquet via {@code AvroParquetWriter} (plain Avro schema ⇒ no Iceberg field ids in
+     * the parquet type metadata) with PHYSICAL columns in REVERSED order {@code [val, id]}. Returns the
+     * record count.
+     */
+    private static long writeIdLessReversedParquet(String path) throws IOException {
+      org.apache.avro.Schema avroSchema =
+          org.apache.avro.SchemaBuilder.record("row")
+              .fields()
+              .name("val")
+              .type()
+              .longType()
+              .noDefault()
+              .name("id")
+              .type()
+              .longType()
+              .noDefault()
+              .endRecord();
+
+      // AvroParquetWriter over a hadoop Path writes to the local filesystem (hadoop's LocalFileSystem
+      // handles the bare absolute path). The parquet-avro + hadoop-client-api compile deps are
+      // TEST-ORACLE only (see the pom). A plain Avro schema carries no field ids ⇒ id-less parquet.
+      try (org.apache.parquet.hadoop.ParquetWriter<org.apache.avro.generic.GenericRecord> writer =
+          org.apache.parquet.avro.AvroParquetWriter.<org.apache.avro.generic.GenericRecord>builder(
+                  new org.apache.hadoop.fs.Path(path))
+              .withSchema(avroSchema)
+              .withConf(new org.apache.hadoop.conf.Configuration())
+              .build()) {
+        for (int i = 0; i < IDS.length; i++) {
+          org.apache.avro.generic.GenericData.Record rec =
+              new org.apache.avro.generic.GenericData.Record(avroSchema);
+          rec.put("val", VALS[i]);
+          rec.put("id", IDS[i]);
+          writer.write(rec);
+        }
+      }
+      return IDS.length;
+    }
+
+    /** Ground-truth rows {@code [{id, val}]} sorted by id — what a correct name-mapped read must yield. */
+    private static String groundTruthRowsJson() {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (int i = 0; i < IDS.length; i++) {
+              gen.writeStartObject();
+              gen.writeNumberField("id", IDS[i]);
+              gen.writeNumberField("val", VALS[i]);
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
     }
   }
 

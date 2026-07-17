@@ -30,10 +30,49 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, PartitionSpecRef, SchemaRef,
-    SnapshotRef, TableMetadataRef,
+    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
+    PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef, TableProperties,
 };
 use crate::{Error, ErrorKind, Result};
+
+/// Parses the table's `schema.name-mapping.default` property into a shared [`NameMapping`],
+/// mirroring Java `NameMappingParser.fromJson(String)`. Java delegates to `JsonUtil.parse` →
+/// `ObjectMapper.readValue(json, JsonNode.class)` and wraps any parse `IOException` in an
+/// `UncheckedIOException` (verified in `iceberg-core-1.10.0.jar` bytecode): a present-but-
+/// unparsable value is therefore a LOUD failure, not a silent fallback. An ABSENT property
+/// yields `None` — Java's caller passes `null` and never invokes `fromJson`, so the reader keeps
+/// its positional field-id fallback for that table.
+///
+/// Called ONCE per plan; the returned `Arc` is threaded onto every [`FileScanTask`] the plan
+/// produces (via [`ManifestFileContext`] → [`ManifestEntryContext`]), so no task re-parses. An
+/// empty or whitespace-only value fails to parse — matching Java, where Jackson reports
+/// "no content" and the `UncheckedIOException` propagates — surfacing here as a typed
+/// [`DataInvalid`](crate::ErrorKind::DataInvalid) error that names the property.
+///
+/// [`FileScanTask`]: crate::scan::FileScanTask
+pub(crate) fn parse_name_mapping(
+    table_metadata: &TableMetadata,
+) -> Result<Option<Arc<NameMapping>>> {
+    let Some(json) = table_metadata
+        .properties()
+        .get(TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
+    else {
+        return Ok(None);
+    };
+
+    let name_mapping: NameMapping = serde_json::from_str(json).map_err(|err| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Failed to parse table property `{}` as a name mapping",
+                TableProperties::PROPERTY_DEFAULT_NAME_MAPPING
+            ),
+        )
+        .with_source(err)
+    })?;
+
+    Ok(Some(Arc::new(name_mapping)))
+}
 
 /// Wraps a [`ManifestFile`] alongside the objects that are needed
 /// to process it in a thread-safe manner
@@ -62,6 +101,15 @@ pub(crate) struct ManifestFileContext {
     /// `PartitionUtil.constantsMap`). `None` only when the spec id cannot be resolved
     /// in the table metadata, in which case the reader reads those columns from the file.
     partition_spec: Option<PartitionSpecRef>,
+
+    /// The table's default name mapping (property `schema.name-mapping.default`), parsed once per
+    /// plan and shared across every manifest. Threaded onto each [`FileScanTask`] so the arrow
+    /// reader can resolve field ids by column name when a data file lacks embedded field ids (the
+    /// `add_files` migration pattern; Java `ParquetSchemaUtil.applyNameMapping`). `None` when the
+    /// table has no name-mapping property (the reader then uses positional fallback ids).
+    ///
+    /// [`FileScanTask`]: crate::scan::FileScanTask
+    name_mapping: Option<Arc<NameMapping>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -86,6 +134,14 @@ pub(crate) struct ManifestEntryContext {
     /// onto the produced [`FileScanTask`] to activate identity-partition constant
     /// materialization in the arrow reader (Java `PartitionUtil.constantsMap`).
     pub partition_spec: Option<PartitionSpecRef>,
+
+    /// The table's default name mapping, shared from the manifest context (parsed once per plan).
+    /// Threaded onto the produced [`FileScanTask`] so the arrow reader resolves field ids by column
+    /// name for data files that lack embedded field ids. `None` when the table has no name-mapping
+    /// property.
+    ///
+    /// [`FileScanTask`]: crate::scan::FileScanTask
+    pub name_mapping: Option<Arc<NameMapping>>,
 }
 
 impl ManifestFileContext {
@@ -103,6 +159,7 @@ impl ManifestFileContext {
             delete_file_index,
             residual_evaluator,
             partition_spec,
+            name_mapping,
             ..
         } = self;
 
@@ -121,6 +178,7 @@ impl ManifestFileContext {
                 case_sensitive: self.case_sensitive,
                 residual_evaluator: residual_evaluator.clone(),
                 partition_spec: partition_spec.clone(),
+                name_mapping: name_mapping.clone(),
             };
 
             sender
@@ -182,8 +240,11 @@ impl ManifestEntryContext {
             // materializes each file's constants under its own spec.
             partition: Some(self.manifest_entry.data_file.partition.clone()),
             partition_spec: self.partition_spec.clone(),
-            // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
-            name_mapping: None,
+            // The table's default name mapping (property `schema.name-mapping.default`), parsed
+            // ONCE per plan and shared down PlanContext → ManifestFileContext → here. The arrow
+            // reader applies it when THIS data file lacks embedded field ids (Java
+            // `ParquetSchemaUtil.applyNameMapping`); `None` when the table has no such property.
+            name_mapping: self.name_mapping.clone(),
             case_sensitive: self.case_sensitive,
 
             // Thread the data file's split offsets (Java `ContentFile.splitOffsets()`, field id
@@ -234,6 +295,12 @@ pub(crate) struct PlanContext {
     pub snapshot_bound_predicate: Option<Arc<BoundPredicate>>,
     pub object_cache: Arc<ObjectCache>,
     pub field_ids: Arc<Vec<i32>>,
+
+    /// The table's default name mapping (property `schema.name-mapping.default`), parsed ONCE per
+    /// plan via [`parse_name_mapping`] and shared (as an `Arc`) onto every manifest/file context
+    /// so no task re-parses. `None` when the table has no name-mapping property (readers then use
+    /// positional fallback field ids for id-less data files).
+    pub name_mapping: Option<Arc<NameMapping>>,
 
     pub partition_filter_cache: Arc<PartitionFilterCache>,
     pub manifest_evaluator_cache: Arc<ManifestEvaluatorCache>,
@@ -459,6 +526,7 @@ impl PlanContext {
             case_sensitive: self.case_sensitive,
             residual_evaluator,
             partition_spec,
+            name_mapping: self.name_mapping.clone(),
         })
     }
 }

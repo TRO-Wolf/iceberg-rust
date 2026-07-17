@@ -69,10 +69,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
-# The discovery floor: the number of run-interop-*.sh suites (49 as of 2026-07-16, when
-# run-interop-staged-txn.sh was added for R158). RATCHET THIS UP when a suite is added (same
-# change); lower it only with a deliberate removal.
-SUITE_FLOOR_DEFAULT=49
+# The discovery floor: the number of run-interop-*.sh suites (50 as of 2026-07-17, when
+# run-interop-name-mapping.sh was added for BUG-002). RATCHET THIS UP when a suite is added
+# (same change); lower it only with a deliberate removal.
+SUITE_FLOOR_DEFAULT=50
 
 SUITES_DIR_DEFAULT="${REPO_ROOT}/dev/java-interop"
 MVN_DEFAULT="/opt/maven/bin/mvn"

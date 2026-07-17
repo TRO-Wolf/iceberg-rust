@@ -451,6 +451,16 @@ impl ArrowReader {
             arrow_metadata
         };
 
+        // Whether the final projection must fall back to POSITION-based matching. This is true
+        // ONLY when the file lacked embedded field ids AND no name mapping supplied them (Branch 3
+        // above, `ParquetSchemaUtil.addFallbackIds` → `pruneColumnsFallback`). When a name mapping
+        // WAS applied (Branch 2), the schema now carries the correct Iceberg field ids stamped by
+        // `apply_name_mapping_to_arrow_schema`, so projection must be FIELD-ID-based (Java
+        // `applyNameMapping` → `pruneColumns`) — a positional projection here would ignore the
+        // mapping and read columns by physical position, the wrong-column class this whole path
+        // exists to prevent.
+        let use_position_fallback = missing_field_ids && task.name_mapping.is_none();
+
         // Coerce INT96 timestamp columns to the resolution specified by the Iceberg schema.
         // This must happen before building the stream reader to avoid i64 overflow in arrow-rs.
         let arrow_metadata = if let Some(coerced_schema) =
@@ -493,7 +503,7 @@ impl ArrowReader {
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
-            missing_field_ids, // Whether to use position-based (true) or field-ID-based (false) projection
+            use_position_fallback, // position-based (true) only for id-less files with NO name mapping
         )?;
 
         record_batch_stream_builder =

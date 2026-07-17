@@ -59,7 +59,7 @@ use std::sync::Arc;
 use futures::channel::mpsc::{Sender, channel};
 use futures::{SinkExt, StreamExt, TryStreamExt};
 
-use super::context::{ManifestEntryContext, PlanContext};
+use super::context::{ManifestEntryContext, PlanContext, parse_name_mapping};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::events::{self, IncrementalScanEvent};
 use crate::expr::{Bind, Predicate};
@@ -360,6 +360,10 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
             snapshot_bound_predicate: snapshot_bound_predicate.map(Arc::new),
             object_cache: self.table.object_cache(),
             field_ids: Arc::new(field_ids),
+            // Parse the table's default name mapping once per plan (Java
+            // `NameMappingParser.fromJson`) so an id-less data file added within the incremental
+            // range resolves field ids by column name, exactly as the snapshot scan does.
+            name_mapping: parse_name_mapping(self.table.metadata())?,
             partition_filter_cache: Arc::new(PartitionFilterCache::new()),
             manifest_evaluator_cache: Arc::new(ManifestEvaluatorCache::new()),
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
