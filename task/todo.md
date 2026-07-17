@@ -49,13 +49,26 @@ hardcodes `name_mapping: None` (`scan/context.rs` TODO) while the downstream
 built — ID-less-Parquet tables with `schema.name-mapping.default` read via position
 fallback (wrong-data class) instead of the mapping (Java-divergent).
 
-- [ ] **Build** (Opus Actor): C-1 property constant · C-2 once-per-plan parse + thread to
-      every task · C-3 Java-faithful failure semantics · C-4 delete-file-task decision from
-      Java source · C-5 unit pins incl. the position-fallback-would-be-WRONG e2e contrast ·
-      C-6 interop suite + floor 49→50 + maps lockstep · C-7 R143 cell note.
-- [ ] **Critic** (independent Opus, fresh context) — convergence is the Critic's call;
-      MEDIUM+/S2+ blocks; mutation-proofs re-run live.
-- [ ] **Close-out** — tracker flip, push, PR body delivered.
+- [x] **Build** — DONE 2026-07-17 (8680f149 fix+pins+R143 cell, 3aaca2fa interop suite,
+      4d559190 empty/whitespace pins; Opus Actor). All 7 clauses landed, PLUS the e2e pin
+      exposed TWO further wrong-column bugs the brief's escape hatch authorized fixing, each
+      uniquely mutation-pinned: (a) `arrow/reader.rs` used the positional projection mask
+      even when a mapping applied; (b) `record_batch_transformer.rs::compare_schemas`
+      compared by position → reordered name-mapped files relabeled in place. C-4 decided
+      delete-task sites stay `None` (javap: Java `GenericReader`/`DeleteFilter`/
+      `BaseDeleteLoader` have zero name-mapping references — engine data reads only).
+      Deviation (flagged for merge): `dev/java-interop/pom.xml` +2 test-oracle deps
+      (parquet-avro 1.16.0, hadoop-client-api 3.3.6) to write ID-less parquet.
+- [x] **Critic** — CONVERGED 2026-07-17 (independent Opus, fresh context, zero findings at
+      the S2 floor). Re-decoded the Java jars itself (C-3/C-4 confirmed; novel non-array
+      probes matched Java beyond the enumerated partition), re-ran all 3 mutations (each fix
+      distinctly+uniquely pinned), blast-radius analysis: both downstream fixes are
+      no-op for embedded-id and no-mapping files. Interop: 50/50 discovery, D1 content-equal,
+      sabotage RED via the id-less differential (embedded ids would have made it vacuous-
+      green — RED proves the mapping is load-bearing). Residue (LOW): incremental-scan
+      wiring correct but untested (F-1); driver floor comment staleness (F-2, fixed in
+      close-out).
+- [x] **Close-out** — tracker flipped, floor comment refreshed, pushed, PR body delivered.
 
 ## ACTIVE UNIT (2026-07-16): R158 Java interop battery (🟡→✅) — branch `parity/r158-staged-txn-interop`
 
