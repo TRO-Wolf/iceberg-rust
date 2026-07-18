@@ -36,7 +36,11 @@ use iceberg::{
 use volo_thrift::MaybeException;
 
 use super::utils::*;
-use crate::error::{from_io_error, from_thrift_error, from_thrift_exception};
+use crate::error::{
+    from_alter_database_exception, from_create_database_exception, from_create_table_exception,
+    from_drop_database_exception, from_drop_table_exception, from_get_database_exception,
+    from_get_table_exception, from_io_error, from_thrift_error, from_thrift_exception,
+};
 
 /// HMS catalog address
 pub const HMS_CATALOG_PROP_URI: &str = "uri";
@@ -363,7 +367,8 @@ impl Catalog for HmsCatalog {
             .0
             .create_database(database)
             .await
-            .map_err(from_thrift_error)?;
+            .map(|v| from_create_database_exception(namespace, v))
+            .map_err(from_thrift_error)??;
 
         Ok(Namespace::with_properties(namespace.clone(), properties))
     }
@@ -386,7 +391,7 @@ impl Catalog for HmsCatalog {
             .0
             .get_database(name.into())
             .await
-            .map(from_thrift_exception)
+            .map(|v| from_get_database_exception(namespace, v))
             .map_err(from_thrift_error)??;
 
         let ns = convert_to_namespace(&db)?;
@@ -456,7 +461,8 @@ impl Catalog for HmsCatalog {
             .0
             .alter_database(name.clone(), db)
             .await
-            .map_err(from_thrift_error)?;
+            .map(|v| from_alter_database_exception(namespace, v))
+            .map_err(from_thrift_error)??;
 
         Ok(())
     }
@@ -475,7 +481,8 @@ impl Catalog for HmsCatalog {
             .0
             .drop_database(name.into(), false, false)
             .await
-            .map_err(from_thrift_error)?;
+            .map(|v| from_drop_database_exception(namespace, v))
+            .map_err(from_thrift_error)??;
 
         Ok(())
     }
@@ -560,7 +567,13 @@ impl Catalog for HmsCatalog {
             .0
             .create_table(hive_table)
             .await
-            .map_err(from_thrift_error)?;
+            .map(|v| {
+                from_create_table_exception(
+                    &TableIdent::new(namespace.clone(), table_name.clone()),
+                    v,
+                )
+            })
+            .map_err(from_thrift_error)??;
 
         Table::builder()
             .file_io(self.file_io())
@@ -590,7 +603,7 @@ impl Catalog for HmsCatalog {
             .0
             .get_table(db_name.clone().into(), table.name.clone().into())
             .await
-            .map(from_thrift_exception)
+            .map(|v| from_get_table_exception(table, v))
             .map_err(from_thrift_error)??;
 
         let metadata_location = get_metadata_location(&hive_table.parameters)?;
@@ -625,7 +638,8 @@ impl Catalog for HmsCatalog {
             .0
             .drop_table(db_name.into(), table.name.clone().into(), false)
             .await
-            .map_err(from_thrift_error)?;
+            .map(|v| from_drop_table_exception(table, v))
+            .map_err(from_thrift_error)??;
 
         Ok(())
     }
@@ -677,17 +691,22 @@ impl Catalog for HmsCatalog {
             .0
             .get_table(src_dbname.clone().into(), src_tbl_name.clone().into())
             .await
-            .map(from_thrift_exception)
+            .map(|v| from_get_table_exception(src, v))
             .map_err(from_thrift_error)??;
 
         tbl.db_name = Some(dest_dbname.into());
         tbl.table_name = Some(dest_tbl_name.into());
 
+        // `alter_table`'s thrift exceptions (`InvalidOperationException`, `MetaException`) carry no
+        // not-found / already-exists semantics, so no typed kind applies — but route the outcome
+        // through the generic mapper so a server-side exception surfaces as `Unexpected` instead of
+        // being silently swallowed as success (uniform with the other write paths).
         self.client
             .0
             .alter_table(src_dbname.into(), src_tbl_name.into(), tbl)
             .await
-            .map_err(from_thrift_error)?;
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
 
         Ok(())
     }

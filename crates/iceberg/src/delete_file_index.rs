@@ -86,7 +86,13 @@ impl DeleteFileIndex {
                 let populated_delete_file_index = PopulatedDeleteFileIndex::new(delete_files);
 
                 {
-                    let mut guard = state.write().unwrap();
+                    // Recover a poisoned guard rather than cascading the panic: this is the sole
+                    // writer and it runs once, so recovering and completing the Populated
+                    // transition is always the right move (a stranded Populating state would hang
+                    // every waiting scan on the notifier below).
+                    let mut guard = state
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *guard = DeleteFileIndexState::Populated(populated_delete_file_index);
                 }
                 notify.notify_waiters();
@@ -108,7 +114,12 @@ impl DeleteFileIndex {
         seq_num: Option<i64>,
     ) -> Result<Vec<FileScanTaskDeleteFile>> {
         let notifier = {
-            let guard = self.state.read().unwrap();
+            let guard = self.state.read().map_err(|_| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "delete file index RwLock was poisoned",
+                )
+            })?;
             match *guard {
                 DeleteFileIndexState::Populating(ref notifier) => notifier.clone(),
                 DeleteFileIndexState::Populated(ref index) => {
@@ -119,12 +130,23 @@ impl DeleteFileIndex {
 
         notifier.notified().await;
 
-        let guard = self.state.read().unwrap();
+        let guard = self.state.read().map_err(|_| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "delete file index RwLock was poisoned",
+            )
+        })?;
         match guard.deref() {
             DeleteFileIndexState::Populated(index) => {
                 index.get_deletes_for_data_file(data_file, seq_num)
             }
-            _ => unreachable!("Cannot be any other state than loaded"),
+            // The populate task sets `Populated` and only then fires the notifier, so after the
+            // await the state is populated. A non-populated state here is an invariant violation
+            // (or a spurious wakeup) — surface a typed error rather than panicking the scan.
+            _ => Err(Error::new(
+                ErrorKind::Unexpected,
+                "delete file index notifier fired but the index is not populated",
+            )),
         }
     }
 }
@@ -182,7 +204,15 @@ impl PopulatedDeleteFileIndex {
             let destination_map = match arc_ctx.manifest_entry.content_type() {
                 DataContentType::PositionDeletes => &mut pos_deletes_by_partition,
                 DataContentType::EqualityDeletes => &mut eq_deletes_by_partition,
-                _ => unreachable!(),
+                // A `Data`-typed entry cannot legitimately reach the delete-file index:
+                // `TableScan::process_delete_manifest_entry` (scan/mod.rs) rejects any data-file
+                // entry found in a delete manifest before it is ever sent here. Skip it defensively
+                // rather than panicking the populate task — a panic there strands every waiting
+                // scan on the populate notifier, which would then never fire. Matching `Data`
+                // explicitly (instead of a `_` arm) also turns a future `DataContentType` variant
+                // into a compile error at this site, forcing a routing decision rather than a
+                // silent insert into the wrong map.
+                DataContentType::Data => return,
             };
 
             destination_map
@@ -783,6 +813,68 @@ mod tests {
         assert_eq!(results.len(), 1, "the invalid DV must reach the loader");
         assert_eq!(results[0].file_format, DataFileFormat::Puffin);
         assert_eq!(results[0].referenced_data_file, None);
+    }
+
+    /// Risk pinned (audit SAF-003): a poisoned index `state` lock must surface a typed error from
+    /// `get_deletes_for_data_file`, never a panic. The sender is kept alive so the populate task
+    /// stays parked (`Populating`) and never touches the lock — the poison below is the only thing
+    /// that can fail the read. MUTATION: restoring `self.state.read().unwrap()` turns the read on
+    /// the poisoned lock into a panic that propagates through the awaited call (RED).
+    #[tokio::test]
+    async fn test_poisoned_index_state_yields_typed_error_not_panic() {
+        let (index, _tx) = DeleteFileIndex::new();
+
+        let poisoner = index.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner
+                .state
+                .write()
+                .expect("acquire write guard to poison");
+            panic!("intentionally poison the delete-file-index state lock");
+        });
+        assert!(
+            handle.join().is_err(),
+            "the poisoning thread must have panicked while holding the guard"
+        );
+
+        let data_file = build_unpartitioned_data_file();
+        let error = index
+            .get_deletes_for_data_file(&data_file, Some(0))
+            .await
+            .expect_err("a poisoned index lock must surface a typed error, not panic");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+    }
+
+    /// Risk pinned (audit SAF-003, `:185` unreachable): a `Data`-typed delete context cannot occur
+    /// in production (`process_delete_manifest_entry` rejects data-file entries in a delete
+    /// manifest), but if one ever reaches the index builder it must be SKIPPED defensively, never
+    /// panic the populate task. A non-empty partition routes it to the content-type match (an empty
+    /// partition would divert it to `global_equality_deletes` first). MUTATION: restoring
+    /// `_ => unreachable!()` panics this test.
+    #[test]
+    fn test_data_typed_delete_context_is_skipped_not_panicked() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+
+        let data_ctx = DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(
+                2,
+                &build_partitioned_data_file(&partition, spec_id),
+            )
+            .into(),
+            partition_spec_id: spec_id,
+        };
+
+        let index = PopulatedDeleteFileIndex::new(vec![data_ctx]);
+
+        let data_file = build_partitioned_data_file(&partition, spec_id);
+        let results = index
+            .get_deletes_for_data_file(&data_file, Some(0))
+            .expect("skipping a Data-typed entry must not error");
+        assert!(
+            results.is_empty(),
+            "a Data-typed entry must be skipped, not indexed as a delete"
+        );
     }
 
     fn build_unpartitioned_data_file() -> DataFile {

@@ -17,9 +17,9 @@
 
 use fnv::FnvHashSet;
 
-use crate::Result;
 use crate::expr::{Predicate, PredicateOperator, Reference};
 use crate::spec::Datum;
+use crate::{Error, ErrorKind, Result};
 
 /// A visitor for [`Predicate`]s. Visits in post-order.
 pub trait PredicateVisitor {
@@ -168,9 +168,10 @@ pub(crate) fn visit<V: PredicateVisitor>(visitor: &mut V, predicate: &Predicate)
             PredicateOperator::NotNull => visitor.not_null(expr.term(), predicate),
             PredicateOperator::IsNan => visitor.is_nan(expr.term(), predicate),
             PredicateOperator::NotNan => visitor.not_nan(expr.term(), predicate),
-            op => {
-                panic!("Unexpected op for unary predicate: {}", &op)
-            }
+            op => Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Unexpected op for unary predicate: {op}"),
+            )),
         },
         Predicate::Binary(expr) => {
             let reference = expr.term();
@@ -192,9 +193,10 @@ pub(crate) fn visit<V: PredicateVisitor>(visitor: &mut V, predicate: &Predicate)
                 PredicateOperator::NotStartsWith => {
                     visitor.not_starts_with(reference, literal, predicate)
                 }
-                op => {
-                    panic!("Unexpected op for binary predicate: {}", &op)
-                }
+                op => Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Unexpected op for binary predicate: {op}"),
+                )),
             }
         }
         Predicate::Set(expr) => {
@@ -203,9 +205,10 @@ pub(crate) fn visit<V: PredicateVisitor>(visitor: &mut V, predicate: &Predicate)
             match expr.op() {
                 PredicateOperator::In => visitor.r#in(reference, literals, predicate),
                 PredicateOperator::NotIn => visitor.not_in(reference, literals, predicate),
-                op => {
-                    panic!("Unexpected op for set predicate: {}", &op)
-                }
+                op => Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Unexpected op for set predicate: {op}"),
+                )),
             }
         }
     }
@@ -669,5 +672,60 @@ mod tests {
         let result = visit(&mut test_evaluator, &predicate);
 
         assert!(!result.unwrap());
+    }
+
+    // Audit SAF-004, layer 2 (defense in depth): if a mismatched-arity operator
+    // ever reaches the dispatcher in a release build (where the constructor's
+    // `debug_assert!` is compiled out), the visit must return a typed
+    // `DataInvalid` error, NOT `panic!`. `new_unchecked` builds the otherwise
+    // unconstructable invalid value; restoring any `panic!` turns these RED.
+
+    #[test]
+    fn visit_unary_with_non_unary_op_errors_not_panics() {
+        let predicate = Predicate::Unary(UnaryExpression::new_unchecked(
+            PredicateOperator::LessThan,
+            Reference::new("a"),
+        ));
+        let mut test_evaluator = TestEvaluator {};
+        let err = visit(&mut test_evaluator, &predicate)
+            .expect_err("non-unary op in unary shape must error, not panic");
+        assert!(
+            err.to_string()
+                .contains("Unexpected op for unary predicate"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn visit_binary_with_non_binary_op_errors_not_panics() {
+        let predicate = Predicate::Binary(BinaryExpression::new_unchecked(
+            PredicateOperator::IsNull,
+            Reference::new("a"),
+            Datum::int(10),
+        ));
+        let mut test_evaluator = TestEvaluator {};
+        let err = visit(&mut test_evaluator, &predicate)
+            .expect_err("non-binary op in binary shape must error, not panic");
+        assert!(
+            err.to_string()
+                .contains("Unexpected op for binary predicate"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn visit_set_with_non_set_op_errors_not_panics() {
+        let predicate = Predicate::Set(SetExpression::new_unchecked(
+            PredicateOperator::LessThan,
+            Reference::new("a"),
+            FnvHashSet::from_iter(vec![Datum::int(1)]),
+        ));
+        let mut test_evaluator = TestEvaluator {};
+        let err = visit(&mut test_evaluator, &predicate)
+            .expect_err("non-set op in set shape must error, not panic");
+        assert!(
+            err.to_string().contains("Unexpected op for set predicate"),
+            "message: {err}"
+        );
     }
 }
