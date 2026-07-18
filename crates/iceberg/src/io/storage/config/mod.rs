@@ -85,7 +85,13 @@ const SECRET_PROP_KEY_SUBSTRINGS: &[&str] = &[
 
 /// Returns true if a property key holds a secret value that must be redacted from `Debug`,
 /// i.e. its lowercased form contains any [`SECRET_PROP_KEY_SUBSTRINGS`] entry.
-fn is_secret_prop_key(key: &str) -> bool {
+///
+/// Exposed as the canonical needle test so the catalog crates' config `Debug` impls
+/// (`iceberg-catalog-glue`/`-hms`/`-s3tables`/`-sql`, whose raw property maps carry the same
+/// AWS-credential / DSN secrets) redact against ONE authoritative superset instead of drifting
+/// copies. Keep new secret substrings in [`SECRET_PROP_KEY_SUBSTRINGS`] here so every consumer
+/// inherits them.
+pub fn is_secret_prop_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     SECRET_PROP_KEY_SUBSTRINGS
         .iter()

@@ -223,7 +223,6 @@ impl HiveVersion {
 }
 
 /// Hive metastore Catalog configuration.
-#[derive(Debug)]
 pub(crate) struct HmsCatalogConfig {
     name: Option<String>,
     address: String,
@@ -231,6 +230,36 @@ pub(crate) struct HmsCatalogConfig {
     warehouse: String,
     hive_version: HiveVersion,
     props: HashMap<String, String>,
+}
+
+impl Debug for HmsCatalogConfig {
+    /// Hand-written so secret-bearing entries in the raw `props` map (the same map handed to the
+    /// `FileIO` builder, which may carry storage credentials) are redacted to `"***"` instead of
+    /// printed in clear. Keys stay visible for diagnostics. Redaction uses the canonical needle
+    /// test `iceberg::io::is_secret_prop_key` (`crates/iceberg/src/io/storage/config/mod.rs`), the
+    /// same superset `StorageConfig` uses (#159), so the list cannot drift per catalog.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let redacted_props: HashMap<&str, &str> = self
+            .props
+            .iter()
+            .map(|(k, v)| {
+                if iceberg::io::is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("HmsCatalogConfig")
+            .field("name", &self.name)
+            .field("address", &self.address)
+            .field("thrift_transport", &self.thrift_transport)
+            .field("warehouse", &self.warehouse)
+            .field("hive_version", &self.hive_version)
+            .field("props", &redacted_props)
+            .finish()
+    }
 }
 
 struct HmsClient(ThriftHiveMetastoreClient);
@@ -801,5 +830,72 @@ mod tests {
             error.to_string().contains(HMS_CATALOG_PROP_HIVE_VERSION),
             "error must name the property, got: {error}"
         );
+    }
+
+    const SECRET: &str = "SECRET_DO_NOT_LEAK";
+
+    fn config_with_secret_props() -> HmsCatalogConfig {
+        HmsCatalogConfig {
+            name: Some("hms_cat".to_string()),
+            address: "127.0.0.1:9083".to_string(),
+            thrift_transport: HmsThriftTransport::Buffered,
+            warehouse: "s3://example-bucket/warehouse".to_string(),
+            hive_version: HiveVersion::Hive3Plus,
+            props: HashMap::from([
+                ("s3.secret-access-key".to_string(), SECRET.to_string()),
+                ("s3.session-token".to_string(), SECRET.to_string()),
+                ("s3.region".to_string(), "us-east-1".to_string()),
+            ]),
+        }
+    }
+
+    /// Risk (#159 unit-D residue): `HmsCatalogConfig` holds the raw prop map that is handed to the
+    /// `FileIO` builder and may carry storage credentials, so a plain-derived `Debug` prints them
+    /// in clear. Pins that secret VALUES redact to `"***"` while KEYS and non-secret values stay
+    /// visible. Mutation: revert the manual `Debug` to `#[derive(Debug)]` → RED.
+    #[test]
+    fn test_config_debug_redacts_secret_prop_values() {
+        let config = config_with_secret_props();
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "HmsCatalogConfig Debug leaked a secret value: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        for key in ["s3.secret-access-key", "s3.session-token"] {
+            assert!(debug.contains(key), "secret key `{key}` dropped: {debug}");
+        }
+        assert!(
+            debug.contains("us-east-1") && debug.contains("hms_cat"),
+            "non-secret fields must stay visible: {debug}"
+        );
+    }
+
+    /// Risk (#159 unit-D residue, composition): `HmsCatalog`'s manual `Debug` renders the `config`
+    /// field, so the redaction must survive one level up. Constructs the catalog offline (a
+    /// loopback address parses without DNS; the thrift client connects lazily, though building it
+    /// needs a Tokio reactor) and pins that a `{:?}` of the whole catalog does not leak a
+    /// credential. Mutation: revert the config `Debug` to derived → RED.
+    #[tokio::test]
+    async fn test_catalog_debug_redacts_secret_prop_values() {
+        let catalog = HmsCatalog::new(
+            config_with_secret_props(),
+            Some(Arc::new(iceberg::io::MemoryStorageFactory)),
+        )
+        .expect("build HmsCatalog offline");
+
+        let debug = format!("{catalog:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "HmsCatalog Debug leaked a secret value: {debug}"
+        );
+        assert!(
+            debug.contains("s3.secret-access-key"),
+            "key dropped: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
     }
 }

@@ -183,9 +183,13 @@ pub fn from_create_table_exception<T>(
 /// `org.apache.iceberg.hive.HiveCatalog.dropNamespace` (iceberg-hive-metastore 1.10.0, decoded with
 /// `javap -p -c`) calls `IMetaStoreClient.dropDatabase(name, false, false, false)` — the trailing
 /// `cascade=false` — and its exception table maps the caught Hive `InvalidOperationException`
-/// (target 40) directly to `new NamespaceNotEmptyException("Namespace %s is not empty. One or more
-/// tables exist.", ...)` (bytecode offsets 41–60). With `cascade=false`, non-empty is the sole
-/// meaning of `InvalidOperationException` on this call, so the arm maps unambiguously.
+/// (target 40) UNCONDITIONALLY to `new NamespaceNotEmptyException("Namespace %s is not empty. One
+/// or more tables exist.", ...)` (bytecode offsets 41–60): the handler does not inspect the cause.
+/// The guarantee this arm mirrors is that unconditional mapping, not that "tables are the sole
+/// meaning" — with `cascade=false` the metastore raises `InvalidOperationException` whenever the
+/// database still holds any child object (tables, functions, or materialized views), and every
+/// such case is the not-empty class. The literal Java message names tables because that is its
+/// hard-coded string, so it is preserved verbatim.
 ///
 /// A `MetaException` (`O3`) is a server-side failure with no typed semantics → [`ErrorKind::Unexpected`].
 pub fn from_drop_database_exception<T>(

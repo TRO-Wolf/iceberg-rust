@@ -133,7 +133,6 @@ impl CatalogBuilder for GlueCatalogBuilder {
     }
 }
 
-#[derive(Debug)]
 /// Glue Catalog configuration
 pub(crate) struct GlueCatalogConfig {
     name: Option<String>,
@@ -141,6 +140,36 @@ pub(crate) struct GlueCatalogConfig {
     catalog_id: Option<String>,
     warehouse: String,
     props: HashMap<String, String>,
+}
+
+impl Debug for GlueCatalogConfig {
+    /// Hand-written so secret-bearing entries in the raw `props` map — AWS
+    /// `aws_secret_access_key` / `aws_session_token` and friends flow through here into the
+    /// `FileIO` this config backs — are redacted to `"***"` instead of printed in clear. Keys
+    /// stay visible for diagnostics. Redaction uses the canonical needle test
+    /// `iceberg::io::is_secret_prop_key` (`crates/iceberg/src/io/storage/config/mod.rs`), the
+    /// same superset `StorageConfig` uses (#159), so the list cannot drift per catalog.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_props: HashMap<&str, &str> = self
+            .props
+            .iter()
+            .map(|(k, v)| {
+                if iceberg::io::is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("GlueCatalogConfig")
+            .field("name", &self.name)
+            .field("uri", &self.uri)
+            .field("catalog_id", &self.catalog_id)
+            .field("warehouse", &self.warehouse)
+            .field("props", &redacted_props)
+            .finish()
+    }
 }
 
 struct GlueClient(aws_sdk_glue::Client);
@@ -470,10 +499,7 @@ impl Catalog for GlueCatalog {
         let table_list = self.list_tables(namespace).await?;
 
         if !table_list.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Database with name: {} is not empty", &db_name),
-            ));
+            return Err(namespace_not_empty_error(&db_name));
         }
 
         let builder = self.client.0.delete_database().name(db_name);
@@ -889,6 +915,21 @@ impl Catalog for GlueCatalog {
     }
 }
 
+/// The typed error returned when a drop is refused because the Glue database still holds tables.
+///
+/// Mirrors Java `org.apache.iceberg.aws.glue.GlueCatalog.dropNamespace`, which raises
+/// `NamespaceNotEmptyException` when the database is non-empty; map it to the dedicated
+/// [`ErrorKind::NamespaceNotEmpty`] (was the generic `DataInvalid`, G2 spillover) so callers can
+/// distinguish a refused-because-non-empty drop from a malformed request. The message is
+/// preserved verbatim. The kind is non-retryable — dropping again without emptying the namespace
+/// fails identically.
+fn namespace_not_empty_error(db_name: &str) -> Error {
+    Error::new(
+        ErrorKind::NamespaceNotEmpty,
+        format!("Database with name: {db_name} is not empty"),
+    )
+}
+
 /// Map a modeled Glue `UpdateTableError` (the service RESPONDED) on the commit path.
 ///
 /// Java `GlueTableOperations` (iceberg-aws 1.10.0): `ConcurrentModificationException` →
@@ -1041,5 +1082,92 @@ mod tests {
         // No network: the inherited no-op defaults return Ok.
         catalog.invalidate_table(&ident).await.unwrap();
         catalog.invalidate_view(&ident).await.unwrap();
+    }
+
+    const SECRET: &str = "SECRET_DO_NOT_LEAK";
+
+    /// Risk (#159 unit-D residue): `GlueCatalogConfig` holds the raw prop map — the AWS
+    /// `aws_secret_access_key` / `aws_session_token` credentials flow through it into `FileIO` —
+    /// so a plain-derived `Debug` prints live credentials. Pins that secret VALUES redact to
+    /// `"***"` while KEYS and non-secret values stay visible. Mutation: revert the manual `Debug`
+    /// to `#[derive(Debug)]` → the raw value prints → RED.
+    #[test]
+    fn test_config_debug_redacts_secret_prop_values() {
+        let config = GlueCatalogConfig {
+            name: Some("glue_cat".to_string()),
+            uri: None,
+            catalog_id: None,
+            warehouse: "s3://example-bucket/warehouse".to_string(),
+            props: HashMap::from([
+                ("aws_secret_access_key".to_string(), SECRET.to_string()),
+                ("aws_session_token".to_string(), SECRET.to_string()),
+                ("region_name".to_string(), "us-east-1".to_string()),
+            ]),
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "GlueCatalogConfig Debug leaked a secret value: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        for key in ["aws_secret_access_key", "aws_session_token"] {
+            assert!(debug.contains(key), "secret key `{key}` dropped: {debug}");
+        }
+        assert!(
+            debug.contains("us-east-1"),
+            "non-secret value must stay visible: {debug}"
+        );
+    }
+
+    /// Risk (#159 unit-D residue, composition): `GlueCatalog`'s `Debug` renders the `config`
+    /// field, so the redaction must survive one level up. Pins that a `{:?}` of the whole catalog
+    /// does not leak a credential-bearing prop. Mutation: revert the config `Debug` to derived →
+    /// the raw value propagates through `GlueCatalog`'s Debug → RED.
+    #[tokio::test]
+    async fn test_catalog_debug_redacts_secret_prop_values() {
+        let catalog = build_glue_catalog(
+            Some("glue_cat"),
+            HashMap::from([("aws_secret_access_key".to_string(), SECRET.to_string())]),
+        )
+        .await;
+
+        let debug = format!("{catalog:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "GlueCatalog Debug leaked a secret value: {debug}"
+        );
+        assert!(
+            debug.contains("aws_secret_access_key"),
+            "key dropped: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+    }
+
+    /// Risk (G3b, GAP parity): dropping a non-empty Glue database must surface the dedicated
+    /// [`iceberg::ErrorKind::NamespaceNotEmpty`] (Java `GlueCatalog.dropNamespace` →
+    /// `NamespaceNotEmptyException`), not the generic `DataInvalid` — a caller retry/branch keys
+    /// on the kind. `drop_namespace` early-returns this error BEFORE calling `delete_database`, so
+    /// the namespace structurally survives the refused drop (the network drop path itself needs a
+    /// live Glue endpoint and is not exercised offline). Pins the kind, non-retryability, and the
+    /// preserved message. Mutation: revert the kind to `DataInvalid` → RED.
+    #[test]
+    fn test_namespace_not_empty_error_maps_to_namespace_not_empty() {
+        let err = namespace_not_empty_error("db1");
+        assert_eq!(err.kind(), iceberg::ErrorKind::NamespaceNotEmpty);
+        assert!(
+            !err.retryable(),
+            "a refused non-empty drop is not retryable"
+        );
+        assert!(
+            err.message().contains("db1"),
+            "message dropped db name: {err}"
+        );
+        assert!(
+            err.message().contains("is not empty"),
+            "message not preserved: {err}"
+        );
     }
 }

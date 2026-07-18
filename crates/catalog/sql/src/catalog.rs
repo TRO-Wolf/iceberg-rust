@@ -212,7 +212,6 @@ impl CatalogBuilder for SqlCatalogBuilder {
 /// The options available for this parameter include:
 /// - `SqlBindStyle::DollarNumeric`: Binds SQL statements using `$1`, `$2`, etc., as placeholders. This is for PostgreSQL databases.
 /// - `SqlBindStyle::QuestionMark`: Binds SQL statements using `?` as a placeholder. This is for MySQL and SQLite databases.
-#[derive(Debug)]
 struct SqlCatalogConfig {
     uri: String,
     name: String,
@@ -221,7 +220,77 @@ struct SqlCatalogConfig {
     props: HashMap<String, String>,
 }
 
-#[derive(Debug)]
+/// Redact the password in a database DSN so it can be printed in a `Debug`/`tracing` view.
+///
+/// A JDBC/libpq-style DSN embeds credentials in the authority's userinfo —
+/// `postgres://user:PASSWORD@host:5432/db` — and the whole string is stored in
+/// [`SqlCatalogConfig::uri`]. We redact ONLY the password portion of the userinfo, keeping the
+/// scheme, user, host, port, and database name visible for diagnostics (the preferred, most
+/// useful redaction), and return everything else unchanged.
+///
+/// Parsing is deliberately conservative: the authority is the span after `"://"` (or the whole
+/// value if there is no scheme separator) up to the first `/`, `?`, or `#`; userinfo is the span
+/// before the LAST `@` in that authority (RFC 3986 forbids an unencoded `@` in host, so the last
+/// `@` is the userinfo/host boundary even if a malformed password contains one); the password is
+/// whatever follows the FIRST `:` in the userinfo. A DSN with no userinfo, or userinfo with no
+/// password, is returned unchanged (nothing secret to mask).
+fn redact_dsn_password(uri: &str) -> String {
+    let authority_start = uri.find("://").map(|i| i + 3).unwrap_or(0);
+    let rest = &uri[authority_start..];
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_len];
+
+    // Userinfo/host boundary is the LAST '@' in the authority (host cannot contain an unencoded
+    // '@'); without one there is no userinfo to redact.
+    let Some(at_rel) = authority.rfind('@') else {
+        return uri.to_string();
+    };
+    let userinfo = &authority[..at_rel];
+    // Password is everything after the FIRST ':' in the userinfo; without one there is only a
+    // username and nothing to mask.
+    let Some(colon_rel) = userinfo.find(':') else {
+        return uri.to_string();
+    };
+
+    let abs_colon = authority_start + colon_rel; // byte index of the userinfo ':' in `uri`
+    let abs_at = authority_start + at_rel; // byte index of the boundary '@' in `uri`
+    let mut out = String::with_capacity(uri.len());
+    out.push_str(&uri[..=abs_colon]);
+    out.push_str("***");
+    out.push_str(&uri[abs_at..]);
+    out
+}
+
+impl std::fmt::Debug for SqlCatalogConfig {
+    /// Hand-written so the two secret-bearing fields cannot leak: the `uri` DSN can embed a
+    /// password in its userinfo (`postgres://user:pass@host`), and the raw `props` map may carry
+    /// storage credentials. The DSN password is masked by [`redact_dsn_password`] (scheme/host/db
+    /// stay visible); prop values are masked with the canonical needle test
+    /// `iceberg::io::is_secret_prop_key` (`crates/iceberg/src/io/storage/config/mod.rs`), the same
+    /// superset `StorageConfig` uses (#159), so the list cannot drift per catalog.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_props: HashMap<&str, &str> = self
+            .props
+            .iter()
+            .map(|(k, v)| {
+                if iceberg::io::is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("SqlCatalogConfig")
+            .field("uri", &redact_dsn_password(&self.uri))
+            .field("name", &self.name)
+            .field("warehouse_location", &self.warehouse_location)
+            .field("sql_bind_style", &self.sql_bind_style)
+            .field("props", &redacted_props)
+            .finish()
+    }
+}
+
 /// Sql catalog implementation.
 pub struct SqlCatalog {
     name: String,
@@ -230,6 +299,38 @@ pub struct SqlCatalog {
     fileio: FileIO,
     sql_bind_style: SqlBindStyle,
     properties: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for SqlCatalog {
+    /// Hand-written so the raw `properties` map cannot leak storage credentials (the same #159
+    /// class as the config types — a plain-derived `Debug` prints its secret VALUES in clear).
+    /// `connection`'s `Debug` renders only pool sizing options — sqlx keeps the DSN in a separate
+    /// `connect_options` field it does NOT print — and `fileio` is already redacted (#159), so
+    /// those two compose safely and are passed through. Prop values are masked with the canonical
+    /// needle test `iceberg::io::is_secret_prop_key`
+    /// (`crates/iceberg/src/io/storage/config/mod.rs`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_properties: HashMap<&str, &str> = self
+            .properties
+            .iter()
+            .map(|(k, v)| {
+                if iceberg::io::is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("SqlCatalog")
+            .field("name", &self.name)
+            .field("connection", &self.connection)
+            .field("warehouse_location", &self.warehouse_location)
+            .field("fileio", &self.fileio)
+            .field("sql_bind_style", &self.sql_bind_style)
+            .field("properties", &redacted_properties)
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq, strum::EnumString, strum::Display)]
@@ -3780,5 +3881,127 @@ mod tests {
         let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
         catalog.invalidate_table(&ident).await.unwrap();
         catalog.invalidate_view(&ident).await.unwrap();
+    }
+
+    const SECRET: &str = "SECRET_DO_NOT_LEAK";
+    /// A DSN password that must never appear in a `Debug` view.
+    const DSN_PASSWORD: &str = "hunter2_DO_NOT_LEAK";
+
+    /// Pins the DSN password-redaction contract of [`super::redact_dsn_password`]: only the
+    /// userinfo password is masked, scheme/user/host/port/db stay visible, and a DSN with no
+    /// userinfo password is returned unchanged. The `p@ss` case guards the "last `@` is the
+    /// userinfo/host boundary" rule (a malformed unencoded `@` in the password must still be fully
+    /// masked, not partially leaked).
+    #[test]
+    fn test_redact_dsn_password_masks_only_the_password() {
+        assert_eq!(
+            super::redact_dsn_password("postgres://user:pass@host:5432/db"),
+            "postgres://user:***@host:5432/db"
+        );
+        // No scheme separator: the whole prefix is treated as authority.
+        assert_eq!(
+            super::redact_dsn_password("user:pass@host/db"),
+            "user:***@host/db"
+        );
+        // Unencoded '@' inside the password: the LAST '@' is the boundary, so the password is
+        // fully masked rather than partially leaked.
+        assert_eq!(
+            super::redact_dsn_password("postgres://user:p@ss@host/db"),
+            "postgres://user:***@host/db"
+        );
+        // Nothing to redact: user-only userinfo, no userinfo at all, sqlite path, and empty.
+        assert_eq!(
+            super::redact_dsn_password("postgres://user@host/db"),
+            "postgres://user@host/db"
+        );
+        assert_eq!(
+            super::redact_dsn_password("postgres://host:5432/db"),
+            "postgres://host:5432/db"
+        );
+        assert_eq!(
+            super::redact_dsn_password("sqlite:/tmp/catalog.db"),
+            "sqlite:/tmp/catalog.db"
+        );
+        assert_eq!(super::redact_dsn_password(""), "");
+    }
+
+    /// Risk (#159 unit-D residue): `SqlCatalogConfig` holds BOTH a DSN that can embed a password
+    /// (`postgres://user:pass@host`) and a raw prop map that may carry storage credentials, so a
+    /// plain-derived `Debug` prints both in clear. Pins that the DSN password AND secret prop
+    /// values are redacted while the diagnostic parts (user/host/db, prop keys, non-secret values)
+    /// stay visible. Mutation: revert the manual `Debug` to `#[derive(Debug)]` → the raw DSN
+    /// password and the raw secret prop value both print → RED.
+    #[test]
+    fn test_config_debug_redacts_dsn_password_and_secret_props() {
+        let config = super::SqlCatalogConfig {
+            uri: format!("postgres://admin:{DSN_PASSWORD}@db.example.com:5432/warehouse"),
+            name: "sql_cat".to_string(),
+            warehouse_location: "s3://example-bucket/wh".to_string(),
+            sql_bind_style: SqlBindStyle::DollarNumeric,
+            props: HashMap::from([
+                ("s3.secret-access-key".to_string(), SECRET.to_string()),
+                ("s3.region".to_string(), "us-east-1".to_string()),
+            ]),
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(DSN_PASSWORD),
+            "SqlCatalogConfig Debug leaked the DSN password: {debug}"
+        );
+        assert!(
+            !debug.contains(SECRET),
+            "SqlCatalogConfig Debug leaked a secret prop value: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        // The DSN's diagnostic parts stay visible.
+        assert!(
+            debug.contains("admin") && debug.contains("db.example.com"),
+            "DSN user/host must stay visible: {debug}"
+        );
+        // Secret prop key visible, non-secret value visible.
+        assert!(
+            debug.contains("s3.secret-access-key") && debug.contains("us-east-1"),
+            "prop key / non-secret value dropped: {debug}"
+        );
+    }
+
+    /// Risk (#159 unit-D residue, composition): `SqlCatalog` holds the raw `properties` map, so its
+    /// `Debug` must redact secret values one level up (the `connection` pool prints only sizing
+    /// options — sqlx keeps the DSN in an unrendered field — and `fileio` is already redacted).
+    /// Builds a real SQLite-backed catalog carrying a secret prop and pins that a `{:?}` of the
+    /// whole catalog does not leak it. Mutation: revert `SqlCatalog`'s manual `Debug` to
+    /// `#[derive(Debug)]` → the raw prop value prints → RED.
+    #[tokio::test]
+    async fn test_catalog_debug_redacts_secret_prop_values() {
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+
+        let props = HashMap::from([
+            (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+            (
+                SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+                "s3://example-bucket/wh".to_string(),
+            ),
+            ("s3.secret-access-key".to_string(), SECRET.to_string()),
+        ]);
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load("sql_cat", props)
+            .await
+            .expect("build SQLite-backed SqlCatalog");
+
+        let debug = format!("{catalog:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "SqlCatalog Debug leaked a secret prop value: {debug}"
+        );
+        assert!(
+            debug.contains("s3.secret-access-key"),
+            "secret prop key dropped: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
     }
 }
