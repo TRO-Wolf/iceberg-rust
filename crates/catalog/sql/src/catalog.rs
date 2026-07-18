@@ -224,63 +224,69 @@ struct SqlCatalogConfig {
 ///
 /// A JDBC/libpq-style DSN embeds credentials in the authority's userinfo —
 /// `postgres://user:PASSWORD@host:5432/db` — and the whole string is stored in
-/// [`SqlCatalogConfig::uri`]. We redact ONLY the password portion of the userinfo, keeping the
-/// scheme, user, host, port, and database name visible for diagnostics (the preferred, most
-/// useful redaction), and return everything else unchanged.
+/// [`SqlCatalogConfig::uri`]. This masks the DSN password with `***` before the string can reach a
+/// `Debug` sink, keeping the surrounding text visible for diagnostics.
 ///
-/// Parsing over-redacts on ambiguity so a full cleartext password can never survive: an
-/// unencoded `/`, `?`, or `#` inside the password must NOT be allowed to slice the userinfo/host
-/// boundary off the string (that was the original bug — truncating the authority at the first
-/// path delimiter dropped the `@` and returned the whole DSN unmasked). We do not truncate at a
-/// path delimiter and we do not blindly take the last `@` (that would grab an `@` sitting in a
-/// path/query/fragment). Instead we scan the `@` candidates in the post-scheme remainder from
-/// left to right and accept the FIRST one that yields a well-formed `userinfo:…@host` split:
+/// # Mechanism (a provably sound coarse rule)
 ///
-/// * the userinfo (text before the `@`) must contain a `:` password separator — otherwise this
-///   `@` is not a `user:pass@` boundary (a user-only userinfo, or an `@` that lives in a path or
-///   query, has nothing to mask); and
-/// * the host (text after the `@`, up to the next `/`, `?`, or `#`, or end) must not itself
-///   contain an `@` — a real host cannot hold an unencoded `@`, so one there means the true
-///   boundary lies further right (this is what fully masks a `p@ss`-style password).
+/// After stripping a leading `<scheme>://` (if present, else nothing), let `rest` be the
+/// remainder. If `rest` contains a `:` AND at least one `@` lies strictly after that FIRST `:`,
+/// replace the span from that first `:` (exclusive) through the LAST `@` in `rest` (exclusive)
+/// with `***`, yielding `<before-colon>:***@<after-last-@>`. Otherwise the input is returned
+/// unchanged — no `:`, or no `@` after it, means there is no userinfo password to mask.
 ///
-/// The password is then everything from the FIRST `:` in that userinfo up to the accepted `@`,
-/// and it is replaced by `***`; the scheme, user, host, port, database, and any path/query stay
-/// visible. A DSN with no such boundary (no userinfo, or userinfo with no password) is returned
-/// unchanged — there is nothing secret to mask.
+/// # Soundness — no password byte can survive, for ANY input
 ///
-/// Over-redaction is the sanctioned safe direction: in a genuinely ambiguous DSN — for example a
-/// bare host with a port colon and a later `@` in a query, `host:5432/db?x=a@b` — the port `:`
-/// reads as a userinfo password separator and this masks (`host:***@b`) rather than leaking. A
-/// bare host WITHOUT a port colon (`host/db?param=a@b`) has no `:` before the query `@`, so it is
-/// correctly left untouched.
+/// When a userinfo password exists it lies strictly between the first userinfo `:` and its
+/// boundary `@`. That boundary `@` is one of the `@`s in `rest`, so it is at or before the LAST
+/// `@`. The masked span `[first ':' , last '@']` therefore always covers the entire password —
+/// regardless of how malformed the DSN is, and regardless of extra `/`, `?`, `#`, `:`, or `@`
+/// bytes inside the password. Under-redaction (a surviving password byte) is impossible whenever a
+/// password is present. Two earlier precise-parsing attempts each leaked one layer deeper —
+/// `p@x/y@host`, `SECRET1@junk/SECRET2@host` — because they tried to locate the *exact* boundary;
+/// this rule does not compute a boundary, so there is no boundary to get wrong.
+///
+/// # Over-redaction envelope (the price of soundness, paid honestly)
+///
+/// The cost is over-redaction on DSNs where a non-userinfo `:` (e.g. a host port) precedes a
+/// non-userinfo `@` (e.g. one inside a query or fragment): the mask span then swallows host/path
+/// bytes. Examples:
+///
+/// * `postgres://user:PWQ@host/db?param=a@b` → `postgres://user:***@b` (the query `@` is the last
+///   `@`, so `host/db?param=a` is masked along with the password).
+/// * `postgres://host:5432/db?x=a@b` → `postgres://host:***@b` (the port `:` reads as a password
+///   separator).
+///
+/// The guarantee is directional: masked-but-visible components may include NON-secrets, but a
+/// visible component never includes a secret. DSNs with no `:` before any `@`
+/// (`postgres://host/db?param=a@b`, `postgres://user@host/db`) and DSNs with no `@` after the
+/// first `:` (`host:5432/db`, `user@host:5432/db`) are left untouched.
 fn redact_dsn_password(uri: &str) -> String {
     let authority_start = uri.find("://").map(|i| i + 3).unwrap_or(0);
     let rest = &uri[authority_start..];
 
-    for (at_rel, _) in rest.match_indices('@') {
-        // Userinfo must carry a password separator; the password starts at its FIRST ':'.
-        let userinfo = &rest[..at_rel];
-        let Some(colon_rel) = userinfo.find(':') else {
-            continue;
-        };
-        // The host (up to the next path/query/fragment delimiter) cannot contain an unencoded
-        // '@'; if it does, this '@' is inside the password and the real boundary is further right.
-        let host = &rest[at_rel + 1..];
-        let host_len = host.find(['/', '?', '#']).unwrap_or(host.len());
-        if host[..host_len].contains('@') {
-            continue;
-        }
-
-        let abs_colon = authority_start + colon_rel; // byte index of the userinfo ':' in `uri`
-        let abs_at = authority_start + at_rel; // byte index of the boundary '@' in `uri`
-        let mut out = String::with_capacity(uri.len());
-        out.push_str(&uri[..=abs_colon]);
-        out.push_str("***");
-        out.push_str(&uri[abs_at..]);
-        return out;
+    // The password, if any, begins immediately after the FIRST ':' in the remainder.
+    let Some(colon_rel) = rest.find(':') else {
+        return uri.to_string();
+    };
+    // Its boundary '@' is at or before the LAST '@'. Require at least one '@' strictly after the
+    // first ':' — equivalently, that the last '@' is after that ':'. With none, there is no
+    // userinfo password to mask.
+    let Some(last_at_rel) = rest.rfind('@') else {
+        return uri.to_string();
+    };
+    if last_at_rel <= colon_rel {
+        return uri.to_string();
     }
 
-    uri.to_string()
+    // Mask the whole span [first ':', last '@'] — sound coverage of any password (see fn doc).
+    let abs_colon = authority_start + colon_rel; // byte index of the first ':' in `uri`
+    let abs_last_at = authority_start + last_at_rel; // byte index of the last '@' in `uri`
+    let mut out = String::with_capacity(uri.len());
+    out.push_str(&uri[..=abs_colon]);
+    out.push_str("***");
+    out.push_str(&uri[abs_last_at..]);
+    out
 }
 
 impl std::fmt::Debug for SqlCatalogConfig {
@@ -3909,111 +3915,179 @@ mod tests {
     /// A DSN password that must never appear in a `Debug` view.
     const DSN_PASSWORD: &str = "hunter2_DO_NOT_LEAK";
 
-    /// Pins the DSN password-redaction contract of [`super::redact_dsn_password`]: only the
-    /// userinfo password is masked, scheme/user/host/port/db stay visible, and a DSN with no
-    /// userinfo password is returned unchanged. The `p@ss` case and the `/`,`?`,`#`-in-password
-    /// cases guard the boundary rule (the `@` whose host segment holds no further `@`), so a
-    /// malformed password embedding those delimiters is still fully masked, never partially
-    /// leaked; the query-`@` cases guard that a non-userinfo `@` is left intact.
+    /// CORPUS PIN for [`super::redact_dsn_password`]'s soundness contract: every password-leak
+    /// input surfaced across both prior review cycles — unencoded `/`,`?`,`#` in the password, a
+    /// `p@ss`-style embedded `@`, multiple `@`s deeper in the userinfo (`SECRET1@junk/SECRET2`,
+    /// `a@b/c@d`), `%40`-encoding, multi-`:`, IPv6, and a query-tail secret — is asserted to leave
+    /// NO marker byte in the output. The coarse rule masks `[first ':' , last '@']`, which
+    /// provably covers any password (see the fn doc), so this table can only stay green while the
+    /// sound rule is in place. Each row also pins the exact masked output and proves the marker is
+    /// genuinely present in the input (no false-green from an absent marker).
     #[test]
-    fn test_redact_dsn_password_masks_only_the_password() {
+    fn test_redact_dsn_password_leak_corpus_no_marker_survives() {
+        // (input, exact expected output, forbidden marker that must not survive)
+        const CORPUS: &[(&str, &str, &str)] = &[
+            // Unencoded '/','?','#' in the password (the original slice-off leak).
+            (
+                "postgres://user:pa/LEAK1@host/db",
+                "postgres://user:***@host/db",
+                "LEAK1",
+            ),
+            (
+                "postgres://user:pa?LEAK2@host/db",
+                "postgres://user:***@host/db",
+                "LEAK2",
+            ),
+            (
+                "postgres://user:pa#LEAK3@host/db",
+                "postgres://user:***@host/db",
+                "LEAK3",
+            ),
+            // Embedded '@' plus a delimiter (cycle-1 / cycle-2 boundary leaks).
+            (
+                "postgres://user:p@ss/LEAKX@host/db",
+                "postgres://user:***@host/db",
+                "LEAKX",
+            ),
+            (
+                "postgres://user:p@x/y@host/db",
+                "postgres://user:***@host/db",
+                "x/y",
+            ),
+            (
+                "postgres://user:p@x?y@host/db",
+                "postgres://user:***@host/db",
+                "x?y",
+            ),
+            (
+                "postgres://user:p@x#y@host/db",
+                "postgres://user:***@host/db",
+                "x#y",
+            ),
+            // Multiple '@'s with a delimiter between them — the cycle-2 acceptance-scan leaked the
+            // tail secret past the first "clean host" it accepted.
+            (
+                "postgres://user:SECRET1@junk/SECRET2@host/db",
+                "postgres://user:***@host/db",
+                "SECRET2",
+            ),
+            (
+                "postgres://user:a@b/c@d@host/db",
+                "postgres://user:***@host/db",
+                "b/c@d",
+            ),
+            (
+                "postgres://user:p@a?SECRET@host/db",
+                "postgres://user:***@host/db",
+                "SECRET",
+            ),
+            // Originals: ':'+'@' in password, '%40'-encoded '@', multi-':'.
+            (
+                "postgres://user:p@:ss@host/db",
+                "postgres://user:***@host/db",
+                "p@:ss",
+            ),
+            (
+                "postgres://user:p%40ss@host/db",
+                "postgres://user:***@host/db",
+                "p%40ss",
+            ),
+            (
+                "postgres://user:a:b:c@host/db",
+                "postgres://user:***@host/db",
+                "a:b:c",
+            ),
+            // IPv6 host: password masked, host/port preserved.
+            (
+                "postgres://user:SEKRET@[::1]:5432/db",
+                "postgres://user:***@[::1]:5432/db",
+                "SEKRET",
+            ),
+        ];
+
+        for &(input, expected, marker) in CORPUS {
+            assert!(
+                input.contains(marker),
+                "test bug: marker {marker:?} absent from input {input:?} (would be a false green)"
+            );
+            let out = super::redact_dsn_password(input);
+            assert_eq!(out, expected, "wrong mask for {input:?}");
+            assert!(
+                !out.contains(marker),
+                "password byte {marker:?} SURVIVED redaction of {input:?} -> {out:?}"
+            );
+            assert!(out.contains("***"), "no redaction marker for {input:?}");
+        }
+    }
+
+    /// UNCHANGED-CASES PIN: inputs with no `:`, or no `@` after the first `:`, carry no userinfo
+    /// password and must be returned byte-identical. Includes the CHECK case
+    /// `user@host:5432/db` (the first ':' is the PORT, after the '@', so there is no '@' after it),
+    /// bare hosts, sqlite paths, an IPv6 hostport, a bare-host query '@' (no ':' before it), and
+    /// the empty string.
+    #[test]
+    fn test_redact_dsn_password_unchanged_cases() {
+        const UNCHANGED: &[&str] = &[
+            "postgres://host:5432/db",
+            "host:5432/db",
+            "postgres://user@host/db",
+            "postgres://user@host:5432/db", // first ':' is the port, AFTER the '@' -> unchanged
+            "postgres://host/db?param=a@b", // no ':' before the query '@'
+            "postgres://[::1]:5432/db",
+            "sqlite::memory:",
+            "sqlite:/tmp/catalog.db",
+            "",
+        ];
+
+        for &input in UNCHANGED {
+            assert_eq!(
+                super::redact_dsn_password(input),
+                input,
+                "input with no userinfo password must be unchanged: {input:?}"
+            );
+        }
+    }
+
+    /// EXACT PER-CASE PINS: the canonical masked shapes, including the two deliberate
+    /// OVER-REDACTION cases the sound coarse rule now produces (documented in the fn's
+    /// over-redaction envelope). Over-redaction is safe by construction — masked-but-visible
+    /// bytes may be non-secrets, but no secret is ever left visible.
+    #[test]
+    fn test_redact_dsn_password_exact_shapes() {
+        // Well-formed DSNs: password masked, everything else visible.
         assert_eq!(
             super::redact_dsn_password("postgres://user:pass@host:5432/db"),
             "postgres://user:***@host:5432/db"
         );
-        // No scheme separator: the whole prefix is treated as authority.
+        // No scheme separator: the whole prefix is treated as the remainder.
         assert_eq!(
             super::redact_dsn_password("user:pass@host/db"),
             "user:***@host/db"
         );
-        // Unencoded '@' inside the password: the boundary is the '@' whose host has no further
-        // '@', so the password is fully masked rather than partially leaked.
-        assert_eq!(
-            super::redact_dsn_password("postgres://user:p@ss@host/db"),
-            "postgres://user:***@host/db"
-        );
-        // Unencoded '/', '?', or '#' inside the password must NOT slice the boundary '@' off the
-        // string (the original leak): the password is still fully masked and no password byte
-        // survives. Each password carries a unique marker to prove it does not leak.
-        assert_eq!(
-            super::redact_dsn_password("postgres://user:pa/LEAK1@host/db"),
-            "postgres://user:***@host/db"
-        );
-        assert!(
-            !super::redact_dsn_password("postgres://user:pa/LEAK1@host/db").contains("LEAK1"),
-            "'/'-in-password leaked"
-        );
-        assert_eq!(
-            super::redact_dsn_password("postgres://user:pa?LEAK2@host/db"),
-            "postgres://user:***@host/db"
-        );
-        assert!(
-            !super::redact_dsn_password("postgres://user:pa?LEAK2@host/db").contains("LEAK2"),
-            "'?'-in-password leaked"
-        );
-        assert_eq!(
-            super::redact_dsn_password("postgres://user:pa#LEAK3@host/db"),
-            "postgres://user:***@host/db"
-        );
-        assert!(
-            !super::redact_dsn_password("postgres://user:pa#LEAK3@host/db").contains("LEAK3"),
-            "'#'-in-password leaked"
-        );
-        // Disambiguation crux: a userinfo password IS masked while an '@' living in the query is
-        // left intact (the boundary '@' is chosen by its clean host, not the last '@')...
-        assert_eq!(
-            super::redact_dsn_password("postgres://user:PWQ@host/db?param=a@b"),
-            "postgres://user:***@host/db?param=a@b"
-        );
-        // ...and a bare host whose query merely contains an '@' (no userinfo ':') stays untouched.
-        assert_eq!(
-            super::redact_dsn_password("postgres://host/db?param=a@b"),
-            "postgres://host/db?param=a@b"
-        );
-        // IPv6 host: userinfo password masked, host/port preserved.
-        assert_eq!(
-            super::redact_dsn_password("postgres://user:SEKRET@[::1]:5432/db"),
-            "postgres://user:***@[::1]:5432/db"
-        );
-        assert_eq!(
-            super::redact_dsn_password("postgres://[::1]:5432/db"),
-            "postgres://[::1]:5432/db"
-        );
-        // '@' AND ':' inside the password: the FIRST userinfo ':' anchors the mask, the last
-        // clean-host '@' is the boundary, so the whole password is masked.
-        assert_eq!(
-            super::redact_dsn_password("postgres://user:p@:ss@host/db"),
-            "postgres://user:***@host/db"
-        );
-        // Empty password (userinfo ends at ':') and a multi-':' password both fully mask.
+        // Empty password (userinfo ends at ':') still masks to the marker.
         assert_eq!(
             super::redact_dsn_password("postgres://user:@host/db"),
             "postgres://user:***@host/db"
         );
+
+        // --- Deliberate over-redaction (see fn doc "Over-redaction envelope"). ---
+        // (f) query case: the query '@' is the LAST '@', so host/path is swallowed into the mask.
+        // CHANGED from the prior precise-parser expectation `...@host/db?param=a@b` — this is the
+        // safe direction: `host/db?param=a` is a NON-secret masked, nothing leaks.
         assert_eq!(
-            super::redact_dsn_password("postgres://user:a:b:c@host/db"),
-            "postgres://user:***@host/db"
+            super::redact_dsn_password("postgres://user:PWQ@host/db?param=a@b"),
+            "postgres://user:***@b"
         );
-        // Over-redaction on genuine ambiguity is acceptable: a bare host with a port ':' and a
-        // later query '@' masks rather than leaks (the port ':' reads as a password separator).
+        // Bare host with a port ':' and a later query '@': the port reads as a password separator.
         assert_eq!(
             super::redact_dsn_password("postgres://host:5432/db?x=a@b"),
             "postgres://host:***@b"
         );
-        // Nothing to redact: user-only userinfo, no userinfo at all, sqlite path, and empty.
+        // A colon anywhere before a later '@' over-redacts (acceptable): host/path masked, no leak.
         assert_eq!(
-            super::redact_dsn_password("postgres://user@host/db"),
-            "postgres://user@host/db"
+            super::redact_dsn_password("postgres://host/db?p=a:b@c"),
+            "postgres://host/db?p=a:***@c"
         );
-        assert_eq!(
-            super::redact_dsn_password("postgres://host:5432/db"),
-            "postgres://host:5432/db"
-        );
-        assert_eq!(
-            super::redact_dsn_password("sqlite:/tmp/catalog.db"),
-            "sqlite:/tmp/catalog.db"
-        );
-        assert_eq!(super::redact_dsn_password(""), "");
     }
 
     /// Risk (#159 unit-D residue): `SqlCatalogConfig` holds BOTH a DSN that can embed a password
