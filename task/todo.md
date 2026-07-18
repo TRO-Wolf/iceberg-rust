@@ -51,13 +51,26 @@ bundle-final Critic + B/C/D/E = OO at max effort. No merges overnight — all SQ
 morning. This tracker rides branch A only (5 parallel branches editing one todo region would conflict
 at SQM); B–E record themselves in PR bodies + the morning memory append.
 
-- [ ] **A1 (FF): BUG-001 real NaN evaluation** — branch `fix/audit-nan-null-residual-parity`,
+- [x] **A1 (FF): BUG-001 real NaN evaluation** — branch `fix/audit-nan-null-residual-parity`,
       charter `task/a1-nan-residual-brief.md`. `is_nan`→always-true / `not_nan`→always-false on
       present columns in `arrow/reader.rs` PredicateConverter (RowFilter — rows dropped at read) AND
       `arrow/record_batch_predicate.rs` (eq-delete application). DF maps `isnan` in
       (`expr_to_predicate.rs:229`); `NOT isnan` over-drops through SQL. Fix = real per-row NaN checks;
       Java oracle (`Evaluator`/`NaNUtil`, cached jars) decides null-cell + missing-col + non-float
       binding arms.
+      *Done 2026-07-17 (Fable Actor): shared two-valued `is_nan_row_mask`/`not_nan_row_mask`
+      (`record_batch_predicate.rs`, imported by both evaluators) — elementwise `is_valid && is_nan`,
+      NULL cell ⇒ not-NaN (self-decoded `NaNUtil.isNaN` bytecode: null ⇒ `iconst_0` at offsets 0-5;
+      non-float ⇒ false at 42-43 mirrored for the bind-unreachable arm). Missing-column arms
+      confirmed already-Java-correct (unchanged). Both engines reject non-float binds (Java
+      `bindUnaryOperation` 158-171/202-215 ValidationException ≙ Rust `predicate.rs:399` DataInvalid)
+      — no binding deviation. Pins: 4 unit truth-table tests (incl. crafted NaN-under-null-slot
+      buffer), full-path `TableScan::to_arrow` scan pin (new `new_nan_floats` fixture, f64+f32 both
+      directions + before-column-existed file), DF e2e `isnan`/`NOT isnan` (the silent-zero-rows
+      regression). 9 mutations each independently RED, restores byte-verified. Gate green
+      (typos/fmt/clippy×2/lib 2789/DF 53+88/artifacts); DF doc-test FAIL = the known pre-existing
+      `-p` rt-multi-thread artifact (2026-07-10 A3 note). Charter file reworded minimally to pass
+      the typos gate (SHA lengthened, two hyphenated words joined) — disclosed deviation.*
 - [ ] **A2 (FF): null-semantics family BUG-002/003/011** — same branch, stacked. Port Java
       nulls-first total-order (bytecode truth table: null<lit=T, null<=lit=T, null!=lit=T,
       null==lit=F, null>lit=F) consistently across `reader.rs` PredicateConverter,

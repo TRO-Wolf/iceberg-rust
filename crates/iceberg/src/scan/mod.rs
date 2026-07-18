@@ -1346,6 +1346,84 @@ pub mod tests {
             }
         }
 
+        /// Builds an UNPARTITIONED fixture whose current schema (id 1) is EXTENDED with two
+        /// optional float columns — `dbl_nan` (id 9, double) and `flt_nan` (id 10, float) — for
+        /// the full-path `is_nan`/`not_nan` pins (audit BUG-001). Unpartitioned so `x` stays a
+        /// file column (no identity-partition constants) and no partition value is needed for
+        /// the new fields. Pair with [`Self::setup_nan_manifest_files`].
+        pub fn new_nan_floats() -> Self {
+            let tmp_dir = TempDir::new().unwrap();
+            let table_location = tmp_dir.path().join("table1");
+            let manifest_list1_location = table_location.join("metadata/manifests_list_1.avro");
+            let manifest_list2_location = table_location.join("metadata/manifests_list_2.avro");
+            let table_metadata1_location = table_location.join("metadata/v1.json");
+
+            let file_io = FileIO::new_with_fs();
+
+            let mut table_metadata = {
+                let template_json_str = fs::read_to_string(format!(
+                    "{}/testdata/example_table_metadata_v2.json",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .unwrap();
+                let metadata_json = render_template(&template_json_str, context! {
+                    table_location => &table_location,
+                    manifest_list_1_location => &manifest_list1_location,
+                    manifest_list_2_location => &manifest_list2_location,
+                    table_metadata_1_location => &table_metadata1_location,
+                });
+                serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
+            };
+
+            // Unpartition (same shape as `new_unpartitioned`).
+            table_metadata.default_spec = Arc::new(PartitionSpec::unpartition_spec());
+            table_metadata.partition_specs.clear();
+            table_metadata.default_partition_type = StructType::new(vec![]);
+            table_metadata
+                .partition_specs
+                .insert(0, table_metadata.default_spec.clone());
+
+            // Extend schema 1 (the current schema, referenced by the current snapshot) with the
+            // two optional float columns the NaN pins filter on.
+            let extended_fields: Vec<_> = table_metadata
+                .schemas
+                .get(&1)
+                .expect("template carries schema id 1")
+                .as_struct()
+                .fields()
+                .iter()
+                .cloned()
+                .chain([
+                    NestedField::optional(9, "dbl_nan", Type::Primitive(PrimitiveType::Double))
+                        .into(),
+                    NestedField::optional(10, "flt_nan", Type::Primitive(PrimitiveType::Float))
+                        .into(),
+                ])
+                .collect();
+            let extended_schema = Arc::new(
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields(extended_fields)
+                    .build()
+                    .expect("extend fixture schema with float columns"),
+            );
+            table_metadata.schemas.insert(1, extended_schema);
+            table_metadata.last_column_id = 10;
+
+            let table = Table::builder()
+                .metadata(table_metadata)
+                .identifier(TableIdent::from_strs(["db", "table1"]).unwrap())
+                .file_io(file_io.clone())
+                .metadata_location(table_metadata1_location.to_str().unwrap())
+                .build()
+                .unwrap();
+
+            Self {
+                table_location: table_location.to_str().unwrap().to_string(),
+                table,
+            }
+        }
+
         /// Builds a fixture partitioned by `truncate(x, 100)` over the same schema
         /// and data as [`Self::new`]. Used to prove the residual wiring on a
         /// NON-identity (transform) partition: the parquet `x` column is `[1; 1024]`,
@@ -2289,6 +2367,134 @@ pub mod tests {
             let data_file_manifest = writer.write_manifest_file().await.unwrap();
 
             // Write to manifest list
+            let mut manifest_list_write = ManifestListWriter::v2(
+                self.table
+                    .file_io()
+                    .new_output(current_snapshot.manifest_list())
+                    .unwrap(),
+                current_snapshot.snapshot_id(),
+                current_snapshot.parent_snapshot_id(),
+                current_snapshot.sequence_number(),
+            );
+            manifest_list_write
+                .add_manifests(vec![data_file_manifest].into_iter())
+                .unwrap();
+            manifest_list_write.close().await.unwrap();
+        }
+
+        /// Writes the two data files for the NaN pins (see [`Self::new_nan_floats`]) and returns
+        /// their byte sizes:
+        ///   * `1.parquet` — `x = [1, 2, 3, 4]` with `dbl_nan = [NaN, 100.5, NULL, -7.25]` and
+        ///     `flt_nan = [NaN, 3.5, NULL, 8.75]` (a {NaN, finite, NULL} truth table per float
+        ///     width);
+        ///   * `2.parquet` — ONLY `x = [100, 200]`, a file written BEFORE the float columns
+        ///     existed (the schema-evolution missing-column arm).
+        fn write_nan_parquet_files(&self) -> (u64, u64) {
+            std::fs::create_dir_all(&self.table_location).unwrap();
+
+            let props = WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build();
+
+            let field_id_metadata =
+                |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+
+            // 1.parquet: x + both float columns.
+            let schema_with_floats = Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("x", arrow_schema::DataType::Int64, false)
+                    .with_metadata(field_id_metadata("1")),
+                arrow_schema::Field::new("dbl_nan", arrow_schema::DataType::Float64, true)
+                    .with_metadata(field_id_metadata("9")),
+                arrow_schema::Field::new("flt_nan", arrow_schema::DataType::Float32, true)
+                    .with_metadata(field_id_metadata("10")),
+            ]));
+            let x_col = Arc::new(Int64Array::from_iter_values([1, 2, 3, 4])) as ArrayRef;
+            let dbl_col = Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(100.5),
+                None,
+                Some(-7.25),
+            ])) as ArrayRef;
+            let flt_col = Arc::new(arrow_array::Float32Array::from(vec![
+                Some(f32::NAN),
+                Some(3.5),
+                None,
+                Some(8.75),
+            ])) as ArrayRef;
+            let with_floats =
+                RecordBatch::try_new(schema_with_floats.clone(), vec![x_col, dbl_col, flt_col])
+                    .unwrap();
+            let file = File::create(format!("{}/1.parquet", &self.table_location)).unwrap();
+            let mut writer =
+                ArrowWriter::try_new(file, schema_with_floats, Some(props.clone())).unwrap();
+            writer.write(&with_floats).expect("Writing batch");
+            writer.close().unwrap();
+
+            // 2.parquet: only x — written "before" ids 9/10 were added to the schema.
+            let schema_x_only = Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("x", arrow_schema::DataType::Int64, false)
+                    .with_metadata(field_id_metadata("1")),
+            ]));
+            let x_col = Arc::new(Int64Array::from_iter_values([100, 200])) as ArrayRef;
+            let x_only = RecordBatch::try_new(schema_x_only.clone(), vec![x_col]).unwrap();
+            let file = File::create(format!("{}/2.parquet", &self.table_location)).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema_x_only, Some(props)).unwrap();
+            writer.write(&x_only).expect("Writing batch");
+            writer.close().unwrap();
+
+            let size_of = |name: &str| {
+                std::fs::metadata(format!("{}/{}", &self.table_location, name))
+                    .unwrap()
+                    .len()
+            };
+            (size_of("1.parquet"), size_of("2.parquet"))
+        }
+
+        /// Declares `1.parquet` + `2.parquet` from [`Self::write_nan_parquet_files`] as the two
+        /// live data files of the current snapshot (unpartitioned V2 manifest).
+        pub async fn setup_nan_manifest_files(&mut self) {
+            let current_snapshot = self.table.metadata().current_snapshot().unwrap();
+            let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
+            let current_partition_spec = Arc::new(PartitionSpec::unpartition_spec());
+
+            let (size_1, size_2) = self.write_nan_parquet_files();
+
+            let mut writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                Some(current_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+            .build_v2_data();
+
+            for (file_name, size, record_count) in
+                [("1.parquet", size_1, 4u64), ("2.parquet", size_2, 2u64)]
+            {
+                writer
+                    .add_entry(
+                        ManifestEntry::builder()
+                            .status(ManifestStatus::Added)
+                            .data_file(
+                                DataFileBuilder::default()
+                                    .partition_spec_id(0)
+                                    .content(DataContentType::Data)
+                                    .file_path(format!("{}/{}", &self.table_location, file_name))
+                                    .file_format(DataFileFormat::Parquet)
+                                    .file_size_in_bytes(size)
+                                    .record_count(record_count)
+                                    .partition(Struct::empty())
+                                    .key_metadata(None)
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .build(),
+                    )
+                    .unwrap();
+            }
+
+            let data_file_manifest = writer.write_manifest_file().await.unwrap();
+
             let mut manifest_list_write = ManifestListWriter::v2(
                 self.table
                     .file_io()
@@ -3951,6 +4157,92 @@ pub mod tests {
         let col = batches[0].column_by_name("y").unwrap();
         let int64_arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(int64_arr.value(0), 2);
+    }
+
+    /// Full-path pins for audit BUG-001 (constant-truth NaN residuals): `TableScan::to_arrow`
+    /// with `is_nan` / `not_nan` filters over BOTH float widths, content-asserted by the `x`
+    /// row set. `1.parquet` carries the {NaN, finite, NULL} truth table (x = 1/2·4/3):
+    ///   * `is_nan` must return ONLY the NaN row (pre-fix: constant `true` returned finite and
+    ///     NULL rows as if NaN);
+    ///   * `not_nan` must KEEP finite AND NULL rows (pre-fix: constant `false` silently dropped
+    ///     EVERY row — the corruption class), NULL kept per Java `NaNUtil.isNaN(null) == false`.
+    /// `2.parquet` (x = 100/200, written BEFORE the float columns existed) pins the
+    /// missing-column arms inside the same scans: its rows must NEVER surface under `is_nan`
+    /// and must ALL surface under `not_nan`.
+    #[tokio::test]
+    async fn test_filter_on_arrow_is_nan_not_nan_full_path() {
+        let mut fixture = TableTestFixture::new_nan_floats();
+        fixture.setup_nan_manifest_files().await;
+
+        // (filter, expected x row set, the filtered float column when the survivors must all
+        //  be NaN — the content proof for the `is_nan` direction)
+        let cases: Vec<(Predicate, Vec<i64>, Option<&str>)> = vec![
+            (Reference::new("dbl_nan").is_nan(), vec![1], Some("dbl_nan")),
+            (
+                Reference::new("dbl_nan").is_not_nan(),
+                vec![2, 3, 4, 100, 200],
+                None,
+            ),
+            (Reference::new("flt_nan").is_nan(), vec![1], Some("flt_nan")),
+            (
+                Reference::new("flt_nan").is_not_nan(),
+                vec![2, 3, 4, 100, 200],
+                None,
+            ),
+        ];
+
+        for (predicate, expected_x, nan_column) in cases {
+            let predicate_display = format!("{predicate}");
+            let table_scan = fixture
+                .table
+                .scan()
+                .select(["x", "dbl_nan", "flt_nan"])
+                .with_filter(predicate)
+                .build()
+                .expect("build the NaN filter scan");
+            let batches: Vec<_> = table_scan
+                .to_arrow()
+                .await
+                .expect("open the arrow stream")
+                .try_collect()
+                .await
+                .expect("collect the filtered batches");
+
+            let mut x_values: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let col = batch
+                        .column_by_name("x")
+                        .expect("scan output carries the x column");
+                    decode_int64_column(col)
+                        .iter()
+                        .map(|value| value.expect("x is a required column"))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            x_values.sort_unstable();
+            assert_eq!(x_values, expected_x, "filter `{predicate_display}`");
+
+            if let Some(nan_column_name) = nan_column {
+                for batch in &batches {
+                    let col = batch
+                        .column_by_name(nan_column_name)
+                        .expect("scan output carries the filtered float column");
+                    let doubles = arrow_cast::cast::cast(col, &arrow_schema::DataType::Float64)
+                        .expect("float column casts to Float64");
+                    let doubles = doubles
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .expect("cast yields a Float64Array");
+                    for row in 0..doubles.len() {
+                        assert!(
+                            doubles.is_valid(row) && doubles.value(row).is_nan(),
+                            "every row surviving `{predicate_display}` must be NaN"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

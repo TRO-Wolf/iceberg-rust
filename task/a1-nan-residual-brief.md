@@ -23,7 +23,7 @@ Branch: `fix/audit-nan-null-residual-parity` (this unit is the first of two stac
 your commits scoped to A1 — a follow-up unit A2 will land the broader null-semantics port on the
 same branch AFTER you finish. Do not fix null-comparison semantics beyond what this charter names).
 
-## The defect (verified 2026-07-17, main @ 4ba52db7)
+## The defect (verified 2026-07-17, main @ 4ba52db7062ba67d95d2599833b852071491b49f)
 
 Both row-level predicate evaluators compile `is_nan` / `not_nan` on a PRESENT float column to
 constants:
@@ -37,7 +37,7 @@ constants:
 2. `crates/iceberg/src/arrow/record_batch_predicate.rs` — `is_nan`/`not_nan` (~L176-189): same
    constant shapes (`all_true()`/`all_false()`). `evaluate_predicate_to_mask` is used by the reader
    post-filter path and by equality-delete application (`arrow/delete_filter.rs`), so eq-delete
-   predicates involving NaN-relevant floats can mis-apply.
+   predicates involving NaN-relevant floats can misapply.
 
 DataFusion maps `isnan(col)` → `Reference::new(col).is_nan()`
 (`crates/integrations/datafusion/src/physical_plan/expr_to_predicate.rs:229`) and pushdown is
@@ -56,7 +56,7 @@ share a helper across the two files without contorting either, do so.
 The parity oracle is Java 1.10.0, cached locally (NO network):
 `~/.m2/repository/org/apache/iceberg/iceberg-api/1.10.0/iceberg-api-1.10.0.jar` (+ iceberg-core
 same tree). `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64`, unzip into your scratch dir, decode
-with `javap -p -c`. A previous unit's brief mis-stated a decoded oracle and the Actor's own decode
+with `javap -p -c`. A previous unit's brief misstated a decoded oracle and the Actor's own decode
 was right — treat every claim in this section as a hypothesis until your own decode confirms it.
 
 Decode and cite (class + method + decisive bytecode offsets) each of:

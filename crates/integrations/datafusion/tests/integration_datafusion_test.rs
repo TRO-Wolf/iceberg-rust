@@ -4815,3 +4815,82 @@ async fn test_update_mread_zero_match_writes_no_file_no_snapshot() -> Result<()>
     );
     Ok(())
 }
+
+/// E2E pin for audit BUG-001 (constant-truth NaN residuals): `isnan(col)` maps to the Iceberg
+/// `is_nan` predicate (`expr_to_predicate.rs`) and is pushed down `Inexact` into the parquet
+/// `RowFilter`. Pre-fix, `not_nan` compiled to constant-`false` there, so
+/// `WHERE NOT isnan(x)` silently returned ZERO rows through SQL — DataFusion's re-filter can
+/// mask over-INCLUSION but cannot restore rows the RowFilter over-DROPPED. Expected row sets:
+/// the NaN row only under `isnan`; the finite row only under `NOT isnan` (Iceberg keeps the
+/// NULL row per Java `NaNUtil.isNaN(null) == false`; DataFusion's own SQL three-valued-logic
+/// re-filter then drops it, since `NOT isnan(NULL)` is SQL NULL).
+#[tokio::test]
+async fn test_isnan_filter_pushdown_returns_correct_rows() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_isnan_pushdown".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "dbl", Type::Primitive(PrimitiveType::Double)).into(),
+            NestedField::optional(3, "flt", Type::Primitive(PrimitiveType::Float)).into(),
+        ])
+        .build()?;
+    let creation = get_table_creation(temp_path(), "my_table", Some(schema))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Rows: id 1 = NaN in both float columns, id 2 = finite, id 3 = NULL.
+    ctx.sql(
+        "INSERT INTO catalog.test_isnan_pushdown.my_table VALUES \
+         (1, CAST('NaN' AS DOUBLE), CAST('NaN' AS FLOAT)), \
+         (2, 2.5, CAST(3.5 AS FLOAT)), \
+         (3, NULL, NULL)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    for (filter, expected_ids) in [
+        ("isnan(dbl)", vec![1]),
+        ("NOT isnan(dbl)", vec![2]),
+        ("isnan(flt)", vec![1]),
+        ("NOT isnan(flt)", vec![2]),
+    ] {
+        let batches = ctx
+            .sql(&format!(
+                "SELECT id FROM catalog.test_isnan_pushdown.my_table WHERE {filter}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column is Int32")
+                    .iter()
+                    .map(|value| value.expect("id is a required column"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "WHERE {filter}");
+    }
+
+    Ok(())
+}

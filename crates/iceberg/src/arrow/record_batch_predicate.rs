@@ -30,13 +30,15 @@
 //!
 //! A reference to a column ABSENT from the batch (schema evolution / projection) is treated as a
 //! NULL column under three-valued logic, matching `PredicateConverter`'s "missing column → null"
-//! branches: `is_null` / `<` / `<=` / `not_starts_with` / `not_in` are `true` on a missing column,
-//! every other leaf is `false`.
+//! branches: `is_null` / `<` / `<=` / `not_starts_with` / `not_in` / `not_nan` are `true` on a
+//! missing column, every other leaf is `false`.
 
 use std::collections::HashMap;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
-use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Datum as ArrowDatum, Float32Array, Float64Array, RecordBatch,
+};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::ArrowError;
 use arrow_string::like::starts_with;
@@ -124,6 +126,48 @@ impl<'a> RecordBatchPredicateEvaluator<'a> {
     }
 }
 
+/// Per-row `is_nan` mask over `column`, mirroring Java `NaNUtil.isNaN(Object)`
+/// (iceberg-api 1.10.0 bytecode: a NULL value is NOT NaN — `ifnonnull 6` / `iconst_0` at offsets
+/// 0-5; `Double.isNaN` at 13-23; `Float.isNaN` at 31-41; any non-floating value falls through to
+/// `iconst_0` at 42-43). The mask is TWO-valued (`null_count() == 0`): Java's NaN predicates
+/// return a plain boolean, never SQL three-valued-logic NULL, so a NULL cell yields literal
+/// `false` here (and literal `true` under [`not_nan_row_mask`]) — a validity-propagating mask
+/// would make the `RowFilter` / `coerce_nulls_to_false` consumers DROP null cells under
+/// `not_nan`, diverging from Java. A non-float column (unreachable through `Predicate::bind`,
+/// which rejects NaN predicates on non-float terms) degrades to the same all-`false` constant
+/// Java produces.
+pub(crate) fn is_nan_row_mask(column: &dyn Array) -> BooleanArray {
+    nan_row_mask(column, false)
+}
+
+/// Per-row `not_nan` mask over `column`: the elementwise negation of [`is_nan_row_mask`],
+/// matching Java `Evaluator$EvalVisitor.notNaN` (`!NaNUtil.isNaN(term.eval(struct))`, bytecode
+/// offsets 10-21). A NULL cell is NOT NaN, so it yields literal `true` (the row is KEPT).
+pub(crate) fn not_nan_row_mask(column: &dyn Array) -> BooleanArray {
+    nan_row_mask(column, true)
+}
+
+/// Shared core of [`is_nan_row_mask`] / [`not_nan_row_mask`]: elementwise
+/// `is_valid(row) && value(row).is_nan()`, XOR-flipped by `negate`. See [`is_nan_row_mask`] for
+/// the Java `NaNUtil` truth table this mirrors (null → not NaN; non-float → not NaN).
+fn nan_row_mask(column: &dyn Array, negate: bool) -> BooleanArray {
+    if let Some(floats) = column.as_any().downcast_ref::<Float32Array>() {
+        BooleanArray::from_iter(
+            (0..floats.len())
+                .map(|row| Some((floats.is_valid(row) && floats.value(row).is_nan()) != negate)),
+        )
+    } else if let Some(floats) = column.as_any().downcast_ref::<Float64Array>() {
+        BooleanArray::from_iter(
+            (0..floats.len())
+                .map(|row| Some((floats.is_valid(row) && floats.value(row).is_nan()) != negate)),
+        )
+    } else {
+        // Java `NaNUtil.isNaN` returns `false` for any non-Double/Float value (bytecode 42-43),
+        // so `is_nan` is all-`false` and `not_nan` all-`true` on a non-float column.
+        BooleanArray::from(vec![negate; column.len()])
+    }
+}
+
 fn arrow_err(e: ArrowError) -> Error {
     Error::new(
         ErrorKind::Unexpected,
@@ -174,18 +218,18 @@ impl BoundPredicateVisitor for RecordBatchPredicateEvaluator<'_> {
     }
 
     fn is_nan(&mut self, reference: &BoundReference, _p: &BoundPredicate) -> Result<BooleanArray> {
-        if self.column_for(reference).is_some() {
-            self.all_true()
-        } else {
-            self.all_false()
+        match self.column_for(reference) {
+            Some(col) => Ok(is_nan_row_mask(&col)),
+            // A missing column is a NULL column: Java `NaNUtil.isNaN(null)` == false.
+            None => self.all_false(),
         }
     }
 
     fn not_nan(&mut self, reference: &BoundReference, _p: &BoundPredicate) -> Result<BooleanArray> {
-        if self.column_for(reference).is_some() {
-            self.all_false()
-        } else {
-            self.all_true()
+        match self.column_for(reference) {
+            Some(col) => Ok(not_nan_row_mask(&col)),
+            // A missing column is a NULL column: `!NaNUtil.isNaN(null)` == true.
+            None => self.all_true(),
         }
     }
 
@@ -301,5 +345,168 @@ impl BoundPredicateVisitor for RecordBatchPredicateEvaluator<'_> {
             }
             None => self.all_true(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Float32Array, Float64Array, RecordBatch};
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    use super::*;
+    use crate::expr::{Bind, Reference};
+    use crate::spec::{NestedField, PrimitiveType, Schema, SchemaRef, Type};
+
+    /// Iceberg schema for the NaN pins: `dbl`/`flt` are float columns PRESENT in the test batch;
+    /// `missing_dbl` binds but is ABSENT from the batch (schema evolution / projection).
+    fn nan_test_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "dbl", Type::Primitive(PrimitiveType::Double)).into(),
+                    NestedField::optional(2, "flt", Type::Primitive(PrimitiveType::Float)).into(),
+                    NestedField::optional(3, "missing_dbl", Type::Primitive(PrimitiveType::Double))
+                        .into(),
+                ])
+                .build()
+                .expect("build the NaN pin schema"),
+        )
+    }
+
+    /// A batch with rows `[NaN, finite, NULL]` in both a Float64 (`dbl`, field id 1) and a
+    /// Float32 (`flt`, field id 2) column.
+    fn nan_finite_null_batch() -> RecordBatch {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("dbl", DataType::Float64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("flt", DataType::Float32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let dbl = Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(1.5), None])) as ArrayRef;
+        let flt = Arc::new(Float32Array::from(vec![Some(f32::NAN), Some(2.5), None])) as ArrayRef;
+        RecordBatch::try_new(arrow_schema, vec![dbl, flt]).expect("build the NaN pin batch")
+    }
+
+    /// Collects a mask to plain bools, first asserting it is TWO-valued (`null_count() == 0`) —
+    /// the Java parity invariant: `NaNUtil.isNaN` returns a boolean, never a 3VL NULL, so a
+    /// validity-propagating mask (which would make `RowFilter`/`coerce_nulls_to_false` DROP null
+    /// cells under `not_nan`) is itself a divergence.
+    fn two_valued(mask: &BooleanArray) -> Vec<bool> {
+        assert_eq!(
+            mask.null_count(),
+            0,
+            "NaN predicate masks must be two-valued (Java NaNUtil returns a plain boolean)"
+        );
+        (0..mask.len()).map(|i| mask.value(i)).collect()
+    }
+
+    /// Pins: `is_nan` on a present float column evaluates PER ROW — the pre-fix constant-`true`
+    /// shape returned finite (and NULL) rows as if they were NaN (audit BUG-001). NULL cell ⇒
+    /// `false` per Java `NaNUtil.isNaN(null)` (bytecode offsets 0-5: `ifnonnull`/`iconst_0`).
+    #[test]
+    fn is_nan_evaluates_per_row_f64_and_f32_null_is_not_nan() {
+        let schema = nan_test_schema();
+        let batch = nan_finite_null_batch();
+
+        for column_name in ["dbl", "flt"] {
+            let predicate = Reference::new(column_name)
+                .is_nan()
+                .bind(schema.clone(), true)
+                .expect("bind is_nan");
+            let mask = evaluate_predicate_to_mask(&predicate, &batch).expect("evaluate is_nan");
+            assert_eq!(
+                two_valued(&mask),
+                vec![true, false, false],
+                "is_nan({column_name}) over [NaN, finite, NULL]"
+            );
+        }
+    }
+
+    /// Pins: `not_nan` on a present float column KEEPS finite AND NULL rows — the pre-fix
+    /// constant-`false` shape silently dropped EVERY row (the corruption class of audit
+    /// BUG-001). NULL cell ⇒ `true` per Java `Evaluator$EvalVisitor.notNaN` =
+    /// `!NaNUtil.isNaN(value)` (bytecode offsets 10-21 negating the null⇒false of `NaNUtil`).
+    /// Also pins `NOT(is_nan)` ≡ `not_nan` through the visitor's `not()` — only a two-valued
+    /// `is_nan` mask keeps that equivalence for NULL cells.
+    #[test]
+    fn not_nan_keeps_finite_and_null_rows_f64_and_f32() {
+        let schema = nan_test_schema();
+        let batch = nan_finite_null_batch();
+
+        for column_name in ["dbl", "flt"] {
+            let not_nan = Reference::new(column_name)
+                .is_not_nan()
+                .bind(schema.clone(), true)
+                .expect("bind not_nan");
+            let mask = evaluate_predicate_to_mask(&not_nan, &batch).expect("evaluate not_nan");
+            assert_eq!(
+                two_valued(&mask),
+                vec![false, true, true],
+                "not_nan({column_name}) over [NaN, finite, NULL]"
+            );
+
+            let negated_is_nan = (!Reference::new(column_name).is_nan())
+                .bind(schema.clone(), true)
+                .expect("bind NOT(is_nan)");
+            let negated_mask =
+                evaluate_predicate_to_mask(&negated_is_nan, &batch).expect("evaluate NOT(is_nan)");
+            assert_eq!(
+                two_valued(&negated_mask),
+                vec![false, true, true],
+                "NOT(is_nan({column_name})) must equal not_nan({column_name})"
+            );
+        }
+    }
+
+    /// Pins the `is_valid` guard directly: a NULL slot whose UNDERLYING BUFFER value is NaN
+    /// (legal in arrow — values under invalid slots are arbitrary) must still evaluate as
+    /// NOT NaN. An implementation that reads the buffer without consulting validity would
+    /// report `true` for `is_nan` on row 2.
+    #[test]
+    fn nan_masks_ignore_buffer_values_under_null_slots() {
+        let floats = Float64Array::new(
+            vec![f64::NAN, 1.5, f64::NAN].into(),
+            Some(NullBuffer::from(vec![true, true, false])),
+        );
+        assert!(floats.is_null(2), "row 2 must be a NULL slot");
+
+        let is_nan_mask = is_nan_row_mask(&floats);
+        assert_eq!(two_valued(&is_nan_mask), vec![true, false, false]);
+
+        let not_nan_mask = not_nan_row_mask(&floats);
+        assert_eq!(two_valued(&not_nan_mask), vec![false, true, true]);
+    }
+
+    /// Pins the missing-column (schema evolution) arms: a bound float column ABSENT from the
+    /// batch is a NULL column, so `is_nan` ⇒ all-`false` and `not_nan` ⇒ all-`true`
+    /// (Java: `term.eval(struct)` yields null ⇒ `NaNUtil.isNaN(null)` == false).
+    #[test]
+    fn nan_predicates_on_missing_column_treat_column_as_null() {
+        let schema = nan_test_schema();
+        let batch = nan_finite_null_batch();
+
+        let is_nan = Reference::new("missing_dbl")
+            .is_nan()
+            .bind(schema.clone(), true)
+            .expect("bind is_nan on the missing column");
+        let mask = evaluate_predicate_to_mask(&is_nan, &batch).expect("evaluate is_nan");
+        assert_eq!(two_valued(&mask), vec![false, false, false]);
+
+        let not_nan = Reference::new("missing_dbl")
+            .is_not_nan()
+            .bind(schema, true)
+            .expect("bind not_nan on the missing column");
+        let mask = evaluate_predicate_to_mask(&not_nan, &batch).expect("evaluate not_nan");
+        assert_eq!(two_valued(&mask), vec![true, true, true]);
     }
 }

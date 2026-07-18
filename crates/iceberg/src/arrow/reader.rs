@@ -52,7 +52,9 @@ use crate::arrow::delete_filter::positional_delete_keep_mask;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::orc_reader::read_orc_data_file;
-use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
+use crate::arrow::record_batch_predicate::{
+    evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask,
+};
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
@@ -2081,10 +2083,15 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if self.bound_reference(reference)?.is_some() {
-            self.build_always_true()
+        if let Some(idx) = self.bound_reference(reference)? {
+            Ok(Box::new(move |batch| {
+                let column = project_column(&batch, idx)?;
+                // Per-row NaN test mirroring Java `NaNUtil.isNaN` (NULL cell ⇒ false; the mask
+                // is two-valued, so the `RowFilter` never drops a row for being NULL here).
+                Ok(is_nan_row_mask(&column))
+            }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column, treating it as null: Java `NaNUtil.isNaN(null)` == false.
             self.build_always_false()
         }
     }
@@ -2094,10 +2101,15 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if self.bound_reference(reference)?.is_some() {
-            self.build_always_false()
+        if let Some(idx) = self.bound_reference(reference)? {
+            Ok(Box::new(move |batch| {
+                let column = project_column(&batch, idx)?;
+                // NULL cell ⇒ NOT NaN ⇒ `true` (row KEPT), matching Java
+                // `Evaluator$EvalVisitor.notNaN` = `!NaNUtil.isNaN(value)`.
+                Ok(not_nan_row_mask(&column))
+            }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column, treating it as null: `!NaNUtil.isNaN(null)` == true.
             self.build_always_true()
         }
     }
