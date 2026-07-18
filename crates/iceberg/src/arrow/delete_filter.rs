@@ -431,8 +431,9 @@ impl DeleteFilter {
             None => None,
         };
 
-        // Equality-delete predicate → a keep-mask (true ⇒ survives). A NULL under three-valued logic
-        // is NOT a survivor (matches the Parquet RowFilter), so coerce nulls to false.
+        // Equality-delete predicate → a keep-mask (true ⇒ survives). The mask is already
+        // two-valued under Java nulls-first semantics (a NULL key cell survives a value delete,
+        // matching Java's StructLikeSet equality); the coercion is defense in depth.
         let predicate_mask: Option<BooleanArray> = match equality_predicate {
             Some(predicate) => Some(coerce_nulls_to_false(&evaluate_predicate_to_mask(
                 predicate, &batch,
@@ -462,9 +463,10 @@ impl DeleteFilter {
     }
 }
 
-/// Coerce a three-valued keep-mask to two-valued: every NULL becomes `false` (drop the row), matching
-/// the Parquet `RowFilter` (which never keeps a null result). Mirrors the reader's
-/// `coerce_nulls_to_false`.
+/// Coerce a three-valued keep-mask to two-valued: every NULL becomes `false` (drop the row),
+/// matching the Parquet `RowFilter` (which never keeps a null result). Mirrors the reader's
+/// `coerce_nulls_to_false`. Defense in depth: `evaluate_predicate_to_mask` now returns
+/// two-valued masks (Java nulls-first verdicts baked in), so this is a no-op on its output.
 fn coerce_nulls_to_false(mask: &BooleanArray) -> BooleanArray {
     if mask.null_count() == 0 {
         return mask.clone();
@@ -1389,9 +1391,11 @@ pub(crate) mod tests {
 
     /// THE KEY-NULL BAIL FOR THE NEW TYPES: a Time / Fixed batch with a NULL in the key column makes
     /// the fast path return `None`, and the predicate fallback — which previously ERRORED for
-    /// Time/Fixed — now SUCCEEDS (the new `get_arrow_datum` arms) and deletes the NULL row via 3VL +
-    /// null-coercion even without a matching NULL delete tuple. This pins the (b)-leg of the gate
-    /// admission: re-admitting Time/Fixed is sound only because the bail target no longer errors.
+    /// Time/Fixed — SUCCEEDS (the `get_arrow_datum` arms) and, under Java nulls-first semantics
+    /// (unit A2), KEEPS the NULL row: `survival(NULL) = (NULL != t) = TRUE`, matching Java's
+    /// `StructLikeSet` eq-delete application (a null key cell equals no non-null delete value).
+    /// This pins the (b)-leg of the gate admission: re-admitting Time/Fixed is sound only because
+    /// the bail target no longer errors.
     #[test]
     fn test_h6_time_fixed_key_null_bails_to_predicate_without_error() {
         use arrow_array::{FixedSizeBinaryArray, Time64MicrosecondArray};
@@ -1413,12 +1417,13 @@ pub(crate) mod tests {
             None,
             "a key-column NULL must force the predicate fallback for Time"
         );
-        // The predicate oracle for that batch must SUCCEED (no FeatureUnsupported) and delete the
-        // NULL row: survival(NULL) = (NULL != t) = NULL → coerced false → deleted.
+        // The predicate oracle for that batch must SUCCEED (no FeatureUnsupported) and KEEP the
+        // NULL row: survival(NULL) = (NULL != t) = TRUE under Java nulls-first (null ≠ any
+        // non-null delete value ⇒ not deleted, the Java StructLikeSet verdict).
         let oracle = multi_col_oracle_deleted_mask(&["t"], schema, &delete_rows, &batch);
         assert_eq!(
             oracle,
-            vec![true, false, true],
+            vec![true, false, false],
             "predicate fallback must now evaluate a Time key (it errored before this change)"
         );
 
@@ -1449,7 +1454,7 @@ pub(crate) mod tests {
         let oracle = multi_col_oracle_deleted_mask(&["f"], schema, &delete_rows, &batch);
         assert_eq!(
             oracle,
-            vec![true, false, true],
+            vec![true, false, false],
             "predicate fallback must now evaluate a Fixed key (it errored before this change)"
         );
     }
@@ -1518,9 +1523,11 @@ pub(crate) mod tests {
     }
 
     /// THE NULL-DATA SOUNDNESS BOUNDARY: a batch with a NULL in a key column makes `delete_mask`
-    /// return `None` (route this batch to the predicate fallback). The predicate path deletes such a
-    /// NULL row via 3VL + null-coercion EVEN WITHOUT a matching NULL delete tuple — which set
-    /// membership would NOT reproduce — so the fallback is mandatory. This pins that exact contract.
+    /// return `None` (route this batch to the predicate fallback). Under Java nulls-first
+    /// semantics (unit A2) the predicate path KEEPS such a NULL row unless a NULL delete tuple
+    /// matches it — the Java `StructLikeSet` verdict. The bail stays mandatory (conservative:
+    /// the predicate path is the oracle); extending the set path to null keys is a possible
+    /// future optimization now that the two agree.
     #[test]
     fn test_h6_set_returns_none_when_key_column_has_null() {
         let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
@@ -1540,14 +1547,15 @@ pub(crate) mod tests {
             "a key-column NULL must force the predicate fallback"
         );
 
-        // And the predicate oracle for that same batch deletes the NULL row (3VL + null-coercion):
-        // survival(NULL) = (NULL != 3) = NULL → coerced false → deleted.
+        // And the predicate oracle for that same batch KEEPS the NULL row (Java nulls-first):
+        // survival(NULL) = (NULL != 3) = TRUE — no NULL delete tuple exists, so the null-key row
+        // is not deleted (Java StructLikeSet equality: null equals only null).
         let oracle = multi_col_oracle_deleted_mask(&["v"], schema, &delete_rows, &batch);
         assert_eq!(
             oracle,
-            vec![true, false, true],
-            "predicate path deletes the NULL key-column row even without a NULL delete tuple — the \
-             reason the set path must defer"
+            vec![true, false, false],
+            "the NULL key-column row survives a value-only delete set under Java nulls-first \
+             semantics"
         );
     }
 

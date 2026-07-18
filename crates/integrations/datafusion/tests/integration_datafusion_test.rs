@@ -4815,3 +4815,160 @@ async fn test_update_mread_zero_match_writes_no_file_no_snapshot() -> Result<()>
     );
     Ok(())
 }
+
+/// E2E pin for audit BUG-001 (constant-truth NaN residuals): `isnan(col)` maps to the Iceberg
+/// `is_nan` predicate (`expr_to_predicate.rs`) and is pushed down `Inexact` into the parquet
+/// `RowFilter`. Pre-fix, `not_nan` compiled to constant-`false` there, so
+/// `WHERE NOT isnan(x)` silently returned ZERO rows through SQL — DataFusion's re-filter can
+/// mask over-INCLUSION but cannot restore rows the RowFilter over-DROPPED. Expected row sets:
+/// the NaN row only under `isnan`; the finite row only under `NOT isnan` (Iceberg keeps the
+/// NULL row per Java `NaNUtil.isNaN(null) == false`; DataFusion's own SQL three-valued-logic
+/// re-filter then drops it, since `NOT isnan(NULL)` is SQL NULL).
+#[tokio::test]
+async fn test_isnan_filter_pushdown_returns_correct_rows() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_isnan_pushdown".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "dbl", Type::Primitive(PrimitiveType::Double)).into(),
+            NestedField::optional(3, "flt", Type::Primitive(PrimitiveType::Float)).into(),
+        ])
+        .build()?;
+    let creation = get_table_creation(temp_path(), "my_table", Some(schema))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Rows: id 1 = NaN in both float columns, id 2 = finite, id 3 = NULL.
+    ctx.sql(
+        "INSERT INTO catalog.test_isnan_pushdown.my_table VALUES \
+         (1, CAST('NaN' AS DOUBLE), CAST('NaN' AS FLOAT)), \
+         (2, 2.5, CAST(3.5 AS FLOAT)), \
+         (3, NULL, NULL)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    for (filter, expected_ids) in [
+        ("isnan(dbl)", vec![1]),
+        ("NOT isnan(dbl)", vec![2]),
+        ("isnan(flt)", vec![1]),
+        ("NOT isnan(flt)", vec![2]),
+    ] {
+        let batches = ctx
+            .sql(&format!(
+                "SELECT id FROM catalog.test_isnan_pushdown.my_table WHERE {filter}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column is Int32")
+                    .iter()
+                    .map(|value| value.expect("id is a required column"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "WHERE {filter}");
+    }
+
+    Ok(())
+}
+
+/// E2E documentation pin for the unit-A2 design decision (Java nulls-first null semantics in the
+/// library evaluators): DataFusion pushes `<>` down as an `Inexact` Iceberg `not_eq` filter, the
+/// scan now KEEPS NULL cells under it (Java `Evaluator` verdict: `notEq(null, lit)` is TRUE —
+/// proven at the library level by `test_filter_on_arrow_nulls_first_neq_lt_lteq_full_path`), and
+/// DataFusion's own SQL three-valued-logic re-filter then RE-DROPS those rows (`NULL <> 100.5`
+/// is SQL NULL). Net: SQL consumers still see SQL semantics — the nulls-first port is invisible
+/// to them — while direct library consumers get the Java contract. `IS NULL OR <>` proves the
+/// NULL rows are still reachable through SQL when asked for explicitly.
+#[tokio::test]
+async fn test_neq_pushdown_sql_3vl_refilter_drops_null_rows() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_neq_3vl_refilter".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "dbl", Type::Primitive(PrimitiveType::Double)).into(),
+        ])
+        .build()?;
+    let creation = get_table_creation(temp_path(), "my_table", Some(schema))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Rows: id 1 matches the literal, id 2 is NULL, id 3 differs.
+    ctx.sql(
+        "INSERT INTO catalog.test_neq_3vl_refilter.my_table VALUES \
+         (1, 100.5), (2, NULL), (3, -7.25)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    for (filter, expected_ids) in [
+        // SQL 3VL: the NULL row (id 2) is kept by the Iceberg scan (Java nulls-first) but
+        // re-dropped by DataFusion's re-filter — the design decision's safety pin.
+        ("dbl <> 100.5", vec![3]),
+        ("dbl < 200.0", vec![1, 3]),
+        // The NULL row remains reachable through SQL when requested explicitly.
+        ("dbl IS NULL OR dbl <> 100.5", vec![2, 3]),
+    ] {
+        let batches = ctx
+            .sql(&format!(
+                "SELECT id FROM catalog.test_neq_3vl_refilter.my_table WHERE {filter}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column is Int32")
+                    .iter()
+                    .map(|value| value.expect("id is a required column"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "WHERE {filter}");
+    }
+
+    Ok(())
+}

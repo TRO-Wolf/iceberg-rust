@@ -39,6 +39,90 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## OVERNIGHT BLOCK (2026-07-17, signed off) — audit-2026-07-17 remediation, 5 units, mixed FF/OO-max
+
+Source: `~/Desktop/repo-audit-iceberg-rust-2026-07-17.md` (5-agent external audit, 74 facets/~34 roots),
+verified same day by 3 parallel verification agents + inline P0 checks (memory:
+`audit-2026-07-17-verification.md`). Verdicts: 0 stale, 1 invalid (BUG-005 — `?` propagates), Critical
+BUG-001 confirmed, null family BUG-002/003/011 bytecode-confirmed vs Java nulls-first total-order.
+**User sign-off: run ALL units incl. E; A2 design call LOCKED = Java nulls-first parity (DataFusion's
+Inexact re-filter stays authoritative for SQL 3VL consumers).** Ladders: A1/A2 = FF (Fable–Fable);
+bundle-final Critic + B/C/D/E = OO at max effort. No merges overnight — all SQMs are the user's in the
+morning. This tracker rides branch A only (5 parallel branches editing one todo region would conflict
+at SQM); B–E record themselves in PR bodies + the morning memory append.
+
+- [x] **A1 (FF): BUG-001 real NaN evaluation** — branch `fix/audit-nan-null-residual-parity`,
+      charter `task/a1-nan-residual-brief.md`. `is_nan`→always-true / `not_nan`→always-false on
+      present columns in `arrow/reader.rs` PredicateConverter (RowFilter — rows dropped at read) AND
+      `arrow/record_batch_predicate.rs` (eq-delete application). DF maps `isnan` in
+      (`expr_to_predicate.rs:229`); `NOT isnan` over-drops through SQL. Fix = real per-row NaN checks;
+      Java oracle (`Evaluator`/`NaNUtil`, cached jars) decides null-cell + missing-col + non-float
+      binding arms.
+      *Done 2026-07-17 (Fable Actor): shared two-valued `is_nan_row_mask`/`not_nan_row_mask`
+      (`record_batch_predicate.rs`, imported by both evaluators) — elementwise `is_valid && is_nan`,
+      NULL cell ⇒ not-NaN (self-decoded `NaNUtil.isNaN` bytecode: null ⇒ `iconst_0` at offsets 0-5;
+      non-float ⇒ false at 42-43 mirrored for the bind-unreachable arm). Missing-column arms
+      confirmed already-Java-correct (unchanged). Both engines reject non-float binds (Java
+      `bindUnaryOperation` 158-171/202-215 ValidationException ≙ Rust `predicate.rs:399` DataInvalid)
+      — no binding deviation. Pins: 4 unit truth-table tests (incl. crafted NaN-under-null-slot
+      buffer), full-path `TableScan::to_arrow` scan pin (new `new_nan_floats` fixture, f64+f32 both
+      directions + before-column-existed file), DF e2e `isnan`/`NOT isnan` (the silent-zero-rows
+      regression). 9 mutations each independently RED, restores byte-verified. Gate green
+      (typos/fmt/clippy×2/lib 2789/DF 53+88/artifacts); DF doc-test FAIL = the known pre-existing
+      `-p` rt-multi-thread artifact (2026-07-10 A3 note). Charter file reworded minimally to pass
+      the typos gate (SHA lengthened, two hyphenated words joined) — disclosed deviation.*
+- [x] **A2 (FF): null-semantics family BUG-002/003/011** — same branch, stacked. Port Java
+      nulls-first total-order (bytecode truth table: null<lit=T, null<=lit=T, null!=lit=T,
+      null==lit=F, null>lit=F) consistently across `reader.rs` PredicateConverter,
+      `record_batch_predicate.rs`, and `expr/visitors/expression_evaluator.rs` (null partition
+      `<`/`<=` currently over-prunes). Missing-col `not_eq` → true. Pin matrix = every op ×
+      {null cell, missing col, null partition}.
+      *Done 2026-07-17 (Fable Actor): self-decoded the full oracle (NullsFirst compare(null,x)
+      = -1 at offsets 19-20; in→false via HashSet + CharSequenceSet instanceof-guard;
+      startsWith ifnull 38 → false; partition oracle CONFIRMED = ManifestReader.evaluator()
+      applying EvalVisitor to file().partition()). Design: EVERY leaf mask two-valued via new
+      shared `null_filled(mask, verdict)` (`record_batch_predicate.rs`) — the Java-null=FALSE
+      ops too, because bind() PRESERVES `Predicate::Not` and `NOT(eq)` over a 3VL eq mask
+      would drop where Java says TRUE (composition pin proves it). Fixed: reader missing-col
+      `not_eq` false→true (BUG-002) + all 8 present-column closures null-filled (BUG-003);
+      record-batch `not_eq` verdict + in/not_in fills; partition `<`/`<=` None→true (BUG-011).
+      Eq-delete consequence (Java StructLikeSet-correct): a NULL key cell now SURVIVES value
+      deletes — 2 delete_filter pins updated to the Java verdict, equality_delete_set bail-doc
+      rewritten (fast path stays conservative). Pins: 22-case mask truth table + NOT-composition
+      + buffer-under-null-slot; full-path scan `!=`/`<`/`<=` (null row + schema-evolved file);
+      13-case null-partition sweep; DF e2e 3VL-refilter documentation pin. 11 mutations each
+      independently RED, restores byte-verified (md5). Lib 2789→2795, DF suite 54.*
+- [x] **A-final: bundle Critic (Opus max)** over the stacked branch; then push + PR body.
+      Done 2026-07-18: **CONVERGED, zero blocking findings.** Third oracle decode matched all 13
+      citations; both adjudications ruled FOR the Actor (eq-delete `[T,F,F]` flip = Java-correct per
+      `Deletes$EqualitySetDeleteFilter`/`StructLikeComparator` decode, necessary consequence of the
+      in-scope not_eq fix; null-filling coinciding ops = safe over-delivery, "necessity" overstated —
+      LOW). 5/5 mutations re-run RED + restored md5-identical; 2 novel probes (OR/double-NOT
+      composition; A1×A2 NaN+NULL not_in cross-cut) pass two-valued. Gate re-run green (2795 lib;
+      DF 88+54+1+4). 3 LOW residues named (notEq offset attribution; necessity framing; 3-consumer
+      blast-radius narrative gap — all verified Java-correct by the Critic itself).
+- [ ] **B (OO max): MoR eq-delete panic/hang** — branch `fix/audit-mor-eqdel-panic-hang`.
+      `equality_ids.unwrap()` (`caching_delete_file_loader.rs:298`) → DataInvalid; oneshot
+      sender-drop must reach a terminal state + notify (kills the forever-hang,
+      `delete_filter.rs:340`); unify the 13 poison-unwrap sites in
+      `delete_filter.rs`/`delete_file_index.rs` onto the crate's poison-recovery policy;
+      `scan/cache.rs` (SAF-006) in-scope stretch.
+- [ ] **C (OO max): predicate serde arity validation (SAF-004)** — branch
+      `fix/audit-predicate-serde-arity`. Derived `Deserialize` on Unary/Binary/Set expressions
+      bypasses ctor debug_asserts (gone in release) → wire-reachable visitor `panic!`s. Validate
+      op/arity at deserialize; visitor dispatch panics → typed `Err`. Fallible `new` = out of scope
+      (breaking surface).
+- [ ] **D (OO max): hardening quick-wins** — branch `infra/audit-hardening-quickwins`. Redacted
+      `Debug` for `StorageConfig` (closes SEC-003→SEC-002 credential chain) + `HttpClient`
+      `extra_headers` (SEC-008); SAF-008 default-literal validation (error, not serialize-panic);
+      GAP_MATRIX rows (fresh R-ids) for the two verification-discovered parity gaps: Java OAuth
+      auto-refresh (`OAuth2Manager` keepRefreshed) and vended `storage_credentials` consumption.
+- [ ] **E (OO max, run even over budget per user): typed error kinds** — branch
+      `fix/audit-typed-error-kinds`. CQ-002/CQ-003: SQL + HMS catalogs emit
+      TableNotFound/NamespaceNotFound/TableAlreadyExists instead of Unexpected.
+- Deferred (charters later, matrix rows tonight via D): token-refresh + vended-creds
+  implementations; parity-shared-with-Java hardening ledger (SEC-001/003/004/009/012 etc.).
+
 ## ACTIVE UNIT (2026-07-17d): G3 HMS type-string parity — branch `fix/g3-hms-type-string-parity`
 
 User-signed 2026-07-17: **FF AC (Fable Actor / independent Fable Critic)**. The HMS

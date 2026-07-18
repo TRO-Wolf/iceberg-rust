@@ -128,6 +128,16 @@ impl BoundPredicateVisitor for ExpressionEvaluatorVisitor<'_> {
         }
     }
 
+    // Null-partition (`None`) arms below port Java's nulls-first TOTAL order: iceberg-core
+    // 1.10.0 `ManifestReader.evaluator()` builds `new Evaluator(spec.partitionType(),
+    // inclusive-projection ∧ partFilter, caseSensitive)` (bytecode offsets 7-55) and applies it
+    // to `entry.file().partition()` (`lambda$entries$0` offsets 4-16), and
+    // `Evaluator$EvalVisitor` compares via `Comparators.nullsFirst().thenComparing(
+    // naturalOrder)` — compare(null, lit) == -1. So for a null partition value: `<`/`<=`/`!=`/
+    // `not_in`/`not_starts_with` ⇒ true (KEEP the file), `>`/`>=`/`==`/`in`/`starts_with` ⇒
+    // false. The same verdicts flow into `ResidualEvaluator` (its Java `ResidualVisitor.lt`
+    // etc. use the identical comparator chain, offsets 0-27), which reuses this visitor.
+
     fn less_than(
         &mut self,
         reference: &BoundReference,
@@ -136,7 +146,9 @@ impl BoundPredicateVisitor for ExpressionEvaluatorVisitor<'_> {
     ) -> Result<bool> {
         match reference.accessor().get(self.partition)? {
             Some(datum) => Ok(&datum < literal),
-            None => Ok(false),
+            // null < lit is TRUE under nulls-first — `Ok(false)` here silently PRUNED files
+            // whose partition value is null (audit BUG-011, lost rows).
+            None => Ok(true),
         }
     }
 
@@ -148,7 +160,8 @@ impl BoundPredicateVisitor for ExpressionEvaluatorVisitor<'_> {
     ) -> Result<bool> {
         match reference.accessor().get(self.partition)? {
             Some(datum) => Ok(&datum <= literal),
-            None => Ok(false),
+            // null <= lit is TRUE under nulls-first (Java `ltEq`, `ifgt 36` over -1).
+            None => Ok(true),
         }
     }
 
@@ -809,5 +822,124 @@ mod tests {
         assert!(result);
 
         Ok(())
+    }
+
+    /// A [`DataFile`] whose single identity-partition value is NULL, for the nulls-first sweep.
+    fn create_data_file_null_partition() -> DataFile {
+        DataFile {
+            partition: Struct::from_iter([None]),
+            ..create_data_file_float()
+        }
+    }
+
+    /// Evaluates one bound predicate over a NULL partition value through the full
+    /// [`ExpressionEvaluator`] (identity spec, so the row predicate projects to itself).
+    fn eval_on_null_partition(
+        predicate: Predicate,
+        r#type: PrimitiveType,
+        expected: bool,
+        op_label: &str,
+    ) {
+        let (partition_spec, schema) =
+            create_partition_spec(r#type).expect("build the partition spec");
+        let bound = predicate
+            .bind(schema.clone(), true)
+            .expect("bind the sweep predicate");
+        let evaluator = create_expression_evaluator(partition_spec, &schema, &bound, true)
+            .expect("build the expression evaluator");
+        let result = evaluator
+            .eval(&create_data_file_null_partition())
+            .expect("evaluate against the null partition");
+        assert_eq!(
+            result, expected,
+            "{op_label} over a NULL partition value must be {expected} (Java nulls-first)"
+        );
+    }
+
+    /// Pins the FULL null-partition truth table against Java's nulls-first total order (audit
+    /// BUG-011): iceberg-core `ManifestReader.evaluator()` applies `Evaluator$EvalVisitor` —
+    /// whose comparisons run `Comparators.nullsFirst().thenComparing(naturalOrder)`,
+    /// compare(null, lit) == -1 — to `entry.file().partition()`. `false` on a keep-op PRUNES
+    /// the file: pre-fix, `<` and `<=` returned `Ok(false)` for a null partition value and
+    /// silently LOST every row of such files.
+    #[test]
+    fn test_null_partition_value_truth_table_nulls_first() {
+        let long_cases: Vec<(Predicate, bool, &str)> = vec![
+            // Java `lt`: compare(null, 5) == -1 < 0 => TRUE (keep). THE BUG-011 headline.
+            (Reference::new("a").less_than(Datum::long(5)), true, "a < 5"),
+            (
+                Reference::new("a").less_than_or_equal_to(Datum::long(5)),
+                true,
+                "a <= 5",
+            ),
+            (
+                Reference::new("a").greater_than(Datum::long(5)),
+                false,
+                "a > 5",
+            ),
+            (
+                Reference::new("a").greater_than_or_equal_to(Datum::long(5)),
+                false,
+                "a >= 5",
+            ),
+            (
+                Reference::new("a").equal_to(Datum::long(5)),
+                false,
+                "a == 5",
+            ),
+            (
+                Reference::new("a").not_equal_to(Datum::long(5)),
+                true,
+                "a != 5",
+            ),
+            // Java `in`: literalSet.contains(null) == false for every set impl.
+            (
+                Reference::new("a").is_in([Datum::long(5), Datum::long(99)]),
+                false,
+                "a IN (5, 99)",
+            ),
+            (
+                Reference::new("a").is_not_in([Datum::long(5), Datum::long(99)]),
+                true,
+                "a NOT IN (5, 99)",
+            ),
+            (Reference::new("a").is_null(), true, "a IS NULL"),
+            (Reference::new("a").is_not_null(), false, "a IS NOT NULL"),
+        ];
+        for (predicate, expected, label) in long_cases {
+            eval_on_null_partition(predicate, PrimitiveType::Long, expected, label);
+        }
+
+        // Java `startsWith` null-guards to false (`ifnull 38`, offsets 11-12);
+        // `notStartsWith` negates it.
+        let string_cases: Vec<(Predicate, bool, &str)> = vec![
+            (
+                Reference::new("a").starts_with(Datum::string("prefix")),
+                false,
+                "a STARTS WITH 'prefix'",
+            ),
+            (
+                Reference::new("a").not_starts_with(Datum::string("prefix")),
+                true,
+                "a NOT STARTS WITH 'prefix'",
+            ),
+        ];
+        for (predicate, expected, label) in string_cases {
+            eval_on_null_partition(predicate, PrimitiveType::String, expected, label);
+        }
+
+        // Java `NaNUtil.isNaN(null)` == false; `notNaN` negates it.
+        eval_on_null_partition(
+            Reference::new("a").is_nan(),
+            PrimitiveType::Double,
+            false,
+            "isnan(a)",
+        );
+        eval_on_null_partition(
+            Reference::new("a").is_not_nan(),
+            PrimitiveType::Double,
+            true,
+            "NOT isnan(a)",
+        );
     }
 }

@@ -158,14 +158,16 @@ impl EqDeleteKeySet {
     /// and tests membership.
     ///
     /// Returns `Ok(None)` — meaning "fall back to the predicate path for this batch" — when ANY key
-    /// column has a NULL in `batch`. This is the soundness boundary: the predicate path's survival
-    /// mask is `coerce_nulls_to_false(eval(NOT(AND col=v)))`, so a data row that is NULL in a key
-    /// column is governed by Arrow three-valued logic + the null→false coercion (it may be deleted
-    /// EVEN WITHOUT a matching NULL delete tuple). Set membership cannot reproduce that 3VL exactly,
-    /// so a batch carrying a key-column NULL defers to the proven predicate path. For batches with NO
-    /// key-column NULLs, set membership is byte-identical to the predicate deletion (proven in
-    /// `delete_filter.rs`'s harness): a fully-non-null row's tuple equals a stored delete tuple iff
-    /// the predicate `OR_j (AND_i col_i = v_i)` is TRUE for it.
+    /// column has a NULL in `batch`. This is the soundness boundary: null-key rows are governed by
+    /// the predicate path's Java nulls-first semantics (unit A2: a NULL cell survives a value
+    /// delete — `NULL != v` is TRUE — and is deleted only by a matching NULL delete tuple via
+    /// `not_null`, the Java `StructLikeSet` verdict). The bail keeps this path conservative: the
+    /// predicate path is the oracle for every null-carrying batch. (Set membership over
+    /// `Option<Datum>` tuples now agrees with those verdicts in principle — extending the fast path
+    /// to null keys is a possible future optimization, deliberately not taken here.) For batches
+    /// with NO key-column NULLs, set membership is byte-identical to the predicate deletion (proven
+    /// in `delete_filter.rs`'s harness): a fully-non-null row's tuple equals a stored delete tuple
+    /// iff the predicate `OR_j (AND_i col_i = v_i)` is TRUE for it.
     ///
     /// A key column ABSENT from the batch returns an error rather than silently disagreeing with the
     /// predicate path (the apply seam guarantees the eq-delete columns are projected).
