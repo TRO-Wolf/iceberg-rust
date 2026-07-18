@@ -92,7 +92,15 @@ at SQM); B–E record themselves in PR bodies + the morning memory append.
       + buffer-under-null-slot; full-path scan `!=`/`<`/`<=` (null row + schema-evolved file);
       13-case null-partition sweep; DF e2e 3VL-refilter documentation pin. 11 mutations each
       independently RED, restores byte-verified (md5). Lib 2789→2795, DF suite 54.*
-- [ ] **A-final: bundle Critic (Opus max)** over the stacked branch; then push + PR body.
+- [x] **A-final: bundle Critic (Opus max)** over the stacked branch; then push + PR body.
+      Done 2026-07-18: **CONVERGED, zero blocking findings.** Third oracle decode matched all 13
+      citations; both adjudications ruled FOR the Actor (eq-delete `[T,F,F]` flip = Java-correct per
+      `Deletes$EqualitySetDeleteFilter`/`StructLikeComparator` decode, necessary consequence of the
+      in-scope not_eq fix; null-filling coinciding ops = safe over-delivery, "necessity" overstated —
+      LOW). 5/5 mutations re-run RED + restored md5-identical; 2 novel probes (OR/double-NOT
+      composition; A1×A2 NaN+NULL not_in cross-cut) pass two-valued. Gate re-run green (2795 lib;
+      DF 88+54+1+4). 3 LOW residues named (notEq offset attribution; necessity framing; 3-consumer
+      blast-radius narrative gap — all verified Java-correct by the Critic itself).
 - [ ] **B (OO max): MoR eq-delete panic/hang** — branch `fix/audit-mor-eqdel-panic-hang`.
       `equality_ids.unwrap()` (`caching_delete_file_loader.rs:298`) → DataInvalid; oneshot
       sender-drop must reach a terminal state + notify (kills the forever-hang,
