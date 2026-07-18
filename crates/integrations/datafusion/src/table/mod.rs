@@ -148,7 +148,7 @@ impl TableProvider for IcebergTableProvider {
             projection,
             filters,
             limit,
-        )))
+        )?))
     }
 
     fn supports_filters_pushdown(
@@ -412,7 +412,7 @@ impl TableProvider for IcebergStaticTableProvider {
             projection,
             filters,
             limit,
-        )))
+        )?))
     }
 
     fn supports_filters_pushdown(

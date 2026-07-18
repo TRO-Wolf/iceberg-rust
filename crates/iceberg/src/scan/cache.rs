@@ -15,6 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Per-partition-spec evaluator caches shared across one scan.
+//!
+//! Lock policy: a poisoned `RwLock` is RECOVERED (`PoisonError::into_inner`, the crate-wide
+//! pattern — see e.g. `metrics::mod`, `events::mod`, `arrow::reader`) rather than unwrapped or
+//! propagated. The cached values are pure derived data — a deterministic function of
+//! (partition spec, schema, filter) — and each insert completes atomically under the write
+//! guard, so a panic in another task cannot leave a logically torn map. Recovering keeps the
+//! shared cache usable instead of failing (or aborting) every subsequent scan that shares it.
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -47,18 +56,14 @@ impl PartitionFilterCache {
         case_sensitive: bool,
         filter: BoundPredicate,
     ) -> Result<Arc<BoundPredicate>> {
-        // we need a block here to ensure that the `read()` gets dropped before we hit the `write()`
-        // below, otherwise we hit deadlock
+        // Scope the read guard so it is dropped before the `write()` below (deadlock avoidance).
         {
-            let read = self.0.read().map_err(|_| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "PartitionFilterCache RwLock was poisoned",
-                )
-            })?;
-
-            if read.contains_key(&spec_id) {
-                return Ok(read.get(&spec_id).unwrap().clone());
+            let read = self
+                .0
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = read.get(&spec_id) {
+                return Ok(cached.clone());
             }
         }
 
@@ -85,24 +90,13 @@ impl PartitionFilterCache {
             .rewrite_not()
             .bind(partition_schema.clone(), case_sensitive)?;
 
-        self.0
+        Ok(self
+            .0
             .write()
-            .map_err(|_| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "PartitionFilterCache RwLock was poisoned",
-                )
-            })?
-            .insert(spec_id, Arc::new(partition_filter));
-
-        let read = self.0.read().map_err(|_| {
-            Error::new(
-                ErrorKind::Unexpected,
-                "PartitionFilterCache RwLock was poisoned",
-            )
-        })?;
-
-        Ok(read.get(&spec_id).unwrap().clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(spec_id)
+            .or_insert_with(|| Arc::new(partition_filter))
+            .clone())
     }
 }
 
@@ -125,43 +119,25 @@ impl ManifestEvaluatorCache {
         spec_id: i32,
         partition_filter: Arc<BoundPredicate>,
     ) -> Arc<ManifestEvaluator> {
-        // This accessor is infallible by signature (its sole caller consumes the evaluator
-        // inline during planning), so a poisoned lock is RECOVERED via `into_inner` rather than
-        // mapped-to-error-then-`unwrap`-panicked as before. The guarded `HashMap` critical
-        // sections do only `contains_key`/`get`/`insert`/`clone` — no re-entrant user code that
-        // could tear the map — so a guard left by a panicked holder still wraps a coherent map;
-        // recovering it keeps planning alive instead of cascading the panic (the crate's
-        // `into_inner` policy, see `arrow/reader.rs`). `PartitionFilterCache`/
-        // `ExpressionEvaluatorCache` map poison to a typed error instead because their signatures
-        // return `Result`; this one cannot without rippling a signature change into `scan/context.rs`.
-        //
-        // we need a block here to ensure that the `read()` gets dropped before we hit the `write()`
-        // below, otherwise we hit deadlock
+        // Scope the read guard so it is dropped before the `write()` below (deadlock avoidance).
         {
             let read = self
                 .0
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-            if read.contains_key(&spec_id) {
-                return read.get(&spec_id).unwrap().clone();
+            if let Some(cached) = read.get(&spec_id) {
+                return cached.clone();
             }
         }
 
         self.0
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                spec_id,
-                Arc::new(ManifestEvaluator::builder(partition_filter.as_ref().clone()).build()),
-            );
-
-        let read = self
-            .0
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        read.get(&spec_id).unwrap().clone()
+            .entry(spec_id)
+            .or_insert_with(|| {
+                Arc::new(ManifestEvaluator::builder(partition_filter.as_ref().clone()).build())
+            })
+            .clone()
     }
 }
 
@@ -183,118 +159,180 @@ impl ExpressionEvaluatorCache {
         &self,
         spec_id: i32,
         partition_filter: &BoundPredicate,
-    ) -> Result<Arc<ExpressionEvaluator>> {
-        // we need a block here to ensure that the `read()` gets dropped before we hit the `write()`
-        // below, otherwise we hit deadlock
+    ) -> Arc<ExpressionEvaluator> {
+        // Scope the read guard so it is dropped before the `write()` below (deadlock avoidance).
         {
-            let read = self.0.read().map_err(|_| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "ExpressionEvaluatorCache RwLock was poisoned",
-                )
-            })?;
-
-            if read.contains_key(&spec_id) {
-                return Ok(read.get(&spec_id).unwrap().clone());
+            let read = self
+                .0
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = read.get(&spec_id) {
+                return cached.clone();
             }
         }
 
         self.0
             .write()
-            .map_err(|_| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "ExpressionEvaluatorCache RwLock was poisoned",
-                )
-            })?
-            .insert(
-                spec_id,
-                Arc::new(ExpressionEvaluator::new(partition_filter.clone())),
-            );
-
-        let read = self.0.read().map_err(|_| {
-            Error::new(
-                ErrorKind::Unexpected,
-                "ExpressionEvaluatorCache RwLock was poisoned",
-            )
-        })?;
-
-        Ok(read.get(&spec_id).unwrap().clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(spec_id)
+            .or_insert_with(|| Arc::new(ExpressionEvaluator::new(partition_filter.clone())))
+            .clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
-
     use super::*;
-    use crate::expr::Predicate;
+    use crate::expr::Reference;
+    use crate::spec::{
+        Datum, FormatVersion, NestedField, PartitionSpec, PrimitiveType, SortOrder,
+        TableMetadataBuilder, Transform, Type,
+    };
 
-    /// A trivially-bound predicate for exercising the caches; the survival predicate itself is
-    /// irrelevant to the lock-recovery behavior under test.
-    fn bound_always_true() -> BoundPredicate {
-        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
-        Predicate::AlwaysTrue
-            .bind(schema, true)
-            .expect("bind AlwaysTrue")
-    }
-
-    /// Poison `lock` by panicking while holding its write guard (the guard poisons the lock as it
-    /// drops during the unwind). Caught in-thread so the test proceeds against the poisoned lock.
-    fn poison_lock<T>(lock: &RwLock<T>) {
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = lock.write().expect("acquire write guard to poison");
-            panic!("intentionally poison the cache lock");
+    /// Panics while holding `lock`'s write guard so the lock is left POISONED — the setup
+    /// for every recovery pin below. Asserts the poisoning actually took.
+    fn poison<T>(lock: &RwLock<T>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock
+                .write()
+                .expect("test setup: the lock must not already be poisoned");
+            panic!("deliberately poison the scan-cache lock");
         }));
-        assert!(
-            poisoned.is_err(),
-            "the poisoning closure must have panicked while holding the guard"
-        );
+        assert!(result.is_err(), "the poisoning closure must panic");
+        assert!(lock.is_poisoned(), "test setup: the lock must be poisoned");
     }
 
-    /// Risk pinned (audit SAF-006): `ManifestEvaluatorCache::get` is infallible by signature, so a
-    /// poisoned lock must be RECOVERED (`into_inner`), never mapped-to-error-then-`unwrap`-panicked.
-    /// MUTATION: restoring `.map_err(|_| Error::new(...)).unwrap()` panics this test.
+    fn table_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .expect("test schema must build"),
+        )
+    }
+
+    /// A predicate bound against the TABLE schema (the input `PartitionFilterCache` projects).
+    fn bound_table_filter(schema: &Arc<Schema>) -> BoundPredicate {
+        Reference::new("id")
+            .less_than(Datum::int(10))
+            .bind(schema.clone(), true)
+            .expect("binding id < 10 must succeed")
+    }
+
+    /// Table metadata with one identity-partitioned spec (id 0) over `table_schema`.
+    fn table_metadata_with_identity_spec(schema: &Arc<Schema>) -> TableMetadataRef {
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("id", "id_part", Transform::Identity)
+            .expect("adding the identity partition field must succeed")
+            .build()
+            .expect("partition spec must build");
+        let sort_order = SortOrder::builder()
+            .build(schema)
+            .expect("sort order must build");
+        let metadata = TableMetadataBuilder::new(
+            schema.as_ref().clone(),
+            spec,
+            sort_order,
+            "memory://test/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder must construct")
+        .build()
+        .expect("table metadata must build");
+        Arc::new(metadata.metadata)
+    }
+
+    /// SAF-003 pin (P1c): `PartitionFilterCache` must RECOVER from a poisoned lock — hit,
+    /// miss-compute, and the not-found error path must all work after a poisoning panic,
+    /// never panic and never fail with a lock error.
     #[test]
-    fn test_manifest_evaluator_cache_recovers_poisoned_lock() {
+    fn test_partition_filter_cache_recovers_from_poisoned_lock() {
+        let schema = table_schema();
+        let metadata = table_metadata_with_identity_spec(&schema);
+
+        // Hit path on a previously poisoned lock: serve the seeded entry.
+        let cache = PartitionFilterCache::new();
+        let seeded = cache
+            .get(0, &metadata, &schema, true, bound_table_filter(&schema))
+            .expect("seeding the cache must succeed");
+        poison(&cache.0);
+        let hit = cache
+            .get(0, &metadata, &schema, true, bound_table_filter(&schema))
+            .expect("a poisoned lock must be recovered, not surfaced");
+        assert!(
+            Arc::ptr_eq(&seeded, &hit),
+            "recovery must serve the entry cached before the panic"
+        );
+
+        // Unknown spec id after poisoning: the ordinary lookup error, not a lock error.
+        let err = cache
+            .get(42, &metadata, &schema, true, bound_table_filter(&schema))
+            .expect_err("an unknown spec id must still error");
+        assert!(
+            err.to_string().contains("partition spec"),
+            "expected the spec-lookup error, got: {err}"
+        );
+
+        // Miss path (compute + insert) on a poisoned lock that was never seeded.
+        let cold_cache = PartitionFilterCache::new();
+        poison(&cold_cache.0);
+        cold_cache
+            .get(0, &metadata, &schema, true, bound_table_filter(&schema))
+            .expect("compute + insert must succeed on a recovered lock");
+    }
+
+    /// SAF-003 pin (P1a): `ManifestEvaluatorCache` must RECOVER from a poisoned lock on both
+    /// the hit and the miss path (previously `map_err(..).unwrap()` — a guaranteed panic).
+    #[test]
+    fn test_manifest_evaluator_cache_recovers_from_poisoned_lock() {
+        let schema = table_schema();
+        let filter = Arc::new(bound_table_filter(&schema));
+
         let cache = ManifestEvaluatorCache::new();
-        poison_lock(&cache.0);
+        let seeded = cache.get(1, filter.clone());
+        poison(&cache.0);
 
-        // Must return an evaluator without panicking, and cache it under spec 0.
-        let evaluator = cache.get(0, Arc::new(bound_always_true()));
+        let hit = cache.get(1, filter.clone());
         assert!(
-            cache
-                .0
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&0),
-            "the evaluator must be cached after a recovered get"
+            Arc::ptr_eq(&seeded, &hit),
+            "recovery must serve the entry cached before the panic"
         );
-        // A second get on the recovered lock hits the cache (same Arc).
-        let evaluator2 = cache.get(0, Arc::new(bound_always_true()));
+
+        let miss = cache.get(2, filter);
         assert!(
-            Arc::ptr_eq(&evaluator, &evaluator2),
-            "the second get must reuse the cached evaluator"
+            !Arc::ptr_eq(&seeded, &miss),
+            "a different spec id must compute (and cache) its own evaluator"
         );
     }
 
-    /// Risk pinned (audit SAF-006): `ExpressionEvaluatorCache::get` returns `Result`, so a poisoned
-    /// lock must surface a TYPED error naming THIS cache — not panic, and not the copy-pasted wrong
-    /// lock name. MUTATION: restoring the poison `.unwrap()` panics; leaving the old
-    /// "PartitionFilterCache" / "ManifestEvaluatorCache" message fails the name assertion.
+    /// SAF-003 pin (P1b): `ExpressionEvaluatorCache` must RECOVER from a poisoned lock on both
+    /// the hit and the miss path (previously `map_err(..).unwrap()` — a guaranteed panic).
     #[test]
-    fn test_expression_evaluator_cache_poison_yields_typed_error_named_correctly() {
-        let cache = ExpressionEvaluatorCache::new();
-        let filter = bound_always_true();
-        poison_lock(&cache.0);
+    fn test_expression_evaluator_cache_recovers_from_poisoned_lock() {
+        let schema = table_schema();
+        let filter = bound_table_filter(&schema);
 
-        let error = cache
-            .get(0, &filter)
-            .expect_err("a poisoned lock must surface a typed error, not panic");
-        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        let cache = ExpressionEvaluatorCache::new();
+        let seeded = cache.get(1, &filter);
+        poison(&cache.0);
+
+        let hit = cache.get(1, &filter);
         assert!(
-            error.to_string().contains("ExpressionEvaluatorCache"),
-            "the error must name the ExpressionEvaluatorCache, not a copy-pasted cache name: {error}"
+            Arc::ptr_eq(&seeded, &hit),
+            "recovery must serve the entry cached before the panic"
+        );
+
+        let miss = cache.get(2, &filter);
+        assert!(
+            !Arc::ptr_eq(&seeded, &miss),
+            "a different spec id must compute (and cache) its own evaluator"
         );
     }
 }
