@@ -101,13 +101,59 @@ where T::Bound: Sized
 }
 
 /// Unary predicate, for example, `a IS NULL`.
+///
+/// Deserialization goes through `SerdeUnaryExpression` so that the operator's
+/// arity is validated at the wire boundary — [`UnaryExpression::new`] only
+/// `debug_assert!`s it, so without this a crafted/corrupt serialized predicate
+/// could smuggle a non-unary operator past construction (see the audit note on
+/// the `SerdeUnaryExpression` shadow).
 #[derive(PartialEq, Clone, Serialize, Deserialize)]
+#[serde(
+    try_from = "SerdeUnaryExpression<T>",
+    bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>")
+)]
 pub struct UnaryExpression<T> {
     /// Operator of this predicate, must be single operand operator.
     op: PredicateOperator,
     /// Term of this predicate, for example, `a` in `a IS NULL`.
-    #[serde(bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>"))]
     term: T,
+}
+
+/// Serde deserialization shadow for [`UnaryExpression`]: it captures the raw
+/// wire fields, then the [`TryFrom`] impl rejects a non-unary operator BEFORE a
+/// [`UnaryExpression`] value exists.
+///
+/// The public constructor [`UnaryExpression::new`] guards arity with a
+/// `debug_assert!` only, which is compiled out in release. Because
+/// `UnaryExpression`/[`Predicate`]/[`BoundPredicate`] derive `Deserialize` and a
+/// `BoundPredicate` is reachable over the wire (it is a field of a
+/// `Serialize`/`Deserialize` `FileScanTask`), a serialized predicate encoding a
+/// mismatched op (e.g. a binary op in a unary shape) would otherwise bypass
+/// `new` entirely and later panic the visitor dispatch in a release build
+/// (audit SAF-004). Validating here closes that hole; `Serialize` stays derived
+/// on the real type because we never emit an invalid shape.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct SerdeUnaryExpression<T> {
+    op: PredicateOperator,
+    term: T,
+}
+
+impl<T> TryFrom<SerdeUnaryExpression<T>> for UnaryExpression<T> {
+    type Error = String;
+
+    fn try_from(raw: SerdeUnaryExpression<T>) -> std::result::Result<Self, Self::Error> {
+        if !raw.op.is_unary() {
+            return Err(format!(
+                "Cannot deserialize unary predicate: {:?} is not a unary operator",
+                raw.op
+            ));
+        }
+        Ok(Self {
+            op: raw.op,
+            term: raw.term,
+        })
+    }
 }
 
 impl<T: Debug> Debug for UnaryExpression<T> {
@@ -149,6 +195,15 @@ impl<T> UnaryExpression<T> {
         Self { op, term }
     }
 
+    /// Test-only constructor that bypasses the `is_unary` guard, so a test can
+    /// build an invalid-arity value and exercise the visitor's defensive error
+    /// path. The serde boundary and `debug_assert!` make such a value otherwise
+    /// unconstructable.
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(op: PredicateOperator, term: T) -> Self {
+        Self { op, term }
+    }
+
     /// Return the operator of this predicate.
     pub fn op(&self) -> PredicateOperator {
         self.op
@@ -161,15 +216,51 @@ impl<T> UnaryExpression<T> {
 }
 
 /// Binary predicate, for example, `a > 10`.
+///
+/// Deserialization goes through `SerdeBinaryExpression` so that a non-binary
+/// operator is rejected at the wire boundary; see the `SerdeUnaryExpression`
+/// shadow for why the derived `Deserialize` alone is unsafe (audit SAF-004).
 #[derive(PartialEq, Clone, Serialize, Deserialize)]
+#[serde(
+    try_from = "SerdeBinaryExpression<T>",
+    bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>")
+)]
 pub struct BinaryExpression<T> {
     /// Operator of this predicate, must be binary operator, such as `=`, `>`, `<`, etc.
     op: PredicateOperator,
     /// Term of this predicate, for example, `a` in `a > 10`.
-    #[serde(bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>"))]
     term: T,
     /// Literal of this predicate, for example, `10` in `a > 10`.
     literal: Datum,
+}
+
+/// Serde deserialization shadow for [`BinaryExpression`]; the [`TryFrom`] impl
+/// rejects a non-binary operator before the value exists. See
+/// [`SerdeUnaryExpression`] for the rationale.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct SerdeBinaryExpression<T> {
+    op: PredicateOperator,
+    term: T,
+    literal: Datum,
+}
+
+impl<T> TryFrom<SerdeBinaryExpression<T>> for BinaryExpression<T> {
+    type Error = String;
+
+    fn try_from(raw: SerdeBinaryExpression<T>) -> std::result::Result<Self, Self::Error> {
+        if !raw.op.is_binary() {
+            return Err(format!(
+                "Cannot deserialize binary predicate: {:?} is not a binary operator",
+                raw.op
+            ));
+        }
+        Ok(Self {
+            op: raw.op,
+            term: raw.term,
+            literal: raw.literal,
+        })
+    }
 }
 
 impl<T: Debug> Debug for BinaryExpression<T> {
@@ -199,6 +290,13 @@ impl<T> BinaryExpression<T> {
     /// ```
     pub fn new(op: PredicateOperator, term: T, literal: Datum) -> Self {
         debug_assert!(op.is_binary());
+        Self { op, term, literal }
+    }
+
+    /// Test-only constructor that bypasses the `is_binary` guard; see
+    /// [`UnaryExpression::new_unchecked`].
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(op: PredicateOperator, term: T, literal: Datum) -> Self {
         Self { op, term, literal }
     }
 
@@ -238,7 +336,15 @@ impl<T: Bind> Bind for BinaryExpression<T> {
 }
 
 /// Set predicates, for example, `a in (1, 2, 3)`.
+///
+/// Deserialization goes through `SerdeSetExpression` so that a non-set operator
+/// is rejected at the wire boundary; see the `SerdeUnaryExpression` shadow for
+/// why the derived `Deserialize` alone is unsafe (audit SAF-004).
 #[derive(PartialEq, Clone, Serialize, Deserialize)]
+#[serde(
+    try_from = "SerdeSetExpression<T>",
+    bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>")
+)]
 pub struct SetExpression<T> {
     /// Operator of this predicate, must be set operator, such as `IN`, `NOT IN`, etc.
     op: PredicateOperator,
@@ -246,6 +352,35 @@ pub struct SetExpression<T> {
     term: T,
     /// Literals of this predicate, for example, `(1, 2, 3)` in `a in (1, 2, 3)`.
     literals: FnvHashSet<Datum>,
+}
+
+/// Serde deserialization shadow for [`SetExpression`]; the [`TryFrom`] impl
+/// rejects a non-set operator before the value exists. See
+/// [`SerdeUnaryExpression`] for the rationale.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct SerdeSetExpression<T> {
+    op: PredicateOperator,
+    term: T,
+    literals: FnvHashSet<Datum>,
+}
+
+impl<T> TryFrom<SerdeSetExpression<T>> for SetExpression<T> {
+    type Error = String;
+
+    fn try_from(raw: SerdeSetExpression<T>) -> std::result::Result<Self, Self::Error> {
+        if !raw.op.is_set() {
+            return Err(format!(
+                "Cannot deserialize set predicate: {:?} is not a set operator",
+                raw.op
+            ));
+        }
+        Ok(Self {
+            op: raw.op,
+            term: raw.term,
+            literals: raw.literals,
+        })
+    }
 }
 
 impl<T: Debug> Debug for SetExpression<T> {
@@ -276,6 +411,17 @@ impl<T> SetExpression<T> {
     /// ```
     pub fn new(op: PredicateOperator, term: T, literals: FnvHashSet<Datum>) -> Self {
         debug_assert!(op.is_set());
+        Self { op, term, literals }
+    }
+
+    /// Test-only constructor that bypasses the `is_set` guard; see
+    /// [`UnaryExpression::new_unchecked`].
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        op: PredicateOperator,
+        term: T,
+        literals: FnvHashSet<Datum>,
+    ) -> Self {
         Self { op, term, literals }
     }
 
@@ -1701,5 +1847,251 @@ mod tests {
             &format!("{result}"),
             "((bar >= 10) AND (foo IS NOT NULL)) AND (bar >= 5)"
         );
+    }
+
+    /// Pins for audit SAF-004 — op/arity validation on the predicate serde
+    /// boundary. They lock three properties: (1) valid payloads keep their exact
+    /// on-disk bytes (wire-format stability), (2) a wrong-class operator is
+    /// rejected at deserialize time with a typed message for every shape, bound
+    /// and unbound, and (3) the constructors' `is_*` guards still admit the
+    /// valid shapes. The visitor's defensive error path is pinned in the two
+    /// visitor modules.
+    mod serde_arity_pins {
+        use fnv::FnvHashSet;
+
+        use super::*;
+        use crate::expr::{
+            BinaryExpression, Predicate, PredicateOperator, SetExpression, UnaryExpression,
+        };
+
+        // -- Wire-format STABILITY --------------------------------------------
+        // Frozen JSON captured from the pre-change serializer. Each payload must
+        // still deserialize to the same value AND re-serialize to identical
+        // bytes now that the deserialize path routes through the shadow structs
+        // — proving already-serialized `FileScanTask` predicates round-trip
+        // unchanged (the serialized FORMAT of valid predicates is load-bearing).
+
+        const FROZEN_UNARY: &str = r#"{"Unary":{"op":"IsNull","term":{"name":"bar"}}}"#;
+        const FROZEN_BINARY: &str = r#"{"Binary":{"op":"LessThan","term":{"name":"bar"},"literal":{"type":"int","literal":10}}}"#;
+        const FROZEN_SET: &str =
+            r#"{"Set":{"op":"In","term":{"name":"bar"},"literals":[{"type":"int","literal":10}]}}"#;
+
+        #[test]
+        fn wire_format_stable_unary() {
+            let expected = Reference::new("bar").is_null();
+            let decoded: Predicate =
+                serde_json::from_str(FROZEN_UNARY).expect("frozen unary payload must deserialize");
+            assert_eq!(decoded, expected);
+            assert_eq!(
+                serde_json::to_string(&expected).expect("serialize unary"),
+                FROZEN_UNARY
+            );
+        }
+
+        #[test]
+        fn wire_format_stable_binary() {
+            let expected = Reference::new("bar").less_than(Datum::int(10));
+            let decoded: Predicate = serde_json::from_str(FROZEN_BINARY)
+                .expect("frozen binary payload must deserialize");
+            assert_eq!(decoded, expected);
+            assert_eq!(
+                serde_json::to_string(&expected).expect("serialize binary"),
+                FROZEN_BINARY
+            );
+        }
+
+        #[test]
+        fn wire_format_stable_set() {
+            let expected = Reference::new("bar").is_in([Datum::int(10)]);
+            let decoded: Predicate =
+                serde_json::from_str(FROZEN_SET).expect("frozen set payload must deserialize");
+            assert_eq!(decoded, expected);
+            assert_eq!(
+                serde_json::to_string(&expected).expect("serialize set"),
+                FROZEN_SET
+            );
+        }
+
+        // -- Round-trip per class (unbound + bound) ---------------------------
+
+        #[test]
+        fn round_trip_unbound_all_classes() {
+            for predicate in [
+                Reference::new("bar").is_null(),
+                Reference::new("bar").less_than(Datum::int(10)),
+                Reference::new("bar").is_in([Datum::int(10), Datum::int(20)]),
+            ] {
+                let json = serde_json::to_string(&predicate).expect("serialize unbound");
+                let decoded: Predicate = serde_json::from_str(&json).expect("deserialize unbound");
+                assert_eq!(decoded, predicate);
+            }
+        }
+
+        #[test]
+        fn round_trip_bound_all_classes() {
+            let schema = table_schema_simple();
+            for predicate in [
+                Reference::new("foo").is_null(),
+                Reference::new("bar").less_than(Datum::int(10)),
+                Reference::new("bar").is_in([Datum::int(10), Datum::int(20)]),
+            ] {
+                let bound = predicate.bind(schema.clone(), true).expect("bind");
+                let json = serde_json::to_string(&bound).expect("serialize bound");
+                let decoded: BoundPredicate =
+                    serde_json::from_str(&json).expect("deserialize bound");
+                assert_eq!(decoded, bound);
+            }
+        }
+
+        // -- Rejection at the serde boundary (unbound), typed message ---------
+
+        #[test]
+        fn reject_unbound_unary_with_binary_op() {
+            let json = r#"{"Unary":{"op":"LessThan","term":{"name":"bar"}}}"#;
+            let err = serde_json::from_str::<Predicate>(json)
+                .expect_err("binary op in unary shape must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("not a unary operator"), "message: {msg}");
+            assert!(msg.contains("LessThan"), "message: {msg}");
+        }
+
+        #[test]
+        fn reject_unbound_binary_with_unary_op() {
+            let json = r#"{"Binary":{"op":"IsNull","term":{"name":"bar"},"literal":{"type":"int","literal":10}}}"#;
+            let err = serde_json::from_str::<Predicate>(json)
+                .expect_err("unary op in binary shape must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("not a binary operator"), "message: {msg}");
+            assert!(msg.contains("IsNull"), "message: {msg}");
+        }
+
+        #[test]
+        fn reject_unbound_binary_with_set_op() {
+            let json = r#"{"Binary":{"op":"In","term":{"name":"bar"},"literal":{"type":"int","literal":10}}}"#;
+            let err = serde_json::from_str::<Predicate>(json)
+                .expect_err("set op in binary shape must be rejected");
+            assert!(
+                err.to_string().contains("not a binary operator"),
+                "message: {err}"
+            );
+        }
+
+        #[test]
+        fn reject_unbound_set_with_binary_op() {
+            let json = r#"{"Set":{"op":"LessThan","term":{"name":"bar"},"literals":[{"type":"int","literal":10}]}}"#;
+            let err = serde_json::from_str::<Predicate>(json)
+                .expect_err("binary op in set shape must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("not a set operator"), "message: {msg}");
+            assert!(msg.contains("LessThan"), "message: {msg}");
+        }
+
+        // -- Rejection at the serde boundary (bound), typed message -----------
+        // A valid bound predicate is serialized, then only its `op` token is
+        // rewritten to a wrong-class operator — so the payload is byte-identical
+        // to a real one except for the smuggled op, mirroring the wire attack.
+
+        fn corrupt_op(json: &str, from: &str, to: &str) -> String {
+            let needle = format!(r#""op":"{from}""#);
+            let replacement = format!(r#""op":"{to}""#);
+            assert!(
+                json.contains(&needle),
+                "op token {needle} not present in {json}"
+            );
+            json.replacen(&needle, &replacement, 1)
+        }
+
+        #[test]
+        fn reject_bound_unary_with_binary_op() {
+            let schema = table_schema_simple();
+            let bound = Reference::new("foo")
+                .is_null()
+                .bind(schema, true)
+                .expect("bind");
+            let json = serde_json::to_string(&bound).expect("serialize");
+            let corrupted = corrupt_op(&json, "IsNull", "LessThan");
+            let err = serde_json::from_str::<BoundPredicate>(&corrupted)
+                .expect_err("binary op in bound unary shape must be rejected");
+            assert!(
+                err.to_string().contains("not a unary operator"),
+                "message: {err}"
+            );
+        }
+
+        #[test]
+        fn reject_bound_binary_with_unary_op() {
+            let schema = table_schema_simple();
+            let bound = Reference::new("bar")
+                .less_than(Datum::int(10))
+                .bind(schema, true)
+                .expect("bind");
+            let json = serde_json::to_string(&bound).expect("serialize");
+            let corrupted = corrupt_op(&json, "LessThan", "IsNull");
+            let err = serde_json::from_str::<BoundPredicate>(&corrupted)
+                .expect_err("unary op in bound binary shape must be rejected");
+            assert!(
+                err.to_string().contains("not a binary operator"),
+                "message: {err}"
+            );
+        }
+
+        #[test]
+        fn reject_bound_set_with_binary_op() {
+            let schema = table_schema_simple();
+            let bound = Reference::new("bar")
+                .is_in([Datum::int(10), Datum::int(20)])
+                .bind(schema, true)
+                .expect("bind");
+            let json = serde_json::to_string(&bound).expect("serialize");
+            let corrupted = corrupt_op(&json, "In", "LessThan");
+            let err = serde_json::from_str::<BoundPredicate>(&corrupted)
+                .expect_err("binary op in bound set shape must be rejected");
+            assert!(
+                err.to_string().contains("not a set operator"),
+                "message: {err}"
+            );
+        }
+
+        // -- The valid shapes still deserialize through each shadow -----------
+
+        #[test]
+        fn accept_each_valid_class() {
+            let unary = r#"{"Unary":{"op":"NotNull","term":{"name":"bar"}}}"#;
+            let binary = r#"{"Binary":{"op":"GreaterThan","term":{"name":"bar"},"literal":{"type":"int","literal":10}}}"#;
+            let set = r#"{"Set":{"op":"NotIn","term":{"name":"bar"},"literals":[{"type":"int","literal":10}]}}"#;
+            assert_eq!(
+                serde_json::from_str::<Predicate>(unary).expect("valid unary"),
+                Reference::new("bar").is_not_null()
+            );
+            assert_eq!(
+                serde_json::from_str::<Predicate>(binary).expect("valid binary"),
+                Reference::new("bar").greater_than(Datum::int(10))
+            );
+            assert_eq!(
+                serde_json::from_str::<Predicate>(set).expect("valid set"),
+                Reference::new("bar").is_not_in([Datum::int(10)])
+            );
+        }
+
+        // Silence unused-import lint for the unchecked constructors, which are
+        // exercised by the visitor-module pins rather than here.
+        #[test]
+        fn unchecked_constructors_build_invalid_shapes() {
+            let unary =
+                UnaryExpression::new_unchecked(PredicateOperator::LessThan, Reference::new("a"));
+            assert_eq!(unary.op(), PredicateOperator::LessThan);
+            let binary = BinaryExpression::new_unchecked(
+                PredicateOperator::IsNull,
+                Reference::new("a"),
+                Datum::int(1),
+            );
+            assert_eq!(binary.op(), PredicateOperator::IsNull);
+            let set = SetExpression::new_unchecked(
+                PredicateOperator::GreaterThan,
+                Reference::new("a"),
+                FnvHashSet::from_iter([Datum::int(1)]),
+            );
+            assert_eq!(set.op(), PredicateOperator::GreaterThan);
+        }
     }
 }
