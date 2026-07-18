@@ -75,7 +75,15 @@ closing Critic). Closes the overnight block's follow-up ledger. All groups conve
       disclosed (client_credentials vs token-exchange; config-token clients not refreshed —
       Critic F1: disclosure broader than "no credential", rewording queued). Critic: CONVERGED,
       2 LOW.
-- [ ] **Closing pass: Fable bundle Critic** over the full branch, then push + PR.
+- [x] **Closing pass: Fable bundle Critic** over the full branch — **CONVERGED** 2026-07-18,
+      zero MEDIUM+. Full-workspace clippy (protoc present) + all six lib suites green (iceberg
+      2831 · sql 80 · hms 43 · glue 30 · s3tables 28 · rest 82); cross-group seams verified
+      (G2→G3 variant dependency ordered; G4×G5 rest-crate hunks disjoint; novel probe: vended
+      creds × token refresh compose in one mockito session, endpoint hit exactly 2×); public-API
+      ledger = exactly the two flagged additions; matrix/tracker ruled truthful; 3 cross-group
+      mutations re-run RED + md5-identical restores. 4 LOW (rest-crate local needle list
+      pre-existing/not unified; G5's expect nit + DEVIATIONS rewording queued; G1 residue
+      descriptions live in its Critic report → pasted into the PR body). Pushed after flip.
 
 ## OVERNIGHT BLOCK (2026-07-17, signed off) — audit-2026-07-17 remediation, 5 units, mixed FF/OO-max
 
