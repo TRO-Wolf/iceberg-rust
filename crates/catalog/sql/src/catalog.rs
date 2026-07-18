@@ -761,7 +761,7 @@ impl Catalog for SqlCatalog {
             let tables = self.list_tables(namespace).await?;
             if !tables.is_empty() {
                 return Err(Error::new(
-                    iceberg::ErrorKind::Unexpected,
+                    iceberg::ErrorKind::NamespaceNotEmpty,
                     format!(
                         "Namespace {:?} is not empty. {} tables exist.",
                         namespace,
@@ -2244,6 +2244,40 @@ mod tests {
         catalog.drop_namespace(&namespace_ident).await.unwrap();
 
         assert!(!catalog.namespace_exists(&namespace_ident).await.unwrap())
+    }
+
+    /// Dropping a namespace that still contains a table must fail with the typed
+    /// `NamespaceNotEmpty` kind (mirrors Java `NamespaceNotEmptyException`), not the old
+    /// `Unexpected`. The message content is preserved so existing log/UX expectations hold, and the
+    /// namespace must remain (drop is refused, not partially applied).
+    #[tokio::test]
+    async fn test_drop_namespace_throws_error_if_namespace_not_empty() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
+        let namespace_ident = NamespaceIdent::new("abc".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        let table_ident = TableIdent::new(namespace_ident.clone(), "tbl".into());
+        create_table(&catalog, &table_ident).await;
+
+        let err = catalog
+            .drop_namespace(&namespace_ident)
+            .await
+            .expect_err("dropping a non-empty namespace must fail");
+
+        assert_eq!(
+            err.kind(),
+            iceberg::ErrorKind::NamespaceNotEmpty,
+            "a non-empty namespace drop must classify as NamespaceNotEmpty"
+        );
+        assert!(
+            err.message().contains("is not empty"),
+            "the not-empty message content must be preserved, got: {}",
+            err.message()
+        );
+        assert!(
+            catalog.namespace_exists(&namespace_ident).await.unwrap(),
+            "the refused drop must leave the namespace in place"
+        );
     }
 
     #[tokio::test]

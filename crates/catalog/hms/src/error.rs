@@ -177,7 +177,17 @@ pub fn from_create_table_exception<T>(
 ///
 /// The thrift `drop_database` IDL declares `NoSuchObjectException o1, InvalidOperationException o2,
 /// MetaException o3`, so `O1` means the namespace does not exist → [`ErrorKind::NamespaceNotFound`].
-/// The other exceptions have no not-found semantics → [`ErrorKind::Unexpected`].
+///
+/// `O2` (`InvalidOperationException`) means the namespace is not empty →
+/// [`ErrorKind::NamespaceNotEmpty`]. This flip is bytecode-grounded: Java
+/// `org.apache.iceberg.hive.HiveCatalog.dropNamespace` (iceberg-hive-metastore 1.10.0, decoded with
+/// `javap -p -c`) calls `IMetaStoreClient.dropDatabase(name, false, false, false)` — the trailing
+/// `cascade=false` — and its exception table maps the caught Hive `InvalidOperationException`
+/// (target 40) directly to `new NamespaceNotEmptyException("Namespace %s is not empty. One or more
+/// tables exist.", ...)` (bytecode offsets 41–60). With `cascade=false`, non-empty is the sole
+/// meaning of `InvalidOperationException` on this call, so the arm maps unambiguously.
+///
+/// A `MetaException` (`O3`) is a server-side failure with no typed semantics → [`ErrorKind::Unexpected`].
 pub fn from_drop_database_exception<T>(
     namespace: &NamespaceIdent,
     value: MaybeException<T, ThriftHiveMetastoreDropDatabaseException>,
@@ -188,6 +198,13 @@ pub fn from_drop_database_exception<T>(
             Err(Error::new(
                 ErrorKind::NamespaceNotFound,
                 format!("No such namespace: {namespace:?}"),
+            )
+            .with_source(anyhow!("thrift error: {exc:?}")))
+        }
+        MaybeException::Exception(exc @ ThriftHiveMetastoreDropDatabaseException::O2(_)) => {
+            Err(Error::new(
+                ErrorKind::NamespaceNotEmpty,
+                format!("Namespace {namespace:?} is not empty. One or more tables exist."),
             )
             .with_source(anyhow!("thrift error: {exc:?}")))
         }
@@ -382,12 +399,33 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NamespaceNotFound);
     }
 
-    /// A `drop_database` `InvalidOperationException` (`O2`, e.g. non-empty namespace) has no
-    /// not-found semantics and must stay `Unexpected`.
+    /// A `drop_database` `InvalidOperationException` (`O2`) means the namespace is not empty and
+    /// must classify as `NamespaceNotEmpty` — bytecode-grounded against Java
+    /// `HiveCatalog.dropNamespace`, which maps this exception (from the `cascade=false`
+    /// `dropDatabase`) to `NamespaceNotEmptyException`. The thrift exception must survive as the
+    /// source so the chain stays intact for debugging.
     #[test]
-    fn drop_database_invalid_operation_stays_unexpected() {
+    fn drop_database_invalid_operation_maps_to_namespace_not_empty() {
         let value: MaybeException<(), _> = MaybeException::Exception(
             ThriftHiveMetastoreDropDatabaseException::O2(InvalidOperationException::default()),
+        );
+        let err = from_drop_database_exception(&namespace(), value).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NamespaceNotEmpty);
+        assert!(
+            std::error::Error::source(&err)
+                .expect("the thrift exception must survive as the source")
+                .to_string()
+                .contains("InvalidOperationException"),
+            "source chain must carry the underlying thrift exception"
+        );
+    }
+
+    /// A `drop_database` `MetaException` (`O3`) has no typed semantics and must stay `Unexpected`
+    /// — proving the mapper does not over-broaden every exception to a typed kind.
+    #[test]
+    fn drop_database_meta_exception_stays_unexpected() {
+        let value: MaybeException<(), _> = MaybeException::Exception(
+            ThriftHiveMetastoreDropDatabaseException::O3(MetaException::default()),
         );
         let err = from_drop_database_exception(&namespace(), value).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unexpected);
