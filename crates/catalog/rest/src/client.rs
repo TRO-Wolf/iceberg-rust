@@ -49,9 +49,23 @@ pub(crate) struct HttpClient {
 
 impl Debug for HttpClient {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // SEC-008: `extra_headers` carries any `header.*`-configured request headers, including
+        // auth (`header.authorization`, `header.x-api-key`, …). Printing the `HeaderMap` raw
+        // would leak those values into any `{:?}`/`tracing` of the client (or a struct embedding
+        // it). Render it through the same `SENSITIVE_HEADERS` policy the error-log path uses,
+        // ALWAYS redacting here regardless of `disable_header_redaction` (that opt-out is scoped
+        // to error logs, not to `Debug`). The wrapper writes the redacted map verbatim so the
+        // field renders cleanly instead of as an escaped string.
+        struct RedactedHeaders<'a>(&'a HeaderMap);
+        impl Debug for RedactedHeaders<'_> {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&format_headers_redacted(self.0, false))
+            }
+        }
+
         f.debug_struct("HttpClient")
             .field("client", &self.client)
-            .field("extra_headers", &self.extra_headers)
+            .field("extra_headers", &RedactedHeaders(&self.extra_headers))
             .finish_non_exhaustive()
     }
 }
@@ -639,5 +653,56 @@ mod tests {
         assert!(result.contains("application/json"));
         // [REDACTED] should NOT be present when redaction is disabled
         assert!(!result.contains("[REDACTED]"));
+    }
+
+    /// Risk (SEC-008): `HttpClient`'s `Debug` prints `extra_headers`, which carries any
+    /// `header.*`-configured request headers — including auth headers like `header.authorization`.
+    /// A raw `HeaderMap` dump leaks those secret VALUES into any `{:?}`/`tracing` of the client
+    /// (or a struct embedding it). Pins that a sensitive header value is redacted while the header
+    /// NAME stays visible, and a non-sensitive header keeps its value. Mutation: revert the Debug
+    /// impl to `.field("extra_headers", &self.extra_headers)` → RED.
+    #[tokio::test]
+    async fn test_http_client_debug_redacts_sensitive_extra_header() {
+        const HEADER_SECRET: &str = "SUPER_SECRET_AUTH_HEADER_DO_NOT_LEAK";
+
+        let mut props = HashMap::new();
+        props.insert(
+            "header.authorization".to_string(),
+            format!("Bearer {HEADER_SECRET}"),
+        );
+        props.insert(
+            "header.x-request-id".to_string(),
+            "req-visible-123".to_string(),
+        );
+
+        let client = HttpClient::new(
+            &RestCatalogConfig::builder()
+                .uri("http://localhost".to_string())
+                .props(props)
+                .build(),
+        )
+        .expect("HttpClient must build from a header-bearing config");
+
+        let debug = format!("{client:?}");
+
+        // The sensitive header VALUE must never appear.
+        assert!(
+            !debug.contains(HEADER_SECRET),
+            "HttpClient Debug leaked a sensitive header value: {debug}"
+        );
+        // Its presence is still signalled: the header NAME and redaction marker survive.
+        assert!(
+            debug.contains("authorization"),
+            "expected the redacted header name to remain: {debug}"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "expected the redaction marker: {debug}"
+        );
+        // A non-sensitive header keeps its value for diagnostics.
+        assert!(
+            debug.contains("x-request-id") && debug.contains("req-visible-123"),
+            "non-sensitive header should stay visible: {debug}"
+        );
     }
 }

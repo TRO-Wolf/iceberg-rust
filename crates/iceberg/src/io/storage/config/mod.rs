@@ -49,10 +49,72 @@ use serde::{Deserialize, Serialize};
 /// which storage backend to use. The storage type is determined by the
 /// explicit factory selection.
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StorageConfig {
     /// Configuration properties for the storage backend
     props: HashMap<String, String>,
+}
+
+/// Substrings (matched case-insensitively) that mark a property KEY as secret-bearing, so its
+/// value is redacted from [`StorageConfig`]'s `Debug`.
+///
+/// `StorageConfig` holds the raw, untyped property map — the REST catalog clones its full
+/// runtime props (which may include `credential`/`token`/`client_secret`) into the `FileIO`
+/// this config backs (`crates/catalog/rest/src/catalog.rs`, `load_file_io`), so a plain-derived
+/// `Debug` — or any `Debug`-deriving struct that embeds a `FileIO`/`StorageConfig` — would print
+/// live credentials.
+///
+/// Substring (not exact) matching keeps this a strict SUPERSET of every value the typed configs
+/// (`S3Config`/`GcsConfig`/`AzdlsConfig`/`OssConfig`) and `RestCatalogConfig` hand-redact:
+/// `credential` (`gcs.credentials-json`, REST `credential`), `token` (`s3.session-token`,
+/// `adls.sas-token`, `gcs.oauth2.token`, REST `token`), `secret` (`s3.secret-access-key`,
+/// `adls.client-secret`, `oss.access-key-secret`, REST `client_secret`), `key` (`s3.access-key-id`,
+/// `s3.sse.key`, `adls.account-key`), `md5` (`s3.sse.md5` — the SSE-C customer-key digest), and
+/// `connection-string` (`adls.connection-string`, which embeds the account key / SAS token).
+/// `password` is carried defensively (no typed config exposes one today). Over-redaction is the
+/// safe direction for a debug view.
+const SECRET_PROP_KEY_SUBSTRINGS: &[&str] = &[
+    "credential",
+    "token",
+    "secret",
+    "key",
+    "password",
+    "md5",
+    "connection-string",
+];
+
+/// Returns true if a property key holds a secret value that must be redacted from `Debug`,
+/// i.e. its lowercased form contains any [`SECRET_PROP_KEY_SUBSTRINGS`] entry.
+fn is_secret_prop_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    SECRET_PROP_KEY_SUBSTRINGS
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+impl std::fmt::Debug for StorageConfig {
+    /// Hand-written so secret-bearing entries in the raw `props` map are redacted to `"***"`
+    /// instead of printed in clear. Keys stay visible for diagnostics; only secret VALUES are
+    /// masked. Mirrors the `RestCatalogConfig` redaction so a `{:?}`/`tracing` of a
+    /// `StorageConfig` — or of any struct that embeds a `FileIO` and derives `Debug` — cannot
+    /// leak credentials.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_props: HashMap<&str, &str> = self
+            .props
+            .iter()
+            .map(|(k, v)| {
+                if is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("StorageConfig")
+            .field("props", &redacted_props)
+            .finish()
+    }
 }
 
 impl StorageConfig {
@@ -231,5 +293,97 @@ mod tests {
 
         assert_eq!(config, deserialized);
         assert!(deserialized.props().is_empty());
+    }
+
+    /// Risk (SEC-002 / SEC-003 chain): `StorageConfig` holds the raw prop map the REST catalog
+    /// clones its full runtime props into, so a plain-derived `Debug` would print live
+    /// `credential`/`token`/`client_secret` (and the typed-config secrets) in clear. Pins that
+    /// secret VALUES are redacted to `"***"` while their KEYS — and every non-secret value —
+    /// stay visible for diagnostics. Mutation: revert to `#[derive(.., Debug, ..)]` → RED.
+    #[test]
+    fn test_storage_config_debug_redacts_secret_values() {
+        const SECRET: &str = "SECRET_VALUE_DO_NOT_LEAK";
+        let config = StorageConfig::new()
+            // REST runtime props cloned into FileIO.
+            .with_prop("credential", SECRET)
+            .with_prop("token", SECRET)
+            .with_prop("client_secret", SECRET)
+            // Representative typed-config secret keys (the superset targets).
+            .with_prop("s3.secret-access-key", SECRET)
+            .with_prop("s3.access-key-id", SECRET)
+            .with_prop("s3.session-token", SECRET)
+            .with_prop("s3.sse.md5", SECRET)
+            .with_prop("adls.connection-string", SECRET)
+            .with_prop("gcs.credentials-json", SECRET)
+            // Non-secret diagnostic props must stay visible.
+            .with_prop("region", "us-east-1")
+            .with_prop("s3.endpoint", "http://localhost:9000");
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "StorageConfig Debug leaked a secret value: {debug}"
+        );
+        // Presence is still signalled: the redaction marker and the secret KEYS survive.
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        for key in [
+            "credential",
+            "token",
+            "client_secret",
+            "s3.secret-access-key",
+            "s3.sse.md5",
+            "adls.connection-string",
+        ] {
+            assert!(
+                debug.contains(key),
+                "expected secret key `{key}` to remain visible: {debug}"
+            );
+        }
+        // Non-secret values are NOT redacted.
+        assert!(
+            debug.contains("us-east-1") && debug.contains("http://localhost:9000"),
+            "Debug dropped non-secret values: {debug}"
+        );
+    }
+
+    /// Guards the "strict superset" claim: every raw property key the typed configs
+    /// (`S3Config`/`GcsConfig`/`AzdlsConfig`/`OssConfig`) and `RestCatalogConfig` hand-redact
+    /// must be classified secret here. If a typed config adds a secret whose key escapes the
+    /// substring list, this fails — forcing the list to grow with it.
+    #[test]
+    fn test_secret_prop_key_is_superset_of_typed_config_secrets() {
+        let redacted_by_typed_configs = [
+            // RestCatalogConfig SECRET_PROP_KEYS
+            "credential",
+            "token",
+            "client_secret",
+            // S3Config
+            "s3.access-key-id",
+            "s3.secret-access-key",
+            "s3.session-token",
+            "s3.sse.key",
+            "s3.sse.md5",
+            // GcsConfig
+            "gcs.credentials-json",
+            "gcs.oauth2.token",
+            // AzdlsConfig
+            "adls.connection-string",
+            "adls.account-key",
+            "adls.sas-token",
+            "adls.client-secret",
+            // OssConfig
+            "oss.access-key-secret",
+        ];
+        for key in redacted_by_typed_configs {
+            assert!(
+                is_secret_prop_key(key),
+                "typed-config secret key `{key}` must be classified secret by StorageConfig"
+            );
+        }
+        // Case-insensitive, and a plainly non-secret key stays visible.
+        assert!(is_secret_prop_key("S3.SECRET-ACCESS-KEY"));
+        assert!(!is_secret_prop_key("region"));
+        assert!(!is_secret_prop_key("s3.endpoint"));
     }
 }
