@@ -295,7 +295,24 @@ impl CachingDeleteFileLoader {
 
                 // Per the Iceberg spec, evolve schema for equality deletes but only for the
                 // equality_ids columns, not all table columns.
-                let equality_ids_vec = task.equality_ids.clone().unwrap();
+                //
+                // A malformed or foreign eq-delete task can arrive with `equality_ids: None`
+                // (corrupt/foreign metadata, or a task deserialized from an older shape). Fail
+                // loud with a typed error naming the file rather than `unwrap`-panicking the scan
+                // — Java's `DeleteLoader` likewise throws on malformed delete metadata instead of
+                // crashing. The early return drops `sender`; the eq-delete receiver task turns that
+                // dropped sender into a terminal `EqDelState::Failed` (see
+                // `DeleteFilter::insert_equality_delete`), so no waiter is left stranded.
+                let Some(equality_ids_vec) = task.equality_ids.clone() else {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid equality delete file '{}': missing equality_ids (an \
+                             equality-delete task must carry the field ids its rows delete on)",
+                            task.file_path
+                        ),
+                    ));
+                };
                 let evolved_stream = BasicDeleteFileLoader::evolve_schema(
                     basic_delete_file_loader
                         .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
@@ -951,6 +968,58 @@ mod tests {
         let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (sa != 5)) OR (b IS NOT NULL))".to_string();
 
         assert_eq!(parsed_eq_delete.to_string(), expected);
+    }
+
+    /// Risk pinned (audit BUG-004): an equality-delete task with `equality_ids: None` — corrupt or
+    /// foreign metadata, or a task deserialized from an older shape — must surface a typed
+    /// `DataInvalid` error naming the delete file, NOT panic the scan on `Option::unwrap`. A REAL
+    /// eq-delete parquet file is used so the ONLY defect is the missing equality_ids (the guard
+    /// fires before the file is opened). MUTATION: restoring `task.equality_ids.clone().unwrap()`
+    /// panics the load task, which drops the result sender; the loader channel then yields
+    /// `RecvError` and the `.expect("loader channel ...")` below fails RED.
+    #[tokio::test]
+    async fn test_eq_delete_missing_equality_ids_yields_typed_error_not_panic() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let table_location = tmp_dir.path().as_os_str().to_str().expect("utf-8 path");
+        let file_io = FileIO::new_with_fs();
+
+        let eq_delete_file_path = setup_write_equality_delete_file_1(table_location);
+
+        let task = FileScanTaskDeleteFile {
+            file_path: eq_delete_file_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&eq_delete_file_path)
+                .map(|m| m.len())
+                .unwrap_or(0),
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: 0,
+            equality_ids: None, // the corrupt input under test
+            file_format: crate::spec::DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let inner = loader
+            .load_deletes(
+                &[task],
+                Arc::new(Schema::builder().build().expect("empty schema")),
+            )
+            .await
+            .expect("loader channel must deliver a result, not panic the load task");
+        let error = inner
+            .expect_err("equality_ids: None must surface a typed error, not load successfully");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains(&eq_delete_file_path),
+            "error must name the delete file: {error}"
+        );
+        assert!(
+            error.to_string().contains("equality_ids"),
+            "error must name the missing equality_ids: {error}"
+        );
     }
 
     /// M5 equivalence: the interned `parse_positional_deletes_record_batch_stream` must build the

@@ -42,6 +42,13 @@ enum EqDelState {
     /// the oracle and the fallback) and, when every key column is type-eligible, the hashed
     /// [`EqDeleteKeySet`] accelerator for the O(R) apply fast path.
     Loaded(Predicate, Option<EqDeleteKeySet>),
+    /// The load failed terminally: the loader dropped the oneshot sender without ever sending a
+    /// predicate. This happens on ANY error or cancellation in the load → parse → send window
+    /// (malformed `equality_ids`, an unreadable delete file, a schema-evolution or parse failure,
+    /// or the whole load stream being torn down because a sibling task errored). Waiters MUST treat
+    /// this as terminal — surfacing absence so the caller raises a typed error — instead of
+    /// re-waiting on the notifier, which would block the scan forever.
+    Failed,
 }
 
 /// State tracking for positional delete files.
@@ -105,6 +112,19 @@ pub(crate) enum PosDelLoadAction {
     WaitFor(Arc<Notify>),
 }
 
+/// Recover a poisoned lock guard instead of cascading the panic to every subsequent scan.
+///
+/// The guarded [`DeleteFileFilterState`] is a set of `HashMap`s (and the per-file delete-vector
+/// `Mutex`es) whose critical sections perform only `insert`/`get`/`clone`/bitmap-union — no
+/// re-entrant user code that could tear a collection mid-mutation — so a guard left behind by a
+/// panicked holder still wraps a structurally coherent state. Recovering it via
+/// [`std::sync::PoisonError::into_inner`] keeps concurrent scans alive rather than turning one
+/// thread's panic into a poison-panic in every reader/writer. This is the crate's established
+/// policy for these delete-path locks (see `arrow/reader.rs`, the positional delete-vector mutex).
+fn recover_poison<G>(result: std::sync::LockResult<G>) -> G {
+    result.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl DeleteFilter {
     /// Retrieve a delete vector for the data file associated with a given file scan task
     pub(crate) fn get_delete_vector(
@@ -126,7 +146,7 @@ impl DeleteFilter {
     }
 
     pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Arc<Notify>> {
-        let mut state = self.state.write().unwrap();
+        let mut state = recover_poison(self.state.write());
 
         // Skip if already loaded/loading - another task owns it
         if state.equality_deletes.contains_key(file_path) {
@@ -147,7 +167,7 @@ impl DeleteFilter {
     /// Returns an action dictating whether the caller should load the file,
     /// wait for another task to load it, or do nothing.
     pub(crate) fn try_start_pos_del_load(&self, file_path: &str) -> PosDelLoadAction {
-        let mut state = self.state.write().unwrap();
+        let mut state = recover_poison(self.state.write());
 
         if let Some(state) = state.positional_deletes.get(file_path) {
             match state {
@@ -167,7 +187,7 @@ impl DeleteFilter {
     /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
     pub(crate) fn finish_pos_del_load(&self, file_path: &str) {
         let notify = {
-            let mut state = self.state.write().unwrap();
+            let mut state = recover_poison(self.state.write());
             if let Some(PosDelState::Loading(notify)) = state
                 .positional_deletes
                 .insert(file_path.to_string(), PosDelState::Loaded)
@@ -189,8 +209,15 @@ impl DeleteFilter {
         file_path: &str,
     ) -> Option<Predicate> {
         let notifier = {
-            match self.state.read().unwrap().equality_deletes.get(file_path) {
+            match recover_poison(self.state.read())
+                .equality_deletes
+                .get(file_path)
+            {
                 None => return None,
+                // A terminally-failed load surfaces as absence: the caller
+                // (`build_equality_delete_predicate`) then raises a typed "missing predicate"
+                // error rather than this task blocking forever on a notifier that already fired.
+                Some(EqDelState::Failed) => return None,
                 Some(EqDelState::Loading(notifier)) => notifier.clone(),
                 Some(EqDelState::Loaded(predicate, _)) => {
                     return Some(predicate.clone());
@@ -200,9 +227,15 @@ impl DeleteFilter {
 
         notifier.notified().await;
 
-        match self.state.read().unwrap().equality_deletes.get(file_path) {
+        // Once the notifier fires the entry is terminal: `Loaded` on success, `Failed` on a load
+        // error. Treat anything other than `Loaded` (Failed, or — defensively — a still-Loading or
+        // absent entry) as absence so the caller surfaces a typed error instead of re-waiting.
+        match recover_poison(self.state.read())
+            .equality_deletes
+            .get(file_path)
+        {
             Some(EqDelState::Loaded(predicate, _)) => Some(predicate.clone()),
-            _ => unreachable!("Cannot be any other state than loaded"),
+            _ => None,
         }
     }
 
@@ -215,8 +248,14 @@ impl DeleteFilter {
         file_path: &str,
     ) -> Option<EqDeleteKeySet> {
         let notifier = {
-            match self.state.read().unwrap().equality_deletes.get(file_path) {
+            match recover_poison(self.state.read())
+                .equality_deletes
+                .get(file_path)
+            {
                 None => return None,
+                // A terminally-failed load surfaces as "no key set", routing this file's task onto
+                // the predicate path — which then raises the typed error — instead of blocking.
+                Some(EqDelState::Failed) => return None,
                 Some(EqDelState::Loading(notifier)) => notifier.clone(),
                 Some(EqDelState::Loaded(_, key_set)) => {
                     return key_set.clone();
@@ -226,9 +265,15 @@ impl DeleteFilter {
 
         notifier.notified().await;
 
-        match self.state.read().unwrap().equality_deletes.get(file_path) {
+        // As in `get_equality_delete_predicate_for_delete_file_path`: after the notifier fires the
+        // entry is terminal; anything other than `Loaded` yields `None` (use the predicate path)
+        // rather than re-waiting.
+        match recover_poison(self.state.read())
+            .equality_deletes
+            .get(file_path)
+        {
             Some(EqDelState::Loaded(_, key_set)) => key_set.clone(),
-            _ => unreachable!("Cannot be any other state than loaded"),
+            _ => None,
         }
     }
 
@@ -307,7 +352,7 @@ impl DeleteFilter {
         data_file_path: String,
         delete_vector: DeleteVector,
     ) {
-        let mut state = self.state.write().unwrap();
+        let mut state = recover_poison(self.state.write());
 
         let Some(entry) = state.delete_vectors.get_mut(&data_file_path) else {
             state
@@ -316,7 +361,7 @@ impl DeleteFilter {
             return;
         };
 
-        *entry.lock().unwrap() |= delete_vector;
+        *recover_poison(entry.lock()) |= delete_vector;
     }
 
     pub(crate) fn insert_equality_delete(
@@ -326,7 +371,7 @@ impl DeleteFilter {
     ) {
         let notify = Arc::new(Notify::new());
         {
-            let mut state = self.state.write().unwrap();
+            let mut state = recover_poison(self.state.write());
             state.equality_deletes.insert(
                 delete_file_path.to_string(),
                 EqDelState::Loading(notify.clone()),
@@ -336,12 +381,22 @@ impl DeleteFilter {
         let state = self.state.clone();
         let delete_file_path = delete_file_path.to_string();
         crate::runtime::spawn(async move {
-            let (predicate, key_set) = eq_del.await.unwrap();
+            // The loader sends the parsed predicate here once the eq-delete file is read. If the
+            // oneshot SENDER is instead dropped without sending — which happens on ANY error or
+            // cancellation in the load → parse → send window (a malformed `equality_ids`, an
+            // unreadable delete file, a schema-evolution or parse failure, or the whole load stream
+            // being torn down because a sibling task errored) — `recv` errs. We MUST then move the
+            // entry to the terminal `Failed` state and STILL wake the waiters: leaving it `Loading`
+            // strands every `equality_delete_predicate` / keyset waiter on the notifier forever
+            // (the hang this fix closes). The waiters read `Failed` as absence and surface a typed
+            // error to the caller.
+            let new_state = match eq_del.await {
+                Ok((predicate, key_set)) => EqDelState::Loaded(predicate, key_set),
+                Err(_) => EqDelState::Failed,
+            };
             {
-                let mut state = state.write().unwrap();
-                state
-                    .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(predicate, key_set));
+                let mut state = recover_poison(state.write());
+                state.equality_deletes.insert(delete_file_path, new_state);
             }
             notify.notify_waiters();
         });
@@ -918,6 +973,125 @@ pub(crate) mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(col.values(), &[2, 4, 7, 9]);
+    }
+
+    /// Risk pinned (audit SAF-001 / BUG-004): a FAILED equality-delete load must surface a typed
+    /// error to the waiting consumer within a BOUNDED await — it must never hang. When the loader
+    /// drops the oneshot sender without sending (the shape of every early-return in the
+    /// load → parse → send window), the receiver task transitions the entry to `EqDelState::Failed`
+    /// and STILL wakes the waiters; the waiter reads `Failed` as absence and the predicate builder
+    /// raises a typed error. MUTATION: reverting the terminal transition (back to
+    /// `eq_del.await.unwrap()`) leaves the entry `Loading` forever and this test TIMES OUT (RED).
+    /// Deterministic on the default current-thread test runtime: the consumer registers its
+    /// notifier interest (first poll of `notified()`) before the dropped-sender receiver task is
+    /// scheduled, so the terminal `notify_waiters()` cannot be missed.
+    #[tokio::test]
+    async fn test_failed_eq_delete_load_surfaces_error_not_hang() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+
+        let task = FileScanTask {
+            file_size_in_bytes: 0,
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: "data.parquet".to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: vec![],
+            predicate: None,
+            deletes: vec![FileScanTaskDeleteFile {
+                file_path: "eq-del.parquet".to_string(),
+                file_size_in_bytes: 1,
+                file_type: DataContentType::EqualityDeletes,
+                partition_spec_id: 0,
+                equality_ids: Some(vec![1]),
+                file_format: DataFileFormat::Parquet,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                record_count: None,
+            }],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        };
+
+        let filter = DeleteFilter::default();
+        let (tx, rx) = tokio::sync::oneshot::channel::<(Predicate, Option<EqDeleteKeySet>)>();
+        filter.insert_equality_delete("eq-del.parquet", rx);
+
+        // Simulate the loader failing AFTER registration: the parsed predicate is never sent and
+        // the sender is dropped — exactly what an early-return in the load window does.
+        drop(tx);
+
+        // The consumer must get a typed error INSIDE the timeout, never block on the notifier.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.build_equality_delete_predicate(&task),
+        )
+        .await;
+
+        let built =
+            outcome.expect("build_equality_delete_predicate must not hang after a load failure");
+        let error =
+            built.expect_err("a failed eq-delete load must surface a typed error to the consumer");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains("eq-del.parquet"),
+            "error must name the eq-delete file: {error}"
+        );
+    }
+
+    /// Risk pinned (audit SAF-003): a thread that panics while holding the `state` write guard
+    /// poisons the `RwLock`, but subsequent scan operations must RECOVER (`into_inner`) rather than
+    /// cascade-panic. MUTATION: restoring `self.state.write().unwrap()` in `upsert_delete_vector` /
+    /// `try_start_pos_del_load` turns these calls into panics on the poisoned lock (RED).
+    #[test]
+    fn test_poisoned_state_lock_recovers_instead_of_cascading() {
+        let mut filter = DeleteFilter::default();
+
+        // Poison the shared state RwLock by panicking while holding the write guard.
+        let poisoner = filter.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner
+                .state
+                .write()
+                .expect("acquire write guard to poison");
+            panic!("intentionally poison the delete-filter state lock");
+        });
+        assert!(
+            handle.join().is_err(),
+            "the poisoning thread must have panicked while holding the guard"
+        );
+
+        // A subsequent WRITER (upsert_delete_vector) must not panic on the poisoned lock, and its
+        // write must land.
+        filter.upsert_delete_vector("data.parquet".to_string(), DeleteVector::default());
+        assert!(
+            recover_poison(filter.state.read())
+                .delete_vectors
+                .contains_key("data.parquet"),
+            "the recovered write must land despite the poisoned lock"
+        );
+
+        // A subsequent writer via try_start_pos_del_load must also recover and proceed.
+        assert!(
+            matches!(
+                filter.try_start_pos_del_load("pos-del.parquet"),
+                PosDelLoadAction::Load
+            ),
+            "a fresh positional-delete load must proceed on the recovered lock"
+        );
     }
 
     // =============================================================================================
