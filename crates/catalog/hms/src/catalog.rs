@@ -51,6 +51,10 @@ pub const THRIFT_TRANSPORT_BUFFERED: &str = "buffered";
 /// HMS Catalog warehouse location
 pub const HMS_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 
+/// HMS Catalog Hive version assumed when producing Hive column type strings
+/// (e.g. `"3.1.3"`); see [`HiveVersion`]. Defaults to Hive 3+ behavior.
+pub const HMS_CATALOG_PROP_HIVE_VERSION: &str = "hive_version";
+
 /// Builder for [`HmsCatalog`].
 #[derive(Debug)]
 pub struct HmsCatalogBuilder {
@@ -66,6 +70,7 @@ impl Default for HmsCatalogBuilder {
                 address: "".to_string(),
                 thrift_transport: HmsThriftTransport::default(),
                 warehouse: "".to_string(),
+                hive_version: HiveVersion::default(),
                 props: HashMap::new(),
             },
             storage_factory: None,
@@ -107,12 +112,23 @@ impl CatalogBuilder for HmsCatalogBuilder {
                 .unwrap_or_default();
         }
 
+        if let Some(hive_version) = props.get(HMS_CATALOG_PROP_HIVE_VERSION) {
+            match HiveVersion::parse(hive_version) {
+                Ok(hive_version) => self.config.hive_version = hive_version,
+                // Invalid values fail loudly instead of silently falling back to the
+                // default: the default (Hive 3+) and the fallback differ in the
+                // timestamptz column type they produce.
+                Err(err) => return std::future::ready(Err(err)),
+            }
+        }
+
         self.config.props = props
             .into_iter()
             .filter(|(k, _)| {
                 k != HMS_CATALOG_PROP_URI
                     && k != HMS_CATALOG_PROP_THRIFT_TRANSPORT
                     && k != HMS_CATALOG_PROP_WAREHOUSE
+                    && k != HMS_CATALOG_PROP_HIVE_VERSION
             })
             .collect();
 
@@ -152,6 +168,56 @@ pub enum HmsThriftTransport {
     Buffered,
 }
 
+/// The Hive version the catalog assumes when producing Hive column type strings.
+///
+/// Java's `HiveVersion.current()` detects the CLIENT classpath's Hive library
+/// (`HiveVersionInfo.getShortVersion()`), not the metastore server's version. This
+/// crate speaks thrift directly and carries no Hive client library, so the
+/// equivalent state is a configuration knob: [`HMS_CATALOG_PROP_HIVE_VERSION`].
+///
+/// Two states are behaviorally sufficient — bytecode-verified (javap,
+/// iceberg-hive-metastore-1.10.0.jar): the Java enum orders `HIVE_4`=4, `HIVE_3`=3,
+/// `HIVE_2`=2, `HIVE_1_2`=1, `NOT_SUPPORTED`=0 with `min(v)` = `CURRENT.order >=
+/// v.order`, and the only gate `HiveSchemaUtil.convertToTypeString` consults is
+/// `min(HIVE_3)` (offsets 118–124).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HiveVersion {
+    /// Hive 2.x or older: no `timestamp with local time zone` column type;
+    /// timestamptz (µs) columns are written as plain `timestamp`.
+    Hive2,
+    /// Hive 3 and newer (the default): timestamptz (µs) columns are written as
+    /// `timestamp with local time zone`.
+    #[default]
+    Hive3Plus,
+}
+
+impl HiveVersion {
+    /// Parses a catalog property value into a [`HiveVersion`].
+    ///
+    /// Mirrors Java `HiveVersion.calculate()` — bytecode-verified (javap,
+    /// iceberg-hive-metastore-1.10.0.jar): `Splitter.on('.')` over
+    /// `getShortVersion()`, first component matched exactly against
+    /// `"4"`/`"3"`/`"2"`/`"1"` (calculate offsets 4–113). Unrecognized majors map
+    /// to Java's `NOT_SUPPORTED` runtime-detection state; as operator input that
+    /// would be a silent behavior fallback, so this knob rejects them loudly
+    /// instead.
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        let major = value.trim().split('.').next().unwrap_or_default();
+        match major {
+            "3" | "4" => Ok(HiveVersion::Hive3Plus),
+            "1" | "2" => Ok(HiveVersion::Hive2),
+            _ => Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid value for catalog property '{HMS_CATALOG_PROP_HIVE_VERSION}': \
+                     '{value}' (expected a Hive version string with major version 1-4, \
+                     e.g. '2.3.9' or '3.1.3')"
+                ),
+            )),
+        }
+    }
+}
+
 /// Hive metastore Catalog configuration.
 #[derive(Debug)]
 pub(crate) struct HmsCatalogConfig {
@@ -159,6 +225,7 @@ pub(crate) struct HmsCatalogConfig {
     address: String,
     thrift_transport: HmsThriftTransport,
     warehouse: String,
+    hive_version: HiveVersion,
     props: HashMap<String, String>,
 }
 
@@ -486,6 +553,7 @@ impl Catalog for HmsCatalog {
             location,
             metadata_location.clone(),
             metadata.properties(),
+            self.config.hive_version,
         )?;
 
         self.client
@@ -640,5 +708,79 @@ impl Catalog for HmsCatalog {
             ErrorKind::FeatureUnsupported,
             "Updating a table is not supported yet",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RISK: the default decides the timestamptz column type for every catalog that does
+    // not set the knob; flipping it to Hive2 would silently strip zone semantics.
+    #[test]
+    fn test_hive_version_default_is_hive3_plus() {
+        assert_eq!(HiveVersion::default(), HiveVersion::Hive3Plus);
+    }
+
+    #[test]
+    fn test_hive_version_parse_recognized_majors() {
+        // Java HiveVersion.calculate() splits on '.' and matches the first component
+        // exactly: "4"→HIVE_4, "3"→HIVE_3, "2"→HIVE_2, "1"→HIVE_1_2/NOT_SUPPORTED —
+        // all of which behave identically under the sole min(HIVE_3) gate except the
+        // 3/4 group.
+        for value in ["3", "3.1.3", "4", "4.0.1"] {
+            assert_eq!(
+                HiveVersion::parse(value).expect("recognized Hive 3+ version"),
+                HiveVersion::Hive3Plus,
+                "value: {value}"
+            );
+        }
+        for value in ["2", "2.3.9", "1", "1.2"] {
+            assert_eq!(
+                HiveVersion::parse(value).expect("recognized Hive 2-era version"),
+                HiveVersion::Hive2,
+                "value: {value}"
+            );
+        }
+    }
+
+    // RISK: a silently-defaulted invalid knob value would flip the timestamptz column
+    // type without any signal to the operator.
+    #[test]
+    fn test_hive_version_parse_invalid_value_is_loud() {
+        for value in ["", "abc", "5", "30", "hive3", ".3"] {
+            let error = HiveVersion::parse(value).expect_err("invalid hive_version value");
+            assert_eq!(error.kind(), ErrorKind::DataInvalid, "value: {value}");
+            assert!(
+                error.to_string().contains(HMS_CATALOG_PROP_HIVE_VERSION),
+                "error must name the property, got: {error} (value: {value})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_load_rejects_invalid_hive_version() {
+        let error = HmsCatalogBuilder::default()
+            .load(
+                "hms",
+                HashMap::from([
+                    (HMS_CATALOG_PROP_URI.to_string(), "127.0.0.1:1".to_string()),
+                    (
+                        HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+                        "s3://warehouse".to_string(),
+                    ),
+                    (
+                        HMS_CATALOG_PROP_HIVE_VERSION.to_string(),
+                        "not-a-version".to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .expect_err("invalid hive_version must fail catalog construction");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains(HMS_CATALOG_PROP_HIVE_VERSION),
+            "error must name the property, got: {error}"
+        );
     }
 }

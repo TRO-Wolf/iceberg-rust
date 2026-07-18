@@ -19,18 +19,30 @@ use hive_metastore::FieldSchema;
 use iceberg::spec::{PrimitiveType, Schema, SchemaVisitor, visit_schema};
 use iceberg::{Error, ErrorKind, Result};
 
+use crate::catalog::HiveVersion;
+
 type HiveSchema = Vec<FieldSchema>;
 
+/// Converts an Iceberg [`Schema`] into a Hive column list, mirroring Java
+/// `HiveSchemaUtil.convertToTypeString` (behavior bytecode-verified against
+/// iceberg-hive-metastore-1.10.0.jar with javap; offsets cited inline below).
 #[derive(Debug, Default)]
 pub(crate) struct HiveSchemaBuilder {
     schema: HiveSchema,
     depth: usize,
+    hive_version: HiveVersion,
 }
 
 impl HiveSchemaBuilder {
-    /// Creates a new `HiveSchemaBuilder` from iceberg `Schema`
-    pub fn from_iceberg(schema: &Schema) -> Result<HiveSchemaBuilder> {
-        let mut builder = Self::default();
+    /// Creates a new `HiveSchemaBuilder` from iceberg `Schema`.
+    ///
+    /// `hive_version` gates the Hive-version-dependent type strings (currently
+    /// only the timestamptz column type); see [`HiveVersion`].
+    pub fn from_iceberg(schema: &Schema, hive_version: HiveVersion) -> Result<HiveSchemaBuilder> {
+        let mut builder = Self {
+            hive_version,
+            ..Self::default()
+        };
         visit_schema(schema, &mut builder)?;
         Ok(builder)
     }
@@ -70,7 +82,10 @@ impl SchemaVisitor for HiveSchemaBuilder {
         r#_struct: &iceberg::spec::StructType,
         results: Vec<String>,
     ) -> iceberg::Result<String> {
-        Ok(format!("struct<{}>", results.join(", ")))
+        // Java joins struct fields with a bare "," (no space) — bytecode-verified
+        // (javap, iceberg-hive-metastore-1.10.0.jar, HiveSchemaUtil.convertToTypeString
+        // offsets 204-206: Collectors.joining(",") into "struct<%s>" at 219).
+        Ok(format!("struct<{}>", results.join(",")))
     }
 
     fn after_struct_field(
@@ -87,6 +102,9 @@ impl SchemaVisitor for HiveSchemaBuilder {
         value: String,
     ) -> iceberg::Result<String> {
         if self.is_inside_struct() {
+            // Java renders struct fields as "%s:%s" (name:type, no case folding) —
+            // bytecode-verified (javap, iceberg-hive-metastore-1.10.0.jar,
+            // HiveSchemaUtil.lambda$convertToTypeString$2 offset 0).
             return Ok(format!("{}:{}", field.name, value));
         }
 
@@ -121,26 +139,32 @@ impl SchemaVisitor for HiveSchemaBuilder {
             PrimitiveType::Double => "double".to_string(),
             PrimitiveType::Date => "date".to_string(),
             PrimitiveType::Timestamp => "timestamp".to_string(),
-            PrimitiveType::TimestampNs => "timestamp_ns".to_string(),
-            PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs => {
+            // Java's TIMESTAMP case is Hive-version-gated: `if HiveVersion.min(HIVE_3)
+            // && ts.shouldAdjustToUTC() -> "timestamp with local time zone" else ->
+            // "timestamp"` — bytecode-verified (javap, iceberg-hive-metastore-1.10.0.jar,
+            // HiveSchemaUtil.convertToTypeString offsets 113-139). So timestamptz (µs)
+            // is a string on every Hive version, never an error.
+            PrimitiveType::Timestamptz => match self.hive_version {
+                HiveVersion::Hive3Plus => "timestamp with local time zone".to_string(),
+                HiveVersion::Hive2 => "timestamp".to_string(),
+            },
+            // Java's TypeID $SwitchMap (HiveSchemaUtil$1) has no TIMESTAMP_NANO or
+            // UNKNOWN entry, so both nano variants (regardless of zone) and `unknown`
+            // fall to the default arm: `throw new UnsupportedOperationException(type +
+            // " is not supported")` — bytecode-verified (javap,
+            // iceberg-hive-metastore-1.10.0.jar, convertToTypeString offsets 303-319;
+            // concat recipe "\u{1} is not supported"). Java never emits a
+            // "timestamp_ns" column type; mirror the throw rather than fabricate one.
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs | PrimitiveType::Unknown => {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
-                    format!("Conversion from {p:?} is not supported"),
+                    format!("{p} is not supported"),
                 ));
             }
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
                 "string".to_string()
             }
             PrimitiveType::Binary | PrimitiveType::Fixed(_) => "binary".to_string(),
-            // `unknown` has no Hive column type (it is an always-null column with no physical
-            // storage). Java's Hive type conversion has no UNKNOWN mapping and throws; mirror that
-            // here rather than fabricate a column type.
-            PrimitiveType::Unknown => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    format!("Conversion from {p:?} is not supported"),
-                ));
-            }
             PrimitiveType::Decimal { precision, scale } => {
                 format!("decimal({precision},{scale})")
             }
@@ -190,7 +214,7 @@ mod tests {
 
         let schema = serde_json::from_str::<Schema>(record)?;
 
-        let result = HiveSchemaBuilder::from_iceberg(&schema)?.build();
+        let result = HiveSchemaBuilder::from_iceberg(&schema, HiveVersion::default())?.build();
 
         let expected = vec![FieldSchema {
             name: Some("quux".into()),
@@ -243,11 +267,11 @@ mod tests {
 
         let schema = serde_json::from_str::<Schema>(record)?;
 
-        let result = HiveSchemaBuilder::from_iceberg(&schema)?.build();
+        let result = HiveSchemaBuilder::from_iceberg(&schema, HiveVersion::default())?.build();
 
         let expected = vec![FieldSchema {
             name: Some("location".into()),
-            r#type: Some("array<struct<latitude:float, longitude:float>>".into()),
+            r#type: Some("array<struct<latitude:float,longitude:float>>".into()),
             comment: None,
         }];
 
@@ -289,11 +313,11 @@ mod tests {
 
         let schema = serde_json::from_str::<Schema>(record)?;
 
-        let result = HiveSchemaBuilder::from_iceberg(&schema)?.build();
+        let result = HiveSchemaBuilder::from_iceberg(&schema, HiveVersion::default())?.build();
 
         let expected = vec![FieldSchema {
             name: Some("person".into()),
-            r#type: Some("struct<name:string, age:int>".into()),
+            r#type: Some("struct<name:string,age:int>".into()),
             comment: None,
         }];
 
@@ -391,7 +415,7 @@ mod tests {
 
         let schema = serde_json::from_str::<Schema>(record)?;
 
-        let result = HiveSchemaBuilder::from_iceberg(&schema)?.build();
+        let result = HiveSchemaBuilder::from_iceberg(&schema, HiveVersion::default())?.build();
 
         let expected = vec![
             FieldSchema {
@@ -476,5 +500,143 @@ mod tests {
             .primitive(&iceberg::spec::PrimitiveType::Unknown)
             .expect_err("unknown has no Hive type");
         assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        // Java message shape: type + " is not supported" (UnknownType.toString() = "unknown").
+        assert!(
+            error.to_string().contains("unknown is not supported"),
+            "error must name the type, got: {error}"
+        );
+    }
+
+    /// Builds a single-field schema around `field_type` and returns the converted
+    /// Hive column type string.
+    fn convert_single_field(
+        field_type: iceberg::spec::PrimitiveType,
+        hive_version: HiveVersion,
+    ) -> Result<String> {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                iceberg::spec::NestedField::required(
+                    1,
+                    "c1",
+                    iceberg::spec::Type::Primitive(field_type),
+                )
+                .into(),
+            ])
+            .build()?;
+        let result = HiveSchemaBuilder::from_iceberg(&schema, hive_version)?.build();
+        result[0]
+            .r#type
+            .as_ref()
+            .map(|t| t.to_string())
+            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "converted column has no type"))
+    }
+
+    // RISK: the version gate decides whether zone semantics survive into the Hive
+    // column type. Java: HiveVersion.min(HIVE_3) && shouldAdjustToUTC() →
+    // "timestamp with local time zone" (bytecode offsets 113-139). Pins BOTH the
+    // default (Hive 3+) branch byte-exactly and that the default IS Hive 3+.
+    #[test]
+    fn test_timestamptz_micros_default_hive3_plus() -> Result<()> {
+        let result = convert_single_field(PrimitiveType::Timestamptz, HiveVersion::default())?;
+        assert_eq!(result, "timestamp with local time zone");
+        Ok(())
+    }
+
+    // The explicit Hive 2 branch: below HIVE_3 the gate short-circuits and
+    // timestamptz (µs) degrades to plain "timestamp" (never an error).
+    #[test]
+    fn test_timestamptz_micros_hive2_is_timestamp() -> Result<()> {
+        let result = convert_single_field(PrimitiveType::Timestamptz, HiveVersion::Hive2)?;
+        assert_eq!(result, "timestamp");
+        Ok(())
+    }
+
+    // Naive timestamp (µs) is "timestamp" on EVERY Hive version — shouldAdjustToUTC()
+    // is false, so the version gate must not affect it.
+    #[test]
+    fn test_naive_timestamp_micros_is_timestamp_on_both_versions() -> Result<()> {
+        for hive_version in [HiveVersion::Hive3Plus, HiveVersion::Hive2] {
+            let result = convert_single_field(PrimitiveType::Timestamp, hive_version)?;
+            assert_eq!(result, "timestamp", "hive_version: {hive_version:?}");
+        }
+        Ok(())
+    }
+
+    // RISK: Java REJECTS both nano variants (TIMESTAMP_NANO has no $SwitchMap entry →
+    // default throw, bytecode offsets 303-319) and never emits a "timestamp_ns"
+    // column type. Emitting one would write a column type no Hive metastore knows.
+    #[test]
+    fn test_timestamp_nanos_rejected_both_variants() {
+        for (field_type, type_name) in [
+            (PrimitiveType::TimestampNs, "timestamp_ns"),
+            (PrimitiveType::TimestamptzNs, "timestamptz_ns"),
+        ] {
+            for hive_version in [HiveVersion::Hive3Plus, HiveVersion::Hive2] {
+                let error = convert_single_field(field_type.clone(), hive_version)
+                    .expect_err("nano timestamps have no Hive type");
+                assert_eq!(
+                    error.kind(),
+                    ErrorKind::FeatureUnsupported,
+                    "type: {type_name}, hive_version: {hive_version:?}"
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("{type_name} is not supported")),
+                    "error must name the type, got: {error}"
+                );
+            }
+        }
+    }
+
+    // RISK: separator-sensitive nested pin — Java joins struct fields with a bare ","
+    // (bytecode offset 204) at EVERY nesting depth; a ", " join would emit column
+    // type strings that differ from every Java-written Hive table.
+    #[test]
+    fn test_nested_struct_join_is_bare_comma() -> Result<()> {
+        let record = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "outer",
+                    "required": true,
+                    "type": {
+                        "type": "struct",
+                        "fields": [
+                            {"id": 2, "name": "a", "required": true, "type": "int"},
+                            {
+                                "id": 3,
+                                "name": "b",
+                                "required": true,
+                                "type": {
+                                    "type": "struct",
+                                    "fields": [
+                                        {"id": 4, "name": "c", "required": true, "type": "string"},
+                                        {"id": 5, "name": "d", "required": true, "type": "long"}
+                                    ]
+                                }
+                            },
+                            {"id": 6, "name": "e", "required": true, "type": "boolean"}
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let schema = serde_json::from_str::<Schema>(record)?;
+        let result = HiveSchemaBuilder::from_iceberg(&schema, HiveVersion::default())?.build();
+
+        let expected = vec![FieldSchema {
+            name: Some("outer".into()),
+            r#type: Some("struct<a:int,b:struct<c:string,d:bigint>,e:boolean>".into()),
+            comment: None,
+        }];
+
+        assert_eq!(result, expected);
+
+        Ok(())
     }
 }
