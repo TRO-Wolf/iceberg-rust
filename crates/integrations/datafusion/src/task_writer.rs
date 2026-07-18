@@ -21,7 +21,6 @@
 //! of RecordBatch data to Iceberg tables.
 
 use datafusion::arrow::array::RecordBatch;
-use iceberg::Result;
 use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::spec::{DataFile, PartitionSpecRef, SchemaRef};
 use iceberg::writer::IcebergWriterBuilder;
@@ -29,6 +28,7 @@ use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::clustered_writer::ClusteredWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter;
+use iceberg::{Error, ErrorKind, Result};
 
 /// High-level writer for DataFusion that handles partitioning and routing of RecordBatch data.
 ///
@@ -214,10 +214,15 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         partition_splitter: &Option<RecordBatchPartitionSplitter>,
         batch: &RecordBatch,
     ) -> Result<()> {
-        // Split batch by partition
-        let splitter = partition_splitter
-            .as_ref()
-            .expect("Partition splitter should be initialized");
+        // Split batch by partition. The splitter is built for every partitioned writer in
+        // `try_new`, so its absence here is an internal invariant breach — surfaced as a typed
+        // error rather than a process-aborting `expect` (SAF-010).
+        let splitter = partition_splitter.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Partition splitter should be initialized for a partitioned table",
+            )
+        })?;
         let partitioned_batches = splitter.split(batch)?;
 
         // Write each partition
@@ -512,6 +517,46 @@ mod tests {
         assert_eq!(partition_counts.get("ASIA"), Some(&2));
         assert_eq!(partition_counts.get("EU"), Some(&2));
 
+        Ok(())
+    }
+
+    /// SAF-010 P4: a partitioned writer whose splitter is (impossibly) absent must surface a
+    /// typed error, not a process-aborting `expect`. The state is unreachable through
+    /// `try_new` (the splitter is built for every partitioned writer), so the test forces it
+    /// through same-module field access.
+    #[tokio::test]
+    async fn test_write_partitioned_without_splitter_errors_not_panics() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let schema = create_test_schema()?;
+
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(1)
+                .add_partition_field("region", "region", iceberg::spec::Transform::Identity)?
+                .build()?,
+        );
+
+        let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
+        let mut task_writer = TaskWriter::try_new(writer_builder, false, schema, partition_spec)?;
+        // Force the invariant breach the hardening guards against.
+        task_writer.partition_splitter = None;
+
+        let batch = RecordBatch::try_new(create_arrow_schema(), vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["Alice"])),
+            Arc::new(StringArray::from(vec!["US"])),
+        ])?;
+
+        let err = task_writer
+            .write(batch)
+            .await
+            .expect_err("writing without a splitter must error, not panic");
+        assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected);
+        assert!(
+            err.message().contains("Partition splitter"),
+            "unexpected message: {}",
+            err.message()
+        );
         Ok(())
     }
 }

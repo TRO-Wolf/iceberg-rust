@@ -19,7 +19,6 @@ use std::cmp::min;
 
 use apache_avro::{Writer as AvroWriter, to_value};
 use bytes::Bytes;
-use itertools::Itertools;
 use serde_json::to_vec;
 
 use super::{
@@ -209,18 +208,55 @@ impl ManifestWriter {
         &mut self,
         partition_type: &StructType,
     ) -> Result<Vec<FieldSummary>> {
-        let mut field_stats: Vec<_> = partition_type
+        // Every step surfaces malformed input as a typed error (never an `unwrap`/`zip_eq`
+        // panic): Java's partition summaries read each slot through the typed
+        // `PartitionData.get(int, Class<T>)` accessor, which throws a catchable
+        // `IllegalArgumentException` for a wrong-kind value (`PartitionSummary.update`).
+        let mut field_stats = partition_type
             .fields()
             .iter()
-            .map(|f| PartitionFieldStats::new(f.field_type.as_primitive_type().unwrap().clone()))
-            .collect();
+            .map(|f| {
+                let primitive_type = f.field_type.as_primitive_type().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "Partition field `{}` should only be primitive type, got `{}`",
+                            f.name, f.field_type
+                        ),
+                    )
+                })?;
+                Ok(PartitionFieldStats::new(primitive_type.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         for partition in self.manifest_entries.iter().map(|e| &e.data_file.partition) {
-            for (literal, stat) in partition.iter().zip_eq(field_stats.iter_mut()) {
-                let primitive_literal = literal.map(|v| v.as_primitive_literal().unwrap());
+            if partition.fields().len() != field_stats.len() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Partition value has {} fields but partition type has {}",
+                        partition.fields().len(),
+                        field_stats.len()
+                    ),
+                ));
+            }
+            for (literal, stat) in partition.iter().zip(field_stats.iter_mut()) {
+                let primitive_literal = literal
+                    .map(|v| {
+                        v.as_primitive_literal().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!("Partition value must be a primitive literal, got `{v:?}`"),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 stat.update(primitive_literal)?;
             }
         }
-        Ok(field_stats.into_iter().map(|stat| stat.finish()).collect())
+        field_stats
+            .into_iter()
+            .map(PartitionFieldStats::finish)
+            .collect()
     }
 
     fn check_data_file(&self, data_file: &DataFile) -> Result<()> {
@@ -540,13 +576,17 @@ impl PartitionFieldStats {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> FieldSummary {
-        FieldSummary {
+    /// Serializes the collected bounds into a [`FieldSummary`], propagating a bound value's
+    /// single-value-serialization failure as a typed error (previously an `unwrap` panic).
+    pub(crate) fn finish(self) -> Result<FieldSummary> {
+        let upper_bound = self.upper_bound.map(|v| v.to_bytes()).transpose()?;
+        let lower_bound = self.lower_bound.map(|v| v.to_bytes()).transpose()?;
+        Ok(FieldSummary {
             contains_null: self.contains_null,
             contains_nan: self.contains_nan,
-            upper_bound: self.upper_bound.map(|v| v.to_bytes().unwrap()),
-            lower_bound: self.lower_bound.map(|v| v.to_bytes().unwrap()),
-        }
+            upper_bound,
+            lower_bound,
+        })
     }
 }
 
@@ -560,7 +600,9 @@ mod tests {
 
     use super::*;
     use crate::io::FileIO;
-    use crate::spec::{DataFileFormat, Manifest, NestedField, PrimitiveType, Schema, Struct, Type};
+    use crate::spec::{
+        DataFileFormat, Literal, Manifest, NestedField, PrimitiveType, Schema, Struct, Type,
+    };
 
     /// Risk: failing to read a Java-written V1 manifest because the V1 entry / data-file Avro
     /// schemas have no `content` / `sequence_number` / `file_sequence_number` columns at all, and a
@@ -885,6 +927,167 @@ mod tests {
         assert_eq!(
             actual_manifest.metadata().content,
             ManifestContentType::Deletes,
+        );
+    }
+
+    /// A V2 DATA manifest writer over `identity(id)` (1-field partition type), for the
+    /// SAF-006 partition-summary hardening pins below.
+    fn identity_partitioned_writer(tmp_dir: &TempDir) -> ManifestWriter {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .expect("schema must build"),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("id", "id_part", crate::spec::Transform::Identity)
+            .expect("adding the identity partition field must succeed")
+            .build()
+            .expect("partition spec must build");
+        let path = tmp_dir.path().join("partition_summary_hardening.avro");
+        let io = FileIO::new_with_fs();
+        let output_file = io
+            .new_output(path.to_str().expect("tmp path must be utf-8"))
+            .expect("creating the output file must succeed");
+        ManifestWriterBuilder::new(output_file, Some(1), None, schema, partition_spec)
+            .build_v2_data()
+    }
+
+    /// An ADDED data-file entry carrying `partition`, otherwise minimal.
+    fn entry_with_partition(partition: Struct) -> ManifestEntry {
+        ManifestEntry {
+            status: ManifestStatus::Added,
+            snapshot_id: None,
+            sequence_number: Some(1),
+            file_sequence_number: Some(1),
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: "memory://data/00000-hardening.parquet".to_string(),
+                file_format: DataFileFormat::Parquet,
+                partition,
+                record_count: 1,
+                file_size_in_bytes: 100,
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        }
+    }
+
+    /// SAF-006 P3a: a partition VALUE holding a non-primitive literal must fail
+    /// `write_manifest_file` with a typed `DataInvalid` — previously
+    /// `as_primitive_literal().unwrap()` aborted the writer mid-flight.
+    #[tokio::test]
+    async fn test_write_manifest_partition_summary_non_primitive_literal_errors_not_panics() {
+        let tmp_dir = TempDir::new().expect("tmp dir must create");
+        let mut writer = identity_partitioned_writer(&tmp_dir);
+        let nested = Struct::from_iter([Some(Literal::int(1))]);
+        writer
+            .add_entry(entry_with_partition(Struct::from_iter([Some(
+                Literal::Struct(nested),
+            )])))
+            .expect("add_entry does not validate partition values");
+
+        let err = writer
+            .write_manifest_file()
+            .await
+            .expect_err("a non-primitive partition literal must fail the write, not panic");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("primitive literal"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    /// SAF-006 P3b: a partition value whose ARITY differs from the partition type must fail
+    /// with a typed `DataInvalid` — previously `zip_eq` panicked inside the summary
+    /// construction.
+    #[tokio::test]
+    async fn test_write_manifest_partition_value_arity_mismatch_errors_not_panics() {
+        let tmp_dir = TempDir::new().expect("tmp dir must create");
+        let mut writer = identity_partitioned_writer(&tmp_dir);
+        writer
+            .add_entry(entry_with_partition(Struct::from_iter([
+                Some(Literal::int(1)),
+                Some(Literal::int(2)),
+            ])))
+            .expect("add_entry does not validate partition arity");
+
+        let err = writer
+            .write_manifest_file()
+            .await
+            .expect_err("an arity-mismatched partition value must fail the write, not panic");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("2 fields but partition type has 1"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    /// SAF-006 P3c: a NON-primitive partition-field TYPE surfaces as `Unexpected` (a spec-level
+    /// invariant breach — transform result types are primitive by spec) instead of an `unwrap`
+    /// panic.
+    #[test]
+    fn test_partition_summary_non_primitive_partition_type_errors() {
+        let tmp_dir = TempDir::new().expect("tmp dir must create");
+        let mut writer = identity_partitioned_writer(&tmp_dir);
+        let bogus_type = StructType::new(vec![Arc::new(NestedField::optional(
+            1001,
+            "nested",
+            Type::Struct(StructType::new(vec![])),
+        ))]);
+
+        let err = writer
+            .construct_partition_summaries(&bogus_type)
+            .expect_err("a non-primitive partition field type must error, not panic");
+        assert_eq!(err.kind(), ErrorKind::Unexpected);
+        assert!(
+            err.message().contains("primitive type"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    /// SAF-006 P3d: `PartitionFieldStats::finish` propagates a bound's single-value
+    /// serialization failure as `Err` — previously `to_bytes().unwrap()` panicked. The state is
+    /// constructible: `Decimal {precision: 99}` accepts an `Int128` literal (`compatible()`)
+    /// but `Datum::to_bytes` rejects precision > 38.
+    #[test]
+    fn test_partition_field_stats_finish_propagates_bound_serialization_error() {
+        let mut stats = PartitionFieldStats::new(PrimitiveType::Decimal {
+            precision: 99,
+            scale: 2,
+        });
+        stats
+            .update(Some(PrimitiveLiteral::Int128(1234)))
+            .expect("Decimal{99} accepts an Int128 literal (compatible)");
+        let err = stats
+            .finish()
+            .expect_err("bounds of an over-precision decimal cannot serialize");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("valid precision") && err.message().contains("99"),
+            "the error should name the invalid precision: {}",
+            err.message()
         );
     }
 }

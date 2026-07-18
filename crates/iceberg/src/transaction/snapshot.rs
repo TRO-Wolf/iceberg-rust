@@ -929,13 +929,22 @@ impl<'a> SnapshotProducer<'a> {
                     "Partition field should only be primitive type.",
                 )
             })?;
-            if let Some(value) = value
-                && !field.compatible(&value.as_primitive_literal().unwrap())
-            {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Partition value is not compatible partition type",
-                ));
+            if let Some(value) = value {
+                // A non-primitive literal in a primitive-typed partition slot is caller-supplied
+                // invalid data: surface it as a typed error (Java's typed `PartitionData` accessors
+                // throw `IllegalArgumentException` for a wrong-kind value — never an abort).
+                let primitive_literal = value.as_primitive_literal().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Partition value must be a primitive literal, got `{value:?}`"),
+                    )
+                })?;
+                if !field.compatible(&primitive_literal) {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Partition value is not compatible partition type",
+                    ));
+                }
             }
         }
         Ok(())
@@ -3130,6 +3139,101 @@ mod multispec_tests {
         assert!(
             err.message()
                 .contains("Partition value is not compatible with partition type"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+}
+
+#[cfg(test)]
+mod validate_partition_value_tests {
+    //! SAF-005 panic-hardening pins: `validate_partition_value` must surface a NON-primitive
+    //! partition literal as a typed `DataInvalid` error — never `unwrap`-panic mid-commit.
+    //! (Java posture: the typed `PartitionData.get(int, Class<T>)` accessor throws
+    //! `IllegalArgumentException` for a wrong-kind value — an error, never an abort;
+    //! `core/src/main/java/org/apache/iceberg/PartitionData.java` L119-129 @ 1.10.0.)
+
+    use std::sync::Arc;
+
+    use super::SnapshotProducer;
+    use crate::ErrorKind;
+    use crate::memory::tests::new_memory_catalog;
+    use crate::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PrimitiveType,
+        Struct, StructType, Type,
+    };
+    use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+    use crate::transaction::{ApplyTransactionAction, Transaction};
+
+    fn long_partition_type() -> StructType {
+        StructType::new(vec![Arc::new(NestedField::optional(
+            1000,
+            "x",
+            Type::Primitive(PrimitiveType::Long),
+        ))])
+    }
+
+    /// P2 (direct): a nested-struct literal in a primitive-typed partition slot → `Err`, not panic.
+    #[test]
+    fn test_validate_partition_value_rejects_non_primitive_literal_as_error() {
+        let nested = Struct::from_iter([Some(Literal::long(1))]);
+        let partition_value = Struct::from_iter([Some(Literal::Struct(nested))]);
+
+        let err =
+            SnapshotProducer::validate_partition_value(&partition_value, &long_partition_type())
+                .expect_err("a non-primitive partition literal must be rejected, not panic");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("primitive literal"),
+            "the error should name the primitive-literal requirement: {}",
+            err.message()
+        );
+    }
+
+    /// P2 regression halves: a compatible primitive passes; an incompatible primitive still errs
+    /// through the pre-existing compatibility arm.
+    #[test]
+    fn test_validate_partition_value_primitive_compatibility_unchanged() {
+        let ok_value = Struct::from_iter([Some(Literal::long(7))]);
+        SnapshotProducer::validate_partition_value(&ok_value, &long_partition_type())
+            .expect("a compatible primitive partition value must pass");
+
+        let incompatible = Struct::from_iter([Some(Literal::string("not-a-long"))]);
+        let err = SnapshotProducer::validate_partition_value(&incompatible, &long_partition_type())
+            .expect_err("an incompatible primitive partition value must be rejected");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    /// P2 (real path): the same rejection reaches the caller as a commit ERROR through
+    /// `fast_append` → `validate_added_data_files` (previously: a process-aborting panic).
+    #[tokio::test]
+    async fn test_fast_append_non_primitive_partition_literal_errors_not_panics() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+
+        let bad = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/non-primitive-part.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::Struct(
+                Struct::from_iter([Some(Literal::long(1))]),
+            ))]))
+            .build()
+            .unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![bad]);
+        let tx = action.apply(tx).unwrap();
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("a non-primitive partition literal must fail the commit, not abort");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("primitive literal"),
             "unexpected message: {}",
             err.message()
         );

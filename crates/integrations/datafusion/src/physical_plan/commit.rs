@@ -16,6 +16,7 @@
 // under the License.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -38,18 +39,57 @@ use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
 use crate::physical_plan::DATA_FILES_COL_NAME;
+use crate::physical_plan::delete::IsolationLevel;
 use crate::to_datafusion_error;
 
-/// IcebergCommitExec is responsible for collecting the files written and use
-/// [`Transaction::fast_append`] to commit the data files written.
+/// Snapshot-summary key stamping every `IcebergCommitExec` commit with a unique id — the
+/// ENGINE_CONTRACT §8 ambiguous-commit-outcome reconciliation class: on a transport-ambiguous
+/// failure the engine reloads the table and scans recent snapshot summaries for this id BEFORE
+/// re-running, so a retry can never silently duplicate an already-landed INSERT. The key matches the
+/// one named in §8 (and the downstream RePark `OPERATION_ID_PROP`) so one reconciliation recipe
+/// serves every engine surface.
+pub(crate) const OPERATION_ID_PROP: &str = "engine.operation-id";
+
+/// The isolation-level table property for `INSERT OVERWRITE` and its accepted values. ENGINE-DEFINED
+/// (this crate), NOT an Iceberg-standard property: Java/Spark expose overwrite isolation only as a
+/// per-write OPTION (`SparkWriteOptions.ISOLATION_LEVEL = "isolation-level"`, read via
+/// `SparkWriteConf.isolationLevel()` `parseOptional` — absent by default, in which case Spark runs NO
+/// overwrite validations, `SparkWrite.java` L364-377), and this DataFusion seam has no per-write
+/// options. Values: `serializable` / `snapshot` (the §5 arms) / `none` (Spark's default absent-option
+/// behavior — no validation). DEFAULT: `snapshot` — a deliberate, documented divergence from Spark's
+/// unvalidated default, arming the §5 recipe against the concurrent-delete-loss class.
+pub(crate) const WRITE_OVERWRITE_ISOLATION_LEVEL: &str = "write.overwrite.isolation-level";
+const OVERWRITE_ISOLATION_NONE: &str = "none";
+
+/// Resolve the `INSERT OVERWRITE` isolation policy from the table properties (see
+/// [`WRITE_OVERWRITE_ISOLATION_LEVEL`]): `None` = validations off (`"none"`, Spark's absent-option
+/// default); `Some(level)` = arm the §5 arms for that level. Default `Some(Snapshot)`. Resolved at
+/// execute time, mirroring Java's `writeConf.isolationLevel()` read inside `commit()`.
+fn overwrite_isolation_level(table: &Table) -> DFResult<Option<IsolationLevel>> {
+    match table
+        .metadata()
+        .properties()
+        .get(WRITE_OVERWRITE_ISOLATION_LEVEL)
+    {
+        None => Ok(Some(IsolationLevel::Snapshot)),
+        Some(name) if name.eq_ignore_ascii_case(OVERWRITE_ISOLATION_NONE) => Ok(None),
+        Some(name) => IsolationLevel::parse(name).map(Some),
+    }
+}
+
+/// IcebergCommitExec is responsible for collecting the files written and committing them per the DML
+/// write operation, stamping every produced snapshot with a unique [`OPERATION_ID_PROP`] (§8).
 #[derive(Debug)]
 pub(crate) struct IcebergCommitExec {
     table: Table,
     catalog: Arc<dyn Catalog>,
     input: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
-    /// The DML write operation: `Append` commits via `fast_append`; `Overwrite` (`INSERT OVERWRITE`)
-    /// replaces ALL existing data via `overwrite_files().overwrite_by_row_filter(AlwaysTrue)`.
+    /// The DML write operation: `Append` commits via `fast_append` (no §5 validations — appends are
+    /// conflict-free by construction, Java `SparkWrite.BatchAppend`); `Overwrite` (`INSERT OVERWRITE`)
+    /// replaces ALL existing data via `overwrite_files().overwrite_by_row_filter(AlwaysTrue)` with the
+    /// §5 static-overwrite validations per [`WRITE_OVERWRITE_ISOLATION_LEVEL`]. Both stamp
+    /// [`OPERATION_ID_PROP`].
     insert_op: InsertOp,
     count_schema: ArrowSchemaRef,
     plan_properties: PlanProperties,
@@ -254,13 +294,25 @@ impl ExecutionPlan for IcebergCommitExec {
                 return Ok(RecordBatch::new_empty(count_schema));
             }
 
+            // One unique operation id per statement execution (§8): stamped into the produced
+            // snapshot's summary so an ambiguous commit outcome can be reconciled by scanning recent
+            // summaries for this id before re-running. The id is action state, so the transaction's
+            // internal refresh-re-apply loop reuses the SAME id — a retried attempt can never mint a
+            // second stamp (the idempotency evidence stays unique).
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let snapshot_properties =
+                HashMap::from([(OPERATION_ID_PROP.to_string(), operation_id)]);
+
             // Create a transaction and commit the data files per the DML write operation.
             let tx = Transaction::new(&table);
             let committed = match insert_op {
-                // INSERT INTO — append the new data files.
+                // INSERT INTO — append the new data files. No §5 validations: an append neither
+                // reads table state nor removes files, so nothing can conflict (Java
+                // `SparkWrite.BatchAppend.commit` runs none).
                 InsertOp::Append => {
                     tx.fast_append()
                         .add_data_files(data_files)
+                        .set_snapshot_properties(snapshot_properties)
                         .apply(tx)
                         .map_err(to_datafusion_error)?
                         .commit(catalog.as_ref())
@@ -268,11 +320,32 @@ impl ExecutionPlan for IcebergCommitExec {
                 }
                 // INSERT OVERWRITE — replace ALL existing data: delete every live row (an
                 // always-true overwrite filter removes all current data files) and add the new files
-                // in one atomic snapshot.
+                // in one atomic snapshot. §5 static-overwrite recipe (Java
+                // `SparkWrite.OverwriteByFilter.commit` L364-377): snapshot →
+                // `validate_no_conflicting_deletes` (L374-375); serializable → +
+                // `validate_no_conflicting_data` (L371-373). NO explicit conflict-detection filter —
+                // Java never sets one here; the row filter itself is the default conflict filter.
+                // `validate_from_snapshot` is armed with the handle's current snapshot (Java arms it
+                // only when the writer tracked one, L367-369; this exec's natural anchor is the
+                // table state the statement was planned against). The policy knob (incl. `none` =
+                // Spark's unvalidated default) is documented on
+                // [`WRITE_OVERWRITE_ISOLATION_LEVEL`].
                 InsertOp::Overwrite => {
-                    tx.overwrite_files()
+                    let mut action = tx
+                        .overwrite_files()
                         .overwrite_by_row_filter(Predicate::AlwaysTrue)
                         .add_files(data_files)
+                        .set_snapshot_properties(snapshot_properties);
+                    if let Some(isolation) = overwrite_isolation_level(&table)? {
+                        action = action.validate_no_conflicting_deletes();
+                        if isolation == IsolationLevel::Serializable {
+                            action = action.validate_no_conflicting_data();
+                        }
+                        if let Some(snapshot_id) = table.metadata().current_snapshot_id() {
+                            action = action.validate_from_snapshot(snapshot_id);
+                        }
+                    }
+                    action
                         .apply(tx)
                         .map_err(to_datafusion_error)?
                         .commit(catalog.as_ref())

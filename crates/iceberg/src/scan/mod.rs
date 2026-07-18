@@ -917,7 +917,7 @@ impl TableScan {
             let expression_evaluator = expression_evaluator_cache.get(
                 manifest_entry_context.partition_spec_id,
                 partition_bound_predicate,
-            )?;
+            );
 
             // skip any data file whose partition data indicates that it can't contain
             // any data that matches this scan's filter
@@ -969,7 +969,7 @@ impl TableScan {
             let expression_evaluator = expression_evaluator_cache.get(
                 manifest_entry_context.partition_spec_id,
                 &bound_predicates.partition_bound_predicate,
-            )?;
+            );
 
             // skip any data file whose partition data indicates that it can't contain
             // any data that matches this scan's filter

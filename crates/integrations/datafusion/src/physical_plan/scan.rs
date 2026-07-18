@@ -57,6 +57,10 @@ pub struct IcebergTableScan {
 
 impl IcebergTableScan {
     /// Creates a new [`IcebergTableScan`] object.
+    ///
+    /// Returns a planning error when `projection` holds an index outside `schema`
+    /// (previously an `unwrap` panic — SAF-004). The projected column names are derived
+    /// from the projected schema itself, so they can never index out of bounds.
     pub(crate) fn new(
         table: Table,
         snapshot_id: Option<i64>,
@@ -64,23 +68,30 @@ impl IcebergTableScan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Self {
-        let output_schema = match projection {
-            None => schema.clone(),
-            Some(projection) => Arc::new(schema.project(projection).unwrap()),
+    ) -> DFResult<Self> {
+        let (output_schema, projection) = match projection {
+            None => (schema, None),
+            Some(indices) => {
+                let projected_schema = Arc::new(schema.project(indices)?);
+                let column_names = projected_schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect();
+                (projected_schema, Some(column_names))
+            }
         };
-        let plan_properties = Self::compute_properties(output_schema.clone());
-        let projection = get_column_names(schema.clone(), projection);
+        let plan_properties = Self::compute_properties(output_schema);
         let predicates = convert_filters_to_predicate(filters);
 
-        Self {
+        Ok(Self {
             table,
             snapshot_id,
             plan_properties,
             projection,
             predicates,
             limit,
-        }
+        })
     }
 
     pub fn table(&self) -> &Table {
@@ -233,13 +244,121 @@ async fn get_batch_stream(
     Ok(Box::pin(stream))
 }
 
-fn get_column_names(
-    schema: ArrowSchemaRef,
-    projection: Option<&Vec<usize>>,
-) -> Option<Vec<String>> {
-    projection.map(|v| {
-        v.iter()
-            .map(|p| schema.field(*p).name().clone())
-            .collect::<Vec<String>>()
-    })
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use datafusion::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
+    use iceberg::TableIdent;
+    use iceberg::io::FileIO;
+    use iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
+    };
+
+    use super::*;
+
+    fn create_test_table() -> Table {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "data",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .expect("test schema must build");
+
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .build()
+            .expect("partition spec must build");
+        let sort_order = SortOrder::builder()
+            .build(&schema)
+            .expect("sort order must build");
+        let table_metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            "memory://test/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder must construct")
+        .build()
+        .expect("table metadata must build");
+
+        Table::builder()
+            .metadata(table_metadata.metadata)
+            .identifier(TableIdent::from_strs(["test", "table"]).expect("ident must parse"))
+            .file_io(FileIO::new_with_memory())
+            .metadata_location("memory://test/metadata.json".to_string())
+            .build()
+            .expect("table must build")
+    }
+
+    fn test_arrow_schema() -> ArrowSchemaRef {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("data", ArrowDataType::Utf8, false),
+        ]))
+    }
+
+    /// SAF-004 P5a: an out-of-bounds projection index must yield a PLANNING error —
+    /// previously `schema.project(projection).unwrap()` panicked.
+    #[test]
+    fn test_scan_out_of_bounds_projection_is_error_not_panic() {
+        let err = IcebergTableScan::new(
+            create_test_table(),
+            None,
+            test_arrow_schema(),
+            Some(&vec![0, 99]),
+            &[],
+            None,
+        )
+        .expect_err("projection index 99 on a 2-column schema must be a planning error");
+        assert!(
+            err.to_string().contains("99"),
+            "the error should name the offending index: {err}"
+        );
+    }
+
+    /// SAF-004 P5b (regression): a valid projection still produces the projected output schema
+    /// and the projected column names, and no projection passes the schema through unchanged.
+    #[test]
+    fn test_scan_valid_projection_schema_and_names() {
+        let projected = IcebergTableScan::new(
+            create_test_table(),
+            None,
+            test_arrow_schema(),
+            Some(&vec![1]),
+            &[],
+            None,
+        )
+        .expect("a valid projection must plan");
+        assert_eq!(projected.projection(), Some(&["data".to_string()][..]));
+        let output_schema = projected.schema();
+        assert_eq!(output_schema.fields().len(), 1);
+        assert_eq!(output_schema.field(0).name(), "data");
+        assert_eq!(output_schema.field(0).data_type(), &ArrowDataType::Utf8);
+
+        let unprojected = IcebergTableScan::new(
+            create_test_table(),
+            None,
+            test_arrow_schema(),
+            None,
+            &[],
+            None,
+        )
+        .expect("a scan without projection must plan");
+        assert_eq!(unprojected.projection(), None);
+        assert_eq!(unprojected.schema(), test_arrow_schema());
+    }
 }

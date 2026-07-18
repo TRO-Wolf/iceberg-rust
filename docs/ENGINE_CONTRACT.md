@@ -43,6 +43,21 @@
   (2026-07-01): it is currently ahead of this document — partitioned copy-on-write DELETE/UPDATE
   and partitioned merge-on-read DELETE/UPDATE landed there (#131, #133) with a partition-aware
   `TaskWriter`. Treat its `physical_plan/{delete,write,commit}.rs` as worked examples of §4–§7.
+  **Its DML commits ARM the §5 recipes (2026-07-18, audit P0-3 / BUG-002/003/004/011):** DELETE/UPDATE
+  resolve their isolation level at plan time from `write.delete.isolation-level` /
+  `write.update.isolation-level` with **Java's per-operation default, serializable**
+  (`SparkRowLevelOperationBuilder.isolationLevel` L96-115; `IsolationLevel.fromName` parse semantics —
+  case-insensitive, unknown names fail loud), and enable the §5 cells per mode: CoW →
+  `validate_from_snapshot` + `AlwaysTrue` conflict filter (nothing is pushed to the scan, so Java's
+  AND-of-pushed-filters is exactly `alwaysTrue`) + conflicting-deletes at both levels + conflicting-data
+  under serializable, with removals supplied as **full-metadata `delete_data_files`** (a bare path would
+  make the deletes-check inert); MoR → the row-delta base (files-exist ALWAYS, DELETE included) +
+  UPDATE-only `validate_deleted_files`/`validate_no_conflicting_delete_files` + conflicting-data-files
+  under serializable. INSERT stamps `engine.operation-id` (§8) on every commit — both arms; INSERT
+  OVERWRITE arms the §5 static-overwrite cells per the **engine-defined** table property
+  `write.overwrite.isolation-level` (`serializable`/`snapshot`/`none`, default `snapshot` — a
+  deliberate, documented divergence from Spark, whose overwrite isolation exists only as a per-write
+  option absent by default ⇒ unvalidated; `none` restores that behavior).
 - **Status change (2026-07-01, decided with the named consumer):** `crates/integrations/datafusion`
   is **promoted from reference implementation to a supported product surface**. RePark consumes it
   directly (rev-pinned `[patch.crates-io]`; RePark ADR-0003 mirrors this decision): scan + INSERT +
