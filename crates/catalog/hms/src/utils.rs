@@ -23,6 +23,7 @@ use iceberg::spec::Schema;
 use iceberg::{Error, ErrorKind, Namespace, NamespaceIdent, Result};
 use pilota::{AHashMap, FastStr};
 
+use crate::catalog::HiveVersion;
 use crate::schema::HiveSchemaBuilder;
 
 /// hive.metastore.database.owner setting
@@ -162,13 +163,14 @@ pub(crate) fn convert_to_hive_table(
     location: String,
     metadata_location: String,
     properties: &HashMap<String, String>,
+    hive_version: HiveVersion,
 ) -> Result<hive_metastore::Table> {
     let serde_info = SerDeInfo {
         serialization_lib: Some(SERIALIZATION_LIB.into()),
         ..Default::default()
     };
 
-    let hive_schema = HiveSchemaBuilder::from_iceberg(schema)?.build();
+    let hive_schema = HiveSchemaBuilder::from_iceberg(schema, hive_version)?.build();
 
     let storage_descriptor = StorageDescriptor {
         location: Some(location.into()),
@@ -361,6 +363,7 @@ mod tests {
             location.clone(),
             metadata_location,
             &properties,
+            HiveVersion::default(),
         )?;
 
         let serde_info = SerDeInfo {
@@ -368,7 +371,7 @@ mod tests {
             ..Default::default()
         };
 
-        let hive_schema = HiveSchemaBuilder::from_iceberg(&schema)?.build();
+        let hive_schema = HiveSchemaBuilder::from_iceberg(&schema, HiveVersion::default())?.build();
 
         let sd = StorageDescriptor {
             location: Some(location.into()),
