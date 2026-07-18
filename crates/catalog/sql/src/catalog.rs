@@ -229,19 +229,26 @@ struct SqlCatalogConfig {
 ///
 /// # Mechanism (a provably sound coarse rule)
 ///
-/// After stripping a leading `<scheme>://` (if present, else nothing), let `rest` be the
-/// remainder. If `rest` contains a `:` AND at least one `@` lies strictly after that FIRST `:`,
-/// replace the span from that first `:` (exclusive) through the LAST `@` in `rest` (exclusive)
-/// with `***`, yielding `<before-colon>:***@<after-last-@>`. Otherwise the input is returned
-/// unchanged — no `:`, or no `@` after it, means there is no userinfo password to mask.
+/// The leading `<scheme>://` is stripped ONLY when the bytes before the first `://`, from position
+/// 0, form a valid URI scheme `[A-Za-z][A-Za-z0-9+.-]*` (which by construction holds no `:`, `@`,
+/// or `/`); otherwise nothing is stripped. This anchoring is load-bearing: a bare `find("://")`
+/// would treat a `://` sitting INSIDE a password (`user:pass://x@host`) as a scheme separator, push
+/// the scan past the userinfo `:`, and return the DSN unmasked. Let `rest` be the remainder. If
+/// `rest` contains a `:` AND at least one `@` lies strictly after that FIRST `:`, replace the span
+/// from that first `:` (exclusive) through the LAST `@` in `rest` (exclusive) with `***`, yielding
+/// `<before-colon>:***@<after-last-@>`. Otherwise the input is returned unchanged — no `:`, or no
+/// `@` after it, means there is no userinfo password to mask.
 ///
 /// # Soundness — no password byte can survive, for ANY input
 ///
-/// When a userinfo password exists it lies strictly between the first userinfo `:` and its
-/// boundary `@`. That boundary `@` is one of the `@`s in `rest`, so it is at or before the LAST
+/// The anchored scheme strip (above) guarantees `authority_start` is either 0 or the index just
+/// past a genuine leading scheme — it can never land in the middle of the userinfo, so `rest`
+/// always begins at or before the userinfo `:` (the premise the rest of this proof rests on).
+/// Given that, when a userinfo password exists it lies strictly between the first userinfo `:` and
+/// its boundary `@`. That boundary `@` is one of the `@`s in `rest`, so it is at or before the LAST
 /// `@`. The masked span `[first ':' , last '@']` therefore always covers the entire password —
-/// regardless of how malformed the DSN is, and regardless of extra `/`, `?`, `#`, `:`, or `@`
-/// bytes inside the password. Under-redaction (a surviving password byte) is impossible whenever a
+/// regardless of how malformed the DSN is, and regardless of extra `/`, `?`, `#`, `:`, `@`, or even
+/// `://` bytes inside the password. Under-redaction (a surviving password byte) is impossible whenever a
 /// password is present. Two earlier precise-parsing attempts each leaked one layer deeper —
 /// `p@x/y@host`, `SECRET1@junk/SECRET2@host` — because they tried to locate the *exact* boundary;
 /// this rule does not compute a boundary, so there is no boundary to get wrong.
@@ -262,7 +269,23 @@ struct SqlCatalogConfig {
 /// (`postgres://host/db?param=a@b`, `postgres://user@host/db`) and DSNs with no `@` after the
 /// first `:` (`host:5432/db`, `user@host:5432/db`) are left untouched.
 fn redact_dsn_password(uri: &str) -> String {
-    let authority_start = uri.find("://").map(|i| i + 3).unwrap_or(0);
+    // Anchor the scheme strip: treat `://` as a scheme separator ONLY when the bytes before the
+    // first `://`, from position 0, form a valid URI scheme `[A-Za-z][A-Za-z0-9+.-]*`. A valid
+    // scheme token contains no `:`, `@`, or `/`, so this both anchors position 0 and rejects a
+    // `://` sitting INSIDE a password (`user:pass://x@host`) that a bare `find("://")` would treat
+    // as a scheme separator — shoving `authority_start` past the userinfo `:` and leaking the DSN.
+    // Any non-scheme prefix falls through to `authority_start = 0`.
+    let authority_start = match uri.find("://") {
+        Some(i)
+            if uri[..i].starts_with(|c: char| c.is_ascii_alphabetic())
+                && uri[..i]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')) =>
+        {
+            i + 3
+        }
+        _ => 0,
+    };
     let rest = &uri[authority_start..];
 
     // The password, if any, begins immediately after the FIRST ':' in the remainder.
@@ -3916,13 +3939,15 @@ mod tests {
     const DSN_PASSWORD: &str = "hunter2_DO_NOT_LEAK";
 
     /// CORPUS PIN for [`super::redact_dsn_password`]'s soundness contract: every password-leak
-    /// input surfaced across both prior review cycles — unencoded `/`,`?`,`#` in the password, a
-    /// `p@ss`-style embedded `@`, multiple `@`s deeper in the userinfo (`SECRET1@junk/SECRET2`,
-    /// `a@b/c@d`), `%40`-encoding, multi-`:`, IPv6, and a query-tail secret — is asserted to leave
-    /// NO marker byte in the output. The coarse rule masks `[first ':' , last '@']`, which
-    /// provably covers any password (see the fn doc), so this table can only stay green while the
-    /// sound rule is in place. Each row also pins the exact masked output and proves the marker is
-    /// genuinely present in the input (no false-green from an absent marker).
+    /// input surfaced across all three prior review cycles — unencoded `/`,`?`,`#` in the password,
+    /// a `p@ss`-style embedded `@`, multiple `@`s deeper in the userinfo (`SECRET1@junk/SECRET2`,
+    /// `a@b/c@d`), `%40`-encoding, multi-`:`, IPv6, a query-tail secret, and the cycle-3
+    /// `://`-INSIDE-the-password class (`user:pass://x@host`) that a bare `find("://")` mistook for
+    /// a scheme separator — is asserted to leave NO marker byte in the output. The coarse rule masks
+    /// `[first ':' , last '@']`, which provably covers any password once the scheme strip is anchored
+    /// (see the fn doc), so this table can only stay green while the sound rule is in place. Each row
+    /// also pins the exact masked output and proves the marker is genuinely present in the input (no
+    /// false-green from an absent marker).
     #[test]
     fn test_redact_dsn_password_leak_corpus_no_marker_survives() {
         // (input, exact expected output, forbidden marker that must not survive)
@@ -4003,6 +4028,25 @@ mod tests {
                 "postgres://user:***@[::1]:5432/db",
                 "SEKRET",
             ),
+            // `://`-INSIDE-the-password class (cycle-3 residue). A bare `find("://")` locks onto the
+            // password's own `://`, jumps `authority_start` past the userinfo `:`, and returns the
+            // DSN UNMASKED. The anchored scheme strip rejects the non-scheme prefix, keeps
+            // `authority_start = 0`, and the coarse `[first ':' , last '@']` span masks the leak.
+            // Scheme-less DSN whose password embeds `://`.
+            ("user:pass://x@host", "user:***@host", "pass://x"),
+            // Scheme-less DSN with an embedded `@` AND a `://` after it (last '@' bounds the mask).
+            ("user:p@ss://host", "user:***@ss://host", "p@ss"),
+            // Multibyte scheme-less DSN with `://` in the password — mask must stay on char
+            // boundaries and still cover the secret.
+            ("usér:p+ø://x@höst", "usér:***@höst", "p+ø"),
+            // Schemeful CONTROL: a valid `postgres` scheme is stripped, and the password's OWN `://`
+            // is then masked by the coarse span. Already sound (masked under both the bare and the
+            // anchored strip) — pinned to prove the anchoring does not regress schemeful DSNs.
+            (
+                "postgres://user:pa://ss@host/db",
+                "postgres://user:***@host/db",
+                "pa://ss",
+            ),
         ];
 
         for &(input, expected, marker) in CORPUS {
@@ -4036,6 +4080,7 @@ mod tests {
             "postgres://[::1]:5432/db",
             "sqlite::memory:",
             "sqlite:/tmp/catalog.db",
+            "sqlite://file.db", // valid scheme stripped, `rest` = "file.db" has no ':' -> unchanged
             "",
         ];
 
