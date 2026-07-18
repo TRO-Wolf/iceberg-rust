@@ -403,6 +403,22 @@ impl RestCatalogConfig {
         params
     }
 
+    /// Whether proactive OAuth token refresh is enabled (`token-refresh-enabled`).
+    ///
+    /// Mirrors Java `OAuth2Properties.TOKEN_REFRESH_ENABLED` /
+    /// `TOKEN_REFRESH_ENABLED_DEFAULT = true`: refresh is ON unless the property is explicitly set
+    /// to `false`. When off, the client exchanges the credential once and caches the token forever
+    /// (the legacy behavior).
+    pub(crate) fn token_refresh_enabled(&self) -> bool {
+        // Java `PropertyUtil.propertyAsBoolean(props, key, true)`: when the key is present the value
+        // is parsed like `Boolean.parseBoolean` (true only for a case-insensitive "true"); when the
+        // key is absent the default is true.
+        self.props
+            .get("token-refresh-enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+
     /// Check if header redaction is disabled in error logs.
     ///
     /// Returns true if the `disable-header-redaction` property is set to "true".

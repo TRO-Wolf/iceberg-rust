@@ -15,8 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! REST catalog HTTP client, including OAuth2 credential exchange and automatic token refresh.
+//!
+//! # DEVIATIONS from Java `iceberg-core` 1.10.0 OAuth2 (GAP_MATRIX R159)
+//!
+//! The refresh *trigger* is faithful: [`TokenState::from_expires_in`] reproduces Java
+//! `OAuth2Util$AuthSession.scheduleTokenRefresh` exactly (`refreshWindow = min(ttl/10, 5min)`,
+//! `wait = max(ttl - refreshWindow, 10ms)`), and defaults match
+//! (`token-refresh-enabled` = true). Two intentional divergences:
+//!
+//! 1. **Refresh grant type.** Java refreshes a *still-valid* token with the OAuth token-exchange
+//!    grant (`grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, current token as
+//!    `subject_token`) and only re-fetches with the credential once the token has *expired*. This
+//!    fork has no token-exchange machinery; it always refreshes through the existing
+//!    `client_credentials` exchange to the SAME `get_token_endpoint()`. Observably equivalent for a
+//!    credential-bearing client (a fresh valid token arrives before expiry); the wire grant differs.
+//! 2. **Token-only clients (no credential) are not refreshed.** Java can keep a token-only session
+//!    alive by token-exchanging the current token against itself. Without a credential this fork has
+//!    nothing to exchange (and no token-exchange path), so a configured-`token`-only client behaves
+//!    as today: the token is used until it expires. Note Java also cannot refresh a token-only
+//!    session once the token is actually *expired* (`refreshExpiredToken` returns null when the
+//!    credential is null) — the gap is limited to the *proactive* pre-expiry window.
+//!
+//! Recommendation: closing divergence (1)/(2) requires implementing the OAuth token-exchange grant
+//! (`subject_token`/`subject_token_type`), a larger surface than this refresh adaptation and a
+//! separate GAP_MATRIX item; it is out of scope here.
+
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
@@ -28,13 +55,92 @@ use tokio::sync::Mutex;
 use crate::RestCatalogConfig;
 use crate::types::{ErrorResponse, TokenResponse};
 
+/// Java oracle (`OAuth2Util$AuthSession.MAX_REFRESH_WINDOW_MILLIS`, iceberg-core 1.10.0): the
+/// refresh window is capped at 5 minutes. A token is refreshed no earlier than `expiresAt - 5min`
+/// even when a proportional (`ttl/10`) window would be larger.
+const MAX_REFRESH_WINDOW_MILLIS: u64 = 300_000;
+/// Java oracle (`OAuth2Util$AuthSession.MIN_REFRESH_WAIT_MILLIS`): the scheduled wait before a
+/// refresh never drops below 10ms, so a near-zero-lifetime token still gets a tiny grace window
+/// rather than refreshing in a tight loop.
+const MIN_REFRESH_WAIT_MILLIS: u64 = 10;
+
+/// A cached OAuth access token together with the monotonic instant at which it becomes due for a
+/// proactive refresh.
+///
+/// SECURITY: `token` is bearer-secret material. This type deliberately does NOT derive `Debug`;
+/// [`HttpClient`]'s `Debug` never renders it, and no error/log path on the refresh code touches it.
+#[derive(Clone)]
+struct TokenState {
+    /// The bearer access token.
+    token: String,
+    /// Monotonic instant at which the token enters Java's refresh window (`expiresAt -
+    /// refreshWindow`). `None` means "never proactively refresh": the token carried no
+    /// `expires_in`, mirroring Java leaving `expiresAtMillis` null and scheduling no refresh.
+    refresh_at: Option<Instant>,
+}
+
+impl TokenState {
+    /// A token with no known expiry — a config-provided `token`, or a token response without
+    /// `expires_in`. Never proactively refreshed, mirroring Java `fromAccessToken` /
+    /// `fromTokenResponse` leaving `expiresAtMillis` null so no refresh is scheduled.
+    fn without_expiry(token: String) -> Self {
+        Self {
+            token,
+            refresh_at: None,
+        }
+    }
+
+    /// Derive the refresh instant from an `expires_in` (seconds), reproducing Java's
+    /// `OAuth2Util$AuthSession.scheduleTokenRefresh` arithmetic exactly:
+    ///
+    /// ```text
+    /// ttl            = expires_in
+    /// refreshWindow  = min(ttl / 10, MAX_REFRESH_WINDOW_MILLIS)   // min(10% of ttl, 5min)
+    /// wait           = max(ttl - refreshWindow, MIN_REFRESH_WAIT_MILLIS)
+    /// refreshAt      = now + wait
+    /// ```
+    ///
+    /// All millisecond math is saturating on `u64`; the final `Instant` add is checked, so an
+    /// absurd `expires_in` can never panic — it falls back to "never refresh" (`None`).
+    fn from_expires_in(now: Instant, token: String, expires_in_secs: Option<u64>) -> Self {
+        let refresh_at = expires_in_secs.and_then(|secs| {
+            let ttl_ms = secs.saturating_mul(1000);
+            let refresh_window_ms = (ttl_ms / 10).min(MAX_REFRESH_WINDOW_MILLIS);
+            let wait_ms = ttl_ms
+                .saturating_sub(refresh_window_ms)
+                .max(MIN_REFRESH_WAIT_MILLIS);
+            now.checked_add(Duration::from_millis(wait_ms))
+        });
+        Self { token, refresh_at }
+    }
+
+    /// Whether `now` has reached the token's refresh instant. A token with no known expiry is never
+    /// due. Uses monotonic [`Instant`] comparison only — no wall-clock arithmetic, no panic on
+    /// clock skew.
+    fn is_due_for_refresh(&self, now: Instant) -> bool {
+        self.refresh_at.is_some_and(|at| now >= at)
+    }
+}
+
 pub(crate) struct HttpClient {
     client: Client,
 
-    /// The token to be used for authentication.
+    /// The token to be used for authentication, with its derived refresh instant.
     ///
     /// It's possible to fetch the token from the server while needed.
-    token: Mutex<Option<String>>,
+    token: Mutex<Option<TokenState>>,
+    /// Single-flight gate for token acquisition/refresh. Concurrent requests that all observe a
+    /// stale token serialize here so exactly ONE token-endpoint exchange happens (Java serializes
+    /// refresh on its scheduler thread; the lazy adaptation serializes on this gate instead).
+    ///
+    /// Lock order: on the acquisition path, `refresh_gate` is acquired BEFORE `token`. The `token`
+    /// mutex is only ever held for brief, non-`await` critical sections (clone-out / store-back),
+    /// so the two locks never deadlock and no lock is held across the HTTP `await` except the
+    /// `refresh_gate` itself — which is the single-flight mechanism and is bounded to one exchange.
+    refresh_gate: Mutex<()>,
+    /// Whether proactive token refresh is enabled (`token-refresh-enabled`; Java default `true`).
+    /// When `false`, behavior is exactly today's: exchange once, cache forever, never refresh.
+    token_refresh_enabled: bool,
     /// The token endpoint to be used for authentication.
     token_endpoint: String,
     /// The credential to be used for authentication.
@@ -76,7 +182,9 @@ impl HttpClient {
         let extra_headers = cfg.extra_headers()?;
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
-            token: Mutex::new(cfg.token()),
+            token: Mutex::new(cfg.token().map(TokenState::without_expiry)),
+            refresh_gate: Mutex::new(()),
+            token_refresh_enabled: cfg.token_refresh_enabled(),
             token_endpoint: cfg.get_token_endpoint(),
             credential: cfg.credential(),
             extra_headers,
@@ -96,7 +204,13 @@ impl HttpClient {
             .unwrap_or(self.extra_headers);
         Ok(HttpClient {
             client: cfg.client().unwrap_or(self.client),
-            token: Mutex::new(cfg.token().or_else(|| self.token.into_inner())),
+            token: Mutex::new(
+                cfg.token()
+                    .map(TokenState::without_expiry)
+                    .or_else(|| self.token.into_inner()),
+            ),
+            refresh_gate: Mutex::new(()),
+            token_refresh_enabled: cfg.token_refresh_enabled(),
             token_endpoint: if !cfg.get_token_endpoint().is_empty() {
                 cfg.get_token_endpoint()
             } else {
@@ -121,10 +235,25 @@ impl HttpClient {
             .build()
             .unwrap();
         self.authenticate(&mut req).await.ok();
-        self.token.lock().await.clone()
+        self.token.lock().await.as_ref().map(|s| s.token.clone())
     }
 
-    pub(crate) async fn exchange_credential_for_token(&self) -> Result<String> {
+    /// Test-only: install a token state directly (with a caller-chosen refresh instant) so a test
+    /// can place a token that is already due for refresh without waiting on wall-clock expiry.
+    #[cfg(test)]
+    async fn install_token_state(&self, token: &str, refresh_at: Option<Instant>) {
+        *self.token.lock().await = Some(TokenState {
+            token: token.to_string(),
+            refresh_at,
+        });
+    }
+
+    /// Exchange the configured credential for an access token via the `client_credentials` grant.
+    ///
+    /// Returns the access token together with its `expires_in` (seconds), when the server supplied
+    /// one — the caller derives the proactive-refresh instant from it. A missing `expires_in`
+    /// yields `None`, which (mirroring Java) means the token is never proactively refreshed.
+    pub(crate) async fn exchange_credential_for_token(&self) -> Result<(String, Option<u64>)> {
         // Credential must exist here.
         let (client_id, client_secret) = self.credential.as_ref().ok_or_else(|| {
             Error::new(
@@ -196,7 +325,7 @@ impl HttpClient {
             })?;
             Err(Error::from(e))
         }?;
-        Ok(auth_res.access_token)
+        Ok((auth_res.access_token, auth_res.expires_in))
     }
 
     /// Invalidate the current token without generating a new one. On the next request, the client
@@ -213,8 +342,9 @@ impl HttpClient {
     /// If credential is invalid, or the request fails, this method will return an error and leave
     /// the current token unchanged.
     pub(crate) async fn regenerate_token(&self) -> Result<()> {
-        let new_token = self.exchange_credential_for_token().await?;
-        *self.token.lock().await = Some(new_token.clone());
+        let (new_token, expires_in) = self.exchange_credential_for_token().await?;
+        let state = TokenState::from_expires_in(Instant::now(), new_token, expires_in);
+        *self.token.lock().await = Some(state);
         Ok(())
     }
 
@@ -228,25 +358,52 @@ impl HttpClient {
     ///
     /// When both `credential` and `token` are present, `token` takes precedence.
     ///
-    /// # TODO: Support automatic token refreshing.
+    /// ## Automatic token refresh (GAP_MATRIX R159)
+    ///
+    /// When `token-refresh-enabled` is on (Java default) and a `credential` is configured, a cached
+    /// token that has entered its refresh window (see [`TokenState::from_expires_in`], which mirrors
+    /// Java `OAuth2Util$AuthSession.scheduleTokenRefresh`) or has already expired is refreshed
+    /// *before use*, so no request is ever sent with a known-expired bearer token. Concurrent
+    /// requests that all observe a stale token collapse to a single token-endpoint exchange via
+    /// [`Self::obtain_token_single_flight`]. When refresh is disabled, behavior is exactly the
+    /// legacy one: exchange once, cache forever.
+    ///
+    /// SANCTIONED ADAPTATION: Java runs a background scheduler thread and, for a still-valid token,
+    /// refreshes via the OAuth *token-exchange* grant (current token as `subject_token`); only an
+    /// already-expired token is re-fetched with the `credential`. This async-Rust library has no
+    /// token-exchange machinery and no background task, so it refreshes *lazily, before use*, always
+    /// through the existing `client_credentials` exchange ([`Self::exchange_credential_for_token`],
+    /// which POSTs to `get_token_endpoint()` — the SAME endpoint and credential location as the
+    /// initial exchange). The observable contract still holds for credential-bearing clients: no
+    /// known-expired token is sent, and tokens refresh proactively near expiry. The divergence for
+    /// token-only clients (no credential) is recorded in the module's DEVIATIONS note.
     async fn authenticate(&self, req: &mut Request) -> Result<()> {
-        // Clone the token from lock without holding the lock for entire function.
-        let token = self.token.lock().await.clone();
+        // Clone the current token state without holding the lock across any await.
+        let snapshot = self.token.lock().await.clone();
 
-        if self.credential.is_none() && token.is_none() {
+        if self.credential.is_none() && snapshot.is_none() {
             return Ok(());
         }
 
-        // Either use the provided token or exchange credential for token, cache and use that
-        let token = match token {
-            Some(token) => token,
-            None => {
-                let token = self.exchange_credential_for_token().await?;
-                // Update token so that we use it for next request instead of
-                // exchanging credential for token from the server again
-                *self.token.lock().await = Some(token.clone());
-                token
+        // Fast path: a cached token that is not due for a proactive refresh is used as-is, with no
+        // lock held and no token-endpoint traffic. Refresh only engages when it is enabled AND we
+        // have a credential to exchange AND the token has entered its refresh window / expired.
+        let needs_acquire = match &snapshot {
+            Some(state) => {
+                self.token_refresh_enabled
+                    && self.credential.is_some()
+                    && state.is_due_for_refresh(Instant::now())
             }
+            None => true,
+        };
+
+        let token = if needs_acquire {
+            self.obtain_token_single_flight(snapshot).await?
+        } else {
+            // `snapshot` is `Some` here (the `None` arm forces `needs_acquire`).
+            snapshot
+                .expect("a non-acquiring path always has a cached token")
+                .token
         };
 
         // Insert token in request.
@@ -262,6 +419,64 @@ impl HttpClient {
         );
 
         Ok(())
+    }
+
+    /// Acquire a usable token under the single-flight [`Self::refresh_gate`], collapsing a stampede
+    /// of concurrent stale requests into ONE token-endpoint exchange.
+    ///
+    /// `prev` is the caller's pre-gate snapshot: `None` means there is no cached token yet (initial
+    /// acquisition), `Some` means a refresh of an existing (now-stale) token. This distinction
+    /// controls the failure policy, mirroring Java's two paths:
+    ///
+    /// - **Initial acquisition failure propagates.** With no token to fall back on, an exchange
+    ///   error is returned to the caller (as the legacy code did, and as Java's initial `fetchToken`
+    ///   does at session creation).
+    /// - **Refresh failure is suppressed, keeping the old token.** Java runs the scheduled refresh
+    ///   under `Tasks…suppressFailureWhenFinished().retry(...)`; on exhausted retries the failure is
+    ///   swallowed and the previous token stays in use rather than erroring the in-flight request.
+    ///   The lazy adaptation matches that observable behavior: it keeps serving the prior token.
+    ///
+    /// Lock order (documented on the fields): `refresh_gate` is taken first; `token` is then locked
+    /// only for brief, non-`await` sections. The single HTTP exchange awaits while holding
+    /// `refresh_gate` (the single-flight mechanism) — bounded to one round-trip — and never while
+    /// holding the `token` mutex.
+    async fn obtain_token_single_flight(&self, prev: Option<TokenState>) -> Result<String> {
+        let _gate = self.refresh_gate.lock().await;
+
+        // Double-check under the gate: a concurrent holder may have already refreshed while we
+        // waited. If the now-current token is usable, reuse it and skip the exchange entirely.
+        let current = self.token.lock().await.clone();
+        if let Some(state) = &current {
+            let still_stale = self.token_refresh_enabled
+                && self.credential.is_some()
+                && state.is_due_for_refresh(Instant::now());
+            if !still_stale {
+                return Ok(state.token.clone());
+            }
+        }
+
+        match self.exchange_credential_for_token().await {
+            Ok((new_token, expires_in)) => {
+                let state = TokenState::from_expires_in(Instant::now(), new_token, expires_in);
+                let token = state.token.clone();
+                *self.token.lock().await = Some(state);
+                Ok(token)
+            }
+            Err(error) => match current.or(prev) {
+                // Refresh of an existing token failed: keep serving it (Java suppresses the
+                // failure). No token/credential material is attached to any log — only the safe
+                // error is traced.
+                Some(state) => {
+                    tracing::warn!(
+                        ?error,
+                        "OAuth token refresh failed; continuing with the previously cached token"
+                    );
+                    Ok(state.token)
+                }
+                // No token to fall back on: propagate (initial acquisition).
+                None => Err(error),
+            },
+        }
     }
 
     #[inline]
@@ -704,5 +919,287 @@ mod tests {
             debug.contains("x-request-id") && debug.contains("req-visible-123"),
             "non-sensitive header should stay visible: {debug}"
         );
+    }
+
+    // ========================================================================
+    // GAP_MATRIX R159 — automatic OAuth token refresh (lazy refresh-before-use)
+    // ========================================================================
+
+    use std::sync::Arc;
+
+    use mockito::{Server, ServerGuard};
+
+    /// Build a credential-bearing client pointed at the given token endpoint host.
+    fn refresh_client(server_url: &str, refresh_enabled: bool) -> HttpClient {
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+        if !refresh_enabled {
+            props.insert("token-refresh-enabled".to_string(), "false".to_string());
+        }
+        HttpClient::new(
+            &RestCatalogConfig::builder()
+                .uri(server_url.to_string())
+                .props(props)
+                .build(),
+        )
+        .expect("client must build from a credential-bearing config")
+    }
+
+    /// A token-endpoint mock returning `token` with an optional `expires_in`, matching `expect`
+    /// requests exactly.
+    async fn token_mock(
+        server: &mut ServerGuard,
+        token: &str,
+        expires_in: Option<u64>,
+        expect: usize,
+    ) -> mockito::Mock {
+        let expires_field = expires_in
+            .map(|s| format!(r#", "expires_in": {s}"#))
+            .unwrap_or_default();
+        let body = format!(
+            r#"{{"access_token": "{token}", "token_type": "Bearer", "issued_token_type": "urn:ietf:params:oauth:token-type:access_token"{expires_field}}}"#
+        );
+        server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(200)
+            .with_body(body)
+            .expect(expect)
+            .create_async()
+            .await
+    }
+
+    async fn authenticated_bearer(client: &HttpClient, base: &str) -> Option<String> {
+        let mut req = client
+            .request(Method::GET, format!("{base}/v1/probe"))
+            .build()
+            .expect("probe request must build");
+        client
+            .authenticate(&mut req)
+            .await
+            .expect("authenticate must succeed");
+        req.headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// Pins that the refresh instant reproduces Java `OAuth2Util$AuthSession.scheduleTokenRefresh`
+    /// (`refreshWindow = min(ttl/10, 5min)`, `wait = max(ttl - refreshWindow, 10ms)`) and that a
+    /// missing `expires_in` yields NO refresh instant (Java schedules none). Mutation: changing the
+    /// window formula (e.g. dropping the `min(_, MAX_REFRESH_WINDOW_MILLIS)` cap) shifts these
+    /// instants → RED.
+    #[test]
+    fn test_refresh_at_matches_java_schedule_rule() {
+        let now = Instant::now();
+
+        // Short-lived token: ttl=100s → window=min(10s, 5min)=10s → wait=90s.
+        let short = TokenState::from_expires_in(now, "t".to_string(), Some(100));
+        let short_at = short
+            .refresh_at
+            .expect("a token with expires_in has an instant");
+        let short_wait = short_at.duration_since(now);
+        assert_eq!(
+            short_wait,
+            Duration::from_secs(90),
+            "ttl=100s must refresh after 90s (window = ttl/10 = 10s)"
+        );
+
+        // Long-lived token: ttl=86400s → ttl/10=8640s but capped at 5min → window=300s → wait=86100s.
+        let long = TokenState::from_expires_in(now, "t".to_string(), Some(86400));
+        let long_at = long
+            .refresh_at
+            .expect("a token with expires_in has an instant");
+        assert_eq!(
+            long_at.duration_since(now),
+            Duration::from_secs(86400 - 300),
+            "the refresh window must be capped at MAX_REFRESH_WINDOW_MILLIS (5min)"
+        );
+
+        // Near-zero ttl: window=0 → wait=max(0, 10ms)=10ms (never a tight loop).
+        let tiny = TokenState::from_expires_in(now, "t".to_string(), Some(0));
+        assert_eq!(
+            tiny.refresh_at
+                .expect("expires_in=0 still derives an instant")
+                .duration_since(now),
+            Duration::from_millis(MIN_REFRESH_WAIT_MILLIS),
+        );
+
+        // Missing expires_in → no refresh instant → never proactively refreshed.
+        let none = TokenState::from_expires_in(now, "t".to_string(), None);
+        assert!(
+            none.refresh_at.is_none(),
+            "a token without expires_in must not be scheduled for refresh"
+        );
+        assert!(
+            !none.is_due_for_refresh(now + Duration::from_secs(10_000_000)),
+            "a no-expiry token is never due, even far in the future"
+        );
+    }
+
+    /// Single-flight pin: N concurrent requests that all observe a token inside its refresh window
+    /// trigger EXACTLY ONE token-endpoint exchange, and every request ends up with the refreshed
+    /// token. Mutation A (drop the `refresh_gate` in `obtain_token_single_flight`) → the stampede
+    /// hits the endpoint N times → the `expect(1)` mock assertion goes RED. Mutation B (disable the
+    /// `is_due_for_refresh` check) → zero refreshes → the `Bearer refreshed` assertion goes RED.
+    #[tokio::test]
+    async fn test_near_expiry_single_flight_refresh_under_concurrency() {
+        let mut server = Server::new_async().await;
+        let mock = token_mock(&mut server, "refreshed", Some(86400), 1).await;
+
+        let client = Arc::new(refresh_client(&server.url(), true));
+        // A cached token already inside its refresh window (refresh_at in the past).
+        client
+            .install_token_state("stale", Some(Instant::now() - Duration::from_secs(1)))
+            .await;
+
+        let base = server.url();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let client = Arc::clone(&client);
+            let base = base.clone();
+            handles.push(tokio::spawn(async move {
+                authenticated_bearer(&client, &base).await
+            }));
+        }
+
+        for handle in handles {
+            let bearer = handle.await.expect("task must join");
+            assert_eq!(
+                bearer.as_deref(),
+                Some("Bearer refreshed"),
+                "every concurrent request must use the refreshed token"
+            );
+        }
+
+        // Exactly one exchange despite eight racing requests.
+        mock.assert_async().await;
+    }
+
+    /// A cached token that is NOT yet inside its refresh window must be used as-is, with zero
+    /// token-endpoint traffic (no gratuitous refresh). Mutation: making every token "due" would
+    /// force an exchange here → the `expect(0)` mock goes RED.
+    #[tokio::test]
+    async fn test_fresh_token_is_not_refreshed() {
+        let mut server = Server::new_async().await;
+        let mock = token_mock(&mut server, "should-not-be-used", Some(86400), 0).await;
+
+        let client = refresh_client(&server.url(), true);
+        // Refresh instant an hour out: nowhere near due.
+        client
+            .install_token_state("fresh", Some(Instant::now() + Duration::from_secs(3600)))
+            .await;
+
+        let bearer = authenticated_bearer(&client, &server.url()).await;
+        assert_eq!(
+            bearer.as_deref(),
+            Some("Bearer fresh"),
+            "a fresh token must be reused verbatim"
+        );
+        mock.assert_async().await; // zero exchanges
+    }
+
+    /// Regression pin for today's behavior: with `token-refresh-enabled=false`, an already-due
+    /// token is STILL never refreshed — zero token-endpoint traffic ever. Mutation: inverting the
+    /// enabled flag (treating disabled as enabled) refreshes the due token → the `expect(0)` mock
+    /// goes RED.
+    #[tokio::test]
+    async fn test_refresh_disabled_never_refreshes() {
+        let mut server = Server::new_async().await;
+        let mock = token_mock(&mut server, "should-not-be-used", Some(86400), 0).await;
+
+        let client = refresh_client(&server.url(), false);
+        // Token is well past its (hypothetical) refresh instant, yet refresh is disabled.
+        client
+            .install_token_state("legacy", Some(Instant::now() - Duration::from_secs(3600)))
+            .await;
+
+        let bearer = authenticated_bearer(&client, &server.url()).await;
+        assert_eq!(
+            bearer.as_deref(),
+            Some("Bearer legacy"),
+            "with refresh disabled the cached token must be used unchanged"
+        );
+        mock.assert_async().await; // zero exchanges
+    }
+
+    /// A token response without `expires_in` must disable proactive refresh for that token (Java
+    /// schedules no refresh when the expiry is unknown). The initial exchange happens once; a
+    /// subsequent authenticated request must NOT hit the endpoint again. Pinned end-to-end with an
+    /// `expect(1)` mock (only the initial fetch).
+    #[tokio::test]
+    async fn test_missing_expires_in_disables_refresh() {
+        let mut server = Server::new_async().await;
+        let mock = token_mock(&mut server, "no-expiry", None, 1).await;
+
+        let client = refresh_client(&server.url(), true);
+
+        // Initial fetch: no cached token → one exchange, caches a no-expiry token.
+        let first = authenticated_bearer(&client, &server.url()).await;
+        assert_eq!(first.as_deref(), Some("Bearer no-expiry"));
+
+        // Any number of later requests reuse it with no further exchange.
+        let second = authenticated_bearer(&client, &server.url()).await;
+        assert_eq!(second.as_deref(), Some("Bearer no-expiry"));
+
+        mock.assert_async().await; // exactly one (the initial fetch)
+    }
+
+    /// Refresh FAILURE is suppressed and the previously cached token is kept (Java runs the refresh
+    /// under `Tasks…suppressFailureWhenFinished()` and keeps the old token on exhausted retries).
+    /// The in-flight request must NOT error; it proceeds with the prior token. Mutation: propagating
+    /// the refresh error instead of falling back would make `authenticate` return `Err` → the
+    /// `expect("authenticate must succeed")` in `authenticated_bearer` goes RED.
+    #[tokio::test]
+    async fn test_refresh_failure_keeps_previous_token() {
+        let mut server = Server::new_async().await;
+        // The refresh exchange fails (500); mock is hit once (the attempted refresh).
+        let mock = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(500)
+            .with_body(r#"{"error": {"message": "boom", "type": "ServerError", "code": 500}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = refresh_client(&server.url(), true);
+        client
+            .install_token_state("old", Some(Instant::now() - Duration::from_secs(1)))
+            .await;
+
+        let bearer = authenticated_bearer(&client, &server.url()).await;
+        assert_eq!(
+            bearer.as_deref(),
+            Some("Bearer old"),
+            "a failed refresh must keep serving the previously cached token"
+        );
+        mock.assert_async().await;
+    }
+
+    /// The INITIAL acquisition failure (no token to fall back on) must propagate as an error — a
+    /// caller with no usable token cannot silently proceed. This complements the refresh-failure
+    /// suppression above: the two paths are distinguished by whether a previous token existed.
+    #[tokio::test]
+    async fn test_initial_acquisition_failure_propagates() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(500)
+            .with_body(r#"{"error": {"message": "boom", "type": "ServerError", "code": 500}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = refresh_client(&server.url(), true);
+        // No cached token: the first authenticate must exchange, and that exchange fails.
+        let mut req = client
+            .request(Method::GET, format!("{}/v1/probe", server.url()))
+            .build()
+            .expect("probe request must build");
+        let result = client.authenticate(&mut req).await;
+        assert!(
+            result.is_err(),
+            "an initial token acquisition failure must propagate, not be swallowed"
+        );
+        mock.assert_async().await;
     }
 }
