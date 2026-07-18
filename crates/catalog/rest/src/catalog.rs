@@ -45,7 +45,7 @@ use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CommitViewRequest,
     CreateNamespaceRequest, CreateTableRequest, CreateViewRequest, ListNamespaceResponse,
     ListTablesResponse, LoadTableResult, LoadViewResult, NamespaceResponse, RegisterTableRequest,
-    RenameTableRequest,
+    RenameTableRequest, StorageCredential,
 };
 
 /// REST catalog URI
@@ -58,6 +58,41 @@ pub const REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str = "disable-header-red
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
+
+/// Select the vended storage credential whose `prefix` most specifically covers
+/// `storage_path`, mirroring Java `S3FileIO.clientForStoragePath`.
+///
+/// Java keeps the **strictly-longest** credential prefix that `storage_path.startsWith(prefix)`
+/// (its per-prefix client map is seeded with a default whose key is the shorter scheme string,
+/// and each candidate replaces the current pick only when its prefix is strictly longer). We
+/// mirror that here: among all credentials whose `prefix` prefixes the table's storage path, the
+/// longest wins; on a length tie the first in list order is kept (a strictly-greater replacement
+/// rule never displaces an equal-length incumbent). If `storage_path` is `None`, or no credential
+/// prefixes it, the result is `None` — Java's silent fall-back to the un-vended base client, which
+/// raises no error.
+///
+/// The returned credential's `config` is layered onto the `FileIO` props by the caller (see
+/// `load_file_io`); selection here carries no secret material into logs.
+fn select_vended_credential<'a>(
+    storage_path: Option<&str>,
+    storage_credentials: Option<&'a [StorageCredential]>,
+) -> Option<&'a StorageCredential> {
+    let path = storage_path?;
+    let mut best: Option<&StorageCredential> = None;
+    for candidate in storage_credentials.unwrap_or(&[]) {
+        if !path.starts_with(&candidate.prefix) {
+            continue;
+        }
+        let is_longer = match best {
+            Some(current) => candidate.prefix.len() > current.prefix.len(),
+            None => true,
+        };
+        if is_longer {
+            best = Some(candidate);
+        }
+    }
+    best
+}
 
 /// Builder for [`RestCatalog`].
 #[derive(Debug)]
@@ -500,10 +535,30 @@ impl RestCatalog {
         &self,
         metadata_location: Option<&str>,
         extra_config: Option<HashMap<String, String>>,
+        storage_credentials: Option<&[StorageCredential]>,
     ) -> Result<FileIO> {
         let mut props = self.context().await?.config.props.clone();
         if let Some(config) = extra_config {
             props.extend(config);
+        }
+
+        // Overlay the vended storage credential for this table's location, mirroring Java
+        // `RESTSessionCatalog.newFileIO(SessionContext, Map, List<Credential>)`: the longest
+        // vended `Credential` prefix that prefixes the storage path wins (S3FileIO's
+        // `clientForStoragePath` keeps the strictly-longest `startsWith` match), and that
+        // credential's config is layered LAST so it beats the catalog/table props on a key
+        // collision (S3FileIO builds the per-prefix client with
+        // `ImmutableMap.builder().putAll(props).putAll(credential.config()).buildKeepingLast()`,
+        // where the last put — the credential — wins). No match ⇒ no overlay (Java falls back to
+        // the base client for the location, silently, with no error). The vended values flow into
+        // the `FileIO`'s `StorageConfig`, whose `Debug` redacts every secret-bearing key
+        // (`s3.access-key-id`/`s3.secret-access-key`/`s3.session-token` all hit the
+        // `is_secret_prop_key` needle list), so this overlay never widens the credential-leak
+        // surface. Expiry/refresh of short-lived vended credentials (Java's
+        // `VendedCredentialsProvider`) is out of scope here — the OpenDAL-backed `FileIO` takes a
+        // static props snapshot; see GAP_MATRIX row R160 residue.
+        if let Some(credential) = select_vended_credential(metadata_location, storage_credentials) {
+            props.extend(credential.config.clone());
         }
 
         // If the warehouse is a logical identifier instead of a URL we don't want
@@ -554,7 +609,7 @@ impl RestCatalog {
             .collect();
 
         let file_io = self
-            .load_file_io(Some(&response.metadata_location), Some(config))
+            .load_file_io(Some(&response.metadata_location), Some(config), None)
             .await?;
 
         View::builder()
@@ -890,7 +945,11 @@ impl Catalog for RestCatalog {
             .collect();
 
         let file_io = self
-            .load_file_io(Some(metadata_location), Some(config))
+            .load_file_io(
+                Some(metadata_location),
+                Some(config),
+                response.storage_credentials.as_deref(),
+            )
             .await?;
 
         let table_builder = Table::builder()
@@ -946,7 +1005,11 @@ impl Catalog for RestCatalog {
             .collect();
 
         let file_io = self
-            .load_file_io(response.metadata_location.as_deref(), Some(config))
+            .load_file_io(
+                response.metadata_location.as_deref(),
+                Some(config),
+                response.storage_credentials.as_deref(),
+            )
             .await?;
 
         let table_builder = Table::builder()
@@ -1095,7 +1158,13 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `register_table` response!",
         ))?;
 
-        let file_io = self.load_file_io(Some(metadata_location), None).await?;
+        let file_io = self
+            .load_file_io(
+                Some(metadata_location),
+                None,
+                response.storage_credentials.as_deref(),
+            )
+            .await?;
 
         Table::builder()
             .identifier(table_ident.clone())
@@ -1191,8 +1260,10 @@ impl Catalog for RestCatalog {
             }
         };
 
+        // `CommitTableResponse` carries no `storage-credentials` (Java's post-commit refreshed
+        // FileIO credentials are a separate concern), so no vended overlay applies here.
         let file_io = self
-            .load_file_io(Some(&response.metadata_location), None)
+            .load_file_io(Some(&response.metadata_location), None, None)
             .await?;
 
         Table::builder()
@@ -2970,6 +3041,326 @@ mod tests {
 
         config_mock.assert_async().await;
         rename_table_mock.assert_async().await;
+    }
+
+    // ===================================================================================
+    // Vended storage credentials (GAP_MATRIX row R160)
+    //
+    // Mirrors Java `RESTSessionCatalog.newFileIO(SessionContext, Map, List<Credential>)` +
+    // `S3FileIO.clientForStoragePath` / `clientByPrefix`: longest-prefix selection against the
+    // table's storage path, credential config layered LAST (wins on collision), no-match is a
+    // silent skip. These pins are RED under the mutations named in the G4 charter (invert the
+    // selection to shortest-prefix, swap the overlay order, or drop the wiring entirely).
+    // ===================================================================================
+
+    /// Build a `load_table` response body from the shared testdata metadata, injecting a specific
+    /// `config` map and (optionally) a `storage-credentials` array.
+    fn load_table_body(
+        config: serde_json::Value,
+        storage_credentials: Option<serde_json::Value>,
+    ) -> String {
+        let path = format!(
+            "{}/testdata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "load_table_response.json"
+        );
+        let file = File::open(path).expect("open load_table_response.json testdata");
+        let mut body: serde_json::Value =
+            serde_json::from_reader(BufReader::new(file)).expect("parse load_table_response.json");
+        body["config"] = config;
+        if let Some(creds) = storage_credentials {
+            body["storage-credentials"] = creds;
+        }
+        serde_json::to_string(&body).expect("serialize patched load_table response")
+    }
+
+    fn s3_credential(prefix: &str) -> StorageCredential {
+        StorageCredential {
+            prefix: prefix.to_string(),
+            config: HashMap::from([
+                ("s3.access-key-id".to_string(), "VENDED_KEY_ID".to_string()),
+                (
+                    "s3.secret-access-key".to_string(),
+                    "VENDED_SECRET".to_string(),
+                ),
+                ("s3.session-token".to_string(), "VENDED_TOKEN".to_string()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn test_select_vended_credential_longest_prefix_wins() {
+        // The table storage path is prefixed by BOTH credentials; the strictly-longer prefix wins
+        // (Java `clientForStoragePath` keeps the longest `startsWith` match). List order is short
+        // then long, so a shortest-prefix mutation would flip the pick — this pins the direction.
+        let short = s3_credential("s3://warehouse/database/table");
+        let long = s3_credential("s3://warehouse/database/table/metadata");
+        let creds = [short, long];
+        let path = "s3://warehouse/database/table/metadata/00001-x.metadata.json";
+
+        let picked = select_vended_credential(Some(path), Some(&creds))
+            .expect("a credential prefixes the storage path");
+
+        assert_eq!(
+            picked.prefix, "s3://warehouse/database/table/metadata",
+            "longest prefix must win, got {}",
+            picked.prefix
+        );
+    }
+
+    #[test]
+    fn test_select_vended_credential_first_of_equal_length_kept() {
+        // Two distinct equal-length prefixes both cover the path; the strictly-greater replacement
+        // rule keeps the first in list order (mirrors Java's `> length` guard).
+        let first = StorageCredential {
+            prefix: "s3://warehouse/database/tab".to_string(),
+            config: HashMap::from([("k".to_string(), "first".to_string())]),
+        };
+        let second = StorageCredential {
+            prefix: "s3://warehouse/database/tab".to_string(),
+            config: HashMap::from([("k".to_string(), "second".to_string())]),
+        };
+        let creds = [first, second];
+        let picked = select_vended_credential(
+            Some("s3://warehouse/database/table/metadata/x.json"),
+            Some(&creds),
+        )
+        .expect("prefix covers path");
+        assert_eq!(picked.config.get("k"), Some(&"first".to_string()));
+    }
+
+    #[test]
+    fn test_select_vended_credential_no_prefix_match_is_none() {
+        // No credential prefixes the storage path → None (Java falls back to the base client
+        // silently, raising no error).
+        let creds = [s3_credential("s3://other-warehouse/db/table")];
+        assert!(
+            select_vended_credential(
+                Some("s3://warehouse/database/table/metadata/x.json"),
+                Some(&creds),
+            )
+            .is_none(),
+            "an unmatched prefix must not be selected"
+        );
+    }
+
+    #[test]
+    fn test_select_vended_credential_none_inputs() {
+        let creds = [s3_credential("s3://warehouse/database/table")];
+        // No storage path → nothing to match against.
+        assert!(select_vended_credential(None, Some(&creds)).is_none());
+        // No credentials → nothing to select (the zero-credentials regression path).
+        assert!(
+            select_vended_credential(Some("s3://warehouse/database/table/m.json"), None).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_table_applies_vended_credentials() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        // Table `config` carries a colliding `s3.access-key-id` and a non-colliding `s3.region`;
+        // the vended credential (whose prefix covers the table location) must WIN the collision
+        // and add its own keys, while the non-colliding table key survives.
+        let body = load_table_body(
+            json!({
+                "s3.access-key-id": "FROM_TABLE_CONFIG",
+                "s3.region": "us-west-2",
+            }),
+            Some(json!([{
+                "prefix": "s3://warehouse/database/table",
+                "config": {
+                    "s3.access-key-id": "VENDED_KEY_ID",
+                    "s3.secret-access-key": "VENDED_SECRET",
+                    "s3.session-token": "VENDED_TOKEN",
+                },
+            }])),
+        );
+
+        let table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let table = catalog
+            .load_table(&TableIdent::from_strs(vec!["ns1", "test1"]).unwrap())
+            .await
+            .expect("load_table with vended credentials");
+
+        let props = table.file_io().config().props();
+        // Overlay order + collision winner: the vended credential beats the table config.
+        assert_eq!(
+            props.get("s3.access-key-id"),
+            Some(&"VENDED_KEY_ID".to_string()),
+            "vended credential must win the collision over table config"
+        );
+        // Vended-only keys are layered in.
+        assert_eq!(
+            props.get("s3.secret-access-key"),
+            Some(&"VENDED_SECRET".to_string())
+        );
+        assert_eq!(
+            props.get("s3.session-token"),
+            Some(&"VENDED_TOKEN".to_string())
+        );
+        // Non-colliding table config key survives the overlay.
+        assert_eq!(props.get("s3.region"), Some(&"us-west-2".to_string()));
+
+        config_mock.assert_async().await;
+        table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_table_vended_credentials_redacted_in_debug() {
+        // Redaction composition: the vended secrets flow into the `FileIO`'s `StorageConfig`,
+        // whose `Debug` redacts every secret-bearing key. A `{:?}` of the `FileIO` must never
+        // print a vended value, yet must keep the marker and the non-secret keys.
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let body = load_table_body(
+            json!({ "s3.region": "us-west-2" }),
+            Some(json!([{
+                "prefix": "s3://warehouse/database/table",
+                "config": {
+                    "s3.access-key-id": "VENDED_KEY_ID",
+                    "s3.secret-access-key": "VENDED_SECRET",
+                    "s3.session-token": "VENDED_TOKEN",
+                },
+            }])),
+        );
+
+        let table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let table = catalog
+            .load_table(&TableIdent::from_strs(vec!["ns1", "test1"]).unwrap())
+            .await
+            .expect("load_table with vended credentials");
+
+        let debug = format!("{:?}", table.file_io());
+        for secret in ["VENDED_KEY_ID", "VENDED_SECRET", "VENDED_TOKEN"] {
+            assert!(
+                !debug.contains(secret),
+                "Debug of FileIO leaked a vended credential value ({secret}): {debug}"
+            );
+        }
+        assert!(
+            debug.contains("***"),
+            "expected the redaction marker in Debug: {debug}"
+        );
+        assert!(
+            debug.contains("s3.region"),
+            "non-secret key must stay visible in Debug: {debug}"
+        );
+
+        config_mock.assert_async().await;
+        table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_table_no_prefix_match_skips_overlay() {
+        // The vended credential's prefix does NOT cover the table's storage path → silent skip
+        // (Java raises no error; the table still loads on the un-vended base props).
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let body = load_table_body(
+            json!({ "s3.access-key-id": "FROM_TABLE_CONFIG" }),
+            Some(json!([{
+                "prefix": "s3://some-other-warehouse/db/table",
+                "config": { "s3.secret-access-key": "VENDED_SECRET" },
+            }])),
+        );
+
+        let table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let table = catalog
+            .load_table(&TableIdent::from_strs(vec!["ns1", "test1"]).unwrap())
+            .await
+            .expect("load_table succeeds even when no credential prefix matches");
+
+        let props = table.file_io().config().props();
+        assert_eq!(
+            props.get("s3.access-key-id"),
+            Some(&"FROM_TABLE_CONFIG".to_string()),
+            "unmatched credential must not overlay"
+        );
+        assert!(
+            props.get("s3.secret-access-key").is_none(),
+            "unmatched credential's keys must not appear"
+        );
+
+        config_mock.assert_async().await;
+        table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_table_without_vended_credentials_regression() {
+        // Zero-credentials path: the common case must behave exactly as before — table config
+        // overlays the base props and no vended key is injected.
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let body = load_table_body(json!({ "s3.access-key-id": "FROM_TABLE_CONFIG" }), None);
+
+        let table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let table = catalog
+            .load_table(&TableIdent::from_strs(vec!["ns1", "test1"]).unwrap())
+            .await
+            .expect("load_table without storage-credentials");
+
+        let props = table.file_io().config().props();
+        assert_eq!(
+            props.get("s3.access-key-id"),
+            Some(&"FROM_TABLE_CONFIG".to_string()),
+            "table config must still overlay the base props"
+        );
+        assert!(
+            props.get("s3.secret-access-key").is_none(),
+            "no vended keys when the response omits storage-credentials"
+        );
+
+        config_mock.assert_async().await;
+        table_mock.assert_async().await;
     }
 
     #[tokio::test]
