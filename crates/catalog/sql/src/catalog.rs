@@ -212,7 +212,6 @@ impl CatalogBuilder for SqlCatalogBuilder {
 /// The options available for this parameter include:
 /// - `SqlBindStyle::DollarNumeric`: Binds SQL statements using `$1`, `$2`, etc., as placeholders. This is for PostgreSQL databases.
 /// - `SqlBindStyle::QuestionMark`: Binds SQL statements using `?` as a placeholder. This is for MySQL and SQLite databases.
-#[derive(Debug)]
 struct SqlCatalogConfig {
     uri: String,
     name: String,
@@ -221,7 +220,128 @@ struct SqlCatalogConfig {
     props: HashMap<String, String>,
 }
 
-#[derive(Debug)]
+/// Redact the password in a database DSN so it can be printed in a `Debug`/`tracing` view.
+///
+/// A JDBC/libpq-style DSN embeds credentials in the authority's userinfo —
+/// `postgres://user:PASSWORD@host:5432/db` — and the whole string is stored in
+/// [`SqlCatalogConfig::uri`]. This masks the DSN password with `***` before the string can reach a
+/// `Debug` sink, keeping the surrounding text visible for diagnostics.
+///
+/// # Mechanism (a provably sound coarse rule)
+///
+/// The leading `<scheme>://` is stripped ONLY when the bytes before the first `://`, from position
+/// 0, form a valid URI scheme `[A-Za-z][A-Za-z0-9+.-]*` (which by construction holds no `:`, `@`,
+/// or `/`); otherwise nothing is stripped. This anchoring is load-bearing: a bare `find("://")`
+/// would treat a `://` sitting INSIDE a password (`user:pass://x@host`) as a scheme separator, push
+/// the scan past the userinfo `:`, and return the DSN unmasked. Let `rest` be the remainder. If
+/// `rest` contains a `:` AND at least one `@` lies strictly after that FIRST `:`, replace the span
+/// from that first `:` (exclusive) through the LAST `@` in `rest` (exclusive) with `***`, yielding
+/// `<before-colon>:***@<after-last-@>`. Otherwise the input is returned unchanged — no `:`, or no
+/// `@` after it, means there is no userinfo password to mask.
+///
+/// # Soundness — no password byte can survive, for ANY input
+///
+/// The anchored scheme strip (above) guarantees `authority_start` is either 0 or the index just
+/// past a genuine leading scheme — it can never land in the middle of the userinfo, so `rest`
+/// always begins at or before the userinfo `:` (the premise the rest of this proof rests on).
+/// Given that, when a userinfo password exists it lies strictly between the first userinfo `:` and
+/// its boundary `@`. That boundary `@` is one of the `@`s in `rest`, so it is at or before the LAST
+/// `@`. The masked span `[first ':' , last '@']` therefore always covers the entire password —
+/// regardless of how malformed the DSN is, and regardless of extra `/`, `?`, `#`, `:`, `@`, or even
+/// `://` bytes inside the password. Under-redaction (a surviving password byte) is impossible whenever a
+/// password is present. Two earlier precise-parsing attempts each leaked one layer deeper —
+/// `p@x/y@host`, `SECRET1@junk/SECRET2@host` — because they tried to locate the *exact* boundary;
+/// this rule does not compute a boundary, so there is no boundary to get wrong.
+///
+/// # Over-redaction envelope (the price of soundness, paid honestly)
+///
+/// The cost is over-redaction on DSNs where a non-userinfo `:` (e.g. a host port) precedes a
+/// non-userinfo `@` (e.g. one inside a query or fragment): the mask span then swallows host/path
+/// bytes. Examples:
+///
+/// * `postgres://user:PWQ@host/db?param=a@b` → `postgres://user:***@b` (the query `@` is the last
+///   `@`, so `host/db?param=a` is masked along with the password).
+/// * `postgres://host:5432/db?x=a@b` → `postgres://host:***@b` (the port `:` reads as a password
+///   separator).
+///
+/// The guarantee is directional: masked-but-visible components may include NON-secrets, but a
+/// visible component never includes a secret. DSNs with no `:` before any `@`
+/// (`postgres://host/db?param=a@b`, `postgres://user@host/db`) and DSNs with no `@` after the
+/// first `:` (`host:5432/db`, `user@host:5432/db`) are left untouched.
+fn redact_dsn_password(uri: &str) -> String {
+    // Anchor the scheme strip: treat `://` as a scheme separator ONLY when the bytes before the
+    // first `://`, from position 0, form a valid URI scheme `[A-Za-z][A-Za-z0-9+.-]*`. A valid
+    // scheme token contains no `:`, `@`, or `/`, so this both anchors position 0 and rejects a
+    // `://` sitting INSIDE a password (`user:pass://x@host`) that a bare `find("://")` would treat
+    // as a scheme separator — shoving `authority_start` past the userinfo `:` and leaking the DSN.
+    // Any non-scheme prefix falls through to `authority_start = 0`.
+    let authority_start = match uri.find("://") {
+        Some(i)
+            if uri[..i].starts_with(|c: char| c.is_ascii_alphabetic())
+                && uri[..i]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')) =>
+        {
+            i + 3
+        }
+        _ => 0,
+    };
+    let rest = &uri[authority_start..];
+
+    // The password, if any, begins immediately after the FIRST ':' in the remainder.
+    let Some(colon_rel) = rest.find(':') else {
+        return uri.to_string();
+    };
+    // Its boundary '@' is at or before the LAST '@'. Require at least one '@' strictly after the
+    // first ':' — equivalently, that the last '@' is after that ':'. With none, there is no
+    // userinfo password to mask.
+    let Some(last_at_rel) = rest.rfind('@') else {
+        return uri.to_string();
+    };
+    if last_at_rel <= colon_rel {
+        return uri.to_string();
+    }
+
+    // Mask the whole span [first ':', last '@'] — sound coverage of any password (see fn doc).
+    let abs_colon = authority_start + colon_rel; // byte index of the first ':' in `uri`
+    let abs_last_at = authority_start + last_at_rel; // byte index of the last '@' in `uri`
+    let mut out = String::with_capacity(uri.len());
+    out.push_str(&uri[..=abs_colon]);
+    out.push_str("***");
+    out.push_str(&uri[abs_last_at..]);
+    out
+}
+
+impl std::fmt::Debug for SqlCatalogConfig {
+    /// Hand-written so the two secret-bearing fields cannot leak: the `uri` DSN can embed a
+    /// password in its userinfo (`postgres://user:pass@host`), and the raw `props` map may carry
+    /// storage credentials. The DSN password is masked by [`redact_dsn_password`] (scheme/host/db
+    /// stay visible); prop values are masked with the canonical needle test
+    /// `iceberg::io::is_secret_prop_key` (`crates/iceberg/src/io/storage/config/mod.rs`), the same
+    /// superset `StorageConfig` uses (#159), so the list cannot drift per catalog.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_props: HashMap<&str, &str> = self
+            .props
+            .iter()
+            .map(|(k, v)| {
+                if iceberg::io::is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("SqlCatalogConfig")
+            .field("uri", &redact_dsn_password(&self.uri))
+            .field("name", &self.name)
+            .field("warehouse_location", &self.warehouse_location)
+            .field("sql_bind_style", &self.sql_bind_style)
+            .field("props", &redacted_props)
+            .finish()
+    }
+}
+
 /// Sql catalog implementation.
 pub struct SqlCatalog {
     name: String,
@@ -230,6 +350,38 @@ pub struct SqlCatalog {
     fileio: FileIO,
     sql_bind_style: SqlBindStyle,
     properties: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for SqlCatalog {
+    /// Hand-written so the raw `properties` map cannot leak storage credentials (the same #159
+    /// class as the config types — a plain-derived `Debug` prints its secret VALUES in clear).
+    /// `connection`'s `Debug` renders only pool sizing options — sqlx keeps the DSN in a separate
+    /// `connect_options` field it does NOT print — and `fileio` is already redacted (#159), so
+    /// those two compose safely and are passed through. Prop values are masked with the canonical
+    /// needle test `iceberg::io::is_secret_prop_key`
+    /// (`crates/iceberg/src/io/storage/config/mod.rs`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_properties: HashMap<&str, &str> = self
+            .properties
+            .iter()
+            .map(|(k, v)| {
+                if iceberg::io::is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("SqlCatalog")
+            .field("name", &self.name)
+            .field("connection", &self.connection)
+            .field("warehouse_location", &self.warehouse_location)
+            .field("fileio", &self.fileio)
+            .field("sql_bind_style", &self.sql_bind_style)
+            .field("properties", &redacted_properties)
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq, strum::EnumString, strum::Display)]
@@ -761,7 +913,7 @@ impl Catalog for SqlCatalog {
             let tables = self.list_tables(namespace).await?;
             if !tables.is_empty() {
                 return Err(Error::new(
-                    iceberg::ErrorKind::Unexpected,
+                    iceberg::ErrorKind::NamespaceNotEmpty,
                     format!(
                         "Namespace {:?} is not empty. {} tables exist.",
                         namespace,
@@ -2244,6 +2396,40 @@ mod tests {
         catalog.drop_namespace(&namespace_ident).await.unwrap();
 
         assert!(!catalog.namespace_exists(&namespace_ident).await.unwrap())
+    }
+
+    /// Dropping a namespace that still contains a table must fail with the typed
+    /// `NamespaceNotEmpty` kind (mirrors Java `NamespaceNotEmptyException`), not the old
+    /// `Unexpected`. The message content is preserved so existing log/UX expectations hold, and the
+    /// namespace must remain (drop is refused, not partially applied).
+    #[tokio::test]
+    async fn test_drop_namespace_throws_error_if_namespace_not_empty() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
+        let namespace_ident = NamespaceIdent::new("abc".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        let table_ident = TableIdent::new(namespace_ident.clone(), "tbl".into());
+        create_table(&catalog, &table_ident).await;
+
+        let err = catalog
+            .drop_namespace(&namespace_ident)
+            .await
+            .expect_err("dropping a non-empty namespace must fail");
+
+        assert_eq!(
+            err.kind(),
+            iceberg::ErrorKind::NamespaceNotEmpty,
+            "a non-empty namespace drop must classify as NamespaceNotEmpty"
+        );
+        assert!(
+            err.message().contains("is not empty"),
+            "the not-empty message content must be preserved, got: {}",
+            err.message()
+        );
+        assert!(
+            catalog.namespace_exists(&namespace_ident).await.unwrap(),
+            "the refused drop must leave the namespace in place"
+        );
     }
 
     #[tokio::test]
@@ -3746,5 +3932,286 @@ mod tests {
         let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
         catalog.invalidate_table(&ident).await.unwrap();
         catalog.invalidate_view(&ident).await.unwrap();
+    }
+
+    const SECRET: &str = "SECRET_DO_NOT_LEAK";
+    /// A DSN password that must never appear in a `Debug` view.
+    const DSN_PASSWORD: &str = "hunter2_DO_NOT_LEAK";
+
+    /// CORPUS PIN for [`super::redact_dsn_password`]'s soundness contract: every password-leak
+    /// input surfaced across all three prior review cycles — unencoded `/`,`?`,`#` in the password,
+    /// a `p@ss`-style embedded `@`, multiple `@`s deeper in the userinfo (`SECRET1@junk/SECRET2`,
+    /// `a@b/c@d`), `%40`-encoding, multi-`:`, IPv6, a query-tail secret, and the cycle-3
+    /// `://`-INSIDE-the-password class (`user:pass://x@host`) that a bare `find("://")` mistook for
+    /// a scheme separator — is asserted to leave NO marker byte in the output. The coarse rule masks
+    /// `[first ':' , last '@']`, which provably covers any password once the scheme strip is anchored
+    /// (see the fn doc), so this table can only stay green while the sound rule is in place. Each row
+    /// also pins the exact masked output and proves the marker is genuinely present in the input (no
+    /// false-green from an absent marker).
+    #[test]
+    fn test_redact_dsn_password_leak_corpus_no_marker_survives() {
+        // (input, exact expected output, forbidden marker that must not survive)
+        const CORPUS: &[(&str, &str, &str)] = &[
+            // Unencoded '/','?','#' in the password (the original slice-off leak).
+            (
+                "postgres://user:pa/LEAK1@host/db",
+                "postgres://user:***@host/db",
+                "LEAK1",
+            ),
+            (
+                "postgres://user:pa?LEAK2@host/db",
+                "postgres://user:***@host/db",
+                "LEAK2",
+            ),
+            (
+                "postgres://user:pa#LEAK3@host/db",
+                "postgres://user:***@host/db",
+                "LEAK3",
+            ),
+            // Embedded '@' plus a delimiter (cycle-1 / cycle-2 boundary leaks).
+            (
+                "postgres://user:p@ss/LEAKX@host/db",
+                "postgres://user:***@host/db",
+                "LEAKX",
+            ),
+            (
+                "postgres://user:p@x/y@host/db",
+                "postgres://user:***@host/db",
+                "x/y",
+            ),
+            (
+                "postgres://user:p@x?y@host/db",
+                "postgres://user:***@host/db",
+                "x?y",
+            ),
+            (
+                "postgres://user:p@x#y@host/db",
+                "postgres://user:***@host/db",
+                "x#y",
+            ),
+            // Multiple '@'s with a delimiter between them — the cycle-2 acceptance-scan leaked the
+            // tail secret past the first "clean host" it accepted.
+            (
+                "postgres://user:SECRET1@junk/SECRET2@host/db",
+                "postgres://user:***@host/db",
+                "SECRET2",
+            ),
+            (
+                "postgres://user:a@b/c@d@host/db",
+                "postgres://user:***@host/db",
+                "b/c@d",
+            ),
+            (
+                "postgres://user:p@a?SECRET@host/db",
+                "postgres://user:***@host/db",
+                "SECRET",
+            ),
+            // Originals: ':'+'@' in password, '%40'-encoded '@', multi-':'.
+            (
+                "postgres://user:p@:ss@host/db",
+                "postgres://user:***@host/db",
+                "p@:ss",
+            ),
+            (
+                "postgres://user:p%40ss@host/db",
+                "postgres://user:***@host/db",
+                "p%40ss",
+            ),
+            (
+                "postgres://user:a:b:c@host/db",
+                "postgres://user:***@host/db",
+                "a:b:c",
+            ),
+            // IPv6 host: password masked, host/port preserved.
+            (
+                "postgres://user:SEKRET@[::1]:5432/db",
+                "postgres://user:***@[::1]:5432/db",
+                "SEKRET",
+            ),
+            // `://`-INSIDE-the-password class (cycle-3 residue). A bare `find("://")` locks onto the
+            // password's own `://`, jumps `authority_start` past the userinfo `:`, and returns the
+            // DSN UNMASKED. The anchored scheme strip rejects the non-scheme prefix, keeps
+            // `authority_start = 0`, and the coarse `[first ':' , last '@']` span masks the leak.
+            // Scheme-less DSN whose password embeds `://`.
+            ("user:pass://x@host", "user:***@host", "pass://x"),
+            // Scheme-less DSN with an embedded `@` AND a `://` after it (last '@' bounds the mask).
+            ("user:p@ss://host", "user:***@ss://host", "p@ss"),
+            // Multibyte scheme-less DSN with `://` in the password — mask must stay on char
+            // boundaries and still cover the secret.
+            ("usér:p+ø://x@höst", "usér:***@höst", "p+ø"),
+            // Schemeful CONTROL: a valid `postgres` scheme is stripped, and the password's OWN `://`
+            // is then masked by the coarse span. Already sound (masked under both the bare and the
+            // anchored strip) — pinned to prove the anchoring does not regress schemeful DSNs.
+            (
+                "postgres://user:pa://ss@host/db",
+                "postgres://user:***@host/db",
+                "pa://ss",
+            ),
+        ];
+
+        for &(input, expected, marker) in CORPUS {
+            assert!(
+                input.contains(marker),
+                "test bug: marker {marker:?} absent from input {input:?} (would be a false green)"
+            );
+            let out = super::redact_dsn_password(input);
+            assert_eq!(out, expected, "wrong mask for {input:?}");
+            assert!(
+                !out.contains(marker),
+                "password byte {marker:?} SURVIVED redaction of {input:?} -> {out:?}"
+            );
+            assert!(out.contains("***"), "no redaction marker for {input:?}");
+        }
+    }
+
+    /// UNCHANGED-CASES PIN: inputs with no `:`, or no `@` after the first `:`, carry no userinfo
+    /// password and must be returned byte-identical. Includes the CHECK case
+    /// `user@host:5432/db` (the first ':' is the PORT, after the '@', so there is no '@' after it),
+    /// bare hosts, sqlite paths, an IPv6 hostport, a bare-host query '@' (no ':' before it), and
+    /// the empty string.
+    #[test]
+    fn test_redact_dsn_password_unchanged_cases() {
+        const UNCHANGED: &[&str] = &[
+            "postgres://host:5432/db",
+            "host:5432/db",
+            "postgres://user@host/db",
+            "postgres://user@host:5432/db", // first ':' is the port, AFTER the '@' -> unchanged
+            "postgres://host/db?param=a@b", // no ':' before the query '@'
+            "postgres://[::1]:5432/db",
+            "sqlite::memory:",
+            "sqlite:/tmp/catalog.db",
+            "sqlite://file.db", // valid scheme stripped, `rest` = "file.db" has no ':' -> unchanged
+            "",
+        ];
+
+        for &input in UNCHANGED {
+            assert_eq!(
+                super::redact_dsn_password(input),
+                input,
+                "input with no userinfo password must be unchanged: {input:?}"
+            );
+        }
+    }
+
+    /// EXACT PER-CASE PINS: the canonical masked shapes, including the two deliberate
+    /// OVER-REDACTION cases the sound coarse rule now produces (documented in the fn's
+    /// over-redaction envelope). Over-redaction is safe by construction — masked-but-visible
+    /// bytes may be non-secrets, but no secret is ever left visible.
+    #[test]
+    fn test_redact_dsn_password_exact_shapes() {
+        // Well-formed DSNs: password masked, everything else visible.
+        assert_eq!(
+            super::redact_dsn_password("postgres://user:pass@host:5432/db"),
+            "postgres://user:***@host:5432/db"
+        );
+        // No scheme separator: the whole prefix is treated as the remainder.
+        assert_eq!(
+            super::redact_dsn_password("user:pass@host/db"),
+            "user:***@host/db"
+        );
+        // Empty password (userinfo ends at ':') still masks to the marker.
+        assert_eq!(
+            super::redact_dsn_password("postgres://user:@host/db"),
+            "postgres://user:***@host/db"
+        );
+
+        // --- Deliberate over-redaction (see fn doc "Over-redaction envelope"). ---
+        // (f) query case: the query '@' is the LAST '@', so host/path is swallowed into the mask.
+        // CHANGED from the prior precise-parser expectation `...@host/db?param=a@b` — this is the
+        // safe direction: `host/db?param=a` is a NON-secret masked, nothing leaks.
+        assert_eq!(
+            super::redact_dsn_password("postgres://user:PWQ@host/db?param=a@b"),
+            "postgres://user:***@b"
+        );
+        // Bare host with a port ':' and a later query '@': the port reads as a password separator.
+        assert_eq!(
+            super::redact_dsn_password("postgres://host:5432/db?x=a@b"),
+            "postgres://host:***@b"
+        );
+        // A colon anywhere before a later '@' over-redacts (acceptable): host/path masked, no leak.
+        assert_eq!(
+            super::redact_dsn_password("postgres://host/db?p=a:b@c"),
+            "postgres://host/db?p=a:***@c"
+        );
+    }
+
+    /// Risk (#159 unit-D residue): `SqlCatalogConfig` holds BOTH a DSN that can embed a password
+    /// (`postgres://user:pass@host`) and a raw prop map that may carry storage credentials, so a
+    /// plain-derived `Debug` prints both in clear. Pins that the DSN password AND secret prop
+    /// values are redacted while the diagnostic parts (user/host/db, prop keys, non-secret values)
+    /// stay visible. Mutation: revert the manual `Debug` to `#[derive(Debug)]` → the raw DSN
+    /// password and the raw secret prop value both print → RED.
+    #[test]
+    fn test_config_debug_redacts_dsn_password_and_secret_props() {
+        let config = super::SqlCatalogConfig {
+            uri: format!("postgres://admin:{DSN_PASSWORD}@db.example.com:5432/warehouse"),
+            name: "sql_cat".to_string(),
+            warehouse_location: "s3://example-bucket/wh".to_string(),
+            sql_bind_style: SqlBindStyle::DollarNumeric,
+            props: HashMap::from([
+                ("s3.secret-access-key".to_string(), SECRET.to_string()),
+                ("s3.region".to_string(), "us-east-1".to_string()),
+            ]),
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(DSN_PASSWORD),
+            "SqlCatalogConfig Debug leaked the DSN password: {debug}"
+        );
+        assert!(
+            !debug.contains(SECRET),
+            "SqlCatalogConfig Debug leaked a secret prop value: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        // The DSN's diagnostic parts stay visible.
+        assert!(
+            debug.contains("admin") && debug.contains("db.example.com"),
+            "DSN user/host must stay visible: {debug}"
+        );
+        // Secret prop key visible, non-secret value visible.
+        assert!(
+            debug.contains("s3.secret-access-key") && debug.contains("us-east-1"),
+            "prop key / non-secret value dropped: {debug}"
+        );
+    }
+
+    /// Risk (#159 unit-D residue, composition): `SqlCatalog` holds the raw `properties` map, so its
+    /// `Debug` must redact secret values one level up (the `connection` pool prints only sizing
+    /// options — sqlx keeps the DSN in an unrendered field — and `fileio` is already redacted).
+    /// Builds a real SQLite-backed catalog carrying a secret prop and pins that a `{:?}` of the
+    /// whole catalog does not leak it. Mutation: revert `SqlCatalog`'s manual `Debug` to
+    /// `#[derive(Debug)]` → the raw prop value prints → RED.
+    #[tokio::test]
+    async fn test_catalog_debug_redacts_secret_prop_values() {
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+
+        let props = HashMap::from([
+            (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+            (
+                SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+                "s3://example-bucket/wh".to_string(),
+            ),
+            ("s3.secret-access-key".to_string(), SECRET.to_string()),
+        ]);
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load("sql_cat", props)
+            .await
+            .expect("build SQLite-backed SqlCatalog");
+
+        let debug = format!("{catalog:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "SqlCatalog Debug leaked a secret prop value: {debug}"
+        );
+        assert!(
+            debug.contains("s3.secret-access-key"),
+            "secret prop key dropped: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
     }
 }

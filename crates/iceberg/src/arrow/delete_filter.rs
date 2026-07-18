@@ -139,10 +139,14 @@ impl DeleteFilter {
         &self,
         data_file_path: &str,
     ) -> Option<Arc<Mutex<DeleteVector>>> {
-        self.state
-            .read()
-            .ok()
-            .and_then(|st| st.delete_vectors.get(data_file_path).cloned())
+        // Recover a poisoned lock instead of `.read().ok()` swallowing the poison as `None`: a
+        // `None` here is read by the reader/`apply` as "no positional deletes for this data file",
+        // so a poison-induced `None` would silently DROP positional deletes and resurrect deleted
+        // rows. Match every other lock site in this file (the `recover_poison` policy).
+        recover_poison(self.state.read())
+            .delete_vectors
+            .get(data_file_path)
+            .cloned()
     }
 
     pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Arc<Notify>> {
@@ -1093,6 +1097,47 @@ pub(crate) mod tests {
                 PosDelLoadAction::Load
             ),
             "a fresh positional-delete load must proceed on the recovered lock"
+        );
+    }
+
+    /// Risk pinned (G1a fail-open): a poisoned `state` lock must NOT make
+    /// `get_delete_vector_for_path` return `None` for a present data file. A `None` is read by the
+    /// reader / `apply` as "no positional deletes here", so a poison-induced `None` would silently
+    /// DROP the file's positional deletes and RESURRECT deleted rows. The reader must recover the
+    /// poison (`into_inner`) and still hand back the delete vector.
+    /// MUTATION: reverting the accessor to `self.state.read().ok().and_then(...)` swallows the
+    /// poison as `None` and this test FAILS (the `expect` below trips) — RED.
+    #[test]
+    fn test_get_delete_vector_survives_poisoned_lock() {
+        let mut filter = DeleteFilter::default();
+
+        // Populate a delete vector for a data file so a correct read returns `Some`.
+        let mut dv = DeleteVector::default();
+        dv.insert(7);
+        filter.upsert_delete_vector("data.parquet".to_string(), dv);
+
+        // Poison the shared state RwLock by panicking while holding the write guard.
+        let poisoner = filter.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner
+                .state
+                .write()
+                .expect("acquire write guard to poison");
+            panic!("intentionally poison the delete-filter state lock");
+        });
+        assert!(
+            handle.join().is_err(),
+            "the poisoning thread must have panicked while holding the guard"
+        );
+
+        // The accessor must RECOVER the poison and still return the present delete vector — not
+        // swallow the poison as `None` (which would resurrect deleted row 7).
+        let dv = filter
+            .get_delete_vector_for_path("data.parquet")
+            .expect("a present delete vector must survive a poisoned state lock, not read as None");
+        assert!(
+            recover_poison(dv.lock()).contains(7),
+            "the recovered delete vector must still carry its deleted positions"
         );
     }
 

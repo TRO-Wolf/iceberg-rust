@@ -53,6 +53,14 @@ pub enum ErrorKind {
     /// Iceberg namespace does not exist.
     NamespaceNotFound,
 
+    /// Iceberg namespace is not empty and cannot be dropped.
+    ///
+    /// Returned when a drop is attempted on a namespace that still contains tables (or other
+    /// child namespaces). Mirrors Java `org.apache.iceberg.exceptions.NamespaceNotEmptyException`
+    /// (iceberg-api 1.10.0), which `HiveCatalog.dropNamespace` throws on the Hive
+    /// `InvalidOperationException` raised by a non-cascading `dropDatabase`.
+    NamespaceNotEmpty,
+
     /// Iceberg table does not exist.
     TableNotFound,
 
@@ -111,6 +119,7 @@ impl From<ErrorKind> for &'static str {
             ErrorKind::ViewNotFound => "ViewNotFound",
             ErrorKind::NamespaceAlreadyExists => "NamespaceAlreadyExists",
             ErrorKind::NamespaceNotFound => "NamespaceNotFound",
+            ErrorKind::NamespaceNotEmpty => "NamespaceNotEmpty",
             ErrorKind::PreconditionFailed => "PreconditionFailed",
             ErrorKind::CatalogCommitConflicts => "CatalogCommitConflicts",
             ErrorKind::CommitStateUnknown => "CommitStateUnknown",
@@ -585,6 +594,23 @@ Source: networking error
                 .contains("connection reset by peer mid-response"),
             "source chain must carry the original transport failure, got: {source}"
         );
+    }
+
+    /// The additive `NamespaceNotEmpty` kind renders its own name through `into_static` and
+    /// `Display` (mirrors Java `NamespaceNotEmptyException`; consumed by the SQL/HMS drop-namespace
+    /// mappers). A missing/aliased Display arm would surface the wrong kind name to callers.
+    #[test]
+    fn test_namespace_not_empty_kind_renders_its_name() {
+        assert_eq!(
+            ErrorKind::NamespaceNotEmpty.into_static(),
+            "NamespaceNotEmpty"
+        );
+        assert_eq!(
+            format!("{}", ErrorKind::NamespaceNotEmpty),
+            "NamespaceNotEmpty"
+        );
+        let err = Error::new(ErrorKind::NamespaceNotEmpty, "ns still has tables");
+        assert_eq!(err.kind(), ErrorKind::NamespaceNotEmpty);
     }
 
     /// Backtrace contains build information, so we just assert the header of error content.

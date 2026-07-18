@@ -43,7 +43,6 @@ pub const S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN: &str = "table_bucket_arn";
 pub const S3TABLES_CATALOG_PROP_ENDPOINT_URL: &str = "endpoint_url";
 
 /// S3Tables catalog configuration.
-#[derive(Debug)]
 struct S3TablesCatalogConfig {
     /// Catalog name.
     name: Option<String>,
@@ -63,6 +62,37 @@ struct S3TablesCatalogConfig {
     /// - `aws_secret_access_key`: The AWS secret access key to use.
     /// - `aws_session_token`: The AWS session token to use.
     props: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for S3TablesCatalogConfig {
+    /// Hand-written so secret-bearing entries in the raw `props` map — the AWS
+    /// `aws_secret_access_key` / `aws_session_token` credentials flow through here into the
+    /// `FileIO` this config backs — are redacted to `"***"` instead of printed in clear. Keys stay
+    /// visible for diagnostics; the pre-built SDK `client` is rendered as a presence flag only.
+    /// Redaction uses the canonical needle test `iceberg::io::is_secret_prop_key`
+    /// (`crates/iceberg/src/io/storage/config/mod.rs`), the same superset `StorageConfig` uses
+    /// (#159), so the list cannot drift per catalog.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_props: HashMap<&str, &str> = self
+            .props
+            .iter()
+            .map(|(k, v)| {
+                if iceberg::io::is_secret_prop_key(k) {
+                    (k.as_str(), "***")
+                } else {
+                    (k.as_str(), v.as_str())
+                }
+            })
+            .collect();
+
+        f.debug_struct("S3TablesCatalogConfig")
+            .field("name", &self.name)
+            .field("table_bucket_arn", &self.table_bucket_arn)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("client_configured", &self.client.is_some())
+            .field("props", &redacted_props)
+            .finish()
+    }
 }
 
 /// Builder for [`S3TablesCatalog`].
@@ -883,6 +913,71 @@ mod tests {
             classify_commit_send_disposition(&TestSdkError::service_error((), ())),
             CommitSendDisposition::ResponseReceived
         ));
+    }
+
+    const SECRET: &str = "SECRET_DO_NOT_LEAK";
+
+    fn config_with_secret_props() -> S3TablesCatalogConfig {
+        S3TablesCatalogConfig {
+            name: Some("s3t_cat".to_string()),
+            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
+            endpoint_url: None,
+            client: None,
+            props: HashMap::from([
+                ("aws_secret_access_key".to_string(), SECRET.to_string()),
+                ("aws_session_token".to_string(), SECRET.to_string()),
+                ("region_name".to_string(), "us-east-1".to_string()),
+            ]),
+        }
+    }
+
+    /// Risk (#159 unit-D residue): `S3TablesCatalogConfig` holds the raw prop map — the AWS
+    /// `aws_secret_access_key` / `aws_session_token` credentials flow through it into `FileIO` —
+    /// so a plain-derived `Debug` prints live credentials. Pins that secret VALUES redact to
+    /// `"***"` while KEYS and non-secret values stay visible. Mutation: revert the manual `Debug`
+    /// to `#[derive(Debug)]` → RED.
+    #[test]
+    fn test_config_debug_redacts_secret_prop_values() {
+        let config = config_with_secret_props();
+
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "S3TablesCatalogConfig Debug leaked a secret value: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        for key in ["aws_secret_access_key", "aws_session_token"] {
+            assert!(debug.contains(key), "secret key `{key}` dropped: {debug}");
+        }
+        assert!(
+            debug.contains("us-east-1") && debug.contains("s3t_cat"),
+            "non-secret fields must stay visible: {debug}"
+        );
+    }
+
+    /// Risk (#159 unit-D residue, composition): `S3TablesCatalog` derives `Debug`, which renders
+    /// the `config` field through `S3TablesCatalogConfig`'s `Debug`, so the redaction must survive
+    /// one level up. Builds the catalog offline (SDK config resolution is lazy — the same path the
+    /// Glue offline tests exercise) and pins that a `{:?}` of the whole catalog does not leak a
+    /// credential. Mutation: revert the config `Debug` to derived → RED.
+    #[tokio::test]
+    async fn test_catalog_debug_redacts_secret_prop_values() {
+        let catalog = S3TablesCatalog::new(config_with_secret_props(), None)
+            .await
+            .expect("build S3TablesCatalog offline");
+
+        let debug = format!("{catalog:?}");
+
+        assert!(
+            !debug.contains(SECRET),
+            "S3TablesCatalog Debug leaked a secret value: {debug}"
+        );
+        assert!(
+            debug.contains("aws_secret_access_key"),
+            "key dropped: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
     }
 
     async fn load_s3tables_catalog_from_env() -> Result<Option<S3TablesCatalog>> {

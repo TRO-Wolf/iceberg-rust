@@ -39,6 +39,52 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## FOLLOW-UPS BUNDLE (2026-07-18, signed off) — audit follow-up ledger, 5 groups, OO-High AC, ONE branch
+
+Branch `fix/audit-followups-bundle` (Mode B; user-directed: Opus-high Actor/Critic per group, Fable
+closing Critic). Closes the overnight block's follow-up ledger. All groups converged:
+
+- [x] **G1 residue closure** (`ae5d4385`, 1 cycle): `get_delete_vector_for_path` poison fail-open →
+      `recover_poison` (resurrection class closed; lock-site sweep — `apply`'s fail-CLOSED mutex
+      justified-not-converted); exhaustive op-class partition guard test (E0004 compile-break
+      proven); R160 cell-text corrections. Critic: CONVERGED, 3 LOW.
+- [x] **G2 `ErrorKind::NamespaceNotEmpty`** (`5a7e5790`, 1 cycle): additive core variant (public-API
+      addition flagged); SQL not-empty drop flipped; HMS `drop_database` O2 arm FLIPPED on the
+      Actor's bytecode adjudication (`cascade=false` ⇒ Java maps `InvalidOperationException`
+      unconditionally to `NamespaceNotEmptyException`, offsets 41-60 — Critic third-decoded,
+      upheld). Critic: CONVERGED, 1 LOW (prose).
+- [x] **G3 config Debug sweep + Glue flip** (`775e2c24` + c2 `61948eff` + c3 `db26147a` + c4
+      `6ec5a765`, **4 cycles**): four catalog configs redacted-Debug via pub-promoted
+      `is_secret_prop_key` (public-API addition); SqlCatalog raw-props leak found+fixed (Actor
+      deviation, upheld); G3b Glue not-empty flip. **The DSN redactor took 3 refutations** —
+      c1 truncate-order leak (`/?#`-in-password), c2 acceptance-scan leak one layer deeper
+      (`p@x/y@host`), c3 sound span rule but unanchored scheme-strip leak (`user:p@ss://host`),
+      c4 anchored `[A-Za-z][A-Za-z0-9+.-]*` strip ruled AIRTIGHT (27-probe attack, zero leaks).
+      Lesson promoted: security-sensitive string handling starts from the coarse PROVABLE rule.
+      Cumulative Critic: CONVERGED.
+- [x] **G4 vended storage credentials, R160 ❌→🟡** (`3acf671e` + c2 `20c36b23`, 2 cycles):
+      longest-prefix/vended-wins/silent-no-match decoded from `S3FileIO` bytecode and wired into
+      `load_file_io`; c1 Critic MEDIUM = honesty (per-accessed-path vs once-at-metadata_location
+      granularity collapse unnamed in the cell) → c2 named it (cell + call-site comment + both
+      divergence cases). Cumulative Critic: CONVERGED.
+- [x] **G5 OAuth2 auto-refresh, R159 ❌→🟡** (`4a00ae94`, 1 cycle): lazy single-flight
+      refresh-before-use reproducing Java `scheduleTokenRefresh` math byte-exactly
+      (`min(ttl/10, 5min)` window, 10ms floor); missing-`expires_in` ⇒ never refresh (Java-exact —
+      the 3600s default is token-prop-only, Critic-verified); refresh failure keeps old token;
+      disabled = legacy verbatim. 8-concurrent→1-hit single-flight pin. Two grant divergences
+      disclosed (client_credentials vs token-exchange; config-token clients not refreshed —
+      Critic F1: disclosure broader than "no credential", rewording queued). Critic: CONVERGED,
+      2 LOW.
+- [x] **Closing pass: Fable bundle Critic** over the full branch — **CONVERGED** 2026-07-18,
+      zero MEDIUM+. Full-workspace clippy (protoc present) + all six lib suites green (iceberg
+      2831 · sql 80 · hms 43 · glue 30 · s3tables 28 · rest 82); cross-group seams verified
+      (G2→G3 variant dependency ordered; G4×G5 rest-crate hunks disjoint; novel probe: vended
+      creds × token refresh compose in one mockito session, endpoint hit exactly 2×); public-API
+      ledger = exactly the two flagged additions; matrix/tracker ruled truthful; 3 cross-group
+      mutations re-run RED + md5-identical restores. 4 LOW (rest-crate local needle list
+      pre-existing/not unified; G5's expect nit + DEVIATIONS rewording queued; G1 residue
+      descriptions live in its Critic report → pasted into the PR body). Pushed after flip.
+
 ## OVERNIGHT BLOCK (2026-07-17, signed off) — audit-2026-07-17 remediation, 5 units, mixed FF/OO-max
 
 Source: `~/Desktop/repo-audit-iceberg-rust-2026-07-17.md` (5-agent external audit, 74 facets/~34 roots),
