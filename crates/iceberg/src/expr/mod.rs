@@ -202,4 +202,73 @@ mod tests {
         assert!(PredicateOperator::In.is_set());
         assert!(PredicateOperator::NotIn.is_set());
     }
+
+    /// Guard: `is_unary`/`is_binary`/`is_set` are discriminant RANGE checks over the
+    /// `#[repr(u16)]` operator bands (unary `1xx` / binary `2xx` / set `3xx`). They are
+    /// load-bearing for wire-input arity rejection (the serde arity guards), so EVERY operator
+    /// must land in EXACTLY ONE class — a value belonging to zero or two bands would let a
+    /// malformed predicate slip past arity validation.
+    ///
+    /// The `match op` below is EXHAUSTIVE with NO wildcard arm on purpose: a future
+    /// `PredicateOperator` variant fails to compile here until its author declares which class it
+    /// belongs to, rather than silently defaulting to "unclassified" (which the range checks would
+    /// then answer inconsistently). That compile break is the guard, not an inconvenience.
+    #[test]
+    fn test_operator_class_is_an_exact_partition() {
+        use PredicateOperator::*;
+
+        #[derive(Debug, PartialEq)]
+        enum Class {
+            Unary,
+            Binary,
+            Set,
+        }
+
+        // Exhaustive iteration set. Kept in sync with the enum by the exhaustive `match op` below:
+        // a new variant makes that match non-exhaustive → this test stops compiling.
+        let all = [
+            IsNull,
+            NotNull,
+            IsNan,
+            NotNan,
+            LessThan,
+            LessThanOrEq,
+            GreaterThan,
+            GreaterThanOrEq,
+            Eq,
+            NotEq,
+            StartsWith,
+            NotStartsWith,
+            In,
+            NotIn,
+        ];
+
+        for op in all {
+            // No `_` arm: a new variant must break compilation until it is classified here.
+            let declared = match op {
+                IsNull | NotNull | IsNan | NotNan => Class::Unary,
+                LessThan | LessThanOrEq | GreaterThan | GreaterThanOrEq | Eq | NotEq
+                | StartsWith | NotStartsWith => Class::Binary,
+                In | NotIn => Class::Set,
+            };
+
+            let flags = [op.is_unary(), op.is_binary(), op.is_set()];
+            assert_eq!(
+                flags.iter().filter(|f| **f).count(),
+                1,
+                "{op:?} must belong to exactly one class, got (unary, binary, set) = {flags:?}"
+            );
+
+            let computed = match flags {
+                [true, false, false] => Class::Unary,
+                [false, true, false] => Class::Binary,
+                [false, false, true] => Class::Set,
+                _ => unreachable!("exactly-one class asserted above"),
+            };
+            assert_eq!(
+                computed, declared,
+                "{op:?} discriminant band disagrees with its declared class"
+            );
+        }
+    }
 }
