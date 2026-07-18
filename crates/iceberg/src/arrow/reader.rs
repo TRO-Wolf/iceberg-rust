@@ -53,7 +53,7 @@ use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::record_batch_predicate::{
-    evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask,
+    evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask, null_filled,
 };
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
@@ -989,14 +989,15 @@ impl ArrowReader {
             None => None,
         };
 
-        // Helper: a keep-mask from a bound predicate (true ⇒ row survives; NULL coerced to false).
+        // Helper: a keep-mask from a bound predicate (true ⇒ row survives). The mask is already
+        // two-valued under Java nulls-first semantics; the coercion is defense in depth.
         let predicate_keep = |predicate: &BoundPredicate| -> Result<BooleanArray> {
             Ok(coerce_nulls_to_false(&evaluate_predicate_to_mask(
                 predicate, batch,
             )?))
         };
 
-        // Scan residual (`task.predicate`) → always via the predicate path (NULL coerced to false).
+        // Scan residual (`task.predicate`) → always via the predicate path.
         let residual_mask: Option<BooleanArray> = match residual_predicate {
             Some(predicate) => Some(predicate_keep(predicate)?),
             None => None,
@@ -1976,8 +1977,10 @@ impl PredicateConverter<'_> {
 }
 
 /// Coerce a three-valued [`BooleanArray`] keep-mask to a two-valued one where every NULL becomes
-/// `false` (drop the row). The Avro delete-application path treats a row the survival predicate does
-/// not prove TRUE as deleted, matching the Parquet `RowFilter` (which never keeps a null result).
+/// `false` (drop the row), matching the Parquet `RowFilter` (which never keeps a null result).
+/// Defense in depth: [`evaluate_predicate_to_mask`] now resolves NULL cells to their Java
+/// nulls-first verdicts and returns a TWO-valued mask (see `record_batch_predicate`'s module
+/// docs), so this is a no-op on its output — it only guards future 3VL leaks.
 fn coerce_nulls_to_false(mask: &BooleanArray) -> BooleanArray {
     if mask.null_count() == 0 {
         return mask.clone();
@@ -2126,10 +2129,13 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
-                lt(&left, literal.as_ref())
+                // NULL cell ⇒ TRUE (row KEPT): Java's nulls-first comparator yields
+                // compare(null, lit) == -1, and `Evaluator$EvalVisitor.lt` is `< 0` (`ifge 36`
+                // at offset 29). A 3VL-null mask slot would make the `RowFilter` DROP the row.
+                Ok(null_filled(lt(&left, literal.as_ref())?, true))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ TRUE (nulls-first: null < lit).
             self.build_always_true()
         }
     }
@@ -2146,10 +2152,12 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
-                lt_eq(&left, literal.as_ref())
+                // NULL cell ⇒ TRUE: Java `ltEq` is `<= 0` (`ifgt 36`) over compare(null, lit)
+                // == -1.
+                Ok(null_filled(lt_eq(&left, literal.as_ref())?, true))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ TRUE (nulls-first: null <= lit).
             self.build_always_true()
         }
     }
@@ -2166,10 +2174,13 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
-                gt(&left, literal.as_ref())
+                // NULL cell ⇒ FALSE (Java `gt` is `> 0`, branch at offset 29) — same verdict
+                // the RowFilter's null-drop produced, made explicit so `not`/`and`/`or`
+                // composition stays plain boolean (Java's).
+                Ok(null_filled(gt(&left, literal.as_ref())?, false))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ FALSE (nulls-first: null > lit is false).
             self.build_always_false()
         }
     }
@@ -2186,10 +2197,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
-                gt_eq(&left, literal.as_ref())
+                // NULL cell ⇒ FALSE (Java `gtEq` is `>= 0`, `iflt 36`).
+                Ok(null_filled(gt_eq(&left, literal.as_ref())?, false))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ FALSE (nulls-first: null >= lit is false).
             self.build_always_false()
         }
     }
@@ -2206,10 +2218,12 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
-                eq(&left, literal.as_ref())
+                // NULL cell ⇒ FALSE (Java `eq` is `== 0`, `ifne 36`; compare(null, lit) == -1).
+                Ok(null_filled(eq(&left, literal.as_ref())?, false))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ FALSE (null == lit is false under
+            // nulls-first).
             self.build_always_false()
         }
     }
@@ -2226,11 +2240,15 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
-                neq(&left, literal.as_ref())
+                // NULL cell ⇒ TRUE (row KEPT): Java `notEq` = !eq. Pre-fix the kernel's 3VL
+                // null made the `RowFilter` DROP every NULL cell under `!=` (audit BUG-003).
+                Ok(null_filled(neq(&left, literal.as_ref())?, true))
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            // A missing column is a NULL column ⇒ TRUE: Java `notEq(null, lit)` is true. The
+            // pre-fix `build_always_false()` made a schema-evolved file return ZERO rows under
+            // `!=` (audit BUG-002).
+            self.build_always_true()
         }
     }
 
@@ -2246,10 +2264,12 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             Ok(Box::new(move |batch| {
                 let left = project_column(&batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
-                starts_with(&left, literal.as_ref())
+                // NULL cell ⇒ FALSE: Java `startsWith` null-guards to false (`ifnull 38`,
+                // offsets 11-12).
+                Ok(null_filled(starts_with(&left, literal.as_ref())?, false))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ FALSE (Java's explicit null guard).
             self.build_always_false()
         }
     }
@@ -2267,10 +2287,16 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 let left = project_column(&batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 // update here if arrow ever adds a native not_starts_with
-                not(&starts_with(&left, literal.as_ref())?)
+                // NULL cell ⇒ TRUE (row KEPT): Java `notStartsWith` = !startsWith(null) =
+                // !false.
+                Ok(null_filled(
+                    not(&starts_with(&left, literal.as_ref())?)?,
+                    true,
+                ))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ TRUE (`notStartsWith` negates the null
+            // guard's false).
             self.build_always_true()
         }
     }
@@ -2297,10 +2323,12 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                     acc = or(&acc, &eq(&left, literal.as_ref())?)?
                 }
 
-                Ok(acc)
+                // NULL cell ⇒ FALSE: Java `in` = `literalSet.contains(null)` = false for
+                // both set impls (see `record_batch_predicate`'s module docs).
+                Ok(null_filled(acc, false))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ FALSE (`contains(null)` is false).
             self.build_always_false()
         }
     }
@@ -2326,10 +2354,12 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                     acc = and(&acc, &neq(&left, literal.as_ref())?)?
                 }
 
-                Ok(acc)
+                // NULL cell ⇒ TRUE (row KEPT): Java `notIn` = !in = !contains(null) = true.
+                // Pre-fix the accumulated 3VL null made the `RowFilter` DROP NULL cells.
+                Ok(null_filled(acc, true))
             }))
         } else {
-            // A missing column, treating it as null.
+            // A missing column is a NULL column ⇒ TRUE (`notIn` negates contains(null)).
             self.build_always_true()
         }
     }

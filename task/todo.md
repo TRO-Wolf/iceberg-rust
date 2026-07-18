@@ -71,12 +71,27 @@ at SQM); B–E record themselves in PR bodies + the morning memory append.
       (typos/fmt/clippy×2/lib 2789/DF 53+88/artifacts); DF doc-test FAIL = the known pre-existing
       `-p` rt-multi-thread artifact (2026-07-10 A3 note). Charter file reworded minimally to pass
       the typos gate (SHA lengthened, two hyphenated words joined) — disclosed deviation.*
-- [ ] **A2 (FF): null-semantics family BUG-002/003/011** — same branch, stacked. Port Java
+- [x] **A2 (FF): null-semantics family BUG-002/003/011** — same branch, stacked. Port Java
       nulls-first total-order (bytecode truth table: null<lit=T, null<=lit=T, null!=lit=T,
       null==lit=F, null>lit=F) consistently across `reader.rs` PredicateConverter,
       `record_batch_predicate.rs`, and `expr/visitors/expression_evaluator.rs` (null partition
       `<`/`<=` currently over-prunes). Missing-col `not_eq` → true. Pin matrix = every op ×
       {null cell, missing col, null partition}.
+      *Done 2026-07-17 (Fable Actor): self-decoded the full oracle (NullsFirst compare(null,x)
+      = -1 at offsets 19-20; in→false via HashSet + CharSequenceSet instanceof-guard;
+      startsWith ifnull 38 → false; partition oracle CONFIRMED = ManifestReader.evaluator()
+      applying EvalVisitor to file().partition()). Design: EVERY leaf mask two-valued via new
+      shared `null_filled(mask, verdict)` (`record_batch_predicate.rs`) — the Java-null=FALSE
+      ops too, because bind() PRESERVES `Predicate::Not` and `NOT(eq)` over a 3VL eq mask
+      would drop where Java says TRUE (composition pin proves it). Fixed: reader missing-col
+      `not_eq` false→true (BUG-002) + all 8 present-column closures null-filled (BUG-003);
+      record-batch `not_eq` verdict + in/not_in fills; partition `<`/`<=` None→true (BUG-011).
+      Eq-delete consequence (Java StructLikeSet-correct): a NULL key cell now SURVIVES value
+      deletes — 2 delete_filter pins updated to the Java verdict, equality_delete_set bail-doc
+      rewritten (fast path stays conservative). Pins: 22-case mask truth table + NOT-composition
+      + buffer-under-null-slot; full-path scan `!=`/`<`/`<=` (null row + schema-evolved file);
+      13-case null-partition sweep; DF e2e 3VL-refilter documentation pin. 11 mutations each
+      independently RED, restores byte-verified (md5). Lib 2789→2795, DF suite 54.*
 - [ ] **A-final: bundle Critic (Opus max)** over the stacked branch; then push + PR body.
 - [ ] **B (OO max): MoR eq-delete panic/hang** — branch `fix/audit-mor-eqdel-panic-hang`.
       `equality_ids.unwrap()` (`caching_delete_file_loader.rs:298`) → DataInvalid; oneshot

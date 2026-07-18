@@ -4245,6 +4245,71 @@ pub mod tests {
         }
     }
 
+    /// Full-path pins for the null-semantics family (audit BUG-002/BUG-003): `TableScan::
+    /// to_arrow` under Java's nulls-first total order over the A1 fixture — `1.parquet` has
+    /// `dbl_nan = [NaN, 100.5, NULL, -7.25]` at `x = [1, 2, 3, 4]`; `2.parquet` (`x = [100,
+    /// 200]`) was written BEFORE `dbl_nan` existed (the column is ABSENT — a NULL column).
+    ///
+    ///   * `!=` KEEPS the NULL cell (x = 3) and the whole schema-evolved file (x = 100/200) —
+    ///     the BUG-003 and BUG-002 headlines: pre-fix the RowFilter dropped the NULL row and
+    ///     the missing-column arm compiled to always-false (ZERO rows from `2.parquet`);
+    ///   * `<` / `<=` KEEP the NULL cell and the schema-evolved file (compare(null, lit) == -1
+    ///     under `Comparators.nullsFirst()`); the NaN row (x = 1) is excluded by BOTH engines
+    ///     (Java `Double.compare(NaN, lit) == +1`, arrow `lt(NaN, lit) == false`).
+    #[tokio::test]
+    async fn test_filter_on_arrow_nulls_first_neq_lt_lteq_full_path() {
+        let mut fixture = TableTestFixture::new_nan_floats();
+        fixture.setup_nan_manifest_files().await;
+
+        let cases: Vec<(Predicate, Vec<i64>)> = vec![
+            (
+                Reference::new("dbl_nan").not_equal_to(Datum::double(100.5)),
+                vec![1, 3, 4, 100, 200],
+            ),
+            (
+                Reference::new("dbl_nan").less_than(Datum::double(200.0)),
+                vec![2, 3, 4, 100, 200],
+            ),
+            (
+                Reference::new("dbl_nan").less_than_or_equal_to(Datum::double(100.5)),
+                vec![2, 3, 4, 100, 200],
+            ),
+        ];
+
+        for (predicate, expected_x) in cases {
+            let predicate_display = format!("{predicate}");
+            let table_scan = fixture
+                .table
+                .scan()
+                .select(["x", "dbl_nan"])
+                .with_filter(predicate)
+                .build()
+                .expect("build the nulls-first filter scan");
+            let batches: Vec<_> = table_scan
+                .to_arrow()
+                .await
+                .expect("open the arrow stream")
+                .try_collect()
+                .await
+                .expect("collect the filtered batches");
+
+            let mut x_values: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let col = batch
+                        .column_by_name("x")
+                        .expect("scan output carries the x column");
+                    decode_int64_column(col)
+                        .iter()
+                        .map(|value| value.expect("x is a required column"))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            x_values.sort_unstable();
+            assert_eq!(x_values, expected_x, "filter `{predicate_display}`");
+        }
+    }
+
     #[tokio::test]
     async fn test_filter_on_arrow_gt_eq() {
         let mut fixture = TableTestFixture::new();
