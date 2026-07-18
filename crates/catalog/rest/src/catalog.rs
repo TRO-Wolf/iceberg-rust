@@ -67,7 +67,9 @@ const PATH_V1: &str = "v1";
 /// and each candidate replaces the current pick only when its prefix is strictly longer). We
 /// mirror that here: among all credentials whose `prefix` prefixes the table's storage path, the
 /// longest wins; on a length tie the first in list order is kept (a strictly-greater replacement
-/// rule never displaces an equal-length incumbent). If `storage_path` is `None`, or no credential
+/// rule never displaces an equal-length incumbent). The equal-length tie-break is the same guard,
+/// not bit-identical: Java iterates its per-prefix `HashMap` in unspecified order, whereas the fork
+/// keeps first-in-list order deterministically. If `storage_path` is `None`, or no credential
 /// prefixes it, the result is `None` — Java's silent fall-back to the un-vended base client, which
 /// raises no error.
 ///
@@ -557,6 +559,14 @@ impl RestCatalog {
         // surface. Expiry/refresh of short-lived vended credentials (Java's
         // `VendedCredentialsProvider`) is out of scope here — the OpenDAL-backed `FileIO` takes a
         // static props snapshot; see GAP_MATRIX row R160 residue.
+        //
+        // GRANULARITY adaptation: Java retains the full `List<Credential>` inside `S3FileIO` and
+        // re-selects per accessed file path (`clientForStoragePath` runs on every
+        // `newInputFile`/`newOutputFile`/`deleteFile`). We select ONCE here, at the table's
+        // `metadata_location`, and overlay that single credential into the table's static per-table
+        // `FileIO` props — per-path selection is not expressible in the OpenDAL flat-props `FileIO`
+        // without core storage changes. This diverges for multi-prefix tables (data bucket ≠
+        // metadata bucket); the divergence cases are recorded as residue in GAP_MATRIX row R160.
         if let Some(credential) = select_vended_credential(metadata_location, storage_credentials) {
             props.extend(credential.config.clone());
         }
