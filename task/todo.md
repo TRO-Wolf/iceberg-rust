@@ -50,12 +50,28 @@ oracle pre-decoded from `iceberg-hive-metastore-1.10.0.jar` bytecode). Includes 
 disclosed capability regression toward parity: `"timestamp_ns"` emission removed (Java
 throws for nano).
 
-- [ ] **Build** (Fable Actor): C-1 version knob (default Hive 3+, loud invalid) · C-2
-      gated timestamptz strings · C-3 nano rejects · C-4 separator + lambda · C-5
-      Unknown message · C-6 byte-exact pins incl. both gate branches + mutation proofs ·
-      C-7 R91 HMS clause + citations.
-- [ ] **Critic** (independent Fable, fresh context) — convergence is the Critic's call.
-- [ ] **Close-out** — tracker flip, push, PR body delivered.
+- [x] **Build** — DONE 2026-07-17 (353bf920, Fable Actor): C-1 `hive_version` knob
+      (bare-snake-case per fork HMS conventions; first-digit parse; default Hive3Plus;
+      invalid ⇒ loud DataInvalid at `load()` BEFORE construction; key filtered from
+      pass-through) · C-2 gated tz strings byte-exact · C-3 nano+Unknown one
+      FeatureUnsupported arm, `"timestamp_ns"` emission removed (disclosed regression
+      toward parity) · C-4 separator `","`, lambda verified · C-5 message
+      `"{type} is not supported"` — the Actor's bytecode read CORRECTED the brief's
+      wrong message shape · C-6 10 pins, 4 mutations · C-7 R91 HMS clause. 24 hms tests
+      (was 20).
+- [x] **Critic** — CONVERGED 2026-07-17 (independent Fable, fresh context, zero blocking
+      findings). Settled the message dispute FOR the Actor (BootstrapMethods recipe
+      `" is not supported"`; brief was wrong); verified Rust Display byte-identity
+      for all three rejected types vs Java `Type.toString()` bytecode. Call-site sweep:
+      exactly one production `from_iceberg` caller (create_table via
+      `convert_to_hive_table`), knob-threaded — no hardcoded-default site. 6 mutations
+      (incl. both-branches-same + accept-"5" + static-message vacuity probes) + a novel
+      `map<string,timestamptz>` execution both versions. Residue (LOW): Java's `"1"`-major
+      handling is finer-grained (HIVE_1_2/NOT_SUPPORTED buckets — behaviorally identical
+      under the only consulted gate); pre-existing `thrift_transport` silent-fallback
+      inconsistency (out of scope, future hygiene pass).
+- [x] **Close-out** — tracker flipped, pushed, PR body delivered. G-series (G1/G2/G3)
+      COMPLETE.
 
 ## DONE 2026-07-17 (merged #156): G2 incremental-scan name-mapping pin — was branch `fix/g2-incremental-name-mapping-pin`
 
