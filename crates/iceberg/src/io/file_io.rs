@@ -641,4 +641,38 @@ mod tests {
         assert_eq!(file_io.config().get("key1"), Some(&"value1".to_string()));
         assert_eq!(file_io.config().get("key2"), Some(&"value2".to_string()));
     }
+
+    /// Risk (SEC-003 composition): `FileIO` and `FileIOBuilder` derive `Debug`, which prints the
+    /// embedded `StorageConfig`. The REST catalog clones its full runtime props (incl.
+    /// `token`/`credential`) into this config, so a `{:?}` on a `FileIO`/`FileIOBuilder` must not
+    /// leak them. Now that `StorageConfig`'s `Debug` redacts secret values, the fix COMPOSES
+    /// through the derived Debugs — pinned here. Mutation: revert `StorageConfig` to a derived
+    /// `Debug` → RED.
+    #[test]
+    fn test_file_io_debug_redacts_embedded_storage_config_secret() {
+        const SECRET: &str = "REST_TOKEN_DO_NOT_LEAK";
+        let builder = FileIOBuilder::new(Arc::new(MemoryStorageFactory))
+            .with_prop("token", SECRET)
+            .with_prop("region", "us-east-1");
+
+        let builder_debug = format!("{builder:?}");
+        let file_io = builder.build();
+        let file_io_debug = format!("{file_io:?}");
+
+        for debug in [&builder_debug, &file_io_debug] {
+            assert!(
+                !debug.contains(SECRET),
+                "Debug leaked the embedded StorageConfig secret: {debug}"
+            );
+            assert!(debug.contains("***"), "expected redaction marker: {debug}");
+            assert!(
+                debug.contains("token"),
+                "expected the secret key to remain visible: {debug}"
+            );
+            assert!(
+                debug.contains("us-east-1"),
+                "expected non-secret values to remain: {debug}"
+            );
+        }
+    }
 }

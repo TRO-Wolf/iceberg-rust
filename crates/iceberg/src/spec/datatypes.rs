@@ -626,8 +626,8 @@ impl fmt::Display for StructType {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Eq, Clone)]
-#[serde(from = "SerdeNestedField", into = "SerdeNestedField")]
+#[derive(Debug, PartialEq, Deserialize, Eq, Clone)]
+#[serde(from = "SerdeNestedField")]
 /// A struct is a tuple of typed values. Each field in the tuple is named and has an integer id that is unique in the table schema.
 /// Each field can be either optional or required, meaning that values can (or cannot) be null. Fields may be any type.
 /// Fields may have an optional comment or doc string. Fields can have default values.
@@ -686,19 +686,47 @@ impl From<SerdeNestedField> for NestedField {
     }
 }
 
-impl From<NestedField> for SerdeNestedField {
-    fn from(value: NestedField) -> Self {
-        let initial_default = value.initial_default.map(|x| x.try_into_json(&value.field_type).expect("We should have checked this in NestedField::with_initial_default, it can't be converted to json value"));
-        let write_default = value.write_default.map(|x| x.try_into_json(&value.field_type).expect("We should have checked this in NestedField::with_write_default, it can't be converted to json value"));
-        SerdeNestedField {
+/// Fallible conversion to the serde shadow. The default literals are rendered to JSON here,
+/// where a type-mismatched `(Literal, Type)` pair — which the `with_initial_default` /
+/// `with_write_default` setters do NOT validate (they take a `Literal` by value and cannot
+/// return `Result` without an API break) — surfaces as a typed [`crate::Error`] instead of the
+/// serialize-time panic the previous `From` impl raised via `.expect()` (SAF-008). The custom
+/// [`Serialize`] impl below maps this error into a serde serialization error.
+impl TryFrom<&NestedField> for SerdeNestedField {
+    type Error = crate::Error;
+
+    fn try_from(value: &NestedField) -> Result<Self> {
+        let initial_default = value
+            .initial_default
+            .as_ref()
+            .map(|literal| literal.clone().try_into_json(&value.field_type))
+            .transpose()?;
+        let write_default = value
+            .write_default
+            .as_ref()
+            .map(|literal| literal.clone().try_into_json(&value.field_type))
+            .transpose()?;
+        Ok(SerdeNestedField {
             id: value.id,
-            name: value.name,
+            name: value.name.clone(),
             required: value.required,
-            field_type: value.field_type,
-            doc: value.doc,
+            field_type: value.field_type.clone(),
+            doc: value.doc.clone(),
             initial_default,
             write_default,
-        }
+        })
+    }
+}
+
+impl Serialize for NestedField {
+    /// Serializes through [`SerdeNestedField`], surfacing an invalid default literal as a serde
+    /// error rather than panicking (SAF-008). Valid fields serialize byte-identically to the
+    /// previous `#[serde(into = "SerdeNestedField")]` wiring — the on-disk/wire form is unchanged.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where S: Serializer {
+        SerdeNestedField::try_from(self)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
     }
 }
 
@@ -1864,5 +1892,67 @@ mod tests {
                 "wrong-cased wrapper must be rejected via the Type path (Java String.equals): {bad}"
             );
         }
+    }
+
+    /// Risk (SAF-008): the `with_initial_default`/`with_write_default` setters do NOT validate
+    /// the `(Literal, Type)` pair, so a type-mismatched default (here a boolean default on an
+    /// `Int` field) reaches serialization. The old `From<NestedField> for SerdeNestedField`
+    /// `.expect()`ed the JSON conversion and PANICKED. It must now return a serde `Err` instead.
+    /// Mutation: restore the `.expect()` in the conversion → this panics instead of returning
+    /// `Err`, turning the `is_err()` assertion RED (the test panics before it can assert).
+    #[test]
+    fn test_invalid_initial_default_serializes_to_err_not_panic() {
+        let field = NestedField::required(1, "f", Type::Primitive(PrimitiveType::Int))
+            .with_initial_default(Literal::bool(true));
+
+        let result = serde_json::to_string(&field);
+
+        assert!(
+            result.is_err(),
+            "a type-mismatched initial_default must serialize to Err, not panic; got: {result:?}"
+        );
+    }
+
+    /// Same guard for the write-default path (a boolean write-default on an `Int` field).
+    #[test]
+    fn test_invalid_write_default_serializes_to_err_not_panic() {
+        let field = NestedField::required(1, "f", Type::Primitive(PrimitiveType::Int))
+            .with_write_default(Literal::bool(true));
+
+        let result = serde_json::to_string(&field);
+
+        assert!(
+            result.is_err(),
+            "a type-mismatched write_default must serialize to Err, not panic; got: {result:?}"
+        );
+    }
+
+    /// Format stability: moving default validation from panic-time to a fallible custom
+    /// `Serialize` must NOT change the wire form of VALID data. A field with valid Int defaults
+    /// serializes to the exact pinned bytes, deserializes back to an equal field, and
+    /// re-serializes identically (idempotent round-trip).
+    #[test]
+    fn test_valid_default_round_trips_byte_identically() {
+        let field = NestedField::required(3, "with_default", Type::Primitive(PrimitiveType::Int))
+            .with_initial_default(Literal::int(42))
+            .with_write_default(Literal::int(7));
+
+        let json = serde_json::to_string(&field).expect("valid defaults must serialize");
+        assert_eq!(
+            json,
+            r#"{"id":3,"name":"with_default","required":true,"type":"int","initial-default":42,"write-default":7}"#,
+            "the on-disk/wire shape of a valid-default field must be unchanged"
+        );
+
+        let round_tripped: NestedField =
+            serde_json::from_str(&json).expect("the serialized field must deserialize");
+        assert_eq!(round_tripped, field, "round-trip must preserve the field");
+
+        let json2 =
+            serde_json::to_string(&round_tripped).expect("re-serialize the round-tripped field");
+        assert_eq!(
+            json, json2,
+            "serialization must be byte-stable across round-trips"
+        );
     }
 }
