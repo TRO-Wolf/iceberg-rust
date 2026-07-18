@@ -44,11 +44,25 @@
 //! paths still buffer the full live row set (their two-pass affected-file rewrite) — streaming COW is a
 //! follow-up (H7-S2).
 //!
+//! **Concurrency — the ENGINE_CONTRACT §5 recipes are ARMED (2026-07-18).** Every DELETE/UPDATE commit
+//! enables the per-operation isolation validations with **Java's per-operation defaults as the oracle**
+//! (`SparkRowLevelOperationBuilder.isolationLevel`, 1.10.0 L96-115: table property
+//! `write.delete.isolation-level` / `write.update.isolation-level`, default **serializable**;
+//! `IsolationLevel.fromName` parse semantics). Copy-on-write commits validate from the scanned snapshot
+//! with an `AlwaysTrue` conflict-detection filter (this path pushes NO filters into the scan, so the
+//! AND-of-pushed-filters Java computes — `SparkWrite.conflictDetectionFilter()` L417-428 — is exactly
+//! `alwaysTrue`), reject concurrent conflicting deletes at BOTH levels, and reject concurrent
+//! conflicting data (inserts) under serializable (`SparkWrite.java` L448-456, L467-509). The removed
+//! files are supplied with FULL metadata (`delete_data_files`) so the conflicting-deletes check is live
+//! — a bare path carries no partition/metrics and would make it inert. Merge-on-read commits always
+//! validate that the data files their position deletes reference still exist
+//! (`SparkPositionDeltaWrite.commit` L243), UPDATE additionally arms `validate_deleted_files` +
+//! `validate_no_conflicting_delete_files` (L251-254 — UPDATE/MERGE only, NOT DELETE), and serializable
+//! adds `validate_no_conflicting_data_files` (L256-258). A zero-match DML commits NOTHING (stronger
+//! than Java's scan==null no-validation arm, L446-447). A validation failure is a NON-retryable
+//! `DataInvalid` surfaced to the caller — see `docs/ENGINE_CONTRACT.md` §5.
+//!
 //! **Scope / limitations (out of scope here, named honestly):**
-//!   * **Concurrency** — the commits use snapshot isolation; we do **not** set
-//!     `validate_no_conflicting_data`/`validate_no_conflicting_deletes`/`validate_from_snapshot`, so a
-//!     concurrent writer can be lost (this matches Java's *default*, where serializable validation is
-//!     opt-in). Layering the validations on is a follow-up.
 //!   * **Partition evolution / multi-spec tables** — copy-on-write rewrites survivors under the table's
 //!     *current* partition spec (as Java does) and merge-on-read stamps each position-delete file with
 //!     its target data file's *own* `(spec_id, partition)`; both are exercised on single-spec tables but
@@ -77,6 +91,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::TryStreamExt;
 use iceberg::Catalog;
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator};
+use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Struct};
 use iceberg::table::Table;
@@ -125,6 +140,52 @@ impl WriteMode {
     }
 }
 
+/// The Iceberg row-level isolation-level table properties (Java `TableProperties.DELETE_ISOLATION_LEVEL`
+/// / `UPDATE_ISOLATION_LEVEL`, 1.10.0 `TableProperties.java` L361/L369; shared default `"serializable"`,
+/// L362/L370).
+pub(crate) const WRITE_DELETE_ISOLATION_LEVEL: &str = "write.delete.isolation-level";
+pub(crate) const WRITE_UPDATE_ISOLATION_LEVEL: &str = "write.update.isolation-level";
+
+/// The isolation level of a row-level write (Java `org.apache.iceberg.IsolationLevel`) — the
+/// engine-owned policy that selects which ENGINE_CONTRACT §5 conflict validations the DML commit
+/// enables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IsolationLevel {
+    /// Reject concurrent conflicting DATA (inserts matching the condition) AND concurrent conflicting
+    /// DELETES.
+    Serializable,
+    /// Reject only concurrent conflicting DELETES; concurrent inserts are tolerated.
+    Snapshot,
+}
+
+impl IsolationLevel {
+    /// Parse an isolation-level name CASE-INSENSITIVELY (Java `IsolationLevel.fromName` =
+    /// `valueOf(levelName.toUpperCase(Locale.ENGLISH))`). An unknown name fails LOUD with Java's
+    /// message shape (`"Invalid isolation level: %s"`) — never silently defaulted.
+    pub(crate) fn parse(name: &str) -> DFResult<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "serializable" => Ok(IsolationLevel::Serializable),
+            "snapshot" => Ok(IsolationLevel::Snapshot),
+            _ => Err(DataFusionError::Plan(format!(
+                "Invalid isolation level: {name}"
+            ))),
+        }
+    }
+
+    /// Resolve the isolation level for a row-level DELETE/UPDATE from its table property, defaulting
+    /// to SERIALIZABLE — Java's per-operation default (`SparkRowLevelOperationBuilder.isolationLevel`,
+    /// 1.10.0 L96-115: `properties.getOrDefault(<op>_ISOLATION_LEVEL, <op>_ISOLATION_LEVEL_DEFAULT)`
+    /// with both defaults `"serializable"`, then `IsolationLevel.fromName`). Like Java, this resolves
+    /// at PLAN time (Java: the row-level-operation-builder constructor), so an invalid property value
+    /// fails the statement before any scan or write happens.
+    pub(crate) fn for_row_level_op(table: &Table, property: &str) -> DFResult<Self> {
+        match table.metadata().properties().get(property) {
+            Some(name) => Self::parse(name),
+            None => Ok(IsolationLevel::Serializable),
+        }
+    }
+}
+
 /// `DELETE FROM` execution plan. Finds the matching rows, writes the delete artifacts, commits, and
 /// emits the deleted-row count.
 pub(crate) struct IcebergDeleteExec {
@@ -134,6 +195,9 @@ pub(crate) struct IcebergDeleteExec {
     /// to delete every row (`DELETE FROM t`).
     predicate: Option<Arc<dyn PhysicalExpr>>,
     mode: WriteMode,
+    /// The §5 isolation level (resolved at plan time from `write.delete.isolation-level`, default
+    /// serializable — Java's per-operation default).
+    isolation: IsolationLevel,
     /// The table's Arrow schema — the projection base for the scan and the schema the `predicate` is
     /// bound to.
     table_schema: SchemaRef,
@@ -147,6 +211,7 @@ impl IcebergDeleteExec {
         catalog: Arc<dyn Catalog>,
         predicate: Option<Arc<dyn PhysicalExpr>>,
         mode: WriteMode,
+        isolation: IsolationLevel,
         table_schema: SchemaRef,
     ) -> Self {
         let count_schema = Self::make_count_schema();
@@ -156,6 +221,7 @@ impl IcebergDeleteExec {
             catalog,
             predicate,
             mode,
+            isolation,
             table_schema,
             count_schema,
             plan_properties,
@@ -251,16 +317,31 @@ impl ExecutionPlan for IcebergDeleteExec {
         let catalog = Arc::clone(&self.catalog);
         let predicate = self.predicate.clone();
         let mode = self.mode;
+        let isolation = self.isolation;
         let table_schema = Arc::clone(&self.table_schema);
         let count_schema = Arc::clone(&self.count_schema);
 
         let stream = futures::stream::once(async move {
             let deleted = match mode {
                 WriteMode::MergeOnRead => {
-                    merge_on_read_delete(&table, catalog.as_ref(), predicate, &table_schema).await?
+                    merge_on_read_delete(
+                        &table,
+                        catalog.as_ref(),
+                        predicate,
+                        &table_schema,
+                        isolation,
+                    )
+                    .await?
                 }
                 WriteMode::CopyOnWrite => {
-                    copy_on_write_delete(&table, catalog.as_ref(), predicate, &table_schema).await?
+                    copy_on_write_delete(
+                        &table,
+                        catalog.as_ref(),
+                        predicate,
+                        &table_schema,
+                        isolation,
+                    )
+                    .await?
                 }
             };
             Self::make_count_batch(count_schema, deleted)
@@ -313,8 +394,14 @@ async fn merge_on_read_delete(
     catalog: &dyn Catalog,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     table_schema: &SchemaRef,
+    isolation: IsolationLevel,
 ) -> DFResult<u64> {
     require_v2_for_merge_on_read(table)?;
+    // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor. Java sets it only
+    // when the scan captured a snapshot (`SparkPositionDeltaWrite.java` L245-249; a table that was
+    // empty at read time has none). The commit below is only reached when rows matched, which implies
+    // a snapshot existed, but the guard keeps the Java shape.
+    let scan_snapshot_id = table.metadata().current_snapshot_id();
     // 1. Scan EVERY live row, projecting the table columns (so the exact filter can be evaluated) plus
     //    the reserved `_file`/`_pos` row identity. We do not push the filter into the scan — see the
     //    module-level note on why Iceberg pushdown is inexact and unsafe for DELETE.
@@ -409,12 +496,33 @@ async fn merge_on_read_delete(
     sort_position_delete_pairs(&mut pairs);
     let deleted = pairs.len() as u64;
 
+    // The DATA files the position deletes reference — the §5 `validate_data_files_exist` set. Java
+    // enables this check UNCONDITIONALLY for every command, DELETE included
+    // (`SparkPositionDeltaWrite.commit` L243): a referenced file compacted or rewritten away by a
+    // concurrent commit would silently lose these deletes.
+    let referenced_files: HashSet<String> = pairs.iter().map(|(path, _)| path.clone()).collect();
+
     // Write ALL position-delete files the (rolling) writer produced and commit EVERY one of them.
     let delete_files = write_position_deletes(table, &pairs).await?;
 
+    // ENGINE_CONTRACT §5 row-delta recipe, MoR DELETE row. The conflict-detection filter is the AND of
+    // the scan's PUSHED filters (`SparkPositionDeltaWrite.conflictDetectionFilter` L284-292); this path
+    // pushes NOTHING into the scan (exact-filter design, module docs), so `AlwaysTrue` is the
+    // Java-exact value. DELETE does NOT arm `validate_deleted_files`/`validate_no_conflicting_delete_files`
+    // (UPDATE/MERGE only — Java L251-254); serializable adds the conflicting-data check (L256-258).
     let tx = Transaction::new(table);
-    tx.row_delta()
+    let mut action = tx
+        .row_delta()
         .add_deletes(delete_files)
+        .conflict_detection_filter(Predicate::AlwaysTrue)
+        .validate_data_files_exist(referenced_files);
+    if let Some(snapshot_id) = scan_snapshot_id {
+        action = action.validate_from_snapshot(snapshot_id);
+    }
+    if isolation == IsolationLevel::Serializable {
+        action = action.validate_no_conflicting_data_files();
+    }
+    action
         .apply(tx)
         .map_err(to_datafusion_error)?
         .commit(catalog)
@@ -440,7 +548,11 @@ async fn copy_on_write_delete(
     catalog: &dyn Catalog,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     table_schema: &SchemaRef,
+    isolation: IsolationLevel,
 ) -> DFResult<u64> {
+    // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor (Java sets it only
+    // when the scan captured one: `SparkWrite.java` L470-472 / L493-495).
+    let scan_snapshot_id = table.metadata().current_snapshot_id();
     // 1. Scan EVERY live row, projecting the table columns PLUS `_file` (not `_pos` — COW doesn't need
     //    positions). We do NOT push the filter into the scan — Iceberg pushdown is inexact (see the
     //    module note); the exact `PhysicalExpr` evaluation here is the correctness contract.
@@ -604,11 +716,29 @@ async fn copy_on_write_delete(
     //    (e.g. every affected file was fully deleted), this produces an empty Vec — correct.
     let new_files = write_partitioned_data_files(table, &survivors_to_rewrite).await?;
 
-    // 7. Commit: delete the affected source files by path, add the rewritten files.
+    // 7. Commit: delete the affected source files, add the rewritten files. The removals carry FULL
+    //    `DataFile` metadata (`delete_data_files`, resolved from the scanned snapshot's manifests) so
+    //    the §5 conflicting-deletes validation is LIVE — it tests concurrently-added delete files
+    //    against the removed files' partition + metrics, which a bare path cannot carry (Java validates
+    //    the scan tasks' `DataFile` objects, `SparkWrite.commit` L434-437). §5 CoW recipe per
+    //    `SparkWrite.java`: deletes-conflict at BOTH levels (L477/L499), data-conflict under
+    //    serializable only (L476), `AlwaysTrue` conflict filter (= Java's AND of pushed filters when
+    //    nothing is pushed, L417-428).
+    let removed_data_files = resolve_affected_data_files(table, &affected).await?;
     let tx = Transaction::new(table);
-    tx.overwrite_files()
-        .delete_files(affected.iter().cloned())
+    let mut action = tx
+        .overwrite_files()
+        .delete_data_files(removed_data_files)
         .add_files(new_files)
+        .conflict_detection_filter(Predicate::AlwaysTrue)
+        .validate_no_conflicting_deletes();
+    if let Some(snapshot_id) = scan_snapshot_id {
+        action = action.validate_from_snapshot(snapshot_id);
+    }
+    if isolation == IsolationLevel::Serializable {
+        action = action.validate_no_conflicting_data();
+    }
+    action
         .apply(tx)
         .map_err(to_datafusion_error)?
         .commit(catalog)
@@ -616,6 +746,62 @@ async fn copy_on_write_delete(
         .map_err(to_datafusion_error)?;
 
     Ok(deleted)
+}
+
+/// Resolve affected file PATHS (collected from the scan's reserved `_file` column) to their full live
+/// [`DataFile`] entries in the scanned snapshot's DATA manifests. The full metadata (partition +
+/// metrics) is what makes the §5 `validate_no_conflicting_deletes` check live on the copy-on-write
+/// commit — the fork validates only `delete_data_files` entries, never bare paths.
+///
+/// Every affected path MUST resolve: the scan just read these files from this same immutable table
+/// handle, so a missing path is an internal invariant breach, not a user error.
+async fn resolve_affected_data_files(
+    table: &Table,
+    affected: &HashSet<String>,
+) -> DFResult<Vec<DataFile>> {
+    let metadata = table.metadata();
+    let mut resolved: Vec<DataFile> = Vec::with_capacity(affected.len());
+    let mut found: HashSet<String> = HashSet::with_capacity(affected.len());
+
+    if let Some(snapshot) = metadata.current_snapshot() {
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), metadata)
+            .await
+            .map_err(to_datafusion_error)?;
+        for manifest_entry in manifest_list.entries() {
+            if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_entry
+                .load_manifest(table.file_io())
+                .await
+                .map_err(to_datafusion_error)?;
+            for entry in manifest.entries() {
+                if entry.is_alive()
+                    && entry.data_file().content_type() == iceberg::spec::DataContentType::Data
+                    && affected.contains(entry.file_path())
+                    && !found.contains(entry.file_path())
+                {
+                    found.insert(entry.file_path().to_string());
+                    resolved.push(entry.data_file().clone());
+                }
+            }
+        }
+    }
+
+    if found.len() != affected.len() {
+        let missing: Vec<&str> = affected
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !found.contains(*path))
+            .collect();
+        return Err(DataFusionError::Internal(format!(
+            "copy-on-write: scanned data file(s) not live in the current snapshot: {}",
+            missing.join(", ")
+        )));
+    }
+
+    Ok(resolved)
 }
 
 /// A streaming, partition-correct data-file writer. Each call to [`Self::write_batch`] feeds one
@@ -1053,6 +1239,9 @@ pub(crate) struct IcebergUpdateExec {
     /// The `SET` assignments: `(table-schema column index, new-value PhysicalExpr)`.
     assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
     mode: WriteMode,
+    /// The §5 isolation level (resolved at plan time from `write.update.isolation-level`, default
+    /// serializable — Java's per-operation default).
+    isolation: IsolationLevel,
     table_schema: SchemaRef,
     count_schema: SchemaRef,
     plan_properties: PlanProperties,
@@ -1065,6 +1254,7 @@ impl IcebergUpdateExec {
         predicate: Option<Arc<dyn PhysicalExpr>>,
         assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
         mode: WriteMode,
+        isolation: IsolationLevel,
         table_schema: SchemaRef,
     ) -> Self {
         let count_schema = IcebergDeleteExec::make_count_schema();
@@ -1075,6 +1265,7 @@ impl IcebergUpdateExec {
             predicate,
             assignments,
             mode,
+            isolation,
             table_schema,
             count_schema,
             plan_properties,
@@ -1144,6 +1335,7 @@ impl ExecutionPlan for IcebergUpdateExec {
         let predicate = self.predicate.clone();
         let assignments = self.assignments.clone();
         let mode = self.mode;
+        let isolation = self.isolation;
         let table_schema = Arc::clone(&self.table_schema);
         let count_schema = Arc::clone(&self.count_schema);
 
@@ -1156,6 +1348,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                         predicate,
                         &assignments,
                         &table_schema,
+                        isolation,
                     )
                     .await?
                 }
@@ -1166,6 +1359,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                         predicate,
                         &assignments,
                         &table_schema,
+                        isolation,
                     )
                     .await?
                 }
@@ -1268,8 +1462,13 @@ async fn merge_on_read_update(
     predicate: Option<Arc<dyn PhysicalExpr>>,
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
+    isolation: IsolationLevel,
 ) -> DFResult<u64> {
     require_v2_for_merge_on_read(table)?;
+
+    // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor
+    // (`SparkPositionDeltaWrite.java` L245-249).
+    let scan_snapshot_id = table.metadata().current_snapshot_id();
 
     let mut projection: Vec<String> = table_schema
         .fields()
@@ -1340,6 +1539,10 @@ async fn merge_on_read_update(
         return Ok(0);
     }
 
+    // The DATA files the position deletes reference — the §5 `validate_data_files_exist` set
+    // (`SparkPositionDeltaWrite.commit` L243, unconditional).
+    let referenced_files: HashSet<String> = pairs.iter().map(|(path, _)| path.clone()).collect();
+
     // Position deletes MUST be grouped + sorted (path, pos) before writing — the whole `pairs` set is
     // required up front (MEDIUM-1). The data files, in contrast, were already streamed above; `finish`
     // just closes the writer. Both complete BEFORE the single commit below (commit-once atomicity).
@@ -1347,10 +1550,29 @@ async fn merge_on_read_update(
     let delete_files = write_position_deletes(table, &pairs).await?;
     let data_files = data_writer.finish().await?;
 
+    // ENGINE_CONTRACT §5 row-delta recipe, MoR UPDATE row. Beyond the base (conflict filter +
+    // files-exist + from-snapshot), UPDATE arms `validate_deleted_files` +
+    // `validate_no_conflicting_delete_files` at BOTH isolation levels — the op READ rows to produce
+    // its output, so a concurrent delete of those rows conflicts (Java `command == UPDATE || MERGE`,
+    // `SparkPositionDeltaWrite.commit` L251-254 — deliberately NOT armed for DELETE). Serializable
+    // adds the conflicting-data check (L256-258). `AlwaysTrue` = Java's AND of pushed filters when
+    // nothing is pushed (L284-292).
     let tx = Transaction::new(table);
-    tx.row_delta()
+    let mut action = tx
+        .row_delta()
         .add_data_files(data_files)
         .add_deletes(delete_files)
+        .conflict_detection_filter(Predicate::AlwaysTrue)
+        .validate_data_files_exist(referenced_files)
+        .validate_deleted_files()
+        .validate_no_conflicting_delete_files();
+    if let Some(snapshot_id) = scan_snapshot_id {
+        action = action.validate_from_snapshot(snapshot_id);
+    }
+    if isolation == IsolationLevel::Serializable {
+        action = action.validate_no_conflicting_data_files();
+    }
+    action
         .apply(tx)
         .map_err(to_datafusion_error)?
         .commit(catalog)
@@ -1376,7 +1598,11 @@ async fn copy_on_write_update(
     predicate: Option<Arc<dyn PhysicalExpr>>,
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
+    isolation: IsolationLevel,
 ) -> DFResult<u64> {
+    // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor (`SparkWrite.java`
+    // L470-472 / L493-495).
+    let scan_snapshot_id = table.metadata().current_snapshot_id();
     // 1. Scan EVERY live row projecting the table columns PLUS `_file` (not `_pos` — COW does not
     //    need positions). We do NOT push the filter into the scan — Iceberg pushdown is inexact (see
     //    the module note); the exact `PhysicalExpr` evaluation here is the correctness contract.
@@ -1499,12 +1725,26 @@ async fn copy_on_write_update(
     //    moves the row to the new partition file.
     let new_files = write_partitioned_data_files(table, &rewritten_batches).await?;
 
-    // 6. Commit: delete the affected source files by path, add the rewritten files.
-    //    Use delete_files (NOT overwrite_by_row_filter) so unaffected files are left in place.
+    // 6. Commit: delete the affected source files, add the rewritten files. Full-metadata removals
+    //    (`delete_data_files`, NOT `overwrite_by_row_filter` — unaffected files stay in place, and NOT
+    //    bare paths — the §5 conflicting-deletes check needs partition + metrics). Same §5 CoW recipe
+    //    as DELETE: Java's isolation `switch` does not branch on the command (`SparkWrite.java`
+    //    L448-456) — deletes-conflict at BOTH levels, data-conflict under serializable.
+    let removed_data_files = resolve_affected_data_files(table, &affected).await?;
     let tx = Transaction::new(table);
-    tx.overwrite_files()
-        .delete_files(affected.iter().cloned())
+    let mut action = tx
+        .overwrite_files()
+        .delete_data_files(removed_data_files)
         .add_files(new_files)
+        .conflict_detection_filter(Predicate::AlwaysTrue)
+        .validate_no_conflicting_deletes();
+    if let Some(snapshot_id) = scan_snapshot_id {
+        action = action.validate_from_snapshot(snapshot_id);
+    }
+    if isolation == IsolationLevel::Serializable {
+        action = action.validate_no_conflicting_data();
+    }
+    action
         .apply(tx)
         .map_err(to_datafusion_error)?
         .commit(catalog)
@@ -1521,7 +1761,9 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, Int32Array, RunArray, StringArray};
     use datafusion::arrow::datatypes::Int32Type;
 
-    use super::{decode_file_path, decode_file_paths_batch, sort_position_delete_pairs};
+    use super::{
+        IsolationLevel, decode_file_path, decode_file_paths_batch, sort_position_delete_pairs,
+    };
 
     /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string
     /// `decode_file_path` would — for a plain `StringArray`, for a run-end-encoded `_file` column
@@ -1663,5 +1905,43 @@ mod tests {
                 window[1]
             );
         }
+    }
+
+    /// §5 isolation-level parse parity with Java `IsolationLevel.fromName` (1.10.0
+    /// `core/IsolationLevel.java`): case-INSENSITIVE accept (`valueOf(levelName.toUpperCase(ENGLISH))`)
+    /// and a LOUD `"Invalid isolation level: <name>"` error on an unknown name — never a silent
+    /// default. (Ledger P14a; MUTATION M7: make the parse default instead of erroring → RED.)
+    #[test]
+    fn test_isolation_level_parse_java_parity() {
+        // Case-insensitive accepts, both levels (Java upper-cases before valueOf).
+        for accepted in ["serializable", "SERIALIZABLE", "Serializable"] {
+            assert_eq!(
+                IsolationLevel::parse(accepted).expect("parse serializable spelling"),
+                IsolationLevel::Serializable,
+                "'{accepted}' must parse as serializable"
+            );
+        }
+        for accepted in ["snapshot", "SNAPSHOT", "Snapshot"] {
+            assert_eq!(
+                IsolationLevel::parse(accepted).expect("parse snapshot spelling"),
+                IsolationLevel::Snapshot,
+                "'{accepted}' must parse as snapshot"
+            );
+        }
+
+        // Unknown name → loud error carrying Java's message shape and the offending name.
+        let err = IsolationLevel::parse("read-committed")
+            .expect_err("an unknown isolation level must fail loud, not default");
+        assert!(
+            err.to_string()
+                .contains("Invalid isolation level: read-committed"),
+            "error must carry Java's message + the offending name, got: {err}"
+        );
+        // 'none' is NOT a row-level isolation level (Java has no way to disable row-level
+        // validation; absence-of-option exists only on the INSERT OVERWRITE write path).
+        assert!(
+            IsolationLevel::parse("none").is_err(),
+            "'none' must be rejected for row-level operations"
+        );
     }
 }

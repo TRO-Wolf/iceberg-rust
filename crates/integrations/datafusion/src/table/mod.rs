@@ -52,7 +52,8 @@ use metadata_table::IcebergMetadataTableProvider;
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::delete::{
-    IcebergDeleteExec, IcebergUpdateExec, WRITE_DELETE_MODE, WRITE_UPDATE_MODE, WriteMode,
+    IcebergDeleteExec, IcebergUpdateExec, IsolationLevel, WRITE_DELETE_ISOLATION_LEVEL,
+    WRITE_DELETE_MODE, WRITE_UPDATE_ISOLATION_LEVEL, WRITE_UPDATE_MODE, WriteMode,
 };
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
@@ -250,6 +251,9 @@ impl TableProvider for IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_DELETE_MODE);
+        // §5 isolation level, resolved at PLAN time like Java's row-level-operation builder
+        // (`SparkRowLevelOperationBuilder` ctor); default serializable (Java's per-op default).
+        let isolation = IsolationLevel::for_row_level_op(&table, WRITE_DELETE_ISOLATION_LEVEL)?;
 
         // Build the EXACT row filter as a `PhysicalExpr` (the `WHERE` clause, AND-combined). We
         // evaluate this ourselves against the scanned rows rather than relying on Iceberg predicate
@@ -268,6 +272,7 @@ impl TableProvider for IcebergTableProvider {
             self.catalog.clone(),
             predicate,
             mode,
+            isolation,
             self.schema.clone(),
         )))
     }
@@ -284,6 +289,8 @@ impl TableProvider for IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_UPDATE_MODE);
+        // §5 isolation level, resolved at PLAN time (see `delete_from`); default serializable.
+        let isolation = IsolationLevel::for_row_level_op(&table, WRITE_UPDATE_ISOLATION_LEVEL)?;
 
         let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
 
@@ -312,6 +319,7 @@ impl TableProvider for IcebergTableProvider {
             predicate,
             physical_assignments,
             mode,
+            isolation,
             self.schema.clone(),
         )))
     }

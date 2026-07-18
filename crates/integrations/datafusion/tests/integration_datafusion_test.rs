@@ -4972,3 +4972,1004 @@ async fn test_neq_pushdown_sql_3vl_refilter_drops_null_rows() -> Result<()> {
 
     Ok(())
 }
+
+// =================================================================================================
+// ENGINE_CONTRACT §5 / §8 — DML OCC validations + operation-id (2026-07-18, audit P0-3 /
+// BUG-002/003/004/011)
+//
+// Two-handle race pattern: a DML statement's PHYSICAL plan is created first (the provider loads its
+// immutable table handle THERE — the "scan snapshot"), a CONCURRENT commit then moves the catalog
+// head through a second engine handle, and only then is the frozen plan executed. The commit inside
+// the frozen plan refreshes to the new head and must run the §5 validations over the
+// (scan-snapshot, head] window — rejecting true conflicts LOUDLY (non-retryable, Java's
+// ValidationException messages) while letting non-conflicting concurrency through. Oracles:
+// `SparkWrite.java` L417-428/L446-509 (CoW + static overwrite), `SparkPositionDeltaWrite.java`
+// L239-292 (MoR), `SparkRowLevelOperationBuilder.java` L96-115 (per-op isolation defaults),
+// 1.10.0 @ 2114bf6.
+// =================================================================================================
+
+/// A `{foo1 int, foo2 string}` table creation with caller-chosen table properties.
+fn get_table_creation_with_props(
+    location: impl ToString,
+    name: impl ToString,
+    properties: HashMap<String, String>,
+) -> Result<TableCreation> {
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "foo1", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "foo2", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+    Ok(TableCreation::builder()
+        .location(location.to_string())
+        .name(name.to_string())
+        .properties(properties)
+        .schema(schema)
+        .build())
+}
+
+/// A FRESH `SessionContext` over the shared catalog — an independent engine handle: its provider
+/// loads the table at ITS OWN plan time, so it sees the current head (not a frozen snapshot).
+async fn s5_new_ctx(client: &Arc<MemoryCatalog>) -> SessionContext {
+    let provider = Arc::new(
+        IcebergCatalogProvider::try_new(client.clone())
+            .await
+            .expect("catalog provider"),
+    );
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", provider);
+    ctx
+}
+
+/// Create `catalog.<namespace>.t` with `properties`, seed it with `INSERT INTO ... VALUES
+/// <seed_values>` (snapshot S1), and return the shared catalog + a context.
+async fn s5_fixture(
+    namespace: &str,
+    properties: HashMap<String, String>,
+    seed_values: &str,
+) -> (Arc<MemoryCatalog>, SessionContext) {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let ns = NamespaceIdent::new(namespace.to_string());
+    set_test_namespace(&iceberg_catalog, &ns)
+        .await
+        .expect("create namespace");
+    let creation =
+        get_table_creation_with_props(temp_path(), "t", properties).expect("table creation");
+    iceberg_catalog
+        .create_table(&ns, creation)
+        .await
+        .expect("create table");
+    let client = Arc::new(iceberg_catalog);
+    let ctx = s5_new_ctx(&client).await;
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{namespace}.t VALUES {seed_values}"
+    ))
+    .await
+    .expect("seed insert plan")
+    .collect()
+    .await
+    .expect("seed insert");
+    (client, ctx)
+}
+
+/// Build the DML statement's PHYSICAL plan — the provider loads (freezes) its table handle here.
+async fn s5_freeze_plan(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    ctx.sql(sql)
+        .await
+        .expect("logical plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan (freezes the table handle)")
+}
+
+/// Execute a frozen DML plan; `Ok(row_count)` from the count batch, or the loud commit error.
+async fn s5_execute_frozen(
+    ctx: &SessionContext,
+    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> std::result::Result<u64, datafusion::error::DataFusionError> {
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok(batches
+        .first()
+        .and_then(|batch| batch.column(0).as_any().downcast_ref::<UInt64Array>())
+        .map_or(0, |arr| if arr.is_empty() { 0 } else { arr.value(0) }))
+}
+
+/// All rows of `catalog.<namespace>.t` as sorted `(foo1, foo2)` pairs, read through a FRESH handle.
+async fn s5_table_rows(client: &Arc<MemoryCatalog>, namespace: &str) -> Vec<(i32, String)> {
+    let ctx = s5_new_ctx(client).await;
+    let batches = ctx
+        .sql(&format!("SELECT * FROM catalog.{namespace}.t"))
+        .await
+        .expect("select plan")
+        .collect()
+        .await
+        .expect("select rows");
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let foo1 = batch
+            .column_by_name("foo1")
+            .and_then(|col| col.as_any().downcast_ref::<Int32Array>().cloned())
+            .expect("foo1 column");
+        let foo2 = batch
+            .column_by_name("foo2")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>().cloned())
+            .expect("foo2 column");
+        for row in 0..batch.num_rows() {
+            rows.push((foo1.value(row), foo2.value(row).to_string()));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// The `engine.operation-id` stamp of every snapshot of `catalog.<namespace>.t` (one entry per
+/// snapshot; `None` for an unstamped snapshot), plus the current head's stamp.
+async fn s5_operation_ids(
+    client: &Arc<MemoryCatalog>,
+    namespace: &str,
+) -> (Vec<Option<String>>, Option<String>) {
+    let table = client
+        .load_table(&TableIdent::from_strs([namespace, "t"]).expect("table ident"))
+        .await
+        .expect("load table");
+    let all: Vec<Option<String>> = table
+        .metadata()
+        .snapshots()
+        .map(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get("engine.operation-id")
+                .cloned()
+        })
+        .collect();
+    let head = table.metadata().current_snapshot().and_then(|snapshot| {
+        snapshot
+            .summary()
+            .additional_properties
+            .get("engine.operation-id")
+            .cloned()
+    });
+    (all, head)
+}
+
+/// The live DATA-file paths of `catalog.<namespace>.t`'s current snapshot (manifest walk through a
+/// fresh handle) — used to name the file a rejection message must cite.
+async fn s5_live_data_paths(client: &Arc<MemoryCatalog>, namespace: &str) -> Vec<String> {
+    let table = client
+        .load_table(&TableIdent::from_strs([namespace, "t"]).expect("table ident"))
+        .await
+        .expect("load table");
+    let metadata = table.metadata();
+    let mut paths = Vec::new();
+    if let Some(snapshot) = metadata.current_snapshot() {
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), metadata)
+            .await
+            .expect("load manifest list");
+        for manifest_entry in manifest_list.entries() {
+            if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_entry
+                .load_manifest(table.file_io())
+                .await
+                .expect("load manifest");
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    paths.push(entry.file_path().to_string());
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// A synthetic (manifest-only) POSITION-delete file for an UNPARTITIONED table — the concurrent
+/// "delete-file add" for races where a real merge-on-read DELETE is unavailable (the table's own
+/// `write.delete.mode` is copy-on-write). No metrics/bounds ⇒ conservatively applies to every data
+/// file, exactly what the conflict should see. NEVER select the table's content after committing
+/// one (the parquet does not exist on disk).
+fn s5_synthetic_position_delete(path: &str) -> iceberg::spec::DataFile {
+    iceberg::spec::DataFileBuilder::default()
+        .content(iceberg::spec::DataContentType::PositionDeletes)
+        .file_path(path.to_string())
+        .file_format(iceberg::spec::DataFileFormat::Parquet)
+        .file_size_in_bytes(100)
+        .record_count(1)
+        .partition_spec_id(0)
+        .partition(iceberg::spec::Struct::empty())
+        .build()
+        .expect("synthetic position-delete file")
+}
+
+/// Commit a synthetic position-delete against the CURRENT head through a fresh handle (a real
+/// concurrent `RowDelta` recording `Operation::Delete`).
+async fn s5_commit_synthetic_delete(client: &Arc<MemoryCatalog>, namespace: &str, path: &str) {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let table = client
+        .load_table(&TableIdent::from_strs([namespace, "t"]).expect("table ident"))
+        .await
+        .expect("load table");
+    let tx = Transaction::new(&table);
+    let action = tx
+        .row_delta()
+        .add_deletes(vec![s5_synthetic_position_delete(path)]);
+    let tx = action.apply(tx).expect("apply row delta");
+    tx.commit(client.as_ref() as &dyn Catalog)
+        .await
+        .expect("concurrent synthetic delete commit");
+}
+
+/// P1 — CoW DELETE at the SERIALIZABLE DEFAULT (Java's per-op default,
+/// `SparkRowLevelOperationBuilder` L96-115 + `TableProperties` L361-362) × a concurrent APPEND
+/// committed between plan and execute → LOUD rejection via `validate_no_conflicting_data`
+/// (`SparkWrite.commitWithSerializableIsolation` L476), Java's message, and NO table mutation.
+/// Before this unit the delete would silently commit over the concurrent writer (BUG-002/011).
+#[tokio::test]
+async fn test_s5_cow_delete_serializable_default_rejects_concurrent_append()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (client, ctx) = s5_fixture("s5_cow_del_ser", HashMap::new(), "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(&ctx, "DELETE FROM catalog.s5_cow_del_ser.t WHERE foo1 = 1").await;
+
+    // Concurrent append through an independent handle — under serializable, a concurrent insert
+    // matching the (AlwaysTrue) conflict filter violates the isolation contract.
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s5_cow_del_ser.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("serializable CoW DELETE must reject the concurrent append");
+    assert!(
+        err.to_string()
+            .contains("Found conflicting files that can contain records matching"),
+        "must carry Java's conflicting-data ValidationException message, got: {err}"
+    );
+
+    // The delete must NOT have applied: base rows AND the concurrent row are all present.
+    let rows = s5_table_rows(&client, "s5_cow_del_ser").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string())
+        ],
+        "rejected DELETE must leave the table exactly as the concurrent writer left it"
+    );
+    Ok(())
+}
+
+/// P2 — CoW DELETE at SNAPSHOT isolation (via `write.delete.isolation-level`) × a concurrent
+/// position-DELETE-file add applying to the file the CoW rewrite removes → LOUD rejection via
+/// `validate_no_conflicting_deletes` (`SparkWrite.commitWithSnapshotIsolation` L499) with Java's
+/// "found new delete for replaced data file" message NAMING the file. This is live ONLY because the
+/// removals now carry full `DataFile` metadata (`delete_data_files`) — the audit's silent hole was
+/// path-only removals making this check inert (BUG-002).
+#[tokio::test]
+async fn test_s5_cow_delete_snapshot_rejects_concurrent_delete_on_affected_file()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([(
+        "write.delete.isolation-level".to_string(),
+        "snapshot".to_string(),
+    )]);
+    let (client, ctx) = s5_fixture("s5_cow_del_snap_del", props, "(1, 'a'), (2, 'b')").await;
+    let seeded_paths = s5_live_data_paths(&client, "s5_cow_del_snap_del").await;
+    assert_eq!(seeded_paths.len(), 1, "seed must land in exactly one file");
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "DELETE FROM catalog.s5_cow_del_snap_del.t WHERE foo1 = 1",
+    )
+    .await;
+
+    // Concurrent row-level delete lands a position-delete file (Operation::Delete) that applies to
+    // the seeded data file the frozen CoW DELETE is about to remove.
+    s5_commit_synthetic_delete(
+        &client,
+        "s5_cow_del_snap_del",
+        "mem/s5-concurrent-pos-del.parquet",
+    )
+    .await;
+
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("snapshot CoW DELETE must reject dropping a file under a concurrent delete");
+    let message = err.to_string();
+    assert!(
+        message.contains("found new delete for replaced data file"),
+        "must carry Java's conflicting-deletes message, got: {message}"
+    );
+    assert!(
+        message.contains(&seeded_paths[0]),
+        "must NAME the replaced data file {}, got: {message}",
+        seeded_paths[0]
+    );
+
+    // Metadata-only post-check (the synthetic delete parquet does not exist — no content read):
+    // seed + concurrent delete = 2 snapshots; the rejected DELETE must not have added a third.
+    let table = client
+        .load_table(&TableIdent::from_strs(["s5_cow_del_snap_del", "t"]).unwrap())
+        .await?;
+    assert_eq!(
+        table.metadata().snapshots().len(),
+        2,
+        "rejected CoW DELETE must not commit a snapshot"
+    );
+    Ok(())
+}
+
+/// P3 — false-positive guard: CoW DELETE at SNAPSHOT isolation × a concurrent APPEND → the commit
+/// SUCCEEDS (snapshot isolation checks only deletes — `SparkWrite.commitWithSnapshotIsolation`
+/// L490-509 has no data check), the deleted row is gone AND the concurrent row survives.
+#[tokio::test]
+async fn test_s5_cow_delete_snapshot_allows_concurrent_append()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([(
+        "write.delete.isolation-level".to_string(),
+        "snapshot".to_string(),
+    )]);
+    let (client, ctx) = s5_fixture("s5_cow_del_snap_ok", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "DELETE FROM catalog.s5_cow_del_snap_ok.t WHERE foo1 = 1",
+    )
+    .await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s5_cow_del_snap_ok.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    let deleted = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect("snapshot CoW DELETE must tolerate a non-conflicting concurrent append");
+    assert_eq!(deleted, 1, "exactly the one matching row is deleted");
+
+    let rows = s5_table_rows(&client, "s5_cow_del_snap_ok").await;
+    assert_eq!(
+        rows,
+        vec![(2, "b".to_string()), (3, "c".to_string())],
+        "deleted row gone; concurrent append survives"
+    );
+    Ok(())
+}
+
+/// P4 — CoW UPDATE at the SERIALIZABLE DEFAULT × a concurrent APPEND → LOUD rejection. Java's
+/// isolation `switch` does not branch on the command (`SparkWrite.commit` L448-456): UPDATE uses
+/// the same CoW recipe as DELETE.
+#[tokio::test]
+async fn test_s5_cow_update_serializable_default_rejects_concurrent_append()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (client, ctx) = s5_fixture("s5_cow_upd_ser", HashMap::new(), "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "UPDATE catalog.s5_cow_upd_ser.t SET foo2 = 'x' WHERE foo1 = 1",
+    )
+    .await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s5_cow_upd_ser.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("serializable CoW UPDATE must reject the concurrent append");
+    assert!(
+        err.to_string()
+            .contains("Found conflicting files that can contain records matching"),
+        "must carry Java's conflicting-data message, got: {err}"
+    );
+
+    let rows = s5_table_rows(&client, "s5_cow_upd_ser").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string())
+        ],
+        "rejected UPDATE must not have changed any row"
+    );
+    Ok(())
+}
+
+/// P4b — false-positive guard: CoW UPDATE at SNAPSHOT isolation × a concurrent APPEND → SUCCEEDS;
+/// the matched row takes the new value, the concurrent row survives untouched.
+#[tokio::test]
+async fn test_s5_cow_update_snapshot_allows_concurrent_append()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([(
+        "write.update.isolation-level".to_string(),
+        "snapshot".to_string(),
+    )]);
+    let (client, ctx) = s5_fixture("s5_cow_upd_snap_ok", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "UPDATE catalog.s5_cow_upd_snap_ok.t SET foo2 = 'x' WHERE foo1 = 1",
+    )
+    .await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s5_cow_upd_snap_ok.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    let updated = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect("snapshot CoW UPDATE must tolerate a non-conflicting concurrent append");
+    assert_eq!(updated, 1);
+
+    let rows = s5_table_rows(&client, "s5_cow_upd_snap_ok").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "x".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string())
+        ],
+        "updated value applied; concurrent append survives"
+    );
+    Ok(())
+}
+
+/// P5 — MoR DELETE (`RowDelta`) × a concurrent COPY-ON-WRITE rewrite of the very data file its
+/// position deletes reference → LOUD rejection via `validate_data_files_exist`
+/// (`SparkPositionDeltaWrite.commit` L243 — UNCONDITIONAL, DELETE included) with Java's "Cannot
+/// commit, missing data files" message. The concurrent rewrite is a REAL CoW UPDATE (the table's
+/// `write.update.mode` stays copy-on-write while `write.delete.mode` is merge-on-read), producing an
+/// `Operation::Overwrite` snapshot that removes the referenced file — the audit's exact
+/// silently-lost-delete scenario (BUG-003). Isolation pinned to snapshot so the files-exist BASE
+/// check (not the serializable data check) is what rejects.
+#[tokio::test]
+async fn test_s5_merge_on_read_delete_rejects_concurrent_rewrite_of_target_file()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([
+        ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+        (
+            "write.delete.isolation-level".to_string(),
+            "snapshot".to_string(),
+        ),
+    ]);
+    let (client, ctx) = s5_fixture("s5_mr_del_rewrite", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "DELETE FROM catalog.s5_mr_del_rewrite.t WHERE foo1 = 1",
+    )
+    .await;
+
+    // Concurrent CoW UPDATE rewrites the single seeded data file (removes it, adds a rewritten one).
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("UPDATE catalog.s5_mr_del_rewrite.t SET foo2 = 'rewritten' WHERE foo1 = 2")
+        .await?
+        .collect()
+        .await?;
+
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("MoR DELETE must reject: its position deletes reference a rewritten-away file");
+    assert!(
+        err.to_string()
+            .contains("Cannot commit, missing data files"),
+        "must carry Java's files-exist ValidationException message, got: {err}"
+    );
+
+    // The rewrite stands; the delete did not apply (row 1 survives with its original value).
+    let rows = s5_table_rows(&client, "s5_mr_del_rewrite").await;
+    assert_eq!(
+        rows,
+        vec![(1, "a".to_string()), (2, "rewritten".to_string())],
+        "concurrent rewrite must stand; the rejected MoR DELETE must not have applied"
+    );
+    Ok(())
+}
+
+/// P6 — false-positive guard: MoR DELETE at SNAPSHOT isolation × a concurrent APPEND → SUCCEEDS
+/// (the appended file is not referenced by the position deletes; snapshot level has no data check),
+/// the deleted row is gone, the concurrent row survives, and the committed `RowDelta` reads back
+/// correctly end-to-end.
+#[tokio::test]
+async fn test_s5_merge_on_read_delete_snapshot_allows_concurrent_append()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([
+        ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+        (
+            "write.delete.isolation-level".to_string(),
+            "snapshot".to_string(),
+        ),
+    ]);
+    let (client, ctx) = s5_fixture("s5_mr_del_snap_ok", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "DELETE FROM catalog.s5_mr_del_snap_ok.t WHERE foo1 = 1",
+    )
+    .await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s5_mr_del_snap_ok.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    let deleted = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect("snapshot MoR DELETE must tolerate a non-conflicting concurrent append");
+    assert_eq!(deleted, 1);
+
+    let rows = s5_table_rows(&client, "s5_mr_del_snap_ok").await;
+    assert_eq!(
+        rows,
+        vec![(2, "b".to_string()), (3, "c".to_string())],
+        "position delete applied on read; concurrent append survives"
+    );
+    Ok(())
+}
+
+/// P6b — MoR DELETE at the SERIALIZABLE DEFAULT × a concurrent APPEND → LOUD rejection via
+/// `validate_no_conflicting_data_files` (`SparkPositionDeltaWrite.commit` L256-258). Pins that the
+/// Java per-operation default (serializable) governs the MoR path too.
+#[tokio::test]
+async fn test_s5_merge_on_read_delete_serializable_default_rejects_concurrent_append()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([("write.delete.mode".to_string(), "merge-on-read".to_string())]);
+    let (client, ctx) = s5_fixture("s5_mr_del_ser", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(&ctx, "DELETE FROM catalog.s5_mr_del_ser.t WHERE foo1 = 1").await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s5_mr_del_ser.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("serializable (default) MoR DELETE must reject the concurrent append");
+    assert!(
+        err.to_string()
+            .contains("Found conflicting files that can contain records matching"),
+        "must carry Java's conflicting-data message, got: {err}"
+    );
+
+    let rows = s5_table_rows(&client, "s5_mr_del_ser").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string())
+        ],
+        "rejected MoR DELETE must not have applied"
+    );
+    Ok(())
+}
+
+/// P7 — the UPDATE-only §5 arms (`validate_deleted_files` + `validate_no_conflicting_delete_files`,
+/// Java `command == UPDATE || MERGE`, `SparkPositionDeltaWrite.commit` L251-254): a MoR UPDATE that
+/// READ rows × a concurrent REAL MoR DELETE of those rows → LOUD rejection with Java's "Found new
+/// conflicting delete files" message — even at SNAPSHOT isolation (the arm is
+/// isolation-independent).
+#[tokio::test]
+async fn test_s5_merge_on_read_update_rejects_concurrent_delete_of_read_rows()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([
+        ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+        ("write.update.mode".to_string(), "merge-on-read".to_string()),
+        (
+            "write.update.isolation-level".to_string(),
+            "snapshot".to_string(),
+        ),
+    ]);
+    let (client, ctx) = s5_fixture("s5_mr_upd_del", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "UPDATE catalog.s5_mr_upd_del.t SET foo2 = 'x' WHERE foo1 = 1",
+    )
+    .await;
+
+    // Concurrent REAL merge-on-read DELETE of the same row lands a position-delete file.
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("DELETE FROM catalog.s5_mr_upd_del.t WHERE foo1 = 1")
+        .await?
+        .collect()
+        .await?;
+
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("MoR UPDATE must reject: a concurrent delete removed rows it read");
+    assert!(
+        err.to_string()
+            .contains("Found new conflicting delete files that can apply to records matching"),
+        "must carry Java's conflicting-delete-files message, got: {err}"
+    );
+
+    // The concurrent delete stands; the update did not apply.
+    let rows = s5_table_rows(&client, "s5_mr_upd_del").await;
+    assert_eq!(
+        rows,
+        vec![(2, "b".to_string())],
+        "concurrent delete stands; rejected UPDATE must not have applied"
+    );
+    Ok(())
+}
+
+/// P7b — the DELETE/UPDATE asymmetry (the §5 2026-07-09 correction): a MoR DELETE × a concurrent
+/// MoR DELETE of the SAME rows → COMMITS. Java arms the delete-conflict checks for UPDATE/MERGE
+/// ONLY (`SparkPositionDeltaWrite.commit` L251-254), and the files-exist check's default op set
+/// excludes `Operation::Delete` snapshots (`skipDeletes` default) — two deletes of the same row are
+/// idempotent, not a conflict.
+#[tokio::test]
+async fn test_s5_merge_on_read_delete_tolerates_concurrent_delete_same_rows()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([
+        ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+        (
+            "write.delete.isolation-level".to_string(),
+            "snapshot".to_string(),
+        ),
+    ]);
+    let (client, ctx) = s5_fixture("s5_mr_del_del", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(&ctx, "DELETE FROM catalog.s5_mr_del_del.t WHERE foo1 = 1").await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("DELETE FROM catalog.s5_mr_del_del.t WHERE foo1 = 1")
+        .await?
+        .collect()
+        .await?;
+
+    let deleted = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect("a MoR DELETE must tolerate a concurrent DELETE of the same rows (Java asymmetry)");
+    assert_eq!(
+        deleted, 1,
+        "the frozen handle still saw the row at scan time"
+    );
+
+    let rows = s5_table_rows(&client, "s5_mr_del_del").await;
+    assert_eq!(
+        rows,
+        vec![(2, "b".to_string())],
+        "both deletes applied idempotently — the row is gone once"
+    );
+    Ok(())
+}
+
+/// P8 — §8 operation-id: every INSERT commit stamps `engine.operation-id` (a UUID) into the
+/// snapshot summary, the reconciliation marker for ambiguous commit outcomes (BUG-004's append
+/// half: a bare `fast_append` left retries un-reconcilable).
+#[tokio::test]
+async fn test_s8_insert_stamps_operation_id() -> std::result::Result<(), Box<dyn std::error::Error>>
+{
+    let (client, _ctx) = s5_fixture("s8_insert_stamp", HashMap::new(), "(1, 'a'), (2, 'b')").await;
+
+    let (all_ids, head_id) = s5_operation_ids(&client, "s8_insert_stamp").await;
+    assert_eq!(all_ids.len(), 1, "one snapshot (the seed INSERT)");
+    let id = head_id.expect("the INSERT snapshot must carry engine.operation-id");
+    assert!(
+        uuid::Uuid::parse_str(&id).is_ok(),
+        "the stamp must be a parseable UUID, got: {id}"
+    );
+    Ok(())
+}
+
+/// P9 — the §8 idempotency shape: an INSERT whose commit must refresh-and-re-apply over a
+/// concurrent commit lands EXACTLY ONE snapshot carrying its operation-id — the re-applied attempt
+/// reuses the SAME id (action state), rows are not duplicated, and ids are unique per statement
+/// (a reconciler scanning summaries for one id can never false-match another operation).
+#[tokio::test]
+async fn test_s8_insert_retry_single_stamp_no_duplicate()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (client, ctx) = s5_fixture("s8_insert_retry", HashMap::new(), "(1, 'a'), (2, 'b')").await;
+
+    // Freeze the INSERT's physical plan against the current head (S1)...
+    let plan = s5_freeze_plan(
+        &ctx,
+        "INSERT INTO catalog.s8_insert_retry.t VALUES (5, 'e')",
+    )
+    .await;
+
+    // ...move the head with a concurrent INSERT (S2)...
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s8_insert_retry.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    // ...then execute: the frozen commit refreshes to S2 and re-applies, landing S3.
+    let written = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect("append never conflicts — the refresh-re-apply must land");
+    assert_eq!(written, 1);
+
+    let rows = s5_table_rows(&client, "s8_insert_retry").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+            (5, "e".to_string())
+        ],
+        "no duplicated rows across the refresh-re-apply"
+    );
+
+    let (all_ids, head_id) = s5_operation_ids(&client, "s8_insert_retry").await;
+    assert_eq!(all_ids.len(), 3, "seed + concurrent + frozen = 3 snapshots");
+    let mut ids: Vec<String> = all_ids
+        .into_iter()
+        .map(|id| id.expect("every INSERT snapshot must be stamped"))
+        .collect();
+    let head = head_id.expect("head (the frozen INSERT) must be stamped");
+    assert_eq!(
+        ids.iter().filter(|id| **id == head).count(),
+        1,
+        "the frozen INSERT's id must appear in EXACTLY one snapshot (no double-stamp on re-apply)"
+    );
+    let before = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        before,
+        "operation ids must be pairwise distinct across statements"
+    );
+    for id in &ids {
+        assert!(
+            uuid::Uuid::parse_str(id).is_ok(),
+            "every stamp must be a parseable UUID, got: {id}"
+        );
+    }
+    Ok(())
+}
+
+/// P10 — INSERT OVERWRITE at the engine DEFAULT (`snapshot`) × a concurrent REAL merge-on-read
+/// DELETE (adds a position-delete file) → LOUD rejection via `validate_no_conflicting_deletes`
+/// with the row filter as the default conflict filter (`SparkWrite.OverwriteByFilter.commit`
+/// L374-375 arm; no explicit `conflictDetectionFilter` — Java never sets one on this path). Before
+/// this unit the bare `overwrite_by_row_filter(AlwaysTrue)` silently discarded the concurrent
+/// deleter's intent (BUG-004).
+#[tokio::test]
+async fn test_s5_insert_overwrite_default_rejects_concurrent_delete()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([("write.delete.mode".to_string(), "merge-on-read".to_string())]);
+    let (client, ctx) = s5_fixture("s5_ow_del", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(&ctx, "INSERT OVERWRITE catalog.s5_ow_del.t VALUES (9, 'z')").await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("DELETE FROM catalog.s5_ow_del.t WHERE foo1 = 1")
+        .await?
+        .collect()
+        .await?;
+
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("default INSERT OVERWRITE must reject the concurrent delete-file add");
+    assert!(
+        err.to_string()
+            .contains("Found new conflicting delete files that can apply to records matching"),
+        "must carry Java's conflicting-delete-files message, got: {err}"
+    );
+
+    let rows = s5_table_rows(&client, "s5_ow_del").await;
+    assert_eq!(
+        rows,
+        vec![(2, "b".to_string())],
+        "concurrent delete stands; the rejected overwrite must not have replaced the table"
+    );
+    Ok(())
+}
+
+/// P11 — INSERT OVERWRITE at SERIALIZABLE (via the engine-defined
+/// `write.overwrite.isolation-level`) × a concurrent APPEND → LOUD rejection via
+/// `validate_no_conflicting_data` (`SparkWrite.OverwriteByFilter.commit` L371-373; the row filter
+/// is the default conflict filter, so ANY concurrent insert conflicts).
+#[tokio::test]
+async fn test_s5_insert_overwrite_serializable_rejects_concurrent_append()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([(
+        "write.overwrite.isolation-level".to_string(),
+        "serializable".to_string(),
+    )]);
+    let (client, ctx) = s5_fixture("s5_ow_ser", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(&ctx, "INSERT OVERWRITE catalog.s5_ow_ser.t VALUES (9, 'z')").await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s5_ow_ser.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("serializable INSERT OVERWRITE must reject the concurrent append");
+    assert!(
+        err.to_string()
+            .contains("Found conflicting files that can contain records matching"),
+        "must carry Java's conflicting-data message, got: {err}"
+    );
+
+    let rows = s5_table_rows(&client, "s5_ow_ser").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string())
+        ],
+        "rejected overwrite must leave the concurrent writer's state intact"
+    );
+    Ok(())
+}
+
+/// P12 — false-positive guard at the default (`snapshot`): INSERT OVERWRITE × a concurrent APPEND
+/// → SUCCEEDS, and the final table is EXACTLY the overwrite's rows — the refreshed re-apply
+/// replaces the concurrent append too (Spark static-overwrite semantics preserved; snapshot
+/// isolation deliberately tolerates concurrent inserts, `SparkWrite` L374-377).
+#[tokio::test]
+async fn test_s5_insert_overwrite_snapshot_allows_concurrent_append_and_replaces_it()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (client, ctx) = s5_fixture("s5_ow_snap_ok", HashMap::new(), "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "INSERT OVERWRITE catalog.s5_ow_snap_ok.t VALUES (9, 'z')",
+    )
+    .await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("INSERT INTO catalog.s5_ow_snap_ok.t VALUES (3, 'c')")
+        .await?
+        .collect()
+        .await?;
+
+    let written = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect("snapshot-level INSERT OVERWRITE must tolerate a concurrent append");
+    assert_eq!(written, 1);
+
+    let rows = s5_table_rows(&client, "s5_ow_snap_ok").await;
+    assert_eq!(
+        rows,
+        vec![(9, "z".to_string())],
+        "INSERT OVERWRITE replaces ALL data — including the concurrent append"
+    );
+
+    // The overwrite snapshot is stamped too (§8 applies to both IcebergCommitExec arms).
+    let (_, head_id) = s5_operation_ids(&client, "s5_ow_snap_ok").await;
+    let id = head_id.expect("the overwrite snapshot must carry engine.operation-id");
+    assert!(uuid::Uuid::parse_str(&id).is_ok());
+    Ok(())
+}
+
+/// P13 — the `none` escape hatch restores Spark's UNVALIDATED default (Java: overwrite isolation
+/// exists only as a per-write option, absent by default ⇒ `SparkWrite.OverwriteByFilter.commit`
+/// runs no validations, L364-377): the same concurrent-delete race that P10 rejects now COMMITS,
+/// and the overwrite replaces the table.
+#[tokio::test]
+async fn test_s5_insert_overwrite_none_restores_unvalidated_java_default()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([
+        ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+        (
+            "write.overwrite.isolation-level".to_string(),
+            "none".to_string(),
+        ),
+    ]);
+    let (client, ctx) = s5_fixture("s5_ow_none", props, "(1, 'a'), (2, 'b')").await;
+
+    let plan = s5_freeze_plan(
+        &ctx,
+        "INSERT OVERWRITE catalog.s5_ow_none.t VALUES (9, 'z')",
+    )
+    .await;
+
+    let ctx2 = s5_new_ctx(&client).await;
+    ctx2.sql("DELETE FROM catalog.s5_ow_none.t WHERE foo1 = 1")
+        .await?
+        .collect()
+        .await?;
+
+    let written = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect("'none' must restore the unvalidated Java-default overwrite");
+    assert_eq!(written, 1);
+
+    let rows = s5_table_rows(&client, "s5_ow_none").await;
+    assert_eq!(
+        rows,
+        vec![(9, "z".to_string())],
+        "unvalidated overwrite replaces the table (the dangling concurrent delete is inert)"
+    );
+    Ok(())
+}
+
+/// P14b — an invalid `write.delete.isolation-level` fails LOUD at PLAN time (Java resolves the
+/// row-level isolation in the operation-builder constructor and `IsolationLevel.fromName` throws
+/// `"Invalid isolation level: %s"`) — never a silent default.
+#[tokio::test]
+async fn test_s5_invalid_isolation_property_fails_plan_loud()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([(
+        "write.delete.isolation-level".to_string(),
+        "read-committed".to_string(),
+    )]);
+    let (_client, ctx) = s5_fixture("s5_bad_iso", props, "(1, 'a')").await;
+
+    let err = ctx
+        .sql("DELETE FROM catalog.s5_bad_iso.t WHERE foo1 = 1")
+        .await?
+        .create_physical_plan()
+        .await
+        .expect_err("an invalid isolation level must fail the statement at plan time");
+    assert!(
+        err.to_string()
+            .contains("Invalid isolation level: read-committed"),
+        "must carry Java's fromName message + the offending value, got: {err}"
+    );
+    Ok(())
+}
+
+/// P14c — an invalid `write.overwrite.isolation-level` fails INSERT OVERWRITE loud, while a plain
+/// INSERT INTO on the same table is UNAFFECTED (the property is consulted only by the Overwrite
+/// arm, mirroring Java's per-operation option scoping).
+#[tokio::test]
+async fn test_s5_invalid_overwrite_isolation_only_gates_overwrite()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let props = HashMap::from([(
+        "write.overwrite.isolation-level".to_string(),
+        "read-committed".to_string(),
+    )]);
+    let (client, ctx) = s5_fixture("s5_bad_ow_iso", props, "(1, 'a')").await;
+
+    // Plain INSERT INTO ignores the overwrite property entirely.
+    ctx.sql("INSERT INTO catalog.s5_bad_ow_iso.t VALUES (2, 'b')")
+        .await?
+        .collect()
+        .await
+        .expect("INSERT INTO must not consult the overwrite isolation property");
+
+    // INSERT OVERWRITE consults it and must fail loud.
+    let plan = s5_freeze_plan(
+        &ctx,
+        "INSERT OVERWRITE catalog.s5_bad_ow_iso.t VALUES (9, 'z')",
+    )
+    .await;
+    let err = s5_execute_frozen(&ctx, plan)
+        .await
+        .expect_err("an invalid overwrite isolation level must fail the statement");
+    assert!(
+        err.to_string()
+            .contains("Invalid isolation level: read-committed"),
+        "must carry Java's fromName message + the offending value, got: {err}"
+    );
+
+    let rows = s5_table_rows(&client, "s5_bad_ow_iso").await;
+    assert_eq!(
+        rows,
+        vec![(1, "a".to_string()), (2, "b".to_string())],
+        "the failed overwrite must not have replaced anything"
+    );
+    Ok(())
+}
