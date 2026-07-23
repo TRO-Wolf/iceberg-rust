@@ -4847,13 +4847,42 @@ public final class InteropOracle {
     /** The per-open file cost (bytes) used in the weight floor. 0 isolates the byte-length packing. */
     static final long OPEN_FILE_COST = 0L;
 
-    /** Direction 1 — Java writes the table + emits the canonical planTasks group plan. */
+    /**
+     * Direction 1 — Java writes the table, persists its metadata, then emits the canonical planTasks
+     * group plan from the table RELOADED off that persisted metadata (see the reload rationale below).
+     */
     static void generate(Path dir) throws IOException {
       Files.createDirectories(dir);
       File tableDir = dir.resolve("table").toFile();
-      BaseTable table = buildTableWithFiles(tableDir);
+      BaseTable built = buildTableWithFiles(tableDir);
 
-      // Run the REAL Java planTasks with the hand-declared knobs and emit the canonical plan.
+      // Persist the final metadata FIRST, then RELOAD it and plan the RELOADED table — so
+      // java_scan_plan.json reflects the SAME persisted manifest the Rust D1 test loads, NOT the
+      // in-memory `built` table.
+      //
+      // WHY (root-caused by the #164 D1 diagnostics on the GitHub runner, 2026-07-23): with parquet-mr
+      // 1.16.0 (build 402c3810) the runner's IN-MEMORY `built` `DataFile.splitOffsets()` for big.parquet
+      // returned only 5 offsets — a coarse SUBSET of its 8 physical row groups — so planning the in-memory
+      // table emitted a 5-split plan, while the PERSISTED manifest AND the physical parquet footer both
+      // correctly carried all 8 offsets (exactly what Rust reads). That in-memory-vs-persisted mismatch
+      // (a parquet-mr-1.16 in-memory-vs-footer quirk seen only on the runner) failed D1 every night
+      // (Rust 8 vs Java 5); it does NOT reproduce on a dev box, where in-memory == persisted (8 == 8).
+      // Reloading makes this an apples-to-apples "both engines plan the PERSISTED table" comparison; the
+      // persisted manifest is authoritative and is what any reader (Rust or Java) actually sees. See
+      // crates/iceberg/tests/interop_scan_plan.rs (the D1 diagnostics that pinned this) and task/lessons.md.
+      Path finalMetadata =
+          new File(tableDir, "metadata").toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(built.operations().current(), finalOut);
+
+      TableMetadata persisted =
+          TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      BaseTable table =
+          new BaseTable(
+              new InMemoryInspectionOperations(persisted, new LocalFileIO()), "interop_scan_plan");
+
+      // Run the REAL Java planTasks over the PERSISTED table + emit the canonical plan.
       String plan = planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST);
       writeJson(dir.resolve("java_scan_plan.json"), plan);
 
@@ -4876,13 +4905,6 @@ public final class InteropOracle {
       String batchPlan = planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST, batchGroups);
       writeJson(dir.resolve("java_batch_scan_plan.json"), batchPlan);
 
-      // Persist the final metadata at a known path for the Rust D1 load.
-      Path finalMetadata =
-          new File(tableDir, "metadata").toPath().resolve("final.metadata.json");
-      OutputFile finalOut =
-          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
-      TableMetadataParser.write(((BaseTable) table).operations().current(), finalOut);
-
       System.out.println(
           "generated scan-plan table + java_scan_plan.json + java_batch_scan_plan.json to "
               + dir
@@ -4892,7 +4914,7 @@ public final class InteropOracle {
               + LOOKBACK
               + " openFileCost="
               + OPEN_FILE_COST
-              + "); BatchScan==Scan adapter delegation OK in Java");
+              + "; plan emitted from the RELOADED persisted table); BatchScan==Scan adapter delegation OK in Java");
     }
 
     /**

@@ -149,3 +149,19 @@ split member keys `(basename,start,length)` ARE the row-group offsets. It could 
   confirm the mechanism; the diagnostics (not the knob) are the deliverable. (Watch the unit trap: the
   Java `64` is BYTES → 8 groups; the Rust GEN side's `set_max_row_group_size(64)` is ROWS → 13 groups —
   the shared literal is coincidental, not a "mirror.")
+- **RESOLVED 2026-07-23 (the instrument-first move paid off; #164 diagnostics → precise fix).** The very
+  first nightly on the instrumented `main` printed the answer in one `tail -40`: manifest field-132 ==
+  physical footer == the SAME 8 offsets (byte-identical to a dev box, `created_by` = the same parquet-mr
+  1.16.0 build 402c3810), Rust correctly planned 8 — but Java's `java_scan_plan.json` was 5. So it was
+  NOT a Rust bug, NOT the grid, and NOT dependency drift: the Java **oracle planned its IN-MEMORY table**,
+  whose `DataFile.splitOffsets()` returned only 5 offsets — a coarse SUBSET of big.parquet's 8 physical row
+  groups — **on the GitHub runner only** (a parquet-mr-1.16 in-memory-vs-footer quirk; the 5-split plan is
+  a strict subset of the 8, and Java's split layer is provably one-sub-task-per-offset), while the
+  PERSISTED manifest correctly kept all 8 — exactly what Rust reads. **Fix: emit `java_scan_plan.json` from the table RELOADED off the
+  persisted `final.metadata.json`** (reusing `ScanPlanOracle.verify()`'s disk-load path), so both engines
+  plan the identical persisted manifest — apples-to-apples. *Why this is the RIGHT fix, not a mask:* the
+  persisted manifest is authoritative and is what any reader sees; comparing Rust's persisted-table plan to
+  Java's *in-memory* plan was the apples-to-oranges bug. **DO, in a cross-engine oracle, have BOTH sides
+  plan the PERSISTED artifact — never plan a freshly-built in-memory table against the other engine's
+  on-disk read** (writer in-memory state can legitimately differ from the flushed footer). Local stays a
+  no-op (in-memory == persisted == 8). The `block=64` fixture-hygiene knob was orthogonal (kept, harmless).
