@@ -229,6 +229,121 @@ fn read_java_plan_file(dir: &Path, file_name: &str) -> JavaScanPlan {
 }
 
 // ===========================================================================================
+// D1 mismatch diagnostics.
+//
+// The scan-plan D1 leg is the parity net's most environment-sensitive fixture: the split member keys
+// `(basename,start,length)` ARE `big.parquet`'s row-group offsets, and those offsets come from parquet-mr's
+// (version-sensitive) row-group flush. When D1 fails in CI, the raw failure carries only the two plans;
+// this block dumps the UPSTREAM facts — the manifest field-132 `split_offsets` Rust actually plans from, plus
+// the PHYSICAL parquet-footer row-group offsets and `created_by` (the parquet-mr build that wrote the file) —
+// so a single CI `tail -40` localizes the fault instead of requiring another round trip. Kept best-effort:
+// this code runs ONLY on the failure path, so it must never itself panic (it degrades to `<unavailable: …>`).
+// ===========================================================================================
+
+/// The manifest field-132 `split_offsets` Rust reads for every data file in the current snapshot — the exact
+/// input to the offsets-aware split. Returned as `(basename, offsets)` rows (empty vec ⇒ field absent).
+async fn manifest_split_offsets(table: &Table) -> Result<Vec<(String, Vec<i64>)>, String> {
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .ok_or_else(|| "no current snapshot".to_string())?;
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut rows = Vec::new();
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .map_err(|error| error.to_string())?;
+        for entry in manifest.entries() {
+            let data_file = entry.data_file();
+            rows.push((
+                basename(data_file.file_path()),
+                data_file
+                    .split_offsets()
+                    .map(<[i64]>::to_vec)
+                    .unwrap_or_default(),
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+/// `big.parquet`'s PHYSICAL row-group layout, read straight from the parquet footer (bypassing the manifest):
+/// `(created_by, row_group_start_offsets, file_len)`. A row group's start is its first column chunk's
+/// dictionary-page offset when present, else its first data-page offset — exactly Java `BlockMetaData
+/// .getStartingPos()`, i.e. what iceberg records as field-132. Comparing this to [`manifest_split_offsets`]
+/// reveals a write that recorded offsets inconsistent with the physical grid.
+fn big_parquet_footer(path: &Path) -> Result<(String, Vec<i64>, u64), String> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let reader = SerializedFileReader::new(file).map_err(|error| error.to_string())?;
+    let metadata = reader.metadata();
+    let created_by = metadata
+        .file_metadata()
+        .created_by()
+        .unwrap_or("<none>")
+        .to_string();
+    let mut offsets = Vec::with_capacity(metadata.num_row_groups());
+    for i in 0..metadata.num_row_groups() {
+        let column = metadata.row_group(i).column(0);
+        offsets.push(
+            column
+                .dictionary_page_offset()
+                .unwrap_or_else(|| column.data_page_offset()),
+        );
+    }
+    let file_len = fs::metadata(path).map_err(|error| error.to_string())?.len();
+    Ok((created_by, offsets, file_len))
+}
+
+/// Build the human-readable D1 mismatch report (see the section banner above). Never panics.
+async fn d1_mismatch_report(table: &Table, dir: &Path) -> String {
+    let mut out =
+        String::from("\n--- D1 DIAGNOSTICS (upstream facts behind the plan mismatch) ---\n");
+
+    out.push_str("manifest field-132 split_offsets Rust plans from (per data file):\n");
+    match manifest_split_offsets(table).await {
+        Ok(rows) => {
+            for (name, offsets) in rows {
+                out.push_str(&format!("    {name}: {offsets:?}\n"));
+            }
+        }
+        Err(error) => out.push_str(&format!("    <unavailable: {error}>\n")),
+    }
+
+    let big = dir.join("table/data/big.parquet");
+    out.push_str(&format!(
+        "big.parquet physical parquet footer ({}):\n",
+        big.display()
+    ));
+    match big_parquet_footer(&big) {
+        Ok((created_by, offsets, file_len)) => {
+            out.push_str(&format!("    created_by:        {created_by}\n"));
+            out.push_str(&format!("    file_len:          {file_len}\n"));
+            out.push_str(&format!(
+                "    row_group_offsets: {offsets:?} ({} row groups)\n",
+                offsets.len()
+            ));
+        }
+        Err(error) => out.push_str(&format!("    <unavailable: {error}>\n")),
+    }
+
+    out.push_str(
+        "READ THIS AS: both engines split ONE sub-task per field-132 offset, so if field-132 == the footer \
+         offsets == Java's emitted plan, the plans MUST match. field-132 != footer ⇒ the write recorded \
+         offsets inconsistent with the physical grid; field-132 == footer but != Java's plan ⇒ the emitted \
+         java_scan_plan.json does not reflect THIS manifest. `created_by` names the parquet-mr build that \
+         wrote big.parquet (differences across environments produce different row-group grids).\n\
+         --- end D1 DIAGNOSTICS ---",
+    );
+    out
+}
+
+// ===========================================================================================
 // Table construction (shared by GEN + the load path).
 // ===========================================================================================
 
@@ -397,21 +512,29 @@ async fn test_scan_plan_d1_rust_plans_java_table() {
     let rust = rust_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
     let java = java_plan_multiset(&read_java_plan(&dir));
 
-    assert_eq!(
-        rust, java,
-        "Rust plan_tasks over the Java table must equal Java's planTasks plan (multiset of per-group \
-         member-key sets + group count)"
-    );
+    // A plain `assert_eq!` here would report only the two plans; on the D1 leg the interesting evidence is
+    // UPSTREAM (the manifest offsets + the physical row-group grid), so on mismatch we panic with that dumped
+    // (see `d1_mismatch_report`). Same failure semantics, far richer CI `tail -40`.
+    if rust != java {
+        let report = d1_mismatch_report(&table, &dir).await;
+        panic!(
+            "Rust plan_tasks over the Java table must equal Java's planTasks plan (multiset of per-group \
+             member-key sets + group count)\n  left  (rust) = {rust:?}\n  right (java) = {java:?}{report}"
+        );
+    }
 
     // BatchScan leg (row R124): Rust `BatchScan::plan_tasks` over the SAME Java table must equal
     //   (a) Java's `newBatchScan().planTasks()` plan (java_batch_scan_plan.json), AND
     //   (b) the plain scan plan (proving the Rust adapter delegates to the same pipeline).
     let rust_batch = rust_batch_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
     let java_batch = java_plan_multiset(&read_java_plan_file(&dir, "java_batch_scan_plan.json"));
-    assert_eq!(
-        rust_batch, java_batch,
-        "Rust BatchScan::plan_tasks over the Java table must equal Java's newBatchScan().planTasks() plan"
-    );
+    if rust_batch != java_batch {
+        let report = d1_mismatch_report(&table, &dir).await;
+        panic!(
+            "Rust BatchScan::plan_tasks over the Java table must equal Java's newBatchScan().planTasks() \
+             plan\n  left  (rust_batch) = {rust_batch:?}\n  right (java_batch) = {java_batch:?}{report}"
+        );
+    }
     assert_eq!(
         rust_batch, rust,
         "Rust BatchScan::plan_tasks must equal Rust TableScan::plan_tasks (adapter delegation)"
