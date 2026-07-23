@@ -117,3 +117,35 @@ How to use it (see the manuals' §2):
   and `cargo clippy -D warnings` (a `collapsible_if` in `publish_replace_table`). A remediation unit
   that gates cleanly must normalize the pre-existing violations in the files it already touches and
   disclose it.
+
+### 2026-07-23 — When a nightly cross-engine assertion fails UNREPRODUCIBLY, INSTRUMENT the upstream facts before "fixing"; do NOT paper over a same-file divergence with a fixture knob
+
+Context: the `Nightly Interop` `scan-plan` D1 leg (`interop_scan_plan.rs`) had failed EVERY run since the
+workflow's first (2026-07-11), reporting Rust splitting `big.parquet` into 8 sub-tasks vs Java 5 — the
+split member keys `(basename,start,length)` ARE the row-group offsets. It could NOT be reproduced locally
+(deterministically green), and the nightly uploads no artifacts + raw Actions logs need auth.
+
+- **DO instrument a cross-engine equality assertion with the UPSTREAM facts, not just the two outputs,
+  when the CI channel is only the driver's `tail -40`.** The D1 leg now, on mismatch, `panic!`s with the
+  manifest field-132 `split_offsets` Rust plans from + `big.parquet`'s PHYSICAL parquet-footer offsets +
+  `created_by` (the parquet-mr build) — so one `tail -40` localizes whether the manifest, the physical
+  grid, or the emitted Java plan is the odd one out, on the next nightly. *Why:* the failing suite's
+  self-printed tail is the ONLY channel that reaches CI logs here; put the evidence where it will be read.
+  Keep such diagnostics best-effort — they run only on the already-failed path, so they must never panic
+  themselves (String-map every error to `<unavailable: …>`; NEVER `unwrap`).
+- **DO NOT assert an unproven failure mechanism as fact, and do NOT mask a possible same-file parity
+  divergence with a fixture-determinism knob.** It was tempting to write "different parquet-mr row-group
+  grids on the CI runner vs a dev box broke the exact-offset assertion" — but the independent Critic
+  DISPROVED that as a *mechanism*: `java_scan_plan.json` is REGENERATED each run (never a committed
+  golden), so within a run BOTH engines plan the SAME `big.parquet`, and Rust `plan_tasks` == Java
+  `planTasks` at EVERY grid tried (2/3/4/8 offsets — both split one-sub-task-per-field-132-offset and
+  bin-pack identically). A differing grid ALONE therefore cannot make the plans diverge; the reported
+  Rust≠Java over the same file is a genuine `plan_tasks` PARITY anomaly (or a CI-only write/read
+  inconsistency), which a grid pin would MASK, not fix. *Why:* a green nightly that hides a real parity
+  gap is worse than a red one (the anti-false-green norm). The `PARQUET_ROW_GROUP_SIZE_BYTES 1024→64`
+  change was kept ONLY as fixture hygiene (a byte target far below the ~1 KiB buffered-at-100-rows size
+  forces parquet-mr's flush at its 100-row check FLOOR ⇒ a deterministic 8×100-row grid; byte-identical
+  on a dev box) — explicitly NOT claimed as the fix. If the nightly goes green after this, that does NOT
+  confirm the mechanism; the diagnostics (not the knob) are the deliverable. (Watch the unit trap: the
+  Java `64` is BYTES → 8 groups; the Rust GEN side's `set_max_row_group_size(64)` is ROWS → 13 groups —
+  the shared literal is coincidental, not a "mirror.")

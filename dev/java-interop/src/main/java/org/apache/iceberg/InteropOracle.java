@@ -5156,9 +5156,27 @@ public final class InteropOracle {
 
       Map<String, String> props = new LinkedHashMap<>();
       props.put(TableProperties.FORMAT_VERSION, "2");
-      // Drive `big.parquet` to MULTIPLE row groups: a tiny parquet row-group size so a few hundred rows
-      // span several groups ⇒ split offsets present + strictly ascending (the offsets-aware split branch).
-      props.put(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "1024");
+      // Drive `big.parquet` to MULTIPLE row groups (⇒ split offsets present + strictly ascending, the
+      // offsets-aware split branch), with a DETERMINISTIC grid across environments — FIXTURE HYGIENE.
+      //
+      // parquet-mr flushes a row group when the buffered (uncompressed) column-store size crosses the target,
+      // but only CHECKS at a row interval (`parquet.page.size.row.check.min`, default 100 rows). For these
+      // ~23-byte rows the dictionary-encoded buffered size at the first 100-row check is ~1 KiB, so a
+      // 1024-byte target sat right on the flush knife-edge (`memSize > target - 2*recordSize`): a box landing
+      // a few bytes ABOVE flushes at 100 rows (8×100-row groups), one BELOW waits to ~200 (a coarser grid).
+      // A target FAR below the ~1 KiB buffered-at-100 size removes the knife-edge — parquet-mr flushes at the
+      // 100-row check FLOOR in every environment, a deterministic 8×100-row grid. (64 is a BYTE target giving
+      // ~15× margin; NOT the same knob as the Rust GEN side's `set_max_row_group_size(64)`, which is a ROW
+      // count that yields 13 groups — the shared literal is coincidental.)
+      //
+      // HONESTY: this is NOT confirmed to fix the nightly's scan-plan D1 failure. `java_scan_plan.json` is
+      // REGENERATED each run (never a committed golden), so within a run BOTH engines plan the SAME
+      // big.parquet — a differing grid alone cannot make Rust's plan diverge from Java's (they both split
+      // one-sub-task-per-offset from the same field-132). A genuine Rust≠Java divergence over the same file
+      // would be a `plan_tasks` PARITY anomaly, which pinning the grid could MASK, not fix. The real
+      // deliverable is the D1 mismatch diagnostics in `crates/iceberg/tests/interop_scan_plan.rs`, which will
+      // localize the true cause on the next nightly. See dev/java-interop/map.md and task/lessons.md.
+      props.put(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "64");
       TableMetadata seed =
           TableMetadata.newTableMetadata(
               schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
@@ -5167,7 +5185,8 @@ public final class InteropOracle {
       ops.commit(null, seed);
       BaseTable table = new BaseTable(ops, "interop_scan_plan");
 
-      // big.parquet — 800 rows so the 1 KiB row groups force several groups (multi-row-group ⇒ offsets).
+      // big.parquet — 800 rows so the small row-group target flushes at the 100-row check floor ⇒ a
+      // deterministic 8×100-row grid (multi-row-group ⇒ split offsets ⇒ the offsets-aware split branch).
       DataFile big =
           writeManyRowDataFile(table, schema, spec, new File(dataDir, "big.parquet"), 800);
       // mid / small1 / small2 — few rows each (single row group).
@@ -5200,10 +5219,11 @@ public final class InteropOracle {
         rows.add(record);
       }
       GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
-      // Honor the table's parquet row-group size so big.parquet gets multiple row groups.
+      // Honor the table's (deterministic, knife-edge-clearing) parquet row-group size so big.parquet gets a
+      // reproducible multi-row-group grid — see the PARQUET_ROW_GROUP_SIZE_BYTES rationale in buildTableWithFiles.
       factory.set(
           TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES,
-          table.properties().getOrDefault(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "1024"));
+          table.properties().getOrDefault(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "64"));
       OutputFile out = table.io().newOutputFile(file.getAbsolutePath());
       DataWriter<Record> writer =
           factory.newDataWriter(
