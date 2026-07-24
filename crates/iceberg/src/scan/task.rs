@@ -455,6 +455,35 @@ impl FileScanTask {
         }
     }
 
+    /// Whether this task can MERGE with `other` into one contiguous span, porting Java
+    /// `BaseFileScanTask$SplitScanTask.canMerge(ScanTask)` (1.10.0, javap-decoded): `other` must be
+    /// a split task over the SAME underlying data file that is CONTIGUOUS with this one. The bytecode
+    /// requires `other instanceof SplitScanTask`, then `this.file().equals(that.file())`, then the
+    /// contiguity test `(this.offset + this.len) == that.start()`. `DataFile` has NO `equals` override
+    /// (identity equality) and every split sub-task of one file wraps the SAME parent, so "same file"
+    /// IS the file identity — the unique data-file path here. NO delete / residual / schema comparison
+    /// appears in the bytecode; splits of one file share those fields by construction, so path plus
+    /// exact contiguity is the whole predicate. Different files, or same-file splits with a gap or an
+    /// overlap, never merge.
+    fn can_merge(&self, other: &FileScanTask) -> bool {
+        self.data_file_path == other.data_file_path
+            && self.start.checked_add(self.length) == Some(other.start)
+    }
+
+    /// Merge this task with a CONTIGUOUS same-file `other`, porting Java
+    /// `SplitScanTask.merge(ScanTask)`: the merged task keeps THIS task's `start` and every
+    /// non-window field, summing the lengths — Java `new SplitScanTask(offset, len + that.length(),
+    /// fileScanTask, deletesSizeBytes)` (offset stays, length grows, the parent's `fileScanTask` and
+    /// its deletes carry over). Only ever called after [`can_merge`](Self::can_merge) returned true,
+    /// so the summed span is exactly `[start, other.start + other.length)`. The add is saturating so
+    /// an adversarial pair cannot panic (Java `long` would silently wrap; saturation is the safer
+    /// faithful-on-the-real-domain choice).
+    fn merge_with(&self, other: &FileScanTask) -> FileScanTask {
+        let mut merged = self.clone();
+        merged.length = self.length.saturating_add(other.length);
+        merged
+    }
+
     /// The bin-packing WEIGHT of this task, porting Java `TableScanUtil.lambda$planTasks$3`:
     /// `max( length + contentSizeInBytes(deletes), (1 + deletes.len()) * openFileCost )`.
     ///
@@ -502,6 +531,48 @@ impl FileScanTask {
     pub fn schema_ref(&self) -> SchemaRef {
         self.schema.clone()
     }
+}
+
+/// Merge adjacent contiguous same-file split tasks in `tasks`, porting Java
+/// `org.apache.iceberg.util.TableScanUtil.mergeTasks(List<T>)` (1.10.0, javap-decoded).
+///
+/// Java walks the list ONCE carrying an accumulator `prev`: while `prev instanceof MergeableScanTask
+/// && prev.canMerge(next)` it folds `next` into `prev` (`prev = prev.merge(next)`); otherwise it
+/// flushes `prev` to the output and restarts the run at `next`; the trailing `prev` is flushed at the
+/// end. Order is preserved and ONLY tasks adjacent-in-list are ever compared. A merged task is itself
+/// still a `SplitScanTask` (mergeable), so a run of three or more contiguous splits collapses into
+/// one. `BaseCombinedScanTask`'s `List` constructor — the one `TableScanUtil.planTasks` maps every
+/// bin through (`REF_newInvokeSpecial BaseCombinedScanTask.<init>:(List)`) — runs this over each bin,
+/// so contiguous same-file splits that land in one bin become a single spanning member.
+///
+/// Java's `instanceof MergeableScanTask` type-guard is SUBSUMED by [`FileScanTask::can_merge`] here:
+/// in the `plan_tasks` pipeline a same-file contiguous pair can only arise from splitting ONE file,
+/// which is exactly the `SplitScanTask` set Java marks mergeable — a non-splittable whole data file
+/// yields a single task with no same-file neighbour, so gating purely on `can_merge` is equivalent.
+pub(crate) fn merge_tasks(tasks: Vec<FileScanTask>) -> Vec<FileScanTask> {
+    let mut merged: Vec<FileScanTask> = Vec::with_capacity(tasks.len());
+    let mut prev: Option<FileScanTask> = None;
+    for current in tasks {
+        match prev {
+            // Contiguous same-file split ⇒ fold into the accumulator (the merged task stays
+            // mergeable, so a longer run keeps collapsing).
+            Some(p) if p.can_merge(&current) => {
+                prev = Some(p.merge_with(&current));
+            }
+            // A non-mergeable neighbour ⇒ flush the run and restart at `current`.
+            Some(p) => {
+                merged.push(p);
+                prev = Some(current);
+            }
+            None => {
+                prev = Some(current);
+            }
+        }
+    }
+    if let Some(p) = prev {
+        merged.push(p);
+    }
+    merged
 }
 
 #[derive(Debug)]
@@ -680,6 +751,57 @@ mod tests {
             content_size_in_bytes: Some(blob_size),
             record_count: Some(10),
         }
+    }
+
+    /// A split sub-task over `path` covering `[start, start + length)`, for the merge predicate
+    /// tests. Only `data_file_path` / `start` / `length` / `deletes` are load-bearing here.
+    fn split_like(path: &str, start: u64, length: u64) -> FileScanTask {
+        let mut t = task(length, DataFileFormat::Parquet, None);
+        t.data_file_path = path.to_string();
+        t.start = start;
+        t.record_count = None;
+        t
+    }
+
+    // ---- merge: canMerge / merge (Java SplitScanTask) ----
+
+    #[test]
+    fn can_merge_requires_same_file_and_exact_contiguity() {
+        let a = split_like("f.parquet", 0, 100);
+        assert!(
+            a.can_merge(&split_like("f.parquet", 100, 50)),
+            "same file, offset+len == next start ⇒ mergeable"
+        );
+        assert!(
+            !a.can_merge(&split_like("f.parquet", 200, 50)),
+            "same file but a GAP (100 != 200) ⇒ not mergeable"
+        );
+        assert!(
+            !a.can_merge(&split_like("f.parquet", 50, 50)),
+            "same file but OVERLAP (100 != 50) ⇒ not mergeable (contiguity is exact ==)"
+        );
+        assert!(
+            !a.can_merge(&split_like("g.parquet", 100, 50)),
+            "different file ⇒ never mergeable even when arithmetically contiguous"
+        );
+    }
+
+    #[test]
+    fn merge_with_sums_length_keeps_start_and_carries_parent_fields() {
+        let mut a = split_like("f.parquet", 0, 100);
+        a.deletes = vec![pos_delete(50)];
+        let merged = a.merge_with(&split_like("f.parquet", 100, 50));
+        assert_eq!(
+            (merged.start, merged.length),
+            (0, 150),
+            "start stays at self's; length is self+other"
+        );
+        assert_eq!(merged.data_file_path, "f.parquet");
+        assert_eq!(
+            merged.deletes.len(),
+            1,
+            "the merged task carries self's deletes (same file ⇒ same delete set)"
+        );
     }
 
     // ---- split: non-splittable passthrough ----
