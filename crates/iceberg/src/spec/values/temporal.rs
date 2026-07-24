@@ -30,11 +30,18 @@ pub(crate) mod date {
         .num_days() as i32
     }
 
-    pub(crate) fn days_to_date(days: i32) -> NaiveDate {
-        // This shouldn't fail until the year 262000
-        (chrono::DateTime::UNIX_EPOCH + TimeDelta::try_days(days as i64).unwrap())
-            .naive_utc()
-            .date()
+    pub(crate) fn days_to_date(days: i32) -> Option<NaiveDate> {
+        // A `days`-since-epoch value near the `i32` extremes (e.g. from corrupt/hostile
+        // on-disk bytes) pushes the date past chrono's representable range, which made the
+        // former `+ TimeDelta::try_days(..).unwrap()` panic. Return `None` instead: callers
+        // render a placeholder (`Display`) or a typed `DataInvalid` error (fallible JSON),
+        // mirroring the sibling temporal converters (`microseconds_to_time`, etc.).
+        Some(
+            chrono::DateTime::UNIX_EPOCH
+                .checked_add_signed(TimeDelta::try_days(i64::from(days))?)?
+                .naive_utc()
+                .date(),
+        )
     }
 
     /// Returns unix epoch.
@@ -129,5 +136,32 @@ pub(crate) mod timestamptz {
         let secs = nanos.div_euclid(1_000_000_000);
         let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
         DateTime::from_timestamp(secs, sub_nanos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::date::{date_to_days, days_to_date};
+
+    /// SAF-003: an out-of-range `days`-since-epoch value (corrupt/hostile on-disk bytes) must
+    /// yield `None`, not panic. For any `i32` the former `TimeDelta::try_days(days as i64)` was
+    /// always `Some`, so the panic was in the subsequent `DateTime + TimeDelta` (`Add`), which
+    /// overflowed chrono's representable range near the `i32` extremes.
+    ///
+    /// MUTATION (restore `pub(crate) fn days_to_date(days: i32) -> NaiveDate` built with
+    /// `(chrono::DateTime::UNIX_EPOCH + TimeDelta::try_days(days as i64).unwrap()).naive_utc().date()`):
+    /// `days_to_date(i32::MAX)` panics in chrono's `DateTime + TimeDelta`.
+    #[test]
+    fn test_days_to_date_out_of_range_is_none_not_panic() {
+        assert!(days_to_date(i32::MAX).is_none());
+        assert!(days_to_date(i32::MIN).is_none());
+    }
+
+    #[test]
+    fn test_days_to_date_roundtrip_valid() {
+        for days in [0, 1, -1, 18_000, -18_000, 100_000, -100_000] {
+            let date = days_to_date(days).expect("in-range days-since-epoch must convert");
+            assert_eq!(date_to_days(&date), days);
+        }
     }
 }

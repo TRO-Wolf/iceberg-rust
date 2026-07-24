@@ -28,6 +28,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
+use iceberg::Result;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::table::Table;
@@ -41,17 +42,23 @@ use crate::to_datafusion_error;
 pub struct IcebergMetadataTableProvider {
     pub(crate) table: Table,
     pub(crate) r#type: MetadataTableType,
+    /// Arrow schema of the metadata table, converted eagerly at construction.
+    ///
+    /// The `TableProvider::schema` trait method is infallible, but the Iceberg → Arrow
+    /// schema conversion is fallible. Resolving it here lets `schema()` return an
+    /// already-validated schema instead of unwrapping the conversion (which would panic
+    /// inside a trait method DataFusion calls).
+    pub(crate) schema: ArrowSchemaRef,
 }
 
-#[async_trait]
-impl TableProvider for IcebergMetadataTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> ArrowSchemaRef {
-        let metadata_table = self.table.inspect();
-        let schema = match self.r#type {
+impl IcebergMetadataTableProvider {
+    /// Builds a metadata-table provider, resolving the Arrow schema for `r#type` up front.
+    ///
+    /// Returns an error if the metadata table's Iceberg schema cannot be represented in
+    /// Arrow, so the panic surface never reaches the infallible [`TableProvider::schema`].
+    pub(crate) fn try_new(table: Table, r#type: MetadataTableType) -> Result<Self> {
+        let metadata_table = table.inspect();
+        let schema = match r#type {
             MetadataTableType::Snapshots => metadata_table.snapshots().schema(),
             MetadataTableType::Manifests => metadata_table.manifests().schema(),
             MetadataTableType::Files => metadata_table.files().schema(),
@@ -68,7 +75,24 @@ impl TableProvider for IcebergMetadataTableProvider {
             MetadataTableType::Partitions => metadata_table.partitions().schema(),
             MetadataTableType::AllManifests => metadata_table.all_manifests().schema(),
         };
-        schema_to_arrow_schema(&schema).unwrap().into()
+        let schema = Arc::new(schema_to_arrow_schema(&schema)?);
+        Ok(Self {
+            table,
+            r#type,
+            schema,
+        })
+    }
+}
+
+#[async_trait]
+impl TableProvider for IcebergMetadataTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> ArrowSchemaRef {
+        // Resolved (and validated) eagerly in `try_new`; this trait method must not fail.
+        self.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -111,5 +135,72 @@ impl IcebergMetadataTableProvider {
         .map_err(to_datafusion_error)?;
         let stream = stream.map_err(to_datafusion_error);
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::datasource::TableProvider;
+    use iceberg::TableIdent;
+    use iceberg::inspect::MetadataTableType;
+    use iceberg::io::FileIO;
+    use iceberg::table::{StaticTable, Table};
+
+    use super::IcebergMetadataTableProvider;
+
+    // Every `MetadataTableType` variant; kept exhaustive alongside the `try_new` match so a new
+    // metadata table cannot silently skip the schema-resolution guard.
+    const ALL_METADATA_TABLE_TYPES: [MetadataTableType; 15] = [
+        MetadataTableType::Snapshots,
+        MetadataTableType::Manifests,
+        MetadataTableType::Files,
+        MetadataTableType::DataFiles,
+        MetadataTableType::DeleteFiles,
+        MetadataTableType::Entries,
+        MetadataTableType::AllFiles,
+        MetadataTableType::AllDataFiles,
+        MetadataTableType::AllDeleteFiles,
+        MetadataTableType::AllEntries,
+        MetadataTableType::History,
+        MetadataTableType::Refs,
+        MetadataTableType::MetadataLogEntries,
+        MetadataTableType::Partitions,
+        MetadataTableType::AllManifests,
+    ];
+
+    async fn test_table() -> Table {
+        let metadata_file_path = format!(
+            "{}/tests/test_data/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2Valid.json"
+        );
+        let file_io = FileIO::new_with_fs();
+        let ident = TableIdent::from_strs(["ns", "t"]).unwrap();
+        StaticTable::from_metadata_file(&metadata_file_path, ident, file_io)
+            .await
+            .unwrap()
+            .into_table()
+    }
+
+    /// SAF-008: `TableProvider::schema()` is infallible, but the Iceberg → Arrow schema
+    /// conversion is not. Every metadata-table type must resolve its Arrow schema at
+    /// construction (`try_new`) so `schema()` returns an already-validated schema and never
+    /// unwraps the conversion inside the trait method.
+    ///
+    /// MUTATION (drop the eager `try_new` resolution and restore
+    /// `schema_to_arrow_schema(&schema).unwrap().into()` inside `schema()`): the fallible
+    /// conversion moves back into the infallible trait method, reintroducing the `.unwrap()`
+    /// panic surface this test guards against for all metadata-table types.
+    #[tokio::test]
+    async fn test_metadata_table_provider_schema_resolves_for_all_types() {
+        let table = test_table().await;
+        for r#type in ALL_METADATA_TABLE_TYPES {
+            let provider = IcebergMetadataTableProvider::try_new(table.clone(), r#type.clone())
+                .unwrap_or_else(|e| panic!("try_new failed for {type:?}: {e}"));
+            assert!(
+                !provider.schema().fields().is_empty(),
+                "arrow schema for metadata table {type:?} must be non-empty",
+            );
+        }
     }
 }

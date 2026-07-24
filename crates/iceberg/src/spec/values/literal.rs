@@ -660,7 +660,13 @@ impl Literal {
                     }
                 }
                 (PrimitiveType::Date, PrimitiveLiteral::Int(val)) => {
-                    Ok(JsonValue::String(date::days_to_date(val).to_string()))
+                    let date = date::days_to_date(val).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Date value {val} is out of the representable range"),
+                        )
+                    })?;
+                    Ok(JsonValue::String(date.to_string()))
                 }
                 // The temporal converters return `None` for an out-of-range stored value; in this
                 // fallible JSON path that is a `DataInvalid` error (never a panic), unlike the
