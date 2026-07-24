@@ -777,9 +777,23 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
             TimestampNanosecondArray::new(vec![*value; 1].into(), None).with_timezone_utc(),
         ))),
         (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(value)) => {
+            // `precision`/`scale` are NOT bound-checked by the `decimal(P,S)` type-string
+            // deserializer nor by `Datum::try_from_bytes`, so a corrupt/hostile catalog or manifest
+            // can carry a precision above Arrow's Decimal128 max (38). `with_precision_and_scale`
+            // rejects such values; map that to a typed error rather than `.unwrap()`-panicking the
+            // predicate path (AGENTS.md: no bare unwrap in production paths).
             let array = Decimal128Array::from_value(*value, 1)
                 .with_precision_and_scale(*precision as _, *scale as _)
-                .unwrap();
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Decimal literal precision/scale ({precision},{scale}) is not a valid \
+                             Arrow Decimal128"
+                        ),
+                    )
+                    .with_source(e)
+                })?;
             Ok(Arc::new(Scalar::new(array)))
         }
         (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(value)) => {
@@ -2293,6 +2307,46 @@ mod tests {
             assert!(is_scalar);
             assert_eq!(array.value_length(), 4);
             assert_eq!(array.value(0), &[0xDEu8, 0xAD, 0xBE, 0xEF]);
+        }
+    }
+
+    /// A `Datum` can carry a decimal `precision > 38` — the type-string deserializer
+    /// (`decimal(P,S)`) and [`Datum::try_from_bytes`] do NOT bound-check precision, so a corrupt or
+    /// hostile catalog/manifest can hand the predicate path such a datum. Arrow's Decimal128 tops
+    /// out at precision 38, so `with_precision_and_scale` rejects it. `get_arrow_datum` must surface
+    /// that as a typed [`ErrorKind::DataInvalid`], never a panic (a predicate pushdown that panics
+    /// takes down the scan/worker instead of failing the one bad query).
+    #[test]
+    fn get_arrow_datum_rejects_over_max_decimal_precision_without_panicking() {
+        // precision 50 > Arrow's Decimal128 max of 38; built via the pub(crate) constructor to
+        // mirror what the unvalidated `decimal(50,0)` type-string deserializer produces.
+        let datum = Datum::new(
+            PrimitiveType::Decimal {
+                precision: 50,
+                scale: 0,
+            },
+            PrimitiveLiteral::Int128(1234),
+        );
+
+        match get_arrow_datum(&datum) {
+            Ok(_) => {
+                panic!("decimal precision 50 exceeds Arrow Decimal128 max and must be an error")
+            }
+            Err(err) => assert_eq!(err.kind(), ErrorKind::DataInvalid),
+        }
+
+        // A second, independent rejection class Arrow's `with_precision_and_scale` enforces:
+        // `scale > precision`. Also unvalidated at the type/datum layer, also must be a typed error.
+        let bad_scale = Datum::new(
+            PrimitiveType::Decimal {
+                precision: 10,
+                scale: 20,
+            },
+            PrimitiveLiteral::Int128(1234),
+        );
+        match get_arrow_datum(&bad_scale) {
+            Ok(_) => panic!("decimal scale 20 > precision 10 is invalid and must be an error"),
+            Err(err) => assert_eq!(err.kind(), ErrorKind::DataInvalid),
         }
     }
 
