@@ -58,8 +58,12 @@
 //!   magic). Note the merged key is INDEPENDENT of the internal row-group grid — merging removes the
 //!   environment sensitivity rather than adding it. The sizing is ASSERTED
 //!   (`fileLength < TARGET`), so a future fixture edit that pushes it over fails loudly instead of
-//!   silently reverting the pin to vacuity, and NON-VACUITY is asserted directly: the emitted member's
-//!   length must STRICTLY EXCEED the largest single row-group span (from the manifest field-132 offsets).
+//!   silently reverting the pin to vacuity. What proves the merge FIRED is the exact
+//!   [`assert_eq`](assert_merge_fixture_pins) on the plan SHAPE — ONE group holding ONE member spanning
+//!   the whole file — read against the offsets-aware-split invariant: the splitter emits exactly one
+//!   sub-task PER SPLIT OFFSET, target-independent (Java `OffsetsAwareSplitScanTaskIterator`, Rust
+//!   `FileScanTask::split_at_offsets`), so `>= 2` offsets means `>= 2` splits and a single spanning
+//!   member is only producible by the merge.
 //! * `gap.parquet` (ids from [`GAP_ID_BASE`], filter [`gap_filter`]) — 3 row groups whose MIDDLE one
 //!   carries [`WIDE_ROWS`] high-entropy [`WIDE_CHARS`]-char strings so its span ALONE exceeds
 //!   [`TARGET`] (asserted), while the outer two are null-`data` row groups whose spans SUM to under
@@ -550,18 +554,42 @@ async fn d1_mismatch_report(table: &Table, dir: &Path) -> String {
 //
 // These assertions are what keep the merge legs from being vacuous. The cross-engine equality of the
 // filtered plans (asserted by the callers) proves the two engines AGREE; the assertions here prove the
-// thing they agree on is actually the merge:
+// thing they agree on is actually the merge.
 //
-//   * `merge.parquet` — the emitted member's length must STRICTLY EXCEED the largest single row-group
-//     span (from the manifest field-132 offsets). A member equal to one span means no merge occurred
-//     and the agreement is about nothing.
-//   * `gap.parquet` — the co-binned pair must remain TWO members and be NON-CONTIGUOUS, pinning that
-//     the merge is an adjacent-run collapse and not a group-by-file coalesce.
+// WHAT DOES THE PROVING — read this before trusting any single assert below. The load-bearing
+// assertions are the two exact `assert_eq`s on the plan SHAPE, interpreted through the
+// OFFSETS-AWARE-SPLIT INVARIANT: the splitter emits exactly ONE sub-task PER SPLIT OFFSET and IGNORES
+// the target in that branch (Java `OffsetsAwareSplitScanTaskIterator`; Rust
+// `FileScanTask::split_at_offsets`). Therefore:
 //
-// Both are guarded by SIZING assertions on the fixture itself (merge total < target; gap middle span >
-// target; gap outer spans sum <= target), so a fixture edit that destroys the precondition fails LOUDLY
-// here instead of silently draining the pins.
+//   * `merge.parquet` has `>= 2` split offsets (asserted) ⇒ the splitter MUST emit `>= 2` sub-tasks ⇒
+//     a plan of ONE group holding ONE member that spans the whole file is producible ONLY by the merge
+//     collapsing them. That equality is the proof.
+//   * `gap.parquet` is asserted to plan as EXACTLY two groups with the outer pair intact — two separate
+//     same-file members in ONE group. A group-by-file coalesce would emit one member there, so the
+//     equality pins the adjacent-run semantics.
+//
+// The surrounding numeric asserts are FIXTURE guards, not the proof: the SIZING trio (merge total <
+// target; gap middle span > target; gap outer spans sum <= target) pins the packing preconditions, and
+// the "member length exceeds the largest single row-group span" / "the co-binned pair is
+// non-contiguous" checks are degenerate-fixture guards — they catch a file that collapsed to a single
+// row group or offsets that stopped ascending. Both are arithmetically implied once the offset counts
+// and ascending-offset invariant hold, so neither is doing the discriminating work; do not read them
+// as the non-vacuity mechanism. The EXECUTABLE proof that all of this is load-bearing is stage [7] of
+// `dev/java-interop/run-interop-scan-plan.sh`, which removes the merge (and, separately, its
+// contiguity clause) from production source and requires these assertions to go RED.
 // ===========================================================================================
+
+/// The `length` field of an EMITTED member key `(basename,start,length)` — so a guard can read the
+/// plan's own observable instead of recomputing it from the manifest facts.
+fn member_length(member: &str) -> u64 {
+    member
+        .trim_end_matches(')')
+        .rsplit(',')
+        .next()
+        .and_then(|length| length.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("member key {member} must end in a numeric length"))
+}
 
 /// The per-row-group byte spans of a data file: `offsets[i+1] - offsets[i]`, the last running to the
 /// file's end — exactly the sub-task lengths the offsets-aware split emits.
@@ -606,8 +634,11 @@ async fn assert_merge_fixture_pins(
     gap_plan: &PlanMultiset,
     label: &str,
 ) {
-    // -- merge.parquet: M-1 (the single spanning member) + M-3 (non-vacuity) + the sizing guard. --
+    // -- merge.parquet: M-1/M-3, the single spanning member + the fixture guards. --
     let (merge_offsets, merge_len) = fixture_file_facts(table, "merge.parquet").await;
+    // The PREMISE of the M-1 proof: with >= 2 split offsets the offsets-aware splitter necessarily
+    // emits >= 2 sub-tasks (one per offset, target-ignored), so the single-member plan asserted below
+    // can only be the merge's doing.
     assert!(
         merge_offsets.len() >= 2,
         "{label}: merge.parquet must have >= 2 row groups to have anything to merge, got offsets \
@@ -638,14 +669,23 @@ async fn assert_merge_fixture_pins(
         merge_offsets.len()
     );
 
-    // M-3, the load-bearing non-vacuity guard: the emitted member SPANS more than any single row group,
-    // so it can only have come from the merge.
+    // DEGENERATE-FIXTURE guard (NOT the non-vacuity proof — see the section banner): the length of the
+    // member the plan ACTUALLY emitted must exceed the largest single row-group span, i.e. the file did
+    // not collapse to one row group. Read out of the emitted plan rather than recomputed, so it
+    // describes the observable; given the `>= 2` ascending offsets above it is arithmetically implied,
+    // which is exactly why the SHAPE equality above — not this — is what discriminates.
+    let emitted_merge_length = merge_plan
+        .iter()
+        .flat_map(|group| group.iter())
+        .map(|member| member_length(member))
+        .max()
+        .unwrap_or_else(|| panic!("{label}: the merge-filtered plan emitted no members at all"));
     assert!(
-        merge_span_length > largest_merge_span,
-        "{label}: NON-VACUITY FAILED — the emitted merge.parquet member length {merge_span_length} \
-         does not strictly exceed its largest single row-group span {largest_merge_span} (spans \
-         {merge_spans:?}), so the merge branch was never exercised and the cross-engine agreement \
-         proves nothing about it"
+        emitted_merge_length > largest_merge_span,
+        "{label}: DEGENERATE FIXTURE — the emitted merge.parquet member length \
+         {emitted_merge_length} does not exceed its largest single row-group span \
+         {largest_merge_span} (spans {merge_spans:?}); the file no longer has two distinct row groups \
+         to merge"
     );
 
     // -- gap.parquet: M-4 (adjacency, not group-by-file) + its sizing guards. --
@@ -684,8 +724,10 @@ async fn assert_merge_fixture_pins(
          spans {gap_spans:?})"
     );
 
-    // M-4 stated directly, independent of the expected-plan equality above: the co-binned same-file
-    // pair is genuinely non-contiguous, so its survival is the adjacency rule doing work.
+    // DEGENERATE-FIXTURE guard, not the M-4 proof (see the section banner): the co-binned pair must be
+    // non-contiguous. Given ascending offsets and a middle span that is asserted `> TARGET` this is
+    // arithmetically implied — the discriminating assertion is the two-group SHAPE equality above,
+    // whose RED under a group-by-file mutation is proven by stage [7] of the run script.
     assert_ne!(
         gap_offsets[0] + gap_spans[0],
         gap_offsets[2],
@@ -694,9 +736,9 @@ async fn assert_merge_fixture_pins(
 
     println!(
         "    {label} merge pins OK — merge.parquet: {} splits (spans {merge_spans:?}) ⇒ ONE member \
-         (merge.parquet,{merge_start},{merge_span_length}), which exceeds the largest single span \
-         {largest_merge_span}; gap.parquet: spans {gap_spans:?} ⇒ co-binned NON-contiguous outer \
-         pair survives unmerged",
+         (merge.parquet,{merge_start},{merge_span_length}) where the splitter must emit one per \
+         offset; gap.parquet: spans {gap_spans:?} ⇒ co-binned NON-contiguous outer pair survives \
+         unmerged as TWO members",
         merge_offsets.len()
     );
 }

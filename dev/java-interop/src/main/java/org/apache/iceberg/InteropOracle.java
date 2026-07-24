@@ -1521,7 +1521,7 @@ public final class InteropOracle {
 
       case "generate-interop-scan-plan":
         // SCAN-PLAN (planTasks) interop, DIRECTION 1 source — "Rust plans what JAVA wrote" (GAP_MATRIX
-        // row 146). Writes a V2 table with several data files of VARYING declared size (so bin-packing
+        // row R148). Writes a V2 table with several data files of VARYING declared size (so bin-packing
         // is non-trivial), at least one file large enough to FIXED-SIZE split under a small target and
         // one with MULTIPLE row groups so its split offsets drive the OFFSETS-AWARE split, plus a MoR
         // file with a position delete so the bin-pack WEIGHT includes the delete bytes. It then runs
@@ -1548,12 +1548,14 @@ public final class InteropOracle {
         }
         break;
       case "sabotage-interop-scan-plan":
-        // SCAN-PLAN SABOTAGE (fail-closed), two load-bearing legs. (1) Re-run Java planTasks over the
+        // SCAN-PLAN SABOTAGE (fail-closed), THREE load-bearing legs. (1) Re-run Java planTasks over the
         // JAVA-written table with a MUCH LARGER target (TARGET * 1024), forcing the groups to MERGE, and
         // assert the plan DIVERGES from the canonical java_scan_plan.json. (2) DROP big.parquet's split
-        // offsets and assert the offsets-aware split flips to fixed-size windows. If EITHER leg left its
-        // grouping unchanged the comparison would be vacuous, so this mode exits NON-ZERO on no-divergence
-        // (proof of vacuity ⇒ hard-fail) and ZERO only when BOTH legs diverge.
+        // offsets and assert the offsets-aware split flips to fixed-size windows. (3) Show the
+        // ADJACENT-SPLIT MERGE is load-bearing: the UNMERGED split keys of merge.parquet, and a re-plan at
+        // a target too small to CO-BIN its splits, must BOTH differ from the canonical merge-filtered plan.
+        // If ANY leg left its grouping unchanged the comparison would be vacuous, so this mode exits
+        // NON-ZERO on no-divergence (proof of vacuity ⇒ hard-fail) and ZERO only when ALL legs diverge.
         Path scanPlanSabotageDir = requireFixturesDir("interop.scan_plan.dir");
         int scanPlanDiverged = ScanPlanOracle.sabotagePerturbedTarget(scanPlanSabotageDir);
         System.out.println(
@@ -4801,7 +4803,8 @@ public final class InteropOracle {
   }
 
   // ===========================================================================================
-  // SCAN-PLAN (planTasks) oracle — GAP_MATRIX row 146.
+  // SCAN-PLAN (planTasks) oracle — GAP_MATRIX row R148 (+ row R124 for the BatchScan legs).
+  // Cite matrix rows ONLY by their permanent R<id> anchor: R146 is CONFLICT DETECTION, not this.
   //
   // Proves the Rust `TableScan::plan_tasks(target, lookback, openFileCost)` produces the SAME bin-packed
   // CombinedScanTask GROUPS as Java's REAL `table.newScan().planTasks(...)`, in BOTH directions, with the
@@ -4930,7 +4933,7 @@ public final class InteropOracle {
       String plan = planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST);
       writeJson(dir.resolve("java_scan_plan.json"), plan);
 
-      // BatchScan adapter delegation (row 122) — prove, IN JAVA, that
+      // BatchScan adapter delegation (row R124) — prove, IN JAVA, that
       // `table.newBatchScan().planTasks()` yields exactly the SAME groups as
       // `table.newScan().planTasks()`. This is the BatchScanAdapter delegation contract; if Java's
       // own adapter ever diverged the comparison below would catch it before the cross-engine leg.
@@ -4944,7 +4947,7 @@ public final class InteropOracle {
                 + batchGroups);
       }
       // Emit the BatchScan plan for the Rust D1 BatchScan leg. It is identical to the scan plan by
-      // the assertion above, but emitted under its OWN name so row 122 has its own artifact and the
+      // the assertion above, but emitted under its OWN name so row R124 has its own artifact and the
       // Rust BatchScan test does not piggy-back on the scan-plan file by accident.
       String batchPlan = planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST, batchGroups);
       writeJson(dir.resolve("java_batch_scan_plan.json"), batchPlan);
@@ -5014,7 +5017,7 @@ public final class InteropOracle {
       Set<Set<String>> javaBatchGroups;
       try {
         javaGroups = planGroups(table, TARGET, LOOKBACK, OPEN_FILE_COST);
-        // Also plan via the BatchScan adapter over the Rust-written table (row 122). It MUST equal
+        // Also plan via the BatchScan adapter over the Rust-written table (row R124). It MUST equal
         // the newScan() plan (the in-Java adapter delegation) before we even compare to Rust.
         javaBatchGroups = planGroupsViaBatchScan(table, TARGET, LOOKBACK, OPEN_FILE_COST);
       } catch (RuntimeException scanError) {
@@ -5121,10 +5124,10 @@ public final class InteropOracle {
     }
 
     /**
-     * SABOTAGE BATTERY (fail-closed) — re-plan the JAVA-written table under TWO independent corruptions and
-     * assert each one DIVERGES from the canonical java_scan_plan.json. Returns 1 only when BOTH legs diverge
-     * (each corruption is load-bearing ⇒ fail-closed confirmed); returns 0 (vacuous ⇒ hard-fail) if EITHER
-     * leg leaves the plan unchanged. The two corruption edges:
+     * SABOTAGE BATTERY (fail-closed) — re-plan the JAVA-written table under THREE independent corruptions
+     * and assert each one DIVERGES from the canonical plan it targets. Returns 1 only when ALL THREE legs
+     * diverge (each corruption is load-bearing ⇒ fail-closed confirmed); returns 0 (vacuous ⇒ hard-fail) if
+     * ANY leg leaves its plan unchanged. The three corruption edges:
      *
      * <ul>
      *   <li><b>target re-pack</b> — re-plan with a MUCH LARGER target (TARGET * 1024). A large target lets
@@ -5136,6 +5139,11 @@ public final class InteropOracle {
      *       offsets-aware split no longer fires; big.parquet FIXED-SIZE splits on the target instead,
      *       changing its sub-task windows (start/length) ⇒ the member keys diverge. This is the "drop/alter
      *       a split-offset" corruption the harness must close.
+     *   <li><b>merge removal / co-bin removal</b> — contrast the canonical MERGE-FILTERED plan against (a)
+     *       the UNMERGED split keys (what a planner that skipped `TableScanUtil.mergeTasks` would emit for
+     *       the same bin) and (b) a re-plan at a target too small to CO-BIN merge.parquet's splits. Both
+     *       must differ, or the adjacent-split merge is not exercised by the fixture. HARD-FAILS (never
+     *       skips) when merge.parquet has no multi-entry split offsets to unmerge.
      * </ul>
      */
     static int sabotagePerturbedTarget(Path dir) {
@@ -5586,7 +5594,7 @@ public final class InteropOracle {
 
     /**
      * Run the REAL Java {@code table.newBatchScan().option(...).planTasks()} (the BatchScanAdapter,
-     * GAP_MATRIX row 122) and return the SET of per-group member-key sets — the SAME shape as
+     * GAP_MATRIX row R124) and return the SET of per-group member-key sets — the SAME shape as
      * {@link #planGroups}. The adapter delegates 1:1 to the underlying TableScan pipeline, so this
      * is BY CONTRACT identical to {@code planGroups} over the same table + knobs; the oracle asserts
      * exactly that (the delegation) on both the Java-written and Rust-written tables.
@@ -5729,22 +5737,32 @@ public final class InteropOracle {
      * {@link IllegalStateException} on any violation ({@code label} names the direction).
      *
      * <p>Cross-engine equality of the filtered plans (asserted by the callers) proves the two engines
-     * AGREE; these assertions prove the thing they agree on is actually the merge:
+     * AGREE; these assertions prove the thing they agree on is actually the merge. WHAT DOES THE
+     * PROVING is the pair of exact plan-SHAPE equalities, interpreted through the OFFSETS-AWARE-SPLIT
+     * INVARIANT — {@code OffsetsAwareSplitScanTaskIterator} emits exactly ONE sub-task PER SPLIT OFFSET
+     * and ignores the target:
      *
      * <ul>
-     *   <li>merge.parquet — the emitted member's length must STRICTLY EXCEED the largest single
-     *       row-group span. A member equal to one span means no merge occurred and the agreement is
-     *       about nothing (the non-vacuity guard).
-     *   <li>gap.parquet — the co-binned same-file pair must remain TWO members and be NON-CONTIGUOUS,
-     *       pinning that mergeTasks is an adjacent-run collapse and not a group-by-file coalesce.
+     *   <li>merge.parquet has {@code >= 2} split offsets (asserted), so the splitter MUST emit
+     *       {@code >= 2} sub-tasks; a plan of ONE group holding ONE member spanning the whole file is
+     *       therefore producible ONLY by {@code TableScanUtil.mergeTasks} collapsing them.
+     *   <li>gap.parquet must plan as EXACTLY two groups with the outer pair INTACT — two same-file
+     *       members in one group. A group-by-file coalesce would emit one member there, so this
+     *       equality pins the adjacent-run semantics.
      * </ul>
      *
-     * Each is guarded by a SIZING assertion on the fixture itself, so a fixture edit that destroys the
-     * precondition fails LOUDLY here instead of silently draining the pin.
+     * The numeric checks around them are FIXTURE guards, not the proof: the SIZING trio pins the
+     * packing preconditions, and the "member length exceeds the largest single row-group span" /
+     * "the co-binned pair is non-contiguous" checks are DEGENERATE-FIXTURE guards (a file that
+     * collapsed to one row group, offsets that stopped ascending) — both are arithmetically implied
+     * once the offset counts hold, so neither does the discriminating work. The executable proof that
+     * these assertions are load-bearing is stage [7] of run-interop-scan-plan.sh, which removes the
+     * merge — and, separately, its contiguity clause — from Rust production source and requires the
+     * corresponding leg to go RED.
      */
     private static void assertMergePins(
         Table table, Set<Set<String>> mergeGroups, Set<Set<String>> gapGroups, String label) {
-      // -- merge.parquet: the single spanning member + non-vacuity + the sizing guard. --
+      // -- merge.parquet: the single spanning member + the fixture guards. --
       DataFile merge = findDataFile(table, "merge.parquet");
       if (merge == null) {
         throw new IllegalStateException(label + ": merge.parquet is absent from the fixture table");
@@ -5789,16 +5807,25 @@ public final class InteropOracle {
                 + " expected "
                 + expectedMerge);
       }
-      if (mergeSpanLength <= largestMergeSpan) {
+      // DEGENERATE-FIXTURE guard (NOT the non-vacuity proof — see the javadoc): the length of the
+      // member the plan ACTUALLY emitted must exceed the largest single row-group span, i.e. the file
+      // did not collapse to one row group. Read out of the emitted plan rather than recomputed.
+      long emittedMergeLength = 0L;
+      for (Set<String> group : mergeGroups) {
+        for (String member : group) {
+          emittedMergeLength = Math.max(emittedMergeLength, memberLength(member));
+        }
+      }
+      if (emittedMergeLength <= largestMergeSpan) {
         throw new IllegalStateException(
             label
-                + ": NON-VACUITY FAILED — the emitted merge.parquet member length "
-                + mergeSpanLength
-                + " does not strictly exceed its largest single row-group span "
+                + ": DEGENERATE FIXTURE — the emitted merge.parquet member length "
+                + emittedMergeLength
+                + " does not exceed its largest single row-group span "
                 + largestMergeSpan
                 + " (spans "
                 + mergeSpans
-                + "), so the merge branch was never exercised");
+                + "); the file no longer has two distinct row groups to merge");
       }
 
       // -- gap.parquet: adjacency (not group-by-file) + its sizing guards. --
@@ -5834,6 +5861,8 @@ public final class InteropOracle {
                 + gapSpans
                 + ")");
       }
+      // DEGENERATE-FIXTURE guard, not the adjacency proof (see the javadoc): implied by ascending
+      // offsets and a middle span asserted > TARGET.
       if (gapOffsets.get(0) + gapSpans.get(0) == gapOffsets.get(2)) {
         throw new IllegalStateException(
             label + ": the co-binned gap.parquet pair must be NON-CONTIGUOUS (offsets " + gapOffsets + ")");
@@ -5871,11 +5900,24 @@ public final class InteropOracle {
               + mergeStart
               + ","
               + mergeSpanLength
-              + "), which exceeds the largest single span "
+              + ") where the splitter must emit one per offset (largest single span "
               + largestMergeSpan
-              + "; gap.parquet: spans "
+              + "); gap.parquet: spans "
               + gapSpans
-              + " ⇒ co-binned NON-contiguous outer pair survives unmerged");
+              + " ⇒ co-binned NON-contiguous outer pair survives unmerged as TWO members");
+    }
+
+    /**
+     * The {@code length} field of an EMITTED member key "(basename,start,length)" — so a guard can read
+     * the plan's own observable instead of recomputing it from the manifest facts.
+     */
+    private static long memberLength(String member) {
+      String trimmed = member.endsWith(")") ? member.substring(0, member.length() - 1) : member;
+      int comma = trimmed.lastIndexOf(',');
+      if (comma < 0) {
+        throw new IllegalStateException("member key " + member + " has no length field");
+      }
+      return Long.parseLong(trimmed.substring(comma + 1));
     }
 
     /** A scan task's cross-engine member key: "(basename,start,length)". */

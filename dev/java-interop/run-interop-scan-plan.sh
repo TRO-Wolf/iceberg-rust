@@ -42,9 +42,12 @@
 # failure was runner-only). `merge.parquet` + `gap.parquet` close that hole. Each is planned under its OWN
 # metrics-prunable row filter (the fixture files own DISJOINT id ranges) and at the DELETE-FREE APPEND
 # snapshot, so its splits meet an EMPTY bin-packer with weights equal to their lengths — deterministic on any
-# parquet build and any checkout path. Both engines additionally assert NON-VACUITY: the merged member's
-# length must STRICTLY exceed the largest single row-group span (manifest field-132), and the co-binned
-# gap.parquet pair must stay TWO non-contiguous members.
+# parquet build and any checkout path. WHAT PROVES THE MERGE FIRED is each engine's exact assertion on the
+# plan SHAPE — ONE group / ONE whole-file-spanning member for merge.parquet, TWO groups with the outer pair
+# INTACT for gap.parquet — read against the offsets-aware-split invariant (the splitter emits exactly one
+# sub-task PER SPLIT OFFSET and ignores the target), so >= 2 offsets means >= 2 splits and a single spanning
+# member is only producible by the merge. The numeric span checks alongside them are fixture guards, not the
+# discriminator; step [7/7] is the executable proof that the shape assertions are load-bearing.
 #
 # THE COMPARISON: each group is a SORTED set of member keys "(basename,start,length)"; the plan is the
 # MULTISET of per-group member-key sets + the group count. Both engines plan the SAME on-disk table within a
@@ -67,15 +70,23 @@
 #         split to fixed-size windows (8→2); (3) the MERGE is shown load-bearing — the UNMERGED split keys
 #         and a re-plan at a target too small to CO-BIN both diverge from the canonical merge-filtered plan.
 #         HARD-FAILS if ANY leg leaves the grouping unchanged (vacuous) or its target is absent.
-#   [7/7] MERGE MUTATION (fail-closed): delete the `merge_tasks` call from the PRODUCTION `CombinedScanTask`
-#         constructor, re-run the D1 leg, and require it to go RED — then restore the source, verify the
-#         restore is byte-identical (md5), and re-run D1 GREEN (which also evicts the mutant from cargo's
-#         build cache). HARD-FAILS if the call site is absent, the mutant PASSES, or the restore is not clean.
+#   [7/7] SOURCE MUTATIONS (fail-closed), TWO mutations of PRODUCTION code, each re-running the D1 leg:
+#         (a) `merge-removal` — delete the `merge_tasks` call from `CombinedScanTask::new` (task_group.rs);
+#             the MERGE-filtered assertion must go RED. (b) `adjacency-removal` — drop the contiguity clause
+#             from `FileScanTask::can_merge` (task.rs) so it coalesces by FILE; the GAP-filtered assertion
+#             must go RED. Each: HARD-FAIL if the pattern is absent (an unappliable mutation proves nothing),
+#             mutate, run, restore, `touch` (cargo's mtime staleness check would otherwise reuse the mutant
+#             lib), md5-verify the restore, then re-run D1 GREEN. A non-zero exit is NOT sufficient — the run
+#             must show a real ASSERTION signal, or a mutant that merely failed to COMPILE would score as a
+#             pass; the signal grep is GATING.
 #
 # This is a TEST-ONLY ORACLE (a dev tool) — NOT part of the shipped Rust library, NOT part of the offline
 # `cargo test` gate (it needs Java + Maven). Nothing binary is committed; the temp dir under
-# dev/java-interop/target/ is gitignored. Step [7/7] edits a tracked source file IN PLACE and restores it in
-# the same step; the restore is md5-verified and runs even when the mutant run fails.
+# dev/java-interop/target/ is gitignored. Step [7/7] edits tracked source files IN PLACE and restores them in
+# the same step; each restore is md5-verified and runs even when the mutant run fails. That window is NOT
+# signal-safe (a SIGINT between mutate and restore leaves the mutant on disk — recover with
+# `git checkout -- <file>`) and it assumes no CONCURRENT cargo build in this checkout: the nightly driver runs
+# suites SEQUENTIALLY today, so do NOT parallelize suites across this stage.
 #
 # Requirements: Maven at /opt/maven/bin/mvn, Java 11 at /usr/lib/jvm/java-11-openjdk-amd64, the repo's Rust
 # toolchain. The first Maven run must be ONLINE to populate ~/.m2; after that `mvn -o` runs fully offline.
@@ -163,69 +174,115 @@ fi
 echo "    SABOTAGE PASS: the large-target, dropped-split-offset and merge legs all diverged (fail-closed)"
 
 echo ""
-echo "==> [7/7] MERGE MUTATION (fail-closed): drop the merge_tasks call from CombinedScanTask::new and"
-echo "     require the D1 leg to go RED, then restore byte-identically (md5-verified)."
-MERGE_SRC="${REPO_ROOT}/crates/iceberg/src/scan/task_group.rs"
-MERGE_CALL='tasks: merge_tasks(tasks),'
-# HARD-FAIL, never skip: a mutation that cannot be applied has proven nothing.
-grep -qF -- "${MERGE_CALL}" "${MERGE_SRC}" \
-  || { echo "FAIL: the merge call site '${MERGE_CALL}' is ABSENT from ${MERGE_SRC} — the mutation cannot"; \
-       echo "      be applied, so this leg would prove nothing. Re-point it at the current call site."; \
-       exit 1; }
-BEFORE_MD5="$(md5sum "${MERGE_SRC}" | cut -d' ' -f1)"
-cp -p "${MERGE_SRC}" "${MERGE_SRC}.bak"
-python3 - "${MERGE_SRC}" <<'PY'
+echo "==> [7/7] SOURCE MUTATIONS (fail-closed): remove the merge — then, separately, its ADJACENCY"
+echo "     clause — from PRODUCTION source and require the matching D1 assertion to go RED, restoring"
+echo "     byte-identically (md5) and re-verifying GREEN after each."
+
+# Run ONE mutation leg. Fail-closed at every step:
+#   * the pattern must be PRESENT (an unappliable mutation proves nothing — HARD-FAIL, never skip);
+#   * the mutant run must fail AND show a real ASSERTION signal. Gating on the exit code alone would
+#     score a mutant that merely failed to COMPILE as a pass — the classic mutation false-green;
+#   * the restore must be byte-identical (md5) AND mtime-stamped forward — `cp -p` + `mv` preserve the
+#     ORIGINAL mtime, which would leave the restored source OLDER than the mutant's build artifacts and
+#     let cargo's staleness check silently reuse the MUTANT lib for every later build in this checkout;
+#   * the restored source must re-run D1 GREEN, which also evicts the mutant from the build cache.
+# NOTE (not signal-safe): a SIGINT inside the mutation window leaves the mutant on disk — recover with
+# `git checkout -- <file>`. It also assumes NO concurrent cargo build in this checkout; the nightly
+# driver runs suites SEQUENTIALLY today, so do NOT parallelize suites across this stage.
+mutation_leg() {
+  local label="$1"
+  local src="$2"
+  local needle="$3"
+  local replacement="$4"
+
+  echo "    -- [${label}] mutating ${src##*/}: '${needle}' => '${replacement}'"
+  grep -qF -- "${needle}" "${src}" \
+    || { echo "FAIL: [${label}] the mutation site '${needle}' is ABSENT from ${src} — the mutation"; \
+         echo "      cannot be applied, so this leg would prove nothing. Re-point it at the current site."; \
+         exit 1; }
+
+  local before_md5
+  before_md5="$(md5sum "${src}" | cut -d' ' -f1)"
+  cp -p "${src}" "${src}.bak"
+  MUTATION_NEEDLE="${needle}" MUTATION_REPLACEMENT="${replacement}" python3 - "${src}" <<'PY'
+import os
 import sys
 
 path = sys.argv[1]
+needle = os.environ["MUTATION_NEEDLE"]
+replacement = os.environ["MUTATION_REPLACEMENT"]
 with open(path, encoding="utf-8") as handle:
     source = handle.read()
-mutant = source.replace("tasks: merge_tasks(tasks),", "tasks,", 1)
+mutant = source.replace(needle, replacement, 1)
 if mutant == source:
-    raise SystemExit("the merge call site vanished between the grep and the rewrite")
+    raise SystemExit("the mutation site vanished between the grep and the rewrite")
 with open(path, "w", encoding="utf-8") as handle:
     handle.write(mutant)
 PY
-# `|| rc=$?` keeps the restore below REACHABLE under `set -e` when the mutant run fails (which is the
-# EXPECTED outcome here).
-MUTANT_RC=0
-(
-  cd "${REPO_ROOT}"
-  ICEBERG_INTEROP_SCAN_PLAN_DIR="${D1_DIR}" \
-    cargo test -p iceberg --test interop_scan_plan
-) > "${TMP}/merge-mutant.log" 2>&1 || MUTANT_RC=$?
-mv -f "${MERGE_SRC}.bak" "${MERGE_SRC}"
-# `cp -p` + `mv` preserve the ORIGINAL mtime, which would leave the restored source OLDER than the
-# mutant's build artifacts — cargo's mtime staleness check would then silently reuse the MUTANT lib
-# for every later build in this checkout. Stamp it forward; the content (hence the md5 below) is
-# untouched.
-touch "${MERGE_SRC}"
-AFTER_MD5="$(md5sum "${MERGE_SRC}" | cut -d' ' -f1)"
-if [ "${BEFORE_MD5}" != "${AFTER_MD5}" ]; then
-  echo "FAIL: ${MERGE_SRC} was NOT restored byte-identically (${BEFORE_MD5} != ${AFTER_MD5})"
-  exit 1
-fi
-if [ "${MUTANT_RC}" -eq 0 ]; then
-  echo "==> MUTATION FAILED (VACUOUS) — the D1 leg PASSED with the adjacent-split merge REMOVED, so it"
-  echo "    does not actually test the merge. See ${TMP}/merge-mutant.log"
-  exit 1
-fi
-grep -m 3 -E "panicked at|assertion .*failed|test result: FAILED" "${TMP}/merge-mutant.log" \
-  | sed 's/^/    RED: /' || true
-# Prove the restore is not merely byte-identical but BUILDS GREEN again — which also forces the
-# mutant artifacts out of the build cache before this harness exits.
-(
-  cd "${REPO_ROOT}"
-  ICEBERG_INTEROP_SCAN_PLAN_DIR="${D1_DIR}" \
-    cargo test -p iceberg --test interop_scan_plan
-) > "${TMP}/merge-restored.log" 2>&1 \
-  || { echo "FAIL: the RESTORED source did not pass D1 — see ${TMP}/merge-restored.log"; exit 1; }
-echo "    MUTATION PASS: the merge-less mutant failed D1 (exit ${MUTANT_RC}); source restored"
-echo "    byte-identically (md5 ${AFTER_MD5}) and re-verified GREEN"
+
+  local log="${TMP}/mutant-${label}.log"
+  # `|| rc=$?` keeps the restore below REACHABLE under `set -e` when the mutant run fails (the EXPECTED
+  # outcome here).
+  local rc=0
+  (
+    cd "${REPO_ROOT}"
+    ICEBERG_INTEROP_SCAN_PLAN_DIR="${D1_DIR}" \
+      cargo test -p iceberg --test interop_scan_plan
+  ) > "${log}" 2>&1 || rc=$?
+
+  mv -f "${src}.bak" "${src}"
+  touch "${src}"
+  local after_md5
+  after_md5="$(md5sum "${src}" | cut -d' ' -f1)"
+  if [ "${before_md5}" != "${after_md5}" ]; then
+    echo "FAIL: [${label}] ${src} was NOT restored byte-identically (${before_md5} != ${after_md5})"
+    exit 1
+  fi
+
+  if [ "${rc}" -eq 0 ]; then
+    echo "==> MUTATION [${label}] FAILED (VACUOUS) — the D1 leg PASSED with the behavior REMOVED, so it"
+    echo "    does not actually test it. See ${log}"
+    exit 1
+  fi
+  # GATING signal check (NOT decoration): a build failure also exits non-zero.
+  if ! grep -qE "panicked at|assertion .*failed|test result: FAILED" "${log}"; then
+    echo "==> MUTATION [${label}] INCONCLUSIVE — the mutant run exited ${rc} WITHOUT any assertion"
+    echo "    signal, i.e. it most likely did not COMPILE. That is not evidence the leg is"
+    echo "    load-bearing. See ${log}"
+    exit 1
+  fi
+  grep -m 2 -E "panicked at|assertion .*failed" "${log}" | sed 's/^/       RED: /' || true
+
+  (
+    cd "${REPO_ROOT}"
+    ICEBERG_INTEROP_SCAN_PLAN_DIR="${D1_DIR}" \
+      cargo test -p iceberg --test interop_scan_plan
+  ) > "${TMP}/restored-${label}.log" 2>&1 \
+    || { echo "FAIL: [${label}] the RESTORED source did not pass D1 — see ${TMP}/restored-${label}.log"; \
+         exit 1; }
+  echo "    -- [${label}] PASS: assertion RED (exit ${rc}); restored md5 ${after_md5}; re-verified GREEN"
+}
+
+# (a) Remove the MERGE itself — `CombinedScanTask::new` stops calling `merge_tasks`, so every bin keeps
+# one member per split. The MERGE-filtered assertion must red.
+mutation_leg "merge-removal" \
+  "${REPO_ROOT}/crates/iceberg/src/scan/task_group.rs" \
+  'tasks: merge_tasks(tasks),' \
+  'tasks,'
+
+# (b) Remove the ADJACENCY clause — `can_merge` keeps the same-path test but drops
+# `offset + len == next.start`, degenerating into a group-by-FILE coalesce. The GAP-filtered assertion
+# must red (its co-binned NON-CONTIGUOUS pair would wrongly collapse into one member) — the leg
+# mutation (a) cannot reach, since with the merge gone entirely the gap pair survives for the WRONG
+# reason.
+mutation_leg "adjacency-removal" \
+  "${REPO_ROOT}/crates/iceberg/src/scan/task.rs" \
+  '&& self.start.checked_add(self.length) == Some(other.start)' \
+  '&& true'
 
 echo ""
 echo "==> DONE — scan-plan interop passed (row R148): plan_tasks split (offsets-aware big.parquet + fixed-size"
 echo "     mid.parquet) + largestBinFirst bin-pack (target/lookback/cost = 4096/5/0, MoR delete bytes in the"
 echo "     weight) + the ADJACENT-SPLIT MERGE (merge.parquet coalesces, gap.parquet's non-contiguous pair does"
 echo "     not), BOTH directions, anti-circular hand-declared knobs, + the large-target / dropped-offset /"
-echo "     merge sabotage legs and the production merge-removal mutation all closed."
+echo "     merge sabotage legs and BOTH production mutations (merge-removal, adjacency-removal) all closed."

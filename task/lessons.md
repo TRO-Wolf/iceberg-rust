@@ -212,10 +212,15 @@ UNFILTERED D1 comparison still passes at 14 groups — only the new merge-filter
   FIXTURE drive the code path that produces it?** *Why:* the two are independent, and a green bidirectional oracle
   says nothing about a branch its fixture never reaches. State the second one explicitly in the row's evidence
   ("the fixture forces X"), not just the first ("the comparison compares X").
-- **DO make a coverage claim EXECUTABLE — assert the branch fired, in the same test.** Here: the emitted member's
-  length must STRICTLY exceed the largest single row-group span (manifest field-132), so a member equal to one span
-  (⇒ no merge) fails loudly. *Why:* a fixture that "should" reach a branch drifts silently; an assertion that the
-  branch's OBSERVABLE effect is present cannot.
+- **DO make a coverage claim EXECUTABLE — assert the branch fired, in the same test — and be precise about WHICH
+  assertion does the discriminating.** Here the proof is an exact `assert_eq` on the plan SHAPE (ONE group holding
+  ONE whole-file-spanning member) read against an invariant of the layer BELOW: the offsets-aware splitter emits
+  exactly one sub-task per split offset and ignores the target, so `>= 2` offsets means `>= 2` splits and a single
+  spanning member is only producible by the merge. *Why:* it is easy to ship a plausible-looking numeric guard that
+  is arithmetically ALWAYS TRUE — the first draft here asserted "the merged member's length exceeds the largest
+  single row-group span", which given `>= 2` ascending offsets is implied, and named THAT the non-vacuity
+  mechanism. The Critic caught the misnaming, not a hole. Keep such checks (they catch a degenerate fixture) but
+  label them as fixture guards, and let a SHAPE equality plus a named lower-layer invariant carry the proof.
 - **DO give a branch-coverage fixture its own ISOLATING scan rather than tuning it into the shared plan.** The
   merge fixtures are planned under a metrics-prunable row filter (disjoint `id` ranges) at the DELETE-FREE append
   snapshot, so their splits meet an EMPTY bin-packer with weights equal to their lengths. *Why:* co-binning inside
@@ -228,8 +233,16 @@ UNFILTERED D1 comparison still passes at 14 groups — only the new merge-filter
   uncompressed, Iceberg-Java zstd); zero-padded digits would have compressed away on the Java side only. A
   deterministic LCG over a 62-char alphabet, mirrored on both sides, keeps the byte size a property of the fixture.
 - **DO pair a new interop leg with a PRODUCTION-SOURCE mutation leg in the same harness run** (mutate → expect RED
-  → restore → md5-verify), hard-failing when the mutation pattern is absent. *Why:* the Java-side sabotage legs
-  prove the fixture is discriminating; only removing the Rust code under test proves the RUST assertions are.
+  → restore → md5-verify), hard-failing when the mutation pattern is absent, and add ONE MUTATION PER CLAIM. *Why:*
+  the Java-side sabotage legs prove the fixture is discriminating; only removing the Rust code under test proves the
+  RUST assertions are. One mutation is not enough when the pin makes two claims: deleting the merge outright reds
+  the "merge fires" leg but NOT the "adjacency is respected" leg (with no merge at all, the non-contiguous pair
+  survives for the WRONG reason) — that one needs its own mutation, dropping the contiguity clause so `can_merge`
+  degenerates to group-by-file.
+- **DO make the mutation leg's assertion-signal grep GATING, not decorative.** A mutant that fails to COMPILE also
+  exits non-zero, so gating on the exit code alone turns a broken mutation into a green "the test is
+  load-bearing" — the classic mutation false-green. Require the run's output to match
+  `panicked at|assertion .*failed|test result: FAILED`; no signal ⇒ restore and hard-fail as INCONCLUSIVE.
 - **DO `touch` the restored file after an in-place source mutation, and re-run the leg GREEN before exiting.**
   Caught the hard way in this unit: `cp -p` + `mv` restore the ORIGINAL mtime, which leaves the restored source
   OLDER than the mutant's build artifacts — cargo's mtime staleness check then silently reuses the MUTANT lib for
