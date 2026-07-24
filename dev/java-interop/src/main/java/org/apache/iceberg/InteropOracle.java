@@ -4847,6 +4847,50 @@ public final class InteropOracle {
     /** The per-open file cost (bytes) used in the weight floor. 0 isolates the byte-length packing. */
     static final long OPEN_FILE_COST = 0L;
 
+    // -- HAND-DECLARED merge-fixture shape (mirrored EXACTLY in interop_scan_plan.rs). --
+    //
+    // Both engines flush a row group every 100 rows: the Rust fixture writer sets the parquet
+    // max-row-group ROW count to 100 outright, and parquet-mr flushes at its 100-row memory-check
+    // FLOOR because the table's write.parquet.row-group-size-bytes is a deliberately tiny 64 bytes
+    // (the same mechanism the big.parquet 8x100 grid already relies on). So a 120-row file is
+    // 100 + 20 and a 210-row file is 100 + 100 + 10 on BOTH sides.
+    //
+    // WHY THESE TWO FILES EXIST. Java's TableScanUtil.planTasks maps every bin through
+    // BaseCombinedScanTask(List), whose ctor calls TableScanUtil.mergeTasks: a run of LIST-ADJACENT
+    // splits of the SAME file that are exactly CONTIGUOUS collapses into one spanning member. The
+    // big/mid/small fixture never deterministically co-bins two adjacent splits of one file, so it
+    // exercised that branch only by accident. Each merge fixture is planned under its OWN
+    // metrics-prunable filter (the files own DISJOINT id ranges) so its splits meet an EMPTY packer:
+    //   * merge.parquet — 2 row groups, NO delete file, total length UNDER TARGET, so both splits
+    //     necessarily co-bin on any parquet build and merge to (merge.parquet, 0, fileLength).
+    //   * gap.parquet   — 3 row groups whose MIDDLE span alone exceeds TARGET while the outer two
+    //     SUM to under it, so first-fit co-bins splits 0 and 2 (non-contiguous!) and gives split 1
+    //     its own bin. The co-binned pair must survive UNMERGED — adjacency, not group-by-file.
+    /** `merge.parquet` row count => 2 row groups (100 + 20) with a total length under TARGET. */
+    static final int MERGE_ROWS = 120;
+    /** The `id` of merge.parquet's first row; its whole range is [MERGE_ID_BASE, GAP_ID_BASE). */
+    static final long MERGE_ID_BASE = 1_000_000L;
+    /** `gap.parquet` row count => 3 row groups (100 + 100 + 10). */
+    static final int GAP_ROWS = 210;
+    /** The `id` of gap.parquet's first row; its range is [GAP_ID_BASE, ..). */
+    static final long GAP_ID_BASE = 2_000_000L;
+    /** gap.parquet's WIDE row window [WIDE_FROM, WIDE_FROM + WIDE_ROWS) — exactly its MIDDLE group. */
+    static final int WIDE_FROM = 100;
+    /** How many rows carry the wide `data` value (one full row group). */
+    static final int WIDE_ROWS = 100;
+    /** Characters per wide `data` value (WIDE_ROWS * WIDE_CHARS = 25,600 bytes of entropy). */
+    static final int WIDE_CHARS = 256;
+
+    /** The `data` column shape of a fixture file (mirrors interop_scan_plan.rs `DataShape`). */
+    private enum DataShape {
+      /** Every row carries the narrow "row-%06d" string (big / mid / small1 / small2). */
+      NARROW,
+      /** Every row carries NULL — how merge.parquet stays under TARGET. */
+      NULL_DATA,
+      /** Rows in the middle group carry a wide high-entropy string; the rest carry NULL. */
+      SPARSE_WIDE
+    }
+
     /**
      * Direction 1 — Java writes the table, persists its metadata, then emits the canonical planTasks
      * group plan from the table RELOADED off that persisted metadata (see the reload rationale below).
@@ -4905,8 +4949,24 @@ public final class InteropOracle {
       String batchPlan = planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST, batchGroups);
       writeJson(dir.resolve("java_batch_scan_plan.json"), batchPlan);
 
+      // The two ADJACENT-SPLIT MERGE plans (row R148), each planned under its isolating filter over
+      // the SAME persisted table. assertMergePins THROWS if the fixture went vacuous, so a merge
+      // fixture that stopped exercising the branch fails the generate step rather than emitting a
+      // plan that both engines can agree on for the wrong reason.
+      Set<Set<String>> mergeGroups =
+          planGroups(table, mergeFilter(), TARGET, LOOKBACK, OPEN_FILE_COST);
+      Set<Set<String>> gapGroups = planGroups(table, gapFilter(), TARGET, LOOKBACK, OPEN_FILE_COST);
+      assertMergePins(table, mergeGroups, gapGroups, "D1 (java fixture)");
+      writeJson(
+          dir.resolve("java_merge_scan_plan.json"),
+          planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST, mergeGroups));
+      writeJson(
+          dir.resolve("java_gap_scan_plan.json"),
+          planToJson(table, TARGET, LOOKBACK, OPEN_FILE_COST, gapGroups));
+
       System.out.println(
-          "generated scan-plan table + java_scan_plan.json + java_batch_scan_plan.json to "
+          "generated scan-plan table + java_scan_plan.json + java_batch_scan_plan.json"
+              + " + java_merge_scan_plan.json + java_gap_scan_plan.json to "
               + dir
               + " (target="
               + TARGET
@@ -5003,11 +5063,56 @@ public final class InteropOracle {
         }
       }
 
+      // The two ADJACENT-SPLIT MERGE legs (row R148) over the RUST-written table: Java's REAL
+      // planTasks under each isolating filter must equal the plan the Rust GEN path emitted, AND the
+      // merge pins must hold (so the agreement is about the merge, not about nothing).
+      Path rustMergePlanPath = dir.resolve("rust_table").resolve("rust_merge_scan_plan.json");
+      Path rustGapPlanPath = dir.resolve("rust_table").resolve("rust_gap_scan_plan.json");
+      if (!Files.exists(rustMergePlanPath) || !Files.exists(rustGapPlanPath)) {
+        System.out.println(
+            "FAIL scan-plan-d2: missing "
+                + rustMergePlanPath
+                + " / "
+                + rustGapPlanPath
+                + " (run the Rust GEN path first)");
+        return 1;
+      }
+      try {
+        Set<Set<String>> javaMergeGroups =
+            planGroups(table, mergeFilter(), TARGET, LOOKBACK, OPEN_FILE_COST);
+        Set<Set<String>> javaGapGroups =
+            planGroups(table, gapFilter(), TARGET, LOOKBACK, OPEN_FILE_COST);
+        Set<Set<String>> rustMergeGroups = readPlanGroups(rustMergePlanPath);
+        Set<Set<String>> rustGapGroups = readPlanGroups(rustGapPlanPath);
+        if (!javaMergeGroups.equals(rustMergeGroups)) {
+          System.out.println(
+              "FAIL scan-plan-d2[merge]: Java planTasks under the merge filter="
+                  + javaMergeGroups
+                  + " != Rust's="
+                  + rustMergeGroups);
+          return 1;
+        }
+        if (!javaGapGroups.equals(rustGapGroups)) {
+          System.out.println(
+              "FAIL scan-plan-d2[gap]: Java planTasks under the gap filter="
+                  + javaGapGroups
+                  + " != Rust's="
+                  + rustGapGroups);
+          return 1;
+        }
+        assertMergePins(table, javaMergeGroups, javaGapGroups, "D2 (rust fixture)");
+      } catch (RuntimeException | IOException mergeError) {
+        // RuntimeException covers the IllegalStateException assertMergePins throws on a vacuous or
+        // divergent fixture, plus any planning failure over the Rust-written table.
+        System.out.println("FAIL scan-plan-d2[merge-pins]: " + mergeError);
+        return 1;
+      }
+
       if (javaGroups.equals(rustGroups)) {
         System.out.println(
             "PASS scan-plan-d2: Java planTasks (scan AND batchScan) over the Rust table == Rust's plan ("
                 + javaGroups.size()
-                + " groups)");
+                + " groups), and the merge/gap filtered plans + merge pins agree");
         return 0;
       }
       System.out.println(
@@ -5137,6 +5242,79 @@ public final class InteropOracle {
               + " fixed-size="
               + offsetsDroppedKeys.size());
 
+      // -- Leg 3: the ADJACENT-SPLIT MERGE is load-bearing (row R148). Two independent contrasts over
+      // merge.parquet, both of which must DIVERGE from the canonical merge-filtered plan:
+      //   (a) the UNMERGED split keys — what a planner that skipped mergeTasks would emit for the same
+      //       bin — must differ from the emitted single spanning member;
+      //   (b) re-planning with a target too small to CO-BIN the splits must break the merge, proving
+      //       the merge only fires on a shared bin (and that the fixture's co-binning is real).
+      // Either contrast coming out equal means the merge branch is not exercised ⇒ VACUOUS ⇒ hard-fail.
+      try {
+        TableMetadata metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+        BaseTable table =
+            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "java_t");
+
+        DataFile merge = findDataFile(table, "merge.parquet");
+        if (merge == null || merge.splitOffsets() == null || merge.splitOffsets().size() <= 1) {
+          // The sabotage target is absent ⇒ the corruption cannot be applied ⇒ hard-fail (never skip).
+          System.out.println(
+              "FAIL scan-plan-sabotage[merge]: merge.parquet has no multi-entry split offsets to unmerge");
+          return 0;
+        }
+
+        Set<Set<String>> canonicalMerge =
+            planGroups(table, mergeFilter(), TARGET, LOOKBACK, OPEN_FILE_COST);
+
+        // (a) The UNMERGED member keys: split the whole-file task exactly as planTasks does, but keep
+        // every sub-task as its own member (i.e. skip the BaseCombinedScanTask(List) merge).
+        Set<String> unmergedKeys = new TreeSet<>();
+        try (CloseableIterable<FileScanTask> tasks =
+            table
+                .newScan()
+                .useSnapshot(appendSnapshotId(table))
+                .filter(mergeFilter())
+                .planFiles()) {
+          for (FileScanTask task : tasks) {
+            for (FileScanTask sub : task.split(TARGET)) {
+              unmergedKeys.add(memberKey(sub));
+            }
+          }
+        }
+        Set<Set<String>> unmergedPlan = new java.util.HashSet<>();
+        unmergedPlan.add(unmergedKeys);
+        if (canonicalMerge.equals(unmergedPlan)) {
+          System.out.println(
+              "scan-plan-sabotage[merge]: UNMERGED split keys == the canonical merged plan (VACUOUS) — "
+                  + "the merge branch is not exercised by merge.parquet");
+          return 0;
+        }
+
+        // (b) A target too small to co-bin merge.parquet's splits ⇒ no shared bin ⇒ no merge.
+        long noCoBinTarget = java.util.Collections.max(rowGroupSpans(merge));
+        Set<Set<String>> uncoBinned =
+            planGroups(table, mergeFilter(), noCoBinTarget, LOOKBACK, OPEN_FILE_COST);
+        if (canonicalMerge.equals(uncoBinned)) {
+          System.out.println(
+              "scan-plan-sabotage[merge]: a target of "
+                  + noCoBinTarget
+                  + " (too small to co-bin) left the plan UNCHANGED (VACUOUS)");
+          return 0;
+        }
+        System.out.println(
+            "scan-plan-sabotage[merge]: merge is load-bearing — canonical="
+                + canonicalMerge
+                + " unmerged="
+                + unmergedPlan
+                + " no-co-bin(target="
+                + noCoBinTarget
+                + ")="
+                + uncoBinned);
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL scan-plan-sabotage[merge]: " + error);
+        return 0;
+      }
+
       return 1;
     }
 
@@ -5217,15 +5395,103 @@ public final class InteropOracle {
           writeManyRowDataFile(table, schema, spec, new File(dataDir, "small1.parquet"), 5);
       DataFile small2 =
           writeManyRowDataFile(table, schema, spec, new File(dataDir, "small2.parquet"), 5);
+      // The two dedicated ADJACENT-SPLIT MERGE fixtures (see the constants above).
+      DataFile merge =
+          writeShapedDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "merge.parquet"),
+              MERGE_ROWS,
+              MERGE_ID_BASE,
+              DataShape.NULL_DATA);
+      DataFile gap =
+          writeShapedDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "gap.parquet"),
+              GAP_ROWS,
+              GAP_ID_BASE,
+              DataShape.SPARSE_WIDE);
 
       // A MoR position delete over big.parquet (deletes position 0), so big's sub-tasks carry deletes and
-      // the weight includes the delete bytes.
+      // the weight includes the delete bytes. NOTE: no delete file is attached to merge/gap — their
+      // bin-pack weight must BE their length for the sizing assertions to hold.
       String deletePath = new File(dataDir, "big-deletes.parquet").getAbsolutePath();
       DeleteFile del = writePosDelete(table, schema, spec, deletePath, big.path());
 
-      table.newAppend().appendFile(big).appendFile(mid).appendFile(small1).appendFile(small2).commit();
+      table
+          .newAppend()
+          .appendFile(big)
+          .appendFile(mid)
+          .appendFile(small1)
+          .appendFile(small2)
+          .appendFile(merge)
+          .appendFile(gap)
+          .commit();
       table.newRowDelta().addDeletes(del).commit();
       return table;
+    }
+
+    /**
+     * A deterministic HIGH-ENTROPY {@link #WIDE_CHARS}-character string for {@code row} (mirrored
+     * EXACTLY by {@code interop_scan_plan.rs::wide_value} — a 32-bit LCG over a 62-char alphabet).
+     *
+     * <p>Entropy is LOAD-BEARING: the two engines write parquet with different default codecs (the
+     * Rust fixture writer uncompressed, Iceberg's Java default zstd), so a low-entropy filler would
+     * compress away here and collapse gap.parquet's middle row group BELOW the split target —
+     * silently reverting the adjacency pin to vacuity. The span is asserted anyway; the entropy keeps
+     * that assertion from being the thing that fails.
+     */
+    private static String wideValue(int row) {
+      final String alphabet =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+      int seed = row * 0x9E3779B1;
+      StringBuilder out = new StringBuilder(WIDE_CHARS);
+      for (int i = 0; i < WIDE_CHARS; i++) {
+        seed = seed * 1103515245 + 12345;
+        // `seed >>> 16` is always in [0, 65535], so the modulo needs no sign fixup.
+        out.append(alphabet.charAt((seed >>> 16) % 62));
+      }
+      return out.toString();
+    }
+
+    /** The `data` value of fixture row {@code row} under {@code shape} (null ⇒ a NULL cell). */
+    private static String shapedDataValue(DataShape shape, int row) {
+      switch (shape) {
+        case NARROW:
+          return "row-" + String.format("%06d", row);
+        case SPARSE_WIDE:
+          return (row >= WIDE_FROM && row < WIDE_FROM + WIDE_ROWS) ? wideValue(row) : null;
+        case NULL_DATA:
+        default:
+          return null;
+      }
+    }
+
+    /**
+     * Write a REAL parquet data file of {@code rowCount} rows whose ids start at {@code idBase} and
+     * whose `data` column follows {@code shape}. The disjoint id range is what lets a metrics-pruned
+     * filtered scan isolate exactly this file.
+     */
+    private static DataFile writeShapedDataFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        File file,
+        int rowCount,
+        long idBase,
+        DataShape shape)
+        throws IOException {
+      List<Record> rows = new ArrayList<>(rowCount);
+      for (int i = 0; i < rowCount; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", idBase + i);
+        record.setField("data", shapedDataValue(shape, i));
+        rows.add(record);
+      }
+      return writeRows(table, schema, spec, file, rows);
     }
 
     /** Write a REAL parquet data file of {@code rowCount} rows and return its DataFile (real metrics). */
@@ -5237,9 +5503,16 @@ public final class InteropOracle {
         GenericRecord record = GenericRecord.create(schema);
         record.setField("id", (long) i);
         // A fixed-width-ish string so the file size grows predictably with rowCount.
-        record.setField("data", "row-" + String.format("%06d", i));
+        record.setField("data", shapedDataValue(DataShape.NARROW, i));
         rows.add(record);
       }
+      return writeRows(table, schema, spec, file, rows);
+    }
+
+    /** Append {@code rows} to a REAL parquet file at {@code file} and return its DataFile. */
+    private static DataFile writeRows(
+        BaseTable table, Schema schema, PartitionSpec spec, File file, List<Record> rows)
+        throws IOException {
       GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
       // Honor the table's (deterministic, knife-edge-clearing) parquet row-group size so big.parquet gets a
       // reproducible multi-row-group grid — see the PARQUET_ROW_GROUP_SIZE_BYTES rationale in buildTableWithFiles.
@@ -5339,6 +5612,270 @@ public final class InteropOracle {
         throw new RuntimeException("failed to planTasks via BatchScan", error);
       }
       return groups;
+    }
+
+    /**
+     * Run the REAL Java planTasks under a ROW FILTER — used by the two merge fixtures. The filter is
+     * metrics-prunable (each fixture file owns a disjoint id range), so the filtered scan plans
+     * exactly ONE data file and its splits meet an EMPTY bin-packer, making the co-binning
+     * deterministic instead of a function of how the rest of the fixture happened to pack.
+     */
+    private static Set<Set<String>> planGroups(
+        Table table, Expression filter, long target, int lookback, long openFileCost) {
+      Set<Set<String>> groups = new java.util.HashSet<>();
+      TableScan scan =
+          table
+              .newScan()
+              .useSnapshot(appendSnapshotId(table))
+              .filter(filter)
+              .option(TableProperties.SPLIT_SIZE, Long.toString(target))
+              .option(TableProperties.SPLIT_LOOKBACK, Integer.toString(lookback))
+              .option(TableProperties.SPLIT_OPEN_FILE_COST, Long.toString(openFileCost));
+      try (CloseableIterable<CombinedScanTask> tasks = scan.planTasks()) {
+        for (CombinedScanTask combined : tasks) {
+          Set<String> members = new TreeSet<>();
+          for (FileScanTask fileTask : combined.files()) {
+            members.add(memberKey(fileTask));
+          }
+          groups.add(members);
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to planTasks under a filter", error);
+      }
+      return groups;
+    }
+
+    /**
+     * The APPEND snapshot — the parent of the current one, i.e. the fixture state BEFORE the MoR
+     * position delete was committed. The merge legs plan THIS snapshot, and that choice is
+     * LOAD-BEARING, not cosmetic.
+     *
+     * <p>The table is UNPARTITIONED, so Java's `DeleteFileIndex` attaches `big-deletes.parquet` to
+     * EVERY data file in the (single, empty) partition — measured: `merge.parquet`'s whole-file task
+     * comes back with `deletes=1, size=1545`. Those delete bytes enter the bin-pack weight of EVERY
+     * sub-task (Java `ScanTaskUtil.contentSizeInBytes`), and the delete file's size is dominated by
+     * the ABSOLUTE data-file path it embeds — so it varies with the checkout directory. Charging it
+     * to each split would put the merge fixture's co-binning back on exactly the environment-sensitive
+     * knife edge that made the original failure runner-only (2 x 1545 alone is 75% of the 4096
+     * target). Planning the delete-free append snapshot makes each split's weight equal its LENGTH,
+     * which is a property of the fixture rather than of the filesystem it was written on.
+     */
+    private static long appendSnapshotId(Table table) {
+      Snapshot current = table.currentSnapshot();
+      if (current == null || current.parentId() == null) {
+        throw new IllegalStateException(
+            "the scan-plan fixture must have an APPEND snapshot before the row-delta; current="
+                + current);
+      }
+      return current.parentId();
+    }
+
+    /**
+     * The metrics-prunable row filter isolating merge.parquet (HAND-DECLARED; mirrors
+     * {@code interop_scan_plan.rs::merge_filter}). Both bounds are needed so gap.parquet's higher ids
+     * are excluded too.
+     */
+    private static Expression mergeFilter() {
+      return Expressions.and(
+          Expressions.greaterThanOrEqual("id", MERGE_ID_BASE),
+          Expressions.lessThan("id", GAP_ID_BASE));
+    }
+
+    /**
+     * The metrics-prunable row filter isolating gap.parquet (HAND-DECLARED; mirrors
+     * {@code interop_scan_plan.rs::gap_filter}).
+     */
+    private static Expression gapFilter() {
+      return Expressions.greaterThanOrEqual("id", GAP_ID_BASE);
+    }
+
+    /** The whole-file DataFile of the fixture file {@code name}, or null when it is absent. */
+    private static DataFile findDataFile(Table table, String name) {
+      DataFile found = null;
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+        for (FileScanTask task : tasks) {
+          if (basename(task.file().path().toString()).equals(name)) {
+            found = task.file();
+          }
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to planFiles while locating " + name, error);
+      }
+      return found;
+    }
+
+    /**
+     * The per-row-group byte spans of {@code file}: {@code offsets[i+1] - offsets[i]}, the last
+     * running to the file's end — exactly the sub-task lengths the offsets-aware split emits.
+     */
+    private static List<Long> rowGroupSpans(DataFile file) {
+      List<Long> offsets = file.splitOffsets();
+      List<Long> spans = new ArrayList<>();
+      for (int i = 0; i < offsets.size(); i++) {
+        long end = (i + 1 < offsets.size()) ? offsets.get(i + 1) : file.fileSizeInBytes();
+        spans.add(end - offsets.get(i));
+      }
+      return spans;
+    }
+
+    /** The member key a split of {@code file} covering {@code [start, start+length)} would carry. */
+    private static String spanKey(DataFile file, long start, long length) {
+      return "(" + basename(file.path().toString()) + "," + start + "," + length + ")";
+    }
+
+    /**
+     * Assert the ADJACENT-SPLIT MERGE pins over {@code table}'s two dedicated fixture files, given the
+     * groups planned under {@link #mergeFilter()} / {@link #gapFilter()}. Throws
+     * {@link IllegalStateException} on any violation ({@code label} names the direction).
+     *
+     * <p>Cross-engine equality of the filtered plans (asserted by the callers) proves the two engines
+     * AGREE; these assertions prove the thing they agree on is actually the merge:
+     *
+     * <ul>
+     *   <li>merge.parquet — the emitted member's length must STRICTLY EXCEED the largest single
+     *       row-group span. A member equal to one span means no merge occurred and the agreement is
+     *       about nothing (the non-vacuity guard).
+     *   <li>gap.parquet — the co-binned same-file pair must remain TWO members and be NON-CONTIGUOUS,
+     *       pinning that mergeTasks is an adjacent-run collapse and not a group-by-file coalesce.
+     * </ul>
+     *
+     * Each is guarded by a SIZING assertion on the fixture itself, so a fixture edit that destroys the
+     * precondition fails LOUDLY here instead of silently draining the pin.
+     */
+    private static void assertMergePins(
+        Table table, Set<Set<String>> mergeGroups, Set<Set<String>> gapGroups, String label) {
+      // -- merge.parquet: the single spanning member + non-vacuity + the sizing guard. --
+      DataFile merge = findDataFile(table, "merge.parquet");
+      if (merge == null) {
+        throw new IllegalStateException(label + ": merge.parquet is absent from the fixture table");
+      }
+      List<Long> mergeOffsets = merge.splitOffsets();
+      if (mergeOffsets == null || mergeOffsets.size() < 2) {
+        throw new IllegalStateException(
+            label + ": merge.parquet must have >= 2 row groups, got offsets " + mergeOffsets);
+      }
+      long mergeLen = merge.fileSizeInBytes();
+      if (mergeLen >= TARGET) {
+        throw new IllegalStateException(
+            label
+                + ": merge.parquet must fit ONE bin so all its splits co-bin on any parquet build — "
+                + "fileLength "
+                + mergeLen
+                + " must be < TARGET "
+                + TARGET
+                + ". Shrink the fixture rather than raising the target.");
+      }
+      List<Long> mergeSpans = rowGroupSpans(merge);
+      long largestMergeSpan = java.util.Collections.max(mergeSpans);
+      // The merged span starts at the FIRST split offset (4 for parquet — after the "PAR1" magic),
+      // not at 0, and runs to the end of the file. It is INDEPENDENT of the internal row-group grid.
+      long mergeStart = mergeOffsets.get(0);
+      long mergeSpanLength = mergeLen - mergeStart;
+
+      Set<Set<String>> expectedMerge = new java.util.HashSet<>();
+      expectedMerge.add(
+          new TreeSet<>(
+              java.util.Collections.singletonList(spanKey(merge, mergeStart, mergeSpanLength))));
+      if (!mergeGroups.equals(expectedMerge)) {
+        throw new IllegalStateException(
+            label
+                + ": the merge-filtered plan must be ONE group holding ONE member — the whole file as "
+                + "a single spanning split (BaseCombinedScanTask(List) → TableScanUtil.mergeTasks over "
+                + mergeOffsets.size()
+                + " contiguous splits, spans "
+                + mergeSpans
+                + "); got "
+                + mergeGroups
+                + " expected "
+                + expectedMerge);
+      }
+      if (mergeSpanLength <= largestMergeSpan) {
+        throw new IllegalStateException(
+            label
+                + ": NON-VACUITY FAILED — the emitted merge.parquet member length "
+                + mergeSpanLength
+                + " does not strictly exceed its largest single row-group span "
+                + largestMergeSpan
+                + " (spans "
+                + mergeSpans
+                + "), so the merge branch was never exercised");
+      }
+
+      // -- gap.parquet: adjacency (not group-by-file) + its sizing guards. --
+      DataFile gap = findDataFile(table, "gap.parquet");
+      if (gap == null) {
+        throw new IllegalStateException(label + ": gap.parquet is absent from the fixture table");
+      }
+      List<Long> gapOffsets = gap.splitOffsets();
+      if (gapOffsets == null || gapOffsets.size() != 3) {
+        throw new IllegalStateException(
+            label
+                + ": gap.parquet must have exactly 3 row groups (small / oversized / small), got "
+                + gapOffsets);
+      }
+      List<Long> gapSpans = rowGroupSpans(gap);
+      if (gapSpans.get(1) <= TARGET) {
+        throw new IllegalStateException(
+            label
+                + ": gap.parquet's MIDDLE row-group span "
+                + gapSpans.get(1)
+                + " must exceed TARGET "
+                + TARGET
+                + " so its split can never join the bin holding the outer two (spans "
+                + gapSpans
+                + ")");
+      }
+      if (gapSpans.get(0) + gapSpans.get(2) > TARGET) {
+        throw new IllegalStateException(
+            label
+                + ": gap.parquet's OUTER row-group spans must SUM to <= TARGET "
+                + TARGET
+                + " so first-fit co-bins them (spans "
+                + gapSpans
+                + ")");
+      }
+      if (gapOffsets.get(0) + gapSpans.get(0) == gapOffsets.get(2)) {
+        throw new IllegalStateException(
+            label + ": the co-binned gap.parquet pair must be NON-CONTIGUOUS (offsets " + gapOffsets + ")");
+      }
+
+      Set<Set<String>> expectedGap = new java.util.HashSet<>();
+      expectedGap.add(
+          new TreeSet<>(
+              Arrays.asList(
+                  spanKey(gap, gapOffsets.get(0), gapSpans.get(0)),
+                  spanKey(gap, gapOffsets.get(2), gapSpans.get(2)))));
+      expectedGap.add(
+          new TreeSet<>(
+              java.util.Collections.singletonList(spanKey(gap, gapOffsets.get(1), gapSpans.get(1)))));
+      if (!gapGroups.equals(expectedGap)) {
+        throw new IllegalStateException(
+            label
+                + ": the gap-filtered plan must be TWO groups — the oversized middle split alone, and "
+                + "the two outer splits co-binned but UNMERGED (separated by the middle span, so "
+                + "canMerge's offset+len == next.start is false). ONE member for the outer pair would "
+                + "mean the merge coalesced by FILE instead of by adjacency. got "
+                + gapGroups
+                + " expected "
+                + expectedGap);
+      }
+
+      System.out.println(
+          "    "
+              + label
+              + " merge pins OK — merge.parquet: "
+              + mergeOffsets.size()
+              + " splits (spans "
+              + mergeSpans
+              + ") ⇒ ONE member (merge.parquet,"
+              + mergeStart
+              + ","
+              + mergeSpanLength
+              + "), which exceeds the largest single span "
+              + largestMergeSpan
+              + "; gap.parquet: spans "
+              + gapSpans
+              + " ⇒ co-binned NON-contiguous outer pair survives unmerged");
     }
 
     /** A scan task's cross-engine member key: "(basename,start,length)". */
@@ -9382,7 +9919,7 @@ public final class InteropOracle {
 
     /** The five fixtures, each a self-contained expire scenario (see the class banner). */
     private static final List<String> FIXTURES =
-        java.util.Arrays.asList("linear", "tag_protected", "stats", "deletes", "rewrite");
+        Arrays.asList("linear", "tag_protected", "stats", "deletes", "rewrite");
 
     static void generate(Path dir) throws IOException {
       for (String fixture : FIXTURES) {
@@ -10560,7 +11097,7 @@ public final class InteropOracle {
 
     /** The COUNT-only summary allowlist — every SnapshotSummary count key, no byte-size keys. */
     private static final List<String> SUMMARY_COUNT_KEYS =
-        java.util.Arrays.asList(
+        Arrays.asList(
             SnapshotSummary.ADDED_FILES_PROP,
             SnapshotSummary.DELETED_FILES_PROP,
             SnapshotSummary.TOTAL_DATA_FILES_PROP,
@@ -14425,7 +14962,7 @@ public final class InteropOracle {
         this.caseSensitive = caseSensitive;
         this.withPartialFile = withPartialFile;
         this.expectError = expectError;
-        this.expectedSurvivors = new java.util.TreeSet<>(java.util.Arrays.asList(expectedSurvivors));
+        this.expectedSurvivors = new java.util.TreeSet<>(Arrays.asList(expectedSurvivors));
       }
     }
 
@@ -16290,7 +16827,7 @@ public final class InteropOracle {
     private CherryPickOracle() {}
 
     private static final List<String> FIXTURES =
-        java.util.Arrays.asList("ff", "replay", "dedup");
+        Arrays.asList("ff", "replay", "dedup");
 
     /** Schema: {1 id long required, 2 data string required} — small, unpartitioned (V2). */
     private static Schema schema() {
@@ -18544,7 +19081,7 @@ public final class InteropOracle {
     private StagedWapOracle() {}
 
     private static final List<String> FIXTURES =
-        java.util.Arrays.asList("S-ff", "S-replay", "S-dedup");
+        Arrays.asList("S-ff", "S-replay", "S-dedup");
 
     /** Schema: {1 id long required, 2 data string required} — small, unpartitioned (V2). */
     private static Schema schema() {
@@ -21839,7 +22376,7 @@ public final class InteropOracle {
         for (org.apache.iceberg.types.Types.NestedField field : schema.columns()) {
           actualFieldNames.add(field.name());
         }
-        java.util.List<String> expectedFieldNames = java.util.Arrays.asList(SCHEMA_FIELD_NAMES);
+        java.util.List<String> expectedFieldNames = Arrays.asList(SCHEMA_FIELD_NAMES);
         if (!expectedFieldNames.equals(actualFieldNames)) {
           System.out.println(
               "FAIL schema field names: expected=" + expectedFieldNames
