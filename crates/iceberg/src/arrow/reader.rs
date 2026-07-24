@@ -2308,10 +2308,14 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literals: Vec<_> = literals
+            // `get_arrow_datum` is fallible (e.g. a decimal literal whose precision exceeds Arrow's
+            // Decimal128 max, or a type it does not yet support). Propagate that as a typed error,
+            // exactly like the scalar comparison arms above (`less_than`, `eq`, …) — never
+            // `.unwrap()`-panic the predicate build.
+            let literals = literals
                 .iter()
-                .map(|lit| get_arrow_datum(lit).unwrap())
-                .collect();
+                .map(get_arrow_datum)
+                .collect::<Result<Vec<_>>>()?;
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native is_in kernel
@@ -2340,10 +2344,12 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literals: Vec<_> = literals
+            // Fallible for the same reasons as `r#in` above — propagate as a typed error rather
+            // than `.unwrap()`-panicking the predicate build.
+            let literals = literals
                 .iter()
-                .map(|lit| get_arrow_datum(lit).unwrap())
-                .collect();
+                .map(get_arrow_datum)
+                .collect::<Result<Vec<_>>>()?;
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native not_in kernel
@@ -2540,6 +2546,7 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use fnv::FnvHashSet;
     use futures::TryStreamExt;
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
     use parquet::arrow::{ArrowWriter, ProjectionMask};
@@ -2552,15 +2559,22 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::ErrorKind;
-    use crate::arrow::reader::{CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY};
+    use crate::arrow::reader::{
+        CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY, PredicateConverter,
+    };
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::delete_vector::DeleteVector;
+    use crate::expr::accessor::StructAccessor;
     use crate::expr::visitors::bound_predicate_visitor::visit;
-    use crate::expr::{Bind, Predicate, Reference};
+    use crate::expr::{
+        Bind, BoundPredicate, BoundReference, Predicate, PredicateOperator, Reference,
+        SetExpression,
+    };
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
-        DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
+        DataContentType, DataFileFormat, Datum, NestedField, PrimitiveLiteral, PrimitiveType,
+        Schema, SchemaRef, Type,
     };
 
     fn table_schema_simple() -> SchemaRef {
@@ -2594,6 +2608,76 @@ mod tests {
         expected.insert(4_i32);
 
         assert_eq!(visitor.field_ids, expected);
+    }
+
+    /// Drives the `IN` / `NOT IN` predicate-conversion arms with a decimal literal whose precision
+    /// exceeds Arrow's Decimal128 max (38). `get_arrow_datum` returns a typed error for such a
+    /// literal; the visitor must PROPAGATE it (like every scalar-comparison arm does), never
+    /// `.unwrap()`-panic while building the row filter. A precision above 38 is reachable because
+    /// the `decimal(P,S)` type-string deserializer and `Datum::try_from_bytes` do not bound-check
+    /// precision, so hostile/corrupt catalog metadata can push such a datum into a bound predicate.
+    fn assert_set_predicate_over_max_decimal_is_typed_error(op: PredicateOperator) {
+        // One leaf decimal column carrying field id 1.
+        let message_type = "
+message schema {
+  optional fixed_len_byte_array(16) d (DECIMAL(38,0)) = 1;
+}
+        ";
+        let parquet_type = parse_message_type(message_type).expect("should parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+        let column_map = HashMap::from([(1_i32, 0_usize)]);
+        let column_indices = vec![0_usize];
+
+        let field = NestedField::optional(
+            1,
+            "d",
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 38,
+                scale: 0,
+            }),
+        )
+        .into();
+        let accessor = Arc::new(StructAccessor::new(0, PrimitiveType::Decimal {
+            precision: 38,
+            scale: 0,
+        }));
+        let bound_ref = BoundReference::new("d", field, accessor);
+
+        // precision 50 > 38: get_arrow_datum returns Err for this literal.
+        let bad = Datum::new(
+            PrimitiveType::Decimal {
+                precision: 50,
+                scale: 0,
+            },
+            PrimitiveLiteral::Int128(1234),
+        );
+        let mut literals = FnvHashSet::default();
+        literals.insert(bad);
+
+        let predicate = BoundPredicate::Set(SetExpression::new(op, bound_ref, literals));
+
+        let mut converter = PredicateConverter {
+            parquet_schema: &parquet_schema,
+            column_map: &column_map,
+            column_indices: &column_indices,
+        };
+
+        match visit(&mut converter, &predicate) {
+            Ok(_) => panic!(
+                "{op:?} with a decimal literal of precision 50 must return a typed error, not panic"
+            ),
+            Err(err) => assert_eq!(err.kind(), ErrorKind::DataInvalid),
+        }
+    }
+
+    #[test]
+    fn in_predicate_over_max_decimal_precision_is_typed_error_not_panic() {
+        assert_set_predicate_over_max_decimal_is_typed_error(PredicateOperator::In);
+    }
+
+    #[test]
+    fn not_in_predicate_over_max_decimal_precision_is_typed_error_not_panic() {
+        assert_set_predicate_over_max_decimal_is_typed_error(PredicateOperator::NotIn);
     }
 
     #[test]
