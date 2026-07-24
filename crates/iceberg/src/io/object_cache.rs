@@ -34,7 +34,7 @@ pub(crate) enum CachedItem {
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum CachedObjectKey {
-    ManifestList((String, FormatVersion, SchemaId)),
+    ManifestList((String, FormatVersion, Option<SchemaId>)),
     Manifest(String),
 }
 
@@ -132,10 +132,13 @@ impl ObjectCache {
                 .map(Arc::new);
         }
 
+        // `Snapshot::schema_id` is `Option`: V1/legacy snapshots may omit it. The manifest-list
+        // path already uniquely identifies the cache entry, so key on the `Option` directly
+        // rather than unwrapping (which panicked on a schema-id-less snapshot).
         let key = CachedObjectKey::ManifestList((
             snapshot.manifest_list().to_string(),
             table_metadata.format_version,
-            snapshot.schema_id().unwrap(),
+            snapshot.schema_id(),
         ));
         let cache_entry = self
             .cache
@@ -184,6 +187,7 @@ impl ObjectCache {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use minijinja::value::Value;
     use minijinja::{AutoEscape, Environment, context};
@@ -195,7 +199,7 @@ mod tests {
     use crate::io::{FileIO, OutputFile};
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
-        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Struct, TableMetadata,
+        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Snapshot, Struct, TableMetadata,
     };
     use crate::table::Table;
 
@@ -343,6 +347,40 @@ mod tests {
                 .unwrap(),
             "1.parquet"
         );
+    }
+
+    /// SAF-001: a V1/legacy snapshot may omit `schema_id` (`Snapshot::schema_id` is `Option`).
+    /// The default (enabled) `ObjectCache` must build its manifest-list key and load the list
+    /// without panicking — matching the cache-disabled path, which already handles `None`.
+    ///
+    /// MUTATION (restore the `SchemaId` key element and `snapshot.schema_id().unwrap()` in
+    /// `get_manifest_list`): key construction panics on this schema-id-less snapshot, before any
+    /// I/O, so this test aborts instead of returning the manifest list.
+    #[tokio::test]
+    async fn test_get_manifest_list_from_default_cache_with_schemaless_snapshot() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let current = fixture.table.metadata().current_snapshot().unwrap();
+        // A legacy snapshot that omits `schema_id`, reusing the real manifest-list path.
+        let schemaless = Arc::new(
+            Snapshot::builder()
+                .with_snapshot_id(current.snapshot_id())
+                .with_sequence_number(current.sequence_number())
+                .with_timestamp_ms(current.timestamp_ms())
+                .with_manifest_list(current.manifest_list())
+                .with_summary(current.summary().clone())
+                .build(),
+        );
+        assert_eq!(schemaless.schema_id(), None);
+
+        let object_cache = ObjectCache::new(fixture.table.file_io().clone());
+        let manifest_list = object_cache
+            .get_manifest_list(&schemaless, &fixture.table.metadata_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(manifest_list.entries().len(), 1);
     }
 
     #[tokio::test]

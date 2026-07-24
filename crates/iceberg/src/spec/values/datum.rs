@@ -296,9 +296,10 @@ impl Display for Datum {
             (PrimitiveType::Long, PrimitiveLiteral::Long(val)) => write!(f, "{val}"),
             (_, PrimitiveLiteral::Float(val)) => write!(f, "{val}"),
             (_, PrimitiveLiteral::Double(val)) => write!(f, "{val}"),
-            (PrimitiveType::Date, PrimitiveLiteral::Int(val)) => {
-                write!(f, "{}", date::days_to_date(*val))
-            }
+            (PrimitiveType::Date, PrimitiveLiteral::Int(val)) => match date::days_to_date(*val) {
+                Some(date) => write!(f, "{date}"),
+                None => write!(f, "<invalid date: {val}>"),
+            },
             // The temporal converters return `None` for an out-of-range stored value (which can
             // arrive from corrupt/hostile on-disk bytes). Formatting must never panic, so render a
             // clearly-marked placeholder instead of unwrapping; valid values format unchanged.
@@ -1318,6 +1319,30 @@ mod tests {
         // One second after midnight; valid values must still render normally.
         let valid = Datum::new(PrimitiveType::Time, PrimitiveLiteral::Long(1_000_000));
         assert_eq!(valid.to_string(), "00:00:01");
+    }
+
+    // SAF-003: a `Date` `Datum` with an out-of-range days-since-epoch value (corrupt/hostile
+    // on-disk bytes) must format via a placeholder rather than panicking. The former
+    // `days_to_date` returned a bare `NaiveDate` and overflowed chrono's `DateTime + TimeDelta`
+    // for extreme `i32` values (the `Add` panicked, not the `try_days` unwrap).
+    //
+    // MUTATION (restore `days_to_date -> NaiveDate` built with
+    // `(UNIX_EPOCH + TimeDelta::try_days(days as i64).unwrap()).naive_utc().date()` and the bare
+    // `write!(f, "{}", date::days_to_date(*val))`): `to_string()` panics here.
+    #[test]
+    fn test_display_date_out_of_range_does_not_panic() {
+        let max = Datum::new(PrimitiveType::Date, PrimitiveLiteral::Int(i32::MAX));
+        assert_eq!(max.to_string(), format!("<invalid date: {}>", i32::MAX));
+
+        let min = Datum::new(PrimitiveType::Date, PrimitiveLiteral::Int(i32::MIN));
+        assert_eq!(min.to_string(), format!("<invalid date: {}>", i32::MIN));
+    }
+
+    #[test]
+    fn test_display_valid_date_unchanged() {
+        // 2024-01-01 is 19_723 days since epoch; valid values must still render normally.
+        let valid = Datum::new(PrimitiveType::Date, PrimitiveLiteral::Int(19_723));
+        assert_eq!(valid.to_string(), "2024-01-01");
     }
 
     #[test]

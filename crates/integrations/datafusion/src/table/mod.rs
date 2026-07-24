@@ -108,7 +108,7 @@ impl IcebergTableProvider {
     ) -> Result<IcebergMetadataTableProvider> {
         // Load fresh table metadata for metadata table access
         let table = self.catalog.load_table(&self.table_ident).await?;
-        Ok(IcebergMetadataTableProvider { table, r#type })
+        IcebergMetadataTableProvider::try_new(table, r#type)
     }
 }
 
