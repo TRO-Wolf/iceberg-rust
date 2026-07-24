@@ -49,9 +49,10 @@ own files, so a shared tracker would collide).
   merge that #169 landed with offline unit tests only. Spec: [g3-scan-plan-merge-interop-brief.md](g3-scan-plan-merge-interop-brief.md).
   Two dedicated fixture files (`merge.parquet` co-binned contiguous pair ⇒ ONE spanning member;
   `gap.parquet` co-binned NON-contiguous pair ⇒ stays two), each planned under an isolating
-  metrics-prunable filter at the delete-free append snapshot; both directions; non-vacuity asserted
-  on both sides; new Java sabotage leg + a production-source merge-removal MUTATION leg (RED, then
-  restored md5-identical). Chain [1/7]…[7/7]. ZERO production-code changes.
+  metrics-prunable filter at the delete-free append snapshot; both directions; non-vacuity proven
+  on both sides by the exact plan-SHAPE asserts (the span inequalities are degenerate-fixture
+  guards); new Java sabotage leg + TWO production-source mutation legs (merge-removal and
+  adjacency-removal, each RED on a real assertion signal, restored md5-identical). Chain [1/7]…[7/7]. ZERO production-code changes.
   _What changed and why:_ the oracle could always REPRESENT a merge divergence but its fixture never
   reached the branch — measured: with `merge_tasks` removed the old unfiltered comparison still
   passes at 14 groups. See [lessons.md](lessons.md) 2026-07-24 (coverage-vs-granularity).

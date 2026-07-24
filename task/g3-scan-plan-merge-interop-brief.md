@@ -56,7 +56,9 @@ went ✅.
   performed by the real `BaseCombinedScanTask(List)` → `TableScanUtil.mergeTasks`.
 - **M-2 (Direction 2, Rust→Java).** Over the Rust-written table, Java's real `planTasks()` produces
   the same single spanning member as Rust's own `rust_scan_plan.json`.
-- **M-3 (Non-vacuity — the load-bearing guard).** The fixture is proven to have *actually exercised
+- **M-3 (Non-vacuity — the load-bearing guard).** *(Superseded in execution: the shipped
+  discriminator is the exact plan-SHAPE assert read against the offsets-aware-split invariant; the
+  span inequality below is a degenerate-fixture guard — see task/lessons.md 2026-07-24.)* The fixture is proven to have *actually exercised
   the merge branch*: at least one emitted member's `length` **strictly exceeds** the largest single
   row-group span of its source file (per the manifest's field-132 split offsets). A member equal to
   a single row-group span means no merge occurred and the pin is vacuous.
@@ -131,4 +133,5 @@ unit to add split provenance.
 chained to the commit in ONE `&&` chain (never a separate line), plus
 `make check-matrix-anchors`, the full `run-interop-scan-plan.sh` chain green with the new leg, and
 the nightly `scan-plan` suite green on the merged tip. Independent Critic must re-derive M-3
-non-vacuity independently — that is the assertion this whole unit turns on.
+non-vacuity independently — that is the proof this whole unit turns on *(as shipped: the plan-shape
+assert, not the span inequality — superseded framing, see task/lessons.md 2026-07-24)*.
