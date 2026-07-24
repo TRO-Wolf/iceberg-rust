@@ -779,11 +779,32 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
         (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(value)) => {
             // `precision`/`scale` are NOT bound-checked by the `decimal(P,S)` type-string
             // deserializer nor by `Datum::try_from_bytes`, so a corrupt/hostile catalog or manifest
-            // can carry a precision above Arrow's Decimal128 max (38). `with_precision_and_scale`
-            // rejects such values; map that to a typed error rather than `.unwrap()`-panicking the
-            // predicate path (AGENTS.md: no bare unwrap in production paths).
+            // can carry a precision/scale far outside Arrow's Decimal128 range. Reject in TWO stages,
+            // each as a typed error (AGENTS.md: no bare unwrap AND no truncating `as` in production
+            // paths):
+            //   1. `u8::try_from` / `i8::try_from` — Arrow takes a `u8` precision + `i8` scale, so a
+            //      plain `as` cast would WRAP (e.g. precision 294 → 38, scale 256 → 0) and SILENTLY
+            //      ACCEPT an invalid value; `try_from` rejects anything outside the numeric range.
+            //   2. `with_precision_and_scale` — enforces Arrow's own rules (precision ≤ 38, and
+            //      scale ≤ precision) on the now in-range values.
+            let arrow_precision = u8::try_from(*precision).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Decimal literal precision {precision} is out of Arrow Decimal128 range"
+                    ),
+                )
+                .with_source(e)
+            })?;
+            let arrow_scale = i8::try_from(*scale).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Decimal literal scale {scale} is out of Arrow Decimal128 range"),
+                )
+                .with_source(e)
+            })?;
             let array = Decimal128Array::from_value(*value, 1)
-                .with_precision_and_scale(*precision as _, *scale as _)
+                .with_precision_and_scale(arrow_precision, arrow_scale)
                 .map_err(|e| {
                     Error::new(
                         ErrorKind::DataInvalid,
@@ -2346,6 +2367,42 @@ mod tests {
         );
         match get_arrow_datum(&bad_scale) {
             Ok(_) => panic!("decimal scale 20 > precision 10 is invalid and must be an error"),
+            Err(err) => assert_eq!(err.kind(), ErrorKind::DataInvalid),
+        }
+    }
+
+    /// The precision/scale rejection must be COMPLETE, not just "large values". Arrow takes a `u8`
+    /// precision + `i8` scale, so casting the `u32` fields with `as` would WRAP an out-of-range value
+    /// INTO Arrow's valid range and SILENTLY accept it — `decimal(294,0)` wraps to precision 38,
+    /// `scale=256` wraps to i8 0, both of which Arrow's `with_precision_and_scale` then ACCEPTS.
+    /// `get_arrow_datum` uses `try_from` (not `as`) so these are rejected as typed
+    /// [`ErrorKind::DataInvalid`]. (Without the `try_from`, this test FAILS — the wrapped values pass.)
+    #[test]
+    fn get_arrow_datum_rejects_wrapping_decimal_precision_scale() {
+        // precision 294 wraps to 38 under `as u8` (294 - 256) — a VALID Arrow precision.
+        let wrapping_precision = Datum::new(
+            PrimitiveType::Decimal {
+                precision: 294,
+                scale: 0,
+            },
+            PrimitiveLiteral::Int128(1234),
+        );
+        match get_arrow_datum(&wrapping_precision) {
+            Ok(_) => panic!("decimal precision 294 wraps to 38 under `as u8` and must be rejected"),
+            Err(err) => assert_eq!(err.kind(), ErrorKind::DataInvalid),
+        }
+
+        // scale 256 wraps to i8 0 under `as i8`; precision 10 is valid, so the wrapped (10,0) is a
+        // decimal Arrow accepts — the truncating cast would silently change scale 256 into 0.
+        let wrapping_scale = Datum::new(
+            PrimitiveType::Decimal {
+                precision: 10,
+                scale: 256,
+            },
+            PrimitiveLiteral::Int128(1234),
+        );
+        match get_arrow_datum(&wrapping_scale) {
+            Ok(_) => panic!("decimal scale 256 wraps to i8 0 under `as i8` and must be rejected"),
             Err(err) => assert_eq!(err.kind(), ErrorKind::DataInvalid),
         }
     }
