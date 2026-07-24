@@ -165,3 +165,34 @@ split member keys `(basename,start,length)` ARE the row-group offsets. It could 
   plan the PERSISTED artifact — never plan a freshly-built in-memory table against the other engine's
   on-disk read** (writer in-memory state can legitimately differ from the flushed footer). Local stays a
   no-op (in-memory == persisted == 8). The `block=64` fixture-hygiene knob was orthogonal (kept, harmless).
+
+### 2026-07-24 — A merged-span START masquerades as an offset SUBSET; decompose the LENGTHS before diagnosing a split-count divergence
+
+Context: the same nightly D1 (`interop_scan_plan.rs`) that the 2026-07-23 entry "resolved" via oracle-reload was
+STILL diverging on the runner. The 2026-07-23 diagnosis — "Java's in-memory `DataFile.splitOffsets()` returned a
+coarser 5-offset SUBSET of big.parquet's 8 physical row groups" — was the **#165 WRONG diagnosis**. The real cause,
+found by decoding the 1.10.0 jar: `TableScanUtil.planTasks` maps every bin through `BaseCombinedScanTask(List)`,
+whose ctor calls `TableScanUtil.mergeTasks` (javap: `REF_newInvokeSpecial BaseCombinedScanTask.<init>:(List)`),
+which MERGES adjacent contiguous same-file splits within a bin (`SplitScanTask.canMerge` = same `file()` +
+`offset+len==next.start`; `merge` sums lengths). Rust never merged, so on the runner — where MoR delete-byte
+pack-weights pushed 2 splits into one bin — Java emitted merged spans and Rust emitted both members.
+
+- **DO decompose a "fewer members on one engine" divergence by SUMMING the suspect side's member LENGTHS against the
+  other side's, not by comparing member STARTS as a set.** Java's members `(4,939),(943,943),(1886,947)` are EXACTLY
+  Rust's `{(4,469),(473,470)},{(943,470),(1413,473)},{(1886,474),(2360,473)}` pairwise-merged (`4+469==473`,
+  `469+470==939`; …). The merged STARTS `{4,943,1886}` are a SUBSET of the 8 split starts
+  `{4,473,943,1413,1886,2360,…}`, so a start-only comparison SCREAMS "coarser grid / dropped offsets" when the truth
+  is "adjacent spans coalesced." *Why:* a merge preserves the run's FIRST start and its TOTAL length; the interior
+  starts vanish, mimicking a subset. Only the length arithmetic (`Σ member.len == merged.len`) distinguishes "merged"
+  from "re-gridded." Apply BEFORE attributing a split-count gap to parquet-mr, in-memory-vs-persisted state, or
+  dependency drift.
+- **DO treat a same-file split-count parity gap as a MERGE-LAYER question first** (`mergeTasks` in the
+  `CombinedScanTask`/`ScanTaskGroup` ctor): Java merges in the group constructor, not the split layer — the split
+  layer is one-sub-task-per-offset on both engines, so a divergence over ONE file is almost always the merge.
+- **DO NOT trust a delete-file's pack-weight to be environment-stable when the delete embeds an absolute path.** The
+  D1 fixture's `big-deletes.parquet` records big.parquet's ABSOLUTE path; its serialized length (hence the bin-pack
+  WEIGHT `length + contentSizeInBytes(deletes)`) differs by warehouse root, so the number of splits that land in one
+  bin sits on a `target=4096` knife edge — single-member bins locally (merge a no-op, D1 green), 2-member bins on the
+  runner (merge fires, Rust≠Java). *Why:* the fix must be environment-INDEPENDENT — implement the merge itself, not a
+  fixture knob that only re-centres the knife edge. The merge is a no-op on single-member bins, so local plans are
+  byte-unchanged (the no-regression proof) while the runner now matches.

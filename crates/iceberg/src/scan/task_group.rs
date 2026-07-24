@@ -24,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::task::FileScanTask;
+use super::task::{FileScanTask, merge_tasks};
 
 /// A group of scan tasks to be read together, porting Java `ScanTaskGroup<T>`.
 ///
@@ -49,10 +49,14 @@ pub trait ScanTaskGroup<T> {
 /// A combined scan task: a bin of [`FileScanTask`]s an executor reads as one unit.
 ///
 /// Ports Java `CombinedScanTask` / `BaseCombinedScanTask` — the element type
-/// `TableScanUtil.planTasks` produces. It is the lowest-level data group: it carries NO grouping
-/// key and does NOT merge tasks (Java's plain `CombinedScanTask` path sets no grouping key and
-/// performs no `mergeTasks` — that is the partition-aware `planTaskGroups(groupingKeyType)`
-/// overload, which is out of scope for this unit).
+/// `TableScanUtil.planTasks` produces. It carries NO grouping key (Java's partition-aware
+/// `planTaskGroups(groupingKeyType)` overload is out of scope), but it DOES merge adjacent
+/// contiguous same-file splits: [`new`](Self::new) mirrors Java's `BaseCombinedScanTask(List)`
+/// constructor, whose bytecode calls `TableScanUtil.mergeTasks` (`REF_newInvokeSpecial
+/// BaseCombinedScanTask.<init>:(List)` is exactly the mapper `TableScanUtil.planTasks` runs each bin
+/// through). So when the bin-packer places two contiguous byte-range splits of ONE file in the same
+/// bin, they collapse into a single spanning member — matching Java's emitted `planTasks` groups.
+/// See [`merge_tasks`](super::task::merge_tasks) for the semantics.
 ///
 /// `size_bytes` is the sum of the member tasks' [`FileScanTask::length`]s (Java
 /// `BaseCombinedScanTask.sizeBytes` sums `task.length()`), NOT the bin-packing weight (which adds
@@ -64,9 +68,14 @@ pub struct CombinedScanTask {
 }
 
 impl CombinedScanTask {
-    /// Builds a combined task from the bin's member tasks (the order the bin-packer emitted them).
+    /// Builds a combined task from the bin's member tasks (the order the bin-packer emitted them),
+    /// MERGING adjacent contiguous same-file splits via [`merge_tasks`](super::task::merge_tasks) —
+    /// a faithful port of Java's `BaseCombinedScanTask(List)` constructor, which calls
+    /// `TableScanUtil.mergeTasks` on the bin. See the type docs for why merging lives here.
     pub fn new(tasks: Vec<FileScanTask>) -> Self {
-        Self { tasks }
+        Self {
+            tasks: merge_tasks(tasks),
+        }
     }
 
     /// The member tasks, in packing order.
@@ -138,6 +147,132 @@ mod tests {
             case_sensitive: true,
             split_offsets: None,
         }
+    }
+
+    /// A split sub-task over `path` covering `[start, start + length)` — the exact shape
+    /// [`FileScanTask::split`](super::super::task::FileScanTask) produces (`record_count` None,
+    /// `split_offsets` None). Used to pin the adjacent-split merge in [`CombinedScanTask::new`].
+    fn split_task(path: &str, start: u64, length: u64) -> FileScanTask {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .expect("schema builds"),
+        );
+        FileScanTask {
+            file_size_in_bytes: 10_000,
+            start,
+            length,
+            record_count: None,
+            data_file_path: path.to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: true,
+            split_offsets: None,
+        }
+    }
+
+    /// The `(path, start, length)` key of each member, in order.
+    fn member_keys(group: &CombinedScanTask) -> Vec<(String, u64, u64)> {
+        group
+            .tasks()
+            .iter()
+            .map(|t| (t.data_file_path().to_string(), t.start(), t.length()))
+            .collect()
+    }
+
+    #[test]
+    fn new_merges_adjacent_contiguous_same_file_splits() {
+        // The runner-observed bin: two CONTIGUOUS big.parquet splits (4,469) + (473,470) — 4+469==473
+        // — which Java's `BaseCombinedScanTask(List)` ctor (`TableScanUtil.mergeTasks`) coalesces into
+        // one span (4,939). Before this fix Rust emitted BOTH members and diverged from Java's plan.
+        let group = CombinedScanTask::new(vec![
+            split_task("s3://b/big.parquet", 4, 469),
+            split_task("s3://b/big.parquet", 473, 470),
+        ]);
+        assert_eq!(
+            group.tasks().len(),
+            1,
+            "adjacent same-file splits must merge into ONE member"
+        );
+        assert_eq!(
+            (group.tasks()[0].start(), group.tasks()[0].length()),
+            (4, 939),
+            "the merged span keeps the first start (4) and sums the lengths (469+470=939)"
+        );
+        assert_eq!(group.size_bytes(), 939);
+        assert_eq!(group.files_count(), 1);
+    }
+
+    #[test]
+    fn new_merges_a_run_of_three_contiguous_splits() {
+        // A run of 3 contiguous splits collapses into ONE: the merged task is itself still a split
+        // (same path, extended length), so `mergeTasks` keeps folding the run.
+        let group = CombinedScanTask::new(vec![
+            split_task("s3://b/f.parquet", 0, 100),
+            split_task("s3://b/f.parquet", 100, 50),
+            split_task("s3://b/f.parquet", 150, 25),
+        ]);
+        assert_eq!(member_keys(&group), vec![(
+            "s3://b/f.parquet".to_string(),
+            0,
+            175
+        )]);
+    }
+
+    #[test]
+    fn new_does_not_merge_non_contiguous_same_file_splits() {
+        // A GAP (100..200 unread) between two same-file splits ⇒ NO merge: 0+100 != 200, so
+        // `canMerge`'s `offset + len == other.start` is false. Both members survive, unchanged.
+        let group = CombinedScanTask::new(vec![
+            split_task("s3://b/f.parquet", 0, 100),
+            split_task("s3://b/f.parquet", 200, 50),
+        ]);
+        assert_eq!(member_keys(&group), vec![
+            ("s3://b/f.parquet".to_string(), 0, 100),
+            ("s3://b/f.parquet".to_string(), 200, 50),
+        ]);
+    }
+
+    #[test]
+    fn new_does_not_merge_different_file_members() {
+        // Numerically "contiguous" (0+100==100) but DIFFERENT files ⇒ never merge — Java compares
+        // `file()` (identity), so a same-offset arithmetic coincidence across files is irrelevant.
+        let group = CombinedScanTask::new(vec![
+            split_task("s3://b/a.parquet", 0, 100),
+            split_task("s3://b/b.parquet", 100, 50),
+        ]);
+        assert_eq!(member_keys(&group), vec![
+            ("s3://b/a.parquet".to_string(), 0, 100),
+            ("s3://b/b.parquet".to_string(), 100, 50),
+        ]);
+    }
+
+    #[test]
+    fn new_merges_only_adjacent_runs_and_preserves_order() {
+        // [a(0,100), a(100,50), b(0,30), b(30,20), a(0,10)] ⇒ [a(0,150), b(0,50), a(0,10)]:
+        // `mergeTasks` compares ONLY list-adjacent tasks, so the trailing a-split — not adjacent to
+        // the first a-run — stays a separate member. Proves adjacency-only + order preservation.
+        let group = CombinedScanTask::new(vec![
+            split_task("s3://b/a.parquet", 0, 100),
+            split_task("s3://b/a.parquet", 100, 50),
+            split_task("s3://b/b.parquet", 0, 30),
+            split_task("s3://b/b.parquet", 30, 20),
+            split_task("s3://b/a.parquet", 0, 10),
+        ]);
+        assert_eq!(member_keys(&group), vec![
+            ("s3://b/a.parquet".to_string(), 0, 150),
+            ("s3://b/b.parquet".to_string(), 0, 50),
+            ("s3://b/a.parquet".to_string(), 0, 10),
+        ]);
     }
 
     #[test]
