@@ -228,10 +228,54 @@ grow MERGE semantics; it will not (out of parity scope).
   `physical_plan/project.rs`) computes `_partition` via `PartitionValueCalculator`; the
   partition-aware `TaskWriter` (`task_writer.rs`) consumes the precomputed `_partition` column
   and routes per row. Clustered input may use the cheaper clustered writer.
-- Position-delete files: **one file per `(spec_id, partition)` group**, stamped with the matching
-  `PartitionKey` (see #131 U3 — an unstamped delete file on a partitioned table fails
-  `validate_partition_value` at commit). Keep `MetricsConfig::for_position_delete` so
-  `file_path`/`pos` bounds stay Full (pruning precision).
+### 7a. Partition-spec identity on every written file · **NORMATIVE (2026-07-25)**
+
+Every file the base writers produce carries a `partition_spec_id`. It is the FIRST half of the
+`(spec_id, partition)` key the read side matches deletes to data with
+(`DeleteFileIndex::get_deletes_for_data_file` requires `data_file.partition_spec_id ==
+delete.partition_spec_id`, for both equality and position deletes), and it decides which per-spec
+manifest a commit routes the file into (`SnapshotProducer::group_files_by_spec`). Java takes the
+`PartitionSpec` as a REQUIRED constructor argument on every file builder — `FileMetadata.Builder`
+sets `this.specId = spec.specId()`, `PositionDeleteWriter` takes `(…, PartitionSpec spec, StructLike
+partition, …)` — so a Java-written file can never claim a spec the table does not have.
+
+- The engine **MUST** give every writer the spec its files are written under: pass a `PartitionKey`
+  (which carries the spec its tuple came from), or configure the spec explicitly with
+  `DataFileWriterBuilder::with_partition_spec` /
+  `PositionDeleteFileWriterBuilder::with_partition_spec` /
+  `EqualityDeleteFileWriterBuilder::with_partition_spec`. When both are given the **`PartitionKey`
+  wins** — it is authoritative for its own tuple.
+- For a delete file the spec **MUST** be the spec of the **DATA FILES the deletes apply to** — never
+  the table's default/current spec, and never a fabricated constant. After a spec evolution the
+  live data files sit under several specs at once; a delete only ever applies to data files carrying
+  the *same* `(spec_id, partition)`.
+- Position-delete files: **one file per `(spec_id, partition)` group**, stamped with that group's
+  `PartitionKey` (#131 U3). Group by the DATA files' own `(spec_id, partition)`, not by the table
+  default.
+- **A wrong spec id is not always loud.** When the claimed spec's partition type happens to be
+  arity- and type-compatible with the tuple the file carries, the commit **ACCEPTS** it —
+  `SnapshotProducer::validate_partition_value` checks arity and per-value type, never *which* spec
+  the file belongs to (Java is identical). The delete then sits in the table, counted and reachable,
+  and is **never applied to any data file**: the rows it was written to delete come back on every
+  read, in this engine and in Java/Spark alike. The canonical instance is a table whose spec 0 is
+  UNPARTITIONED and whose current spec is not 0 — the empty tuple matches spec 0's empty partition
+  type exactly. Pinned end-to-end in
+  `writer/base_writer/position_delete_writer.rs::spec_stamp_e2e_test`.
+- The mirror-image failure is loud but total: when the current spec is UNPARTITIONED with a NON-ZERO
+  id (reachable on V2 by removing a spec's only field), a writer given neither key nor spec claims
+  spec 0 — and if spec 0 is partitioned the commit rejects every file with `Partition value is not
+  compatible with partition type`. Such a table cannot be written at all until the spec is passed.
+- **Legacy fallback (deliberate, non-breaking).** A writer built with neither a `PartitionKey` nor a
+  configured spec still stamps `DEFAULT_PARTITION_SPEC_ID` (0), so pre-existing callers keep
+  compiling and behaving as before. That fallback is correct ONLY for a table whose current spec
+  really is spec 0. Treat it as deprecated: pass the spec.
+- A partitioned spec configured WITHOUT a `PartitionKey` is rejected at `build()` with
+  `ErrorKind::DataInvalid` — the file would claim a spec whose partition type has fields while
+  carrying an empty tuple. The check is keyed on partition-field **arity**, not on
+  `PartitionSpec::is_unpartitioned()`, which also reports `true` for an ALL-VOID spec whose partition
+  type still has fields.
+- Keep `MetricsConfig::for_position_delete` so `file_path`/`pos` bounds stay Full (pruning
+  precision).
 - Sort-order application before write is engine-owned; core records the order.
 
 ## 8. Commit semantics
