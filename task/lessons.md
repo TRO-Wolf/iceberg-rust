@@ -272,3 +272,36 @@ observable is that cargo's freshness check passed over artifacts built from diff
 - **DO NOT infer freshness from `cargo` recompiling SOMETHING.** The run that produced the phantom RED did print
   `Compiling iceberg-datafusion` — it was recompiling only the integration-test target, linking two stale lib
   rlibs underneath. A `Compiling` line for the crate you edited says nothing about its dependencies.
+
+### 2026-07-25 — A verifier that reads through the normal read path is fed the very metadata it is trying to falsify
+
+Context (G1, engine-trust bundle): the partition-tuple detector re-reads each data file and recomputes its
+partition tuple to compare against the manifest entry. The obvious implementation — plan the scan, read the
+tasks, recompute — is **vacuous for identity transforms**: a `FileScanTask` carries `partition` +
+`partition_spec`, and `RecordBatchTransformer` materializes identity-partitioned columns as CONSTANTS from
+that tuple which **override the column physically stored in the file** (`constant_overrides_file_column`,
+Iceberg "Column Projection" rule 1 / Java `PartitionUtil.constantsMap`). Recomputing `identity(col)` from
+such a read returns the RECORDED value by construction, so a corrupted file audits clean — and the matching
+*repair* would have written that wrong value into the rewritten rows. Both halves were mutation-proven:
+clearing the two task fields is the fix; restoring them drops the identity-only finding (2 findings → 1) and
+turns the repaired data from `{(eng,alp),(ops,bet)}` into `{(sales,alp),(sales,bet)}`.
+
+- **DO, when building a tool that verifies metadata M against the data, audit every layer between the bytes
+  and your comparison for a path that injects M.** A read path optimized to *trust* metadata (constants,
+  pruning, projection short-cuts, cached stats) is exactly the wrong substrate for *checking* it. Enumerate
+  what the task/handle you pass down carries, and strip anything derived from M — here `partition`,
+  `partition_spec` (constants) and `predicate` (a residual that would drop rows). *Why:* the failure is
+  silent and total — the verifier passes on genuinely corrupt input, which is worse than not having one.
+- **DO make the vacuity independently falsifiable by SPLITTING the fixture along the axis the trap follows.**
+  Two corrupt files were built, one wrong ONLY in its `identity(dept)` component and one wrong ONLY in its
+  `truncate[3](name)` component. The mutation then yields a *precise, explainable* delta (the identity-only
+  finding disappears, the truncate-only one survives) instead of a mushy "some tests fail". A single
+  all-families-wrong fixture would have gone RED under the mutation too — for reasons that do not
+  discriminate. *Apply:* when one transform/branch/type is the trap, give it a fixture no other branch can
+  cover for it.
+- **DO build the corrupted fixture at the layer BELOW the one that was fixed.** After the engine fix (#172)
+  no engine path can produce a wrong tuple, so the fixture is written through the public `DataFileBuilder` +
+  `fast_append`: the commit path validates a partition tuple's ARITY and TYPES but never its VALUES (Java
+  identical), so a same-typed wrong value commits cleanly. *Why:* "we can't reproduce it any more" is not a
+  reason to skip the regression fixture — it is a reason to inject one layer down, and the injection point
+  doubles as the honest statement of what the format does and does not enforce.
