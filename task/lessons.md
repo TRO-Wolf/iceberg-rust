@@ -385,3 +385,26 @@ G3 (engine-trust bundle), totalising `PartitionSpec::partition_to_path`. Two reu
   equality directly. Reuse an EXISTING predicate for the anomaly test (`PrimitiveType::compatible`, already the
   commit path's `validate_partition_value` rule) instead of mirroring the formatter's match arms — then add a
   matrix test that EXECUTES every accepted pair through the formatter as the drift alarm.
+
+### 2026-07-25 — Java's partition-path escaper is FORM encoding, not percent encoding
+
+G4 (engine-trust bundle), R161. Java `PartitionSpec.escape` decodes to a one-liner —
+`java.net.URLEncoder.encode(s, "UTF-8")` — and `partitionToPath` runs BOTH the field name and the
+transform's human string through it. Two reusable findings:
+
+- **DON'T reach for the percent-encoding default when a Java call site says "URL encode".**
+  `URLEncoder` is `application/x-www-form-urlencoded`: `-`, `_`, `.` and `*` pass through, and a
+  SPACE becomes `+`, not `%20`. An RFC-3986-style fix (e.g. a `NON_ALPHANUMERIC` set) would have
+  churned the layout of every ordinary partition path (`us-east-1`, `2024-01-31`, `a.b`) — the exact
+  opposite of the "only special values move" promise the format-stability attestation makes. The
+  space rule also has a trap of its own: mapping space to `+` is only sound BECAUSE a literal `+` is
+  escaped to `%2B` in the same pass; do one without the other and the distinct values `"a b"` and
+  `"a+b"` collapse onto the SAME path. *Detector that costs one JVM invocation:*
+  sweep `0x20..=0x7E` through the real Java method and pin the surviving set as a constant; the
+  sweep is 95 assertions and refutes every guessed safe-set in one run.
+- **A behavior-preserving control is only load-bearing if a plausible WRONG fix reds it.** The two
+  "safe-set values are byte-identical to pre-change output" regressions look vacuous next to a
+  no-escaping mutation (they stay green — correctly, since safe values are unchanged either way).
+  They earn their place under the OVER-escaping mutation: restricting the pass-through set to
+  alphanumerics reds them and nothing else reds them. *Pattern:* pair every "nothing changed for the
+  common case" pin with a mutation that changes the common case, or the pin is decoration.

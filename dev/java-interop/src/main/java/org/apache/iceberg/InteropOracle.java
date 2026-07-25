@@ -1659,6 +1659,14 @@ public final class InteropOracle {
         LockOracle.generate(requireFixturesDir("interop.lock.dir"));
         break;
 
+      case "generate-interop-partition-path":
+        // PARTITION-PATH URL-escaping conformance (GAP_MATRIX row R161). Emits Java's OWN
+        // PartitionSpec.partitionToPath output per named case into java_partition_paths.json; the
+        // Rust test rebuilds each case independently and byte-compares. The dir is supplied via
+        // -Dinterop.partition_path.dir on the CLI (same JVM, so System.getProperty sees it).
+        PartitionPathOracle.generate(requireFixturesDir("interop.partition_path.dir"));
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -25036,6 +25044,148 @@ public final class InteropOracle {
                 + "); seq semantics BIDIRECTIONALLY PROVEN");
       }
       return failures;
+    }
+  }
+
+  // ===========================================================================================
+  // PARTITION-PATH oracle (GAP_MATRIX row R161) — cross-impl conformance of the URL escaping in
+  // org.apache.iceberg.PartitionSpec.partitionToPath.
+  //
+  // partitionToPath is a PURE function (spec + schema + tuple -> String) with no on-disk artifact,
+  // so this is a CONFORMANCE oracle, not a round-trip: Java emits its own path for each NAMED case
+  // and the Rust test (crates/iceberg/tests/interop_partition_path.rs) rebuilds the SAME case
+  // INDEPENDENTLY from its own battery keyed by the same id, then byte-compares. No input is copied
+  // across, so a match cannot be an echo.
+  //
+  // The cases deliberately stay on the types whose HUMAN STRING is identical on both engines
+  // (string/int identity, bucket, truncate, void) so the comparison isolates the escaping. The
+  // temporal/binary human-string renderings are a separate, pre-existing divergence recorded as a
+  // named residue on row R161 — they are NOT exercised here.
+  // ===========================================================================================
+
+  /** The partition-path (URL escaping) half of the oracle. */
+  static final class PartitionPathOracle {
+    private PartitionPathOracle() {}
+
+    /** Minimal StructLike over a fixed Object[] — the shape PartitionData exposes to the spec. */
+    private static final class Tuple implements StructLike {
+      private final Object[] values;
+
+      private Tuple(Object... values) {
+        this.values = values;
+      }
+
+      @Override
+      public int size() {
+        return values.length;
+      }
+
+      @Override
+      public <T> T get(int pos, Class<T> javaClass) {
+        return javaClass.cast(values[pos]);
+      }
+
+      @Override
+      public <T> void set(int pos, T value) {
+        values[pos] = value;
+      }
+    }
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.optional(1, "s", Types.StringType.get()),
+            Types.NestedField.optional(2, "i", Types.IntegerType.get()));
+
+    /** identity(s) exposed under {@code name}, rendered over a single-slot tuple. */
+    private static String identity(String name, Object value) {
+      return PartitionSpec.builderFor(SCHEMA)
+          .identity("s", name)
+          .build()
+          .partitionToPath(new Tuple(value));
+    }
+
+    /** case id -> Java's own {@code partitionToPath} output. */
+    private static Map<String, String> cases() {
+      Map<String, String> paths = new LinkedHashMap<>();
+
+      // Safe-set controls — these MUST be byte-identical to an unescaped rendering.
+      paths.put("plain_string", identity("s", "alice"));
+      paths.put("safe_dashes", identity("dt", "2024-01-31"));
+      paths.put("safe_punctuation", identity("s", "-_.*"));
+
+      // Value-side escaping.
+      paths.put("slash_value", identity("s", "a/b"));
+      paths.put("space_value", identity("s", "a b"));
+      paths.put("plus_value", identity("s", "a+b"));
+      paths.put("percent_value", identity("s", "a%b"));
+      paths.put("equals_value", identity("s", "a=b"));
+      paths.put("ampersand_value", identity("s", "a&b"));
+      paths.put("empty_value", identity("s", ""));
+      paths.put("newline_value", identity("s", "a\nb"));
+      paths.put("unicode_2byte", identity("s", "é"));
+      paths.put("unicode_3byte", identity("s", "中文"));
+      paths.put("unicode_4byte", identity("s", "😀"));
+
+      // Name-side escaping (and the NULL branch, which is a separate code path).
+      paths.put("nasty_name", identity("a/b c=d", "v"));
+      paths.put("null_value", identity("s", null));
+      paths.put("nasty_name_null", identity("a/b c=d", null));
+
+      // Multi-field: the `/` between pairs and the `=` inside a pair stay raw.
+      paths.put(
+          "multi_field",
+          PartitionSpec.builderFor(SCHEMA)
+              .identity("s", "a b")
+              .identity("i", "c/d")
+              .build()
+              .partitionToPath(new Tuple("x/y", 5)));
+
+      // Non-identity transforms, on the types whose human string matches on both engines.
+      paths.put(
+          "int_identity",
+          PartitionSpec.builderFor(SCHEMA).identity("i").build().partitionToPath(new Tuple(42)));
+      paths.put(
+          "bucket_int",
+          PartitionSpec.builderFor(SCHEMA)
+              .bucket("s", 16)
+              .build()
+              .partitionToPath(new Tuple(7)));
+      paths.put(
+          "truncate_string",
+          PartitionSpec.builderFor(SCHEMA)
+              .truncate("s", 4)
+              .build()
+              .partitionToPath(new Tuple("a/b c")));
+      paths.put(
+          "void_null",
+          PartitionSpec.builderFor(SCHEMA)
+              .alwaysNull("s", "s_void")
+              .build()
+              .partitionToPath(new Tuple((Object) null)));
+
+      return paths;
+    }
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Map<String, String> paths = cases();
+      writeJson(dir.resolve("java_partition_paths.json"), toJson(paths));
+      System.out.println(
+          "emitted java_partition_paths.json with " + paths.size() + " partitionToPath cases");
+    }
+
+    private static String toJson(Map<String, String> paths) {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartObject();
+            gen.writeObjectFieldStart("cases");
+            for (Map.Entry<String, String> entry : paths.entrySet()) {
+              gen.writeStringField(entry.getKey(), entry.getValue());
+            }
+            gen.writeEndObject();
+            gen.writeEndObject();
+          },
+          true);
     }
   }
 }
