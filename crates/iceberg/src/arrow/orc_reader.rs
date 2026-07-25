@@ -128,10 +128,15 @@ pub(crate) async fn read_orc_data_file(
     batch_size: usize,
 ) -> Result<Vec<RecordBatch>> {
     let bytes = input.read().await?;
+    // `try_join` (not a bare `.await`) for the same reason as the Avro reader: an `orc-rust`
+    // or `arrow` panic on a malformed file must fail this read with a typed error rather than
+    // unwind into the awaiting scan. The outer `?` unwraps the join result; the inner `Result`
+    // is the decode's own.
     crate::runtime::spawn_blocking(move || {
         read_orc_data_bytes(&bytes, expected.as_ref(), batch_size)
     })
-    .await
+    .try_join()
+    .await?
 }
 
 /// Decode ORC `bytes` into Arrow [`RecordBatch`]es against the `expected` projection schema.
