@@ -48,7 +48,42 @@ use crate::types::{
     RenameTableRequest, StorageCredential,
 };
 
-/// REST catalog URI
+/// REST catalog URI — the base address of the Iceberg REST catalog service.
+///
+/// # Trust model (SEC-011 adjudication, Java parity)
+///
+/// This value, and the `oauth2-server-uri` property that overrides the token endpoint (see
+/// [`RestCatalogConfig::get_token_endpoint`]), are **operator-supplied catalog configuration and
+/// are treated as trusted**. The client will connect to whatever host they name, including
+/// loopback, RFC 1918 / link-local addresses, and cluster-internal DNS names — which is the normal
+/// deployment, since catalog services usually live on a private network.
+///
+/// This deliberately mirrors Java `iceberg-core` 1.10.0, which applies **no** host, IP-range, or
+/// scheme restriction of any kind:
+///
+/// * `HTTPClient.Builder.uri(String)` only null-checks and parses:
+///   `Preconditions.checkNotNull(baseUri, …)` then `URI.create(RESTUtil.stripTrailingSlash(baseUri))`,
+///   rethrowing an `IllegalArgumentException` as a `RESTException`. Syntax validity only — no
+///   scheme allowlist, no HTTPS requirement, no address filtering
+///   (`core/src/main/java/org/apache/iceberg/rest/HTTPClient.java:483-491`).
+/// * `RESTSessionCatalog` passes the configured value straight through:
+///   `HTTPClient.builder(config).uri(config.get(CatalogProperties.URI))`
+///   (`core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:175`).
+/// * `oauth2-server-uri` is taken verbatim from properties, defaulting to the catalog-relative
+///   `ResourcePaths.tokens()`
+///   (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:85`); `OAuth2Manager`
+///   only emits a deprecation WARN when it is unset — never a restriction
+///   (`core/src/main/java/org/apache/iceberg/rest/auth/OAuth2Manager.java:274-291`).
+/// * A grep of the entire `core/src/main/java/org/apache/iceberg/rest/` tree finds no loopback /
+///   `InetAddress` / site-local / allowlist logic. TLS is a pluggable operator *extension* point
+///   (`rest.client.tls.configurer-impl`, `HTTPClient.java:98`), not a restriction.
+///
+/// SSRF is a concern when a URI arrives from an *untrusted* source (a request parameter, a
+/// user-submitted document). That is not this surface: whoever can set catalog properties can
+/// already point the client anywhere and read whatever it fetches. Adding a private-IP blocklist
+/// here would break legitimate private-endpoint deployments — the majority case — and diverge from
+/// Java. Callers that DO accept a catalog URI from untrusted input must validate it before it
+/// reaches this configuration; that check belongs at their trust boundary, not in this client.
 pub const REST_CATALOG_PROP_URI: &str = "uri";
 /// REST catalog warehouse location
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
@@ -178,16 +213,22 @@ impl RestCatalogBuilder {
     }
 }
 
-/// Property keys whose values are secret-bearing and must be redacted from `Debug`.
-///
-/// `credential` holds the OAuth `client_id:client_secret`, `token` holds a bearer token,
-/// and `client_secret` is the raw secret. Their presence is preserved as `"***"` but the
-/// value is never printed.
-const SECRET_PROP_KEYS: &[&str] = &["credential", "token", "client_secret"];
-
 /// Returns true if a property key holds a secret value that must be redacted from `Debug`.
+///
+/// SEC-010: this delegates to the canonical needle test `iceberg::io::is_secret_prop_key`
+/// (`crates/iceberg/src/io/storage/config/mod.rs`) instead of keeping a REST-local list. The
+/// previous local list matched only the three EXACT keys `credential` / `token` / `client_secret`,
+/// but [`RestCatalogConfig`]`::props` is exactly the map this catalog clones into the table's
+/// `FileIO` props (see [`RestCatalog::load_file_io`]), so it routinely carries storage credentials
+/// — `s3.secret-access-key`, `s3.session-token`, `gcs.oauth2.token`, `adls.connection-string` —
+/// none of which the exact-match list redacted. One authoritative needle list (shared with
+/// `StorageConfig` and the Glue / HMS / S3Tables / SQL config `Debug` impls) removes that drift.
+///
+/// The canonical test is a deliberate SUPERSET: a non-secret key whose name merely contains a
+/// needle (e.g. `token-refresh-enabled`) is redacted too. Over-redaction is the safe direction for
+/// a debug view.
 fn is_secret_prop_key(key: &str) -> bool {
-    SECRET_PROP_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+    iceberg::io::is_secret_prop_key(key)
 }
 
 /// Rest catalog configuration.
@@ -250,6 +291,14 @@ impl RestCatalogConfig {
         [&self.uri, PATH_V1, "config"].join("/")
     }
 
+    /// The OAuth token endpoint: the operator-configured `oauth2-server-uri` when present,
+    /// otherwise the catalog-relative `<uri>/v1/oauth/tokens`.
+    ///
+    /// The configured value is used VERBATIM — no scheme, host, or address restriction — matching
+    /// Java `AuthConfig.fromProperties`, which does
+    /// `properties.getOrDefault(OAuth2Properties.OAUTH2_SERVER_URI, ResourcePaths.tokens())`
+    /// (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:85`). See the trust-model
+    /// note on [`REST_CATALOG_PROP_URI`] for the SEC-011 adjudication.
     pub(crate) fn get_token_endpoint(&self) -> String {
         if let Some(oauth2_uri) = self.props.get("oauth2-server-uri") {
             oauth2_uri.to_string()
@@ -2267,6 +2316,108 @@ mod tests {
         assert!(
             debug.contains("visible-value"),
             "Debug dropped non-secret props: {debug}"
+        );
+    }
+
+    /// SECURITY (SEC-010, needle-drift fix): `RestCatalogConfig::props` is cloned wholesale into
+    /// the table's `FileIO` props by [`RestCatalog::load_file_io`], so operators put storage
+    /// credentials there. The REST-local redaction list used to be an EXACT match on
+    /// `credential` / `token` / `client_secret` only, which masked NONE of the keys below —
+    /// `RestCatalogConfig`'s own `Debug` printed them in clear. Redaction now routes through the
+    /// canonical superset `iceberg::io::is_secret_prop_key`.
+    ///
+    /// RED-able: restore the exact-match `SECRET_PROP_KEYS` list and this fails on every key.
+    #[test]
+    fn test_rest_catalog_config_debug_redacts_vended_filei_o_credentials() {
+        const SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_DEBUG";
+
+        for key in [
+            "s3.secret-access-key",
+            "s3.session-token",
+            "s3.access-key-id",
+            "gcs.oauth2.token",
+            "adls.connection-string",
+        ] {
+            let props = HashMap::from([
+                (key.to_string(), SENTINEL.to_string()),
+                (
+                    "s3.endpoint".to_string(),
+                    "https://s3.example.test".to_string(),
+                ),
+            ]);
+
+            let config = RestCatalogConfig::builder()
+                .uri("http://localhost".to_string())
+                .props(props)
+                .build();
+
+            let debug = format!("{config:?}");
+
+            assert!(
+                !debug.contains(SENTINEL),
+                "Debug leaked the value of `{key}`: {debug}"
+            );
+            assert!(
+                debug.contains("***"),
+                "`{key}` was not masked at all: {debug}"
+            );
+            // Anti-over-redaction: the key itself and non-secret siblings stay readable.
+            assert!(
+                debug.contains(key),
+                "Debug dropped the key `{key}`: {debug}"
+            );
+            assert!(
+                debug.contains("https://s3.example.test"),
+                "Debug dropped the non-secret endpoint alongside `{key}`: {debug}"
+            );
+        }
+    }
+
+    /// SEC-011 adjudication guard (Java parity — see the trust-model note on
+    /// [`REST_CATALOG_PROP_URI`]).
+    ///
+    /// Java `iceberg-core` 1.10.0 applies NO host/IP/scheme restriction to the catalog `uri` or to
+    /// `oauth2-server-uri`: `HTTPClient.Builder.uri` only null-checks and `URI.create`s
+    /// (`HTTPClient.java:483-491`), `RESTSessionCatalog` passes the property straight through
+    /// (`RESTSessionCatalog.java:175`), and `AuthConfig.fromProperties` takes `oauth2-server-uri`
+    /// verbatim (`AuthConfig.java:85`). Reaching a private endpoint is the NORMAL deployment — that
+    /// is where catalog services live — so the audit's proposed private-IP blocklist is rejected as
+    /// a Java divergence that would break legitimate deployments.
+    ///
+    /// This test pins that decision: a loopback / RFC 1918 / link-local endpoint must be accepted
+    /// and used verbatim. RED-able: adding any private-address or scheme blocklist fails it.
+    #[test]
+    fn test_private_and_loopback_uris_are_accepted_java_parity() {
+        // Catalog uri: accepted verbatim, no rewriting, no rejection.
+        for uri in [
+            "http://127.0.0.1:8181",
+            "http://localhost:8181",
+            "http://10.0.0.7:8181",
+            "http://192.168.1.10:8181",
+            "http://169.254.169.254",
+            "http://catalog.internal:8181",
+        ] {
+            let config = RestCatalogConfig::builder().uri(uri.to_string()).build();
+            assert_eq!(
+                config.get_token_endpoint(),
+                format!("{uri}/v1/oauth/tokens"),
+                "catalog uri `{uri}` must be used verbatim (Java applies no address restriction)"
+            );
+        }
+
+        // oauth2-server-uri: an explicitly configured private token endpoint wins verbatim,
+        // mirroring Java `AuthConfig.fromProperties`.
+        let config = RestCatalogConfig::builder()
+            .uri("https://catalog.example.test".to_string())
+            .props(HashMap::from([(
+                "oauth2-server-uri".to_string(),
+                "http://10.1.2.3:9000/token".to_string(),
+            )]))
+            .build();
+        assert_eq!(
+            config.get_token_endpoint(),
+            "http://10.1.2.3:9000/token",
+            "a configured private oauth2-server-uri must be honoured verbatim"
         );
     }
 
