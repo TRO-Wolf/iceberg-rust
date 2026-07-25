@@ -30,7 +30,7 @@ pub mod table_provider_factory;
 
 use std::any::Any;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -70,45 +70,47 @@ use crate::physical_plan::write::IcebergWriteExec;
 /// For read-only access to a specific snapshot without catalog overhead, use
 /// [`IcebergStaticTableProvider`] instead.
 ///
-/// # Schema freshness (BUG-005)
+/// # Schema freshness (BUG-005) — a new INSTANCE, never a mutating one
 ///
-/// [`TableProvider::schema`] is synchronous, so it can only ever return a SNAPSHOT of the table's
-/// Arrow schema — it cannot reload the table. What it must not do is return the schema the provider
-/// happened to see when it was CONSTRUCTED: this provider is long-lived (the catalog's
-/// `SchemaProvider` caches one per table for the life of the session), so a table evolved by another
-/// engine would otherwise be planned against a schema that no longer describes it, forever.
+/// [`TableProvider::schema`] is synchronous, so it can only ever return a snapshot of the table's
+/// Arrow schema. This provider's snapshot is fixed for the life of the INSTANCE, and that
+/// immutability is load-bearing rather than an oversight: DataFusion resolves a projection to
+/// ORDINALS against `schema()` at planning time and stores them in the logical plan (a view, a
+/// deferred `DataFrame`). A provider whose schema mutates under such a plan makes those ordinals
+/// lie — DataFusion's own `TableScan::try_new` indexes the schema with them and PANICS with
+/// "index out of bounds" when the schema has since shrunk, and silently maps the wrong columns when a
+/// drop-plus-add keeps the length. So the schema an instance advertises never changes.
 ///
-/// So the cached schema is republished from every operation that loads the table
-/// ([`TableProvider::scan`], [`TableProvider::insert_into`], [`TableProvider::delete_from`],
-/// [`TableProvider::update`]) and by the explicit [`IcebergTableProvider::refresh`]. Java's analog
-/// is Spark's `SparkTable`, which is resolved per query by `SparkCatalog.loadTable` and therefore
-/// never outlives one plan; a provider that DOES outlive its plan has to converge instead.
+/// Freshness therefore comes from a NEW instance, exactly as it does in Java: Spark's `SparkTable`
+/// is built per query by `SparkCatalog.loadTable`, so a plan never sees its table's schema move
+/// underneath it. Two ways to get one:
 ///
-/// The residual is one query wide: a query planned before an evolution still carries the older
-/// schema into `scan`. That is not a correctness hole — the scan emits exactly the column set it
-/// advertised (see [`IcebergTableScan`]) — and the same operation republishes the current schema,
-/// so the next query plans against it.
+/// * the catalog path (the normal one) — `IcebergSchemaProvider::table` builds a provider bound to
+///   freshly loaded metadata on EVERY resolution, so each query plans against the current schema
+///   with no action from the caller;
+/// * [`IcebergTableProvider::refreshed`] — for a provider registered directly with a
+///   `SessionContext`, returns a NEW provider carrying the table's current schema, leaving this one
+///   (and every plan built against it) untouched. Re-register it to pick up the evolution.
+///
+/// DATA is always current regardless: every operation reloads the table from the catalog, so a scan
+/// reads the latest snapshot even when it is advertising an older schema. [`IcebergTableScan`]
+/// reconciles the two by field id — see there.
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
     /// The catalog that manages this table
     catalog: Arc<dyn Catalog>,
     /// The table identifier (namespace + name)
     table_ident: TableIdent,
-    /// The most recently observed Arrow schema, republished by every operation that loads the
-    /// table. Shared across clones of the provider so they cannot diverge.
-    ///
-    /// The lock is held only long enough to clone or replace an `Arc` — never across an `.await`,
-    /// and never while any invariant is half-established, which is why a poisoned lock is recovered
-    /// (`PoisonError::into_inner`) rather than propagated: the guarded value is a single immutable
-    /// `Arc` that no panic can leave inconsistent.
-    schema: Arc<RwLock<ArrowSchemaRef>>,
+    /// The Arrow schema this instance advertises. FIXED for the life of the instance — DataFusion
+    /// stores projection ordinals resolved against it (see the type docs).
+    schema: ArrowSchemaRef,
 }
 
 impl IcebergTableProvider {
     /// Creates a new catalog-backed table provider.
     ///
-    /// Loads the table once to get the initial schema, then stores the catalog
-    /// reference for future metadata refreshes on each operation.
+    /// Loads the table once to capture the schema this instance will advertise, then keeps the
+    /// catalog reference so every operation can reload the table's data.
     pub(crate) async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
@@ -123,41 +125,36 @@ impl IcebergTableProvider {
         Ok(IcebergTableProvider {
             catalog,
             table_ident,
-            schema: Arc::new(RwLock::new(schema)),
+            schema,
         })
     }
 
-    /// The most recently published Arrow schema — what [`TableProvider::schema`] returns.
-    fn cached_schema(&self) -> ArrowSchemaRef {
-        self.schema
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+    /// Returns a NEW provider for the same table, advertising the table's current schema.
+    ///
+    /// This provider is left untouched, so logical plans already built against it stay valid — that
+    /// is the whole point of returning a new instance instead of mutating this one (see the type
+    /// docs). Register the result to plan subsequent queries against the evolved schema; callers
+    /// going through [`crate::IcebergCatalogProvider`] never need this, since each query resolves a
+    /// fresh provider already.
+    pub async fn refreshed(&self) -> Result<Self> {
+        let table = self.catalog.load_table(&self.table_ident).await?;
+        Ok(IcebergTableProvider {
+            catalog: self.catalog.clone(),
+            table_ident: self.table_ident.clone(),
+            schema: Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?),
+        })
     }
 
-    /// Loads the table from the catalog and republishes its current schema, returning both.
+    /// Loads the table's current state from the catalog, with the Arrow form of its CURRENT schema.
     ///
-    /// Every operation goes through here, so each one plans against ONE table state and leaves the
-    /// cached schema describing that same state.
-    async fn load_table_and_publish_schema(&self) -> Result<(Table, ArrowSchemaRef)> {
+    /// The write paths plan against this rather than against [`Self::schema`]: they re-scan and
+    /// commit against the table state they load, so their row filters, assignment indices and
+    /// projections must describe that same state.
+    async fn load_table_with_current_schema(&self) -> Result<(Table, ArrowSchemaRef)> {
         let table = self.catalog.load_table(&self.table_ident).await?;
         let schema: ArrowSchemaRef =
             Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
-        *self
-            .schema
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = schema.clone();
         Ok((table, schema))
-    }
-
-    /// Reloads the table metadata from the catalog so [`TableProvider::schema`] reports the table's
-    /// current schema.
-    ///
-    /// Operations refresh on their own, so this is only needed to converge a provider that is
-    /// registered but idle — e.g. before inspecting the schema of a table another engine has just
-    /// evolved. Clones of a provider share one cache, so refreshing any of them refreshes all.
-    pub async fn refresh(&self) -> Result<()> {
-        self.load_table_and_publish_schema().await.map(|_| ())
     }
 
     pub(crate) async fn metadata_table(
@@ -177,7 +174,7 @@ impl TableProvider for IcebergTableProvider {
     }
 
     fn schema(&self) -> ArrowSchemaRef {
-        self.cached_schema()
+        self.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -191,24 +188,21 @@ impl TableProvider for IcebergTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // The schema DataFusion PLANNED this query against — `projection` indexes into it and the
-        // parent operators were built from it, so it is the schema the returned plan must advertise.
-        // Read BEFORE the reload below, which republishes the current schema for the next query.
-        let planned_schema = self.cached_schema();
-
-        // Load fresh table metadata from catalog
-        let (table, _current_schema) = self
-            .load_table_and_publish_schema()
+        // Load fresh table metadata from catalog — the DATA is always current.
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
 
-        // Create scan with fresh metadata (always use current snapshot). `IcebergTableScan` keeps
-        // the emitted batches consistent with `planned_schema` even when the reloaded table has
-        // evolved past it.
+        // `self.schema` IS the schema DataFusion planned against: `projection` holds ordinals it
+        // resolved against `schema()`, and this instance's schema cannot have moved since (see the
+        // type docs). `IcebergTableScan` binds that schema to the freshly loaded table by FIELD ID,
+        // so the emitted batches match what this plan advertises even when the table has evolved.
         Ok(Arc::new(IcebergTableScan::new(
             table,
             None, // Always use current snapshot for catalog-backed provider
-            planned_schema,
+            self.schema.clone(),
             projection,
             filters,
             limit,
@@ -232,7 +226,7 @@ impl TableProvider for IcebergTableProvider {
         // Load fresh table metadata from catalog. The write is planned against the CURRENT schema —
         // the table state the data files will be written and committed against.
         let (table, current_schema) = self
-            .load_table_and_publish_schema()
+            .load_table_with_current_schema()
             .await
             .map_err(to_datafusion_error)?;
 
@@ -309,7 +303,7 @@ impl TableProvider for IcebergTableProvider {
         // the cached one: the exec re-scans the table itself, and a projection naming a column the
         // table no longer has fails the whole DELETE (BUG-005).
         let (table, current_schema) = self
-            .load_table_and_publish_schema()
+            .load_table_with_current_schema()
             .await
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_DELETE_MODE);
@@ -348,7 +342,7 @@ impl TableProvider for IcebergTableProvider {
         // As in `delete_from`: the CURRENT schema is the one the row filter, the `SET` assignment
         // indices and the exec's projection base are all derived from (BUG-005).
         let (table, current_schema) = self
-            .load_table_and_publish_schema()
+            .load_table_with_current_schema()
             .await
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_UPDATE_MODE);
@@ -999,10 +993,23 @@ mod tests {
     //   * BUG-011 — the scan reloaded the table but the stream adapter still advertised the
     //     construction-time schema, so the emitted batches could not match the advertised schema.
 
-    /// Adds an optional `int` column through a SECOND catalog handle — an out-of-band schema
-    /// evolution, exactly as another engine or writer performs it. The provider under test never
-    /// sees this transaction; it must discover it by reloading.
-    async fn evolve_add_column(catalog: &Arc<dyn Catalog>, ident: &TableIdent, name: &str) {
+    /// A schema evolution another engine applies out of band. NONE of these create a snapshot, so
+    /// after any of them the table's CURRENT schema and the schema its data is read with (the
+    /// current snapshot's) disagree — which is the whole point.
+    enum SchemaOp<'a> {
+        /// `ALTER TABLE ADD COLUMN <name> int` (optional).
+        AddOptionalInt(&'a str),
+        /// `ALTER TABLE RENAME COLUMN <from> TO <to>` — keeps the field id, changes only the name.
+        Rename(&'a str, &'a str),
+        /// `ALTER TABLE ALTER COLUMN <name> TYPE bigint` — a legal Iceberg int → long promotion.
+        PromoteToLong(&'a str),
+        /// `ALTER TABLE DROP COLUMN <name>`.
+        Drop(&'a str),
+    }
+
+    /// Applies an out-of-band schema evolution through a SECOND catalog handle — exactly what
+    /// another engine or writer does. The provider under test never sees this transaction.
+    async fn evolve_schema(catalog: &Arc<dyn Catalog>, ident: &TableIdent, op: SchemaOp<'_>) {
         use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
         let table = catalog
@@ -1010,21 +1017,59 @@ mod tests {
             .await
             .expect("load table for out-of-band evolution");
         let tx = Transaction::new(&table);
-        let tx = tx
-            .update_schema()
-            .add_column(name, Type::Primitive(PrimitiveType::Int))
-            .apply(tx)
-            .expect("queue the schema update");
+        let action = tx.update_schema();
+        let action = match op {
+            SchemaOp::AddOptionalInt(name) => {
+                action.add_column(name, Type::Primitive(PrimitiveType::Int))
+            }
+            SchemaOp::Rename(from, to) => action.rename_column(from, to),
+            SchemaOp::PromoteToLong(name) => action.update_column(name, PrimitiveType::Long),
+            SchemaOp::Drop(name) => action.delete_column(name),
+        };
+        let tx = action.apply(tx).expect("queue the schema update");
         tx.commit(catalog.as_ref())
             .await
             .expect("commit the out-of-band schema evolution");
     }
 
-    /// BUG-005: a long-lived provider must not serve the construction-time schema forever. Both the
-    /// explicit `refresh()` and any ordinary operation (here: a scan) must republish the current
-    /// schema, so the NEXT DataFusion planning round sees the evolved table.
+    /// Registers `provider` in a fresh session and runs `sql`, returning the batches.
+    async fn query_through(
+        provider: Arc<dyn TableProvider>,
+        sql: &str,
+    ) -> Vec<datafusion::arrow::array::RecordBatch> {
+        let ctx = SessionContext::new();
+        ctx.register_table("t", provider)
+            .expect("register the provider under test");
+        ctx.sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("plan `{sql}`: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("execute `{sql}`: {e}"))
+    }
+
+    /// Seeds `rows` through a provider resolved fresh against the table's current schema.
+    async fn seed(
+        catalog: &Arc<dyn Catalog>,
+        namespace: &NamespaceIdent,
+        table_name: &str,
+        sql: &str,
+    ) {
+        let provider = IcebergTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.to_string(),
+        )
+        .await
+        .expect("construct a provider for the seed write");
+        let batches: Vec<_> = query_through(Arc::new(provider), sql).await;
+        assert!(!batches.is_empty(), "a write must report its row count");
+    }
+
+    /// BUG-005 + S1-2: an instance's advertised schema is STABLE — DataFusion stores projection
+    /// ordinals resolved against it — and freshness comes from a NEW instance via `refreshed()`.
     #[tokio::test]
-    async fn test_provider_schema_tracks_out_of_band_evolution() {
+    async fn test_provider_schema_is_stable_and_refreshed_serves_the_current_schema() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
         let ident = TableIdent::new(namespace.clone(), table_name.clone());
 
@@ -1032,39 +1077,84 @@ mod tests {
             IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
                 .await
                 .expect("construct the catalog-backed provider");
-        assert_eq!(
-            provider.schema().fields().len(),
-            2,
-            "the provider starts at the construction-time schema"
-        );
+        assert_eq!(provider.schema().fields().len(), 2);
 
-        evolve_add_column(&catalog, &ident, "extra").await;
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
 
-        provider.refresh().await.expect("refresh the provider");
-        let refreshed = provider.schema();
-        assert_eq!(
-            refreshed.fields().len(),
-            3,
-            "refresh() must republish the CURRENT schema, got {refreshed:?}"
-        );
-        assert_eq!(refreshed.field(2).name(), "extra");
-
-        // A second evolution, discovered through an ordinary operation rather than `refresh()`.
-        evolve_add_column(&catalog, &ident, "extra2").await;
-
+        // An ordinary operation must NOT move the advertised schema: plans already hold ordinals
+        // resolved against it.
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let _plan = provider
+        provider
             .scan(&state, None, &[], None)
             .await
             .expect("scan against the evolved table");
-        let after_scan = provider.schema();
         assert_eq!(
-            after_scan.fields().len(),
-            4,
-            "an ordinary operation must also republish the current schema, got {after_scan:?}"
+            provider.schema().fields().len(),
+            2,
+            "an instance's advertised schema must not move under the plans built on it"
         );
-        assert_eq!(after_scan.field(3).name(), "extra2");
+
+        // A NEW instance carries the current schema; the original is untouched.
+        let refreshed = provider
+            .refreshed()
+            .await
+            .expect("refresh into a new provider");
+        assert_eq!(
+            refreshed.schema().fields().len(),
+            3,
+            "refreshed() must serve the CURRENT schema, got {:?}",
+            refreshed.schema()
+        );
+        assert_eq!(refreshed.schema().field(2).name(), "extra");
+        assert_eq!(
+            provider.schema().fields().len(),
+            2,
+            "refreshed() must leave the original instance alone"
+        );
+    }
+
+    /// BUG-005 on the SHIPPING path: queries that go through the catalog resolve a provider per
+    /// planning round (Java: `SparkCatalog.loadTable` per query), so a session sees an out-of-band
+    /// evolution on its very next query without any refresh call.
+    #[tokio::test]
+    async fn test_catalog_resolves_a_fresh_provider_per_query() {
+        use datafusion::catalog::SchemaProvider;
+
+        use crate::schema::IcebergSchemaProvider;
+
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        let schema_provider = IcebergSchemaProvider::try_new(catalog.clone(), namespace.clone())
+            .await
+            .expect("construct the namespace schema provider");
+
+        let before = schema_provider
+            .table(&table_name)
+            .await
+            .expect("resolve the table")
+            .expect("the table is listed");
+        assert_eq!(before.schema().fields().len(), 2);
+
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
+
+        let after = schema_provider
+            .table(&table_name)
+            .await
+            .expect("re-resolve the table")
+            .expect("the table is still listed");
+        assert_eq!(
+            after.schema().fields().len(),
+            3,
+            "the next resolution must carry the evolved schema, got {:?}",
+            after.schema()
+        );
+        assert_eq!(
+            before.schema().fields().len(),
+            2,
+            "the previously resolved provider must be untouched — plans hold ordinals into it"
+        );
     }
 
     /// BUG-011, the same-instant case: `ADD COLUMN` does not create a snapshot, so the table's
@@ -1096,7 +1186,7 @@ mod tests {
                 .expect("execute the seed insert");
         }
 
-        evolve_add_column(&catalog, &ident, "extra").await;
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
 
         let provider =
             IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
@@ -1144,7 +1234,7 @@ mod tests {
     /// the NEW column set. The emitted batches must match the schema the plan advertised — and the
     /// provider must then self-heal, so the next query sees the evolved schema.
     #[tokio::test]
-    async fn test_stale_provider_scan_is_self_consistent_then_self_heals() {
+    async fn test_stale_provider_scan_is_self_consistent() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
         let ident = TableIdent::new(namespace.clone(), table_name.clone());
 
@@ -1156,7 +1246,7 @@ mod tests {
 
         // Out-of-band: add a column AND write a row through it, so the table's current snapshot
         // carries the 3-column schema while `stale_provider` still advertises 2 columns.
-        evolve_add_column(&catalog, &ident, "extra").await;
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
         {
             let fresh = IcebergTableProvider::try_new(
                 catalog.clone(),
@@ -1202,11 +1292,13 @@ mod tests {
             );
         }
 
-        // Self-heal: the scan republished the current schema, so the next query sees 3 columns.
+        // And it stays that way: the instance's advertised schema does not move, so a second query
+        // through the SAME provider is planned and answered identically (freshness comes from a new
+        // instance — see `test_catalog_resolves_a_fresh_provider_per_query`).
         assert_eq!(
             stale_provider.schema().fields().len(),
-            3,
-            "the scan must have republished the current schema"
+            2,
+            "the advertised schema must not move under the plans built on it"
         );
         let batches = ctx
             .sql("SELECT * FROM t")
@@ -1216,12 +1308,7 @@ mod tests {
             .await
             .expect("execute the follow-up SELECT *");
         for batch in &batches {
-            assert_eq!(
-                batch.num_columns(),
-                3,
-                "the follow-up query must see the evolved column set, got {:?}",
-                batch.schema()
-            );
+            assert_eq!(batch.num_columns(), 2, "got {:?}", batch.schema());
         }
     }
 
@@ -1240,7 +1327,7 @@ mod tests {
                 .await
                 .expect("construct the provider BEFORE the evolution");
 
-        evolve_add_column(&catalog, &ident, "extra").await;
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
         {
             let fresh = IcebergTableProvider::try_new(
                 catalog.clone(),
@@ -1305,7 +1392,7 @@ mod tests {
         .await
         .expect("construct the provider BEFORE the evolution");
 
-        evolve_add_column(catalog, &ident, "extra").await;
+        evolve_schema(catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
 
         let fresh = IcebergTableProvider::try_new(
             catalog.clone(),
@@ -1396,6 +1483,297 @@ mod tests {
             1,
             "exactly the row matching `id = 1` must be updated"
         );
+    }
+
+    /// S1-1: `RENAME COLUMN` keeps the field id, rewrites the name and creates NO snapshot, so the
+    /// advertised (current) name and the scanned snapshot's name for the SAME column differ. Binding
+    /// by name would null-fill over live data — losing the value silently. Binding by field id
+    /// returns the value under its new name.
+    #[tokio::test]
+    async fn test_rename_preserves_values_under_the_new_name() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("opt")).await;
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 'a', 7)",
+        )
+        .await;
+
+        // The rename lands AFTER the write, so the data is stored under the old name/id.
+        evolve_schema(&catalog, &ident, SchemaOp::Rename("opt", "opt2")).await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct a provider on the renamed table");
+        let batches = query_through(Arc::new(provider), "SELECT * FROM t").await;
+
+        let mut seen = 0;
+        for batch in &batches {
+            let renamed = batch
+                .column_by_name("opt2")
+                .expect("the renamed column must be present under its NEW name");
+            assert_eq!(
+                renamed.null_count(),
+                0,
+                "the renamed column must carry its data, not NULLs: {:?}",
+                batch.schema()
+            );
+            let values = renamed
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .expect("opt2 must be Int32");
+            for i in 0..values.len() {
+                assert_eq!(
+                    values.value(i),
+                    7,
+                    "the stored value must survive the rename"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1, "the seeded row must be readable");
+    }
+
+    /// S1-1, the REQUIRED-column case: a renamed required column has no null-fill escape hatch, so
+    /// name-binding would fail the query outright. Field-id binding returns the values.
+    #[tokio::test]
+    async fn test_required_column_rename_preserves_values() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 'a')",
+        )
+        .await;
+        // `name` is REQUIRED in the fixture schema.
+        evolve_schema(&catalog, &ident, SchemaOp::Rename("name", "full_name")).await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct a provider on the renamed table");
+        let batches = query_through(Arc::new(provider), "SELECT * FROM t").await;
+
+        let mut seen = 0;
+        for batch in &batches {
+            use datafusion::arrow::array::Array;
+            let renamed = batch
+                .column_by_name("full_name")
+                .expect("the renamed required column must be present")
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("full_name must be Utf8");
+            for i in 0..renamed.len() {
+                assert_eq!(renamed.value(i), "a");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1, "the seeded row must be readable");
+    }
+
+    /// S1-2 (probe F): a VIEW captures the provider and its projection ORDINALS. If the provider's
+    /// advertised schema shrank under it, DataFusion's own `TableScan::try_new` would index the
+    /// shorter schema with a stale ordinal and PANIC. Two rounds, with a column dropped out of band
+    /// in between, must both answer normally.
+    #[tokio::test]
+    async fn test_view_survives_an_out_of_band_column_drop() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 'a')",
+        )
+        .await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct the provider the view will capture");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register the table");
+        ctx.sql("CREATE VIEW v AS SELECT name FROM t")
+            .await
+            .expect("plan CREATE VIEW")
+            .collect()
+            .await
+            .expect("create the view");
+
+        // The out-of-band drop that used to make the stored ordinals lie. It lands BEFORE the first
+        // round, so a provider that republished its schema during round 1 would leave round 2's
+        // re-plan indexing a SHORTER schema with round-1's ordinals — DataFusion's own
+        // `TableScan::try_new` panics with "index out of bounds" when that happens.
+        evolve_schema(&catalog, &ident, SchemaOp::Drop("id")).await;
+
+        let round1 = ctx
+            .sql("SELECT * FROM v")
+            .await
+            .expect("plan round 1")
+            .collect()
+            .await
+            .expect("execute round 1");
+        assert_eq!(round1.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+        let round2 = ctx
+            .sql("SELECT * FROM v")
+            .await
+            .expect("plan round 2 (must not panic)")
+            .collect()
+            .await
+            .expect("execute round 2 (must not panic)");
+        assert_eq!(
+            round2.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "the view must keep answering against the schema it was created with"
+        );
+        for batch in &round2 {
+            assert_eq!(batch.num_columns(), 1);
+            assert!(batch.column_by_name("name").is_some());
+        }
+    }
+
+    /// S1-2 (probe C): a DataFrame built before an evolution and collected after it must not panic
+    /// either — its plan holds ordinals against the schema it was planned with.
+    #[tokio::test]
+    async fn test_deferred_dataframe_survives_an_out_of_band_evolution() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 'a')",
+        )
+        .await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct the provider");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register the table");
+
+        // Plan now...
+        let df = ctx.sql("SELECT name FROM t").await.expect("plan the query");
+
+        // ...evolve out of band...
+        evolve_schema(&catalog, &ident, SchemaOp::Drop("id")).await;
+
+        // ...and only then execute — twice, because the second physical-planning round is what
+        // re-indexes the (possibly moved) provider schema with the plan's stored ordinals.
+        let first = df
+            .clone()
+            .collect()
+            .await
+            .expect("the deferred plan must execute, not panic");
+        assert_eq!(first.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let second = df
+            .collect()
+            .await
+            .expect("re-executing the deferred plan must not panic either");
+        assert_eq!(second.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        for batch in &second {
+            assert_eq!(batch.num_columns(), 1);
+        }
+    }
+
+    /// S2-3: `int` → `long` is a LEGAL Iceberg promotion and creates no snapshot, so the scanned
+    /// data is still `int` while the plan advertises `long`. The values must be read, widened.
+    #[tokio::test]
+    async fn test_legal_int_to_long_promotion_reads_widened_values() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (42, 'a')",
+        )
+        .await;
+        evolve_schema(&catalog, &ident, SchemaOp::PromoteToLong("id")).await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct a provider on the promoted table");
+        assert_eq!(
+            provider.schema().field(0).data_type(),
+            &datafusion::arrow::datatypes::DataType::Int64,
+            "the provider advertises the promoted type"
+        );
+        let batches = query_through(Arc::new(provider), "SELECT * FROM t").await;
+
+        let mut seen = 0;
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("id")
+                .expect("id must be present")
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("id must be read as the PROMOTED Int64");
+            for i in 0..ids.len() {
+                assert_eq!(
+                    ids.value(i),
+                    42,
+                    "the stored value must survive the promotion"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1, "the seeded row must be readable");
+    }
+
+    /// LOW-5 (measured, then pinned): in the steady state the scanned batch's schema is IDENTICAL to
+    /// the advertised one — same fields, same `PARQUET:field_id` metadata — so `conform_batch`'s
+    /// equality fast path hits and no batch is rebuilt. A reader change that broke that identity
+    /// would silently move every scan onto the rebuild path; this catches it.
+    #[tokio::test]
+    async fn test_steady_state_batch_schema_is_identical_to_the_advertised_schema() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 'a')",
+        )
+        .await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct the provider");
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = provider
+            .scan(&state, None, &[], None)
+            .await
+            .expect("plan the scan");
+        let advertised = plan.schema();
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("execute the scan");
+        assert!(!batches.is_empty(), "the seeded row must produce a batch");
+        for batch in &batches {
+            assert_eq!(
+                batch.schema(),
+                advertised,
+                "the reader's schema must be identical to the advertised one in the steady state"
+            );
+        }
     }
 
     #[tokio::test]
