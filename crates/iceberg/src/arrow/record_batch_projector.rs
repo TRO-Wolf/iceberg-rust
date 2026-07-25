@@ -180,17 +180,47 @@ impl RecordBatchProjector {
 
     fn get_column_by_field_index(batch: &[ArrayRef], field_index: &[usize]) -> Result<ArrayRef> {
         let mut rev_iterator = field_index.iter().rev();
-        let mut array = batch[*rev_iterator.next().unwrap()].clone();
+        let top_index = *rev_iterator.next().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Field index path is empty in RecordBatchProjector",
+            )
+        })?;
+        // Bounds-checked: the index paths were derived from the schema the
+        // projector was built with — a batch with FEWER top-level columns
+        // (e.g. one produced by a different plan node than the projector was
+        // planned against) must yield a typed error, not a slice panic.
+        let mut array = batch
+            .get(top_index)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Column index out of bounds for batch in RecordBatchProjector",
+                )
+                .with_context("column_index", top_index.to_string())
+                .with_context("batch_columns", batch.len().to_string())
+            })?
+            .clone();
         let mut null_buffer = array.logical_nulls();
         for idx in rev_iterator {
-            array = array
+            let struct_array = array
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or(Error::new(
                     ErrorKind::Unexpected,
                     "Cannot convert Array to StructArray",
-                ))?
-                .column(*idx)
+                ))?;
+            array = struct_array
+                .columns()
+                .get(*idx)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Struct child index out of bounds in RecordBatchProjector",
+                    )
+                    .with_context("child_index", idx.to_string())
+                    .with_context("struct_children", struct_array.num_columns().to_string())
+                })?
                 .clone();
             null_buffer = NullBuffer::union(null_buffer.as_ref(), array.logical_nulls().as_ref());
         }

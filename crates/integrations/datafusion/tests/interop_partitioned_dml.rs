@@ -45,11 +45,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int32Array, StringArray, UInt64Array};
+use datafusion::arrow::array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec};
+use iceberg::spec::{
+    Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Transform, Type,
+    UnboundPartitionSpec,
+};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergCatalogProvider;
 
@@ -284,5 +289,201 @@ async fn test_part_dml_gen_rust_writes_java_readable_partitioned_cow_table() {
          survivor ids = {{3, 4}} (books: novel, textbook). \
          final.metadata.json → {final_metadata_path}. \
          Java verify-interop-part-dml reads it next."
+    );
+}
+
+// ===========================================================================
+// WG1 null-tuple GEN test — `INSERT … SELECT CASE … THEN NULL` → Java reads
+// the NULL partition tuple back
+// ===========================================================================
+
+/// GEN direction for the WG1 (honest-children `PartitionExpr`) interop leg:
+/// build a partitioned `identity(category)` V2 table with an OPTIONAL category
+/// column at `<gen_dir>/rust_table_nulltuple` and insert through the engine
+/// path the fix repaired — `INSERT … SELECT id, CASE WHEN id = 2 THEN NULL
+/// ELSE category END, value FROM src` (a computed SELECT item):
+///
+/// * id=1 lands in the `books` partition;
+/// * id=2's partition-source value is NULL, so its manifest tuple slot is NULL.
+///
+/// The test asserts the manifest tuples through the core API, then writes
+/// `final.metadata.json` so the Java oracle can (a) read the FILE-level
+/// partition tuples (one NULL slot, one `books`) and (b) read both rows back
+/// with id=2's category IS NULL. Before the fix this write produced a
+/// real-but-wrong `electronics` tuple for id=2 (never a NULL slot), so the
+/// Java-side tuple assertion pins the repaired behavior cross-engine.
+///
+/// **When `ICEBERG_INTEROP_PART_DML_GEN_DIR` is unset this test is a clean no-op.**
+#[tokio::test]
+async fn test_part_dml_gen_null_partition_tuple_via_insert_select_case() {
+    let Some(gen_dir) = part_dml_gen_dir() else {
+        println!(
+            "skipping interop_partitioned_dml null-tuple GEN — set \
+             ICEBERG_INTEROP_PART_DML_GEN_DIR \
+             (run dev/java-interop/run-interop-partitioned-dml.sh)"
+        );
+        return;
+    };
+
+    // ------------------------------------------------------------------
+    // 1. MemoryCatalog over the LOCAL FS, warehouse = <gen_dir>; fixed
+    //    table location <gen_dir>/rust_table_nulltuple for Java.
+    // ------------------------------------------------------------------
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table_nulltuple");
+
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_part_dml_nulltuple",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS for null-tuple interop");
+
+    // ------------------------------------------------------------------
+    // 2. Namespace + partitioned table: {id int required, category string
+    //    OPTIONAL, value string required}, identity(category).
+    // ------------------------------------------------------------------
+    let namespace = NamespaceIdent::new("interop_null".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("build schema");
+
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)
+        .expect("add identity(category) partition field")
+        .build();
+
+    let creation = TableCreation::builder()
+        .name("rust_table_nulltuple".to_string())
+        .location(table_location.clone())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create rust_table_nulltuple");
+
+    // ------------------------------------------------------------------
+    // 3. DataFusion provider + a plain `src` table with the input rows.
+    // ------------------------------------------------------------------
+    let client = Arc::new(catalog);
+    let provider = IcebergCatalogProvider::try_new(client.clone())
+        .await
+        .expect("build IcebergCatalogProvider");
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", Arc::new(provider));
+
+    let src_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let src_batch = RecordBatch::try_new(src_schema.clone(), vec![
+        Arc::new(Int32Array::from(vec![1, 2])),
+        Arc::new(StringArray::from(vec![Some("books"), Some("electronics")])),
+        Arc::new(StringArray::from(vec!["x", "y"])),
+    ])
+    .expect("build src batch");
+    let src = MemTable::try_new(src_schema, vec![vec![src_batch]]).expect("build src MemTable");
+    ctx.register_table("src", Arc::new(src))
+        .expect("register src table");
+
+    // ------------------------------------------------------------------
+    // 4. The repaired engine path: INSERT … SELECT with a computed
+    //    (CASE → NULL) partition-source item.
+    // ------------------------------------------------------------------
+    let insert_batches = ctx
+        .sql(
+            "INSERT INTO catalog.interop_null.rust_table_nulltuple \
+             SELECT id, CASE WHEN id = 2 THEN NULL ELSE category END AS category, value FROM src",
+        )
+        .await
+        .expect("INSERT SELECT CASE SQL plan")
+        .collect()
+        .await
+        .expect("collect INSERT result");
+    let inserted: u64 = insert_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("insert count column")
+        .value(0);
+    assert_eq!(inserted, 2, "INSERT must write exactly 2 rows");
+
+    // ------------------------------------------------------------------
+    // 5. Rust-side manifest truth: tuples must be [NULL, 'books'].
+    // ------------------------------------------------------------------
+    let tbl_ident = TableIdent::new(namespace, "rust_table_nulltuple".to_string());
+    let table = client
+        .load_table(&tbl_ident)
+        .await
+        .expect("reload rust_table_nulltuple after DML");
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("table has a committed snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("load manifest list");
+    let mut tuples: Vec<Option<String>> = Vec::new();
+    for mf in manifest_list.entries() {
+        let manifest = mf
+            .load_manifest(table.file_io())
+            .await
+            .expect("load manifest");
+        for entry in manifest.entries() {
+            if entry.is_alive() {
+                let partition = entry.data_file().partition();
+                assert_eq!(partition.fields().len(), 1, "single-field partition spec");
+                let slot = match partition.fields()[0].as_ref() {
+                    Some(Literal::Primitive(PrimitiveLiteral::String(s))) => Some(s.clone()),
+                    None => None,
+                    other => panic!("unexpected partition literal kind: {other:?}"),
+                };
+                tuples.push(slot);
+            }
+        }
+    }
+    tuples.sort();
+    assert_eq!(
+        tuples,
+        vec![None, Some("books".to_string())],
+        "manifest partition tuples must be computed from the projected CASE \
+         values: one NULL slot (id=2) and one 'books' slot (id=1)"
+    );
+
+    // ------------------------------------------------------------------
+    // 6. Land final.metadata.json at the deterministic path Java reads.
+    // ------------------------------------------------------------------
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    println!(
+        "interop_partitioned_dml null-tuple GEN OK — Rust wrote {table_location} via \
+         INSERT … SELECT CASE (id=1 → books partition, id=2 → NULL partition tuple); \
+         manifest tuples = [null, books]. final.metadata.json → {final_metadata_path}. \
+         Java verify-interop-part-dml reads the NULL tuple back next."
     );
 }

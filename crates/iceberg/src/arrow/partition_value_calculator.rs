@@ -23,10 +23,11 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SchemaRef};
 
 use super::record_batch_projector::RecordBatchProjector;
 use super::type_to_arrow_type;
+use crate::arrow::schema::schema_to_arrow_schema;
 use crate::spec::{PartitionSpec, Schema, StructType, Type};
 use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::{Error, ErrorKind, Result};
@@ -41,6 +42,12 @@ pub struct PartitionValueCalculator {
     transform_functions: Vec<BoxedTransformFunction>,
     partition_type: StructType,
     partition_arrow_type: DataType,
+    /// The Arrow rendering of the table schema the projector's index paths were
+    /// derived from. [`Self::calculate`] validates incoming batches against it:
+    /// the projector reads columns POSITIONALLY, so a batch whose top-level
+    /// layout differs from this schema would silently yield wrong partition
+    /// values.
+    source_arrow_schema: SchemaRef,
 }
 
 impl PartitionValueCalculator {
@@ -93,11 +100,15 @@ impl PartitionValueCalculator {
         let partition_type = partition_spec.partition_type(table_schema)?;
         let partition_arrow_type = type_to_arrow_type(&Type::Struct(partition_type.clone()))?;
 
+        // The schema the projector's positional index paths are valid against.
+        let source_arrow_schema = Arc::new(schema_to_arrow_schema(table_schema)?);
+
         Ok(Self {
             projector,
             transform_functions,
             partition_type,
             partition_arrow_type,
+            source_arrow_schema,
         })
     }
 
@@ -114,13 +125,16 @@ impl PartitionValueCalculator {
     /// Calculate partition values for a record batch.
     ///
     /// This method:
-    /// 1. Projects the source columns from the batch
-    /// 2. Applies partition transforms to each source column
-    /// 3. Constructs a StructArray containing the partition values
+    /// 1. Validates the batch's top-level layout against the table schema the
+    ///    calculator was built from (the projector reads columns positionally)
+    /// 2. Projects the source columns from the batch
+    /// 3. Applies partition transforms to each source column
+    /// 4. Constructs a StructArray containing the partition values
     ///
     /// # Arguments
     ///
-    /// * `batch` - The record batch to calculate partition values for
+    /// * `batch` - The record batch to calculate partition values for. Its
+    ///   top-level columns must be the table's columns, in table-schema order.
     ///
     /// # Returns
     ///
@@ -129,12 +143,101 @@ impl PartitionValueCalculator {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The batch's width or top-level column names do not match the table
+    ///   schema the calculator was built from
     /// - Column projection fails
     /// - Transform application fails
     /// - StructArray construction fails
     pub fn calculate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        // The projector's index paths are positional: a batch with the right
+        // arity but the wrong columns would not fail below — it would produce
+        // wrong-but-well-formed partition values. Validate NAME + WIDTH here
+        // (types are deliberately not compared: legitimate callers may feed
+        // representationally different but logically identical arrays, e.g.
+        // dictionary-encoded columns; value types are enforced downstream by
+        // the transforms and the struct construction).
+        let batch_schema = batch.schema();
+        let expected_fields = self.source_arrow_schema.fields();
+        if batch_schema.fields().len() != expected_fields.len() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Partition source batch width does not match the table schema \
+                 the partition calculator was built from",
+            )
+            .with_context("batch_columns", batch_schema.fields().len().to_string())
+            .with_context("expected_columns", expected_fields.len().to_string()));
+        }
+        for (position, (batch_field, expected_field)) in batch_schema
+            .fields()
+            .iter()
+            .zip(expected_fields.iter())
+            .enumerate()
+        {
+            if batch_field.name() != expected_field.name() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Partition source batch column name does not match the table \
+                     schema the partition calculator was built from",
+                )
+                .with_context("position", position.to_string())
+                .with_context("batch_column", batch_field.name().clone())
+                .with_context("expected_column", expected_field.name().clone()));
+            }
+        }
+
+        self.calculate_from_columns(batch.columns(), batch.num_rows())
+    }
+
+    /// Calculate partition values from raw top-level columns.
+    ///
+    /// The columns must be the table's top-level columns in table-schema order
+    /// (the same layout [`Self::calculate`] expects as a `RecordBatch`). This
+    /// entry point exists for callers that already hold per-column arrays —
+    /// e.g. an engine evaluating one expression per table column — and cannot
+    /// or should not reassemble a `RecordBatch` first.
+    ///
+    /// # Arguments
+    ///
+    /// * `columns` - The table's top-level columns, in table-schema order
+    /// * `num_rows` - The row count every column must have
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `columns` does not have exactly one entry per table column
+    /// - Any column's length differs from `num_rows`
+    /// - Column projection fails
+    /// - Transform application fails
+    /// - StructArray construction fails
+    pub fn calculate_from_columns(
+        &self,
+        columns: &[ArrayRef],
+        num_rows: usize,
+    ) -> Result<ArrayRef> {
+        let expected_width = self.source_arrow_schema.fields().len();
+        if columns.len() != expected_width {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Partition source column count does not match the table schema \
+                 the partition calculator was built from",
+            )
+            .with_context("columns", columns.len().to_string())
+            .with_context("expected_columns", expected_width.to_string()));
+        }
+        for (position, column) in columns.iter().enumerate() {
+            if column.len() != num_rows {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Partition source column length does not match the row count",
+                )
+                .with_context("position", position.to_string())
+                .with_context("column_length", column.len().to_string())
+                .with_context("num_rows", num_rows.to_string()));
+            }
+        }
+
         // Project source columns from the batch
-        let source_columns = self.projector.project_column(batch.columns())?;
+        let source_columns = self.projector.project_column(columns)?;
 
         // Get expected struct fields for the result
         let expected_struct_fields = match &self.partition_arrow_type {

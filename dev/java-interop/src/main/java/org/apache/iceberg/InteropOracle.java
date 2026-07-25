@@ -8593,12 +8593,136 @@ public final class InteropOracle {
             "PASS part-dml-d2: id=3 → (books,novel); id=4 → (books,textbook)");
       }
 
+      // -------------------------------------------------------------------
+      // WG1 null-tuple leg: Rust wrote <dir>/rust_table_nulltuple via
+      // `INSERT … SELECT id, CASE WHEN id = 2 THEN NULL ELSE category END,
+      // value` — a COMPUTED partition-source item through the honest-children
+      // PartitionExpr path.  Java must read the FILE-level partition tuples
+      // back as exactly {null, "books"} (before the fix the engine stamped a
+      // real-but-wrong `electronics` tuple for id=2, never a NULL slot), and
+      // read both rows with id=2's category IS NULL.
+      // -------------------------------------------------------------------
+      failures += verifyPartDmlNullTuple(dir, io);
+
       if (failures == 0) {
         System.out.println(
             "verify-interop-part-dml OK — Java read the RUST-written partitioned COW-DELETE table; "
                 + "survivor ids = {3,4} (books partition: novel/textbook); "
-                + "electronics ids 1/2 absent (COW removed the partition file)");
+                + "electronics ids 1/2 absent (COW removed the partition file); "
+                + "null-tuple leg: manifest tuples = [null, books], id=2 category IS NULL");
       }
+      return failures;
+    }
+
+    /**
+     * WG1 null-tuple leg of the partitioned-DML verify — "Java reads the NULL partition tuple
+     * RUST wrote through a computed {@code INSERT … SELECT CASE} item."
+     *
+     * <p>The Rust GEN test wrote {@code <dir>/rust_table_nulltuple}: a V2 {@code {id int required,
+     * category string optional, value string required}} table, identity(category) partition, filled
+     * via {@code INSERT … SELECT id, CASE WHEN id = 2 THEN NULL ELSE category END, value} — so id=1
+     * lands in the {@code books} partition and id=2's manifest tuple slot is NULL.
+     *
+     * <p>Assertions: (1) FILE level — exactly two live data files whose partition tuples are
+     * {@code {null, "books"}} (read via {@code FileScanTask.file().partition()}); (2) ROW level —
+     * both rows read back via {@code IcebergGenerics}, id=1 = (books, x) and id=2 = (null, y).
+     */
+    static int verifyPartDmlNullTuple(Path dir, FileIO io) {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table_nulltuple").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL part-dml-nulltuple: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL part-dml-nulltuple: Java could not parse the Rust-written final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      BaseTable table =
+          new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table_nulltuple");
+
+      // ASSERTION 1 (FILE level): exactly two live data files; partition tuple
+      // slots are {null, "books"}.
+      int nullSlots = 0;
+      List<String> nonNullSlots = new ArrayList<>();
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+        for (FileScanTask task : tasks) {
+          CharSequence slot = task.file().partition().get(0, CharSequence.class);
+          if (slot == null) {
+            nullSlots++;
+          } else {
+            nonNullSlots.add(slot.toString());
+          }
+        }
+      } catch (RuntimeException | IOException planError) {
+        System.out.println(
+            "FAIL part-dml-nulltuple: Java could not plan the Rust-written null-tuple table: "
+                + planError);
+        return failures + 1;
+      }
+      if (nullSlots != 1
+          || nonNullSlots.size() != 1
+          || !"books".equals(nonNullSlots.get(0))) {
+        System.out.println(
+            "FAIL part-dml-nulltuple: expected partition tuples {null, books}, got "
+                + nullSlots
+                + " null slot(s) + "
+                + nonNullSlots);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS part-dml-nulltuple: manifest partition tuples = {null, books} "
+                + "(the CASE→NULL row landed in the NULL partition slot)");
+      }
+
+      // ASSERTION 2 (ROW level): both rows readable; id=1 = (books, x), id=2 = (null, y).
+      Map<Integer, String[]> rowsById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Integer id = (Integer) record.getField("id");
+          String category = (String) record.getField("category");
+          String value = (String) record.getField("value");
+          rowsById.put(id, new String[] {category, value});
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL part-dml-nulltuple: Java could not READ the Rust-written null-tuple table: "
+                + readError);
+        return failures + 1;
+      }
+      boolean rowsOk = rowsById.size() == 2;
+      String[] row1 = rowsById.get(1);
+      String[] row2 = rowsById.get(2);
+      if (row1 == null || !"books".equals(row1[0]) || !"x".equals(row1[1])) {
+        rowsOk = false;
+      }
+      if (row2 == null || row2[0] != null || !"y".equals(row2[1])) {
+        rowsOk = false;
+      }
+      if (!rowsOk) {
+        System.out.println(
+            "FAIL part-dml-nulltuple: expected rows {1=(books,x), 2=(null,y)}, got "
+                + rowsById.entrySet().stream()
+                    .map(e -> e.getKey() + "=" + Arrays.toString(e.getValue()))
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("<empty>"));
+        failures++;
+      } else {
+        System.out.println(
+            "PASS part-dml-nulltuple: id=1 → (books,x); id=2 → (null,y) — the NULL "
+                + "partition-source value round-trips");
+      }
+
       return failures;
     }
 
