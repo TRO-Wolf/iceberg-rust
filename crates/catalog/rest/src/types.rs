@@ -51,25 +51,38 @@ use serde_derive::{Deserialize, Serialize};
 // whose name merely contains a needle (e.g. `token-refresh-enabled`) renders as `***` too.
 // Over-redaction is the safe direction for a debug view.
 //
-// ASSESSED and deliberately left on `#[derive(Debug)]` (anti-over-redaction):
+// ASSESSED and deliberately left on `#[derive(Debug)]` — no `String -> String` value map
+// and no secret field of their own:
+//   * Identifier / pagination-only shapes: `ListNamespaceResponse`, `ListTablesResponse`,
+//     `RenameTableRequest`, `RegisterTableRequest`, `UpdateNamespacePropertiesResponse`.
+//
+// ASSESSED as RESIDUE, not as an all-clear — left on `#[derive(Debug)]` because redacting
+// only `Debug` would be theater while `Display` carries the same values:
 //   * `ErrorModel` / `ErrorResponse` — `message` / `type` / `code` / `stack` are the
 //     server's diagnostic payload, and `From<ErrorModel> for Error` already surfaces them
-//     verbatim in `Display`; redacting only `Debug` would be theater.
-//   * `OAuthError` — RFC 6749 §5.2 fields: `error` is a fixed error code,
-//     `error_description` is human-readable ASCII diagnostic text, `error_uri` is a
-//     documentation link. None carries the client secret, and `From<OAuthError> for Error`
-//     already surfaces all three.
-//   * Identifier / pagination-only shapes (`ListNamespaceResponse`, `ListTablesResponse`,
-//     `RenameTableRequest`, `RegisterTableRequest`, `CommitTableResponse`,
-//     `UpdateNamespacePropertiesResponse`) — they carry no `String -> String` value map.
+//     verbatim. They are server-controlled free text: a hostile or careless server can echo
+//     whatever it likes into `message`, and this is now the one channel by which content from
+//     a token-endpoint / catalog response body still reaches logs, since
+//     `deserialize_catalog_response` stopped attaching raw bodies (SEC-010/F1).
+//   * `OAuthError` — RFC 6749 §5.2 fields (`error` is a fixed error code, `error_description`
+//     is human-readable text, `error_uri` a documentation link), all three already surfaced by
+//     `From<OAuthError> for Error`. `error_description` is likewise server-controlled free
+//     text, so the same residue applies: the SHAPE carries no client secret, but the CONTENT
+//     is the server's to choose.
 //
-// NAMED RESIDUE (core crate, out of scope for this unit): `TableMetadata.properties`,
-// `ViewMetadata.properties`, and the `TableUpdate::SetProperties` / `ViewUpdate::SetProperties`
-// payloads derive `Debug` in `crates/iceberg` and still print table/view properties in
-// clear. A `{:?}` of `LoadTableResult.metadata` or of `CommitTableRequest.updates` can
-// therefore still surface a credential that an operator stored as a TABLE property. The
-// REST server's own credential channels (`config`, `storage-credentials`) are covered
-// here; closing the core-crate property maps is a separate unit.
+// NAMED RESIDUE (core crate, out of scope for this unit) — `String -> String` maps that still
+// derive `Debug` in `crates/iceberg` and print in clear:
+//   * `TableMetadata.properties` — reachable via `LoadTableResult.metadata` and
+//     `CommitTableResponse.metadata` (which is why `CommitTableResponse` is NOT in the
+//     all-clear list above: it carries a full `TableMetadata`).
+//   * `ViewMetadata.properties` — reachable via `LoadViewResult.metadata`.
+//   * `ViewVersion.summary` — reachable via `CreateViewRequest.view_version` and, nested,
+//     through both view-metadata paths.
+//   * `TableUpdate::SetProperties` / `ViewUpdate::SetProperties` — reachable via
+//     `CommitTableRequest.updates` / `CommitViewRequest.updates`.
+// So a `{:?}` of those fields can still surface a credential an operator stored as a TABLE or
+// VIEW property. The REST server's own credential channels (`config`, `storage-credentials`)
+// are covered here; closing the core-crate property maps is a separate unit.
 // ============================================================================
 
 /// Marker written in place of a redacted secret value. Its presence also signals that the
@@ -526,6 +539,9 @@ pub struct CreateViewRequest {
 impl std::fmt::Debug for CreateViewRequest {
     /// Hand-written: `properties` carries the view properties being written, which may include
     /// FileIO credentials; entries are redacted per key.
+    ///
+    /// RESIDUE: `view_version` renders through core's derived `ViewVersion` `Debug`, whose
+    /// `summary` is an unredacted `String -> String` map — see the module's redaction banner.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreateViewRequest")
             .field("name", &self.name)

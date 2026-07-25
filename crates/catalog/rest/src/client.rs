@@ -555,9 +555,37 @@ pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest:
 /// Deserializes a catalog response into the given [`DeserializedOwned`] type.
 ///
 /// Returns an error if unable to parse the response bytes.
+///
+/// SECURITY (SEC-010): this is the SUCCESS (2xx) body path, so the bytes in hand are a
+/// credential-bearing payload — `CatalogConfig` (`defaults`/`overrides`, which the catalog merges
+/// into its runtime props and hands to `FileIO`), `LoadTableResult` (`config` plus the vended
+/// `storage-credentials`), `LoadViewResult` (`config`), and `NamespaceResponse` (`properties`) all
+/// deserialize through here. Attaching the raw body to the error context — as this function used to
+/// — put those secrets into `Error`'s context, which `iceberg::Error` renders VERBATIM in both
+/// `Display` and `Debug` (`crates/iceberg/src/error.rs`), so a single parse failure leaked live
+/// credentials into every `{e}` / `tracing::error!(?e)` site. The trigger is entirely realistic: a
+/// server returning a payload this parser rejects (an unknown V3 field, a version skew) hands back
+/// the SAME body that carries the vended `s3.session-token`.
+///
+/// So: never attach the raw body. Only non-secret diagnostics are attached — the HTTP status, the
+/// request URL, and the body's byte LENGTH — mirroring the token-endpoint paths in
+/// [`HttpClient::exchange_credential_for_token`], which have withheld the body since the SEC-fix
+/// series. This costs parse-failure debuggability; operators who need the payload can capture it at
+/// the HTTP layer (a proxy or a `reqwest` middleware), where the exposure is a deliberate choice
+/// rather than an unconditional log write.
+///
+/// RESIDUE: `with_source(e)` is retained because AGENTS.md requires the error chain to survive, and
+/// `serde_json`'s own message can echo the offending token (e.g. `invalid type: integer `12345``).
+/// That echo is bounded to the single value at the parse-failure position — it is never the whole
+/// body, and for the realistic failures (missing/unknown field) it echoes only a FIELD NAME. A
+/// secret is only reachable through it if the server puts the secret itself in a type-mismatched
+/// structural position, which no real server response does. Both shapes are pinned by
+/// `test_config_parse_failure_does_not_leak_body` / `test_load_table_parse_failure_does_not_leak_vended_credentials`.
 pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
     response: Response,
 ) -> Result<R> {
+    let status = response.status();
+    let url = response.url().clone();
     let bytes = response.bytes().await?;
 
     serde_json::from_slice::<R>(&bytes).map_err(|e| {
@@ -565,7 +593,9 @@ pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
             ErrorKind::Unexpected,
             "Failed to parse response from rest catalog server",
         )
-        .with_context("json", String::from_utf8_lossy(&bytes))
+        .with_context("status", status.to_string())
+        .with_context("url", url.to_string())
+        .with_context("response_body_len", bytes.len().to_string())
         .with_source(e)
     })
 }
@@ -615,6 +645,15 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
 }
 
 /// Deserializes a unexpected catalog response into an error.
+///
+/// SEC-010 scope note: unlike [`deserialize_catalog_response`], this is the NON-2xx path, and it
+/// deliberately still attaches the body. A non-2xx response means the request FAILED — no table was
+/// loaded, so no `config` overlay and no vended `storage-credentials` were issued — and the body is
+/// an `ErrorResponse` whose `message` is the whole diagnostic value. Java surfaces exactly this to
+/// the caller (`ErrorHandlers` parse the payload and rethrow `ErrorResponse.message`), so
+/// withholding it would cost real debuggability and diverge from Java for no security gain. The one
+/// non-2xx body that COULD echo submitted credentials — the token endpoint's — is handled
+/// separately in [`HttpClient::exchange_credential_for_token`], which withholds it.
 pub(crate) async fn deserialize_unexpected_catalog_error(
     response: Response,
     disable_header_redaction: bool,
