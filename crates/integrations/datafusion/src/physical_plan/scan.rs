@@ -16,13 +16,19 @@
 // under the License.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, ListArray, MapArray, RecordBatch, RecordBatchOptions, StructArray,
+    new_null_array,
+};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field as ArrowField, SchemaRef as ArrowSchemaRef};
+use datafusion::common::Column;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -102,6 +108,13 @@ impl IcebergTableScan {
     /// each advertised field BY FIELD ID against the scanned snapshot's schema (see
     /// [`ColumnSource`]), selects the name that schema gives the id, and [`conform_batch`] renames,
     /// promotes or null-fills on the way out.
+    ///
+    /// # Pushed-down filters are rebound too
+    ///
+    /// A pushed filter PRUNES: rows it excludes never reach DataFusion, so an `Inexact` pushdown
+    /// only lets DataFusion remove false positives — it cannot recover a row the scan dropped. The
+    /// filter therefore has to be rebound to the scanned snapshot's names exactly like the
+    /// projection ([`rebind_filters`]), and any filter that cannot be rebound is not pushed at all.
     pub(crate) fn new(
         table: Table,
         snapshot_id: Option<i64>,
@@ -110,6 +123,10 @@ impl IcebergTableScan {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Self> {
+        // Bind the FULL advertised schema, not just the projection: a pushed-down filter may
+        // reference a column the projection does not output.
+        let bindings = resolve_bindings(&table, snapshot_id, &schema)?;
+
         let (output_schema, projection) = match projection {
             None => (schema, None),
             Some(indices) => {
@@ -122,9 +139,9 @@ impl IcebergTableScan {
                 (projected_schema, Some(column_names))
             }
         };
-        let (scan_columns, sources) = resolve_projection(&table, snapshot_id, &output_schema)?;
+        let (scan_columns, sources) = project_bindings(&output_schema, &bindings)?;
         let plan_properties = Self::compute_properties(output_schema);
-        let predicates = convert_filters_to_predicate(filters);
+        let predicates = convert_filters_to_predicate(&rebind_filters(filters, &bindings));
 
         Ok(Self {
             table,
@@ -268,7 +285,7 @@ impl DisplayAs for IcebergTableScan {
 ///
 /// This function initializes a [`TableScan`], builds it,
 /// and then converts it into a stream of Arrow [`RecordBatch`]es.
-async fn get_batch_stream(
+pub(crate) async fn get_batch_stream(
     table: Table,
     snapshot_id: Option<i64>,
     column_names: Vec<String>,
@@ -295,8 +312,8 @@ async fn get_batch_stream(
     Ok(Box::pin(stream))
 }
 
-/// Binds each advertised output column to the scanned snapshot's schema BY FIELD ID, returning the
-/// names to `select` from the table and the per-column [`ColumnSource`] bindings.
+/// Binds every advertised column to the scanned snapshot's schema BY FIELD ID: advertised name →
+/// the name that schema gives the same field id, or `None` when it has no field with that id.
 ///
 /// Names are not identities in Iceberg — `RENAME COLUMN` keeps the field id, rewrites the name and
 /// creates no snapshot, so the schema the data is read with (the snapshot's) and the schema the plan
@@ -311,48 +328,114 @@ async fn get_batch_stream(
 /// When there is no snapshot to resolve against — an unknown snapshot id (the core scan reports
 /// that itself, with the better message) or a table with no snapshot at all (an empty scan that
 /// emits no batches) — the binding is the identity and field ids are not consulted.
-fn resolve_projection(
+fn resolve_bindings(
     table: &Table,
     snapshot_id: Option<i64>,
-    output_schema: &ArrowSchemaRef,
-) -> DFResult<(Vec<String>, Vec<ColumnSource>)> {
+    schema: &ArrowSchemaRef,
+) -> DFResult<HashMap<String, Option<String>>> {
     let metadata = table.metadata();
     let snapshot = match snapshot_id {
         Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id),
         None => metadata.current_snapshot(),
     };
     let Some(snapshot) = snapshot else {
-        let names: Vec<String> = output_schema
+        return Ok(schema
             .fields()
             .iter()
-            .map(|field| field.name().clone())
-            .collect();
-        let sources = names.iter().cloned().map(ColumnSource::Scanned).collect();
-        return Ok((names, sources));
+            .map(|field| (field.name().clone(), Some(field.name().clone())))
+            .collect());
     };
     let snapshot_schema = snapshot.schema(metadata).map_err(to_datafusion_error)?;
 
-    let mut scan_columns = Vec::with_capacity(output_schema.fields().len());
-    let mut sources = Vec::with_capacity(output_schema.fields().len());
-    for field in output_schema.fields() {
+    let mut bindings = HashMap::with_capacity(schema.fields().len());
+    for field in schema.fields() {
         // Reserved metadata columns (`_file`, `_pos`, ...) are not table fields; the core scan
         // resolves their reserved ids from the name itself.
         if is_metadata_column_name(field.name()) {
-            scan_columns.push(field.name().clone());
-            sources.push(ColumnSource::Scanned(field.name().clone()));
+            bindings.insert(field.name().clone(), Some(field.name().clone()));
             continue;
         }
-
         let field_id = advertised_field_id(field)?;
-        match snapshot_schema.name_by_field_id(field_id) {
-            Some(name) => {
-                scan_columns.push(name.to_string());
-                sources.push(ColumnSource::Scanned(name.to_string()));
+        bindings.insert(
+            field.name().clone(),
+            snapshot_schema
+                .name_by_field_id(field_id)
+                .map(str::to_string),
+        );
+    }
+    Ok(bindings)
+}
+
+/// Turns the advertised OUTPUT columns' bindings into the names to `select` and the per-column
+/// [`ColumnSource`]s, in advertised order.
+fn project_bindings(
+    output_schema: &ArrowSchemaRef,
+    bindings: &HashMap<String, Option<String>>,
+) -> DFResult<(Vec<String>, Vec<ColumnSource>)> {
+    let mut scan_columns = Vec::with_capacity(output_schema.fields().len());
+    let mut sources = Vec::with_capacity(output_schema.fields().len());
+    for field in output_schema.fields() {
+        match bindings.get(field.name()) {
+            Some(Some(name)) => {
+                scan_columns.push(name.clone());
+                sources.push(ColumnSource::Scanned(name.clone()));
             }
-            None => sources.push(ColumnSource::Absent),
+            Some(None) => sources.push(ColumnSource::Absent),
+            None => {
+                return Err(datafusion::error::DataFusionError::Internal(format!(
+                    "projected column '{}' is not part of the schema the scan was built from",
+                    field.name()
+                )));
+            }
         }
     }
     Ok((scan_columns, sources))
+}
+
+/// Rewrites pushed-down filters onto the scanned snapshot's column names, dropping any filter that
+/// cannot be rewritten.
+///
+/// A pushed filter is applied to the DATA, so it must speak the names the scanned snapshot's schema
+/// uses — after a rename those differ from the advertised ones, and pushing the advertised name
+/// either fails to bind or, worse, binds to a DIFFERENT column that happens to carry that name now
+/// (a name swap), pruning rows DataFusion can never get back: `TableProviderFilterPushDown::Inexact`
+/// lets DataFusion re-check the rows it RECEIVES, not resurrect the ones the scan discarded.
+///
+/// A filter over a column with no counterpart in the scanned snapshot (dropped, or dropped and
+/// re-added under a fresh id) is not pushed at all: its column reads as NULL, and only DataFusion's
+/// own re-check — over the conformed batches — can evaluate it correctly.
+fn rebind_filters(filters: &[Expr], bindings: &HashMap<String, Option<String>>) -> Vec<Expr> {
+    filters
+        .iter()
+        .filter_map(|filter| rebind_filter(filter, bindings))
+        .collect()
+}
+
+/// One filter, rewritten onto the scanned snapshot's names, or `None` if any column it references
+/// cannot be bound there.
+fn rebind_filter(filter: &Expr, bindings: &HashMap<String, Option<String>>) -> Option<Expr> {
+    let mut unbound = false;
+    let rewritten = filter
+        .clone()
+        .transform(|node| {
+            if let Expr::Column(column) = &node {
+                match bindings.get(&column.name) {
+                    Some(Some(scanned_name)) if scanned_name != &column.name => {
+                        return Ok(Transformed::yes(Expr::Column(Column::new(
+                            column.relation.clone(),
+                            scanned_name,
+                        ))));
+                    }
+                    Some(Some(_)) => {}
+                    // Either the column has no counterpart in the scanned snapshot, or it is not a
+                    // table column at all: refuse to push this filter rather than guess.
+                    Some(None) | None => unbound = true,
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .ok()?;
+    (!unbound).then_some(rewritten.data)
 }
 
 /// The Iceberg field id an advertised Arrow field carries, or a loud error.
@@ -456,28 +539,7 @@ fn conform_batch(
                         field.name()
                     ))
                 })?;
-                if column.data_type() == field.data_type() {
-                    columns.push(column.clone());
-                } else if is_arrow_promotion_allowed(column.data_type(), field.data_type()) {
-                    columns.push(cast(column, field.data_type()).map_err(|e| {
-                        datafusion::error::DataFusionError::ArrowError(
-                            Box::new(e),
-                            Some(format!("promoting column '{}'", field.name())),
-                        )
-                    })?);
-                } else {
-                    return Err(to_datafusion_error(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "column '{}' is {} in the snapshot being scanned but {} in the schema \
-                             this query was planned against, and that is not a legal Iceberg type \
-                             promotion — the data cannot be read as the planned type",
-                            field.name(),
-                            column.data_type(),
-                            field.data_type()
-                        ),
-                    )));
-                }
+                columns.push(conform_column(column, field, field.name())?);
             }
             ColumnSource::Absent if field.is_nullable() => {
                 columns.push(new_null_array(field.data_type(), num_rows))
@@ -506,6 +568,146 @@ fn conform_batch(
             Box::new(e),
             Some("failed to conform a scanned batch to the schema the plan advertised".to_string()),
         )
+    })
+}
+
+/// Coerces ONE scanned column to its advertised field, recursing through nested types.
+///
+/// Iceberg evolves nested fields exactly as it evolves top-level ones — `ADD COLUMN s.b`,
+/// `RENAME COLUMN s.a`, `ALTER COLUMN s.a TYPE bigint` — and none of those create a snapshot either,
+/// so a struct read from an older snapshot can be missing a child the plan advertises, carry it
+/// under a different name, or carry it at a narrower type. Nested Arrow fields carry
+/// `PARQUET:field_id` just like top-level ones, so the same field-id resolution applies at every
+/// level; `path` accumulates the dotted column path (`s.b`) so an error names the offending field
+/// and not just its root column.
+///
+/// Lists and maps are conformed through their element / entry types, preserving offsets and null
+/// buffers, so a nested evolution inside a `list<struct<...>>` or `map<..., struct<...>>` is handled
+/// at the level where it actually happened.
+fn conform_column(column: &ArrayRef, target: &ArrowField, path: &str) -> DFResult<ArrayRef> {
+    if column.data_type() == target.data_type() {
+        return Ok(column.clone());
+    }
+    if is_arrow_promotion_allowed(column.data_type(), target.data_type()) {
+        return cast(column, target.data_type()).map_err(|e| {
+            datafusion::error::DataFusionError::ArrowError(
+                Box::new(e),
+                Some(format!("promoting column '{path}'")),
+            )
+        });
+    }
+
+    match (column.data_type(), target.data_type()) {
+        (DataType::Struct(scanned_fields), DataType::Struct(target_fields)) => {
+            let scanned = downcast::<StructArray>(column, path)?;
+            let len = scanned.len();
+
+            // Every scanned child must be identifiable, or a target child that fails to match one
+            // could not be told apart from a child that is genuinely absent.
+            let scanned_ids = scanned_fields
+                .iter()
+                .map(|field| advertised_field_id(field))
+                .collect::<DFResult<Vec<_>>>()?;
+
+            let mut children = Vec::with_capacity(target_fields.len());
+            for target_child in target_fields {
+                let child_path = format!("{path}.{}", target_child.name());
+                let target_id = advertised_field_id(target_child)?;
+                match scanned_ids.iter().position(|id| *id == target_id) {
+                    Some(index) => children.push(conform_column(
+                        scanned.column(index),
+                        target_child,
+                        &child_path,
+                    )?),
+                    None if target_child.is_nullable() => {
+                        children.push(new_null_array(target_child.data_type(), len))
+                    }
+                    None => {
+                        return Err(to_datafusion_error(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "required field '{child_path}' has no field with its id in the \
+                                 snapshot being scanned, so there is no data to read for it and a \
+                                 required field cannot be null-filled"
+                            ),
+                        )));
+                    }
+                }
+            }
+            Ok(Arc::new(
+                StructArray::try_new_with_length(
+                    target_fields.clone(),
+                    children,
+                    scanned.nulls().cloned(),
+                    len,
+                )
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::ArrowError(
+                        Box::new(e),
+                        Some(format!("conforming struct column '{path}'")),
+                    )
+                })?,
+            ))
+        }
+        (DataType::List(_), DataType::List(target_element)) => {
+            let scanned = downcast::<ListArray>(column, path)?;
+            let values =
+                conform_column(scanned.values(), target_element, &format!("{path}.element"))?;
+            Ok(Arc::new(
+                ListArray::try_new(
+                    target_element.clone(),
+                    scanned.offsets().clone(),
+                    values,
+                    scanned.nulls().cloned(),
+                )
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::ArrowError(
+                        Box::new(e),
+                        Some(format!("conforming list column '{path}'")),
+                    )
+                })?,
+            ))
+        }
+        (DataType::Map(_, _), DataType::Map(target_entries, ordered)) => {
+            let scanned = downcast::<MapArray>(column, path)?;
+            let entries: ArrayRef = Arc::new(scanned.entries().clone());
+            let conformed = conform_column(&entries, target_entries, path)?;
+            let conformed = downcast::<StructArray>(&conformed, path)?.clone();
+            Ok(Arc::new(
+                MapArray::try_new(
+                    target_entries.clone(),
+                    scanned.offsets().clone(),
+                    conformed,
+                    scanned.nulls().cloned(),
+                    *ordered,
+                )
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::ArrowError(
+                        Box::new(e),
+                        Some(format!("conforming map column '{path}'")),
+                    )
+                })?,
+            ))
+        }
+        (scanned_type, target_type) => Err(to_datafusion_error(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "column '{path}' is {scanned_type} in the snapshot being scanned but {target_type} \
+                 in the schema this query was planned against, and that is not a legal Iceberg type \
+                 promotion — the data cannot be read as the planned type"
+            ),
+        ))),
+    }
+}
+
+/// Downcasts an array whose `DataType` has already been matched; a failure here is a broken Arrow
+/// invariant, not user input, so it is an internal error naming the column path.
+fn downcast<'a, T: 'static>(column: &'a ArrayRef, path: &str) -> DFResult<&'a T> {
+    column.as_any().downcast_ref::<T>().ok_or_else(|| {
+        datafusion::error::DataFusionError::Internal(format!(
+            "column '{path}' has type {} but is not backed by the matching array kind",
+            column.data_type()
+        ))
     })
 }
 
@@ -737,12 +939,24 @@ mod tests {
     }
 
     /// S2-3: the Arrow promotion mirror must agree with the AUTHORITY,
-    /// [`iceberg::spec::is_promotion_allowed`], on every pair of primitives — a drift between the
-    /// two would either reject a legal promotion or, worse, cast something Iceberg forbids.
+    /// [`iceberg::spec::is_promotion_allowed`], over ALL 17 `PrimitiveType` variants — a drift
+    /// between the two would either reject a legal promotion or, worse, cast something Iceberg
+    /// forbids.
+    ///
+    /// The one documented exception is where the mirror is NECESSARILY coarser: distinct Iceberg
+    /// primitives that share ONE Arrow representation (`uuid` and `fixed[16]` are both
+    /// `FixedSizeBinary(16)`; `binary` and an oversized `fixed` are both `LargeBinary`) are
+    /// indistinguishable to an Arrow-typed check, so the mirror's identity arm accepts a pair the
+    /// Iceberg rule rejects. That is inert: `ensure_promotion_allowed` blocks such a change at the
+    /// DDL, so no table can present it — and if one somehow did, the representations are identical,
+    /// so the values would be read correctly anyway. The assertion below encodes exactly that
+    /// exception rather than papering over it.
     #[test]
     fn test_arrow_promotion_mirror_agrees_with_iceberg_rule() {
         use iceberg::spec::{PrimitiveType as P, Type as T, is_promotion_allowed};
 
+        // Every variant of `PrimitiveType` (17), with three decimals to exercise the
+        // precision/scale arm in both directions.
         let primitives = [
             P::Boolean,
             P::Int,
@@ -764,16 +978,27 @@ mod tests {
             P::Date,
             P::Time,
             P::Timestamp,
+            P::Timestamptz,
+            P::TimestampNs,
+            P::TimestamptzNs,
             P::String,
-            P::Binary,
             P::Uuid,
+            P::Fixed(16),
+            P::Binary,
+            P::Unknown,
         ];
+        // Sanity: the list must cover every variant the authority can be asked about.
+        assert_eq!(
+            primitives.len(),
+            17 + 2,
+            "17 variants, with two extra decimals for the precision/scale arm"
+        );
 
         // The Arrow form of each primitive, via the crate's own converter — so the mirror is checked
         // against the very mapping production uses.
         let arrow_of = |primitive: &P| -> ArrowDataType {
             let schema = Schema::builder()
-                .with_fields(vec![Arc::new(NestedField::required(
+                .with_fields(vec![Arc::new(NestedField::optional(
                     1,
                     "c",
                     Type::Primitive(primitive.clone()),
@@ -788,26 +1013,270 @@ mod tests {
         };
 
         let mut checked = 0;
+        let mut collisions = 0;
         for from in &primitives {
             for to in &primitives {
+                let (arrow_from, arrow_to) = (arrow_of(from), arrow_of(to));
                 let expected = is_promotion_allowed(&T::Primitive(from.clone()), to);
-                let actual = is_arrow_promotion_allowed(&arrow_of(from), &arrow_of(to));
-                assert_eq!(
-                    actual,
-                    expected,
-                    "mirror disagrees for {from} -> {to} (arrow {:?} -> {:?})",
-                    arrow_of(from),
-                    arrow_of(to)
-                );
+                let actual = is_arrow_promotion_allowed(&arrow_from, &arrow_to);
+                if from != to && arrow_from == arrow_to {
+                    // The documented coarseness: one Arrow type, two Iceberg primitives.
+                    assert!(
+                        actual,
+                        "the mirror's identity arm must accept {from} -> {to} (both {arrow_from:?})"
+                    );
+                    collisions += 1;
+                } else {
+                    assert_eq!(
+                        actual, expected,
+                        "mirror disagrees for {from} -> {to} (arrow {arrow_from:?} -> {arrow_to:?})"
+                    );
+                }
                 checked += 1;
             }
         }
         assert_eq!(checked, primitives.len() * primitives.len());
-        // Non-vacuity: the matrix must contain at least one allowed NON-identity promotion.
+        // Non-vacuity: the matrix must contain at least one allowed NON-identity promotion...
         assert!(is_arrow_promotion_allowed(
             &ArrowDataType::Int32,
             &ArrowDataType::Int64
         ));
+        // ...and the collision exception must be exercised, not merely available (uuid <-> fixed[16]
+        // in both directions).
+        assert_eq!(
+            collisions, 2,
+            "the uuid / fixed[16] collision must be the only one this matrix hits"
+        );
+    }
+
+    /// S2-2: a struct read from an older snapshot gains the advertised child as NULLs, keeps the
+    /// one it has, and the struct's own null buffer survives.
+    #[test]
+    fn test_conform_column_null_fills_a_nested_field() {
+        use datafusion::arrow::array::{Int32Array, StructArray};
+        use datafusion::arrow::buffer::NullBuffer;
+        use datafusion::arrow::datatypes::Fields;
+
+        let scanned_children =
+            Fields::from(vec![field_with_id("a", ArrowDataType::Int32, true, 3)]);
+        let scanned: ArrayRef = Arc::new(
+            StructArray::try_new(
+                scanned_children,
+                vec![Arc::new(Int32Array::from(vec![Some(5), Some(6)]))],
+                Some(NullBuffer::from(vec![true, false])),
+            )
+            .expect("the scanned struct must build"),
+        );
+
+        let target_children = Fields::from(vec![
+            field_with_id("a", ArrowDataType::Int32, true, 3),
+            field_with_id("b", ArrowDataType::Int32, true, 4),
+        ]);
+        let target = ArrowField::new("s", ArrowDataType::Struct(target_children.clone()), true);
+
+        let conformed = conform_column(&scanned, &target, "s").expect("the struct must conform");
+        assert_eq!(conformed.data_type(), target.data_type());
+        let conformed = conformed
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("still a struct");
+        assert_eq!(conformed.len(), 2);
+        assert_eq!(
+            conformed.column(1).null_count(),
+            2,
+            "the added child must be all-NULL"
+        );
+        assert!(
+            conformed.is_null(1),
+            "the struct's own null buffer must survive"
+        );
+    }
+
+    /// S2-2: the same evolution one level down, inside a `list<struct<...>>` — offsets and the
+    /// list's null buffer must be preserved while the element struct is conformed.
+    #[test]
+    fn test_conform_column_recurses_into_a_list_element() {
+        use datafusion::arrow::array::{Int32Array, ListArray, StructArray};
+        use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use datafusion::arrow::datatypes::Fields;
+
+        let scanned_children =
+            Fields::from(vec![field_with_id("a", ArrowDataType::Int32, true, 3)]);
+        let scanned_element = Arc::new(ArrowField::new(
+            "element",
+            ArrowDataType::Struct(scanned_children.clone()),
+            true,
+        ));
+        let scanned_values: ArrayRef = Arc::new(
+            StructArray::try_new(
+                scanned_children,
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+                None,
+            )
+            .expect("element struct"),
+        );
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+        let scanned: ArrayRef = Arc::new(
+            ListArray::try_new(scanned_element, offsets, scanned_values, None)
+                .expect("the scanned list must build"),
+        );
+
+        let target_children = Fields::from(vec![
+            field_with_id("a", ArrowDataType::Int32, true, 3),
+            field_with_id("b", ArrowDataType::Int32, true, 4),
+        ]);
+        let target_element = Arc::new(ArrowField::new(
+            "element",
+            ArrowDataType::Struct(target_children),
+            true,
+        ));
+        let target = ArrowField::new("l", ArrowDataType::List(target_element), true);
+
+        let conformed = conform_column(&scanned, &target, "l").expect("the list must conform");
+        assert_eq!(conformed.data_type(), target.data_type());
+        let conformed = conformed
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("still a list");
+        assert_eq!(conformed.len(), 2, "the list offsets must be preserved");
+        assert_eq!(conformed.value(0).len(), 2);
+        assert_eq!(conformed.value(1).len(), 1);
+        let values = conformed
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("element struct");
+        assert_eq!(
+            values.column(1).null_count(),
+            3,
+            "the added element field must be all-NULL"
+        );
+    }
+
+    /// S2-2: and inside a `map<string, struct<...>>` — the entries struct is conformed through the
+    /// map's key/value pair, preserving offsets.
+    #[test]
+    fn test_conform_column_recurses_into_a_map_value() {
+        use datafusion::arrow::array::{Int32Array, MapArray, StringArray, StructArray};
+        use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use datafusion::arrow::datatypes::Fields;
+
+        let value_children = Fields::from(vec![field_with_id("a", ArrowDataType::Int32, true, 3)]);
+        let scanned_entry_fields = Fields::from(vec![
+            field_with_id("key", ArrowDataType::Utf8, false, 5),
+            field_with_id(
+                "value",
+                ArrowDataType::Struct(value_children.clone()),
+                true,
+                6,
+            ),
+        ]);
+        let scanned_entries = StructArray::try_new(
+            scanned_entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["k1", "k2"])),
+                Arc::new(
+                    StructArray::try_new(
+                        value_children,
+                        vec![Arc::new(Int32Array::from(vec![7, 8]))],
+                        None,
+                    )
+                    .expect("value struct"),
+                ),
+            ],
+            None,
+        )
+        .expect("entries struct");
+        let scanned_entries_field = Arc::new(ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(scanned_entry_fields),
+            false,
+        ));
+        let scanned: ArrayRef = Arc::new(
+            MapArray::try_new(
+                scanned_entries_field,
+                OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2])),
+                scanned_entries,
+                None,
+                false,
+            )
+            .expect("the scanned map must build"),
+        );
+
+        let target_value_children = Fields::from(vec![
+            field_with_id("a", ArrowDataType::Int32, true, 3),
+            field_with_id("b", ArrowDataType::Int32, true, 4),
+        ]);
+        let target_entry_fields = Fields::from(vec![
+            field_with_id("key", ArrowDataType::Utf8, false, 5),
+            field_with_id(
+                "value",
+                ArrowDataType::Struct(target_value_children),
+                true,
+                6,
+            ),
+        ]);
+        let target = ArrowField::new(
+            "m",
+            ArrowDataType::Map(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    ArrowDataType::Struct(target_entry_fields),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+
+        let conformed = conform_column(&scanned, &target, "m").expect("the map must conform");
+        assert_eq!(conformed.data_type(), target.data_type());
+        let conformed = conformed
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("still a map");
+        assert_eq!(conformed.len(), 1);
+        assert_eq!(conformed.value_length(0), 2, "the map offsets must survive");
+        let values = conformed
+            .entries()
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("value struct")
+            .clone();
+        assert_eq!(
+            values.column(1).null_count(),
+            2,
+            "the added value field must be all-NULL"
+        );
+    }
+
+    /// S2-2: an illegal change BENEATH a column must name the nested PATH, not just the root.
+    #[test]
+    fn test_conform_column_names_the_nested_path_on_an_illegal_change() {
+        use datafusion::arrow::array::{Int64Array, StructArray};
+        use datafusion::arrow::datatypes::Fields;
+
+        let scanned_children =
+            Fields::from(vec![field_with_id("a", ArrowDataType::Int64, true, 3)]);
+        let scanned: ArrayRef = Arc::new(
+            StructArray::try_new(
+                scanned_children,
+                vec![Arc::new(Int64Array::from(vec![5]))],
+                None,
+            )
+            .expect("the scanned struct must build"),
+        );
+        // long -> int is NOT a legal promotion.
+        let target_children = Fields::from(vec![field_with_id("a", ArrowDataType::Int32, true, 3)]);
+        let target = ArrowField::new("s", ArrowDataType::Struct(target_children), true);
+
+        let err = conform_column(&scanned, &target, "s")
+            .expect_err("a narrowing nested change must not be coerced");
+        assert!(
+            err.to_string().contains("s.a"),
+            "the error must name the nested path: {err}"
+        );
     }
 
     /// S2-3: a legally promoted column is cast to the advertised type, not rejected.
@@ -883,7 +1352,7 @@ mod tests {
             false,
         )]));
 
-        let err = resolve_projection(&table, None, &advertised)
+        let err = resolve_bindings(&table, None, &advertised)
             .expect_err("a field without an id must not be bound by name");
         assert!(
             err.to_string().contains(PARQUET_FIELD_ID_META_KEY) && err.to_string().contains('x'),
@@ -902,8 +1371,10 @@ mod tests {
             field_with_id("added_later", ArrowDataType::Int32, true, 99),
         ]));
 
+        let bindings =
+            resolve_bindings(&table, None, &advertised).expect("the bindings must resolve");
         let (scan_columns, sources) =
-            resolve_projection(&table, None, &advertised).expect("the projection must resolve");
+            project_bindings(&advertised, &bindings).expect("the projection must resolve");
         assert_eq!(
             scan_columns,
             vec!["y".to_string()],

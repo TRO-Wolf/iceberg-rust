@@ -1776,6 +1776,416 @@ mod tests {
         }
     }
 
+    /// A table `(id int, s struct<a int>)` — the nested-evolution fixture. `s.a` is field 3, so an
+    /// added `s.b` takes field 4, matching the shape Iceberg assigns.
+    async fn get_test_catalog_and_struct_table()
+    -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
+        use iceberg::spec::StructType;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let warehouse_path = temp_dir.path().to_str().expect("utf-8 path").to_string();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+            )
+            .await
+            .expect("memory catalog");
+        let namespace = NamespaceIdent::new("test_ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create namespace");
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("nested schema");
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("nested_table".to_string())
+                    .location(format!("{warehouse_path}/nested_table"))
+                    .schema(schema)
+                    .properties(HashMap::new())
+                    .build(),
+            )
+            .await
+            .expect("create nested table");
+
+        (
+            Arc::new(catalog),
+            namespace,
+            "nested_table".to_string(),
+            temp_dir,
+        )
+    }
+
+    /// Adds a NESTED column out of band: `ALTER TABLE ADD COLUMN <parent>.<name> int`.
+    async fn evolve_add_nested_column(
+        catalog: &Arc<dyn Catalog>,
+        ident: &TableIdent,
+        parent: &str,
+        name: &str,
+    ) {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+        let table = catalog
+            .load_table(ident)
+            .await
+            .expect("load table for out-of-band evolution");
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .add_column_to(
+                Some(parent),
+                name,
+                Type::Primitive(PrimitiveType::Int),
+                None,
+            )
+            .apply(tx)
+            .expect("queue the nested add-column");
+        tx.commit(catalog.as_ref())
+            .await
+            .expect("commit the nested add-column");
+    }
+
+    /// S2-2: `ADD COLUMN s.b` creates no snapshot, so the scanned struct has only `a` while the
+    /// plan advertises `{a, b}`. Java/Spark reads `{a: 5, b: null}`; conforming must recurse into
+    /// the struct rather than treating the whole column as an illegal type change.
+    #[tokio::test]
+    async fn test_nested_add_column_reads_null_for_the_new_field() {
+        use datafusion::arrow::array::{Array, Int32Array, StructArray};
+
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_struct_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, named_struct('a', 5))",
+        )
+        .await;
+
+        evolve_add_nested_column(&catalog, &ident, "s", "b").await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct a provider on the nested-evolved table");
+        let batches = query_through(Arc::new(provider), "SELECT * FROM t").await;
+
+        let mut seen = 0;
+        for batch in &batches {
+            let structs = batch
+                .column_by_name("s")
+                .expect("the struct column must be present")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("s must be a struct");
+            assert_eq!(
+                structs.num_columns(),
+                2,
+                "the struct must carry the advertised child set, got {:?}",
+                structs.data_type()
+            );
+            let a = structs
+                .column_by_name("a")
+                .expect("s.a must be present")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("s.a must be Int32");
+            let b = structs.column_by_name("b").expect("s.b must be present");
+            for i in 0..a.len() {
+                assert_eq!(a.value(i), 5, "the stored nested value must survive");
+                assert!(b.is_null(i), "a nested column added later reads as NULL");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1, "the seeded row must be readable");
+    }
+
+    /// Renames a column out of band; `name` may be a dotted path for a nested field.
+    async fn evolve_rename(catalog: &Arc<dyn Catalog>, ident: &TableIdent, name: &str, to: &str) {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+        let table = catalog
+            .load_table(ident)
+            .await
+            .expect("load table for out-of-band evolution");
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .rename_column(name, to)
+            .apply(tx)
+            .expect("queue the rename");
+        tx.commit(catalog.as_ref())
+            .await
+            .expect("commit the rename");
+    }
+
+    /// S2-2, the nested rename: the child keeps its field id, so its value must come back under the
+    /// new child name — the nested analogue of `test_rename_preserves_values_under_the_new_name`.
+    #[tokio::test]
+    async fn test_nested_rename_preserves_values() {
+        use datafusion::arrow::array::{Array, Int32Array, StructArray};
+
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_struct_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, named_struct('a', 5))",
+        )
+        .await;
+
+        evolve_rename(&catalog, &ident, "s.a", "renamed_a").await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct a provider on the nested-renamed table");
+        let batches = query_through(Arc::new(provider), "SELECT * FROM t").await;
+
+        let mut seen = 0;
+        for batch in &batches {
+            let structs = batch
+                .column_by_name("s")
+                .expect("the struct column must be present")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("s must be a struct");
+            let renamed = structs
+                .column_by_name("renamed_a")
+                .expect("the renamed child must be present under its NEW name")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("s.renamed_a must be Int32");
+            for i in 0..renamed.len() {
+                assert!(
+                    renamed.is_valid(i),
+                    "the renamed nested column must carry its data, not NULLs"
+                );
+                assert_eq!(renamed.value(i), 5);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1, "the seeded row must be readable");
+    }
+
+    // Pushed-down-filter rebinding (S2-1)
+    //
+    // A pushed filter PRUNES rows before DataFusion sees them, and `Inexact` pushdown only lets
+    // DataFusion discard false positives — never resurrect a row the scan dropped. These three pin
+    // the ways a name-keyed filter goes wrong once names and field ids disagree.
+
+    /// A table `(a int, b int)` for the name-swap case, where both columns share a type so a filter
+    /// bound to the wrong one still type-checks — and silently returns the wrong rows.
+    async fn get_test_catalog_and_two_int_table()
+    -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let warehouse_path = temp_dir.path().to_str().expect("utf-8 path").to_string();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+            )
+            .await
+            .expect("memory catalog");
+        let namespace = NamespaceIdent::new("test_ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create namespace");
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .expect("two-int schema");
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("swap_table".to_string())
+                    .location(format!("{warehouse_path}/swap_table"))
+                    .schema(schema)
+                    .properties(HashMap::new())
+                    .build(),
+            )
+            .await
+            .expect("create two-int table");
+
+        (
+            Arc::new(catalog),
+            namespace,
+            "swap_table".to_string(),
+            temp_dir,
+        )
+    }
+
+    /// S2-1: after a plain rename, a filter over the NEW name has to be pushed under the name the
+    /// scanned snapshot uses. Pushing the advertised name fails to bind at all
+    /// ("Field opt2 not found in schema") — the query dies rather than returning the row.
+    #[tokio::test]
+    async fn test_pushdown_after_a_rename_binds_the_snapshot_name() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("opt")).await;
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 'a', 7), (2, 'b', 8)",
+        )
+        .await;
+        evolve_rename(&catalog, &ident, "opt", "opt2").await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct a provider on the renamed table");
+        let batches = query_through(Arc::new(provider), "SELECT id FROM t WHERE opt2 = 7").await;
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "exactly the row with opt2 = 7 must come back"
+        );
+    }
+
+    /// S2-1: after DROP + re-ADD, the advertised column has a FRESH field id that the scanned
+    /// snapshot knows nothing about — every row reads NULL for it. Pushing the filter under the old
+    /// name evaluates it against the OLD column's live data and prunes both rows; DataFusion can
+    /// never get them back.
+    #[tokio::test]
+    async fn test_pushdown_after_drop_and_readd_keeps_the_rows() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("opt")).await;
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 'a', 7), (2, 'b', 8)",
+        )
+        .await;
+        evolve_schema(&catalog, &ident, SchemaOp::Drop("opt")).await;
+        evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("opt")).await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct a provider on the re-added column");
+        let batches = query_through(Arc::new(provider), "SELECT id FROM t WHERE opt IS NULL").await;
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            2,
+            "the re-added column reads NULL for every row, so both must match"
+        );
+    }
+
+    /// S2-1, the silent one: swap two columns' names. A filter pushed under the advertised name
+    /// binds to the OTHER column's data — same type, no error, wrong rows.
+    #[tokio::test]
+    async fn test_pushdown_after_a_name_swap_filters_the_right_column() {
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_two_int_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 2)",
+        )
+        .await;
+
+        // a -> tmp, b -> a, tmp -> b: field 1 is now called `b` and field 2 is now called `a`.
+        evolve_rename(&catalog, &ident, "a", "tmp").await;
+        evolve_rename(&catalog, &ident, "b", "a").await;
+        evolve_rename(&catalog, &ident, "tmp", "b").await;
+
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("construct a provider on the swapped table");
+        // Positions are unchanged; only the NAMES moved. The column now advertised as `a` is field
+        // id 2 — the one the snapshot still calls `b`, holding the value 2.
+        assert_eq!(provider.schema().field(0).name(), "b");
+        assert_eq!(provider.schema().field(1).name(), "a");
+
+        let batches = query_through(Arc::new(provider), "SELECT * FROM t WHERE a = 2").await;
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "`a` now holds the value 2, so the row must match"
+        );
+    }
+
+    /// S3-4: the scan must read ONLY the projected column. This drives the very function the plan
+    /// executes ([`crate::physical_plan::scan::get_batch_stream`]) with the column set the plan
+    /// resolved, so a revert to `select_all()` widens the pre-conform batch and goes RED here —
+    /// `conform_batch` would otherwise hide it, since it narrows the batch back down afterwards.
+    #[tokio::test]
+    async fn test_scan_reads_only_the_projected_column() {
+        use futures::TryStreamExt;
+
+        use crate::physical_plan::scan::get_batch_stream;
+
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        seed(
+            &catalog,
+            &namespace,
+            &table_name,
+            "INSERT INTO t VALUES (1, 'a')",
+        )
+        .await;
+
+        let table = catalog
+            .load_table(&TableIdent::new(namespace.clone(), table_name.clone()))
+            .await
+            .expect("load the seeded table");
+        let batches: Vec<_> = get_batch_stream(table, None, vec!["name".to_string()], None)
+            .await
+            .expect("open the scan stream")
+            .try_collect()
+            .await
+            .expect("read the scan stream");
+
+        assert!(!batches.is_empty(), "the seeded row must produce a batch");
+        for batch in &batches {
+            assert_eq!(
+                batch.num_columns(),
+                1,
+                "only the projected column may be read, got {:?}",
+                batch.schema()
+            );
+            assert_eq!(batch.schema().field(0).name(), "name");
+        }
+    }
+
     #[tokio::test]
     async fn test_no_limit_pushdown() {
         use datafusion::datasource::TableProvider;
