@@ -365,3 +365,23 @@ otherwise a correct, mutation-proven change — both of them in the *claims*, no
   OVER-delete. *Why it matters more than a typo:* the two hazards need opposite mitigations, and the doc was
   the deliverable. A contract sentence about what the READER does is only as good as the e2e that executed
   it; write the probe, then write the sentence.
+
+### 2026-07-25 — When a phase runs FIRST and cannot fail, its panics preempt every typed error downstream
+
+G3 (engine-trust bundle), totalising `PartitionSpec::partition_to_path`. Two reusable findings:
+
+- **Locate the abort by PHASE ORDER, not by which check "should" have caught it.** `SnapshotProducer::commit`
+  runs `summary()` BEFORE `manifest_file()`, and `summary()` is infallible. So a commit over broken metadata
+  died in the summary — the typed `DataInvalid` the manifest rewriter would have produced for the SAME input
+  was unreachable. An in-code comment at the fabricating call site even claimed "the validation will reject
+  them" — validation never ran. *Detector:* before asserting which error a hardening test observes, read the
+  order of the phases in `commit()`; the first infallible phase that touches the bad input is the one that
+  must be made total, and the test then observes the SECOND phase's error.
+- **An infallible signature you cannot change is hardened by a `try_` sibling with an EQUALITY contract, not by
+  a second opinion.** `partition_to_path` must stay infallible (the public `LocationGenerator` trait, plus the
+  summary path), so the fix pairs it with `try_partition_to_path` whose contract is "returns EXACTLY the same
+  string whenever it returns `Ok`". That single sentence makes the leniency mutation-provable: the total path's
+  behavior is pinned to the fallible one everywhere except the anomaly branches, and one test asserts the
+  equality directly. Reuse an EXISTING predicate for the anomaly test (`PrimitiveType::compatible`, already the
+  commit path's `validate_partition_value` rule) instead of mirroring the formatter's match arms — then add a
+  matrix test that EXECUTES every accepted pair through the formatter as the drift alarm.
