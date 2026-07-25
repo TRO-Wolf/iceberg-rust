@@ -305,3 +305,37 @@ turns the repaired data from `{(eng,alp),(ops,bet)}` into `{(sales,alp),(sales,b
   identical), so a same-typed wrong value commits cleanly. *Why:* "we can't reproduce it any more" is not a
   reason to skip the regression fixture — it is a reason to inject one layer down, and the injection point
   doubles as the honest statement of what the format does and does not enforce.
+
+### 2026-07-25 — A "silent corruption" fixture must be chosen so the corruption STAYS silent; and assert the row-level outcome BEFORE the metadata field that caused it
+
+Context (G2, engine-trust bundle): the delete writers stamped `partition_spec_id` only when a `PartitionKey`
+was present, else `DEFAULT_PARTITION_SPEC_ID` (0). Two fixtures were built for the same defect. Fixture A
+(spec 0 UNPARTITIONED, evolved to a partitioned spec 1): the wrong stamp COMMITS — spec 0's partition type is
+empty, exactly the tuple the file carries — and the delete then never applies; every row survives, nothing
+errors. Fixture B (spec 0 partitioned, evolved to an UNPARTITIONED spec whose id is 1): the same wrong stamp
+is caught LOUDLY at commit (`Partition value is not compatible with partition type`), because spec 0's type
+has a field the empty tuple cannot fill.
+
+- **DO pick the fixture whose claimed-spec partition type is ARITY- AND TYPE-COMPATIBLE with the tuple the
+  file carries when the claim is "this corruption is silent."** Commit validation checks the tuple against
+  *the spec the file claims*, never against *which* spec the file belongs to (Java identical) — so the same
+  wrong id is loud or silent purely as a function of the two specs' shapes. A fixture in which it is loud
+  proves the opposite of what the unit is about, and a reviewer reading only the test name cannot tell. State
+  which shape each fixture exercises in its doc comment.
+- **DO order an end-to-end test so the ROW-LEVEL outcome is asserted BEFORE the metadata field you believe
+  causes it, and label the field assertion as a corroborating guard.** The first draft asserted
+  `delete.partition_spec_id() == cur_spec_id` and only then the post-delete row set; every mutation that
+  changed the stamp therefore reddened on the *stamp* assertion, leaving the row-set assertion never
+  executed under any mutation — i.e. unproven. *Why:* a metadata assertion placed upstream of the behavior
+  short-circuits every mutation you would use to prove the behavioral assertion is load-bearing.
+- **DO add a WITHIN-FIXTURE positive control when the headline assertion is "nothing happened".** "The rows
+  survived the delete" is also what you would see if deletes never worked in that fixture at all. The same
+  table, the same data file, the same positions, re-deleted with the correct `PartitionKey` — and now
+  emptied — makes the spec stamp the only difference between the two outcomes. This is a controlled A/B, and
+  it is stronger than a mutation here because no in-scope production mutation can hold the commit legal while
+  breaking the pairing.
+- **DO key a "does this spec need a partition tuple?" guard on partition-field ARITY, never on
+  `PartitionSpec::is_unpartitioned()`** — the latter is also `true` for an ALL-VOID spec (`fields.is_empty()
+  || all fields are Void`), whose partition TYPE still has fields, so a tuple is still required.
+  `is_unpartitioned()` would wave exactly that case through into the commit-time arity failure the guard
+  exists to prevent. Mutation-proven: swapping the predicate reds the all-void leg and nothing else.
