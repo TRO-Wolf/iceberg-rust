@@ -17,7 +17,7 @@
 
 //! This module provide `DataFileWriter`.
 //!
-//! It also hosts [`resolve_partition_spec_id`] — the partition-spec-id stamping rule shared by all
+//! It also hosts `resolve_partition_spec_id` — the partition-spec-id stamping rule shared by all
 //! three base writers (data, position-delete, equality-delete).
 
 use arrow_array::RecordBatch;
@@ -110,7 +110,7 @@ where
     ///
     /// Prefer chaining [`with_partition_spec`](Self::with_partition_spec): without it, a writer built
     /// with no [`PartitionKey`] falls back to stamping [`DEFAULT_PARTITION_SPEC_ID`] (0) — see
-    /// [`resolve_partition_spec_id`].
+    /// `resolve_partition_spec_id`.
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
         Self {
             inner,
@@ -122,7 +122,7 @@ where
     ///
     /// This is the Rust counterpart of Java's REQUIRED `DataFiles.Builder(spec)` argument. It is used
     /// only when the writer is built WITHOUT a [`PartitionKey`]; a key always wins, because it
-    /// carries the spec its tuple was produced from. See [`resolve_partition_spec_id`] for the full
+    /// carries the spec its tuple was produced from. See `resolve_partition_spec_id` for the full
     /// precedence and for why a partitioned spec with no key is rejected.
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
@@ -156,7 +156,7 @@ pub struct DataFileWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNam
     inner: Option<RollingFileWriter<B, L, F>>,
     partition_key: Option<PartitionKey>,
     /// The spec id stamped on every produced file, resolved once at build time by
-    /// [`resolve_partition_spec_id`].
+    /// `resolve_partition_spec_id`.
     partition_spec_id: i32,
 }
 

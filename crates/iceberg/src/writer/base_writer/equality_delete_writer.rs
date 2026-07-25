@@ -57,7 +57,7 @@ where
     /// Prefer chaining [`with_partition_spec`](Self::with_partition_spec): without it, a writer built
     /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0) — a delete file
     /// that claims spec 0 is never applied to data files under any other spec. See
-    /// [`resolve_partition_spec_id`].
+    /// `resolve_partition_spec_id`.
     pub fn new(
         inner: RollingFileWriterBuilder<B, L, F>,
         config: EqualityDeleteWriterConfig,
@@ -75,7 +75,7 @@ where
     /// argument. The spec MUST be the spec of the DATA FILES the deletes apply to, not the table's
     /// current spec — a partition-scoped equality delete only ever applies to data files carrying the
     /// same `(spec_id, partition)`. It is used only when the writer is built WITHOUT a
-    /// [`PartitionKey`]; a key always wins. See [`resolve_partition_spec_id`].
+    /// [`PartitionKey`]; a key always wins. See `resolve_partition_spec_id`.
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
@@ -171,7 +171,7 @@ pub struct EqualityDeleteFileWriter<
     equality_ids: Vec<i32>,
     partition_key: Option<PartitionKey>,
     /// The spec id stamped on every produced delete file, resolved once at build time by
-    /// [`resolve_partition_spec_id`].
+    /// `resolve_partition_spec_id`.
     partition_spec_id: i32,
 }
 
