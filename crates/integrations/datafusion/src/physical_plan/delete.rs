@@ -1037,17 +1037,9 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         }
     }
 
-    // Group pairs by (spec_id, partition). Pairs whose data file path is not found in the manifest
-    // (shouldn't happen in practice) are grouped under the default spec with an empty partition as a
-    // safe fallback — the validation will reject them if the spec is partitioned, exposing the bug.
-    let mut groups: HashMap<(i32, Struct), Vec<(String, i64)>> = HashMap::new();
-    for pair in pairs {
-        let key = path_to_partition
-            .get(&pair.0)
-            .cloned()
-            .unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()));
-        groups.entry(key).or_default().push(pair.clone());
-    }
+    // Group pairs by (spec_id, partition) — every pair's data file must be live in the snapshot the
+    // map was built from.
+    let groups = group_pairs_by_partition(pairs, &path_to_partition)?;
 
     // Write one position-delete file per (spec_id, partition) group.
     let mut all_delete_files: Vec<DataFile> = Vec::new();
@@ -1079,6 +1071,41 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
     // Each group above is non-empty and `write_position_deletes_for_partition` guarantees it
     // produced at least one file, so `all_delete_files` is non-empty whenever `pairs` was.
     Ok(all_delete_files)
+}
+
+/// The `(path, pos)` pairs of one position-delete output file, keyed by the `(spec_id, partition)`
+/// of the data files they delete from.
+type PositionDeleteGroups = HashMap<(i32, Struct), Vec<(String, i64)>>;
+
+/// Group `(path, pos)` pairs by the `(spec_id, partition)` of the data file each one deletes from,
+/// so every position-delete file can be stamped with the SAME spec and partition as its target
+/// (Java `PositionDeleteWriter` always carries a per-data-file `PartitionKey`).
+///
+/// A pair whose data file is absent from `path_to_partition` is a hard error. The map is built from
+/// the current snapshot's DATA manifests, so a miss means the pair references a file that is not
+/// live — the pairs come from a scan of that same snapshot, so it cannot happen without a bug.
+/// Fabricating `(default_spec, Struct::empty())` for it (the previous fallback) pairs a PARTITIONED
+/// spec with an EMPTY tuple: that used to ABORT in `PartitionKey::to_path` before any validation
+/// could see it, and with the path walk totalised it would instead write a delete file under a
+/// `field=null` path carrying a tuple no reader can match.
+///
+/// Only reached on the PARTITIONED path — the unpartitioned table returns before this.
+fn group_pairs_by_partition(
+    pairs: &[(String, i64)],
+    path_to_partition: &HashMap<String, (i32, Struct)>,
+) -> DFResult<PositionDeleteGroups> {
+    let mut groups = PositionDeleteGroups::new();
+    for pair in pairs {
+        let key = path_to_partition.get(&pair.0).cloned().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "position-delete: data file `{}` is not a live file of the current snapshot, so \
+                 its partition cannot be resolved",
+                pair.0
+            ))
+        })?;
+        groups.entry(key).or_default().push(pair.clone());
+    }
+    Ok(groups)
 }
 
 /// Write one position-delete file for a SINGLE `(spec_id, partition)` group. When `partition_key`
@@ -1762,7 +1789,8 @@ mod tests {
     use datafusion::arrow::datatypes::Int32Type;
 
     use super::{
-        IsolationLevel, decode_file_path, decode_file_paths_batch, sort_position_delete_pairs,
+        IsolationLevel, decode_file_path, decode_file_paths_batch, group_pairs_by_partition,
+        sort_position_delete_pairs,
     };
 
     /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string
@@ -1942,6 +1970,82 @@ mod tests {
         assert!(
             IsolationLevel::parse("none").is_err(),
             "'none' must be rejected for row-level operations"
+        );
+    }
+
+    // ============================================================================================
+    // WG3-L3: the position-delete grouping resolves every pair's real partition instead of
+    // fabricating `(default_spec, Struct::empty())` for an unmatched data file.
+    // ============================================================================================
+
+    /// `path → (spec_id, partition)` for two files of a one-field partitioned spec.
+    fn partition_map() -> std::collections::HashMap<String, (i32, iceberg::spec::Struct)> {
+        use iceberg::spec::{Literal, Struct};
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "s3://b/x0.parquet".to_string(),
+            (1, Struct::from_iter([Some(Literal::long(0))])),
+        );
+        map.insert(
+            "s3://b/x1.parquet".to_string(),
+            (1, Struct::from_iter([Some(Literal::long(1))])),
+        );
+        map
+    }
+
+    /// The normal path: pairs are grouped by their data file's own `(spec_id, partition)`, so each
+    /// delete file is stamped with the spec + partition of the file it deletes from.
+    #[test]
+    fn test_group_pairs_by_partition_groups_by_the_target_files_partition() {
+        let map = partition_map();
+        let pairs = vec![
+            ("s3://b/x0.parquet".to_string(), 3),
+            ("s3://b/x1.parquet".to_string(), 7),
+            ("s3://b/x0.parquet".to_string(), 1),
+        ];
+
+        let groups = group_pairs_by_partition(&pairs, &map).expect("every pair resolves");
+        assert_eq!(
+            groups.len(),
+            2,
+            "one group per distinct partition: {groups:?}"
+        );
+        let x0 = groups
+            .get(&map["s3://b/x0.parquet"])
+            .expect("the x=0 group must exist");
+        assert_eq!(x0.len(), 2, "both x=0 pairs land in the same group");
+        assert_eq!(
+            groups
+                .get(&map["s3://b/x1.parquet"])
+                .expect("the x=1 group must exist")
+                .len(),
+            1
+        );
+    }
+
+    /// A pair whose data file is not live in the snapshot the map was built from must FAIL — the
+    /// previous fallback fabricated `(default_spec, Struct::empty())`, pairing a partitioned spec
+    /// with an empty tuple. That aborted in `PartitionKey::to_path` before any validation ran, and
+    /// with the path walk totalised it would write a delete file under a `field=null` path that no
+    /// reader can ever match (a silent under-delete: the rows come back).
+    ///
+    /// MUTATION (restore the `unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()))`
+    /// fallback): this test goes RED.
+    #[test]
+    fn test_group_pairs_by_partition_rejects_an_unmatched_data_file() {
+        let map = partition_map();
+        let pairs = vec![
+            ("s3://b/x0.parquet".to_string(), 3),
+            ("s3://b/ghost.parquet".to_string(), 0),
+        ];
+
+        let err = group_pairs_by_partition(&pairs, &map)
+            .expect_err("an unresolvable data file must fail loudly");
+        assert!(
+            err.to_string().contains("s3://b/ghost.parquet")
+                && err.to_string().contains("is not a live file"),
+            "the error must name the offending file: {err}"
         );
     }
 }
