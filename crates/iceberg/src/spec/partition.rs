@@ -373,6 +373,11 @@ fn escape_partition_path_component(component: &str) -> String {
 /// through [`escape_partition_path_component`]; the `=` between them (and the `/` the callers join
 /// pairs with) is path STRUCTURE and stays raw. Every pair the partition path emits is built here,
 /// so the escaping cannot be missed on one branch.
+///
+/// There are FOUR call sites — the rendered-value branch and the three `name=null` branches (the
+/// lenient fallback in [`PartitionSpec::partition_to_path`], the `void`-past-end-of-tuple branch,
+/// and the NULL-literal branch) — and each is pinned INDIVIDUALLY: unescaping any one of them
+/// alone reds a distinct test in `partition_path_escaping_tests`.
 fn escaped_partition_pair(name: &str, value: &str) -> String {
     format!(
         "{}={}",
@@ -2951,6 +2956,93 @@ mod partition_path_escaping_tests {
         assert_eq!(render("s", Some("null")), render("s", None));
     }
 
+    /// `name=null` is emitted from THREE distinct sites, and each needs its own pin — a mutation
+    /// of one is invisible to the others (Java authority for all three: `Transform.toHumanString`
+    /// returns the literal `"null"` unconditionally, before it switches on the type — 1.10.0
+    /// bytecode offsets 0-6, `aload_2; ifnonnull; ldc "null"; areturn`).
+    ///
+    /// This is site 1: `partition_to_path`'s LENIENT fallback (WG3/G3), taken when the
+    /// `(spec, schema, tuple)` triple is not self-consistent. It is not hypothetical — the commit
+    /// path pairs a file's older spec with the table's current schema
+    /// (`SnapshotProducer::summary` → `snapshot_summary.rs`), so an unescaped name here puts a raw
+    /// `/` straight into a `partitions.` summary key, the exact defect R161 removes.
+    #[test]
+    fn the_lenient_fallback_null_still_escapes_the_field_name() {
+        let spec = string_spec("a/b");
+        // A schema that no longer carries source id 1: the field's partition type cannot be
+        // derived, so the total path falls back to `null` for it.
+        let evolved: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(2, "other", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .expect("the evolved schema must build"),
+        );
+        // A value that WOULD have rendered, to prove the fallback is what emits the pair.
+        let data = Struct::from_iter([Some(Literal::string("x/y"))]);
+
+        let path = spec.partition_to_path(&data, evolved.clone());
+        assert_eq!(
+            path, "a%2Fb=null",
+            "the lenient fallback must escape the field name exactly as Java does"
+        );
+        assert_eq!(
+            path.matches('/').count(),
+            0,
+            "a `/` in the field name must not forge a directory level on the fallback branch"
+        );
+        // Fixture sanity: this branch is reached only because the triple is inconsistent.
+        let err = spec
+            .try_partition_to_path(&data, evolved)
+            .expect_err("a dropped source column must be a typed error on the fallible path");
+        assert_eq!(err.kind(), crate::ErrorKind::Unexpected);
+    }
+
+    /// Site 2 of three: the `void`-past-the-end-of-tuple branch inside `render_partition_field`.
+    /// An all-`void` spec reports `is_unpartitioned()`, so callers legitimately pair it with an
+    /// empty tuple — a shape that reaches `name=null` without ever touching site 1 or site 3.
+    #[test]
+    fn the_void_past_end_null_still_escapes_the_field_name() {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "s", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("one-column schema must build"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("s", "c/d", Transform::Void)
+            .expect("void(s) under an arbitrary partition-field name is legal")
+            .build()
+            .expect("the one-field void spec must build");
+        assert!(
+            spec.is_unpartitioned(),
+            "fixture sanity: an all-void spec reports unpartitioned, which is why callers pair it \
+             with an empty tuple"
+        );
+        let data = Struct::empty();
+
+        let path = spec.partition_to_path(&data, schema.clone());
+        assert_eq!(
+            path, "c%2Fd=null",
+            "the void-past-end branch must escape the field name exactly as Java does"
+        );
+        assert_eq!(
+            path.matches('/').count(),
+            0,
+            "a `/` in the field name must not forge a directory level on the void branch"
+        );
+        assert_eq!(
+            spec.try_partition_to_path(&data, schema)
+                .expect("an all-void spec paired with an empty tuple is legitimate"),
+            path,
+            "the fallible path must render the same escaped pair"
+        );
+    }
+
     // ============================================================================================
     // Structure vs. content.
     // ============================================================================================
@@ -3079,6 +3171,87 @@ mod partition_path_escaping_tests {
         assert_eq!(
             spec.partition_to_path(&data, schema.into()),
             "id=42/name=alice/ts_hour=1000/empty_void=null"
+        );
+    }
+
+    /// The other half of the format-stability attestation: which value CLASSES move. Three
+    /// ordinary column types render a human string containing `:` (and, for `timestamp` /
+    /// `timestamptz`, a space too), so their path changes for EVERY value, not only for odd
+    /// strings — pinned here so the approved blast radius (D6) is executable, not derivable.
+    ///
+    /// Java ground truth re-derived 2026-07-25 by executing
+    /// `Transforms.identity().toHumanString(type, value)` against `iceberg-api-1.10.0` on JDK 11
+    /// and passing the result through `java.net.URLEncoder.encode(s, "UTF-8")` (the whole body of
+    /// `PartitionSpec.escape`). The two `assert_ne!`s are the ALARM for the named human-string
+    /// residue on row R161 — when either becomes equal, that residue has been closed and the row
+    /// must be updated in the same change.
+    #[test]
+    fn timestamp_time_and_timestamptz_paths_move_for_every_value() {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                    NestedField::optional(2, "tz", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                    NestedField::optional(3, "tm", Type::Primitive(PrimitiveType::Time)).into(),
+                    NestedField::optional(4, "dt", Type::Primitive(PrimitiveType::Date)).into(),
+                ])
+                .build()
+                .expect("the four-column temporal schema must build"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("ts", "ts", Transform::Identity)
+            .expect("identity(ts) is legal")
+            .add_partition_field("tz", "tz", Transform::Identity)
+            .expect("identity(tz) is legal")
+            .add_partition_field("tm", "tm", Transform::Identity)
+            .expect("identity(tm) is legal")
+            .add_partition_field("dt", "dt", Transform::Identity)
+            .expect("identity(dt) is legal")
+            .build()
+            .expect("the four-field temporal spec must build");
+        // 2017-11-16T22:31:08 in micros; 22:31:08 in micros; 2022-01-08 in days.
+        let data = Struct::from_iter([
+            Some(Literal::timestamp(1_510_871_468_000_000)),
+            Some(Literal::timestamptz(1_510_871_468_000_000)),
+            Some(Literal::time(81_068_000_000)),
+            Some(Literal::date(19_000)),
+        ]);
+
+        let path = spec.partition_to_path(&data, schema);
+        let pairs: Vec<&str> = path.split('/').collect();
+        assert_eq!(
+            pairs,
+            vec![
+                "ts=2017-11-16+22%3A31%3A08",
+                "tz=2017-11-16+22%3A31%3A08+UTC",
+                "tm=22%3A31%3A08",
+                "dt=2022-01-08",
+            ],
+            "the three temporal types whose human string holds a `:` move under the escaper; \
+             `date` does not"
+        );
+
+        // `time` MATCHES Java post-R161 — a divergence this change CLOSES (pre-R161 the fork
+        // emitted the raw `22:31:08` where Java emits the escaped form).
+        assert_eq!(
+            pairs[2], "tm=22%3A31%3A08",
+            "Java: `22:31:08` escapes to `22%3A31%3A08`"
+        );
+        // `date` is byte-stable: its human string holds no character outside the safe set.
+        assert_eq!(
+            pairs[3], "dt=2022-01-08",
+            "Java: `2022-01-08`, untouched by the escaper"
+        );
+        // The two remaining divergences, pinned as an alarm (Java's own forms, escaped).
+        assert_ne!(
+            pairs[0], "ts=2017-11-16T22%3A31%3A08",
+            "residue R161: Java renders ISO `T`, the fork renders a space (escaped `+`)"
+        );
+        assert_ne!(
+            pairs[1], "tz=2017-11-16T22%3A31%3A08%2B00%3A00",
+            "residue R161: Java renders ISO `T` and `+00:00`, the fork renders a space and ` UTC`"
         );
     }
 }

@@ -408,3 +408,23 @@ transform's human string through it. Two reusable findings:
   They earn their place under the OVER-escaping mutation: restricting the pass-through set to
   alphanumerics reds them and nothing else reds them. *Pattern:* pair every "nothing changed for the
   common case" pin with a mutation that changes the common case, or the pin is decoration.
+
+### 2026-07-25 — Mutating a shared seam at ALL its call sites proves only "at least one is covered"
+
+G4 remediation (engine-trust bundle), R161. The escaping fix funnels every `name=value` pair through one
+helper, and the increment's mutation for the `name=null` family unescaped **all three** call sites at once:
+1 test went RED, which reads like coverage. Mutating them **individually** showed two of the three were
+completely unpinned — `partition_to_path`'s lenient fallback and the `void`-past-end-of-tuple branch each
+left the full 2920-test lib suite GREEN. Both are reachable in three lines, and the first sits on the commit
+path (`SnapshotProducer::summary` pairs the CURRENT schema with a file's OLDER spec), so a regression there
+would put a raw `/` straight into a `partitions.` summary key — the exact defect the change existed to remove.
+
+- **A single-seam refactor CONCENTRATES the code but MULTIPLIES the call sites you must pin.** "One helper,
+  so it cannot be missed" is an argument about today's structure, not about what the suite enforces; the next
+  editor changes a call site, not the helper. *Rule:* when a fix routes N branches through one helper, the
+  mutation budget is N+1 — one per call site, plus the helper itself — and the union-mutation is a summary,
+  never the evidence.
+- **The tell is arithmetic:** an N-site mutation that reds strictly fewer than N distinct tests has at least
+  one unpinned site. Cheap detector, no reasoning required — count the sites, count the distinct RED tests.
+- *Corollary for docs:* a rustdoc/matrix sentence like "no branch can skip it" is only earned once each
+  branch reds alone; otherwise state what the suite actually enforces.
