@@ -136,9 +136,11 @@ where
     /// [`PositionDeleteWriterConfig::schema`]).
     ///
     /// Prefer chaining [`with_partition_spec`](Self::with_partition_spec): without it, a writer built
-    /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0) — a delete file
-    /// that claims spec 0 is never applied to data files under any other spec. See
-    /// `resolve_partition_spec_id`.
+    /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0) — and a
+    /// POSITION delete is paired to data on `(spec_id, partition)`
+    /// (`DeleteFileIndex::get_deletes_for_data_file`), so one that claims spec 0 is never applied to
+    /// data files under any other spec: the rows it was written to delete come back. See
+    /// `resolve_partition_spec_id` and `docs/ENGINE_CONTRACT.md` §7a.
     pub fn new(
         inner: RollingFileWriterBuilder<B, L, F>,
         config: PositionDeleteWriterConfig,
@@ -158,6 +160,10 @@ where
     /// deletes reference, not the table's current spec — a delete file only ever applies to data
     /// files carrying the same `(spec_id, partition)`. It is used only when the writer is built
     /// WITHOUT a [`PartitionKey`]; a key always wins. See `resolve_partition_spec_id`.
+    ///
+    /// **This writer OWNS `partition_spec_id` on every [`DataFile`] it emits** — `close()` sets the
+    /// field unconditionally, overriding anything a custom
+    /// [`FileWriter`](crate::writer::file_writer::FileWriter) put on the returned `DataFileBuilder`.
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
@@ -624,9 +630,12 @@ mod test {
 /// End-to-end partition-spec-id stamping
 /// ======================================
 ///
-/// Writer → commit → scan, over a table whose partition spec EVOLVED. These are the two observable
+/// Writer → commit → scan, over a table whose partition spec EVOLVED. These are the observable
 /// consequences of the fabricated `DEFAULT_PARTITION_SPEC_ID` stamp; they are stated normatively in
-/// `docs/ENGINE_CONTRACT.md` §7.
+/// `docs/ENGINE_CONTRACT.md` §7a (WG4c). The equality-delete legs live here too (rather than in
+/// `equality_delete_writer.rs`) because the catalog/commit/scan machinery below is shared: they pin
+/// the read-side ASYMMETRY §7a has to state — a keyless equality delete carries an EMPTY tuple and
+/// is therefore GLOBAL, not inert.
 #[cfg(test)]
 mod spec_stamp_e2e_test {
     use std::collections::HashMap;
@@ -637,7 +646,7 @@ mod spec_stamp_e2e_test {
     use parquet::file::properties::WriterProperties;
 
     use super::{PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig};
-    use crate::arrow::schema_to_arrow_schema;
+    use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataFile, DataFileFormat, FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec,
@@ -646,6 +655,9 @@ mod spec_stamp_e2e_test {
     use crate::table::Table;
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use crate::writer::base_writer::equality_delete_writer::{
+        EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+    };
     use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
@@ -683,6 +695,26 @@ mod spec_stamp_e2e_test {
             .expect("add identity(dept)")
             .build()
             .expect("build identity(dept) spec")
+    }
+
+    /// A `truncate[5](dept)` spec under `spec_id`, partition field named `dept_trunc`.
+    ///
+    /// Its partition TYPE is the same shape as [`identity_dept_spec`]'s — one required-source string
+    /// field — and for any `dept` value of five characters or fewer the two transforms produce the
+    /// SAME tuple. That is what lets a fixture vary the spec id while holding the tuple constant.
+    fn truncate5_dept_spec(spec_id: i32) -> PartitionSpec {
+        PartitionSpec::builder(test_schema())
+            .with_spec_id(spec_id)
+            .add_unbound_field(
+                UnboundPartitionField::builder()
+                    .source_id(2)
+                    .name("dept_trunc".to_string())
+                    .transform(Transform::Truncate(5))
+                    .build(),
+            )
+            .expect("add truncate[5](dept)")
+            .build()
+            .expect("build truncate[5](dept) spec")
     }
 
     /// A fresh V2 table in `catalog` under `spec`.
@@ -804,6 +836,46 @@ mod spec_stamp_e2e_test {
             .expect("one pos-delete file")
     }
 
+    /// Write one equality-delete file on `id`, optionally under a configured spec and/or a key.
+    ///
+    /// `rows` are full table rows; the writer projects them down to the equality columns.
+    async fn write_eq_delete_on_id(
+        table: &Table,
+        configured_spec: Option<PartitionSpec>,
+        partition_key: Option<PartitionKey>,
+        rows: &[(i64, &str)],
+    ) -> DataFile {
+        let schema = table.metadata().current_schema();
+        let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
+            .expect("equality-delete config on id");
+        let projected = Arc::new(
+            arrow_schema_to_schema(config.projected_arrow_schema_ref())
+                .expect("projected iceberg schema"),
+        );
+        let mut builder = EqualityDeleteFileWriterBuilder::new(
+            rolling_builder(table, "eq-del", projected),
+            config,
+        );
+        if let Some(spec) = configured_spec {
+            builder = builder.with_partition_spec(spec);
+        }
+        let mut writer = builder
+            .build(partition_key)
+            .await
+            .expect("build eq-delete writer");
+        writer
+            .write(rows_batch(schema, rows))
+            .await
+            .expect("write eq deletes");
+        writer
+            .close()
+            .await
+            .expect("close eq-delete writer")
+            .into_iter()
+            .next()
+            .expect("one eq-delete file")
+    }
+
     async fn fast_append(
         catalog: &impl Catalog,
         table: &Table,
@@ -888,14 +960,21 @@ mod spec_stamp_e2e_test {
     // The two consequences.
     // -------------------------------------------------------------------------------------------
 
-    /// SILENT UNDER-DELETE (the probe that sized this unit; 2026-07-25).
+    /// SILENT UNDER-DELETE, ENGINE-REACHABLE SHAPE (the probe that sized this unit; 2026-07-25).
     ///
     /// Table: spec 0 UNPARTITIONED, evolved to a partitioned spec 1. Data lands under spec 1. A
     /// position delete built with neither a `PartitionKey` nor a configured spec claims spec 0 — and
     /// spec 0's partition type is EMPTY, exactly the tuple the file carries, so
     /// `SnapshotProducer::validate_partition_value` ACCEPTS it. The read side then never pairs it
-    /// with the data (`DeleteFileIndex::get_deletes_for_data_file` requires equal
-    /// `partition_spec_id`), so every "deleted" row survives. Nothing anywhere fails.
+    /// with the data, so every "deleted" row survives. Nothing anywhere fails.
+    ///
+    /// ATTRIBUTION (be precise — 2026-07-25 Critic): the unstamped delete here differs from the data
+    /// on BOTH halves of the read-side `(spec_id, partition)` key — its tuple is `Struct::empty()`
+    /// while the data's is `{"eng"}` — so the miss happens at the partition-bucket lookup
+    /// (`pos_deletes_by_partition.get(data_file.partition())`) and never reaches the
+    /// `partition_spec_id` comparison. This test pins the SHAPE an engine actually produces (a
+    /// writer given no key at all); the spec id is isolated as the sole discriminator by its twin,
+    /// [`test_e2e_same_tuple_wrong_spec_id_alone_silently_under_deletes`].
     ///
     /// The second half is the fix: the same call with the spec configured is REJECTED at build time
     /// instead of producing the silent artifact.
@@ -963,8 +1042,10 @@ mod spec_stamp_e2e_test {
 
         // POSITIVE CONTROL, same table / same data file / same positions: a delete carrying the
         // data file's OWN PartitionKey removes exactly those rows. Without this leg the survival
-        // above would be attributable to "deletes never work in this fixture"; with it, the spec-id
-        // stamp is the ONLY difference between the two outcomes.
+        // above would be attributable to "deletes never work in this fixture"; with it, the
+        // difference is exactly "the delete was given its data files' key" vs "it was given
+        // nothing". (Which HALF of the `(spec_id, partition)` key does the excluding is isolated by
+        // the twin test, not here — see this test's doc comment.)
         let correct_key = PartitionKey::new(
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
@@ -1071,5 +1152,247 @@ mod spec_stamp_e2e_test {
         // Corroborating guard (not the discriminating assertion): the delete really did claim the
         // current spec rather than reaching the data by some other route.
         assert_eq!(delete_spec_id, cur_spec_id);
+    }
+
+    /// SILENT UNDER-DELETE, ISOLATED ON THE SPEC ID ALONE (2026-07-25, Critic-supplied fixture).
+    ///
+    /// The engine-reachable twin above cannot attribute the miss to the spec id, because its
+    /// unkeyed delete also differs in the partition TUPLE. Here the tuple is held CONSTANT and only
+    /// the spec id varies: spec 0 is `truncate[5](dept)` and the current spec is `identity(dept)`,
+    /// and for `"eng"` both transforms yield the byte-identical tuple `{"eng"}`. The delete is built
+    /// from a `PartitionKey` on the OLD spec, so it carries the data file's exact partition value
+    /// while claiming a different `partition_spec_id`.
+    ///
+    /// The commit ACCEPTS it (`validate_partition_value` checks the tuple against the spec the file
+    /// CLAIMS — arity 1, type string — never *which* spec the file belongs to) and the read side
+    /// then drops it at the `data_file.partition_spec_id == delete.partition_spec_id` condition in
+    /// `DeleteFileIndex::get_deletes_for_data_file`. This is the fixture that makes that condition
+    /// load-bearing: deleting it turns this test red.
+    #[tokio::test]
+    async fn test_e2e_same_tuple_wrong_spec_id_alone_silently_under_deletes() {
+        let catalog = new_memory_catalog().await;
+        let old_spec = truncate5_dept_spec(0);
+        let table = make_table(&catalog, old_spec.clone()).await;
+
+        // spec 0 `truncate[5](dept)` → (remove) unpartitioned → (add) `identity(dept)`.
+        let (table, _) = evolve_remove_field(&catalog, &table, "dept_trunc").await;
+        let (table, cur_spec_id) = evolve_add_field(&catalog, &table, "dept").await;
+        let cur_spec = table.metadata().default_partition_spec().as_ref().clone();
+        assert_ne!(cur_spec_id, 0, "fixture: the current spec is not spec 0");
+        assert_eq!(
+            cur_spec.fields().len(),
+            old_spec.fields().len(),
+            "fixture: both specs have the same partition arity"
+        );
+
+        // The one tuple both specs produce for dept = "eng".
+        let tuple = Struct::from_iter([Some(Literal::string("eng"))]);
+
+        let data = write_data_file(
+            &table,
+            None,
+            Some(PartitionKey::new(
+                cur_spec.clone(),
+                table.metadata().current_schema().clone(),
+                tuple.clone(),
+            )),
+            &[(1, "eng"), (2, "eng")],
+        )
+        .await;
+        assert_eq!(data.partition_spec_id(), cur_spec_id);
+        assert_eq!(
+            data.partition, tuple,
+            "fixture: the data carries {{\"eng\"}}"
+        );
+        let data_path = data.file_path().to_string();
+        let table = fast_append(&catalog, &table, vec![data])
+            .await
+            .expect("commit data");
+        assert_eq!(scan_ids(&table).await, vec![1, 2]);
+
+        // The delete: SAME tuple, OLD spec id.
+        let wrong_key = PartitionKey::new(
+            old_spec,
+            table.metadata().current_schema().clone(),
+            tuple.clone(),
+        );
+        let delete = write_pos_delete(&table, None, Some(wrong_key), &[
+            (data_path.as_str(), 0),
+            (data_path.as_str(), 1),
+        ])
+        .await;
+        assert_eq!(
+            delete.partition, tuple,
+            "ISOLATION: the delete's tuple equals the data's, byte for byte"
+        );
+        assert_eq!(
+            delete.partition_spec_id(),
+            0,
+            "ISOLATION: the spec id is the ONLY difference"
+        );
+
+        let table = add_deletes(&catalog, &table, vec![delete]).await;
+        assert_eq!(
+            scan_ids(&table).await,
+            vec![1, 2],
+            "a delete differing ONLY in spec id commits and silently never applies"
+        );
+
+        // POSITIVE CONTROL: the same positions, the same tuple, the CURRENT spec id ⇒ applied.
+        let correct_key =
+            PartitionKey::new(cur_spec, table.metadata().current_schema().clone(), tuple);
+        let correct_delete = write_pos_delete(&table, None, Some(correct_key), &[
+            (data_path.as_str(), 0),
+            (data_path.as_str(), 1),
+        ])
+        .await;
+        let correct_spec_id = correct_delete.partition_spec_id();
+        let table = add_deletes(&catalog, &table, vec![correct_delete]).await;
+        assert!(
+            scan_ids(&table).await.is_empty(),
+            "the same delete under the matching spec id DOES apply"
+        );
+        assert_eq!(correct_spec_id, cur_spec_id);
+    }
+
+    /// EQUALITY DELETES ARE THE OTHER DIRECTION: a keyless one is GLOBAL, not inert.
+    ///
+    /// The Iceberg spec says "equality delete files stored with an unpartitioned spec are applied as
+    /// global deletes", and both engines implement it — Rust routes on the file's EMPTY TUPLE
+    /// (`PopulatedDeleteFileIndex::new` → `global_equality_deletes`), Java on the SPEC being
+    /// unpartitioned (`DeleteFileIndex.java` `add(...)`, 1.10.0). The global bucket is consulted with
+    /// NO spec-id and NO partition condition, only the sequence-number filter.
+    ///
+    /// So the hazard of a missing `PartitionKey` INVERTS between the two delete kinds: for a
+    /// position delete it under-deletes (rows resurrect); for an equality delete it OVER-deletes,
+    /// table-wide. `docs/ENGINE_CONTRACT.md` §7a must say so, and this test is its pin.
+    #[tokio::test]
+    async fn test_e2e_keyless_equality_delete_is_global_not_inert() {
+        let catalog = new_memory_catalog().await;
+        let table = make_table(
+            &catalog,
+            PartitionSpec::builder(test_schema())
+                .with_spec_id(0)
+                .build()
+                .expect("unpartitioned spec 0"),
+        )
+        .await;
+        let (table, cur_spec_id) = evolve_add_field(&catalog, &table, "dept").await;
+        let cur_spec = table.metadata().default_partition_spec().as_ref().clone();
+        let schema = table.metadata().current_schema().clone();
+
+        let eng = write_data_file(
+            &table,
+            None,
+            Some(PartitionKey::new(
+                cur_spec.clone(),
+                schema.clone(),
+                Struct::from_iter([Some(Literal::string("eng"))]),
+            )),
+            &[(1, "eng"), (2, "eng")],
+        )
+        .await;
+        let ops = write_data_file(
+            &table,
+            None,
+            Some(PartitionKey::new(
+                cur_spec,
+                schema,
+                Struct::from_iter([Some(Literal::string("ops"))]),
+            )),
+            &[(1, "ops"), (3, "ops")],
+        )
+        .await;
+        assert_eq!(eng.partition_spec_id(), cur_spec_id);
+        let table = fast_append(&catalog, &table, vec![eng, ops])
+            .await
+            .expect("commit data");
+        assert_eq!(scan_ids(&table).await, vec![1, 1, 2, 3]);
+
+        // No key, no configured spec: spec 0 AND an EMPTY tuple.
+        let delete = write_eq_delete_on_id(&table, None, None, &[(1, "eng")]).await;
+        assert_eq!(delete.partition_spec_id(), 0);
+        assert!(
+            delete.partition.fields().is_empty(),
+            "the keyless equality delete carries an empty tuple"
+        );
+
+        let table = add_deletes(&catalog, &table, vec![delete]).await;
+        assert_eq!(
+            scan_ids(&table).await,
+            vec![2, 3],
+            "id = 1 is gone from BOTH partitions: the keyless equality delete is GLOBAL, and it \
+             ignored the spec id it claimed"
+        );
+    }
+
+    /// The contrast leg: an equality delete with a NON-EMPTY tuple IS partition-scoped, and is the
+    /// case §7a's `(spec_id, partition)` pairing rule actually covers.
+    ///
+    /// Same fixture as the global twin; the only change is that the delete is built from the `eng`
+    /// `PartitionKey`. It must remove `id = 1` from `eng` ONLY — leaving `ops`'s `id = 1` alive,
+    /// which is exactly what distinguishes `[1, 2, 3]` here from `[2, 3]` there.
+    #[tokio::test]
+    async fn test_e2e_keyed_equality_delete_is_partition_scoped() {
+        let catalog = new_memory_catalog().await;
+        let table = make_table(
+            &catalog,
+            PartitionSpec::builder(test_schema())
+                .with_spec_id(0)
+                .build()
+                .expect("unpartitioned spec 0"),
+        )
+        .await;
+        let (table, cur_spec_id) = evolve_add_field(&catalog, &table, "dept").await;
+        let cur_spec = table.metadata().default_partition_spec().as_ref().clone();
+        let schema = table.metadata().current_schema().clone();
+        let eng_tuple = Struct::from_iter([Some(Literal::string("eng"))]);
+
+        let eng = write_data_file(
+            &table,
+            None,
+            Some(PartitionKey::new(
+                cur_spec.clone(),
+                schema.clone(),
+                eng_tuple.clone(),
+            )),
+            &[(1, "eng"), (2, "eng")],
+        )
+        .await;
+        let ops = write_data_file(
+            &table,
+            None,
+            Some(PartitionKey::new(
+                cur_spec.clone(),
+                schema.clone(),
+                Struct::from_iter([Some(Literal::string("ops"))]),
+            )),
+            &[(1, "ops"), (3, "ops")],
+        )
+        .await;
+        let table = fast_append(&catalog, &table, vec![eng, ops])
+            .await
+            .expect("commit data");
+        assert_eq!(scan_ids(&table).await, vec![1, 1, 2, 3]);
+
+        let delete = write_eq_delete_on_id(
+            &table,
+            None,
+            Some(PartitionKey::new(cur_spec, schema, eng_tuple.clone())),
+            &[(1, "eng")],
+        )
+        .await;
+        let delete_spec_id = delete.partition_spec_id();
+        let delete_partition = delete.partition.clone();
+
+        let table = add_deletes(&catalog, &table, vec![delete]).await;
+        assert_eq!(
+            scan_ids(&table).await,
+            vec![1, 2, 3],
+            "only eng's id = 1 is deleted — ops's survives, so this delete is partition-scoped"
+        );
+        // Corroborating guards, after the row-level outcome.
+        assert_eq!(delete_spec_id, cur_spec_id);
+        assert_eq!(delete_partition, eng_tuple);
     }
 }

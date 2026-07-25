@@ -55,9 +55,18 @@ where
     /// Create a new `EqualityDeleteFileWriterBuilder` using a `RollingFileWriterBuilder`.
     ///
     /// Prefer chaining [`with_partition_spec`](Self::with_partition_spec): without it, a writer built
-    /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0) — a delete file
-    /// that claims spec 0 is never applied to data files under any other spec. See
+    /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0). See
     /// `resolve_partition_spec_id`.
+    ///
+    /// **For equality deletes a missing key OVER-deletes, it does not under-delete.** A writer built
+    /// with no [`PartitionKey`] also emits an EMPTY partition tuple, and the Iceberg spec applies an
+    /// equality delete stored with an unpartitioned spec as a GLOBAL delete: the read side puts it in
+    /// a bucket consulted with no spec-id and no partition condition (Rust
+    /// `PopulatedDeleteFileIndex::new`; Java `DeleteFileIndex`), so it deletes matching rows from
+    /// EVERY data file in the table, whatever spec id it claims. Only an equality delete carrying a
+    /// NON-EMPTY tuple is scoped by `(spec_id, partition)` — and then a wrong spec id makes it apply
+    /// to nothing. See `docs/ENGINE_CONTRACT.md` §7a; both directions are pinned end-to-end in
+    /// `position_delete_writer.rs::spec_stamp_e2e_test`.
     pub fn new(
         inner: RollingFileWriterBuilder<B, L, F>,
         config: EqualityDeleteWriterConfig,
@@ -76,6 +85,14 @@ where
     /// current spec — a partition-scoped equality delete only ever applies to data files carrying the
     /// same `(spec_id, partition)`. It is used only when the writer is built WITHOUT a
     /// [`PartitionKey`]; a key always wins. See `resolve_partition_spec_id`.
+    ///
+    /// Configuring the spec does NOT by itself scope the delete: without a [`PartitionKey`] the file
+    /// still carries an EMPTY tuple and is applied as a GLOBAL equality delete (see [`new`](Self::new)).
+    /// Pass the key when the delete is meant for one partition.
+    ///
+    /// **This writer OWNS `partition_spec_id` on every [`DataFile`] it emits** — `close()` sets the
+    /// field unconditionally, overriding anything a custom
+    /// [`FileWriter`](crate::writer::file_writer::FileWriter) put on the returned `DataFileBuilder`.
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
@@ -841,9 +858,13 @@ mod test {
     // ============================================================================================
     // Partition-spec-id stamping — the equality-delete leg of `resolve_partition_spec_id`.
     //
-    // An equality delete that claims the wrong spec is never paired with the data files it was
-    // written for (`DeleteFileIndex::get_deletes_for_data_file` requires
-    // `data_file.partition_spec_id == delete.partition_spec_id`), so the rows it deletes resurrect.
+    // These are STAMP-level pins (what value lands on the file). The read-side consequence is
+    // asymmetric and is pinned end-to-end in `position_delete_writer.rs::spec_stamp_e2e_test`:
+    // an equality delete carrying a NON-EMPTY tuple is paired on `(spec_id, partition)`
+    // (`DeleteFileIndex::get_deletes_for_data_file`), so a wrong spec id makes it apply to nothing;
+    // but one carrying an EMPTY tuple — the shape a writer built with no `PartitionKey` produces —
+    // is a GLOBAL delete that applies to every data file regardless of the spec id it claims. See
+    // `docs/ENGINE_CONTRACT.md` §7a.
     // ============================================================================================
 
     /// `1: id long`, `2: dept string`, both required — the fixture schema for the stamping tests.
@@ -1011,7 +1032,7 @@ mod test {
     }
 
     /// LEGACY PATH PIN. Neither a configured spec nor a key ⇒ `DEFAULT_PARTITION_SPEC_ID` (0), the
-    /// pre-existing behavior every current caller relies on. See ENGINE_CONTRACT §7.
+    /// pre-existing behavior every current caller relies on. See `docs/ENGINE_CONTRACT.md` §7a.
     #[tokio::test]
     async fn test_equality_delete_writer_without_spec_or_key_stamps_default_zero()
     -> Result<(), anyhow::Error> {

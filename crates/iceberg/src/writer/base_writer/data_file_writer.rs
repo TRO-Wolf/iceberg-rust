@@ -42,9 +42,9 @@ use crate::{Error, ErrorKind, Result};
 /// always claims a spec that exists in the table. Rust's `DataFileBuilder` instead *defaults*
 /// `partition_spec_id` to [`DEFAULT_PARTITION_SPEC_ID`] (0), a fabricated value with no table behind
 /// it. A file stamped 0 by that default is silently wrong whenever the spec it was actually written
-/// under is not spec 0 — see [`ENGINE_CONTRACT.md`] §7 for the two observable outcomes (a
-/// same-arity wrong-spec delete commits and then never applies; an unpartitioned current spec with a
-/// non-zero id cannot be written at all).
+/// under is not spec 0 — see `docs/ENGINE_CONTRACT.md` §7a for the observable outcomes (a same-arity
+/// wrong-spec POSITION delete commits and then never applies; a keyless EQUALITY delete becomes a
+/// GLOBAL delete instead; an unpartitioned current spec with a non-zero id cannot be written at all).
 ///
 /// # Precedence
 ///
@@ -70,8 +70,6 @@ use crate::{Error, ErrorKind, Result};
 /// fields were void-replaced). An all-void spec still has partition fields, so its partition type
 /// still has that arity and a file under it still needs a tuple (of nulls) — `is_unpartitioned`
 /// would wave it through into the same commit-time arity failure this check exists to prevent.
-///
-/// [`ENGINE_CONTRACT.md`]: https://github.com/apache/iceberg-rust/blob/main/docs/ENGINE_CONTRACT.md
 pub(crate) fn resolve_partition_spec_id(
     configured_spec: Option<&PartitionSpec>,
     partition_key: Option<&PartitionKey>,
@@ -109,7 +107,7 @@ where
     /// Create a new `DataFileWriterBuilder` using a `RollingFileWriterBuilder`.
     ///
     /// Prefer chaining [`with_partition_spec`](Self::with_partition_spec): without it, a writer built
-    /// with no [`PartitionKey`] falls back to stamping [`DEFAULT_PARTITION_SPEC_ID`] (0) — see
+    /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0) — see
     /// `resolve_partition_spec_id`.
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
         Self {
@@ -124,6 +122,12 @@ where
     /// only when the writer is built WITHOUT a [`PartitionKey`]; a key always wins, because it
     /// carries the spec its tuple was produced from. See `resolve_partition_spec_id` for the full
     /// precedence and for why a partitioned spec with no key is rejected.
+    ///
+    /// **This writer OWNS `partition_spec_id` on every [`DataFile`] it emits.** `close()` sets the
+    /// field unconditionally, so a custom [`FileWriter`](crate::writer::file_writer::FileWriter)
+    /// that stamps it on the `DataFileBuilder` it returns will be overridden; give the spec to this
+    /// builder instead. (No in-tree `FileWriter` stamps it — `ParquetWriter` leaves the field at its
+    /// derive default.)
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
@@ -675,7 +679,7 @@ mod test {
     /// LEGACY PATH PIN. With neither a configured spec nor a key the writer still stamps
     /// `DEFAULT_PARTITION_SPEC_ID` (0) — source-compatible with every pre-existing caller, and
     /// correct only when the table's current spec really is spec 0. Pinned so that changing it is a
-    /// deliberate (breaking) act. See ENGINE_CONTRACT §7.
+    /// deliberate (breaking) act. See `docs/ENGINE_CONTRACT.md` §7a.
     #[tokio::test]
     async fn test_data_file_writer_without_spec_or_key_stamps_default_zero() -> Result<()> {
         let temp_dir = TempDir::new().expect("temp dir");

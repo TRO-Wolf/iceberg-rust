@@ -339,3 +339,29 @@ has a field the empty tuple cannot fill.
   || all fields are Void`), whose partition TYPE still has fields, so a tuple is still required.
   `is_unpartitioned()` would wave exactly that case through into the commit-time arity failure the guard
   exists to prevent. Mutation-proven: swapping the predicate reds the all-void leg and nothing else.
+
+### 2026-07-25 — A fixture that differs on TWO dimensions cannot attribute the outcome to one; and never state a read-side consequence without executing it
+
+Same unit (G2, engine-trust bundle), found by the independent Critic. Two separate defects in what was
+otherwise a correct, mutation-proven change — both of them in the *claims*, not the code.
+
+- **DON'T pin a claim of the form "X is what excludes it" with a fixture that also differs in Y.** The
+  wrong-spec delete e2e differed from its data in BOTH halves of the read-side `(spec_id, partition)` key:
+  spec 0 vs spec 1 AND `Struct::empty()` vs `{"eng"}`. The exclusion therefore happened at the partition
+  BUCKET LOOKUP and never reached the `partition_spec_id` comparison the test was advertised as proving —
+  deleting that comparison from `delete_file_index.rs` left the test GREEN. *Fix pattern:* find two specs
+  whose TRANSFORMS AGREE on the fixture value, so the tuple is byte-identical and the id is the only
+  variable — here `truncate[5](dept)` and `identity(dept)`, both `{"eng"}` for `"eng"`. Then the
+  condition-deleting mutation reds. *Cheap detector:* mutate the exact production line you are claiming
+  credit for; if the new test does not red, the fixture is not isolating it.
+- **DON'T write a normative read-side consequence into a contract doc (or public rustdoc) from the writer's
+  side of the seam — run it.** §7a asserted a wrong-spec delete "is never applied to any data file, for both
+  equality and position deletes". True for position deletes; INVERTED for the equality-delete shape the same
+  paragraph told engines to avoid: a writer with no `PartitionKey` also emits an EMPTY partition tuple, and
+  per the Iceberg spec an equality delete stored with an unpartitioned spec is a GLOBAL delete — Rust routes
+  on the empty tuple (`PopulatedDeleteFileIndex::new`), Java on `spec.isUnpartitioned()`
+  (`DeleteFileIndex.Builder.add`), and the global bucket is consulted with no spec-id and no partition
+  condition at all. The doc told engines "rows resurrect" where the real behavior is a table-wide
+  OVER-delete. *Why it matters more than a typo:* the two hazards need opposite mitigations, and the doc was
+  the deliverable. A contract sentence about what the READER does is only as good as the e2e that executed
+  it; write the probe, then write the sentence.
