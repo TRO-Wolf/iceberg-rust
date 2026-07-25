@@ -48,7 +48,105 @@ use crate::types::{
     RenameTableRequest, StorageCredential,
 };
 
-/// REST catalog URI
+/// REST catalog URI — the base address of the Iceberg REST catalog service.
+///
+/// # Trust model (SEC-011 adjudication, Java parity)
+///
+/// This value and the `oauth2-server-uri` property that overrides the token endpoint (see
+/// [`RestCatalogConfig::get_token_endpoint`]) have **two provenances**, and both are treated as
+/// trusted:
+///
+/// 1. **Operator-supplied** — the properties passed to `load`/the builder.
+/// 2. **Server-overridable** — [`RestCatalogConfig::merge_with_config`] lets the `/v1/config`
+///    response replace `uri` outright (`overrides.uri`) and merges the server's `defaults` /
+///    `overrides` into `props`, from which `oauth2-server-uri` is read. So a compromised catalog
+///    server can redirect subsequent requests, and can point the token POST — which carries the
+///    operator's `client_secret` — at a third-party host.
+///
+/// Provenance (2) is **parity-shared, not a fork defect**. In Java `RESTSessionCatalog.initialize`:
+/// the merged map is `mergedProps = config.merge(props)`
+/// (`core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:202-211`); the real client is
+/// then rebuilt from it and the catalog auth session is created from it
+/// (`:225-230`); the default client builder derives its base URI as
+/// `.uri(config.get(CatalogProperties.URI))` from whatever map it is handed (`:171-179`, `.uri` at
+/// `:175`); and the auth session reads `oauth2-server-uri` out of those same merged properties —
+/// `OAuth2Manager.catalogSession` calls `AuthConfig.fromProperties(properties)`
+/// (`core/src/main/java/org/apache/iceberg/rest/auth/OAuth2Manager.java:104-109`), which does
+/// `properties.getOrDefault(OAuth2Properties.OAUTH2_SERVER_URI, ResourcePaths.tokens())`
+/// (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:84-85`).
+///
+/// The merge order makes this stronger than "the server can contribute": server **`overrides`
+/// OUTRANK user properties**. `ConfigResponse.merge` seeds from `defaults`, then
+/// `merged.putAll(clientProperties)`, then `merged.putAll(overrides)` — last write wins — and the
+/// only filter applied is `Maps.filterValues(merged, Objects::nonNull)`, i.e. drop null VALUES;
+/// there is no key allowlist or denylist, and `ConfigResponse.validate()` is empty
+/// (`core/src/main/java/org/apache/iceberg/rest/responses/ConfigResponse.java:108-119`, `validate`
+/// at `:68`). A client that trusts a catalog server for its endpoint set necessarily trusts it for
+/// the endpoints themselves.
+///
+/// Bootstrap ordering is parity too: Java builds the init client and fetches `/v1/config` with the
+/// PRE-merge `props` and only then rebuilds from `mergedProps` (`:202-211` then `:225`), so the
+/// config fetch itself can never be redirected by the response it is fetching. This fork matches —
+/// [`RestCatalog::context`] does `HttpClient::new(&self.user_config)` and
+/// `load_config(&client, &self.user_config)` before `merge_with_config` and `update_with(&config)`.
+///
+/// **This does not contradict the `disable-header-redaction` strip** in
+/// [`RestCatalogConfig::merge_with_config`], and the distinction is the point: that key is a
+/// *client-only logging control* with no wire meaning, so a server has no legitimate reason to set
+/// it and a malicious one would use it to unmask the `Authorization` header this client already
+/// holds — pure downside, so it is stripped. `uri` and `oauth2-server-uri` are the opposite: server
+/// override is a *documented, functional* part of the REST config protocol (endpoint discovery /
+/// migration), and honoring it is required for correctness. Strip the former, honor the latter — and
+/// where the trust in the server is misplaced, the credential exposure via a redirected token POST is
+/// a risk Java carries identically.
+///
+/// To be precise about what the strip is: **Java has no `disable-header-redaction` analogue and
+/// filters nothing by key** (see the `filterValues`-only merge above). The strip is therefore
+/// fork-local hardening of a fork-local knob, NOT a parity claim — it neither follows Java nor
+/// diverges from it, because the key does not exist there.
+///
+/// Against either provenance the client applies no address filtering: it will connect to whatever
+/// host is named, including loopback, RFC 1918 / link-local addresses, and cluster-internal DNS
+/// names — the normal deployment, since catalog services usually live on a private network.
+///
+/// This deliberately mirrors Java `iceberg-core` 1.10.0, which applies **no** host, IP-range, or
+/// scheme restriction:
+///
+/// * `HTTPClient.Builder.uri(String)` only null-checks and parses:
+///   `Preconditions.checkNotNull(baseUri, …)` then `URI.create(RESTUtil.stripTrailingSlash(baseUri))`,
+///   rethrowing an `IllegalArgumentException` as a `RESTException`. Syntax validity only — no
+///   scheme allowlist, no HTTPS requirement, no address filtering
+///   (`core/src/main/java/org/apache/iceberg/rest/HTTPClient.java:483-491`).
+/// * `RESTSessionCatalog` passes the configured value straight through:
+///   `HTTPClient.builder(config).uri(config.get(CatalogProperties.URI))`
+///   (`core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:175`).
+/// * `oauth2-server-uri` is taken verbatim from properties, defaulting to the catalog-relative
+///   `ResourcePaths.tokens()`
+///   (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:85`); `OAuth2Manager`'s
+///   `warnIfOAuthServerUriNotSet` emits a deprecation WARN only when the key is ABSENT **and** the
+///   client is authenticating — `initToken != null` OR a non-empty `credential`
+///   (`core/src/main/java/org/apache/iceberg/rest/auth/OAuth2Manager.java:275-293`). A log line
+///   under a narrow condition, never a restriction.
+/// * A grep of the entire `core/src/main/java/org/apache/iceberg/rest/` tree finds no loopback /
+///   `InetAddress` / site-local / allowlist logic. TLS is a pluggable operator *extension* point
+///   (`rest.client.tls.configurer-impl`, `HTTPClient.java:98`), not a restriction.
+///
+/// One transport-layer nuance, for precision: "no restriction" is true of Iceberg's *own* code on
+/// both sides, but the underlying HTTP clients differ, and this fork is the STRICTER of the two.
+/// Iceberg configures no redirect policy anywhere in `core/.../rest/`, so Java inherits Apache
+/// HttpClient5's defaults (follow redirects, max 50, no cross-origin header stripping), whereas this
+/// fork inherits `reqwest`'s (follow redirects, max 10, and `Authorization` / `Cookie` /
+/// `Proxy-Authorization` stripped on a cross-origin redirect). Redirect-following is therefore a
+/// smaller credential-forwarding surface here than in Java — a divergence in the safe direction, and
+/// not one to "fix".
+///
+/// SSRF is a concern when a URI arrives from an *untrusted* source (a request parameter, a
+/// user-submitted document). That is not this surface: whoever can set catalog properties — or
+/// operate the catalog server the client was pointed at — can already point the client anywhere and
+/// read whatever it fetches. Adding a private-IP blocklist here would break legitimate
+/// private-endpoint deployments, the majority case, and diverge from Java. Callers that DO accept a
+/// catalog URI from untrusted input must validate it before it reaches this configuration; that
+/// check belongs at their trust boundary, not in this client.
 pub const REST_CATALOG_PROP_URI: &str = "uri";
 /// REST catalog warehouse location
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
@@ -178,16 +276,22 @@ impl RestCatalogBuilder {
     }
 }
 
-/// Property keys whose values are secret-bearing and must be redacted from `Debug`.
-///
-/// `credential` holds the OAuth `client_id:client_secret`, `token` holds a bearer token,
-/// and `client_secret` is the raw secret. Their presence is preserved as `"***"` but the
-/// value is never printed.
-const SECRET_PROP_KEYS: &[&str] = &["credential", "token", "client_secret"];
-
 /// Returns true if a property key holds a secret value that must be redacted from `Debug`.
+///
+/// SEC-010: this delegates to the canonical needle test `iceberg::io::is_secret_prop_key`
+/// (`crates/iceberg/src/io/storage/config/mod.rs`) instead of keeping a REST-local list. The
+/// previous local list matched only the three EXACT keys `credential` / `token` / `client_secret`,
+/// but [`RestCatalogConfig`]`::props` is exactly the map this catalog clones into the table's
+/// `FileIO` props (see [`RestCatalog::load_file_io`]), so it routinely carries storage credentials
+/// — `s3.secret-access-key`, `s3.session-token`, `gcs.oauth2.token`, `adls.connection-string` —
+/// none of which the exact-match list redacted. One authoritative needle list (shared with
+/// `StorageConfig` and the Glue / HMS / S3Tables / SQL config `Debug` impls) removes that drift.
+///
+/// The canonical test is a deliberate SUPERSET: a non-secret key whose name merely contains a
+/// needle (e.g. `token-refresh-enabled`) is redacted too. Over-redaction is the safe direction for
+/// a debug view.
 fn is_secret_prop_key(key: &str) -> bool {
-    SECRET_PROP_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+    iceberg::io::is_secret_prop_key(key)
 }
 
 /// Rest catalog configuration.
@@ -250,6 +354,14 @@ impl RestCatalogConfig {
         [&self.uri, PATH_V1, "config"].join("/")
     }
 
+    /// The OAuth token endpoint: the operator-configured `oauth2-server-uri` when present,
+    /// otherwise the catalog-relative `<uri>/v1/oauth/tokens`.
+    ///
+    /// The configured value is used VERBATIM — no scheme, host, or address restriction — matching
+    /// Java `AuthConfig.fromProperties`, which does
+    /// `properties.getOrDefault(OAuth2Properties.OAUTH2_SERVER_URI, ResourcePaths.tokens())`
+    /// (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:85`). See the trust-model
+    /// note on [`REST_CATALOG_PROP_URI`] for the SEC-011 adjudication.
     pub(crate) fn get_token_endpoint(&self) -> String {
         if let Some(oauth2_uri) = self.props.get("oauth2-server-uri") {
             oauth2_uri.to_string()
@@ -2267,6 +2379,328 @@ mod tests {
         assert!(
             debug.contains("visible-value"),
             "Debug dropped non-secret props: {debug}"
+        );
+    }
+
+    /// SECURITY (SEC-010, needle-drift fix): `RestCatalogConfig::props` is cloned wholesale into
+    /// the table's `FileIO` props by [`RestCatalog::load_file_io`], so operators put storage
+    /// credentials there. The REST-local redaction list used to be an EXACT match on
+    /// `credential` / `token` / `client_secret` only, which masked NONE of the keys below —
+    /// `RestCatalogConfig`'s own `Debug` printed them in clear. Redaction now routes through the
+    /// canonical superset `iceberg::io::is_secret_prop_key`.
+    ///
+    /// RED-able: restore the exact-match `SECRET_PROP_KEYS` list and this fails on every key.
+    #[test]
+    fn test_rest_catalog_config_debug_redacts_vended_filei_o_credentials() {
+        const SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_DEBUG";
+
+        for key in [
+            "s3.secret-access-key",
+            "s3.session-token",
+            "s3.access-key-id",
+            "gcs.oauth2.token",
+            "adls.connection-string",
+        ] {
+            let props = HashMap::from([
+                (key.to_string(), SENTINEL.to_string()),
+                (
+                    "s3.endpoint".to_string(),
+                    "https://s3.example.test".to_string(),
+                ),
+            ]);
+
+            let config = RestCatalogConfig::builder()
+                .uri("http://localhost".to_string())
+                .props(props)
+                .build();
+
+            let debug = format!("{config:?}");
+
+            assert!(
+                !debug.contains(SENTINEL),
+                "Debug leaked the value of `{key}`: {debug}"
+            );
+            assert!(
+                debug.contains("***"),
+                "`{key}` was not masked at all: {debug}"
+            );
+            // Anti-over-redaction: the key itself and non-secret siblings stay readable.
+            assert!(
+                debug.contains(key),
+                "Debug dropped the key `{key}`: {debug}"
+            );
+            assert!(
+                debug.contains("https://s3.example.test"),
+                "Debug dropped the non-secret endpoint alongside `{key}`: {debug}"
+            );
+        }
+    }
+
+    /// SECURITY (SEC-010 / F1): redacting the wire types' `Debug` is defeated if the RAW response
+    /// body reaches the error context — `iceberg::Error` renders context VERBATIM in both `Display`
+    /// and `Debug`, so one parse failure printed everything the redaction had just masked.
+    ///
+    /// This is the `/v1/config` path: `defaults` carries a vended credential and `overrides` is
+    /// MISSING, so `CatalogConfig` fails to deserialize while the secret is in the body. The
+    /// realistic trigger is version skew — a server returning a payload this parser rejects hands
+    /// back the same body that carries the credentials.
+    ///
+    /// RED-able: restore `.with_context("json", String::from_utf8_lossy(&bytes))` in
+    /// `deserialize_catalog_response`.
+    #[tokio::test]
+    async fn test_config_parse_failure_does_not_leak_body() {
+        const SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_ERROR";
+
+        let mut server = Server::new_async().await;
+        // 200 OK, secret present in `defaults`, but `overrides` is absent => parse failure.
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"defaults": {{"s3.secret-access-key": "{SENTINEL}"}}}}"#
+            ))
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let err = catalog
+            .list_namespaces(None)
+            .await
+            .expect_err("an unparsable /v1/config body must surface an error");
+
+        config_mock.assert_async().await;
+
+        let rendered = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "config body leaked into Display: {rendered}"
+        );
+        assert!(
+            !debug.contains(SENTINEL),
+            "config body leaked into Debug: {debug}"
+        );
+        // Anti-over-redaction: the safe diagnostics must still be attached, or the error is
+        // useless and this test would pass vacuously against a context-free error.
+        assert!(
+            rendered.contains("response_body_len"),
+            "expected the safe body-length diagnostic: {rendered}"
+        );
+        assert!(
+            rendered.contains("status"),
+            "expected the safe status diagnostic: {rendered}"
+        );
+    }
+
+    /// SECURITY (SEC-010 / F1), the higher-value payload: a `load_table` 200 body carries BOTH the
+    /// `config` overlay and the vended `storage-credentials`. Here the body is rejected because
+    /// `metadata` is the wrong JSON type (standing in for an unknown V3 field / version skew) while
+    /// the vended `s3.session-token` sits in the same body.
+    ///
+    /// SCOPE: this pins the SAFE shape only — a scalar type mismatch, where `serde_json`'s message
+    /// echoes just the offending scalar (`invalid type: integer 12345`). It does NOT establish that
+    /// credentials elsewhere in a body are generally unreachable through `source`: when the
+    /// mismatch sits at a CONTAINER boundary the echoed value is an entire sub-document. That leaky
+    /// shape is pinned separately by
+    /// [`test_known_residue_double_encoded_body_leaks_through_error_source`].
+    ///
+    /// RED-able: restore `.with_context("json", …)` in `deserialize_catalog_response`.
+    #[tokio::test]
+    async fn test_load_table_parse_failure_does_not_leak_vended_credentials() {
+        const SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_ERROR";
+
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        // A real load_table body, carrying vended credentials, corrupted so it cannot parse.
+        let mut body: serde_json::Value = serde_json::from_str(&load_table_body(
+            json!({ "s3.secret-access-key": SENTINEL }),
+            Some(json!([{
+                "prefix": "s3://warehouse",
+                "config": { "s3.session-token": SENTINEL }
+            }])),
+        ))
+        .expect("patched load_table body must be valid JSON");
+        body["metadata"] = json!(12345);
+        let broken = serde_json::to_string(&body).expect("serialize the corrupted body");
+        assert!(
+            broken.contains(SENTINEL),
+            "precondition: the body under test must actually carry the secret"
+        );
+
+        let table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/table1")
+            .with_status(200)
+            .with_body(broken)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let err = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "table1".to_string(),
+            ))
+            .await
+            .expect_err("an unparsable load_table body must surface an error");
+
+        config_mock.assert_async().await;
+        table_mock.assert_async().await;
+
+        let rendered = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "vended credentials leaked into Display: {rendered}"
+        );
+        assert!(
+            !debug.contains(SENTINEL),
+            "vended credentials leaked into Debug: {debug}"
+        );
+        assert!(
+            rendered.contains("response_body_len"),
+            "expected the safe body-length diagnostic: {rendered}"
+        );
+    }
+
+    /// KNOWN RESIDUE PIN — this test asserts that a leak **still happens**. It is not a guard; it
+    /// documents the boundary of the F1 fix so the gap cannot be quietly forgotten or over-claimed.
+    ///
+    /// Withholding the raw body from the error CONTEXT does not close the `source` channel.
+    /// `deserialize_catalog_response` keeps `.with_source(e)` because AGENTS.md requires the error
+    /// chain to survive, and `iceberg::Error` renders the source VERBATIM (`, source: {source}`) in
+    /// both `Display` and `Debug` (`crates/iceberg/src/error.rs`). `serde_json`'s message echoes the
+    /// value AT THE FAILURE POSITION — and when the mismatch is at a CONTAINER boundary, that value
+    /// is an entire sub-document, echoed in full via `Unexpected::Str`.
+    ///
+    /// The shape below is a real, well-known bug class, not a contrivance: a server or API gateway
+    /// that emits a nested object as a JSON *string* (`writeValueAsString` on a sub-map, a
+    /// proxy-integration stringifying the body) turns `config` into a string whose CONTENT is the
+    /// whole vended-credential map. `serde` then reports `invalid type: string "…", expected a map`
+    /// with the credentials inline.
+    ///
+    /// FIX OWNER: this is not closable in this crate without breaking the error chain. It belongs to
+    /// the core-crate residue unit that reworks `iceberg::Error`'s `Display`/`Debug` source
+    /// rendering (the chain obligation is satisfied by `source()` EXISTING; the leak is core's
+    /// verbatim interpolation of it). **When that unit lands, this test flips**: the assertions
+    /// invert to `!contains`, and this doc block is deleted.
+    #[tokio::test]
+    async fn test_known_residue_double_encoded_body_leaks_through_error_source() {
+        const SENTINEL: &str = "SENTINEL_LEAKS_VIA_SERDE_SOURCE_KNOWN_RESIDUE";
+
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        // `config` arrives DOUBLE-ENCODED: a JSON string whose content is the credential map.
+        // Metadata is untouched and valid, so the ONLY parse failure is the container mismatch.
+        let body = load_table_body(
+            json!(format!(r#"{{"s3.secret-access-key":"{SENTINEL}"}}"#)),
+            None,
+        );
+        assert!(
+            body.contains(SENTINEL),
+            "precondition: the body under test must carry the secret"
+        );
+
+        let table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/table1")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let err = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "table1".to_string(),
+            ))
+            .await
+            .expect_err("a double-encoded config must fail to deserialize");
+
+        config_mock.assert_async().await;
+        table_mock.assert_async().await;
+
+        let rendered = format!("{err}");
+        let debug = format!("{err:?}");
+
+        // The raw-body CONTEXT attach is gone — that part of the F1 fix holds.
+        assert!(
+            rendered.contains("response_body_len"),
+            "the safe diagnostics must still be attached: {rendered}"
+        );
+
+        // ...but the secret still reaches the log through `source`. Asserting the leak keeps this
+        // documented and makes the eventual core fix observable here.
+        assert!(
+            rendered.contains(SENTINEL),
+            "KNOWN RESIDUE no longer reproduces in Display — if the core `iceberg::Error` source \
+             rendering was fixed, invert these assertions and delete the residue doc block. \
+             Rendered: {rendered}"
+        );
+        assert!(
+            debug.contains(SENTINEL),
+            "KNOWN RESIDUE no longer reproduces in Debug — see the note above. Debug: {debug}"
+        );
+    }
+
+    /// SEC-011 adjudication guard (Java parity — see the trust-model note on
+    /// [`REST_CATALOG_PROP_URI`]).
+    ///
+    /// Java `iceberg-core` 1.10.0 applies NO host/IP/scheme restriction to the catalog `uri` or to
+    /// `oauth2-server-uri`: `HTTPClient.Builder.uri` only null-checks and `URI.create`s
+    /// (`HTTPClient.java:483-491`), `RESTSessionCatalog` passes the property straight through
+    /// (`RESTSessionCatalog.java:175`), and `AuthConfig.fromProperties` takes `oauth2-server-uri`
+    /// verbatim (`AuthConfig.java:85`). Reaching a private endpoint is the NORMAL deployment — that
+    /// is where catalog services live — so the audit's proposed private-IP blocklist is rejected as
+    /// a Java divergence that would break legitimate deployments.
+    ///
+    /// This test pins that decision: a loopback / RFC 1918 / link-local endpoint must be accepted
+    /// and used verbatim. RED-able: adding any private-address or scheme blocklist fails it.
+    #[test]
+    fn test_private_and_loopback_uris_are_accepted_java_parity() {
+        // Catalog uri: accepted verbatim, no rewriting, no rejection.
+        for uri in [
+            "http://127.0.0.1:8181",
+            "http://localhost:8181",
+            "http://10.0.0.7:8181",
+            "http://192.168.1.10:8181",
+            "http://169.254.169.254",
+            "http://catalog.internal:8181",
+        ] {
+            let config = RestCatalogConfig::builder().uri(uri.to_string()).build();
+            assert_eq!(
+                config.get_token_endpoint(),
+                format!("{uri}/v1/oauth/tokens"),
+                "catalog uri `{uri}` must be used verbatim (Java applies no address restriction)"
+            );
+        }
+
+        // oauth2-server-uri: an explicitly configured private token endpoint wins verbatim,
+        // mirroring Java `AuthConfig.fromProperties`.
+        let config = RestCatalogConfig::builder()
+            .uri("https://catalog.example.test".to_string())
+            .props(HashMap::from([(
+                "oauth2-server-uri".to_string(),
+                "http://10.1.2.3:9000/token".to_string(),
+            )]))
+            .build();
+        assert_eq!(
+            config.get_token_endpoint(),
+            "http://10.1.2.3:9000/token",
+            "a configured private oauth2-server-uri must be honoured verbatim"
         );
     }
 

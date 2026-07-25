@@ -16,12 +16,12 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{Sender, channel};
 use tokio::sync::Notify;
+use tokio::sync::futures::OwnedNotified;
 
 use crate::runtime::spawn;
 use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
@@ -38,6 +38,86 @@ pub(crate) struct DeleteFileIndex {
 enum DeleteFileIndexState {
     Populating(Arc<Notify>),
     Populated(PopulatedDeleteFileIndex),
+    /// The populate task terminated WITHOUT publishing an index — it unwound, or its future was
+    /// dropped by a runtime teardown (whether parked at `collect()` or never polled at all).
+    ///
+    /// Terminal, exactly like [`DeleteFileIndexState::Populated`]: the populate task is the sole
+    /// writer and runs once, so if it dies the state can never advance on its own. Without this
+    /// variant the state would stay `Populating` forever and every scan parked in
+    /// [`DeleteFileIndex::get_deletes_for_data_file`] would wait on a notification that can no
+    /// longer be sent. The `String` is the reason, rendered into each waiter's typed error. This
+    /// mirrors `EqDelState::Failed` in [`crate::arrow::delete_filter`].
+    Failed(String),
+}
+
+/// Publishes the populate task's TERMINAL state and wakes the waiters.
+///
+/// Constructed in the `spawn` PRELUDE — not inside the `async move` block — so the populate
+/// future CAPTURES an already-armed guard rather than arming it on its first poll. That
+/// distinction is the whole guarantee: a future constructed-on-poll that is dropped before it is
+/// ever polled runs no local destructors, so a runtime torn down between `spawn` and the first
+/// poll would leave the state stranded at `Populating`.
+///
+/// [`PopulateGuard::publish`] disarms it on the success path. If that call is never reached,
+/// `Drop` publishes [`DeleteFileIndexState::Failed`] instead, so every waiter reaches a terminal
+/// state and gets a typed error rather than hanging forever. `Drop` therefore covers all three
+/// ways the task can die without publishing: never polled, unwound (tokio drops the task's future
+/// as the panic propagates), and cancelled/parked-future teardown.
+///
+/// Both paths write the state under the write lock and fire the notifier only AFTER releasing it,
+/// so a woken waiter always observes the terminal state (see [`DeleteFileIndex::lookup_or_arm`]
+/// for the other half of that handshake).
+struct PopulateGuard {
+    state: Arc<RwLock<DeleteFileIndexState>>,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl PopulateGuard {
+    fn new(state: Arc<RwLock<DeleteFileIndexState>>, notify: Arc<Notify>) -> Self {
+        Self {
+            state,
+            notify,
+            armed: true,
+        }
+    }
+
+    /// Publish `terminal` and wake every waiter, disarming the guard.
+    fn publish(&mut self, terminal: DeleteFileIndexState) {
+        {
+            // Recover a poisoned guard rather than cascading the panic: this is the sole writer
+            // and it runs once, so recovering and completing the transition is always the right
+            // move (a stranded `Populating` state would hang every waiting scan on the notifier
+            // below).
+            let mut guard = self
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = terminal;
+        }
+        self.armed = false;
+        self.notify.notify_waiters();
+    }
+}
+
+impl Drop for PopulateGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.publish(DeleteFileIndexState::Failed(
+                "the delete file index populate task terminated before publishing an index \
+                 (it panicked, or the runtime was shut down)"
+                    .to_string(),
+            ));
+        }
+    }
+}
+
+/// The outcome of consulting the index state once — see [`DeleteFileIndex::lookup_or_arm`].
+enum IndexLookup {
+    /// The index had reached a terminal state; this is the answer.
+    Ready(Vec<FileScanTaskDeleteFile>),
+    /// The index was still populating. Await this future, then read the state again.
+    Wait(OwnedNotified),
 }
 
 #[derive(Debug)]
@@ -78,24 +158,20 @@ impl DeleteFileIndex {
         let delete_file_stream = rx.boxed();
 
         spawn({
-            let state = state.clone();
+            // Armed HERE, in the prelude, so the future below CAPTURES the guard instead of
+            // constructing it on its first poll. Dropping the future then always runs the guard's
+            // `Drop` — including when the future is dropped before it is ever polled (a runtime
+            // torn down between this `spawn` and the first poll), which a guard constructed inside
+            // the `async move` block would miss entirely.
+            let mut guard = PopulateGuard::new(state.clone(), notify);
+
             async move {
                 let delete_files: Vec<DeleteFileContext> =
                     delete_file_stream.collect::<Vec<_>>().await;
 
                 let populated_delete_file_index = PopulatedDeleteFileIndex::new(delete_files);
 
-                {
-                    // Recover a poisoned guard rather than cascading the panic: this is the sole
-                    // writer and it runs once, so recovering and completing the Populated
-                    // transition is always the right move (a stranded Populating state would hang
-                    // every waiting scan on the notifier below).
-                    let mut guard = state
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    *guard = DeleteFileIndexState::Populated(populated_delete_file_index);
-                }
-                notify.notify_waiters();
+                guard.publish(DeleteFileIndexState::Populated(populated_delete_file_index));
             }
         });
 
@@ -113,40 +189,58 @@ impl DeleteFileIndex {
         data_file: &DataFile,
         seq_num: Option<i64>,
     ) -> Result<Vec<FileScanTaskDeleteFile>> {
-        let notifier = {
-            let guard = self.state.read().map_err(|_| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "delete file index RwLock was poisoned",
-                )
-            })?;
-            match *guard {
-                DeleteFileIndexState::Populating(ref notifier) => notifier.clone(),
-                DeleteFileIndexState::Populated(ref index) => {
-                    return index.get_deletes_for_data_file(data_file, seq_num);
-                }
-            }
-        };
+        match self.lookup_or_arm(data_file, seq_num)? {
+            IndexLookup::Ready(deletes) => return Ok(deletes),
+            IndexLookup::Wait(notified) => notified.await,
+        }
 
-        notifier.notified().await;
+        // The populate task publishes a TERMINAL state under the write lock and only then fires
+        // the notifier, so a woken waiter always observes `Populated` or `Failed`. (This second
+        // call arms a notifier it will not use — one `Arc` clone — which keeps the lock/arm
+        // handshake in exactly one place.)
+        match self.lookup_or_arm(data_file, seq_num)? {
+            IndexLookup::Ready(deletes) => Ok(deletes),
+            IndexLookup::Wait(_) => Err(Error::new(
+                ErrorKind::Unexpected,
+                "delete file index notifier fired but the index is not populated",
+            )),
+        }
+    }
 
+    /// Read the index state once: answer outright if it is terminal, otherwise ARM the notifier.
+    ///
+    /// The arming MUST happen here, while the read lock is still held.
+    /// [`Notify::notify_waiters`] stores no permit and only wakes `Notified` futures that already
+    /// EXIST when it fires, and `Notify::notified_owned` snapshots the notifier's
+    /// `notify_waiters` counter at CALL time — so a `Notified` created after the populate task
+    /// fired is never woken. Returning a bare `Arc<Notify>` and calling `.notified()` at the await
+    /// site left exactly that window open between releasing the read lock and creating the future:
+    /// if the populate task published and notified in it, the wakeup was dropped and the scan
+    /// awaited forever (upstream apache/iceberg-rust#2696, the same class as #2859 on the
+    /// positional-delete wait path).
+    ///
+    /// Creating the future under the read lock closes the window: the populate task cannot fire
+    /// the notifier until it has taken the WRITE lock, which cannot be granted while this read
+    /// lock is held, so any notification necessarily follows this arming and is delivered.
+    fn lookup_or_arm(&self, data_file: &DataFile, seq_num: Option<i64>) -> Result<IndexLookup> {
         let guard = self.state.read().map_err(|_| {
             Error::new(
                 ErrorKind::Unexpected,
                 "delete file index RwLock was poisoned",
             )
         })?;
-        match guard.deref() {
-            DeleteFileIndexState::Populated(index) => {
-                index.get_deletes_for_data_file(data_file, seq_num)
-            }
-            // The populate task sets `Populated` and only then fires the notifier, so after the
-            // await the state is populated. A non-populated state here is an invariant violation
-            // (or a spurious wakeup) — surface a typed error rather than panicking the scan.
-            _ => Err(Error::new(
-                ErrorKind::Unexpected,
-                "delete file index notifier fired but the index is not populated",
+
+        match &*guard {
+            DeleteFileIndexState::Populated(index) => Ok(IndexLookup::Ready(
+                index.get_deletes_for_data_file(data_file, seq_num)?,
             )),
+            DeleteFileIndexState::Failed(reason) => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("delete file index is unavailable: {reason}"),
+            )),
+            DeleteFileIndexState::Populating(notifier) => {
+                Ok(IndexLookup::Wait(notifier.clone().notified_owned()))
+            }
         }
     }
 }
@@ -329,6 +423,8 @@ impl PopulatedDeleteFileIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use uuid::Uuid;
 
     use super::*;
@@ -875,6 +971,225 @@ mod tests {
             results.is_empty(),
             "a Data-typed entry must be skipped, not indexed as a delete"
         );
+    }
+
+    /// Risk pinned (audit SAF-007 / upstream apache/iceberg-rust#2696): the waiter must ARM its
+    /// notifier while it still holds the read lock, so a `notify_waiters()` that fires before the
+    /// waiter awaits still wakes it. `notify_waiters()` stores no permit, so this test's ordering
+    /// — publish FIRST, await SECOND — only completes when the `Notified` already existed at
+    /// publish time.
+    ///
+    /// MUTATION (semantic revert to the base contract: `IndexLookup::Wait` carries a raw
+    /// `Arc<Notify>` and the waiter calls `.notified()` at the await site): the future is created
+    /// after `publish`, the wakeup is lost, and the timeout below fires (RED).
+    #[tokio::test]
+    async fn test_waiter_is_armed_before_the_publisher_can_notify() {
+        // The sender stays alive for the whole test, so the real populate task stays parked on
+        // its `collect()` and this test is the only publisher.
+        let (index, _tx) = DeleteFileIndex::new();
+        let data_file = build_unpartitioned_data_file();
+
+        let notified = match index
+            .lookup_or_arm(&data_file, Some(0))
+            .expect("arming a populating index must not error")
+        {
+            IndexLookup::Wait(notified) => notified,
+            IndexLookup::Ready(_) => {
+                panic!("the index must still be populating while the sender is alive")
+            }
+        };
+
+        // Publish + `notify_waiters()` through the production publisher, BEFORE the waiter awaits.
+        let notifier = {
+            let guard = index.state.read().expect("read the index state");
+            match &*guard {
+                DeleteFileIndexState::Populating(notifier) => notifier.clone(),
+                other => panic!("expected a populating index, got {other:?}"),
+            }
+        };
+        PopulateGuard::new(index.state.clone(), notifier).publish(DeleteFileIndexState::Populated(
+            PopulatedDeleteFileIndex::new(vec![]),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), notified)
+            .await
+            .expect("a notification fired after arming must wake the waiter, not be lost");
+
+        let deletes = index
+            .get_deletes_for_data_file(&data_file, Some(0))
+            .await
+            .expect("the woken waiter must read the published index");
+        assert!(
+            deletes.is_empty(),
+            "the published index was empty, so no deletes may apply"
+        );
+    }
+
+    /// Risk pinned (audit SAF-007): if the populate task dies WITHOUT publishing — here by tearing
+    /// down the runtime that hosts it while it is parked on `collect()` — the index must reach the
+    /// terminal `Failed` state so every waiter gets a typed error. Nothing can advance the state
+    /// afterwards, so without that transition the waiter parks on a notification that can never be
+    /// sent.
+    ///
+    /// MUTATION: reverting `delete_file_index.rs` (no `PopulateGuard`, no `Failed`) leaves the
+    /// state at `Populating`; the waiter never wakes and the timeout below fires (RED).
+    #[tokio::test]
+    async fn test_dead_populate_task_yields_a_typed_error_not_a_hang() {
+        let data_file = build_unpartitioned_data_file();
+
+        // Build the index on a runtime that is then DESTROYED, cancelling the populate task and
+        // dropping its future. Done on a separate thread because dropping a runtime from inside
+        // an async context panics.
+        let (index, _tx) = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build the throwaway runtime that hosts the populate task");
+            let (index, tx) = runtime.block_on(async {
+                let (index, tx) = DeleteFileIndex::new();
+                // Let the populate task reach its `collect()` await, past the point where its
+                // drop guard is armed.
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                (index, tx)
+            });
+            drop(runtime);
+            (index, tx)
+        })
+        .join()
+        .expect("the runtime-teardown thread must not panic");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&data_file, Some(0)),
+        )
+        .await
+        .expect("a dead populate task must not hang the waiter")
+        .expect_err("a dead populate task must surface a typed error");
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains("populate task"),
+            "the error must name the dead populate task, got: {error}"
+        );
+    }
+
+    /// Risk pinned (audit SAF-007, Critic probe P1b): the populate future can be dropped BEFORE IT
+    /// IS EVER POLLED — a runtime torn down between `spawn` and the first poll. A future dropped
+    /// unpolled runs no local destructors, so a guard constructed *inside* the `async move` block
+    /// would never exist and the state would strand at `Populating`. The guard is therefore
+    /// constructed in the `spawn` prelude and CAPTURED by the future.
+    ///
+    /// MUTATION: moving `PopulateGuard::new(...)` back inside the `async move` block leaves this
+    /// waiter with no terminal state and the timeout below fires (RED), while the parked-future
+    /// test above still passes — which is exactly why this pin is separate from it.
+    #[tokio::test]
+    async fn test_never_polled_populate_task_yields_a_typed_error_not_a_hang() {
+        let data_file = build_unpartitioned_data_file();
+
+        let (index, _tx) = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build the throwaway runtime that hosts the populate task");
+            // ZERO yields: `block_on` returns as soon as `new()` does, so the populate future is
+            // queued but never polled before the runtime below is destroyed.
+            let (index, tx) = runtime.block_on(async { DeleteFileIndex::new() });
+            drop(runtime);
+            (index, tx)
+        })
+        .join()
+        .expect("the runtime-teardown thread must not panic");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&data_file, Some(0)),
+        )
+        .await
+        .expect("a never-polled populate task must not hang the waiter")
+        .expect_err("a never-polled populate task must surface a typed error");
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains("populate task"),
+            "the error must name the dead populate task, got: {error}"
+        );
+    }
+
+    /// Risk pinned (audit SAF-007, Critic probe P2): a populate task that UNWINDS must leave the
+    /// index in the terminal `Failed` state, not stranded at `Populating`.
+    ///
+    /// The panic is raised in a task holding a [`PopulateGuard`] over the real index's state
+    /// rather than inside the real populate task: that task's body has no reachable panic source
+    /// today (`PopulatedDeleteFileIndex::new` handles every `DataContentType` without indexing or
+    /// unwrapping), so injecting one would need a test-only seam in production code. What is
+    /// pinned is the property that matters — an unwind past a live guard publishes `Failed` and
+    /// wakes the waiters.
+    #[tokio::test]
+    async fn test_unwinding_populate_task_yields_a_typed_error_not_a_hang() {
+        let (index, _tx) = DeleteFileIndex::new();
+        let data_file = build_unpartitioned_data_file();
+
+        let notifier = {
+            let guard = index.state.read().expect("read the index state");
+            match &*guard {
+                DeleteFileIndexState::Populating(notifier) => notifier.clone(),
+                other => panic!("expected a populating index, got {other:?}"),
+            }
+        };
+
+        let state = index.state.clone();
+        let join_error = spawn(async move {
+            let _guard = PopulateGuard::new(state, notifier);
+            panic!("simulated populate-task unwind");
+        })
+        .try_join()
+        .await
+        .expect_err("the simulated populate task must have unwound");
+        assert_eq!(join_error.kind(), ErrorKind::Unexpected);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&data_file, Some(0)),
+        )
+        .await
+        .expect("an unwound populate task must not hang the waiter")
+        .expect_err("an unwound populate task must surface a typed error");
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains("populate task"),
+            "the error must name the dead populate task, got: {error}"
+        );
+    }
+
+    /// The terminal `Failed` state must be reported to EVERY subsequent caller, not just the one
+    /// that was parked when the populate task died — the state can never advance again.
+    #[tokio::test]
+    async fn test_failed_index_state_is_terminal_for_later_callers() {
+        let (index, _tx) = DeleteFileIndex::new();
+        let data_file = build_unpartitioned_data_file();
+
+        {
+            let mut guard = index.state.write().expect("write the index state");
+            *guard = DeleteFileIndexState::Failed("populate task was cancelled".to_string());
+        }
+
+        for _ in 0..2 {
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                index.get_deletes_for_data_file(&data_file, Some(0)),
+            )
+            .await
+            .expect("a failed index must answer immediately")
+            .expect_err("a failed index must surface a typed error");
+            assert_eq!(error.kind(), ErrorKind::Unexpected);
+            assert!(
+                error.to_string().contains("populate task was cancelled"),
+                "the error must carry the recorded reason, got: {error}"
+            );
+        }
     }
 
     fn build_unpartitioned_data_file() -> DataFile {

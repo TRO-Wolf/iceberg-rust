@@ -555,9 +555,53 @@ pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest:
 /// Deserializes a catalog response into the given [`DeserializedOwned`] type.
 ///
 /// Returns an error if unable to parse the response bytes.
+///
+/// SECURITY (SEC-010): this is the SUCCESS (2xx) body path, so the bytes in hand are a
+/// credential-bearing payload — `CatalogConfig` (`defaults`/`overrides`, which the catalog merges
+/// into its runtime props and hands to `FileIO`), `LoadTableResult` (`config` plus the vended
+/// `storage-credentials`), `LoadViewResult` (`config`), and `NamespaceResponse` (`properties`) all
+/// deserialize through here. Attaching the raw body to the error context — as this function used to
+/// — put those secrets into `Error`'s context, which `iceberg::Error` renders VERBATIM in both
+/// `Display` and `Debug` (`crates/iceberg/src/error.rs`), so a single parse failure leaked live
+/// credentials into every `{e}` / `tracing::error!(?e)` site. The trigger is entirely realistic: a
+/// server returning a payload this parser rejects (an unknown V3 field, a version skew) hands back
+/// the SAME body that carries the vended `s3.session-token`.
+///
+/// So: never attach the raw body. Only non-secret diagnostics are attached — the HTTP status, the
+/// request URL, and the body's byte LENGTH — mirroring the token-endpoint paths in
+/// [`HttpClient::exchange_credential_for_token`], which have withheld the body since the SEC-fix
+/// series. This costs parse-failure debuggability; operators who need the payload can capture it at
+/// the HTTP layer (a proxy or a `reqwest` middleware), where the exposure is a deliberate choice
+/// rather than an unconditional log write.
+///
+/// RESIDUE — this fix closes the CONTEXT channel, not the `source` channel. `with_source(e)` is
+/// retained because AGENTS.md requires the error chain to survive, and `iceberg::Error` renders the
+/// source VERBATIM (`, source: {source}`) in both `Display` and `Debug`
+/// (`crates/iceberg/src/error.rs`). `serde_json`'s message echoes the value AT THE PARSE-FAILURE
+/// POSITION, and the size of that value is NOT bounded to a scalar: when the mismatch sits at a
+/// CONTAINER boundary, the echoed value is an entire sub-document, emitted in full through
+/// `Unexpected::Str`.
+///
+/// The load-bearing case is a real, well-known bug class rather than a contrivance: a server or API
+/// gateway that emits a nested object as a JSON *string* (`writeValueAsString` over a sub-map, a
+/// proxy integration stringifying the body) turns `config` into a string whose CONTENT is the whole
+/// vended-credential map, and `serde` reports `invalid type: string "…", expected a map` with those
+/// credentials inline. So a malformed credential-bearing body CAN still leak through `source`.
+///
+/// FIX OWNER: not closable here without breaking the error chain — the chain obligation is satisfied
+/// by `source()` existing; the leak is core's verbatim interpolation of it into `Display`/`Debug`.
+/// It belongs to the core-crate residue unit that reworks `iceberg::Error`'s source rendering.
+///
+/// Both shapes are pinned in `catalog.rs`: the SAFE scalar-mismatch shape by
+/// `test_config_parse_failure_does_not_leak_body` /
+/// `test_load_table_parse_failure_does_not_leak_vended_credentials`, and the LEAKY container-boundary
+/// shape by `test_known_residue_double_encoded_body_leaks_through_error_source`, which asserts the
+/// leak still happens so the gap cannot be silently forgotten or over-claimed as closed.
 pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
     response: Response,
 ) -> Result<R> {
+    let status = response.status();
+    let url = response.url().clone();
     let bytes = response.bytes().await?;
 
     serde_json::from_slice::<R>(&bytes).map_err(|e| {
@@ -565,7 +609,9 @@ pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
             ErrorKind::Unexpected,
             "Failed to parse response from rest catalog server",
         )
-        .with_context("json", String::from_utf8_lossy(&bytes))
+        .with_context("status", status.to_string())
+        .with_context("url", url.to_string())
+        .with_context("response_body_len", bytes.len().to_string())
         .with_source(e)
     })
 }
@@ -615,6 +661,27 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
 }
 
 /// Deserializes a unexpected catalog response into an error.
+///
+/// SEC-010 scope note: unlike [`deserialize_catalog_response`], this is the NON-2xx path, and it
+/// deliberately still attaches the body. The exposure here is NOT symmetric with the success path,
+/// and both directions must be stated:
+///
+/// * RESPONSE direction — safe. A non-2xx means the request FAILED, so no table was loaded and
+///   neither a `config` overlay nor vended `storage-credentials` were issued. The server has no
+///   credential to hand back.
+/// * REQUEST-ECHO direction — NOT credential-free. This function is the fallthrough for the WRITE
+///   routes (`create_table`, `create_namespace`, `update_namespace_properties`, `create_view`),
+///   whose request types carry operator property maps — the very maps redacted in `types.rs`
+///   precisely because they can hold credentials. A validation failure that echoes the offending
+///   request back in its error payload (a common server pattern) therefore puts those submitted
+///   values into this error context.
+///
+/// The body is nonetheless retained: it is an `ErrorResponse` whose `message` is the whole
+/// diagnostic value, and Java surfaces exactly this to the caller (`ErrorHandlers` parse the payload
+/// and rethrow `ErrorResponse.message`), so withholding it would cost real debuggability and diverge
+/// from Java. The residual request-echo exposure is **parity-shared** — Java has it identically.
+/// The one non-2xx body that reliably carries submitted credentials — the token endpoint's — is
+/// handled separately in [`HttpClient::exchange_credential_for_token`], which withholds it.
 pub(crate) async fn deserialize_unexpected_catalog_error(
     response: Response,
     disable_header_redaction: bool,
