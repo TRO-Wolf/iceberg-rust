@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{ArrayRef, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_expr::PhysicalExpr;
@@ -91,35 +91,76 @@ pub fn project_with_partition(
         projection_exprs.push((column_expr, field.name().clone()));
     }
 
-    let partition_expr = Arc::new(PartitionExpr::new(calculator, partition_spec.clone()));
+    // One child per column of the (already-validated) input schema. The children
+    // are how DataFusion's optimizers see — and rewrite — this expression's
+    // inputs; hiding them (children() == vec![]) lets `ProjectionPushdown`
+    // re-parent the expression verbatim onto a different plan node, computing
+    // partition values from the wrong batch.
+    let children: Vec<Arc<dyn PhysicalExpr>> = input_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>)
+        .collect();
+
+    let partition_expr = Arc::new(PartitionExpr::new(
+        calculator,
+        partition_spec.clone(),
+        children,
+    ));
     projection_exprs.push((partition_expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string()));
 
     let projection = ProjectionExec::try_new(projection_exprs, input)?;
     Ok(Arc::new(projection))
 }
 
-/// PhysicalExpr implementation for partition value calculation
+/// PhysicalExpr implementation for partition value calculation.
+///
+/// The expression reads EVERY table column: `children` carries one expression
+/// per top-level column of the table schema (initially `Column` references into
+/// the validated input, in table-schema order). Declaring the children honestly
+/// is load-bearing for correctness, not decoration:
+///
+/// * `ProjectionPushdown`'s `try_unifying_projections` counts column references
+///   through `children()` — with the children visible, its anti-fusion guard
+///   (`count > 1 && !is_expr_trivial`) refuses to fuse this projection with a
+///   non-trivial SELECT-list projection below it.
+/// * When fusion or push-through IS legal (all-trivial inputs), `update_expr`
+///   rewrites the children (`Column` → the child projection's expression), and
+///   `with_new_children` rebuilds this expression around them — so `evaluate`
+///   always computes partition values from the values this plan node actually
+///   receives, never from a positional read of a re-parented batch.
 #[derive(Debug, Clone)]
 struct PartitionExpr {
     calculator: Arc<PartitionValueCalculator>,
     partition_spec: Arc<PartitionSpec>,
+    /// One expression per top-level table column, in table-schema order.
+    children: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl PartitionExpr {
-    fn new(calculator: PartitionValueCalculator, partition_spec: Arc<PartitionSpec>) -> Self {
+    fn new(
+        calculator: PartitionValueCalculator,
+        partition_spec: Arc<PartitionSpec>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
         Self {
             calculator: Arc::new(calculator),
             partition_spec,
+            children,
         }
     }
 }
 
-// Manual PartialEq/Eq implementations for pointer-based equality
-// (two PartitionExpr are equal if they share the same calculator and partition_spec instances)
+// Manual PartialEq/Eq implementations: pointer equality on the shared
+// calculator/partition_spec instances, STRUCTURAL equality on the children —
+// two PartitionExpr with the same calculator but different child expressions
+// compute different values and must not compare equal.
 impl PartialEq for PartitionExpr {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.calculator, &other.calculator)
             && Arc::ptr_eq(&self.partition_spec, &other.partition_spec)
+            && self.children == other.children
     }
 }
 
@@ -139,22 +180,47 @@ impl PhysicalExpr for PartitionExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        // Evaluate the children and feed THOSE arrays to the calculator —
+        // never `batch.columns()`: after an optimizer rewrite the batch may
+        // belong to a different plan node, and only the (rewritten) children
+        // map this expression onto it correctly. A substituted child can
+        // evaluate to a Scalar (e.g. a literal from a fused VALUES/SELECT
+        // projection), so normalize each result to an array of the batch's
+        // row count.
+        let num_rows = batch.num_rows();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.children.len());
+        for child in &self.children {
+            let value = child.evaluate(batch)?;
+            columns.push(value.into_array(num_rows)?);
+        }
         let array = self
             .calculator
-            .calculate(batch)
+            .calculate_from_columns(&columns, num_rows)
             .map_err(to_datafusion_error)?;
         Ok(ColumnarValue::Array(array))
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        vec![]
+        self.children.iter().collect()
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn PhysicalExpr>>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> DFResult<Arc<dyn PhysicalExpr>> {
-        Ok(self)
+        if children.len() != self.children.len() {
+            return Err(DataFusionError::Internal(format!(
+                "PartitionExpr::with_new_children expects exactly {} children \
+                 (one per table column), got {}",
+                self.children.len(),
+                children.len()
+            )));
+        }
+        Ok(Arc::new(PartitionExpr {
+            calculator: Arc::clone(&self.calculator),
+            partition_spec: Arc::clone(&self.partition_spec),
+            children,
+        }))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -182,9 +248,11 @@ impl std::fmt::Display for PartitionExpr {
 
 impl std::hash::Hash for PartitionExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Two PartitionExpr are equal if they share the same calculator and partition_spec Arcs
+        // Mirror PartialEq: pointer identity for the shared calculator and
+        // partition_spec, structural hashing for the children.
         Arc::as_ptr(&self.calculator).hash(state);
         Arc::as_ptr(&self.partition_spec).hash(state);
+        self.children.hash(state);
     }
 }
 
@@ -256,7 +324,13 @@ mod tests {
             projection_exprs.push((column_expr, field.name().clone()));
         }
 
-        let partition_expr = Arc::new(PartitionExpr::new(calculator, partition_spec));
+        let children: Vec<Arc<dyn PhysicalExpr>> = arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>)
+            .collect();
+        let partition_expr = Arc::new(PartitionExpr::new(calculator, partition_spec, children));
         projection_exprs.push((partition_expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string()));
 
         let projection = ProjectionExec::try_new(projection_exprs, input).unwrap();
@@ -301,7 +375,13 @@ mod tests {
         let partition_spec = Arc::new(partition_spec);
         let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
         let partition_type = calculator.partition_arrow_type().clone();
-        let expr = PartitionExpr::new(calculator, partition_spec);
+        let children: Vec<Arc<dyn PhysicalExpr>> = arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>)
+            .collect();
+        let expr = PartitionExpr::new(calculator, partition_spec, children);
 
         assert_eq!(expr.data_type(&arrow_schema).unwrap(), partition_type);
         assert!(!expr.nullable(&arrow_schema).unwrap());
@@ -322,6 +402,215 @@ mod tests {
             }
             _ => panic!("Expected array result"),
         }
+    }
+
+    /// Build the `{id int, data string}` identity(id) fixture used by the T7
+    /// unit tests: (arrow schema, batch, partition spec, calculator-backed expr).
+    fn t7_fixture() -> (Arc<ArrowSchema>, RecordBatch, Arc<PartitionExpr>) {
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("build table schema");
+
+        let partition_spec = Arc::new(
+            iceberg::spec::PartitionSpec::builder(Arc::new(table_schema.clone()))
+                .add_partition_field("id", "id_partition", Transform::Identity)
+                .expect("add partition field")
+                .build()
+                .expect("build partition spec"),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("data", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+            Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                "a", "b", "c",
+            ])),
+        ])
+        .expect("build batch");
+
+        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema)
+            .expect("build calculator");
+        let children: Vec<Arc<dyn PhysicalExpr>> = arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>)
+            .collect();
+        let expr = Arc::new(PartitionExpr::new(calculator, partition_spec, children));
+        (arrow_schema, batch, expr)
+    }
+
+    /// T7: the expression must declare one child per top-level input column,
+    /// in schema order — this is what makes it visible to DataFusion's
+    /// optimizer rewrites.
+    #[test]
+    fn test_partition_expr_children_one_per_input_column() {
+        let (arrow_schema, _batch, expr) = t7_fixture();
+
+        let children = expr.children();
+        assert_eq!(
+            children.len(),
+            arrow_schema.fields().len(),
+            "one child per input column"
+        );
+        for (i, (child, field)) in children.iter().zip(arrow_schema.fields()).enumerate() {
+            let column = child
+                .as_any()
+                .downcast_ref::<Column>()
+                .expect("initial children are Column references");
+            assert_eq!(column.name(), field.name().as_str(), "child {i} name");
+            assert_eq!(column.index(), i, "child {i} index");
+        }
+    }
+
+    /// T7: `with_new_children` must reject an arity mismatch with a typed
+    /// error — never silently return the original expression.
+    #[test]
+    fn test_partition_expr_with_new_children_arity_mismatch_is_error() {
+        let (_arrow_schema, _batch, expr) = t7_fixture();
+
+        let one_child: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("id", 0))];
+        let result = Arc::clone(&expr).with_new_children(one_child);
+        let err = result.expect_err("arity mismatch must be an error");
+        assert!(
+            err.to_string().contains("expects exactly 2 children"),
+            "error must name the expected arity, got: {err}"
+        );
+    }
+
+    /// T7: `with_new_children` must REBUILD the expression around the new
+    /// children, and `evaluate` must compute from them — substituting a
+    /// literal for the partition-source child must change the output.
+    #[tokio::test]
+    async fn test_partition_expr_with_new_children_rebuilds_and_evaluates() {
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Literal;
+
+        let (_arrow_schema, batch, expr) = t7_fixture();
+
+        let new_children: Vec<Arc<dyn PhysicalExpr>> = vec![
+            Arc::new(Literal::new(ScalarValue::Int32(Some(7)))),
+            Arc::new(Column::new("data", 1)),
+        ];
+        let rebuilt = Arc::clone(&expr)
+            .with_new_children(new_children.clone())
+            .expect("rebuild with matching arity");
+
+        // The rebuilt expression must EXPOSE the new children...
+        let rebuilt_children = rebuilt.children();
+        assert_eq!(rebuilt_children.len(), 2);
+        assert!(
+            rebuilt_children[0]
+                .as_any()
+                .downcast_ref::<Literal>()
+                .is_some(),
+            "rebuilt child 0 must be the substituted literal"
+        );
+
+        // ...and USE them: identity(id) over a literal 7 child (a Scalar
+        // result, exercising the into_array normalization) is 7 on every row.
+        let result = rebuilt.evaluate(&batch).expect("evaluate rebuilt expr");
+        let array = match result {
+            ColumnarValue::Array(array) => array,
+            ColumnarValue::Scalar(_) => panic!("expected array result"),
+        };
+        let struct_array = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("partition column is a struct");
+        let id_partition = struct_array
+            .column_by_name("id_partition")
+            .expect("id_partition field")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id_partition is Int32");
+        assert_eq!(id_partition.len(), 3, "one partition value per batch row");
+        for i in 0..3 {
+            assert_eq!(
+                id_partition.value(i),
+                7,
+                "row {i}: partition value must come from the substituted literal child"
+            );
+        }
+    }
+
+    /// T7: equality and hashing must include the children — two expressions
+    /// sharing the same calculator/spec instances but holding different
+    /// children compute different values and must not compare equal (or the
+    /// optimizer's common-subexpression machinery could substitute one for
+    /// the other).
+    #[test]
+    fn test_partition_expr_eq_hash_include_children() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Literal;
+
+        let (_arrow_schema, _batch, expr) = t7_fixture();
+
+        // Same calculator/spec Arcs, structurally identical children.
+        let same_children: Vec<Arc<dyn PhysicalExpr>> = vec![
+            Arc::new(Column::new("id", 0)),
+            Arc::new(Column::new("data", 1)),
+        ];
+        let rebuilt_same = Arc::clone(&expr)
+            .with_new_children(same_children)
+            .expect("rebuild with same-shaped children");
+        let rebuilt_same = rebuilt_same
+            .as_any()
+            .downcast_ref::<PartitionExpr>()
+            .expect("rebuilt expr is a PartitionExpr")
+            .clone();
+
+        // Same calculator/spec Arcs, DIFFERENT children.
+        let different_children: Vec<Arc<dyn PhysicalExpr>> = vec![
+            Arc::new(Literal::new(ScalarValue::Int32(Some(7)))),
+            Arc::new(Column::new("data", 1)),
+        ];
+        let rebuilt_different = Arc::clone(&expr)
+            .with_new_children(different_children)
+            .expect("rebuild with different children");
+        let rebuilt_different = rebuilt_different
+            .as_any()
+            .downcast_ref::<PartitionExpr>()
+            .expect("rebuilt expr is a PartitionExpr")
+            .clone();
+
+        assert_eq!(
+            *expr, rebuilt_same,
+            "same calculator/spec + structurally equal children => equal"
+        );
+        assert_ne!(
+            *expr, rebuilt_different,
+            "different children must make the expressions unequal even when \
+             the calculator and partition spec instances are shared"
+        );
+
+        let hash_of = |e: &PartitionExpr| {
+            let mut hasher = DefaultHasher::new();
+            e.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(
+            hash_of(&expr),
+            hash_of(&rebuilt_same),
+            "equal expressions must hash equally"
+        );
+        assert_ne!(
+            hash_of(&expr),
+            hash_of(&rebuilt_different),
+            "children must contribute to the hash (deterministic here: the \
+             pointer components are identical, only the children differ)"
+        );
     }
 
     #[test]
@@ -519,6 +808,168 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Input schema does not match Iceberg table schema")
+        );
+    }
+
+    /// T1 (hermetic): the partition column must be computed from the PROJECTED
+    /// (computed) SELECT values even after `ProjectionPushdown` fuses the
+    /// partition-bearing projection with the SELECT-list projection below it.
+    ///
+    /// Plan under test (hand-built, mirroring the provider's `insert_into` shape):
+    ///
+    /// ```text
+    /// ProjectionExec[id, name, PartitionExpr]        <- project_with_partition
+    ///   ProjectionExec[id@0 + 100 AS id, name@1]     <- computed SELECT item (non-trivial)
+    ///     DataSourceExec[id=[1,2,3], name=[a,b,c]]
+    /// ```
+    ///
+    /// `ProjectionPushdown` (runs twice in the real physical-optimizer pipeline)
+    /// attempts `try_unifying_projections` on the adjacent pair. The assertion is on
+    /// the EXECUTED `_partition` VALUES — never on plan shape — so it holds whether
+    /// or not DataFusion fuses: the identity(id) partition value must equal the
+    /// computed `id + 100` data value on every row.
+    #[tokio::test]
+    async fn test_partition_values_survive_projection_pushdown_fusion() {
+        use datafusion::common::ScalarValue;
+        use datafusion::common::config::ConfigOptions;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::execution::TaskContext;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+        use datafusion::physical_plan::collect;
+        use iceberg::TableIdent;
+        use iceberg::io::FileIO;
+        use iceberg::spec::FormatVersion;
+
+        // Iceberg table {id int, name string} partitioned by identity(id).
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("build table schema"),
+        );
+        let partition_spec = iceberg::spec::PartitionSpec::builder(table_schema.clone())
+            .add_partition_field("id", "id_partition", Transform::Identity)
+            .expect("add identity(id) partition field")
+            .build()
+            .expect("build partition spec");
+        let sort_order = iceberg::spec::SortOrder::builder()
+            .build(&table_schema)
+            .expect("build sort order");
+        let table_metadata = iceberg::spec::TableMetadataBuilder::new(
+            (*table_schema).clone(),
+            partition_spec,
+            sort_order,
+            "/test/table".to_string(),
+            FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .expect("table metadata builder")
+        .build()
+        .expect("build table metadata");
+        let table = iceberg::table::Table::builder()
+            .metadata(table_metadata.metadata)
+            .identifier(TableIdent::from_strs(["test", "table"]).expect("table ident"))
+            .file_io(FileIO::new_with_fs())
+            .metadata_location("/test/metadata.json".to_string())
+            .build()
+            .expect("build table");
+
+        // Source batch: id=[1,2,3], name=[a,b,c].
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                "a", "b", "c",
+            ])),
+        ])
+        .expect("build source batch");
+        let source = MemorySourceConfig::try_new_exec(&[vec![batch]], arrow_schema, None)
+            .expect("build memory source exec");
+
+        // Inner projection: the computed SELECT list `id + 100 AS id, name`.
+        let id_plus_100: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Plus,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(100)))),
+        ));
+        let inner = Arc::new(
+            ProjectionExec::try_new(
+                vec![
+                    (id_plus_100, "id".to_string()),
+                    (
+                        Arc::new(Column::new("name", 1)) as Arc<dyn PhysicalExpr>,
+                        "name".to_string(),
+                    ),
+                ],
+                source,
+            )
+            .expect("build inner (SELECT-list) projection"),
+        );
+
+        // Outer projection: passthroughs + the `_partition` expression.
+        let plan = project_with_partition(inner, &table).expect("project_with_partition");
+
+        // The optimizer pass that fuses adjacent projections (runs twice for real plans).
+        let optimized = ProjectionPushdown::new()
+            .optimize(plan, &ConfigOptions::default())
+            .expect("run ProjectionPushdown");
+
+        let batches = collect(optimized, Arc::new(TaskContext::default()))
+            .await
+            .expect("execute optimized plan");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "all three source rows must flow through");
+
+        let mut data_ids: Vec<i32> = Vec::new();
+        let mut partition_ids: Vec<i32> = Vec::new();
+        for batch in &batches {
+            let schema = batch.schema();
+            let id_idx = schema.index_of("id").expect("id column present");
+            let part_idx = schema
+                .index_of(PROJECTED_PARTITION_VALUE_COLUMN)
+                .expect("_partition column present");
+            let id_col = batch
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id column is Int32");
+            let part_col = batch
+                .column(part_idx)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("_partition column is a struct");
+            let id_partition = part_col
+                .column_by_name("id_partition")
+                .expect("id_partition field present")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id_partition is Int32");
+            for i in 0..batch.num_rows() {
+                data_ids.push(id_col.value(i));
+                partition_ids.push(id_partition.value(i));
+            }
+        }
+        assert_eq!(
+            data_ids,
+            vec![101, 102, 103],
+            "data column must carry the computed id + 100 values"
+        );
+        // The load-bearing assertion: identity(id) partition values must equal the
+        // COMPUTED data values, not the raw source values [1, 2, 3].
+        assert_eq!(
+            partition_ids,
+            vec![101, 102, 103],
+            "identity(id) partition values must be computed from the projected \
+             (id + 100) column, not from the raw source batch"
         );
     }
 
