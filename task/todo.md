@@ -82,7 +82,18 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       **ACTOR DONE 2026-07-25** (two code commits on the branch: the fix+tests commit and the
       `93e31b2b` interop null-tuple leg — Java read the NULL tuple back, full chain green; RED
       evidence + mutation matrix in the PR body at the scratchpad
-      `pr-bodies/WG1-partition-expr-honest-children.md`) — awaiting independent Critic, then PR.
+      `pr-bodies/WG1-partition-expr-honest-children.md`).
+      **CONVERGED 2026-07-25, cycle 1 — DUAL independent Fable-max Critics, zero S1/S2.**
+      Critic 1 (adversarial): re-derived the DataFusion 52.2 mechanism from vendored sources,
+      re-ran the full gate (lib 2865, datafusion 218) + all 5 mutations + 6 novel probes
+      (filter/limit-between-projections, multi-partition-field, 3-column rotation — the only
+      M2/M3-killing probe, 0-row source, nested CASE-in-CAST) + the full interop chain
+      independently. Critic 2 (contract/honesty): re-derived the ORIGINAL RED at true base
+      `ce2affc9` in a temp worktree (verbatim failure messages), format-stability spot-check
+      (correct-input tuples byte-identical at base and tip), pub-surface grep (exactly one
+      added pub item), caller-compat sweep. 3 S3 total: PR-body gate-number refresh (applied
+      at close-out), duplicate Column-list style + second sabotage leg (recorded as residue).
+      PUSHED for PR — merge is the user's; RoadMapSync announce + RePark repin follow merge.
 - [ ] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic)** — branch
       `fix/engine-trust-bundle-2026-07` after Unit 1 merges. G1 WG2 detector+remediation → G2
       WG4a stamp probe/fix + WG4c contract normativity (R113) → G3 WG3 L2+L3 non-breaking →
