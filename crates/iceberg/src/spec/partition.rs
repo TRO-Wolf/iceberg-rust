@@ -3174,19 +3174,24 @@ mod partition_path_escaping_tests {
         );
     }
 
-    /// The other half of the format-stability attestation: which value CLASSES move. Three
-    /// ordinary column types render a human string containing `:` (and, for `timestamp` /
-    /// `timestamptz`, a space too), so their path changes for EVERY value, not only for odd
-    /// strings — pinned here so the approved blast radius (D6) is executable, not derivable.
+    /// The other half of the format-stability attestation: which value CLASSES move. FIVE
+    /// fork-supported column types render a human string containing `:` (and, for four of them, a
+    /// space too), so their path changes for EVERY value, not only for odd strings — pinned here so
+    /// the approved blast radius (D6) is executable, not derivable. `date` is the byte-stable
+    /// control in the same tuple.
+    ///
+    /// The V3 nanosecond pair (`timestamp_ns` / `timestamptz_ns`) is NOT a corner case bolted on:
+    /// it renders through the same `Display for Datum` path as the microsecond pair and therefore
+    /// moves for every value too — it was simply missed by the first (three-type) sweep.
     ///
     /// Java ground truth re-derived 2026-07-25 by executing
     /// `Transforms.identity().toHumanString(type, value)` against `iceberg-api-1.10.0` on JDK 11
     /// and passing the result through `java.net.URLEncoder.encode(s, "UTF-8")` (the whole body of
-    /// `PartitionSpec.escape`). The two `assert_ne!`s are the ALARM for the named human-string
-    /// residue on row R161 — when either becomes equal, that residue has been closed and the row
-    /// must be updated in the same change.
+    /// `PartitionSpec.escape`). The four `assert_ne!`s are the ALARM for the named human-string
+    /// residue on row R161 — when any becomes equal, that residue has been closed and the row must
+    /// be updated in the same change.
     #[test]
-    fn timestamp_time_and_timestamptz_paths_move_for_every_value() {
+    fn the_five_always_moving_temporal_types_move_for_every_value() {
         let schema: SchemaRef = Arc::new(
             Schema::builder()
                 .with_fields(vec![
@@ -3195,10 +3200,14 @@ mod partition_path_escaping_tests {
                     NestedField::optional(2, "tz", Type::Primitive(PrimitiveType::Timestamptz))
                         .into(),
                     NestedField::optional(3, "tm", Type::Primitive(PrimitiveType::Time)).into(),
-                    NestedField::optional(4, "dt", Type::Primitive(PrimitiveType::Date)).into(),
+                    NestedField::optional(4, "tsn", Type::Primitive(PrimitiveType::TimestampNs))
+                        .into(),
+                    NestedField::optional(5, "tzn", Type::Primitive(PrimitiveType::TimestamptzNs))
+                        .into(),
+                    NestedField::optional(6, "dt", Type::Primitive(PrimitiveType::Date)).into(),
                 ])
                 .build()
-                .expect("the four-column temporal schema must build"),
+                .expect("the six-column temporal schema must build"),
         );
         let spec = PartitionSpec::builder(schema.clone())
             .add_partition_field("ts", "ts", Transform::Identity)
@@ -3207,15 +3216,22 @@ mod partition_path_escaping_tests {
             .expect("identity(tz) is legal")
             .add_partition_field("tm", "tm", Transform::Identity)
             .expect("identity(tm) is legal")
+            .add_partition_field("tsn", "tsn", Transform::Identity)
+            .expect("identity(tsn) is legal")
+            .add_partition_field("tzn", "tzn", Transform::Identity)
+            .expect("identity(tzn) is legal")
             .add_partition_field("dt", "dt", Transform::Identity)
             .expect("identity(dt) is legal")
             .build()
-            .expect("the four-field temporal spec must build");
-        // 2017-11-16T22:31:08 in micros; 22:31:08 in micros; 2022-01-08 in days.
+            .expect("the six-field temporal spec must build");
+        // 2017-11-16T22:31:08 in micros (and the same instant in nanos); 22:31:08 in micros;
+        // 2022-01-08 in days.
         let data = Struct::from_iter([
             Some(Literal::timestamp(1_510_871_468_000_000)),
             Some(Literal::timestamptz(1_510_871_468_000_000)),
             Some(Literal::time(81_068_000_000)),
+            Some(Literal::timestamp_nano(1_510_871_468_000_000_000)),
+            Some(Literal::timestamptz_nano(1_510_871_468_000_000_000)),
             Some(Literal::date(19_000)),
         ]);
 
@@ -3227,9 +3243,11 @@ mod partition_path_escaping_tests {
                 "ts=2017-11-16+22%3A31%3A08",
                 "tz=2017-11-16+22%3A31%3A08+UTC",
                 "tm=22%3A31%3A08",
+                "tsn=2017-11-16+22%3A31%3A08",
+                "tzn=2017-11-16+22%3A31%3A08+UTC",
                 "dt=2022-01-08",
             ],
-            "the three temporal types whose human string holds a `:` move under the escaper; \
+            "the five temporal types whose human string holds a `:` move under the escaper; \
              `date` does not"
         );
 
@@ -3241,10 +3259,12 @@ mod partition_path_escaping_tests {
         );
         // `date` is byte-stable: its human string holds no character outside the safe set.
         assert_eq!(
-            pairs[3], "dt=2022-01-08",
+            pairs[5], "dt=2022-01-08",
             "Java: `2022-01-08`, untouched by the escaper"
         );
-        // The two remaining divergences, pinned as an alarm (Java's own forms, escaped).
+        // The four remaining divergences, pinned as an alarm (Java's own forms, escaped —
+        // measured on the JVM, so none of these is a dead comparison against a string Java
+        // never produces).
         assert_ne!(
             pairs[0], "ts=2017-11-16T22%3A31%3A08",
             "residue R161: Java renders ISO `T`, the fork renders a space (escaped `+`)"
@@ -3253,5 +3273,216 @@ mod partition_path_escaping_tests {
             pairs[1], "tz=2017-11-16T22%3A31%3A08%2B00%3A00",
             "residue R161: Java renders ISO `T` and `+00:00`, the fork renders a space and ` UTC`"
         );
+        assert_ne!(
+            pairs[3], "tsn=2017-11-16T22%3A31%3A08",
+            "residue R161: the nanosecond pair diverges exactly like the microsecond pair"
+        );
+        assert_ne!(
+            pairs[4], "tzn=2017-11-16T22%3A31%3A08%2B00%3A00",
+            "residue R161: the nanosecond pair diverges exactly like the microsecond pair"
+        );
+    }
+
+    /// Render a one-field `transform(column)` spec over `column: ty` holding `value`.
+    fn render_one(
+        column: &str,
+        field_name: &str,
+        ty: PrimitiveType,
+        transform: Transform,
+        value: Literal,
+    ) -> String {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, column, Type::Primitive(ty)).into(),
+                ])
+                .build()
+                .expect("the one-column schema must build"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field(column, field_name, transform)
+            .expect("the transform must be legal for this column type")
+            .build()
+            .expect("the one-field spec must build");
+        spec.partition_to_path(&Struct::from_iter([Some(value)]), schema)
+    }
+
+    /// Byte-stability is a property of the OUTPUT type, never of the transform name.
+    /// `Transform::result_type` returns `input_type.clone()` for `Truncate`, so
+    /// `truncate(string, N)` renders a STRING and is exactly as escaper-sensitive as
+    /// `identity(string)` — `truncate` over a high-cardinality string column is the single most
+    /// likely shape to move on a real table, and an ordinary space in the truncated prefix is
+    /// enough. `truncate` over int / long / decimal / binary stays inside the safe set; the binary
+    /// leg is deliberate — its SOURCE bytes contain `0x2F` (`/`) yet the human string is hex, so
+    /// the raw byte never reaches the path.
+    ///
+    /// Java ground truth (jar oracle, 2026-07-25, `iceberg-api-1.10.0` on JDK 11):
+    /// `Transforms.truncate(4).toHumanString(StringType, "a/b c")` → `a/b c` → `URLEncoder.encode`
+    /// → `a%2Fb+c`, and `truncate(5)` on `east 1x` → `east+1x`. The first case is also
+    /// `truncate_string` in the LIVE interop battery, where Java's own `partitionToPath` emits
+    /// `s_trunc=a%2Fb+c` — the same bytes this pin asserts.
+    #[test]
+    fn truncate_is_byte_stable_except_over_string() {
+        let moving = [
+            (
+                render_one(
+                    "s",
+                    "s_trunc",
+                    PrimitiveType::String,
+                    Transform::Truncate(4),
+                    Literal::string("a/b c"),
+                ),
+                "s_trunc=a%2Fb+c",
+            ),
+            (
+                render_one(
+                    "s",
+                    "t5",
+                    PrimitiveType::String,
+                    Transform::Truncate(5),
+                    Literal::string("east 1x"),
+                ),
+                "t5=east+1x",
+            ),
+        ];
+        for (rendered, expected) in &moving {
+            assert_eq!(
+                rendered, expected,
+                "truncate over `string` renders a string and MUST be escaped"
+            );
+        }
+
+        let stable = [
+            (
+                render_one(
+                    "s",
+                    "tsafe",
+                    PrimitiveType::String,
+                    Transform::Truncate(16),
+                    Literal::string("us-east-1"),
+                ),
+                "tsafe=us-east-1",
+            ),
+            (
+                render_one(
+                    "i",
+                    "ti",
+                    PrimitiveType::Int,
+                    Transform::Truncate(10),
+                    Literal::int(25),
+                ),
+                "ti=25",
+            ),
+            (
+                render_one(
+                    "l",
+                    "tl",
+                    PrimitiveType::Long,
+                    Transform::Truncate(10),
+                    Literal::long(-25),
+                ),
+                "tl=-25",
+            ),
+            (
+                render_one(
+                    "d",
+                    "td",
+                    PrimitiveType::Decimal {
+                        precision: 9,
+                        scale: 2,
+                    },
+                    Transform::Truncate(50),
+                    Literal::decimal(12345),
+                ),
+                "td=123.45",
+            ),
+            (
+                render_one(
+                    "bn",
+                    "tb",
+                    PrimitiveType::Binary,
+                    Transform::Truncate(2),
+                    Literal::binary(vec![0x61, 0x2F, 0x62]),
+                ),
+                "tb=612F62",
+            ),
+        ];
+        for (rendered, expected) in &stable {
+            assert_eq!(
+                rendered, expected,
+                "this truncate output holds no character outside the safe set — it must be \
+                 byte-identical to pre-R161"
+            );
+        }
+    }
+
+    /// R161 restores INJECTIVITY of partition tuple → directory, which is the data-trust half of
+    /// the defect (the layout half — a forged extra directory level — is
+    /// `a_slash_in_a_value_cannot_forge_a_directory_level`).
+    ///
+    /// Pre-R161 the pair was `format!("{name}={value}")` with BOTH sides raw, so a `/` and an `=`
+    /// inside a VALUE could make two DISTINCT tuples render the SAME path: every case below
+    /// collapsed onto `a=1/b=2/b=3` (same spec) or `a=1/b=2` (across two specs of one table).
+    /// Colliding paths mean two partitions' data files land in one directory AND their
+    /// `partitions.<path>` summary entries merge into one key, so the per-partition record counts
+    /// are silently summed. Escaping separates every case.
+    #[test]
+    fn two_distinct_tuples_can_no_longer_collide_on_one_directory() {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "a", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(2, "b", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("the two-column schema must build"),
+        );
+        let two_field = PartitionSpec::builder(schema.clone())
+            .add_partition_field("a", "a", Transform::Identity)
+            .expect("identity(a) is legal")
+            .add_partition_field("b", "b", Transform::Identity)
+            .expect("identity(b) is legal")
+            .build()
+            .expect("the two-field spec must build");
+
+        // Same spec, two distinct tuples — both rendered `a=1/b=2/b=3` before R161.
+        let x = two_field.partition_to_path(
+            &Struct::from_iter([Some(Literal::string("1/b=2")), Some(Literal::string("3"))]),
+            schema.clone(),
+        );
+        let y = two_field.partition_to_path(
+            &Struct::from_iter([Some(Literal::string("1")), Some(Literal::string("2/b=3"))]),
+            schema.clone(),
+        );
+        // Injectivity FIRST, so a regression's failure message displays the collision itself
+        // rather than a byte mismatch on one side of it.
+        assert_ne!(
+            x, y,
+            "two distinct partition tuples of ONE spec must never share a directory"
+        );
+        assert_eq!(x, "a=1%2Fb%3D2/b=3");
+        assert_eq!(y, "a=1/b=2%2Fb%3D3");
+
+        // Cross-arity: a 1-field spec and a 2-field spec of the same evolving table — both
+        // rendered `a=1/b=2` before R161.
+        let one_field = PartitionSpec::builder(schema.clone())
+            .add_partition_field("a", "a", Transform::Identity)
+            .expect("identity(a) is legal")
+            .build()
+            .expect("the one-field spec must build");
+        let narrow = one_field.partition_to_path(
+            &Struct::from_iter([Some(Literal::string("1/b=2"))]),
+            schema.clone(),
+        );
+        let wide = two_field.partition_to_path(
+            &Struct::from_iter([Some(Literal::string("1")), Some(Literal::string("2"))]),
+            schema,
+        );
+        assert_ne!(
+            narrow, wide,
+            "tuples under two specs of ONE table must never share a directory"
+        );
+        assert_eq!(narrow, "a=1%2Fb%3D2");
+        assert_eq!(wide, "a=1/b=2");
     }
 }

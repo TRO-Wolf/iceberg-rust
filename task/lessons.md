@@ -428,3 +428,37 @@ would put a raw `/` straight into a `partitions.` summary key — the exact defe
   one unpinned site. Cheap detector, no reasoning required — count the sites, count the distinct RED tests.
 - *Corollary for docs:* a rustdoc/matrix sentence like "no branch can skip it" is only earned once each
   branch reds alone; otherwise state what the suite actually enforces.
+
+### 2026-07-25 — A byte-stability claim is about the rendered OUTPUT type, never the transform's name
+
+G4 remediation cycle 2 (engine-trust bundle), R161. The format-stability attestation for the
+partition-path escaper asserted that "every `bucket` / `truncate` / `day` output is byte-stable" —
+affirmatively false, and the PR's own shipped interop evidence refuted it: Java's oracle case
+`truncate_string` is `s_trunc=a%2Fb+c`. `Transform::result_type` returns `input_type.clone()` for
+`Truncate`, so `truncate(string, N)` renders a STRING and is exactly as escaper-sensitive as
+`identity(string)` — and `truncate` over a high-cardinality string column is the single most likely
+real-table shape to move.
+
+- **Group the claim by what is RENDERED, not by the transform that produced it.** `bucket` → int and
+  `day` → date really are stable because their OUTPUT type is; `truncate` is not a peer of theirs, it
+  is type-preserving. *Detector:* before writing "transform X is stable", read `result_type` for X —
+  if it can return the source type, the claim must be stated per source type.
+- **A universally-quantified sentence in an attestation is a testable claim; make it a pin.** The
+  wrong clause survived a full Critic cycle because it lived only in prose. It is now
+  `truncate_is_byte_stable_except_over_string`, offline, and it reds under 5 of the 9 mutations.
+- **A "measured, not derived" sweep is only as complete as its type list.** The same sentence named
+  three always-moving temporal types; `timestamp_ns` / `timestamptz_ns` move identically and were
+  missed by two consecutive sweeps. *Rule:* enumerate from `PrimitiveType`'s own variants, not from
+  the types the fixture happened to use.
+
+### 2026-07-25 — A per-site mutation anchor that is a SUBSTRING of another site's line silently re-runs that site
+
+Same increment. Three `name=null` call sites share the text `return Ok(escaped_partition_pair(&field.name,
+"null"));` at different indentations; the 12-space anchor is a substring of the 16-space line, so a
+first-match string replace mutated the WRONG site and the "site 3" leg silently re-ran "site 2".
+
+- **The tell is that a per-site mutation reds a DIFFERENT site's test.** If leg N reds leg M's pin, the
+  anchor missed — a per-site mutation must red the test named for that site, and nothing else. Treat a
+  mismatch as a harness bug, never as evidence.
+- **Anchor on the preceding distinguishing line, not on the mutated line alone** (here `let Some(literal)
+  = slot.as_ref() else {`). Indentation is not identity.
