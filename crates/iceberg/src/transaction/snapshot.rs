@@ -1352,8 +1352,15 @@ impl<'a> SnapshotProducer<'a> {
     /// Resolve the partition spec a summarized file belongs to (`file.partition_spec_id`), for the
     /// per-file partition-summary path (Java `SnapshotSummary.Builder` uses `spec(file.specId())`). Falls
     /// back to the table default spec only if the file's spec is somehow absent — unreachable for the
-    /// add path (the added-file validation already proved every spec exists) but kept so the infallible
-    /// summary path never panics.
+    /// ADD path (the added-file validation already proved every spec exists), REACHABLE for the
+    /// `removed_*_files` loops, which are populated from the resolved delete set without running
+    /// `validate_partition_value` (e.g. a live file whose spec was dropped by
+    /// `remove_partition_specs`, which only refuses to drop the DEFAULT spec).
+    ///
+    /// The substituted spec can therefore have a different arity/type than the file's tuple. That is
+    /// safe ONLY because [`PartitionSpec::partition_to_path`] is total: it renders the unmatched
+    /// fields as `null` and warns (WG3-L2). Before that it aborted mid-commit — this fallback used
+    /// to claim the summary path "never panics", and the claim was false.
     fn file_partition_spec(&self, file: &DataFile) -> crate::spec::PartitionSpecRef {
         let metadata = self.table.metadata();
         metadata
@@ -1390,8 +1397,10 @@ impl<'a> SnapshotProducer<'a> {
         // `updatePartitions(spec, file)` computes the partition path with the file's own spec). On a
         // multi-spec commit (a file added under an older spec) using the default spec would compute the
         // WRONG partition path and corrupt the changed-partition summaries. `file_partition_spec` falls
-        // back to the default only for the unreachable "spec vanished" case (validation already proved
-        // every added file's spec exists; the summary path must stay infallible).
+        // back to the default for the "spec vanished" case — unreachable HERE (validation already proved
+        // every added file's spec exists) but reachable in the `removed_*_files` loops below, which
+        // bypass `validate_partition_value`. This whole path is infallible, so it stays total only
+        // because `partition_to_path` is (see `file_partition_spec`).
         for data_file in &self.added_data_files {
             summary_collector.add_file(
                 data_file,
@@ -1416,6 +1425,9 @@ impl<'a> SnapshotProducer<'a> {
         // is populated in `commit()` (the resolved delete set) before `summary()` is called; it is empty
         // for add-only operations such as fast append, so this loop is a no-op there. Summarized under each
         // removed file's OWN spec (a removed file may belong to an older spec than the table default).
+        // NOTE: unlike the add loops, nothing validated these tuples against their spec — this loop is
+        // the reachable half of `file_partition_spec`'s substitution (WG3-L2 test
+        // `test_summary_survives_a_removed_file_under_a_substituted_spec`).
         for data_file in &self.removed_data_files {
             summary_collector.remove_file(
                 data_file,
@@ -3139,6 +3151,169 @@ mod multispec_tests {
         assert!(
             err.message()
                 .contains("Partition value is not compatible with partition type"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    // ============================================================================================
+    // WG3-L2 COMMIT-PATH REACHABILITY: the summary path must not ABORT on a mismatched
+    // (spec, tuple) pair it cannot validate.
+    // ============================================================================================
+
+    /// A minimal operation for calling `summary()` directly: the producer's OWN state (the
+    /// `removed_*_files` vectors `commit()` assigns before `summary()`) is what the summary walks.
+    struct SummaryOnlyOperation;
+
+    impl super::SnapshotProduceOperation for SummaryOnlyOperation {
+        fn operation(&self) -> crate::spec::Operation {
+            crate::spec::Operation::Delete
+        }
+
+        async fn delete_entries(
+            &self,
+            _snapshot_produce: &super::SnapshotProducer<'_>,
+        ) -> crate::Result<Vec<crate::spec::ManifestEntry>> {
+            Ok(vec![])
+        }
+
+        async fn delete_files(
+            &self,
+            _snapshot_produce: &super::SnapshotProducer<'_>,
+        ) -> crate::Result<Vec<DataFile>> {
+            Ok(vec![])
+        }
+
+        async fn existing_manifest(
+            &self,
+            _snapshot_produce: &super::SnapshotProducer<'_>,
+        ) -> crate::Result<Vec<crate::spec::ManifestFile>> {
+            Ok(vec![])
+        }
+    }
+
+    /// SUMMARY-PATH TOTALITY (the `removed_data_files` loop × `file_partition_spec`'s default-spec
+    /// substitution). `commit()` assigns `removed_data_files` from the resolved delete set and calls
+    /// `summary()` BEFORE `manifest_file()`; that loop never runs `validate_partition_value`, and
+    /// `file_partition_spec` substitutes the table DEFAULT spec when a file's spec id is unknown. A
+    /// removed file claiming an absent spec therefore reaches `partition_to_path` paired with a spec
+    /// of a DIFFERENT arity.
+    ///
+    /// Before WG3-L2 this ABORTED (`partition.rs` index out of bounds) — mid-commit, in the
+    /// infallible summary path, with no error to catch. It now renders the missing field as `null`
+    /// and the summary is produced.
+    ///
+    /// MUTATION (restore the positional `data[index]` lookup in `PartitionSpec::partition_to_path`):
+    /// this test panics.
+    #[tokio::test]
+    async fn test_summary_survives_a_removed_file_under_a_substituted_spec() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = set_property(
+            &catalog,
+            &table,
+            crate::spec::TableProperties::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT,
+            "100",
+        )
+        .await;
+        // Default spec is now spec 1 = identity(x) + identity(y) — TWO fields.
+        let (table, new_spec_id) = evolve_spec(&catalog, &table).await;
+        assert_eq!(
+            table
+                .metadata()
+                .partition_spec_by_id(new_spec_id)
+                .expect("the evolved spec must exist")
+                .fields()
+                .len(),
+            2,
+            "fixture sanity: the substituted default spec has two fields"
+        );
+
+        // A REMOVED file claiming spec 99 (absent) and carrying a ONE-value tuple.
+        let removed = data_file_spec0_under("test/gone.parquet", 5, 99);
+        let mut producer = super::SnapshotProducer::new(
+            &table,
+            uuid::Uuid::now_v7(),
+            None,
+            HashMap::new(),
+            vec![],
+        );
+        producer.removed_data_files = vec![removed];
+
+        let summary = producer
+            .summary(&SummaryOnlyOperation)
+            .expect("the summary path must stay total for a tuple it cannot validate");
+        // The per-partition summary VALUE is a `HashMap`-ordered join, so assert its components.
+        let partition_summary = summary
+            .additional_properties
+            .get("partitions.x=5/y=null")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            partition_summary.contains("deleted-data-files=1")
+                && partition_summary.contains("deleted-records=1"),
+            "the missing tuple slot must render `null` under the substituted spec: {:?}",
+            summary.additional_properties
+        );
+        assert_eq!(
+            summary.additional_properties.get("changed-partition-count"),
+            Some(&"1".to_string())
+        );
+    }
+
+    /// END-TO-END COMMIT-PATH REACHABILITY. `remove_partition_specs` only refuses to drop the
+    /// DEFAULT spec — it does not check whether live files still reference the spec being dropped.
+    /// Deleting such a file drives `summary()` (which runs BEFORE `manifest_file()`) into
+    /// `file_partition_spec`'s default-spec substitution with a one-value tuple and a two-field spec.
+    ///
+    /// Before WG3-L2 the commit ABORTED there. It now reaches the first consumer that CAN report the
+    /// broken metadata — the manifest rewriter — and fails with a typed, catchable error. The
+    /// engine-trust property under test is "no abort", not "the commit succeeds": the metadata is
+    /// genuinely inconsistent, so failing loudly is correct.
+    ///
+    /// MUTATION (restore the positional `data[index]` lookup in `PartitionSpec::partition_to_path`):
+    /// this test panics instead of returning the typed error.
+    #[tokio::test]
+    async fn test_delete_of_a_file_whose_spec_was_dropped_errors_instead_of_aborting() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .add_data_files(vec![data_file_spec0("test/seed.parquet", 5)]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let (table, _new_spec_id) = evolve_spec(&catalog, &table).await;
+
+        // Drop spec 0 while `test/seed.parquet` still references it.
+        let commit = crate::TableCommit::builder()
+            .ident(table.identifier().to_owned())
+            .updates(vec![crate::TableUpdate::RemovePartitionSpecs {
+                spec_ids: vec![0],
+            }])
+            .requirements(vec![])
+            .base_metadata_location(table.metadata_location().map(str::to_string))
+            .build();
+        let table = catalog
+            .update_table(commit)
+            .await
+            .expect("dropping a non-default spec is permitted");
+        assert!(
+            table.metadata().partition_spec_by_id(0).is_none(),
+            "fixture sanity: spec 0 is gone while a live file still claims it"
+        );
+
+        let tx = Transaction::new(&table);
+        let action = tx.delete_files().delete_file("test/seed.parquet");
+        let tx = action.apply(tx).unwrap();
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("the dropped spec must surface as an error, not an abort");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message()
+                .contains("Cannot rewrite manifest: unknown partition spec id 0"),
             "unexpected message: {}",
             err.message()
         );
