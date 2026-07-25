@@ -74,7 +74,7 @@ R161 URL-escaping APPROVED). RePark work order delivered:
 `~/Desktop/repark-work-order-2026-07-25.md`. Goal frame: gate 1 data-trust → gate 2 engine-trust
 → gate 3 scale.
 
-- [ ] **Unit 1 — WG1 honest-children `PartitionExpr` (S1, Mode A solo PR, AC·OO)** — branch
+- [x] **Unit 1 — WG1 honest-children `PartitionExpr` (S1, Mode A solo PR, AC·OO)** — branch
       `fix/partition-expr-honest-children` off `ce2affc9`. FORK-O7+O8 are ONE defect (optimizer
       re-parents the children-less expr; positional read hits the wrong batch). Fix shape D1 +
       core-seam guard + T1-T10/M1-M5 per brief. Claim OPENED on the PrimarySync board
@@ -94,8 +94,12 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       added pub item), caller-compat sweep. 3 S3 total: PR-body gate-number refresh (applied
       at close-out), duplicate Column-list style + second sabotage leg (recorded as residue).
       PUSHED for PR — merge is the user's; RoadMapSync announce + RePark repin follow merge.
-- [ ] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic)** — branch
-      `fix/engine-trust-bundle-2026-07` after Unit 1 merges. G1 WG2 detector+remediation → G2
+      **MERGED #172 (`a6199ca5`) 2026-07-25, content-verified R4; RoadMapSync repin+pin-flip
+      announcement posted; claim released. FORK-O7/O8 CLOSED.**
+- [ ] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic) — IN PROGRESS
+      2026-07-25**, branch `fix/engine-trust-bundle-2026-07` off `a6199ca5`; user-directed
+      Opus-max AC per group + Fable-max closing bundle Critic. **G0 T10 nullability-widening
+      residue (+ ADV-1/ADV-2 riders; spec added to the brief)** → G1 WG2 detector+remediation → G2
       WG4a stamp probe/fix + WG4c contract normativity (R113) → G3 WG3 L2+L3 non-breaking →
       G4 R161 escaping (format-stability attestation) → G5 WG4b path-keyed pos-delete routing
       (+ remove_dangling same-unit; R117 demote→re-promote) → G6 WG5 null-bit family → G7 WG6

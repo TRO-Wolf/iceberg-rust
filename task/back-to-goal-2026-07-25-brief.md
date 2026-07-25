@@ -132,10 +132,33 @@ cross-repo done-signal.
 
 ## Unit 2 — engine-trust bundle (Mode B, one branch, sequential groups, final bundle Critic)
 
-**Branch** `fix/engine-trust-bundle-2026-07` off main after Unit 1 merges. Per-group AC·OO ladders,
-orchestrator gates+commits between groups, staged Critic checkpoints, ONE final independent bundle
-Critic over the whole diff; push on CONVERGED; single PR. A group whose ladder cannot converge is
-parked on its own branch and the bundle ships without it.
+**Branch** `fix/engine-trust-bundle-2026-07` off main after Unit 1 merges. Per-group AC ladders
+(user-directed 2026-07-25: **Opus-max Actor + independent Opus-max Critic per group**), sequential
+in the ws worktree, ONE final independent Fable-max bundle Critic over the whole diff; push on
+CONVERGED; single PR. A group whose ladder cannot converge in 2 remediation cycles is reset to the
+last good commit and the bundle ships without it.
+
+**G0 — the Unit 1 T10 residue: provider INSERT nullability widening (added 2026-07-25 post-#172).**
+`project_with_partition`'s input-schema validation requires exact Arrow field equality INCLUDING
+nullability, so an input plan carrying non-nullable fields (FROM-less literals, non-null `VALUES`,
+`SELECT` from required columns) into a table whose target column is OPTIONAL fails with
+Plan("Input schema does not match Iceberg table schema … nullable Utf8 vs Utf8") before the
+partition machinery runs (first T10 run, 2026-07-25, recorded as Unit 1 residue). **Fix:** relax
+exactly the SAFE direction — input field non-nullable where the table field is nullable — applied
+RECURSIVELY (nested struct fields, list elements, map values); everything else stays strict:
+nullable input into a required target keeps failing loudly, and names/types/order are unchanged.
+Anchor: required-into-optional is the standard write-compatible direction (Spark accepts it; Java
+Iceberg write compatibility treats it as legal; verify the DataFusion-side behavior in-tree rather
+than by citation). **RED-first tests:** the original T10 optional-column shape (FROM-less literal
+into an optional-column partitioned table — must succeed post-fix with correct manifest tuples and
+NULL legality intact); non-null `VALUES` into optional; `SELECT` required-source into optional;
+NEGATIVE pins: nullable input → required target still rejected with the existing loud error;
+record the unpartitioned-path behavior for symmetry. **Mutations:** revert the widening (strict
+equality restored) → the new positives RED; over-widen (nullable→required accepted) → the negative
+pin RED. **Riders:** ADV-1 — deduplicate the double `Column` list construction in
+`project_with_partition` (same file, style-only, from the Unit 1 Critic); ADV-2 — add the second
+interop sabotage leg truncating `rust_table_nulltuple`'s metadata in
+`dev/java-interop/run-interop-partitioned-dml.sh`, HARD-FAIL-never-SKIP pattern.
 
 **G1 — WG2: exposure detector + remediation tooling (D3).** Detector (offline, mechanical): for
 each live data file, re-read partition-source columns, recompute the transform, compare to the
