@@ -761,7 +761,10 @@ fn pack_bins(tasks: Vec<FileScanTask>, target_weight: u64) -> Vec<Vec<FileScanTa
 /// Parse the `write.target-file-size-bytes` table property (Java `defaultTargetFileSize` via
 /// `PropertyUtil.propertyAsLong`). A present-but-unparsable value is a loud error; absent yields the
 /// 512 MiB default. A negative value is rejected (`target` must be `> 0`, enforced downstream too).
-fn parse_target_file_size(properties: &HashMap<String, String>) -> Result<u64> {
+///
+/// `pub(super)` so the sibling [`partition_key_audit`](super::partition_key_audit) repair resolves
+/// its rolling-writer target the same way (one home for the property name + the 512 MiB default).
+pub(super) fn parse_target_file_size(properties: &HashMap<String, String>) -> Result<u64> {
     match properties.get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES) {
         None => Ok(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT as u64),
         Some(value) => value.parse::<u64>().map_err(|error| {

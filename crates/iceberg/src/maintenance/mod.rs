@@ -97,6 +97,15 @@
 //!   files copy FROM source). One of the twelve `ActionsProvider` methods (`rewrite_table_path(Table)`).
 //!   Incremental mode + version-hint are DEFERRED. **This action STAGES rewritten metadata + emits a
 //!   copy-plan; it does NOT physically copy data files.**
+//! - [`AuditPartitionKeys`] / [`RepairPartitionKeys`] — FORK-ORIGINAL (no Java counterpart, and
+//!   deliberately NOT `ActionsProvider` methods): re-derive every live data file's partition tuple
+//!   from the file's OWN rows and report the files whose manifest entry disagrees
+//!   ([`PartitionKeyFinding`]), then repair them by rewriting the live rows under their correct
+//!   partition keys — one atomic
+//!   [`RewriteFilesAction`](crate::transaction::rewrite_files) `Replace` per file, no in-place
+//!   metadata surgery. Built for the wrong-partition-tuple exposure class (a real-but-wrong tuple
+//!   passes every commit validation and then silently prunes its own rows out of query results, in
+//!   Rust AND Java). Operator recipe: `docs/partition-key-audit.md`. **The repair rewrites data.**
 //! - [`Actions`](crate::maintenance::Actions) / [`ActionsProvider`](crate::maintenance::ActionsProvider)
 //!   — the factory surface mirroring Java's `org.apache.iceberg.actions.ActionsProvider` (1.10.0): one
 //!   entry point that hands out the maintenance actions above (constructed `X::new(table)`) AND the
@@ -121,6 +130,7 @@ mod compute_table_stats;
 mod convert_equality_delete_files;
 mod delete_orphan_files;
 mod delete_reachable_files;
+mod partition_key_audit;
 pub mod partition_stats;
 mod remove_dangling_delete_files;
 mod rewrite_data_files;
@@ -140,6 +150,10 @@ pub use delete_orphan_files::{DeleteOrphanFiles, DeleteOrphanFilesResult, Prefix
 pub use delete_reachable_files::{
     DeleteReachableFiles, DeleteReachableFilesResult, ReachableDeleteFailure,
     ReachableDeleteFunction,
+};
+pub use partition_key_audit::{
+    AuditPartitionKeys, AuditPartitionKeysResult, PartitionKeyFinding, RepairPartitionKeys,
+    RepairPartitionKeysResult,
 };
 pub use partition_stats::{
     PartitionStats, compute_and_write_stats_file, compute_partition_stats, partition_stats_schema,

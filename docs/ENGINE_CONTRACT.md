@@ -144,6 +144,13 @@ engine may therefore hand `"UTC"`-tagged batches directly. The alias set is CLOS
 **nested** alias mismatch (inside a struct/list) is NOT coerced and fails loud — nested normalization
 is a deferred fork follow-up.
 
+**Partition-tuple integrity.** A wrong partition tuple is *accepted* by every commit path (arity and
+types are validated, values are not) and is then silent in both engines: a pruned read drops the
+file's rows, an unpruned read hands back the recorded value for identity-partitioned columns. If an
+engine's projection layer can compute a partition-source column, audit it —
+[`partition-key-audit.md`](partition-key-audit.md) is the detection + remediation recipe
+(`maintenance::AuditPartitionKeys` / `RepairPartitionKeys`).
+
 ## 5. Isolation level → validation recipes  ·  **NORMATIVE (oracle-verified 2026-07-09)**
 
 Rust builder methods, verbatim from `transaction/{row_delta,overwrite_files,replace_partitions}.rs`.
