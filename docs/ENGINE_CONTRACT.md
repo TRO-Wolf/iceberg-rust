@@ -228,6 +228,8 @@ grow MERGE semantics; it will not (out of parity scope).
   `physical_plan/project.rs`) computes `_partition` via `PartitionValueCalculator`; the
   partition-aware `TaskWriter` (`task_writer.rs`) consumes the precomputed `_partition` column
   and routes per row. Clustered input may use the cheaper clustered writer.
+- Sort-order application before write is engine-owned; core records the order.
+
 ### 7a. Partition-spec identity on every written file · **NORMATIVE (2026-07-25)**
 
 Every file the base writers produce carries a `partition_spec_id`. It is the FIRST half of the
@@ -276,7 +278,6 @@ partition, …)` — so a Java-written file can never claim a spec the table doe
   type still has fields.
 - Keep `MetricsConfig::for_position_delete` so `file_path`/`pos` bounds stay Full (pruning
   precision).
-- Sort-order application before write is engine-owned; core records the order.
 
 ## 8. Commit semantics
 
