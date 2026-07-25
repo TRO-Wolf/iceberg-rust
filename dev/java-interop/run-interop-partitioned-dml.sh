@@ -34,6 +34,12 @@
 #   * Electronics ids 1 and 2 are ABSENT (COW removed the partition file).
 #   * Column values match: id=3 → (books,novel); id=4 → (books,textbook).
 #
+# WG1 NULL-TUPLE LEG (honest-children PartitionExpr): a second Rust GEN test writes
+# <dir>/rust_table_nulltuple via `INSERT … SELECT id, CASE WHEN id = 2 THEN NULL ELSE category
+# END, value` — a COMPUTED partition-source item. Java reads the FILE-level partition tuples
+# back ({null, "books"} via FileScanTask.file().partition()) and both rows (id=2 category IS
+# NULL). Before the fix this write stamped a real-but-wrong `electronics` tuple, never NULL.
+#
 # SABOTAGE STEP (non-vacuity proof): after the green verify, the script corrupts the
 # final.metadata.json (truncates it), re-runs Java verify, and asserts Java now reports >0
 # failures.  The original file is then restored and Java is re-run to confirm GREEN.
@@ -55,19 +61,19 @@ echo "==> [1/5] Reset the temp table dir: ${TMP_DIR}"
 rm -rf "${TMP_DIR}"
 mkdir -p "${TMP_DIR}"
 
-echo "==> [2/5] Rust: WRITE a partitioned V2 table via DataFusion SQL DML \
-(INSERT + COW DELETE) + final.metadata.json"
+echo "==> [2/5] Rust: WRITE the partitioned V2 tables via DataFusion SQL DML \
+(INSERT + COW DELETE; INSERT…SELECT CASE→NULL) + final.metadata.json each"
 (
   cd "${REPO_ROOT}"
+  # No test-name filter: runs BOTH GEN tests (COW-DELETE table + WG1 null-tuple table).
   ICEBERG_INTEROP_PART_DML_GEN_DIR="${TMP_DIR}" \
     cargo test -p iceberg-datafusion \
       --test interop_partitioned_dml \
-      test_part_dml_gen_rust_writes_java_readable_partitioned_cow_table \
       -- --nocapture
 )
 
-echo "==> [3/5] Java: load the RUST-written final.metadata.json, read via IcebergGenerics, \
-verify survivor ids = {3,4} (books partition)"
+echo "==> [3/5] Java: load the RUST-written final.metadata.json files, read via IcebergGenerics, \
+verify survivor ids = {3,4} (books partition) + the WG1 null partition tuple"
 VERIFY_OUT="$(
   cd "${SCRIPT_DIR}"
   JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
