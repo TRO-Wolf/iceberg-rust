@@ -64,6 +64,34 @@ own files, so a shared tracker would collide).
 - [ ] **WG4 — `fix/rest-secret-debug-ssrf`** (SEC-010 / SEC-011): REST catalog secret-in-`Debug`
   exposure + SSRF surface.
 
+## BACK-TO-GOAL BLOCK (2026-07-25, signed off) — consumer fork-queue remediation, 3+2 units
+
+Spec (single home, supersedes the triage scratchpad):
+[back-to-goal-2026-07-25-brief.md](back-to-goal-2026-07-25-brief.md). Decisions D1-D6 recorded
+there (WG1 = children-bearing PhysicalExpr; WG3 non-breaking first; WG2 + remediation tooling;
+WG1 solo Mode A then Mode B bundle; bundle-first satisfied = #170/#171 merged, content-verified;
+R161 URL-escaping APPROVED). RePark work order delivered:
+`~/Desktop/repark-work-order-2026-07-25.md`. Goal frame: gate 1 data-trust → gate 2 engine-trust
+→ gate 3 scale.
+
+- [ ] **Unit 1 — WG1 honest-children `PartitionExpr` (S1, Mode A solo PR, AC·OO)** — branch
+      `fix/partition-expr-honest-children` off `ce2affc9`. FORK-O7+O8 are ONE defect (optimizer
+      re-parents the children-less expr; positional read hits the wrong batch). Fix shape D1 +
+      core-seam guard + T1-T10/M1-M5 per brief. Claim OPENED on the PrimarySync board
+      2026-07-25. Close-out: RoadMapSync announce → RePark repins + flips its 2 detector pins.
+- [ ] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic)** — branch
+      `fix/engine-trust-bundle-2026-07` after Unit 1 merges. G1 WG2 detector+remediation → G2
+      WG4a stamp probe/fix + WG4c contract normativity (R113) → G3 WG3 L2+L3 non-breaking →
+      G4 R161 escaping (format-stability attestation) → G5 WG4b path-keyed pos-delete routing
+      (+ remove_dangling same-unit; R117 demote→re-promote) → G6 WG5 null-bit family → G7 WG6
+      mechanical → G8 delete_filter lost-wakeup (3 sites + `PosDelState::Failed`).
+- [ ] **Unit 3 — breaking follow-up (Mode A, after Unit 2)** — `PartitionKey::new -> Result`
+      (58 sites/34 files incl. 6 `no_run` doc fences) + `CurrentFileStatus` unwraps.
+- [ ] **Unit 4 — H7-S2 COW streaming** · **Unit 5 — H7-P1 pushdown** (footgun precondition) —
+      re-scope at signing.
+- Watch: nightly-interop dispatch on main (#169/#170 live proof); branch pruning (classifier-
+      blocked this session); tail backlog in the brief.
+
 ## FOLLOW-UPS BUNDLE (2026-07-18, signed off) — audit follow-up ledger, 5 groups, OO-High AC, ONE branch
 
 Branch `fix/audit-followups-bundle` (Mode B; user-directed: Opus-high Actor/Critic per group, Fable
