@@ -68,13 +68,20 @@ pub(crate) struct IcebergWriteExec {
 }
 
 impl IcebergWriteExec {
-    pub fn new(table: Table, input: Arc<dyn ExecutionPlan>, schema: ArrowSchemaRef) -> Self {
-        let plan_properties = Self::compute_properties(&input, schema);
+    /// Creates the write node.
+    ///
+    /// The node's advertised schema is its RESULT schema (the serialized data files), not the
+    /// table's: `execute` emits result batches, and a node whose parents are planned against a
+    /// schema it never emits is the BUG-011 skew in the write path. It also removes the last
+    /// consumer of the provider's cached table schema from this branch of the plan.
+    pub fn new(table: Table, input: Arc<dyn ExecutionPlan>) -> Self {
+        let result_schema = Self::make_result_schema();
+        let plan_properties = Self::compute_properties(&input, Arc::clone(&result_schema));
 
         Self {
             table,
             input,
-            result_schema: Self::make_result_schema(),
+            result_schema,
             plan_properties,
         }
     }
@@ -175,7 +182,6 @@ impl ExecutionPlan for IcebergWriteExec {
         Ok(Arc::new(Self::new(
             self.table.clone(),
             Arc::clone(&children[0]),
-            self.schema(),
         )))
     }
 
@@ -503,7 +509,15 @@ mod tests {
         ]));
 
         // 4. Create IcebergWriteExec
-        let write_exec = IcebergWriteExec::new(table.clone(), input_plan, arrow_schema);
+        let write_exec = IcebergWriteExec::new(table.clone(), input_plan);
+
+        // The node must advertise the schema it actually emits — the serialized data files, not the
+        // table's schema (which is what it used to advertise while emitting result batches).
+        assert_eq!(
+            write_exec.schema().as_ref(),
+            &ArrowSchema::new(vec![Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false)]),
+            "IcebergWriteExec must advertise its result schema"
+        );
 
         // 5. Execute the plan
         let task_ctx = Arc::new(TaskContext::default());
