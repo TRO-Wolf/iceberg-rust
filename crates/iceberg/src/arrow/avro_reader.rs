@@ -142,13 +142,15 @@ pub(crate) async fn read_avro_data_file(
     // Decode off the async executor: Avro datum decode is CPU-bound. `try_join` (not a bare
     // `.await`) because the decoder is third-party code running on bytes we do not control: a
     // panic inside `apache_avro`/`arrow` on a malformed or hostile file must fail THIS read with a
-    // typed error, not unwind into whoever is awaiting the scan. The outer `?` unwraps the join
-    // result; the inner `Result` is the decode's own and is returned as-is.
+    // typed error, not unwind into whoever is awaiting the scan. The path is attached as context
+    // because the join error itself cannot name which file killed the decoder. The outer `?`
+    // unwraps the join result; the inner `Result` is the decode's own and is returned as-is.
     crate::runtime::spawn_blocking(move || {
         read_avro_data_bytes(&bytes, expected.as_ref(), batch_size)
     })
     .try_join()
-    .await?
+    .await
+    .map_err(|error| error.with_context("path", input.location().to_string()))?
 }
 
 /// Decode Avro OCF `bytes` into Arrow [`RecordBatch`]es against the `expected` projection schema.

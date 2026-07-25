@@ -38,8 +38,8 @@ pub(crate) struct DeleteFileIndex {
 enum DeleteFileIndexState {
     Populating(Arc<Notify>),
     Populated(PopulatedDeleteFileIndex),
-    /// The populate task terminated WITHOUT publishing an index — it unwound, or the runtime was
-    /// torn down and the task's future was dropped at its `collect()` await.
+    /// The populate task terminated WITHOUT publishing an index — it unwound, or its future was
+    /// dropped by a runtime teardown (whether parked at `collect()` or never polled at all).
     ///
     /// Terminal, exactly like [`DeleteFileIndexState::Populated`]: the populate task is the sole
     /// writer and runs once, so if it dies the state can never advance on its own. Without this
@@ -50,13 +50,19 @@ enum DeleteFileIndexState {
     Failed(String),
 }
 
-/// Publishes the populate task's TERMINAL state and wakes the waiters, on every exit path.
+/// Publishes the populate task's TERMINAL state and wakes the waiters.
 ///
-/// Constructed at the top of the populate task, before its first await, and disarmed by
-/// [`PopulateGuard::publish`] on the success path. If the task never reaches that call — it
-/// unwound (tokio drops the task's future as the panic propagates), or the runtime shut down and
-/// dropped the parked future — `Drop` publishes [`DeleteFileIndexState::Failed`] instead, so every
-/// waiter reaches a terminal state and gets a typed error rather than hanging forever.
+/// Constructed in the `spawn` PRELUDE — not inside the `async move` block — so the populate
+/// future CAPTURES an already-armed guard rather than arming it on its first poll. That
+/// distinction is the whole guarantee: a future constructed-on-poll that is dropped before it is
+/// ever polled runs no local destructors, so a runtime torn down between `spawn` and the first
+/// poll would leave the state stranded at `Populating`.
+///
+/// [`PopulateGuard::publish`] disarms it on the success path. If that call is never reached,
+/// `Drop` publishes [`DeleteFileIndexState::Failed`] instead, so every waiter reaches a terminal
+/// state and gets a typed error rather than hanging forever. `Drop` therefore covers all three
+/// ways the task can die without publishing: never polled, unwound (tokio drops the task's future
+/// as the panic propagates), and cancelled/parked-future teardown.
 ///
 /// Both paths write the state under the write lock and fire the notifier only AFTER releasing it,
 /// so a woken waiter always observes the terminal state (see [`DeleteFileIndex::lookup_or_arm`]
@@ -152,13 +158,14 @@ impl DeleteFileIndex {
         let delete_file_stream = rx.boxed();
 
         spawn({
-            let state = state.clone();
-            async move {
-                // Armed BEFORE the first await, so every way out of this task — including the
-                // runtime dropping the future while it is parked on `collect()` below — publishes
-                // a terminal state and wakes the waiters.
-                let mut guard = PopulateGuard::new(state, notify);
+            // Armed HERE, in the prelude, so the future below CAPTURES the guard instead of
+            // constructing it on its first poll. Dropping the future then always runs the guard's
+            // `Drop` — including when the future is dropped before it is ever polled (a runtime
+            // torn down between this `spawn` and the first poll), which a guard constructed inside
+            // the `async move` block would miss entirely.
+            let mut guard = PopulateGuard::new(state.clone(), notify);
 
+            async move {
                 let delete_files: Vec<DeleteFileContext> =
                     delete_file_stream.collect::<Vec<_>>().await;
 
@@ -1060,6 +1067,95 @@ mod tests {
         .await
         .expect("a dead populate task must not hang the waiter")
         .expect_err("a dead populate task must surface a typed error");
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains("populate task"),
+            "the error must name the dead populate task, got: {error}"
+        );
+    }
+
+    /// Risk pinned (audit SAF-007, Critic probe P1b): the populate future can be dropped BEFORE IT
+    /// IS EVER POLLED — a runtime torn down between `spawn` and the first poll. A future dropped
+    /// unpolled runs no local destructors, so a guard constructed *inside* the `async move` block
+    /// would never exist and the state would strand at `Populating`. The guard is therefore
+    /// constructed in the `spawn` prelude and CAPTURED by the future.
+    ///
+    /// MUTATION: moving `PopulateGuard::new(...)` back inside the `async move` block leaves this
+    /// waiter with no terminal state and the timeout below fires (RED), while the parked-future
+    /// test above still passes — which is exactly why this pin is separate from it.
+    #[tokio::test]
+    async fn test_never_polled_populate_task_yields_a_typed_error_not_a_hang() {
+        let data_file = build_unpartitioned_data_file();
+
+        let (index, _tx) = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build the throwaway runtime that hosts the populate task");
+            // ZERO yields: `block_on` returns as soon as `new()` does, so the populate future is
+            // queued but never polled before the runtime below is destroyed.
+            let (index, tx) = runtime.block_on(async { DeleteFileIndex::new() });
+            drop(runtime);
+            (index, tx)
+        })
+        .join()
+        .expect("the runtime-teardown thread must not panic");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&data_file, Some(0)),
+        )
+        .await
+        .expect("a never-polled populate task must not hang the waiter")
+        .expect_err("a never-polled populate task must surface a typed error");
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains("populate task"),
+            "the error must name the dead populate task, got: {error}"
+        );
+    }
+
+    /// Risk pinned (audit SAF-007, Critic probe P2): a populate task that UNWINDS must leave the
+    /// index in the terminal `Failed` state, not stranded at `Populating`.
+    ///
+    /// The panic is raised in a task holding a [`PopulateGuard`] over the real index's state
+    /// rather than inside the real populate task: that task's body has no reachable panic source
+    /// today (`PopulatedDeleteFileIndex::new` handles every `DataContentType` without indexing or
+    /// unwrapping), so injecting one would need a test-only seam in production code. What is
+    /// pinned is the property that matters — an unwind past a live guard publishes `Failed` and
+    /// wakes the waiters.
+    #[tokio::test]
+    async fn test_unwinding_populate_task_yields_a_typed_error_not_a_hang() {
+        let (index, _tx) = DeleteFileIndex::new();
+        let data_file = build_unpartitioned_data_file();
+
+        let notifier = {
+            let guard = index.state.read().expect("read the index state");
+            match &*guard {
+                DeleteFileIndexState::Populating(notifier) => notifier.clone(),
+                other => panic!("expected a populating index, got {other:?}"),
+            }
+        };
+
+        let state = index.state.clone();
+        let join_error = spawn(async move {
+            let _guard = PopulateGuard::new(state, notifier);
+            panic!("simulated populate-task unwind");
+        })
+        .try_join()
+        .await
+        .expect_err("the simulated populate task must have unwound");
+        assert_eq!(join_error.kind(), ErrorKind::Unexpected);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&data_file, Some(0)),
+        )
+        .await
+        .expect("an unwound populate task must not hang the waiter")
+        .expect_err("an unwound populate task must surface a typed error");
 
         assert_eq!(error.kind(), ErrorKind::Unexpected);
         assert!(

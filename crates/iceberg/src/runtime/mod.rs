@@ -40,15 +40,23 @@ impl<T> Unpin for JoinHandle<T> {}
 ///
 /// * **Task panicked.** The original panic payload is re-raised verbatim with
 ///   [`std::panic::resume_unwind`], which preserves the payload a downstream
-///   [`std::panic::catch_unwind`] boundary (or a panic hook) would see. This mirrors Java, where
-///   `Future.get()` rethrows the task's own exception at the caller (`ExecutionException::getCause`
-///   is the original throwable; Iceberg's own `Tasks`/`ExceptionUtil.castAndThrow` goes further and
-///   rethrows the unchecked exception unwrapped). The previous `.expect("tokio spawned task
-///   failed")` DESTROYED the payload — every task panic surfaced as the same opaque string — which
-///   is neither Java parity nor debuggable.
-/// * **Task cancelled.** Nothing failed; there is simply no value. With `Output = T` the only
-///   honest option is a panic that says so. Callers whose signature can carry an error should use
-///   [`JoinHandle::try_join`] instead, which turns BOTH cases into a typed [`Error`].
+///   [`std::panic::catch_unwind`] boundary (or a panic hook) would see. The parity anchor is the
+///   JDK contract: `Future.get()` reports the task's own failure to the caller by throwing
+///   `ExecutionException` whose `getCause()` IS the original throwable — the failure survives the
+///   hand-off. The previous `.expect("tokio spawned task failed")` DESTROYED the payload (every
+///   task panic surfaced as the same opaque string), which is neither that contract nor debuggable.
+///
+///   Iceberg's own Java `Tasks.waitFor` is deliberately NOT the anchor: it unwraps only `Error`
+///   causes, and for everything else it collects the `ExecutionException` WRAPPER, which
+///   `ExceptionUtil.castAndThrow` then re-wraps again as `RuntimeException(ExecutionException(cause))`
+///   — doubly wrapped (verified against Java 1.10.0). We match `Future.get`, the contract that
+///   preserves the original failure.
+/// * **Task cancelled.** Nothing failed; there is simply no value. With `Output = T` there is no
+///   value to return and no error channel, so the only honest option is a panic that says so.
+///   This is a DELIBERATE DIVERGENCE from Java `Tasks.waitFor`, which explicitly IGNORES
+///   `CancellationException` and carries on — an option we do not have here. Callers whose
+///   signature can carry an error should use [`JoinHandle::try_join`] instead, which turns BOTH
+///   cases into a typed [`Error`] and so does not have to make this choice.
 ///
 /// Converting `Output` itself to `Result<T, Error>` would touch every awaited *and* detached
 /// `spawn` site in the crate; [`JoinHandle::try_join`] gets the typed error to the call sites whose
@@ -61,9 +69,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
         Pin::new(handle).poll(cx).map(|result| match result {
             Ok(value) => value,
             Err(join_error) if join_error.is_panic() => resume_unwind(join_error.into_panic()),
-            Err(join_error) => panic!(
-                "iceberg spawned task was cancelled before it produced a value: {join_error}"
-            ),
+            Err(join_error) => panic!("{CANCELLED_MESSAGE}: {join_error}"),
         })
     }
 }
@@ -89,8 +95,17 @@ impl<T: Send + 'static> JoinHandle<T> {
     }
 }
 
+/// The one wording for "the task was cancelled", shared by the [`Future`] impl's panic and
+/// [`JoinHandle::try_join`]'s typed error so the two paths cannot drift apart.
+const CANCELLED_MESSAGE: &str = "spawned task was cancelled before it produced a value";
+
 /// Render a [`JoinError`] as a typed [`Error`], keeping the panic payload (or the join error
 /// itself, for a cancellation) reachable rather than collapsing both into one opaque string.
+///
+/// The `JoinError` is attached as [`Error::source`] only on the CANCELLATION path: on the panic
+/// path `JoinError::into_panic` consumes it by value to hand back the payload, so there is no
+/// `JoinError` left to attach — the payload itself is carried in the message instead, which is the
+/// information the source would have rendered anyway.
 fn join_failure_to_error(join_error: JoinError) -> Error {
     if join_error.is_panic() {
         let payload = panic_payload_message(&*join_error.into_panic());
@@ -104,11 +119,7 @@ fn join_failure_to_error(join_error: JoinError) -> Error {
         );
     }
 
-    Error::new(
-        ErrorKind::Unexpected,
-        "spawned task was cancelled before it produced a value",
-    )
-    .with_source(join_error)
+    Error::new(ErrorKind::Unexpected, CANCELLED_MESSAGE).with_source(join_error)
 }
 
 /// Best-effort rendering of a panic payload. `panic!`/`assert!` produce either a `&'static str`
