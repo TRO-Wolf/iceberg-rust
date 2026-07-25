@@ -35,6 +35,21 @@
 //! * T10 — FROM-less literal `INSERT INTO … SELECT <literals>` (no `FROM`):
 //!   plans over `PlaceholderRowExec` (1 row, 0 columns); panicked before the fix,
 //!   must succeed with the correct tuple after it.
+//!
+//! Unit 2 / G0 (nullability widening — `task/back-to-goal-2026-07-25-brief.md`):
+//! * G0-1 — FROM-less literal `SELECT` into a table whose partition-source column
+//!   is OPTIONAL: the literal SELECT items are non-nullable, the target column is
+//!   nullable. Rejected by the strict input-schema equality before G0.
+//! * G0-2 — the same shape with an explicit `NULL` partition-source literal:
+//!   NULL legality must survive the widening (tuple slot NULL).
+//! * G0-3 — non-null `VALUES` into the optional column.
+//! * G0-4 — `SELECT` from a source whose column is NON-nullable into the optional
+//!   column.
+//! * G0-5 — NEGATIVE pin: a NULLABLE source column into a REQUIRED target column
+//!   is still rejected, loudly, by the same validation.
+//! * G0-6 — symmetry record: the UNPARTITIONED write path never runs this
+//!   validation at all (`project_with_partition` returns early), so the widened
+//!   shape was — and stays — accepted there.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -429,11 +444,10 @@ async fn test_insert_values_control_manifest_tuple() -> Result<()> {
 /// `record_batch_projector`; after the fix the substituted literal children
 /// evaluate correctly and the manifest tuple is `'books'`.
 ///
-/// The table uses REQUIRED fields: literal SELECT items are non-nullable, and
-/// `project_with_partition`'s pre-existing strict schema validation (nullability
-/// included) must pass for the plan to reach the partition machinery at all.
-/// (On an optional-column table the same statement is rejected by that
-/// validation today — a separate, loud, pre-existing provider limitation.)
+/// The table uses REQUIRED fields, so literal SELECT items (which are
+/// non-nullable) match the target columns exactly. The OPTIONAL-column variant
+/// of this same statement is G0-1 below: it needed the safe-direction
+/// nullability widening to reach the partition machinery at all.
 #[tokio::test]
 async fn test_insert_fromless_literal_select_partitioned() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -482,6 +496,278 @@ async fn test_insert_fromless_literal_select_partitioned() -> Result<()> {
         tuples,
         vec![Some("books".to_string())],
         "FROM-less literal insert must land in the 'books' partition"
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// G0 — nullability widening: NON-nullable input into an OPTIONAL target column
+// ===========================================================================
+
+/// G0-1: the T10 shape on a table whose partition-source column is OPTIONAL.
+///
+/// `INSERT INTO t SELECT 1, 'books', 'x'` plans three non-nullable literals;
+/// the table's `category` column is optional (nullable). Before G0 the
+/// provider's input-schema validation required exact Arrow field equality
+/// INCLUDING nullability, so this statement failed with
+/// `Plan("Input schema does not match Iceberg table schema …")` before the
+/// partition machinery ever ran. Required-into-optional is the standard
+/// write-compatible direction, so it must now be accepted — and produce the
+/// correct manifest tuple.
+#[tokio::test]
+async fn test_insert_fromless_literal_into_optional_column_partitioned() -> Result<()> {
+    let (ctx, client, ident) = make_case_ctx("g0_fromless_optional").await?;
+
+    let inserted = run_insert(
+        &ctx,
+        "INSERT INTO catalog.g0_fromless_optional.t SELECT 1, 'books', 'x'",
+    )
+    .await;
+    assert_eq!(inserted, 1, "INSERT must report 1 row written");
+
+    let (tuples, total_records) = manifest_partition_tuples(&client, &ident).await?;
+    assert_eq!(total_records, 1, "manifest record counts must sum to 1");
+    assert_eq!(
+        tuples,
+        vec![Some("books".to_string())],
+        "non-nullable literal SELECT items must be accepted into the OPTIONAL \
+         category column and land in the 'books' partition"
+    );
+    Ok(())
+}
+
+/// G0-2: NULL legality survives the widening. A FROM-less `SELECT` whose
+/// partition-source item is an explicit `NULL` writes a NULL partition tuple
+/// slot into the optional column — the widening must not have turned the
+/// optional column into a required one.
+#[tokio::test]
+async fn test_insert_fromless_literal_null_into_optional_column_stays_legal() -> Result<()> {
+    let (ctx, client, ident) = make_case_ctx("g0_fromless_null").await?;
+
+    let inserted = run_insert(
+        &ctx,
+        "INSERT INTO catalog.g0_fromless_null.t SELECT 2, NULL, 'y'",
+    )
+    .await;
+    assert_eq!(inserted, 1, "INSERT must report 1 row written");
+
+    let (tuples, total_records) = manifest_partition_tuples(&client, &ident).await?;
+    assert_eq!(total_records, 1, "manifest record counts must sum to 1");
+    assert_eq!(
+        tuples,
+        vec![None],
+        "a NULL partition-source literal must still land in the NULL slot"
+    );
+    Ok(())
+}
+
+/// G0-3: non-null `VALUES` into the optional column.
+#[tokio::test]
+async fn test_insert_values_non_null_into_optional_column_partitioned() -> Result<()> {
+    let (ctx, client, ident) = make_case_ctx("g0_values_optional").await?;
+
+    let inserted = run_insert(
+        &ctx,
+        "INSERT INTO catalog.g0_values_optional.t VALUES (1, 'books', 'x')",
+    )
+    .await;
+    assert_eq!(inserted, 1, "INSERT must report 1 row written");
+
+    let (tuples, total_records) = manifest_partition_tuples(&client, &ident).await?;
+    assert_eq!(total_records, 1, "manifest record counts must sum to 1");
+    assert_eq!(
+        tuples,
+        vec![Some("books".to_string())],
+        "non-null VALUES must land in the 'books' partition"
+    );
+    Ok(())
+}
+
+/// G0-4: `SELECT` from a source whose `category` column is NON-nullable into the
+/// optional target column — the "required source" leg of the widening.
+#[tokio::test]
+async fn test_insert_select_required_source_into_optional_column_partitioned() -> Result<()> {
+    let (ctx, client, ident) = make_case_ctx("g0_required_source").await?;
+
+    // A second source table whose `category` column is NOT nullable.
+    let src_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let src_batch = RecordBatch::try_new(src_schema.clone(), vec![
+        Arc::new(Int32Array::from(vec![1])),
+        Arc::new(StringArray::from(vec!["books"])),
+        Arc::new(StringArray::from(vec!["x"])),
+    ])
+    .expect("build src_required batch");
+    let src =
+        MemTable::try_new(src_schema, vec![vec![src_batch]]).expect("build src_required MemTable");
+    ctx.register_table("src_required", Arc::new(src))
+        .expect("register src_required table");
+
+    let inserted = run_insert(
+        &ctx,
+        "INSERT INTO catalog.g0_required_source.t \
+         SELECT id, category, value FROM src_required",
+    )
+    .await;
+    assert_eq!(inserted, 1, "INSERT must report 1 row written");
+
+    let (tuples, total_records) = manifest_partition_tuples(&client, &ident).await?;
+    assert_eq!(total_records, 1, "manifest record counts must sum to 1");
+    assert_eq!(
+        tuples,
+        vec![Some("books".to_string())],
+        "a NON-nullable source column must be accepted into the OPTIONAL \
+         category column and land in the 'books' partition"
+    );
+    Ok(())
+}
+
+/// G0-5 NEGATIVE pin: the UNSAFE direction stays rejected. A NULLABLE source
+/// column selected into a REQUIRED target column could carry a NULL the table
+/// forbids, so the provider must keep failing loudly with the pre-existing
+/// message — the widening is one-directional.
+#[tokio::test]
+async fn test_insert_nullable_source_into_required_column_still_rejected() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("g0_required_target".to_string());
+    iceberg_catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await?;
+
+    // Every column REQUIRED, partitioned by identity(category).
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let provider = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", provider);
+
+    // Source `category` column IS nullable — the unsafe direction.
+    let src_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let src_batch = RecordBatch::try_new(src_schema.clone(), vec![
+        Arc::new(Int32Array::from(vec![1])),
+        Arc::new(StringArray::from(vec![Some("books")])),
+        Arc::new(StringArray::from(vec!["x"])),
+    ])
+    .expect("build nullable src batch");
+    let src = MemTable::try_new(src_schema, vec![vec![src_batch]]).expect("build src MemTable");
+    ctx.register_table("src_nullable", Arc::new(src))
+        .expect("register src_nullable table");
+
+    let plan = ctx
+        .sql(
+            "INSERT INTO catalog.g0_required_target.t \
+             SELECT id, category, value FROM src_nullable",
+        )
+        .await;
+    let err = match plan {
+        Err(err) => err,
+        Ok(df) => df
+            .collect()
+            .await
+            .expect_err("nullable source into a REQUIRED target column must be rejected"),
+    };
+    assert!(
+        err.to_string()
+            .contains("Input schema does not match Iceberg table schema"),
+        "the unsafe nullability direction must keep failing with the \
+         pre-existing loud provider error, got: {err}"
+    );
+
+    // Nothing may have been committed.
+    let ident = TableIdent::new(namespace, "t".to_string());
+    let table = client.load_table(&ident).await?;
+    assert!(
+        table.metadata().current_snapshot().is_none(),
+        "the rejected INSERT must not have committed a snapshot"
+    );
+    Ok(())
+}
+
+/// G0-6 symmetry record: on an UNPARTITIONED table `project_with_partition`
+/// returns before the validation runs, so the widened shape (non-nullable
+/// literals into an optional column) was accepted there even before G0 — and
+/// must stay accepted. This pins the asymmetry so a future change that moves
+/// the validation earlier cannot silently break the unpartitioned path.
+#[tokio::test]
+async fn test_insert_fromless_literal_into_optional_column_unpartitioned() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("g0_unpartitioned".to_string());
+    iceberg_catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .properties(HashMap::new())
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let provider = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", provider);
+
+    let inserted = run_insert(
+        &ctx,
+        "INSERT INTO catalog.g0_unpartitioned.t SELECT 1, 'books', 'x'",
+    )
+    .await;
+    assert_eq!(inserted, 1, "INSERT must report 1 row written");
+
+    let rows = ctx
+        .sql("SELECT id, category, value FROM catalog.g0_unpartitioned.t")
+        .await
+        .expect("plan SELECT")
+        .collect()
+        .await
+        .expect("execute SELECT");
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let category = rows[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("category column is Utf8");
+    assert_eq!(
+        category.value(0),
+        "books",
+        "the unpartitioned path must write the literal category through"
     );
     Ok(())
 }

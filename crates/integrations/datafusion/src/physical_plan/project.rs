@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, RecordBatch};
-use datafusion::arrow::datatypes::{DataType, Schema as ArrowSchema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Column;
@@ -34,6 +34,98 @@ use iceberg::spec::PartitionSpec;
 use iceberg::table::Table;
 
 use crate::to_datafusion_error;
+
+/// Nesting depth beyond which [`data_type_is_write_compatible`] stops walking and
+/// falls back to plain structural equality (the pre-widening rule).
+///
+/// The input schema comes from a query plan, so the walk is user-influenced: a
+/// pathologically nested type must not be able to overflow the thread stack
+/// (AGENTS.md, "Recursion Safety"). The fallback is the STRICT comparison, so
+/// exceeding the limit can only ever reject a write the widened rule would have
+/// accepted — never accept one it would have rejected.
+const MAX_WRITE_COMPATIBILITY_DEPTH: usize = 64;
+
+/// Whether an input field may be written into the table field `expected`.
+///
+/// Identical to structural equality except for **one-directional nullability
+/// widening**: a NON-nullable input value can always be stored in a nullable
+/// (Iceberg OPTIONAL) target, so `required -> optional` is accepted. The reverse
+/// is not: a nullable input into a required target may carry a NULL the table
+/// forbids, and stays rejected. Names, types, field order and arity are
+/// unchanged — strict.
+///
+/// This is the direction Java Iceberg gates writes on. Decoded from the
+/// `iceberg-api` 1.10.0 bytecode (`org.apache.iceberg.types.CheckCompatibility`):
+/// `writeCompatibilityErrors(readSchema, writeSchema)` visits the TABLE schema
+/// with `checkNullability = true`, and `field()` records the nullability error
+/// `"<name> should be required, but is optional"` on exactly one condition —
+/// `readField.isRequired() && writeField.isOptional()`, i.e. optional incoming
+/// data into a required table column. A required incoming field landing in an
+/// optional table column produces no error at all. Java never gates a write on
+/// whole-schema equality.
+///
+/// The fork's check stays STRICTER than Java's on every other axis (Java matches
+/// by field id, tolerates missing optionals and extra fields, and permits type
+/// promotion); this function relaxes the nullability axis only.
+///
+/// Comparing name + nullability + data type is EXHAUSTIVE here, not a subset of
+/// `Field`'s own equality: both sides arrive from `strip_metadata_from_schema`,
+/// which rebuilds every field at every level with `Field::new`, so the remaining
+/// `Field` components (`metadata`, `dict_is_ordered`) are equal by construction.
+/// Nullability is therefore the only axis this relaxes.
+fn field_is_write_compatible(input: &Field, expected: &Field, depth: usize) -> bool {
+    input.name() == expected.name()
+        // The ONLY relaxation: reject exactly `nullable input -> required target`.
+        && (!input.is_nullable() || expected.is_nullable())
+        && data_type_is_write_compatible(input.data_type(), expected.data_type(), depth)
+}
+
+/// [`field_is_write_compatible`] for data types: recurses through the nested
+/// kinds an Iceberg schema can produce (struct fields, list elements, map
+/// key/value) so the widening applies at every level, and compares everything
+/// else exactly.
+fn data_type_is_write_compatible(input: &DataType, expected: &DataType, depth: usize) -> bool {
+    if depth >= MAX_WRITE_COMPATIBILITY_DEPTH {
+        // Depth guard: degrade to the strict pre-widening rule rather than
+        // recursing further (see MAX_WRITE_COMPATIBILITY_DEPTH).
+        return input == expected;
+    }
+    let depth = depth + 1;
+    match (input, expected) {
+        (DataType::Struct(input_fields), DataType::Struct(expected_fields)) => {
+            input_fields.len() == expected_fields.len()
+                && input_fields
+                    .iter()
+                    .zip(expected_fields.iter())
+                    .all(|(input, expected)| field_is_write_compatible(input, expected, depth))
+        }
+        (DataType::List(input_element), DataType::List(expected_element))
+        | (DataType::LargeList(input_element), DataType::LargeList(expected_element)) => {
+            field_is_write_compatible(input_element, expected_element, depth)
+        }
+        (
+            DataType::FixedSizeList(input_element, input_len),
+            DataType::FixedSizeList(expected_element, expected_len),
+        ) => {
+            input_len == expected_len
+                && field_is_write_compatible(input_element, expected_element, depth)
+        }
+        // The map's `key_value` entries field is a struct of {key, value}; the
+        // recursion widens the VALUE field. The `sorted` flag is part of the
+        // type and must match.
+        (
+            DataType::Map(input_entries, input_sorted),
+            DataType::Map(expected_entries, expected_sorted),
+        ) => {
+            input_sorted == expected_sorted
+                && field_is_write_compatible(input_entries, expected_entries, depth)
+        }
+        // Every primitive — and any nested kind not modelled above — must match
+        // EXACTLY. Unknown shapes fall back to the strict rule rather than being
+        // waved through.
+        (input, expected) => input == expected,
+    }
+}
 
 /// Extends an ExecutionPlan with partition value calculations for Iceberg tables.
 ///
@@ -71,7 +163,20 @@ pub fn project_with_partition(
     let expected_schema_cleaned =
         strip_metadata_from_schema(&expected_arrow_schema).map_err(to_datafusion_error)?;
 
-    if input_schema_cleaned != expected_schema_cleaned {
+    // Field-by-field rather than `!=` on the whole schema: the ONE tolerated
+    // difference is safe-direction nullability widening (a non-nullable input
+    // column into an OPTIONAL table column), applied recursively. Everything
+    // else — names, types, arity, order, and `nullable input -> required target`
+    // — stays strict and fails with the message below.
+    let input_fields = input_schema_cleaned.fields();
+    let expected_fields = expected_schema_cleaned.fields();
+    let schemas_compatible = input_fields.len() == expected_fields.len()
+        && input_fields
+            .iter()
+            .zip(expected_fields.iter())
+            .all(|(input, expected)| field_is_write_compatible(input, expected, 0));
+
+    if !schemas_compatible {
         return Err(DataFusionError::Plan(format!(
             "Input schema does not match Iceberg table schema.\n\
              Expected schema: {expected_schema_cleaned}\n\
@@ -82,14 +187,6 @@ pub fn project_with_partition(
     let calculator =
         PartitionValueCalculator::try_new(partition_spec.as_ref(), table_schema.as_ref())
             .map_err(to_datafusion_error)?;
-
-    let mut projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(input_schema.fields().len() + 1);
-
-    for (index, field) in input_schema.fields().iter().enumerate() {
-        let column_expr = Arc::new(Column::new(field.name(), index));
-        projection_exprs.push((column_expr, field.name().clone()));
-    }
 
     // One child per column of the (already-validated) input schema. The children
     // are how DataFusion's optimizers see — and rewrite — this expression's
@@ -102,6 +199,14 @@ pub fn project_with_partition(
         .enumerate()
         .map(|(index, field)| Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>)
         .collect();
+
+    // The passthrough SELECT items ARE those same children — built once, so the
+    // projection's columns and the partition expression's inputs cannot drift.
+    let mut projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(children.len() + 1);
+    for (child, field) in children.iter().zip(input_schema.fields().iter()) {
+        projection_exprs.push((Arc::clone(child), field.name().clone()));
+    }
 
     let partition_expr = Arc::new(PartitionExpr::new(
         calculator,
@@ -971,6 +1076,376 @@ mod tests {
             "identity(id) partition values must be computed from the projected \
              (id + 100) column, not from the raw source batch"
         );
+    }
+
+    // =======================================================================
+    // G0 — write-compatibility (safe-direction nullability widening)
+    // =======================================================================
+
+    /// `{id int required (partition source), payload <ty> <nullable>}` as an
+    /// Iceberg-shaped table plus a matching partitioned `Table`.
+    ///
+    /// The partition spec is `identity(id)`, so `payload` only ever exercises
+    /// the schema validation — never the partition machinery.
+    fn payload_table(payload: NestedField) -> iceberg::table::Table {
+        use iceberg::TableIdent;
+        use iceberg::io::FileIO;
+        use iceberg::spec::FormatVersion;
+
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    payload.into(),
+                ])
+                .build()
+                .expect("build table schema"),
+        );
+        let partition_spec = iceberg::spec::PartitionSpec::builder(table_schema.clone())
+            .add_partition_field("id", "id_partition", Transform::Identity)
+            .expect("add identity(id) partition field")
+            .build()
+            .expect("build partition spec");
+        let sort_order = iceberg::spec::SortOrder::builder()
+            .build(&table_schema)
+            .expect("build sort order");
+        let table_metadata = iceberg::spec::TableMetadataBuilder::new(
+            (*table_schema).clone(),
+            partition_spec,
+            sort_order,
+            "/test/table".to_string(),
+            FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .expect("table metadata builder")
+        .build()
+        .expect("build table metadata");
+
+        iceberg::table::Table::builder()
+            .metadata(table_metadata.metadata)
+            .identifier(TableIdent::from_strs(["test", "table"]).expect("table ident"))
+            .file_io(FileIO::new_with_fs())
+            .metadata_location("/test/metadata.json".to_string())
+            .build()
+            .expect("build table")
+    }
+
+    /// Plan `project_with_partition` for [`payload_table`] against an input
+    /// whose second column is `payload_field`.
+    fn plan_with_payload_input(
+        table: &iceberg::table::Table,
+        payload_field: Field,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            payload_field,
+        ]));
+        project_with_partition(Arc::new(EmptyExec::new(arrow_schema)), table)
+    }
+
+    /// G0: a NON-nullable input column is accepted into an OPTIONAL (nullable)
+    /// table column — the safe write direction, and the shape every FROM-less
+    /// literal `INSERT` produces.
+    #[test]
+    fn test_schema_validation_accepts_required_input_into_optional_target() {
+        let table = payload_table(NestedField::optional(
+            2,
+            "name",
+            Type::Primitive(PrimitiveType::String),
+        ));
+        let result = plan_with_payload_input(&table, Field::new("name", DataType::Utf8, false));
+        assert!(
+            result.is_ok(),
+            "a non-nullable input column must be accepted into an OPTIONAL \
+             table column, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// G0 NEGATIVE pin: the unsafe direction — a NULLABLE input column into a
+    /// REQUIRED table column — keeps failing with the pre-existing message.
+    #[test]
+    fn test_schema_validation_rejects_nullable_input_into_required_target() {
+        let table = payload_table(NestedField::required(
+            2,
+            "name",
+            Type::Primitive(PrimitiveType::String),
+        ));
+        let result = plan_with_payload_input(&table, Field::new("name", DataType::Utf8, true));
+        let err = result.expect_err("nullable input into a REQUIRED target must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Input schema does not match Iceberg table schema"),
+            "the unsafe direction must keep failing loudly, got: {err}"
+        );
+    }
+
+    /// G0: the widening is RECURSIVE — a struct whose child field is required
+    /// in the input and optional in the table is accepted through the real
+    /// `project_with_partition` entry point.
+    #[test]
+    fn test_schema_validation_accepts_nested_struct_widening() {
+        let table = payload_table(NestedField::optional(
+            2,
+            "addr",
+            Type::Struct(StructType::new(vec![
+                NestedField::optional(3, "city", Type::Primitive(PrimitiveType::String)).into(),
+            ])),
+        ));
+        // Input: same struct, but `city` is NOT nullable — safe direction.
+        let input_struct = DataType::Struct(Fields::from(vec![Field::new(
+            "city",
+            DataType::Utf8,
+            false,
+        )]));
+        let result = plan_with_payload_input(&table, Field::new("addr", input_struct, true));
+        assert!(
+            result.is_ok(),
+            "a required NESTED field must be accepted into an optional nested \
+             field, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// G0 NEGATIVE pin (nested): a nullable nested input field into a required
+    /// nested table field is still rejected — the recursion is one-directional
+    /// at every level, not just the top.
+    #[test]
+    fn test_schema_validation_rejects_nested_struct_narrowing() {
+        let table = payload_table(NestedField::optional(
+            2,
+            "addr",
+            Type::Struct(StructType::new(vec![
+                NestedField::required(3, "city", Type::Primitive(PrimitiveType::String)).into(),
+            ])),
+        ));
+        let input_struct =
+            DataType::Struct(Fields::from(vec![Field::new("city", DataType::Utf8, true)]));
+        let result = plan_with_payload_input(&table, Field::new("addr", input_struct, true));
+        let err =
+            result.expect_err("nullable NESTED input into a required nested target is rejected");
+        assert!(
+            err.to_string()
+                .contains("Input schema does not match Iceberg table schema"),
+            "the unsafe nested direction must keep failing loudly, got: {err}"
+        );
+    }
+
+    /// Build `{name, nullability}` field pairs for the comparator tests.
+    fn utf8(name: &str, nullable: bool) -> Field {
+        Field::new(name, DataType::Utf8, nullable)
+    }
+
+    /// A one-field struct type `{inner: Utf8 <nullable>}`.
+    fn struct_of(inner: Field) -> DataType {
+        DataType::Struct(Fields::from(vec![inner]))
+    }
+
+    /// An Iceberg-shaped Arrow map: `key_value: struct<key, value>`, entries
+    /// field non-nullable.
+    fn map_of(value: Field, sorted: bool) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(Fields::from(vec![utf8("key", false), value])),
+                false,
+            )),
+            sorted,
+        )
+    }
+
+    /// G0 comparator: top-level nullability is one-directional; names and types
+    /// stay strict.
+    #[test]
+    fn test_field_write_compatibility_top_level() {
+        // required -> optional: the widening.
+        assert!(field_is_write_compatible(
+            &utf8("a", false),
+            &utf8("a", true),
+            0
+        ));
+        // equal nullability, both directions.
+        assert!(field_is_write_compatible(
+            &utf8("a", true),
+            &utf8("a", true),
+            0
+        ));
+        assert!(field_is_write_compatible(
+            &utf8("a", false),
+            &utf8("a", false),
+            0
+        ));
+        // optional -> required: REJECTED.
+        assert!(!field_is_write_compatible(
+            &utf8("a", true),
+            &utf8("a", false),
+            0
+        ));
+        // names stay strict.
+        assert!(!field_is_write_compatible(
+            &utf8("a", false),
+            &utf8("b", true),
+            0
+        ));
+        // types stay strict, even in the widening direction.
+        assert!(!field_is_write_compatible(
+            &Field::new("a", DataType::Int32, false),
+            &Field::new("a", DataType::Int64, true),
+            0
+        ));
+    }
+
+    /// G0 comparator: struct children widen in the safe direction only, and
+    /// arity/name/type stay strict inside the struct.
+    #[test]
+    fn test_field_write_compatibility_nested_struct() {
+        let required_inner = Field::new("s", struct_of(utf8("inner", false)), false);
+        let optional_inner = Field::new("s", struct_of(utf8("inner", true)), false);
+
+        assert!(field_is_write_compatible(
+            &required_inner,
+            &optional_inner,
+            0
+        ));
+        assert!(!field_is_write_compatible(
+            &optional_inner,
+            &required_inner,
+            0
+        ));
+
+        // Arity inside the struct stays strict.
+        let two_fields = Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![
+                utf8("inner", false),
+                utf8("extra", true),
+            ])),
+            false,
+        );
+        assert!(!field_is_write_compatible(&two_fields, &optional_inner, 0));
+        assert!(!field_is_write_compatible(&optional_inner, &two_fields, 0));
+
+        // Nested field NAME stays strict.
+        let renamed = Field::new("s", struct_of(utf8("other", true)), false);
+        assert!(!field_is_write_compatible(&required_inner, &renamed, 0));
+    }
+
+    /// G0 comparator: list/large-list/fixed-size-list elements widen; the list
+    /// KIND and the fixed size stay strict.
+    #[test]
+    fn test_field_write_compatibility_nested_list() {
+        let required_element = Arc::new(utf8("element", false));
+        let optional_element = Arc::new(utf8("element", true));
+
+        let required_list = Field::new("l", DataType::List(required_element.clone()), true);
+        let optional_list = Field::new("l", DataType::List(optional_element.clone()), true);
+        assert!(field_is_write_compatible(&required_list, &optional_list, 0));
+        assert!(!field_is_write_compatible(
+            &optional_list,
+            &required_list,
+            0
+        ));
+
+        let required_large = Field::new("l", DataType::LargeList(required_element.clone()), true);
+        let optional_large = Field::new("l", DataType::LargeList(optional_element.clone()), true);
+        assert!(field_is_write_compatible(
+            &required_large,
+            &optional_large,
+            0
+        ));
+        // List KIND is not interchangeable.
+        assert!(!field_is_write_compatible(
+            &required_large,
+            &optional_list,
+            0
+        ));
+
+        let required_fixed = Field::new(
+            "l",
+            DataType::FixedSizeList(required_element.clone(), 3),
+            true,
+        );
+        let optional_fixed = Field::new(
+            "l",
+            DataType::FixedSizeList(optional_element.clone(), 3),
+            true,
+        );
+        let optional_fixed_4 = Field::new("l", DataType::FixedSizeList(optional_element, 4), true);
+        assert!(field_is_write_compatible(
+            &required_fixed,
+            &optional_fixed,
+            0
+        ));
+        // The fixed size stays strict.
+        assert!(!field_is_write_compatible(
+            &required_fixed,
+            &optional_fixed_4,
+            0
+        ));
+    }
+
+    /// G0 comparator: map VALUES widen; the `sorted` flag and the key stay
+    /// strict.
+    #[test]
+    fn test_field_write_compatibility_nested_map() {
+        let required_value = Field::new("m", map_of(utf8("value", false), false), true);
+        let optional_value = Field::new("m", map_of(utf8("value", true), false), true);
+        assert!(field_is_write_compatible(
+            &required_value,
+            &optional_value,
+            0
+        ));
+        assert!(!field_is_write_compatible(
+            &optional_value,
+            &required_value,
+            0
+        ));
+
+        // The `sorted` flag is part of the type.
+        let optional_value_sorted = Field::new("m", map_of(utf8("value", true), true), true);
+        assert!(!field_is_write_compatible(
+            &required_value,
+            &optional_value_sorted,
+            0
+        ));
+    }
+
+    /// G0: the recursion carries a depth limit; past it the comparison degrades
+    /// to STRICT structural equality, so a deeper-than-limit widening is
+    /// rejected while an identical deep type still compares equal. The guard can
+    /// only ever reject — never accept something the strict rule would refuse.
+    #[test]
+    fn test_write_compatibility_depth_limit_falls_back_to_strict_equality() {
+        /// Wrap `inner` in `depth` nested single-field structs.
+        fn nest(inner: Field, depth: usize) -> Field {
+            let mut field = inner;
+            for _ in 0..depth {
+                field = Field::new("s", struct_of(field), false);
+            }
+            field
+        }
+
+        let over = MAX_WRITE_COMPATIBILITY_DEPTH + 2;
+        let deep_required = nest(utf8("leaf", false), over);
+        let deep_optional = nest(utf8("leaf", true), over);
+
+        // Identical deep types still compare equal (no regression).
+        assert!(field_is_write_compatible(&deep_required, &deep_required, 0));
+        // Beyond the limit the widening is NOT applied — strict equality wins.
+        assert!(!field_is_write_compatible(
+            &deep_required,
+            &deep_optional,
+            0
+        ));
+        // Just inside the limit the very same widening IS applied — proving the
+        // rejection above comes from the depth guard, not from the shape.
+        let shallow_required = nest(utf8("leaf", false), MAX_WRITE_COMPATIBILITY_DEPTH - 2);
+        let shallow_optional = nest(utf8("leaf", true), MAX_WRITE_COMPATIBILITY_DEPTH - 2);
+        assert!(field_is_write_compatible(
+            &shallow_required,
+            &shallow_optional,
+            0
+        ));
     }
 
     #[test]

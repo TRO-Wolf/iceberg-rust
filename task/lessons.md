@@ -250,3 +250,25 @@ UNFILTERED D1 comparison still passes at 14 groups — only the new merge-filter
   byte-perfect working tree). *Why:* an md5-identical restore is necessary but NOT sufficient; the build cache is
   part of the state a mutation leg perturbs. `touch` costs nothing (content, hence the md5, is unchanged) and the
   green re-run both proves the restore and evicts the mutant.
+
+### 2026-07-25 — A pre-warmed `target/` in a fresh worktree can serve STALE rlibs that cargo calls fresh: verify a post-fix symbol is IN the linked artifact before believing any RED
+
+Context (G0, engine-trust bundle): the first RED-first run in the `iceberg-rust-ws` worktree failed **seven** tests,
+including four (`T2`/`T3`/`T4`/`T10`) that #172 had just made green on the branch's own parent commit — with the
+exact pre-#172 signature (`record_batch_projector.rs:183: index out of bounds`, tuples `[books, electronics]`).
+The source on disk was unambiguously post-#172. The linked artifact was not: `strings
+target/debug/deps/libiceberg-<hash>.rlib | grep -c "Column index out of bounds for batch in RecordBatchProjector"`
+returned **0**, and cargo had printed no `Compiling iceberg` line — it considered the crate fresh. `find
+crates/iceberg/src crates/integrations/datafusion/src -name '*.rs' -exec touch {} +` forced the rebuild; the same
+grep then returned 1 and the four tests were green. (Provenance of the warm `target/` was not determined; the
+observable is that cargo's freshness check passed over artifacts built from different bytes.)
+
+- **DO prove the artifact matches the source before trusting a RED (or a GREEN) in a worktree with an inherited
+  `target/`:** pick a string that exists ONLY in the post-fix source — an error message, a new symbol name — and
+  `strings` the linked rlib for it (`cargo test … --no-run -v | grep -oE '\-\-extern <crate>=[^ ]*'` names the exact
+  file). *Why:* a stale-but-"fresh" rlib fabricates a RED that looks exactly like the bug you are about to fix, and
+  the natural response — "good, the defect reproduces" — writes a whole unit against a phantom. The same failure
+  mode in the other direction (stale rlib still containing the fix) manufactures a false GREEN, which ships.
+- **DO NOT infer freshness from `cargo` recompiling SOMETHING.** The run that produced the phantom RED did print
+  `Compiling iceberg-datafusion` — it was recompiling only the integration-test target, linking two stale lib
+  rlibs underneath. A `Compiling` line for the crate you edited says nothing about its dependencies.
