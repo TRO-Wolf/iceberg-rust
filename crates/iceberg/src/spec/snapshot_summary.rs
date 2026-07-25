@@ -1180,6 +1180,90 @@ mod tests {
         assert!(partition_summary.contains(&format!("{ADDED_RECORDS}=20")));
     }
 
+    /// R161: the `changed-partition` summary KEYS share `PartitionSpec::partition_to_path` with the
+    /// data-file layout, so they inherit its escaping — Java composes the key the same way
+    /// (`SnapshotSummary.Builder.updatePartitions` calls `PartitionSpec.partitionToPath`, and
+    /// `CHANGED_PARTITION_PREFIX` = `"partitions."`, 1.10.0 bytecode). Pre-R161 a `/` in a partition
+    /// value produced the key `partitions.year=2024/25`, which no Java reader could match back to a
+    /// partition. This is a SECOND consumer of the shared function, so it gets its own pin.
+    #[test]
+    fn test_changed_partition_keys_are_url_escaped() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("the two-column schema must build"),
+        );
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .add_unbound_fields(vec![
+                    UnboundPartitionField::builder()
+                        .source_id(2)
+                        .name("year".to_string())
+                        .transform(Transform::Identity)
+                        .build(),
+                ])
+                .expect("identity(name) as `year` is legal")
+                .with_spec_id(1)
+                .build()
+                .expect("the one-field spec must build"),
+        );
+
+        let mut collector = SnapshotSummaryCollector::default();
+        collector_partition_summary_limit_check(&collector);
+        collector.set_partition_summary_limit(10);
+
+        // A partition value carrying `/`, a space and `=` — every character that would otherwise
+        // forge structure inside the summary key.
+        let file = DataFile {
+            content: DataContentType::Data,
+            file_path: "s3://testbucket/path/to/nasty.parquet".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: Struct::from_iter(vec![Some(Literal::string("2024/25 a=b"))]),
+            record_count: 5,
+            file_size_in_bytes: 50,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            sort_order_id: Some(0),
+            partition_spec_id: 1,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        collector.add_file(&file, schema, partition_spec);
+
+        let props = collector.build();
+        let expected_key = format!("{CHANGED_PARTITION_PREFIX}year=2024%2F25+a%3Db");
+        assert!(
+            props.contains_key(&expected_key),
+            "the changed-partition key must be URL-escaped like Java's; got {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            props
+                .keys()
+                .filter(|key| key.starts_with(CHANGED_PARTITION_PREFIX))
+                .count(),
+            1,
+            "exactly one changed-partition key"
+        );
+        assert_eq!(
+            props.get(CHANGED_PARTITION_COUNT_PROP).map(String::as_str),
+            Some("1")
+        );
+    }
+
     /// Java parity for the EMPTY-changeset case (Java `SnapshotSummary.Builder.build`, lines
     /// 200/203): when partition metrics are TRUSTED but nothing was tracked, `changed-partition-count`
     /// is still emitted as `0` (`setIf(trustPartitionMetrics, ...)` — unconditional on trust, count

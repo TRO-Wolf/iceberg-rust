@@ -158,6 +158,11 @@ impl PartitionSpec {
     /// Returns partition path string containing partition type and partition
     /// value as key-value pairs.
     ///
+    /// Both sides of every `name=value` pair are URL-escaped exactly as Java escapes them (see
+    /// [`escape_partition_path_component`]), so a `/`, `=` or space inside a partition-field name
+    /// or value can never forge path structure. The `=` inside a pair and the `/` between pairs are
+    /// structure and stay raw.
+    ///
     /// TOTAL: a `(spec, schema, data)` triple that is not self-consistent renders `null` for the
     /// offending field (and emits a `tracing::warn!`) rather than aborting. That mirrors Java's
     /// leniency for the one case it tolerates — `PartitionData.get(pos)` returns `null` past the
@@ -193,7 +198,7 @@ impl PartitionSpec {
                             "partition value is not renderable under this spec/schema; rendering \
                              `null` for it (Java renders `null` for an absent partition value)"
                         );
-                        format!("{}=null", field.name)
+                        escaped_partition_pair(&field.name, "null")
                     }
                 }
             })
@@ -201,7 +206,8 @@ impl PartitionSpec {
     }
 
     /// The fallible sibling of [`PartitionSpec::partition_to_path`]: returns the SAME string on
-    /// `Ok`, and a typed error when the `(spec, schema, data)` triple is not self-consistent — the
+    /// `Ok` (escaping included), and a typed error when the `(spec, schema, data)` triple is not
+    /// self-consistent — the
     /// partition type cannot be derived under `schema`, the tuple is shorter than the spec, a value
     /// is not a primitive literal, or a value's literal kind is not compatible with its partition
     /// field's type (`PrimitiveType::compatible`, the same predicate the commit path's
@@ -243,8 +249,8 @@ impl PartitionSpec {
             .collect()
     }
 
-    /// Render one `name=value` pair, or describe why it cannot be rendered. `field_type` is `None`
-    /// when the field's partition type could not be derived under the schema in use.
+    /// Render one escaped `name=value` pair, or describe why it cannot be rendered. `field_type` is
+    /// `None` when the field's partition type could not be derived under the schema in use.
     ///
     /// Every `Ok` return is a pair that renders without aborting: the value is either absent/NULL
     /// (rendered `null`) or a primitive literal whose kind `PrimitiveType::compatible` accepts for
@@ -261,7 +267,7 @@ impl PartitionSpec {
             // for one carries no information — not an anomaly (this is the pair an all-`void`
             // spec's `is_unpartitioned()` callers legitimately produce).
             if field.transform == Transform::Void {
-                return Ok(format!("{}=null", field.name));
+                return Ok(escaped_partition_pair(&field.name, "null"));
             }
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -286,7 +292,7 @@ impl PartitionSpec {
 
         // A NULL partition value is legal and renders `null` (Java `toHumanString(type, null)`).
         let Some(literal) = slot.as_ref() else {
-            return Ok(format!("{}=null", field.name));
+            return Ok(escaped_partition_pair(&field.name, "null"));
         };
 
         let Some(primitive_value) = literal.as_primitive_literal() else {
@@ -319,12 +325,60 @@ impl PartitionSpec {
             ));
         }
 
-        Ok(format!(
-            "{}={}",
-            field.name,
-            field.transform.to_human_string(field_type, Some(literal))
+        Ok(escaped_partition_pair(
+            &field.name,
+            &field.transform.to_human_string(field_type, Some(literal)),
         ))
     }
+}
+
+/// The UPPERCASE hex alphabet `java.net.URLEncoder` emits.
+const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// Escape one side of a partition path's `name=value` pair exactly as Java escapes it.
+///
+/// Java 1.10.0: `PartitionSpec.escape(String)` is a one-liner —
+/// `java.net.URLEncoder.encode(s, "UTF-8")` — and `partitionToPath` is its only caller, passing
+/// BOTH the partition-field name and the transform's human string through it. `URLEncoder` is
+/// `application/x-www-form-urlencoded`, **not** RFC-3986 percent-encoding:
+///
+/// * `A-Z`, `a-z`, `0-9`, `-`, `_`, `.` and `*` pass through unchanged;
+/// * a space becomes `+` (so `"a b"` and `"a+b"` stay distinct: the latter becomes `a%2Bb`);
+/// * every other character becomes one `%XX` group per UTF-8 byte, with UPPERCASE hex digits.
+///
+/// Iterating BYTES is equivalent to Java's UTF-16 `char` loop: every pass-through character is
+/// single-byte ASCII and every byte of a multi-byte UTF-8 sequence is `>= 0x80`, so no lead or
+/// continuation byte can be mistaken for a safe character. Java's one remaining case — an unpaired
+/// surrogate, which it encodes as `?` — is unreachable here, because a Rust `str` is always
+/// well-formed UTF-8.
+fn escape_partition_path_component(component: &str) -> String {
+    let mut escaped = String::with_capacity(component.len());
+    for &byte in component.as_bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                escaped.push(char::from(byte));
+            }
+            b' ' => escaped.push('+'),
+            _ => {
+                escaped.push('%');
+                escaped.push(char::from(UPPER_HEX[usize::from(byte >> 4)]));
+                escaped.push(char::from(UPPER_HEX[usize::from(byte & 0x0F)]));
+            }
+        }
+    }
+    escaped
+}
+
+/// Render one escaped `name=value` pair — the body of Java's `partitionToPath` loop. Both sides go
+/// through [`escape_partition_path_component`]; the `=` between them (and the `/` the callers join
+/// pairs with) is path STRUCTURE and stays raw. Every pair the partition path emits is built here,
+/// so the escaping cannot be missed on one branch.
+fn escaped_partition_pair(name: &str, value: &str) -> String {
+    format!(
+        "{}={}",
+        escape_partition_path_component(name),
+        escape_partition_path_component(value)
+    )
 }
 
 /// A partition key represents a specific partition in a table, containing the partition spec,
@@ -2669,6 +2723,362 @@ mod partition_path_totalisation_tests {
         assert_eq!(
             rendered, 16,
             "the accepted matrix changed shape — re-check the guard against `Display for Datum`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod partition_path_escaping_tests {
+    //! R161 pins: BOTH sides of every `name=value` pair are escaped, exactly as Java does.
+    //!
+    //! Java ground truth (1.10.0 bytecode): `PartitionSpec.partitionToPath` appends
+    //! `escape(field.name())`, `"="`, `escape(transform.toHumanString(type, value))` per field and
+    //! joins the pairs with a raw `"/"` — the two separators are STRUCTURE and are never escaped.
+    //! `PartitionSpec.escape` is a one-liner: `java.net.URLEncoder.encode(s, "UTF-8")` (it is the
+    //! ONLY caller of `escape`, both call sites inside `partitionToPath`).
+    //!
+    //! `URLEncoder` is `application/x-www-form-urlencoded`, NOT RFC-3986 percent-encoding:
+    //! `A-Z a-z 0-9 - _ . *` pass through, a space becomes `+`, and every other character is
+    //! encoded as `%XX` (UPPERCASE hex) per UTF-8 byte.
+    //!
+    //! Every expectation below is a verbatim jar-execution oracle result (2026-07-25, run against
+    //! `iceberg-api-1.10.0.jar` on JDK 11; the live leg is `dev/java-interop/run-interop-partition-path.sh`).
+
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::spec::{Literal, PrimitiveType, Type};
+
+    /// A one-column `s: string` schema — the binding target for every one-field spec below.
+    fn string_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "s", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("one-column schema must build"),
+        )
+    }
+
+    /// `identity(s)` exposed under `field_name`.
+    fn string_spec(field_name: &str) -> PartitionSpec {
+        PartitionSpec::builder(string_schema())
+            .add_partition_field("s", field_name, Transform::Identity)
+            .expect("identity(s) under an arbitrary partition-field name is legal")
+            .build()
+            .expect("the one-field spec must build")
+    }
+
+    /// Render `field_name=value` through EVERY public entry point and assert they agree — the
+    /// total path, the fallible path, and `PartitionKey::to_path`.
+    fn render(field_name: &str, value: Option<&str>) -> String {
+        let schema = string_schema();
+        let spec = string_spec(field_name);
+        let data = Struct::from_iter([value.map(Literal::string)]);
+
+        let total = spec.partition_to_path(&data, schema.clone());
+        let fallible = spec
+            .try_partition_to_path(&data, schema.clone())
+            .expect("a well-formed (spec, schema, tuple) triple must not error");
+        let via_key = PartitionKey::new(spec, schema, data).to_path();
+
+        assert_eq!(
+            total, fallible,
+            "the total and fallible paths must render identically"
+        );
+        assert_eq!(
+            total, via_key,
+            "`PartitionKey::to_path` must render identically"
+        );
+        total
+    }
+
+    // ============================================================================================
+    // The escaper itself — a full printable-ASCII sweep against Java's `URLEncoder`.
+    // ============================================================================================
+
+    /// The printable-ASCII characters `URLEncoder.encode(s, "UTF-8")` leaves untouched, verbatim
+    /// from the jar sweep over `0x20..=0x7E` (note: a space is NOT here — it maps to `+`).
+    const JAVA_SAFE_ASCII: &str =
+        "*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+
+    /// Every printable-ASCII partition value renders exactly as Java's `URLEncoder` renders it:
+    /// the 66 safe characters pass through, a space becomes `+`, and the remaining 28 become
+    /// `%XX` with UPPERCASE hex.
+    #[test]
+    fn printable_ascii_sweep_matches_java_url_encoder() {
+        let mut passed_through = 0usize;
+        let mut percent_encoded = 0usize;
+        for byte in 0x20u8..=0x7Eu8 {
+            let ch = char::from(byte);
+            let expected = if JAVA_SAFE_ASCII.contains(ch) {
+                passed_through += 1;
+                ch.to_string()
+            } else if ch == ' ' {
+                "+".to_string()
+            } else {
+                percent_encoded += 1;
+                format!("%{byte:02X}")
+            };
+            assert_eq!(
+                render("s", Some(&ch.to_string())),
+                format!("s={expected}"),
+                "ASCII 0x{byte:02X} ({ch:?}) must render as Java's URLEncoder renders it"
+            );
+        }
+        assert_eq!(
+            passed_through, 66,
+            "the URLEncoder safe set is `A-Z a-z 0-9 - _ . *` — 66 printable-ASCII characters"
+        );
+        assert_eq!(
+            percent_encoded, 28,
+            "95 printable ASCII = 66 safe + 1 space + 28 percent-encoded"
+        );
+    }
+
+    // ============================================================================================
+    // The VALUE side — jar-oracle table.
+    // ============================================================================================
+
+    /// `identity(s: string)` named `s`: (partition value, Java `partitionToPath`).
+    const JAVA_IDENTITY_STRING_PATHS: &[(&str, &str)] = &[
+        ("plain", "s=plain"),
+        ("AZaz09", "s=AZaz09"),
+        ("-_.*", "s=-_.*"),
+        ("a/b", "s=a%2Fb"),
+        ("a b", "s=a+b"),
+        ("a+b", "s=a%2Bb"),
+        ("a%b", "s=a%25b"),
+        ("a=b", "s=a%3Db"),
+        ("a&b", "s=a%26b"),
+        ("a?b", "s=a%3Fb"),
+        ("a#b", "s=a%23b"),
+        ("a:b", "s=a%3Ab"),
+        ("a~b", "s=a%7Eb"),
+        ("a!b", "s=a%21b"),
+        ("a'b", "s=a%27b"),
+        ("a(b)c", "s=a%28b%29c"),
+        ("a,b", "s=a%2Cb"),
+        ("a;b", "s=a%3Bb"),
+        ("a@b", "s=a%40b"),
+        ("a$b", "s=a%24b"),
+        ("", "s="),
+        ("  ", "s=++"),
+        ("\u{e9}", "s=%C3%A9"),
+        ("\u{4e2d}\u{6587}", "s=%E4%B8%AD%E6%96%87"),
+        ("\u{1f600}", "s=%F0%9F%98%80"),
+        ("x\u{e9} / y", "s=x%C3%A9+%2F+y"),
+        ("%2F", "s=%252F"),
+        ("a\nb", "s=a%0Ab"),
+        ("..", "s=.."),
+        (".", "s=."),
+        ("null", "s=null"),
+    ];
+
+    /// Every value in the jar-oracle table renders byte-identically to Java, including the
+    /// multi-byte UTF-8 cases (2-byte `é`, 3-byte CJK, 4-byte emoji — one `%XX` per UTF-8 byte,
+    /// never per `char`).
+    #[test]
+    fn identity_string_values_match_java() {
+        for (value, expected) in JAVA_IDENTITY_STRING_PATHS {
+            assert_eq!(
+                &render("s", Some(value)),
+                expected,
+                "partition value {value:?} must render exactly as Java does"
+            );
+        }
+        assert_eq!(
+            JAVA_IDENTITY_STRING_PATHS.len(),
+            31,
+            "the jar-oracle value table lost rows"
+        );
+    }
+
+    // ============================================================================================
+    // The NAME side — Java escapes it too.
+    // ============================================================================================
+
+    /// `identity(s)` under a tricky partition-field NAME, value `"v"`: (field name, Java path).
+    const JAVA_FIELD_NAME_PATHS: &[(&str, &str)] = &[
+        ("weird name", "weird+name=v"),
+        ("a/b", "a%2Fb=v"),
+        ("a=b", "a%3Db=v"),
+        ("a%b", "a%25b=v"),
+        ("s_bucket", "s_bucket=v"),
+        ("x\u{e9}", "x%C3%A9=v"),
+        ("a+b", "a%2Bb=v"),
+        ("*star*", "*star*=v"),
+    ];
+
+    /// The partition-field NAME goes through the same escaper as the value (Java escapes both
+    /// sides; escaping only the value would still let a `/` in a field name forge a directory).
+    #[test]
+    fn field_names_match_java() {
+        for (field_name, expected) in JAVA_FIELD_NAME_PATHS {
+            assert_eq!(
+                &render(field_name, Some("v")),
+                expected,
+                "partition-field name {field_name:?} must render exactly as Java does"
+            );
+        }
+        assert_eq!(
+            JAVA_FIELD_NAME_PATHS.len(),
+            8,
+            "the jar-oracle field-name table lost rows"
+        );
+    }
+
+    /// A NULL partition value stays the literal `null` (R-anchor: the WG3-L2 leniency pin), and the
+    /// NAME is still escaped on that branch — the `name=null` fallbacks are a separate code path
+    /// from the rendered-value one, so they need their own pin.
+    #[test]
+    fn null_values_keep_rendering_null_with_an_escaped_name() {
+        const JAVA_FIELD_NAME_NULL_PATHS: &[(&str, &str)] = &[
+            ("a/b", "a%2Fb=null"),
+            ("weird name", "weird+name=null"),
+            ("a%b", "a%25b=null"),
+        ];
+        for (field_name, expected) in JAVA_FIELD_NAME_NULL_PATHS {
+            assert_eq!(
+                &render(field_name, None),
+                expected,
+                "a NULL value under field name {field_name:?} must render exactly as Java does"
+            );
+        }
+        // A string value that literally reads "null" is indistinguishable from a NULL value — the
+        // same ambiguity Java has, pinned so nobody "fixes" it into a divergence.
+        assert_eq!(render("s", Some("null")), render("s", None));
+    }
+
+    // ============================================================================================
+    // Structure vs. content.
+    // ============================================================================================
+
+    /// The `/` between pairs and the `=` inside a pair are STRUCTURE — they stay raw — while a `/`
+    /// or `=` inside a name or a value is CONTENT and is escaped.
+    #[test]
+    fn pair_and_field_separators_stay_raw() {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "s", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(2, "i", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("two-column schema must build"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("s", "a b", Transform::Identity)
+            .expect("identity(s) as `a b` is legal")
+            .add_partition_field("i", "c/d", Transform::Identity)
+            .expect("identity(i) as `c/d` is legal")
+            .build()
+            .expect("the two-field spec must build");
+        let data = Struct::from_iter([Some(Literal::string("x/y")), Some(Literal::int(5))]);
+
+        // Jar oracle: `a+b=x%2Fy/c%2Fd=5`.
+        let path = spec.partition_to_path(&data, schema);
+        assert_eq!(path, "a+b=x%2Fy/c%2Fd=5");
+        assert_eq!(
+            path.matches('/').count(),
+            1,
+            "exactly ONE raw `/` — the separator between the two pairs"
+        );
+        assert_eq!(
+            path.matches('=').count(),
+            2,
+            "exactly TWO raw `=` — one per pair"
+        );
+    }
+
+    /// The headline safety property: a `/` inside a partition VALUE can no longer forge an extra
+    /// directory level in a data file's location (nor a bogus `partitions.` summary key).
+    #[test]
+    fn a_slash_in_a_value_cannot_forge_a_directory_level() {
+        let path = render("s", Some("a/b/c"));
+        assert_eq!(path, "s=a%2Fb%2Fc");
+        assert_eq!(
+            path.matches('/').count(),
+            0,
+            "a single-field path must contain no raw `/` whatever the value holds"
+        );
+    }
+
+    /// A space and a `+` must not collide: Java maps space to `+` and `+` to `%2B`, so the two
+    /// values keep distinct paths (a naive "escape `/` only" fix would collapse them).
+    #[test]
+    fn space_and_plus_stay_distinct() {
+        assert_eq!(render("s", Some("a b")), "s=a+b");
+        assert_eq!(render("s", Some("a+b")), "s=a%2Bb");
+        assert_ne!(render("s", Some("a b")), render("s", Some("a+b")));
+    }
+
+    // ============================================================================================
+    // The no-churn invariant — the overwhelmingly common case must be BYTE-IDENTICAL to pre-R161.
+    // ============================================================================================
+
+    /// Every partition value made only of the URLEncoder safe set renders EXACTLY as it did before
+    /// R161 — no `%XX`, no `+`. This is the regression that keeps the layout of ordinary tables
+    /// unchanged; it also fails loudly under an over-eager escaper (RFC-3986 `NON_ALPHANUMERIC`
+    /// would mangle `-`, `_`, `.` and `*`).
+    #[test]
+    fn safe_partition_values_are_byte_identical_to_the_unescaped_rendering() {
+        const COMMON: &[(&str, &str)] = &[
+            ("dt", "2024-01-31"),
+            ("category", "electronics"),
+            ("id", "42"),
+            ("region", "us-east-1"),
+            ("s_bucket", "7"),
+            ("amount", "-12.34"),
+            ("uu", "f79c3e09-677c-4bbd-a479-3f349cb785e7"),
+            ("star.name_1", "*star.name_1*"),
+            ("empty_void", "null"),
+        ];
+        for (field_name, value) in COMMON {
+            assert_eq!(
+                &render(field_name, Some(value)),
+                &format!("{field_name}={value}"),
+                "a safe-set partition value must render byte-identically to pre-R161"
+            );
+        }
+    }
+
+    /// The pre-R161 fixture from `tests::test_partition_to_path` is byte-stable: a realistic
+    /// four-field path over plain values is untouched by the escaper.
+    #[test]
+    fn the_pre_r161_multi_field_fixture_is_byte_stable() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "timestamp", Type::Primitive(PrimitiveType::Timestamp))
+                    .into(),
+                NestedField::required(4, "empty", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("the four-column schema must build");
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id", Transform::Identity)
+            .expect("identity(id) is legal")
+            .add_partition_field("name", "name", Transform::Identity)
+            .expect("identity(name) is legal")
+            .add_partition_field("timestamp", "ts_hour", Transform::Hour)
+            .expect("hour(timestamp) is legal")
+            .add_partition_field("empty", "empty_void", Transform::Void)
+            .expect("void(empty) is legal")
+            .build()
+            .expect("the four-field spec must build");
+        let data = Struct::from_iter([
+            Some(Literal::int(42)),
+            Some(Literal::string("alice")),
+            Some(Literal::int(1000)),
+            Some(Literal::string("empty")),
+        ]);
+
+        assert_eq!(
+            spec.partition_to_path(&data, schema.into()),
+            "id=42/name=alice/ts_hour=1000/empty_void=null"
         );
     }
 }
