@@ -79,6 +79,10 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       re-parents the children-less expr; positional read hits the wrong batch). Fix shape D1 +
       core-seam guard + T1-T10/M1-M5 per brief. Claim OPENED on the PrimarySync board
       2026-07-25. Close-out: RoadMapSync announce → RePark repins + flips its 2 detector pins.
+      **ACTOR DONE 2026-07-25** (two code commits on the branch: the fix+tests commit and the
+      `93e31b2b` interop null-tuple leg — Java read the NULL tuple back, full chain green; RED
+      evidence + mutation matrix in the PR body at the scratchpad
+      `pr-bodies/WG1-partition-expr-honest-children.md`) — awaiting independent Critic, then PR.
 - [ ] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic)** — branch
       `fix/engine-trust-bundle-2026-07` after Unit 1 merges. G1 WG2 detector+remediation → G2
       WG4a stamp probe/fix + WG4c contract normativity (R113) → G3 WG3 L2+L3 non-breaking →
