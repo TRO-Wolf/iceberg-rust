@@ -63,22 +63,47 @@ use crate::types::{
 ///    server can redirect subsequent requests, and can point the token POST — which carries the
 ///    operator's `client_secret` — at a third-party host.
 ///
-/// Provenance (2) is **parity-shared, not a fork defect**: Java does exactly the same. Its
-/// `RESTSessionCatalog.initialize` builds `mergedProps = config.merge(props)` from the `/v1/config`
-/// response and then constructs BOTH the real client (`clientBuilder.apply(mergedProps)`, whose
-/// `uri` is `mergedProps.get(CatalogProperties.URI)`) and the auth config
-/// (`AuthConfig.fromProperties(mergedProps)`, which reads `oauth2-server-uri`) from that merged map
-/// (`RESTSessionCatalog.java:211-230`). A client that trusts a catalog server for its endpoint set
-/// necessarily trusts it for the endpoints themselves.
+/// Provenance (2) is **parity-shared, not a fork defect**. In Java `RESTSessionCatalog.initialize`:
+/// the merged map is `mergedProps = config.merge(props)`
+/// (`core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:202-211`); the real client is
+/// then rebuilt from it and the catalog auth session is created from it
+/// (`:225-230`); the default client builder derives its base URI as
+/// `.uri(config.get(CatalogProperties.URI))` from whatever map it is handed (`:171-179`, `.uri` at
+/// `:175`); and the auth session reads `oauth2-server-uri` out of those same merged properties —
+/// `OAuth2Manager.catalogSession` calls `AuthConfig.fromProperties(properties)`
+/// (`core/src/main/java/org/apache/iceberg/rest/auth/OAuth2Manager.java:104-109`), which does
+/// `properties.getOrDefault(OAuth2Properties.OAUTH2_SERVER_URI, ResourcePaths.tokens())`
+/// (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:84-85`).
 ///
-/// **This does not contradict the `disable-header-redaction` strip** in `merge_with_config`, and the
-/// distinction is the point: that key is a *client-only logging control* with no wire meaning, so a
-/// server has no legitimate reason to set it and a malicious one would use it to unmask the
-/// `Authorization` header this client already holds — pure downside, so it is stripped. `uri` and
-/// `oauth2-server-uri` are the opposite: server override is a *documented, functional* part of the
-/// REST config protocol (endpoint discovery / migration), and honoring it is required for
-/// correctness. Strip the former, honor the latter — and where the trust in the server is
-/// misplaced, the credential exposure via a redirected token POST is a risk Java carries identically.
+/// The merge order makes this stronger than "the server can contribute": server **`overrides`
+/// OUTRANK user properties**. `ConfigResponse.merge` seeds from `defaults`, then
+/// `merged.putAll(clientProperties)`, then `merged.putAll(overrides)` — last write wins — and the
+/// only filter applied is `Maps.filterValues(merged, Objects::nonNull)`, i.e. drop null VALUES;
+/// there is no key allowlist or denylist, and `ConfigResponse.validate()` is empty
+/// (`core/src/main/java/org/apache/iceberg/rest/responses/ConfigResponse.java:108-119`, `validate`
+/// at `:68`). A client that trusts a catalog server for its endpoint set necessarily trusts it for
+/// the endpoints themselves.
+///
+/// Bootstrap ordering is parity too: Java builds the init client and fetches `/v1/config` with the
+/// PRE-merge `props` and only then rebuilds from `mergedProps` (`:202-211` then `:225`), so the
+/// config fetch itself can never be redirected by the response it is fetching. This fork matches —
+/// [`RestCatalog::context`] does `HttpClient::new(&self.user_config)` and
+/// `load_config(&client, &self.user_config)` before `merge_with_config` and `update_with(&config)`.
+///
+/// **This does not contradict the `disable-header-redaction` strip** in
+/// [`RestCatalogConfig::merge_with_config`], and the distinction is the point: that key is a
+/// *client-only logging control* with no wire meaning, so a server has no legitimate reason to set
+/// it and a malicious one would use it to unmask the `Authorization` header this client already
+/// holds — pure downside, so it is stripped. `uri` and `oauth2-server-uri` are the opposite: server
+/// override is a *documented, functional* part of the REST config protocol (endpoint discovery /
+/// migration), and honoring it is required for correctness. Strip the former, honor the latter — and
+/// where the trust in the server is misplaced, the credential exposure via a redirected token POST is
+/// a risk Java carries identically.
+///
+/// To be precise about what the strip is: **Java has no `disable-header-redaction` analogue and
+/// filters nothing by key** (see the `filterValues`-only merge above). The strip is therefore
+/// fork-local hardening of a fork-local knob, NOT a parity claim — it neither follows Java nor
+/// diverges from it, because the key does not exist there.
 ///
 /// Against either provenance the client applies no address filtering: it will connect to whatever
 /// host is named, including loopback, RFC 1918 / link-local addresses, and cluster-internal DNS
@@ -2476,9 +2501,12 @@ mod tests {
     /// `metadata` is the wrong JSON type (standing in for an unknown V3 field / version skew) while
     /// the vended `s3.session-token` sits in the same body.
     ///
-    /// This shape also pins the `with_source` residue bound: `serde_json` echoes the offending
-    /// token at the failure POSITION (`invalid type: integer ...`), never the surrounding payload,
-    /// so the credentials elsewhere in the body stay unreachable.
+    /// SCOPE: this pins the SAFE shape only — a scalar type mismatch, where `serde_json`'s message
+    /// echoes just the offending scalar (`invalid type: integer 12345`). It does NOT establish that
+    /// credentials elsewhere in a body are generally unreachable through `source`: when the
+    /// mismatch sits at a CONTAINER boundary the echoed value is an entire sub-document. That leaky
+    /// shape is pinned separately by
+    /// [`test_known_residue_double_encoded_body_leaks_through_error_source`].
     ///
     /// RED-able: restore `.with_context("json", …)` in `deserialize_catalog_response`.
     #[tokio::test]
@@ -2540,6 +2568,91 @@ mod tests {
         assert!(
             rendered.contains("response_body_len"),
             "expected the safe body-length diagnostic: {rendered}"
+        );
+    }
+
+    /// KNOWN RESIDUE PIN — this test asserts that a leak **still happens**. It is not a guard; it
+    /// documents the boundary of the F1 fix so the gap cannot be quietly forgotten or over-claimed.
+    ///
+    /// Withholding the raw body from the error CONTEXT does not close the `source` channel.
+    /// `deserialize_catalog_response` keeps `.with_source(e)` because AGENTS.md requires the error
+    /// chain to survive, and `iceberg::Error` renders the source VERBATIM (`, source: {source}`) in
+    /// both `Display` and `Debug` (`crates/iceberg/src/error.rs`). `serde_json`'s message echoes the
+    /// value AT THE FAILURE POSITION — and when the mismatch is at a CONTAINER boundary, that value
+    /// is an entire sub-document, echoed in full via `Unexpected::Str`.
+    ///
+    /// The shape below is a real, well-known bug class, not a contrivance: a server or API gateway
+    /// that emits a nested object as a JSON *string* (`writeValueAsString` on a sub-map, a
+    /// proxy-integration stringifying the body) turns `config` into a string whose CONTENT is the
+    /// whole vended-credential map. `serde` then reports `invalid type: string "…", expected a map`
+    /// with the credentials inline.
+    ///
+    /// FIX OWNER: this is not closable in this crate without breaking the error chain. It belongs to
+    /// the core-crate residue unit that reworks `iceberg::Error`'s `Display`/`Debug` source
+    /// rendering (the chain obligation is satisfied by `source()` EXISTING; the leak is core's
+    /// verbatim interpolation of it). **When that unit lands, this test flips**: the assertions
+    /// invert to `!contains`, and this doc block is deleted.
+    #[tokio::test]
+    async fn test_known_residue_double_encoded_body_leaks_through_error_source() {
+        const SENTINEL: &str = "SENTINEL_LEAKS_VIA_SERDE_SOURCE_KNOWN_RESIDUE";
+
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        // `config` arrives DOUBLE-ENCODED: a JSON string whose content is the credential map.
+        // Metadata is untouched and valid, so the ONLY parse failure is the container mismatch.
+        let body = load_table_body(
+            json!(format!(r#"{{"s3.secret-access-key":"{SENTINEL}"}}"#)),
+            None,
+        );
+        assert!(
+            body.contains(SENTINEL),
+            "precondition: the body under test must carry the secret"
+        );
+
+        let table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/table1")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let err = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "table1".to_string(),
+            ))
+            .await
+            .expect_err("a double-encoded config must fail to deserialize");
+
+        config_mock.assert_async().await;
+        table_mock.assert_async().await;
+
+        let rendered = format!("{err}");
+        let debug = format!("{err:?}");
+
+        // The raw-body CONTEXT attach is gone — that part of the F1 fix holds.
+        assert!(
+            rendered.contains("response_body_len"),
+            "the safe diagnostics must still be attached: {rendered}"
+        );
+
+        // ...but the secret still reaches the log through `source`. Asserting the leak keeps this
+        // documented and makes the eventual core fix observable here.
+        assert!(
+            rendered.contains(SENTINEL),
+            "KNOWN RESIDUE no longer reproduces in Display — if the core `iceberg::Error` source \
+             rendering was fixed, invert these assertions and delete the residue doc block. \
+             Rendered: {rendered}"
+        );
+        assert!(
+            debug.contains(SENTINEL),
+            "KNOWN RESIDUE no longer reproduces in Debug — see the note above. Debug: {debug}"
         );
     }
 

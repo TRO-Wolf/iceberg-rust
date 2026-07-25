@@ -81,8 +81,16 @@ use serde_derive::{Deserialize, Serialize};
 //   * `TableUpdate::SetProperties` / `ViewUpdate::SetProperties` — reachable via
 //     `CommitTableRequest.updates` / `CommitViewRequest.updates`.
 // So a `{:?}` of those fields can still surface a credential an operator stored as a TABLE or
-// VIEW property. The REST server's own credential channels (`config`, `storage-credentials`)
-// are covered here; closing the core-crate property maps is a separate unit.
+// VIEW property. Closing the core-crate property maps is a separate unit.
+//
+// SCOPE OF THIS FIX — the REST server's own credential channels (`config`,
+// `storage-credentials`) are covered AT THE `Debug` LAYER, which is not the same as "covered".
+// A credential-bearing body that fails to PARSE can still reach logs through the
+// `serde_json` error attached as the `source` of the parse error, because `iceberg::Error`
+// renders its source verbatim; the echo is unbounded when the type mismatch sits at a
+// container boundary (double-encoded JSON). That path is documented on
+// `client.rs::deserialize_catalog_response` and pinned as known residue by
+// `test_known_residue_double_encoded_body_leaks_through_error_source`.
 // ============================================================================
 
 /// Marker written in place of a redacted secret value. Its presence also signals that the

@@ -574,13 +574,29 @@ pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest:
 /// the HTTP layer (a proxy or a `reqwest` middleware), where the exposure is a deliberate choice
 /// rather than an unconditional log write.
 ///
-/// RESIDUE: `with_source(e)` is retained because AGENTS.md requires the error chain to survive, and
-/// `serde_json`'s own message can echo the offending token (e.g. `invalid type: integer `12345``).
-/// That echo is bounded to the single value at the parse-failure position — it is never the whole
-/// body, and for the realistic failures (missing/unknown field) it echoes only a FIELD NAME. A
-/// secret is only reachable through it if the server puts the secret itself in a type-mismatched
-/// structural position, which no real server response does. Both shapes are pinned by
-/// `test_config_parse_failure_does_not_leak_body` / `test_load_table_parse_failure_does_not_leak_vended_credentials`.
+/// RESIDUE — this fix closes the CONTEXT channel, not the `source` channel. `with_source(e)` is
+/// retained because AGENTS.md requires the error chain to survive, and `iceberg::Error` renders the
+/// source VERBATIM (`, source: {source}`) in both `Display` and `Debug`
+/// (`crates/iceberg/src/error.rs`). `serde_json`'s message echoes the value AT THE PARSE-FAILURE
+/// POSITION, and the size of that value is NOT bounded to a scalar: when the mismatch sits at a
+/// CONTAINER boundary, the echoed value is an entire sub-document, emitted in full through
+/// `Unexpected::Str`.
+///
+/// The load-bearing case is a real, well-known bug class rather than a contrivance: a server or API
+/// gateway that emits a nested object as a JSON *string* (`writeValueAsString` over a sub-map, a
+/// proxy integration stringifying the body) turns `config` into a string whose CONTENT is the whole
+/// vended-credential map, and `serde` reports `invalid type: string "…", expected a map` with those
+/// credentials inline. So a malformed credential-bearing body CAN still leak through `source`.
+///
+/// FIX OWNER: not closable here without breaking the error chain — the chain obligation is satisfied
+/// by `source()` existing; the leak is core's verbatim interpolation of it into `Display`/`Debug`.
+/// It belongs to the core-crate residue unit that reworks `iceberg::Error`'s source rendering.
+///
+/// Both shapes are pinned in `catalog.rs`: the SAFE scalar-mismatch shape by
+/// `test_config_parse_failure_does_not_leak_body` /
+/// `test_load_table_parse_failure_does_not_leak_vended_credentials`, and the LEAKY container-boundary
+/// shape by `test_known_residue_double_encoded_body_leaks_through_error_source`, which asserts the
+/// leak still happens so the gap cannot be silently forgotten or over-claimed as closed.
 pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
     response: Response,
 ) -> Result<R> {
@@ -647,13 +663,25 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
 /// Deserializes a unexpected catalog response into an error.
 ///
 /// SEC-010 scope note: unlike [`deserialize_catalog_response`], this is the NON-2xx path, and it
-/// deliberately still attaches the body. A non-2xx response means the request FAILED — no table was
-/// loaded, so no `config` overlay and no vended `storage-credentials` were issued — and the body is
-/// an `ErrorResponse` whose `message` is the whole diagnostic value. Java surfaces exactly this to
-/// the caller (`ErrorHandlers` parse the payload and rethrow `ErrorResponse.message`), so
-/// withholding it would cost real debuggability and diverge from Java for no security gain. The one
-/// non-2xx body that COULD echo submitted credentials — the token endpoint's — is handled
-/// separately in [`HttpClient::exchange_credential_for_token`], which withholds it.
+/// deliberately still attaches the body. The exposure here is NOT symmetric with the success path,
+/// and both directions must be stated:
+///
+/// * RESPONSE direction — safe. A non-2xx means the request FAILED, so no table was loaded and
+///   neither a `config` overlay nor vended `storage-credentials` were issued. The server has no
+///   credential to hand back.
+/// * REQUEST-ECHO direction — NOT credential-free. This function is the fallthrough for the WRITE
+///   routes (`create_table`, `create_namespace`, `update_namespace_properties`, `create_view`),
+///   whose request types carry operator property maps — the very maps redacted in `types.rs`
+///   precisely because they can hold credentials. A validation failure that echoes the offending
+///   request back in its error payload (a common server pattern) therefore puts those submitted
+///   values into this error context.
+///
+/// The body is nonetheless retained: it is an `ErrorResponse` whose `message` is the whole
+/// diagnostic value, and Java surfaces exactly this to the caller (`ErrorHandlers` parse the payload
+/// and rethrow `ErrorResponse.message`), so withholding it would cost real debuggability and diverge
+/// from Java. The residual request-echo exposure is **parity-shared** — Java has it identically.
+/// The one non-2xx body that reliably carries submitted credentials — the token endpoint's — is
+/// handled separately in [`HttpClient::exchange_credential_for_token`], which withholds it.
 pub(crate) async fn deserialize_unexpected_catalog_error(
     response: Response,
     disable_header_redaction: bool,
