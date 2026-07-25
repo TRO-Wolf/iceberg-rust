@@ -39,6 +39,31 @@ How to use it (see the manuals' §1):
 > wave5 file), 2026-06-12 (pass 3 — 2,358 lines → the wave3-wave4 file), 2026-06-11 (pass 2),
 > 2026-06-09 (pass 1). Procedure: [skills/compaction.md](../skills/compaction.md) §Todo Archival.
 
+## POST-D1 BLOCK (2026-07-24) — 4 parallel work groups, AC·OO per group
+
+Follow-on from the scan-plan D1 root-cause + merge fix (fork #169, `c88888c3`, row R148). Four
+independent groups, one branch each; this tracker rides ONLY the WG1 branch (each group edits its
+own files, so a shared tracker would collide).
+
+- [x] **WG1 — `fix/g3-scan-plan-merge-interop-pin`** (row R148): interop-pin the adjacent-split
+  merge that #169 landed with offline unit tests only. Spec: [g3-scan-plan-merge-interop-brief.md](g3-scan-plan-merge-interop-brief.md).
+  Two dedicated fixture files (`merge.parquet` co-binned contiguous pair ⇒ ONE spanning member;
+  `gap.parquet` co-binned NON-contiguous pair ⇒ stays two), each planned under an isolating
+  metrics-prunable filter at the delete-free append snapshot; both directions; non-vacuity proven
+  on both sides by the exact plan-SHAPE asserts (the span inequalities are degenerate-fixture
+  guards); new Java sabotage leg + TWO production-source mutation legs (merge-removal and
+  adjacency-removal, each RED on a real assertion signal, restored md5-identical). Chain [1/7]…[7/7]. ZERO production-code changes.
+  _What changed and why:_ the oracle could always REPRESENT a merge divergence but its fixture never
+  reached the branch — measured: with `merge_tasks` removed the old unfiltered comparison still
+  passes at 14 groups. See [lessons.md](lessons.md) 2026-07-24 (coverage-vs-granularity).
+- [ ] **WG2 — `fix/df-provider-live-schema`** (BUG-005 / BUG-011): the DataFusion `TableProvider`
+  freezes the Iceberg schema at construction, so a post-construction schema evolution is invisible
+  to planning.
+- [ ] **WG3 — `fix/safety-joinhandle-channel`** (SAF-006 / SAF-007): `JoinHandle` / channel
+  panic-and-drop hardening.
+- [ ] **WG4 — `fix/rest-secret-debug-ssrf`** (SEC-010 / SEC-011): REST catalog secret-in-`Debug`
+  exposure + SSRF surface.
+
 ## FOLLOW-UPS BUNDLE (2026-07-18, signed off) — audit follow-up ledger, 5 groups, OO-High AC, ONE branch
 
 Branch `fix/audit-followups-bundle` (Mode B; user-directed: Opus-high Actor/Critic per group, Fable
