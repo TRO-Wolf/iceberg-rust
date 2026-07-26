@@ -293,22 +293,51 @@ fn reverse_predicate_operator(op: PredicateOperator) -> PredicateOperator {
 
 const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
+/// Convert an Arrow `Date64` literal (milliseconds since the Unix epoch) to an Iceberg `date`
+/// datum (days since the Unix epoch), or `None` when it cannot be represented as one.
+///
+/// Returning `None` means "not pushed down": the caller drops the comparison and DataFusion
+/// evaluates it itself. That is always safe; an approximate day is not, because the predicate
+/// this feeds is the ONLY filter the Iceberg scan applies. The provider reports
+/// [`TableProviderFilterPushDown::Inexact`](datafusion::logical_expr::TableProviderFilterPushDown),
+/// so DataFusion re-checks the rows the scan RETURNS but can never resurrect rows a wrong
+/// predicate pruned away.
+///
+/// Two inputs are rejected:
+///
+/// * **Not a whole number of days.** Arrow requires `Date64` values to be evenly divisible by
+///   86_400_000, so this is out-of-contract input. Rounding it to a day is unsound in a way that
+///   depends on the comparison operator — which this function does not know. For
+///   `millis = 1 day + 1 ms`, `col < millis` matches days `{0, 1}` (day 1 begins before the
+///   literal) but the truncated `col < date(1)` matches only `{0}`, silently dropping every
+///   day-1 row; rounding UP breaks `>` symmetrically.
+/// * **Out of the `date` range.** The day count must fit `i32`. The previous `as i32` wrapped
+///   instead: one day past `i32::MAX` became `i32::MIN`, turning a far-future bound into a
+///   far-past one — with `<`, a filter matching every row became one matching none.
+fn date64_millis_to_datum(millis: i64) -> Option<Datum> {
+    if millis % MILLIS_PER_DAY != 0 {
+        return None;
+    }
+    // Exact for a whole number of days: truncating and flooring division agree on multiples.
+    i32::try_from(millis / MILLIS_PER_DAY).ok().map(Datum::date)
+}
+
 /// Convert a scalar value to an iceberg datum.
 fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
     match value {
         ScalarValue::Boolean(Some(v)) => Some(Datum::bool(*v)),
-        ScalarValue::Int8(Some(v)) => Some(Datum::int(*v as i32)),
-        ScalarValue::Int16(Some(v)) => Some(Datum::int(*v as i32)),
+        ScalarValue::Int8(Some(v)) => Some(Datum::int(i32::from(*v))),
+        ScalarValue::Int16(Some(v)) => Some(Datum::int(i32::from(*v))),
         ScalarValue::Int32(Some(v)) => Some(Datum::int(*v)),
         ScalarValue::Int64(Some(v)) => Some(Datum::long(*v)),
-        ScalarValue::Float32(Some(v)) => Some(Datum::double(*v as f64)),
+        ScalarValue::Float32(Some(v)) => Some(Datum::double(f64::from(*v))),
         ScalarValue::Float64(Some(v)) => Some(Datum::double(*v)),
         ScalarValue::Utf8(Some(v)) => Some(Datum::string(v.clone())),
         ScalarValue::LargeUtf8(Some(v)) => Some(Datum::string(v.clone())),
         ScalarValue::Binary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
-        ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
+        ScalarValue::Date64(Some(v)) => date64_millis_to_datum(*v),
         // Timestamp conversions
         // Note: TimestampSecond and TimestampMillisecond are not handled here because
         // DataFusion's type coercion always converts them to match the column type
@@ -570,6 +599,131 @@ mod tests {
         let datum =
             super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(Some(ts_millis), None));
         assert_eq!(datum, None);
+    }
+
+    /// Control: a `Date64` literal that IS a whole number of days and fits the Iceberg `date`
+    /// range converts to exactly that day, and a `Date32` literal is passed through unchanged.
+    ///
+    /// This is the leg that keeps the two guards below from being a blanket "never push down a
+    /// Date64" — it goes RED under a mutation that returns `None` unconditionally.
+    #[test]
+    fn test_scalar_value_to_datum_date64_day_aligned_in_range() {
+        use datafusion::common::ScalarValue;
+
+        // 2023-01-05, 19362 days after the epoch.
+        let days = 19362i32;
+        let millis = i64::from(days) * super::MILLIS_PER_DAY;
+
+        let datum = super::scalar_value_to_datum(&ScalarValue::Date64(Some(millis)));
+        assert_eq!(datum, Some(Datum::date(days)));
+
+        // The epoch itself, and a pre-epoch day, are both day-aligned and in range.
+        assert_eq!(
+            super::scalar_value_to_datum(&ScalarValue::Date64(Some(0))),
+            Some(Datum::date(0))
+        );
+        assert_eq!(
+            super::scalar_value_to_datum(&ScalarValue::Date64(Some(-super::MILLIS_PER_DAY))),
+            Some(Datum::date(-1))
+        );
+
+        // Date32 is already a day count and never goes through the millisecond conversion.
+        assert_eq!(
+            super::scalar_value_to_datum(&ScalarValue::Date32(Some(days))),
+            Some(Datum::date(days))
+        );
+        assert_eq!(
+            super::scalar_value_to_datum(&ScalarValue::Date64(None)),
+            None
+        );
+    }
+
+    /// A `Date64` whose day count does not fit `i32` must NOT be pushed down.
+    ///
+    /// `(millis / MILLIS_PER_DAY) as i32` wrapped: one day past `i32::MAX` became `i32::MIN`,
+    /// i.e. a far-future literal was pushed down as a far-PAST date. `TableProvider::scan` takes
+    /// the resulting predicate as the only file/row filter it applies, and the fork reports
+    /// `TableProviderFilterPushDown::Inexact`, so DataFusion re-checks the rows the scan RETURNS
+    /// but can never resurrect rows the wrapped predicate pruned away.
+    #[test]
+    fn test_scalar_value_to_datum_date64_out_of_date_range_is_not_pushed_down() {
+        use datafusion::common::ScalarValue;
+
+        // One day past `i32::MAX` days: the old cast wrapped this to `i32::MIN`.
+        let millis = (i64::from(i32::MAX) + 1) * super::MILLIS_PER_DAY;
+        assert_eq!(
+            ((millis / super::MILLIS_PER_DAY) as i32),
+            i32::MIN,
+            "fixture precondition: this value is exactly the one the old cast wrapped"
+        );
+        assert_eq!(
+            super::scalar_value_to_datum(&ScalarValue::Date64(Some(millis))),
+            None
+        );
+
+        // ... and symmetrically one day below `i32::MIN`.
+        let millis = (i64::from(i32::MIN) - 1) * super::MILLIS_PER_DAY;
+        assert_eq!(
+            super::scalar_value_to_datum(&ScalarValue::Date64(Some(millis))),
+            None
+        );
+    }
+
+    /// A `Date64` that is not a whole number of days must NOT be pushed down.
+    ///
+    /// Arrow requires `Date64` values to be evenly divisible by 86_400_000, so this is
+    /// out-of-contract input — but the old code answered it with a truncated day, and truncation
+    /// is UNDER-inclusive for `<` and `<>`: for `millis = 1 day + 1 ms` the true set of matching
+    /// days for `col < millis` is `{0, 1}` (day 1 starts before the literal), while the pushed
+    /// `col < date(1)` is `{0}`, so every day-1 row is silently dropped. There is no single day
+    /// that is correct for every operator, and this function does not know the operator, so the
+    /// only sound answer is "cannot be pushed down".
+    #[test]
+    fn test_scalar_value_to_datum_date64_not_day_aligned_is_not_pushed_down() {
+        use datafusion::common::ScalarValue;
+
+        for millis in [
+            super::MILLIS_PER_DAY + 1,
+            super::MILLIS_PER_DAY - 1,
+            1,
+            -1,
+            -super::MILLIS_PER_DAY - 1,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            assert_eq!(
+                super::scalar_value_to_datum(&ScalarValue::Date64(Some(millis))),
+                None,
+                "millis {millis} is not a whole number of days and must not be pushed down"
+            );
+        }
+    }
+
+    /// End of the seam: an out-of-range `Date64` comparison drops the WHOLE filter rather than
+    /// pushing a wrapped one. With `<` the wrapped date was `i32::MIN`, which prunes every file
+    /// in the table — a silent empty result for a filter that matches everything.
+    #[test]
+    fn test_predicate_conversion_date64_out_of_range_is_dropped_not_wrapped() {
+        use datafusion::common::ScalarValue;
+        use datafusion::prelude::col;
+
+        let millis = (i64::from(i32::MAX) + 1) * super::MILLIS_PER_DAY;
+        let filter = col("foo").lt(Expr::Literal(ScalarValue::Date64(Some(millis)), None));
+
+        let predicate = convert_filters_to_predicate(&[filter]);
+        assert_eq!(
+            predicate, None,
+            "an out-of-range Date64 must not reach the scan as a predicate"
+        );
+
+        // The same shape with a representable Date64 still pushes down, so the assertion above
+        // is about the range check and not about `Date64` comparisons in general.
+        let millis = 19362i64 * super::MILLIS_PER_DAY;
+        let filter = col("foo").lt(Expr::Literal(ScalarValue::Date64(Some(millis)), None));
+        assert_eq!(
+            convert_filters_to_predicate(&[filter]),
+            Some(Reference::new("foo").less_than(Datum::date(19362)))
+        );
     }
 
     #[test]
