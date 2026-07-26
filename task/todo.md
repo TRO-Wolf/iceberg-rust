@@ -104,6 +104,15 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       G4 R161 escaping (format-stability attestation) → G5 WG4b path-keyed pos-delete routing
       (+ remove_dangling same-unit; R117 demote→re-promote) → G6 WG5 null-bit family → G7 WG6
       mechanical → G8 delete_filter lost-wakeup (3 sites + `PosDelState::Failed`).
+      **BUNDLE CONVERGED 2026-07-26** (36 commits, 16h run): 8 groups converged in-ladder (G2
+      cycle 1, G8 cycle 2, rest cycle 0); **G4 parked-not-converged on matrix-cell wording, its
+      reset was classifier-blocked, and the Fable-max closing Critic caught it as S1** → CLOSE
+      remediation corrected the R161 residue ledger (truncate FIXED/BINARY hex-vs-base64
+      divergence named from an independent Java re-decode), ratcheted the interop floor to 52,
+      and the re-attestation ruled the WHOLE bundle CONVERGED zero S1/S2 — with a live 22/22
+      byte-match vs Java's own partitionToPath. Gate at tip: lib 2974 (+109), datafusion 246
+      (+28), anchors 75 rows. ONE user merge-gate rides the PR (closer CR-1): **waive or strip
+      G4** (strip = surgical, 7 of its 10 files overlap later groups). PUSHED for PR.
 - [ ] **Unit 3 — breaking follow-up (Mode A, after Unit 2)** — `PartitionKey::new -> Result`
       (58 sites/34 files incl. 6 `no_run` doc fences) + `CurrentFileStatus` unwraps.
 - [ ] **Unit 4 — H7-S2 COW streaming** · **Unit 5 — H7-P1 pushdown** (footgun precondition) —
