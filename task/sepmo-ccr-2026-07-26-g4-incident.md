@@ -124,6 +124,33 @@ The section currently triggers only on an **escaped defect**. Append:
 ledger the spine itself mandates; ref 08 mirrors this extension — canonical rule stays in the
 spine.)
 
+## Amendment E — external critic-engine binding point (optional; second provenance event)
+
+Provenance: on 2026-07-26 a **delegated agent (mistakenly instructed) amended the master canon in
+place** — a runtime-specific "critic engine" companion section in the spine, a `v2.2+kit`
+changelog entry, and engine-specific tunables in the portable template, plus a runtime install
+kit inside the canon home. Caught the same day by user report; the master was restored byte-exact
+to v2.2 from the fork-instance baseline and the kit relocated to its own home
+(`~/Desktop/Sepmo-octo-kit/`) — incident #2 in [task/sepmo-metrics.md](sepmo-metrics.md). The one
+idea worth canon, abstracted runtime-neutral:
+
+> **Template (optional binding row) `critic_engine`** — default: the spine's own Critic stage. A
+> project MAY bind an **external critic engine** (a multi-critic harness, a different runtime)
+> for STANDARD-and-above units. Constraints (normative, ref 05): (1) an external engine's
+> convergence signal is **never Delivery** — its output maps to a coverage attestation plus a
+> findings ledger, and PR_READINESS_AUDIT then proceeds as always; (2) **LIGHT units never
+> select an external engine**; (3) the engine's attack taxonomy must satisfy **R4** — its
+> categories map onto ref 05's canonical taxonomy (plus manifest extensions) or each unmapped
+> category is justified `N/A`; (4) **engine-specific tunables** (cycle counts, early-stop
+> policy, scratch locations) bind in the project's manifest, never in the portable template.
+
+Two governance observations from the same event, for ratification alongside: (a) the master home
+has **no gate** — nothing detected the in-place canon edit but a user report and an mtime audit;
+recommend placing `~/Desktop/Sepmo` under version control so canon changes are diffable events;
+(b) the audit also discovered the master's `references/` are **stale** — they lack the v2.1/v2.2
+*required* reference amendments that currently exist only in this repo's instance — folded into
+the adoption protocol below.
+
 ## Changelog entry (draft for the master)
 
 > **v2.3 — 2026-07-··.** The disposition discipline lands: **R11** (contingencies must be
@@ -143,9 +170,10 @@ spine.)
 > contingency-executability; *Cycle-cap escalation* gains the REMOVED/REMANDED dispositions and
 > the multi-unit-assembly binding; ref 03 — the review format gains a
 > contingency-executability line; ref 05 — the bundle-scope closing Critic's item-by-item
-> remand duty; ref 06 — new watch item (next unused trigger id): unsettled-disposition
-> consumption / invalid contingency; ref 08 — mirrors Amendment D (canonical rule stays in the
-> spine).
+> remand duty AND the external-critic-engine constraints (Amendment E); ref 06 — new watch item
+> (next unused trigger id): unsettled-disposition consumption / invalid contingency; ref 08 —
+> mirrors Amendment D (canonical rule stays in the spine); the template — the optional
+> `critic_engine` binding row (Amendment E, runtime-neutral).
 
 ## Adoption protocol
 
@@ -153,7 +181,10 @@ spine.)
    accompli).
 2. **Master home updated:** `~/Desktop/Sepmo/` — spine `version: "2.3"`, the three rules
    inserted after R10, the *Incident retrospectives* extension (Amendment D), the changelog
-   entry, and the five reference amendments.
+   entry, the five reference amendments plus the template's `critic_engine` row (Amendment E),
+   AND the master-reference reconciliation: apply the v2.1/v2.2 *required* amendment sets (today
+   present only in this repo's instance) so the master is whole. Recommended at the same step:
+   `git init` the master home so future canon changes are diffable events, not mtime forensics.
 3. **This repo re-binds** as its own SEPMO unit (verbatim spine copy, reference amendments,
    `spine_version: v2.3` in the manifest, instantiation checklist re-proven, independent Critic)
    — the same flow as `infra/sepmo-canon-v2.2`.
