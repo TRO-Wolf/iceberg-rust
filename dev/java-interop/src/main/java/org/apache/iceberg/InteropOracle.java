@@ -315,6 +315,14 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-file-scoped-deletes":
+        // FILE-SCOPED position-delete routing (WG4b), DIRECTION 1 — "Rust reads what JAVA writes".
+        // Java writes a V2 table whose position deletes identify their target BY REFERENCE (one via
+        // the `referenced_data_file` field, one via EQUAL `file_path` bounds) while being stamped
+        // with a spec + partition that match NEITHER data file, plus a partition-scoped CONTROL that
+        // must NOT apply. Java's own read = {10,30,40,60} is the ground truth.
+        FileScopedDeleteOracle.generate(requireFixturesDir("interop.file_scoped_deletes.dir"));
+        break;
       case "generate-interop-nonidentity-scan":
         // NON-IDENTITY TRANSFORM merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes". A
         // truncate[10](id)-partitioned table; the partition VALUE is the truncate of id (10/20), a
@@ -21821,6 +21829,372 @@ public final class InteropOracle {
       String toDescriptorJson() {
         return JsonUtil.generate(gen -> gen.writeString(toDescriptor()), false);
       }
+    }
+  }
+
+  // ===========================================================================================
+  // FILE-SCOPED POSITION-DELETE routing oracle (WG4b) — Java writes a V2 table whose position
+  // deletes identify their target BY REFERENCE, not by partition, and Java's own merge-on-read read
+  // is the ground truth the Rust scan must equal.
+  //
+  // Java `DeleteFileIndex.Builder.add(Map<String, PositionDeletes>, PartitionMap<PositionDeletes>,
+  // DeleteFile)` routes a position delete into the PATH-keyed map whenever
+  // `ContentFileUtil.referencedDataFileLocation(file)` is non-null, and `findPathDeletes` then
+  // consults that map with the data file's LOCATION alone — no spec condition, no partition
+  // condition. Two independent legs derive that location (1.10.0 bytecode): the explicit
+  // `referenced_data_file` field, and EQUAL `file_path`-column lower/upper bounds. This fixture
+  // isolates ONE leg per delete file, and adds a partition-scoped control that must NOT apply.
+  // ===========================================================================================
+  static final class FileScopedDeleteOracle {
+    private FileScopedDeleteOracle() {}
+
+    /**
+     * DIRECTION 1 — "Rust reads what JAVA writes". Builds {@code <dir>/table}:
+     *
+     * <ul>
+     *   <li>created UNPARTITIONED (spec 0), then evolved to {@code identity(category)} (spec 1);
+     *   <li>data file A (category=a, ids 10/20/30) and data file B (category=b, ids 40/50/60), both
+     *       written and stamped under spec 1;
+     *   <li>delete FIELD-LEG: a real parquet position delete removing A's position 1 (id 20), whose
+     *       metadata carries {@code referenced_data_file = A} and NO metrics — stamped spec 0 with an
+     *       EMPTY partition, so neither the spec nor the partition matches A's;
+     *   <li>delete BOUNDS-LEG: the RAW output of Java's {@link PositionDeleteWriter} removing B's
+     *       position 1 (id 50) — that writer never sets {@code referenced_data_file}, it preserves the
+     *       {@code file_path} bounds instead — also stamped spec 0 with an EMPTY partition;
+     *   <li>CONTROL: a position delete naming A's position 2 (id 30) with NEITHER the field NOR path
+     *       bounds, stamped spec 1 / partition {@code category=c} — a partition holding NO data file.
+     *       Being partition-scoped it is looked up by {@code (spec, partition)} and therefore reaches
+     *       NO data file at all, in Java or in Rust: id 30 SURVIVES even though a delete file names
+     *       it. That is the pin that stops "route every position delete by path" from passing.
+     * </ul>
+     *
+     * <p>The control deliberately sits in an EMPTY partition rather than in {@code category=b}: a
+     * partition-scoped delete that names file A while being attached to file B's task trips a
+     * SEPARATE, pre-existing defect in the Rust reader (its per-scan {@code DeleteFilter} caches
+     * parsed positional deletes keyed by the DATA file path they name, so a delete file loaded for
+     * one task contributes deletions to another task's file). That defect is reported as a residue of
+     * the WG4b group; entangling it here would leave this fixture unable to prove the routing claim
+     * it exists for.
+     *
+     * Live merge-on-read rows = {10, 30, 40, 60}. The generator asserts Java's OWN read equals that
+     * set and that each delete file really has the shape its leg requires, so a fixture that silently
+     * stopped exercising the routing fails HERE instead of passing vacuously downstream.
+     */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.required(2, "category", Types.StringType.get()),
+              Types.NestedField.optional(3, "data", Types.StringType.get()));
+
+      // The table starts UNPARTITIONED so spec 0 is the unpartitioned spec; the delete files below
+      // are stamped with it while the data files live under the EVOLVED spec 1. That is the shape a
+      // writer that stamps deletes from the table default (rather than from the data files being
+      // deleted from) produces, and it is exactly what the path-keyed lookup must be immune to.
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              tableDir.getAbsolutePath(),
+              props);
+
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_file_scoped_deletes");
+
+      PartitionSpec unpartitioned = table.spec();
+      if (unpartitioned.specId() != 0 || !unpartitioned.isUnpartitioned()) {
+        throw new IllegalStateException(
+            "fixture precondition: spec 0 must be the unpartitioned spec, got " + unpartitioned);
+      }
+
+      table.updateSpec().addField("category").commit();
+      PartitionSpec partitioned = table.spec();
+      if (partitioned.specId() == 0 || partitioned.isUnpartitioned()) {
+        throw new IllegalStateException(
+            "fixture precondition: the evolved spec must be a NEW partitioned spec, got "
+                + partitioned);
+      }
+
+      Types.StructType partitionType = partitioned.partitionType();
+      PartitionData partitionA = new PartitionData(partitionType);
+      partitionA.set(0, "a");
+      PartitionData partitionB = new PartitionData(partitionType);
+      partitionB.set(0, "b");
+      // An EMPTY partition — no data file is ever written under it. The control delete is stamped
+      // with it, so the partition-keyed lookup reaches nothing.
+      PartitionData partitionC = new PartitionData(partitionType);
+      partitionC.set(0, "c");
+
+      String dataPathA = new File(dataDir, "category=a/00000-a.parquet").getAbsolutePath();
+      DataFile dataFileA =
+          writeDataFile(
+              table,
+              schema,
+              partitioned,
+              partitionA,
+              dataPathA,
+              new long[] {10L, 20L, 30L},
+              new String[] {"x", "y", "z"});
+      String dataPathB = new File(dataDir, "category=b/00000-b.parquet").getAbsolutePath();
+      DataFile dataFileB =
+          writeDataFile(
+              table,
+              schema,
+              partitioned,
+              partitionB,
+              dataPathB,
+              new long[] {40L, 50L, 60L},
+              new String[] {"p", "q", "r"});
+      table.newAppend().appendFile(dataFileA).appendFile(dataFileB).commit();
+
+      // --- FIELD leg: referenced_data_file set, NO file_path bounds -------------------------------
+      String fieldDeletePath = new File(dataDir, "00000-field-leg-deletes.parquet").getAbsolutePath();
+      DeleteFile rawFieldDelete =
+          writeUnpartitionedPosDelete(
+              table, schema, unpartitioned, fieldDeletePath, dataFileA.location(), 1L);
+      DeleteFile fieldLegDelete =
+          FileMetadata.deleteFileBuilder(unpartitioned)
+              .ofPositionDeletes()
+              .withFormat(FileFormat.PARQUET)
+              .withPath(rawFieldDelete.location())
+              .withFileSizeInBytes(rawFieldDelete.fileSizeInBytes())
+              .withRecordCount(rawFieldDelete.recordCount())
+              .withReferencedDataFile(dataFileA.location())
+              .build();
+
+      // --- BOUNDS leg: the writer's own output — no field, file_path bounds kept ------------------
+      String boundsDeletePath =
+          new File(dataDir, "00000-bounds-leg-deletes.parquet").getAbsolutePath();
+      DeleteFile boundsLegDelete =
+          writeUnpartitionedPosDelete(
+              table, schema, unpartitioned, boundsDeletePath, dataFileB.location(), 1L);
+
+      // --- CONTROL: neither leg; stamped partition category=c (EMPTY), names A's position 2 ------
+      String controlDeletePath = new File(dataDir, "00000-control-deletes.parquet").getAbsolutePath();
+      DeleteFile rawControlDelete =
+          writeUnpartitionedPosDelete(
+              table, schema, unpartitioned, controlDeletePath, dataFileA.location(), 2L);
+      DeleteFile controlDelete =
+          FileMetadata.deleteFileBuilder(partitioned)
+              .ofPositionDeletes()
+              .withFormat(FileFormat.PARQUET)
+              .withPath(rawControlDelete.location())
+              .withFileSizeInBytes(rawControlDelete.fileSizeInBytes())
+              .withRecordCount(rawControlDelete.recordCount())
+              .withPartition(partitionC)
+              .build();
+
+      assertShapes(fieldLegDelete, boundsLegDelete, controlDelete, dataFileA, dataFileB);
+
+      table
+          .newRowDelta()
+          .addDeletes(fieldLegDelete)
+          .addDeletes(boundsLegDelete)
+          .addDeletes(controlDelete)
+          .commit();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      Map<Long, String> live = readLiveRows(table);
+      List<Long> liveIds = new ArrayList<>(live.keySet());
+      liveIds.sort(Long::compareTo);
+      List<Long> expected = Arrays.asList(10L, 30L, 40L, 60L);
+      if (!liveIds.equals(expected)) {
+        // Java itself must behave the way the parity claim says it does. If it does not, the whole
+        // fixture is worthless — fail LOUD here rather than emit a ground truth nobody checked.
+        throw new IllegalStateException(
+            "fixture precondition: Java's own merge-on-read read must be "
+                + expected
+                + " (both file-scoped deletes applied across the spec/partition mismatch, the "
+                + "partition-scoped control NOT applied), got "
+                + liveIds);
+      }
+
+      writeJson(dir.resolve("java_file_scoped_delete_rows.json"), liveRowsToJson(live));
+      System.out.println(
+          "generated file-scoped position-delete table + java_file_scoped_delete_rows.json to " + dir);
+    }
+
+    /**
+     * Assert each delete file really carries the shape its leg is meant to isolate, via the SAME Java
+     * predicate the reader uses ({@link org.apache.iceberg.util.ContentFileUtil#referencedDataFile}).
+     * A drift here (a future writer that starts stamping the field, a metrics default that drops the
+     * bounds) would leave the fixture green while testing nothing.
+     */
+    private static void assertShapes(
+        DeleteFile fieldLeg,
+        DeleteFile boundsLeg,
+        DeleteFile control,
+        DataFile dataFileA,
+        DataFile dataFileB) {
+      int pathId = MetadataColumns.DELETE_FILE_PATH.fieldId();
+
+      if (fieldLeg.referencedDataFile() == null
+          || !fieldLeg.referencedDataFile().contentEquals(dataFileA.location())) {
+        throw new IllegalStateException(
+            "FIELD leg must carry referenced_data_file = A, got " + fieldLeg.referencedDataFile());
+      }
+      if (fieldLeg.lowerBounds() != null && fieldLeg.lowerBounds().containsKey(pathId)) {
+        throw new IllegalStateException(
+            "FIELD leg must carry NO file_path bounds, or it does not isolate the field leg");
+      }
+
+      if (boundsLeg.referencedDataFile() != null) {
+        throw new IllegalStateException(
+            "BOUNDS leg must NOT carry referenced_data_file, got " + boundsLeg.referencedDataFile());
+      }
+      if (boundsLeg.lowerBounds() == null
+          || !boundsLeg.lowerBounds().containsKey(pathId)
+          || boundsLeg.upperBounds() == null
+          || !boundsLeg.upperBounds().containsKey(pathId)
+          || !boundsLeg.lowerBounds().get(pathId).equals(boundsLeg.upperBounds().get(pathId))) {
+        throw new IllegalStateException(
+            "BOUNDS leg must carry EQUAL file_path lower/upper bounds — the writer's own metrics");
+      }
+      CharSequence derived = org.apache.iceberg.util.ContentFileUtil.referencedDataFile(boundsLeg);
+      if (derived == null || !derived.toString().equals(dataFileB.location())) {
+        throw new IllegalStateException(
+            "BOUNDS leg must derive B's location from its bounds, got " + derived);
+      }
+
+      if (org.apache.iceberg.util.ContentFileUtil.referencedDataFile(control) != null) {
+        throw new IllegalStateException(
+            "CONTROL must be partition-scoped (no derivable referenced data file), got "
+                + org.apache.iceberg.util.ContentFileUtil.referencedDataFile(control));
+      }
+      if (control.specId() == fieldLeg.specId()) {
+        throw new IllegalStateException(
+            "CONTROL must be stamped with the PARTITIONED spec, not the file-scoped deletes' spec");
+      }
+    }
+
+    /** A real parquet data file for one partition, stamped with that partition (spec-1 shape). */
+    private static DataFile writeDataFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        long[] ids,
+        String[] dataValues)
+        throws IOException {
+      String category = partition.get(0, String.class);
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("category", category);
+        record.setField("data", dataValues[i]);
+        rows.add(record);
+      }
+
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    /**
+     * A real parquet position delete written under the UNPARTITIONED spec (partition = null),
+     * removing {@code position} of {@code referencedDataPath}. Returned as Java's own writer built it
+     * — no {@code referenced_data_file}, {@code file_path} bounds preserved.
+     */
+    private static DeleteFile writeUnpartitionedPosDelete(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        String path,
+        CharSequence referencedDataPath,
+        long position)
+        throws IOException {
+      // `MetricsConfig.forPositionDelete(table)` — the config Spark's `SparkFileWriterFactory` uses
+      // for position deletes — forces the reserved `file_path` column to FULL metrics. Without it
+      // the appender falls back to the default truncate(16), and the bounds of a real (long) data
+      // file location come back UNEQUAL — precisely the "more than one referenced file" signal, so
+      // Java itself would route the delete by partition. Setting the property on the factory
+      // reproduces the production shape.
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(schema, spec)
+              .set(
+                  TableProperties.METRICS_MODE_COLUMN_CONF_PREFIX
+                      + MetadataColumns.DELETE_FILE_PATH.name(),
+                  "full");
+      OutputFile out = table.io().newOutputFile(path);
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(referencedDataPath, position, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    /** Java's OWN merge-on-read read of the table, as {@code id -> data}. */
+    private static Map<Long, String> readLiveRows(BaseTable table) {
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
+      }
+      return dataById;
+    }
+
+    /** Serialize {@code id -> data} sorted by id as a JSON array of {@code {id, data}}. */
+    private static String liveRowsToJson(Map<Long, String> dataById) {
+      List<Long> ids = new ArrayList<>(dataById.keySet());
+      ids.sort(Long::compareTo);
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (Long id : ids) {
+              gen.writeStartObject();
+              gen.writeNumberField("id", id);
+              String data = dataById.get(id);
+              if (data == null) {
+                gen.writeNullField("data");
+              } else {
+                gen.writeStringField("data", data);
+              }
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
     }
   }
 

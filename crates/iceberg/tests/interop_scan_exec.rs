@@ -183,6 +183,29 @@ fn multifile_scan_gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_MULTIFILE_SCAN_GEN_DIR").map(PathBuf::from)
 }
 
+/// The trailing path component of a file location — the plan assertions compare basenames because
+/// the fixture's absolute paths depend on the temp dir the runner script picked.
+fn file_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// The temp dir the Java oracle wrote the FILE-SCOPED position-delete table + JSON rows into
+/// (Direction 1). `None` when `ICEBERG_INTEROP_FILE_SCOPED_DELETES_DIR` is unset (then a clean
+/// no-op, so the offline gate stays green).
+fn file_scoped_deletes_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_FILE_SCOPED_DELETES_DIR").map(PathBuf::from)
+}
+
+/// Load + parse the Java ground-truth FILE-SCOPED-delete rows from
+/// `<dir>/java_file_scoped_delete_rows.json`.
+fn read_java_file_scoped_rows(dir: &std::path::Path) -> Vec<ScanRow> {
+    let path = dir.join("java_file_scoped_delete_rows.json");
+    let json = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str::<Vec<ScanRow>>(&json)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+}
+
 /// Load + parse the Java ground-truth MULTI-FILE rows from `<dir>/java_multifile_scan_rows.json`.
 fn read_java_multifile_rows(dir: &std::path::Path) -> Vec<ScanRow> {
     let path = dir.join("java_multifile_scan_rows.json");
@@ -2027,6 +2050,125 @@ async fn test_multifile_scan_exec_matches_java_read() {
     println!(
         "interop_scan_exec multi-file OK — Rust scan = Java read: 5 live rows {{10,30,40,50,60}}, \
          file1 id 20 deleted, file2 sibling id 50 spared"
+    );
+}
+
+// ===========================================================================================
+// FILE-SCOPED position-delete routing INTEROP (WG4b) — Java's `DeleteFileIndex` routes a position
+// delete with a derivable referenced data file into a PATH-keyed map consulted with NO spec and NO
+// partition condition. Java writes a table whose deletes are stamped with a spec + partition that
+// match NEITHER data file (the FIELD leg via `referenced_data_file`, the BOUNDS leg via equal
+// `file_path` bounds — the shape Java's own `PositionDeleteWriter` emits), plus a partition-scoped
+// CONTROL that must NOT apply. Driver: run-interop-file-scoped-deletes.sh. A clean no-op offline.
+// ===========================================================================================
+
+#[tokio::test]
+async fn test_file_scoped_delete_scan_matches_java_read() {
+    let Some(dir) = file_scoped_deletes_dir() else {
+        println!(
+            "skipping interop_scan_exec file-scoped deletes — set \
+             ICEBERG_INTEROP_FILE_SCOPED_DELETES_DIR \
+             (run dev/java-interop/run-interop-file-scoped-deletes.sh)"
+        );
+        return;
+    };
+
+    let table = load_table(&dir);
+
+    // PLAN-LEVEL parity — the direct expression of Java `DeleteFileIndex.forDataFile`: which delete
+    // files attach to which data file. Asserted BEFORE the rows because it localises a routing
+    // regression precisely, and because a row-level result can coincidentally match while the wrong
+    // delete files are attached.
+    let mut planned: Vec<(String, Vec<String>)> = table
+        .scan()
+        .build()
+        .expect("build table scan for planning")
+        .plan_files()
+        .await
+        .expect("plan files")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect file scan tasks")
+        .into_iter()
+        .map(|task| {
+            let mut deletes: Vec<String> = task
+                .deletes
+                .iter()
+                .map(|delete| file_name(&delete.file_path))
+                .collect();
+            deletes.sort();
+            (file_name(&task.data_file_path), deletes)
+        })
+        .collect();
+    planned.sort();
+    assert_eq!(
+        planned,
+        vec![
+            ("00000-a.parquet".to_string(), vec![
+                "00000-field-leg-deletes.parquet".to_string()
+            ]),
+            ("00000-b.parquet".to_string(), vec![
+                "00000-bounds-leg-deletes.parquet".to_string()
+            ]),
+        ],
+        "each data file must receive EXACTLY the file-scoped delete that references it — and the \
+         partition-scoped control (stamped an empty partition) must reach neither"
+    );
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let java_rows = sorted_by_id(read_java_file_scoped_rows(&dir));
+
+    let live_ids: Vec<i64> = rust_rows.iter().map(|row| row.id).collect();
+    // id 20: deleted by the FIELD-leg delete (referenced_data_file = file A) even though that delete
+    // is stamped spec 0 / EMPTY partition while file A is spec 1 / category=a.
+    assert!(
+        !live_ids.contains(&20),
+        "id 20 must be deleted by the file-scoped delete carrying referenced_data_file, live: \
+         {live_ids:?}"
+    );
+    // id 50: deleted by the BOUNDS-leg delete — no referenced_data_file at all, only equal
+    // `file_path` lower/upper bounds naming file B. This is the shape Java's PositionDeleteWriter
+    // (and Spark's file-granularity writer) actually produces.
+    assert!(
+        !live_ids.contains(&50),
+        "id 50 must be deleted by the file-scoped delete identified by its file_path bounds, live: \
+         {live_ids:?}"
+    );
+    // id 30: named by the CONTROL delete, which is partition-scoped (neither leg) and stamped
+    // category=b while the row lives in category=a. Java does not apply it; neither may Rust.
+    assert!(
+        live_ids.contains(&30),
+        "id 30 must SURVIVE — the control delete is partition-scoped and its partition does not \
+         match the data file's, live: {live_ids:?}"
+    );
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40, 60],
+        "the live id set after file-scoped merge-on-read is exactly {{10, 30, 40, 60}}"
+    );
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust scan→Arrow rows must equal Java's own IcebergGenerics read of the same table"
+    );
+
+    println!(
+        "interop_scan_exec file-scoped deletes OK — Rust scan = Java read: live rows \
+         {{10,30,40,60}}, field-leg id 20 and bounds-leg id 50 deleted across the spec/partition \
+         mismatch, partition-scoped control id 30 spared"
     );
 }
 

@@ -462,3 +462,37 @@ first-match string replace mutated the WRONG site and the "site 3" leg silently 
   mismatch as a harness bug, never as evidence.
 - **Anchor on the preceding distinguishing line, not on the mutated line alone** (here `let Some(literal)
   = slot.as_ref() else {`). Indentation is not identity.
+
+### 2026-07-25 — A guard inside a SHARED predicate can be dead for one caller and load-bearing for another; mutate the helper and check EVERY caller's tests
+
+WG4b (path-keyed position-delete routing). `referenced_data_file_location` (Java
+`ContentFileUtil.referencedDataFile`) opens with "equality deletes are never file-scoped". A read-path
+unit test was written to pin it and passed — but the mutation that DELETES that early return produced
+zero failures, because the index consults the helper only inside its `PositionDeletes` match arm, so
+the guard is unreachable from that caller. The guard is genuinely load-bearing for the OTHER caller,
+`RemoveDanglingDeleteFiles`, where an equality delete judged by reference instead of by the partition
+min-sequence rule is removed while it still applies — an irreversible resurrection.
+
+- **DO run each mutation against the WHOLE suite, not the test you wrote it for, and read the failure
+  set.** An empty failure set is the finding: the code you mutated is dead for that path, or nothing
+  covers it. Here the empty set bought a real corruption-direction test that did not exist.
+- **DO NOT let a test's doc comment claim a mutation it does not actually detect.** The corrected
+  comment now names the mutation that DOES red it (content-blind routing) and points at the sibling
+  test in the other module that owns the early return.
+- **Detector:** a `pub(crate)` predicate with more than one caller. Enumerate the callers before
+  writing the mutation list, and give each caller its own leg.
+
+### 2026-07-25 — parquet-rs truncates byte-array statistics at 64 bytes by DEFAULT, so a bounds-derived fixture can silently carry no bounds
+
+Same increment. A test that needed a position delete carrying EQUAL `file_path` lower/upper bounds
+wrote one with `MetricsConfig::for_position_delete()` (which forces that column to FULL) and still got
+no bounds at all: `DEFAULT_STATISTICS_TRUNCATE_LENGTH = Some(64)` in parquet-rs truncates the min/max,
+`Statistics::min_is_exact()` then returns false, and the Iceberg metrics aggregator drops the bound.
+Java's parquet-mr does not truncate row-group statistics, which is why the same fixture shape works
+there — a real fork-vs-Java asymmetry, not just a test problem.
+
+- **DO assert the fixture's own precondition when the fixture depends on emitted METRICS** (here:
+  both bounds present AND equal AND naming the intended file). Without it the test would have gone
+  green the moment the routing stopped being exercised.
+- **DO reach for `set_statistics_truncate_length(None)` when a test needs exact bounds**, and say in
+  the comment why — otherwise the next reader deletes it as noise.
