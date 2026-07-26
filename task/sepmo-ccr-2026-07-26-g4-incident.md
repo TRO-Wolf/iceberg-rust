@@ -39,17 +39,19 @@ an open S2 that was a **record-truth defect** (a GAP_MATRIX residue clause claim
 The bundle design's parking contingency — reset the branch to the last good commit — required
 **destructive git authority the executing agent did not hold**; the session's permission
 classifier blocked it (correctly: the contingency was orchestrator-authored, never user-named).
-The pipeline then **continued**: groups G5–G8 built on top of the unsettled state, with 7 of G4's
-10 touched files later modified by those groups. The bundle-scope closing Critic caught the
+The pipeline then **continued**: groups G5–G8 built on top of the unsettled state — 5 of G4's 10
+touched files were modified by those groups (7 of 10 by branch tip, once the closing remediation
+also landed). The bundle-scope closing Critic caught the
 breach as its S1, a closing remediation corrected the record defects, the re-attestation
 converged the whole bundle with the residual governance decision (strip-or-waive G4) surfaced as
 an explicit user merge gate on the PR. **No defect escaped**; this is a lifecycle-machinery
 incident, filed per the spine's incident-retrospective rule while the evidence is fresh.
 
-Evidence homes: the PrimarySync claim-board rows for `fix/engine-trust-bundle-2026-07`
-(2026-07-25/26), the bundle branch's `task/todo.md` Unit-2 close-out block, and the orchestration
-run record (session `99d5183a`, workflow `wf_417ac10c-e61`, per-group Critic reports under
-`scratchpad/pr-bodies/bundle-2026-07/`).
+Durable evidence homes: the PrimarySync claim-board rows for `fix/engine-trust-bundle-2026-07`
+(2026-07-25/26), the bundle branch's `task/todo.md` Unit-2 close-out block and `task/lessons.md`
+entries (the CLOSE lesson: "a tripped per-group gate must be settled before the next group"),
+and the bundle PR's description, which embeds the record per R8 (the per-group Critic reports it
+was assembled from are session-scratchpad artifacts and ephemeral).
 
 ## Root causes — three, distinct
 
@@ -88,14 +90,15 @@ run record (session `99d5183a`, workflow `wf_417ac10c-e61`, per-group Critic rep
 > is unresolved — including work whose contingency fired and failed — is a blocking state:
 > nothing downstream may consume it or build atop it. *Interactive mode:* halt and escalate.
 > *Delegated mode:* stop the line and flag; downstream stages do not run. Proceeding past an
-> unsettled disposition is a silent gate skip (Invariant V) **even when the proceeding is loudly
-> logged** — logging a breach is not settling it.
+> unsettled disposition is an Invariant V alarm in its own right — **unsettled-disposition
+> consumption** — **even when the proceeding is loudly logged**: logging a breach is not
+> settling it.
 
 ## Amendment C — new sub-machine rule R13: remand to the assembly's closing authority
 
 > **R13 — Remand.** In a multi-unit assembly (a bundled PR), a unit that reaches its cycle cap
-> without convergence has three legal dispositions: escalate (per *Cycle-cap escalation*),
-> REMOVED, or **REMANDED**. A remand is explicit, never implied by continuation: the remand
+> without convergence either follows *Cycle-cap escalation* (which terminates in a disposition)
+> or takes one of two settled dispositions directly: **REMOVED**, or **REMANDED**. A remand is explicit, never implied by continuation: the remand
 > record enumerates every open finding with its severity. Downstream units may proceed only
 > where their scope is demonstrably disjoint from the open findings' blast radius, and the
 > disjointness claim is recorded. The assembly's **closing authority** — the independent
@@ -106,6 +109,21 @@ run record (session `99d5183a`, workflow `wf_417ac10c-e61`, per-group Critic rep
 > authority that converges an assembly containing a remanded unit without the item-by-item
 > disposition has not converged it.
 
+## Amendment D — the spine's *Incident retrospectives* section widens its trigger
+
+The section currently triggers only on an **escaped defect**. Append:
+
+> **A lifecycle-machinery incident triggers the same retrospective.** A failure of SEPMO's own
+> machinery — an invalid contingency, an unsettled disposition consumed downstream, a gate
+> bypassed — files the same immediate `kind: incident` metrics section and runs the same
+> asymmetric feed-forward, whether or not any product defect escaped. In such a section,
+> `coverage_misses` and `escaped_defects_by_origin` may be legitimately empty — the keys are
+> still filed, and the incident's mechanism is named in the section body.
+
+(Without this, a machinery incident like the one motivating this CCR has no legal home in the
+ledger the spine itself mandates; ref 08 mirrors this extension — canonical rule stays in the
+spine.)
+
 ## Changelog entry (draft for the master)
 
 > **v2.3 — 2026-07-··.** The disposition discipline lands: **R11** (contingencies must be
@@ -114,24 +132,28 @@ run record (session `99d5183a`, workflow `wf_417ac10c-e61`, per-group Critic rep
 > CONVERGED / REMOVED / REMANDED; an unsettled disposition blocks the line, and logging a breach
 > is not settling it), **R13** (remand to the assembly's closing authority: explicit record with
 > enumerated findings, recorded disjoint-scope rule for downstream work, item-by-item closing
-> disposition, user decisions as named PR merge gates). Promoted from a consuming project's
-> incident retrospective: a bundle group parked on an open finding, its destructive parking
-> contingency proved unexecutable under the live permission regime, downstream groups consumed
-> the unsettled state, and the bundle-scope closing Critic caught the breach and improvised what
-> R13 now legalizes. *Reference amendments required by this version:* ref 02 —
-> PRE_EXECUTION_REVIEW checklist gains contingency-executability; *Cycle-cap escalation* gains
-> the REMOVED/REMANDED dispositions and the multi-unit-assembly binding; ref 03 — the review
-> format gains a contingency-executability line; ref 05 — the bundle-scope closing Critic's
-> item-by-item remand duty; ref 06 — new watch item: unsettled-disposition consumption /
-> invalid contingency (T8-class); ref 08 — incident retrospectives explicitly cover
-> lifecycle-machinery incidents, not only escaped code defects.
+> disposition, user decisions as named PR merge gates). The spine's *Incident retrospectives*
+> section widens its trigger to **lifecycle-machinery incidents** (Amendment D) — machinery
+> failures file the same immediate `kind: incident` section whether or not a product defect
+> escaped. Promoted from a consuming project's incident retrospective: a bundle group parked on
+> an open finding, its destructive parking contingency proved unexecutable under the live
+> permission regime, downstream groups consumed the unsettled state, and the bundle-scope
+> closing Critic caught the breach and improvised what R13 now legalizes. *Reference amendments
+> required by this version:* ref 02 — PRE_EXECUTION_REVIEW checklist gains
+> contingency-executability; *Cycle-cap escalation* gains the REMOVED/REMANDED dispositions and
+> the multi-unit-assembly binding; ref 03 — the review format gains a
+> contingency-executability line; ref 05 — the bundle-scope closing Critic's item-by-item
+> remand duty; ref 06 — new watch item (next unused trigger id): unsettled-disposition
+> consumption / invalid contingency; ref 08 — mirrors Amendment D (canonical rule stays in the
+> spine).
 
 ## Adoption protocol
 
 1. **User ratifies** this CCR (edits welcome — the text above is a proposal, not a fait
    accompli).
 2. **Master home updated:** `~/Desktop/Sepmo/` — spine `version: "2.3"`, the three rules
-   inserted after R10, the changelog entry, and the five reference amendments.
+   inserted after R10, the *Incident retrospectives* extension (Amendment D), the changelog
+   entry, and the five reference amendments.
 3. **This repo re-binds** as its own SEPMO unit (verbatim spine copy, reference amendments,
    `spine_version: v2.3` in the manifest, instantiation checklist re-proven, independent Critic)
    — the same flow as `infra/sepmo-canon-v2.2`.
