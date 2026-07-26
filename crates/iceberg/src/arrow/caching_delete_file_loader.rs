@@ -26,6 +26,7 @@ use tokio::sync::oneshot::{Receiver, channel};
 use super::delete_filter::{DeleteFilter, PosDelLoadAction};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
+use crate::arrow::null_propagation::propagate_struct_validity;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
@@ -680,7 +681,14 @@ impl CachingDeleteFileLoader {
                 }
             };
 
-            let root_array: ArrayRef = Arc::new(StructArray::from(record_batch));
+            // Push every struct's validity down into its fields BEFORE the visit: the processor
+            // below collects each key column as a STANDALONE array, so a key nested under a NULL
+            // struct would otherwise decode to whatever bytes happen to sit in the child buffer
+            // (Arrow does not require a null struct to mask its children) and produce
+            // `= <stale value>` instead of `IS NULL`.
+            let root_array: ArrayRef = propagate_struct_validity(
+                &(Arc::new(StructArray::from(record_batch)) as ArrayRef),
+            )?;
 
             let mut processor = EqDelColumnProcessor::new(&equality_ids);
             visit_schema_with_partner(schema, &root_array, &mut processor, &accessor)?;
@@ -761,6 +769,12 @@ impl CachingDeleteFileLoader {
 struct EqDelColumnProcessor<'a> {
     equality_ids: &'a HashSet<i32>,
     collected_columns: Vec<(ArrayRef, i32, String, Type)>,
+    /// The names of the struct fields currently being descended through, outermost first. A
+    /// collected key's [`Reference`] name must be the FULL dotted path (`outer.inner`) because
+    /// that is what `Schema::name_to_id` indexes and therefore the only form
+    /// [`crate::expr::Bind`] can resolve — a leaf-only name either fails to bind or, when a
+    /// top-level column shares the leaf name, binds to the wrong column.
+    field_path: Vec<String>,
 }
 
 impl<'a> EqDelColumnProcessor<'a> {
@@ -768,6 +782,16 @@ impl<'a> EqDelColumnProcessor<'a> {
         Self {
             equality_ids,
             collected_columns: Vec::with_capacity(equality_ids.len()),
+            field_path: Vec::new(),
+        }
+    }
+
+    /// The full dotted name of `field` given the struct path currently being descended.
+    fn full_field_name(&self, field: &NestedFieldRef) -> String {
+        if self.field_path.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{}.{}", self.field_path.join("."), field.name)
         }
     }
 
@@ -823,12 +847,31 @@ impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
         Ok(())
     }
 
+    /// `before_struct_field` / `after_struct_field` bracket the visit of ONE struct field, so
+    /// pushing here and popping there leaves [`Self::field_path`] holding exactly the ANCESTORS of
+    /// the field `field()` is called with (the visitor calls `after_struct_field` before `field`).
+    fn before_struct_field(&mut self, field: &NestedFieldRef, _partner: &ArrayRef) -> Result<()> {
+        self.field_path.push(field.name.clone());
+        Ok(())
+    }
+
+    fn after_struct_field(&mut self, field: &NestedFieldRef, _partner: &ArrayRef) -> Result<()> {
+        self.field_path.pop().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Unbalanced struct-field walk while collecting equality-delete key columns",
+            )
+            .with_context("field_name", &field.name)
+        })?;
+        Ok(())
+    }
+
     fn field(&mut self, field: &NestedFieldRef, partner: &ArrayRef, _value: ()) -> Result<()> {
         if self.equality_ids.contains(&field.id) && field.field_type.as_primitive_type().is_some() {
             self.collected_columns.push((
                 partner.clone(),
                 field.id,
-                field.name.clone(),
+                self.full_field_name(field),
                 field.field_type.as_ref().clone(),
             ));
         }
@@ -935,6 +978,7 @@ mod tests {
 
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
+    use crate::expr::Bind;
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{DataContentType, Schema};
 
@@ -965,9 +1009,110 @@ mod tests {
         .expect("error parsing batch stream");
         println!("{parsed_eq_delete}");
 
-        let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (sa != 5)) OR (b IS NOT NULL))".to_string();
+        // `sa` (field id 6) lives inside the struct column `s` (field id 5), so its reference is
+        // `s.sa` — the form `Schema::name_to_id` indexes and the only one `Bind` can resolve. This
+        // expectation previously read a leaf-only `sa`, which is unbindable (WG5 (b)).
+        let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (s.sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (s.sa != 5)) OR (b IS NOT NULL))".to_string();
 
         assert_eq!(parsed_eq_delete.to_string(), expected);
+    }
+
+    /// Build an in-memory equality-delete batch whose key column is NESTED:
+    /// `struct<1: id required int, 2: nested optional struct<3: k optional int>>`, with
+    /// `nested` NULL on row 0 while the `k` slot underneath still holds a live `7` (Arrow does not
+    /// require a null struct to mask its children). Row 1 is fully live with `k = 9`.
+    fn nested_key_equality_delete_batch() -> RecordBatch {
+        let k_field = Arc::new(simple_field("k", DataType::Int32, true, "3"));
+        let k_values = Arc::new(Int32Array::from(vec![Some(7), Some(9)])) as ArrayRef;
+        let nested = StructArray::try_new(
+            Fields::from(vec![k_field]),
+            vec![k_values],
+            Some(arrow_buffer::NullBuffer::from(vec![false, true])),
+        )
+        .expect("nested struct array");
+        let nested_field = simple_field("nested", nested.data_type().clone(), true, "2");
+        let id_field = simple_field("id", DataType::Int32, false, "1");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![id_field, nested_field]));
+        RecordBatch::try_new(schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(nested) as ArrayRef,
+        ])
+        .expect("nested-key equality delete batch")
+    }
+
+    /// The iceberg table schema `nested_key_equality_delete_batch` is a delete against.
+    fn nested_key_table_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "nested",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "k", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("nested key table schema")
+    }
+
+    /// WG5 (b): a nested equality-delete key must decode as the value the ROW logically holds.
+    /// Row 0's `nested` struct is NULL, so its key is NULL — Java's delete set compares
+    /// `StructLike`s, where a null parent yields a null key and matches only other NULLs. Handing
+    /// the `k` child back detached from its parent turns that into an equality against the stale
+    /// `7` that happens to sit in the child buffer: the delete then removes rows that hold 7 and
+    /// misses the rows it was written for. It also pins the reference NAME: `Schema::name_to_id`
+    /// indexes nested fields by their FULL dotted path, so a leaf-only `k` cannot bind.
+    #[tokio::test]
+    async fn test_nested_equality_delete_key_uses_parent_validity_and_full_name() {
+        use futures::stream;
+
+        let batch = nested_key_equality_delete_batch();
+        let stream: ArrowRecordBatchStream = stream::iter(vec![Ok(batch)]).boxed();
+
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![3]),
+        )
+        .await
+        .expect("nested-key equality deletes must parse");
+
+        assert_eq!(
+            predicate.to_string(),
+            "(nested.k IS NOT NULL) AND (nested.k != 9)",
+            "row 0's key is NULL (its parent struct is NULL), and the reference must be the full \
+             dotted path"
+        );
+    }
+
+    /// The consequence of the name half of the test above: the parsed predicate is bound against
+    /// the TABLE schema at `DeleteFilter::build_equality_delete_predicate`. A leaf-only reference
+    /// either fails to bind outright or — when a top-level column shares the leaf name — binds to
+    /// the WRONG column and deletes silently wrong rows.
+    #[tokio::test]
+    async fn test_nested_equality_delete_predicate_binds_to_table_schema() {
+        use futures::stream;
+
+        let batch = nested_key_equality_delete_batch();
+        let stream: ArrowRecordBatchStream = stream::iter(vec![Ok(batch)]).boxed();
+
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![3]),
+        )
+        .await
+        .expect("nested-key equality deletes must parse");
+
+        let bound = predicate
+            .bind(Arc::new(nested_key_table_schema()), true)
+            .expect("the nested-key predicate must bind against the table schema");
+        assert!(
+            bound.to_string().contains("nested.k"),
+            "bound predicate must reference the nested column: {bound}"
+        );
     }
 
     /// Risk pinned (audit BUG-004): an equality-delete task with `equality_ids: None` — corrupt or
