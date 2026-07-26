@@ -46,7 +46,9 @@
 //!   Java/Spark — the tuple is on-disk metadata, not an engine artifact);
 //! - an unpruned read hands back the RECORDED value for every identity-partitioned column, because
 //!   partition metadata is authoritative over the file's own column (Iceberg "Column Projection"
-//!   rule 1 / Java `PartitionUtil.constantsMap`) — the rows come back with the wrong values.
+//!   rule 1 / Java `PartitionUtil.constantsMap`) — the rows come back with the wrong values. The
+//!   file's own value is MASKED, not lost, so the corruption is repairable in place (why, and why a
+//!   query-level self-check cannot see it, in the recipe's "Why it is silent").
 //!
 //! Both actions here are offline and mechanical: they need only the table and its storage.
 //!

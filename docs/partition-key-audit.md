@@ -63,6 +63,28 @@ wrong batch**. The result is a *real-but-wrong* tuple, and nothing rejects it:
   partition metadata is authoritative over the file's own column (Iceberg spec "Column Projection"
   rule 1 / Java `PartitionUtil.constantsMap`). The rows come back with the wrong values.
 
+The identity case is worth stating twice, because it looks like data loss and is not. The values the
+SELECT computed **are in the data file** — the provider writes every table column, and a wrong tuple
+only ever changed which file a row landed in, never the row. What an identity-partitioned column
+reads back is the RECORDED tuple substituted OVER the file's own column
+(`arrow/record_batch_transformer.rs`, `constant_overrides_file_column`): the stored value is masked,
+not destroyed. Repair the tuple and the true value reappears — that is what §3 does. Measured
+independently by the RePark consumer (2026-07-25): the same
+`INSERT OVERWRITE … SELECT id, concat(name,'X')` reads back `gX` on a `bucket(4,name)` table and `g`
+on an `identity(name)` table. Same writer, same parquet payload; the only difference is the
+read-side constants map, which admits identity transforms and nothing else (Java
+`PartitionUtil.constantsMap` filters `transform().isIdentity()`).
+
+### Corollary — a hand-rolled self-check is BLIND on identity specs
+
+Verifying by querying the table (`SELECT … WHERE dept <> <expected>`, or recomputing the transform
+over what a scan hands back) **cannot see this corruption**: on an identity spec the value the scan
+serves IS the recorded tuple, so the recomputation agrees with the tuple it was meant to falsify, by
+construction. Only a read that is not told the tuple can falsify it — which is why
+`AuditPartitionKeys` clears `partition` / `partition_spec` on every scan task (`prepare_read_task`)
+and why that clearing is mutation-pinned. Non-identity transforms (bucket / truncate / temporal) never
+enter the constants map, so a query-level check happens to work there; do not generalize from it.
+
 The fix (#172) stops NEW corruption. It does not repair tuples already written; that is what this
 recipe is for.
 
@@ -164,6 +186,13 @@ Properties worth knowing before you run it:
 - **Each file keeps its own partition spec.** A file written under an older spec is repaired under
   *that* spec — the repair fixes the tuple and changes nothing else. It is not a re-partitioning
   tool; use `RewriteDataFiles` for that.
+- **The repair restores the true values; it does not approximate them.** Rows are rewritten from the
+  file's own columns, so an identity-partitioned column stops serving the wrong recorded constant and
+  returns what was written. A single manifest-tuple rewrite would not always suffice — a miskeyed file
+  can hold rows of several true partitions and an identity partition must be single-valued per file —
+  which is why the repair splits and rewrites rather than patching metadata. What it does not reach is
+  history: older snapshots keep their miskeyed entries (expire them if the time-travel view must be
+  clean).
 - **Position deletes that referenced a repaired file dangle afterwards** (their rows were already
   excluded from what was rewritten). This is the same posture `RewriteDataFiles` takes; run
   `RemoveDanglingDeleteFiles` afterwards to clean them up.

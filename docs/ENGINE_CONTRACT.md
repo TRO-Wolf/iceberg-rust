@@ -146,10 +146,28 @@ is a deferred fork follow-up.
 
 **Partition-tuple integrity.** A wrong partition tuple is *accepted* by every commit path (arity and
 types are validated, values are not) and is then silent in both engines: a pruned read drops the
-file's rows, an unpruned read hands back the recorded value for identity-partitioned columns. If an
-engine's projection layer can compute a partition-source column, audit it —
-[`partition-key-audit.md`](partition-key-audit.md) is the detection + remediation recipe
-(`maintenance::AuditPartitionKeys` / `RepairPartitionKeys`).
+file's rows, and an unpruned read hands back the RECORDED value for identity-partitioned columns —
+partition metadata OVERRIDES the file's own column for an identity transform (Iceberg "Column
+Projection" rule 1 / Java `PartitionUtil.constantsMap`; Rust
+`arrow/record_batch_transformer.rs::constant_overrides_file_column`). Two consequences an engine must
+internalise. First, on an identity spec the damage is visible on an ORDINARY FULL SCAN, not only on a
+pruned one: rows come back carrying the recorded value in place of the value that was written.
+Second, the written value is NOT lost — it is still in the data file, masked — so the corruption is
+repairable in place; `maintenance::RepairPartitionKeys` rewrites the rows under their recomputed keys
+and the true values return.
+
+Two duties follow for any engine that can compute a partition-source column:
+
+1. **Declare your data dependencies to your optimizer, or compute the tuple inside the operator.** An
+   expression node that reads its input positionally while declaring no children can be re-parented
+   onto a different input by any projection-fusing optimizer and will then compute the tuple from the
+   wrong batch — a real-but-wrong tuple that nothing rejects. The fixed `PartitionExpr`
+   (`iceberg-datafusion` `physical_plan/project.rs`) is the worked example: honest `children()`,
+   evaluation THROUGH those children, never `batch.columns()`.
+2. **Do not verify partition tuples by reading the table.** On identity specs the read serves the
+   recorded tuple, so any check computed from served rows is vacuous. Use
+   `maintenance::AuditPartitionKeys`, which reads with the tuple stripped —
+   [`partition-key-audit.md`](partition-key-audit.md) is the detection + remediation recipe.
 
 ## 5. Isolation level → validation recipes  ·  **NORMATIVE (oracle-verified 2026-07-09)**
 
@@ -294,6 +312,21 @@ partition, …)` — so a Java-written file can never claim a spec the table doe
   carrying an empty tuple. The check is keyed on partition-field **arity**, not on
   `PartitionSpec::is_unpartitioned()`, which also reports `true` for an ALL-VOID spec whose partition
   type still has fields.
+- **Neither routing leg rescues a wrongly stamped position delete this crate writes.** The read side can
+  bind a position delete to one data file by the `referenced_data_file` field or by EQUAL `file_path`
+  column bounds — and a delete this crate writes offers neither: it does not set the field (nor does
+  Java through 1.11.0 for parquet position deletes; only the V3 DV writer does), and parquet-rs
+  truncates byte-array statistics at 64 bytes so the metrics aggregator drops the `file_path` bounds
+  as non-exact. A fork-written position delete is therefore routed by `(spec_id, partition)` ALONE. A
+  wrong stamp is a silent under-delete with no fallback — which is why the stamping rules above are
+  MUSTs, not hygiene.
+- **Delete granularity is the ENGINE's choice; the core has no knob.** This crate neither reads nor
+  persists `write.delete.granularity`, so nothing infers granularity for you: you get what your
+  grouping produces — one delete file per `(spec_id, partition)` group is PARTITION granularity, one
+  per data file is FILE granularity. Do not read a table's properties to discover what another writer
+  did: the property is not persisted when unset and the two Java defaults DISAGREE —
+  `TableProperties.DELETE_GRANULARITY_DEFAULT` is PARTITION while `SparkWriteConf.deleteGranularity()`
+  defaults to FILE, and Spark writes FILE. (Bytecode-verified by the RePark consumer, 2026-07-25.)
 - Keep `MetricsConfig::for_position_delete` so `file_path`/`pos` bounds stay Full (pruning
   precision).
 

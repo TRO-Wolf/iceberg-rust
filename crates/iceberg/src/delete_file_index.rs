@@ -173,7 +173,10 @@ pub(crate) fn is_deletion_vector(data_file: &DataFile) -> bool {
 ///    (`content() == EQUALITY_DELETES → null`): an equality delete matches by VALUE across a whole
 ///    partition, so a `file_path` bound on it would be meaningless.
 /// 2. **The explicit back-reference wins.** `referenced_data_file` (spec field 143), when set, is
-///    returned as-is. Deletion vectors always carry it; parquet position deletes may.
+///    returned as-is. Deletion vectors always carry it; a PARQUET position delete essentially never
+///    does — through Iceberg 1.11.0 the only writer that sets the field is `deletes.BaseDVFileWriter`
+///    (the V3 DV writer), so this leg is dead for every Spark-written V2 table and leg 3 carries them
+///    all. Independently bytecode-verified at 1.10.0 and 1.11.0 by the RePark consumer, 2026-07-25.
 /// 3. **Otherwise derive it from the `file_path`-column bounds.** Java reads the lower and upper
 ///    bound of the reserved `file_path` column ([`RESERVED_FIELD_ID_DELETE_FILE_PATH`]) and returns
 ///    the decoded value only when BOTH exist and are EQUAL — equal bounds mean every row in the

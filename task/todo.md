@@ -113,6 +113,30 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       byte-match vs Java's own partitionToPath. Gate at tip: lib 2974 (+109), datafusion 246
       (+28), anchors 75 rows. ONE user merge-gate rides the PR (closer CR-1): **waive or strip
       G4** (strip = surgical: 5 of its 10 files overlap later groups, 7 of 10 by branch tip incl. the closing chain). PUSHED for PR.
+      **TRIAGE RIDER 2026-07-26 (docs/evidence only, NO behavior change — the bundle needed none):**
+      the RePark consumer's response to the 5-action fork work order was adjudicated and absorbed.
+      (a) EXPOSURE AUDIT — CLOSED as an audit, not a probability: they delivered an inventory
+      (real-AWS surfaces write exclusively via CTAS + MERGE INTO, never the provider; targets
+      unpartitioned; scratch Glue namespace disposable; provider `insert_into` consumers are
+      ephemeral test fixtures), so "none exist" is answered. The `RoadMapSync.md` 2026-07-25 row
+      still reads "the exposure-audit ask stays OPEN" and needs updating; one narrow follow-up
+      question remains (their inventory is scoped to `insert_into` — confirm no OTHER RePark
+      `PhysicalExpr` reads its input positionally while declaring no children, which is the general
+      defect class). (b) WG4b FIXTURE — DELIVERED, and now WIRED: `interop_spark_mor_fixtures.rs`
+      (env-gated, fixture NOT committed here). (c) IDENTITY-SPEC CORRECTION — ABSORBED with the
+      mechanism RULED: their observation is right, their inference is not. The computed values ARE
+      in the parquet (the write path drops no columns); the READ path substitutes the manifest
+      tuple over the file's own column for identity transforms only, so the values are MASKED, not
+      lost, and `RepairPartitionKeys` recovers them. The detector's severity model therefore needs
+      no change; the recipe + contract wording landed in this rider. Honest boundaries sent back:
+      history is not healed, and a pure manifest-tuple rewrite is NOT always sufficient (that half
+      of their claim stands). (d) PIN PROTOCOL — their Group-AA guard makes their divergence MATRIX
+      a RePark-with-guard measurement until repin; their bypass pins stay fork-direct, and the
+      removal checklist must revert BOTH the bypass and the cell relabel in the same change. Open
+      asks back to them: reconcile the pin arithmetic (the doc describes four new pins, the repin
+      posture says two), rename the identity pin away from "data-loss", and note the FROM-less
+      literal pin's post-repin expectation is schema-dependent (Unit 1 + required columns = Ok;
+      Unit 1 + optional = still a loud `Plan(...)` rejection until this bundle's G0).
 - [ ] **Unit 3 — breaking follow-up (Mode A, after Unit 2)** — `PartitionKey::new -> Result`
       (58 sites/34 files incl. 6 `no_run` doc fences) + `CurrentFileStatus` unwraps.
 - [ ] **Unit 4 — H7-S2 COW streaming** · **Unit 5 — H7-P1 pushdown** (footgun precondition) —
