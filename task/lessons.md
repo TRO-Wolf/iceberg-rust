@@ -659,3 +659,31 @@ rather than argued.
   hang, so the class-correct instrument is a HARNESS-level per-test timeout (`cargo nextest`
   `slow-timeout` + `terminate-after`, or a CI job timeout), not N test edits. Scope the claim in the
   PR body to what the bounds actually cover and name the rest as a residue.
+
+### 2026-07-26 — A per-group gate that TRIPS must be settled before the next group starts; a residue ledger can contradict itself two clauses apart; and an `assert_ne!` alarm needs its own non-vacuity mutation
+
+From the closing-Critic remediation of the engine-trust bundle.
+
+- **"Parked, not converged" is not a state a branch can hold.** The bundle brief says a group whose
+  ladder cannot converge in two remediation cycles is reset to its last good commit and the bundle
+  ships without it. G4's cycle-2 Critic returned CHANGES_REQUIRED; the group was recorded PARKED —
+  and its four commits were left on the branch while five more groups stacked on top. Nothing was
+  hidden and no one lied, but by the time the bundle Critic re-read the rule, the cheap remedy
+  (reset, one commit deep) had become a conflict-heavy rebase across six groups that invalidates
+  every per-group attestation sha. A tripped gate has exactly two settlements, and both are cheap
+  ONLY at the moment it trips: actually reset the branch, or record the waiver in writing. Deferring
+  the choice silently converts "ship without it" into "ship it".
+- **A residue inventory is a promise the next agent will act on — file each divergence on the right
+  side of the ledger.** Row R161 said `truncate` "already matches" Java in one clause and "the binary
+  leg's human string is hex" two clauses earlier; Java renders base64 there. Every mechanical check
+  passed (anchors, 5-pipe audit, citation resolution) because the contradiction is semantic. The
+  only instrument that catches it is measuring EACH claim of the inventory against the JVM, one row
+  at a time — and the failure mode it protects against is specific: the next agent closes the named
+  residue, skips the item filed as matching, and flips the row.
+- **An `assert_ne!` alarm is a dead comparison until you prove the compared string is REACHABLE.**
+  The alarm that keeps a residue non-skippable ("when this becomes equal, the residue is closed and
+  the row must be updated") passes trivially forever if the expectation is a string the code can
+  never produce. Its non-vacuity mutation is the inverse of the usual one: simulate the residue being
+  CLOSED (here, make `display_bytes` emit Java's base64 for the pinned bytes) and prove the alarm
+  goes RED. Order it BEFORE the value pin in the same test, or the byte-stability `assert_eq!` fires
+  first and the alarm's own coverage stays unproven.
