@@ -496,3 +496,40 @@ there — a real fork-vs-Java asymmetry, not just a test problem.
   green the moment the routing stopped being exercised.
 - **DO reach for `set_statistics_truncate_length(None)` when a test needs exact bounds**, and say in
   the comment why — otherwise the next reader deletes it as noise.
+
+### 2026-07-25 — a NULL-parent bug is invisible to any test whose fixture masks its children
+
+G6 (WG5, null-bit propagation). Arrow does **not** require a null struct slot to mask its children —
+`StructArray::try_new` only enforces the *reverse* containment (a non-nullable field's own nulls must
+be masked by the parent). So the class of defect is: detach a nested child from its parent, or judge
+it on its own, and you read whatever bytes happen to sit under a logically-absent row. Three separate
+live sites had it, and **none** of the pre-existing tests could see it: the projector's only nested
+test has no nulls at all, and the equality-delete fixture's nested key column happened to be non-null.
+
+- **DO build the fixture with the child LIVE and the parent NULL.** That is the only shape that
+  distinguishes "propagates validity" from "does not". A fixture where the child is null too passes
+  either way, and a fixture where the parent is live never enters the branch.
+- **DO make the negative pin a MINIMAL PAIR of the positive one** — same arrays, one flipped null
+  bit. For the "required field has a null value" check, the pair (parent NULL ⇒ accept) /
+  (parent LIVE ⇒ still reject) is what proves the check moved rather than disappeared; a mutation
+  that deletes the check entirely reds only the second one.
+- **DO NOT assume the union is the whole fix.** Unioning the parent's validity into the child makes
+  a `required` child under a NULL parent *more* null, so the required-check had to move to the
+  parent-aware callback in the same change; the union alone would have made the false rejection
+  worse, not better.
+- **Detector:** any `-> Result<&'a P>` accessor over a nested container, and any `.column(i)` /
+  `.columns()[i]` whose result outlives the parent binding.
+
+### 2026-07-25 — a fixture's own expected string can be asserting the bug
+
+Same increment. `test_delete_file_loader_parse_equality_deletes` asserted `sa != 4` for a key column
+that lives inside struct `s`. `Schema::name_to_id` indexes nested fields by their FULL dotted path,
+so `sa` is unbindable — the fixture had frozen an unbindable reference as the contract, and the real
+fix flipped it to `s.sa`.
+
+- **DO treat a pre-existing expectation that flips as EVIDENCE, not as breakage** — but only after
+  deciding from the spec (here `Schema::name_to_id` + `Reference::bind`) which side is right, and
+  saying so in the test comment.
+- **DO check whether the assertion ever exercised the consequence.** A predicate string test never
+  binds the predicate; adding a `bind()` leg turned a cosmetic-looking rename into a proven
+  scan-failure fix.

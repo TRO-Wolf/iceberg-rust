@@ -121,6 +121,10 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
         for i in 0..row_len {
             let mut literals = Vec::with_capacity(columns_iters.len());
             for column_iter in columns_iters.iter_mut() {
+                // `flatten`, not `unwrap`: the equal-length check above already guarantees every
+                // column yields `row_len` items, so an exhausted iterator is unreachable — and if
+                // it ever happened it degrades to a NULL cell (caught below for a `required`
+                // field) instead of panicking a write.
                 literals.push(column_iter.next().flatten());
             }
             if array.is_null(i) {
