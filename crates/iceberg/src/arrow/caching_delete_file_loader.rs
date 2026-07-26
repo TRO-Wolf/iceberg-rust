@@ -2759,8 +2759,14 @@ mod tests {
     /// Risk pinned: the DV `WaitFor` arm must consult the SAME `{puffin path}@{offset}` key it
     /// claimed under. Two concurrent `load_deletes` calls for one DV drive the real production
     /// wait path (`DeleteFilter::wait_for_pos_del_load`, reached from
-    /// `load_deletion_vector_for_task`); the waiting load must observe the POPULATED vector — not
-    /// an empty one, and not a spurious error.
+    /// `load_deletion_vector_for_task`); one of them waits, and both must end on the one shared
+    /// vector rather than a spurious error.
+    ///
+    /// Scope: because both loads are read AFTER they have joined, this test cannot see WHEN the
+    /// waiter returned — a waiter that returned too early would still read the by-then-published
+    /// vector here. That ordering property has its own pin
+    /// (`test_dv_waiter_does_not_return_before_the_vector_is_installed`), which parks the wait
+    /// deterministically instead of racing.
     ///
     /// MUTATION: looking the state up under `&task.file_path` instead of `&cache_key` in that arm
     /// — a one-token copy-paste slip — makes the waiter miss the terminal state and fail a HEALTHY
@@ -2808,7 +2814,7 @@ mod tests {
         assert_eq!(
             vector_a.lock().expect("delete vector mutex").len(),
             2,
-            "the WAITING load must observe the populated vector, not an empty one"
+            "the one shared vector must hold both deleted positions"
         );
     }
 
@@ -2902,5 +2908,275 @@ mod tests {
                  got: {second}"
             );
         }
+    }
+
+    /// Claim `key` on the loader's OWN delete filter, so the loader's next load of that file
+    /// necessarily takes the `WaitFor` arm. Returns the claim guard: publish it to release the
+    /// waiter, or drop it to kill the claim under it.
+    ///
+    /// Driving the wait this way rather than by racing two loads is what makes the two properties
+    /// below observable at all — a race can only be read after both loads have finished, by which
+    /// point the claimant has published either way.
+    fn claim_pos_del(loader: &CachingDeleteFileLoader, key: &str) -> PosDelLoadGuard {
+        match loader
+            .delete_filter
+            .try_start_pos_del_load(key)
+            .expect("a fresh claim on an unknown key must not error")
+        {
+            PosDelLoadAction::Load(guard) => guard,
+            other => panic!("expected a fresh claim for '{key}', got {other:?}"),
+        }
+    }
+
+    /// Assert that an in-flight `load_deletes` really is PARKED on the claim above — i.e. it took
+    /// the `WaitFor` arm — and hand it back still pending.
+    async fn assert_parked_on_claim(waiting: &mut Receiver<Result<DeleteFilter>>, why: &str) {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
+                .await
+                .is_err(),
+            "{why}"
+        );
+    }
+
+    /// Risk pinned (the ORDERING half of the deletion-vector wait contract): a `load_deletes` that
+    /// finds the blob ALREADY CLAIMED must not return until the claiming task has installed the
+    /// vector. `DeleteFilter::get_delete_vector` is synchronous, so a waiter that returns early
+    /// hands the reader an ABSENT delete vector and every row that vector deletes RESURRECTS — the
+    /// silent under-delete class, not a hang.
+    ///
+    /// MUTATION: dropping the `wait_for_pos_del_load` await on the DV path (`drop(notified);` in
+    /// its place) makes the load resolve immediately with no delete vector — RED here, while every
+    /// other lib test stays green. The parquet analogue has its own pin below.
+    #[tokio::test]
+    async fn test_dv_waiter_does_not_return_before_the_vector_is_installed() {
+        let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let (puffin_path, offset, length) =
+            write_dv_puffin_file(&file_io, tmp_dir.path(), "deletes.puffin", &data_file, &[
+                1, 3,
+            ])
+            .await;
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [dv_task(&puffin_path, &data_file, offset, length, 2)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let cache_key = format!("{puffin_path}@{offset}");
+        let guard = claim_pos_del(&loader, &cache_key);
+
+        let mut waiting = loader.load_deletes(&tasks, schema);
+        assert_parked_on_claim(
+            &mut waiting,
+            "the waiting load must still be pending while the claim is unpublished — returning \
+             here hands the reader an absent delete vector and resurrects every deleted row",
+        )
+        .await;
+
+        // Publish exactly as the production loader does: vectors first, then the terminal state.
+        let mut delete_vector = DeleteVector::default();
+        delete_vector.insert(1);
+        delete_vector.insert(3);
+        let mut filter = loader.delete_filter.clone();
+        filter.upsert_delete_vector(data_file.clone(), delete_vector);
+        guard.publish_loaded();
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting load must finish once the claim is published")
+            .expect("the waiting load must deliver a result")
+            .expect("the waiting load must succeed");
+        let vector = loaded
+            .get_delete_vector_for_path(&data_file)
+            .expect("the waiter must see the published vector");
+        assert_eq!(
+            vector.lock().expect("delete vector mutex").len(),
+            2,
+            "the waiter must observe the fully populated vector"
+        );
+    }
+
+    /// Risk pinned (the FAIL-LOUD half of the same contract, on the DV path): when the task that
+    /// claimed a deletion-vector blob dies without publishing, the load WAITING on it must surface
+    /// the typed error — not proceed as though the deletes had loaded. Swallowing the wait result
+    /// (`let _ = ... .await;` in place of the `?`) is a one-token slip that returns a
+    /// `DeleteFilter` with NO vector for the data file, so every row it deletes RESURRECTS.
+    ///
+    /// Also pins the CAUSE across the post-wake arm: `wait_for_pos_del_load` must render the
+    /// reason the dead claimant recorded (`PosDelLoadGuard::note_failure`), not a generic one —
+    /// the claim-time arm is pinned by
+    /// `test_failed_pos_del_load_reports_the_cause_to_later_callers`, this is the other arm.
+    ///
+    /// MUTATIONS: `let _ = del_filter.wait_for_pos_del_load(&cache_key, notified).await;` — RED,
+    /// with every other lib test green. Hard-coding the post-wake `Failed` reason instead of
+    /// carrying `reason` — RED on the cause assertion only.
+    #[tokio::test]
+    async fn test_dv_waiter_surfaces_a_dead_claimants_error_instead_of_dropping_the_deletes() {
+        let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let (puffin_path, offset, length) =
+            write_dv_puffin_file(&file_io, tmp_dir.path(), "deletes.puffin", &data_file, &[
+                1, 3,
+            ])
+            .await;
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [dv_task(&puffin_path, &data_file, offset, length, 2)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let cache_key = format!("{puffin_path}@{offset}");
+        let mut guard = claim_pos_del(&loader, &cache_key);
+
+        let mut waiting = loader.load_deletes(&tasks, schema);
+        // Park the load ON THE NOTIFIER first. Without this the guard could already be dropped
+        // when the loader claims, and it would take the claim-time `Failed` arm instead — a
+        // different path, and the one this test is NOT about.
+        assert_parked_on_claim(
+            &mut waiting,
+            "the load must be parked on the claim's notifier before the claimant dies",
+        )
+        .await;
+
+        // The claiming task records its cause and dies without publishing: `Drop` installs the
+        // terminal failed state carrying that cause.
+        let propagated = guard.note_failure(Error::new(
+            ErrorKind::DataInvalid,
+            "sentinel-cause: the claimant's own blob read failed",
+        ));
+        assert_eq!(
+            propagated.kind(),
+            ErrorKind::DataInvalid,
+            "note_failure must hand the error back unchanged for `?` propagation"
+        );
+        drop(guard);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("a waiter whose claimant died must not hang")
+            .expect("the waiting load must deliver a result");
+        let error = result.expect_err(
+            "a waiter whose claimant died must surface a typed error — succeeding here returns a \
+             filter with NO delete vector and resurrects every deleted row",
+        );
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains(&cache_key),
+            "the error must name the blob claim key, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("sentinel-cause"),
+            "the woken waiter's error must carry the cause the dead claimant recorded, got: \
+             {error}"
+        );
+    }
+
+    /// The parquet positional-delete analogue of
+    /// `test_dv_waiter_does_not_return_before_the_vector_is_installed` — the OTHER production call
+    /// site the guard machinery rewrote, claiming under the bare delete-file path. Same silent
+    /// under-delete consequence, same deterministic parking.
+    ///
+    /// MUTATION: `drop(notified);` in place of the `wait_for_pos_del_load` await on the parquet
+    /// path — RED here. (Three `maintenance::*` tests also catch that one incidentally; this pins
+    /// it locally, where the contract lives.)
+    #[tokio::test]
+    async fn test_parquet_pos_del_waiter_does_not_return_before_the_deletes_are_installed() {
+        let tmp_dir = TempDir::new().expect("temp dir for the positional-delete fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let pos_del_path = write_pos_del_parquet(tmp_dir.path(), "pos-del.parquet", &[
+            (&data_file, Some(1)),
+            (&data_file, Some(3)),
+        ]);
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [parquet_pos_del_task(&pos_del_path)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let guard = claim_pos_del(&loader, &pos_del_path);
+
+        let mut waiting = loader.load_deletes(&tasks, schema);
+        assert_parked_on_claim(
+            &mut waiting,
+            "the waiting load must still be pending while the claim is unpublished — returning \
+             here hands the reader absent positional deletes and resurrects every deleted row",
+        )
+        .await;
+
+        let mut delete_vector = DeleteVector::default();
+        delete_vector.insert(1);
+        delete_vector.insert(3);
+        let mut filter = loader.delete_filter.clone();
+        filter.upsert_delete_vector(data_file.clone(), delete_vector);
+        guard.publish_loaded();
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting load must finish once the claim is published")
+            .expect("the waiting load must deliver a result")
+            .expect("the waiting load must succeed");
+        let vector = loaded
+            .get_delete_vector_for_path(&data_file)
+            .expect("the waiter must see the published positions");
+        assert_eq!(
+            vector.lock().expect("delete vector mutex").len(),
+            2,
+            "the waiter must observe the fully populated position set"
+        );
+    }
+
+    /// The parquet positional-delete analogue of
+    /// `test_dv_waiter_surfaces_a_dead_claimants_error_instead_of_dropping_the_deletes`: the second
+    /// rewritten call site must PROPAGATE the wait error too.
+    ///
+    /// MUTATION: `let _ = del_filter.wait_for_pos_del_load(&task.file_path, notified).await;` —
+    /// RED here, and green across every other lib test.
+    #[tokio::test]
+    async fn test_parquet_pos_del_waiter_surfaces_a_dead_claimants_error() {
+        let tmp_dir = TempDir::new().expect("temp dir for the positional-delete fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let pos_del_path =
+            write_pos_del_parquet(tmp_dir.path(), "pos-del.parquet", &[(&data_file, Some(1))]);
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [parquet_pos_del_task(&pos_del_path)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let mut guard = claim_pos_del(&loader, &pos_del_path);
+
+        let mut waiting = loader.load_deletes(&tasks, schema);
+        assert_parked_on_claim(
+            &mut waiting,
+            "the load must be parked on the claim's notifier before the claimant dies",
+        )
+        .await;
+
+        let propagated = guard.note_failure(Error::new(
+            ErrorKind::DataInvalid,
+            "sentinel-cause: the claimant's own parquet read failed",
+        ));
+        assert_eq!(
+            propagated.kind(),
+            ErrorKind::DataInvalid,
+            "note_failure must hand the error back unchanged for `?` propagation"
+        );
+        drop(guard);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("a waiter whose claimant died must not hang")
+            .expect("the waiting load must deliver a result");
+        let error = result.expect_err(
+            "a waiter whose claimant died must surface a typed error — succeeding here returns a \
+             filter with NO positional deletes and resurrects every deleted row",
+        );
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains(&pos_del_path),
+            "the error must name the delete file, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("sentinel-cause"),
+            "the woken waiter's error must carry the cause the dead claimant recorded, got: \
+             {error}"
+        );
     }
 }

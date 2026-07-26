@@ -628,3 +628,34 @@ catch. Generalisations:
   pre-existing predicate test with a bare `.await` turned a lost-wakeup mutation into a hung CI job
   instead of a red test — and hid a fourth RED in the mutation matrix. `tokio::time::timeout(5s)`
   around the await converts it into evidence.
+
+### 2026-07-26 — Per-test wall-clock bounds RELOCATE a lost-wakeup hang; and a "did the waiter WAIT?" property is invisible to any test that reads the result after both sides joined
+
+Two refinements to the previous entry, both from the G8 cycle-1 Critic and both proved by mutation
+rather than argued.
+
+- **A race-shaped concurrency test cannot pin an ORDERING property.** Two concurrent `load_deletes`
+  calls for one delete file DO drive the real `WaitFor` arm, but the assertions run after both
+  futures have joined — by which point the claiming task has published either way. So "the waiter
+  observed the populated vector" is unfalsifiable there: deleting the wait entirely (`drop(notified)`
+  in place of the `.await`) left the whole suite green while every deleted row RESURRECTED. Drive it
+  DETERMINISTICALLY instead — claim the loader's own key first, so the production path must take
+  `WaitFor`, then assert the load is STILL PENDING while the claim is unpublished. The same fixture
+  then pins the fail-loud half: record a sentinel cause, drop the claim, and assert the woken
+  waiter's error carries it (that one also kills a hard-coded post-wake reason). Corollary for
+  reviewing an assert message: if the message names a property the test's own timing cannot observe,
+  the message is the bug.
+- **`let _ = ...await;` is a distinct mutation class from deleting the await, and on a wait path it
+  is the WORSE one.** Removing the await returns early; swallowing the result returns AFTER the wait
+  but as though it had succeeded, so a waiter whose claimant DIED proceeds with no deletes at all.
+  Both are one-token slips at a `?`. Run both against every `.await?` a diff introduces on a
+  synchronisation path.
+- **Do NOT try to close "a lost-wakeup regression must not hang CI" with per-test timeouts.** Bounding
+  the awaits inside the tests that exist to pin the wait contract is right — the bound is part of the
+  pin. Spraying bounds elsewhere is not: with the eq-delete arming mutation applied, the full lib
+  suite hung in one compaction test; bounding that module's read helper simply MOVED the hang to the
+  next test in the same module (the one that reaches the delete-applied read through
+  `RewriteDataFiles::execute` rather than the helper). Any test that reads merge-on-read deletes can
+  hang, so the class-correct instrument is a HARNESS-level per-test timeout (`cargo nextest`
+  `slow-timeout` + `terminate-after`, or a CI job timeout), not N test edits. Scope the claim in the
+  PR body to what the bounds actually cover and name the rest as a residue.
