@@ -87,7 +87,7 @@ time — a new suite is picked up with zero maintenance) and run unprompted ever
 [`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh) (`make interop`) via
 [`.github/workflows/nightly_interop.yml`](../../.github/workflows/nightly_interop.yml). The driver
 hard-fails on missing prerequisites (never skips), fails if discovery drops below its suite-count
-FLOOR (`SUITE_FLOOR_DEFAULT`, 50 as of 2026-07-17), continues across failing suites, and reports every
+FLOOR (`SUITE_FLOOR_DEFAULT`, 52 as of 2026-07-25), continues across failing suites, and reports every
 suite's PASS/FAIL. **When you ADD a suite here, ratchet `SUITE_FLOOR_DEFAULT` up in the same
 change.** `run.sh` and `run-inspection-manifests.sh` do not match the glob and are OUTSIDE the
 nightly set (named deferral).
@@ -123,7 +123,7 @@ nightly set (named deferral).
 | A data-level fixture passes while a partition/column divergence exists | Projection-completeness gap: the row compare must cover EVERY schema column (partition columns included) on BOTH language sides — a dumper reused from a narrower template inherits its projection, and the Java verify needs its own column assertion (an id-keyed map is blind to uncompared columns). _Promoted 2026-06-12 from lessons (S3/W1)._ |
 | `mvn` step fails offline | The oracle needs network for first dependency resolution; committed fixtures keep `cargo test` independent of it |
 | The nightly run fails with `discovery found N ... below the floor` | A suite was renamed/removed (restore it), or the glob broke — or a suite was DELIBERATELY removed, in which case lower `SUITE_FLOOR_DEFAULT` in `scripts/run_interop_suites.sh` in the same change. An emptied glob must never green |
-| A suite passes locally but fails in the nightly with a path error | All 51 suites default to `/opt/maven/bin/mvn` + `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` (49 hardcode them outright; `run-interop-aggregate.sh` and `run-interop-partition-path.sh` read `$MVN`/`$JAVA_HOME`); the workflow provides EXACTLY those paths (apt JDK 11 + `/opt/maven` symlink) — a local machine must too, or the driver's prerequisite check fails first |
+| A suite passes locally but fails in the nightly with a path error | All 52 suites default to `/opt/maven/bin/mvn` + `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` (50 hardcode them outright; `run-interop-aggregate.sh` and `run-interop-partition-path.sh` read `$MVN`/`$JAVA_HOME`); the workflow provides EXACTLY those paths (apt JDK 11 + `/opt/maven` symlink) — a local machine must too, or the driver's prerequisite check fails first |
 | Scenario passes one direction only | Scenario op-sequences must be **identical and identically named** on both sides — diff `apply_scenario_ops` vs `InteropOracle.scenarios()` |
 | A Java code path silently doesn't run in the oracle | Drive REAL Java objects (`new BaseTable(ops, name).updateSpec()…commit()` over an in-memory `TableOperations`), NOT the `@VisibleForTesting` ctors — those set `base = null` and skip base-dependent paths (e.g. field-id recycling) |
 | Interop test passes but proves nothing | Mutation-prove BOTH directions by corrupting fixtures: edit a Java-written field (Dir-1 assertion must fail) and shrink a Rust-written value (Dir-2 `mvn verify` must exit 1). A harness comparing a file to itself passes tautologically |

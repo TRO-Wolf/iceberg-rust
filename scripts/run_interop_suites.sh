@@ -48,10 +48,11 @@
 #                                                 # (fake suites in a temp dir; ~seconds)
 #
 # Environment overrides — SELF-TEST HOOKS, not configuration. Each prints a loud TEST-MODE
-# banner when set. The suites themselves default to exactly these paths (47 of the 48 hardcode
-# /opt/maven/bin/mvn + JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 outright — 29 via an MVN=
-# variable, 18 inline; run-interop-aggregate.sh alone reads $MVN/$JAVA_HOME from the
-# environment), so overriding these only moves the driver's prerequisite check — a real run
+# banner when set. The suites themselves default to exactly these paths (50 of the 52 hardcode
+# /opt/maven/bin/mvn + JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 outright — 31 via an MVN=
+# variable, 19 inline; run-interop-aggregate.sh and run-interop-partition-path.sh alone read
+# $MVN/$JAVA_HOME from the environment, defaulting to those same paths), so overriding these
+# only moves the driver's prerequisite check — a real run
 # still needs the defaults present:
 #   ICEBERG_INTEROP_SUITES_DIR   directory to discover suites in (default dev/java-interop)
 #   ICEBERG_INTEROP_SUITE_FLOOR  discovery floor (default SUITE_FLOOR_DEFAULT below)
@@ -69,10 +70,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
-# The discovery floor: the number of run-interop-*.sh suites (51 as of 2026-07-25, when
-# run-interop-partition-path.sh was added for GAP_MATRIX row R161). RATCHET THIS UP when a suite
-# is added (same change); lower it only with a deliberate removal.
-SUITE_FLOOR_DEFAULT=51
+# The discovery floor: the number of run-interop-*.sh suites (52 as of 2026-07-25, when
+# run-interop-file-scoped-deletes.sh was added for the path-keyed position-delete routing —
+# the 51st was run-interop-partition-path.sh, for GAP_MATRIX row R161). RATCHET THIS UP when a
+# suite is added (same change); lower it only with a deliberate removal.
+SUITE_FLOOR_DEFAULT=52
 
 SUITES_DIR_DEFAULT="${REPO_ROOT}/dev/java-interop"
 MVN_DEFAULT="/opt/maven/bin/mvn"
