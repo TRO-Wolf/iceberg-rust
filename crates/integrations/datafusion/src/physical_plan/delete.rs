@@ -482,7 +482,10 @@ async fn merge_on_read_delete(
                 Some(mask) => mask.is_valid(row) && mask.value(row),
             };
             if delete_row {
-                pairs.push((decode_file_path(file_col, row)?, pos_col.value(row)));
+                pairs.push((
+                    decode_file_path(file_col, row)?,
+                    decode_position(pos_col, row)?,
+                ));
             }
         }
     }
@@ -1169,11 +1172,19 @@ async fn write_position_deletes_for_partition(
 
 /// Decode the reserved `_file` column at `row`. The scan emits `_file` as a per-file constant, which the
 /// transformer materializes as a Run-End-Encoded `Utf8` column; tolerate both REE and plain `Utf8`.
+///
+/// A NULL slot is a hard error rather than a decoded value: arrow's `value()` returns `""` for a
+/// null string, and an empty path silently becomes a position delete against a file that does not
+/// exist. `_file` is a reserved metadata column the scan always materializes, so a NULL means the
+/// batch did not come from where this code believes it did.
 fn decode_file_path(col: &ArrayRef, row: usize) -> DFResult<String> {
     use datafusion::arrow::array::RunArray;
     use datafusion::arrow::datatypes::Int32Type;
 
     if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
+        if plain.is_null(row) {
+            return Err(null_file_path_error(row));
+        }
         return Ok(plain.value(row).to_string());
     }
     if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
@@ -1185,12 +1196,37 @@ fn decode_file_path(col: &ArrayRef, row: usize) -> DFResult<String> {
             .ok_or_else(|| {
                 DataFusionError::Internal("_file REE values are not Utf8".to_string())
             })?;
+        if values.is_null(physical) {
+            return Err(null_file_path_error(row));
+        }
         return Ok(values.value(physical).to_string());
     }
     Err(DataFusionError::Internal(format!(
         "unexpected _file column type: {:?}",
         col.data_type()
     )))
+}
+
+/// The one error raised for a NULL reserved `_file` slot, in both decode paths.
+fn null_file_path_error(row: usize) -> DataFusionError {
+    DataFusionError::Internal(format!(
+        "reserved _file column is NULL at row {row}; a position delete cannot be keyed by an \
+         unknown data file"
+    ))
+}
+
+/// Decode the reserved `_pos` column at `row`.
+///
+/// A NULL slot is a hard error for the same reason as [`decode_file_path`]: arrow's `value()`
+/// returns `0` for a null `i64`, which would silently position-delete row 0 of a real data file.
+fn decode_position(col: &Int64Array, row: usize) -> DFResult<i64> {
+    if col.is_null(row) {
+        return Err(DataFusionError::Internal(format!(
+            "reserved _pos column is NULL at row {row}; a position delete cannot be keyed by an \
+             unknown row position"
+        )));
+    }
+    Ok(col.value(row))
 }
 
 /// Decode the `_file` column for an ENTIRE batch in one pass, returning one borrowed path per row
@@ -1207,7 +1243,14 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
     use datafusion::arrow::datatypes::Int32Type;
 
     if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
-        return Ok((0..plain.len()).map(|row| plain.value(row)).collect());
+        return (0..plain.len())
+            .map(|row| {
+                if plain.is_null(row) {
+                    return Err(null_file_path_error(row));
+                }
+                Ok(plain.value(row))
+            })
+            .collect();
     }
     if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
         let values = run
@@ -1230,6 +1273,9 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
                 let end = usize::try_from(end).map_err(|_| {
                     DataFusionError::Internal("_file REE run-end is negative".to_string())
                 })?;
+                if start < end && values.is_null(physical) {
+                    return Err(null_file_path_error(start));
+                }
                 let value = values.value(physical);
                 for _ in start..end {
                     out.push(value);
@@ -1241,7 +1287,11 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
             // `get_physical_index` per row (still allocation-free). Behaviorally identical to the
             // fast path; kept separate because a sliced run-ends walk is easy to get subtly wrong.
             for row in 0..run.len() {
-                out.push(values.value(run.get_physical_index(row)));
+                let physical = run.get_physical_index(row);
+                if values.is_null(physical) {
+                    return Err(null_file_path_error(row));
+                }
+                out.push(values.value(physical));
             }
         }
         return Ok(out);
@@ -1465,8 +1515,12 @@ fn apply_assignments(
         };
         // An assignment must not introduce NULLs into a REQUIRED (non-nullable) column — Parquet would
         // write the null and silently violate the Iceberg schema contract.
+        //
+        // `logical_null_count`, not `null_count`: the latter is the PHYSICAL count, which is 0 for a
+        // dictionary- or run-end-encoded array whose *values* carry the NULL. `RecordBatch::try_new`'s
+        // own nullability check is physical too, so such a NULL would clear both gates and be written.
         let field = table_schema.field(*col_idx);
-        if !field.is_nullable() && assigned.null_count() > 0 {
+        if !field.is_nullable() && assigned.logical_null_count() > 0 {
             return Err(DataFusionError::Plan(format!(
                 "UPDATE cannot assign NULL to required column '{}'",
                 field.name()
@@ -1545,7 +1599,10 @@ async fn merge_on_read_update(
             .ok_or_else(|| DataFusionError::Internal("_pos column is not Int64".to_string()))?;
         for row in 0..mask.len() {
             if mask.value(row) {
-                pairs.push((decode_file_path(file_col, row)?, pos_col.value(row)));
+                pairs.push((
+                    decode_file_path(file_col, row)?,
+                    decode_position(pos_col, row)?,
+                ));
             }
         }
 
@@ -1785,13 +1842,148 @@ async fn copy_on_write_update(
 mod tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{ArrayRef, Int32Array, RunArray, StringArray};
-    use datafusion::arrow::datatypes::Int32Type;
+    use datafusion::arrow::array::{
+        ArrayRef, DictionaryArray, Int32Array, Int64Array, RecordBatch, RunArray, StringArray,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::Column;
 
     use super::{
-        IsolationLevel, decode_file_path, decode_file_paths_batch, group_pairs_by_partition,
-        sort_position_delete_pairs,
+        IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch,
+        decode_position, group_pairs_by_partition, sort_position_delete_pairs,
     };
+
+    // =============================================================================================
+    // WG5 (c) — an assignment must never smuggle a NULL into a REQUIRED column. `null_count()` is
+    // the PHYSICAL count: a dictionary (or run-end) array whose *values* hold a NULL reports 0
+    // while `logical_null_count()` reports the real answer, and `RecordBatch::try_new`'s own
+    // nullability check is physical too — so the NULL passes both gates and is written.
+    // =============================================================================================
+
+    /// A single-column table schema for `d`, `nullable` as given, dictionary-encoded Utf8.
+    fn dict_column_schema(nullable: bool) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            nullable,
+        )]))
+    }
+
+    /// Dictionary array with a NULL hiding in the VALUES: physically null-free keys, logically a
+    /// NULL at row 1.
+    fn dict_with_null_value() -> ArrayRef {
+        let values = StringArray::from(vec![Some("x"), None]);
+        let keys = Int32Array::from(vec![0, 1]);
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))
+                .expect("dictionary array"),
+        )
+    }
+
+    #[test]
+    fn test_dictionary_encoded_null_cannot_be_assigned_to_a_required_column() {
+        let column = dict_with_null_value();
+        // The premise of the whole test: physically clean, logically NULL.
+        assert_eq!(column.null_count(), 0, "physical null count must be 0");
+        assert_eq!(column.logical_null_count(), 1, "row 1 is logically NULL");
+
+        let schema = dict_column_schema(false);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
+        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
+
+        let err = apply_assignments(&batch, &[(0, assignment)], &schema, None)
+            .expect_err("a dictionary-encoded NULL must not reach a required column");
+        assert!(
+            err.to_string()
+                .contains("UPDATE cannot assign NULL to required column 'd'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dictionary_encoded_null_is_fine_for_an_optional_column() {
+        // The negative pin: the guard must reject only REQUIRED columns.
+        let column = dict_with_null_value();
+        let schema = dict_column_schema(true);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
+        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
+
+        let out = apply_assignments(&batch, &[(0, assignment)], &schema, None)
+            .expect("an optional column may take a NULL");
+        assert_eq!(out.column(0).logical_null_count(), 1);
+    }
+
+    #[test]
+    fn test_null_free_assignment_to_a_required_column_still_succeeds() {
+        // The other negative pin: `logical_null_count` must not reject clean data.
+        let values = StringArray::from(vec![Some("x"), Some("y")]);
+        let keys = Int32Array::from(vec![0, 1]);
+        let column: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))
+                .expect("dictionary array"),
+        );
+        let schema = dict_column_schema(false);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
+        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
+
+        let out = apply_assignments(&batch, &[(0, assignment)], &schema, None)
+            .expect("a NULL-free assignment to a required column must succeed");
+        assert_eq!(out.column(0).logical_null_count(), 0);
+    }
+
+    // =============================================================================================
+    // WG5 (d) — the reserved `_file` / `_pos` decode read `.value(i)` with no validity check.
+    // Arrow's `value()` on a NULL slot returns a well-formed lie: `""` for a string, `0` for an
+    // i64. Both feed straight into a position-delete tuple, so a NULL `_file` deletes against an
+    // empty path and a NULL `_pos` deletes ROW 0 of a real data file.
+    // =============================================================================================
+
+    #[test]
+    fn test_decode_file_path_rejects_a_null_path() {
+        let col: ArrayRef = Arc::new(StringArray::from(vec![Some("s3://b/a.parquet"), None]));
+        assert!(
+            decode_file_path(&col, 0).is_ok(),
+            "the live row must still decode"
+        );
+        let err = decode_file_path(&col, 1).expect_err("a NULL _file must not decode to \"\"");
+        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_decode_file_paths_batch_rejects_a_null_path() {
+        let col: ArrayRef = Arc::new(StringArray::from(vec![Some("s3://b/a.parquet"), None]));
+        let err = decode_file_paths_batch(&col).expect_err("a NULL _file must not decode to \"\"");
+        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_decode_file_path_rejects_a_null_ree_value() {
+        // The REE shape the COW scan actually produces, with a NULL in the run VALUES.
+        let run_ends = Int32Array::from(vec![2, 4]);
+        let values = StringArray::from(vec![Some("f/a.parquet"), None]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
+        let col: ArrayRef = Arc::new(ree);
+        assert!(decode_file_path(&col, 0).is_ok(), "run 0 is live");
+        let err = decode_file_path(&col, 3).expect_err("a NULL REE _file value must not decode");
+        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
+        let err = decode_file_paths_batch(&col).expect_err("batch decode must reject it too");
+        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_decode_position_rejects_a_null_position() {
+        let col = Int64Array::from(vec![Some(7), None]);
+        assert_eq!(
+            decode_position(&col, 0).expect("the live row must decode"),
+            7
+        );
+        let err = decode_position(&col, 1).expect_err("a NULL _pos must not decode to 0");
+        assert!(err.to_string().contains("_pos"), "unexpected error: {err}");
+    }
 
     /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string
     /// `decode_file_path` would — for a plain `StringArray`, for a run-end-encoded `_file` column
