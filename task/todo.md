@@ -96,8 +96,9 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       PUSHED for PR — merge is the user's; RoadMapSync announce + RePark repin follow merge.
       **MERGED #172 (`a6199ca5`) 2026-07-25, content-verified R4; RoadMapSync repin+pin-flip
       announcement posted; claim released. FORK-O7/O8 CLOSED.**
-- [ ] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic) — IN PROGRESS
-      2026-07-25**, branch `fix/engine-trust-bundle-2026-07` off `a6199ca5`; user-directed
+- [x] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic) — STARTED
+      2026-07-25, MERGED 2026-07-26**, branch `fix/engine-trust-bundle-2026-07` off
+      `a6199ca5`; user-directed
       Opus-max AC per group + Fable-max closing bundle Critic. **G0 T10 nullability-widening
       residue (+ ADV-1/ADV-2 riders; spec added to the brief)** → G1 WG2 detector+remediation → G2
       WG4a stamp probe/fix + WG4c contract normativity (R113) → G3 WG3 L2+L3 non-breaking →
@@ -113,6 +114,11 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       byte-match vs Java's own partitionToPath. Gate at tip: lib 2974 (+109), datafusion 246
       (+28), anchors 75 rows. ONE user merge-gate rides the PR (closer CR-1): **waive or strip
       G4** (strip = surgical: 5 of its 10 files overlap later groups, 7 of 10 by branch tip incl. the closing chain). PUSHED for PR.
+      **MERGED #173 (`4063007b`) 2026-07-26, G4 WAIVED; R161 escaping landed** — the user took
+      the waive branch of the closer's CR-1 merge gate at SQM (the R13-remand substance had
+      already been independently re-attested by the closing chain), so G4's escaping fix ships
+      with the bundle. Disposition appended to the incident section in
+      [sepmo-metrics.md](sepmo-metrics.md); the canon gap it exposed is closed as v2.3 (below).
       **TRIAGE RIDER 2026-07-26 (docs/evidence only, NO behavior change — the bundle needed none):**
       the RePark consumer's response to the 5-action fork work order was adjudicated and absorbed.
       (a) EXPOSURE AUDIT — CLOSED as an audit, not a probability: they delivered an inventory
@@ -143,6 +149,36 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       re-scope at signing.
 - Watch: nightly-interop dispatch on main (#169/#170 live proof); branch pruning (classifier-
       blocked this session); tail backlog in the brief.
+
+## ACTIVE UNIT (2026-07-26): SEPMO canon v2.3 re-bind — branch `infra/sepmo-v2-3-rebind`
+
+Closes the canon gap the G4 parking incident exposed (Unit 2 above). CCR
+[sepmo-ccr-2026-07-26-g4-incident.md](sepmo-ccr-2026-07-26-g4-incident.md) **RATIFIED by the
+user 2026-07-26**. Docs-only: no crate code, no matrix row. STANDARD path (governance surface,
+multi-file, >150 lines — LIGHT criteria 1/3 fail).
+
+- [x] **1. Master home raised to v2.3** — `~/Desktop/Sepmo` (not under version control; pre-change
+      state archived at `~/Desktop/Sepmo-v2.2-archive`): spine `version: "2.3"` + R11/R12/R13 after
+      R10 + the widened *Incident retrospectives* trigger (Amendment D) + the v2.3 changelog head;
+      refs 02/03/05/06/08 amended; template gained the optional `critic_engine` row (Amendment E,
+      runtime-neutral). Refs 01/04/07 byte-identical to the archive.
+- [x] **2. This instance re-bound** — spine replaced with a **byte-identical copy** of the master
+      (`cmp`-verified, closing the 2026-07-13 install's transcription caveat); the same v2.3 deltas
+      applied **in place** to the fork's references, preserving their ASF headers and their own
+      (legitimately diverged) lineage wording — the two-lineage reconciliation the CCR settled.
+      Lineage-local adaptations: the new vigilance trigger is **T10** here (the fork numbers
+      triggers T1–T9, the master numbers watch items W1–W9), and ref 05's engine constraint (3)
+      cites "the canonical categories" rather than the master's "ten" (this lineage tables nine).
+- [x] **3. Manifest + map** — `spine_version: v2.3` (frontmatter fact + I-2, now carrying the
+      byte-identity proof); `contingency_mechanics` SLIMMED to project values + an R11–R13 pointer
+      (its own recorded duty — canon owns the rules now); NEW `critic_engine` row binding the
+      **default** (the spine's own Critic stage via the standing sub-agent hard break, no external
+      engine); the Debug canon-gap filing flipped to RESOLVED; `map.md` in lockstep (v2.3,
+      R1–R13, tunables list).
+- [x] **4. Ledger + tracker** — the G4 incident section's open disposition completed (WAIVED,
+      #173); this block added.
+- [ ] **5. Independent Critic (fresh context, per the sub-agent policy row)** — dispatched;
+      convergence is the Critic's call (R4). Flip on CONVERGED, then push for PR.
 
 ## FOLLOW-UPS BUNDLE (2026-07-18, signed off) — audit follow-up ledger, 5 groups, OO-High AC, ONE branch
 

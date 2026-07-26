@@ -93,7 +93,9 @@ proposal (R11/R12/R13) in the CCR, awaiting user ratification at the master home
 (`~/Desktop/Sepmo`).
 
 **Open disposition (append when decided):** the user's strip-or-waive call on G4 at the bundle
-PR's merge. *(Appended 2026-07-··: ……)*
+PR's merge. *(Appended 2026-07-26: WAIVED — user decision at SQM; the bundle merged as #173
+(`4063007b`) with G4 retained; the R13-remand substance had been independently re-attested by
+the closing chain.)*
 
 ## 2026-07-26 — incident #2: delegated-agent canon edit (master home)
 

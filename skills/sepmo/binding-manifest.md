@@ -23,14 +23,15 @@
 [references/](references/) are portable canon and are never edited per-project; every
 project-specific role and tunable resolves through the tables below. Instantiated from
 [binding-manifest.template.md](binding-manifest.template.md) — re-instantiated 2026-07-13
-against canon v2.2 (superseding the 2026-06-15 pre-ledger install). **A manifest binds; it
-does not restate** — every row is a pointer into the repo or a declared fallback, never a
-copy of a rule that lives somewhere else.
+against canon v2.2 (superseding the 2026-06-15 pre-ledger install), **re-bound 2026-07-26 to
+canon v2.3** (the ratified G4-incident amendments R11–R13). **A manifest binds; it does not
+restate** — every row is a pointer into the repo or a declared fallback, never a copy of a
+rule that lives somewhere else.
 
 ## Spine version
 
-`spine_version:` **v2.2** — the canon version this manifest binds (spine frontmatter
-`version: "2.2"`, changelog entry v2.2 — 2026-07-13). If the master spine moves past it,
+`spine_version:` **v2.3** — the canon version this manifest binds (spine frontmatter
+`version: "2.3"`, changelog entry v2.3 — 2026-07-26). If the master spine moves past it,
 this manifest is **stale, not silently wrong** (Invariant V staleness alarm): re-bind
 before the next project starts.
 
@@ -81,13 +82,14 @@ landed at the master home.
 | `s0_fresh_execution` | **N/A — standing hard break** (the template's sanctioned justification: this row is mandatory only when `context_break_mechanics` binds a procedural break). Voluntary standing practice, recorded not as a substitute but because it exceeds the compensation rule: repo Critics are mutation-gated (each pin proven RED against a live sabotage with byte-identical restore) and the `dev/java-interop/` suites (48, discovered dynamically; nightly via `make interop`) are the standing cross-engine detector for silently-wrong-results classes. Masking surfaces, named for completeness: `inspect/` metadata tables and `Debug` impls are display paths — never sole evidence. | Bound N/A per the template rule; re-bind as a full row if the sub-agent policy ever admits a procedural break on the PR path. |
 | `metrics_ledger_location` | [task/sepmo-metrics.md](../../task/sepmo-metrics.md) — CREATED 2026-07-13 with the [references/08](references/08-retrospective.md) metric set, including `environment_drift_events`. One section per retrospective (charter-close or incident). | Exists ✓; first populated section lands with the first v2.2-era retrospective. |
 | `taxonomy_extensions` | Two, added 2026-07-13 (extend-only): **`java-parity`** — behavioral divergence from Java `iceberg-core`/`iceberg-api` 1.10.0, attacked against the reference checkout source or jar bytecode (the [CLAUDE.md](../../CLAUDE.md) *Parity mandate* as attack duty); **`format-stability`** — an on-disk format break (the *Absolute prohibitions* format rule as attack duty). Provenance: both were de facto attack categories in every prior Critic run (bytecode-verified citations, format-break sweeps); binding them makes the attestation duty explicit and non-skippable. | Pure additions to the ref-05 canonical taxonomy; they widen every subsequent Critic's attestation duty — deliberate. |
-| `contingency_mechanics` | **Additive-only (stamped 2026-07-26; G4-incident feed-forward, bar-raising, landed immediately).** Failure-path actions in plans and orchestration scripts — parking, rollback, abort — are implemented with **forward operations only** (revert commits, supersede records); destructive forms (`reset --hard`, `clean`, force ops) are invalid on unattended paths unless named, scoped, and explicitly pre-authorized in the user's sign-off for that plan (the agent permission regime blocks them regardless — the 2026-07-26 incident proved the block is load-bearing). A contingency that fires and **fails** is a HALT: downstream stages do not run (delegated mode: stop + flag). In a multi-unit bundle, a group that cannot converge is **REMOVED** (reverted) or **explicitly REMANDED** to the final bundle Critic with its open findings enumerated; the closing attestation must disposition each item-by-item, and any resulting user decision rides the PR as a named merge gate. Canon status: proposed as v2.3 R11–R13 in [task/sepmo-ccr-2026-07-26-g4-incident.md](../../task/sepmo-ccr-2026-07-26-g4-incident.md); this row binds the repo NOW regardless of ratification. | Bar-raising; lands immediately per the asymmetric feed-forward rule. Previously unbound — the exact gap the 2026-07-26 incident fell through. On v2.3 ratification, SLIM this row to project values + a canon pointer (it would otherwise restate R11–R13) — a named duty of the re-bind unit. |
+| `contingency_mechanics` | **Additive-only** (stamped 2026-07-26 as G4-incident feed-forward; SLIMMED at the v2.3 re-bind — canon now owns the rules, so this row carries only what is this repo's to choose). **Form (a) is this repo's standing binding:** every failure-path action in a plan or orchestration script uses forward operations only — revert commits, superseding records. **Form (b) is not pre-granted here:** destructive git/filesystem operations require a named, scoped grant in the user's sign-off for that specific plan, and the agent permission classifier blocks them regardless (the 2026-07-26 incident proved that block load-bearing — the [CLAUDE.md](../../CLAUDE.md) *Absolute prohibitions* row is the standing constraint). **Bundle groups:** a group that cannot converge is REMOVED (reverted) or REMANDED to the closing bundle Critic. The rules themselves — executability, the disposition set, the remand duty — are spine **R11–R13**; this row does not restate them. Incident provenance: [task/sepmo-metrics.md](../../task/sepmo-metrics.md) §2026-07-26 + [task/sepmo-ccr-2026-07-26-g4-incident.md](../../task/sepmo-ccr-2026-07-26-g4-incident.md). | Ratified into canon v2.3 (2026-07-26), so the row binds project values only. Previously unbound — the exact gap the 2026-07-26 incident fell through. |
+| `critic_engine` | **The spine's own Critic stage — the default, stated explicitly.** No external critic engine binds in this repo: the per-PR **independent Critic** (separate agent, fresh context) that the *Sub-agent / tier policy* row and `context_break_mechanics` already bind IS that stage, run at the tier those rows name ([CLAUDE.md](../../CLAUDE.md) `<subagent_policy>`: OO by default; never below Opus on correctness review). No engine-specific tunables exist to record. | Optional row (spine v2.3+). The [references/05](references/05-critic.md) *External critic engines* constraints bite only if an external engine is ever bound here; binding one would be a manifest change with its own provenance stamp. |
 
 ## Pointers
 
 - **Up:** repo root [CLAUDE.md](../../CLAUDE.md) (read-order + precedence);
   [skills/map.md](../map.md) (the skills index).
-- **Related:** [SKILL.md](SKILL.md) (the spine, canon v2.2);
+- **Related:** [SKILL.md](SKILL.md) (the spine, canon v2.3);
   [references/](references/) (canonical instrument homes);
   [binding-manifest.template.md](binding-manifest.template.md) (the portable template
   this file instantiates); the bound repo docs: [Roadmap.md](../../Roadmap.md),
@@ -100,18 +102,21 @@ landed at the master home.
 
 - A SEPMO behavior contradicts the engineering contract → the contract wins on
   engineering; fix this manifest or its usage, never canon. Canon defects are filed
-  upstream to the master home (D2), not patched in this repo's copy. **Filed 2026-07-13:**
-  the v2.2 spine's *Model assumption* section carries a "For **this** repo that resolves
-  to a **single-agent default**" sentence — an instantiation artifact inside portable
-  canon. It does not bind here: this manifest's *Sub-agent / tier policy* row and
-  `context_break_mechanics` (the homes the spine itself delegates to) bind the
-  independent-Critic hard break, and [CLAUDE.md](../../CLAUDE.md) wins regardless.
-  **Filed 2026-07-26:** v2.2 halts an unconverged **PR unit** at the cycle cap (ref 02,
-  *Cycle-cap escalation*) but leaves intra-bundle **group** dispositions and contingency
-  **executability** unbound — the G4 parking incident fell exactly through that gap
-  ([task/sepmo-ccr-2026-07-26-g4-incident.md](../../task/sepmo-ccr-2026-07-26-g4-incident.md)
-  proposes canon v2.3 R11–R13; the `contingency_mechanics` row above binds this repo in the
-  interim).
+  upstream to the master home (D2), not patched in this repo's copy. **Filed 2026-07-13, still
+  open at v2.3:** the spine's *Model assumption* section carries a "For **this** repo that
+  resolves to a **single-agent default**" sentence — an instantiation artifact inside portable
+  canon (re-checked against the v2.3 spine 2026-07-26; unchanged). It does not bind
+  here: this manifest's *Sub-agent / tier policy* row and `context_break_mechanics`
+  (the homes the spine itself delegates to) bind the independent-Critic hard break,
+  and [CLAUDE.md](../../CLAUDE.md) wins regardless.
+  **Filed 2026-07-26 — RESOLVED the same day:** v2.2 halted an unconverged **PR unit** at the
+  cycle cap (ref 02, *Cycle-cap escalation*) but left intra-bundle **group** dispositions
+  and contingency **executability** unbound — the G4 parking incident fell exactly through
+  that gap. Filed upstream as
+  [task/sepmo-ccr-2026-07-26-g4-incident.md](../../task/sepmo-ccr-2026-07-26-g4-incident.md),
+  **ratified by the user and landed at the master home as canon v2.3 (R11–R13)**; this
+  instance re-bound in the same-day unit `infra/sepmo-v2-3-rebind`. The gap is closed in
+  canon, not patched locally — the pattern this bullet prescribes, executed end to end.
 - The same status appears in two places → SSOT breach; the Status SSOT row is the only
   home.
 - A row points at a missing file → this manifest is stale; fix the row.
@@ -146,8 +151,11 @@ The install is complete when every proposition below is provable:
 - [x] I-1 — Every role row resolves to BIND (thirteen rows, all BIND — every home
       pre-existed; one BIND-and-map for PR-unit grouping); no italic guidance and no
       `> Fill:` lines remain.
-- [x] I-2 — `spine_version: v2.2` matches the shipped spine's frontmatter
-      (`version: "2.2"`) and its changelog head entry (v2.2 — 2026-07-13).
+- [x] I-2 — `spine_version: v2.3` matches the shipped spine's frontmatter
+      (`version: "2.3"`) and its changelog head entry (v2.3 — 2026-07-26). The shipped
+      [SKILL.md](SKILL.md) is a **byte-identical copy of the master spine** at
+      `~/Desktop/Sepmo/SKILL.md` (`cmp`-verified at the re-bind, 41,957 bytes) — not a
+      transcription, closing the 2026-07-13 install's disclosed caveat.
 - [x] I-3 — Every path this manifest links resolves (link-checked at instantiation;
       `task/sepmo-metrics.md` created in the same change).
 - [x] I-4 — `green_commands` names both gates; the pre-merge command mirrors every
@@ -165,10 +173,17 @@ The install is complete when every proposition below is provable:
 - [x] I-8 — Status sweep: capability status has exactly one home
       ([docs/parity/GAP_MATRIX.md](../../docs/parity/GAP_MATRIX.md), the SSOT row);
       SEPMO files restate no cell.
-- [x] I-9 — This manifest re-instantiation ran as a SEPMO unit
-      (`infra/sepmo-canon-v2.2`, tracked in [task/todo.md](../../task/todo.md)
-      §2026-07-13): rubric recorded **STANDARD** (criteria 1 and 3 fail LIGHT —
-      multi-file governance surface, > 150 lines), one AC cycle with the independent
-      fresh-context Critic per the sub-agent policy row.
+- [x] I-9 — This manifest's bindings run as SEPMO units, each tracked in
+      [task/todo.md](../../task/todo.md): the 2026-07-13 re-instantiation
+      (`infra/sepmo-canon-v2.2`) and the 2026-07-26 v2.3 re-bind
+      (`infra/sepmo-v2-3-rebind`, §2026-07-26). Both recorded **STANDARD** (criteria 1
+      and 3 fail LIGHT — multi-file governance surface, > 150 lines) and both dispatch
+      the independent fresh-context Critic per the sub-agent policy row; convergence is
+      that Critic's call (R4), never asserted here.
 - [x] I-10 — `s0_fresh_execution` is marked N/A with the standing sub-agent hard break
       as the justification (the `context_break_mechanics` row binds it).
+
+No I-row is added for `critic_engine`: the v2.3 template's checklist is unchanged at
+I-1…I-10, and this manifest already carries optional tunable rows without dedicated
+propositions (`contingency_mechanics`, bound 2026-07-26). The row itself is the record —
+and it binds the **default**, so there is no external-engine claim to prove.

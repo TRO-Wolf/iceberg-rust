@@ -135,7 +135,7 @@ METRICS:
 `coverage_misses` and `escaped_defects_by_origin` are empty on a clean run — but the keys are
 still filed; an absent key is indistinguishable from an unexamined one.
 
-### Incident retrospectives — when a defect escapes
+### Incident retrospectives — when a defect escapes, or the machinery fails
 
 An **escaped defect** — discovered after its PR was accepted — does not wait for the charter to
 close: run a **mini state-6 scoped to the defect immediately** (canonical rule: `../SKILL.md`,
@@ -146,6 +146,14 @@ asymmetric feed-forward rule above. The defect's remediation is its own unit thr
 machine with R5's regression proof; where the defect falsified a quantified clause, check whether
 the clause's enumeration contained the failing element — if it did not, the enumeration was the
 defect: grow it.
+
+**Machinery incidents file the same section** *(spine v2.3)*: a failure of SEPMO's own machinery —
+an invalid contingency (R11), an unsettled disposition consumed downstream (R12), a gate bypassed
+— triggers the same immediate `kind: incident` filing as an escaped defect, whether or not any
+product defect escaped. The canonical trigger lives in the spine (*Incident retrospectives*); what
+this reference adds is the ledger's shape in that case: `coverage_misses` and
+`escaped_defects_by_origin` may be legitimately **empty** — the keys are still filed, and the
+incident's mechanism is named in the section body.
 
 ---
 
