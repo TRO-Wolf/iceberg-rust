@@ -577,3 +577,29 @@ Cargo approval).
   `Int32Array` is rejected by the annotated result type, so that arm's mapping is owned by the
   compiler, not by a test — record which arms have that guarantee instead of "adding coverage" the
   type system already provides.
+
+### 2026-07-26 — A blanket `#[allow(unused_variables)]` can hide a DEAD SYNCHRONIZATION HANDLE; and a publish-then-await test cannot tell "armed under the lock" from "armed one line later"
+
+The delete-filter lost-wakeup unit (G8, `arrow/delete_filter.rs`) turned up three notifier bugs where
+the brief predicted two. Three things generalise:
+
+- **Remove a module-wide `#[allow(unused_variables)]` BEFORE trusting anything about its concurrency.**
+  `impl CachingDeleteFileLoader` carried one. Under it, `try_start_eq_del_load` returned an
+  `Arc<Notify>` that the caller bound and never used — while the very next line replaced the state
+  entry with a SECOND notifier. A waiter that armed on the first one in the window between the two
+  calls was woken by nothing, ever. A dead binding of a notifier / lock guard / channel handle is not
+  lint noise, it is a liveness bug the compiler was already pointing at. Cost of removing the allow
+  here: three lines (two other dead bindings, both genuinely dead, deleted).
+- **The mutation that proves an arming fix must cross the function boundary the test observes.** The
+  test shape is "publish FIRST, await SECOND", which pins *the future existed before the
+  notification*. Moving the arming a few lines later — still inside the claiming function, just after
+  the lock is released — does NOT fail that test, so it proves nothing. The honest revert is the BASE
+  CONTRACT: hand back the raw `Arc<Notify>` and create the `Notified` at the AWAIT SITE. That one
+  REDs (`Elapsed(())`), and it is exactly what the pre-fix tree did — so the same test also gives a
+  genuine pre-group RED when the old API can express it.
+- **Arm the drop guard in the CLAIM, not in the publisher's registration.** Every `?` between "insert
+  Loading" and "register the publisher" is a stranded waiter. Returning the guard *from* the claiming
+  call makes that window unrepresentable, and letting the spawned publisher CAPTURE the guard (rather
+  than construct it inside its `async move`) is what covers the never-polled teardown — a future
+  dropped before its first poll runs no local destructors. Those are two separate pins with two
+  separate mutations; one passing does not imply the other.
