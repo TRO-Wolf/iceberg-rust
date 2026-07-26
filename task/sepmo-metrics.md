@@ -102,7 +102,9 @@ instructed) amended the MASTER canon home (`~/Desktop/Sepmo`) in place: a runtim
 companion section + a `v2.2+kit` changelog entry + engine tunables in the portable template, plus
 a runtime install kit inside the canon directory. Caught same-day by user report; an mtime audit
 scoped it; the master was restored **byte-exact to v2.2** (36695/12375 bytes, verified against
-the fork-instance baseline at `a6199ca5`) and the kit relocated to `~/Desktop/Sepmo-octo-kit/`
+the fork-instance baseline at `a6199ca5` — SKILL.md cmp-identical; the template identical after
+stripping the fork copy's ASF header, which the master deliberately does not carry) and the kit
+relocated to `~/Desktop/Sepmo-octo-kit/`
 (value preserved; its install script re-pointed). No instance impact — this repo's
 `skills/sepmo/` and the coordination hub were untouched.
 
@@ -115,7 +117,7 @@ METRICS:
   cycles_per_unit: []
   findings_filed: {S0: 0, S1: 0, S2: 0, S3: 0}   # no AC ladder ran; nothing to file under R4
   findings_withdrawn: 0
-  noise_ratio: 0.0
+  noise_ratio: 0.0            # 0 over 0, rendered as zero by convention
   disputes: {sustained: 0, withdrawn: 0}
   accepted_flags: 0
   coverage_misses: []
@@ -127,5 +129,7 @@ METRICS:
 
 **Feed-forward filed:** CCR Amendment E (runtime-neutral `critic_engine` binding point — the
 event's one canon-worthy idea, abstracted) + two governance recommendations riding the CCR
-adoption protocol: version-control the master home; reconcile the master's stale references
-(discovered by this audit) at ratification.
+adoption protocol: version-control the master home; reconcile the DIVERGED reference lineages at
+ratification (master vs instance wording — both carry the required amendments; the audit's first
+"stale" reading was refuted by the unit's Critic, and the correction is itself recorded in the
+CCR).

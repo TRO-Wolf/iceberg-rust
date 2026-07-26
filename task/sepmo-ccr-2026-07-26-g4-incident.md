@@ -147,9 +147,11 @@ idea worth canon, abstracted runtime-neutral:
 Two governance observations from the same event, for ratification alongside: (a) the master home
 has **no gate** — nothing detected the in-place canon edit but a user report and an mtime audit;
 recommend placing `~/Desktop/Sepmo` under version control so canon changes are diffable events;
-(b) the audit also discovered the master's `references/` are **stale** — they lack the v2.1/v2.2
-*required* reference amendments that currently exist only in this repo's instance — folded into
-the adoption protocol below.
+(b) the audit also discovered the master's `references/` and this repo's instance have
+**diverged in wording**: both lineages carry the v2.1/v2.2 *required* amendments, in different
+text — the master's is in places the richer form (verified marker-by-marker 2026-07-26; an
+earlier "stale/missing" reading of this divergence was refuted by the unit's Critic) — folded
+into the adoption protocol below as a deliberate two-lineage reconciliation.
 
 ## Changelog entry (draft for the master)
 
@@ -182,9 +184,11 @@ the adoption protocol below.
 2. **Master home updated:** `~/Desktop/Sepmo/` — spine `version: "2.3"`, the three rules
    inserted after R10, the *Incident retrospectives* extension (Amendment D), the changelog
    entry, the five reference amendments plus the template's `critic_engine` row (Amendment E),
-   AND the master-reference reconciliation: apply the v2.1/v2.2 *required* amendment sets (today
-   present only in this repo's instance) so the master is whole. Recommended at the same step:
-   `git init` the master home so future canon changes are diffable events, not mtime forensics.
+   AND the reference-lineage reconciliation: DIFF the master's references against this repo's
+   instance (both carry the v2.1/v2.2 required amendments in diverged wording — verified
+   2026-07-26) and merge deliberately, with the master as the canonical home; do NOT bulk-apply
+   the instance's text over the master's. Recommended at the same step: `git init` the master
+   home so future canon changes are diffable events, not mtime forensics.
 3. **This repo re-binds** as its own SEPMO unit (verbatim spine copy, reference amendments,
    `spine_version: v2.3` in the manifest, instantiation checklist re-proven, independent Critic)
    — the same flow as `infra/sepmo-canon-v2.2`.
