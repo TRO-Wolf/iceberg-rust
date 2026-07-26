@@ -20,3 +20,10 @@ extend-ignore-identifiers-re = ["^bimap$"]
 
 [files]
 extend-exclude = ["**/testdata", "CHANGELOG.md"]
+
+# `MoR` = merge-on-read. The Spark-written fixtures read by
+# `crates/iceberg/tests/interop_spark_mor_fixtures.rs` are NAMED `db.mor_*` on disk
+# (`mor_file_gran`, `mor_partition_gran`, `mor_dv_v3`, `mor_legacy_no_field`), so the
+# abbreviation is load-bearing in that file's name, its env-var gate, and its string literals.
+[default.extend-words]
+mor = "mor"
