@@ -3321,6 +3321,17 @@ mod partition_path_escaping_tests {
     /// → `a%2Fb+c`, and `truncate(5)` on `east 1x` → `east+1x`. The first case is also
     /// `truncate_string` in the LIVE interop battery, where Java's own `partitionToPath` emits
     /// `s_trunc=a%2Fb+c` — the same bytes this pin asserts.
+    ///
+    /// The binary leg carries a second, DIFFERENT assertion. It is byte-stable under the ESCAPER
+    /// (hex holds nothing outside the safe set), but its HUMAN STRING is not Java's: Java's default
+    /// `Transform.toHumanString(Type, T)` routes FIXED and BINARY to `TransformUtil.base64encode`
+    /// before the default arm, and `Truncate` declares NO override, so EVERY transform whose output
+    /// type is binary renders base64 there — `truncate(binary, 2)`, `identity(binary)` and
+    /// `identity(fixed[3])` over these very bytes all emit `YS9i` from Java's own `partitionToPath`
+    /// (JVM-measured 2026-07-25, `iceberg-api-1.10.0` on JDK 11). That is the SAME hex-vs-base64
+    /// residue row R161 names for `identity(binary)`/`fixed`, so it gets the same ALARM the four
+    /// temporal divergences carry: when the `assert_ne!` becomes equal, the base64 residue has been
+    /// closed and row R161 must be updated in the same change.
     #[test]
     fn truncate_is_byte_stable_except_over_string() {
         let moving = [
@@ -3351,6 +3362,23 @@ mod partition_path_escaping_tests {
                 "truncate over `string` renders a string and MUST be escaped"
             );
         }
+
+        // The human-string ALARM for the binary leg, asserted BEFORE its byte-stability pin so
+        // that a change adopting Java's base64 reds THIS assertion first and names the residue in
+        // the failure message, rather than surfacing as a bare byte mismatch.
+        let truncated_binary = render_one(
+            "bn",
+            "tb",
+            PrimitiveType::Binary,
+            Transform::Truncate(2),
+            Literal::binary(vec![0x61, 0x2F, 0x62]),
+        );
+        assert_ne!(
+            truncated_binary, "tb=YS9i",
+            "residue R161: Java renders base64 for a binary partition value (its own \
+             `partitionToPath` emits `tb=YS9i` for these bytes), the fork renders UPPERCASE HEX — \
+             closing that residue must update row R161 in the same change"
+        );
 
         let stable = [
             (
@@ -3396,16 +3424,7 @@ mod partition_path_escaping_tests {
                 ),
                 "td=123.45",
             ),
-            (
-                render_one(
-                    "bn",
-                    "tb",
-                    PrimitiveType::Binary,
-                    Transform::Truncate(2),
-                    Literal::binary(vec![0x61, 0x2F, 0x62]),
-                ),
-                "tb=612F62",
-            ),
+            (truncated_binary.clone(), "tb=612F62"),
         ];
         for (rendered, expected) in &stable {
             assert_eq!(
