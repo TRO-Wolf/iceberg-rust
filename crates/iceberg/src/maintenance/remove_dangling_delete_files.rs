@@ -135,6 +135,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::Catalog;
+use crate::delete_file_index::referenced_data_file_location;
 use crate::error::Result;
 use crate::spec::{DataContentType, DataFile, DataFileFormat, Struct};
 use crate::table::Table;
@@ -332,18 +333,26 @@ fn find_dangling_deletes(live: &LiveEntries) -> Vec<DataFile> {
     for entry in &live.live_delete_entries {
         let data_file = &entry.data_file;
 
-        // A DELETION VECTOR (PUFFIN position delete) dangles when its referenced data file is not a live
-        // data-file path (Java `findDanglingDvs`). This is checked FIRST and independently of the
-        // sequence-number rule: a DV is file-scoped, so the per-partition min-seq comparison does not
-        // apply to it. A DV with no `referenced_data_file` is malformed; treat it as dangling-by-absence
-        // (its reference can never match a live path), matching the leftouter-join-then-null semantics.
-        if is_deletion_vector(data_file) {
-            let referenced_live = data_file
-                .referenced_data_file()
-                .is_some_and(|path| live.live_data_file_paths.contains(&path));
-            if !referenced_live {
+        // A FILE-SCOPED delete — a DV, or any position delete whose referenced data file the READ
+        // path can derive (`referenced_data_file_location`: the explicit field, else equal
+        // `file_path`-column bounds) — dangles when that referenced path is not a live data-file
+        // path (Java `findDanglingDvs`). This is checked FIRST and independently of the
+        // sequence-number rule, because such a delete is routed BY PATH in
+        // [`crate::delete_file_index`] (Java `DeleteFileIndex.findPathDeletes` / `findDV`): the
+        // lookup consults neither the spec id nor the partition tuple, so the per-partition min-seq
+        // comparison says nothing about whether it still applies. Judging one by that rule would
+        // remove a delete file the reader still honors and resurrect the rows it masks —
+        // irreversibly, since the removal is a committed metadata change.
+        if let Some(referenced) = referenced_data_file_location(data_file) {
+            if !live.live_data_file_paths.contains(&referenced) {
                 dangling.push(data_file.clone());
             }
+            continue;
+        }
+        // A DV with no `referenced_data_file` is malformed; treat it as dangling-by-absence (its
+        // reference can never match a live path), matching the leftouter-join-then-null semantics.
+        if is_deletion_vector(data_file) {
+            dangling.push(data_file.clone());
             continue;
         }
 
@@ -401,8 +410,9 @@ mod tests {
     use super::*;
     use crate::io::LocalFsStorageFactory;
     use crate::memory::MemoryCatalogBuilder;
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
         ManifestStatus, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Struct,
         Transform, Type,
     };
@@ -612,6 +622,182 @@ mod tests {
             dangling,
             vec!["spec1-pos.parquet".to_string()],
             "a spec-1 delete must not borrow spec-0's data minimum"
+        );
+    }
+
+    /// THE IRREVERSIBLE-DELETE PIN (WG4b). A FILE-SCOPED position delete — one whose referenced data
+    /// file the read path can derive, either from the `referenced_data_file` field or from equal
+    /// `file_path`-column bounds — is routed BY PATH in
+    /// [`crate::delete_file_index`] (Java `DeleteFileIndex.findPathDeletes`), with no spec and no
+    /// partition condition. Classifying it dangling because its OWN partition+spec group holds no
+    /// live data file would delete a delete file the reader still honors, and the rows it masks would
+    /// resurrect — permanently, since the removal is a committed metadata change.
+    ///
+    /// Both legs are pinned here alongside a non-file-scoped delete in the SAME empty group, which
+    /// must still dangle: the fix is "route by reference", not "stop collecting".
+    ///
+    /// MUTATION: dropping the file-scoped leg (partition min-seq rule for every parquet delete) puts
+    /// both file-scoped deletes in the dangling set (RED); dropping the `contains` check (never
+    /// dangling once file-scoped) leaves `pos-file-scoped-gone.parquet` uncollected (RED).
+    #[test]
+    fn test_file_scoped_position_delete_referencing_live_data_is_not_dangling() {
+        let referenced_field = {
+            let mut file = delete_file(
+                "pos-file-scoped-field.parquet",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Parquet,
+                9,
+                0,
+            );
+            file.referenced_data_file = Some("live-data.parquet".to_string());
+            file
+        };
+        let referenced_bounds = {
+            let mut file = delete_file(
+                "pos-file-scoped-bounds.parquet",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Parquet,
+                9,
+                0,
+            );
+            file.lower_bounds = HashMap::from([(
+                RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string("live-data.parquet"),
+            )]);
+            file.upper_bounds = HashMap::from([(
+                RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string("live-data.parquet"),
+            )]);
+            file
+        };
+        let referenced_gone = {
+            let mut file = delete_file(
+                "pos-file-scoped-gone.parquet",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Parquet,
+                9,
+                0,
+            );
+            file.referenced_data_file = Some("rewritten-away.parquet".to_string());
+            file
+        };
+        let partition_scoped = delete_file(
+            "pos-partition-scoped.parquet",
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet,
+            9,
+            0,
+        );
+
+        let deletes = vec![
+            LiveDeleteEntry {
+                data_file: referenced_field,
+                sequence_number: Some(2),
+            },
+            LiveDeleteEntry {
+                data_file: referenced_bounds,
+                sequence_number: Some(2),
+            },
+            LiveDeleteEntry {
+                data_file: referenced_gone,
+                sequence_number: Some(2),
+            },
+            LiveDeleteEntry {
+                data_file: partition_scoped,
+                sequence_number: Some(2),
+            },
+        ];
+        // Live data exists ONLY in (spec 0, partition 0); every delete above is stamped partition 9,
+        // so the partition min-seq rule would call all four dangling.
+        let live = live_entries(&[((0, 0), Some(1))], &["live-data.parquet"], deletes);
+
+        let dangling: HashSet<String> = find_dangling_deletes(&live)
+            .into_iter()
+            .map(|file| file.file_path().to_string())
+            .collect();
+        assert_eq!(
+            dangling,
+            HashSet::from([
+                "pos-file-scoped-gone.parquet".to_string(),
+                "pos-partition-scoped.parquet".to_string(),
+            ]),
+            "file-scoped deletes dangle by REFERENCE (only the one naming a gone data file), while a \
+             partition-scoped delete in the same empty group still dangles by the min-seq rule"
+        );
+    }
+
+    /// An EQUALITY delete is never file-scoped, whatever bounds it carries — Java's
+    /// `ContentFileUtil.referencedDataFile` returns null for `EQUALITY_DELETES` before it inspects
+    /// the field or the bounds. It must therefore keep being judged by the partition min-seq rule
+    /// here, not by whether some path it happens to bound is still live. Both directions:
+    ///
+    /// - an equality delete in a partition with NO live data dangles (min IS NULL), even though its
+    ///   bounds name a live data file — otherwise it is kept forever (a GC miss);
+    /// - an equality delete that still applies (`seq > min`) does NOT dangle, even though its bounds
+    ///   name a file that is gone — removing it would RESURRECT the rows it masks in the live data
+    ///   files of its partition, and the removal is irreversible.
+    ///
+    /// MUTATION: dropping the equality early-return from `referenced_data_file_location` flips both
+    /// (the first is spared by reference, the second is collected by reference) — the second is the
+    /// corruption direction, and no read-path test catches it because the index routes by content
+    /// type before it ever consults the helper.
+    #[test]
+    fn test_equality_delete_with_path_bounds_is_judged_by_min_seq_not_by_reference() {
+        let path_bounds = |path: &str| {
+            HashMap::from([(
+                RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string(path.to_string()),
+            )])
+        };
+
+        // In partition 9 — no live data there — with bounds naming a LIVE data file.
+        let orphan_eq = {
+            let mut file = delete_file(
+                "eq-orphan-bounds-live.parquet",
+                DataContentType::EqualityDeletes,
+                DataFileFormat::Parquet,
+                9,
+                0,
+            );
+            file.lower_bounds = path_bounds("live-data.parquet");
+            file.upper_bounds = path_bounds("live-data.parquet");
+            file
+        };
+        // In partition 0 at seq 5 — still applies over the min of 1 — with bounds naming a GONE file.
+        let applicable_eq = {
+            let mut file = delete_file(
+                "eq-applicable-bounds-gone.parquet",
+                DataContentType::EqualityDeletes,
+                DataFileFormat::Parquet,
+                0,
+                0,
+            );
+            file.lower_bounds = path_bounds("rewritten-away.parquet");
+            file.upper_bounds = path_bounds("rewritten-away.parquet");
+            file
+        };
+
+        let deletes = vec![
+            LiveDeleteEntry {
+                data_file: orphan_eq,
+                sequence_number: Some(5),
+            },
+            LiveDeleteEntry {
+                data_file: applicable_eq,
+                sequence_number: Some(5),
+            },
+        ];
+        let live = live_entries(&[((0, 0), Some(1))], &["live-data.parquet"], deletes);
+
+        let dangling: Vec<String> = find_dangling_deletes(&live)
+            .into_iter()
+            .map(|file| file.file_path().to_string())
+            .collect();
+        assert_eq!(
+            dangling,
+            vec!["eq-orphan-bounds-live.parquet".to_string()],
+            "equality deletes follow the partition min-seq rule; their file_path bounds are not a \
+             file scope"
         );
     }
 
@@ -850,6 +1036,71 @@ mod tests {
             parquet::file::properties::WriterProperties::builder().build(),
             config.schema().clone(),
         );
+        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_builder,
+            table.file_io().clone(),
+            location_gen,
+            file_name_gen,
+        );
+        let partition_key = crate::spec::PartitionKey::new(
+            table.metadata().default_partition_spec().as_ref().clone(),
+            table.metadata().current_schema().clone(),
+            Struct::from_iter([Some(Literal::long(part_value))]),
+        );
+        let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+            .build(Some(partition_key))
+            .await
+            .unwrap();
+
+        let paths: Vec<&str> = deletes.iter().map(|(path, _)| path.as_str()).collect();
+        let positions: Vec<i64> = deletes.iter().map(|(_, pos)| *pos).collect();
+        let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+            Arc::new(StringArray::from(paths)) as ArrayRef,
+            Arc::new(Int64Array::from(positions)) as ArrayRef,
+        ])
+        .unwrap();
+        writer.write(batch).await.unwrap();
+        writer.close().await.unwrap().into_iter().next().unwrap()
+    }
+
+    /// A REAL parquet position delete written with [`MetricsConfig::for_position_delete`] — the
+    /// config that forces the reserved `file_path` column to FULL metrics, so the produced delete
+    /// file carries EQUAL `file_path` lower/upper bounds and is FILE-SCOPED exactly as a
+    /// Java-written one is (Java's `PositionDeleteWriter.close()` never sets
+    /// `referenced_data_file`; it preserves those bounds instead).
+    ///
+    /// `part_value` is the partition tuple the delete is STAMPED with, which the caller deliberately
+    /// picks to differ from the referenced data file's.
+    async fn write_file_scoped_position_delete_file(
+        table: &Table,
+        part_value: i64,
+        deletes: &[(String, i64)],
+    ) -> DataFile {
+        use crate::spec::MetricsConfig;
+
+        let config = PositionDeleteWriterConfig::new().unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let file_name_gen = DefaultFileNameGenerator::new(
+            "file-scoped-pos-del".to_string(),
+            Some(uuid::Uuid::now_v7().to_string()),
+            DataFileFormat::Parquet,
+        );
+        // `set_statistics_truncate_length(None)`: parquet-rs truncates byte-array statistics at 64
+        // bytes by DEFAULT, and the metrics aggregator drops any bound whose parquet statistic is
+        // not exact (`min_is_exact`) — so with the stock properties a `file_path` bound simply never
+        // survives for a realistic (>64-byte) data-file location, whatever the MetricsConfig says.
+        // Java's parquet-mr does not truncate row-group statistics, which is why Java-written
+        // file-granularity position deletes DO carry these bounds. That asymmetry is a WRITE-side
+        // residue named in this group's PR body (the writer is out of scope here); this fixture
+        // opts out of the truncation so the READ path is exercised through metrics the parquet
+        // writer really computed rather than a hand-set field.
+        let parquet_builder = ParquetWriterBuilder::new(
+            parquet::file::properties::WriterProperties::builder()
+                .set_statistics_truncate_length(None)
+                .build(),
+            config.schema().clone(),
+        )
+        .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             table.file_io().clone(),
@@ -1400,6 +1651,172 @@ mod tests {
         assert!(
             found_tombstone,
             "the dangling equality delete must be a Deleted tombstone (producer routing fired)"
+        );
+    }
+
+    /// THE IRREVERSIBLE-DELETE PIN, end to end through REAL parquet metrics (WG4b).
+    ///
+    /// A position delete written with [`MetricsConfig::for_position_delete`] carries EQUAL
+    /// `file_path` bounds and is therefore FILE-SCOPED — Java routes it by the referenced data
+    /// file's path with no spec and no partition condition. Here it is deliberately STAMPED with
+    /// partition `x=2`, which holds no live data file, while the file it references lives in `x=1`.
+    ///
+    /// Two things must hold together, and each protects the other: the READ path must apply it
+    /// (else the masked row resurrects on every scan), and the maintenance action must NOT collect
+    /// it (else the delete file is tombstoned by a committed metadata change and the row resurrects
+    /// permanently). Before the path-keyed routing landed, the read path dropped it (`x=1` never
+    /// consults the `x=2` bucket) and the action removed it as dangling.
+    ///
+    /// MUTATION: reverting the maintenance file-scoped leg removes the delete and fails the
+    /// `removed_delete_files.is_empty()` assertion; reverting the index's path map fails the first
+    /// `scan_y_values` assertion with `{10, 20, 30}`.
+    #[tokio::test]
+    async fn test_file_scoped_position_delete_in_a_foreign_partition_applies_and_survives() {
+        let (catalog, _temp) = local_fs_catalog().await;
+        let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+        // Data file A in partition x=1: rows y=10/20/30.
+        let a = write_data_file(&table, "a.parquet", 1, &[
+            (1, 10, 100),
+            (1, 20, 200),
+            (1, 30, 300),
+        ])
+        .await;
+        let a_path = a.file_path().to_string();
+        let table = append_files(&catalog, &table, vec![a]).await;
+
+        // A FILE-SCOPED position delete for A's position 1 (y=20), stamped partition x=2 — a
+        // partition holding NO live data file. This is the shape a writer that stamps the delete
+        // with the table's default/current partitioning instead of the deleted-from data file's
+        // produces, and the shape Java routes purely by path.
+        let delete =
+            write_file_scoped_position_delete_file(&table, 2, &[(a_path.clone(), 1)]).await;
+        let delete_path = delete.file_path().to_string();
+
+        // FIXTURE SANITY — none of these may drift, or the test goes vacuously green:
+        assert_eq!(
+            delete.referenced_data_file(),
+            None,
+            "the explicit back-reference field is NOT set: this fixture exercises the BOUNDS leg, \
+             through metrics the parquet writer actually computed"
+        );
+        assert_eq!(
+            referenced_data_file_location(&delete).as_deref(),
+            Some(a_path.as_str()),
+            "the file_path-column bounds must pin exactly one referenced data file"
+        );
+        assert_eq!(
+            delete.partition(),
+            &Struct::from_iter([Some(Literal::long(2))]),
+            "the delete is stamped with a partition tuple that differs from the data file's"
+        );
+
+        let table = add_deletes(&catalog, &table, vec![delete]).await;
+
+        // READ PATH: the delete applies even though its partition tuple (x=2) is not the data
+        // file's (x=1) — it is routed by the referenced data file's path.
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10, 30]),
+            "the file-scoped delete drops y=20 despite the partition mismatch"
+        );
+
+        // MAINTENANCE PATH: partition x=2 holds no live data file, so the partition min-seq rule
+        // would call this delete dangling and REMOVE it — an irreversible metadata change that
+        // would resurrect y=20. It must be kept.
+        let result = RemoveDanglingDeleteFiles::new(table.clone())
+            .execute(&catalog)
+            .await
+            .unwrap();
+        assert!(
+            result.removed_delete_files.is_empty(),
+            "a delete the reader still honors must never be collected, got {:?}",
+            result
+                .removed_delete_files
+                .iter()
+                .map(|file| file.file_path())
+                .collect::<Vec<_>>()
+        );
+
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert!(
+            live_delete_paths(&reloaded).await.contains(&delete_path),
+            "the file-scoped delete must still be live after the action"
+        );
+        assert_eq!(
+            scan_y_values(&reloaded).await,
+            HashSet::from([10, 30]),
+            "y=20 must stay masked after the maintenance action"
+        );
+    }
+
+    /// The counterpart of the test above: once the referenced data file is gone, the SAME
+    /// file-scoped delete is genuinely dangling and IS collected — the leg is "route by reference",
+    /// not "never collect".
+    #[tokio::test]
+    async fn test_file_scoped_position_delete_is_collected_once_its_referenced_file_is_gone() {
+        let (catalog, _temp) = local_fs_catalog().await;
+        let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+        let a = write_data_file(&table, "a.parquet", 1, &[
+            (1, 10, 100),
+            (1, 20, 200),
+            (1, 30, 300),
+        ])
+        .await;
+        let a_path = a.file_path().to_string();
+        let table = append_files(&catalog, &table, vec![a.clone()]).await;
+
+        let delete =
+            write_file_scoped_position_delete_file(&table, 2, &[(a_path.clone(), 1)]).await;
+        let delete_path = delete.file_path().to_string();
+        let table = add_deletes(&catalog, &table, vec![delete]).await;
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10, 30]),
+            "the file-scoped delete applies before the rewrite"
+        );
+
+        // RewriteFiles A -> A' (a NEW path), so the delete's reference no longer resolves.
+        let a_prime = write_data_file(&table, "a-prime.parquet", 1, &[
+            (1, 10, 100),
+            (1, 20, 200),
+            (1, 30, 300),
+        ])
+        .await;
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files(vec![a], vec![a_prime]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        assert_eq!(
+            scan_y_values(&table).await,
+            HashSet::from([10, 20, 30]),
+            "after A->A' the delete references a gone file, so y=20 is already back"
+        );
+
+        let result = RemoveDanglingDeleteFiles::new(table.clone())
+            .execute(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .removed_delete_files
+                .iter()
+                .map(|file| file.file_path().to_string())
+                .collect::<Vec<_>>(),
+            vec![delete_path.clone()],
+            "the file-scoped delete whose referenced file is gone must be collected"
+        );
+        assert_eq!(
+            result.removed_position_delete_files_count(),
+            1,
+            "it is counted as a parquet position delete, not a DV"
+        );
+
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert!(
+            !live_delete_paths(&reloaded).await.contains(&delete_path),
+            "the dangling file-scoped delete must be tombstoned"
         );
     }
 
