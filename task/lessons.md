@@ -533,3 +533,47 @@ fix flipped it to `s.sa`.
 - **DO check whether the assertion ever exercised the consequence.** A predicate string test never
   binds the predicate; adding a `bind()` leg turned a cosmetic-looking rename into a proven
   scan-failure fix.
+
+### 2026-07-25 — A conversion that feeds a PUSHDOWN filter must be exact or absent; there is no safe rounding direction
+
+G7 (engine-trust bundle). `scalar_value_to_datum` turned a DataFusion `Date64` literal
+(milliseconds) into an Iceberg `date` (days) with `(millis / MILLIS_PER_DAY) as i32` — a wrap AND a
+truncation, in a function whose result becomes the scan's only filter.
+
+- **DO answer `None` for any input the target type cannot represent EXACTLY when the consumer is a
+  filter.** The comparison operator lives at a different call site, and every rounding direction is
+  under-inclusive for some operator: for `millis = 1 day + 1 ms`, flooring makes `col < millis`
+  match `{0}` where the truth is `{0, 1}`, and rounding up breaks `>` symmetrically. A converter
+  that already returns `Option` has the correct answer built in — "cannot be pushed down" — and the
+  engine then evaluates the predicate itself.
+- **DO NOT assume `Inexact` pushdown makes a wrong predicate harmless.**
+  `TableProviderFilterPushDown::Inexact` means the engine re-checks the rows the scan RETURNS; it
+  cannot resurrect rows the scan pruned. Over-inclusive is free, under-inclusive is silent row loss
+  — that asymmetry is what decides between "convert approximately" and "do not push down at all".
+- *Detector:* any `-> Option<Datum>` / `-> Option<Literal>` converter whose result becomes a
+  comparison's right-hand side. Read every `as` cast inside it first; each is a wrap waiting for an
+  out-of-range literal, and the RED test writes itself (one day past `i32::MAX` became `i32::MIN`,
+  i.e. a far-future bound pushed down as a far-past one).
+
+### 2026-07-25 — When you cannot build the adversarial input, pin the HELPER — then spend the freed budget on the hazard the EDIT introduces
+
+Same increment, `transform/bucket.rs` + `truncate.rs`: 19 `downcast_ref::<ConcreteArray>().unwrap()`
+sites, each inside a `match input.data_type()` arm. For arrow's own arrays the pairing is exact
+(`make_array` maps each `DataType` to exactly one struct), but `transform` takes `Arc<dyn Array>` and
+`Array` is a public trait, so it is not enforceable. Writing a lying `Array` impl to prove the branch
+reachable turned out to be impossible from this crate: the trait requires
+`fn to_data(&self) -> ArrayData`, and `arrow-data` is not a direct dependency (adding one needs
+Cargo approval).
+
+- **DO factor the unprovable guard into a named helper and unit-test the HELPER with an ordinary
+  mismatched pair** (a `StringArray` asked for as an `Int32Array`). The guard then REDs under a real
+  mutation (`ok_or_else` → `.unwrap()`) even though no call site can reach it — far better than a
+  prose claim that it is unreachable.
+- **DO spend the freed test budget on the hazard the EDIT introduces, not the one the code had.**
+  Rewriting 19 downcasts risks pairing a concrete type with the WRONG arm; `Bucket`'s array path had
+  tests for 2 of its 13 arms. A per-arm sweep whose oracle is the independent `transform_literal`
+  match is what actually protects the change, and it REDs under two different arm-swap mutations.
+- **A mutation that does not COMPILE is evidence too.** Swapping truncate's `Int64` arm to
+  `Int32Array` is rejected by the annotated result type, so that arm's mapping is owned by the
+  compiler, not by a test — record which arms have that guarantee instead of "adding coverage" the
+  type system already provides.
