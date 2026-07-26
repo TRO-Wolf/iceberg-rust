@@ -45,10 +45,20 @@ at minimum (canonical list: `../SKILL.md`, *PRE_EXECUTION_REVIEW — one review,
 one owner*): the charter (the frozen proposition ledger) is frozen; the PR
 carving is clause-complete — every clause maps to exactly one PR unit and
 every unit traces to clauses; each unit's LIGHT/STANDARD path assignment has a
-recorded rubric result; and the binding manifest resolves every open binding
-(models, tiers, green commands). A gap here routes backward via T6 — it never
-gets patched inline. The Orchestrator does not advance until this review reads
+recorded rubric result; the binding manifest resolves every open binding
+(models, tiers, green commands); and every named contingency is executable
+(R11, below). A gap here routes backward via T6 — it never gets patched
+inline. The Orchestrator does not advance until this review reads
 `verdict: PROCEED`.
+
+**Contingency executability (R11) — the fifth confirmation.** Each
+failure-path action the plan names — parking, rollback, reset, abort — is
+executable *by the role that will trigger it*, under the live permission
+regime, at the moment it fires: either **additive by construction** (forward
+operations only — revert commits, superseding records) or **destructive and
+explicitly pre-authorized** in the user's sign-off for this plan. A contingency
+whose authority its executor does not hold is an unproven assumption wearing a
+safety label (D1), and the gap routes backward via T6 like any other.
 
 **State 4 — `ORCHESTRATED_EXECUTION`.** The Orchestrator drives the full
 AC sub-machine for each PR-unit in dependency order until every PR in the
@@ -291,6 +301,42 @@ When the cap is reached and the Critic has not converged:
 - **Delegated mode:** document the state in the final report (open findings,
   cycle count, the specific clause ID that did not converge), flag prominently,
   and stop. Do not deliver a PR with an unconverged Critic.
+
+**Every cap ends in a recorded disposition (R12).** The escalation above is how
+a disposition is *reached*; it is never a substitute for recording one. Exactly
+one of:
+
+- **CONVERGED** — the Critic's declaration (R4), never the Orchestrator's.
+- **REMOVED** — the unit's effects are **verifiably absent** from the branch:
+  checked against the diff, not asserted from intent.
+- **REMANDED** — the unit is carried forward with its open findings
+  enumerated, for the assembly's closing authority to disposition (R13,
+  below).
+
+Until one of the three is recorded, the unit is in a **blocking state**: no
+downstream stage runs, nothing builds atop it, nothing consumes it. A
+contingency that fired and *failed* leaves exactly this state — stop the line
+and settle it. Proceeding anyway is an Invariant V alarm in its own right
+(`06-vigilance.md`, T10 — *unsettled-disposition consumption*) **even when the
+breach was logged loudly**: logging is not settling.
+
+**Multi-unit assemblies — the R13 binding.** A group inside a bundled PR is
+not itself a PR, so "do not deliver a PR with an unconverged Critic" does not
+reach it; R13 does. Such a group either runs the escalation above or takes
+**REMOVED** or **REMANDED** directly, and a remand is **explicit, never
+implied by continuation**:
+
+- The **remand record** enumerates every open finding with its severity, and
+  travels with the assembly into its PR evidence (R8).
+- **Downstream groups proceed only where their scope is demonstrably
+  disjoint** from the open findings' blast radius, and the Orchestrator
+  **records the disjointness claim** at the moment it lets the next group
+  start. An unrecorded claim is not a claim.
+- The Orchestrator hands the remand record to the assembly's **closing
+  authority** — the independent bundle-scope Critic — whose item-by-item
+  disposition duty lives in `05-critic.md`. Every user decision that duty
+  produces (waive, strip, accept) is named as an **explicit merge gate** in
+  the PR description (R8), never left implicit in prose.
 
 ---
 

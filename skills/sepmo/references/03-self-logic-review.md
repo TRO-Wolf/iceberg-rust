@@ -79,6 +79,8 @@ SELF_LOGIC_REVIEW:
   success_condition: <the one checkable test for "this action done right">  # D4
   step_risks:                                                        # mini edge-case pass
     - <what could go wrong with THIS step>: HANDLED (<how>) | OPEN
+  contingencies:                                                     # R11 — one-time review
+    - <failure-path action>: EXECUTABLE (<additive | pre-authorized>) | NOT_EXECUTABLE → HALT
   tripwire_scan: CLEAN | FIRED on "<word/phrase>" → <resolution>     # D1
   uncertainty: NONE | <describe the doubt>                           # D2
   verdict: PROCEED | HALT

@@ -19,14 +19,15 @@
 
 # SEPMO canon change request — CCR-2026-07-26 (the G4 parking incident)
 
-**Status: DRAFTED, awaiting user ratification.** Canon changes land only by amendment at the
-master home (spine, *Global conventions — versioned canon*). The master home on this machine is
-`~/Desktop/Sepmo/`; this repo's `skills/sepmo/` is an instance bound at `spine_version: v2.2`.
-On ratification: the amendment text below lands at the master as **canon v2.3** (spine + changelog
-+ required reference amendments), then this repo re-binds as its own SEPMO unit (verbatim spine
-copy, reference amendments, manifest version bump + instantiation checklist), the same flow as the
-2026-07-13 v2.2 install. **Repo-side bar-raising bindings landed immediately** under the
-asymmetric feed-forward rule, independent of ratification: the `contingency_mechanics` row in
+**Status: RATIFIED by the user 2026-07-26.** Canon changes land only by amendment at the master
+home (spine, *Global conventions — versioned canon*). The master home on this machine is
+`~/Desktop/Sepmo/`; this repo's `skills/sepmo/` was an instance bound at `spine_version: v2.2`.
+The amendment text below landed at the master as **canon v2.3** — spine + changelog + the five
+reference amendments + the template's `critic_engine` row — and this repo re-bound as its own
+SEPMO unit (verbatim spine copy, reference amendments, manifest version bump + instantiation
+checklist) in `infra/sepmo-v2-3-rebind`, the same flow as the 2026-07-13 v2.2 install.
+**Repo-side bar-raising bindings had landed earlier**, under the asymmetric feed-forward rule and
+independent of ratification: the `contingency_mechanics` row in
 [skills/sepmo/binding-manifest.md](../skills/sepmo/binding-manifest.md) (stamped 2026-07-26) and
 the first incident section in [task/sepmo-metrics.md](sepmo-metrics.md).
 
@@ -205,3 +206,7 @@ into the adoption protocol below as a deliberate two-lineage reconciliation.
   pending until the user decides at the bundle's merge.
 - Orchestration practice (not canon): this workstream's workflow scripts adopt park-by-revert
   and halt-on-failed-park as standing mechanics regardless of ratification.
+
+*(Superseded in form at the v2.3 re-bind: the `contingency_mechanics` row was SLIMMED to this
+repo's project values plus a pointer to **R11–R13**, since canon now owns the rules; and the
+metrics section's open disposition was completed — **WAIVED** at the bundle's merge, #173.)*

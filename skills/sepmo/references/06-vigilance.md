@@ -151,6 +151,26 @@ project starts.
 
 ---
 
+### T10 — Unsettled disposition consumed / unexecutable contingency
+
+**Condition:** work whose disposition is unresolved is consumed downstream — a
+unit, or a group inside a multi-unit assembly, that never reached `CONVERGED`,
+`REMOVED`, or `REMANDED` is built atop, delivered, or assembled into a PR —
+**including when the breach was loudly logged**: logging is not settling. The
+trigger fires equally on the upstream cause: a named failure-path action
+(parking, rollback, reset, abort) that the role which would trigger it cannot
+execute under the live permission regime, and any contingency that fired,
+failed, and did not stop the line.
+
+**Canonical rule:** `../SKILL.md` **R12** (an unsettled disposition blocks the
+line) and **R11** (contingencies must be executable). Operated in
+`02-orchestrator.md` — *State ownership*, where contingency executability is a
+PRE_EXECUTION_REVIEW confirmation, and *Cycle-cap escalation*, which owns the
+disposition set and the multi-unit-assembly binding — and in `05-critic.md`
+(*Closing authority*, the item-by-item remand duty).
+
+---
+
 ## Alarm protocol
 
 On any trigger, the Monitor immediately emits a `VIGILANCE_ALARM` (format
@@ -169,11 +189,14 @@ transition: the spine's **T8 drift alarm**, back to state 1
 (`AGGRESSIVE_LOGIC_SCOPE_AUDIT`) for re-audit against the new reality. This
 applies regardless of trigger type: scope-boundary and orphan-work alarms
 commonly represent new scope; the others may equally reveal undefined
-requirements or stale charter derivations that require re-audit. The
-Orchestrator executes the routing; the Monitor raises and documents the alarm.
-T8 is the one transition Invariant V owns (`../SKILL.md`, *The Iron State
-Machine*). A silent-gate-skip alarm routes differently: its remediation target
-is the binding manifest (`green_commands`), fixed as its own unit.
+requirements or stale charter derivations that require re-audit. **T10 is a
+stop-the-line trigger first:** the disposition is recorded — or the contingency
+repaired — before any downstream work resumes, and it routes to re-audit only
+when settling it changes scope. The Orchestrator executes the routing; the
+Monitor raises and documents the alarm. T8 is the one transition Invariant V
+owns (`../SKILL.md`, *The Iron State Machine*). A silent-gate-skip alarm routes
+differently: its remediation target is the binding manifest (`green_commands`),
+fixed as its own unit.
 
 ---
 
@@ -185,7 +208,7 @@ are this file's watch-item numbers, not the spine's transition numbers.)
 ```yaml
 VIGILANCE_ALARM:
   id: VA-<short-id>               # stable; referenced in the final report and by the Orchestrator
-  trigger: T1 | T2 | T3 | T4 | T5 | T6 | T7 | T8 | T9
+  trigger: T1 | T2 | T3 | T4 | T5 | T6 | T7 | T8 | T9 | T10
   canonical_rule: >
     # Pointer to the canonical home of the rule breached — file + section, no content restated
   offending_artifact: >

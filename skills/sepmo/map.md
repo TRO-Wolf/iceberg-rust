@@ -32,8 +32,8 @@ SEPMO governs *lifecycle*; it **cedes the engineering contract** to the tier man
 
 | File | For |
 |---|---|
-| `SKILL.md` | The spine — **versioned canon, v2.2**: the Iron State Machine (T1–T12), the proposition-ledger gate, the AC sub-machine rules R1–R10, the S0–S3 severity scale, the LIGHT/STANDARD rubric, doctrines, roster, changelog. Never edited per-project. |
-| `binding-manifest.md` | The one project-specific file: role bindings + tunables (`spine_version`, `severity_floor`, `green_commands` two-tier + CI-exception record, `context_break_mechanics`, `s0_fresh_execution`, `metrics_ledger_location`, `taxonomy_extensions`, `contingency_mechanics`). **Re-instantiate this to port SEPMO.** |
+| `SKILL.md` | The spine — **versioned canon, v2.3**: the Iron State Machine (T1–T12), the proposition-ledger gate, the AC sub-machine rules R1–R13, the S0–S3 severity scale, the LIGHT/STANDARD rubric, doctrines, roster, changelog. Never edited per-project. |
+| `binding-manifest.md` | The one project-specific file: role bindings + tunables (`spine_version`, `severity_floor`, `green_commands` two-tier + CI-exception record, `context_break_mechanics`, `s0_fresh_execution`, `metrics_ledger_location`, `taxonomy_extensions`, `contingency_mechanics`, `critic_engine`). **Re-instantiate this to port SEPMO.** |
 | `binding-manifest.template.md` | The portable template the manifest instantiates from — ships with the canon; edit neither per-project. |
 | `references/01-scope-auditor.md` | Scope Auditor — the proposition ledger (PROVEN/OPEN/REJECTED), the enumeration obligation for quantified clauses, the approval gate |
 | `references/02-orchestrator.md` | Orchestrator — charter ← plan-of-record, PR carving + rubric, context-break enforcement (R3), AC-loop coordination, R7 readiness checklist |
