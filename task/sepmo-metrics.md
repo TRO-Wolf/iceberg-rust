@@ -135,3 +135,13 @@ adoption protocol: version-control the master home; reconcile the DIVERGED refer
 ratification (master vs instance wording — both carry the required amendments; the audit's first
 "stale" reading was refuted by the unit's Critic, and the correction is itself recorded in the
 CCR).
+
+**Dispositions (2026-07-26, at the v2.3 re-bind):** Amendment E **RATIFIED** and landed — the
+normative constraints in canon's ref 05, the optional `critic_engine` row in the template, and
+this repo bound to the default (the spine's own Critic stage). Lineage reconciliation **SETTLED
+as deliberate coexistence**: each version's deltas are applied per lineage in that lineage's own
+wording, neither imported over the other, with only the spine byte-identical — the standing rule
+now lives in the *Debug* list of
+[skills/sepmo/binding-manifest.md](../skills/sepmo/binding-manifest.md). Version-controlling the
+master home **DEFERRED by the user** — it stays ungoverned, so a dated pre-change copy
+(`~/Desktop/Sepmo-v2.2-archive` for this one) is the only diff baseline a canon change gets.

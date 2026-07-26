@@ -179,6 +179,20 @@ multi-file, >150 lines — LIGHT criteria 1/3 fail).
       #173); this block added.
 - [ ] **5. Independent Critic (fresh context, per the sub-agent policy row)** — dispatched;
       convergence is the Critic's call (R4). Flip on CONVERGED, then push for PR.
+      **Cycle 1 → CHANGES_REQUIRED** (1 S2 + 5 S3); cycle 2 dispositions, all APPLIED:
+      **S2** — the CCR's own `Status:` still read "DRAFTED, awaiting user ratification" while the
+      manifest, this file and the master all said RATIFIED; fixed, together with the stale
+      *What already landed* close. **S3-1** — the template's "the ten canonical ones" is false in
+      a lineage tabling nine; fixed **at the master** (portable canon may not hard-code a
+      per-lineage count) and re-copied. **S3-2** — the changelog's "W9 in this lineage" travels
+      into instances numbering T1–T9; fixed at the master to "each lineage's next unused id
+      (**W9** in the master's references)", keeping instance ids out of portable canon.
+      **S3-3** — the spine's *PRE_EXECUTION_REVIEW* list omitted the fifth confirmation that
+      ref 02 gained; appended at the master, spine re-copied (I-2 byte count 41,957 → 42,055).
+      **S3-4** — the two-lineage decision lived only in this file, which archives out of required
+      reading; now durable in the manifest's *Debug* list and the metrics feed-forward
+      dispositions. **S3-5** — the `contingency_mechanics` row's residual R11(a)/(b) glosses
+      trimmed to project selections.
 
 ## FOLLOW-UPS BUNDLE (2026-07-18, signed off) — audit follow-up ledger, 5 groups, OO-High AC, ONE branch
 

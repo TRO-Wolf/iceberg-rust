@@ -184,9 +184,10 @@ Orchestrator logs one Self Logic Review (format: ref 03) over the complete
 plan, confirming at minimum: the charter is frozen; the PR carving is
 clause-complete (every clause maps to exactly one PR unit, every unit traces
 to clauses); each unit's path assignment (LIGHT/STANDARD, below) has a
-recorded rubric result; and the binding manifest resolves every open binding
-(models, tiers, green commands). A gap here routes backward via T6 — it never
-gets patched inline.
+recorded rubric result; the binding manifest resolves every open binding
+(models, tiers, green commands); and every named contingency is executable
+by the role that will trigger it (R11). A gap here routes backward via T6 —
+it never gets patched inline.
 
 ### Invariant V — Vigilance (not a state)
 
@@ -646,11 +647,11 @@ routes to them.
   multi-unit-assembly binding; ref 03 — the review format gains a
   contingency-executability line; ref 05 — the bundle-scope closing Critic's
   item-by-item remand duty AND the external-critic-engine constraints
-  (Amendment E); ref 06 — new watch item (next unused trigger id; **W9** in
-  this lineage): unsettled-disposition consumption / invalid contingency;
-  ref 08 — mirrors Amendment D (canonical rule stays in the spine); the
-  template — the optional `critic_engine` binding row (Amendment E,
-  runtime-neutral).
+  (Amendment E); ref 06 — new watch item at each lineage's next unused id
+  (**W9** in the master's references): unsettled-disposition consumption /
+  invalid contingency; ref 08 — mirrors Amendment D (canonical rule stays in
+  the spine); the template — the optional `critic_engine` binding row
+  (Amendment E, runtime-neutral).
 - **v2.2 — 2026-07-13.** The quantifier discipline lands: the ledger gains
   the **enumeration obligation** (a quantified proposition is `OPEN` until
   its domain is a finite, attackable partition) and R2 pins **per enumerated
