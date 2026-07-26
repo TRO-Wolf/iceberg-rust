@@ -64,6 +64,27 @@ own files, so a shared tracker would collide).
 - [ ] **WG4 — `fix/rest-secret-debug-ssrf`** (SEC-010 / SEC-011): REST catalog secret-in-`Debug`
   exposure + SSRF surface.
 
+## POST-BUNDLE QUEUE (2026-07-26, signed off) — D7 order + D8 toHumanString approval
+
+Spec: [post-bundle-queue-2026-07-26-brief.md](post-bundle-queue-2026-07-26-brief.md). Signed
+order: QA (R117 cross-task over-delete) → Unit 3 breaking → QB (writer path bounds) → H7-S2 →
+H7-P1, with QC (R161-completion toHumanString parity, format-visible, D8-APPROVED) alongside
+Unit 3. Mode A per-unit PRs; SEPMO v2.3 duties. Context at signing: nightly interop FULLY GREEN
+(scan-plan arc live-proven); all review branches pruned; main `a08a0957`.
+
+- [ ] **QA — per-task DeleteFilter scope** (S1 read correctness; branch
+      `fix/delete-filter-per-task-scope`): scope delete APPLICATION to `task.deletes()`
+      Java-exact while keeping load caching; RED-first the recorded category=b repro (id 30
+      resurrects correctly); eq-delete path checked same-class; R117 🟡→✅ IF this was the sole
+      blocker (Actor adjudicates; anchors gate). IN FLIGHT.
+- [ ] **Unit 3 — breaking** (`PartitionKey::new -> Result` + `CurrentFileStatus`): after QA
+      merges; RoadMapSync warning to RePark BEFORE their next repin.
+- [ ] **QC — toHumanString parity** (D8-approved, format-visible; FIXED/BINARY hex→base64 +
+      Unknown taxonomy + identity(float/double)): alongside Unit 3; format-stability attestation.
+- [ ] **QB — delete-writer file_path bounds** (fork file-scoped deletes must self-identify;
+      parquet-rs 64-byte stat truncation; investigate-first, STOP on any Cargo.toml need).
+- [ ] **H7-S2 → H7-P1** (re-scope at signing; P1's footgun pre-condition unchanged).
+
 ## BACK-TO-GOAL BLOCK (2026-07-25, signed off) — consumer fork-queue remediation, 3+2 units
 
 Spec (single home, supersedes the triage scratchpad):

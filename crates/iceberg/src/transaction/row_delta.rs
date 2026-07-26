@@ -5816,7 +5816,7 @@ mod tests {
             .expect("loader future")
             .expect("the production loader must load the committed DV");
         let vector = delete_filter
-            .get_delete_vector_for_path(referenced_data_file)
+            .resolve_delete_vector(std::slice::from_ref(&task), referenced_data_file)
             .expect("a delete vector for the referenced data file");
         let guard = vector.lock().expect("lock delete vector");
         DeleteVector::new(guard.iter().collect())

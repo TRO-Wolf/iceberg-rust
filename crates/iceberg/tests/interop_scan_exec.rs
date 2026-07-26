@@ -196,6 +196,13 @@ fn file_scoped_deletes_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_FILE_SCOPED_DELETES_DIR").map(PathBuf::from)
 }
 
+/// The temp dir the Java oracle wrote the R117 CROSS-TASK variant of the file-scoped fixture into
+/// (the control delete stamped `category=b` instead of the empty `category=c`). `None` when
+/// `ICEBERG_INTEROP_FILE_SCOPED_DELETES_CROSSTASK_DIR` is unset (then a clean no-op).
+fn file_scoped_deletes_crosstask_dir() -> Option<PathBuf> {
+    std::env::var_os("ICEBERG_INTEROP_FILE_SCOPED_DELETES_CROSSTASK_DIR").map(PathBuf::from)
+}
+
 /// Load + parse the Java ground-truth FILE-SCOPED-delete rows from
 /// `<dir>/java_file_scoped_delete_rows.json`.
 fn read_java_file_scoped_rows(dir: &std::path::Path) -> Vec<ScanRow> {
@@ -2148,8 +2155,10 @@ async fn test_file_scoped_delete_scan_matches_java_read() {
         "id 50 must be deleted by the file-scoped delete identified by its file_path bounds, live: \
          {live_ids:?}"
     );
-    // id 30: named by the CONTROL delete, which is partition-scoped (neither leg) and stamped
-    // category=b while the row lives in category=a. Java does not apply it; neither may Rust.
+    // id 30: named by the CONTROL delete, which is partition-scoped (neither leg) and stamped the
+    // EMPTY category=c while the row lives in category=a. Java does not apply it; neither may Rust.
+    // (The category=b variant of this control — attached to file B's task while naming file A —
+    // is its own fixture: `test_file_scoped_delete_crosstask_control_does_not_leak`.)
     assert!(
         live_ids.contains(&30),
         "id 30 must SURVIVE — the control delete is partition-scoped and its partition does not \
@@ -2169,6 +2178,115 @@ async fn test_file_scoped_delete_scan_matches_java_read() {
         "interop_scan_exec file-scoped deletes OK — Rust scan = Java read: live rows \
          {{10,30,40,60}}, field-leg id 20 and bounds-leg id 50 deleted across the spec/partition \
          mismatch, partition-scoped control id 30 spared"
+    );
+}
+
+/// The R117 CROSS-TASK OVER-DELETE interop pin (S1 read correctness) — the file-scoped fixture with
+/// its control delete stamped `category=b` (file B's partition) instead of the empty `category=c`.
+///
+/// The control is partition-scoped, so the plan attaches it to file B's TASK — but its rows name
+/// file A's position 2 (id 30). Java 1.10.0 builds one `data.DeleteFilter` per task over
+/// `task.deletes()` only and filters each delete file's rows to the task's OWN file path
+/// (`BaseDeleteLoader.getOrReadPosDeletes` → `getOrDefault(filePath, empty)`), so the control
+/// deletes NOTHING and Java's own read — asserted inside the generator — is {10,30,40,60}. The
+/// pre-fix Rust reader merged every parsed positional delete into ONE shared data-file-keyed map
+/// across the scan's tasks, so the control (loaded for B's task) contributed position 2 to file A
+/// and id 30 was WRONGLY deleted. This test pins the per-task scoping end-to-end through the real
+/// scan; the deterministic unit-level twin is
+/// `arrow::caching_delete_file_loader::tests::test_cross_task_pos_delete_does_not_leak_into_other_tasks_files`.
+#[tokio::test]
+async fn test_file_scoped_delete_crosstask_control_does_not_leak() {
+    let Some(dir) = file_scoped_deletes_crosstask_dir() else {
+        println!(
+            "skipping interop_scan_exec cross-task file-scoped deletes — set \
+             ICEBERG_INTEROP_FILE_SCOPED_DELETES_CROSSTASK_DIR \
+             (run dev/java-interop/run-interop-file-scoped-deletes.sh)"
+        );
+        return;
+    };
+
+    let table = load_table(&dir);
+
+    // PLAN-LEVEL parity first: the control (partition-scoped, category=b) must attach to file B's
+    // task — the attachment IS the hazard this fixture exists to exercise, so prove it is present
+    // before asserting the rows (a fixture whose control attached to nothing would pass the row
+    // assertions vacuously, testing the original fixture twice).
+    let mut planned: Vec<(String, Vec<String>)> = table
+        .scan()
+        .build()
+        .expect("build table scan for planning")
+        .plan_files()
+        .await
+        .expect("plan files")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect file scan tasks")
+        .into_iter()
+        .map(|task| {
+            let mut deletes: Vec<String> = task
+                .deletes
+                .iter()
+                .map(|delete| file_name(&delete.file_path))
+                .collect();
+            deletes.sort();
+            (file_name(&task.data_file_path), deletes)
+        })
+        .collect();
+    planned.sort();
+    assert_eq!(
+        planned,
+        vec![
+            ("00000-a.parquet".to_string(), vec![
+                "00000-field-leg-deletes.parquet".to_string()
+            ]),
+            ("00000-b.parquet".to_string(), vec![
+                "00000-bounds-leg-deletes.parquet".to_string(),
+                "00000-control-deletes.parquet".to_string(),
+            ]),
+        ],
+        "the cross-task control (partition-scoped, category=b) must attach to file B's task and \
+         ONLY there — its rows naming file A must not re-route it"
+    );
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .build()
+        .expect("build table scan")
+        .to_arrow()
+        .await
+        .expect("scan to_arrow")
+        .try_collect()
+        .await
+        .expect("collect scan batches");
+    let mut rust_rows = Vec::new();
+    for batch in &batches {
+        rust_rows.extend(extract_rows(batch));
+    }
+    let rust_rows = sorted_by_id(rust_rows);
+    let java_rows = sorted_by_id(read_java_file_scoped_rows(&dir));
+
+    let live_ids: Vec<i64> = rust_rows.iter().map(|row| row.id).collect();
+    // THE pin: id 30 (file A position 2, named by the control that is attached to file B's task)
+    // must SURVIVE. The pre-fix shared delete state deleted it.
+    assert!(
+        live_ids.contains(&30),
+        "id 30 must SURVIVE — the control delete belongs to file B's task and its rows for file A \
+         must not leak across tasks (the R117 over-delete), live: {live_ids:?}"
+    );
+    // The task's legitimate deletes still apply: field-leg id 20, bounds-leg id 50.
+    assert_eq!(
+        live_ids,
+        vec![10, 30, 40, 60],
+        "the live id set must match Java's per-task merge-on-read exactly"
+    );
+    assert_eq!(
+        rust_rows, java_rows,
+        "Rust scan→Arrow rows must equal Java's own IcebergGenerics read of the same table"
+    );
+
+    println!(
+        "interop_scan_exec cross-task file-scoped deletes OK — Rust scan = Java read: live rows \
+         {{10,30,40,60}}; the category=b control stayed scoped to file B's task and id 30 survived"
     );
 }
 

@@ -844,13 +844,13 @@ mod tests {
             .expect("the D1 loader must load what the D2 writer wrote");
 
         let vector_x = delete_filter
-            .get_delete_vector_for_path(data_file_x)
+            .resolve_delete_vector(&tasks, data_file_x)
             .expect("vector for data file x");
         let positions_x: Vec<u64> = vector_x.lock().expect("lock x").iter().collect();
         assert_eq!(positions_x, vec![0, 5, (1u64 << 32) + 7]);
 
         let vector_y = delete_filter
-            .get_delete_vector_for_path(data_file_y)
+            .resolve_delete_vector(&tasks, data_file_y)
             .expect("vector for data file y");
         let positions_y: Vec<u64> = vector_y.lock().expect("lock y").iter().collect();
         assert_eq!(positions_y, (100u64..200).collect::<Vec<_>>());

@@ -23,7 +23,7 @@ use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
-use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard};
+use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard, pos_del_claim_key};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::null_propagation::propagate_struct_validity;
@@ -129,9 +129,10 @@ impl CachingDeleteFileLoader {
     ///  * The unbound Predicates resulting from equality deletes are sent to their associated oneshot
     ///    channel to store them in the right place in the delete file managers state.
     ///  * The results of all of these futures are awaited on in parallel with the specified
-    ///    level of concurrency and collected into a vec. We then combine all the delete
-    ///    vector maps that resulted from any positional delete or delete vector files into a
-    ///    single map and persist it in the state.
+    ///    level of concurrency. Each positional source's parsed map is installed in the state
+    ///    PER SOURCE, under its claim key — NOT merged into one shared data-file-keyed map —
+    ///    so `DeleteFilter::resolve_delete_vector` can scope application to each task's own
+    ///    delete files (Java's per-task `DeleteFilter` over `task.deletes()`).
     ///
     ///
     ///  Conceptually, the data flow is like this:
@@ -158,10 +159,8 @@ impl CachingDeleteFileLoader {
     ///                                                     |
     ///                                             [buffer unordered]
     ///                                                     |
-    ///                                            [combine del vectors]
-    ///                                        HashMap<String, RoaringTreeMap>
-    ///                                                     |
-    ///                                        [persist del vectors to state]
+    ///                                 [install each source's map under its claim key]
+    ///                              HashMap<claim key, HashMap<String, RoaringTreeMap>>
     ///                                                    ()
     ///                                                    |
     ///                                                    |
@@ -208,7 +207,7 @@ impl CachingDeleteFileLoader {
         let basic_delete_file_loader = self.basic_delete_file_loader.clone();
         crate::runtime::spawn(async move {
             let result = async move {
-                let mut del_filter = del_filter;
+                let del_filter = del_filter;
                 let basic_delete_file_loader = basic_delete_file_loader.clone();
 
                 let mut results_stream = task_stream
@@ -232,13 +231,16 @@ impl CachingDeleteFileLoader {
                 while let Some(item) = results_stream.next().await {
                     let item = item?;
                     if let ParsedDeleteFileContext::DelVecs { guard, results } = item {
-                        for (data_file_path, delete_vector) in results.into_iter() {
-                            del_filter.upsert_delete_vector(data_file_path, delete_vector);
-                        }
+                        // Install this source's parsed contribution map UNDER ITS CLAIM KEY —
+                        // kept per source, not merged into shared per-data-file state, so delete
+                        // APPLICATION can scope to each task's own delete files (Java builds one
+                        // `DeleteFilter` per task over `task.deletes()` only; merging here let a
+                        // source loaded for one task delete rows from another task's file).
+                        del_filter.install_pos_del_contribution(&guard, results);
                         // Mark the positional delete file as fully loaded so waiters can proceed.
-                        // AFTER the upserts, and in the same await-free block: a woken waiter reads
-                        // the vectors synchronously, so publishing first (or being cancelled in
-                        // between) would hand it an empty or partial result.
+                        // AFTER the install, and in the same await-free block: a woken waiter
+                        // resolves the contribution synchronously, so publishing first (or being
+                        // cancelled in between) would hand it an absent result.
                         guard.publish_loaded();
                     }
                 }
@@ -367,7 +369,20 @@ impl CachingDeleteFileLoader {
         let (referenced_data_file, content_offset, content_size_in_bytes) =
             Self::validate_deletion_vector_task(task)?;
 
-        let cache_key = format!("{}@{content_offset}", task.file_path);
+        // Claim under the SHARED key derivation (`pos_del_claim_key`) so the key this blob is
+        // loaded + installed under is byte-identical to the key `resolve_delete_vector` looks up
+        // at application time — key drift between the two sides would silently drop the vector.
+        // Validation above guarantees the offset is present and non-negative, so the derivation
+        // cannot fail here; the error arm is defensive, never a panic.
+        let cache_key = pos_del_claim_key(task).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "no claim key derivable for validated deletion vector '{}'",
+                    task.file_path
+                ),
+            )
+        })?;
         match del_filter.try_start_pos_del_load(&cache_key)? {
             PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
             PosDelLoadAction::WaitFor(notified) => {
@@ -1626,9 +1641,10 @@ mod tests {
         ]);
 
         let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [parquet_pos_del_task(&pos_del_path)];
         let delete_filter = loader
             .load_deletes(
-                &[parquet_pos_del_task(&pos_del_path)],
+                &tasks,
                 Arc::new(Schema::builder().build().expect("empty schema")),
             )
             .await
@@ -1636,7 +1652,7 @@ mod tests {
             .expect("valid positions (including the 0 boundary) must load cleanly");
 
         let vector = delete_filter
-            .get_delete_vector_for_path(&data_file)
+            .resolve_delete_vector(&tasks, &data_file)
             .expect("delete vector installed under the data file");
         let positions: Vec<u64> = vector.lock().expect("vector lock").iter().collect();
         assert_eq!(
@@ -2199,30 +2215,28 @@ mod tests {
             .await;
 
         let loader = CachingDeleteFileLoader::new(file_io.clone(), 10);
+        let tasks = [dv_task(&puffin_path, &data_file_a, offset, length, 2)];
         let delete_filter = loader
-            .load_deletes(
-                &[dv_task(&puffin_path, &data_file_a, offset, length, 2)],
-                Arc::new(Schema::builder().build().unwrap()),
-            )
+            .load_deletes(&tasks, Arc::new(Schema::builder().build().unwrap()))
             .await
             .unwrap()
             .expect("DV load must succeed (parquet routing would fail here)");
 
         let vector = delete_filter
-            .get_delete_vector_for_path(&data_file_a)
+            .resolve_delete_vector(&tasks, &data_file_a)
             .expect("vector must be keyed by the referenced data file");
         let positions: Vec<u64> = vector.lock().unwrap().iter().collect();
         assert_eq!(positions, vec![1, 3]);
 
         assert!(
             delete_filter
-                .get_delete_vector_for_path(&puffin_path)
+                .resolve_delete_vector(&tasks, &puffin_path)
                 .is_none(),
             "the vector must NOT be keyed by the Puffin file's own path"
         );
         assert!(
             delete_filter
-                .get_delete_vector_for_path(&data_file_b)
+                .resolve_delete_vector(&tasks, &data_file_b)
                 .is_none(),
             "a DV for data file A must not leak onto sibling data file B"
         );
@@ -2257,8 +2271,12 @@ mod tests {
             .unwrap()
             .expect("second DV load");
 
-        let vector_1 = filter_1.get_delete_vector_for_path(&data_file_a).unwrap();
-        let vector_2 = filter_2.get_delete_vector_for_path(&data_file_a).unwrap();
+        let vector_1 = filter_1
+            .resolve_delete_vector(&tasks, &data_file_a)
+            .unwrap();
+        let vector_2 = filter_2
+            .resolve_delete_vector(&tasks, &data_file_a)
+            .unwrap();
         assert!(
             Arc::ptr_eq(&vector_1, &vector_2),
             "the second load must reuse the cached vector"
@@ -2267,6 +2285,19 @@ mod tests {
             vector_1.lock().unwrap().len(),
             3,
             "re-loading must not union a second copy into the vector"
+        );
+        // The dedup that makes reuse structural: after the first load the blob's claim key is
+        // terminally `Loaded`, so a re-load can only take the `AlreadyLoaded` arm — the sole path
+        // to a second decode is a fresh `Load` claim, which no longer exists for this key.
+        assert!(
+            matches!(
+                loader
+                    .delete_filter
+                    .try_start_pos_del_load(&format!("{puffin_path}@{offset}"))
+                    .expect("a loaded blob must not error at claim time"),
+                PosDelLoadAction::AlreadyLoaded
+            ),
+            "the second load must observe the first load's terminal state, not re-claim the blob"
         );
     }
 
@@ -2295,38 +2326,36 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io.clone(), 10);
+        let tasks = [
+            dv_task(
+                &puffin_path,
+                &data_file_a,
+                coordinates[0].0,
+                coordinates[0].1,
+                2,
+            ),
+            dv_task(
+                &puffin_path,
+                &data_file_b,
+                coordinates[1].0,
+                coordinates[1].1,
+                3,
+            ),
+        ];
         let delete_filter = loader
-            .load_deletes(
-                &[
-                    dv_task(
-                        &puffin_path,
-                        &data_file_a,
-                        coordinates[0].0,
-                        coordinates[0].1,
-                        2,
-                    ),
-                    dv_task(
-                        &puffin_path,
-                        &data_file_b,
-                        coordinates[1].0,
-                        coordinates[1].1,
-                        3,
-                    ),
-                ],
-                Arc::new(Schema::builder().build().unwrap()),
-            )
+            .load_deletes(&tasks, Arc::new(Schema::builder().build().unwrap()))
             .await
             .unwrap()
             .expect("both DV blobs in one Puffin file must load");
 
         let vector_a = delete_filter
-            .get_delete_vector_for_path(&data_file_a)
+            .resolve_delete_vector(&tasks, &data_file_a)
             .expect("blob 1 must land under data file A");
         let positions_a: Vec<u64> = vector_a.lock().unwrap().iter().collect();
         assert_eq!(positions_a, vec![1, 3]);
 
         let vector_b = delete_filter
-            .get_delete_vector_for_path(&data_file_b)
+            .resolve_delete_vector(&tasks, &data_file_b)
             .expect("blob 2 must land under data file B (not be marked already-loaded)");
         let positions_b: Vec<u64> = vector_b.lock().unwrap().iter().collect();
         assert_eq!(positions_b, vec![0, 2, 4]);
@@ -2630,6 +2659,189 @@ mod tests {
         assert!(Arc::ptr_eq(&dv1, &dv2));
     }
 
+    /// THE R117 REPRODUCTION (S1 read correctness) — a delete file loaded for ONE task must not
+    /// contribute deletions to ANOTHER task's data file.
+    ///
+    /// Fixture: tasks A and B share one loader (one scan). `foreign.parquet` is listed ONLY by
+    /// task B (the shape of a partition-scoped delete attached to B's partition) but its rows name
+    /// data file A — a delete pointing outside its own bucket. Task A has one delete of its own,
+    /// so it consults the loader's shared state. Task B is loaded FIRST, which lands `foreign`'s
+    /// parsed positions in that state deterministically before task A resolves — the same leak the
+    /// interop fixture (`run-interop-file-scoped-deletes.sh`, control stamped `category=b`) hits
+    /// racily through the concurrent scan.
+    ///
+    /// Java scope (1.10.0, bytecode): one `data.DeleteFilter` per task over `task.deletes()` only
+    /// (constructor partitions the GIVEN list, offsets 51-208), and `deletedRowPositions()` merges
+    /// exactly `loadPositionDeletes(this.posDeletes, this.filePath)` (offsets 19-37) — `foreign`
+    /// is not in task A's list, so its `(A, 2)` row can never reach task A. Pre-fix Rust merged
+    /// every parsed row into ONE shared data-file-keyed map, so task A's vector read `{1, 2}` and
+    /// id 30 (position 2 of file A) was WRONGLY deleted.
+    ///
+    /// MUTATION (the shared-state revert): unioning ALL installed contributions in
+    /// `resolve_delete_vector` regardless of the task's delete list turns exactly this test RED
+    /// (`[1, 2]` instead of `[1]`).
+    #[tokio::test]
+    async fn test_cross_task_pos_delete_does_not_leak_into_other_tasks_files() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let file_io = FileIO::new_with_fs();
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let data_file_a = write_data_parquet(tmp_dir.path(), "data-a.parquet", &[10, 20, 30]);
+        let data_file_b = write_data_parquet(tmp_dir.path(), "data-b.parquet", &[40, 50, 60]);
+
+        // own-a deletes A's position 1 (id 20); own-b deletes B's position 1 (id 50); foreign —
+        // listed by task B ONLY — names A's position 2 (id 30).
+        let own_a =
+            write_pos_del_parquet(tmp_dir.path(), "own-a.parquet", &[(&data_file_a, Some(1))]);
+        let own_b =
+            write_pos_del_parquet(tmp_dir.path(), "own-b.parquet", &[(&data_file_b, Some(1))]);
+        let foreign = write_pos_del_parquet(tmp_dir.path(), "foreign.parquet", &[(
+            &data_file_a,
+            Some(2),
+        )]);
+
+        let task_a = data_scan_task(&data_file_a, schema.clone(), vec![parquet_pos_del_task(
+            &own_a,
+        )]);
+        let task_b = data_scan_task(&data_file_b, schema.clone(), vec![
+            parquet_pos_del_task(&own_b),
+            parquet_pos_del_task(&foreign),
+        ]);
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        // Task B first: `foreign`'s parse is in the loader's shared state BEFORE task A resolves.
+        let filter_b = loader
+            .load_deletes(&task_b.deletes, schema.clone())
+            .await
+            .expect("loader channel for task B")
+            .expect("task B's deletes must load");
+        let filter_a = loader
+            .load_deletes(&task_a.deletes, schema)
+            .await
+            .expect("loader channel for task A")
+            .expect("task A's deletes must load");
+
+        let vector_a = filter_a
+            .get_delete_vector(&task_a)
+            .expect("task A has a delete of its own");
+        let positions_a: Vec<u64> = vector_a
+            .lock()
+            .expect("task A delete vector mutex")
+            .iter()
+            .collect();
+        assert_eq!(
+            positions_a,
+            vec![1],
+            "task A's vector must hold ONLY its own delete's position — `foreign` (loaded for \
+             task B, naming file A) must not leak position 2 (id 30) into task A"
+        );
+
+        let vector_b = filter_b
+            .get_delete_vector(&task_b)
+            .expect("task B has a delete of its own");
+        let positions_b: Vec<u64> = vector_b
+            .lock()
+            .expect("task B delete vector mutex")
+            .iter()
+            .collect();
+        assert_eq!(
+            positions_b,
+            vec![1],
+            "task B's vector must hold only positions its OWN deletes name for file B — \
+             `foreign`'s rows name file A and contribute nothing to B"
+        );
+    }
+
+    /// The LEGITIMATE-SHARE control for the per-task scoping (kills the over-scope direction): one
+    /// delete file listed by TWO tasks — a partition-scoped delete over a multi-file partition —
+    /// must still apply in BOTH, each task receiving exactly the positions the file names for ITS
+    /// data file. Per-task scoping restricts application to the task's OWN delete list; it must
+    /// not drop a file that IS in both lists, and must not broadcast one file's positions onto the
+    /// other.
+    ///
+    /// Also pins that the parse cache SURVIVES the scoping: the second task's load observes the
+    /// first's terminal `Loaded` claim (`AlreadyLoaded` — the only path to a re-parse is a fresh
+    /// `Load` claim, which no longer exists for this key), mirroring Java's per-delete-file cache
+    /// (`BaseDeleteLoader.getOrReadPosDeletes` caches `readPosDeletes(deleteFile)` under
+    /// `deleteFile.location()`, 1.10.0 bytecode offsets 22-39) under per-task application.
+    ///
+    /// MUTATION (over-scope): restricting a source's contribution to tasks whose data file is the
+    /// ONLY file it names — or skipping sources listed by more than one task — turns this RED.
+    #[tokio::test]
+    async fn test_pos_delete_shared_by_two_tasks_applies_in_both() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let file_io = FileIO::new_with_fs();
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let data_file_a = write_data_parquet(tmp_dir.path(), "data-a.parquet", &[10, 20, 30]);
+        let data_file_b = write_data_parquet(tmp_dir.path(), "data-b.parquet", &[40, 50, 60]);
+
+        // ONE delete file naming rows in BOTH data files: (A, 0) and (B, 2).
+        let shared = write_pos_del_parquet(tmp_dir.path(), "shared.parquet", &[
+            (&data_file_a, Some(0)),
+            (&data_file_b, Some(2)),
+        ]);
+
+        let task_a = data_scan_task(&data_file_a, schema.clone(), vec![parquet_pos_del_task(
+            &shared,
+        )]);
+        let task_b = data_scan_task(&data_file_b, schema.clone(), vec![parquet_pos_del_task(
+            &shared,
+        )]);
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let filter_a = loader
+            .load_deletes(&task_a.deletes, schema.clone())
+            .await
+            .expect("loader channel for task A")
+            .expect("task A's deletes must load");
+        let filter_b = loader
+            .load_deletes(&task_b.deletes, schema)
+            .await
+            .expect("loader channel for task B")
+            .expect("task B's deletes must load");
+
+        // Parse-once: after task A's load, the shared file's claim is terminally `Loaded`; task
+        // B's load can only have taken the `AlreadyLoaded`/`WaitFor` arm, never a second parse.
+        assert!(
+            matches!(
+                loader
+                    .delete_filter
+                    .try_start_pos_del_load(&shared)
+                    .expect("a loaded delete file must not error at claim time"),
+                PosDelLoadAction::AlreadyLoaded
+            ),
+            "the shared delete file must be parsed once and reused, not re-claimed per task"
+        );
+
+        let positions_a: Vec<u64> = filter_a
+            .get_delete_vector(&task_a)
+            .expect("the shared delete names a row of file A")
+            .lock()
+            .expect("task A delete vector mutex")
+            .iter()
+            .collect();
+        assert_eq!(
+            positions_a,
+            vec![0],
+            "task A must receive the shared delete's position for file A"
+        );
+
+        let positions_b: Vec<u64> = filter_b
+            .get_delete_vector(&task_b)
+            .expect("the shared delete names a row of file B")
+            .lock()
+            .expect("task B delete vector mutex")
+            .iter()
+            .collect();
+        assert_eq!(
+            positions_b,
+            vec![2],
+            "task B must receive the shared delete's position for file B — per-task scoping must \
+             not drop a file legitimately listed by two tasks"
+        );
+    }
+
     /// Risk pinned (the production shape of the positional-delete lost-wakeup class): a delete
     /// file whose load DIES after claiming it — here an unreadable file, the same shape as a
     /// corrupt one or a sibling task's error tearing the shared stream down — must not strand the
@@ -2802,10 +3014,10 @@ mod tests {
             .expect("load B must deliver a result")
             .expect("load B must succeed");
         let vector_a = filter_a
-            .get_delete_vector_for_path(&data_file)
+            .resolve_delete_vector(&tasks, &data_file)
             .expect("A must see the vector");
         let vector_b = filter_b
-            .get_delete_vector_for_path(&data_file)
+            .resolve_delete_vector(&tasks, &data_file)
             .expect("B must see the vector");
         assert!(
             Arc::ptr_eq(&vector_a, &vector_b),
@@ -2973,12 +3185,16 @@ mod tests {
         )
         .await;
 
-        // Publish exactly as the production loader does: vectors first, then the terminal state.
+        // Publish exactly as the production loader does: the contribution first, then the
+        // terminal state.
         let mut delete_vector = DeleteVector::default();
         delete_vector.insert(1);
         delete_vector.insert(3);
-        let mut filter = loader.delete_filter.clone();
-        filter.upsert_delete_vector(data_file.clone(), delete_vector);
+        let filter = loader.delete_filter.clone();
+        filter.install_pos_del_contribution(
+            &guard,
+            HashMap::from([(data_file.clone(), delete_vector)]),
+        );
         guard.publish_loaded();
 
         let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
@@ -2987,7 +3203,7 @@ mod tests {
             .expect("the waiting load must deliver a result")
             .expect("the waiting load must succeed");
         let vector = loaded
-            .get_delete_vector_for_path(&data_file)
+            .resolve_delete_vector(&tasks, &data_file)
             .expect("the waiter must see the published vector");
         assert_eq!(
             vector.lock().expect("delete vector mutex").len(),
@@ -3104,8 +3320,11 @@ mod tests {
         let mut delete_vector = DeleteVector::default();
         delete_vector.insert(1);
         delete_vector.insert(3);
-        let mut filter = loader.delete_filter.clone();
-        filter.upsert_delete_vector(data_file.clone(), delete_vector);
+        let filter = loader.delete_filter.clone();
+        filter.install_pos_del_contribution(
+            &guard,
+            HashMap::from([(data_file.clone(), delete_vector)]),
+        );
         guard.publish_loaded();
 
         let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
@@ -3114,7 +3333,7 @@ mod tests {
             .expect("the waiting load must deliver a result")
             .expect("the waiting load must succeed");
         let vector = loaded
-            .get_delete_vector_for_path(&data_file)
+            .resolve_delete_vector(&tasks, &data_file)
             .expect("the waiter must see the published positions");
         assert_eq!(
             vector.lock().expect("delete vector mutex").len(),

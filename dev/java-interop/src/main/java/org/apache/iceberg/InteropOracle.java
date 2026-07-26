@@ -321,7 +321,17 @@ public final class InteropOracle {
         // the `referenced_data_file` field, one via EQUAL `file_path` bounds) while being stamped
         // with a spec + partition that match NEITHER data file, plus a partition-scoped CONTROL that
         // must NOT apply. Java's own read = {10,30,40,60} is the ground truth.
-        FileScopedDeleteOracle.generate(requireFixturesDir("interop.file_scoped_deletes.dir"));
+        FileScopedDeleteOracle.generate(requireFixturesDir("interop.file_scoped_deletes.dir"), false);
+        break;
+      case "generate-interop-file-scoped-deletes-crosstask":
+        // The R117 CROSS-TASK variant of the fixture above: the CONTROL delete is stamped
+        // `category=b` (a partition that HOLDS a data file) instead of the empty `category=c`, so it
+        // attaches to file B's task while its rows name file A's position 2 (id 30). Java's per-task
+        // `DeleteFilter` (over `task.deletes()` only, filtered to the task's own file path) still
+        // reads {10,30,40,60}; a reader whose shared delete state leaks one task's parsed deletes
+        // into another task's file wrongly deletes id 30.
+        FileScopedDeleteOracle.generate(
+            requireFixturesDir("interop.file_scoped_deletes_crosstask.dir"), true);
         break;
       case "generate-interop-nonidentity-scan":
         // NON-IDENTITY TRANSFORM merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes". A
@@ -21868,19 +21878,22 @@ public final class InteropOracle {
      *       it. That is the pin that stops "route every position delete by path" from passing.
      * </ul>
      *
-     * <p>The control deliberately sits in an EMPTY partition rather than in {@code category=b}: a
-     * partition-scoped delete that names file A while being attached to file B's task trips a
-     * SEPARATE, pre-existing defect in the Rust reader (its per-scan {@code DeleteFilter} caches
-     * parsed positional deletes keyed by the DATA file path they name, so a delete file loaded for
-     * one task contributes deletions to another task's file). That defect is reported as a residue of
-     * the WG4b group; entangling it here would leave this fixture unable to prove the routing claim
-     * it exists for.
+     * <p>With {@code controlInPartitionB = false} the control sits in the EMPTY {@code category=c}:
+     * that keeps the ROUTING fixture pure (it proves the path-keyed lookup without touching any
+     * other machinery). With {@code controlInPartitionB = true} — the R117 CROSS-TASK variant — the
+     * control is stamped {@code category=b} instead, so it attaches to file B's task while its rows
+     * name file A's position 2. Java's per-task {@code DeleteFilter} still never applies it (it is
+     * built over {@code task.deletes()} only and filters the rows to the task's OWN file path), so
+     * Java's read is {10,30,40,60} in BOTH variants; a reader whose shared per-scan delete state
+     * leaks one task's parsed deletes into another task's file wrongly deletes id 30. The variant
+     * was originally kept out of the routing fixture exactly because it trips that (then-unfixed)
+     * reader defect; it now exists as its own fixture to pin the fix end-to-end.
      *
      * Live merge-on-read rows = {10, 30, 40, 60}. The generator asserts Java's OWN read equals that
      * set and that each delete file really has the shape its leg requires, so a fixture that silently
      * stopped exercising the routing fails HERE instead of passing vacuously downstream.
      */
-    static void generate(Path dir) throws IOException {
+    static void generate(Path dir, boolean controlInPartitionB) throws IOException {
       Files.createDirectories(dir);
       File tableDir = dir.resolve("table").toFile();
       File metadataDir = new File(tableDir, "metadata");
@@ -21984,7 +21997,9 @@ public final class InteropOracle {
           writeUnpartitionedPosDelete(
               table, schema, unpartitioned, boundsDeletePath, dataFileB.location(), 1L);
 
-      // --- CONTROL: neither leg; stamped partition category=c (EMPTY), names A's position 2 ------
+      // --- CONTROL: neither leg; names A's position 2. Stamped partition category=c (EMPTY) in the
+      // routing fixture, or category=b (file B's partition — the R117 cross-task variant, attaching
+      // it to B's task while its rows name file A) when controlInPartitionB is set. ---------------
       String controlDeletePath = new File(dataDir, "00000-control-deletes.parquet").getAbsolutePath();
       DeleteFile rawControlDelete =
           writeUnpartitionedPosDelete(
@@ -21996,7 +22011,7 @@ public final class InteropOracle {
               .withPath(rawControlDelete.location())
               .withFileSizeInBytes(rawControlDelete.fileSizeInBytes())
               .withRecordCount(rawControlDelete.recordCount())
-              .withPartition(partitionC)
+              .withPartition(controlInPartitionB ? partitionB : partitionC)
               .build();
 
       assertShapes(fieldLegDelete, boundsLegDelete, controlDelete, dataFileA, dataFileB);
