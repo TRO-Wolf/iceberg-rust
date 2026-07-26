@@ -17,11 +17,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, StructArray, make_array};
-use arrow_buffer::NullBuffer;
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use crate::arrow::null_propagation::array_with_parent_validity;
 use crate::arrow::schema::schema_to_arrow_schema;
 use crate::error::Result;
 use crate::spec::Schema as IcebergSchema;
@@ -201,7 +201,6 @@ impl RecordBatchProjector {
                 .with_context("batch_columns", batch.len().to_string())
             })?
             .clone();
-        let mut null_buffer = array.logical_nulls();
         for idx in rev_iterator {
             let struct_array = array
                 .as_any()
@@ -210,7 +209,7 @@ impl RecordBatchProjector {
                     ErrorKind::Unexpected,
                     "Cannot convert Array to StructArray",
                 ))?;
-            array = struct_array
+            let child = struct_array
                 .columns()
                 .get(*idx)
                 .ok_or_else(|| {
@@ -222,11 +221,11 @@ impl RecordBatchProjector {
                     .with_context("struct_children", struct_array.num_columns().to_string())
                 })?
                 .clone();
-            null_buffer = NullBuffer::union(null_buffer.as_ref(), array.logical_nulls().as_ref());
+            // Detaching a child from its parent loses the parent's NULLs unless they are unioned
+            // in — the shared walk in `crate::arrow::null_propagation` owns that step.
+            array = array_with_parent_validity(&child, array.logical_nulls().as_ref())?;
         }
-        Ok(make_array(
-            array.to_data().into_builder().nulls(null_buffer).build()?,
-        ))
+        Ok(array)
     }
 }
 
@@ -234,7 +233,7 @@ impl RecordBatchProjector {
 mod test {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields, Schema};
 
     use crate::arrow::record_batch_projector::RecordBatchProjector;
@@ -302,6 +301,71 @@ mod test {
 
         assert_eq!(projected_int_array.values(), &[1, 2, 3]);
         assert_eq!(projected_inner_int_array.values(), &[4, 5, 6]);
+    }
+
+    /// Projecting a field OUT of a nullable struct detaches it from the parent that made it
+    /// unreachable, so the parent's validity must be unioned in. Arrow does not require a null
+    /// struct slot to mask its children — here every inner value is physically live while the
+    /// parent is NULL at row 1, so without the union the projection would hand back a live `5`
+    /// for a logically-NULL row. (Pre-existing behavior; pinned here because the walk moved to
+    /// the shared `null_propagation` helper and the other nested test has no nulls at all.)
+    #[test]
+    fn test_record_batch_projector_nested_null_parent_masks_child() {
+        let inner_fields = vec![
+            Field::new("inner_field1", DataType::Int32, true),
+            Field::new("inner_field2", DataType::Utf8, true),
+        ];
+        let fields = vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new(
+                "field2",
+                DataType::Struct(Fields::from(inner_fields.clone())),
+                true,
+            ),
+        ];
+        let schema = Arc::new(Schema::new(fields));
+
+        let field_id_fetch_func = |field: &Field| match field.name().as_str() {
+            "field1" => Ok(Some(1)),
+            "field2" => Ok(Some(2)),
+            "inner_field1" => Ok(Some(3)),
+            "inner_field2" => Ok(Some(4)),
+            _ => Err(Error::new(ErrorKind::Unexpected, "Field id not found")),
+        };
+        let projector =
+            RecordBatchProjector::new(schema.clone(), &[3], field_id_fetch_func, |_| true)
+                .expect("projector");
+
+        let int_array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        // Every inner value is live; only the PARENT is null at row 1.
+        let inner_int_array = Arc::new(Int32Array::from(vec![4, 5, 6])) as ArrayRef;
+        let inner_string_array = Arc::new(StringArray::from(vec!["x", "y", "z"])) as ArrayRef;
+        let struct_array = Arc::new(
+            StructArray::try_new(
+                Fields::from(inner_fields),
+                vec![inner_int_array, inner_string_array],
+                Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+            )
+            .expect("struct array"),
+        ) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![int_array, struct_array]).expect("batch");
+
+        let projected_batch = projector.project_batch(batch).expect("project");
+        let projected = projected_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("projected inner int array");
+
+        assert_eq!(projected.len(), 3);
+        assert!(projected.is_valid(0), "row 0 parent is live");
+        assert!(
+            projected.is_null(1),
+            "row 1 parent is NULL, so the projected child must be NULL — not a live 5"
+        );
+        assert!(projected.is_valid(2), "row 2 parent is live");
+        assert_eq!(projected.value(0), 4);
+        assert_eq!(projected.value(2), 6);
     }
 
     #[test]

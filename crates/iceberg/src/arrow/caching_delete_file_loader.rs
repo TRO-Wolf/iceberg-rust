@@ -23,9 +23,10 @@ use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
-use super::delete_filter::{DeleteFilter, PosDelLoadAction};
+use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
+use crate::arrow::null_propagation::propagate_struct_validity;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
@@ -52,17 +53,23 @@ pub(crate) struct CachingDeleteFileLoader {
 enum DeleteFileContext {
     ExistingEqDel,
     ExistingPosDel,
+    /// A positional delete file THIS task claimed. `guard` is that claim: it publishes the file's
+    /// terminal load state and wakes the waiters, on the success path via `publish_loaded` and on
+    /// every failure path (an early `?`, a sibling task's error tearing the stream down, an
+    /// unwind, a runtime shutdown) via its `Drop`. It travels with the context so the claim can
+    /// never outlive the task that made it.
     PosDels {
+        guard: PosDelLoadGuard,
         file_path: String,
         stream: ArrowRecordBatchStream,
     },
-    /// A freshly loaded + decoded Puffin deletion vector. `cache_key` is the loader's
+    /// A freshly loaded + decoded Puffin deletion vector. The load was claimed under the loader's
     /// dedup/notify key (`{puffin path}@{blob offset}` — one Puffin file holds many DV blobs, so
-    /// the bare file path would wrongly mark every later blob "already loaded");
-    /// `referenced_data_file` is the data file the vector applies to and the key it is installed
-    /// under in the [`DeleteFilter`].
+    /// the bare file path would wrongly mark every later blob "already loaded"), which `guard`
+    /// carries; `referenced_data_file` is the data file the vector applies to and the key it is
+    /// installed under in the [`DeleteFilter`].
     FreshDeletionVector {
-        cache_key: String,
+        guard: PosDelLoadGuard,
         referenced_data_file: String,
         delete_vector: DeleteVector,
     },
@@ -77,14 +84,13 @@ enum DeleteFileContext {
 // results are fully merged into the DeleteFileManager's state
 enum ParsedDeleteFileContext {
     DelVecs {
-        file_path: String,
+        guard: PosDelLoadGuard,
         results: HashMap<String, DeleteVector>,
     },
     EqDel,
     ExistingPosDel,
 }
 
-#[allow(unused_variables)]
 impl CachingDeleteFileLoader {
     pub(crate) fn new(file_io: FileIO, concurrency_limit_data_files: usize) -> Self {
         CachingDeleteFileLoader {
@@ -193,14 +199,7 @@ impl CachingDeleteFileLoader {
 
         let stream_items = delete_file_entries
             .iter()
-            .map(|t| {
-                (
-                    t.clone(),
-                    self.basic_delete_file_loader.clone(),
-                    self.delete_filter.clone(),
-                    schema.clone(),
-                )
-            })
+            .map(|t| (t.clone(), self.delete_filter.clone(), schema.clone()))
             .collect::<Vec<_>>();
         let task_stream = futures::stream::iter(stream_items);
 
@@ -213,7 +212,7 @@ impl CachingDeleteFileLoader {
                 let basic_delete_file_loader = basic_delete_file_loader.clone();
 
                 let mut results_stream = task_stream
-                    .map(move |(task, file_io, del_filter, schema)| {
+                    .map(move |(task, del_filter, schema)| {
                         let basic_delete_file_loader = basic_delete_file_loader.clone();
                         async move {
                             Self::load_file_for_task(
@@ -232,12 +231,15 @@ impl CachingDeleteFileLoader {
 
                 while let Some(item) = results_stream.next().await {
                     let item = item?;
-                    if let ParsedDeleteFileContext::DelVecs { file_path, results } = item {
+                    if let ParsedDeleteFileContext::DelVecs { guard, results } = item {
                         for (data_file_path, delete_vector) in results.into_iter() {
                             del_filter.upsert_delete_vector(data_file_path, delete_vector);
                         }
-                        // Mark the positional delete file as fully loaded so waiters can proceed
-                        del_filter.finish_pos_del_load(&file_path);
+                        // Mark the positional delete file as fully loaded so waiters can proceed.
+                        // AFTER the upserts, and in the same await-free block: a woken waiter reads
+                        // the vectors synchronously, so publishing first (or being cancelled in
+                        // between) would hand it an empty or partial result.
+                        guard.publish_loaded();
                     }
                 }
 
@@ -267,31 +269,43 @@ impl CachingDeleteFileLoader {
             }
 
             DataContentType::PositionDeletes => {
-                match del_filter.try_start_pos_del_load(&task.file_path) {
+                match del_filter.try_start_pos_del_load(&task.file_path)? {
                     PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
-                    PosDelLoadAction::WaitFor(notify) => {
+                    PosDelLoadAction::WaitFor(notified) => {
                         // Positional deletes are accessed synchronously by ArrowReader.
                         // We must wait here to ensure the data is ready before returning,
-                        // otherwise ArrowReader might get an empty/partial result.
-                        notify.notified().await;
+                        // otherwise ArrowReader might get an empty/partial result. A loader that
+                        // died without publishing surfaces as a typed error here, never a hang.
+                        del_filter
+                            .wait_for_pos_del_load(&task.file_path, notified)
+                            .await?;
                         Ok(DeleteFileContext::ExistingPosDel)
                     }
-                    PosDelLoadAction::Load => Ok(DeleteFileContext::PosDels {
-                        file_path: task.file_path.clone(),
-                        stream: basic_delete_file_loader
+                    PosDelLoadAction::Load(mut guard) => {
+                        // `guard` is a local: an `Err` from the stream open below returns early and
+                        // drops it, publishing the terminal failed state to every waiter.
+                        // `note_failure` hands that error to the guard first, so the waiters'
+                        // typed error names the cause and not just the file.
+                        let stream = basic_delete_file_loader
                             .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
-                            .await?,
-                    }),
+                            .await
+                            .map_err(|error| guard.note_failure(error))?;
+                        Ok(DeleteFileContext::PosDels {
+                            guard,
+                            file_path: task.file_path.clone(),
+                            stream,
+                        })
+                    }
                 }
             }
 
             DataContentType::EqualityDeletes => {
-                let Some(notify) = del_filter.try_start_eq_del_load(&task.file_path) else {
+                let Some(guard) = del_filter.try_start_eq_del_load(&task.file_path) else {
                     return Ok(DeleteFileContext::ExistingEqDel);
                 };
 
                 let (sender, receiver) = channel();
-                del_filter.insert_equality_delete(&task.file_path, receiver);
+                guard.spawn_publisher(receiver);
 
                 // Per the Iceberg spec, evolve schema for equality deletes but only for the
                 // equality_ids columns, not all table columns.
@@ -302,7 +316,7 @@ impl CachingDeleteFileLoader {
                 // — Java's `DeleteLoader` likewise throws on malformed delete metadata instead of
                 // crashing. The early return drops `sender`; the eq-delete receiver task turns that
                 // dropped sender into a terminal `EqDelState::Failed` (see
-                // `DeleteFilter::insert_equality_delete`), so no waiter is left stranded.
+                // `EqDelLoadGuard::spawn_publisher`), so no waiter is left stranded.
                 let Some(equality_ids_vec) = task.equality_ids.clone() else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
@@ -354,19 +368,27 @@ impl CachingDeleteFileLoader {
             Self::validate_deletion_vector_task(task)?;
 
         let cache_key = format!("{}@{content_offset}", task.file_path);
-        match del_filter.try_start_pos_del_load(&cache_key) {
+        match del_filter.try_start_pos_del_load(&cache_key)? {
             PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
-            PosDelLoadAction::WaitFor(notify) => {
+            PosDelLoadAction::WaitFor(notified) => {
                 // Like parquet positional deletes, the decoded vector must be fully available
-                // before ArrowReader proceeds (retrieval is synchronous).
-                notify.notified().await;
+                // before ArrowReader proceeds (retrieval is synchronous). A loader that died
+                // without publishing surfaces as a typed error here, never a hang.
+                del_filter
+                    .wait_for_pos_del_load(&cache_key, notified)
+                    .await?;
                 Ok(DeleteFileContext::ExistingPosDel)
             }
-            PosDelLoadAction::Load => {
+            // `guard` is a local: every `?` below returns early and drops it, publishing the
+            // terminal failed state to every waiter on this blob — carrying the cause, which each
+            // failure path hands over with `note_failure` before propagating it.
+            PosDelLoadAction::Load(mut guard) => {
                 let blob = basic_delete_file_loader
                     .read_bytes_range(&task.file_path, content_offset, content_size_in_bytes)
-                    .await?;
-                let delete_vector = DeleteVector::deserialize_deletion_vector_v1(&blob)?;
+                    .await
+                    .map_err(|error| guard.note_failure(error))?;
+                let delete_vector = DeleteVector::deserialize_deletion_vector_v1(&blob)
+                    .map_err(|error| guard.note_failure(error))?;
 
                 // Java validates the decoded cardinality against the DeleteFile's recordCount
                 // (`deserializeBitmap`: "Invalid cardinality: %s, expected %s") — a mismatch
@@ -374,7 +396,7 @@ impl CachingDeleteFileLoader {
                 if let Some(expected_cardinality) = task.record_count
                     && delete_vector.len() != expected_cardinality
                 {
-                    return Err(Error::new(
+                    return Err(guard.note_failure(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
                             "Invalid deletion vector cardinality for '{}': decoded {} positions, \
@@ -382,11 +404,11 @@ impl CachingDeleteFileLoader {
                             task.file_path,
                             delete_vector.len(),
                         ),
-                    ));
+                    )));
                 }
 
                 Ok(DeleteFileContext::FreshDeletionVector {
-                    cache_key,
+                    guard,
                     referenced_data_file,
                     delete_vector,
                 })
@@ -453,11 +475,19 @@ impl CachingDeleteFileLoader {
         match ctx {
             DeleteFileContext::ExistingEqDel => Ok(ParsedDeleteFileContext::EqDel),
             DeleteFileContext::ExistingPosDel => Ok(ParsedDeleteFileContext::ExistingPosDel),
-            DeleteFileContext::PosDels { file_path, stream } => {
+            // `guard` is a local: a parse error returns early and drops it, publishing the terminal
+            // failed state — with the parse error as its cause — to every waiter on this file.
+            DeleteFileContext::PosDels {
+                mut guard,
+                file_path,
+                stream,
+            } => {
                 let del_vecs =
-                    Self::parse_positional_deletes_record_batch_stream(&file_path, stream).await?;
+                    Self::parse_positional_deletes_record_batch_stream(&file_path, stream)
+                        .await
+                        .map_err(|error| guard.note_failure(error))?;
                 Ok(ParsedDeleteFileContext::DelVecs {
-                    file_path,
+                    guard,
                     results: del_vecs,
                 })
             }
@@ -465,14 +495,14 @@ impl CachingDeleteFileLoader {
             // DV's referenced_data_file) — NOT under the Puffin file's own path: the DeleteFilter
             // hands a scan task its delete vector by data-file-path lookup, so keying by the
             // Puffin path would orphan the vector and silently resurrect every deleted row.
-            // `file_path` carries the loader's `{path}@{offset}` cache key so the notify
-            // machinery marks the right blob loaded.
+            // `guard` carries the loader's `{path}@{offset}` cache key so the notify machinery
+            // marks the right blob loaded.
             DeleteFileContext::FreshDeletionVector {
-                cache_key,
+                guard,
                 referenced_data_file,
                 delete_vector,
             } => Ok(ParsedDeleteFileContext::DelVecs {
-                file_path: cache_key,
+                guard,
                 results: HashMap::from([(referenced_data_file, delete_vector)]),
             }),
             DeleteFileContext::FreshEqDel {
@@ -541,16 +571,31 @@ impl CachingDeleteFileLoader {
 
         while let Some(batch) = stream.next().await {
             let batch = batch?;
-            let schema = batch.schema();
             let columns = batch.columns();
 
-            let Some(file_paths) = columns[0].as_any().downcast_ref::<StringArray>() else {
+            // This reader takes the two spec-required columns POSITIONALLY (`file_path` then
+            // `pos` — Java `MetadataColumns.DELETE_FILE_PATH` / `DELETE_FILE_POS`). A delete
+            // file is untrusted input read from object storage, so a batch with fewer than two
+            // columns must fail closed with a typed error naming the file: indexing it would
+            // abort the scan task's process, and a `panic` is not a diagnosis.
+            let [file_paths, positions, ..] = columns else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Invalid position delete file '{delete_file_path}': expected at least 2 \
+                         columns (file_path, pos), found {}",
+                        columns.len()
+                    ),
+                ));
+            };
+
+            let Some(file_paths) = file_paths.as_any().downcast_ref::<StringArray>() else {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Could not downcast file paths array to StringArray",
                 ));
             };
-            let Some(positions) = columns[1].as_any().downcast_ref::<Int64Array>() else {
+            let Some(positions) = positions.as_any().downcast_ref::<Int64Array>() else {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Could not downcast positions array to Int64Array",
@@ -680,7 +725,14 @@ impl CachingDeleteFileLoader {
                 }
             };
 
-            let root_array: ArrayRef = Arc::new(StructArray::from(record_batch));
+            // Push every struct's validity down into its fields BEFORE the visit: the processor
+            // below collects each key column as a STANDALONE array, so a key nested under a NULL
+            // struct would otherwise decode to whatever bytes happen to sit in the child buffer
+            // (Arrow does not require a null struct to mask its children) and produce
+            // `= <stale value>` instead of `IS NULL`.
+            let root_array: ArrayRef = propagate_struct_validity(
+                &(Arc::new(StructArray::from(record_batch)) as ArrayRef),
+            )?;
 
             let mut processor = EqDelColumnProcessor::new(&equality_ids);
             visit_schema_with_partner(schema, &root_array, &mut processor, &accessor)?;
@@ -761,6 +813,12 @@ impl CachingDeleteFileLoader {
 struct EqDelColumnProcessor<'a> {
     equality_ids: &'a HashSet<i32>,
     collected_columns: Vec<(ArrayRef, i32, String, Type)>,
+    /// The names of the struct fields currently being descended through, outermost first. A
+    /// collected key's [`Reference`] name must be the FULL dotted path (`outer.inner`) because
+    /// that is what `Schema::name_to_id` indexes and therefore the only form
+    /// [`crate::expr::Bind`] can resolve — a leaf-only name either fails to bind or, when a
+    /// top-level column shares the leaf name, binds to the wrong column.
+    field_path: Vec<String>,
 }
 
 impl<'a> EqDelColumnProcessor<'a> {
@@ -768,6 +826,16 @@ impl<'a> EqDelColumnProcessor<'a> {
         Self {
             equality_ids,
             collected_columns: Vec::with_capacity(equality_ids.len()),
+            field_path: Vec::new(),
+        }
+    }
+
+    /// The full dotted name of `field` given the struct path currently being descended.
+    fn full_field_name(&self, field: &NestedFieldRef) -> String {
+        if self.field_path.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{}.{}", self.field_path.join("."), field.name)
         }
     }
 
@@ -823,12 +891,31 @@ impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
         Ok(())
     }
 
+    /// `before_struct_field` / `after_struct_field` bracket the visit of ONE struct field, so
+    /// pushing here and popping there leaves [`Self::field_path`] holding exactly the ANCESTORS of
+    /// the field `field()` is called with (the visitor calls `after_struct_field` before `field`).
+    fn before_struct_field(&mut self, field: &NestedFieldRef, _partner: &ArrayRef) -> Result<()> {
+        self.field_path.push(field.name.clone());
+        Ok(())
+    }
+
+    fn after_struct_field(&mut self, field: &NestedFieldRef, _partner: &ArrayRef) -> Result<()> {
+        self.field_path.pop().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Unbalanced struct-field walk while collecting equality-delete key columns",
+            )
+            .with_context("field_name", &field.name)
+        })?;
+        Ok(())
+    }
+
     fn field(&mut self, field: &NestedFieldRef, partner: &ArrayRef, _value: ()) -> Result<()> {
         if self.equality_ids.contains(&field.id) && field.field_type.as_primitive_type().is_some() {
             self.collected_columns.push((
                 partner.clone(),
                 field.id,
-                field.name.clone(),
+                self.full_field_name(field),
                 field.field_type.as_ref().clone(),
             ));
         }
@@ -935,6 +1022,7 @@ mod tests {
 
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
+    use crate::expr::Bind;
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{DataContentType, Schema};
 
@@ -965,9 +1053,110 @@ mod tests {
         .expect("error parsing batch stream");
         println!("{parsed_eq_delete}");
 
-        let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (sa != 5)) OR (b IS NOT NULL))".to_string();
+        // `sa` (field id 6) lives inside the struct column `s` (field id 5), so its reference is
+        // `s.sa` — the form `Schema::name_to_id` indexes and the only one `Bind` can resolve. This
+        // expectation previously read a leaf-only `sa`, which is unbindable (WG5 (b)).
+        let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (s.sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (s.sa != 5)) OR (b IS NOT NULL))".to_string();
 
         assert_eq!(parsed_eq_delete.to_string(), expected);
+    }
+
+    /// Build an in-memory equality-delete batch whose key column is NESTED:
+    /// `struct<1: id required int, 2: nested optional struct<3: k optional int>>`, with
+    /// `nested` NULL on row 0 while the `k` slot underneath still holds a live `7` (Arrow does not
+    /// require a null struct to mask its children). Row 1 is fully live with `k = 9`.
+    fn nested_key_equality_delete_batch() -> RecordBatch {
+        let k_field = Arc::new(simple_field("k", DataType::Int32, true, "3"));
+        let k_values = Arc::new(Int32Array::from(vec![Some(7), Some(9)])) as ArrayRef;
+        let nested = StructArray::try_new(
+            Fields::from(vec![k_field]),
+            vec![k_values],
+            Some(arrow_buffer::NullBuffer::from(vec![false, true])),
+        )
+        .expect("nested struct array");
+        let nested_field = simple_field("nested", nested.data_type().clone(), true, "2");
+        let id_field = simple_field("id", DataType::Int32, false, "1");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![id_field, nested_field]));
+        RecordBatch::try_new(schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(nested) as ArrayRef,
+        ])
+        .expect("nested-key equality delete batch")
+    }
+
+    /// The iceberg table schema `nested_key_equality_delete_batch` is a delete against.
+    fn nested_key_table_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "nested",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "k", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("nested key table schema")
+    }
+
+    /// WG5 (b): a nested equality-delete key must decode as the value the ROW logically holds.
+    /// Row 0's `nested` struct is NULL, so its key is NULL — Java's delete set compares
+    /// `StructLike`s, where a null parent yields a null key and matches only other NULLs. Handing
+    /// the `k` child back detached from its parent turns that into an equality against the stale
+    /// `7` that happens to sit in the child buffer: the delete then removes rows that hold 7 and
+    /// misses the rows it was written for. It also pins the reference NAME: `Schema::name_to_id`
+    /// indexes nested fields by their FULL dotted path, so a leaf-only `k` cannot bind.
+    #[tokio::test]
+    async fn test_nested_equality_delete_key_uses_parent_validity_and_full_name() {
+        use futures::stream;
+
+        let batch = nested_key_equality_delete_batch();
+        let stream: ArrowRecordBatchStream = stream::iter(vec![Ok(batch)]).boxed();
+
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![3]),
+        )
+        .await
+        .expect("nested-key equality deletes must parse");
+
+        assert_eq!(
+            predicate.to_string(),
+            "(nested.k IS NOT NULL) AND (nested.k != 9)",
+            "row 0's key is NULL (its parent struct is NULL), and the reference must be the full \
+             dotted path"
+        );
+    }
+
+    /// The consequence of the name half of the test above: the parsed predicate is bound against
+    /// the TABLE schema at `DeleteFilter::build_equality_delete_predicate`. A leaf-only reference
+    /// either fails to bind outright or — when a top-level column shares the leaf name — binds to
+    /// the WRONG column and deletes silently wrong rows.
+    #[tokio::test]
+    async fn test_nested_equality_delete_predicate_binds_to_table_schema() {
+        use futures::stream;
+
+        let batch = nested_key_equality_delete_batch();
+        let stream: ArrowRecordBatchStream = stream::iter(vec![Ok(batch)]).boxed();
+
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter(vec![3]),
+        )
+        .await
+        .expect("nested-key equality deletes must parse");
+
+        let bound = predicate
+            .bind(Arc::new(nested_key_table_schema()), true)
+            .expect("the nested-key predicate must bind against the table schema");
+        assert!(
+            bound.to_string().contains("nested.k"),
+            "bound predicate must reference the nested column: {bound}"
+        );
     }
 
     /// Risk pinned (audit BUG-004): an equality-delete task with `equality_ids: None` — corrupt or
@@ -1283,6 +1472,104 @@ mod tests {
             error.to_string().contains("null position"),
             "error must name the null position column: {error}"
         );
+    }
+
+    /// Risk pinned: a position-delete batch with FEWER than the two columns this reader takes
+    /// positionally fails closed with a typed error naming the delete file, instead of
+    /// panicking on `columns[0]` / `columns[1]`.
+    ///
+    /// Both arities are exercised separately because they are two distinct unchecked indexes:
+    /// a one-column batch only reaches `columns[1]`, and a zero-column batch only reaches
+    /// `columns[0]`. A delete file is untrusted input read from object storage, and this parse
+    /// runs inside a long-running engine's scan task, where an index panic aborts the process.
+    #[tokio::test]
+    async fn test_short_column_arity_yields_typed_error_not_panic() {
+        use arrow_array::RecordBatchOptions;
+        use futures::stream;
+
+        // One column: `columns[1]` is the out-of-bounds index.
+        let one_col_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "file_path",
+            DataType::Utf8,
+            false,
+        )]));
+        let one_col = RecordBatch::try_new(one_col_schema, vec![Arc::new(StringArray::from(vec![
+            "data-1.parquet",
+        ])) as ArrayRef])
+        .expect("build one-column batch");
+
+        // Zero columns: `columns[0]` is the out-of-bounds index. A row count is required
+        // because it cannot be inferred without columns.
+        let no_col = RecordBatch::try_new_with_options(
+            Arc::new(arrow_schema::Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(1)),
+        )
+        .expect("build zero-column batch");
+
+        for (batch, arity) in [(one_col, 1usize), (no_col, 0usize)] {
+            let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
+            let error = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+                "truncated-pos-dels.parquet",
+                stream,
+            )
+            .await
+            .expect_err("a short column arity must fail closed with a typed error");
+
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            assert!(
+                error.to_string().contains("truncated-pos-dels.parquet"),
+                "error must name the delete file (arity {arity}): {error}"
+            );
+            assert!(
+                error.to_string().contains("column"),
+                "error must say the column arity is wrong (arity {arity}): {error}"
+            );
+        }
+    }
+
+    /// Over-firing CONTROL for the arity guard: a position-delete batch with MORE than two
+    /// columns must still parse from the first two.
+    ///
+    /// This is not hypothetical. The spec's position-delete schema has an optional third
+    /// column, `row` (Java `MetadataColumns.DELETE_FILE_ROW_FIELD_NAME`), which Java writes
+    /// whenever the writer is configured to keep the deleted row, and `parquet_to_batch_stream`
+    /// applies NO projection — every column in the file reaches this parse. A guard demanding
+    /// exactly two columns would reject those Java-written files, so the `..` in the arity
+    /// pattern is load-bearing and this test is what holds it.
+    #[tokio::test]
+    async fn test_position_delete_batch_with_a_trailing_row_column_still_parses() {
+        use futures::stream;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+            Field::new("row", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(vec!["data-1.parquet", "data-1.parquet"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![3i64, 9i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("deleted-a"),
+                Some("deleted-b"),
+            ])) as ArrayRef,
+        ])
+        .expect("build three-column position delete batch");
+        let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
+
+        let result = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+            "pos-dels-with-row.parquet",
+            stream,
+        )
+        .await
+        .expect("a delete file carrying the optional `row` column must still parse");
+
+        let deletes = result
+            .get("data-1.parquet")
+            .expect("the data file must be present in the parsed deletes");
+        assert!(deletes.contains(3), "position 3 must be deleted");
+        assert!(deletes.contains(9), "position 9 must be deleted");
+        assert!(!deletes.contains(4), "position 4 must NOT be deleted");
     }
 
     /// Risk pinned: a NULL file_path row fails closed with a typed error naming the delete
@@ -1687,10 +1974,15 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Verify both delete types can be processed together
-        let result = delete_filter
-            .build_equality_delete_predicate(&file_scan_task)
-            .await;
+        // Verify both delete types can be processed together. BOUNDED: this call can reach the
+        // eq-delete wait path (the publisher runs on its own task), so a lost-wakeup regression
+        // would hang the test binary forever instead of failing it.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            delete_filter.build_equality_delete_predicate(&file_scan_task),
+        )
+        .await
+        .expect("build_equality_delete_predicate must not hang");
         assert!(
             result.is_ok(),
             "Failed to build equality delete predicate: {:?}",
@@ -2336,5 +2628,555 @@ mod tests {
         // Verify that the delete vectors point to the same memory location,
         // confirming that the second load reused the result from the first.
         assert!(Arc::ptr_eq(&dv1, &dv2));
+    }
+
+    /// Risk pinned (the production shape of the positional-delete lost-wakeup class): a delete
+    /// file whose load DIES after claiming it — here an unreadable file, the same shape as a
+    /// corrupt one or a sibling task's error tearing the shared stream down — must not strand the
+    /// NEXT `load_deletes` call on the same (result-caching) loader. Before the loading guard
+    /// existed, the failed claim stayed `Loading` forever and the second call parked on a notifier
+    /// that could never fire: the scan hung with no error, no timeout and no log line.
+    ///
+    /// MUTATION: disarming the guard before it drops (no `Failed` publish) makes the second load
+    /// hang and the timeout below fires (RED — verified on the pre-fix tree: `Elapsed(())`).
+    #[tokio::test]
+    async fn test_failed_pos_del_load_does_not_strand_the_next_load() {
+        let tmp_dir = TempDir::new().unwrap();
+        let missing = format!("{}/missing-pos-del.parquet", tmp_dir.path().display());
+        let file_io = FileIO::new_with_fs();
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let schema = Arc::new(Schema::builder().build().unwrap());
+        let tasks = [FileScanTaskDeleteFile {
+            file_path: missing.clone(),
+            file_size_in_bytes: 1,
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        }];
+
+        let first = loader
+            .load_deletes(&tasks, schema.clone())
+            .await
+            .expect("the first load must deliver a result")
+            .expect_err("an unreadable positional delete file must error");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            loader.load_deletes(&tasks, schema),
+        )
+        .await
+        .expect("a load after a failed load must not hang")
+        .expect("the second load must deliver a result");
+
+        let error = second.expect_err(
+            "the file whose load died must error again, never silently resolve with no deletes",
+        );
+        assert!(
+            error.to_string().contains(&missing),
+            "the error must name the delete file, got: {error}"
+        );
+        // The claiming task's own error is recorded into the terminal state, so this later caller
+        // learns WHY the load died and not just THAT it did (`PosDelLoadGuard::note_failure` on the
+        // delete-file open path).
+        assert!(
+            error.to_string().contains(&first.to_string()),
+            "the later caller's error must carry the original cause '{first}', got: {error}"
+        );
+    }
+
+    /// Risk pinned (the DELETION-VECTOR half of the same class — the second production call site
+    /// the guard machinery rewrote): a DV blob whose load DIES after claiming it — here an
+    /// unreadable Puffin file, the same shape as a corrupt blob or a sibling task's error tearing
+    /// the shared stream down — must publish the terminal `PosDelState::Failed` under the
+    /// `{puffin path}@{offset}` claim key, so the NEXT `load_deletes` on the same (result-caching)
+    /// loader errors instead of parking on a notifier that can never fire.
+    ///
+    /// Keyed-claim coverage matters here specifically: the DV path claims under a COMPOSITE key,
+    /// so a guard that published under the bare file path would leave the real entry `Loading`.
+    ///
+    /// MUTATION: leaking the claim on the DV read-failure path (`std::mem::forget(guard)` in place
+    /// of the `?`) makes the second load hang and the timeout below fires (RED — `Elapsed(())`);
+    /// every other test in the crate stays green. Disarming `PosDelLoadGuard::drop` REDs it the
+    /// same way.
+    #[tokio::test]
+    async fn test_failed_dv_load_does_not_strand_the_next_load() {
+        let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
+        let missing_puffin = format!("{}/missing.puffin", tmp_dir.path().display());
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let file_io = FileIO::new_with_fs();
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+        let tasks = [FileScanTaskDeleteFile {
+            file_path: missing_puffin.clone(),
+            file_size_in_bytes: 64,
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Puffin,
+            referenced_data_file: Some(data_file),
+            content_offset: Some(4),
+            content_size_in_bytes: Some(16),
+            record_count: Some(2),
+        }];
+
+        let first = loader
+            .load_deletes(&tasks, schema.clone())
+            .await
+            .expect("the first DV load must deliver a result")
+            .expect_err("an unreadable Puffin DV must error");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            loader.load_deletes(&tasks, schema),
+        )
+        .await
+        .expect("a DV load after a failed DV load must not hang")
+        .expect("the second DV load must deliver a result");
+
+        let error =
+            second.expect_err("a terminally failed DV must error, never resolve with no deletes");
+        assert!(
+            error.to_string().contains(&missing_puffin),
+            "the error must name the Puffin file, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("@4"),
+            "the error must name the blob claim key, got: {error}"
+        );
+        // As on the parquet path: the blob-read error is recorded into the terminal state
+        // (`PosDelLoadGuard::note_failure`), so the later caller sees the cause.
+        assert!(
+            error.to_string().contains(&first.to_string()),
+            "the later caller's error must carry the original cause '{first}', got: {error}"
+        );
+    }
+
+    /// Risk pinned: the DV `WaitFor` arm must consult the SAME `{puffin path}@{offset}` key it
+    /// claimed under. Two concurrent `load_deletes` calls for one DV drive the real production
+    /// wait path (`DeleteFilter::wait_for_pos_del_load`, reached from
+    /// `load_deletion_vector_for_task`); one of them waits, and both must end on the one shared
+    /// vector rather than a spurious error.
+    ///
+    /// Scope: because both loads are read AFTER they have joined, this test cannot see WHEN the
+    /// waiter returned — a waiter that returned too early would still read the by-then-published
+    /// vector here. That ordering property has its own pin
+    /// (`test_dv_waiter_does_not_return_before_the_vector_is_installed`), which parks the wait
+    /// deterministically instead of racing.
+    ///
+    /// MUTATION: looking the state up under `&task.file_path` instead of `&cache_key` in that arm
+    /// — a one-token copy-paste slip — makes the waiter miss the terminal state and fail a HEALTHY
+    /// scan with the defensive "notified its waiters without reaching a terminal load state" error
+    /// (RED); every other test in the crate stays green.
+    #[tokio::test]
+    async fn test_concurrent_dv_loads_share_one_claim() {
+        let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let (puffin_path, offset, length) =
+            write_dv_puffin_file(&file_io, tmp_dir.path(), "deletes.puffin", &data_file, &[
+                1, 3,
+            ])
+            .await;
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [dv_task(&puffin_path, &data_file, offset, length, 2)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let a = loader.load_deletes(&tasks, schema.clone());
+        let b = loader.load_deletes(&tasks, schema);
+        let (ra, rb) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join(a, b),
+        )
+        .await
+        .expect("concurrent DV loads of one blob must not deadlock");
+
+        let filter_a = ra
+            .expect("load A must deliver a result")
+            .expect("load A must succeed");
+        let filter_b = rb
+            .expect("load B must deliver a result")
+            .expect("load B must succeed");
+        let vector_a = filter_a
+            .get_delete_vector_for_path(&data_file)
+            .expect("A must see the vector");
+        let vector_b = filter_b
+            .get_delete_vector_for_path(&data_file)
+            .expect("B must see the vector");
+        assert!(
+            Arc::ptr_eq(&vector_a, &vector_b),
+            "both loads must observe the one shared delete vector"
+        );
+        assert_eq!(
+            vector_a.lock().expect("delete vector mutex").len(),
+            2,
+            "the one shared vector must hold both deleted positions"
+        );
+    }
+
+    /// Risk pinned: the terminal `PosDelState::Failed` must carry the CAUSE, on EVERY failure path
+    /// that has one. Only the task that claimed the file ever sees its own error; every later
+    /// consumer reads the state instead, so without the recorded cause an operator learns THAT a
+    /// delete load died but never WHY — on a long-running engine that is the difference between an
+    /// actionable failure and a hunt.
+    ///
+    /// Three claim-then-die paths, each on its own loader (the terminal state is cached per
+    /// loader) and each with a deterministic message: the DV cardinality check, the DV blob
+    /// decoder (reached with a deliberately shifted blob range), and the position-delete parser.
+    /// The two remaining paths — opening the delete file, and the ranged blob read — are pinned by
+    /// the "must carry the original cause" assertions in
+    /// `test_failed_pos_del_load_does_not_strand_the_next_load` and
+    /// `test_failed_dv_load_does_not_strand_the_next_load`.
+    ///
+    /// MUTATION: dropping any one of the three `note_failure` calls leaves that case's second load
+    /// reporting only the generic "no cause was recorded" reason, and its assertion fails (RED).
+    #[tokio::test]
+    async fn test_failed_pos_del_load_reports_the_cause_to_later_callers() {
+        let tmp_dir = TempDir::new().expect("temp dir for the fixtures");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let (puffin_path, offset, length) =
+            write_dv_puffin_file(&file_io, tmp_dir.path(), "deletes.puffin", &data_file, &[
+                1, 3,
+            ])
+            .await;
+        let neg_pos_del_path = write_pos_del_parquet(tmp_dir.path(), "neg-pos.parquet", &[
+            (&data_file, Some(0)),
+            (&data_file, Some(-1)),
+        ]);
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        // (a) the cardinality check: record_count claims 5 positions, the blob holds 2.
+        // (b) the blob decoder: the claimed range is shifted one byte, so the bytes read back are
+        //     not a `deletion-vector-v1` blob.
+        // (c) the position-delete parser: the second row carries a negative position.
+        let cases: [(&str, FileScanTaskDeleteFile, &str); 3] = [
+            (
+                "the DV cardinality check",
+                dv_task(&puffin_path, &data_file, offset, length, 5),
+                "cardinality",
+            ),
+            (
+                "the DV blob decoder",
+                dv_task(&puffin_path, &data_file, offset + 1, length, 2),
+                "Invalid deletion vector",
+            ),
+            (
+                "the position-delete parser",
+                parquet_pos_del_task(&neg_pos_del_path),
+                "negative position -1",
+            ),
+        ];
+
+        for (path_under_test, task, expected_cause) in cases {
+            let loader = CachingDeleteFileLoader::new(file_io.clone(), 10);
+            let delete_file_path = task.file_path.clone();
+            let tasks = [task];
+
+            let first = loader
+                .load_deletes(&tasks, schema.clone())
+                .await
+                .expect("the first load must deliver a result")
+                .expect_err("the fixture must make the claiming task's load fail");
+            assert!(
+                first.to_string().contains(expected_cause),
+                "{path_under_test}: the claiming task must see its own error, got: {first}"
+            );
+
+            let second = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                loader.load_deletes(&tasks, schema.clone()),
+            )
+            .await
+            .expect("a load after a failed load must not hang")
+            .expect("the second load must deliver a result")
+            .expect_err("a terminally failed delete file must error for later callers too");
+
+            assert_eq!(second.kind(), ErrorKind::Unexpected);
+            assert!(
+                second.to_string().contains(expected_cause),
+                "{path_under_test}: the later caller's error must carry the ORIGINAL cause, got: \
+                 {second}"
+            );
+            assert!(
+                second.to_string().contains(&delete_file_path),
+                "{path_under_test}: the later caller's error must still name the delete file, \
+                 got: {second}"
+            );
+        }
+    }
+
+    /// Claim `key` on the loader's OWN delete filter, so the loader's next load of that file
+    /// necessarily takes the `WaitFor` arm. Returns the claim guard: publish it to release the
+    /// waiter, or drop it to kill the claim under it.
+    ///
+    /// Driving the wait this way rather than by racing two loads is what makes the two properties
+    /// below observable at all — a race can only be read after both loads have finished, by which
+    /// point the claimant has published either way.
+    fn claim_pos_del(loader: &CachingDeleteFileLoader, key: &str) -> PosDelLoadGuard {
+        match loader
+            .delete_filter
+            .try_start_pos_del_load(key)
+            .expect("a fresh claim on an unknown key must not error")
+        {
+            PosDelLoadAction::Load(guard) => guard,
+            other => panic!("expected a fresh claim for '{key}', got {other:?}"),
+        }
+    }
+
+    /// Assert that an in-flight `load_deletes` really is PARKED on the claim above — i.e. it took
+    /// the `WaitFor` arm — and hand it back still pending.
+    async fn assert_parked_on_claim(waiting: &mut Receiver<Result<DeleteFilter>>, why: &str) {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
+                .await
+                .is_err(),
+            "{why}"
+        );
+    }
+
+    /// Risk pinned (the ORDERING half of the deletion-vector wait contract): a `load_deletes` that
+    /// finds the blob ALREADY CLAIMED must not return until the claiming task has installed the
+    /// vector. `DeleteFilter::get_delete_vector` is synchronous, so a waiter that returns early
+    /// hands the reader an ABSENT delete vector and every row that vector deletes RESURRECTS — the
+    /// silent under-delete class, not a hang.
+    ///
+    /// MUTATION: dropping the `wait_for_pos_del_load` await on the DV path (`drop(notified);` in
+    /// its place) makes the load resolve immediately with no delete vector — RED here, while every
+    /// other lib test stays green. The parquet analogue has its own pin below.
+    #[tokio::test]
+    async fn test_dv_waiter_does_not_return_before_the_vector_is_installed() {
+        let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let (puffin_path, offset, length) =
+            write_dv_puffin_file(&file_io, tmp_dir.path(), "deletes.puffin", &data_file, &[
+                1, 3,
+            ])
+            .await;
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [dv_task(&puffin_path, &data_file, offset, length, 2)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let cache_key = format!("{puffin_path}@{offset}");
+        let guard = claim_pos_del(&loader, &cache_key);
+
+        let mut waiting = loader.load_deletes(&tasks, schema);
+        assert_parked_on_claim(
+            &mut waiting,
+            "the waiting load must still be pending while the claim is unpublished — returning \
+             here hands the reader an absent delete vector and resurrects every deleted row",
+        )
+        .await;
+
+        // Publish exactly as the production loader does: vectors first, then the terminal state.
+        let mut delete_vector = DeleteVector::default();
+        delete_vector.insert(1);
+        delete_vector.insert(3);
+        let mut filter = loader.delete_filter.clone();
+        filter.upsert_delete_vector(data_file.clone(), delete_vector);
+        guard.publish_loaded();
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting load must finish once the claim is published")
+            .expect("the waiting load must deliver a result")
+            .expect("the waiting load must succeed");
+        let vector = loaded
+            .get_delete_vector_for_path(&data_file)
+            .expect("the waiter must see the published vector");
+        assert_eq!(
+            vector.lock().expect("delete vector mutex").len(),
+            2,
+            "the waiter must observe the fully populated vector"
+        );
+    }
+
+    /// Risk pinned (the FAIL-LOUD half of the same contract, on the DV path): when the task that
+    /// claimed a deletion-vector blob dies without publishing, the load WAITING on it must surface
+    /// the typed error — not proceed as though the deletes had loaded. Swallowing the wait result
+    /// (`let _ = ... .await;` in place of the `?`) is a one-token slip that returns a
+    /// `DeleteFilter` with NO vector for the data file, so every row it deletes RESURRECTS.
+    ///
+    /// Also pins the CAUSE across the post-wake arm: `wait_for_pos_del_load` must render the
+    /// reason the dead claimant recorded (`PosDelLoadGuard::note_failure`), not a generic one —
+    /// the claim-time arm is pinned by
+    /// `test_failed_pos_del_load_reports_the_cause_to_later_callers`, this is the other arm.
+    ///
+    /// MUTATIONS: `let _ = del_filter.wait_for_pos_del_load(&cache_key, notified).await;` — RED,
+    /// with every other lib test green. Hard-coding the post-wake `Failed` reason instead of
+    /// carrying `reason` — RED on the cause assertion only.
+    #[tokio::test]
+    async fn test_dv_waiter_surfaces_a_dead_claimants_error_instead_of_dropping_the_deletes() {
+        let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let (puffin_path, offset, length) =
+            write_dv_puffin_file(&file_io, tmp_dir.path(), "deletes.puffin", &data_file, &[
+                1, 3,
+            ])
+            .await;
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [dv_task(&puffin_path, &data_file, offset, length, 2)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let cache_key = format!("{puffin_path}@{offset}");
+        let mut guard = claim_pos_del(&loader, &cache_key);
+
+        let mut waiting = loader.load_deletes(&tasks, schema);
+        // Park the load ON THE NOTIFIER first. Without this the guard could already be dropped
+        // when the loader claims, and it would take the claim-time `Failed` arm instead — a
+        // different path, and the one this test is NOT about.
+        assert_parked_on_claim(
+            &mut waiting,
+            "the load must be parked on the claim's notifier before the claimant dies",
+        )
+        .await;
+
+        // The claiming task records its cause and dies without publishing: `Drop` installs the
+        // terminal failed state carrying that cause.
+        let propagated = guard.note_failure(Error::new(
+            ErrorKind::DataInvalid,
+            "sentinel-cause: the claimant's own blob read failed",
+        ));
+        assert_eq!(
+            propagated.kind(),
+            ErrorKind::DataInvalid,
+            "note_failure must hand the error back unchanged for `?` propagation"
+        );
+        drop(guard);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("a waiter whose claimant died must not hang")
+            .expect("the waiting load must deliver a result");
+        let error = result.expect_err(
+            "a waiter whose claimant died must surface a typed error — succeeding here returns a \
+             filter with NO delete vector and resurrects every deleted row",
+        );
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains(&cache_key),
+            "the error must name the blob claim key, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("sentinel-cause"),
+            "the woken waiter's error must carry the cause the dead claimant recorded, got: \
+             {error}"
+        );
+    }
+
+    /// The parquet positional-delete analogue of
+    /// `test_dv_waiter_does_not_return_before_the_vector_is_installed` — the OTHER production call
+    /// site the guard machinery rewrote, claiming under the bare delete-file path. Same silent
+    /// under-delete consequence, same deterministic parking.
+    ///
+    /// MUTATION: `drop(notified);` in place of the `wait_for_pos_del_load` await on the parquet
+    /// path — RED here. (Three `maintenance::*` tests also catch that one incidentally; this pins
+    /// it locally, where the contract lives.)
+    #[tokio::test]
+    async fn test_parquet_pos_del_waiter_does_not_return_before_the_deletes_are_installed() {
+        let tmp_dir = TempDir::new().expect("temp dir for the positional-delete fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let pos_del_path = write_pos_del_parquet(tmp_dir.path(), "pos-del.parquet", &[
+            (&data_file, Some(1)),
+            (&data_file, Some(3)),
+        ]);
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [parquet_pos_del_task(&pos_del_path)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let guard = claim_pos_del(&loader, &pos_del_path);
+
+        let mut waiting = loader.load_deletes(&tasks, schema);
+        assert_parked_on_claim(
+            &mut waiting,
+            "the waiting load must still be pending while the claim is unpublished — returning \
+             here hands the reader absent positional deletes and resurrects every deleted row",
+        )
+        .await;
+
+        let mut delete_vector = DeleteVector::default();
+        delete_vector.insert(1);
+        delete_vector.insert(3);
+        let mut filter = loader.delete_filter.clone();
+        filter.upsert_delete_vector(data_file.clone(), delete_vector);
+        guard.publish_loaded();
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting load must finish once the claim is published")
+            .expect("the waiting load must deliver a result")
+            .expect("the waiting load must succeed");
+        let vector = loaded
+            .get_delete_vector_for_path(&data_file)
+            .expect("the waiter must see the published positions");
+        assert_eq!(
+            vector.lock().expect("delete vector mutex").len(),
+            2,
+            "the waiter must observe the fully populated position set"
+        );
+    }
+
+    /// The parquet positional-delete analogue of
+    /// `test_dv_waiter_surfaces_a_dead_claimants_error_instead_of_dropping_the_deletes`: the second
+    /// rewritten call site must PROPAGATE the wait error too.
+    ///
+    /// MUTATION: `let _ = del_filter.wait_for_pos_del_load(&task.file_path, notified).await;` —
+    /// RED here, and green across every other lib test.
+    #[tokio::test]
+    async fn test_parquet_pos_del_waiter_surfaces_a_dead_claimants_error() {
+        let tmp_dir = TempDir::new().expect("temp dir for the positional-delete fixture");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-a.parquet", tmp_dir.path().display());
+        let pos_del_path =
+            write_pos_del_parquet(tmp_dir.path(), "pos-del.parquet", &[(&data_file, Some(1))]);
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let tasks = [parquet_pos_del_task(&pos_del_path)];
+        let schema = Arc::new(Schema::builder().build().expect("empty schema"));
+
+        let mut guard = claim_pos_del(&loader, &pos_del_path);
+
+        let mut waiting = loader.load_deletes(&tasks, schema);
+        assert_parked_on_claim(
+            &mut waiting,
+            "the load must be parked on the claim's notifier before the claimant dies",
+        )
+        .await;
+
+        let propagated = guard.note_failure(Error::new(
+            ErrorKind::DataInvalid,
+            "sentinel-cause: the claimant's own parquet read failed",
+        ));
+        assert_eq!(
+            propagated.kind(),
+            ErrorKind::DataInvalid,
+            "note_failure must hand the error back unchanged for `?` propagation"
+        );
+        drop(guard);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("a waiter whose claimant died must not hang")
+            .expect("the waiting load must deliver a result");
+        let error = result.expect_err(
+            "a waiter whose claimant died must surface a typed error — succeeding here returns a \
+             filter with NO positional deletes and resurrects every deleted row",
+        );
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains(&pos_del_path),
+            "the error must name the delete file, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("sentinel-cause"),
+            "the woken waiter's error must carry the cause the dead claimant recorded, got: \
+             {error}"
+        );
     }
 }

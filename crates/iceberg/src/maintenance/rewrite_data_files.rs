@@ -152,7 +152,7 @@ use crate::Catalog;
 use crate::error::{Error, ErrorKind, Result};
 use crate::expr::Predicate;
 use crate::scan::FileScanTask;
-use crate::spec::{DataFile, Struct, TableProperties};
+use crate::spec::{DataFile, PartitionSpec, Struct, TableProperties};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 
@@ -574,16 +574,9 @@ impl RewriteDataFiles {
         let spec = table.metadata().default_partition_spec().as_ref().clone();
 
         // The group's partition tuple — every task in the group shares it (planner groups by
-        // partition). Use the first task's partition; an unpartitioned table has an empty struct.
-        let partition = group
-            .first()
-            .and_then(|task| task.partition.clone())
-            .unwrap_or_else(Struct::empty);
-        let partition_key = if spec.is_unpartitioned() {
-            None
-        } else {
-            Some(PartitionKey::new(spec, schema.clone(), partition))
-        };
+        // partition), validated against the OUTPUT spec before it is stamped onto anything.
+        let partition_key = group_partition_tuple(group, &spec)?
+            .map(|partition| PartitionKey::new(spec, schema.clone(), partition));
 
         // Build the rolling data-file writer rolling at the target size.
         let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
@@ -638,6 +631,51 @@ impl RewriteDataFiles {
 
         writer.close().await
     }
+}
+
+/// The partition tuple a compaction group's OUTPUT files must be stamped with under `spec`.
+///
+/// `None` for an unpartitioned output spec — including an ALL-`void` spec, which reports
+/// [`PartitionSpec::is_unpartitioned`] even though it has fields, so this must branch on that method
+/// and never on a raw field count.
+///
+/// For a partitioned spec the group's tuple must be present and match the spec's arity.
+/// [`plan_file_groups`] buckets a task whose spec id differs from the table default under the EMPTY
+/// struct (Java `groupByPartition`'s incompatible-spec rule) while the task itself still carries the
+/// tuple of its OWN spec, so a group can hold a tuple shaped for a different spec. Pairing that with
+/// the output spec used to ABORT in `PartitionKey::to_path` (index out of bounds) and, now that the
+/// path walk is total, would stamp the output file with a tuple that does not describe it. Java
+/// recomputes the output partition per row (its partitioned fanout writer); this port stamps ONE key
+/// per group, so the only correct answer for a mismatched group is to fail loudly.
+fn group_partition_tuple(group: &[FileScanTask], spec: &PartitionSpec) -> Result<Option<Struct>> {
+    if spec.is_unpartitioned() {
+        return Ok(None);
+    }
+
+    let Some(partition) = group.first().and_then(|task| task.partition.clone()) else {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot compact into partitioned spec {}: the file group carries no partition tuple",
+                spec.spec_id()
+            ),
+        ));
+    };
+
+    if partition.fields().len() != spec.fields().len() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot compact into partitioned spec {} ({} field(s)): the file group's partition \
+                 tuple has {} value(s) — its files were written under an incompatible spec",
+                spec.spec_id(),
+                spec.fields().len(),
+                partition.fields().len()
+            ),
+        ));
+    }
+
+    Ok(Some(partition))
 }
 
 /// Group the scan tasks by partition (current spec else empty), candidate-filter, bin-pack, and
@@ -761,7 +799,10 @@ fn pack_bins(tasks: Vec<FileScanTask>, target_weight: u64) -> Vec<Vec<FileScanTa
 /// Parse the `write.target-file-size-bytes` table property (Java `defaultTargetFileSize` via
 /// `PropertyUtil.propertyAsLong`). A present-but-unparsable value is a loud error; absent yields the
 /// 512 MiB default. A negative value is rejected (`target` must be `> 0`, enforced downstream too).
-fn parse_target_file_size(properties: &HashMap<String, String>) -> Result<u64> {
+///
+/// `pub(super)` so the sibling [`partition_key_audit`](super::partition_key_audit) repair resolves
+/// its rolling-writer target the same way (one home for the property name + the 512 MiB default).
+pub(super) fn parse_target_file_size(properties: &HashMap<String, String>) -> Result<u64> {
     match properties.get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES) {
         None => Ok(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT as u64),
         Some(value) => value.parse::<u64>().map_err(|error| {
@@ -2623,5 +2664,124 @@ mod tests {
             "an incompatible-spec file and a current-spec file with the SAME partition struct are \
              bucketed SEPARATELY (incompatible ⇒ empty struct), never merged into a qualifying group"
         );
+    }
+
+    // ============================================================================================
+    // WG3-L3: the OUTPUT partition tuple is validated against the output spec instead of being
+    // fabricated as `Struct::empty()`.
+    // ============================================================================================
+
+    /// The two-field `identity(x) + identity(y)` output spec (spec id 1) — the shape a table has
+    /// after `add_field("y")`, while its existing files still carry spec 0's ONE-value tuple.
+    fn two_field_spec() -> (Arc<PartitionSpec>, crate::spec::SchemaRef) {
+        let schema: crate::spec::SchemaRef = Arc::new(three_long_schema());
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(1)
+                .add_partition_field("x", "x", Transform::Identity)
+                .expect("identity(x)")
+                .add_partition_field("y", "y", Transform::Identity)
+                .expect("identity(y)")
+                .build()
+                .expect("two-field spec"),
+        );
+        (spec, schema)
+    }
+
+    /// An unpartitioned output spec yields NO partition key — and never errors, even for a group
+    /// whose tasks carry tuples.
+    #[test]
+    fn test_group_partition_tuple_unpartitioned_spec_is_none() {
+        let (spec, schema) = synthetic_spec_and_schema();
+        let unpartitioned = PartitionSpec::unpartition_spec();
+        let group = vec![synthetic_task("a", 10, 0, 0, &spec, &schema)];
+
+        assert!(
+            group_partition_tuple(&group, &unpartitioned)
+                .expect("an unpartitioned output spec never errors")
+                .is_none()
+        );
+    }
+
+    /// TRAP: an ALL-`void` spec HAS fields but reports `is_unpartitioned() == true`, and its callers
+    /// legitimately pair it with an empty tuple. It must take the `None` branch — a rule written
+    /// against a raw field count would reject a legitimate group here.
+    ///
+    /// MUTATION (branch on `spec.fields().is_empty()` instead of `is_unpartitioned()`): this test
+    /// goes RED while `test_group_partition_tuple_cross_spec_arity_mismatch_errors` stays GREEN,
+    /// proving the void case and the arity rule are independent.
+    #[test]
+    fn test_group_partition_tuple_all_void_spec_is_none() {
+        let (spec, schema) = synthetic_spec_and_schema();
+        let void_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(2)
+            .add_partition_field("x", "x_void", Transform::Void)
+            .expect("void(x)")
+            .build()
+            .expect("all-void spec");
+        assert!(
+            void_spec.is_unpartitioned(),
+            "fixture sanity: an all-void spec reports unpartitioned"
+        );
+        let group = vec![synthetic_task("a", 10, 0, 0, &spec, &schema)];
+
+        assert!(
+            group_partition_tuple(&group, &void_spec)
+                .expect("an all-void output spec is unpartitioned, not an anomaly")
+                .is_none()
+        );
+    }
+
+    /// The normal path: the group's tuple matches the output spec's arity and is returned as-is.
+    #[test]
+    fn test_group_partition_tuple_matching_arity_is_returned() {
+        let (spec, schema) = synthetic_spec_and_schema();
+        let group = vec![synthetic_task("a", 10, 7, 0, &spec, &schema)];
+
+        assert_eq!(
+            group_partition_tuple(&group, &spec).expect("a matching tuple is accepted"),
+            Some(Struct::from_iter([Some(Literal::long(7))]))
+        );
+    }
+
+    /// The REACHABLE mismatch: `plan_file_groups` buckets an old-spec task under the empty struct
+    /// but the task keeps its OWN one-value tuple, so a group can reach the writer with a tuple
+    /// shaped for a different spec than the two-field output spec. That must fail loudly — it used
+    /// to abort in `PartitionKey::to_path`, and with the path walk totalised it would otherwise
+    /// stamp the output file with a tuple that does not describe it.
+    #[test]
+    fn test_group_partition_tuple_cross_spec_arity_mismatch_errors() {
+        let (old_spec, schema) = synthetic_spec_and_schema();
+        let (output_spec, _schema) = two_field_spec();
+        let group = vec![synthetic_task("old", 10, 5, 0, &old_spec, &schema)];
+
+        let err = group_partition_tuple(&group, &output_spec)
+            .expect_err("a tuple shaped for another spec must be rejected");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("tuple has 1 value(s)"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    /// A task with NO partition tuple under a partitioned output spec: the exact input the previous
+    /// `unwrap_or_else(Struct::empty)` fabricated a partitioned-spec-with-empty-tuple key from.
+    #[test]
+    fn test_group_partition_tuple_absent_tuple_errors() {
+        let (spec, schema) = synthetic_spec_and_schema();
+        let mut task = synthetic_task("a", 10, 0, 0, &spec, &schema);
+        task.partition = None;
+
+        let err = group_partition_tuple(&[task], &spec)
+            .expect_err("a partitioned output spec with no group tuple must be rejected");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("carries no partition tuple"),
+            "unexpected message: {}",
+            err.message()
+        );
+        // The empty group is the same shape (nothing to take a tuple from).
+        assert!(group_partition_tuple(&[], &spec).is_err());
     }
 }

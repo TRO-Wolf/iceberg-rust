@@ -74,7 +74,7 @@ R161 URL-escaping APPROVED). RePark work order delivered:
 `~/Desktop/repark-work-order-2026-07-25.md`. Goal frame: gate 1 data-trust → gate 2 engine-trust
 → gate 3 scale.
 
-- [ ] **Unit 1 — WG1 honest-children `PartitionExpr` (S1, Mode A solo PR, AC·OO)** — branch
+- [x] **Unit 1 — WG1 honest-children `PartitionExpr` (S1, Mode A solo PR, AC·OO)** — branch
       `fix/partition-expr-honest-children` off `ce2affc9`. FORK-O7+O8 are ONE defect (optimizer
       re-parents the children-less expr; positional read hits the wrong batch). Fix shape D1 +
       core-seam guard + T1-T10/M1-M5 per brief. Claim OPENED on the PrimarySync board
@@ -94,12 +94,49 @@ R161 URL-escaping APPROVED). RePark work order delivered:
       added pub item), caller-compat sweep. 3 S3 total: PR-body gate-number refresh (applied
       at close-out), duplicate Column-list style + second sabotage leg (recorded as residue).
       PUSHED for PR — merge is the user's; RoadMapSync announce + RePark repin follow merge.
-- [ ] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic)** — branch
-      `fix/engine-trust-bundle-2026-07` after Unit 1 merges. G1 WG2 detector+remediation → G2
+      **MERGED #172 (`a6199ca5`) 2026-07-25, content-verified R4; RoadMapSync repin+pin-flip
+      announcement posted; claim released. FORK-O7/O8 CLOSED.**
+- [ ] **Unit 2 — engine-trust bundle (Mode B, one branch, final bundle Critic) — IN PROGRESS
+      2026-07-25**, branch `fix/engine-trust-bundle-2026-07` off `a6199ca5`; user-directed
+      Opus-max AC per group + Fable-max closing bundle Critic. **G0 T10 nullability-widening
+      residue (+ ADV-1/ADV-2 riders; spec added to the brief)** → G1 WG2 detector+remediation → G2
       WG4a stamp probe/fix + WG4c contract normativity (R113) → G3 WG3 L2+L3 non-breaking →
       G4 R161 escaping (format-stability attestation) → G5 WG4b path-keyed pos-delete routing
       (+ remove_dangling same-unit; R117 demote→re-promote) → G6 WG5 null-bit family → G7 WG6
       mechanical → G8 delete_filter lost-wakeup (3 sites + `PosDelState::Failed`).
+      **BUNDLE CONVERGED 2026-07-26** (36 commits, 16h run): 8 groups converged in-ladder (G2
+      cycle 1, G8 cycle 2, rest cycle 0); **G4 parked-not-converged on matrix-cell wording, its
+      reset was classifier-blocked, and the Fable-max closing Critic caught it as S1** → CLOSE
+      remediation corrected the R161 residue ledger (truncate FIXED/BINARY hex-vs-base64
+      divergence named from an independent Java re-decode), ratcheted the interop floor to 52,
+      and the re-attestation ruled the WHOLE bundle CONVERGED zero S1/S2 — with a live 22/22
+      byte-match vs Java's own partitionToPath. Gate at tip: lib 2974 (+109), datafusion 246
+      (+28), anchors 75 rows. ONE user merge-gate rides the PR (closer CR-1): **waive or strip
+      G4** (strip = surgical: 5 of its 10 files overlap later groups, 7 of 10 by branch tip incl. the closing chain). PUSHED for PR.
+      **TRIAGE RIDER 2026-07-26 (docs/evidence only, NO behavior change — the bundle needed none):**
+      the RePark consumer's response to the 5-action fork work order was adjudicated and absorbed.
+      (a) EXPOSURE AUDIT — CLOSED as an audit, not a probability: they delivered an inventory
+      (real-AWS surfaces write exclusively via CTAS + MERGE INTO, never the provider; targets
+      unpartitioned; scratch Glue namespace disposable; provider `insert_into` consumers are
+      ephemeral test fixtures), so "none exist" is answered. The `RoadMapSync.md` 2026-07-25 row
+      still reads "the exposure-audit ask stays OPEN" and needs updating; one narrow follow-up
+      question remains (their inventory is scoped to `insert_into` — confirm no OTHER RePark
+      `PhysicalExpr` reads its input positionally while declaring no children, which is the general
+      defect class). (b) WG4b FIXTURE — DELIVERED, and now WIRED: `interop_spark_mor_fixtures.rs`
+      (env-gated, fixture NOT committed here). (c) IDENTITY-SPEC CORRECTION — ABSORBED with the
+      mechanism RULED: their observation is right, their inference is not. The computed values ARE
+      in the parquet (the write path drops no columns); the READ path substitutes the manifest
+      tuple over the file's own column for identity transforms only, so the values are MASKED, not
+      lost, and `RepairPartitionKeys` recovers them. The detector's severity model therefore needs
+      no change; the recipe + contract wording landed in this rider. Honest boundaries sent back:
+      history is not healed, and a pure manifest-tuple rewrite is NOT always sufficient (that half
+      of their claim stands). (d) PIN PROTOCOL — their Group-AA guard makes their divergence MATRIX
+      a RePark-with-guard measurement until repin; their bypass pins stay fork-direct, and the
+      removal checklist must revert BOTH the bypass and the cell relabel in the same change. Open
+      asks back to them: reconcile the pin arithmetic (the doc describes four new pins, the repin
+      posture says two), rename the identity pin away from "data-loss", and note the FROM-less
+      literal pin's post-repin expectation is schema-dependent (Unit 1 + required columns = Ok;
+      Unit 1 + optional = still a loud `Plan(...)` rejection until this bundle's G0).
 - [ ] **Unit 3 — breaking follow-up (Mode A, after Unit 2)** — `PartitionKey::new -> Result`
       (58 sites/34 files incl. 6 `no_run` doc fences) + `CurrentFileStatus` unwraps.
 - [ ] **Unit 4 — H7-S2 COW streaming** · **Unit 5 — H7-P1 pushdown** (footgun precondition) —

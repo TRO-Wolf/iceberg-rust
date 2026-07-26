@@ -89,6 +89,29 @@ impl Truncate {
     }
 }
 
+/// Downcast a transform input to the concrete Arrow array its [`DataType`] implies, or return a
+/// typed error naming both.
+///
+/// Every caller sits in an arm of a `match input.data_type()`, and for arrow's own arrays the
+/// pairing is exact: `arrow_array::make_array` maps each `DataType` to exactly one array struct,
+/// so no arrow-native value can take an arm whose concrete type it is not. That is a property of
+/// the VALUES arrow builds, though, not of this function's signature: `transform` accepts
+/// `Arc<dyn Array>`, and `Array` is a public trait, so the pairing is not something this crate
+/// can enforce. Answering an unexpected implementation with a typed error rather than a panic
+/// costs nothing and keeps a library call from aborting its caller's process.
+fn downcast_input<T: 'static>(input: &ArrayRef) -> crate::Result<&T> {
+    input.as_any().downcast_ref::<T>().ok_or_else(|| {
+        Error::new(
+            crate::ErrorKind::DataInvalid,
+            format!(
+                "Array with data type {:?} is not a {} and cannot be truncate-transformed",
+                input.data_type(),
+                std::any::type_name::<T>()
+            ),
+        )
+    })
+}
+
 impl TransformFunction for Truncate {
     fn transform(&self, input: ArrayRef) -> crate::Result<ArrayRef> {
         match input.data_type() {
@@ -99,28 +122,22 @@ impl TransformFunction for Truncate {
                         "width is failed to convert to i32 when truncate Int32Array",
                     )
                 })?;
-                let res: arrow_array::Int32Array = input
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int32Array>()
-                    .unwrap()
-                    .unary(|v| Self::truncate_i32(v, width));
+                let res: arrow_array::Int32Array =
+                    downcast_input::<arrow_array::Int32Array>(&input)?
+                        .unary(|v| Self::truncate_i32(v, width));
                 Ok(Arc::new(res))
             }
             DataType::Int64 => {
                 let width = self.width as i64;
-                let res: arrow_array::Int64Array = input
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                    .unwrap()
-                    .unary(|v| Self::truncate_i64(v, width));
+                let res: arrow_array::Int64Array =
+                    downcast_input::<arrow_array::Int64Array>(&input)?
+                        .unary(|v| Self::truncate_i64(v, width));
                 Ok(Arc::new(res))
             }
             DataType::Decimal128(precision, scale) => {
                 let width = self.width as i128;
-                let res: arrow_array::Decimal128Array = input
-                    .as_any()
-                    .downcast_ref::<arrow_array::Decimal128Array>()
-                    .unwrap()
+                let decimals = downcast_input::<arrow_array::Decimal128Array>(&input)?;
+                let res: arrow_array::Decimal128Array = decimals
                     .unary(|v| Self::truncate_decimal_i128(v, width))
                     .with_precision_and_scale(*precision, *scale)
                     .map_err(|err| Error::new(crate::ErrorKind::Unexpected, format!("{err}")))?;
@@ -129,10 +146,7 @@ impl TransformFunction for Truncate {
             DataType::Utf8 => {
                 let len = self.width as usize;
                 let res: arrow_array::StringArray = arrow_array::StringArray::from_iter(
-                    input
-                        .as_any()
-                        .downcast_ref::<arrow_array::StringArray>()
-                        .unwrap()
+                    downcast_input::<arrow_array::StringArray>(&input)?
                         .iter()
                         .map(|v| v.map(|v| Self::truncate_str(v, len))),
                 );
@@ -141,10 +155,7 @@ impl TransformFunction for Truncate {
             DataType::LargeUtf8 => {
                 let len = self.width as usize;
                 let res: arrow_array::LargeStringArray = arrow_array::LargeStringArray::from_iter(
-                    input
-                        .as_any()
-                        .downcast_ref::<arrow_array::LargeStringArray>()
-                        .unwrap()
+                    downcast_input::<arrow_array::LargeStringArray>(&input)?
                         .iter()
                         .map(|v| v.map(|v| Self::truncate_str(v, len))),
                 );
@@ -153,10 +164,7 @@ impl TransformFunction for Truncate {
             DataType::Binary => {
                 let len = self.width as usize;
                 let res: arrow_array::BinaryArray = arrow_array::BinaryArray::from_iter(
-                    input
-                        .as_any()
-                        .downcast_ref::<arrow_array::BinaryArray>()
-                        .unwrap()
+                    downcast_input::<arrow_array::BinaryArray>(&input)?
                         .iter()
                         .map(|v| v.map(|v| Self::truncate_binary(v, len))),
                 );
@@ -215,7 +223,7 @@ mod test {
 
     use arrow_array::builder::PrimitiveBuilder;
     use arrow_array::types::Decimal128Type;
-    use arrow_array::{Decimal128Array, Int32Array, Int64Array};
+    use arrow_array::{ArrayRef, Decimal128Array, Int32Array, Int64Array};
 
     use crate::Result;
     use crate::expr::PredicateOperator;
@@ -771,6 +779,34 @@ mod test {
                 .expect("int is truncatable")
                 .expect("truncate of a non-null value is non-null"),
             Datum::int(0)
+        );
+    }
+
+    /// A mismatch between an input's `DataType` and its concrete Arrow type is answered with a
+    /// typed error, not a panic.
+    ///
+    /// The six call sites in `transform` cannot reach this branch with an arrow-native array —
+    /// `arrow_array::make_array` maps each `DataType` to exactly one array struct — but
+    /// `transform` takes `Arc<dyn Array>`, whose trait is public, so the pairing is a property
+    /// of arrow's constructors rather than of this crate's types. Replacing the `ok_or_else`
+    /// with the `.unwrap()` that used to be at each site turns this test into a panic.
+    ///
+    /// The per-arm behaviour of the six rewritten sites is held by `test_truncate_simple`
+    /// below, which transforms one array of every supported type.
+    #[test]
+    fn test_downcast_input_is_a_typed_error_not_a_panic() {
+        let mislabelled: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["not an int"]));
+        let error = super::downcast_input::<Int32Array>(&mislabelled)
+            .expect_err("a StringArray is not an Int32Array");
+
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains("Utf8"),
+            "the error must name the data type it was given: {error}"
+        );
+        assert!(
+            error.to_string().contains("Int32"),
+            "the error must name the array type it expected: {error}"
         );
     }
 

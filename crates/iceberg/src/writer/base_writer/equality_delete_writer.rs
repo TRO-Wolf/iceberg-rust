@@ -26,7 +26,8 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::record_batch_projector::RecordBatchProjector;
 use crate::arrow::schema_to_arrow_schema;
-use crate::spec::{DataFile, PartitionKey, SchemaRef};
+use crate::spec::{DataFile, PartitionKey, PartitionSpec, SchemaRef};
+use crate::writer::base_writer::data_file_writer::resolve_partition_spec_id;
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
@@ -42,6 +43,7 @@ pub struct EqualityDeleteFileWriterBuilder<
 > {
     inner: RollingFileWriterBuilder<B, L, F>,
     config: EqualityDeleteWriterConfig,
+    partition_spec: Option<PartitionSpec>,
 }
 
 impl<B, L, F> EqualityDeleteFileWriterBuilder<B, L, F>
@@ -51,11 +53,49 @@ where
     F: FileNameGenerator,
 {
     /// Create a new `EqualityDeleteFileWriterBuilder` using a `RollingFileWriterBuilder`.
+    ///
+    /// Prefer chaining [`with_partition_spec`](Self::with_partition_spec): without it, a writer built
+    /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0). See
+    /// `resolve_partition_spec_id`.
+    ///
+    /// **For equality deletes a missing key OVER-deletes, it does not under-delete.** A writer built
+    /// with no [`PartitionKey`] also emits an EMPTY partition tuple, and the Iceberg spec applies an
+    /// equality delete stored with an unpartitioned spec as a GLOBAL delete: the read side puts it in
+    /// a bucket consulted with no spec-id and no partition condition (Rust
+    /// `PopulatedDeleteFileIndex::new`; Java `DeleteFileIndex`), so it deletes matching rows from
+    /// EVERY data file in the table, whatever spec id it claims. Only an equality delete carrying a
+    /// NON-EMPTY tuple is scoped by `(spec_id, partition)` — and then a wrong spec id makes it apply
+    /// to nothing. See `docs/ENGINE_CONTRACT.md` §7a; both directions are pinned end-to-end in
+    /// `position_delete_writer.rs::spec_stamp_e2e_test`.
     pub fn new(
         inner: RollingFileWriterBuilder<B, L, F>,
         config: EqualityDeleteWriterConfig,
     ) -> Self {
-        Self { inner, config }
+        Self {
+            inner,
+            config,
+            partition_spec: None,
+        }
+    }
+
+    /// Set the [`PartitionSpec`] the produced delete files are written under.
+    ///
+    /// This is the Rust counterpart of Java's REQUIRED `FileMetadata.deleteFileBuilder(spec)`
+    /// argument. The spec MUST be the spec of the DATA FILES the deletes apply to, not the table's
+    /// current spec — a partition-scoped equality delete only ever applies to data files carrying the
+    /// same `(spec_id, partition)`. It is used only when the writer is built WITHOUT a
+    /// [`PartitionKey`]; a key always wins. See `resolve_partition_spec_id`.
+    ///
+    /// Configuring the spec does NOT by itself scope the delete: without a [`PartitionKey`] the file
+    /// still carries an EMPTY tuple and is applied as a GLOBAL equality delete (see [`new`](Self::new)).
+    /// Pass the key when the delete is meant for one partition.
+    ///
+    /// **This writer OWNS `partition_spec_id` on every [`DataFile`] it emits** — `close()` sets the
+    /// field unconditionally, overriding anything a custom
+    /// [`FileWriter`](crate::writer::file_writer::FileWriter) put on the returned `DataFileBuilder`.
+    pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
+        self.partition_spec = Some(partition_spec);
+        self
     }
 }
 
@@ -124,11 +164,14 @@ where
     type R = EqualityDeleteFileWriter<B, L, F>;
 
     async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
+        let partition_spec_id =
+            resolve_partition_spec_id(self.partition_spec.as_ref(), partition_key.as_ref())?;
         Ok(EqualityDeleteFileWriter {
             inner: Some(self.inner.build()),
             projector: self.config.projector.clone(),
             equality_ids: self.config.equality_ids.clone(),
             partition_key,
+            partition_spec_id,
         })
     }
 }
@@ -144,6 +187,9 @@ pub struct EqualityDeleteFileWriter<
     projector: RecordBatchProjector,
     equality_ids: Vec<i32>,
     partition_key: Option<PartitionKey>,
+    /// The spec id stamped on every produced delete file, resolved once at build time by
+    /// `resolve_partition_spec_id`.
+    partition_spec_id: i32,
 }
 
 #[async_trait::async_trait]
@@ -174,9 +220,13 @@ where
                 .map(|mut res| {
                     res.content(crate::spec::DataContentType::EqualityDeletes);
                     res.equality_ids(Some(self.equality_ids.iter().copied().collect_vec()));
+                    // ALWAYS stamp the spec id (Java `FileMetadata.Builder(spec)` does), never only
+                    // when a partition key happens to be present — a delete file stamped with the
+                    // wrong spec commits and then silently never applies. See
+                    // `resolve_partition_spec_id`.
+                    res.partition_spec_id(self.partition_spec_id);
                     if let Some(pk) = self.partition_key.as_ref() {
                         res.partition(pk.data().clone());
-                        res.partition_spec_id(pk.spec().spec_id());
                     }
                     res.build().map_err(|e| {
                         Error::new(
@@ -802,6 +852,201 @@ mod test {
             ])
             .unwrap();
         assert_eq!(to_write_projected, expect_batch);
+        Ok(())
+    }
+
+    // ============================================================================================
+    // Partition-spec-id stamping — the equality-delete leg of `resolve_partition_spec_id`.
+    //
+    // These are STAMP-level pins (what value lands on the file). The read-side consequence is
+    // asymmetric and is pinned end-to-end in `position_delete_writer.rs::spec_stamp_e2e_test`:
+    // an equality delete carrying a NON-EMPTY tuple is paired on `(spec_id, partition)`
+    // (`DeleteFileIndex::get_deletes_for_data_file`), so a wrong spec id makes it apply to nothing;
+    // but one carrying an EMPTY tuple — the shape a writer built with no `PartitionKey` produces —
+    // is a GLOBAL delete that applies to every data file regardless of the spec id it claims. See
+    // `docs/ENGINE_CONTRACT.md` §7a.
+    // ============================================================================================
+
+    /// `1: id long`, `2: dept string`, both required — the fixture schema for the stamping tests.
+    fn stamp_test_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(2, "dept", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("build stamp test schema"),
+        )
+    }
+
+    /// An `identity(dept)` spec under `spec_id`.
+    fn identity_dept_spec(schema: &Arc<Schema>, spec_id: i32) -> crate::spec::PartitionSpec {
+        crate::spec::PartitionSpec::builder(schema.as_ref().clone())
+            .with_spec_id(spec_id)
+            .add_unbound_field(
+                crate::spec::UnboundPartitionField::builder()
+                    .source_id(2)
+                    .name("dept_part".to_string())
+                    .transform(crate::spec::Transform::Identity)
+                    .build(),
+            )
+            .expect("add identity(dept)")
+            .build()
+            .expect("build identity(dept) spec")
+    }
+
+    /// An `EqualityDeleteFileWriterBuilder` on `id` writing under `temp_dir`.
+    fn stamp_writer_builder(
+        file_io: &FileIO,
+        temp_dir: &TempDir,
+        schema: &Arc<Schema>,
+    ) -> EqualityDeleteFileWriterBuilder<
+        ParquetWriterBuilder,
+        DefaultLocationGenerator,
+        DefaultFileNameGenerator,
+    > {
+        let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
+            .expect("equality delete config on id");
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir
+                .path()
+                .to_str()
+                .expect("temp dir path is utf-8")
+                .to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("eq-del".to_string(), None, DataFileFormat::Parquet);
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            Arc::new(
+                arrow_schema_to_schema(config.projected_arrow_schema_ref())
+                    .expect("projected schema"),
+            ),
+        );
+        EqualityDeleteFileWriterBuilder::new(
+            RollingFileWriterBuilder::new_with_default_file_size(
+                parquet_writer_builder,
+                file_io.clone(),
+                location_gen,
+                file_name_gen,
+            ),
+            config,
+        )
+    }
+
+    /// One row `(1, "eng")` in the fixture schema.
+    fn stamp_test_batch(schema: &Arc<Schema>) -> RecordBatch {
+        let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("arrow schema"));
+        RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+            Arc::new(arrow_array::StringArray::from(vec!["eng"])) as ArrayRef,
+        ])
+        .expect("build stamp test batch")
+    }
+
+    /// CONFIGURED SPEC, NO KEY. An unpartitioned spec whose id is NOT 0 must be stamped as itself,
+    /// not as the fabricated `DEFAULT_PARTITION_SPEC_ID`.
+    #[tokio::test]
+    async fn test_equality_delete_writer_stamps_configured_unpartitioned_spec_id()
+    -> Result<(), anyhow::Error> {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let schema = stamp_test_schema();
+        let spec = crate::spec::PartitionSpec::builder(schema.as_ref().clone())
+            .with_spec_id(7)
+            .build()
+            .expect("unpartitioned spec 7");
+
+        let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .with_partition_spec(spec)
+            .build(None)
+            .await?;
+        writer.write(stamp_test_batch(&schema)).await?;
+        let delete_files = writer.close().await?;
+
+        assert_eq!(delete_files.len(), 1);
+        assert_eq!(
+            delete_files[0].partition_spec_id(),
+            7,
+            "the delete file must claim the CONFIGURED spec, not the fabricated default 0"
+        );
+        Ok(())
+    }
+
+    /// CONFIGURED PARTITIONED SPEC, NO KEY. Rejected at build time — the delete would claim a
+    /// partitioned spec while carrying an empty tuple.
+    #[tokio::test]
+    async fn test_equality_delete_writer_rejects_partitioned_spec_without_partition_key() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let schema = stamp_test_schema();
+
+        let err = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .with_partition_spec(identity_dept_spec(&schema, 3))
+            .build(None)
+            .await
+            .expect_err("a partitioned spec with no PartitionKey must be rejected");
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("must carry its partition tuple"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// PRECEDENCE. The `PartitionKey`'s spec wins: an equality delete written for data files under an
+    /// OLDER spec keeps that spec even when the builder carries the current one.
+    #[tokio::test]
+    async fn test_equality_delete_writer_partition_key_spec_wins_over_configured_spec()
+    -> Result<(), anyhow::Error> {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let schema = stamp_test_schema();
+        let configured = crate::spec::PartitionSpec::builder(schema.as_ref().clone())
+            .with_spec_id(7)
+            .build()
+            .expect("unpartitioned spec 7");
+        let key_partition =
+            crate::spec::Struct::from_iter([Some(crate::spec::Literal::string("eng"))]);
+        let partition_key = crate::spec::PartitionKey::new(
+            identity_dept_spec(&schema, 3),
+            schema.clone(),
+            key_partition.clone(),
+        );
+
+        let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .with_partition_spec(configured)
+            .build(Some(partition_key))
+            .await?;
+        writer.write(stamp_test_batch(&schema)).await?;
+        let delete_files = writer.close().await?;
+
+        assert_eq!(
+            delete_files[0].partition_spec_id(),
+            3,
+            "the PartitionKey's spec must win over the configured spec"
+        );
+        assert_eq!(delete_files[0].partition, key_partition);
+        Ok(())
+    }
+
+    /// LEGACY PATH PIN. Neither a configured spec nor a key ⇒ `DEFAULT_PARTITION_SPEC_ID` (0), the
+    /// pre-existing behavior every current caller relies on. See `docs/ENGINE_CONTRACT.md` §7a.
+    #[tokio::test]
+    async fn test_equality_delete_writer_without_spec_or_key_stamps_default_zero()
+    -> Result<(), anyhow::Error> {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let schema = stamp_test_schema();
+
+        let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .build(None)
+            .await?;
+        writer.write(stamp_test_batch(&schema)).await?;
+        let delete_files = writer.close().await?;
+
+        assert_eq!(delete_files[0].partition_spec_id(), 0);
         Ok(())
     }
 }

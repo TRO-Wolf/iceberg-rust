@@ -40,9 +40,15 @@
 # back ({null, "books"} via FileScanTask.file().partition()) and both rows (id=2 category IS
 # NULL). Before the fix this write stamped a real-but-wrong `electronics` tuple, never NULL.
 #
-# SABOTAGE STEP (non-vacuity proof): after the green verify, the script corrupts the
-# final.metadata.json (truncates it), re-runs Java verify, and asserts Java now reports >0
-# failures.  The original file is then restored and Java is re-run to confirm GREEN.
+# SABOTAGE STEPS (non-vacuity proof), TWO legs — one per table, because the verify returns
+# early on the FIRST parse failure:
+#   LEG A: truncate <dir>/rust_table/metadata/final.metadata.json           (COW-DELETE table)
+#   LEG B: truncate <dir>/rust_table_nulltuple/metadata/final.metadata.json (WG1 null-tuple table)
+# Leg A alone proves nothing about the null-tuple assertions: with rust_table's metadata
+# corrupt, `verifyPartDml` returns before `verifyPartDmlNullTuple` ever runs, so those
+# assertions would stay unexercised. Leg B corrupts ONLY the null-tuple table, leaving the
+# COW-DELETE leg green, so the >0 failures can only come from the null-tuple assertions.
+# Each leg: corrupt → re-run Java verify → assert >0 failures → restore → re-run → assert GREEN.
 # If the corruption cannot be applied (file absent), the script exits non-zero (HARD-FAIL per
 # CLAUDE.md — a sabotage that cannot be applied must FAIL, not skip).
 #
@@ -56,6 +62,78 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP_DIR="${SCRIPT_DIR}/target/interop-partitioned-dml"
+
+# Run the Java oracle over TMP_DIR and echo everything it printed.
+run_java_verify() {
+  (
+    cd "${SCRIPT_DIR}"
+    JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
+      PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:${PATH} \
+      /opt/maven/bin/mvn -o -q compile exec:java \
+      -Dexec.args=verify-interop-part-dml \
+      -Dinterop.part_dml.dir="${TMP_DIR}" 2>&1
+  )
+}
+
+# One sabotage leg: truncate ONE final.metadata.json, prove the verify goes RED,
+# restore it, prove the verify goes GREEN again.
+#   $1 = human label   $2 = path to the final.metadata.json to corrupt
+# Every failure mode is a HARD-FAIL (exit non-zero), never a SKIP: a sabotage
+# that could not be applied has proven nothing.
+sabotage_leg() {
+  local label="$1"
+  local target="$2"
+
+  echo "==> SABOTAGE ${label}: truncate ${target} → Java must report >0 failures (non-vacuity)"
+  if [ ! -f "${target}" ]; then
+    echo "==> HARD-FAIL: ${target} absent — sabotage ${label} cannot be applied."
+    exit 1
+  fi
+  cp "${target}" "${target}.bak"
+
+  # Truncate to 16 bytes — Java's JSON parser will fail to parse it.
+  local rc=0
+  dd if=/dev/zero of="${target}" bs=1 count=16 2>/dev/null || rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    # Restore before failing.
+    cp "${target}.bak" "${target}"
+    rm -f "${target}.bak"
+    echo "==> HARD-FAIL: sabotage ${label} truncation failed (exit ${rc})."
+    exit 1
+  fi
+  if cmp -s "${target}.bak" "${target}"; then
+    cp "${target}.bak" "${target}"
+    rm -f "${target}.bak"
+    echo "==> HARD-FAIL: sabotage ${label} left the file unchanged — nothing was corrupted."
+    exit 1
+  fi
+
+  local sabotage_out
+  sabotage_out="$(run_java_verify || true)"
+  echo "${sabotage_out}"
+
+  # Restore the original metadata BEFORE checking the sabotage result.
+  cp "${target}.bak" "${target}"
+  rm -f "${target}.bak"
+
+  if echo "${sabotage_out}" | grep -q ': 0 failures'; then
+    echo "==> HARD-FAIL: sabotage ${label} did NOT trigger a verify failure — \
+that leg of the verify is vacuous."
+    exit 1
+  fi
+  echo "==> SABOTAGE ${label} RED: Java correctly detected the corruption (>0 failures)."
+
+  echo "==> Post-sabotage restore (${label}): re-run verify on the restored metadata — must be GREEN"
+  local restore_out
+  restore_out="$(run_java_verify)"
+  echo "${restore_out}"
+  if echo "${restore_out}" | grep -q '^FAIL ' || ! echo "${restore_out}" | grep -q ': 0 failures'; then
+    echo "==> HARD-FAIL: post-restore verify (${label}) failed — the restore did not work or \
+the verify is broken."
+    exit 1
+  fi
+  echo "==> Post-restore verify (${label}) returned GREEN."
+}
 
 echo "==> [1/5] Reset the temp table dir: ${TMP_DIR}"
 rm -rf "${TMP_DIR}"
@@ -74,14 +152,7 @@ echo "==> [2/5] Rust: WRITE the partitioned V2 tables via DataFusion SQL DML \
 
 echo "==> [3/5] Java: load the RUST-written final.metadata.json files, read via IcebergGenerics, \
 verify survivor ids = {3,4} (books partition) + the WG1 null partition tuple"
-VERIFY_OUT="$(
-  cd "${SCRIPT_DIR}"
-  JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
-    PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:${PATH} \
-    /opt/maven/bin/mvn -o -q compile exec:java \
-    -Dexec.args=verify-interop-part-dml \
-    -Dinterop.part_dml.dir="${TMP_DIR}" 2>&1
-)"
+VERIFY_OUT="$(run_java_verify)"
 echo "${VERIFY_OUT}"
 if echo "${VERIFY_OUT}" | grep -q '^FAIL ' || ! echo "${VERIFY_OUT}" | grep -q ': 0 failures'; then
   echo "==> FAILED — Java could not correctly read the Rust-written partitioned COW-DELETE table \
@@ -90,62 +161,20 @@ if echo "${VERIFY_OUT}" | grep -q '^FAIL ' || ! echo "${VERIFY_OUT}" | grep -q '
 fi
 echo "==> GREEN — Java read the Rust-written partitioned COW-DELETE table (survivor ids = {3,4})."
 
-echo "==> [4/5] SABOTAGE: truncate final.metadata.json → Java must report >0 failures (non-vacuity)"
-FINAL_META="${TMP_DIR}/rust_table/metadata/final.metadata.json"
-if [ ! -f "${FINAL_META}" ]; then
-  echo "==> HARD-FAIL: final.metadata.json absent — sabotage cannot be applied."
-  exit 1
-fi
-cp "${FINAL_META}" "${FINAL_META}.bak"
+echo "==> [4/5] SABOTAGE LEG A — the COW-DELETE table (rust_table)"
+sabotage_leg "A (rust_table)" "${TMP_DIR}/rust_table/metadata/final.metadata.json"
 
-# Truncate to 16 bytes — Java's JSON parser will fail to parse it.
-rc=0
-dd if=/dev/zero of="${FINAL_META}" bs=1 count=16 2>/dev/null || rc=$?
-if [ "${rc}" -ne 0 ]; then
-  # Restore before failing
-  cp "${FINAL_META}.bak" "${FINAL_META}"
-  echo "==> HARD-FAIL: sabotage truncation failed (exit ${rc})."
-  exit 1
-fi
-
-SABOTAGE_OUT="$(
-  cd "${SCRIPT_DIR}"
-  JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
-    PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:${PATH} \
-    /opt/maven/bin/mvn -o -q compile exec:java \
-    -Dexec.args=verify-interop-part-dml \
-    -Dinterop.part_dml.dir="${TMP_DIR}" 2>&1 || true
-)"
-echo "${SABOTAGE_OUT}"
-
-# Restore the original metadata BEFORE checking the sabotage result.
-cp "${FINAL_META}.bak" "${FINAL_META}"
-rm -f "${FINAL_META}.bak"
-
-if echo "${SABOTAGE_OUT}" | grep -q ': 0 failures'; then
-  echo "==> HARD-FAIL: sabotage (truncated metadata) did NOT trigger a verify failure — \
-the verify is vacuous."
-  exit 1
-fi
-echo "==> SABOTAGE RED: Java correctly detected the corruption (>0 failures)."
-
-echo "==> [5/5] Post-sabotage restore: re-run verify on the restored metadata — must be GREEN"
-RESTORE_OUT="$(
-  cd "${SCRIPT_DIR}"
-  JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
-    PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:${PATH} \
-    /opt/maven/bin/mvn -o -q compile exec:java \
-    -Dexec.args=verify-interop-part-dml \
-    -Dinterop.part_dml.dir="${TMP_DIR}" 2>&1
-)"
-echo "${RESTORE_OUT}"
-if echo "${RESTORE_OUT}" | grep -q '^FAIL ' || ! echo "${RESTORE_OUT}" | grep -q ': 0 failures'; then
-  echo "==> HARD-FAIL: post-restore verify failed — the restore did not work or the verify is broken."
-  exit 1
-fi
+echo "==> [5/5] SABOTAGE LEG B — the WG1 null-tuple table (rust_table_nulltuple). Leg A cannot \
+reach these assertions: the verify returns on rust_table's parse failure before the null-tuple \
+leg runs, so only this leg proves the null-tuple assertions are non-vacuous."
+sabotage_leg "B (rust_table_nulltuple)" \
+  "${TMP_DIR}/rust_table_nulltuple/metadata/final.metadata.json"
 
 echo "==> DONE — U4 partitioned COW DELETE round-trip passed:"
 echo "    * Java read the Rust-written partitioned table (DataFusion SQL DML)."
 echo "    * Survivor ids = {3,4} (books: novel/textbook); electronics ids 1/2 absent."
-echo "    * Sabotage (truncated metadata) triggered >0 failures — verify is non-vacuous."
-echo "    * Post-restore verify returned GREEN."
+echo "    * Java read the WG1 null partition tuple back ({null, books}; id=2 category IS NULL)."
+echo "    * Sabotage leg A (truncated rust_table metadata) triggered >0 failures."
+echo "    * Sabotage leg B (truncated rust_table_nulltuple metadata) triggered >0 failures —"
+echo "      the null-tuple assertions are non-vacuous in their own right."
+echo "    * Both post-restore verifies returned GREEN."

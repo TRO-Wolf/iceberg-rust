@@ -62,6 +62,16 @@ impl Bucket {
 
 impl Bucket {
     /// When switch the hash function, we only need to change this function.
+    ///
+    /// The `unwrap` cannot fire: `murmur3_32` reads through `std::io::Read`, and the only
+    /// error it can propagate is one from the reader — here `&[u8]`, whose `Read` impl copies
+    /// out of a slice and is total (it returns `Ok` for every call, `Ok(0)` at the end).
+    /// Making this fallible would mean threading a `Result` through all eight `bucket_*`
+    /// helpers for a branch nothing can reach; the invariant is documented instead.
+    ///
+    /// The `as i32` is a deliberate two's-complement reinterpretation, not a lossy conversion:
+    /// the spec's `bucket_N(x) = (murmur3_x86_32_hash(x) & Integer.MAX_VALUE) % N` is defined
+    /// over Java's SIGNED 32-bit hash, so the sign bit has to survive.
     #[inline]
     fn hash_bytes(mut v: &[u8]) -> i32 {
         murmur3::murmur3_32(&mut v, 0).unwrap() as i32
@@ -177,86 +187,81 @@ impl Bucket {
     }
 }
 
+/// Downcast a transform input to the concrete Arrow array its [`DataType`] implies, or return a
+/// typed error naming both.
+///
+/// Every caller sits in an arm of a `match input.data_type()`, and for arrow's own arrays the
+/// pairing is exact: `arrow_array::make_array` maps each `DataType` to exactly one array struct,
+/// so no arrow-native value can take an arm whose concrete type it is not. That is a property of
+/// the VALUES arrow builds, though, not of this function's signature: `transform` accepts
+/// `Arc<dyn Array>`, and `Array` is a public trait, so the pairing is not something this crate
+/// can enforce. Answering an unexpected implementation with a typed error rather than a panic
+/// costs nothing and keeps a library call from aborting its caller's process.
+fn downcast_input<T: 'static>(input: &ArrayRef) -> crate::Result<&T> {
+    input.as_any().downcast_ref::<T>().ok_or_else(|| {
+        crate::Error::new(
+            crate::ErrorKind::DataInvalid,
+            format!(
+                "Array with data type {:?} is not a {} and cannot be bucket-transformed",
+                input.data_type(),
+                std::any::type_name::<T>()
+            ),
+        )
+    })
+}
+
 impl TransformFunction for Bucket {
     fn transform(&self, input: ArrayRef) -> crate::Result<ArrayRef> {
         let res: arrow_array::Int32Array = match input.data_type() {
-            DataType::Int32 => input
-                .as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap()
-                .unary(|v| self.bucket_int(v)),
-            DataType::Int64 => input
-                .as_any()
-                .downcast_ref::<arrow_array::Int64Array>()
-                .unwrap()
-                .unary(|v| self.bucket_long(v)),
-            DataType::Decimal128(_, _) => input
-                .as_any()
-                .downcast_ref::<arrow_array::Decimal128Array>()
-                .unwrap()
+            DataType::Int32 => {
+                downcast_input::<arrow_array::Int32Array>(&input)?.unary(|v| self.bucket_int(v))
+            }
+            DataType::Int64 => {
+                downcast_input::<arrow_array::Int64Array>(&input)?.unary(|v| self.bucket_long(v))
+            }
+            DataType::Decimal128(_, _) => downcast_input::<arrow_array::Decimal128Array>(&input)?
                 .unary(|v| self.bucket_decimal(v)),
-            DataType::Date32 => input
-                .as_any()
-                .downcast_ref::<arrow_array::Date32Array>()
-                .unwrap()
-                .unary(|v| self.bucket_date(v)),
-            DataType::Time64(TimeUnit::Microsecond) => input
-                .as_any()
-                .downcast_ref::<arrow_array::Time64MicrosecondArray>()
-                .unwrap()
-                .unary(|v| self.bucket_time(v)),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => input
-                .as_any()
-                .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
-                .unwrap()
-                .unary(|v| self.bucket_timestamp(v)),
-            DataType::Time64(TimeUnit::Nanosecond) => input
-                .as_any()
-                .downcast_ref::<arrow_array::Time64NanosecondArray>()
-                .unwrap()
-                .unary(|v| self.bucket_time(v / 1000)),
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => input
-                .as_any()
-                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
-                .unwrap()
-                .unary(|v| self.bucket_timestamp(v / 1000)),
+            DataType::Date32 => {
+                downcast_input::<arrow_array::Date32Array>(&input)?.unary(|v| self.bucket_date(v))
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                downcast_input::<arrow_array::Time64MicrosecondArray>(&input)?
+                    .unary(|v| self.bucket_time(v))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                downcast_input::<arrow_array::TimestampMicrosecondArray>(&input)?
+                    .unary(|v| self.bucket_timestamp(v))
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                downcast_input::<arrow_array::Time64NanosecondArray>(&input)?
+                    .unary(|v| self.bucket_time(v / 1000))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                downcast_input::<arrow_array::TimestampNanosecondArray>(&input)?
+                    .unary(|v| self.bucket_timestamp(v / 1000))
+            }
             DataType::Utf8 => arrow_array::Int32Array::from_iter(
-                input
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringArray>()
-                    .unwrap()
+                downcast_input::<arrow_array::StringArray>(&input)?
                     .iter()
                     .map(|v| v.map(|v| self.bucket_str(v))),
             ),
             DataType::LargeUtf8 => arrow_array::Int32Array::from_iter(
-                input
-                    .as_any()
-                    .downcast_ref::<arrow_array::LargeStringArray>()
-                    .unwrap()
+                downcast_input::<arrow_array::LargeStringArray>(&input)?
                     .iter()
                     .map(|v| v.map(|v| self.bucket_str(v))),
             ),
             DataType::Binary => arrow_array::Int32Array::from_iter(
-                input
-                    .as_any()
-                    .downcast_ref::<arrow_array::BinaryArray>()
-                    .unwrap()
+                downcast_input::<arrow_array::BinaryArray>(&input)?
                     .iter()
                     .map(|v| v.map(|v| self.bucket_bytes(v))),
             ),
             DataType::LargeBinary => arrow_array::Int32Array::from_iter(
-                input
-                    .as_any()
-                    .downcast_ref::<arrow_array::LargeBinaryArray>()
-                    .unwrap()
+                downcast_input::<arrow_array::LargeBinaryArray>(&input)?
                     .iter()
                     .map(|v| v.map(|v| self.bucket_bytes(v))),
             ),
             DataType::FixedSizeBinary(_) => arrow_array::Int32Array::from_iter(
-                input
-                    .as_any()
-                    .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
-                    .unwrap()
+                downcast_input::<arrow_array::FixedSizeBinaryArray>(&input)?
                     .iter()
                     .map(|v| v.map(|v| self.bucket_bytes(v))),
             ),
@@ -1052,6 +1057,134 @@ mod test {
                 .unwrap()
                 .unwrap(),
             Datum::int(7)
+        );
+    }
+
+    /// Every arm of the array `transform` produces the same bucket as the literal path for the
+    /// same value.
+    ///
+    /// The array path and `transform_literal` are two independent `match`es over two different
+    /// input types, and before this sweep only the two timestamp arms of the ARRAY path were
+    /// exercised at all — the other eleven arms had no test, so a concrete Arrow type paired
+    /// with the wrong `DataType` arm (the mechanical hazard of rewriting all thirteen downcasts
+    /// at once) would have gone unnoticed. The literal path is the oracle because its expected
+    /// values are pinned separately against the spec's own examples (`test_int_literal` and
+    /// friends below).
+    #[test]
+    fn test_transform_array_matches_literal_for_every_supported_arm() {
+        use arrow_array::{
+            BinaryArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Int64Array,
+            LargeBinaryArray, LargeStringArray, StringArray, Time64MicrosecondArray,
+            Time64NanosecondArray,
+        };
+
+        let bucket = Bucket::new(100).expect("bucket count is within 1..=i32::MAX");
+
+        let micros = 1510871468000000i64;
+        let time_micros = 81068000000i64;
+        let bytes = b"\x00\x01\x02\x03".to_vec();
+
+        let cases: Vec<(ArrayRef, Datum)> = vec![
+            (Arc::new(Int32Array::from(vec![34])), Datum::int(34)),
+            (Arc::new(Int64Array::from(vec![34i64])), Datum::long(34)),
+            (
+                Arc::new(
+                    Decimal128Array::from(vec![1420i128])
+                        .with_precision_and_scale(20, 0)
+                        .expect("decimal precision/scale"),
+                ),
+                Datum::decimal(decimal_new(1420, 0)).expect("decimal datum"),
+            ),
+            (Arc::new(Date32Array::from(vec![17486])), Datum::date(17486)),
+            (
+                Arc::new(Time64MicrosecondArray::from(vec![time_micros])),
+                Datum::time_micros(time_micros).expect("time datum"),
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![micros])),
+                Datum::timestamp_micros(micros),
+            ),
+            // The nanosecond arms divide by 1000 before hashing, so their oracle is the
+            // microsecond literal of the same instant.
+            (
+                Arc::new(Time64NanosecondArray::from(vec![time_micros * 1000])),
+                Datum::time_micros(time_micros).expect("time datum"),
+            ),
+            (
+                Arc::new(TimestampNanosecondArray::from(vec![micros * 1000])),
+                Datum::timestamp_nanos(micros * 1000),
+            ),
+            (
+                Arc::new(StringArray::from(vec!["iceberg"])),
+                Datum::string("iceberg"),
+            ),
+            (
+                Arc::new(LargeStringArray::from(vec!["iceberg"])),
+                Datum::string("iceberg"),
+            ),
+            (
+                Arc::new(BinaryArray::from_vec(vec![&bytes])),
+                Datum::binary(bytes.clone()),
+            ),
+            (
+                Arc::new(LargeBinaryArray::from_vec(vec![&bytes])),
+                Datum::binary(bytes.clone()),
+            ),
+            (
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(vec![b"foo".to_vec()].into_iter())
+                        .expect("fixed size binary array"),
+                ),
+                Datum::fixed(b"foo".to_vec()),
+            ),
+        ];
+
+        for (array, literal) in cases {
+            let data_type = array.data_type().clone();
+            let transformed = bucket
+                .transform(array)
+                .unwrap_or_else(|e| panic!("{data_type:?} must be bucketable: {e}"));
+            let transformed = transformed
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap_or_else(|| panic!("{data_type:?} must bucket to an Int32Array"));
+            let expected = bucket
+                .transform_literal(&literal)
+                .unwrap_or_else(|e| panic!("{literal} must be bucketable: {e}"))
+                .unwrap_or_else(|| panic!("{literal} must bucket to a value"));
+
+            assert_eq!(
+                Datum::int(transformed.value(0)),
+                expected,
+                "the {data_type:?} array arm must bucket {literal} exactly as the literal path"
+            );
+        }
+    }
+
+    /// A mismatch between an input's `DataType` and its concrete Arrow type is answered with a
+    /// typed error, not a panic.
+    ///
+    /// The thirteen call sites in `transform` cannot reach this branch with an arrow-native
+    /// array — `arrow_array::make_array` maps each `DataType` to exactly one array struct — but
+    /// `transform` takes `Arc<dyn Array>`, whose trait is public, so the pairing is a property
+    /// of arrow's constructors rather than of this crate's types. Replacing the `ok_or_else`
+    /// with the `.unwrap()` that used to be at each site turns this test into a panic.
+    #[test]
+    fn test_downcast_input_is_a_typed_error_not_a_panic() {
+        use arrow_array::StringArray;
+
+        let mislabelled: ArrayRef = Arc::new(StringArray::from(vec!["not an int"]));
+        let error = super::downcast_input::<Int32Array>(&mislabelled)
+            .expect_err("a StringArray is not an Int32Array");
+
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains("Utf8"),
+            "the error must name the data type it was given: {error}"
+        );
+        assert!(
+            error.to_string().contains("Int32"),
+            "the error must name the array type it expected: {error}"
         );
     }
 

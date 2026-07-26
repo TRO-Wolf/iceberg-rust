@@ -86,6 +86,7 @@ engine) parity work.
 | Action emits over-constrained commit requirements | Derive each `TableRequirement` from the update that induces it (Java `UpdateRequirements`): `AddSpec` ⇒ last-assigned-partition-id, `SetDefaultSpec` ⇒ default-spec-id — never emit guards unconditionally |
 | A lifted guard exposes latent bugs in the path it guarded | When removing a coarse precondition/guard, audit the ENTIRE previously-unreachable path — the guard may have masked a second bug no test could reach (the lifted `has_outstanding_delete_files` guard hid `existing_manifest` dropping every DELETE manifest). _Promoted 2026-06-11._ |
 | Surviving entries silently corrupted by a rewrite | The #1 corruption class: re-stamping a surviving/carried-forward entry's snapshot id or sequence numbers. `add_existing_entry` preserves provenance; `add_entry` RESTAMPS. Pin with a cross-snapshot provenance test (see docs/testing.md) |
+| A commit ABORTS mid-flight instead of returning an error | `commit()` runs `summary()` BEFORE `manifest_file()`, and the summary path is infallible: any panic in a summary helper preempts every typed error the later phases would have produced. The `removed_*_files` loops feed it tuples nothing validated, and `file_partition_spec` substitutes the DEFAULT spec for an unknown spec id — so the helpers it calls (e.g. `PartitionSpec::partition_to_path`) must be TOTAL. _Added 2026-07-25 (WG3-L2)._ |
 
 ### First checks
 

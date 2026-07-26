@@ -482,7 +482,10 @@ async fn merge_on_read_delete(
                 Some(mask) => mask.is_valid(row) && mask.value(row),
             };
             if delete_row {
-                pairs.push((decode_file_path(file_col, row)?, pos_col.value(row)));
+                pairs.push((
+                    decode_file_path(file_col, row)?,
+                    decode_position(pos_col, row)?,
+                ));
             }
         }
     }
@@ -1037,17 +1040,9 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         }
     }
 
-    // Group pairs by (spec_id, partition). Pairs whose data file path is not found in the manifest
-    // (shouldn't happen in practice) are grouped under the default spec with an empty partition as a
-    // safe fallback — the validation will reject them if the spec is partitioned, exposing the bug.
-    let mut groups: HashMap<(i32, Struct), Vec<(String, i64)>> = HashMap::new();
-    for pair in pairs {
-        let key = path_to_partition
-            .get(&pair.0)
-            .cloned()
-            .unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()));
-        groups.entry(key).or_default().push(pair.clone());
-    }
+    // Group pairs by (spec_id, partition) — every pair's data file must be live in the snapshot the
+    // map was built from.
+    let groups = group_pairs_by_partition(pairs, &path_to_partition)?;
 
     // Write one position-delete file per (spec_id, partition) group.
     let mut all_delete_files: Vec<DataFile> = Vec::new();
@@ -1079,6 +1074,41 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
     // Each group above is non-empty and `write_position_deletes_for_partition` guarantees it
     // produced at least one file, so `all_delete_files` is non-empty whenever `pairs` was.
     Ok(all_delete_files)
+}
+
+/// The `(path, pos)` pairs of one position-delete output file, keyed by the `(spec_id, partition)`
+/// of the data files they delete from.
+type PositionDeleteGroups = HashMap<(i32, Struct), Vec<(String, i64)>>;
+
+/// Group `(path, pos)` pairs by the `(spec_id, partition)` of the data file each one deletes from,
+/// so every position-delete file can be stamped with the SAME spec and partition as its target
+/// (Java `PositionDeleteWriter` always carries a per-data-file `PartitionKey`).
+///
+/// A pair whose data file is absent from `path_to_partition` is a hard error. The map is built from
+/// the current snapshot's DATA manifests, so a miss means the pair references a file that is not
+/// live — the pairs come from a scan of that same snapshot, so it cannot happen without a bug.
+/// Fabricating `(default_spec, Struct::empty())` for it (the previous fallback) pairs a PARTITIONED
+/// spec with an EMPTY tuple: that used to ABORT in `PartitionKey::to_path` before any validation
+/// could see it, and with the path walk totalised it would instead write a delete file under a
+/// `field=null` path carrying a tuple no reader can match.
+///
+/// Only reached on the PARTITIONED path — the unpartitioned table returns before this.
+fn group_pairs_by_partition(
+    pairs: &[(String, i64)],
+    path_to_partition: &HashMap<String, (i32, Struct)>,
+) -> DFResult<PositionDeleteGroups> {
+    let mut groups = PositionDeleteGroups::new();
+    for pair in pairs {
+        let key = path_to_partition.get(&pair.0).cloned().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "position-delete: data file `{}` is not a live file of the current snapshot, so \
+                 its partition cannot be resolved",
+                pair.0
+            ))
+        })?;
+        groups.entry(key).or_default().push(pair.clone());
+    }
+    Ok(groups)
 }
 
 /// Write one position-delete file for a SINGLE `(spec_id, partition)` group. When `partition_key`
@@ -1142,11 +1172,19 @@ async fn write_position_deletes_for_partition(
 
 /// Decode the reserved `_file` column at `row`. The scan emits `_file` as a per-file constant, which the
 /// transformer materializes as a Run-End-Encoded `Utf8` column; tolerate both REE and plain `Utf8`.
+///
+/// A NULL slot is a hard error rather than a decoded value: arrow's `value()` returns `""` for a
+/// null string, and an empty path silently becomes a position delete against a file that does not
+/// exist. `_file` is a reserved metadata column the scan always materializes, so a NULL means the
+/// batch did not come from where this code believes it did.
 fn decode_file_path(col: &ArrayRef, row: usize) -> DFResult<String> {
     use datafusion::arrow::array::RunArray;
     use datafusion::arrow::datatypes::Int32Type;
 
     if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
+        if plain.is_null(row) {
+            return Err(null_file_path_error(row));
+        }
         return Ok(plain.value(row).to_string());
     }
     if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
@@ -1158,12 +1196,37 @@ fn decode_file_path(col: &ArrayRef, row: usize) -> DFResult<String> {
             .ok_or_else(|| {
                 DataFusionError::Internal("_file REE values are not Utf8".to_string())
             })?;
+        if values.is_null(physical) {
+            return Err(null_file_path_error(row));
+        }
         return Ok(values.value(physical).to_string());
     }
     Err(DataFusionError::Internal(format!(
         "unexpected _file column type: {:?}",
         col.data_type()
     )))
+}
+
+/// The one error raised for a NULL reserved `_file` slot, in both decode paths.
+fn null_file_path_error(row: usize) -> DataFusionError {
+    DataFusionError::Internal(format!(
+        "reserved _file column is NULL at row {row}; a position delete cannot be keyed by an \
+         unknown data file"
+    ))
+}
+
+/// Decode the reserved `_pos` column at `row`.
+///
+/// A NULL slot is a hard error for the same reason as [`decode_file_path`]: arrow's `value()`
+/// returns `0` for a null `i64`, which would silently position-delete row 0 of a real data file.
+fn decode_position(col: &Int64Array, row: usize) -> DFResult<i64> {
+    if col.is_null(row) {
+        return Err(DataFusionError::Internal(format!(
+            "reserved _pos column is NULL at row {row}; a position delete cannot be keyed by an \
+             unknown row position"
+        )));
+    }
+    Ok(col.value(row))
 }
 
 /// Decode the `_file` column for an ENTIRE batch in one pass, returning one borrowed path per row
@@ -1180,7 +1243,14 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
     use datafusion::arrow::datatypes::Int32Type;
 
     if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
-        return Ok((0..plain.len()).map(|row| plain.value(row)).collect());
+        return (0..plain.len())
+            .map(|row| {
+                if plain.is_null(row) {
+                    return Err(null_file_path_error(row));
+                }
+                Ok(plain.value(row))
+            })
+            .collect();
     }
     if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
         let values = run
@@ -1203,6 +1273,9 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
                 let end = usize::try_from(end).map_err(|_| {
                     DataFusionError::Internal("_file REE run-end is negative".to_string())
                 })?;
+                if start < end && values.is_null(physical) {
+                    return Err(null_file_path_error(start));
+                }
                 let value = values.value(physical);
                 for _ in start..end {
                     out.push(value);
@@ -1214,7 +1287,11 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
             // `get_physical_index` per row (still allocation-free). Behaviorally identical to the
             // fast path; kept separate because a sliced run-ends walk is easy to get subtly wrong.
             for row in 0..run.len() {
-                out.push(values.value(run.get_physical_index(row)));
+                let physical = run.get_physical_index(row);
+                if values.is_null(physical) {
+                    return Err(null_file_path_error(row));
+                }
+                out.push(values.value(physical));
             }
         }
         return Ok(out);
@@ -1438,8 +1515,12 @@ fn apply_assignments(
         };
         // An assignment must not introduce NULLs into a REQUIRED (non-nullable) column — Parquet would
         // write the null and silently violate the Iceberg schema contract.
+        //
+        // `logical_null_count`, not `null_count`: the latter is the PHYSICAL count, which is 0 for a
+        // dictionary- or run-end-encoded array whose *values* carry the NULL. `RecordBatch::try_new`'s
+        // own nullability check is physical too, so such a NULL would clear both gates and be written.
         let field = table_schema.field(*col_idx);
-        if !field.is_nullable() && assigned.null_count() > 0 {
+        if !field.is_nullable() && assigned.logical_null_count() > 0 {
             return Err(DataFusionError::Plan(format!(
                 "UPDATE cannot assign NULL to required column '{}'",
                 field.name()
@@ -1518,7 +1599,10 @@ async fn merge_on_read_update(
             .ok_or_else(|| DataFusionError::Internal("_pos column is not Int64".to_string()))?;
         for row in 0..mask.len() {
             if mask.value(row) {
-                pairs.push((decode_file_path(file_col, row)?, pos_col.value(row)));
+                pairs.push((
+                    decode_file_path(file_col, row)?,
+                    decode_position(pos_col, row)?,
+                ));
             }
         }
 
@@ -1758,12 +1842,148 @@ async fn copy_on_write_update(
 mod tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{ArrayRef, Int32Array, RunArray, StringArray};
-    use datafusion::arrow::datatypes::Int32Type;
+    use datafusion::arrow::array::{
+        ArrayRef, DictionaryArray, Int32Array, Int64Array, RecordBatch, RunArray, StringArray,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::Column;
 
     use super::{
-        IsolationLevel, decode_file_path, decode_file_paths_batch, sort_position_delete_pairs,
+        IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch,
+        decode_position, group_pairs_by_partition, sort_position_delete_pairs,
     };
+
+    // =============================================================================================
+    // WG5 (c) — an assignment must never smuggle a NULL into a REQUIRED column. `null_count()` is
+    // the PHYSICAL count: a dictionary (or run-end) array whose *values* hold a NULL reports 0
+    // while `logical_null_count()` reports the real answer, and `RecordBatch::try_new`'s own
+    // nullability check is physical too — so the NULL passes both gates and is written.
+    // =============================================================================================
+
+    /// A single-column table schema for `d`, `nullable` as given, dictionary-encoded Utf8.
+    fn dict_column_schema(nullable: bool) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            nullable,
+        )]))
+    }
+
+    /// Dictionary array with a NULL hiding in the VALUES: physically null-free keys, logically a
+    /// NULL at row 1.
+    fn dict_with_null_value() -> ArrayRef {
+        let values = StringArray::from(vec![Some("x"), None]);
+        let keys = Int32Array::from(vec![0, 1]);
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))
+                .expect("dictionary array"),
+        )
+    }
+
+    #[test]
+    fn test_dictionary_encoded_null_cannot_be_assigned_to_a_required_column() {
+        let column = dict_with_null_value();
+        // The premise of the whole test: physically clean, logically NULL.
+        assert_eq!(column.null_count(), 0, "physical null count must be 0");
+        assert_eq!(column.logical_null_count(), 1, "row 1 is logically NULL");
+
+        let schema = dict_column_schema(false);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
+        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
+
+        let err = apply_assignments(&batch, &[(0, assignment)], &schema, None)
+            .expect_err("a dictionary-encoded NULL must not reach a required column");
+        assert!(
+            err.to_string()
+                .contains("UPDATE cannot assign NULL to required column 'd'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dictionary_encoded_null_is_fine_for_an_optional_column() {
+        // The negative pin: the guard must reject only REQUIRED columns.
+        let column = dict_with_null_value();
+        let schema = dict_column_schema(true);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
+        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
+
+        let out = apply_assignments(&batch, &[(0, assignment)], &schema, None)
+            .expect("an optional column may take a NULL");
+        assert_eq!(out.column(0).logical_null_count(), 1);
+    }
+
+    #[test]
+    fn test_null_free_assignment_to_a_required_column_still_succeeds() {
+        // The other negative pin: `logical_null_count` must not reject clean data.
+        let values = StringArray::from(vec![Some("x"), Some("y")]);
+        let keys = Int32Array::from(vec![0, 1]);
+        let column: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))
+                .expect("dictionary array"),
+        );
+        let schema = dict_column_schema(false);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
+        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
+
+        let out = apply_assignments(&batch, &[(0, assignment)], &schema, None)
+            .expect("a NULL-free assignment to a required column must succeed");
+        assert_eq!(out.column(0).logical_null_count(), 0);
+    }
+
+    // =============================================================================================
+    // WG5 (d) — the reserved `_file` / `_pos` decode read `.value(i)` with no validity check.
+    // Arrow's `value()` on a NULL slot returns a well-formed lie: `""` for a string, `0` for an
+    // i64. Both feed straight into a position-delete tuple, so a NULL `_file` deletes against an
+    // empty path and a NULL `_pos` deletes ROW 0 of a real data file.
+    // =============================================================================================
+
+    #[test]
+    fn test_decode_file_path_rejects_a_null_path() {
+        let col: ArrayRef = Arc::new(StringArray::from(vec![Some("s3://b/a.parquet"), None]));
+        assert!(
+            decode_file_path(&col, 0).is_ok(),
+            "the live row must still decode"
+        );
+        let err = decode_file_path(&col, 1).expect_err("a NULL _file must not decode to \"\"");
+        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_decode_file_paths_batch_rejects_a_null_path() {
+        let col: ArrayRef = Arc::new(StringArray::from(vec![Some("s3://b/a.parquet"), None]));
+        let err = decode_file_paths_batch(&col).expect_err("a NULL _file must not decode to \"\"");
+        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_decode_file_path_rejects_a_null_ree_value() {
+        // The REE shape the COW scan actually produces, with a NULL in the run VALUES.
+        let run_ends = Int32Array::from(vec![2, 4]);
+        let values = StringArray::from(vec![Some("f/a.parquet"), None]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
+        let col: ArrayRef = Arc::new(ree);
+        assert!(decode_file_path(&col, 0).is_ok(), "run 0 is live");
+        let err = decode_file_path(&col, 3).expect_err("a NULL REE _file value must not decode");
+        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
+        let err = decode_file_paths_batch(&col).expect_err("batch decode must reject it too");
+        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_decode_position_rejects_a_null_position() {
+        let col = Int64Array::from(vec![Some(7), None]);
+        assert_eq!(
+            decode_position(&col, 0).expect("the live row must decode"),
+            7
+        );
+        let err = decode_position(&col, 1).expect_err("a NULL _pos must not decode to 0");
+        assert!(err.to_string().contains("_pos"), "unexpected error: {err}");
+    }
 
     /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string
     /// `decode_file_path` would — for a plain `StringArray`, for a run-end-encoded `_file` column
@@ -1942,6 +2162,82 @@ mod tests {
         assert!(
             IsolationLevel::parse("none").is_err(),
             "'none' must be rejected for row-level operations"
+        );
+    }
+
+    // ============================================================================================
+    // WG3-L3: the position-delete grouping resolves every pair's real partition instead of
+    // fabricating `(default_spec, Struct::empty())` for an unmatched data file.
+    // ============================================================================================
+
+    /// `path → (spec_id, partition)` for two files of a one-field partitioned spec.
+    fn partition_map() -> std::collections::HashMap<String, (i32, iceberg::spec::Struct)> {
+        use iceberg::spec::{Literal, Struct};
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "s3://b/x0.parquet".to_string(),
+            (1, Struct::from_iter([Some(Literal::long(0))])),
+        );
+        map.insert(
+            "s3://b/x1.parquet".to_string(),
+            (1, Struct::from_iter([Some(Literal::long(1))])),
+        );
+        map
+    }
+
+    /// The normal path: pairs are grouped by their data file's own `(spec_id, partition)`, so each
+    /// delete file is stamped with the spec + partition of the file it deletes from.
+    #[test]
+    fn test_group_pairs_by_partition_groups_by_the_target_files_partition() {
+        let map = partition_map();
+        let pairs = vec![
+            ("s3://b/x0.parquet".to_string(), 3),
+            ("s3://b/x1.parquet".to_string(), 7),
+            ("s3://b/x0.parquet".to_string(), 1),
+        ];
+
+        let groups = group_pairs_by_partition(&pairs, &map).expect("every pair resolves");
+        assert_eq!(
+            groups.len(),
+            2,
+            "one group per distinct partition: {groups:?}"
+        );
+        let x0 = groups
+            .get(&map["s3://b/x0.parquet"])
+            .expect("the x=0 group must exist");
+        assert_eq!(x0.len(), 2, "both x=0 pairs land in the same group");
+        assert_eq!(
+            groups
+                .get(&map["s3://b/x1.parquet"])
+                .expect("the x=1 group must exist")
+                .len(),
+            1
+        );
+    }
+
+    /// A pair whose data file is not live in the snapshot the map was built from must FAIL — the
+    /// previous fallback fabricated `(default_spec, Struct::empty())`, pairing a partitioned spec
+    /// with an empty tuple. That aborted in `PartitionKey::to_path` before any validation ran, and
+    /// with the path walk totalised it would write a delete file under a `field=null` path that no
+    /// reader can ever match (a silent under-delete: the rows come back).
+    ///
+    /// MUTATION (restore the `unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()))`
+    /// fallback): this test goes RED.
+    #[test]
+    fn test_group_pairs_by_partition_rejects_an_unmatched_data_file() {
+        let map = partition_map();
+        let pairs = vec![
+            ("s3://b/x0.parquet".to_string(), 3),
+            ("s3://b/ghost.parquet".to_string(), 0),
+        ];
+
+        let err = group_pairs_by_partition(&pairs, &map)
+            .expect_err("an unresolvable data file must fail loudly");
+        assert!(
+            err.to_string().contains("s3://b/ghost.parquet")
+                && err.to_string().contains("is not a live file"),
+            "the error must name the offending file: {err}"
         );
     }
 }

@@ -144,6 +144,31 @@ engine may therefore hand `"UTC"`-tagged batches directly. The alias set is CLOS
 **nested** alias mismatch (inside a struct/list) is NOT coerced and fails loud — nested normalization
 is a deferred fork follow-up.
 
+**Partition-tuple integrity.** A wrong partition tuple is *accepted* by every commit path (arity and
+types are validated, values are not) and is then silent in both engines: a pruned read drops the
+file's rows, and an unpruned read hands back the RECORDED value for identity-partitioned columns —
+partition metadata OVERRIDES the file's own column for an identity transform (Iceberg "Column
+Projection" rule 1 / Java `PartitionUtil.constantsMap`; Rust
+`arrow/record_batch_transformer.rs::constant_overrides_file_column`). Two consequences an engine must
+internalise. First, on an identity spec the damage is visible on an ORDINARY FULL SCAN, not only on a
+pruned one: rows come back carrying the recorded value in place of the value that was written.
+Second, the written value is NOT lost when the writer emits the partition-source column (as this crate's writers always do) — it is still in the data file, masked — so the corruption is
+repairable in place; `maintenance::RepairPartitionKeys` rewrites the rows under their recomputed keys
+and the true values return.
+
+Two duties follow for any engine that can compute a partition-source column:
+
+1. **Declare your data dependencies to your optimizer, or compute the tuple inside the operator.** An
+   expression node that reads its input positionally while declaring no children can be re-parented
+   onto a different input by any projection-fusing optimizer and will then compute the tuple from the
+   wrong batch — a real-but-wrong tuple that nothing rejects. The fixed `PartitionExpr`
+   (`iceberg-datafusion` `physical_plan/project.rs`) is the worked example: honest `children()`,
+   evaluation THROUGH those children, never `batch.columns()`.
+2. **Do not verify partition tuples by reading the table.** On identity specs the read serves the
+   recorded tuple, so any check computed from served rows is vacuous. Use
+   `maintenance::AuditPartitionKeys`, which reads with the tuple stripped —
+   [`partition-key-audit.md`](partition-key-audit.md) is the detection + remediation recipe.
+
 ## 5. Isolation level → validation recipes  ·  **NORMATIVE (oracle-verified 2026-07-09)**
 
 Rust builder methods, verbatim from `transaction/{row_delta,overwrite_files,replace_partitions}.rs`.
@@ -221,11 +246,89 @@ grow MERGE semantics; it will not (out of parity scope).
   `physical_plan/project.rs`) computes `_partition` via `PartitionValueCalculator`; the
   partition-aware `TaskWriter` (`task_writer.rs`) consumes the precomputed `_partition` column
   and routes per row. Clustered input may use the cheaper clustered writer.
-- Position-delete files: **one file per `(spec_id, partition)` group**, stamped with the matching
-  `PartitionKey` (see #131 U3 — an unstamped delete file on a partitioned table fails
-  `validate_partition_value` at commit). Keep `MetricsConfig::for_position_delete` so
-  `file_path`/`pos` bounds stay Full (pruning precision).
 - Sort-order application before write is engine-owned; core records the order.
+
+### 7a. Partition-spec identity on every written file · **NORMATIVE (2026-07-25)**
+
+Every file the base writers produce carries a `partition_spec_id`. It is the FIRST half of the
+`(spec_id, partition)` key the read side matches deletes to data with
+(`DeleteFileIndex::get_deletes_for_data_file` requires `data_file.partition_spec_id ==
+delete.partition_spec_id` — for position deletes, and for equality deletes carrying a NON-EMPTY
+partition tuple; see the global-equality-delete carve-out below), and it decides which per-spec
+manifest a commit routes the file into (`SnapshotProducer::group_files_by_spec`). Java takes the
+`PartitionSpec` as a REQUIRED constructor argument on every file builder — `FileMetadata.Builder`
+sets `this.specId = spec.specId()`, `PositionDeleteWriter` takes `(…, PartitionSpec spec, StructLike
+partition, …)` — so a Java-written file can never claim a spec the table does not have.
+
+- The engine **MUST** give every writer the spec its files are written under: pass a `PartitionKey`
+  (which carries the spec its tuple came from), or configure the spec explicitly with
+  `DataFileWriterBuilder::with_partition_spec` /
+  `PositionDeleteFileWriterBuilder::with_partition_spec` /
+  `EqualityDeleteFileWriterBuilder::with_partition_spec`. When both are given the **`PartitionKey`
+  wins** — it is authoritative for its own tuple.
+- For a delete file the spec **MUST** be the spec of the **DATA FILES the deletes apply to** — never
+  the table's default/current spec, and never a fabricated constant. After a spec evolution the
+  live data files sit under several specs at once; a delete only ever applies to data files carrying
+  the *same* `(spec_id, partition)`.
+- Position-delete files: **one file per `(spec_id, partition)` group**, stamped with that group's
+  `PartitionKey` (#131 U3). Group by the DATA files' own `(spec_id, partition)`, not by the table
+  default.
+- **A wrong spec id is not always loud.** When the claimed spec's partition type happens to be
+  arity- and type-compatible with the tuple the file carries, the commit **ACCEPTS** it —
+  `SnapshotProducer::validate_partition_value` checks arity and per-value type, never *which* spec
+  the file belongs to (Java is identical). A POSITION delete (or a partition-scoped equality delete)
+  then sits in the table, counted and reachable, and is **never applied to any data file**: the rows
+  it was written to delete come back on every read, in this engine and in Java/Spark alike. The
+  canonical instance is a table whose spec 0 is UNPARTITIONED and whose current spec is not 0 — the
+  empty tuple matches spec 0's empty partition type exactly. Pinned end-to-end in
+  `writer/base_writer/position_delete_writer.rs::spec_stamp_e2e_test`
+  (`…_unstamped_delete_under_evolved_spec_commits_and_never_applies` for the engine-reachable shape,
+  and `…_same_tuple_wrong_spec_id_alone_silently_under_deletes`, which holds the TUPLE constant —
+  `truncate[5](dept)` vs `identity(dept)`, identical for `"eng"` — so the spec id is the sole
+  discriminator).
+- **CARVE-OUT — a keyless EQUALITY delete OVER-deletes, it does not under-delete.** The hazard
+  direction INVERTS for equality deletes built with no `PartitionKey`, because such a file also
+  carries an EMPTY partition tuple, and the Iceberg spec applies an equality delete stored with an
+  unpartitioned spec as a **global delete**. Both engines implement it — Rust routes on the file's
+  empty tuple (`PopulatedDeleteFileIndex::new` → `global_equality_deletes`), Java on the SPEC being
+  unpartitioned (`DeleteFileIndex.Builder.add`, 1.10.0) — and the global bucket is consulted with **no
+  spec-id and no partition condition**, only the sequence-number filter. So the file applies to EVERY
+  data file in the table whatever spec id it claims: the loss is data deleted table-wide, not rows
+  resurrecting. Give an equality delete meant for one partition its `PartitionKey`; configuring the
+  spec alone does not scope it. Pinned by `…_keyless_equality_delete_is_global_not_inert` and its
+  contrast leg `…_keyed_equality_delete_is_partition_scoped`. (Divergence worth knowing: the two
+  engines' routing predicates differ for an ALL-VOID spec carrying a null tuple — Rust would scope
+  it, Java would globalise it. Backlog, not a writer concern.)
+- The mirror-image failure is loud but total: when the current spec is UNPARTITIONED with a NON-ZERO
+  id (reachable on V2 by removing a spec's only field), a writer given neither key nor spec claims
+  spec 0 — and if spec 0 is partitioned the commit rejects every file with `Partition value is not
+  compatible with partition type`. Such a table cannot be written at all until the spec is passed.
+- **Legacy fallback (deliberate, non-breaking).** A writer built with neither a `PartitionKey` nor a
+  configured spec still stamps `DEFAULT_PARTITION_SPEC_ID` (0), so pre-existing callers keep
+  compiling and behaving as before. That fallback is correct ONLY for a table whose current spec
+  really is spec 0. Treat it as deprecated: pass the spec.
+- A partitioned spec configured WITHOUT a `PartitionKey` is rejected at `build()` with
+  `ErrorKind::DataInvalid` — the file would claim a spec whose partition type has fields while
+  carrying an empty tuple. The check is keyed on partition-field **arity**, not on
+  `PartitionSpec::is_unpartitioned()`, which also reports `true` for an ALL-VOID spec whose partition
+  type still has fields.
+- **Neither routing leg rescues a wrongly stamped position delete this crate writes.** The read side can
+  bind a position delete to one data file by the `referenced_data_file` field or by EQUAL `file_path`
+  column bounds — and a delete this crate writes offers neither: it does not set the field (nor does
+  Java through 1.11.0 for parquet position deletes; only the V3 DV writer does), and parquet-rs
+  truncates byte-array statistics at 64 bytes so the metrics aggregator drops the `file_path` bounds
+  as non-exact. A fork-written position delete is therefore routed by `(spec_id, partition)` ALONE. A
+  wrong stamp is a silent under-delete with no fallback — which is why the stamping rules above are
+  MUSTs, not hygiene.
+- **Delete granularity is the ENGINE's choice; the core has no knob.** This crate neither reads nor
+  persists `write.delete.granularity`, so nothing infers granularity for you: you get what your
+  grouping produces — one delete file per `(spec_id, partition)` group is PARTITION granularity, one
+  per data file is FILE granularity. Do not read a table's properties to discover what another writer
+  did: the property is not persisted when unset and the two Java defaults DISAGREE —
+  `TableProperties.DELETE_GRANULARITY_DEFAULT` is PARTITION while `SparkWriteConf.deleteGranularity()`
+  defaults to FILE, and Spark writes FILE. (Bytecode-verified by the RePark consumer, 2026-07-25.)
+- Keep `MetricsConfig::for_position_delete` so `file_path`/`pos` bounds stay Full (pruning
+  precision).
 
 ## 8. Commit semantics
 

@@ -22,6 +22,7 @@ use arrow_arith::boolean::and;
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_select::filter::filter_record_batch;
 use tokio::sync::Notify;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::oneshot::Receiver;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -61,6 +62,25 @@ enum PosDelState {
     Loading(Arc<Notify>),
     /// The file has been fully loaded and merged into the delete vector map.
     Loaded,
+    /// The load failed terminally: the task that claimed this file (see
+    /// [`DeleteFilter::try_start_pos_del_load`]) died without ever publishing its delete vectors.
+    /// This happens on ANY error or cancellation in the claim → read → parse → merge window (an
+    /// unreadable or corrupt delete file, a negative position, the whole load stream being torn
+    /// down because a sibling task errored, a panic, or a runtime shutdown). The claiming task is
+    /// the sole writer for its file and runs once, so the state can never advance on its own:
+    /// waiters MUST treat this as terminal and surface a typed error instead of re-waiting on a
+    /// notifier that has already fired for the last time — which would block the scan forever.
+    /// Mirrors [`EqDelState::Failed`] (and `DeleteFileIndexState::Failed` in
+    /// [`crate::delete_file_index`]).
+    ///
+    /// Carries the CAUSE, rendered into every waiter's (and every later claimant's) error — the
+    /// error itself cannot be carried, since it reaches only the task that produced it and
+    /// [`Error`] is not `Clone`. The claiming task records it with
+    /// [`PosDelLoadGuard::note_failure`] on the paths where it has one; the paths where it does not
+    /// (an unwind, a cancelled future, a runtime shutdown) publish a generic reason. Deliberately
+    /// asymmetric with [`EqDelState::Failed`]: there the terminal transition is made by the
+    /// publisher task, which observes only a dropped oneshot sender and so has no cause to record.
+    Failed(String),
 }
 
 #[derive(Debug, Default)]
@@ -101,15 +121,184 @@ pub struct DeleteFilter {
 }
 
 /// Action to take when trying to start loading a positional delete file
+#[derive(Debug)]
 pub(crate) enum PosDelLoadAction {
-    /// The file is not loaded, the caller should load it.
-    Load,
+    /// The file is not loaded, the caller should load it. The guard carries the claim: publish it
+    /// with [`PosDelLoadGuard::publish_loaded`] once the delete vectors are merged into the
+    /// filter, or let it drop and every waiter gets a typed error instead of hanging.
+    Load(PosDelLoadGuard),
     /// The file is already loaded, nothing to do.
     AlreadyLoaded,
-    /// The file is currently being loaded by another task.
-    /// The caller *must* wait for this notifier to ensure data availability
-    /// before returning, as subsequent access (get_delete_vector) is synchronous.
-    WaitFor(Arc<Notify>),
+    /// The file is currently being loaded by another task. The caller *must* wait — pass this
+    /// future to [`DeleteFilter::wait_for_pos_del_load`] — to ensure data availability before
+    /// returning, as subsequent access (`get_delete_vector`) is synchronous.
+    ///
+    /// The future is ARMED HERE, under the state lock, and handed to the caller already created.
+    /// That is load-bearing: [`Notify::notify_waiters`] stores no permit and only wakes `Notified`
+    /// futures that already EXIST when it fires, and `Notify::notified_owned` snapshots the
+    /// notifier's `notify_waiters` counter at CALL time. Returning a bare `Arc<Notify>` for the
+    /// caller to `.notified()` at the await site left a window between releasing the lock and
+    /// creating the future in which the loader could publish + notify — the wakeup was then
+    /// dropped and the waiting scan parked forever (upstream apache/iceberg-rust#2859, the same
+    /// class as #2696 on the delete-file-index wait path). Creating the future while the lock is
+    /// held closes it: the loader cannot notify until it has taken the WRITE lock, which cannot be
+    /// granted while this lock is held, so any notification necessarily follows this arming.
+    WaitFor(OwnedNotified),
+}
+
+/// Publishes the TERMINAL state of one positional-delete file's load and wakes its waiters.
+///
+/// Handed to the claiming task by [`DeleteFilter::try_start_pos_del_load`] — i.e. armed in the
+/// same critical section that installs [`PosDelState::Loading`], so there is no window in which
+/// the claim exists without its guard. [`PosDelLoadGuard::publish_loaded`] disarms it on the
+/// success path; if that call is never reached, `Drop` publishes [`PosDelState::Failed`] instead,
+/// so every waiter reaches a terminal state and gets a typed error rather than hanging forever.
+/// `Drop` therefore covers every way the loading task can die without publishing: an early `?`
+/// return (unreadable file, corrupt rows), a sibling task's error tearing down the shared load
+/// stream, an unwind, and a runtime shutdown that drops the task's future.
+///
+/// Both paths write the state under the write lock and fire the notifier only AFTER releasing it,
+/// so a woken waiter always observes the terminal state — the other half of the handshake with
+/// [`PosDelLoadAction::WaitFor`]'s arming.
+pub(crate) struct PosDelLoadGuard {
+    state: Arc<RwLock<DeleteFileFilterState>>,
+    notify: Arc<Notify>,
+    file_path: String,
+    armed: bool,
+    /// The cause recorded by [`PosDelLoadGuard::note_failure`], published into
+    /// [`PosDelState::Failed`] so waiters learn WHY the load died, not just THAT it did.
+    failure_reason: Option<String>,
+}
+
+/// Renders the claim, not the whole guarded filter state: a `Debug` that reached for the state
+/// would `try_read` a lock this guard's own `publish` may be holding.
+impl std::fmt::Debug for PosDelLoadGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PosDelLoadGuard")
+            .field("file_path", &self.file_path)
+            .field("armed", &self.armed)
+            .field("failure_reason", &self.failure_reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PosDelLoadGuard {
+    fn publish(&mut self, terminal: PosDelState) {
+        {
+            // Recover a poisoned guard rather than cascading the panic: this task is the sole
+            // writer for its file and runs once, so recovering and completing the transition is
+            // always the right move — a stranded `Loading` would hang every waiter below.
+            let mut state = recover_poison(self.state.write());
+            state
+                .positional_deletes
+                .insert(self.file_path.clone(), terminal);
+        }
+        self.armed = false;
+        self.notify.notify_waiters();
+    }
+
+    /// Mark this positional delete file fully loaded and wake every waiter. Call it only AFTER the
+    /// file's delete vectors have been merged into the filter: a woken waiter reads them
+    /// synchronously and would otherwise see an empty or partial result.
+    pub(crate) fn publish_loaded(mut self) {
+        self.publish(PosDelState::Loaded);
+    }
+
+    /// Record the error that is about to end this load, then hand it back for `?` propagation.
+    ///
+    /// Only the task holding the guard ever sees that error; every OTHER consumer of this file —
+    /// a concurrent waiter, and any later claimant on the same (result-caching) loader — reaches
+    /// the terminal state instead, so without this the cause is lost to them and they learn only
+    /// THAT the load died. Use it on every failure path that has a cause in hand; the paths that
+    /// do not (an unwind, a future dropped by a runtime teardown, a sibling task's error tearing
+    /// the shared load stream down) still publish `Failed` from `Drop`, with a generic reason.
+    pub(crate) fn note_failure(&mut self, error: Error) -> Error {
+        self.failure_reason = Some(error.to_string());
+        error
+    }
+}
+
+impl Drop for PosDelLoadGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let reason = self.failure_reason.take().unwrap_or_else(|| {
+                "no cause was recorded — the load was cancelled, panicked, or the runtime was \
+                 shut down"
+                    .to_string()
+            });
+            self.publish(PosDelState::Failed(reason));
+        }
+    }
+}
+
+/// Publishes the TERMINAL state of one equality-delete file's load and wakes its waiters.
+///
+/// The equality-delete counterpart of [`PosDelLoadGuard`], armed by
+/// [`DeleteFilter::try_start_eq_del_load`] in the same critical section that installs
+/// [`EqDelState::Loading`]. It carries the notifier that claim installed, so the waiter-visible
+/// notifier and the one that eventually fires are THE SAME object — minting a fresh notifier at
+/// publish-registration time would strand any waiter that armed on the claim's notifier in
+/// between.
+///
+/// [`EqDelLoadGuard::spawn_publisher`] hands the guard to the task that awaits the loader's
+/// oneshot; the guard is CAPTURED by that task's future rather than constructed inside it, so a
+/// future dropped before it is ever polled (a runtime torn down between `spawn` and the first
+/// poll) still runs `Drop` and publishes [`EqDelState::Failed`].
+pub(crate) struct EqDelLoadGuard {
+    state: Arc<RwLock<DeleteFileFilterState>>,
+    notify: Arc<Notify>,
+    file_path: String,
+    armed: bool,
+}
+
+impl EqDelLoadGuard {
+    fn publish(&mut self, terminal: EqDelState) {
+        {
+            let mut state = recover_poison(self.state.write());
+            state
+                .equality_deletes
+                .insert(self.file_path.clone(), terminal);
+        }
+        self.armed = false;
+        self.notify.notify_waiters();
+    }
+
+    /// Spawn the task that turns the loader's oneshot into this file's terminal state.
+    ///
+    /// The loader sends the parsed predicate (and optional key set) once the eq-delete file is
+    /// read. If the SENDER is instead dropped without sending — which happens on ANY error or
+    /// cancellation in the load → parse → send window (a malformed `equality_ids`, an unreadable
+    /// delete file, a schema-evolution or parse failure, or the whole load stream being torn down
+    /// because a sibling task errored) — `recv` errs and the entry moves to the terminal
+    /// [`EqDelState::Failed`], STILL waking the waiters: leaving it `Loading` strands every
+    /// predicate / key-set waiter on the notifier forever. The waiters read `Failed` as absence
+    /// and surface a typed error to the caller.
+    pub(crate) fn spawn_publisher(mut self, eq_del: Receiver<(Predicate, Option<EqDeleteKeySet>)>) {
+        crate::runtime::spawn(async move {
+            let terminal = match eq_del.await {
+                Ok((predicate, key_set)) => EqDelState::Loaded(predicate, key_set),
+                Err(_) => EqDelState::Failed,
+            };
+            self.publish(terminal);
+        });
+    }
+}
+
+impl Drop for EqDelLoadGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.publish(EqDelState::Failed);
+        }
+    }
+}
+
+/// The outcome of consulting one equality-delete entry once — see
+/// [`DeleteFilter::lookup_or_arm_eq_del`].
+enum EqDelLookup<T> {
+    /// The entry had reached a terminal state (or is unknown); this is the answer.
+    Ready(Option<T>),
+    /// The entry was still loading. Await this ALREADY-ARMED future, then read the state again.
+    Wait(OwnedNotified),
 }
 
 /// Recover a poisoned lock guard instead of cascading the panic to every subsequent scan.
@@ -149,61 +338,140 @@ impl DeleteFilter {
             .cloned()
     }
 
-    pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Arc<Notify>> {
+    /// Attempts to claim an equality delete file for loading, returning the guard that publishes
+    /// its terminal state. `None` means another task already owns it (or it already reached a
+    /// terminal state) and this caller must not load it.
+    pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<EqDelLoadGuard> {
         let mut state = recover_poison(self.state.write());
 
-        // Skip if already loaded/loading - another task owns it
+        // Skip if already loaded/loading/failed - another task owns it. A terminal `Failed` is NOT
+        // re-claimed: it is cached for the lifetime of this filter exactly as `Loaded` is, so the
+        // waiters' post-wake re-read stays unambiguous (a re-claim could install a fresh `Loading`
+        // under a woken waiter). The waiter reads `Failed` as absence and the caller raises a
+        // typed error naming the file.
         if state.equality_deletes.contains_key(file_path) {
             return None;
         }
 
-        // Mark as loading to prevent duplicate work
-        let notifier = Arc::new(Notify::new());
+        // Mark as loading to prevent duplicate work. The guard carries THIS notifier, so the
+        // notifier waiters arm on is the notifier that eventually fires.
+        let notify = Arc::new(Notify::new());
         state
             .equality_deletes
-            .insert(file_path.to_string(), EqDelState::Loading(notifier.clone()));
+            .insert(file_path.to_string(), EqDelState::Loading(notify.clone()));
 
-        Some(notifier)
+        Some(EqDelLoadGuard {
+            state: self.state.clone(),
+            notify,
+            file_path: file_path.to_string(),
+            armed: true,
+        })
     }
 
     /// Attempts to mark a positional delete file as "loading".
     ///
-    /// Returns an action dictating whether the caller should load the file,
-    /// wait for another task to load it, or do nothing.
-    pub(crate) fn try_start_pos_del_load(&self, file_path: &str) -> PosDelLoadAction {
+    /// Returns an action dictating whether the caller should load the file (carrying the guard
+    /// that publishes the outcome), wait for another task to load it, or do nothing.
+    ///
+    /// Errs when a previous loader for this file terminated without publishing
+    /// ([`PosDelState::Failed`]): the state is terminal, so a fresh claim would be a lie and a
+    /// wait would never end. The scan fails loudly instead — never silently without this file's
+    /// deletes, which would resurrect deleted rows.
+    pub(crate) fn try_start_pos_del_load(&self, file_path: &str) -> Result<PosDelLoadAction> {
         let mut state = recover_poison(self.state.write());
 
-        if let Some(state) = state.positional_deletes.get(file_path) {
-            match state {
-                PosDelState::Loaded => return PosDelLoadAction::AlreadyLoaded,
-                PosDelState::Loading(notify) => return PosDelLoadAction::WaitFor(notify.clone()),
+        if let Some(existing) = state.positional_deletes.get(file_path) {
+            match existing {
+                PosDelState::Loaded => return Ok(PosDelLoadAction::AlreadyLoaded),
+                // ARM HERE, under the lock — see `PosDelLoadAction::WaitFor`.
+                PosDelState::Loading(notify) => {
+                    return Ok(PosDelLoadAction::WaitFor(notify.clone().notified_owned()));
+                }
+                PosDelState::Failed(reason) => {
+                    return Err(pos_del_load_failed_error(file_path, reason));
+                }
             }
         }
 
-        let notifier = Arc::new(Notify::new());
+        let notify = Arc::new(Notify::new());
         state
             .positional_deletes
-            .insert(file_path.to_string(), PosDelState::Loading(notifier));
+            .insert(file_path.to_string(), PosDelState::Loading(notify.clone()));
 
-        PosDelLoadAction::Load
+        Ok(PosDelLoadAction::Load(PosDelLoadGuard {
+            state: self.state.clone(),
+            notify,
+            file_path: file_path.to_string(),
+            armed: true,
+            failure_reason: None,
+        }))
     }
 
-    /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
-    pub(crate) fn finish_pos_del_load(&self, file_path: &str) {
-        let notify = {
-            let mut state = recover_poison(self.state.write());
-            if let Some(PosDelState::Loading(notify)) = state
-                .positional_deletes
-                .insert(file_path.to_string(), PosDelState::Loaded)
-            {
-                Some(notify)
-            } else {
-                None
-            }
-        };
+    /// Wait for another task's in-flight positional-delete load to reach a terminal state.
+    ///
+    /// `notified` MUST be the future armed by [`Self::try_start_pos_del_load`] under the state
+    /// lock; awaiting a `Notified` created here instead would reopen the lost-wakeup window.
+    /// Returns once the file's delete vectors are merged into the filter, or a typed error if the
+    /// loading task died without publishing them — never a hang.
+    pub(crate) async fn wait_for_pos_del_load(
+        &self,
+        file_path: &str,
+        notified: OwnedNotified,
+    ) -> Result<()> {
+        notified.await;
 
-        if let Some(notify) = notify {
-            notify.notify_waiters();
+        // The loading task publishes a TERMINAL state under the write lock and only then fires the
+        // notifier, so a woken waiter always observes `Loaded` or `Failed`. Neither is ever
+        // replaced (`try_start_pos_del_load` re-claims neither), so anything else here means the
+        // notifier fired without a terminal transition — surface it rather than re-waiting.
+        match recover_poison(self.state.read())
+            .positional_deletes
+            .get(file_path)
+        {
+            Some(PosDelState::Loaded) => Ok(()),
+            Some(PosDelState::Failed(reason)) => Err(pos_del_load_failed_error(file_path, reason)),
+            _ => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "the positional delete file '{file_path}' notified its waiters without \
+                     reaching a terminal load state"
+                ),
+            )),
+        }
+    }
+
+    /// Read one equality-delete entry once: answer outright if it is terminal, otherwise ARM the
+    /// notifier.
+    ///
+    /// The arming MUST happen here, while the read lock is still held — the same handshake
+    /// [`PosDelLoadAction::WaitFor`] documents. [`Notify::notify_waiters`] stores no permit and
+    /// only wakes `Notified` futures that already EXIST when it fires, and
+    /// `Notify::notified_owned` snapshots the notifier's `notify_waiters` counter at CALL time,
+    /// so a future created after the loader published is never woken. Cloning the `Arc<Notify>`
+    /// out and calling `.notified()` at the await site left exactly that window open between
+    /// releasing the read lock and creating the future: a load that published + notified in it
+    /// dropped the wakeup and the querying scan awaited forever (upstream
+    /// apache/iceberg-rust#2859). Creating the future under the read lock closes it — the
+    /// publisher cannot notify until it has taken the WRITE lock, which cannot be granted while
+    /// this read lock is held.
+    ///
+    /// `Ready(None)` covers both an unknown file and a terminally [`EqDelState::Failed`] one: the
+    /// caller surfaces absence, and `build_equality_delete_predicate` turns it into a typed error
+    /// rather than blocking forever on a notifier that already fired.
+    fn lookup_or_arm_eq_del<T>(
+        &self,
+        file_path: &str,
+        project: impl FnOnce(&Predicate, &Option<EqDeleteKeySet>) -> T,
+    ) -> EqDelLookup<T> {
+        match recover_poison(self.state.read())
+            .equality_deletes
+            .get(file_path)
+        {
+            None | Some(EqDelState::Failed) => EqDelLookup::Ready(None),
+            Some(EqDelState::Loaded(predicate, key_set)) => {
+                EqDelLookup::Ready(Some(project(predicate, key_set)))
+            }
+            Some(EqDelState::Loading(notify)) => EqDelLookup::Wait(notify.clone().notified_owned()),
         }
     }
 
@@ -212,34 +480,18 @@ impl DeleteFilter {
         &self,
         file_path: &str,
     ) -> Option<Predicate> {
-        let notifier = {
-            match recover_poison(self.state.read())
-                .equality_deletes
-                .get(file_path)
-            {
-                None => return None,
-                // A terminally-failed load surfaces as absence: the caller
-                // (`build_equality_delete_predicate`) then raises a typed "missing predicate"
-                // error rather than this task blocking forever on a notifier that already fired.
-                Some(EqDelState::Failed) => return None,
-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
-                Some(EqDelState::Loaded(predicate, _)) => {
-                    return Some(predicate.clone());
-                }
-            }
-        };
-
-        notifier.notified().await;
+        match self.lookup_or_arm_eq_del(file_path, |predicate, _| predicate.clone()) {
+            EqDelLookup::Ready(predicate) => return predicate,
+            EqDelLookup::Wait(notified) => notified.await,
+        }
 
         // Once the notifier fires the entry is terminal: `Loaded` on success, `Failed` on a load
-        // error. Treat anything other than `Loaded` (Failed, or — defensively — a still-Loading or
-        // absent entry) as absence so the caller surfaces a typed error instead of re-waiting.
-        match recover_poison(self.state.read())
-            .equality_deletes
-            .get(file_path)
-        {
-            Some(EqDelState::Loaded(predicate, _)) => Some(predicate.clone()),
-            _ => None,
+        // error, and neither is ever replaced (`try_start_eq_del_load` never re-claims a present
+        // entry). Treat anything other than `Loaded` (Failed, or — defensively — a still-Loading
+        // or absent entry) as absence so the caller surfaces a typed error instead of re-waiting.
+        match self.lookup_or_arm_eq_del(file_path, |predicate, _| predicate.clone()) {
+            EqDelLookup::Ready(predicate) => predicate,
+            EqDelLookup::Wait(_) => None,
         }
     }
 
@@ -251,33 +503,20 @@ impl DeleteFilter {
         &self,
         file_path: &str,
     ) -> Option<EqDeleteKeySet> {
-        let notifier = {
-            match recover_poison(self.state.read())
-                .equality_deletes
-                .get(file_path)
-            {
-                None => return None,
-                // A terminally-failed load surfaces as "no key set", routing this file's task onto
-                // the predicate path — which then raises the typed error — instead of blocking.
-                Some(EqDelState::Failed) => return None,
-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
-                Some(EqDelState::Loaded(_, key_set)) => {
-                    return key_set.clone();
-                }
-            }
-        };
-
-        notifier.notified().await;
+        // A terminally-failed (or unknown) load surfaces as "no key set", routing this file's task
+        // onto the predicate path — which then raises the typed error — instead of blocking. The
+        // outer `Option` is the entry's presence, the inner one the file's fast-path eligibility.
+        match self.lookup_or_arm_eq_del(file_path, |_, key_set| key_set.clone()) {
+            EqDelLookup::Ready(key_set) => return key_set.flatten(),
+            EqDelLookup::Wait(notified) => notified.await,
+        }
 
         // As in `get_equality_delete_predicate_for_delete_file_path`: after the notifier fires the
         // entry is terminal; anything other than `Loaded` yields `None` (use the predicate path)
         // rather than re-waiting.
-        match recover_poison(self.state.read())
-            .equality_deletes
-            .get(file_path)
-        {
-            Some(EqDelState::Loaded(_, key_set)) => key_set.clone(),
-            _ => None,
+        match self.lookup_or_arm_eq_del(file_path, |_, key_set| key_set.clone()) {
+            EqDelLookup::Ready(key_set) => key_set.flatten(),
+            EqDelLookup::Wait(_) => None,
         }
     }
 
@@ -367,44 +606,23 @@ impl DeleteFilter {
 
         *recover_poison(entry.lock()) |= delete_vector;
     }
+}
 
-    pub(crate) fn insert_equality_delete(
-        &self,
-        delete_file_path: &str,
-        eq_del: Receiver<(Predicate, Option<EqDeleteKeySet>)>,
-    ) {
-        let notify = Arc::new(Notify::new());
-        {
-            let mut state = recover_poison(self.state.write());
-            state.equality_deletes.insert(
-                delete_file_path.to_string(),
-                EqDelState::Loading(notify.clone()),
-            );
-        }
-
-        let state = self.state.clone();
-        let delete_file_path = delete_file_path.to_string();
-        crate::runtime::spawn(async move {
-            // The loader sends the parsed predicate here once the eq-delete file is read. If the
-            // oneshot SENDER is instead dropped without sending — which happens on ANY error or
-            // cancellation in the load → parse → send window (a malformed `equality_ids`, an
-            // unreadable delete file, a schema-evolution or parse failure, or the whole load stream
-            // being torn down because a sibling task errored) — `recv` errs. We MUST then move the
-            // entry to the terminal `Failed` state and STILL wake the waiters: leaving it `Loading`
-            // strands every `equality_delete_predicate` / keyset waiter on the notifier forever
-            // (the hang this fix closes). The waiters read `Failed` as absence and surface a typed
-            // error to the caller.
-            let new_state = match eq_del.await {
-                Ok((predicate, key_set)) => EqDelState::Loaded(predicate, key_set),
-                Err(_) => EqDelState::Failed,
-            };
-            {
-                let mut state = recover_poison(state.write());
-                state.equality_deletes.insert(delete_file_path, new_state);
-            }
-            notify.notify_waiters();
-        });
-    }
+/// The typed error every consumer of a terminally-failed positional-delete load receives — the
+/// claim-time and the post-wake paths must render the same failure, so it lives in one place.
+///
+/// `reason` is the cause carried by [`PosDelState::Failed`]: the failing task's own error where it
+/// had one ([`PosDelLoadGuard::note_failure`]), else a generic reason. It is rendered inline rather
+/// than attached with `with_source`, because it is a message the failing task left behind, not an
+/// [`Error`] this one is wrapping — nothing is dropped from a source chain here.
+fn pos_del_load_failed_error(file_path: &str, reason: &str) -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        format!(
+            "the loader for positional delete file '{file_path}' terminated without publishing \
+             its deletes: {reason}"
+        ),
+    )
 }
 
 /// Engine-facing API — the stable public surface mirroring Java `org.apache.iceberg.data.DeleteFilter`.
@@ -919,13 +1137,25 @@ pub(crate) mod tests {
         let pred = Reference::new("id").equal_to(Datum::long(10));
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete("eq-del.parquet", rx);
+        filter
+            .try_start_eq_del_load("eq-del.parquet")
+            .expect("a fresh eq-delete file must be claimable")
+            .spawn_publisher(rx);
 
         // No key set (predicate-only path) for this case-sensitivity test.
         tx.send((pred, None)).unwrap();
 
         // ---------- should FAIL ----------
-        let result = filter.build_equality_delete_predicate(&task).await;
+        // BOUNDED: this call reaches the eq-delete wait path, so a lost-wakeup regression makes it
+        // never return. Without the timeout that is a hung CI job instead of a red test (the
+        // eq-delete arming mutations do exactly that) — the same bound
+        // `test_failed_eq_delete_load_surfaces_error_not_hang` already carries.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.build_equality_delete_predicate(&task),
+        )
+        .await
+        .expect("build_equality_delete_predicate must not hang");
 
         assert!(
             result.is_err(),
@@ -1034,7 +1264,10 @@ pub(crate) mod tests {
 
         let filter = DeleteFilter::default();
         let (tx, rx) = tokio::sync::oneshot::channel::<(Predicate, Option<EqDeleteKeySet>)>();
-        filter.insert_equality_delete("eq-del.parquet", rx);
+        filter
+            .try_start_eq_del_load("eq-del.parquet")
+            .expect("a fresh eq-delete file must be claimable")
+            .spawn_publisher(rx);
 
         // Simulate the loader failing AFTER registration: the parsed predicate is never sent and
         // the sender is dropped — exactly what an early-return in the load window does.
@@ -1093,8 +1326,10 @@ pub(crate) mod tests {
         // A subsequent writer via try_start_pos_del_load must also recover and proceed.
         assert!(
             matches!(
-                filter.try_start_pos_del_load("pos-del.parquet"),
-                PosDelLoadAction::Load
+                filter
+                    .try_start_pos_del_load("pos-del.parquet")
+                    .expect("claiming a fresh file must not error"),
+                PosDelLoadAction::Load(_)
             ),
             "a fresh positional-delete load must proceed on the recovered lock"
         );
@@ -2098,6 +2333,281 @@ pub(crate) mod tests {
         assert!(
             checked >= bases.len() * widths.len() * 4,
             "generator must have exercised every (base, width, density) combination"
+        );
+    }
+
+    /// Claim `file_path` and hand back the loading guard, failing the test if the file was not
+    /// claimable.
+    fn claim_pos_del(filter: &DeleteFilter, file_path: &str) -> PosDelLoadGuard {
+        match filter
+            .try_start_pos_del_load(file_path)
+            .expect("a fresh positional delete file must be claimable")
+        {
+            PosDelLoadAction::Load(guard) => guard,
+            _ => panic!("a fresh positional delete file must be claimed, not waited on"),
+        }
+    }
+
+    /// Arm a waiter on an in-flight positional-delete load, failing the test if the file is not
+    /// currently claimed by someone else.
+    fn arm_pos_del_waiter(filter: &DeleteFilter, file_path: &str) -> OwnedNotified {
+        match filter
+            .try_start_pos_del_load(file_path)
+            .expect("a claimed positional delete file must not error at claim time")
+        {
+            PosDelLoadAction::WaitFor(notified) => notified,
+            _ => panic!("a file already claimed by another task must make this caller wait"),
+        }
+    }
+
+    /// Risk pinned (upstream apache/iceberg-rust#2859): the positional-delete waiter must ARM its
+    /// notifier while [`DeleteFilter::try_start_pos_del_load`] still holds the state lock, so a
+    /// `notify_waiters()` that fires before the waiter awaits still wakes it. `notify_waiters()`
+    /// stores no permit, so this test's ordering — publish FIRST, await SECOND — only completes
+    /// when the `Notified` already existed at publish time.
+    ///
+    /// MUTATION (semantic revert to the base contract: `PosDelLoadAction::WaitFor` carries a raw
+    /// `Arc<Notify>` and the caller calls `.notified()` at the await site): the future is created
+    /// after the publish, the wakeup is lost, and the timeout below fires (RED — verified on the
+    /// pre-fix tree, `Elapsed(())`).
+    #[tokio::test]
+    async fn test_pos_del_waiter_is_armed_before_the_publisher_can_notify() {
+        let filter = DeleteFilter::default();
+        let guard = claim_pos_del(&filter, "pos-del.parquet");
+        let notified = arm_pos_del_waiter(&filter, "pos-del.parquet");
+
+        // Publish + `notify_waiters()` through the production publisher, BEFORE the waiter awaits.
+        guard.publish_loaded();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.wait_for_pos_del_load("pos-del.parquet", notified),
+        )
+        .await
+        .expect("a notification fired after arming must wake the waiter, not be lost")
+        .expect("a published load must resolve as loaded");
+
+        assert!(
+            matches!(
+                filter
+                    .try_start_pos_del_load("pos-del.parquet")
+                    .expect("a loaded file must not error at claim time"),
+                PosDelLoadAction::AlreadyLoaded
+            ),
+            "the published load must be visible to later callers as AlreadyLoaded"
+        );
+    }
+
+    /// Risk pinned: a positional-delete loader that dies WITHOUT publishing — an early `?` on an
+    /// unreadable or corrupt file, a sibling task's error tearing the shared load stream down, an
+    /// unwind, or a runtime shutdown — must move the entry to the terminal [`PosDelState::Failed`]
+    /// and STILL wake its waiters, so each gets a typed error inside a BOUNDED await. The claiming
+    /// task is the sole writer for its file, so without that transition the entry stays `Loading`
+    /// forever and every waiter parks on a notification that can never be sent.
+    ///
+    /// MUTATION: disarming the guard before it drops (`self.armed = false`, i.e. no `Failed`
+    /// publish) leaves the entry `Loading`; the waiter never wakes and the timeout fires (RED —
+    /// verified on the pre-fix tree, which has no `Failed` variant at all: `Elapsed(())`).
+    #[tokio::test]
+    async fn test_dead_pos_del_loader_yields_a_typed_error_not_a_hang() {
+        let filter = DeleteFilter::default();
+        let guard = claim_pos_del(&filter, "pos-del.parquet");
+        let notified = arm_pos_del_waiter(&filter, "pos-del.parquet");
+
+        // The loader dies without publishing; nothing else will ever touch this entry.
+        drop(guard);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.wait_for_pos_del_load("pos-del.parquet", notified),
+        )
+        .await
+        .expect("a dead loader must not strand the waiter")
+        .expect_err("a dead loader must surface a typed error to the waiter");
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains("pos-del.parquet"),
+            "the error must name the delete file, got: {error}"
+        );
+    }
+
+    /// Risk pinned: [`PosDelState::Failed`] is TERMINAL — a later caller must NOT be handed a fresh
+    /// `Load` claim (which would lie about the file having no deletes if it, too, silently died) or
+    /// an `AlreadyLoaded` (which would resurrect every row the file deletes). It gets the same
+    /// typed error the waiters got, at claim time, without awaiting anything.
+    ///
+    /// MUTATION: mapping `PosDelState::Failed` to `PosDelLoadAction::AlreadyLoaded` in
+    /// `try_start_pos_del_load` makes this test's `expect_err` trip (RED) — and would silently drop
+    /// the file's deletes in production.
+    #[test]
+    fn test_claiming_a_pos_del_file_whose_loader_died_errors() {
+        let filter = DeleteFilter::default();
+        let guard = claim_pos_del(&filter, "pos-del.parquet");
+        drop(guard);
+
+        let error = filter
+            .try_start_pos_del_load("pos-del.parquet")
+            .expect_err("a terminally failed positional delete file must not be re-claimed");
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error.to_string().contains("pos-del.parquet"),
+            "the error must name the delete file, got: {error}"
+        );
+    }
+
+    /// Risk pinned (upstream apache/iceberg-rust#2859, the equality-delete half): the eq-delete
+    /// waiter must ARM its notifier inside [`DeleteFilter::lookup_or_arm_eq_del`], while the read
+    /// lock is held. Both eq-delete accessors go through that one seam, so this pins both. The
+    /// publisher here is the production one (`spawn_publisher` on the claim's guard), driven to
+    /// completion — asserted, not assumed — BEFORE the waiter awaits.
+    ///
+    /// MUTATION (semantic revert to the base contract: clone the `Arc<Notify>` out of the lock and
+    /// call `.notified()` at the await site): the future is created after the publish, the wakeup
+    /// is lost, and the timeout below fires (RED).
+    #[tokio::test]
+    async fn test_eq_del_waiter_is_armed_before_the_publisher_can_notify() {
+        let filter = DeleteFilter::default();
+        let guard = filter
+            .try_start_eq_del_load("eq-del.parquet")
+            .expect("a fresh eq-delete file must be claimable");
+
+        // Arm through the production seam, exactly as both accessors do.
+        let EqDelLookup::Wait(notified) =
+            filter.lookup_or_arm_eq_del("eq-del.parquet", |predicate, _| predicate.clone())
+        else {
+            panic!("a claimed but unloaded eq-delete file must make the caller wait");
+        };
+
+        let predicate = Reference::new("id").equal_to(Datum::long(10));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        guard.spawn_publisher(rx);
+        tx.send((predicate.clone(), None))
+            .expect("the publisher task must still be listening");
+
+        // Drive the publisher to completion BEFORE awaiting: the ordering under test is
+        // "notify fires, THEN the waiter awaits".
+        for _ in 0..64 {
+            if !matches!(
+                recover_poison(filter.state.read())
+                    .equality_deletes
+                    .get("eq-del.parquet"),
+                Some(EqDelState::Loading(_))
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(
+                recover_poison(filter.state.read())
+                    .equality_deletes
+                    .get("eq-del.parquet"),
+                Some(EqDelState::Loaded(_, _))
+            ),
+            "the publisher must have published before the waiter awaits, or this test proves nothing"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), notified)
+            .await
+            .expect("a notification fired after arming must wake the waiter, not be lost");
+
+        assert_eq!(
+            filter
+                .get_equality_delete_predicate_for_delete_file_path("eq-del.parquet")
+                .await,
+            Some(predicate),
+            "the woken waiter must read the published predicate"
+        );
+    }
+
+    /// Risk pinned: the notifier a waiter arms on (the one installed in the state by
+    /// [`DeleteFilter::try_start_eq_del_load`]) MUST be the notifier the publisher eventually
+    /// fires. The base contract minted a SECOND notifier when the loader registered its receiver,
+    /// replacing the state entry — so a waiter that armed on the claim's notifier in the window
+    /// between the two calls was never woken by anything.
+    ///
+    /// MUTATION: making the guard carry a fresh `Arc::new(Notify::new())` instead of the notifier
+    /// installed in the state (either at claim time or at registration time) loses this waiter's
+    /// wakeup and the timeout below fires (RED).
+    #[tokio::test]
+    async fn test_eq_del_claim_notifier_is_the_one_the_publisher_fires() {
+        let filter = DeleteFilter::default();
+        let guard = filter
+            .try_start_eq_del_load("eq-del.parquet")
+            .expect("a fresh eq-delete file must be claimable");
+
+        let EqDelLookup::Wait(notified) =
+            filter.lookup_or_arm_eq_del("eq-del.parquet", |predicate, _| predicate.clone())
+        else {
+            panic!("a claimed but unloaded eq-delete file must make the caller wait");
+        };
+
+        // The loader dies before it ever registers a receiver: the guard's `Drop` must publish the
+        // terminal state on the SAME notifier this waiter armed on.
+        drop(guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), notified)
+            .await
+            .expect("the claim's notifier must be the one the publisher fires");
+
+        assert!(
+            filter
+                .get_equality_delete_predicate_for_delete_file_path("eq-del.parquet")
+                .await
+                .is_none(),
+            "a terminally failed eq-delete load must read as absence, so the caller errors"
+        );
+    }
+
+    /// Risk pinned (the zero-yield teardown probe): the eq-delete publisher future can be dropped
+    /// BEFORE IT IS EVER POLLED — a runtime torn down between `spawn` and the first poll. A future
+    /// dropped unpolled runs no local destructors, so a guard constructed *inside* the `async move`
+    /// block would never exist and the entry would strand at `Loading` — with every waiter parked
+    /// forever. The guard is therefore created by the claim and CAPTURED by the future.
+    ///
+    /// MUTATION: rebuilding the guard inside `spawn_publisher`'s `async move` block (from cloned
+    /// `state` / `notify` handles) leaves this entry `Loading` and the timeout below fires (RED).
+    #[tokio::test]
+    async fn test_never_polled_eq_del_publisher_yields_absence_not_a_hang() {
+        let filter = DeleteFilter::default();
+
+        // Register the publisher on a runtime that is then DESTROYED with ZERO yields, so its
+        // future is queued but never polled. Done on a separate thread because dropping a runtime
+        // from inside an async context panics. The sender is kept ALIVE for the rest of the test,
+        // so a dropped sender cannot be what resolves the entry.
+        let filter_for_teardown = filter.clone();
+        let _tx = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build the throwaway runtime that hosts the publisher task");
+            let tx = runtime.block_on(async {
+                let (tx, rx) =
+                    tokio::sync::oneshot::channel::<(Predicate, Option<EqDeleteKeySet>)>();
+                filter_for_teardown
+                    .try_start_eq_del_load("eq-del.parquet")
+                    .expect("a fresh eq-delete file must be claimable")
+                    .spawn_publisher(rx);
+                tx
+            });
+            drop(runtime);
+            tx
+        })
+        .join()
+        .expect("the runtime-teardown thread must not panic");
+
+        let predicate = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.get_equality_delete_predicate_for_delete_file_path("eq-del.parquet"),
+        )
+        .await
+        .expect("a never-polled publisher must not hang the waiter");
+
+        assert!(
+            predicate.is_none(),
+            "a never-polled publisher must leave the entry terminally failed, read as absence"
         );
     }
 }

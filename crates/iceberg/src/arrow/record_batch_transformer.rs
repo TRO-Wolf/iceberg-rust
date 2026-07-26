@@ -80,9 +80,32 @@ fn constants_map(
                 }
             };
 
-            // Get the partition value for this field
+            // Get the partition value for this field.
+            //
+            // The tuple can be SHORTER than the spec — corrupt metadata, or a file's tuple
+            // paired with a different spec. Java resolves that to null rather than failing:
+            // `PartitionUtil.constantsMap` reads `partitionData.get(pos)`, and
+            // `PartitionData.get(int)` opens with `if (pos >= data.length) { return null; }`
+            // (iceberg-core 1.10.0, decoded from the shipped jar), after which
+            // `IdentityPartitionConverters.convertConstant` maps a null value back to null.
+            // Match that — warn, then fall through to the same "absent from the constants map"
+            // resolution the explicit-null case uses — instead of indexing past the end and
+            // aborting the scan task.
+            let Some(partition_value) = partition_data.fields().get(pos) else {
+                tracing::warn!(
+                    source_id = field.source_id,
+                    position = pos,
+                    tuple_len = partition_data.fields().len(),
+                    spec_id = partition_spec.spec_id(),
+                    "partition tuple is shorter than its partition spec; resolving the \
+                     identity-partitioned column as null (Java PartitionData.get returns null \
+                     past the end of the tuple)"
+                );
+                continue;
+            };
+
             // Handle both None (null) and Some(Literal::Primitive) cases
-            match &partition_data[pos] {
+            match partition_value {
                 None => {
                     // Skip null partition values - they will be resolved as null per Iceberg spec rule #4.
                     // When a partition value is null, we don't add it to the constants map,
@@ -828,7 +851,7 @@ mod test {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use crate::arrow::record_batch_transformer::{
-        RecordBatchTransformer, RecordBatchTransformerBuilder,
+        RecordBatchTransformer, RecordBatchTransformerBuilder, constants_map,
     };
     use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
 
@@ -1593,6 +1616,64 @@ mod test {
         // name column comes from file
         assert_eq!(get_string_value(result.column(2).as_ref(), 0), "Alice");
         assert_eq!(get_string_value(result.column(2).as_ref(), 1), "Bob");
+    }
+
+    /// A partition tuple SHORTER than its partition spec must not abort the read.
+    ///
+    /// `constants_map` walks the spec's fields by position and reads the tuple at that position.
+    /// A tuple that is too short — corrupt metadata, or a file's tuple paired with a different
+    /// spec (the shape `SnapshotProducer::summary` produces on the commit path) — used to index
+    /// past the end of `Struct` and panic, killing the scan task.
+    ///
+    /// Java resolves the same input to null: `PartitionUtil.constantsMap` reads
+    /// `partitionData.get(pos)`, and `PartitionData.get(int)` opens with
+    /// `if (pos >= data.length) { return null; }` (iceberg-core 1.10.0, decoded from the shipped
+    /// jar), after which `IdentityPartitionConverters.convertConstant` returns null for a null
+    /// value. Leaving the field out of the constants map is how this module represents "resolve
+    /// as null" — the same path the explicit-null case takes.
+    #[test]
+    fn constants_map_tolerates_a_partition_tuple_shorter_than_the_spec() {
+        use crate::spec::{Datum, PartitionSpec, Struct, Transform};
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "dept", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(3, "region", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .expect("build snapshot schema"),
+        );
+
+        // Two identity partition fields...
+        let partition_spec = PartitionSpec::builder(snapshot_schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("dept", "dept", Transform::Identity)
+            .expect("add dept partition field")
+            .add_partition_field("region", "region", Transform::Identity)
+            .expect("add region partition field")
+            .build()
+            .expect("build partition spec");
+
+        // ... but a tuple carrying only the first value.
+        let partition_data = Struct::from_iter(vec![Some(Literal::string("engineering"))]);
+
+        let constants = constants_map(&partition_spec, &partition_data, &snapshot_schema)
+            .expect("a short partition tuple must not fail the read");
+
+        assert_eq!(
+            constants.get(&2),
+            Some(&Datum::string("engineering")),
+            "the value the tuple DOES carry must still be used as a constant"
+        );
+        assert!(
+            !constants.contains_key(&3),
+            "the missing position must resolve as null (absent from the constants map), \
+             not as some other field's value: {constants:?}"
+        );
     }
 
     /// Test bucket partitioning with renamed source column.

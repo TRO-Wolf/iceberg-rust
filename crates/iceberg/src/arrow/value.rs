@@ -85,25 +85,19 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
 
     fn field(
         &mut self,
-        field: &crate::spec::NestedFieldRef,
+        _field: &crate::spec::NestedFieldRef,
         _partner: &ArrayRef,
         value: Vec<Option<Literal>>,
     ) -> Result<Vec<Option<Literal>>> {
-        // Make there is no null value if the field is required
-        if field.required && value.iter().any(Option::is_none) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "The field is required but has null value",
-            )
-            .with_context("field_id", field.id.to_string())
-            .with_context("field_name", &field.name));
-        }
+        // NOTE: the `required` check deliberately does NOT live here. A field's null-ness is only
+        // a violation relative to its ENCLOSING struct's validity, and this callback cannot see
+        // the parent — see [`Self::struct`], which owns the check.
         Ok(value)
     }
 
     fn r#struct(
         &mut self,
-        _struct: &StructType,
+        r#struct: &StructType,
         array: &ArrayRef,
         results: Vec<Vec<Option<Literal>>>,
     ) -> Result<Vec<Option<Literal>>> {
@@ -118,6 +112,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
         }
 
         let mut struct_literals = Vec::with_capacity(row_len);
+        let fields = r#struct.fields();
         let mut columns_iters = results
             .into_iter()
             .map(|column| column.into_iter())
@@ -126,11 +121,31 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
         for i in 0..row_len {
             let mut literals = Vec::with_capacity(columns_iters.len());
             for column_iter in columns_iters.iter_mut() {
-                literals.push(column_iter.next().unwrap());
+                // `flatten`, not `unwrap`: the equal-length check above already guarantees every
+                // column yields `row_len` items, so an exhausted iterator is unreachable — and if
+                // it ever happened it degrades to a NULL cell (caught below for a `required`
+                // field) instead of panicking a write.
+                literals.push(column_iter.next().flatten());
             }
             if array.is_null(i) {
+                // The row's struct is NULL: its fields are unreachable, so a `required` field
+                // carrying no value here is NOT a violation. Java agrees by construction — the
+                // Avro writer's `ValueWriters$OptionWriter.write` (iceberg-core 1.10.0) emits the
+                // null union branch and never invokes the value writer for the struct's fields.
                 struct_literals.push(None);
             } else {
+                // The row's struct is live, so every `required` field MUST carry a value.
+                for (field, literal) in fields.iter().zip(literals.iter()) {
+                    if field.required && literal.is_none() {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "The field is required but has null value",
+                        )
+                        .with_context("field_id", field.id.to_string())
+                        .with_context("field_name", &field.name)
+                        .with_context("row", i.to_string()));
+                    }
+                }
                 struct_literals.push(Some(Literal::Struct(Struct::from_iter(literals))));
             }
         }
@@ -1055,8 +1070,8 @@ mod test {
     use arrow_array::builder::{Int32Builder, ListBuilder, MapBuilder, StructBuilder};
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int32Array, Int64Array, StringArray, StructArray, Time64MicrosecondArray,
-        TimestampMicrosecondArray, TimestampNanosecondArray,
+        Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+        Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, TimeUnit};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -1966,6 +1981,117 @@ mod test {
 
         assert_eq!(array.data_type(), &target_type);
         assert_eq!(array.len(), num_rows);
+    }
+
+    // =============================================================================================
+    // WG5 (a) — the required-field check must be evaluated relative to the ENCLOSING struct's
+    // validity. Java never inspects a null struct's children on write:
+    // `ValueWriters$OptionWriter.write` (iceberg-core 1.10.0 bytecode) is
+    // `if (value == null) { encoder.writeIndex(nullIndex); }` — the value writer is NOT invoked,
+    // so a `required` child under a NULL optional parent is unreachable and therefore legal.
+    // The three tests below are a minimal pair + a control: they differ ONLY in the outer struct's
+    // null bit / the child's value.
+    // =============================================================================================
+
+    /// Build `struct<1: outer optional struct<2: inner required int>>` as (arrow root struct,
+    /// iceberg struct type), exactly the way the Avro writer does
+    /// (`avro_writer::encode_batch_to_values` → `StructArray::from(batch)` →
+    /// `arrow_struct_to_literal`). `outer_valid` is the outer struct's per-row validity and
+    /// `inner` the child values (arrow-nullable, as a file-derived batch is).
+    fn optional_struct_with_required_child(
+        outer_valid: Vec<bool>,
+        inner: Vec<Option<i32>>,
+    ) -> (ArrayRef, StructType) {
+        let inner_field = Arc::new(Field::new("inner", DataType::Int32, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+        ));
+        let inner_array = Arc::new(Int32Array::from(inner)) as ArrayRef;
+        let outer_array = StructArray::try_new(
+            Fields::from(vec![inner_field]),
+            vec![inner_array],
+            Some(NullBuffer::from(outer_valid)),
+        )
+        .expect("outer struct array");
+        let outer_field = Arc::new(
+            Field::new("outer", outer_array.data_type().clone(), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            ),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![outer_field])),
+            vec![Arc::new(outer_array) as ArrayRef],
+        )
+        .expect("record batch");
+        let root = Arc::new(StructArray::from(batch)) as ArrayRef;
+
+        let iceberg_type = StructType::new(vec![
+            NestedField::optional(
+                1,
+                "outer",
+                Type::Struct(StructType::new(vec![
+                    NestedField::required(2, "inner", Type::Primitive(PrimitiveType::Int)).into(),
+                ])),
+            )
+            .into(),
+        ]);
+        (root, iceberg_type)
+    }
+
+    #[test]
+    fn test_required_child_null_under_null_parent_is_accepted() {
+        // Row 0: outer struct is NULL and the child carries a null in that slot (the shape a
+        // Parquet/Avro reader produces for a null struct). Java accepts it — the child is never
+        // written. Row 1: outer valid, child 42.
+        let (root, iceberg_type) =
+            optional_struct_with_required_child(vec![false, true], vec![None, Some(42)]);
+
+        let result = arrow_struct_to_literal(&root, &iceberg_type)
+            .expect("a NULL optional struct must not make its required child a violation");
+
+        assert_eq!(result, vec![
+            Some(Literal::Struct(Struct::from_iter(vec![None]))),
+            Some(Literal::Struct(Struct::from_iter(vec![Some(
+                Literal::Struct(Struct::from_iter(vec![Some(Literal::int(42))]))
+            )]))),
+        ]);
+    }
+
+    #[test]
+    fn test_required_child_null_under_valid_parent_still_rejected() {
+        // The negative pin, and the minimal pair of the test above: the ONLY difference is the
+        // outer struct's null bit at row 0. A NULL required child under a LIVE parent is a real
+        // violation and must keep failing loudly.
+        let (root, iceberg_type) =
+            optional_struct_with_required_child(vec![true, true], vec![None, Some(42)]);
+
+        let err = arrow_struct_to_literal(&root, &iceberg_type)
+            .expect_err("a NULL required child under a LIVE parent must still be rejected");
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string()
+                .contains("The field is required but has null value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_null_parent_discards_stale_child_value() {
+        // Control: a NULL parent whose child slot holds a live-but-meaningless value (arrow does
+        // not require a null struct to mask its children). The row must decode to NULL — the
+        // stale 7 must never surface.
+        let (root, iceberg_type) =
+            optional_struct_with_required_child(vec![false, true], vec![Some(7), Some(42)]);
+
+        let result = arrow_struct_to_literal(&root, &iceberg_type)
+            .expect("a NULL parent with a live child slot must decode");
+
+        assert_eq!(result, vec![
+            Some(Literal::Struct(Struct::from_iter(vec![None]))),
+            Some(Literal::Struct(Struct::from_iter(vec![Some(
+                Literal::Struct(Struct::from_iter(vec![Some(Literal::int(42))]))
+            )]))),
+        ]);
     }
 
     // FIX 4: the list/map offset slicing must turn degenerate buffers into typed errors, never

@@ -23,9 +23,10 @@ use futures::channel::mpsc::{Sender, channel};
 use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
 
+use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
 use crate::runtime::spawn;
 use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
-use crate::spec::{DataContentType, DataFile, DataFileFormat, Struct};
+use crate::spec::{DataContentType, DataFile, DataFileFormat, PrimitiveLiteral, Struct};
 use crate::{Error, ErrorKind, Result};
 
 /// Index of delete files
@@ -126,8 +127,18 @@ struct PopulatedDeleteFileIndex {
     global_equality_deletes: Vec<Arc<DeleteFileContext>>,
     eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
     pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
-    // TODO: do we need this?
-    // pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
+    /// FILE-SCOPED position deletes keyed by the data file they reference, mirroring Java
+    /// `DeleteFileIndex.posDeletesByPath` (`Builder.add(Map<String, PositionDeletes>,
+    /// PartitionMap<PositionDeletes>, DeleteFile)`: when
+    /// `ContentFileUtil.referencedDataFileLocation(file)` is non-null the file goes here INSTEAD of
+    /// into [`Self::pos_deletes_by_partition`]).
+    ///
+    /// Consulted by path ALONE — no spec condition, no partition condition (Java `findPathDeletes`
+    /// = `posDeletesByPath.get(dataFile.location())`). Spark's default write granularity is FILE, so
+    /// this is the common shape in Java-written merge-on-read tables; before this map existed such a
+    /// delete was indexed by its own `(spec_id, partition)` and a data file whose partition or spec
+    /// differed never found it — the masked rows silently resurrected.
+    pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
     /// Deletion vectors keyed by the data file they apply to (the DV's
     /// `referenced_data_file`), mirroring Java `DeleteFileIndex.dvByPath`
     /// (`DeleteFileIndex.Builder.build` L500/L505-506: a POSITION_DELETES file with
@@ -144,6 +155,63 @@ struct PopulatedDeleteFileIndex {
 /// `deleteFile.format() == FileFormat.PUFFIN`.
 pub(crate) fn is_deletion_vector(data_file: &DataFile) -> bool {
     data_file.file_format() == DataFileFormat::Puffin
+}
+
+/// The single data file a delete file references, or `None` when it references more than one.
+///
+/// The Rust mirror of Java `ContentFileUtil.referencedDataFile(DeleteFile)` +
+/// `referencedDataFileLocation` (1.10.0 bytecode-decoded), which is THE routing predicate for
+/// position deletes: `DeleteFileIndex.Builder.add` sends a delete with a referenced data file into
+/// the PATH-keyed map and every other delete into the `(spec, partition)`-keyed map. The same
+/// predicate governs which deletes the [`RemoveDanglingDeleteFiles`] maintenance action may collect
+/// (`crate::maintenance::remove_dangling_delete_files`), so it lives in exactly one place — a reader
+/// and a collector that disagree about file-scoping is how a still-applicable delete gets deleted.
+///
+/// Three legs, in Java's order:
+///
+/// 1. **Equality deletes are never file-scoped.** Java returns null before looking at anything else
+///    (`content() == EQUALITY_DELETES → null`): an equality delete matches by VALUE across a whole
+///    partition, so a `file_path` bound on it would be meaningless.
+/// 2. **The explicit back-reference wins.** `referenced_data_file` (spec field 143), when set, is
+///    returned as-is. Deletion vectors always carry it; a PARQUET position delete essentially never
+///    does — through Iceberg 1.11.0 the only writer that sets the field is `deletes.BaseDVFileWriter`
+///    (the V3 DV writer), so this leg is dead for every Spark-written V2 table and leg 3 carries them
+///    all. Independently bytecode-verified at 1.10.0 and 1.11.0 by the RePark consumer, 2026-07-25.
+/// 3. **Otherwise derive it from the `file_path`-column bounds.** Java reads the lower and upper
+///    bound of the reserved `file_path` column ([`RESERVED_FIELD_ID_DELETE_FILE_PATH`]) and returns
+///    the decoded value only when BOTH exist and are EQUAL — equal bounds mean every row in the
+///    delete file names the same data file. This leg is not an optimization: Java's own
+///    `PositionDeleteWriter.close()` never sets `referenced_data_file`, it only preserves those
+///    bounds (`metrics()` strips them once a second referenced file appears), so leg 3 is how
+///    virtually every Java-written file-granularity position delete is recognised. Implementing only
+///    leg 2 leaves that entire class unrouted — and no fixture that sets the field can detect it.
+///
+/// Bounds that are absent, unequal, or not string-typed leave the delete partition-scoped, exactly
+/// as in Java (which compares the raw bound `ByteBuffer`s and decodes with the `file_path` column's
+/// string type). Bound TRUNCATION cannot forge a match: a truncated lower bound is shortened and the
+/// matching upper bound is rounded UP, so the two are equal only when both are the full value.
+pub(crate) fn referenced_data_file_location(delete_file: &DataFile) -> Option<String> {
+    if delete_file.content_type() == DataContentType::EqualityDeletes {
+        return None;
+    }
+
+    if let Some(referenced) = delete_file.referenced_data_file() {
+        return Some(referenced);
+    }
+
+    let lower = delete_file
+        .lower_bounds()
+        .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
+    let upper = delete_file
+        .upper_bounds()
+        .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)?;
+
+    match (lower.literal(), upper.literal()) {
+        (PrimitiveLiteral::String(lower), PrimitiveLiteral::String(upper)) if lower == upper => {
+            Some(lower.clone())
+        }
+        _ => None,
+    }
 }
 
 impl DeleteFileIndex {
@@ -252,11 +320,15 @@ impl PopulatedDeleteFileIndex {
     /// 1. The partition information is extracted from each delete file's manifest entry.
     /// 2. If the partition is empty and the delete file is not a positional delete,
     ///    it is added to the `global_equality_deletes` vector
-    /// 3. Otherwise, the delete file is added to one of two hash maps based on its content type.
+    /// 3. A FILE-SCOPED position delete (one with a derivable referenced data file — see
+    ///    [`referenced_data_file_location`]) is added to `pos_deletes_by_path`, keyed by that file.
+    /// 4. Otherwise, the delete file is added to one of two hash maps based on its content type.
     fn new(files: Vec<DeleteFileContext>) -> PopulatedDeleteFileIndex {
         let mut eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
             HashMap::default();
         let mut pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
+            HashMap::default();
+        let mut pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>> =
             HashMap::default();
         let mut dv_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>> = HashMap::default();
 
@@ -296,7 +368,24 @@ impl PopulatedDeleteFileIndex {
             }
 
             let destination_map = match arc_ctx.manifest_entry.content_type() {
-                DataContentType::PositionDeletes => &mut pos_deletes_by_partition,
+                DataContentType::PositionDeletes => {
+                    // Java `DeleteFileIndex.Builder.add(Map<String, PositionDeletes>,
+                    // PartitionMap<PositionDeletes>, DeleteFile)`: a position delete with a
+                    // derivable referenced data file is keyed by that PATH, otherwise by
+                    // `(spec_id, partition)`. The two are EXCLUSIVE — indexing a file-scoped delete
+                    // in both maps would attach it to every sibling data file in its partition and
+                    // return it TWICE for the file it actually references.
+                    if let Some(referenced_data_file) =
+                        referenced_data_file_location(arc_ctx.manifest_entry.data_file())
+                    {
+                        pos_deletes_by_path
+                            .entry(referenced_data_file)
+                            .or_default()
+                            .push(arc_ctx);
+                        return;
+                    }
+                    &mut pos_deletes_by_partition
+                }
                 DataContentType::EqualityDeletes => &mut eq_deletes_by_partition,
                 // A `Data`-typed entry cannot legitimately reach the delete-file index:
                 // `TableScan::process_delete_manifest_entry` (scan/mod.rs) rejects any data-file
@@ -321,6 +410,7 @@ impl PopulatedDeleteFileIndex {
             global_equality_deletes,
             eq_deletes_by_partition,
             pos_deletes_by_partition,
+            pos_deletes_by_path,
             dv_by_path,
         }
     }
@@ -400,10 +490,8 @@ impl PopulatedDeleteFileIndex {
             return Ok(results);
         }
 
-        // TODO: the spec states that:
-        //     "The data file's file_path is equal to the delete file's referenced_data_file if it is non-null".
-        //     we're not yet doing that here. The referenced data file's name will also be present in the positional
-        //     delete file's file path column.
+        // Java `findPosPartitionDeletes` (L304-328): the `(spec_id, partition)`-keyed position
+        // deletes — the ones with no derivable referenced data file.
         if let Some(deletes) = self.pos_deletes_by_partition.get(data_file.partition()) {
             deletes
                 .iter()
@@ -413,6 +501,27 @@ impl PopulatedDeleteFileIndex {
                         .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
+                })
+                .for_each(|delete| results.push(delete.as_ref().into()));
+        }
+
+        // Java `findPathDeletes` (L355-377): the FILE-SCOPED position deletes, looked up by the data
+        // file's LOCATION and filtered ONLY by sequence number — `posDeletesByPath.get(dataFile
+        // .location())` then `PositionDeletes.filter(seq)`. There is deliberately NO spec condition
+        // and NO partition condition here: the delete names this exact file, so the partition tuple
+        // it happens to be stamped with is irrelevant (and is routinely a different spec's — Spark's
+        // default write granularity is FILE). The sequence rule is the same `>=` as the partition
+        // map (Java `findStartIndex` keeps `delete_seq >= data_seq`); only the KEY changes.
+        //
+        // Appended after the partition-keyed deletes to mirror Java's
+        // `concat(global, eqPartition, posPartition, posPath)` result order.
+        if let Some(deletes) = self.pos_deletes_by_path.get(data_file.file_path()) {
+            deletes
+                .iter()
+                .filter(|&delete| {
+                    seq_num
+                        .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
+                        .unwrap_or_else(|| true)
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
@@ -428,9 +537,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry, ManifestStatus,
-        Struct,
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
+        ManifestStatus, Struct,
     };
 
     #[test]
@@ -658,18 +768,415 @@ mod tests {
         build_partitioned_pos_delete(&Struct::empty(), 0)
     }
 
+    /// A PARTITION-scoped parquet position delete: no `referenced_data_file`, no `file_path`-column
+    /// bounds — nothing from which Java's `ContentFileUtil.referencedDataFile` could derive a single
+    /// referenced data file, so it is indexed by `(spec_id, partition)`.
     fn build_partitioned_pos_delete(partition: &Struct, spec_id: i32) -> DataFile {
         DataFileBuilder::default()
             .file_path(format!("{}-pos-delete.parquet", Uuid::new_v4()))
             .file_format(DataFileFormat::Parquet)
             .content(DataContentType::PositionDeletes)
             .record_count(1)
-            .referenced_data_file(Some("/some-data-file.parquet".to_string()))
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)
             .build()
             .unwrap()
+    }
+
+    /// A FILE-scoped parquet position delete carrying the explicit `referenced_data_file`
+    /// back-reference (leg (a) of Java `ContentFileUtil.referencedDataFile`: the field, when set,
+    /// wins outright).
+    fn build_file_scoped_pos_delete(
+        referenced: &str,
+        partition: &Struct,
+        spec_id: i32,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .file_path(format!("{}-pos-delete.parquet", Uuid::new_v4()))
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(Some(referenced.to_string()))
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap()
+    }
+
+    /// A parquet position delete carrying ONLY the `file_path`-column lower/upper BOUNDS — the shape
+    /// Java's `PositionDeleteWriter` actually emits (its `close()` never calls
+    /// `withReferencedDataFile`; `metrics()` keeps the `file_path` bounds whenever the writer saw at
+    /// most one referenced data file — 1.10.0 bytecode). Leg (b) of
+    /// `ContentFileUtil.referencedDataFile`.
+    fn build_pos_delete_with_path_bounds(
+        lower: &str,
+        upper: &str,
+        partition: &Struct,
+        spec_id: i32,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .file_path(format!("{}-pos-delete.parquet", Uuid::new_v4()))
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .lower_bounds(HashMap::from([(
+                RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string(lower),
+            )]))
+            .upper_bounds(HashMap::from([(
+                RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string(upper),
+            )]))
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap()
+    }
+
+    /// Index `deletes` (each paired with its data sequence number) under `spec_id` and return the
+    /// paths the index hands back for `data_file` at `seq_num`.
+    fn applied_paths(
+        deletes: Vec<(i64, DataFile)>,
+        spec_id: i32,
+        data_file: &DataFile,
+        seq_num: i64,
+    ) -> Vec<String> {
+        let contexts: Vec<DeleteFileContext> = deletes
+            .iter()
+            .map(|(seq, file)| DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(*seq, file).into(),
+                partition_spec_id: spec_id,
+            })
+            .collect();
+        PopulatedDeleteFileIndex::new(contexts)
+            .get_deletes_for_data_file(data_file, Some(seq_num))
+            .expect("the index lookup must succeed")
+            .into_iter()
+            .map(|file| file.file_path)
+            .collect()
+    }
+
+    // =========================================================================================
+    // PATH-KEYED position-delete routing (Java `DeleteFileIndex.findPathDeletes` +
+    // `Builder.add(Map<String, PositionDeletes>, PartitionMap<...>, DeleteFile)`)
+    // =========================================================================================
+
+    /// Risk pinned (WG4b): Java routes a FILE-SCOPED position delete — one whose referenced data
+    /// file is derivable — into `posDeletesByPath`, which `findPathDeletes` consults with the data
+    /// file's LOCATION ALONE: no spec condition, no partition condition (1.10.0 bytecode,
+    /// `findPathDeletes` = `posDeletesByPath.get(dataFile.location())`). Leg (a): the explicit
+    /// `referenced_data_file` field.
+    ///
+    /// The delete here is stamped spec 0 with an EMPTY partition while the data file lives in spec 1
+    /// partition `{100}` — the shape a writer that defaults the spec stamp produces. Before the path
+    /// map existed the fork indexed it by `(0, {})`, no lookup ever reached it, and the rows it masks
+    /// silently resurrected.
+    ///
+    /// MUTATION: routing file-scoped deletes back into the partition map (or dropping the path
+    /// lookup) empties this result (RED).
+    #[test]
+    fn test_file_scoped_pos_delete_applies_regardless_of_partition_and_spec() {
+        let data_file =
+            build_partitioned_data_file(&Struct::from_iter([Some(Literal::long(100))]), 1);
+        let delete = build_file_scoped_pos_delete(data_file.file_path(), &Struct::empty(), 0);
+        let delete_path = delete.file_path().to_string();
+
+        let applied = applied_paths(vec![(2, delete)], 0, &data_file, 1);
+
+        assert_eq!(
+            applied,
+            vec![delete_path],
+            "a file-scoped position delete must apply to the data file it references even though \
+             its spec id (0 vs 1) and partition tuple ({{}} vs {{100}}) both differ"
+        );
+    }
+
+    /// Risk pinned (WG4b leg (b)): Java's `PositionDeleteWriter` never sets `referenced_data_file`
+    /// — it keeps the `file_path`-column BOUNDS instead, and `ContentFileUtil.referencedDataFile`
+    /// derives the path from them when lower == upper (1.10.0 bytecode: read
+    /// `lowerBounds().get(PATH_ID)` / `upperBounds().get(PATH_ID)`, return null unless both exist and
+    /// `lower.equals(upper)`, then `Conversions.fromByteBuffer(StringType, lower)`). Implementing
+    /// only the field leg leaves EVERY Java-written file-granularity position delete unrouted — a
+    /// fixture that sets the field cannot detect it.
+    ///
+    /// MUTATION: dropping the bounds leg (field-only routing) sends this delete to the partition map
+    /// under `(0, {})`, which the `(1, {100})` data file never consults (RED).
+    #[test]
+    fn test_pos_delete_with_equal_path_bounds_is_file_scoped() {
+        let data_file =
+            build_partitioned_data_file(&Struct::from_iter([Some(Literal::long(100))]), 1);
+        let delete = build_pos_delete_with_path_bounds(
+            data_file.file_path(),
+            data_file.file_path(),
+            &Struct::empty(),
+            0,
+        );
+        let delete_path = delete.file_path().to_string();
+
+        let applied = applied_paths(vec![(2, delete)], 0, &data_file, 1);
+
+        assert_eq!(
+            applied,
+            vec![delete_path],
+            "equal file_path lower/upper bounds identify ONE referenced data file, so the delete is \
+             file-scoped and applies across the spec/partition mismatch"
+        );
+    }
+
+    /// Risk pinned: UNEQUAL `file_path` bounds mean the delete spans MORE than one data file, so
+    /// Java derives no referenced file and keeps it PARTITION-scoped (`lower.equals(upper)` is the
+    /// only gate). It must therefore still obey the partition + spec condition: it reaches a data
+    /// file in its own partition and NOT one in another, even though that other file's path equals
+    /// the lower bound.
+    ///
+    /// MUTATION: keying the path map off the lower bound alone (dropping the `lower == upper`
+    /// condition) makes the mismatched-partition file receive it (RED on the second assertion).
+    #[test]
+    fn test_pos_delete_with_unequal_path_bounds_stays_partition_scoped() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let same_partition_file = build_partitioned_data_file(&partition, 1);
+        let other_partition_file =
+            build_partitioned_data_file(&Struct::from_iter([Some(Literal::long(200))]), 1);
+
+        let delete = build_pos_delete_with_path_bounds(
+            other_partition_file.file_path(),
+            same_partition_file.file_path(),
+            &partition,
+            1,
+        );
+        let delete_path = delete.file_path().to_string();
+
+        assert_eq!(
+            applied_paths(vec![(2, delete.clone())], 1, &same_partition_file, 1),
+            vec![delete_path],
+            "a multi-file position delete stays partition-scoped and applies within its partition"
+        );
+        assert!(
+            applied_paths(vec![(2, delete)], 1, &other_partition_file, 1).is_empty(),
+            "it must NOT be treated as file-scoped for the file its LOWER bound names — Java \
+             derives a referenced file only when lower == upper"
+        );
+    }
+
+    /// Risk pinned: Java's routing is EXCLUSIVE — `Builder.add` puts a file-scoped delete in the
+    /// path map INSTEAD of the partition map (`if (path != null) … else …`, 1.10.0 bytecode). A
+    /// sibling data file in the same partition must therefore not receive it, and must not receive
+    /// it twice.
+    ///
+    /// MUTATION: indexing file-scoped deletes into BOTH maps makes the sibling receive it (RED on
+    /// the sibling assertion) and duplicates it for the referenced file (RED on the first).
+    #[test]
+    fn test_file_scoped_pos_delete_is_not_applied_to_a_sibling_in_the_same_partition() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let referenced_file = build_partitioned_data_file(&partition, 1);
+        let sibling_file = build_partitioned_data_file(&partition, 1);
+        let delete = build_file_scoped_pos_delete(referenced_file.file_path(), &partition, 1);
+        let delete_path = delete.file_path().to_string();
+
+        assert_eq!(
+            applied_paths(vec![(2, delete.clone())], 1, &referenced_file, 1),
+            vec![delete_path],
+            "the referenced data file receives the file-scoped delete exactly once"
+        );
+        assert!(
+            applied_paths(vec![(2, delete)], 1, &sibling_file, 1).is_empty(),
+            "a sibling in the SAME partition must not receive a file-scoped delete — Java indexes \
+             it by path INSTEAD of by partition"
+        );
+    }
+
+    /// CONTROL (must hold before and after the path map exists): a genuinely partition-scoped
+    /// position delete — no referenced field, no path bounds — still requires BOTH the partition
+    /// tuple and the spec id to match. This is the pin that stops "route everything by path" from
+    /// passing: it has no path to be routed by.
+    #[test]
+    fn test_partition_scoped_pos_delete_still_requires_matching_partition_and_spec() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let delete = build_partitioned_pos_delete(&partition, 1);
+        let delete_path = delete.file_path().to_string();
+
+        assert_eq!(
+            applied_paths(
+                vec![(2, delete.clone())],
+                1,
+                &build_partitioned_data_file(&partition, 1),
+                1
+            ),
+            vec![delete_path],
+            "same partition + same spec: it applies"
+        );
+        assert!(
+            applied_paths(
+                vec![(2, delete.clone())],
+                1,
+                &build_partitioned_data_file(&Struct::from_iter([Some(Literal::long(200))]), 1),
+                1
+            )
+            .is_empty(),
+            "different partition tuple: it must NOT apply"
+        );
+        assert!(
+            applied_paths(
+                vec![(2, delete)],
+                1,
+                &build_partitioned_data_file(&partition, 2),
+                1
+            )
+            .is_empty(),
+            "same partition tuple, different spec id: it must NOT apply"
+        );
+    }
+
+    /// Risk pinned: Java's `ContentFileUtil.referencedDataFile` returns null for EQUALITY_DELETES
+    /// BEFORE it looks at either the field or the bounds (the first branch, 1.10.0 bytecode). An
+    /// equality delete is never file-scoped, whatever its metrics say — it stays a partition (or
+    /// global) delete, and applies STRICTLY to lower-sequence data.
+    ///
+    /// MUTATION (content-BLIND file-scoping — hoisting the path routing above the content-type match
+    /// AND dropping the helper's equality early-return): this delete lands in the POSITION path map,
+    /// where its partition peers never find it (RED on the second assertion). The early-return alone
+    /// is not observable HERE, because the index consults the helper only inside the
+    /// `PositionDeletes` arm; it is load-bearing on the maintenance side, pinned by
+    /// `remove_dangling_delete_files`'s
+    /// `test_equality_delete_with_path_bounds_is_judged_by_min_seq_not_by_reference`.
+    #[test]
+    fn test_equality_delete_with_path_bounds_is_never_file_scoped() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let data_file = build_partitioned_data_file(&partition, 1);
+
+        let mut eq_delete = build_partitioned_eq_delete(&partition, 1);
+        eq_delete.lower_bounds = HashMap::from([(
+            RESERVED_FIELD_ID_DELETE_FILE_PATH,
+            Datum::string(data_file.file_path()),
+        )]);
+        eq_delete.upper_bounds = HashMap::from([(
+            RESERVED_FIELD_ID_DELETE_FILE_PATH,
+            Datum::string(data_file.file_path()),
+        )]);
+        let eq_delete_path = eq_delete.file_path().to_string();
+
+        assert_eq!(
+            applied_paths(vec![(4, eq_delete.clone())], 1, &data_file, 1),
+            vec![eq_delete_path.clone()],
+            "the equality delete applies to its partition's data file"
+        );
+        assert_eq!(
+            applied_paths(
+                vec![(4, eq_delete)],
+                1,
+                &build_partitioned_data_file(&partition, 1),
+                1
+            ),
+            vec![eq_delete_path],
+            "and to every OTHER data file in the same partition — it was not diverted into the \
+             file-scoped position map"
+        );
+    }
+
+    /// Risk pinned: the path map is sequence-filtered exactly like the partition map — Java's
+    /// `findPathDeletes` calls `PositionDeletes.filter(seq)`, whose `findStartIndex` keeps the files
+    /// with `delete_seq >= data_seq` (1.10.0 bytecode). Only the partition/spec condition is dropped
+    /// by the path key, never the sequence rule.
+    ///
+    /// MUTATION: dropping the sequence filter on the path lookup makes the seq-3 delete apply to the
+    /// seq-4 data file (RED).
+    #[test]
+    fn test_file_scoped_pos_delete_is_sequence_filtered_like_the_partition_map() {
+        let data_file =
+            build_partitioned_data_file(&Struct::from_iter([Some(Literal::long(100))]), 1);
+        let delete = build_file_scoped_pos_delete(data_file.file_path(), &Struct::empty(), 0);
+        let delete_path = delete.file_path().to_string();
+
+        assert_eq!(
+            applied_paths(vec![(4, delete.clone())], 0, &data_file, 4),
+            vec![delete_path.clone()],
+            "delete_seq == data_seq (4 == 4): a position delete applies at the boundary"
+        );
+        assert_eq!(
+            applied_paths(vec![(4, delete.clone())], 0, &data_file, 3),
+            vec![delete_path],
+            "delete_seq > data_seq (4 > 3): it applies"
+        );
+        assert!(
+            applied_paths(vec![(3, delete)], 0, &data_file, 4).is_empty(),
+            "delete_seq < data_seq (3 < 4): it must NOT apply"
+        );
+    }
+
+    /// Risk pinned: when a data file has a DELETION VECTOR, Java's `forDataFile` returns
+    /// {global eq, partition eq, DV} and never calls `findPosPartitionDeletes` OR `findPathDeletes`
+    /// (1.10.0 bytecode: both are inside the `dv == null` branch). The DV is the complete
+    /// position-delete state for that file; also returning a superseded parquet delete would
+    /// re-apply deletes the DV already accounts for.
+    ///
+    /// MUTATION: consulting the path map before/alongside the DV branch returns the parquet delete
+    /// too (RED).
+    #[test]
+    fn test_dv_supersedes_a_file_scoped_position_delete() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let data_file = build_partitioned_data_file(&partition, 1);
+        let dv = build_partitioned_deletion_vector(data_file.file_path(), &partition, 1);
+        let dv_path = dv.file_path().to_string();
+
+        let applied = applied_paths(
+            vec![
+                (
+                    2,
+                    build_file_scoped_pos_delete(data_file.file_path(), &partition, 1),
+                ),
+                (2, dv),
+            ],
+            1,
+            &data_file,
+            1,
+        );
+
+        assert_eq!(
+            applied,
+            vec![dv_path],
+            "the DV supersedes the file-scoped parquet position delete, exactly as it supersedes a \
+             partition-scoped one"
+        );
+    }
+
+    /// Risk pinned: the result ORDER mirrors Java's `concat(global, eqPartition, posPartition,
+    /// posPath)` (1.10.0 bytecode). Order is observable — `FileScanTask.deletes` is serialized and
+    /// compared against Java in the interop suites — so it is pinned rather than left incidental.
+    #[test]
+    fn test_result_order_matches_java_concat_global_eq_partition_pos_path() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let data_file = build_partitioned_data_file(&partition, 1);
+
+        let global_eq = build_partitioned_eq_delete(&Struct::empty(), 1);
+        let partition_eq = build_partitioned_eq_delete(&partition, 1);
+        let partition_pos = build_partitioned_pos_delete(&partition, 1);
+        let path_pos = build_file_scoped_pos_delete(data_file.file_path(), &Struct::empty(), 1);
+        let expected = vec![
+            global_eq.file_path().to_string(),
+            partition_eq.file_path().to_string(),
+            partition_pos.file_path().to_string(),
+            path_pos.file_path().to_string(),
+        ];
+
+        let applied = applied_paths(
+            vec![
+                (2, path_pos),
+                (2, partition_pos),
+                (2, partition_eq),
+                (2, global_eq),
+            ],
+            1,
+            &data_file,
+            1,
+        );
+
+        assert_eq!(
+            applied, expected,
+            "global equality, then partition equality, then partition position, then path position"
+        );
     }
 
     /// Build a deletion vector `DataFile`: a POSITION_DELETES entry in PUFFIN format referencing
