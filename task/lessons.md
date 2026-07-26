@@ -603,3 +603,28 @@ the brief predicted two. Three things generalise:
   than construct it inside its `async move`) is what covers the never-polled teardown — a future
   dropped before its first poll runs no local destructors. Those are two separate pins with two
   separate mutations; one passing does not imply the other.
+
+### 2026-07-26 — When one fix rewrites TWO call sites of shared machinery, the SECOND site needs its own pin — the whole suite stays green without it
+
+The G8 remediation (independent Critic, `arrow/caching_delete_file_loader.rs`). The lost-wakeup fix
+rewrote both positional-delete claim sites: the parquet path (`{file path}` key) and the
+deletion-vector path (`{puffin path}@{offset}` key). Only the parquet path got a production-path
+test. Two independent regressions in the DV half — leaking the claim on the blob-read failure, and
+consulting the wait state under `&task.file_path` instead of the composite key — each left ALL 2967
+lib tests green, while one of them reproduced the exact hang the group's headline test exists to
+catch. Generalisations:
+
+- **Enumerate the call sites your diff touched and check each one appears in a test name.** "The
+  mechanism is pinned" is not the bar; the bar is "every site that instantiates the mechanism is
+  pinned". A composite claim key is its own risk: a guard that publishes under the wrong key leaves
+  the real entry `Loading` forever, and no test of the other site can see it.
+- **A terminal failure state should carry its CAUSE from the first design pass.** The failing task is
+  the only one that sees its own error; every waiter and every later caller reads the state instead.
+  `Failed` as a unit variant means they learn THAT a load died, never WHY — and on a caching loader
+  the later caller has no other channel. Recording `error.to_string()` at each failure site (and a
+  generic reason from `Drop`, which has none) costs one `map_err` per site and is mutation-provable
+  per site.
+- **Bound EVERY test await that can reach a wait path, not just the ones about waiting.** A
+  pre-existing predicate test with a bare `.await` turned a lost-wakeup mutation into a hung CI job
+  instead of a red test — and hid a fourth RED in the mutation matrix. `tokio::time::timeout(5s)`
+  around the await converts it into evidence.

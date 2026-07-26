@@ -72,7 +72,15 @@ enum PosDelState {
     /// notifier that has already fired for the last time — which would block the scan forever.
     /// Mirrors [`EqDelState::Failed`] (and `DeleteFileIndexState::Failed` in
     /// [`crate::delete_file_index`]).
-    Failed,
+    ///
+    /// Carries the CAUSE, rendered into every waiter's (and every later claimant's) error — the
+    /// error itself cannot be carried, since it reaches only the task that produced it and
+    /// [`Error`] is not `Clone`. The claiming task records it with
+    /// [`PosDelLoadGuard::note_failure`] on the paths where it has one; the paths where it does not
+    /// (an unwind, a cancelled future, a runtime shutdown) publish a generic reason. Deliberately
+    /// asymmetric with [`EqDelState::Failed`]: there the terminal transition is made by the
+    /// publisher task, which observes only a dropped oneshot sender and so has no cause to record.
+    Failed(String),
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +165,9 @@ pub(crate) struct PosDelLoadGuard {
     notify: Arc<Notify>,
     file_path: String,
     armed: bool,
+    /// The cause recorded by [`PosDelLoadGuard::note_failure`], published into
+    /// [`PosDelState::Failed`] so waiters learn WHY the load died, not just THAT it did.
+    failure_reason: Option<String>,
 }
 
 /// Renders the claim, not the whole guarded filter state: a `Debug` that reached for the state
@@ -166,6 +177,7 @@ impl std::fmt::Debug for PosDelLoadGuard {
         f.debug_struct("PosDelLoadGuard")
             .field("file_path", &self.file_path)
             .field("armed", &self.armed)
+            .field("failure_reason", &self.failure_reason)
             .finish_non_exhaustive()
     }
 }
@@ -191,12 +203,30 @@ impl PosDelLoadGuard {
     pub(crate) fn publish_loaded(mut self) {
         self.publish(PosDelState::Loaded);
     }
+
+    /// Record the error that is about to end this load, then hand it back for `?` propagation.
+    ///
+    /// Only the task holding the guard ever sees that error; every OTHER consumer of this file —
+    /// a concurrent waiter, and any later claimant on the same (result-caching) loader — reaches
+    /// the terminal state instead, so without this the cause is lost to them and they learn only
+    /// THAT the load died. Use it on every failure path that has a cause in hand; the paths that
+    /// do not (an unwind, a future dropped by a runtime teardown, a sibling task's error tearing
+    /// the shared load stream down) still publish `Failed` from `Drop`, with a generic reason.
+    pub(crate) fn note_failure(&mut self, error: Error) -> Error {
+        self.failure_reason = Some(error.to_string());
+        error
+    }
 }
 
 impl Drop for PosDelLoadGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.publish(PosDelState::Failed);
+            let reason = self.failure_reason.take().unwrap_or_else(|| {
+                "no cause was recorded — the load was cancelled, panicked, or the runtime was \
+                 shut down"
+                    .to_string()
+            });
+            self.publish(PosDelState::Failed(reason));
         }
     }
 }
@@ -357,7 +387,9 @@ impl DeleteFilter {
                 PosDelState::Loading(notify) => {
                     return Ok(PosDelLoadAction::WaitFor(notify.clone().notified_owned()));
                 }
-                PosDelState::Failed => return Err(pos_del_load_failed_error(file_path)),
+                PosDelState::Failed(reason) => {
+                    return Err(pos_del_load_failed_error(file_path, reason));
+                }
             }
         }
 
@@ -371,6 +403,7 @@ impl DeleteFilter {
             notify,
             file_path: file_path.to_string(),
             armed: true,
+            failure_reason: None,
         }))
     }
 
@@ -396,7 +429,7 @@ impl DeleteFilter {
             .get(file_path)
         {
             Some(PosDelState::Loaded) => Ok(()),
-            Some(PosDelState::Failed) => Err(pos_del_load_failed_error(file_path)),
+            Some(PosDelState::Failed(reason)) => Err(pos_del_load_failed_error(file_path, reason)),
             _ => Err(Error::new(
                 ErrorKind::Unexpected,
                 format!(
@@ -577,12 +610,17 @@ impl DeleteFilter {
 
 /// The typed error every consumer of a terminally-failed positional-delete load receives — the
 /// claim-time and the post-wake paths must render the same failure, so it lives in one place.
-fn pos_del_load_failed_error(file_path: &str) -> Error {
+///
+/// `reason` is the cause carried by [`PosDelState::Failed`]: the failing task's own error where it
+/// had one ([`PosDelLoadGuard::note_failure`]), else a generic reason. It is rendered inline rather
+/// than attached with `with_source`, because it is a message the failing task left behind, not an
+/// [`Error`] this one is wrapping — nothing is dropped from a source chain here.
+fn pos_del_load_failed_error(file_path: &str, reason: &str) -> Error {
     Error::new(
         ErrorKind::Unexpected,
         format!(
             "the loader for positional delete file '{file_path}' terminated without publishing \
-             its deletes (it errored, panicked, or the runtime was shut down)"
+             its deletes: {reason}"
         ),
     )
 }
@@ -1108,7 +1146,16 @@ pub(crate) mod tests {
         tx.send((pred, None)).unwrap();
 
         // ---------- should FAIL ----------
-        let result = filter.build_equality_delete_predicate(&task).await;
+        // BOUNDED: this call reaches the eq-delete wait path, so a lost-wakeup regression makes it
+        // never return. Without the timeout that is a hung CI job instead of a red test (the
+        // eq-delete arming mutations do exactly that) — the same bound
+        // `test_failed_eq_delete_load_surfaces_error_not_hang` already carries.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.build_equality_delete_predicate(&task),
+        )
+        .await
+        .expect("build_equality_delete_predicate must not hang");
 
         assert!(
             result.is_err(),
