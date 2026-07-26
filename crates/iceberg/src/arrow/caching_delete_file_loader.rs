@@ -545,13 +545,29 @@ impl CachingDeleteFileLoader {
             let schema = batch.schema();
             let columns = batch.columns();
 
-            let Some(file_paths) = columns[0].as_any().downcast_ref::<StringArray>() else {
+            // This reader takes the two spec-required columns POSITIONALLY (`file_path` then
+            // `pos` — Java `MetadataColumns.DELETE_FILE_PATH` / `DELETE_FILE_POS`). A delete
+            // file is untrusted input read from object storage, so a batch with fewer than two
+            // columns must fail closed with a typed error naming the file: indexing it would
+            // abort the scan task's process, and a `panic` is not a diagnosis.
+            let [file_paths, positions, ..] = columns else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Invalid position delete file '{delete_file_path}': expected at least 2 \
+                         columns (file_path, pos), found {}",
+                        columns.len()
+                    ),
+                ));
+            };
+
+            let Some(file_paths) = file_paths.as_any().downcast_ref::<StringArray>() else {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Could not downcast file paths array to StringArray",
                 ));
             };
-            let Some(positions) = columns[1].as_any().downcast_ref::<Int64Array>() else {
+            let Some(positions) = positions.as_any().downcast_ref::<Int64Array>() else {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Could not downcast positions array to Int64Array",
@@ -1428,6 +1444,104 @@ mod tests {
             error.to_string().contains("null position"),
             "error must name the null position column: {error}"
         );
+    }
+
+    /// Risk pinned: a position-delete batch with FEWER than the two columns this reader takes
+    /// positionally fails closed with a typed error naming the delete file, instead of
+    /// panicking on `columns[0]` / `columns[1]`.
+    ///
+    /// Both arities are exercised separately because they are two distinct unchecked indexes:
+    /// a one-column batch only reaches `columns[1]`, and a zero-column batch only reaches
+    /// `columns[0]`. A delete file is untrusted input read from object storage, and this parse
+    /// runs inside a long-running engine's scan task, where an index panic aborts the process.
+    #[tokio::test]
+    async fn test_short_column_arity_yields_typed_error_not_panic() {
+        use arrow_array::RecordBatchOptions;
+        use futures::stream;
+
+        // One column: `columns[1]` is the out-of-bounds index.
+        let one_col_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "file_path",
+            DataType::Utf8,
+            false,
+        )]));
+        let one_col = RecordBatch::try_new(one_col_schema, vec![Arc::new(StringArray::from(vec![
+            "data-1.parquet",
+        ])) as ArrayRef])
+        .expect("build one-column batch");
+
+        // Zero columns: `columns[0]` is the out-of-bounds index. A row count is required
+        // because it cannot be inferred without columns.
+        let no_col = RecordBatch::try_new_with_options(
+            Arc::new(arrow_schema::Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(1)),
+        )
+        .expect("build zero-column batch");
+
+        for (batch, arity) in [(one_col, 1usize), (no_col, 0usize)] {
+            let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
+            let error = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+                "truncated-pos-dels.parquet",
+                stream,
+            )
+            .await
+            .expect_err("a short column arity must fail closed with a typed error");
+
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            assert!(
+                error.to_string().contains("truncated-pos-dels.parquet"),
+                "error must name the delete file (arity {arity}): {error}"
+            );
+            assert!(
+                error.to_string().contains("column"),
+                "error must say the column arity is wrong (arity {arity}): {error}"
+            );
+        }
+    }
+
+    /// Over-firing CONTROL for the arity guard: a position-delete batch with MORE than two
+    /// columns must still parse from the first two.
+    ///
+    /// This is not hypothetical. The spec's position-delete schema has an optional third
+    /// column, `row` (Java `MetadataColumns.DELETE_FILE_ROW_FIELD_NAME`), which Java writes
+    /// whenever the writer is configured to keep the deleted row, and `parquet_to_batch_stream`
+    /// applies NO projection — every column in the file reaches this parse. A guard demanding
+    /// exactly two columns would reject those Java-written files, so the `..` in the arity
+    /// pattern is load-bearing and this test is what holds it.
+    #[tokio::test]
+    async fn test_position_delete_batch_with_a_trailing_row_column_still_parses() {
+        use futures::stream;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+            Field::new("row", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(StringArray::from(vec!["data-1.parquet", "data-1.parquet"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![3i64, 9i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("deleted-a"),
+                Some("deleted-b"),
+            ])) as ArrayRef,
+        ])
+        .expect("build three-column position delete batch");
+        let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
+
+        let result = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+            "pos-dels-with-row.parquet",
+            stream,
+        )
+        .await
+        .expect("a delete file carrying the optional `row` column must still parse");
+
+        let deletes = result
+            .get("data-1.parquet")
+            .expect("the data file must be present in the parsed deletes");
+        assert!(deletes.contains(3), "position 3 must be deleted");
+        assert!(deletes.contains(9), "position 9 must be deleted");
+        assert!(!deletes.contains(4), "position 4 must NOT be deleted");
     }
 
     /// Risk pinned: a NULL file_path row fails closed with a typed error naming the delete
