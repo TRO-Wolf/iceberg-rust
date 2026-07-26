@@ -152,7 +152,7 @@ Projection" rule 1 / Java `PartitionUtil.constantsMap`; Rust
 `arrow/record_batch_transformer.rs::constant_overrides_file_column`). Two consequences an engine must
 internalise. First, on an identity spec the damage is visible on an ORDINARY FULL SCAN, not only on a
 pruned one: rows come back carrying the recorded value in place of the value that was written.
-Second, the written value is NOT lost — it is still in the data file, masked — so the corruption is
+Second, the written value is NOT lost when the writer emits the partition-source column (as this crate's writers always do) — it is still in the data file, masked — so the corruption is
 repairable in place; `maintenance::RepairPartitionKeys` rewrites the rows under their recomputed keys
 and the true values return.
 

@@ -77,7 +77,7 @@
 //! # The fixture (NOT in this repo)
 //!
 //! Generated 2026-07-25 by the RePark consumer with real Spark, and deliberately **not committed
-//! here**: the four warehouses are ~216 KB of binary parquet/Avro/Puffin whose manifests are
+//! here**: the four warehouses are ~220 KB of binary parquet/Avro/Puffin whose manifests are
 //! DEFLATE-compressed with the generating machine's ABSOLUTE paths baked in (metadata JSON,
 //! manifest lists, manifests, and the position-delete `file_path` column alike), so they are not
 //! relocatable without either a prefix-remapping storage shim or regeneration. See
