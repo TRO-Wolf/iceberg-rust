@@ -83,9 +83,35 @@ enum PosDelState {
     Failed(String),
 }
 
+/// The memo key for one task-shaped positional-delete resolution: the task's data file path plus
+/// the SORTED, DEDUPLICATED claim keys of its positional delete sources. Two tasks (or two loads of
+/// one task) with the same data file and the same delete set resolve to the same key and share one
+/// merged vector — the shared-state analogue of Java's per-task
+/// `DeleteFilter.deleteRowPositions` memo field (`DeleteFilter.deletedRowPositions()`, 1.10.0
+/// bytecode offsets 0-4: return the cached index when non-null).
+type PosDelResolutionKey = (String, Vec<String>);
+
 #[derive(Debug, Default)]
 struct DeleteFileFilterState {
-    delete_vectors: HashMap<String, Arc<Mutex<DeleteVector>>>,
+    /// Parsed positional-delete content, PER SOURCE — the load cache. Keyed by the source's claim
+    /// key ([`pos_del_claim_key`]: the parquet delete file's path, or `{puffin path}@{offset}` for
+    /// a deletion-vector blob); each value maps a DATA file path to the positions that source
+    /// deletes from it. This is Java's cache shape exactly: `BaseDeleteLoader.getOrReadPosDeletes`
+    /// caches `readPosDeletes(deleteFile)` — a `CharSequenceMap<PositionDeleteIndex>` keyed by data
+    /// file — under `deleteFile.location()` (1.10.0 bytecode offsets 22-39).
+    ///
+    /// Keeping the per-source maps SEPARATE (instead of merging them into one shared
+    /// data-file-keyed map at load time, as this state did before) is what scopes delete
+    /// APPLICATION to each task's own delete set: a source loaded for one task can no longer
+    /// contribute deletions to a task that does not list it (the R117 cross-task over-delete).
+    /// An installed map is never mutated again (each claim key is loaded exactly once — the
+    /// [`PosDelState`] machinery is the single-writer guarantee), so resolution can snapshot the
+    /// `Arc`s and union outside the lock.
+    pos_del_contributions: HashMap<String, Arc<HashMap<String, DeleteVector>>>,
+    /// Memoized per-task merged vectors — see [`PosDelResolutionKey`]. Entries are only installed
+    /// once every claim key they depend on is present in `pos_del_contributions`, and contributions
+    /// are immutable once installed, so a memoized union can never go stale.
+    resolved_pos_dels: HashMap<PosDelResolutionKey, Arc<Mutex<DeleteVector>>>,
     equality_deletes: HashMap<String, EqDelState>,
     positional_deletes: HashMap<String, PosDelState>,
 }
@@ -314,28 +340,150 @@ fn recover_poison<G>(result: std::sync::LockResult<G>) -> G {
     result.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The claim/cache key under which one positional-delete SOURCE is loaded and its parsed
+/// contribution installed — the single source of truth shared by the loader (claim + install)
+/// and by [`DeleteFilter::resolve_delete_vector`] (application), so the two sides can never
+/// drift apart and silently drop deletes.
+///
+/// * A parquet position-delete file is keyed by its own path.
+/// * A deletion vector (a position delete in PUFFIN format) is keyed `{puffin path}@{offset}` —
+///   one Puffin file holds many DV blobs, so the bare file path would collide them.
+/// * Anything else (equality deletes, data files) has no positional claim key: `None`.
+///
+/// Returns `None` for a Puffin entry with a missing or negative `content_offset` — invalid
+/// metadata that `CachingDeleteFileLoader::validate_deletion_vector_task` fails loud on at load
+/// time, so such an entry can never have an installed contribution to resolve.
+pub(crate) fn pos_del_claim_key(delete: &FileScanTaskDeleteFile) -> Option<String> {
+    if delete.file_type != DataContentType::PositionDeletes {
+        return None;
+    }
+    if delete.file_format == crate::spec::DataFileFormat::Puffin {
+        let offset = delete.content_offset.filter(|offset| *offset >= 0)?;
+        Some(format!("{}@{offset}", delete.file_path))
+    } else {
+        Some(delete.file_path.clone())
+    }
+}
+
 impl DeleteFilter {
-    /// Retrieve a delete vector for the data file associated with a given file scan task
+    /// Retrieve the merged positional-delete vector for a file scan task — the union of the
+    /// contributions that the task's OWN delete files make to the task's data file. See
+    /// [`Self::resolve_delete_vector`].
     pub(crate) fn get_delete_vector(
         &self,
         file_scan_task: &FileScanTask,
     ) -> Option<Arc<Mutex<DeleteVector>>> {
-        self.get_delete_vector_for_path(file_scan_task.data_file_path())
+        self.resolve_delete_vector(&file_scan_task.deletes, file_scan_task.data_file_path())
     }
 
-    /// Retrieve a delete vector for a data file
-    pub(crate) fn get_delete_vector_for_path(
+    /// Resolve the positional deletes that `deletes` (a task's delete files) apply to
+    /// `data_file_path` (that task's data file): the union, over the task's own positional
+    /// sources only, of each source's contribution to this data file.
+    ///
+    /// This is Java's per-task scope exactly: Java builds one `data.DeleteFilter` per task over
+    /// `task.deletes()` alone (constructor bytecode offsets 51-208 partition the GIVEN list), and
+    /// `deletedRowPositions()` merges `deleteLoader().loadPositionDeletes(this.posDeletes,
+    /// this.filePath)` (offsets 19-37) — per delete file, the cached contribution map is consulted
+    /// with `getOrDefault(filePath, PositionDeleteIndex.empty())` (`BaseDeleteLoader
+    /// .getOrReadPosDeletes`, offsets 41-50) and the per-file indexes merged into a FRESH index
+    /// (`PositionDeleteIndexUtil.merge`, offsets 0-26). A delete file loaded for a DIFFERENT task
+    /// therefore never contributes here, and a listed delete file's rows that name OTHER data
+    /// files are ignored for this one.
+    ///
+    /// The merged vector is memoized per [`PosDelResolutionKey`] (Java memoizes the merge in the
+    /// per-task `deleteRowPositions` field), so repeated resolution of one task — and every other
+    /// task with the identical delete set + data file — returns the SAME `Arc`.
+    ///
+    /// Returns `None` when no listed source contributes any position for this data file. Two
+    /// unreachable-by-contract shapes also resolve as `None`, loudly: a listed positional source
+    /// with an underivable claim key, and one whose contribution was never installed (resolution
+    /// before `load_deletes` completed — the loader awaits every listed source before handing the
+    /// filter out, and a failed load fails the whole scan instead). Both log at WARN because
+    /// silently dropping a REAL source here would resurrect deleted rows.
+    pub(crate) fn resolve_delete_vector(
         &self,
+        deletes: &[FileScanTaskDeleteFile],
         data_file_path: &str,
     ) -> Option<Arc<Mutex<DeleteVector>>> {
-        // Recover a poisoned lock instead of `.read().ok()` swallowing the poison as `None`: a
-        // `None` here is read by the reader/`apply` as "no positional deletes for this data file",
-        // so a poison-induced `None` would silently DROP positional deletes and resurrect deleted
-        // rows. Match every other lock site in this file (the `recover_poison` policy).
-        recover_poison(self.state.read())
-            .delete_vectors
-            .get(data_file_path)
-            .cloned()
+        let mut claim_keys: Vec<String> = Vec::new();
+        for delete in deletes {
+            if delete.file_type != DataContentType::PositionDeletes {
+                continue;
+            }
+            match pos_del_claim_key(delete) {
+                Some(key) => claim_keys.push(key),
+                None => {
+                    // Invalid DV metadata (missing/negative offset) — the loader fails loud on
+                    // this shape before any contribution exists, so a filter being resolved can
+                    // only see it through contract misuse.
+                    tracing::warn!(
+                        delete_file = %delete.file_path,
+                        "skipping a positional delete source with an underivable claim key \
+                         (invalid deletion-vector metadata); its load would have failed the scan"
+                    );
+                }
+            }
+        }
+        claim_keys.sort_unstable();
+        claim_keys.dedup();
+        if claim_keys.is_empty() {
+            return None;
+        }
+
+        // Snapshot the contribution maps under the read lock; union OUTSIDE it (contributions are
+        // immutable once installed, so the snapshot cannot go stale). Poison is recovered rather
+        // than swallowed as `None` — a poison-induced `None` is read as "no positional deletes"
+        // and would silently resurrect deleted rows (the `recover_poison` policy of this file).
+        let mut contributions: Vec<Arc<HashMap<String, DeleteVector>>> =
+            Vec::with_capacity(claim_keys.len());
+        let mut every_source_installed = true;
+        {
+            let state = recover_poison(self.state.read());
+            if let Some(resolved) = state
+                .resolved_pos_dels
+                .get(&(data_file_path.to_string(), claim_keys.clone()))
+            {
+                return Some(resolved.clone());
+            }
+            for key in &claim_keys {
+                match state.pos_del_contributions.get(key) {
+                    Some(contribution) => contributions.push(contribution.clone()),
+                    None => {
+                        // Reachable only by resolving before this source's load completed (the
+                        // loader publishes every listed source before delivering the filter).
+                        // Never memoize a union computed without every listed source.
+                        every_source_installed = false;
+                        tracing::warn!(
+                            claim_key = %key,
+                            data_file = %data_file_path,
+                            "resolving positional deletes for a source whose contribution is not \
+                             installed; load_deletes for this task has not completed"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut merged: Option<DeleteVector> = None;
+        for contribution in &contributions {
+            if let Some(vector) = contribution.get(data_file_path) {
+                *merged.get_or_insert_with(DeleteVector::default) |= vector.clone();
+            }
+        }
+        let merged = Arc::new(Mutex::new(merged?));
+
+        if every_source_installed {
+            // Double-checked install: a concurrent resolver may have memoized the same key while
+            // the union above ran outside the lock — return THEIRS so every resolver of one task
+            // shape shares a single vector.
+            let mut state = recover_poison(self.state.write());
+            let entry = state
+                .resolved_pos_dels
+                .entry((data_file_path.to_string(), claim_keys))
+                .or_insert_with(|| merged.clone());
+            return Some(entry.clone());
+        }
+        Some(merged)
     }
 
     /// Attempts to claim an equality delete file for loading, returning the guard that publishes
@@ -590,21 +738,26 @@ impl DeleteFilter {
         Ok(Some(bound_predicate))
     }
 
-    pub(crate) fn upsert_delete_vector(
-        &mut self,
-        data_file_path: String,
-        delete_vector: DeleteVector,
+    /// Install the parsed contribution map of ONE freshly loaded positional-delete source — the
+    /// `data file path → positions` map its rows produced — under the claim the loading task holds.
+    /// Call it BEFORE [`PosDelLoadGuard::publish_loaded`], in the same await-free block: a woken
+    /// waiter resolves synchronously, so publishing first (or being cancelled in between) would
+    /// hand it an absent contribution.
+    ///
+    /// Taking the [`PosDelLoadGuard`] rather than a bare key ties the install to the claim: only
+    /// the single task that owns a source's load can install its contribution, and only under the
+    /// exact key it claimed (key drift between claim, install and resolution would silently drop
+    /// deletes). Installing over a present entry is structurally unreachable (the claim machinery
+    /// hands out one `Load` per key per filter lifetime); `insert` keeps the operation total.
+    pub(crate) fn install_pos_del_contribution(
+        &self,
+        claim: &PosDelLoadGuard,
+        contribution: HashMap<String, DeleteVector>,
     ) {
         let mut state = recover_poison(self.state.write());
-
-        let Some(entry) = state.delete_vectors.get_mut(&data_file_path) else {
-            state
-                .delete_vectors
-                .insert(data_file_path, Arc::new(Mutex::new(delete_vector)));
-            return;
-        };
-
-        *recover_poison(entry.lock()) |= delete_vector;
+        state
+            .pos_del_contributions
+            .insert(claim.file_path.clone(), Arc::new(contribution));
     }
 }
 
@@ -1291,13 +1444,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// Build a parquet positional-delete task entry for `file_path` (metadata only — these tests
+    /// never open it).
+    fn parquet_pos_del_entry(file_path: &str) -> FileScanTaskDeleteFile {
+        FileScanTaskDeleteFile {
+            file_path: file_path.to_string(),
+            file_size_in_bytes: 0,
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        }
+    }
+
     /// Risk pinned (audit SAF-003): a thread that panics while holding the `state` write guard
     /// poisons the `RwLock`, but subsequent scan operations must RECOVER (`into_inner`) rather than
-    /// cascade-panic. MUTATION: restoring `self.state.write().unwrap()` in `upsert_delete_vector` /
-    /// `try_start_pos_del_load` turns these calls into panics on the poisoned lock (RED).
+    /// cascade-panic. MUTATION: restoring `self.state.write().unwrap()` in
+    /// `install_pos_del_contribution` / `try_start_pos_del_load` turns these calls into panics on
+    /// the poisoned lock (RED). (Adapted for R117: the writer under test was `upsert_delete_vector`
+    /// until the per-task scoping change replaced it with `install_pos_del_contribution` — the
+    /// pinned risk, poison-recovery on the state writers, is unchanged.)
     #[test]
     fn test_poisoned_state_lock_recovers_instead_of_cascading() {
-        let mut filter = DeleteFilter::default();
+        let filter = DeleteFilter::default();
+        // Claim BEFORE poisoning so only the writer-under-test runs on the poisoned lock.
+        let guard = claim_pos_del(&filter, "pos-del-installed.parquet");
 
         // Poison the shared state RwLock by panicking while holding the write guard.
         let poisoner = filter.clone();
@@ -1313,15 +1488,20 @@ pub(crate) mod tests {
             "the poisoning thread must have panicked while holding the guard"
         );
 
-        // A subsequent WRITER (upsert_delete_vector) must not panic on the poisoned lock, and its
-        // write must land.
-        filter.upsert_delete_vector("data.parquet".to_string(), DeleteVector::default());
+        // A subsequent WRITER (install_pos_del_contribution) must not panic on the poisoned lock,
+        // and its write must land.
+        filter.install_pos_del_contribution(
+            &guard,
+            HashMap::from([("data.parquet".to_string(), DeleteVector::default())]),
+        );
         assert!(
             recover_poison(filter.state.read())
-                .delete_vectors
-                .contains_key("data.parquet"),
+                .pos_del_contributions
+                .contains_key("pos-del-installed.parquet"),
             "the recovered write must land despite the poisoned lock"
         );
+        // Publishing the claim also runs on the poisoned lock (the guard's own recover path).
+        guard.publish_loaded();
 
         // A subsequent writer via try_start_pos_del_load must also recover and proceed.
         assert!(
@@ -1336,20 +1516,29 @@ pub(crate) mod tests {
     }
 
     /// Risk pinned (G1a fail-open): a poisoned `state` lock must NOT make
-    /// `get_delete_vector_for_path` return `None` for a present data file. A `None` is read by the
+    /// `resolve_delete_vector` return `None` for a present contribution. A `None` is read by the
     /// reader / `apply` as "no positional deletes here", so a poison-induced `None` would silently
-    /// DROP the file's positional deletes and RESURRECT deleted rows. The reader must recover the
+    /// DROP the file's positional deletes and RESURRECT deleted rows. The resolver must recover the
     /// poison (`into_inner`) and still hand back the delete vector.
-    /// MUTATION: reverting the accessor to `self.state.read().ok().and_then(...)` swallows the
-    /// poison as `None` and this test FAILS (the `expect` below trips) — RED.
+    /// MUTATION: reverting the resolver's state read to `self.state.read().ok()` + early-`None`
+    /// swallows the poison as `None` and this test FAILS (the `expect` below trips) — RED.
+    /// (Adapted for R117: the accessor under test was `get_delete_vector_for_path` until the
+    /// per-task scoping change replaced it with the task-scoped resolver — the pinned risk, a
+    /// poisoned read failing open as "no deletes", is unchanged.)
     #[test]
     fn test_get_delete_vector_survives_poisoned_lock() {
-        let mut filter = DeleteFilter::default();
+        let filter = DeleteFilter::default();
 
-        // Populate a delete vector for a data file so a correct read returns `Some`.
+        // Populate a contribution for a data file so a correct read returns `Some`, installing it
+        // exactly as the production loader does (claim → install → publish).
         let mut dv = DeleteVector::default();
         dv.insert(7);
-        filter.upsert_delete_vector("data.parquet".to_string(), dv);
+        let guard = claim_pos_del(&filter, "pos-del.parquet");
+        filter.install_pos_del_contribution(
+            &guard,
+            HashMap::from([("data.parquet".to_string(), dv)]),
+        );
+        guard.publish_loaded();
 
         // Poison the shared state RwLock by panicking while holding the write guard.
         let poisoner = filter.clone();
@@ -1365,14 +1554,118 @@ pub(crate) mod tests {
             "the poisoning thread must have panicked while holding the guard"
         );
 
-        // The accessor must RECOVER the poison and still return the present delete vector — not
+        // The resolver must RECOVER the poison and still return the present delete vector — not
         // swallow the poison as `None` (which would resurrect deleted row 7).
         let dv = filter
-            .get_delete_vector_for_path("data.parquet")
+            .resolve_delete_vector(&[parquet_pos_del_entry("pos-del.parquet")], "data.parquet")
             .expect("a present delete vector must survive a poisoned state lock, not read as None");
         assert!(
             recover_poison(dv.lock()).contains(7),
             "the recovered delete vector must still carry its deleted positions"
+        );
+    }
+
+    /// EQ-DELETE SWEEP for the R117 class (documents that the equality path does NOT share the
+    /// cross-task defect): equality-delete state is a pure load-cache keyed by DELETE FILE path,
+    /// and APPLICATION (`build_equality_delete_predicate`, `collect_equality_delete_keysets`)
+    /// iterates `task.deletes` — so a predicate loaded for one task can never fold into a task
+    /// that does not list its file. Mirrors Java: `DeleteFilter.applyEqDeletes()` reads only
+    /// `this.eqDeletes`, the constructor's partition of the task's own list (1.10.0 bytecode,
+    /// constructor offsets 51-208).
+    ///
+    /// Two eq-delete files are loaded into ONE shared filter; the task listing only the first must
+    /// get exactly the first's predicate (never the second's), and a task listing neither gets
+    /// `None`. MUTATION: folding every loaded eq predicate from the shared state into the task's
+    /// predicate (ignoring `task.deletes`) turns this RED on the `id = 20` assertion.
+    #[tokio::test]
+    async fn test_eq_delete_application_scoped_to_tasks_own_files() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+
+        let eq_delete_entry = |file_path: &str| FileScanTaskDeleteFile {
+            file_path: file_path.to_string(),
+            file_size_in_bytes: 1,
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: 0,
+            equality_ids: Some(vec![1]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+        let task_for = |data_file_path: &str, deletes: Vec<FileScanTaskDeleteFile>| FileScanTask {
+            file_size_in_bytes: 0,
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: data_file_path.to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: vec![],
+            predicate: None,
+            deletes,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        };
+
+        let filter = DeleteFilter::default();
+        // Load TWO eq-delete predicates into the ONE shared filter, through the production claim +
+        // publish machinery.
+        for (path, value) in [("eq-del-1.parquet", 10i64), ("eq-del-2.parquet", 20i64)] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            filter
+                .try_start_eq_del_load(path)
+                .expect("a fresh eq-delete file must be claimable")
+                .spawn_publisher(rx);
+            tx.send((Reference::new("id").equal_to(Datum::long(value)), None))
+                .expect("the publisher task must be listening");
+        }
+
+        // The task lists ONLY eq-del-1: its combined predicate must be exactly eq-del-1's.
+        let task_with_first = task_for("data-x.parquet", vec![eq_delete_entry("eq-del-1.parquet")]);
+        let bound = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.build_equality_delete_predicate(&task_with_first),
+        )
+        .await
+        .expect("predicate build must not hang")
+        .expect("predicate build must succeed")
+        .expect("a task with an eq delete must get a predicate");
+        let rendered = bound.to_string();
+        assert!(
+            rendered.contains("10"),
+            "the task's own eq-delete predicate must be applied, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("20"),
+            "eq-del-2 (loaded for ANOTHER task, absent from this task's delete list) must not \
+             fold into this task's predicate, got: {rendered}"
+        );
+
+        // A task listing NO eq deletes gets no predicate at all, however much the shared state
+        // holds.
+        let task_without = task_for("data-y.parquet", vec![]);
+        let none = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            filter.build_equality_delete_predicate(&task_without),
+        )
+        .await
+        .expect("predicate build must not hang")
+        .expect("predicate build must succeed");
+        assert!(
+            none.is_none(),
+            "a task with no eq deletes must get None even when the shared state holds predicates"
         );
     }
 
