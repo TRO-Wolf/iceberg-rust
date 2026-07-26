@@ -348,9 +348,9 @@ mod tests {
     use apache_avro::Codec;
     use arrow_array::types::Int64Type;
     use arrow_array::{
-        ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float32Array,
-        Float64Array, Int32Array, Int64Array, LargeBinaryArray, ListArray, MapArray, RecordBatch,
-        StringArray, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+        Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+        Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, ListArray, MapArray,
+        RecordBatch, StringArray, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
         TimestampNanosecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
@@ -583,6 +583,95 @@ mod tests {
                 "column {c} mismatch on round-trip"
             );
         }
+    }
+
+    /// WG5 (a), end-to-end: an OPTIONAL struct with a REQUIRED child, NULL on one row, must be
+    /// writable. Java writes this without ever looking at the child —
+    /// `ValueWriters$OptionWriter.write` (iceberg-core 1.10.0 bytecode) emits the null union branch
+    /// and never invokes the value writer — so rejecting it is a parity break. Before the fix this
+    /// failed at `arrow_struct_to_literal` with "The field is required but has null value".
+    #[tokio::test]
+    async fn test_avro_writer_null_optional_struct_with_required_child() {
+        let (_t, file_io, location_gen) = make_temp();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(0, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        1,
+                        "opt_struct",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::required(2, "req", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let arrow_schema: ArrowSchemaRef =
+            Arc::new(crate::arrow::schema_to_arrow_schema(schema.as_ref()).expect("arrow schema"));
+
+        // The struct is NULL on row 0; its `req` child carries a null in that slot, exactly as a
+        // file-derived batch would.
+        let DataType::Struct(struct_fields) = arrow_schema.field(1).data_type().clone() else {
+            panic!("field 1 must be a struct");
+        };
+        let opt_struct = StructArray::try_new(
+            struct_fields,
+            vec![Arc::new(Int32Array::from(vec![None, Some(42)])) as ArrayRef],
+            Some(arrow_buffer::NullBuffer::from(vec![false, true])),
+        )
+        .expect("optional struct array");
+        let to_write = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(opt_struct) as ArrayRef,
+        ])
+        .expect("batch");
+
+        let (_path, of) = output_file(&file_io, &location_gen, "null_opt_struct");
+        let mut w = AvroWriterBuilder::new(schema.clone())
+            .build(of)
+            .await
+            .expect("build writer");
+        w.write(&to_write)
+            .await
+            .expect("a NULL optional struct with a required child must be writable");
+        let res = w.close().await.expect("close");
+        assert_eq!(res.len(), 1);
+
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .partition_spec_id(0)
+            .build()
+            .expect("data file");
+        let input = file_io.new_input(data_file.file_path()).expect("input");
+        let bytes = input.read().await.expect("read back");
+        let batches = read_avro_data_bytes(&bytes, schema.as_ref(), 1024).expect("decode");
+        let read_back =
+            arrow_select::concat::concat_batches(&batches[0].schema(), &batches).expect("concat");
+
+        assert_eq!(read_back.num_rows(), 2);
+        let struct_col = read_back
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("struct column");
+        assert!(struct_col.is_null(0), "row 0's struct must round-trip NULL");
+        assert!(struct_col.is_valid(1), "row 1's struct must stay live");
+        assert_eq!(
+            struct_col
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("required child")
+                .value(1),
+            42
+        );
     }
 
     /// 2. NESTED round-trip via U1: struct-of-struct, list, string-keyed map, non-string-keyed map.
