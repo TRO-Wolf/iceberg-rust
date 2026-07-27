@@ -31,6 +31,8 @@ reconstructing why a shipped increment did what it did).
 
 | File | Covers |
 |---|---|
+| [2026-07_audit-hardening-engine-trust.md](2026-07_audit-hardening-engine-trust.md) | **2026-07-01 → 07-26 (pass-scoped).** The engine-first era: commit-outcome taxonomy (#144) + the 07-01 review follow-ups; the 07-09 overnight and 07-10 audit-tier-1 Mode-B bundles; SEPMO canon v2.2; the 07-15/16/17 remediation arc (replace-table atomicity #149, R158 battery #150, BUG-002 scan wiring #154, G1/G2/G3 type-string parity #155–#157); the 07-17 overnight block (A-units; B/C/E lifted to Carried-forward) + the 07-18 follow-ups bundle (#162); the POST-D1 groups (#170/#171); the back-to-goal block (PartitionExpr honest-children #172, engine-trust bundle #173); the 2026-07-26 SEPMO v2.3 re-bind (#175) + post-D1/POST-BUNDLE planning narratives; the 07-10 zero-width transform hardening. Added by archival pass 6 (2026-07-26). |
+| [2026-06_charter-8hour-blocks.md](2026-06_charter-8hour-blocks.md) | **2026-06-13 → 06-19 (pass-scoped).** The superseded near-full-parity queue (multi-spec / geometry / encryption lifted to Carried-forward); the conflict-validation + multi-spec charter and post-charter maintenance surface; 8-hour-plan Blocks 2–10 (BatchScan, RewriteTablePath, Avro read+write, TypeUtil, ORC read, events/listeners) + the roadmap check; the OverwriteFiles C1 DONE unit; the three 2026-06-13 LANDED sections (RewriteFiles delete-ADD surface, `caseSensitive`, `deleteFromRowFilter`). Added by archival pass 6 (2026-07-26). |
 | [2026-06_wave6-wave7.md](2026-06_wave6-wave7.md) | **Waves 6–7 (PRs #43–#47; pass-scoped).** Wave 6 — the I increments (I1 theta-blob interop, I2 view-metadata interop, I3 data-level WAP interop, all LANDED) + the O increments (O1 MemoryCatalog optimistic-concurrency CAS, O2 partition-stats incremental+exotic-type residue, O3 divergence burn-down — type-name case / sort-order bind / manifest-list order / map-value avro naming, incl. its O3 REVIEWER sub-section); Wave 7 — the R increments (R1 SQL-catalog base-location CAS + doctest fixes, R2 partition-stats interop chain extension incl. UUID, R3 partition-stats time/fixed/binary exotic-type interop + 7b fail-closed). Added by archival pass 5 (2026-06-13). |
 | [2026-06_wave5.md](2026-06_wave5.md) | **Wave 5 (PRs #39–#41; pass-scoped).** U views (U1 layer + U2 SQL/REST CRUD), Z interop chains (Z1 staged-WAP, Z2 multi-spec, Z3 partition-stats), Y theta/Alpha (Y1 crate, Y2 action + the family STOP-finding, Y3 Alpha port). Added by archival pass 4 (2026-06-12). |
 | [2026-06_wave3-wave4-overnight.md](2026-06_wave3-wave4-overnight.md) | **Waves 3–4 + the 2026-06-12 overnight session (PRs #25–#37; pass-scoped, not phase-filed — deviation documented in the header).** Multi-spec writes + constants-map activation + removeRows; ExpireSnapshots B1/B2 + the A3 interop chain; DeleteOrphanFiles A1/A2; the variant arc (B1/B2 read+write, F1 schema-type entry, F2 shredding overlay); Wave-4 O1 (FastAppend carry fix) / O2 (RewriteDataFiles) / O3 (RemoveDanglingDeleteFiles); the S1–S3 Sonnet interop arc + W1–W3 data-level fixtures C–G + the spec-id comparator groundwork; overnight V1 (stage_only) / V2 (WAP dedup) / X1–X2 (ComputePartitionStats); the pass-2 doc-pass records; the superseded wave-charter planning section. Added by archival pass 3 (2026-06-12). |
@@ -59,6 +61,15 @@ reconstructing why a shipped increment did what it did).
 
 ## Archival log
 
+- **2026-07-26** (pass 6 — size trigger, live `todo.md` was 2,012 lines; run by the RePark workstream
+  under the hub concurrency-protocol claim of the same date): 38 `## ` / 0 `### ` pre-pass — 3 `## `
+  kept live (the POST-BUNDLE QUEUE, the 2026-07-01 open queue reconciled in place with two explicit
+  dated flips — item 1 = merged #144, item 5 = nightly live on `main` — and Archived-narratives),
+  35 archived (17 → [2026-07_audit-hardening-engine-trust.md](2026-07_audit-hardening-engine-trust.md),
+  18 → [2026-06_charter-8hour-blocks.md](2026-06_charter-8hour-blocks.md)); 7 buried open items
+  lifted into Carried-forward (B/C/E of the 07-17 overnight list — status caveat recorded there;
+  multi-spec write interop + its MERGING-path wiring gap; geometry/geography; parked encryption).
+  Live `todo.md` → 181 lines.
 - **2026-06-13** (pass 5 — Wave-6/Wave-7 union, live `todo.md` was 466 lines): archived the nine spent
   Wave-6 + Wave-7 increment narratives → [2026-06_wave6-wave7.md](2026-06_wave6-wave7.md). 12 `## ` /
   1 `### ` pre-pass — 3 `## ` kept live (the refreshed open queue, Carried-forward, Archived-narratives),
