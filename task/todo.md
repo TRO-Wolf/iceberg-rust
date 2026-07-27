@@ -51,11 +51,19 @@ H7-P1, with QC (R161-completion toHumanString parity, format-visible, D8-APPROVE
 Unit 3. Mode A per-unit PRs; SEPMO v2.3 duties. Context at signing: nightly interop FULLY GREEN
 (scan-plan arc live-proven); all review branches pruned; main `a08a0957`.
 
-- [ ] **QA — per-task DeleteFilter scope** (S1 read correctness; branch
+- [x] **QA — per-task DeleteFilter scope** (S1 read correctness; branch
       `fix/delete-filter-per-task-scope`): scope delete APPLICATION to `task.deletes()`
       Java-exact while keeping load caching; RED-first the recorded category=b repro (id 30
       resurrects correctly); eq-delete path checked same-class; R117 🟡→✅ IF this was the sole
-      blocker (Actor adjudicates; anchors gate). IN FLIGHT.
+      blocker (Actor adjudicates; anchors gate).
+      **MERGED #176 (`14921e78`) 2026-07-26**, content-verified R4 (per-task resolve +
+      contribution install on main; R117 cell reads ✅). AC converged cycle 1, zero S1/S2 (2 S3
+      residues: eq KEYSET fast-path pin coverage; theoretical claim-key namespace collision).
+      Java-exact shape: per-SOURCE contribution maps (load-once preserved; G8 claim/notify/
+      `Failed` machinery byte-untouched) + per-task application over `task.deletes()` with a
+      per-(file, claims) memo; the defect's unattributed path-keyed API REMOVED, `reader.rs`
+      unchanged. Eq-deletes PROVEN not-same-class (pinned + mutation-proven); DVs covered.
+      Interop crosstask leg added (id 30 survives == Java `{10,30,40,60}`). Lib 2977.
 - [ ] **Unit 3 — breaking** (`PartitionKey::new -> Result` + `CurrentFileStatus`): after QA
       merges; RoadMapSync warning to RePark BEFORE their next repin.
 - [ ] **QC — toHumanString parity** (D8-approved, format-visible; FIXED/BINARY hex→base64 +
