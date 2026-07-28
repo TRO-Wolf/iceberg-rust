@@ -678,6 +678,74 @@ impl Catalog for S3TablesCatalog {
             .write_to(staged_table.file_io(), staged_metadata_location)
             .await?;
 
+        self.cas_update_metadata_location(
+            &table_ident,
+            table_namespace,
+            version_token,
+            staged_metadata_location,
+        )
+        .await?;
+
+        Ok(staged_table)
+    }
+
+    /// Atomically publish a fully staged **replace** (metadata-pointer CAS).
+    ///
+    /// QE / RePark A2 OR-REPLACE: `CREATE OR REPLACE TABLE … AS SELECT` against S3 Tables
+    /// stages files under the existing table location, then calls this to swap the catalog
+    /// pointer via `UpdateTableMetadataLocation` (same API as [`Catalog::update_table`]).
+    ///
+    /// Optimistic concurrency: if `expected_base_metadata_location` is `Some` and does not
+    /// match the service-current pointer, returns a retryable
+    /// [`ErrorKind::CatalogCommitConflicts`] before sending the update.
+    async fn publish_replace_table(
+        &self,
+        table: Table,
+        expected_base_metadata_location: Option<String>,
+    ) -> Result<Table> {
+        let table_ident = table.identifier().clone();
+        let table_namespace = table_ident.namespace();
+        let (current_table, version_token) =
+            self.load_table_with_version_token(&table_ident).await?;
+        let stored = current_table.metadata_location_result()?.to_string();
+
+        if let Some(expected) = expected_base_metadata_location.as_deref()
+            && stored != expected
+        {
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "Cannot publish replace for table {table_ident}: concurrent modification \
+                     (expected base metadata location {expected}, found {stored})"
+                ),
+            )
+            .with_retryable(true));
+        }
+
+        let new_metadata_location = table.metadata_location_result()?.to_string();
+        // Staged replace materializes the new metadata file before publish; only the
+        // service-side pointer CAS remains.
+        self.cas_update_metadata_location(
+            &table_ident,
+            table_namespace,
+            version_token,
+            &new_metadata_location,
+        )
+        .await?;
+
+        Ok(table)
+    }
+}
+
+impl S3TablesCatalog {
+    /// CAS the table's metadata pointer via S3 Tables `UpdateTableMetadataLocation`.
+    async fn cas_update_metadata_location(
+        &self,
+        table_ident: &TableIdent,
+        table_namespace: &NamespaceIdent,
+        version_token: String,
+        metadata_location: &str,
+    ) -> Result<()> {
         let builder = self
             .s3tables_client
             .update_table_metadata_location()
@@ -685,7 +753,7 @@ impl Catalog for S3TablesCatalog {
             .namespace(table_namespace.to_url_string())
             .name(table_ident.name())
             .version_token(version_token)
-            .metadata_location(staged_metadata_location);
+            .metadata_location(metadata_location);
 
         // Sent-vs-unsent classification of the commit call (GAP_MATRIX row R157): a failure
         // that may have occurred AFTER the request reached S3 Tables maps to
@@ -718,12 +786,11 @@ impl Catalog for S3TablesCatalog {
                 CommitSendDisposition::ResponseReceived => {
                     map_update_table_metadata_location_service_error(
                         e.into_service_error(),
-                        &table_ident,
+                        table_ident,
                     )
                 }
             })?;
-
-        Ok(staged_table)
+        Ok(())
     }
 }
 

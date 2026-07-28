@@ -44,13 +44,23 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// Parse manifest metadata and entries from bytes of avro file.
+    /// Parse manifest metadata and entries from bytes of avro file (strict embedded schema).
     pub(crate) fn try_from_avro_bytes(bs: &[u8]) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
+        Self::try_from_avro_bytes_with_schema_fallback(bs, None)
+    }
+
+    /// Parse manifest bytes; on embedded-`schema` parse failure, use `schema_fallback`
+    /// (table/snapshot schema) instead of hard-failing. See
+    /// [`ManifestMetadata::parse_with_schema_fallback`].
+    pub(crate) fn try_from_avro_bytes_with_schema_fallback(
+        bs: &[u8],
+        schema_fallback: Option<crate::spec::SchemaRef>,
+    ) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
         let reader = AvroReader::new(bs)?;
 
         // Parse manifest metadata
         let meta = reader.user_metadata();
-        let metadata = ManifestMetadata::parse(meta)?;
+        let metadata = ManifestMetadata::parse_with_schema_fallback(meta, schema_fallback)?;
 
         // Parse manifest entries
         let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
@@ -93,6 +103,16 @@ impl Manifest {
     /// Parse manifest from bytes of avro file.
     pub fn parse_avro(bs: &[u8]) -> Result<Self> {
         let (metadata, entries) = Self::try_from_avro_bytes(bs)?;
+        Ok(Self::new(metadata, entries))
+    }
+
+    /// Parse manifest from Avro bytes with table-schema fallback on embedded-schema failure.
+    pub fn parse_avro_with_schema_fallback(
+        bs: &[u8],
+        schema_fallback: Option<crate::spec::SchemaRef>,
+    ) -> Result<Self> {
+        let (metadata, entries) =
+            Self::try_from_avro_bytes_with_schema_fallback(bs, schema_fallback)?;
         Ok(Self::new(metadata, entries))
     }
 

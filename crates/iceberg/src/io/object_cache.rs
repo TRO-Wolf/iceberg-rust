@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use crate::io::FileIO;
 use crate::spec::{
-    FormatVersion, Manifest, ManifestFile, ManifestList, SchemaId, SnapshotRef, TableMetadataRef,
+    FormatVersion, Manifest, ManifestFile, ManifestList, SchemaId, SchemaRef, SnapshotRef,
+    TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -35,7 +36,10 @@ pub(crate) enum CachedItem {
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum CachedObjectKey {
     ManifestList((String, FormatVersion, Option<SchemaId>)),
-    Manifest(String),
+    /// Manifest path plus optional fallback schema id used when the embedded
+    /// `"schema"` key fails strict parse (QD). Path-only keys are wrong once
+    /// parse depends on caller-supplied fallback (C1-SEC-002).
+    Manifest((String, Option<SchemaId>)),
 }
 
 /// Caches metadata objects deserialized from immutable files
@@ -84,21 +88,30 @@ impl ObjectCache {
     }
 
     /// Retrieves an Arc [`Manifest`] from the cache
-    /// or retrieves one from FileIO and parses it if not present
-    pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
+    /// or retrieves one from FileIO and parses it if not present.
+    ///
+    /// `schema_fallback` is the table/snapshot schema used when the manifest's embedded
+    /// `"schema"` key fails strict parse (DuckDB malformation tolerance).
+    pub(crate) async fn get_manifest(
+        &self,
+        manifest_file: &ManifestFile,
+        schema_fallback: Option<SchemaRef>,
+    ) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
             return manifest_file
-                .load_manifest(&self.file_io)
+                .load_manifest_with_schema_fallback(&self.file_io, schema_fallback)
                 .await
                 .map(Arc::new);
         }
 
-        let key = CachedObjectKey::Manifest(manifest_file.manifest_path.clone());
+        let fallback_schema_id = schema_fallback.as_ref().map(|s| s.schema_id());
+        let key =
+            CachedObjectKey::Manifest((manifest_file.manifest_path.clone(), fallback_schema_id));
 
         let cache_entry = self
             .cache
             .entry_by_ref(&key)
-            .or_try_insert_with(self.fetch_and_parse_manifest(manifest_file))
+            .or_try_insert_with(self.fetch_and_parse_manifest(manifest_file, schema_fallback))
             .await
             .map_err(|err| {
                 Error::new(
@@ -165,8 +178,14 @@ impl ObjectCache {
         }
     }
 
-    async fn fetch_and_parse_manifest(&self, manifest_file: &ManifestFile) -> Result<CachedItem> {
-        let manifest = manifest_file.load_manifest(&self.file_io).await?;
+    async fn fetch_and_parse_manifest(
+        &self,
+        manifest_file: &ManifestFile,
+        schema_fallback: Option<SchemaRef>,
+    ) -> Result<CachedItem> {
+        let manifest = manifest_file
+            .load_manifest_with_schema_fallback(&self.file_io, schema_fallback)
+            .await?;
 
         Ok(CachedItem::Manifest(Arc::new(manifest)))
     }
@@ -334,7 +353,10 @@ mod tests {
         assert_eq!(result_manifest_list.entries().len(), 1);
 
         let manifest_file = result_manifest_list.entries().first().unwrap();
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -415,7 +437,10 @@ mod tests {
         let manifest_file = result_manifest_list.entries().first().unwrap();
 
         // not in cache
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -430,7 +455,10 @@ mod tests {
         );
 
         // retrieve cached version
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest

@@ -194,8 +194,14 @@ impl<'a> PartitionsTable<'a> {
             let manifest_list = snapshot
                 .load_manifest_list(self.table.file_io(), metadata)
                 .await?;
+            let schema_fallback = Some(metadata.current_schema().clone());
             for manifest_file in manifest_list.entries() {
-                let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+                let manifest = manifest_file
+                    .load_manifest_with_schema_fallback(
+                        self.table.file_io(),
+                        schema_fallback.clone(),
+                    )
+                    .await?;
                 for entry in manifest.entries() {
                     if !entry.is_alive() {
                         continue;

@@ -202,11 +202,14 @@ impl<'a> FilesTable<'a> {
             ReadableMetricsBuilder::try_new(&readable_metrics_arrow_fields, &data_schema)?;
 
         let manifest_files = collect_manifest_files(self.table, self.scope).await?;
+        let schema_fallback = Some(self.table.metadata().current_schema().clone());
         for manifest_file in &manifest_files {
             if !self.kind.includes_manifest(manifest_file.content) {
                 continue;
             }
-            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            let manifest = manifest_file
+                .load_manifest_with_schema_fallback(self.table.file_io(), schema_fallback.clone())
+                .await?;
             for entry in manifest.entries() {
                 if entry.is_alive() {
                     data_file_builder.append(entry.data_file())?;

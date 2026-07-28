@@ -163,7 +163,11 @@ impl ManifestFileContext {
             ..
         } = self;
 
-        let manifest = object_cache.get_manifest(&manifest_file).await?;
+        // Table/snapshot schema as fallback when the manifest's embedded `schema` key
+        // fails strict SchemaEnum parse (QD: DuckDB writer malformation).
+        let manifest = object_cache
+            .get_manifest(&manifest_file, Some(snapshot_schema.clone()))
+            .await?;
 
         for manifest_entry in manifest.entries() {
             let manifest_entry_context = ManifestEntryContext {

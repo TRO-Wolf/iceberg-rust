@@ -846,9 +846,24 @@ impl ManifestFile {
     ///
     /// This method will also initialize inherited values of [`ManifestEntry`], such as `sequence_number`.
     pub async fn load_manifest(&self, file_io: &FileIO) -> Result<Manifest> {
+        self.load_manifest_with_schema_fallback(file_io, None).await
+    }
+
+    /// Load [`Manifest`], falling back to `schema_fallback` when the embedded
+    /// Iceberg `"schema"` key fails strict parse (see
+    /// [`crate::spec::ManifestMetadata::parse_with_schema_fallback`]).
+    ///
+    /// Pass the table/snapshot schema for read paths so third-party writer
+    /// malformations (e.g. DuckDB) do not hard-fail the scan.
+    pub async fn load_manifest_with_schema_fallback(
+        &self,
+        file_io: &FileIO,
+        schema_fallback: Option<crate::spec::SchemaRef>,
+    ) -> Result<Manifest> {
         let avro = file_io.new_input(&self.manifest_path)?.read().await?;
 
-        let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
+        let (metadata, mut entries) =
+            Manifest::try_from_avro_bytes_with_schema_fallback(&avro, schema_fallback)?;
 
         // Let entries inherit values from the manifest list entry.
         for entry in &mut entries {
