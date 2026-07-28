@@ -171,8 +171,11 @@ impl<'a> EntriesTable<'a> {
             ReadableMetricsBuilder::try_new(&readable_metrics_arrow_fields, &data_schema)?;
 
         let manifest_files = collect_manifest_files(self.table, self.scope).await?;
+        let schema_fallback = Some(self.table.metadata().current_schema().clone());
         for manifest_file in &manifest_files {
-            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            let manifest = manifest_file
+                .load_manifest_with_schema_fallback(self.table.file_io(), schema_fallback.clone())
+                .await?;
             for entry in manifest.entries() {
                 // ALL entries — incl. Deleted tombstones (status 2). This is the difference from the
                 // `files` family, which filters on `entry.is_alive()`.

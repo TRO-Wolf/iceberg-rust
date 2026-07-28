@@ -36,7 +36,10 @@ pub(crate) enum CachedItem {
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum CachedObjectKey {
     ManifestList((String, FormatVersion, Option<SchemaId>)),
-    Manifest(String),
+    /// Manifest path plus optional fallback schema id used when the embedded
+    /// `"schema"` key fails strict parse (QD). Path-only keys are wrong once
+    /// parse depends on caller-supplied fallback (C1-SEC-002).
+    Manifest((String, Option<SchemaId>)),
 }
 
 /// Caches metadata objects deserialized from immutable files
@@ -101,7 +104,9 @@ impl ObjectCache {
                 .map(Arc::new);
         }
 
-        let key = CachedObjectKey::Manifest(manifest_file.manifest_path.clone());
+        let fallback_schema_id = schema_fallback.as_ref().map(|s| s.schema_id());
+        let key =
+            CachedObjectKey::Manifest((manifest_file.manifest_path.clone(), fallback_schema_id));
 
         let cache_entry = self
             .cache

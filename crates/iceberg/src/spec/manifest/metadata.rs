@@ -63,23 +63,29 @@ impl ManifestMetadata {
         meta: &HashMap<String, Vec<u8>>,
         schema_fallback: Option<SchemaRef>,
     ) -> Result<Self> {
-        let schema = match resolve_manifest_schema(meta, schema_fallback)? {
-            ResolvedManifestSchema::Embedded(s) => s,
-            ResolvedManifestSchema::Fallback(s) => s,
+        let (schema, used_fallback) = match resolve_manifest_schema(meta, schema_fallback)? {
+            ResolvedManifestSchema::Embedded(s) => (s, false),
+            ResolvedManifestSchema::Fallback(s) => (s, true),
         };
-        let schema_id: i32 = meta
-            .get("schema-id")
-            .map(|bs| {
-                String::from_utf8_lossy(bs).parse().map_err(|err| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "Fail to parse schema id in manifest metadata",
-                    )
-                    .with_source(err)
+        // When we discarded the embedded schema body, the free-standing `schema-id`
+        // key (often 0 for DuckDB poison) must not disagree with the body we installed
+        // (C1-Q-005 / C1-L-002). Prefer the fallback schema's id.
+        let schema_id: i32 = if used_fallback {
+            schema.schema_id()
+        } else {
+            meta.get("schema-id")
+                .map(|bs| {
+                    String::from_utf8_lossy(bs).parse().map_err(|err| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "Fail to parse schema id in manifest metadata",
+                        )
+                        .with_source(err)
+                    })
                 })
-            })
-            .transpose()?
-            .unwrap_or_else(|| schema.schema_id());
+                .transpose()?
+                .unwrap_or_else(|| schema.schema_id())
+        };
         let partition_spec = {
             let fields = {
                 let bs = meta.get("partition-spec").ok_or_else(|| {
@@ -328,6 +334,8 @@ mod tests {
         let parsed = ManifestMetadata::parse_with_schema_fallback(&meta, Some(fallback.clone()))
             .expect("poison + fallback must succeed");
         assert_eq!(parsed.schema.schema_id(), fallback.schema_id());
+        // Free-standing schema_id must agree with body after fallback (C1-Q-005).
+        assert_eq!(parsed.schema_id(), fallback.schema_id());
         assert!(parsed.schema.as_ref().field_by_id(1).is_some());
         assert!(
             parsed.schema.as_ref().field_by_name("status").is_none(),
