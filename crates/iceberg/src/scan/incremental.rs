@@ -1175,7 +1175,7 @@ impl IncrementalChangelogScan {
         for manifest_file in delete_manifests {
             let manifest = plan_context
                 .object_cache
-                .get_manifest(manifest_file)
+                .get_manifest(manifest_file, Some(plan_context.snapshot_schema.clone()))
                 .await?;
             for entry in manifest.entries() {
                 if entry.status() == ManifestStatus::Deleted {
