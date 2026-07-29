@@ -75,6 +75,7 @@ use crate::{Error, ErrorKind, Result};
 /// selectors ([`use_snapshot`](Self::use_snapshot) / [`use_ref`](Self::use_ref) /
 /// [`as_of_time`](Self::as_of_time)) and re-exposes the inherited scan knobs
 /// ([`select`](Self::select) / [`with_filter`](Self::with_filter) /
+/// [`with_file_prune_only`](Self::with_file_prune_only) /
 /// [`with_case_sensitive`](Self::with_case_sensitive) / the split-config setters) by forwarding
 /// to the wrapped [`TableScanBuilder`]. [`plan_files`](Self::plan_files) /
 /// [`plan_tasks`](Self::plan_tasks) DELEGATE to the underlying

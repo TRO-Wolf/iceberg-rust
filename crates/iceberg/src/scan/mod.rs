@@ -185,8 +185,10 @@ impl<'a> TableScanBuilder<'a> {
     /// pruning) **and** as a residual row filter on each surviving [`FileScanTask`] (and
     /// therefore as row-group filtering when enabled). This matches Java `Scan.filter`.
     ///
-    /// For copy-on-write MERGE target scans that need file pruning without dropping co-located
-    /// survivor rows, use [`with_file_prune_only`](Self::with_file_prune_only) instead.
+    /// **COW MERGE footgun:** this applies a residual that drops co-located non-matching
+    /// rows inside surviving files. For copy-on-write MERGE target scans that need file pruning
+    /// without dropping survivors, use [`with_file_prune_only`](Self::with_file_prune_only)
+    /// instead — never this method.
     ///
     /// Calling this clears any prior [`with_file_prune_only`](Self::with_file_prune_only) mode
     /// (last call wins).
@@ -515,6 +517,11 @@ impl<'a> TableScanBuilder<'a> {
         }
 
         let snapshot_bound_predicate = if let Some(ref predicates) = self.filter {
+            // Honor the builder's case-sensitivity for plan-time metrics prune (and residual
+            // construction when apply_residual_filter is true). Partition-filter rebinding in
+            // PlanContext already used `case_sensitive`; binding with a hardcoded `true` here
+            // made InclusiveMetricsEvaluator disagree with partition prune under
+            // `.with_case_sensitive(false)`.
             Some(predicates.bind(schema.clone(), self.case_sensitive)?)
         } else {
             None
@@ -5007,6 +5014,158 @@ pub mod tests {
             tasks[0].predicate.is_some(),
             "with_filter last must re-enable residual attachment"
         );
+    }
+
+    /// Reverse last-call: `with_file_prune_only` after `with_filter` clears residual mode
+    /// (the COW-relevant order when a helper first sets a generic filter).
+    #[tokio::test]
+    async fn test_file_prune_only_after_with_filter_clears_residual() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let pred = Reference::new("x").equal_to(Datum::long(1));
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_filter(pred.clone())
+            .with_file_prune_only(pred)
+            .build()
+            .expect("build")
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].predicate, None,
+            "with_file_prune_only last must clear residual attachment"
+        );
+    }
+
+    /// Mutation pin for inclusive-metrics under prune-only: two unpartitioned files with
+    /// disjoint `y` bounds; prune-only on `y == 2` must drop the y∈[10,20] file via metrics
+    /// (not partition), keep the y∈[1,3] file, and attach no residual.
+    ///
+    /// If residual-skip incorrectly cleared `bound_predicates` / skipped
+    /// InclusiveMetricsEvaluator, both files would survive and this test would RED.
+    #[tokio::test]
+    async fn test_file_prune_only_still_applies_inclusive_metrics_prune() {
+        let fixture = TableTestFixture::new_unpartitioned();
+        let current_snapshot = fixture.table.metadata().current_snapshot().unwrap();
+        let current_schema = current_snapshot.schema(fixture.table.metadata()).unwrap();
+        let current_partition_spec = fixture.table.metadata().default_partition_spec();
+
+        // field id 2 = y in the fixture schema
+        let y_field_id = 2i32;
+        let mut writer = ManifestWriterBuilder::new(
+            fixture.next_manifest_file(),
+            Some(current_snapshot.snapshot_id()),
+            None,
+            current_schema.clone(),
+            current_partition_spec.as_ref().clone(),
+        )
+        .build_v2_data();
+
+        for (name, lo, hi) in [
+            ("metrics_y_low.parquet", 1i64, 3i64),
+            ("metrics_y_high.parquet", 10i64, 20i64),
+        ] {
+            let path = format!("{}/{}", &fixture.table_location, name);
+            writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(0)
+                                .content(DataContentType::Data)
+                                .file_path(path)
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(100)
+                                .record_count(10)
+                                .partition(Struct::empty())
+                                .lower_bounds(HashMap::from([(
+                                    y_field_id,
+                                    Datum::long(lo),
+                                )]))
+                                .upper_bounds(HashMap::from([(
+                                    y_field_id,
+                                    Datum::long(hi),
+                                )]))
+                                .build()
+                                .expect("data file"),
+                        )
+                        .build(),
+                )
+                .expect("add entry");
+        }
+        let data_manifest = writer.write_manifest_file().await.expect("write manifest");
+        let mut manifest_list_write = ManifestListWriter::v2(
+            fixture
+                .table
+                .file_io()
+                .new_output(current_snapshot.manifest_list())
+                .expect("manifest list output"),
+            current_snapshot.snapshot_id(),
+            current_snapshot.parent_snapshot_id(),
+            current_snapshot.sequence_number(),
+        );
+        manifest_list_write
+            .add_manifests(vec![data_manifest].into_iter())
+            .expect("add manifests");
+        manifest_list_write.close().await.expect("close list");
+
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_file_prune_only(Reference::new("y").equal_to(Datum::long(2)))
+            .build()
+            .expect("build")
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(
+            tasks.len(),
+            1,
+            "inclusive metrics must drop metrics_y_high under prune-only"
+        );
+        assert!(
+            tasks[0].data_file_path.ends_with("metrics_y_low.parquet"),
+            "surviving path = low-y bounds file, got {}",
+            tasks[0].data_file_path
+        );
+        assert_eq!(
+            tasks[0].predicate, None,
+            "metrics prune must not re-attach residual under prune-only"
+        );
+    }
+
+    /// BatchScan forwards with_file_prune_only (residual none).
+    #[tokio::test]
+    async fn test_batch_scan_file_prune_only_forwards() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .batch_scan()
+            .with_file_prune_only(Reference::new("x").equal_to(Datum::long(1)))
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].predicate, None);
     }
 
     #[tokio::test]

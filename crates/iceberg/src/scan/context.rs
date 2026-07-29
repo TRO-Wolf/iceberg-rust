@@ -91,7 +91,9 @@ pub(crate) struct ManifestFileContext {
 
     /// The residual evaluator for this manifest's (spec, snapshot filter) pair,
     /// built once per manifest file and shared across its entries. `None` when the
-    /// scan has no row filter (every task then carries no per-row predicate).
+    /// scan has no row filter **or** residual application is disabled via
+    /// [`TableScanBuilder::with_file_prune_only`](crate::scan::TableScanBuilder::with_file_prune_only)
+    /// (plan-time prune still runs; every task then carries no per-row residual).
     residual_evaluator: Option<Arc<ResidualEvaluator>>,
 
     /// The partition spec this manifest's files were written under (Java `file.spec()`),
@@ -126,7 +128,8 @@ pub(crate) struct ManifestEntryContext {
     pub case_sensitive: bool,
 
     /// The residual evaluator for the scan's (spec, snapshot filter) pair, shared
-    /// across the manifest's entries. `None` when the scan has no row filter.
+    /// across the manifest's entries. `None` when the scan has no row filter or
+    /// residual application is disabled (`with_file_prune_only`).
     pub residual_evaluator: Option<Arc<ResidualEvaluator>>,
 
     /// The partition spec this entry's file was written under, shared from the
