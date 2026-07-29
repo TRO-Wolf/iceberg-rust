@@ -296,8 +296,9 @@ impl RewriteDataFiles {
     }
 
     /// Restrict the rewrite to files matching `filter` (Java `RewriteDataFiles.filter(Expression)`).
-    /// The predicate is pushed into the planning scan; only matching data files are considered for
-    /// rewriting. Defaults to [`Predicate::AlwaysTrue`] (every file).
+    /// The predicate is used for **file selection only** (partition + inclusive metrics; residual
+    /// not applied), so every live row in a selected file is rewritten — co-located non-matching
+    /// survivors are kept. Defaults to [`Predicate::AlwaysTrue`] (every file).
     pub fn filter(mut self, filter: Predicate) -> Self {
         self.filter = filter;
         self
@@ -608,10 +609,18 @@ impl RewriteDataFiles {
             .await?;
 
         // Read the group's tasks (each carries its delete files), with deletes applied. Planning
-        // used `with_file_prune_only` so tasks already carry `predicate: None` (file selection
-        // only — Java `ignoreResiduals`). Non-matching LIVE rows in a partially-matching file must
-        // be rewritten, not residual-filtered. Deletes on each task are RETAINED (MoR).
-        let tasks: Vec<Result<FileScanTask>> = group.iter().cloned().map(Ok).collect();
+        // uses `with_file_prune_only` so tasks already carry `predicate: None` (file selection
+        // only — Java `ignoreResiduals`). Belt-and-suspenders: clear residual again before the
+        // rewrite read so a future plan-path regression cannot reintroduce the O2 filter-leak
+        // class. Deletes on each task are RETAINED (MoR).
+        let tasks: Vec<Result<FileScanTask>> = group
+            .iter()
+            .cloned()
+            .map(|mut task| {
+                task.predicate = None;
+                Ok(task)
+            })
+            .collect();
         let task_stream = Box::pin(futures::stream::iter(tasks)) as crate::scan::FileScanTaskStream;
         // Stream batches from the reader into the writer — do NOT collect the full group into a
         // Vec first. Large compaction groups would otherwise hold every live row in memory at once.
@@ -1491,6 +1500,77 @@ mod tests {
             rows_after, rows_before,
             "EVERY live row survives a filtered compaction — the y<100 rows of the rewritten files \
              must NOT be dropped (the filter is a file-selection device, not a row filter on the read)"
+        );
+    }
+
+    /// FILE-SELECTION pin for filtered compaction: a partition filter must leave non-matching
+    /// partitions' files UNTOUCHED (path preserved) while still rewriting matching undersized
+    /// files. Guards against `plan_scan_tasks` ignoring `self.filter` / AlwaysTrue prune-only
+    /// (mutation that would rewrite every partition and still pass row-conservation e2es).
+    #[tokio::test]
+    async fn test_filtered_compaction_excludes_non_matching_partition_files() {
+        use crate::expr::Reference;
+        use crate::spec::Datum;
+
+        let (catalog, _temp) = local_fs_catalog().await;
+        let table = create_partitioned_table(&catalog, crate::spec::FormatVersion::V2).await;
+
+        // 5 undersized files in partition x=0 + 1 undersized file in partition x=1.
+        let mut files = Vec::new();
+        for index in 0..5i64 {
+            files.push(
+                write_data_file(&table, &format!("p0-{index}.parquet"), 0, &[(
+                    0, index, index,
+                )])
+                .await,
+            );
+        }
+        let p1 = write_data_file(&table, "p1-keep.parquet", 1, &[(1, 99, 99)]).await;
+        let p1_path = p1.file_path().to_string();
+        files.push(p1);
+        let table = append_files(&catalog, &table, files).await;
+
+        let rows_before = scan_rows(&table).await;
+        assert_eq!(rows_before.len(), 6);
+
+        // Filter x == 0: only partition-0 files are candidates. p1 must stay.
+        let result = RewriteDataFiles::new(table.clone())
+            .target_file_size_bytes(1_000_000)
+            .filter(Reference::new("x").equal_to(Datum::long(0)))
+            .execute(&catalog)
+            .await
+            .expect("filtered compaction");
+        assert_eq!(
+            result.rewritten_data_files_count, 5,
+            "only the 5 x==0 files are rewritten"
+        );
+
+        let table = catalog.load_table(table.identifier()).await.unwrap();
+        let paths_after: std::collections::HashSet<String> = {
+            use futures::TryStreamExt;
+            table
+                .scan()
+                .build()
+                .unwrap()
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.data_file_path)
+                .collect()
+        };
+        assert!(
+            paths_after.contains(&p1_path),
+            "partition x==1 file must remain (filter excluded it from rewrite): {paths_after:?}"
+        );
+
+        let rows_after = scan_rows(&table).await;
+        assert_eq!(
+            rows_after, rows_before,
+            "all live rows conserved across filtered rewrite"
         );
     }
 
