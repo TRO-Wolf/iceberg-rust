@@ -235,6 +235,13 @@ impl<'a> BatchScan<'a> {
         self
     }
 
+    /// Apply a metrics-only file prune (no residual row filter). Forwards to
+    /// [`TableScanBuilder::with_file_prune_only`].
+    pub fn with_file_prune_only(mut self, predicate: crate::expr::Predicate) -> Self {
+        self.builder = self.builder.with_file_prune_only(predicate);
+        self
+    }
+
     /// Set the scan's case sensitivity (Java `Scan.caseSensitive`). Forwards to
     /// [`TableScanBuilder::with_case_sensitive`].
     pub fn with_case_sensitive(mut self, case_sensitive: bool) -> Self {

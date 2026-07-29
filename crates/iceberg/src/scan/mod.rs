@@ -85,6 +85,13 @@ pub struct TableScanBuilder<'a> {
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
+    /// When true, [`filter`](Self::filter) is used only for planning-time file / manifest
+    /// pruning (partition summaries + inclusive metrics). Surviving files return **all** rows:
+    /// no residual is attached to [`FileScanTask`] and therefore no row-group / per-row residual
+    /// filtering is applied. Required for copy-on-write MERGE target scans that must keep
+    /// co-located survivor rows. Set by [`with_file_prune_only`](Self::with_file_prune_only);
+    /// cleared by [`with_filter`](Self::with_filter).
+    file_prune_only: bool,
     concurrency_limit_data_files: usize,
     concurrency_limit_manifest_entries: usize,
     concurrency_limit_manifest_files: usize,
@@ -114,6 +121,7 @@ impl<'a> TableScanBuilder<'a> {
             batch_size: None,
             case_sensitive: true,
             filter: None,
+            file_prune_only: false,
             concurrency_limit_data_files: num_cpus,
             concurrency_limit_manifest_entries: num_cpus,
             concurrency_limit_manifest_files: num_cpus,
@@ -172,10 +180,40 @@ impl<'a> TableScanBuilder<'a> {
     }
 
     /// Specifies a predicate to use as a filter
+    ///
+    /// The predicate is applied at **plan time** (manifest / partition / inclusive-metrics
+    /// pruning) **and** as a residual row filter on each surviving [`FileScanTask`] (and
+    /// therefore as row-group filtering when enabled). This matches Java `Scan.filter`.
+    ///
+    /// For copy-on-write MERGE target scans that need file pruning without dropping co-located
+    /// survivor rows, use [`with_file_prune_only`](Self::with_file_prune_only) instead.
+    ///
+    /// Calling this clears any prior [`with_file_prune_only`](Self::with_file_prune_only) mode
+    /// (last call wins).
     pub fn with_filter(mut self, predicate: Predicate) -> Self {
         // calls rewrite_not to remove Not nodes, which must be absent
         // when applying the manifest evaluator
         self.filter = Some(predicate.rewrite_not());
+        self.file_prune_only = false;
+        self
+    }
+
+    /// Specifies a predicate used **only** for planning-time file / manifest pruning.
+    ///
+    /// Manifests and data files are still pruned via partition summaries and inclusive column
+    /// metrics exactly as with [`with_filter`](Self::with_filter), but surviving files return
+    /// **every row** — no residual is attached to [`FileScanTask`], so residual row filters and
+    /// predicate-driven row-group filtering do not run. This is the mode COW MERGE needs: prune
+    /// files that cannot contain any ON-clause match, then rewrite whole surviving files
+    /// including unmatched co-located survivors.
+    ///
+    /// Spark's MERGE target planning applies a runtime file filter while keeping full file
+    /// contents for the rewrite (`SparkCopyOnWrite` scan-task filtering).
+    ///
+    /// Calling this replaces any prior [`with_filter`](Self::with_filter) (last call wins).
+    pub fn with_file_prune_only(mut self, predicate: Predicate) -> Self {
+        self.filter = Some(predicate.rewrite_not());
+        self.file_prune_only = true;
         self
     }
 
@@ -525,6 +563,9 @@ impl<'a> TableScanBuilder<'a> {
             case_sensitive: self.case_sensitive,
             predicate: self.filter.map(Arc::new),
             snapshot_bound_predicate: snapshot_bound_predicate.map(Arc::new),
+            // File-prune-only scans keep plan-time pruning but skip residual attachment so
+            // co-located survivors remain (COW MERGE). Default `with_filter` applies residuals.
+            apply_residual_filter: !self.file_prune_only,
             object_cache: self.table.object_cache(),
             field_ids,
             name_mapping,
@@ -4793,6 +4834,179 @@ pub mod tests {
         for task in &tasks {
             assert_eq!(task.predicate, None);
         }
+    }
+
+    /// COW MERGE target-scan mode: plan-time prune only, no residual on tasks.
+    ///
+    /// Pins the RePark R-PERF-MERGE-PRUNE STOP: `with_filter` would attach a residual that
+    /// drops co-located survivors; `with_file_prune_only` must prune the same files while
+    /// leaving `FileScanTask.predicate = None`.
+    #[tokio::test]
+    async fn test_file_prune_only_prunes_files_but_attaches_no_residual() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let prune = Reference::new("x").equal_to(Datum::long(1));
+
+        let filtered_tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_filter(prune.clone())
+            .build()
+            .expect("build with_filter")
+            .plan_files()
+            .await
+            .expect("plan with_filter")
+            .try_collect()
+            .await
+            .expect("collect with_filter");
+
+        let prune_only_tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_file_prune_only(prune)
+            .build()
+            .expect("build with_file_prune_only")
+            .plan_files()
+            .await
+            .expect("plan with_file_prune_only")
+            .try_collect()
+            .await
+            .expect("collect with_file_prune_only");
+
+        // Same surviving file set as full filter (partition prune of x==2).
+        assert_eq!(filtered_tasks.len(), 1, "with_filter keeps only x==1 file");
+        assert_eq!(
+            prune_only_tasks.len(),
+            1,
+            "with_file_prune_only keeps the same file set"
+        );
+        assert_eq!(
+            filtered_tasks[0].data_file_path, prune_only_tasks[0].data_file_path,
+            "prune-only and filter must select the same surviving path"
+        );
+        assert!(
+            filtered_tasks[0].data_file_path.ends_with("p1.parquet"),
+            "x==1 file survives"
+        );
+
+        // Full filter attaches a residual; prune-only must not.
+        assert!(
+            filtered_tasks[0].predicate.is_some(),
+            "with_filter attaches residual"
+        );
+        assert_eq!(
+            prune_only_tasks[0].predicate, None,
+            "with_file_prune_only must leave task.predicate = None so survivors are kept"
+        );
+    }
+
+    /// Mutation pin: if file-prune-only incorrectly attached the residual (or used
+    /// `with_filter` semantics), an unpartitioned scan of co-located keys would drop
+    /// non-matching rows. Pins that ALL rows from surviving files are returned.
+    #[tokio::test]
+    async fn test_file_prune_only_returns_all_rows_in_surviving_files() {
+        // Unpartitioned fixture: residual == full filter under with_filter. Filter y == 2
+        // would drop y == 3 rows on the residual path; prune-only must keep every row in
+        // the file (metrics cannot drop a mixed-y file).
+        let mut fixture = TableTestFixture::new_unpartitioned();
+        fixture.setup_unpartitioned_manifest_files().await;
+
+        let filter = Reference::new("y").equal_to(Datum::long(2));
+
+        let residual_scan = fixture
+            .table
+            .scan()
+            .with_filter(filter.clone())
+            .with_row_selection_enabled(true)
+            .build()
+            .expect("build residual scan");
+        let residual_batches: Vec<_> = residual_scan
+            .to_arrow()
+            .await
+            .expect("to_arrow residual")
+            .try_collect()
+            .await
+            .expect("collect residual");
+        let residual_rows: usize = residual_batches.iter().map(|b| b.num_rows()).sum();
+
+        let prune_scan = fixture
+            .table
+            .scan()
+            .with_file_prune_only(filter)
+            .with_row_selection_enabled(true)
+            .build()
+            .expect("build prune-only scan");
+        let prune_batches: Vec<_> = prune_scan
+            .to_arrow()
+            .await
+            .expect("to_arrow prune-only")
+            .try_collect()
+            .await
+            .expect("collect prune-only");
+        let prune_rows: usize = prune_batches.iter().map(|b| b.num_rows()).sum();
+
+        // Fixture files carry y in {2, 3} (and more); residual filter keeps only y==2.
+        assert!(
+            residual_rows > 0,
+            "residual path must still return matching rows"
+        );
+        assert!(
+            prune_rows > residual_rows,
+            "prune-only must keep co-located non-matching rows (got prune={prune_rows} residual={residual_rows})"
+        );
+
+        // Explicit COW survivor class: some y != 2 rows must appear under prune-only.
+        let mut saw_non_match = false;
+        for batch in &prune_batches {
+            let y = batch
+                .column_by_name("y")
+                .expect("y column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("y Int64");
+            for i in 0..y.len() {
+                if y.value(i) != 2 {
+                    saw_non_match = true;
+                    break;
+                }
+            }
+            if saw_non_match {
+                break;
+            }
+        }
+        assert!(
+            saw_non_match,
+            "prune-only scan must surface at least one y!=2 survivor row in a surviving file"
+        );
+    }
+
+    /// Last-call wins: `with_filter` after `with_file_prune_only` restores residual mode.
+    #[tokio::test]
+    async fn test_with_filter_after_file_prune_only_restores_residual() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let pred = Reference::new("x").equal_to(Datum::long(1));
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_file_prune_only(pred.clone())
+            .with_filter(pred)
+            .build()
+            .expect("build")
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            tasks[0].predicate.is_some(),
+            "with_filter last must re-enable residual attachment"
+        );
     }
 
     #[tokio::test]
