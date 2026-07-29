@@ -51,7 +51,13 @@ use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::metrics::{MetricsReport, MetricsReporter, ScanReport, TimeUnit, TimerResult};
 use crate::runtime::spawn;
 use crate::scan::metrics_collector::ScanMetricsCollector;
-use crate::spec::{DataContentType, ManifestContentType, SnapshotRef};
+use crate::spec::{DataContentType, DataFileFormat, ManifestContentType, SnapshotRef};
+
+/// True when `offsets` is strictly ascending (each value > previous). Used to gate within-file
+/// expand so we only take the offsets-aware split branch, never fixed-size windows.
+fn is_strictly_ascending_offsets(offsets: &[i64]) -> bool {
+    offsets.windows(2).all(|w| w[1] > w[0])
+}
 use crate::table::Table;
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind, Result};
@@ -966,12 +972,15 @@ impl TableScan {
         Ok(Box::pin(
             tasks
                 .and_then(move |task| async move {
-                    // Only expand when the task is a whole-file Parquet with split offsets.
+                    // Only expand whole-file Parquet tasks whose split_offsets are the
+                    // offsets-aware (strictly ascending) row-group grid. Never call
+                    // FileScanTask::split's fixed-size fallback from this path — non-aligned
+                    // windows can re-select the same row group and duplicate rows.
                     let can_expand = task.start == 0
-                        && task
-                            .split_offsets
-                            .as_ref()
-                            .is_some_and(|offsets| offsets.len() > 1);
+                        && task.data_file_format == DataFileFormat::Parquet
+                        && task.split_offsets.as_ref().is_some_and(|offsets| {
+                            offsets.len() > 1 && is_strictly_ascending_offsets(offsets)
+                        });
 
                     let subtasks = if can_expand {
                         task.split(split_target)?
@@ -6097,18 +6106,141 @@ pub mod tests {
             whole.len() + expected_subs - 1,
             "multi-offset whole-file task must expand to {expected_subs} subtasks"
         );
-        // Subtasks clear split_offsets and cover the parent length sum.
-        let expanded_from_parent: Vec<_> = expanded
+        // Exact windows for the multi-offset parent (fixture offsets [0,400,800], length 1000).
+        let mut windows: Vec<(u64, u64)> = expanded
             .iter()
-            .filter(|t| t.data_file_path == parent.data_file_path && t.split_offsets.is_none())
+            .filter(|t| {
+                t.data_file_path == parent.data_file_path
+                    && t.split_offsets.is_none()
+                    && t.file_size_in_bytes == parent.file_size_in_bytes
+            })
+            .map(|t| (t.start, t.length))
             .collect();
-        assert!(
-            expanded_from_parent.len() >= expected_subs,
-            "parent path appears as expanded subtasks"
+        windows.sort_unstable();
+        assert_eq!(
+            windows,
+            vec![(0, 400), (400, 400), (800, 200)],
+            "offsets-aware windows for the multi-offset entry only"
         );
-        let sum_len: u64 = expanded_from_parent.iter().map(|t| t.length).sum();
-        // May include non-offset entries pointing at same path (mid/small share path in fixture).
-        assert!(sum_len >= parent.length, "subtask lengths cover parent");
+    }
+
+    /// Non-ascending multi-offsets must NOT expand (fixed-size split would risk duplicate RGs).
+    #[tokio::test]
+    async fn test_within_file_parallel_skips_non_ascending_offsets() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Build a synthetic task stream by planning then mutating one entry's offsets is hard;
+        // instead unit-test the gate helper + split interaction via a constructed FileScanTask.
+        let base = {
+            let mut tasks: Vec<FileScanTask> = fixture
+                .table
+                .scan()
+                .build()
+                .unwrap()
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            tasks.pop().expect("at least one task")
+        };
+        let mut bad = base.clone();
+        bad.split_offsets = Some(vec![0, 500, 400]); // not strictly ascending
+        bad.data_file_format = DataFileFormat::Parquet;
+        bad.start = 0;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .build()
+            .unwrap();
+        let stream = Box::pin(futures::stream::iter(vec![Ok(bad.clone())])) as FileScanTaskStream;
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(stream)
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect");
+        assert_eq!(expanded.len(), 1, "non-ascending must not expand");
+        assert_eq!(expanded[0].start, 0);
+        assert_eq!(expanded[0].length, bad.length);
+    }
+
+    /// Avro tasks never expand even with multi-offsets.
+    #[tokio::test]
+    async fn test_within_file_parallel_skips_non_parquet() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let mut task: FileScanTask = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        task.data_file_format = DataFileFormat::Avro;
+        task.split_offsets = Some(vec![0, 100, 200]);
+        task.start = 0;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .build()
+            .unwrap();
+        let stream = Box::pin(futures::stream::iter(vec![Ok(task.clone())])) as FileScanTaskStream;
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(stream)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(expanded.len(), 1, "Avro must not expand");
+    }
+
+    /// Projecting `_pos` suppresses expand (absolute ordinals need whole-file decode).
+    #[tokio::test]
+    async fn test_within_file_parallel_suppressed_when_pos_projected() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .select(["x", "_pos"])
+            .with_data_file_concurrency_limit(4)
+            .with_within_file_read_parallelism(true)
+            .build()
+            .expect("build with _pos");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.unwrap())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            expanded.len(),
+            whole.len(),
+            "_pos projection must suppress within-file expand"
+        );
     }
 
     /// Disabled within-file parallelism leaves plan_files task count unchanged.
