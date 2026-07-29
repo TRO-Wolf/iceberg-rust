@@ -51,8 +51,10 @@
 //!
 //! # The algorithm (Java `BinPackRewriteFilePlanner.plan`)
 //!
-//! 1. **Enumerate tasks**: scan the current snapshot (`scan().filter(filter).plan_files()`), one
-//!    [`FileScanTask`](crate::scan::FileScanTask) per live data file, each carrying its size
+//! 1. **Enumerate tasks**: scan the current snapshot with
+//!    [`with_file_prune_only`](crate::scan::TableScanBuilder::with_file_prune_only) (file selection
+//!    via partition/metrics only — no residual), one
+//!    [`FileScanTask`](crate::scan::FileScanTask) per live candidate file, each carrying its size
 //!    (`file_size_in_bytes`), record count, partition, partition spec, and attached delete files
 //!    (Java `table.newScan().filter(filter).ignoreResiduals().planFiles()`).
 //! 2. **Group by partition** (`groupByPartition`): key each task by its file's partition tuple when
