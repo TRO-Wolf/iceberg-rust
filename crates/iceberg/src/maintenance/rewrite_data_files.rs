@@ -428,16 +428,17 @@ impl RewriteDataFiles {
         })
     }
 
-    /// Plan the current snapshot's live data-file scan tasks with the configured row filter (Java
-    /// `table.newScan().filter(filter).planFiles()`). Each [`FileScanTask`] carries the file size,
-    /// record count, partition, spec, and the delete files that apply to it.
+    /// Plan the current snapshot's live data-file scan tasks with the configured filter used for
+    /// **file selection only** (partition + inclusive metrics), matching Java
+    /// `BinPackRewriteFilePlanner` + `ignoreResiduals()`: surviving files keep every live row for
+    /// the rewrite read. Uses [`TableScanBuilder::with_file_prune_only`].
     async fn plan_scan_tasks(&self) -> Result<Vec<FileScanTask>> {
         use futures::TryStreamExt;
 
         let stream = self
             .table
             .scan()
-            .with_filter(self.filter.clone())
+            .with_file_prune_only(self.filter.clone())
             .build()?
             .plan_files()
             .await?;
@@ -604,23 +605,11 @@ impl RewriteDataFiles {
             .build(partition_key)
             .await?;
 
-        // Read the group's tasks (each carries its delete files), with deletes applied. STRIP the
-        // per-file RESIDUAL (`task.predicate`) the planning scan attached for `self.filter`: the
-        // filter is a FILE-SELECTION device (which files become candidates), NOT a row filter on the
-        // rewrite read. If the residual reached the reader it would become a row-level `RowFilter`
-        // (`arrow::reader`), and a file whose rows only PARTIALLY match the filter would have its
-        // non-matching LIVE rows silently dropped — a compaction MUST conserve every live row. This
-        // is the Rust analogue of Java's `BinPackRewriteFilePlanner.planFileGroups` building the plan
-        // scan with `.ignoreResiduals()` so the runner reads all rows of every selected file. The
-        // delete files each task carries are RETAINED (merge-on-read deletes still apply).
-        let tasks: Vec<Result<FileScanTask>> = group
-            .iter()
-            .cloned()
-            .map(|mut task| {
-                task.predicate = None;
-                Ok(task)
-            })
-            .collect();
+        // Read the group's tasks (each carries its delete files), with deletes applied. Planning
+        // used `with_file_prune_only` so tasks already carry `predicate: None` (file selection
+        // only — Java `ignoreResiduals`). Non-matching LIVE rows in a partially-matching file must
+        // be rewritten, not residual-filtered. Deletes on each task are RETAINED (MoR).
+        let tasks: Vec<Result<FileScanTask>> = group.iter().cloned().map(Ok).collect();
         let task_stream = Box::pin(futures::stream::iter(tasks)) as crate::scan::FileScanTaskStream;
         // Stream batches from the reader into the writer — do NOT collect the full group into a
         // Vec first. Large compaction groups would otherwise hold every live row in memory at once.
@@ -1448,8 +1437,8 @@ mod tests {
     /// qualifying group; the rewritten table MUST still contain EVERY live row — the `y < 100` rows
     /// included. If the residual leaks into the read, those rows vanish and this test FAILS.
     ///
-    /// MUTATION (run manually): restore the residual leak (drop the `task.predicate = None` strip in
-    /// `write_compacted_files`) ⇒ the `y < 100` rows are dropped from the output ⇒ this test FAILS.
+    /// MUTATION (run manually): plan with `with_filter` instead of `with_file_prune_only` in
+    /// `plan_scan_tasks` ⇒ residual drops `y < 100` rows from the rewrite read ⇒ this test FAILS.
     #[tokio::test]
     async fn test_filtered_compaction_keeps_non_matching_live_rows() {
         use crate::expr::Reference;

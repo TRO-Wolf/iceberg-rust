@@ -5168,6 +5168,50 @@ pub mod tests {
         assert_eq!(tasks[0].predicate, None);
     }
 
+    /// Mutation pin for cycle-1 case_sensitive bind fix: wrong-cased column name must
+    /// bind under `.with_case_sensitive(false)` for both filter modes. Reverting
+    /// `bind(..., self.case_sensitive)` to `bind(..., true)` makes `build()` fail.
+    #[tokio::test]
+    async fn test_case_insensitive_bind_works_for_filter_and_file_prune_only() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        // Schema field is lowercase `x`; Reference uses uppercase `X`.
+        let wrong_case = Reference::new("X").equal_to(Datum::long(1));
+
+        let residual_tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_case_sensitive(false)
+            .with_filter(wrong_case.clone())
+            .build()
+            .expect("case-insensitive with_filter must bind")
+            .plan_files()
+            .await
+            .expect("plan filter")
+            .try_collect()
+            .await
+            .expect("collect filter");
+        assert_eq!(residual_tasks.len(), 1);
+        assert!(residual_tasks[0].predicate.is_some());
+
+        let prune_tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_case_sensitive(false)
+            .with_file_prune_only(wrong_case)
+            .build()
+            .expect("case-insensitive with_file_prune_only must bind")
+            .plan_files()
+            .await
+            .expect("plan prune")
+            .try_collect()
+            .await
+            .expect("collect prune");
+        assert_eq!(prune_tasks.len(), 1);
+        assert_eq!(prune_tasks[0].predicate, None);
+    }
+
     #[tokio::test]
     async fn test_filter_excluding_the_partition_prunes_the_file_entirely() {
         // Filter `x == 999`: no live file is in partition x == 999, so the

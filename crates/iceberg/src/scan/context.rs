@@ -270,12 +270,13 @@ impl ManifestEntryContext {
     /// partition-reduced residual of the scan's snapshot filter for this file's
     /// partition tuple.
     ///
-    /// Returns `None` when the scan has no filter. Otherwise it evaluates the
-    /// pre-built [`ResidualEvaluator`] against this file's partition and binds the
-    /// resulting (unbound) residual `Predicate` back to the snapshot schema — the
-    /// `BoundPredicate` the reader consumes. A residual of `AlwaysTrue` binds to
-    /// `BoundPredicate::AlwaysTrue` (the reader applies no per-row filtering); an
-    /// `AlwaysFalse` residual binds to `BoundPredicate::AlwaysFalse` (the file
+    /// Returns `None` when the scan has no filter **or** residual application is
+    /// disabled (`with_file_prune_only` / `apply_residual_filter = false`). Otherwise
+    /// it evaluates the pre-built [`ResidualEvaluator`] against this file's partition
+    /// and binds the resulting (unbound) residual `Predicate` back to the snapshot
+    /// schema — the `BoundPredicate` the reader consumes. A residual of `AlwaysTrue`
+    /// binds to `BoundPredicate::AlwaysTrue` (the reader applies no per-row filtering);
+    /// an `AlwaysFalse` residual binds to `BoundPredicate::AlwaysFalse` (the file
     /// produces no rows).
     ///
     /// Residuals are memoized per partition on the shared [`ResidualEvaluator`] so

@@ -231,13 +231,19 @@ impl<'a> BatchScan<'a> {
     }
 
     /// Apply a row filter (Java `Scan.filter`). Forwards to [`TableScanBuilder::with_filter`].
+    ///
+    /// **COW MERGE footgun:** residual filtering drops co-located non-matching rows.
+    /// For copy-on-write MERGE target scans use
+    /// [`with_file_prune_only`](Self::with_file_prune_only) instead.
     pub fn with_filter(mut self, predicate: crate::expr::Predicate) -> Self {
         self.builder = self.builder.with_filter(predicate);
         self
     }
 
-    /// Apply a metrics-only file prune (no residual row filter). Forwards to
+    /// Metrics-only file prune (no residual row filter). Forwards to
     /// [`TableScanBuilder::with_file_prune_only`].
+    ///
+    /// Surviving files return **all** rows — required for COW MERGE rewrite targets.
     pub fn with_file_prune_only(mut self, predicate: crate::expr::Predicate) -> Self {
         self.builder = self.builder.with_file_prune_only(predicate);
         self
