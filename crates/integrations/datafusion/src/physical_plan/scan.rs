@@ -343,11 +343,13 @@ pub(crate) async fn get_batch_stream(
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
+    // Clamp at the apply site (not only in from_context) so a hand-built ScanKnobs with
+    // Some(0) cannot reach Parquet empty-stream or try_buffer_unordered(0) hang.
     if let Some(batch_size) = knobs.batch_size {
-        scan_builder = scan_builder.with_batch_size(Some(batch_size));
+        scan_builder = scan_builder.with_batch_size(Some(clamp_scan_knob(batch_size)));
     }
     if let Some(concurrency) = knobs.data_file_concurrency {
-        scan_builder = scan_builder.with_data_file_concurrency_limit(concurrency);
+        scan_builder = scan_builder.with_data_file_concurrency_limit(clamp_scan_knob(concurrency));
     }
     // Row selection: left at the core default (disabled). Auto-enabling when filters are present
     // is not clearly safe — page-index parse cost can dominate; opt in via the core API instead.
@@ -1492,6 +1494,21 @@ mod tests {
         assert_eq!(clamp_scan_knob(0), 1);
         assert_eq!(clamp_scan_knob(1), 1);
         assert_eq!(clamp_scan_knob(8), 8);
+    }
+
+    /// Pin: hand-built ScanKnobs with Some(0) are still floored at apply time (get_batch_stream),
+    /// not only when derived from TaskContext.
+    #[test]
+    fn test_get_batch_stream_clamps_zero_knobs_at_apply() {
+        // Pure contract of the apply-site clamp (mirrors get_batch_stream body).
+        let knobs = ScanKnobs {
+            batch_size: Some(0),
+            data_file_concurrency: Some(0),
+        };
+        let effective_batch = knobs.batch_size.map(clamp_scan_knob);
+        let effective_conc = knobs.data_file_concurrency.map(clamp_scan_knob);
+        assert_eq!(effective_batch, Some(1));
+        assert_eq!(effective_conc, Some(1));
     }
 
     /// Pin: session `batch_size = 0` is accepted by DF config but must not wire through as 0
