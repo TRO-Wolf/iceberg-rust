@@ -191,6 +191,25 @@ impl ResidualEvaluator {
         snapshot_schema: SchemaRef,
         bind_case_sensitive: bool,
     ) -> Result<Arc<BoundPredicate>> {
+        self.residual_bound_for_with_cap(
+            partition,
+            snapshot_schema,
+            bind_case_sensitive,
+            RESIDUAL_BOUND_MEMO_SOFT_CAP,
+        )
+    }
+
+    /// Same as [`residual_bound_for`](Self::residual_bound_for) with an explicit
+    /// memo insert soft-cap. Production always uses
+    /// [`RESIDUAL_BOUND_MEMO_SOFT_CAP`]; tests pass a smaller cap so the gate is
+    /// pin-able without filling 8192 partitions (C2-Q-001 / C1-SEC-001).
+    fn residual_bound_for_with_cap(
+        &self,
+        partition: &Struct,
+        snapshot_schema: SchemaRef,
+        bind_case_sensitive: bool,
+        soft_cap: usize,
+    ) -> Result<Arc<BoundPredicate>> {
         // Scan planning always uses one case-sensitivity for the evaluator and
         // the bind step; a mismatch would make memo hits wrong if someone later
         // called with a different bind flag (C1-Q-003 / C1-SEC-002).
@@ -217,10 +236,37 @@ impl ResidualEvaluator {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Soft cap: skip insert when full so cardinality spikes cannot OOM the memo.
-        if write.len() >= RESIDUAL_BOUND_MEMO_SOFT_CAP {
+        if write.len() >= soft_cap {
             return Ok(bound);
         }
         Ok(write.entry(partition.clone()).or_insert(bound).clone())
+    }
+
+    /// Current residual-bound memo size (test inspection for soft-cap / poison pins).
+    #[cfg(test)]
+    fn residual_memo_len(&self) -> usize {
+        self.residual_bound_memo
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Panic while holding the memo write guard so the lock is left poisoned
+    /// (setup for the C2-Q-002 recovery pin). Asserts the poison took.
+    #[cfg(test)]
+    fn poison_residual_memo_for_test(&self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self
+                .residual_bound_memo
+                .write()
+                .expect("test setup: residual memo must not already be poisoned");
+            panic!("deliberately poison residual_bound_memo");
+        }));
+        assert!(result.is_err(), "the poisoning closure must panic");
+        assert!(
+            self.residual_bound_memo.is_poisoned(),
+            "test setup: residual_bound_memo must be poisoned"
+        );
     }
 }
 
@@ -1426,6 +1472,164 @@ mod tests {
         assert!(
             !matches!(bound.as_ref(), BoundPredicate::AlwaysTrue),
             "boundary residual under case_insensitive bind must stay non-trivial"
+        );
+    }
+
+    /// C2-Q-001 / C1-SEC-001: soft-cap insert ceiling is real — past `soft_cap`,
+    /// residuals still compute correctly but the memo does not grow. Uses a tiny
+    /// cap via `residual_bound_for_with_cap` so removing the gate fails this test
+    /// without needing to insert 8192 partitions. Also pins the production
+    /// constant value so a silent raise/lower of the ceiling is deliberate.
+    #[test]
+    fn test_residual_bound_memo_soft_cap_skips_insert_past_ceiling() {
+        assert_eq!(
+            RESIDUAL_BOUND_MEMO_SOFT_CAP, 8192,
+            "production residual memo soft-cap must stay 8192 (C1-SEC-001); \
+             change only with an intentional capacity review"
+        );
+
+        let schema = day_example_schema();
+        let spec = day_partition_spec(schema.clone());
+        let filter =
+            ts_between_filter(schema.clone(), "2021-01-01T10:00:00", "2021-01-31T10:00:00");
+        let evaluator =
+            ResidualEvaluator::of(spec, &schema, filter, true).expect("evaluator must build");
+
+        // Cap of 2: first two distinct partitions insert; third+ still compute.
+        const TEST_CAP: usize = 2;
+        let partitions = [
+            day_partition("2021-01-01"),
+            day_partition("2021-01-15"),
+            day_partition("2021-01-31"),
+            day_partition("2021-01-20"),
+        ];
+
+        let mut computed: Vec<Arc<BoundPredicate>> = Vec::with_capacity(partitions.len());
+        for partition in &partitions {
+            let bound = evaluator
+                .residual_bound_for_with_cap(partition, schema.clone(), true, TEST_CAP)
+                .expect("residual_bound_for_with_cap must succeed past soft-cap");
+            // Semantic oracle: still matches residual_for + bind even when not inserted.
+            let expected = evaluator
+                .residual_for(partition)
+                .expect("residual_for")
+                .bind(schema.clone(), true)
+                .expect("bind residual");
+            assert_eq!(
+                bound.as_ref(),
+                &expected,
+                "soft-cap skip must still return a correct residual for {partition:?}"
+            );
+            computed.push(bound);
+        }
+
+        assert_eq!(
+            evaluator.residual_memo_len(),
+            TEST_CAP,
+            "memo must stop growing at the soft-cap; if this grows past {TEST_CAP}, \
+             the insert gate was removed or bypassed"
+        );
+
+        // First two inserts remain memo hits (same Arc on re-query).
+        let first_again = evaluator
+            .residual_bound_for_with_cap(&partitions[0], schema.clone(), true, TEST_CAP)
+            .expect("memo hit for first insert");
+        let second_again = evaluator
+            .residual_bound_for_with_cap(&partitions[1], schema.clone(), true, TEST_CAP)
+            .expect("memo hit for second insert");
+        assert!(
+            Arc::ptr_eq(&computed[0], &first_again),
+            "partition under the cap must remain a memo hit"
+        );
+        assert!(
+            Arc::ptr_eq(&computed[1], &second_again),
+            "partition under the cap must remain a memo hit"
+        );
+
+        // Past-cap partitions are recomputed each time (not Arc-identical across calls).
+        let third_again = evaluator
+            .residual_bound_for_with_cap(&partitions[2], schema.clone(), true, TEST_CAP)
+            .expect("past-cap residual must still compute");
+        assert_eq!(
+            third_again.as_ref(),
+            computed[2].as_ref(),
+            "past-cap recompute must stay semantically equal"
+        );
+        assert!(
+            !Arc::ptr_eq(&computed[2], &third_again),
+            "past-cap partitions must not be memoized (fresh Arc each call)"
+        );
+        assert_eq!(
+            evaluator.residual_memo_len(),
+            TEST_CAP,
+            "re-query of past-cap partitions must not grow the memo"
+        );
+    }
+
+    /// C2-Q-002: residual memo recovers from a poisoned `RwLock` (crate-wide
+    /// scan-cache policy: `PoisonError::into_inner`). Hit and miss paths both
+    /// return correct residuals after a poisoning panic.
+    #[test]
+    fn test_residual_bound_memo_recovers_from_poisoned_lock() {
+        let schema = day_example_schema();
+        let spec = day_partition_spec(schema.clone());
+        let filter =
+            ts_between_filter(schema.clone(), "2021-01-01T10:00:00", "2021-01-31T10:00:00");
+        let evaluator =
+            ResidualEvaluator::of(spec, &schema, filter, true).expect("evaluator must build");
+
+        // Seed a memo entry, then poison — hit path must recover and serve it.
+        let partition = day_partition("2021-01-15");
+        let seeded = evaluator
+            .residual_bound_for(&partition, schema.clone(), true)
+            .expect("seed residual_bound_for must succeed");
+        assert!(
+            matches!(seeded.as_ref(), BoundPredicate::AlwaysTrue),
+            "strictly-between day residual must be AlwaysTrue for the seed"
+        );
+        evaluator.poison_residual_memo_for_test();
+
+        let hit = evaluator
+            .residual_bound_for(&partition, schema.clone(), true)
+            .expect("poisoned residual memo must recover on hit, not panic");
+        assert!(
+            Arc::ptr_eq(&seeded, &hit),
+            "recovery must serve the entry cached before the panic"
+        );
+        assert_eq!(
+            hit.as_ref(),
+            seeded.as_ref(),
+            "recovered hit must retain the bound residual value"
+        );
+
+        // Miss path (compute + insert) on a poisoned lock that still holds prior data.
+        let cold_partition = day_partition("2021-01-01");
+        let expected = evaluator
+            .residual_for(&cold_partition)
+            .expect("residual_for")
+            .bind(schema.clone(), true)
+            .expect("bind residual");
+        evaluator.poison_residual_memo_for_test();
+        let miss = evaluator
+            .residual_bound_for(&cold_partition, schema.clone(), true)
+            .expect("poisoned residual memo must recover on miss-compute, not panic");
+        assert_eq!(
+            miss.as_ref(),
+            &expected,
+            "miss after poison must equal residual_for + bind"
+        );
+        assert!(
+            !matches!(miss.as_ref(), BoundPredicate::AlwaysTrue),
+            "boundary day residual after poison recovery must stay non-trivial"
+        );
+
+        // Second call after miss-insert is a memo hit despite the earlier poison.
+        let miss_again = evaluator
+            .residual_bound_for(&cold_partition, schema, true)
+            .expect("memo hit after poison-recovered insert must succeed");
+        assert!(
+            Arc::ptr_eq(&miss, &miss_again),
+            "insert performed under poison recovery must be memoized"
         );
     }
 
