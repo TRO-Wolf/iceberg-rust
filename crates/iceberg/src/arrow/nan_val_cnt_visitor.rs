@@ -533,6 +533,60 @@ mod tests {
         assert_eq!(visitor.nan_value_counts.get(&1).copied(), Some(2));
     }
 
+    #[test]
+    fn list_of_struct_float_enables_gate() {
+        use crate::spec::ListType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            3,
+            "v",
+            Type::Primitive(PrimitiveType::Float),
+        ))]));
+        let element = Arc::new(NestedField::list_element(2, inner, false));
+        let list = Type::List(ListType::new(element));
+        let schema = schema_with_fields(vec![NestedField::optional(1, "items", list)]);
+        assert!(
+            schema_needs_nan_value_counts(&schema, &MetricsConfig::default()),
+            "list<struct<float>> must enable the NaN visitor"
+        );
+    }
+
+    /// Distinct NaN payloads (incl. negative NaN) all count as NaN.
+    #[test]
+    fn distinct_nan_bit_patterns_all_count() {
+        use arrow_array::{Float32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+        let iceberg = Arc::new(schema_with_fields(vec![NestedField::optional(
+            1,
+            "f",
+            Type::Primitive(PrimitiveType::Float),
+        )]));
+        let quiet = f32::NAN;
+        let neg_nan = f32::from_bits(0xffc0_0000);
+        let f32 = Float32Array::from(vec![quiet, 1.0, neg_nan, f32::INFINITY]);
+        assert!(quiet.is_nan() && neg_nan.is_nan());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("f", DataType::Float32, true).with_metadata(
+                std::collections::HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )]),
+            ),
+        ]));
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(f32) as ArrayRef]).expect("batch");
+        let mut visitor = NanValueCountVisitor::new();
+        visitor
+            .compute(iceberg, &batch)
+            .expect("compute nan counts");
+        assert_eq!(
+            visitor.nan_value_counts.get(&1).copied(),
+            Some(2),
+            "quiet NaN + negative NaN both count; Inf does not"
+        );
+    }
+
     /// Inf/-Inf are not NaN; the buffer walk must not treat them as NaN.
     #[test]
     fn infinity_is_not_counted_as_nan() {
