@@ -64,7 +64,7 @@
 #
 # NOT discovered (documented, not silent): dev/java-interop/run.sh (the original
 # metadata-evolution oracle pass) and run-inspection-manifests.sh do not match the
-# run-interop-*.sh glob and are outside the nightly set — a named deferral, tracked in
+# run-interop-*.sh glob and are outside the scheduled set — a named deferral, tracked in
 # dev/java-interop/map.md.
 
 set -euo pipefail

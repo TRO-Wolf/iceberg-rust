@@ -117,7 +117,7 @@ scheduled set (named deferral).
 |---|---|
 | Flip a 🟡 row to ✅ | add scenarios on BOTH sides (Rust `apply_scenario_ops` + `InteropOracle` scenarios, identical names), `generate` fixtures, write the Rust test, run the `-d2` verify |
 | Regenerate fixtures after a contract change | the matching `run*.sh` (needs `mvn` + JDK; fixtures are committed so plain `cargo test` stays offline) |
-| Add a NEW interop suite | name it `run-interop-*.sh` (the nightly driver auto-discovers it) AND ratchet `SUITE_FLOOR_DEFAULT` in [`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh) in the same change |
+| Add a NEW interop suite | name it `run-interop-*.sh` (the scheduled driver auto-discovers it) AND ratchet `SUITE_FLOOR_DEFAULT` in [`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh) in the same change |
 | Run the full suite set locally | `make interop` (or a bounded slice: `scripts/run_interop_suites.sh --only <a.sh,b.sh>` — logs what it drops; local use only) |
 | Write Rust output for Java to verify | run the Rust interop test with `ICEBERG_INTEROP_GEN=1`, then the `-d2` script |
 | Understand why comparison is structural | README "Comparison" — Jackson vs serde_json key order makes raw bytes meaningless; logical identity incl. field ids is the contract |
