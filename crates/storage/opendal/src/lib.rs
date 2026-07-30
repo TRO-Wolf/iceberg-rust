@@ -854,6 +854,114 @@ mod tests {
         );
     }
 
+    /// OperatorCache invokes the build closure once per key (miss), never on hit.
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_operator_cache_build_runs_once_per_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = OperatorCache::default();
+        let builds = AtomicUsize::new(0);
+
+        let op1 = cache
+            .get_or_insert_with("once".to_string(), || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                memory_config_build()
+            })
+            .expect("first miss builds");
+        let op2 = cache
+            .get_or_insert_with("once".to_string(), || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                memory_config_build()
+            })
+            .expect("hit must not rebuild");
+        let op3 = cache
+            .get_or_insert_with("once".to_string(), || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                memory_config_build()
+            })
+            .expect("second hit must not rebuild");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "build once per key");
+        assert!(std::sync::Arc::ptr_eq(op1.inner(), op2.inner()));
+        assert!(std::sync::Arc::ptr_eq(op1.inner(), op3.inner()));
+
+        let _other = cache
+            .get_or_insert_with("other".to_string(), || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                memory_config_build()
+            })
+            .expect("different key builds again");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "distinct key builds once more"
+        );
+    }
+
+    /// Trailing-slash list prefix must not double-slash locations (orphan path equality).
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_opendal_memory_list_trailing_slash_prefix_locations() {
+        let storage = memory_storage();
+        storage
+            .write("memory:/dir/a.txt", Bytes::from("a"))
+            .await
+            .expect("write");
+        let listed = storage
+            .list("memory:/dir/")
+            .await
+            .expect("list trailing-slash prefix");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].location, "memory:/dir/a.txt",
+            "trailing-slash prefix must not produce double-slash locations"
+        );
+        assert!(!listed[0].location.contains("//dir"), "no scheme-local //");
+        assert!(!listed[0].location.contains("dir//"), "no dir//");
+    }
+
+    /// GCS offline: same-bucket paths share a cached Operator; other buckets do not.
+    #[cfg(feature = "opendal-gcs")]
+    #[test]
+    fn test_operator_cache_reuses_operator_for_same_gcs_bucket() {
+        use iceberg::io::{GCS_DISABLE_CONFIG_LOAD, GCS_DISABLE_VM_METADATA, GCS_NO_AUTH};
+
+        let props: std::collections::HashMap<String, String> = [
+            (GCS_NO_AUTH, "true"),
+            (GCS_DISABLE_CONFIG_LOAD, "true"),
+            (GCS_DISABLE_VM_METADATA, "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = crate::gcs::gcs_config_parse(props).expect("offline gcs config");
+        let storage = OpenDalStorage::Gcs {
+            config: std::sync::Arc::new(config),
+            operator_cache: OperatorCache::default(),
+        };
+
+        let (op1, rel1) = storage
+            .create_operator(&"gs://gcs-bucket/k1")
+            .expect("first gcs path");
+        let (op2, rel2) = storage
+            .create_operator(&"gs://gcs-bucket/nested/k2")
+            .expect("second same bucket");
+        assert_eq!(rel1, "k1");
+        assert_eq!(rel2, "nested/k2");
+        assert!(
+            std::sync::Arc::ptr_eq(op1.inner(), op2.inner()),
+            "same GCS bucket must reuse the cached Operator"
+        );
+
+        let (op_other, _) = storage
+            .create_operator(&"gs://other-gcs-bucket/k")
+            .expect("other bucket");
+        assert!(
+            !std::sync::Arc::ptr_eq(op1.inner(), op_other.inner()),
+            "different GCS buckets must not share Operators"
+        );
+    }
+
     /// Pins the complete-list-meta selection of `(size, created_at_millis)` so a
     /// sabotage that drops mtime or size under the complete branch fails loudly.
     #[test]
