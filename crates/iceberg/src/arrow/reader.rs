@@ -7627,4 +7627,65 @@ mod parquet_eq_keyset_mor_tests {
             "pos must drop id=40 and eq-keyset must drop id=20 (C2-Q-002)"
         );
     }
+
+    /// Critic-octo C3-Q-001: keyset path when the projection is *only* the key column (no
+    /// non-key data columns). Gate is keys ⊆ projection, not projection == full schema.
+    #[tokio::test]
+    async fn parquet_eq_keyset_project_key_only() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[20]);
+        // Project only field 1 (the key) — keyset eligible, output has no `data` column.
+        let task = parquet_task(&data_path, schema, vec![1], vec![eq_del]);
+        let ids = surviving_ids(&run_scan(task).await);
+        assert_eq!(
+            ids,
+            vec![10, 30],
+            "key-only projection keyset path (C3-Q-001)"
+        );
+    }
+
+    /// Critic-octo C3-Q-002: two eq-delete files OR-combined under the keyset path
+    /// (a row matching EITHER file is deleted).
+    #[tokio::test]
+    async fn parquet_eq_keyset_two_delete_files_or() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+            (40, Some("d")),
+        ]);
+        let d1 = tmp.path().join("eq1.parquet").to_string_lossy().to_string();
+        let d2 = tmp.path().join("eq2.parquet").to_string_lossy().to_string();
+        let eq1 = write_eq_delete_file(&d1, &[20]);
+        let eq2 = write_eq_delete_file(&d2, &[40]);
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq1, eq2]);
+        assert_eq!(
+            surviving_ids(&run_scan(task).await),
+            vec![10, 30],
+            "two eq-delete keysets must OR (drop 20 and 40) (C3-Q-002)"
+        );
+    }
 }
