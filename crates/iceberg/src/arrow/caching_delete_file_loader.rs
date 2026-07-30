@@ -288,8 +288,14 @@ impl CachingDeleteFileLoader {
                         // drops it, publishing the terminal failed state to every waiter.
                         // `note_failure` hands that error to the guard first, so the waiters'
                         // typed error names the cause and not just the file.
+                        //
+                        // Wave B: project only the reserved `file_path` + `pos` columns (falls
+                        // back to a full read if the ProjectionMask cannot be built safely).
                         let stream = basic_delete_file_loader
-                            .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
+                            .parquet_positional_delete_batch_stream(
+                                &task.file_path,
+                                task.file_size_in_bytes,
+                            )
                             .await
                             .map_err(|error| guard.note_failure(error))?;
                         Ok(DeleteFileContext::PosDels {
@@ -329,9 +335,15 @@ impl CachingDeleteFileLoader {
                         ),
                     ));
                 };
+                // Wave B: project only the equality_ids key columns from the eq-delete file
+                // (falls back to a full read if the ProjectionMask cannot be built safely).
                 let evolved_stream = BasicDeleteFileLoader::evolve_schema(
                     basic_delete_file_loader
-                        .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
+                        .parquet_to_batch_stream_with_projection(
+                            &task.file_path,
+                            task.file_size_in_bytes,
+                            Some(equality_ids_vec.as_slice()),
+                        )
                         .await?,
                     schema,
                     &equality_ids_vec,
