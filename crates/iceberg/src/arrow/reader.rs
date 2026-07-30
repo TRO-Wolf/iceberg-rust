@@ -7275,8 +7275,6 @@ mod parquet_eq_keyset_mor_tests {
     /// `ArrowReader::eq_delete_keep_mask`).
     #[test]
     fn test_eq_delete_keep_mask_set_matches_oracle() {
-        use arrow_array::BooleanArray;
-
         use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
         use crate::expr::{Bind, Predicate, Reference};
 
@@ -7327,8 +7325,137 @@ mod parquet_eq_keyset_mor_tests {
             "eq_delete_keep_mask set path must match predicate oracle"
         );
         assert_eq!(set_deleted, vec![false, true, false]);
-        // Sanity: BooleanArray keep mask length.
+        // Sanity: BooleanArray keep mask length matches the batch.
         assert_eq!(keep.len(), 3);
-        let _ = BooleanArray::from(vec![true, false, true]);
+    }
+
+    /// Critic-octo C1-Q-001: when keys are projected (keyset post-decode path), the scan residual
+    /// must still be applied via RowFilter. Survivors = residual ∩ ¬eq-deleted.
+    #[tokio::test]
+    async fn parquet_eq_keyset_with_scan_residual() {
+        use crate::expr::{Bind, Predicate, Reference};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        // ids 10..50; residual will keep only data ∈ {a,b,c}; eq-delete removes 20.
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+            (40, Some("d")),
+            (50, Some("e")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[20]);
+
+        let residual = Reference::new("data")
+            .equal_to(Datum::string("a"))
+            .or(Reference::new("data").equal_to(Datum::string("b")))
+            .or(Reference::new("data").equal_to(Datum::string("c")));
+        let residual: Predicate = residual;
+        let bound = residual.bind(schema.clone(), true).expect("bind residual");
+
+        let mut task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        task.predicate = Some(bound);
+
+        let batches = run_scan(task).await;
+        // Residual keeps a,b,c (ids 10,20,30); eq-delete drops 20 → 10,30.
+        assert_eq!(
+            surviving_ids(&batches),
+            vec![10, 30],
+            "keyset MoR path must AND scan residual with eq-deletes (C1-Q-001)"
+        );
+    }
+
+    /// Critic-octo C1-Q-002: nullable key column with a NULL cell forces predicate fallback
+    /// under the keyset-eligible path. A value-delete must NOT drop the NULL-key row
+    /// (Java nulls-first / unit A2).
+    #[tokio::test]
+    async fn parquet_eq_keyset_null_key_falls_back_to_predicate() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Optional id so NULL keys are legal in the data file.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let data_path = tmp
+            .path()
+            .join("data-null-key.parquet")
+            .to_string_lossy()
+            .to_string();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("data", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![Some(10i64), None, Some(20)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("null-key"),
+                Some("b"),
+            ])) as ArrayRef,
+        ])
+        .expect("batch");
+        {
+            let file = File::create(&data_path).expect("create");
+            let mut writer = ArrowWriter::try_new(
+                file,
+                arrow_schema,
+                Some(WriterProperties::builder().build()),
+            )
+            .expect("writer");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
+        }
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        // Value-delete id=20 only — must not delete the NULL-key row.
+        let eq_del = write_eq_delete_file(&del_path, &[20]);
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        let batches = run_scan(task).await;
+
+        let mut data_vals: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column_by_name("data").expect("data");
+                (0..b.num_rows()).map(move |i| {
+                    if col.is_null(i) {
+                        String::new()
+                    } else {
+                        col.as_string::<i32>().value(i).to_string()
+                    }
+                })
+            })
+            .collect();
+        data_vals.sort();
+        assert_eq!(
+            data_vals,
+            vec!["a".to_string(), "null-key".to_string()],
+            "NULL-key row must survive a value eq-delete; id=20 must be dropped (C1-Q-002)"
+        );
     }
 }

@@ -558,4 +558,53 @@ mod tests {
         // setup() writes 8 rows per pos-delete file — projection must not drop rows.
         assert_eq!(batches[0].num_rows(), 8);
     }
+
+    /// Critic-octo C1-Q-003: incomplete field-id match must refuse the mask (→ full read),
+    /// never return a partial ProjectionMask that could drop a requested leaf silently.
+    #[test]
+    fn test_try_build_delete_projection_mask_incomplete_field_ids_returns_none() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            // payload has NO field-id metadata — wanted id 2 is unresolvable.
+            Field::new("payload", DataType::Utf8, true),
+        ]));
+        // Build a minimal parquet schema descriptor by writing a throwaway file — the mask
+        // builder only needs leaf count alignment with the Arrow schema.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("incomplete-ids.parquet");
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("x")])) as ArrayRef,
+        ])
+        .expect("batch");
+        {
+            let file = File::create(&path).expect("create");
+            let mut writer = ArrowWriter::try_new(
+                file,
+                arrow_schema.clone(),
+                Some(WriterProperties::builder().build()),
+            )
+            .expect("writer");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
+        }
+        let file = File::open(&path).expect("open");
+        let meta =
+            parquet::arrow::arrow_reader::ArrowReaderMetadata::load(&file, Default::default())
+                .expect("meta");
+        let mask = try_build_delete_projection_mask(&[1, 2], meta.parquet_schema(), meta.schema());
+        assert!(
+            mask.is_none(),
+            "incomplete field-id match must return None (full-read fallback), got {mask:?}"
+        );
+        // Control: single resolvable id still builds a mask.
+        let mask_ok = try_build_delete_projection_mask(&[1], meta.parquet_schema(), meta.schema());
+        assert!(
+            mask_ok.is_some(),
+            "complete single-id match must build a mask"
+        );
+    }
 }
