@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# run_interop_suites.sh — the nightly Java-interop DRIVER (2026-07-10, bundle unit G3).
+# run_interop_suites.sh — the scheduled Java-interop DRIVER (2026-07-10, bundle unit G3).
 #
 # The Java oracle under dev/java-interop/ is the parity mandate's ground truth, but until this
 # driver existed every suite ran only when a human remembered to invoke it. This script turns the
@@ -24,7 +24,8 @@
 # dev/java-interop/run-interop-*.sh at run time (zero maintenance when suites are added), runs
 # EACH one to completion (continue-on-failure ACROSS suites, so one red suite cannot hide the
 # others), prints a per-suite PASS/FAIL summary table, and exits non-zero if ANY suite failed.
-# Invoked nightly by .github/workflows/nightly_interop.yml via `make interop`.
+# Invoked weekly (nightly until 2026-07-30 — cadence lives in the workflow's cron) by
+# .github/workflows/nightly_interop.yml via `make interop`.
 #
 # House doctrine encoded here (CLAUDE.md working conventions + the G3 brief):
 #   * HARD-FAIL, never SKIP. Missing prerequisites (mvn / the JDK-11 home / cargo) are an error
@@ -63,7 +64,7 @@
 #
 # NOT discovered (documented, not silent): dev/java-interop/run.sh (the original
 # metadata-evolution oracle pass) and run-inspection-manifests.sh do not match the
-# run-interop-*.sh glob and are outside the nightly set — a named deferral, tracked in
+# run-interop-*.sh glob and are outside the scheduled set — a named deferral, tracked in
 # dev/java-interop/map.md.
 
 set -euo pipefail
