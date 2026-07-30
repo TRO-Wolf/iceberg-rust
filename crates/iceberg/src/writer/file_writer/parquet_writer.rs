@@ -38,7 +38,7 @@ use parquet::file::statistics::Statistics;
 use super::{FileWriter, FileWriterBuilder};
 use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor, UTC_TIME_ZONE,
-    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
+    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum, schema_needs_nan_value_counts,
 };
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
@@ -101,6 +101,11 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        // Detect once at build time: only run the NaN visitor when the schema has float/double
+        // leaves under a counts-collecting metrics mode. Int/string/timestamp-only tables skip
+        // the full schema walk on every batch.
+        let collect_nan_value_counts =
+            schema_needs_nan_value_counts(self.schema.as_ref(), &self.metrics_config);
         Ok(ParquetWriter {
             schema: self.schema.clone(),
             writer_arrow_schema: Arc::new(self.schema.as_ref().try_into()?),
@@ -109,6 +114,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            collect_nan_value_counts,
             metrics_config: self.metrics_config.clone(),
         })
     }
@@ -244,6 +250,9 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+    /// When false the write path skips the NaN visitor entirely (no float/double leaves under a
+    /// counts-collecting metrics mode). Computed once in [`ParquetWriterBuilder::build`].
+    collect_nan_value_counts: bool,
     metrics_config: MetricsConfig,
 }
 
@@ -553,9 +562,12 @@ impl FileWriter for ParquetWriter {
 
         self.current_row_num += batch.num_rows();
 
-        let batch_c = batch.clone();
-        self.nan_value_count_visitor
-            .compute(self.schema.clone(), batch_c)?;
+        // Only walk the batch for NaN counts when the schema has float/double leaves under a
+        // counts-collecting metrics mode. The visitor takes `&RecordBatch` (no batch clone).
+        if self.collect_nan_value_counts {
+            self.nan_value_count_visitor
+                .compute(self.schema.clone(), batch)?;
+        }
 
         // Normalize UTC-alias timestamp timezones to the writer schema (metadata-only). Spark
         // tags Iceberg `timestamptz` batches `Timestamp(_, "UTC")`; the writer schema tags them
@@ -1086,11 +1098,84 @@ mod tests {
             HashMap::from([(0, Datum::long(1023))])
         );
         assert_eq!(*data_file.null_value_counts(), HashMap::from([(0, 1024)]));
+        // Int-only schema: NaN visitor is gated off; nan_value_counts stays empty (no full-batch walk).
+        assert!(
+            data_file.nan_value_counts().is_empty(),
+            "int-only schema must not produce nan_value_counts"
+        );
 
         // check the written file
         let expect_batch = concat_batches(&schema, vec![&to_write, &to_write_null]).unwrap();
         check_parquet_data_file(&file_io, &data_file, &expect_batch).await;
 
+        Ok(())
+    }
+
+    /// Pin the NaN-visitor gate: a writer built for an int-only schema has
+    /// `collect_nan_value_counts == false`, so the write path never walks batches for NaNs.
+    #[tokio::test]
+    async fn test_nan_visitor_gated_off_for_int_only_schema() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-gate".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = {
+            let fields =
+                vec![
+                    Field::new("col", DataType::Int64, true).with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "0".to_string(),
+                    )])),
+                ];
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let col = Arc::new(Int64Array::from_iter_values(0..8)) as ArrayRef;
+        let to_write = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+        let iceberg_schema: SchemaRef = Arc::new(
+            to_write
+                .schema()
+                .as_ref()
+                .try_into()
+                .expect("iceberg schema"),
+        );
+
+        assert!(
+            !schema_needs_nan_value_counts(
+                iceberg_schema.as_ref(),
+                &crate::spec::MetricsConfig::default()
+            ),
+            "gate must be false for int-only schema"
+        );
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .build(output_file)
+            .await?;
+        assert!(
+            !pw.collect_nan_value_counts,
+            "ParquetWriter must gate off NaN visitor for int-only schema"
+        );
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        assert!(
+            data_file.nan_value_counts().is_empty(),
+            "gated writer must emit empty nan_value_counts"
+        );
         Ok(())
     }
 
