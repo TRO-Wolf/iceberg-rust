@@ -3006,6 +3006,55 @@ mod tests {
         );
     }
 
+    /// Pin: planner Conflict cell composes with the retryable error helper used by Glue/S3 Tables.
+    #[test]
+    fn test_plan_conflict_composes_to_retryable_error() {
+        let service = "s3://b/m/v2.json";
+        let base = "s3://b/m/v1.json";
+        assert_eq!(
+            plan_commit_base_load(service, Some(base), Some(service)),
+            CommitBaseLoadPlan::Conflict
+        );
+        let ident = TableIdent::from_strs(["db", "tbl"]).expect("ident");
+        let err = super::commit_base_conflict_error(&ident, Some(base), service);
+        assert_eq!(err.kind(), crate::ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable());
+    }
+
+    /// Pin: `take_base_table` is oneshot — a second take cannot accidentally reuse a stolen base.
+    #[test]
+    fn test_table_commit_take_base_table_is_oneshot() {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2Valid.json"
+        ))
+        .expect("open fixture");
+        let metadata =
+            serde_json::from_reader::<_, TableMetadata>(BufReader::new(file)).expect("parse");
+        let table = Table::builder()
+            .metadata(metadata)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).expect("ident"))
+            .file_io(FileIO::new_with_memory())
+            .build()
+            .expect("table");
+        let loc = table.metadata_location().map(str::to_string);
+        let mut commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .updates(vec![])
+            .requirements(vec![])
+            .base_metadata_location(loc)
+            .base_table(Some(table))
+            .build();
+        assert!(commit.base_table().is_some());
+        assert!(commit.take_base_table().is_some());
+        assert!(
+            commit.base_table().is_none() && commit.take_base_table().is_none(),
+            "second take must be None"
+        );
+    }
+
     /// A minimal [`Catalog`] that overrides NONE of the default accessor/lifecycle methods, so
     /// it exercises the trait-supplied defaults: `name()` → [`UNNAMED_CATALOG`], `properties()`
     /// → empty map, `invalidate_table`/`invalidate_view` → no-op `Ok(())`. The table/namespace
