@@ -121,16 +121,21 @@ fn opendal_timestamp_to_millis(timestamp: opendal::raw::Timestamp) -> i64 {
 
 /// Whether list-entry metadata is complete enough to skip a per-file `stat`.
 ///
-/// **Rule:** use list metadata when the backend filled size (`content_length > 0`)
-/// **or** set `last_modified` (covers empty files whose size is legitimately 0).
-/// OpenDAL returns `content_length() == 0` when size was never set, so the pair
-/// `(size == 0, no last_modified)` is treated as incomplete and falls back to `stat`.
+/// **Rule:** use list metadata only when the backend reported a **positive**
+/// `content_length`. OpenDAL's public `content_length()` returns `0` both when
+/// size was never set (`None`) and when the object is legitimately empty
+/// (`Some(0)`), so a zero length is **never** treated as complete — empty and
+/// unknown entries always fall back to `stat` (one HEAD; correct size 0).
 ///
-/// Some backends (e.g. in-memory OpenDAL) never populate list metadata — those
-/// paths always `stat`. Backends that fill list entries (typical object-store
-/// LIST) avoid N extra HEAD/stat round-trips.
+/// Do **not** treat `last_modified` alone as proof of size: backends can set
+/// mtime without size (e.g. S3/OSS delete markers under `list_with_deleted`),
+/// which would otherwise be reported as empty files without `stat`.
+///
+/// Some backends (e.g. in-memory OpenDAL, local FS list) never populate list
+/// size — those paths always `stat`. Object-store LIST responses that carry a
+/// non-zero Size skip the N HEAD round-trips for real data files.
 fn list_entry_metadata_complete(meta: &opendal::Metadata) -> bool {
-    meta.content_length() > 0 || meta.last_modified().is_some()
+    !meta.is_deleted() && meta.content_length() > 0
 }
 
 cfg_if! {
@@ -611,12 +616,13 @@ impl Storage for OpenDalStorage {
     /// # Metadata source
     ///
     /// Prefer size + last-modified from the list entry when
-    /// [`list_entry_metadata_complete`] (non-zero `content_length`, or a present
-    /// `last_modified`). Only `stat` when list metadata is incomplete. Incomplete
-    /// backends (e.g. OpenDAL memory) therefore still pay one `stat` per file;
-    /// object-store LIST responses that already carry Size/LastModified skip the
-    /// N HEAD round-trips. A file with no last-modified is reported with
-    /// `created_at_millis = 0`.
+    /// [`list_entry_metadata_complete`] (positive `content_length`, not deleted).
+    /// Only `stat` when list metadata is incomplete (zero/unknown size, or a
+    /// deleted marker). Incomplete backends (e.g. OpenDAL memory, FS list) pay
+    /// one `stat` per file; object-store LIST responses that already carry a
+    /// non-zero Size skip the N HEAD round-trips for data files. Empty objects
+    /// always `stat` so size 0 is authoritative. A file with no last-modified
+    /// is reported with `created_at_millis = 0`.
     async fn list(&self, path: &str) -> Result<Vec<FileInfo>> {
         let (op, relative_path) = self.create_operator(&path)?;
         // The base is the part of the caller-supplied `path` that precedes the
@@ -639,7 +645,8 @@ impl Storage for OpenDalStorage {
         let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
             let list_meta = entry.metadata();
-            if !list_meta.is_file() {
+            // Skip directory markers and delete-marker entries (not live files).
+            if !list_meta.is_file() || list_meta.is_deleted() {
                 continue;
             }
 
@@ -792,9 +799,10 @@ mod tests {
 
     /// Pins the list-metadata completeness rule used to skip `stat`.
     ///
-    /// OpenDAL's public `content_length()` is 0 when unset, so non-zero size or a
-    /// present last-modified means "backend filled list metadata". Empty-file +
-    /// mtime is complete; bare FILE mode is incomplete (memory list shape).
+    /// OpenDAL's public `content_length()` is 0 when unset **and** when the object
+    /// is empty, so only a **positive** size is complete. Mtime alone must not
+    /// skip stat (would report size 0 for unset length). Deleted markers are
+    /// never complete.
     #[test]
     fn test_list_entry_metadata_complete_rule() {
         use opendal::{EntryMode, Metadata};
@@ -802,22 +810,218 @@ mod tests {
         let incomplete = Metadata::new(EntryMode::FILE);
         assert!(
             !list_entry_metadata_complete(&incomplete),
-            "list entries with no size and no mtime must fall back to stat"
+            "list entries with no size must fall back to stat"
         );
 
         let with_size = Metadata::new(EntryMode::FILE).with_content_length(42);
         assert!(
             list_entry_metadata_complete(&with_size),
-            "non-zero content_length is complete"
+            "positive content_length is complete"
         );
 
-        let empty_with_mtime = Metadata::new(EntryMode::FILE).with_last_modified(
+        let mtime_only = Metadata::new(EntryMode::FILE).with_last_modified(
             opendal::raw::Timestamp::from_millisecond(1_700_000_000_000).expect("ts"),
         );
         assert!(
-            list_entry_metadata_complete(&empty_with_mtime),
-            "last_modified alone covers empty files (size 0)"
+            !list_entry_metadata_complete(&mtime_only),
+            "mtime alone must not be treated as complete (unset size collapses to 0)"
         );
+
+        let empty_with_mtime = Metadata::new(EntryMode::FILE)
+            .with_content_length(0)
+            .with_last_modified(
+                opendal::raw::Timestamp::from_millisecond(1_700_000_000_000).expect("ts"),
+            );
+        assert!(
+            !list_entry_metadata_complete(&empty_with_mtime),
+            "empty objects (size 0) must stat so size is authoritative"
+        );
+
+        let deleted = Metadata::new(EntryMode::FILE)
+            .with_content_length(42)
+            .with_is_deleted(true);
+        assert!(
+            !list_entry_metadata_complete(&deleted),
+            "delete markers must not be treated as complete live files"
+        );
+    }
+
+    /// OperatorCache recovers from a poisoned mutex so later I/O is not denied.
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_operator_cache_recovers_from_poisoned_mutex() {
+        let cache = OperatorCache::default();
+        // Poison the mutex by panicking while the guard is held.
+        let cache_for_panic = cache.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache_for_panic.inner.lock().expect("lock before poison");
+            panic!("intentional poison for OperatorCache recovery pin");
+        }));
+        assert!(
+            cache.inner.lock().is_err(),
+            "mutex must be poisoned after the panicking critical section"
+        );
+
+        let op = cache
+            .get_or_insert_with("poison-key".to_string(), memory_config_build)
+            .expect("get_or_insert_with must recover from poison via into_inner");
+        assert_eq!(op.info().scheme().to_string(), "memory");
+
+        // Second lookup still works and reuses the inserted Operator.
+        let op2 = cache
+            .get_or_insert_with("poison-key".to_string(), || {
+                panic!("build must not run on cache hit after poison recovery")
+            })
+            .expect("cache hit after poison recovery");
+        assert!(
+            std::sync::Arc::ptr_eq(op.inner(), op2.inner()),
+            "recovered cache must still share the finished Operator"
+        );
+    }
+
+    /// Serde skips `operator_cache` (`#[serde(skip, default)]`). Simulate the
+    /// post-deserialize state with a fresh empty cache sharing the same config:
+    /// create_operator must rebuild Operators, and clones must share that new cache
+    /// without retaining the pre-skip Operator identity.
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_empty_after_serde_skip_rebuilds() {
+        use iceberg::io::{S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_REGION};
+
+        let props: std::collections::HashMap<String, String> = [
+            (S3_REGION, "us-east-1"),
+            (S3_DISABLE_CONFIG_LOAD, "true"),
+            (S3_DISABLE_EC2_METADATA, "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = crate::s3::s3_config_parse(props).expect("offline s3 config");
+        let config = std::sync::Arc::new(config);
+        let storage = OpenDalStorage::S3 {
+            configured_scheme: "s3".to_string(),
+            config: config.clone(),
+            customized_credential_load: None,
+            operator_cache: OperatorCache::default(),
+        };
+
+        let (warm_op, warm_rel) = storage
+            .create_operator(&"s3://serde-bucket/pre")
+            .expect("warm create_operator");
+        assert_eq!(warm_rel, "pre");
+        assert_eq!(warm_op.info().name(), "serde-bucket");
+
+        // Post-serde-skip shape: same durable config, empty operator_cache.
+        let restored = OpenDalStorage::S3 {
+            configured_scheme: "s3".to_string(),
+            config,
+            customized_credential_load: None,
+            operator_cache: OperatorCache::default(),
+        };
+
+        let (op1, rel1) = restored
+            .create_operator(&"s3://serde-bucket/post/nested")
+            .expect("post-skip create_operator must rebuild operator from config");
+        assert_eq!(rel1, "post/nested");
+        assert_eq!(op1.info().name(), "serde-bucket");
+
+        let cloned = restored.clone();
+        let (op2, rel2) = cloned
+            .create_operator(&"s3a://serde-bucket/other")
+            .expect("clone after rebuild must share the fresh cache");
+        assert_eq!(rel2, "other");
+        assert!(
+            std::sync::Arc::ptr_eq(op1.inner(), op2.inner()),
+            "fresh cache after serde-skip must be shared across clones"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(warm_op.inner(), op1.inner()),
+            "empty cache must not retain the pre-skip Operator identity"
+        );
+    }
+
+    /// Nested keys keep correct relative paths after the bucket Operator is cached,
+    /// including across S3 scheme aliases (URL strip, not operator-root strip).
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_nested_relative_path_after_warm() {
+        use iceberg::io::{S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_REGION};
+
+        let props: std::collections::HashMap<String, String> = [
+            (S3_REGION, "us-east-1"),
+            (S3_DISABLE_CONFIG_LOAD, "true"),
+            (S3_DISABLE_EC2_METADATA, "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = crate::s3::s3_config_parse(props).expect("offline s3 config");
+        let storage = OpenDalStorage::S3 {
+            configured_scheme: "s3".to_string(),
+            config: std::sync::Arc::new(config),
+            customized_credential_load: None,
+            operator_cache: OperatorCache::default(),
+        };
+
+        let (op_warm, rel_warm) = storage
+            .create_operator(&"s3://nest-bucket/seed")
+            .expect("warm");
+        assert_eq!(rel_warm, "seed");
+
+        let (op_nested, rel_nested) = storage
+            .create_operator(&"s3://nest-bucket/a/b/c.parquet")
+            .expect("nested after warm");
+        assert_eq!(rel_nested, "a/b/c.parquet");
+        assert!(
+            std::sync::Arc::ptr_eq(op_warm.inner(), op_nested.inner()),
+            "nested path must reuse the warm bucket Operator"
+        );
+
+        let (op_alias, rel_alias) = storage
+            .create_operator(&"s3a://nest-bucket/x/y/z")
+            .expect("alias nested after warm");
+        assert_eq!(rel_alias, "x/y/z");
+        assert!(std::sync::Arc::ptr_eq(op_warm.inner(), op_alias.inner()));
+    }
+
+    /// Local FS list goes through the incomplete-meta → stat path (OpenDAL FS list
+    /// entries carry mode only). Pins empty + non-empty sizes under Wave C list.
+    #[cfg(feature = "opendal-fs")]
+    #[tokio::test]
+    async fn test_opendal_fs_list_sizes_via_stat_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "iceberg-opendal-fs-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("sub")).expect("mkdir");
+        std::fs::write(root.join("empty.txt"), b"").expect("write empty");
+        std::fs::write(root.join("payload.txt"), b"hello").expect("write payload");
+        std::fs::write(root.join("sub").join("nested.txt"), b"ab").expect("write nested");
+
+        let storage = OpenDalStorage::LocalFs {
+            operator_cache: OperatorCache::default(),
+        };
+        // file:/ + absolute path (strip "file:/" keeps leading / on Unix).
+        let prefix = format!("file:{}", root.display());
+        let listed = storage.list(&prefix).await;
+        let _ = std::fs::remove_dir_all(&root);
+        let mut listed = listed.expect("FS list must succeed via stat fallback");
+        listed.sort_by(|a, b| a.location.cmp(&b.location));
+
+        let by_name = |name: &str| {
+            listed
+                .iter()
+                .find(|f| f.location.ends_with(name))
+                .unwrap_or_else(|| panic!("missing {name} in {listed:?}"))
+        };
+        assert_eq!(by_name("empty.txt").size, 0, "empty file size via stat");
+        assert_eq!(by_name("payload.txt").size, 5, "payload size via stat");
+        assert_eq!(by_name("nested.txt").size, 2, "nested size via stat");
+        assert_eq!(listed.len(), 3, "exactly the three files, no dirs");
     }
 
     /// Memory OpenDAL list entries only carry mode (no size / mtime). List must
