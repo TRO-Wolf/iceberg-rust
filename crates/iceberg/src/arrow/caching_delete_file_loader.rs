@@ -288,8 +288,14 @@ impl CachingDeleteFileLoader {
                         // drops it, publishing the terminal failed state to every waiter.
                         // `note_failure` hands that error to the guard first, so the waiters'
                         // typed error names the cause and not just the file.
+                        //
+                        // Wave B: project only the reserved `file_path` + `pos` columns (falls
+                        // back to a full read if the ProjectionMask cannot be built safely).
                         let stream = basic_delete_file_loader
-                            .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
+                            .parquet_positional_delete_batch_stream(
+                                &task.file_path,
+                                task.file_size_in_bytes,
+                            )
                             .await
                             .map_err(|error| guard.note_failure(error))?;
                         Ok(DeleteFileContext::PosDels {
@@ -329,9 +335,15 @@ impl CachingDeleteFileLoader {
                         ),
                     ));
                 };
+                // Wave B: project only the equality_ids key columns from the eq-delete file
+                // (falls back to a full read if the ProjectionMask cannot be built safely).
                 let evolved_stream = BasicDeleteFileLoader::evolve_schema(
                     basic_delete_file_loader
-                        .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
+                        .parquet_to_batch_stream_with_projection(
+                            &task.file_path,
+                            task.file_size_in_bytes,
+                            Some(equality_ids_vec.as_slice()),
+                        )
                         .await?,
                     schema,
                     &equality_ids_vec,
@@ -1327,17 +1339,36 @@ mod tests {
         file_name: &str,
         rows: &[(&str, Option<i64>)],
     ) -> String {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
+        write_pos_del_parquet_maybe_row(dir, file_name, rows, false)
+    }
+
+    /// Like [`write_pos_del_parquet`], optionally with the third optional `row` column Java may emit.
+    fn write_pos_del_parquet_maybe_row(
+        dir: &std::path::Path,
+        file_name: &str,
+        rows: &[(&str, Option<i64>)],
+        with_row_column: bool,
+    ) -> String {
+        let mut fields = vec![
             simple_field("file_path", DataType::Utf8, false, "2147483546"),
             simple_field("pos", DataType::Int64, true, "2147483545"),
-        ]));
+        ];
+        if with_row_column {
+            fields.push(simple_field("row", DataType::Utf8, true, "999"));
+        }
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
         let paths: Vec<&str> = rows.iter().map(|(path, _)| *path).collect();
         let positions: Vec<Option<i64>> = rows.iter().map(|(_, pos)| *pos).collect();
-        let batch = RecordBatch::try_new(schema.clone(), vec![
+        let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(paths)) as ArrayRef,
             Arc::new(Int64Array::from(positions)) as ArrayRef,
-        ])
-        .expect("build positional-delete batch");
+        ];
+        if with_row_column {
+            let rows_payload: Vec<Option<&str>> = rows.iter().map(|_| Some("payload")).collect();
+            columns.push(Arc::new(StringArray::from(rows_payload)) as ArrayRef);
+        }
+        let batch =
+            RecordBatch::try_new(schema.clone(), columns).expect("build positional-delete batch");
 
         let path = dir
             .join(file_name)
@@ -1371,6 +1402,68 @@ mod tests {
             content_size_in_bytes: None,
             record_count: None,
         }
+    }
+
+    /// Critic-octo C1-Q-004: production `load_deletes` path projects path+pos (Wave B) and must
+    /// still install correct positions when the on-disk file carries the optional third `row`
+    /// column. Pins the CachingDeleteFileLoader → projection → parse seam (not just in-memory parse).
+    #[tokio::test]
+    async fn test_load_deletes_pos_delete_with_row_column_projects_and_applies() {
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let file_io = FileIO::new_with_fs();
+        let data_file = format!("{}/data-1.parquet", tmp_dir.path().display());
+        let pos_del_path = write_pos_del_parquet_maybe_row(
+            tmp_dir.path(),
+            "pos-with-row.parquet",
+            &[
+                (&data_file, Some(0)),
+                (&data_file, Some(3)),
+                (&data_file, Some(7)),
+            ],
+            true, // include optional `row` column
+        );
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10);
+        let delete_filter = loader
+            .load_deletes(
+                &[parquet_pos_del_task(&pos_del_path)],
+                Arc::new(Schema::builder().build().expect("empty schema")),
+            )
+            .await
+            .expect("loader channel")
+            .expect("load pos-delete with row column");
+
+        // Build a minimal task pointing at data_file so get_delete_vector resolves the path.
+        let task = crate::scan::FileScanTask {
+            file_size_in_bytes: 0,
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: data_file.clone(),
+            data_file_format: crate::spec::DataFileFormat::Parquet,
+            schema: Arc::new(Schema::builder().build().expect("schema")),
+            project_field_ids: vec![],
+            predicate: None,
+            deletes: vec![parquet_pos_del_task(&pos_del_path)],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: true,
+            split_offsets: None,
+        };
+        let vector = delete_filter
+            .get_delete_vector(&task)
+            .expect("delete vector for data file");
+        let locked = vector.lock().expect("lock");
+        assert!(locked.contains(0), "pos 0 must be deleted");
+        assert!(locked.contains(3), "pos 3 must be deleted");
+        assert!(locked.contains(7), "pos 7 must be deleted");
+        assert!(!locked.contains(1), "pos 1 must NOT be deleted");
+        assert_eq!(
+            locked.len(),
+            3,
+            "exactly three positions from the projected file"
+        );
     }
 
     /// Risk pinned (audit BUG-005, run-continuation insert site): a NEGATIVE position in a

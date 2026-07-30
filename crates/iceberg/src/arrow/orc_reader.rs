@@ -133,8 +133,12 @@ pub(crate) async fn read_orc_data_file(
     // unwind into the awaiting scan, and the path is attached as context because the join error
     // cannot name the file. The outer `?` unwraps the join result; the inner `Result` is the
     // decode's own.
+    //
+    // Wave B: the owned `Bytes` from `input.read()` is moved into the blocking task and reused
+    // for both footer parse (`&bytes`) and `ArrowReaderBuilder::try_new(bytes)` — no second
+    // full-file `Bytes::copy_from_slice`.
     crate::runtime::spawn_blocking(move || {
-        read_orc_data_bytes(&bytes, expected.as_ref(), batch_size)
+        read_orc_data_bytes(bytes, expected.as_ref(), batch_size)
     })
     .try_join()
     .await
@@ -145,8 +149,12 @@ pub(crate) async fn read_orc_data_file(
 ///
 /// The synchronous core; [`read_orc_data_file`] is the async/[`InputFile`] wrapper. Exposed
 /// `pub(crate)` so callers holding the bytes (and offline tests) drive it without an [`InputFile`].
+///
+/// Takes owned [`Bytes`] so the production path can thread the buffer from `InputFile::read`
+/// into `orc-rust` without a second full-file copy. Callers with a borrowed slice (tests over a
+/// static fixture) can use [`Bytes::from_static`] / [`Bytes::copy_from_slice`] once at the edge.
 pub(crate) fn read_orc_data_bytes(
-    bytes: &[u8],
+    bytes: Bytes,
     expected: &Schema,
     batch_size: usize,
 ) -> Result<Vec<RecordBatch>> {
@@ -158,10 +166,12 @@ pub(crate) fn read_orc_data_bytes(
     }
 
     // (1) Hand-parse the footer to recover the `field-id → ORC type` map (with `iceberg.id`).
-    let file_types = parse_footer(bytes)?;
+    //     Borrow only; the owned buffer is moved into `orc-rust` next.
+    let file_types = parse_footer(bytes.as_ref())?;
 
-    // (2) Open `orc-rust` over the same bytes (it re-reads the footer itself for the data streams).
-    let builder = ArrowReaderBuilder::try_new(Bytes::copy_from_slice(bytes)).map_err(|e| {
+    // (2) Open `orc-rust` over the SAME owned buffer (it re-reads the footer itself for the data
+    //     streams). No `Bytes::copy_from_slice` — the buffer is transferred once.
+    let builder = ArrowReaderBuilder::try_new(bytes).map_err(|e| {
         Error::new(
             ErrorKind::DataInvalid,
             "Failed to open ORC data file (orc-rust could not read the file metadata)",

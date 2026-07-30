@@ -567,19 +567,54 @@ impl ArrowReader {
             )
             .with_source(e)
         })??;
-        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
-        // In addition to the optional predicate supplied in the `FileScanTask`,
-        // we also have an optional predicate resulting from equality delete files.
-        // If both are present, we logical-AND them together to form a single filter
-        // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (&task.predicate, delete_predicate) {
-            (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(ref predicate)) => Some(predicate.clone()),
-            (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
+        // Equality-delete routing for the Parquet pushdown path (Wave B):
+        //
+        // * Prefer the O(R) [`EqDeleteKeySet`] post-decode fast path when
+        //   (a) every eq-delete file for this task is type-eligible and shares one key schema
+        //       (`collect_equality_delete_keysets` → `Some(sets)`), AND
+        //   (b) every key field id is present in the projected non-metadata columns (so the
+        //       transformed batch can resolve keys by `PARQUET_FIELD_ID_META_KEY`).
+        //   In that case the Parquet `RowFilter` residual is **scan-predicate only** — eq-deletes
+        //   are applied AFTER `RecordBatchTransformer` via the same keep-mask logic as the
+        //   whole-file (`survival_mask`) eq branch (set first; NULL-key batches fall back to the
+        //   bound eq-delete predicate).
+        // * Otherwise (no keysets / keys missing from projection / ineligible types): keep today's
+        //   correctness-first path and AND the eq-delete predicate into the RowFilter residual so
+        //   Parquet still filters deleted rows at decode time (the RowFilter can still read key
+        //   columns that the data projection omitted).
+        let eq_delete_sets = delete_filter.collect_equality_delete_keysets(&task).await;
+        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let keyset_post_decode = eq_delete_sets.as_ref().is_some_and(|sets| {
+            !sets.is_empty()
+                && eq_delete_key_fields_projected(sets, &project_field_ids_without_metadata)
+        });
+
+        // Residual pushed into RowFilter / RG skip / page selection: scan predicate always; AND
+        // eq-delete predicate only when the post-decode keyset path is NOT taken.
+        let final_predicate = if keyset_post_decode {
+            task.predicate.clone()
+        } else {
+            match (&task.predicate, &delete_predicate) {
+                (None, None) => None,
+                (Some(predicate), None) => Some(predicate.clone()),
+                (None, Some(predicate)) => Some(predicate.clone()),
+                (Some(filter_predicate), Some(delete_predicate)) => {
+                    Some(filter_predicate.clone().and(delete_predicate.clone()))
+                }
             }
+        };
+
+        // Owned state for the post-decode keyset apply (only when the routing above selected it).
+        let post_decode_eq_sets = if keyset_post_decode {
+            eq_delete_sets
+        } else {
+            None
+        };
+        let post_decode_eq_predicate = if keyset_post_decode {
+            delete_predicate
+        } else {
+            None
         };
 
         // There are three possible sources for potential lists of selected RowGroup indices,
@@ -695,14 +730,35 @@ impl ArrowReader {
         }
 
         // Build the batch stream and send all the RecordBatches that it generates
-        // to the requester.
+        // to the requester. When `keyset_post_decode` is set, eq-deletes are applied
+        // here (post-transform) rather than via the Parquet RowFilter residual above.
         let record_batch_stream =
             record_batch_stream_builder
                 .build()?
                 .map(move |batch| match batch {
                     Ok(batch) => {
                         // Process the record batch (type promotion, column reordering, virtual fields, etc.)
-                        record_batch_transformer.process_record_batch(batch)
+                        let transformed = record_batch_transformer.process_record_batch(batch)?;
+                        if post_decode_eq_sets.is_none() && post_decode_eq_predicate.is_none() {
+                            return Ok(transformed);
+                        }
+                        // Same keep-mask routing as `survival_mask`'s eq branch: prefer keysets;
+                        // fall back to the bound eq-delete predicate on NULL-key batches.
+                        match Self::eq_delete_keep_mask(
+                            &transformed,
+                            transformed.num_rows(),
+                            post_decode_eq_predicate.as_ref(),
+                            post_decode_eq_sets.as_deref(),
+                        )? {
+                            None => Ok(transformed),
+                            Some(mask) => filter_record_batch(&transformed, &mask).map_err(|e| {
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    "Failed to apply equality-delete keyset keep-mask to a Parquet data batch",
+                                )
+                                .with_source(e)
+                            }),
+                        }
                     }
                     Err(err) => Err(err.into()),
                 });
@@ -1003,42 +1059,9 @@ impl ArrowReader {
             None => None,
         };
 
-        // Equality-delete keep-mask. Prefer the O(R) set fast path; if any set reports a key-column
-        // NULL in this batch, fall back to the eq-delete predicate for the whole batch.
-        let eq_delete_mask: Option<BooleanArray> = {
-            let mut from_sets: Option<BooleanArray> = None;
-            if let Some(sets) = eq_delete_sets.filter(|s| !s.is_empty()) {
-                let mut keep = vec![true; num_rows];
-                let mut all_sets_safe = true;
-                for set in sets {
-                    if set.is_empty() {
-                        continue;
-                    }
-                    match set.delete_mask(batch)? {
-                        Some(deleted) => {
-                            for (k, d) in keep.iter_mut().zip(deleted.iter()) {
-                                *k &= !*d;
-                            }
-                        }
-                        None => {
-                            all_sets_safe = false;
-                            break;
-                        }
-                    }
-                }
-                if all_sets_safe {
-                    from_sets = Some(BooleanArray::from(keep));
-                }
-            }
-            match from_sets {
-                Some(mask) => Some(mask),
-                // No set path (absent, empty, or a key-column NULL forced fallback) → predicate.
-                None => match eq_delete_predicate {
-                    Some(predicate) => Some(predicate_keep(predicate)?),
-                    None => None,
-                },
-            }
-        };
+        // Equality-delete keep-mask (shared with the Parquet pushdown post-decode keyset path).
+        let eq_delete_mask =
+            Self::eq_delete_keep_mask(batch, num_rows, eq_delete_predicate, eq_delete_sets)?;
 
         // AND the present keep-masks together.
         let combine =
@@ -1057,6 +1080,56 @@ impl ArrowReader {
             };
         let combined = combine(positional_mask, residual_mask)?;
         combine(combined, eq_delete_mask)
+    }
+
+    /// Equality-delete keep-mask for one transformed batch: prefer the O(R) [`EqDeleteKeySet`]
+    /// fast path; if any set reports a key-column NULL in this batch, fall back to the bound
+    /// eq-delete predicate for the whole batch. Returns `None` when no eq-deletes apply.
+    ///
+    /// Shared by the whole-file path ([`Self::survival_mask`]) and the Parquet pushdown path when
+    /// keysets are eligible and keys are projected (see `process_parquet_file_scan_task` routing).
+    fn eq_delete_keep_mask(
+        batch: &RecordBatch,
+        num_rows: usize,
+        eq_delete_predicate: Option<&BoundPredicate>,
+        eq_delete_sets: Option<&[EqDeleteKeySet]>,
+    ) -> Result<Option<BooleanArray>> {
+        // Prefer the O(R) set fast path; if any set reports a key-column NULL in this batch,
+        // fall back to the eq-delete predicate for the whole batch.
+        let mut from_sets: Option<BooleanArray> = None;
+        if let Some(sets) = eq_delete_sets.filter(|s| !s.is_empty()) {
+            let mut keep = vec![true; num_rows];
+            let mut all_sets_safe = true;
+            for set in sets {
+                if set.is_empty() {
+                    continue;
+                }
+                match set.delete_mask(batch)? {
+                    Some(deleted) => {
+                        for (k, d) in keep.iter_mut().zip(deleted.iter()) {
+                            *k &= !*d;
+                        }
+                    }
+                    None => {
+                        all_sets_safe = false;
+                        break;
+                    }
+                }
+            }
+            if all_sets_safe {
+                from_sets = Some(BooleanArray::from(keep));
+            }
+        }
+        match from_sets {
+            Some(mask) => Ok(Some(mask)),
+            // No set path (absent, empty, or a key-column NULL forced fallback) → predicate.
+            None => match eq_delete_predicate {
+                Some(predicate) => Ok(Some(coerce_nulls_to_false(&evaluate_predicate_to_mask(
+                    predicate, batch,
+                )?))),
+                None => Ok(None),
+            },
+        }
     }
 
     /// Opens a Parquet file and loads its metadata, returning both the reader and metadata.
@@ -1986,6 +2059,25 @@ fn coerce_nulls_to_false(mask: &BooleanArray) -> BooleanArray {
         return mask.clone();
     }
     BooleanArray::from_iter((0..mask.len()).map(|i| Some(mask.is_valid(i) && mask.value(i))))
+}
+
+/// `true` iff every key field id of `sets` appears in the projected non-metadata field ids.
+/// The Parquet MoR keyset path requires this so post-transform batches can resolve keys by
+/// `PARQUET_FIELD_ID_META_KEY`; otherwise the reader falls back to the eq-delete RowFilter path.
+pub(crate) fn eq_delete_key_fields_projected(
+    sets: &[EqDeleteKeySet],
+    projected_non_metadata_field_ids: &[i32],
+) -> bool {
+    if sets.is_empty() {
+        return false;
+    }
+    // `collect_equality_delete_keysets` only returns sets that share one key schema, so the first
+    // set's key ids stand for the whole task.
+    let projected: HashSet<i32> = projected_non_metadata_field_ids.iter().copied().collect();
+    sets[0]
+        .key_field_ids()
+        .iter()
+        .all(|id| projected.contains(id))
 }
 
 /// Gets the leaf column from the record batch for the required column index. Only
@@ -6870,5 +6962,757 @@ mod avro_scan_tests {
         // id=1 MUST be gone; 2 and 3 survive. A reader ignoring the delete vector would keep 1.
         assert!(!ids.contains(&1), "position-0 row (id=1) must be deleted");
         assert_eq!(ids, vec![2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod parquet_eq_keyset_mor_tests {
+    //! Wave B: Parquet MoR path wires [`EqDeleteKeySet`] when key columns are projected.
+    //!
+    //! Routing (see `process_parquet_file_scan_task`):
+    //! * keys ⊆ projected non-metadata field ids → post-decode keyset keep-mask (RowFilter residual
+    //!   is scan-predicate only);
+    //! * otherwise → today's AND of eq-delete predicate into the Parquet RowFilter.
+    //!
+    //! Both routes must produce the same survivors (predicate oracle).
+
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::ops::Not;
+    use std::sync::Arc;
+
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::file::properties::WriterProperties;
+    use tempfile::TempDir;
+
+    use super::eq_delete_key_fields_projected;
+    use crate::arrow::equality_delete_set::EqDeleteKeySet;
+    use crate::arrow::{ArrowReader, ArrowReaderBuilder};
+    use crate::io::FileIO;
+    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
+    use crate::spec::{
+        DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
+    };
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("build test schema"),
+        )
+    }
+
+    fn write_parquet_data_file(path: &str, rows: &[(i64, Option<&str>)]) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("data", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        let data: Vec<Option<&str>> = rows.iter().map(|(_, d)| *d).collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(data)) as ArrayRef,
+        ])
+        .expect("build data batch");
+        let file = File::create(path).expect("create data file");
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(WriterProperties::builder().build()))
+                .expect("data writer");
+        writer.write(&batch).expect("write data");
+        writer.close().expect("close data");
+    }
+
+    fn write_eq_delete_file(path: &str, delete_ids: &[i64]) -> FileScanTaskDeleteFile {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(
+            delete_ids.to_vec(),
+        )) as ArrayRef])
+        .expect("build eq-delete batch");
+        let file = File::create(path).expect("create eq-delete file");
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(WriterProperties::builder().build()))
+                .expect("eq-delete writer");
+        writer.write(&batch).expect("write eq-delete");
+        writer.close().expect("close eq-delete");
+        FileScanTaskDeleteFile {
+            file_path: path.to_string(),
+            file_size_in_bytes: std::fs::metadata(path).expect("stat").len(),
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: 0,
+            equality_ids: Some(vec![1]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        }
+    }
+
+    fn parquet_task(
+        path: &str,
+        schema: SchemaRef,
+        project_field_ids: Vec<i32>,
+        deletes: Vec<FileScanTaskDeleteFile>,
+    ) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: std::fs::metadata(path).expect("stat data").len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: path.to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids,
+            predicate: None,
+            deletes,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: true,
+            split_offsets: None,
+        }
+    }
+
+    async fn run_scan(task: FileScanTask) -> Vec<RecordBatch> {
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let tasks =
+            Box::pin(futures::stream::iter(vec![Ok(task)].into_iter())) as FileScanTaskStream;
+        reader
+            .read(tasks)
+            .expect("build scan stream")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("collect scan batches")
+    }
+
+    fn surviving_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .expect("id column")
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Unit pin: keyset routing requires every key field id to be projected.
+    #[test]
+    fn test_eq_delete_key_fields_projected_gate() {
+        let set =
+            EqDeleteKeySet::try_build(vec![(1, "id".to_string(), PrimitiveType::Long)], vec![
+                vec![Some(Datum::long(20))],
+            ])
+            .expect("long key is eligible");
+        assert!(
+            eq_delete_key_fields_projected(std::slice::from_ref(&set), &[1, 2]),
+            "keys ⊆ projection → eligible"
+        );
+        assert!(
+            eq_delete_key_fields_projected(std::slice::from_ref(&set), &[1]),
+            "key alone is enough"
+        );
+        assert!(
+            !eq_delete_key_fields_projected(std::slice::from_ref(&set), &[2]),
+            "key missing from projection → not eligible (RowFilter fallback)"
+        );
+        assert!(
+            !eq_delete_key_fields_projected(&[], &[1]),
+            "empty sets are never eligible"
+        );
+    }
+
+    /// When the eq-delete key is projected, the Parquet MoR path applies the keyset keep-mask
+    /// post-decode. Survivors must match the predicate oracle (delete ids 20 and 40).
+    #[tokio::test]
+    async fn parquet_eq_keyset_path_when_keys_projected() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+            (40, Some("d")),
+            (50, Some("e")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[20, 40]);
+
+        // Project both id (key) and data → keyset path eligible.
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        let batches = run_scan(task).await;
+        assert_eq!(
+            surviving_ids(&batches),
+            vec![10, 30, 50],
+            "keyset MoR path must drop deleted ids 20 and 40"
+        );
+    }
+
+    /// Mutation bait: a keyset path that forgot to apply deletes would keep 20/40.
+    #[tokio::test]
+    async fn parquet_eq_keyset_mutation_bait_drops_deleted_ids() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[20]);
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        let ids = surviving_ids(&run_scan(task).await);
+        assert!(
+            !ids.contains(&20),
+            "id=20 MUST be deleted by the keyset/post-decode path"
+        );
+        assert_eq!(ids, vec![10, 30]);
+    }
+
+    /// When the eq-delete key is NOT projected, the reader falls back to the RowFilter path
+    /// without error. Survivors still match the oracle (deletes applied via predicate pushdown).
+    ///
+    /// Note: projecting only `data` (field 2) means the output has no `id` column — we assert
+    /// surviving *data* values instead.
+    #[tokio::test]
+    async fn parquet_eq_keyset_falls_back_when_keys_not_projected() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+            (40, Some("d")),
+            (50, Some("e")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[20, 40]);
+
+        // Project ONLY data (field 2) — key field 1 is absent → RowFilter fallback.
+        let task = parquet_task(&data_path, schema, vec![2], vec![eq_del]);
+        let batches = run_scan(task).await;
+
+        let mut data_vals: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column_by_name("data").expect("data column");
+                (0..b.num_rows()).map(move |i| {
+                    if col.is_null(i) {
+                        String::new()
+                    } else {
+                        col.as_string::<i32>().value(i).to_string()
+                    }
+                })
+            })
+            .collect();
+        data_vals.sort();
+        assert_eq!(
+            data_vals,
+            vec!["a".to_string(), "c".to_string(), "e".to_string()],
+            "fallback RowFilter path must still drop rows whose id was equality-deleted"
+        );
+        // No `id` column in the projection — proves we did not require the key in the output.
+        assert!(
+            batches.iter().all(|b| b.column_by_name("id").is_none()),
+            "key column must remain unprojected"
+        );
+    }
+
+    /// Direct unit pin of the shared keep-mask helper: set path matches predicate oracle on a
+    /// non-null long-key batch (same contract as delete_filter H6 harness, routed through
+    /// `ArrowReader::eq_delete_keep_mask`).
+    #[test]
+    fn test_eq_delete_keep_mask_set_matches_oracle() {
+        use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
+        use crate::expr::{Bind, Predicate, Reference};
+
+        let schema = test_schema();
+        // Data batch with field-id metadata so both paths resolve column 1.
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+            ])),
+            vec![Arc::new(Int64Array::from(vec![Some(10i64), Some(20), Some(30)])) as ArrayRef],
+        )
+        .expect("batch");
+
+        let delete_rows = vec![vec![Some(Datum::long(20))]];
+        let set = EqDeleteKeySet::try_build(
+            vec![(1, "id".to_string(), PrimitiveType::Long)],
+            delete_rows.clone(),
+        )
+        .expect("set builds");
+
+        // Predicate oracle: NOT(id = 20) survival → deleted mask [false, true, false].
+        let survival = Reference::new("id")
+            .equal_to(Datum::long(20))
+            .not()
+            .rewrite_not();
+        // Fold into a single-file survival predicate shape (AlwaysTrue.and leaves).
+        let survival: Predicate = survival;
+        let bound = survival.bind(schema, false).expect("bind");
+        let survives = evaluate_predicate_to_mask(&bound, &batch).expect("eval");
+        let oracle_deleted: Vec<bool> = (0..survives.len())
+            .map(|i| !(survives.is_valid(i) && survives.value(i)))
+            .collect();
+
+        let keep = ArrowReader::eq_delete_keep_mask(
+            &batch,
+            batch.num_rows(),
+            Some(&bound),
+            Some(std::slice::from_ref(&set)),
+        )
+        .expect("keep mask")
+        .expect("mask present");
+        let set_deleted: Vec<bool> = (0..keep.len()).map(|i| !keep.value(i)).collect();
+        assert_eq!(
+            set_deleted, oracle_deleted,
+            "eq_delete_keep_mask set path must match predicate oracle"
+        );
+        assert_eq!(set_deleted, vec![false, true, false]);
+        // Sanity: BooleanArray keep mask length matches the batch.
+        assert_eq!(keep.len(), 3);
+    }
+
+    /// Critic-octo C1-Q-001: when keys are projected (keyset post-decode path), the scan residual
+    /// must still be applied via RowFilter. Survivors = residual ∩ ¬eq-deleted.
+    #[tokio::test]
+    async fn parquet_eq_keyset_with_scan_residual() {
+        use crate::expr::{Bind, Predicate, Reference};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        // ids 10..50; residual will keep only data ∈ {a,b,c}; eq-delete removes 20.
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+            (40, Some("d")),
+            (50, Some("e")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[20]);
+
+        let residual = Reference::new("data")
+            .equal_to(Datum::string("a"))
+            .or(Reference::new("data").equal_to(Datum::string("b")))
+            .or(Reference::new("data").equal_to(Datum::string("c")));
+        let residual: Predicate = residual;
+        let bound = residual.bind(schema.clone(), true).expect("bind residual");
+
+        let mut task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        task.predicate = Some(bound);
+
+        let batches = run_scan(task).await;
+        // Residual keeps a,b,c (ids 10,20,30); eq-delete drops 20 → 10,30.
+        assert_eq!(
+            surviving_ids(&batches),
+            vec![10, 30],
+            "keyset MoR path must AND scan residual with eq-deletes (C1-Q-001)"
+        );
+    }
+
+    /// Critic-octo C1-Q-002: nullable key column with a NULL cell forces predicate fallback
+    /// under the keyset-eligible path. A value-delete must NOT drop the NULL-key row
+    /// (Java nulls-first / unit A2).
+    #[tokio::test]
+    async fn parquet_eq_keyset_null_key_falls_back_to_predicate() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Optional id so NULL keys are legal in the data file.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let data_path = tmp
+            .path()
+            .join("data-null-key.parquet")
+            .to_string_lossy()
+            .to_string();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("data", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![Some(10i64), None, Some(20)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("null-key"),
+                Some("b"),
+            ])) as ArrayRef,
+        ])
+        .expect("batch");
+        {
+            let file = File::create(&data_path).expect("create");
+            let mut writer = ArrowWriter::try_new(
+                file,
+                arrow_schema,
+                Some(WriterProperties::builder().build()),
+            )
+            .expect("writer");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
+        }
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        // Value-delete id=20 only — must not delete the NULL-key row.
+        let eq_del = write_eq_delete_file(&del_path, &[20]);
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        let batches = run_scan(task).await;
+
+        let mut data_vals: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column_by_name("data").expect("data");
+                (0..b.num_rows()).map(move |i| {
+                    if col.is_null(i) {
+                        String::new()
+                    } else {
+                        col.as_string::<i32>().value(i).to_string()
+                    }
+                })
+            })
+            .collect();
+        data_vals.sort();
+        assert_eq!(
+            data_vals,
+            vec!["a".to_string(), "null-key".to_string()],
+            "NULL-key row must survive a value eq-delete; id=20 must be dropped (C1-Q-002)"
+        );
+    }
+
+    /// Critic-octo C2-Q-001: composite equality key (id + data) on the Parquet keyset path.
+    /// Pins multi-column tuple membership — a sabotage that only matches the first key column
+    /// would over-delete.
+    #[tokio::test]
+    async fn parquet_eq_keyset_composite_key() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (20, Some("c")), // same id, different data — must SURVIVE if delete is (20,b) only
+            (30, Some("d")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del-composite.parquet")
+            .to_string_lossy()
+            .to_string();
+        // Composite eq-delete: only (id=20, data=b).
+        let del_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("data", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let del_batch = RecordBatch::try_new(del_schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![20i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("b")])) as ArrayRef,
+        ])
+        .expect("del batch");
+        {
+            let file = File::create(&del_path).expect("create");
+            let mut writer =
+                ArrowWriter::try_new(file, del_schema, Some(WriterProperties::builder().build()))
+                    .expect("writer");
+            writer.write(&del_batch).expect("write");
+            writer.close().expect("close");
+        }
+        let eq_del = FileScanTaskDeleteFile {
+            file_path: del_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&del_path).expect("stat").len(),
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: 0,
+            equality_ids: Some(vec![1, 2]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        let batches = run_scan(task).await;
+        // Expect (10,a), (20,c), (30,d) — not (20,b).
+        let mut pairs: Vec<(i64, String)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ids = b
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec();
+                let data = b.column_by_name("data").expect("data");
+                ids.into_iter().enumerate().map(move |(i, id)| {
+                    let s = if data.is_null(i) {
+                        String::new()
+                    } else {
+                        data.as_string::<i32>().value(i).to_string()
+                    };
+                    (id, s)
+                })
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (10, "a".to_string()),
+                (20, "c".to_string()),
+                (30, "d".to_string())
+            ],
+            "composite keyset must delete only the matching (id,data) tuple (C2-Q-001)"
+        );
+    }
+
+    /// Critic-octo C2-Q-002: positional RowSelection + eq keyset post-decode on one Parquet task.
+    #[tokio::test]
+    async fn parquet_eq_keyset_with_positional_deletes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        // positions: 0→10, 1→20, 2→30, 3→40
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+            (40, Some("d")),
+        ]);
+        let eq_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&eq_path, &[20]); // drops id 20 (pos 1)
+
+        let pos_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        // Pos-delete physical position 3 (id 40).
+        let pos_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2147483546".to_string(),
+            )])),
+            Field::new("pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2147483545".to_string(),
+            )])),
+        ]));
+        let pos_batch = RecordBatch::try_new(pos_schema.clone(), vec![
+            Arc::new(StringArray::from(vec![data_path.as_str()])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![3i64])) as ArrayRef,
+        ])
+        .expect("pos batch");
+        {
+            let file = File::create(&pos_path).expect("create");
+            let mut writer =
+                ArrowWriter::try_new(file, pos_schema, Some(WriterProperties::builder().build()))
+                    .expect("writer");
+            writer.write(&pos_batch).expect("write");
+            writer.close().expect("close");
+        }
+        let pos_del = FileScanTaskDeleteFile {
+            file_path: pos_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&pos_path).expect("stat").len(),
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del, pos_del]);
+        let ids = surviving_ids(&run_scan(task).await);
+        assert_eq!(
+            ids,
+            vec![10, 30],
+            "pos must drop id=40 and eq-keyset must drop id=20 (C2-Q-002)"
+        );
+    }
+
+    /// Critic-octo C3-Q-001: keyset path when the projection is *only* the key column (no
+    /// non-key data columns). Gate is keys ⊆ projection, not projection == full schema.
+    #[tokio::test]
+    async fn parquet_eq_keyset_project_key_only() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[20]);
+        // Project only field 1 (the key) — keyset eligible, output has no `data` column.
+        let task = parquet_task(&data_path, schema, vec![1], vec![eq_del]);
+        let ids = surviving_ids(&run_scan(task).await);
+        assert_eq!(
+            ids,
+            vec![10, 30],
+            "key-only projection keyset path (C3-Q-001)"
+        );
+    }
+
+    /// Critic-octo C3-Q-002: two eq-delete files OR-combined under the keyset path
+    /// (a row matching EITHER file is deleted).
+    #[tokio::test]
+    async fn parquet_eq_keyset_two_delete_files_or() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+            (40, Some("d")),
+        ]);
+        let d1 = tmp.path().join("eq1.parquet").to_string_lossy().to_string();
+        let d2 = tmp.path().join("eq2.parquet").to_string_lossy().to_string();
+        let eq1 = write_eq_delete_file(&d1, &[20]);
+        let eq2 = write_eq_delete_file(&d2, &[40]);
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq1, eq2]);
+        assert_eq!(
+            surviving_ids(&run_scan(task).await),
+            vec![10, 30],
+            "two eq-delete keysets must OR (drop 20 and 40) (C3-Q-002)"
+        );
+    }
+
+    /// Critic-octo C4-Q-002: keyset path that deletes every row yields empty (or no-row) output —
+    /// must not error and must not resurrect rows.
+    #[tokio::test]
+    async fn parquet_eq_keyset_deletes_all_rows() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[(10, Some("a")), (20, Some("b"))]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[10, 20]);
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        let batches = run_scan(task).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 0,
+            "all-deleted keyset path must leave zero rows (C4-Q-002)"
+        );
     }
 }
