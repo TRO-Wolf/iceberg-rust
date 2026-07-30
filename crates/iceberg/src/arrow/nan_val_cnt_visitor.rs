@@ -360,6 +360,44 @@ mod tests {
     }
 
     #[test]
+    fn map_key_float_enables_gate() {
+        use crate::spec::MapType;
+        let key = Arc::new(NestedField::map_key_element(
+            2,
+            Type::Primitive(PrimitiveType::Float),
+        ));
+        let value = Arc::new(NestedField::map_value_element(
+            3,
+            Type::Primitive(PrimitiveType::String),
+            false,
+        ));
+        let map = Type::Map(MapType::new(key, value));
+        let schema = schema_with_fields(vec![NestedField::optional(1, "m", map)]);
+        assert!(
+            schema_needs_nan_value_counts(&schema, &MetricsConfig::default()),
+            "map key float leaf must enable the NaN visitor"
+        );
+    }
+
+    #[test]
+    fn metrics_counts_mode_enables_gate_for_float() {
+        let schema = schema_with_fields(vec![NestedField::optional(
+            1,
+            "score",
+            Type::Primitive(PrimitiveType::Float),
+        )]);
+        let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([(
+            "write.metadata.metrics.default".to_string(),
+            "counts".to_string(),
+        )]));
+        assert_eq!(metrics.default_mode_of(), MetricsMode::Counts);
+        assert!(
+            schema_needs_nan_value_counts(&schema, &metrics),
+            "MetricsMode::Counts must collect nan_value_counts"
+        );
+    }
+
+    #[test]
     fn column_override_full_enables_gate_when_default_none() {
         let schema = schema_with_fields(vec![NestedField::optional(
             1,

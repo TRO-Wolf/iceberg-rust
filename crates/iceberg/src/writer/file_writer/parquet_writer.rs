@@ -1179,6 +1179,63 @@ mod tests {
         Ok(())
     }
 
+    /// Empty batch under a gate-on float writer must not invent nan_value_counts entries.
+    #[tokio::test]
+    async fn test_empty_batch_under_gate_emits_no_nan_counts() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-empty".to_string(), None, DataFileFormat::Parquet);
+
+        let schema =
+            {
+                let fields = vec![Field::new("score", DataType::Float32, true).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+                )];
+                Arc::new(arrow_schema::Schema::new(fields))
+            };
+        let empty = RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(
+            Vec::<f32>::new(),
+        )) as ArrayRef])
+        .unwrap();
+        let non_empty =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(vec![
+                1.0_f32, 2.0,
+            ])) as ArrayRef])
+            .unwrap();
+        let iceberg_schema: SchemaRef =
+            Arc::new(empty.schema().as_ref().try_into().expect("iceberg schema"));
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .build(output_file)
+            .await?;
+        assert!(pw.collect_nan_value_counts);
+        pw.write(&empty).await?;
+        pw.write(&non_empty).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        // No NaNs written — map may be empty or zero; must not report positive nan counts.
+        assert!(
+            data_file.nan_value_counts().values().all(|&c| c == 0)
+                || data_file.nan_value_counts().is_empty(),
+            "empty+non-NaN batches must not produce positive nan_value_counts"
+        );
+        Ok(())
+    }
+
     /// Multi-batch NaN accumulation under a gate-on float writer: counts sum across write() calls.
     /// MUTATION: drop Occupied-branch add in `accumulate_nan_count` ⇒ second batch overwrites, pin fails.
     #[tokio::test]
