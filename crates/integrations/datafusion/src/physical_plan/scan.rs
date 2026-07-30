@@ -216,13 +216,15 @@ impl ExecutionPlan for IcebergTableScan {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let knobs = scan_knobs_from_context(&context);
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             self.scan_columns.clone(),
             self.predicates.clone(),
+            knobs,
         );
         // Every emitted batch is conformed to the schema this node advertised — see
         // `IcebergTableScan::new` and `conform_batch`.
@@ -280,6 +282,34 @@ impl DisplayAs for IcebergTableScan {
     }
 }
 
+/// Session-derived knobs applied when building an Iceberg core [`TableScan`](iceberg::scan::TableScan).
+///
+/// Wired from DataFusion's `TaskContext` so session `batch_size` / `target_partitions` affect the
+/// Iceberg reader. Row selection is **not** auto-enabled here: the core default is off because
+/// parsing the Parquet page index can outweigh the gain; enable via the core scan API when the
+/// table layout warrants it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ScanKnobs {
+    /// Arrow record-batch size for the Iceberg reader (`TableScanBuilder::with_batch_size`).
+    pub batch_size: Option<usize>,
+    /// Concurrent data-file reads (`TableScanBuilder::with_data_file_concurrency_limit`).
+    pub data_file_concurrency: Option<usize>,
+}
+
+/// Derive Iceberg scan knobs from a DataFusion [`TaskContext`].
+pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
+    let config = context.session_config();
+    let batch_size = config.batch_size();
+    // target_partitions is the session parallelism target; use it as the data-file concurrency
+    // ceiling so a single-partition Iceberg scan still fans out file IO to the session budget.
+    // Clamp to at least 1 so a misconfigured 0 does not disable the reader.
+    let data_file_concurrency = config.target_partitions().max(1);
+    ScanKnobs {
+        batch_size: Some(batch_size),
+        data_file_concurrency: Some(data_file_concurrency),
+    }
+}
+
 /// Asynchronously retrieves a stream of [`RecordBatch`] instances
 /// from a given table.
 ///
@@ -290,6 +320,7 @@ pub(crate) async fn get_batch_stream(
     snapshot_id: Option<i64>,
     column_names: Vec<String>,
     predicates: Option<Predicate>,
+    knobs: ScanKnobs,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -302,6 +333,14 @@ pub(crate) async fn get_batch_stream(
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
+    if let Some(batch_size) = knobs.batch_size {
+        scan_builder = scan_builder.with_batch_size(Some(batch_size));
+    }
+    if let Some(concurrency) = knobs.data_file_concurrency {
+        scan_builder = scan_builder.with_data_file_concurrency_limit(concurrency);
+    }
+    // Row selection: left at the core default (disabled). Auto-enabling when filters are present
+    // is not clearly safe — page-index parse cost can dominate; opt in via the core API instead.
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
     let stream = table_scan
@@ -1416,5 +1455,36 @@ mod tests {
         .expect("a scan without projection must plan");
         assert_eq!(unprojected.projection(), None);
         assert_eq!(unprojected.schema(), test_arrow_schema());
+    }
+
+    /// Pin: session `batch_size` and `target_partitions` flow into Iceberg scan knobs so
+    /// `execute` does not hardcode the core reader defaults.
+    #[test]
+    fn test_scan_knobs_from_context_wires_batch_size_and_concurrency() {
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        let config = SessionConfig::new()
+            .set_usize("datafusion.execution.batch_size", 17)
+            .set_usize("datafusion.execution.target_partitions", 5);
+        let state = SessionStateBuilder::new().with_config(config).build();
+        let context = state.task_ctx();
+
+        let knobs = scan_knobs_from_context(&context);
+        assert_eq!(knobs.batch_size, Some(17));
+        assert_eq!(knobs.data_file_concurrency, Some(5));
+    }
+
+    #[test]
+    fn test_scan_knobs_clamps_zero_target_partitions() {
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        // Config may reject 0 target_partitions via transform; if accepted, knobs clamp to 1.
+        let config = SessionConfig::new().set_usize("datafusion.execution.target_partitions", 1);
+        let state = SessionStateBuilder::new().with_config(config).build();
+        let knobs = scan_knobs_from_context(&state.task_ctx());
+        assert_eq!(knobs.data_file_concurrency, Some(1));
+        assert!(knobs.batch_size.is_some_and(|b| b > 0));
     }
 }

@@ -31,8 +31,9 @@ use iceberg::io::{
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
+    Catalog, CatalogBuilder, CommitBaseLoadPlan, Error, ErrorKind, MetadataLocation, Namespace,
+    NamespaceIdent, Result, TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
+    plan_commit_base_load,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
@@ -250,22 +251,16 @@ impl GlueCatalog {
         self.file_io.clone()
     }
 
-    /// Loads a table from the Glue Catalog along with its version_id for optimistic locking.
-    ///
-    /// # Returns
-    /// A `Result` wrapping a tuple of (`Table`, `Option<String>`) where the String is the version_id
-    /// from Glue that should be used for optimistic concurrency control when updating the table.
-    ///
-    /// # Errors
-    /// This function may return an error in several scenarios, including:
-    /// - Failure to validate the namespace.
-    /// - Failure to retrieve the table from the Glue Catalog.
-    /// - Absence of metadata location information in the table's properties.
-    /// - Issues reading or deserializing the table's metadata file.
-    async fn load_table_with_version_id(
+    /// Glue GetTable for the service metadata pointer + version_id, without reading TableMetadata
+    /// from object storage. Used by the commit path to skip a second full metadata load when the
+    /// pointer still matches the commit base.
+    async fn get_table_pointer(
         &self,
         table: &TableIdent,
-    ) -> Result<(Table, Option<String>)> {
+    ) -> Result<(
+        String,         /* metadata_location */
+        Option<String>, /* version_id */
+    )> {
         let db_name = validate_namespace(table.namespace())?;
         let table_name = table.name();
 
@@ -290,6 +285,28 @@ impl GlueCatalog {
 
         let version_id = glue_table.version_id.clone();
         let metadata_location = get_metadata_location(&glue_table.parameters)?;
+        Ok((metadata_location, version_id))
+    }
+
+    /// Loads a table from the Glue Catalog along with its version_id for optimistic locking.
+    ///
+    /// # Returns
+    /// A `Result` wrapping a tuple of (`Table`, `Option<String>`) where the String is the version_id
+    /// from Glue that should be used for optimistic concurrency control when updating the table.
+    ///
+    /// # Errors
+    /// This function may return an error in several scenarios, including:
+    /// - Failure to validate the namespace.
+    /// - Failure to retrieve the table from the Glue Catalog.
+    /// - Absence of metadata location information in the table's properties.
+    /// - Issues reading or deserializing the table's metadata file.
+    async fn load_table_with_version_id(
+        &self,
+        table: &TableIdent,
+    ) -> Result<(Table, Option<String>)> {
+        let db_name = validate_namespace(table.namespace())?;
+        let table_name = table.name();
+        let (metadata_location, version_id) = self.get_table_pointer(table).await?;
 
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
 
@@ -304,6 +321,64 @@ impl GlueCatalog {
             .build()?;
 
         Ok((table, version_id))
+    }
+
+    /// Resolve the base table for a commit: GetTable for the pointer + version_id, then either
+    /// reuse a pre-loaded base (skip S3 metadata parse), conflict early, or full-load metadata.
+    async fn resolve_commit_base(
+        &self,
+        table_ident: &TableIdent,
+        commit: &mut TableCommit,
+    ) -> Result<(
+        Table,
+        Option<String>, /* version_id */
+        String,         /* current_metadata_location */
+    )> {
+        let (service_location, version_id) = self.get_table_pointer(table_ident).await?;
+        let base_loc = commit.base_metadata_location().map(str::to_string);
+        let provided = commit.take_base_table();
+        let provided_loc = provided
+            .as_ref()
+            .and_then(|t| t.metadata_location().map(str::to_string));
+
+        match plan_commit_base_load(
+            &service_location,
+            base_loc.as_deref(),
+            provided_loc.as_deref(),
+        ) {
+            CommitBaseLoadPlan::ReuseProvided => {
+                let table = provided.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "commit base-load plan is ReuseProvided but no base table was supplied",
+                    )
+                })?;
+                Ok((table, version_id, service_location))
+            }
+            CommitBaseLoadPlan::Conflict => Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "Cannot commit table {table_ident}: concurrent modification \
+                     (expected base metadata location {}, found {service_location})",
+                    base_loc.as_deref().unwrap_or("<none>")
+                ),
+            )
+            .with_retryable(true)),
+            CommitBaseLoadPlan::FullLoad => {
+                let metadata = TableMetadata::read_from(&self.file_io, &service_location).await?;
+                let db_name = validate_namespace(table_ident.namespace())?;
+                let table = Table::builder()
+                    .file_io(self.file_io())
+                    .metadata_location(service_location.clone())
+                    .metadata(metadata)
+                    .identifier(TableIdent::new(
+                        NamespaceIdent::new(db_name),
+                        table_ident.name().to_owned(),
+                    ))
+                    .build()?;
+                Ok((table, version_id, service_location))
+            }
+        }
     }
 }
 
@@ -841,13 +916,14 @@ impl Catalog for GlueCatalog {
             .build()?)
     }
 
-    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         let table_namespace = validate_namespace(table_ident.namespace())?;
 
-        let (current_table, current_version_id) =
-            self.load_table_with_version_id(&table_ident).await?;
-        let current_metadata_location = current_table.metadata_location_result()?.to_string();
+        // GetTable for version_id + pointer; skip the second full S3 metadata parse when the
+        // service pointer still matches the commit base and Transaction supplied a base table.
+        let (current_table, current_version_id, current_metadata_location) =
+            self.resolve_commit_base(&table_ident, &mut commit).await?;
 
         let staged_table = commit.apply(current_table)?;
         let staged_metadata_location = staged_table.metadata_location_result()?;

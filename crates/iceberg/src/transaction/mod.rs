@@ -542,11 +542,13 @@ impl Transaction {
 
         let refreshed = catalog.load_table(self.table.identifier()).await?;
 
-        if self.table.metadata() != refreshed.metadata()
-            || self.table.metadata_location() != refreshed.metadata_location()
-        {
+        // Location first (cheap string compare), then deep TableMetadata PartialEq only when
+        // the catalog pointer is unchanged. Metadata files are immutable at a given location,
+        // so a pointer mismatch is sufficient to re-base; a pointer match still falls through
+        // to content equality as a defensive check against a malformed catalog.
+        if is_transaction_base_stale(&self.table, &refreshed) {
             // current base is stale, use refreshed as base and re-apply transaction actions
-            self.table = refreshed.clone();
+            self.table = refreshed;
         }
 
         let mut current_table = self.table.clone();
@@ -607,6 +609,10 @@ impl Transaction {
             // location-CAS; on a conflict the retry reloads, advancing this to the winner's location
             // so the next attempt's CAS matches (Java `BaseMetastoreTableOperations.commit` retry).
             .base_metadata_location(self.table.metadata_location().map(str::to_string))
+            // Metastore catalogs (Glue / S3 Tables) may reuse this base and skip a second full
+            // TableMetadata object-store read when the service pointer still matches
+            // `base_metadata_location`. OCC still goes through version token / location CAS.
+            .base_table(Some(self.table.clone()))
             .build();
 
         let committed = catalog.update_table(table_commit).await?;
@@ -656,6 +662,19 @@ impl Transaction {
 
         Ok(committed)
     }
+}
+
+/// Whether a transaction must re-base onto a catalog refresh before re-applying actions.
+///
+/// Compares `metadata_location` first (cheap) and only falls through to deep
+/// [`TableMetadata`](crate::spec::TableMetadata) equality when the pointer is unchanged.
+/// Exported for unit pins; production use is only inside [`Transaction::do_commit`].
+pub(crate) fn is_transaction_base_stale(
+    current: &crate::table::Table,
+    refreshed: &crate::table::Table,
+) -> bool {
+    current.metadata_location() != refreshed.metadata_location()
+        || current.metadata() != refreshed.metadata()
 }
 
 #[cfg(test)]
@@ -794,6 +813,26 @@ mod tests {
             crate::spec::FormatVersion::V3,
         )
         .await
+    }
+
+    /// Pin: location-first stale check re-bases when the catalog pointer moved, without needing
+    /// deep metadata content to differ (metadata files are immutable at a given location).
+    #[test]
+    fn test_is_transaction_base_stale_location_first() {
+        let current = make_v2_table();
+        let same_location = current.clone();
+        assert!(
+            !super::is_transaction_base_stale(&current, &same_location),
+            "identical table is not stale"
+        );
+
+        let moved = current
+            .clone()
+            .with_metadata_location("s3://bucket/test/location/metadata/v2-moved.json".to_string());
+        assert!(
+            super::is_transaction_base_stale(&current, &moved),
+            "a moved metadata_location must mark the base stale before any deep PartialEq"
+        );
     }
 
     /// Helper function to create a test table with retry properties
