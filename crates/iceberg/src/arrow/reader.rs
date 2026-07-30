@@ -7458,4 +7458,173 @@ mod parquet_eq_keyset_mor_tests {
             "NULL-key row must survive a value eq-delete; id=20 must be dropped (C1-Q-002)"
         );
     }
+
+    /// Critic-octo C2-Q-001: composite equality key (id + data) on the Parquet keyset path.
+    /// Pins multi-column tuple membership — a sabotage that only matches the first key column
+    /// would over-delete.
+    #[tokio::test]
+    async fn parquet_eq_keyset_composite_key() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (20, Some("c")), // same id, different data — must SURVIVE if delete is (20,b) only
+            (30, Some("d")),
+        ]);
+        let del_path = tmp
+            .path()
+            .join("eq-del-composite.parquet")
+            .to_string_lossy()
+            .to_string();
+        // Composite eq-delete: only (id=20, data=b).
+        let del_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("data", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let del_batch = RecordBatch::try_new(del_schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![20i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("b")])) as ArrayRef,
+        ])
+        .expect("del batch");
+        {
+            let file = File::create(&del_path).expect("create");
+            let mut writer =
+                ArrowWriter::try_new(file, del_schema, Some(WriterProperties::builder().build()))
+                    .expect("writer");
+            writer.write(&del_batch).expect("write");
+            writer.close().expect("close");
+        }
+        let eq_del = FileScanTaskDeleteFile {
+            file_path: del_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&del_path).expect("stat").len(),
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: 0,
+            equality_ids: Some(vec![1, 2]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        let batches = run_scan(task).await;
+        // Expect (10,a), (20,c), (30,d) — not (20,b).
+        let mut pairs: Vec<(i64, String)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ids = b
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec();
+                let data = b.column_by_name("data").expect("data");
+                ids.into_iter().enumerate().map(move |(i, id)| {
+                    let s = if data.is_null(i) {
+                        String::new()
+                    } else {
+                        data.as_string::<i32>().value(i).to_string()
+                    };
+                    (id, s)
+                })
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (10, "a".to_string()),
+                (20, "c".to_string()),
+                (30, "d".to_string())
+            ],
+            "composite keyset must delete only the matching (id,data) tuple (C2-Q-001)"
+        );
+    }
+
+    /// Critic-octo C2-Q-002: positional RowSelection + eq keyset post-decode on one Parquet task.
+    #[tokio::test]
+    async fn parquet_eq_keyset_with_positional_deletes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        // positions: 0→10, 1→20, 2→30, 3→40
+        write_parquet_data_file(&data_path, &[
+            (10, Some("a")),
+            (20, Some("b")),
+            (30, Some("c")),
+            (40, Some("d")),
+        ]);
+        let eq_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&eq_path, &[20]); // drops id 20 (pos 1)
+
+        let pos_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        // Pos-delete physical position 3 (id 40).
+        let pos_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2147483546".to_string(),
+            )])),
+            Field::new("pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2147483545".to_string(),
+            )])),
+        ]));
+        let pos_batch = RecordBatch::try_new(pos_schema.clone(), vec![
+            Arc::new(StringArray::from(vec![data_path.as_str()])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![3i64])) as ArrayRef,
+        ])
+        .expect("pos batch");
+        {
+            let file = File::create(&pos_path).expect("create");
+            let mut writer =
+                ArrowWriter::try_new(file, pos_schema, Some(WriterProperties::builder().build()))
+                    .expect("writer");
+            writer.write(&pos_batch).expect("write");
+            writer.close().expect("close");
+        }
+        let pos_del = FileScanTaskDeleteFile {
+            file_path: pos_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&pos_path).expect("stat").len(),
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del, pos_del]);
+        let ids = surviving_ids(&run_scan(task).await);
+        assert_eq!(
+            ids,
+            vec![10, 30],
+            "pos must drop id=40 and eq-keyset must drop id=20 (C2-Q-002)"
+        );
+    }
 }
