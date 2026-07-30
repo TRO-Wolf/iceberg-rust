@@ -398,6 +398,49 @@ mod tests {
     }
 
     #[test]
+    fn metrics_truncate_mode_enables_gate_for_float() {
+        let schema = schema_with_fields(vec![NestedField::optional(
+            1,
+            "score",
+            Type::Primitive(PrimitiveType::Float),
+        )]);
+        let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([(
+            "write.metadata.metrics.default".to_string(),
+            "truncate(1)".to_string(),
+        )]));
+        assert!(
+            matches!(metrics.default_mode_of(), MetricsMode::Truncate(1)),
+            "parsed truncate(1)"
+        );
+        assert!(
+            schema_needs_nan_value_counts(&schema, &metrics),
+            "Truncate mode still collects nan_value_counts"
+        );
+    }
+
+    #[test]
+    fn mixed_column_modes_gate_true_when_any_float_collects() {
+        let schema = schema_with_fields(vec![
+            NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Float)),
+            NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Double)),
+        ]);
+        let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([
+            (
+                "write.metadata.metrics.default".to_string(),
+                "none".to_string(),
+            ),
+            (
+                "write.metadata.metrics.column.b".to_string(),
+                "full".to_string(),
+            ),
+        ]));
+        assert!(
+            schema_needs_nan_value_counts(&schema, &metrics),
+            "gate true when any float leaf collects counts"
+        );
+    }
+
+    #[test]
     fn column_override_full_enables_gate_when_default_none() {
         let schema = schema_with_fields(vec![NestedField::optional(
             1,

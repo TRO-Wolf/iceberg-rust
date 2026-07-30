@@ -1179,6 +1179,88 @@ mod tests {
         Ok(())
     }
 
+    /// Two float columns: metrics default none + column `b` full. Gate on; only field b gets
+    /// nan_value_counts after retain (column `a` mode none is stripped).
+    #[tokio::test]
+    async fn test_mixed_float_metrics_modes_retain_only_collecting_column() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-modes".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = {
+            let fields = vec![
+                Field::new("a", DataType::Float32, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+                Field::new("b", DataType::Float64, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )])),
+            ];
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let to_write = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Float32Array::from(vec![f32::NAN, 1.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0_f64, f64::NAN])) as ArrayRef,
+        ])
+        .unwrap();
+        let iceberg_schema: SchemaRef = Arc::new(
+            to_write
+                .schema()
+                .as_ref()
+                .try_into()
+                .expect("iceberg schema"),
+        );
+        let metrics = crate::spec::MetricsConfig::from_properties(&HashMap::from([
+            (
+                "write.metadata.metrics.default".to_string(),
+                "none".to_string(),
+            ),
+            (
+                "write.metadata.metrics.column.b".to_string(),
+                "full".to_string(),
+            ),
+        ]));
+        assert!(schema_needs_nan_value_counts(
+            iceberg_schema.as_ref(),
+            &metrics
+        ));
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .with_metrics_config(metrics)
+            .build(output_file)
+            .await?;
+        assert!(pw.collect_nan_value_counts);
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        assert_eq!(
+            data_file.nan_value_counts().get(&2).copied(),
+            Some(1),
+            "column b (full) keeps nan count"
+        );
+        assert!(
+            !data_file.nan_value_counts().contains_key(&1),
+            "column a (none) must be stripped from nan_value_counts"
+        );
+        Ok(())
+    }
+
     /// Mixed int+float schema: gate is on; nan_value_counts only for the float field id.
     #[tokio::test]
     async fn test_mixed_int_float_nan_counts_only_on_float_id() -> Result<()> {
