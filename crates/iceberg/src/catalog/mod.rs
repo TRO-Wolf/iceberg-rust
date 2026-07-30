@@ -601,6 +601,79 @@ pub struct TableCommit {
     /// metadata_location = ?`) ignore this field.
     #[builder(default)]
     base_metadata_location: Option<String>,
+    /// Optional pre-loaded base table for metastore catalogs (Glue / S3 Tables) that can skip a
+    /// second full TableMetadata object-store read when the service pointer still matches
+    /// [`Self::base_metadata_location`]. Optimistic concurrency still goes through the service
+    /// version token / location CAS. Catalogs that ignore this field keep their existing load path.
+    #[builder(default)]
+    base_table: Option<Table>,
+}
+
+/// How a metastore catalog should obtain the base table for [`Catalog::update_table`].
+///
+/// Used by Glue / S3 Tables to avoid re-reading TableMetadata from object storage when the
+/// service pointer still matches the commit base and a pre-loaded base table is available.
+/// OCC is preserved: a mismatched pointer is a retryable conflict, and the version-token CAS
+/// still guards the final pointer flip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitBaseLoadPlan {
+    /// Service pointer matches the commit base and a provided base table is usable — skip the
+    /// object-store metadata JSON parse.
+    ReuseProvided,
+    /// Commit base location is known and does not match the service pointer — concurrent
+    /// modification; return a retryable [`ErrorKind::CatalogCommitConflicts`].
+    Conflict,
+    /// Must load full table metadata (no base location on the commit, or no usable provided base).
+    FullLoad,
+}
+
+/// Plan whether a metastore catalog can reuse a pre-loaded base table for apply.
+///
+/// * `service_metadata_location` — metadata location currently stored by the service (Glue
+///   parameters / S3 Tables GetTable).
+/// * `base_metadata_location` — [`TableCommit::base_metadata_location`].
+/// * `provided_base_metadata_location` — location on the optional pre-loaded base table.
+///
+/// **OCC contract:** a mismatched commit base vs service pointer is always [`Conflict`], even if
+/// a provided table's location already matches the service (stale base + "current" forge). Reuse
+/// is location-only and assumes Iceberg metadata immutability at a given path; callers must not
+/// supply a `base_table` whose content does not match that location.
+pub fn plan_commit_base_load(
+    service_metadata_location: &str,
+    base_metadata_location: Option<&str>,
+    provided_base_metadata_location: Option<&str>,
+) -> CommitBaseLoadPlan {
+    match base_metadata_location {
+        Some(base) if base != service_metadata_location => CommitBaseLoadPlan::Conflict,
+        Some(_) if provided_base_metadata_location == Some(service_metadata_location) => {
+            CommitBaseLoadPlan::ReuseProvided
+        }
+        _ => CommitBaseLoadPlan::FullLoad,
+    }
+}
+
+/// Retryable conflict when a metastore commit base no longer matches the service pointer.
+///
+/// Metastore catalogs (Glue / S3 Tables) return this from `resolve_commit_base` on
+/// [`CommitBaseLoadPlan::Conflict`]. The error **must** stay
+/// [`ErrorKind::CatalogCommitConflicts`] and **retryable** so
+/// [`crate::transaction::Transaction::commit`] reloads, re-applies actions, and retries
+/// (Java `CommitFailedException` / only-retry-on-conflict). Dropping `retryable` permanently
+/// fails concurrent writers.
+pub fn commit_base_conflict_error(
+    table_ident: &TableIdent,
+    expected_base_metadata_location: Option<&str>,
+    service_metadata_location: &str,
+) -> Error {
+    Error::new(
+        ErrorKind::CatalogCommitConflicts,
+        format!(
+            "Cannot commit table {table_ident}: concurrent modification \
+             (expected base metadata location {}, found {service_metadata_location})",
+            expected_base_metadata_location.unwrap_or("<none>")
+        ),
+    )
+    .with_retryable(true)
 }
 
 impl TableCommit {
@@ -615,6 +688,18 @@ impl TableCommit {
     /// supports.
     pub fn base_metadata_location(&self) -> Option<&str> {
         self.base_metadata_location.as_deref()
+    }
+
+    /// Return the optional pre-loaded base table, if the commit carried one.
+    ///
+    /// See [`TableCommit::base_table`] for when metastore catalogs may reuse it.
+    pub fn base_table(&self) -> Option<&Table> {
+        self.base_table.as_ref()
+    }
+
+    /// Take the optional pre-loaded base table (catalog update paths).
+    pub fn take_base_table(&mut self) -> Option<Table> {
+        take(&mut self.base_table)
     }
 
     /// Take all requirements.
@@ -1419,7 +1504,10 @@ mod tests {
     use serde::de::DeserializeOwned;
     use uuid::uuid;
 
-    use super::{Catalog, UNNAMED_CATALOG, ViewRequirement, ViewUpdate};
+    use super::{
+        Catalog, CommitBaseLoadPlan, UNNAMED_CATALOG, ViewRequirement, ViewUpdate,
+        plan_commit_base_load,
+    };
     use crate::io::FileIO;
     use crate::spec::{
         BlobMetadata, EncryptedKey, FormatVersion, MAIN_BRANCH, NestedField, NullOrder, Operation,
@@ -2852,6 +2940,118 @@ mod tests {
         assert_eq!(
             updated_table.metadata().location,
             "s3://bucket/test/new_location/data",
+        );
+    }
+
+    /// Pin the metastore commit base-load plan: reuse when the service pointer still matches
+    /// the commit base and a provided base is available; conflict when the pointer moved;
+    /// full load otherwise. A regression here either double-loads metadata on the hot path
+    /// or silences concurrent-writer detection.
+    #[test]
+    fn test_plan_commit_base_load() {
+        let service = "s3://b/m/v1.json";
+        assert_eq!(
+            plan_commit_base_load(service, Some(service), Some(service)),
+            CommitBaseLoadPlan::ReuseProvided
+        );
+        assert_eq!(
+            plan_commit_base_load(service, Some("s3://b/m/other.json"), Some(service)),
+            CommitBaseLoadPlan::Conflict
+        );
+        assert_eq!(
+            plan_commit_base_load(service, Some(service), None),
+            CommitBaseLoadPlan::FullLoad
+        );
+        assert_eq!(
+            plan_commit_base_load(service, None, Some(service)),
+            CommitBaseLoadPlan::FullLoad
+        );
+        assert_eq!(
+            plan_commit_base_load(service, Some(service), Some("s3://b/m/stale.json")),
+            CommitBaseLoadPlan::FullLoad
+        );
+        // Concurrent forge matrix: commit base is stale (L0) while a provided table points at the
+        // *current* service pointer (L1). Must Conflict — never Reuse — or L0-planned updates
+        // would be applied against L1 content under a location-only match arm.
+        let service_l1 = "s3://b/m/v2.json";
+        assert_eq!(
+            plan_commit_base_load(service_l1, Some(service), Some(service_l1)),
+            CommitBaseLoadPlan::Conflict,
+            "stale base_metadata_location must win over a provided table at the current pointer"
+        );
+        // Empty-string locations: still location-equality only (no special-case silent reuse).
+        assert_eq!(
+            plan_commit_base_load("", Some(""), Some("")),
+            CommitBaseLoadPlan::ReuseProvided
+        );
+        assert_eq!(
+            plan_commit_base_load(service, Some(""), Some(service)),
+            CommitBaseLoadPlan::Conflict
+        );
+    }
+
+    /// Pin: early base-pointer conflict is CatalogCommitConflicts + retryable so Transaction
+    /// re-bases. A regression that drops retryable permanently fails concurrent writers.
+    #[test]
+    fn test_commit_base_conflict_error_is_retryable_conflict() {
+        let ident = TableIdent::from_strs(["ns", "t"]).expect("ident");
+        let err =
+            super::commit_base_conflict_error(&ident, Some("s3://b/m/v1.json"), "s3://b/m/v2.json");
+        assert_eq!(err.kind(), crate::ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable(), "base-pointer conflict must be retryable");
+        let msg = err.message();
+        assert!(
+            msg.contains("s3://b/m/v1.json") && msg.contains("s3://b/m/v2.json"),
+            "message must carry expected and found locations: {msg}"
+        );
+    }
+
+    /// Pin: planner Conflict cell composes with the retryable error helper used by Glue/S3 Tables.
+    #[test]
+    fn test_plan_conflict_composes_to_retryable_error() {
+        let service = "s3://b/m/v2.json";
+        let base = "s3://b/m/v1.json";
+        assert_eq!(
+            plan_commit_base_load(service, Some(base), Some(service)),
+            CommitBaseLoadPlan::Conflict
+        );
+        let ident = TableIdent::from_strs(["db", "tbl"]).expect("ident");
+        let err = super::commit_base_conflict_error(&ident, Some(base), service);
+        assert_eq!(err.kind(), crate::ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable());
+    }
+
+    /// Pin: `take_base_table` is oneshot — a second take cannot accidentally reuse a stolen base.
+    #[test]
+    fn test_table_commit_take_base_table_is_oneshot() {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2Valid.json"
+        ))
+        .expect("open fixture");
+        let metadata =
+            serde_json::from_reader::<_, TableMetadata>(BufReader::new(file)).expect("parse");
+        let table = Table::builder()
+            .metadata(metadata)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).expect("ident"))
+            .file_io(FileIO::new_with_memory())
+            .build()
+            .expect("table");
+        let loc = table.metadata_location().map(str::to_string);
+        let mut commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .updates(vec![])
+            .requirements(vec![])
+            .base_metadata_location(loc)
+            .base_table(Some(table))
+            .build();
+        assert!(commit.base_table().is_some());
+        assert!(commit.take_base_table().is_some());
+        assert!(
+            commit.base_table().is_none() && commit.take_base_table().is_none(),
+            "second take must be None"
         );
     }
 

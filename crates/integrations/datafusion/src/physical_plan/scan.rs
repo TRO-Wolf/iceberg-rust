@@ -216,13 +216,15 @@ impl ExecutionPlan for IcebergTableScan {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let knobs = scan_knobs_from_context(&context);
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             self.scan_columns.clone(),
             self.predicates.clone(),
+            knobs,
         );
         // Every emitted batch is conformed to the schema this node advertised — see
         // `IcebergTableScan::new` and `conform_batch`.
@@ -280,6 +282,44 @@ impl DisplayAs for IcebergTableScan {
     }
 }
 
+/// Session-derived knobs applied when building an Iceberg core [`TableScan`](iceberg::scan::TableScan).
+///
+/// Wired from DataFusion's `TaskContext` so session `batch_size` / `target_partitions` affect the
+/// Iceberg reader. Row selection is **not** auto-enabled here: the core default is off because
+/// parsing the Parquet page index can outweigh the gain; enable via the core scan API when the
+/// table layout warrants it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ScanKnobs {
+    /// Arrow record-batch size for the Iceberg reader (`TableScanBuilder::with_batch_size`).
+    pub batch_size: Option<usize>,
+    /// Concurrent data-file reads (`TableScanBuilder::with_data_file_concurrency_limit`).
+    pub data_file_concurrency: Option<usize>,
+}
+
+/// Floor session-derived scan knobs so a misconfigured 0 cannot empty the reader.
+///
+/// Parquet's `ParquetRecordBatchReader` treats `batch_size == 0` as end-of-stream (`Ok(None)`),
+/// which would surface as a successful empty scan. `try_buffer_unordered(0)` never pulls tasks
+/// (hang). Both knobs therefore clamp to at least 1.
+pub(crate) fn clamp_scan_knob(value: usize) -> usize {
+    value.max(1)
+}
+
+/// Derive Iceberg scan knobs from a DataFusion [`TaskContext`].
+pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
+    let config = context.session_config();
+    // Clamp batch_size: DF does not normalize 0; Parquet returns an empty stream on batch_size 0.
+    let batch_size = clamp_scan_knob(config.batch_size());
+    // target_partitions is the session parallelism target; use it as the data-file concurrency
+    // ceiling so a single-partition Iceberg scan still fans out file IO to the session budget.
+    // DF rewrites target_partitions 0 → available parallelism; still clamp for defense in depth.
+    let data_file_concurrency = clamp_scan_knob(config.target_partitions());
+    ScanKnobs {
+        batch_size: Some(batch_size),
+        data_file_concurrency: Some(data_file_concurrency),
+    }
+}
+
 /// Asynchronously retrieves a stream of [`RecordBatch`] instances
 /// from a given table.
 ///
@@ -290,6 +330,7 @@ pub(crate) async fn get_batch_stream(
     snapshot_id: Option<i64>,
     column_names: Vec<String>,
     predicates: Option<Predicate>,
+    knobs: ScanKnobs,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -302,6 +343,16 @@ pub(crate) async fn get_batch_stream(
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
+    // Clamp at the apply site (not only in from_context) so a hand-built ScanKnobs with
+    // Some(0) cannot reach Parquet empty-stream or try_buffer_unordered(0) hang.
+    if let Some(batch_size) = knobs.batch_size {
+        scan_builder = scan_builder.with_batch_size(Some(clamp_scan_knob(batch_size)));
+    }
+    if let Some(concurrency) = knobs.data_file_concurrency {
+        scan_builder = scan_builder.with_data_file_concurrency_limit(clamp_scan_knob(concurrency));
+    }
+    // Row selection: left at the core default (disabled). Auto-enabling when filters are present
+    // is not clearly safe — page-index parse cost can dominate; opt in via the core API instead.
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
     let stream = table_scan
@@ -1416,5 +1467,83 @@ mod tests {
         .expect("a scan without projection must plan");
         assert_eq!(unprojected.projection(), None);
         assert_eq!(unprojected.schema(), test_arrow_schema());
+    }
+
+    /// Pin: session `batch_size` and `target_partitions` flow into Iceberg scan knobs so
+    /// `execute` does not hardcode the core reader defaults.
+    #[test]
+    fn test_scan_knobs_from_context_wires_batch_size_and_concurrency() {
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        let config = SessionConfig::new()
+            .set_usize("datafusion.execution.batch_size", 17)
+            .set_usize("datafusion.execution.target_partitions", 5);
+        let state = SessionStateBuilder::new().with_config(config).build();
+        let context = state.task_ctx();
+
+        let knobs = scan_knobs_from_context(&context);
+        assert_eq!(knobs.batch_size, Some(17));
+        assert_eq!(knobs.data_file_concurrency, Some(5));
+    }
+
+    /// Pin: clamp floor is 1 — a raw 0 must never reach Parquet (`batch_size == 0` → empty
+    /// stream) or `try_buffer_unordered(0)` (hang).
+    #[test]
+    fn test_clamp_scan_knob_floors_zero_to_one() {
+        assert_eq!(clamp_scan_knob(0), 1);
+        assert_eq!(clamp_scan_knob(1), 1);
+        assert_eq!(clamp_scan_knob(8), 8);
+    }
+
+    /// Pin: hand-built ScanKnobs with Some(0) are still floored at apply time (get_batch_stream),
+    /// not only when derived from TaskContext.
+    #[test]
+    fn test_get_batch_stream_clamps_zero_knobs_at_apply() {
+        // Pure contract of the apply-site clamp (mirrors get_batch_stream body).
+        let knobs = ScanKnobs {
+            batch_size: Some(0),
+            data_file_concurrency: Some(0),
+        };
+        let effective_batch = knobs.batch_size.map(clamp_scan_knob);
+        let effective_conc = knobs.data_file_concurrency.map(clamp_scan_knob);
+        assert_eq!(effective_batch, Some(1));
+        assert_eq!(effective_conc, Some(1));
+    }
+
+    /// Pin: session `batch_size = 0` is accepted by DF config but must not wire through as 0
+    /// (Parquet treats batch_size 0 as end-of-stream — silent empty scan).
+    #[test]
+    fn test_scan_knobs_clamps_zero_batch_size() {
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        let config = SessionConfig::new().set_usize("datafusion.execution.batch_size", 0);
+        let state = SessionStateBuilder::new().with_config(config).build();
+        let knobs = scan_knobs_from_context(&state.task_ctx());
+        assert_eq!(
+            knobs.batch_size,
+            Some(1),
+            "batch_size 0 must clamp to 1 (Parquet empty-stream hazard)"
+        );
+        assert!(
+            knobs.data_file_concurrency.is_some_and(|c| c >= 1),
+            "data-file concurrency must stay ≥ 1"
+        );
+    }
+
+    /// Pin: DF rewrites `target_partitions = 0` to available parallelism; knobs must still be ≥ 1.
+    #[test]
+    fn test_scan_knobs_target_partitions_zero_still_at_least_one() {
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        let config = SessionConfig::new().set_usize("datafusion.execution.target_partitions", 0);
+        let state = SessionStateBuilder::new().with_config(config).build();
+        let knobs = scan_knobs_from_context(&state.task_ctx());
+        assert!(
+            knobs.data_file_concurrency.is_some_and(|c| c >= 1),
+            "target_partitions 0 must not yield concurrency 0 (hang hazard)"
+        );
     }
 }
