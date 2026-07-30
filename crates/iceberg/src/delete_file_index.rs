@@ -214,11 +214,16 @@ pub(crate) fn referenced_data_file_location(delete_file: &DataFile) -> Option<St
     }
 }
 
+/// Backpressure buffer capacity for delete-file contexts streamed into the index populate
+/// task. Sized to absorb a burst of delete entries without stalling concurrent manifest
+/// processing under typical scan concurrency; not a hard limit on total delete files (the
+/// receiver drains the stream into a `Vec` before indexing).
+const DELETE_FILE_INDEX_CHANNEL_CAPACITY: usize = 1024;
+
 impl DeleteFileIndex {
     /// create a new `DeleteFileIndex` along with the sender that populates it with delete files
     pub(crate) fn new() -> (DeleteFileIndex, Sender<DeleteFileContext>) {
-        // TODO: what should the channel limit be?
-        let (tx, rx) = channel(10);
+        let (tx, rx) = channel(DELETE_FILE_INDEX_CHANNEL_CAPACITY);
         let notify = Arc::new(Notify::new());
         let state = Arc::new(RwLock::new(DeleteFileIndexState::Populating(
             notify.clone(),

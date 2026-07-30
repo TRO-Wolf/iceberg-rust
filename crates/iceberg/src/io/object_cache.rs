@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::mem::size_of_val;
 use std::sync::Arc;
 
 use crate::io::FileIO;
@@ -26,6 +25,56 @@ use crate::spec::{
 use crate::{Error, ErrorKind, Result};
 
 const DEFAULT_CACHE_SIZE_BYTES: u64 = 32 * 1024 * 1024; // 32MB
+
+/// Rough per-entry memory estimate for a parsed [`Manifest`].
+///
+/// `size_of_val` only measures the shallow `Manifest` shell (metadata + `Vec` header), not
+/// the heap-backed entry list. Entry count × this constant is a stable capacity-accounting
+/// proxy so large manifests weigh more than tiny ones under moka's weighted eviction.
+const ROUGH_MANIFEST_ENTRY_BYTES: u64 = 768;
+
+/// Fallback per-entry estimate for a [`ManifestList`] when `manifest_length` is absent or
+/// non-positive on every entry. Prefer summing declared `manifest_length` when present.
+const ROUGH_MANIFEST_LIST_ENTRY_BYTES: u64 = 256;
+
+/// Floor at 1 and clamp to `u32::MAX` for moka's weigher signature.
+fn clamp_cache_weight(bytes: u64) -> u32 {
+    let clamped = bytes.clamp(1, u32::MAX as u64);
+    // Domain is bounded to `[1, u32::MAX]` by the clamp above.
+    clamped as u32
+}
+
+/// Estimated resident weight of a parsed manifest for the object cache.
+fn estimate_manifest_weight(manifest: &Manifest) -> u32 {
+    let n = (manifest.entries().len() as u64).max(1);
+    clamp_cache_weight(n.saturating_mul(ROUGH_MANIFEST_ENTRY_BYTES))
+}
+
+/// Estimated resident weight of a parsed manifest list for the object cache.
+///
+/// Prefers the sum of each entry's declared `manifest_length` (on-disk Avro size) when at
+/// least one positive length is present; otherwise falls back to entry-count × a rough
+/// per-entry constant.
+fn estimate_manifest_list_weight(list: &ManifestList) -> u32 {
+    let sum_lengths: u64 = list
+        .entries()
+        .iter()
+        .map(|e| {
+            if e.manifest_length > 0 {
+                // Positive on-disk length is a bounded domain for cache accounting.
+                e.manifest_length as u64
+            } else {
+                0
+            }
+        })
+        .sum();
+    if sum_lengths > 0 {
+        clamp_cache_weight(sum_lengths)
+    } else {
+        let n = (list.entries().len() as u64).max(1);
+        clamp_cache_weight(n.saturating_mul(ROUGH_MANIFEST_LIST_ENTRY_BYTES))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum CachedItem {
@@ -66,9 +115,9 @@ impl ObjectCache {
             Self {
                 cache: moka::future::Cache::builder()
                     .weigher(|_, val: &CachedItem| match val {
-                        CachedItem::ManifestList(item) => size_of_val(item.as_ref()),
-                        CachedItem::Manifest(item) => size_of_val(item.as_ref()),
-                    } as u32)
+                        CachedItem::ManifestList(item) => estimate_manifest_list_weight(item),
+                        CachedItem::Manifest(item) => estimate_manifest_weight(item),
+                    })
                     .max_capacity(cache_size_bytes)
                     .build(),
                 file_io,
@@ -403,6 +452,78 @@ mod tests {
             .unwrap();
 
         assert_eq!(manifest_list.entries().len(), 1);
+    }
+
+    /// Wave A: weigher clamp floors at 1 and caps at `u32::MAX`.
+    #[test]
+    fn test_clamp_cache_weight_floor_and_cap() {
+        assert_eq!(clamp_cache_weight(0), 1);
+        assert_eq!(clamp_cache_weight(1), 1);
+        assert_eq!(clamp_cache_weight(u32::MAX as u64), u32::MAX);
+        assert_eq!(clamp_cache_weight(u32::MAX as u64 + 1), u32::MAX);
+        assert_eq!(clamp_cache_weight(100), 100);
+
+        // Relative scale of the entry-count estimate used for manifests.
+        let one = clamp_cache_weight(1u64.saturating_mul(ROUGH_MANIFEST_ENTRY_BYTES));
+        let ten = clamp_cache_weight(10u64.saturating_mul(ROUGH_MANIFEST_ENTRY_BYTES));
+        assert!(
+            ten > one,
+            "more entries must weigh more: one={one} ten={ten}"
+        );
+        assert_eq!(one, ROUGH_MANIFEST_ENTRY_BYTES as u32);
+    }
+
+    /// Wave A: loaded manifest / manifest-list weights use real estimates (≥ 1, and
+    /// manifest entry weight scales with the entry count for a 1-entry fixture).
+    #[tokio::test]
+    async fn test_estimate_weights_on_loaded_manifests() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let object_cache = ObjectCache::new(fixture.table.file_io().clone());
+        let manifest_list = object_cache
+            .get_manifest_list(
+                fixture
+                    .table
+                    .metadata()
+                    .current_snapshot()
+                    .expect("fixture must have a current snapshot"),
+                &fixture.table.metadata_ref(),
+            )
+            .await
+            .expect("manifest list must load");
+
+        let list_weight = estimate_manifest_list_weight(&manifest_list);
+        assert!(
+            list_weight >= 1,
+            "manifest list weight must floor at 1, got {list_weight}"
+        );
+        // One-entry fixture: if lengths are present, weight equals that length; else
+        // falls back to one rough list-entry estimate.
+        let entry = manifest_list
+            .entries()
+            .first()
+            .expect("fixture list has one entry");
+        if entry.manifest_length > 0 {
+            assert_eq!(list_weight, entry.manifest_length as u32);
+        } else {
+            assert_eq!(list_weight, ROUGH_MANIFEST_LIST_ENTRY_BYTES as u32);
+        }
+
+        let manifest = object_cache
+            .get_manifest(entry, None)
+            .await
+            .expect("manifest must load");
+        let manifest_weight = estimate_manifest_weight(&manifest);
+        let expected = clamp_cache_weight(
+            (manifest.entries().len() as u64)
+                .max(1)
+                .saturating_mul(ROUGH_MANIFEST_ENTRY_BYTES),
+        );
+        assert_eq!(
+            manifest_weight, expected,
+            "manifest weight must be entry_count × rough bytes (floored)"
+        );
     }
 
     #[tokio::test]

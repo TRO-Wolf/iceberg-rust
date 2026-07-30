@@ -36,7 +36,7 @@ modules are `pub(crate)`.
 | `strict_metrics_evaluator.rs` | `StrictMetricsEvaluator` | "do ALL rows match?" |
 | `aggregate_evaluator.rs` | `UnboundAggregate`/`BoundAggregate`/`AggregateEvaluator` (`CountStar`/`CountNonNull`/`MinAggregate`/`MaxAggregate`) | compute `count(*)`/`count(col)`/`min`/`max` from `DataFile` metrics with no data scan; a missing required metric invalidates the aggregate (not pushable → engine scans). `Extract` (variant shredding) is CUT. Not yet wired to a scan consumer. |
 | `inclusive_projection.rs` / `strict_projection.rs` | `Projections` | row filter → partition-space predicate via `Transform::project`/`strict_project` |
-| `residual_evaluator.rs` | `ResidualEvaluator` | partial-evaluate a row filter against partition values → residual (strict-true ⇒ `AlwaysTrue`, inclusive-false ⇒ `AlwaysFalse`, else keep) |
+| `residual_evaluator.rs` | `ResidualEvaluator` | partial-evaluate a row filter against partition values → residual (strict-true ⇒ `AlwaysTrue`, inclusive-false ⇒ `AlwaysFalse`, else keep); `residual_bound_for` binds to the snapshot schema and memoizes by partition (`RwLock` map, poison-recovered) for scan planning |
 | `rewrite_not.rs` | `RewriteNot` | NOT-elimination pre-pass (evaluators assume NOT-free input) |
 | `page_index_evaluator.rs` / `row_group_metrics_evaluator.rs` | (parquet) | Parquet-level pruning in the arrow reader |
 

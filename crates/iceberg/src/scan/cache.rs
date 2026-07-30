@@ -48,13 +48,17 @@ impl PartitionFilterCache {
 
     /// Retrieves a [`BoundPredicate`] from the cache
     /// or computes it if not present.
+    ///
+    /// `filter` must already be bound against the table/snapshot schema. Callers that hold a
+    /// scan-level `snapshot_bound_predicate` should pass it by reference — do not re-bind the
+    /// unbound row filter on every manifest (projection work only runs on a cache miss).
     pub(crate) fn get(
         &self,
         spec_id: i32,
         table_metadata: &TableMetadataRef,
         schema: &Schema,
         case_sensitive: bool,
-        filter: BoundPredicate,
+        filter: &BoundPredicate,
     ) -> Result<Arc<BoundPredicate>> {
         // Scope the read guard so it is dropped before the `write()` below (deadlock avoidance).
         {
@@ -86,7 +90,7 @@ impl PartitionFilterCache {
         let mut inclusive_projection = InclusiveProjection::new(partition_spec.clone());
 
         let partition_filter = inclusive_projection
-            .project(&filter)?
+            .project(filter)?
             .rewrite_not()
             .bind(partition_schema.clone(), case_sensitive)?;
 
@@ -259,12 +263,13 @@ mod tests {
 
         // Hit path on a previously poisoned lock: serve the seeded entry.
         let cache = PartitionFilterCache::new();
+        let filter = bound_table_filter(&schema);
         let seeded = cache
-            .get(0, &metadata, &schema, true, bound_table_filter(&schema))
+            .get(0, &metadata, &schema, true, &filter)
             .expect("seeding the cache must succeed");
         poison(&cache.0);
         let hit = cache
-            .get(0, &metadata, &schema, true, bound_table_filter(&schema))
+            .get(0, &metadata, &schema, true, &filter)
             .expect("a poisoned lock must be recovered, not surfaced");
         assert!(
             Arc::ptr_eq(&seeded, &hit),
@@ -273,7 +278,7 @@ mod tests {
 
         // Unknown spec id after poisoning: the ordinary lookup error, not a lock error.
         let err = cache
-            .get(42, &metadata, &schema, true, bound_table_filter(&schema))
+            .get(42, &metadata, &schema, true, &filter)
             .expect_err("an unknown spec id must still error");
         assert!(
             err.to_string().contains("partition spec"),
@@ -284,8 +289,28 @@ mod tests {
         let cold_cache = PartitionFilterCache::new();
         poison(&cold_cache.0);
         cold_cache
-            .get(0, &metadata, &schema, true, bound_table_filter(&schema))
+            .get(0, &metadata, &schema, true, &filter)
             .expect("compute + insert must succeed on a recovered lock");
+    }
+
+    /// Hit path must not re-project: two gets with the same spec id return the same Arc.
+    #[test]
+    fn test_partition_filter_cache_hit_reuses_arc() {
+        let schema = table_schema();
+        let metadata = table_metadata_with_identity_spec(&schema);
+        let filter = bound_table_filter(&schema);
+        let cache = PartitionFilterCache::new();
+
+        let first = cache
+            .get(0, &metadata, &schema, true, &filter)
+            .expect("first get must compute the partition filter");
+        let second = cache
+            .get(0, &metadata, &schema, true, &filter)
+            .expect("second get must hit the cache");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache hit must return the same Arc without re-projecting"
+        );
     }
 
     /// SAF-003 pin (P1a): `ManifestEvaluatorCache` must RECOVER from a poisoned lock on both

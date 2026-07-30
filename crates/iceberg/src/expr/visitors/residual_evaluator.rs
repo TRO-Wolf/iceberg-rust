@@ -34,8 +34,11 @@
 //!
 //! The evaluator is wired into scan planning (`scan/context.rs` computes each
 //! [`crate::scan::FileScanTask`]'s partition-reduced residual via
-//! [`ResidualEvaluator::residual_for`]); Increment 3 adds a second consumer in
-//! filter-based conflict validation.
+//! [`ResidualEvaluator::residual_bound_for`] / [`ResidualEvaluator::residual_for`]);
+//! Increment 3 adds a second consumer in filter-based conflict validation.
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use fnv::FnvHashSet;
 
@@ -60,7 +63,11 @@ use crate::spec::{Datum, PartitionSpecRef, Schema, SchemaRef, Struct};
 /// "keep the original predicate" cases reconstruct the unbound predicate from the
 /// bound one by name; partition source columns are always top-level schema
 /// fields, so the [`BoundReference`]'s field name is the unbound reference name.
-#[derive(Debug, Clone)]
+///
+/// When the evaluator is shared behind an `Arc` (scan planning),
+/// [`residual_bound_for`](Self::residual_bound_for) memoizes bound residuals by
+/// partition so many files in the same partition do not re-run residual evaluation.
+#[derive(Debug)]
 pub(crate) struct ResidualEvaluator {
     /// `Some(spec, partition_schema)` for a partitioned spec; `None` for an
     /// unpartitioned spec (the residual is then always the whole filter).
@@ -69,6 +76,10 @@ pub(crate) struct ResidualEvaluator {
     filter: BoundPredicate,
     /// Case sensitivity used when binding projected predicates to the partition type.
     case_sensitive: bool,
+    /// Memo of partition tuple → bound residual (for the snapshot-schema bind in
+    /// [`residual_bound_for`](Self::residual_bound_for)). Poisoned locks are recovered
+    /// (crate-wide scan-cache policy): values are pure derived data.
+    residual_bound_memo: RwLock<HashMap<Struct, Arc<BoundPredicate>>>,
 }
 
 /// The state needed to evaluate residuals against a non-empty partition spec.
@@ -89,6 +100,7 @@ impl ResidualEvaluator {
             partitioned: None,
             filter,
             case_sensitive: false,
+            residual_bound_memo: RwLock::new(HashMap::new()),
         }
     }
 
@@ -122,6 +134,7 @@ impl ResidualEvaluator {
             }),
             filter,
             case_sensitive,
+            residual_bound_memo: RwLock::new(HashMap::new()),
         })
     }
 
@@ -141,6 +154,37 @@ impl ResidualEvaluator {
             case_sensitive: self.case_sensitive,
         };
         visit(&mut visitor, &self.filter)
+    }
+
+    /// Returns the residual of the filter for `partition`, already bound to
+    /// `snapshot_schema` under `bind_case_sensitive`.
+    ///
+    /// Results are memoized by partition tuple so many files that share a partition
+    /// reuse a single `residual_for` + bind. Poisoned memo locks are recovered.
+    pub(crate) fn residual_bound_for(
+        &self,
+        partition: &Struct,
+        snapshot_schema: SchemaRef,
+        bind_case_sensitive: bool,
+    ) -> Result<Arc<BoundPredicate>> {
+        {
+            let read = self
+                .residual_bound_memo
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = read.get(partition) {
+                return Ok(cached.clone());
+            }
+        }
+
+        let residual = self.residual_for(partition)?;
+        let bound = Arc::new(residual.bind(snapshot_schema, bind_case_sensitive)?);
+
+        let mut write = self
+            .residual_bound_memo
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(write.entry(partition.clone()).or_insert(bound).clone())
     }
 }
 
@@ -1222,6 +1266,43 @@ mod tests {
             .residual_for(&day_partition("2021-01-01"))
             .unwrap();
         assert_eq!(residual, Reference::new("name").is_null());
+    }
+
+    /// Wave A: `residual_bound_for` memoizes by partition so files that share a
+    /// partition reuse one residual_for + bind (Arc identity on the second call).
+    #[test]
+    fn test_residual_bound_for_memoizes_by_partition() {
+        let schema = day_example_schema();
+        let spec = day_partition_spec(schema.clone());
+        let filter =
+            ts_between_filter(schema.clone(), "2021-01-01T10:00:00", "2021-01-31T10:00:00");
+        let evaluator =
+            ResidualEvaluator::of(spec, &schema, filter, true).expect("evaluator must build");
+
+        let partition = day_partition("2021-01-15");
+        let first = evaluator
+            .residual_bound_for(&partition, schema.clone(), true)
+            .expect("first residual_bound_for must succeed");
+        let second = evaluator
+            .residual_bound_for(&partition, schema.clone(), true)
+            .expect("memoized residual_bound_for must succeed");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same partition must reuse the memoized Arc"
+        );
+        assert!(
+            matches!(first.as_ref(), BoundPredicate::AlwaysTrue),
+            "strictly-between day residual must be AlwaysTrue, got {first:?}"
+        );
+
+        // A different partition must not share the AlwaysTrue memo entry.
+        let other = evaluator
+            .residual_bound_for(&day_partition("2021-01-01"), schema, true)
+            .expect("residual for boundary day must succeed");
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "different partitions must not share the same memo entry"
+        );
     }
 
     // ---- Multiple partition fields on one source column (reviewer-added) ----
