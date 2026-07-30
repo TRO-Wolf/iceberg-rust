@@ -342,7 +342,7 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
         }
 
         let snapshot_bound_predicate = if let Some(ref predicate) = self.filter {
-            Some(predicate.bind(schema.clone(), true)?)
+            Some(predicate.bind(schema.clone(), self.case_sensitive)?)
         } else {
             None
         };
@@ -508,16 +508,15 @@ impl IncrementalAppendScan {
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
 
         // Process the data entries in parallel, keeping only `Added` entries.
+        // Entry work runs inline under `try_for_each_concurrent` — nested per-entry
+        // `spawn` added task overhead without extra parallelism beyond the concurrent limit.
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
                 .try_for_each_concurrent(
                     concurrency_limit_manifest_entries,
                     |(manifest_entry_context, tx)| async move {
-                        spawn(async move {
-                            Self::process_append_manifest_entry(manifest_entry_context, tx).await
-                        })
-                        .await
+                        Self::process_append_manifest_entry(manifest_entry_context, tx).await
                     },
                 )
                 .await;

@@ -477,7 +477,7 @@ impl<'a> TableScanBuilder<'a> {
         }
 
         let snapshot_bound_predicate = if let Some(ref predicates) = self.filter {
-            Some(predicates.bind(schema.clone(), true)?)
+            Some(predicates.bind(schema.clone(), self.case_sensitive)?)
         } else {
             None
         };
@@ -731,17 +731,16 @@ impl TableScan {
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
-        // Process the delete file [`ManifestEntry`] stream in parallel
+        // Process the delete file [`ManifestEntry`] stream in parallel.
+        // Entry work runs inline under `try_for_each_concurrent` — a nested per-entry
+        // `spawn` only added task overhead without extra parallelism beyond the concurrent limit.
         spawn(async move {
             let result = manifest_entry_delete_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
                 .try_for_each_concurrent(
                     concurrency_limit_manifest_entries,
                     |(manifest_entry_context, tx)| async move {
-                        spawn(async move {
-                            Self::process_delete_manifest_entry(manifest_entry_context, tx).await
-                        })
-                        .await
+                        Self::process_delete_manifest_entry(manifest_entry_context, tx).await
                     },
                 )
                 .await;
@@ -754,17 +753,14 @@ impl TableScan {
         })
         .await;
 
-        // Process the data file [`ManifestEntry`] stream in parallel
+        // Process the data file [`ManifestEntry`] stream in parallel (inline under concurrent limit).
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
                 .try_for_each_concurrent(
                     concurrency_limit_manifest_entries,
                     |(manifest_entry_context, tx)| async move {
-                        spawn(async move {
-                            Self::process_data_manifest_entry(manifest_entry_context, tx).await
-                        })
-                        .await
+                        Self::process_data_manifest_entry(manifest_entry_context, tx).await
                     },
                 )
                 .await;
@@ -1097,9 +1093,13 @@ impl futures::Stream for MetricsReportingFileScanTaskStream {
     }
 }
 
+/// Snapshot- and partition-bound predicates shared across a manifest's entries.
+///
+/// Fields are `Arc` so `create_manifest_file_context` can share the trees without deep-cloning
+/// them once per manifest (and once more per entry via the outer `Arc<BoundPredicates>`).
 pub(crate) struct BoundPredicates {
-    partition_bound_predicate: BoundPredicate,
-    snapshot_bound_predicate: BoundPredicate,
+    partition_bound_predicate: Arc<BoundPredicate>,
+    snapshot_bound_predicate: Arc<BoundPredicate>,
 }
 
 #[cfg(test)]
