@@ -84,19 +84,36 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
     Ok(config)
 }
 
-/// Builds an OpenDAL operator from the AzdlsConfig and path.
+/// Parsed + validated AzDLS location, ready for operator build / cache keying.
+///
+/// Separates path validation from Operator construction so the Wave C operator
+/// cache can key on `filesystem` and build only on a cache miss.
+pub(crate) struct AzdlsResolved<'a> {
+    /// Cache key / OpenDAL filesystem name.
+    pub filesystem: String,
+    /// Operator-relative path (suffix of the absolute location).
+    pub relative_path: &'a str,
+    path: AzureStoragePath,
+}
+
+impl AzdlsResolved<'_> {
+    /// Build a raw (unlayered) OpenDAL Operator for this filesystem.
+    pub(crate) fn build_operator(&self, config: &AzdlsConfig) -> Result<opendal::Operator> {
+        azdls_config_build(config, &self.path)
+    }
+}
+
+/// Parse and validate an absolute AzDLS path without constructing an Operator.
 ///
 /// The path is expected to include the scheme in a format like:
 /// `abfss://<myfs>@<myaccount>.dfs.core.windows.net/mydir/myfile.parquet`.
-pub(crate) fn azdls_create_operator<'a>(
+pub(crate) fn azdls_resolve<'a>(
     absolute_path: &'a str,
     config: &AzdlsConfig,
     configured_scheme: &AzureStorageScheme,
-) -> Result<(opendal::Operator, &'a str)> {
+) -> Result<AzdlsResolved<'a>> {
     let path = absolute_path.parse::<AzureStoragePath>()?;
     match_path_with_config(&path, config, configured_scheme)?;
-
-    let op = azdls_config_build(config, &path)?;
 
     // Paths to files in ADLS tend to be written in fully qualified form,
     // including their filesystem and account name.
@@ -105,7 +122,26 @@ pub(crate) fn azdls_create_operator<'a>(
     let relative_path_len = path.path.len();
     let (_, relative_path) = absolute_path.split_at(absolute_path.len() - relative_path_len);
 
-    Ok((op, relative_path))
+    Ok(AzdlsResolved {
+        filesystem: path.filesystem.clone(),
+        relative_path,
+        path,
+    })
+}
+
+/// Builds an OpenDAL operator from the AzdlsConfig and path.
+///
+/// Test helper; production I/O goes through [`azdls_resolve`] + the operator
+/// cache so Operators are built only on miss.
+#[cfg(test)]
+pub(crate) fn azdls_create_operator<'a>(
+    absolute_path: &'a str,
+    config: &AzdlsConfig,
+    configured_scheme: &AzureStorageScheme,
+) -> Result<(opendal::Operator, &'a str)> {
+    let resolved = azdls_resolve(absolute_path, config, configured_scheme)?;
+    let op = resolved.build_operator(config)?;
+    Ok((op, resolved.relative_path))
 }
 
 /// Note that `abf[s]` and `wasb[s]` variants have different implications:
