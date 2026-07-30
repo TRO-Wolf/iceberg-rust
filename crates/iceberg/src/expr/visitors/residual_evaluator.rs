@@ -235,6 +235,13 @@ impl ResidualEvaluator {
             .residual_bound_memo
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Double-check under the write lock (C4-Q-001 / C2-Q-003): a concurrent
+        // writer may have inserted this same partition (and filled the map to the
+        // soft-cap) between our read miss and this acquire. Prefer the memoized Arc
+        // over a fresh one so the Arc-identity contract holds at the CAP race edge.
+        if let Some(cached) = write.get(partition) {
+            return Ok(cached.clone());
+        }
         // Soft cap: skip insert when full so cardinality spikes cannot OOM the memo.
         if write.len() >= soft_cap {
             return Ok(bound);
