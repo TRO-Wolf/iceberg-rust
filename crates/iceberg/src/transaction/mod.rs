@@ -860,6 +860,53 @@ mod tests {
         );
     }
 
+    /// Pin: `do_commit` always ships `base_metadata_location` + `base_table` for the refreshed
+    /// base so metastore catalogs can ReuseProvided without a second metadata JSON load.
+    /// Dropping either field silently forces FullLoad or (worse) reuses a wrong base.
+    #[tokio::test]
+    async fn test_do_commit_ships_base_table_matching_base_metadata_location() {
+        let table = setup_test_table("1");
+        let expected_location = table
+            .metadata_location()
+            .expect("fixture table has metadata_location")
+            .to_string();
+
+        let mut mock_catalog = MockCatalog::new();
+        let load_table = table.clone();
+        mock_catalog
+            .expect_load_table()
+            .times(1)
+            .returning_st(move |_| {
+                let t = load_table.clone();
+                Box::pin(async move { Ok(t) })
+            });
+
+        let expected_for_assert = expected_location.clone();
+        let return_table = table.clone();
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .withf(move |commit| {
+                let base_loc = commit.base_metadata_location();
+                let provided = commit.base_table();
+                base_loc == Some(expected_for_assert.as_str())
+                    && provided.is_some_and(|t| {
+                        t.metadata_location() == Some(expected_for_assert.as_str())
+                    })
+            })
+            .returning_st(move |_commit| {
+                let out = return_table.clone();
+                Box::pin(async move { Ok(out) })
+            });
+
+        let tx = create_test_transaction(&table);
+        let result = tx.commit(&mock_catalog).await;
+        assert!(
+            result.is_ok(),
+            "commit with base_table payload must succeed: {result:?}"
+        );
+    }
+
     /// Helper function to create a test table with retry properties
     pub(super) fn setup_test_table(num_retries: &str) -> Table {
         let table = make_v2_table();
