@@ -559,6 +559,68 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 8);
     }
 
+    /// Critic-octo C4-Q-001: pos-delete projection with only ONE reserved field id present
+    /// still falls back to name-based selection of `file_path` + `pos` (not a partial mask).
+    #[tokio::test]
+    async fn test_positional_delete_projection_partial_field_ids_name_fallback() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp
+            .path()
+            .join("pos-partial-ids.parquet")
+            .to_string_lossy()
+            .to_string();
+        // file_path has reserved field id; pos has name only (no field id).
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_DELETE_FILE_PATH.to_string(),
+            )])),
+            Field::new("pos", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(vec!["d.parquet"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![11i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("x")])) as ArrayRef,
+        ])
+        .expect("batch");
+        {
+            let file = File::create(&path).expect("create");
+            let mut writer =
+                ArrowWriter::try_new(file, schema, Some(WriterProperties::builder().build()))
+                    .expect("writer");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
+        }
+        let loader = BasicDeleteFileLoader::new(FileIO::new_with_fs());
+        let batches = loader
+            .parquet_positional_delete_batch_stream(
+                &path,
+                std::fs::metadata(&path).expect("stat").len(),
+            )
+            .await
+            .expect("stream")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect");
+        assert_eq!(
+            batches[0].num_columns(),
+            2,
+            "name fallback must project path+pos only"
+        );
+        assert!(batches[0].column_by_name("extra").is_none());
+        assert_eq!(
+            batches[0]
+                .column_by_name("pos")
+                .expect("pos")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i64")
+                .values(),
+            &[11]
+        );
+    }
+
     /// Critic-octo C1-Q-003: incomplete field-id match must refuse the mask (→ full read),
     /// never return a partial ProjectionMask that could drop a requested leaf silently.
     #[test]

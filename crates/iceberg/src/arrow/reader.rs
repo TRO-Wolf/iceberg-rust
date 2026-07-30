@@ -7688,4 +7688,31 @@ mod parquet_eq_keyset_mor_tests {
             "two eq-delete keysets must OR (drop 20 and 40) (C3-Q-002)"
         );
     }
+
+    /// Critic-octo C4-Q-002: keyset path that deletes every row yields empty (or no-row) output —
+    /// must not error and must not resurrect rows.
+    #[tokio::test]
+    async fn parquet_eq_keyset_deletes_all_rows() {
+        let tmp = TempDir::new().expect("tempdir");
+        let schema = test_schema();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_data_file(&data_path, &[(10, Some("a")), (20, Some("b"))]);
+        let del_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_del = write_eq_delete_file(&del_path, &[10, 20]);
+        let task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
+        let batches = run_scan(task).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 0,
+            "all-deleted keyset path must leave zero rows (C4-Q-002)"
+        );
+    }
 }
