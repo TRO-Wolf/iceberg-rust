@@ -854,6 +854,84 @@ mod tests {
         );
     }
 
+    /// AzDLS: same filesystem reuses the cached finished Operator; a second
+    /// filesystem gets a distinct Operator. Offline (no Azure network I/O).
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_operator_cache_reuses_operator_for_same_azdls_filesystem() {
+        use opendal::services::AzdlsConfig;
+
+        let config = AzdlsConfig {
+            account_name: Some("myaccount".to_string()),
+            endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
+            ..Default::default()
+        };
+        let storage = OpenDalStorage::Azdls {
+            configured_scheme: AzureStorageScheme::Abfss,
+            config: std::sync::Arc::new(config),
+            operator_cache: OperatorCache::default(),
+        };
+
+        let p1 = "abfss://myfs@myaccount.dfs.core.windows.net/path/to/a.parquet";
+        let p2 = "abfss://myfs@myaccount.dfs.core.windows.net/other/b.parquet";
+        let p_other = "abfss://otherfs@myaccount.dfs.core.windows.net/x.parquet";
+
+        let (op1, rel1) = storage.create_operator(&p1).expect("azdls first");
+        let (op2, rel2) = storage.create_operator(&p2).expect("azdls second same fs");
+        assert_eq!(rel1, "/path/to/a.parquet");
+        assert_eq!(rel2, "/other/b.parquet");
+        assert_eq!(op1.info().name(), "myfs");
+        assert!(
+            std::sync::Arc::ptr_eq(op1.inner(), op2.inner()),
+            "same AzDLS filesystem must reuse the cached Operator"
+        );
+
+        let (op_other, rel_other) = storage
+            .create_operator(&p_other)
+            .expect("azdls other filesystem");
+        assert_eq!(rel_other, "/x.parquet");
+        assert_eq!(op_other.info().name(), "otherfs");
+        assert!(
+            !std::sync::Arc::ptr_eq(op1.inner(), op_other.inner()),
+            "different filesystems must not share Operators"
+        );
+    }
+
+    /// Delete through the cached Operator removes the object (layers must not
+    /// swallow delete).
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_memory_delete_through_operator_cache() {
+        let storage = memory_storage();
+        storage
+            .write("memory:/del/x", Bytes::from("x"))
+            .await
+            .expect("write");
+        assert!(storage.exists("memory:/del/x").await.expect("exists"));
+        storage.delete("memory:/del/x").await.expect("delete");
+        assert!(
+            !storage
+                .exists("memory:/del/x")
+                .await
+                .expect("exists after delete"),
+            "delete via cached Operator must remove the object"
+        );
+    }
+
+    /// Range reader via cached Operator returns the requested slice.
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_memory_reader_range_through_operator_cache() {
+        let storage = memory_storage();
+        storage
+            .write("memory:/range/data", Bytes::from("abcdefgh"))
+            .await
+            .expect("write");
+        let reader = storage.reader("memory:/range/data").await.expect("reader");
+        let slice = reader.read(2..6).await.expect("range read");
+        assert_eq!(slice.as_ref(), b"cdef");
+    }
+
     /// Concurrent first-accesses for the same key must build once and all share
     /// the finished Operator (double-checked locking under the mutex).
     #[cfg(feature = "opendal-memory")]
