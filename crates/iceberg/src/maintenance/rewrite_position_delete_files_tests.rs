@@ -580,8 +580,9 @@ async fn test_multi_file_grouping_one_partition() {
 /// partition, never merging across partitions). Read identity per-partition must hold.
 ///
 /// Each group commits its own `Replace` snapshot; the action advances the base table after each
-/// group commit (mirrors `RewriteDataFiles`) so the second group's CAS is against the first
-/// group's tip — without that advance, multi-group runs would force N-1 conflict retries.
+/// group commit (mirrors `RewriteDataFiles`) so the next `Transaction` is built on the prior
+/// group's tip. Without advance, `do_commit` still refreshes + re-applies (correctness holds;
+/// cost is extra re-apply work — not forced CAS conflict retries).
 ///
 /// MUTATION COVERAGE: collapse the `(spec, partition)` group key to spec-only and both partitions' files
 /// would merge into one group; the compacted file's partition would be wrong and the per-partition read
@@ -635,8 +636,9 @@ async fn test_partition_isolation_compacts_each_group_separately() {
         2,
         "exactly two compacted files (one per partition)"
     );
-    // Two sequential group commits each append a snapshot log entry (table advance after group 1
-    // is what lets group 2 commit without a forced CAS retry against a stale base).
+    // Two sequential group commits each append a snapshot log entry. (Advance is a re-apply
+    // avoidance / RewriteDataFiles parity seam; history +2 pins multi-group commits, not that
+    // CAS would fail without advance — `do_commit` refreshes a stale base on first attempt.)
     assert_eq!(
         reloaded.metadata().history().len(),
         history_before + 2,

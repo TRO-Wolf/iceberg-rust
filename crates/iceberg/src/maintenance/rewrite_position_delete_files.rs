@@ -209,9 +209,11 @@ impl RewritePositionDeleteFiles {
         // Puffin DVs are SKIPPED (file-scoped, never bin-packed) — the documented V2-parquet-only scope.
         let groups = self.collect_position_delete_groups(&snapshot).await?;
 
-        // Advance the base table after each group commit so the next group's RewriteFiles CAS
-        // sees the updated metadata tip (mirrors RewriteDataFiles). Without this, groups 2..N
-        // force N-1 catalog conflict retries against a stale base.
+        // Advance the base table after each group commit so the next group's `Transaction` is
+        // built on the committed tip (mirrors RewriteDataFiles). Without this, groups 2..N still
+        // succeed via `Transaction::do_commit`'s stale-base refresh + re-apply, but each group
+        // pays a full rewrite re-apply against the refreshed tip. Advancing avoids that redundant
+        // re-apply work; it is not required for CAS correctness under the retry/refresh loop.
         let mut table = self.table.clone();
         let mut result = RewritePositionDeleteFilesResult::default();
         for (key, entries) in groups {

@@ -322,4 +322,140 @@ mod tests {
             "nested float leaf must enable the NaN visitor"
         );
     }
+
+    #[test]
+    fn column_override_full_enables_gate_when_default_none() {
+        let schema = schema_with_fields(vec![NestedField::optional(
+            1,
+            "score",
+            Type::Primitive(PrimitiveType::Float),
+        )]);
+        let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([
+            (
+                "write.metadata.metrics.default".to_string(),
+                "none".to_string(),
+            ),
+            (
+                "write.metadata.metrics.column.score".to_string(),
+                "full".to_string(),
+            ),
+        ]));
+        assert!(
+            schema_needs_nan_value_counts(&schema, &metrics),
+            "per-column full override must enable the NaN visitor when default is none"
+        );
+    }
+
+    #[test]
+    fn column_override_none_disables_gate_for_only_float() {
+        let schema = schema_with_fields(vec![NestedField::optional(
+            1,
+            "score",
+            Type::Primitive(PrimitiveType::Float),
+        )]);
+        let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([(
+            "write.metadata.metrics.column.score".to_string(),
+            "none".to_string(),
+        )]));
+        assert!(
+            !schema_needs_nan_value_counts(&schema, &metrics),
+            "per-column none on the only float must skip the NaN visitor"
+        );
+    }
+
+    /// MUTATION: drop `n.is_valid(*i) &&` in `count_nans_f32`/`count_nans_f64` ⇒ null slot with a
+    /// NaN bit-pattern is counted and this pin fails (Iceberg: null is not NaN).
+    #[test]
+    fn null_slot_with_nan_bits_is_not_counted() {
+        use arrow_array::{Float32Array, Float64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+        let iceberg = Arc::new(schema_with_fields(vec![
+            NestedField::optional(1, "f", Type::Primitive(PrimitiveType::Float)),
+            NestedField::optional(2, "d", Type::Primitive(PrimitiveType::Double)),
+        ]));
+
+        // Index 1 is null but the values buffer holds NaN — must NOT count as a NaN value.
+        let f32 = Float32Array::from(vec![Some(1.0_f32), None, Some(f32::NAN)]);
+        // Force NaN bits into the null slot (Arrow may leave arbitrary payload there).
+        let mut f32_builder_vals = f32.values().to_vec();
+        f32_builder_vals[1] = f32::NAN;
+        let f32 = Float32Array::new(
+            arrow_buffer::ScalarBuffer::from(f32_builder_vals),
+            f32.nulls().cloned(),
+        );
+
+        let f64 = Float64Array::from(vec![Some(1.0_f64), None, Some(f64::NAN)]);
+        let mut f64_vals = f64.values().to_vec();
+        f64_vals[1] = f64::NAN;
+        let f64 = Float64Array::new(
+            arrow_buffer::ScalarBuffer::from(f64_vals),
+            f64.nulls().cloned(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("f", DataType::Float32, true).with_metadata(
+                std::collections::HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )]),
+            ),
+            Field::new("d", DataType::Float64, true).with_metadata(
+                std::collections::HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )]),
+            ),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(f32) as ArrayRef,
+            Arc::new(f64) as ArrayRef,
+        ])
+        .expect("batch");
+
+        let mut visitor = NanValueCountVisitor::new();
+        visitor
+            .compute(iceberg, &batch)
+            .expect("compute nan counts");
+        assert_eq!(
+            visitor.nan_value_counts.get(&1).copied().unwrap_or(0),
+            1,
+            "exactly one valid f32 NaN (null slot must not count)"
+        );
+        assert_eq!(
+            visitor.nan_value_counts.get(&2).copied().unwrap_or(0),
+            1,
+            "exactly one valid f64 NaN (null slot must not count)"
+        );
+    }
+
+    #[test]
+    fn all_valid_nans_are_counted() {
+        use arrow_array::{Float32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+        let iceberg = Arc::new(schema_with_fields(vec![NestedField::optional(
+            1,
+            "f",
+            Type::Primitive(PrimitiveType::Float),
+        )]));
+        let f32 = Float32Array::from(vec![f32::NAN, 1.0, f32::NAN]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("f", DataType::Float32, true).with_metadata(
+                std::collections::HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )]),
+            ),
+        ]));
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(f32) as ArrayRef]).expect("batch");
+        let mut visitor = NanValueCountVisitor::new();
+        visitor
+            .compute(iceberg, &batch)
+            .expect("compute nan counts");
+        assert_eq!(visitor.nan_value_counts.get(&1).copied(), Some(2));
+    }
 }
