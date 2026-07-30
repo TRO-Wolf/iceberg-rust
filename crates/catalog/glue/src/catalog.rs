@@ -33,7 +33,7 @@ use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, CommitBaseLoadPlan, Error, ErrorKind, MetadataLocation, Namespace,
     NamespaceIdent, Result, TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
-    plan_commit_base_load,
+    commit_base_conflict_error, plan_commit_base_load,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
@@ -347,23 +347,30 @@ impl GlueCatalog {
             provided_loc.as_deref(),
         ) {
             CommitBaseLoadPlan::ReuseProvided => {
-                let table = provided.ok_or_else(|| {
+                let provided = provided.ok_or_else(|| {
                     Error::new(
                         ErrorKind::Unexpected,
                         "commit base-load plan is ReuseProvided but no base table was supplied",
                     )
                 })?;
+                // Rebind catalog FileIO + commit identifier (defense in depth vs forged base).
+                let db_name = validate_namespace(table_ident.namespace())?;
+                let table = Table::builder()
+                    .file_io(self.file_io())
+                    .metadata_location(service_location.clone())
+                    .metadata(provided.metadata_ref())
+                    .identifier(TableIdent::new(
+                        NamespaceIdent::new(db_name),
+                        table_ident.name().to_owned(),
+                    ))
+                    .build()?;
                 Ok((table, version_id, service_location))
             }
-            CommitBaseLoadPlan::Conflict => Err(Error::new(
-                ErrorKind::CatalogCommitConflicts,
-                format!(
-                    "Cannot commit table {table_ident}: concurrent modification \
-                     (expected base metadata location {}, found {service_location})",
-                    base_loc.as_deref().unwrap_or("<none>")
-                ),
-            )
-            .with_retryable(true)),
+            CommitBaseLoadPlan::Conflict => Err(commit_base_conflict_error(
+                table_ident,
+                base_loc.as_deref(),
+                &service_location,
+            )),
             CommitBaseLoadPlan::FullLoad => {
                 let metadata = TableMetadata::read_from(&self.file_io, &service_location).await?;
                 let db_name = validate_namespace(table_ident.namespace())?;

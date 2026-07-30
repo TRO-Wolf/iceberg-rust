@@ -652,6 +652,30 @@ pub fn plan_commit_base_load(
     }
 }
 
+/// Retryable conflict when a metastore commit base no longer matches the service pointer.
+///
+/// Metastore catalogs (Glue / S3 Tables) return this from `resolve_commit_base` on
+/// [`CommitBaseLoadPlan::Conflict`]. The error **must** stay
+/// [`ErrorKind::CatalogCommitConflicts`] and **retryable** so
+/// [`crate::transaction::Transaction::commit`] reloads, re-applies actions, and retries
+/// (Java `CommitFailedException` / only-retry-on-conflict). Dropping `retryable` permanently
+/// fails concurrent writers.
+pub fn commit_base_conflict_error(
+    table_ident: &TableIdent,
+    expected_base_metadata_location: Option<&str>,
+    service_metadata_location: &str,
+) -> Error {
+    Error::new(
+        ErrorKind::CatalogCommitConflicts,
+        format!(
+            "Cannot commit table {table_ident}: concurrent modification \
+             (expected base metadata location {}, found {service_metadata_location})",
+            expected_base_metadata_location.unwrap_or("<none>")
+        ),
+    )
+    .with_retryable(true)
+}
+
 impl TableCommit {
     /// Return the table identifier.
     pub fn identifier(&self) -> &TableIdent {
@@ -2963,6 +2987,22 @@ mod tests {
         assert_eq!(
             plan_commit_base_load(service, Some(""), Some(service)),
             CommitBaseLoadPlan::Conflict
+        );
+    }
+
+    /// Pin: early base-pointer conflict is CatalogCommitConflicts + retryable so Transaction
+    /// re-bases. A regression that drops retryable permanently fails concurrent writers.
+    #[test]
+    fn test_commit_base_conflict_error_is_retryable_conflict() {
+        let ident = TableIdent::from_strs(["ns", "t"]).expect("ident");
+        let err =
+            super::commit_base_conflict_error(&ident, Some("s3://b/m/v1.json"), "s3://b/m/v2.json");
+        assert_eq!(err.kind(), crate::ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable(), "base-pointer conflict must be retryable");
+        let msg = err.message();
+        assert!(
+            msg.contains("s3://b/m/v1.json") && msg.contains("s3://b/m/v2.json"),
+            "message must carry expected and found locations: {msg}"
         );
     }
 
