@@ -897,6 +897,51 @@ mod tests {
         );
     }
 
+    /// `delete_prefix` via cached Operator removes the prefix tree only.
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_memory_delete_prefix_through_operator_cache() {
+        let storage = memory_storage();
+        storage
+            .write("memory:/pfx/a", Bytes::from("a"))
+            .await
+            .expect("write a");
+        storage
+            .write("memory:/pfx/sub/b", Bytes::from("b"))
+            .await
+            .expect("write b");
+        storage
+            .write("memory:/pfx2/c", Bytes::from("c"))
+            .await
+            .expect("write sibling");
+        storage
+            .delete_prefix("memory:/pfx")
+            .await
+            .expect("delete_prefix");
+        assert!(!storage.exists("memory:/pfx/a").await.expect("a"));
+        assert!(!storage.exists("memory:/pfx/sub/b").await.expect("b"));
+        assert!(
+            storage.exists("memory:/pfx2/c").await.expect("sibling"),
+            "delete_prefix must not remove sibling prefix"
+        );
+    }
+
+    /// Streaming writer through cached Operator flushes on close.
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_memory_writer_close_through_operator_cache() {
+        let storage = memory_storage();
+        let mut w = storage.writer("memory:/w/out.bin").await.expect("writer");
+        w.write(Bytes::from("hello")).await.expect("write chunk");
+        w.write(Bytes::from(" world")).await.expect("write chunk 2");
+        w.close().await.expect("close");
+        let body = storage
+            .read("memory:/w/out.bin")
+            .await
+            .expect("read after close");
+        assert_eq!(body.as_ref(), b"hello world");
+    }
+
     /// Delete through the cached Operator removes the object (layers must not
     /// swallow delete).
     #[cfg(feature = "opendal-memory")]
