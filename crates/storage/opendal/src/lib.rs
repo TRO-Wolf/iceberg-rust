@@ -24,7 +24,8 @@
 
 mod utils;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,9 +36,74 @@ use iceberg::io::{
 };
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
-use opendal::layers::RetryLayer;
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use serde::{Deserialize, Serialize};
 use utils::from_opendal_error;
+
+/// Per-operator concurrent request cap applied once when an Operator is first cached.
+///
+/// Each cached Operator gets its own [`ConcurrentLimitLayer`] (independent semaphore).
+/// Chosen as a conservative default; not a global process-wide limit.
+const OPERATOR_CONCURRENT_LIMIT: usize = 64;
+
+/// Apply transport layers once at Operator construction / cache insertion.
+///
+/// Layers are **not** re-applied on cache hits — stacking `RetryLayer` on every
+/// `create_operator` call would multiply retries and allocate a new Operator wrapper
+/// per I/O.
+fn finish_operator(op: Operator) -> Operator {
+    op.layer(RetryLayer::new())
+        .layer(ConcurrentLimitLayer::new(OPERATOR_CONCURRENT_LIMIT))
+}
+
+/// Thread-safe cache of finished OpenDAL [`Operator`]s, keyed by backend name
+/// (S3/GCS/OSS bucket, AzDLS filesystem, or a fixed key for FS / Memory).
+///
+/// Cloning shares the map via [`Arc`] so `OpenDalStorage` clones (e.g. per
+/// `InputFile` / `OutputFile`) reuse Operators.
+///
+/// Public only because it appears on [`OpenDalStorage`] enum fields (serde +
+/// construction); the map itself is an implementation detail.
+#[derive(Clone, Default)]
+#[doc(hidden)]
+pub struct OperatorCache {
+    inner: Arc<Mutex<HashMap<String, Operator>>>,
+}
+
+impl std::fmt::Debug for OperatorCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.inner.lock().map(|g| g.len()).unwrap_or(0);
+        f.debug_struct("OperatorCache")
+            .field("entries", &len)
+            .finish()
+    }
+}
+
+impl OperatorCache {
+    /// Return a cached finished Operator for `key`, building and finishing it on miss.
+    fn get_or_insert_with(
+        &self,
+        key: String,
+        build: impl FnOnce() -> Result<Operator>,
+    ) -> Result<Operator> {
+        {
+            let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(op) = guard.get(&key) {
+                return Ok(op.clone());
+            }
+        }
+
+        // Build under the lock so concurrent first-accesses for the same key do not
+        // each construct an Operator (connection pools / HTTP clients).
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(op) = guard.get(&key) {
+            return Ok(op.clone());
+        }
+        let op = finish_operator(build()?);
+        guard.insert(key, op.clone());
+        Ok(op)
+    }
+}
 
 /// Convert an OpenDAL last-modified timestamp into milliseconds since the Unix epoch.
 ///
@@ -51,6 +117,20 @@ fn opendal_timestamp_to_millis(timestamp: opendal::raw::Timestamp) -> i64 {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
+}
+
+/// Whether list-entry metadata is complete enough to skip a per-file `stat`.
+///
+/// **Rule:** use list metadata when the backend filled size (`content_length > 0`)
+/// **or** set `last_modified` (covers empty files whose size is legitimately 0).
+/// OpenDAL returns `content_length() == 0` when size was never set, so the pair
+/// `(size == 0, no last_modified)` is treated as incomplete and falls back to `stat`.
+///
+/// Some backends (e.g. in-memory OpenDAL) never populate list metadata — those
+/// paths always `stat`. Backends that fill list entries (typical object-store
+/// LIST) avoid N extra HEAD/stat round-trips.
+fn list_entry_metadata_complete(meta: &opendal::Metadata) -> bool {
+    meta.content_length() > 0 || meta.last_modified().is_some()
 }
 
 cfg_if! {
@@ -142,11 +222,14 @@ impl StorageFactory for OpenDalStorageFactory {
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
         match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorageFactory::Memory => {
-                Ok(Arc::new(OpenDalStorage::Memory(memory_config_build()?)))
-            }
+            OpenDalStorageFactory::Memory => Ok(Arc::new(OpenDalStorage::Memory {
+                operator: memory_config_build()?,
+                operator_cache: OperatorCache::default(),
+            })),
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs)),
+            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs {
+                operator_cache: OperatorCache::default(),
+            })),
             #[cfg(feature = "opendal-s3")]
             OpenDalStorageFactory::S3 {
                 configured_scheme,
@@ -155,20 +238,24 @@ impl StorageFactory for OpenDalStorageFactory {
                 configured_scheme: configured_scheme.clone(),
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
+                operator_cache: OperatorCache::default(),
             })),
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
+                operator_cache: OperatorCache::default(),
             })),
             #[cfg(feature = "opendal-oss")]
             OpenDalStorageFactory::Oss => Ok(Arc::new(OpenDalStorage::Oss {
                 config: oss_config_parse(config.props().clone())?.into(),
+                operator_cache: OperatorCache::default(),
             })),
             #[cfg(feature = "opendal-azdls")]
             OpenDalStorageFactory::Azdls { configured_scheme } => {
                 Ok(Arc::new(OpenDalStorage::Azdls {
                     configured_scheme: configured_scheme.clone(),
                     config: azdls_config_parse(config.props().clone())?.into(),
+                    operator_cache: OperatorCache::default(),
                 }))
             }
             #[cfg(all(
@@ -198,10 +285,21 @@ fn default_memory_operator() -> Operator {
 pub enum OpenDalStorage {
     /// Memory storage variant.
     #[cfg(feature = "opendal-memory")]
-    Memory(#[serde(skip, default = "self::default_memory_operator")] Operator),
+    Memory {
+        /// Underlying OpenDAL memory operator (raw; layers applied via cache).
+        #[serde(skip, default = "self::default_memory_operator")]
+        operator: Operator,
+        /// Finished-operator cache (single entry keyed `"memory"`). Shared on clone.
+        #[serde(skip, default)]
+        operator_cache: OperatorCache,
+    },
     /// Local filesystem storage variant.
     #[cfg(feature = "opendal-fs")]
-    LocalFs,
+    LocalFs {
+        /// Finished-operator cache (single entry keyed `"fs"`). Shared on clone.
+        #[serde(skip, default)]
+        operator_cache: OperatorCache,
+    },
     /// S3 storage variant.
     #[cfg(feature = "opendal-s3")]
     S3 {
@@ -213,18 +311,27 @@ pub enum OpenDalStorage {
         /// Custom AWS credential loader.
         #[serde(skip)]
         customized_credential_load: Option<s3::CustomAwsCredentialLoader>,
+        /// Operators keyed by bucket name. Shared on clone.
+        #[serde(skip, default)]
+        operator_cache: OperatorCache,
     },
     /// GCS storage variant.
     #[cfg(feature = "opendal-gcs")]
     Gcs {
         /// GCS configuration.
         config: Arc<GcsConfig>,
+        /// Operators keyed by bucket name. Shared on clone.
+        #[serde(skip, default)]
+        operator_cache: OperatorCache,
     },
     /// OSS storage variant.
     #[cfg(feature = "opendal-oss")]
     Oss {
         /// OSS configuration.
         config: Arc<OssConfig>,
+        /// Operators keyed by bucket name. Shared on clone.
+        #[serde(skip, default)]
+        operator_cache: OperatorCache,
     },
     /// Azure Data Lake Storage variant.
     /// Expects paths of the form
@@ -239,6 +346,9 @@ pub enum OpenDalStorage {
         configured_scheme: AzureStorageScheme,
         /// Azure DLS configuration.
         config: Arc<AzdlsConfig>,
+        /// Operators keyed by filesystem name. Shared on clone.
+        #[serde(skip, default)]
+        operator_cache: OperatorCache,
     },
 }
 
@@ -261,41 +371,60 @@ impl OpenDalStorage {
         path: &'a impl AsRef<str>,
     ) -> Result<(Operator, &'a str)> {
         let path = path.as_ref();
-        let (operator, relative_path): (Operator, &str) = match self {
+        match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorage::Memory(op) => {
-                if let Some(stripped) = path.strip_prefix("memory:/") {
-                    (op.clone(), stripped)
+            OpenDalStorage::Memory {
+                operator,
+                operator_cache,
+            } => {
+                let relative_path = if let Some(stripped) = path.strip_prefix("memory:/") {
+                    stripped
                 } else {
-                    (op.clone(), &path[1..])
-                }
+                    &path[1..]
+                };
+                let op = operator_cache
+                    .get_or_insert_with("memory".to_string(), || Ok(operator.clone()))?;
+                Ok((op, relative_path))
             }
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorage::LocalFs => {
-                let op = fs_config_build()?;
-                if let Some(stripped) = path.strip_prefix("file:/") {
-                    (op, stripped)
+            OpenDalStorage::LocalFs { operator_cache } => {
+                let relative_path = if let Some(stripped) = path.strip_prefix("file:/") {
+                    stripped
                 } else {
-                    (op, &path[1..])
-                }
+                    &path[1..]
+                };
+                let op = operator_cache.get_or_insert_with("fs".to_string(), fs_config_build)?;
+                Ok((op, relative_path))
             }
             #[cfg(feature = "opendal-s3")]
             OpenDalStorage::S3 {
                 configured_scheme,
                 config,
                 customized_credential_load,
+                operator_cache,
             } => {
-                let op = s3_config_build(config, customized_credential_load, path)?;
-                // `s3_config_build` derives the operator's bucket from `path`.
-                let bucket = op.info().name().to_string();
+                // Derive the bucket from the URL host without building an Operator,
+                // so cache hits skip `s3_config_build` entirely.
+                let url = url::Url::parse(path).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid s3 url: {path}: {e}"),
+                    )
+                })?;
+                let bucket = url.host_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid s3 url: {path}, missing bucket"),
+                    )
+                })?;
 
                 // `s3`, `s3a`, and `s3n` are aliases of the same object store
                 // (Java `S3FileIO` parity): a location for this bucket resolves
                 // under ANY alias, regardless of which alias the storage was
                 // configured with. The relative key is stripped using the matched
                 // alias's prefix length (see `s3_relative_path`).
-                match s3_relative_path(path, &bucket) {
-                    Some(relative_path) => (op, relative_path),
+                let relative_path = match s3_relative_path(path, bucket) {
+                    Some(relative_path) => relative_path,
                     None => {
                         let accepted = S3_SCHEME_ALIASES
                             .iter()
@@ -311,58 +440,98 @@ impl OpenDalStorage {
                             ),
                         ));
                     }
-                }
+                };
+
+                let op = operator_cache.get_or_insert_with(bucket.to_string(), || {
+                    s3_config_build(config, customized_credential_load, path)
+                })?;
+                Ok((op, relative_path))
             }
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { config } => {
-                let operator = gcs_config_build(config, path)?;
-                let prefix = format!("gs://{}/", operator.info().name());
-                if path.starts_with(&prefix) {
-                    (operator, &path[prefix.len()..])
-                } else {
+            OpenDalStorage::Gcs {
+                config,
+                operator_cache,
+            } => {
+                let url = url::Url::parse(path).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid gcs url: {path}: {e}"),
+                    )
+                })?;
+                let bucket = url.host_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid gcs url: {path}, bucket is required"),
+                    )
+                })?;
+                let prefix = format!("gs://{bucket}/");
+                if !path.starts_with(&prefix) {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!("Invalid gcs url: {path}, should start with {prefix}"),
                     ));
                 }
+                let relative_path = &path[prefix.len()..];
+                let op = operator_cache
+                    .get_or_insert_with(bucket.to_string(), || gcs_config_build(config, path))?;
+                Ok((op, relative_path))
             }
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorage::Oss { config } => {
-                let op = oss_config_build(config, path)?;
-                let prefix = format!("oss://{}/", op.info().name());
-                if path.starts_with(&prefix) {
-                    (op, &path[prefix.len()..])
-                } else {
+            OpenDalStorage::Oss {
+                config,
+                operator_cache,
+            } => {
+                let url = url::Url::parse(path).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid oss url: {path}: {e}"),
+                    )
+                })?;
+                let bucket = url.host_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid oss url: {path}, missing bucket"),
+                    )
+                })?;
+                let prefix = format!("oss://{bucket}/");
+                if !path.starts_with(&prefix) {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!("Invalid oss url: {path}, should start with {prefix}"),
                     ));
                 }
+                let relative_path = &path[prefix.len()..];
+                let op = operator_cache
+                    .get_or_insert_with(bucket.to_string(), || oss_config_build(config, path))?;
+                Ok((op, relative_path))
             }
             #[cfg(feature = "opendal-azdls")]
             OpenDalStorage::Azdls {
                 configured_scheme,
                 config,
-            } => azdls_create_operator(path, config, configured_scheme)?,
+                operator_cache,
+            } => {
+                // `azdls_create_operator` validates the path and builds a raw Operator;
+                // we re-key it by the filesystem name so subsequent I/O reuses it.
+                let (raw_op, relative_path) =
+                    azdls_create_operator(path, config, configured_scheme)?;
+                let key = raw_op.info().name().to_string();
+                let op = operator_cache.get_or_insert_with(key, || Ok(raw_op))?;
+                Ok((op, relative_path))
+            }
             #[cfg(all(
                 not(feature = "opendal-s3"),
                 not(feature = "opendal-fs"),
                 not(feature = "opendal-gcs"),
                 not(feature = "opendal-oss"),
                 not(feature = "opendal-azdls"),
+                not(feature = "opendal-memory"),
             ))]
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "No storage service has been enabled",
-                ));
-            }
-        };
-
-        // Transient errors are common for object stores; however there's no
-        // harm in retrying temporary failures for other storage backends as well.
-        let operator = operator.layer(RetryLayer::new());
-        Ok((operator, relative_path))
+            _ => Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "No storage service has been enabled",
+            )),
+        }
     }
 }
 
@@ -439,10 +608,15 @@ impl Storage for OpenDalStorage {
     /// shape `delete_prefix` removes), so a sibling key `ab2/...` is not reported for prefix
     /// `ab`.
     ///
-    /// Each file's authoritative `size` and last-modified time are read via `stat` so the
-    /// reported metadata is correct across every OpenDAL backend (some backends do not
-    /// populate full metadata on a list). A file whose backend reports no last-modified time
-    /// is reported with `created_at_millis = 0`.
+    /// # Metadata source
+    ///
+    /// Prefer size + last-modified from the list entry when
+    /// [`list_entry_metadata_complete`] (non-zero `content_length`, or a present
+    /// `last_modified`). Only `stat` when list metadata is incomplete. Incomplete
+    /// backends (e.g. OpenDAL memory) therefore still pay one `stat` per file;
+    /// object-store LIST responses that already carry Size/LastModified skip the
+    /// N HEAD round-trips. A file with no last-modified is reported with
+    /// `created_at_millis = 0`.
     async fn list(&self, path: &str) -> Result<Vec<FileInfo>> {
         let (op, relative_path) = self.create_operator(&path)?;
         // The base is the part of the caller-supplied `path` that precedes the
@@ -464,17 +638,32 @@ impl Storage for OpenDalStorage {
 
         let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
-            if !entry.metadata().is_file() {
+            let list_meta = entry.metadata();
+            if !list_meta.is_file() {
                 continue;
             }
-            let stat = op.stat(entry.path()).await.map_err(from_opendal_error)?;
-            let created_at_millis = stat
-                .last_modified()
-                .map(opendal_timestamp_to_millis)
-                .unwrap_or(0);
+
+            let (size, created_at_millis) = if list_entry_metadata_complete(list_meta) {
+                (
+                    list_meta.content_length(),
+                    list_meta
+                        .last_modified()
+                        .map(opendal_timestamp_to_millis)
+                        .unwrap_or(0),
+                )
+            } else {
+                let stat = op.stat(entry.path()).await.map_err(from_opendal_error)?;
+                (
+                    stat.content_length(),
+                    stat.last_modified()
+                        .map(opendal_timestamp_to_millis)
+                        .unwrap_or(0),
+                )
+            };
+
             files.push(FileInfo::new(
                 format!("{base}{}", entry.path()),
-                stat.content_length(),
+                size,
                 created_at_millis,
             ));
         }
@@ -539,6 +728,15 @@ mod tests {
         assert_eq!(op.info().scheme().to_string(), "memory");
     }
 
+    /// Helper: build an in-memory OpenDalStorage with a fresh operator + cache.
+    #[cfg(feature = "opendal-memory")]
+    fn memory_storage() -> OpenDalStorage {
+        OpenDalStorage::Memory {
+            operator: memory_config_build().expect("memory operator builds"),
+            operator_cache: OperatorCache::default(),
+        }
+    }
+
     /// Risk: the OpenDAL listing must return the exact recursive file set, with the right
     /// scheme-qualified locations and sizes, and must never report a sibling key outside the
     /// prefix (over-listing is over-deletion in the orphan-file action). Smoke test over the
@@ -546,7 +744,7 @@ mod tests {
     #[cfg(feature = "opendal-memory")]
     #[tokio::test]
     async fn test_opendal_memory_list_recursive_and_prefix_bounded() {
-        let storage = OpenDalStorage::Memory(memory_config_build().unwrap());
+        let storage = memory_storage();
 
         storage
             .write("memory:/dir/a.txt", Bytes::from("a"))
@@ -582,7 +780,7 @@ mod tests {
     #[cfg(feature = "opendal-memory")]
     #[tokio::test]
     async fn test_opendal_memory_list_empty_prefix_is_empty() {
-        let storage = OpenDalStorage::Memory(memory_config_build().unwrap());
+        let storage = memory_storage();
         storage
             .write("memory:/other/a.txt", Bytes::from("a"))
             .await
@@ -590,6 +788,94 @@ mod tests {
 
         let listed = storage.list("memory:/nothing-here").await.unwrap();
         assert!(listed.is_empty());
+    }
+
+    /// Pins the list-metadata completeness rule used to skip `stat`.
+    ///
+    /// OpenDAL's public `content_length()` is 0 when unset, so non-zero size or a
+    /// present last-modified means "backend filled list metadata". Empty-file +
+    /// mtime is complete; bare FILE mode is incomplete (memory list shape).
+    #[test]
+    fn test_list_entry_metadata_complete_rule() {
+        use opendal::{EntryMode, Metadata};
+
+        let incomplete = Metadata::new(EntryMode::FILE);
+        assert!(
+            !list_entry_metadata_complete(&incomplete),
+            "list entries with no size and no mtime must fall back to stat"
+        );
+
+        let with_size = Metadata::new(EntryMode::FILE).with_content_length(42);
+        assert!(
+            list_entry_metadata_complete(&with_size),
+            "non-zero content_length is complete"
+        );
+
+        let empty_with_mtime = Metadata::new(EntryMode::FILE).with_last_modified(
+            opendal::raw::Timestamp::from_millisecond(1_700_000_000_000).expect("ts"),
+        );
+        assert!(
+            list_entry_metadata_complete(&empty_with_mtime),
+            "last_modified alone covers empty files (size 0)"
+        );
+    }
+
+    /// Memory OpenDAL list entries only carry mode (no size / mtime). List must
+    /// still return correct sizes via the `stat` fallback — pins the incomplete path.
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_opendal_memory_list_uses_stat_fallback_for_incomplete_list_meta() {
+        let storage = memory_storage();
+        storage
+            .write("memory:/meta/empty.txt", Bytes::from(""))
+            .await
+            .expect("write empty");
+        storage
+            .write("memory:/meta/payload.txt", Bytes::from("hello"))
+            .await
+            .expect("write payload");
+
+        let mut listed = storage
+            .list("memory:/meta")
+            .await
+            .expect("list must succeed via stat fallback");
+        listed.sort_by(|a, b| a.location.cmp(&b.location));
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].location, "memory:/meta/empty.txt");
+        assert_eq!(listed[0].size, 0, "empty file size via stat");
+        assert_eq!(listed[1].location, "memory:/meta/payload.txt");
+        assert_eq!(listed[1].size, 5, "payload size via stat");
+    }
+
+    /// Operator cache reuses the same finished Operator for two paths on the same
+    /// memory backend, and clones of storage share the cache.
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_operator_cache_reuses_operator_for_same_backend() {
+        let storage = memory_storage();
+        let (op1, rel1) = storage
+            .create_operator(&"memory:/a/x")
+            .expect("first create_operator");
+        let (op2, rel2) = storage
+            .create_operator(&"memory:/a/y")
+            .expect("second create_operator");
+        assert_eq!(rel1, "a/x");
+        assert_eq!(rel2, "a/y");
+        assert_eq!(op1.info().name(), op2.info().name());
+        assert!(
+            Arc::ptr_eq(op1.inner(), op2.inner()),
+            "same-backend paths must share the cached Operator accessor"
+        );
+
+        let cloned = storage.clone();
+        let (op3, _) = cloned
+            .create_operator(&"memory:/a/z")
+            .expect("clone create_operator");
+        assert!(
+            Arc::ptr_eq(op1.inner(), op3.inner()),
+            "cloned OpenDalStorage must share the operator cache"
+        );
     }
 
     /// Risk: a wrong epoch base or a secs/millis mix-up in the OpenDAL last-modified conversion
@@ -633,7 +919,7 @@ mod tests {
             StorageFactory,
         };
 
-        use crate::{OpenDalStorage, OpenDalStorageFactory};
+        use crate::{OpenDalStorage, OpenDalStorageFactory, OperatorCache};
 
         /// Offline S3 props: a fixed region plus disabled ambient config/EC2 loads
         /// so the operator builds without any network or credential probe.
@@ -657,7 +943,48 @@ mod tests {
                 configured_scheme: configured_scheme.to_string(),
                 config: Arc::new(config),
                 customized_credential_load: None,
+                operator_cache: OperatorCache::default(),
             }
+        }
+
+        /// Operator cache: two keys in the same bucket share one Operator; a
+        /// different bucket gets a different Operator. Offline (no AWS I/O).
+        #[test]
+        fn test_operator_cache_reuses_operator_for_same_bucket() {
+            let storage = s3_storage("s3");
+            let (op1, rel1) = storage
+                .create_operator(&"s3://my-bucket/k1")
+                .expect("first path");
+            let (op2, rel2) = storage
+                .create_operator(&"s3://my-bucket/k2")
+                .expect("second path same bucket");
+            assert_eq!(rel1, "k1");
+            assert_eq!(rel2, "k2");
+            assert_eq!(op1.info().name(), "my-bucket");
+            assert_eq!(op2.info().name(), "my-bucket");
+            assert!(
+                Arc::ptr_eq(op1.inner(), op2.inner()),
+                "same bucket must reuse the cached Operator"
+            );
+
+            let (op_other, _) = storage
+                .create_operator(&"s3://other-bucket/k")
+                .expect("other bucket");
+            assert_eq!(op_other.info().name(), "other-bucket");
+            assert!(
+                !Arc::ptr_eq(op1.inner(), op_other.inner()),
+                "different buckets must not share Operators"
+            );
+
+            // Clone shares the cache.
+            let cloned = storage.clone();
+            let (op3, _) = cloned
+                .create_operator(&"s3a://my-bucket/k3")
+                .expect("clone + s3a alias");
+            assert!(
+                Arc::ptr_eq(op1.inner(), op3.inner()),
+                "cloned storage must share the operator cache for the same bucket"
+            );
         }
 
         /// Assert a location resolves against a store configured with `configured`,
