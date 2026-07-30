@@ -324,6 +324,42 @@ mod tests {
     }
 
     #[test]
+    fn list_element_float_enables_gate() {
+        use crate::spec::ListType;
+        let element = Arc::new(NestedField::list_element(
+            2,
+            Type::Primitive(PrimitiveType::Float),
+            false,
+        ));
+        let list = Type::List(ListType::new(element));
+        let schema = schema_with_fields(vec![NestedField::optional(1, "scores", list)]);
+        assert!(
+            schema_needs_nan_value_counts(&schema, &MetricsConfig::default()),
+            "list<float> element leaf must enable the NaN visitor"
+        );
+    }
+
+    #[test]
+    fn map_value_float_enables_gate() {
+        use crate::spec::MapType;
+        let key = Arc::new(NestedField::map_key_element(
+            2,
+            Type::Primitive(PrimitiveType::String),
+        ));
+        let value = Arc::new(NestedField::map_value_element(
+            3,
+            Type::Primitive(PrimitiveType::Double),
+            false,
+        ));
+        let map = Type::Map(MapType::new(key, value));
+        let schema = schema_with_fields(vec![NestedField::optional(1, "m", map)]);
+        assert!(
+            schema_needs_nan_value_counts(&schema, &MetricsConfig::default()),
+            "map value double leaf must enable the NaN visitor"
+        );
+    }
+
+    #[test]
     fn column_override_full_enables_gate_when_default_none() {
         let schema = schema_with_fields(vec![NestedField::optional(
             1,

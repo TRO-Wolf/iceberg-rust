@@ -1179,6 +1179,73 @@ mod tests {
         Ok(())
     }
 
+    /// Multi-batch NaN accumulation under a gate-on float writer: counts sum across write() calls.
+    /// MUTATION: drop Occupied-branch add in `accumulate_nan_count` ⇒ second batch overwrites, pin fails.
+    #[tokio::test]
+    async fn test_nan_counts_accumulate_across_batches() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-accum".to_string(), None, DataFileFormat::Parquet);
+
+        let schema =
+            {
+                let fields = vec![Field::new("score", DataType::Float32, true).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+                )];
+                Arc::new(arrow_schema::Schema::new(fields))
+            };
+        let b1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(vec![
+            1.0_f32,
+            f32::NAN,
+        ])) as ArrayRef])
+        .unwrap();
+        let b2 = RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(vec![
+            f32::NAN,
+            f32::NAN,
+            3.0,
+        ])) as ArrayRef])
+        .unwrap();
+        let iceberg_schema: SchemaRef =
+            Arc::new(b1.schema().as_ref().try_into().expect("iceberg schema"));
+        assert!(
+            schema_needs_nan_value_counts(
+                iceberg_schema.as_ref(),
+                &crate::spec::MetricsConfig::default()
+            ),
+            "float schema must gate the visitor on"
+        );
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .build(output_file)
+            .await?;
+        assert!(pw.collect_nan_value_counts);
+        pw.write(&b1).await?;
+        pw.write(&b2).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        assert_eq!(
+            data_file.nan_value_counts().get(&1).copied(),
+            Some(3),
+            "1 NaN in batch1 + 2 NaNs in batch2 must accumulate to 3"
+        );
+        Ok(())
+    }
+
     /// MetricsMode::None on a float schema must gate the visitor off even when the batch contains
     /// NaNs — Iceberg persists no nan_value_counts under `none`.
     #[tokio::test]
