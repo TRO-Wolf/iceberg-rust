@@ -854,6 +854,109 @@ mod tests {
         );
     }
 
+    /// Concurrent first-accesses for the same key must build once and all share
+    /// the finished Operator (double-checked locking under the mutex).
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_operator_cache_concurrent_same_key_builds_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let cache = OperatorCache::default();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let builds = Arc::clone(&builds);
+            handles.push(thread::spawn(move || {
+                cache
+                    .get_or_insert_with("concurrent".to_string(), || {
+                        builds.fetch_add(1, Ordering::SeqCst);
+                        // Slight delay so threads pile up on the miss path.
+                        thread::sleep(std::time::Duration::from_millis(2));
+                        memory_config_build()
+                    })
+                    .expect("concurrent get_or_insert_with")
+            }));
+        }
+        let ops: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "exactly one build under concurrent first-access"
+        );
+        for op in &ops[1..] {
+            assert!(
+                Arc::ptr_eq(ops[0].inner(), op.inner()),
+                "all concurrent callers must share the same finished Operator"
+            );
+        }
+    }
+
+    /// Layered cached memory Operator still reads back what was written (Retry +
+    /// ConcurrentLimit must not alter payload correctness).
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_memory_write_read_roundtrip_through_operator_cache() {
+        let storage = memory_storage();
+        let payload = Bytes::from(vec![7u8; 4096]);
+        storage
+            .write("memory:/rt/blob.bin", payload.clone())
+            .await
+            .expect("write through cache");
+        let read_back = storage
+            .read("memory:/rt/blob.bin")
+            .await
+            .expect("read through cache");
+        assert_eq!(read_back, payload);
+        assert!(storage.exists("memory:/rt/blob.bin").await.expect("exists"));
+        let meta = storage
+            .metadata("memory:/rt/blob.bin")
+            .await
+            .expect("metadata");
+        assert_eq!(meta.size, 4096);
+    }
+
+    /// S3 bucket-root relative path is empty string; scheme prefix forms list base.
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_s3_bucket_root_relative_path_is_empty() {
+        use iceberg::io::{S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_REGION};
+
+        let props: std::collections::HashMap<String, String> = [
+            (S3_REGION, "us-east-1"),
+            (S3_DISABLE_CONFIG_LOAD, "true"),
+            (S3_DISABLE_EC2_METADATA, "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = crate::s3::s3_config_parse(props).expect("offline s3 config");
+        let storage = OpenDalStorage::S3 {
+            configured_scheme: "s3".to_string(),
+            config: std::sync::Arc::new(config),
+            customized_credential_load: None,
+            operator_cache: OperatorCache::default(),
+        };
+
+        let (op, rel) = storage
+            .create_operator(&"s3://root-bucket/")
+            .expect("bucket root must resolve");
+        assert_eq!(rel, "", "relative path for bucket root must be empty");
+        assert_eq!(op.info().name(), "root-bucket");
+
+        // After warm, nested key still correct.
+        let (op2, rel2) = storage
+            .create_operator(&"s3://root-bucket/prefix/obj")
+            .expect("nested after root warm");
+        assert_eq!(rel2, "prefix/obj");
+        assert!(std::sync::Arc::ptr_eq(op.inner(), op2.inner()));
+    }
+
     /// OperatorCache invokes the build closure once per key (miss), never on hit.
     #[cfg(feature = "opendal-memory")]
     #[test]
