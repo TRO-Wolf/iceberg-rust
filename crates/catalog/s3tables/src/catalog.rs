@@ -30,8 +30,9 @@ use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
+    Catalog, CatalogBuilder, CommitBaseLoadPlan, Error, ErrorKind, MetadataLocation, Namespace,
+    NamespaceIdent, Result, TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
+    commit_base_conflict_error, plan_commit_base_load,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
@@ -246,10 +247,15 @@ impl S3TablesCatalog {
         })
     }
 
-    async fn load_table_with_version_token(
+    /// S3 Tables GetTable for the service metadata pointer + version_token, without reading
+    /// TableMetadata from object storage.
+    async fn get_table_pointer(
         &self,
         table_ident: &TableIdent,
-    ) -> Result<(Table, String)> {
+    ) -> Result<(
+        String, /* metadata_location */
+        String, /* version_token */
+    )> {
         let req = self
             .s3tables_client
             .get_table()
@@ -268,7 +274,15 @@ impl S3TablesCatalog {
                 ),
             )
         })?;
-        let metadata = TableMetadata::read_from(&self.file_io, metadata_location).await?;
+        Ok((metadata_location.to_string(), resp.version_token))
+    }
+
+    async fn load_table_with_version_token(
+        &self,
+        table_ident: &TableIdent,
+    ) -> Result<(Table, String)> {
+        let (metadata_location, version_token) = self.get_table_pointer(table_ident).await?;
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
 
         let table = Table::builder()
             .identifier(table_ident.clone())
@@ -276,7 +290,60 @@ impl S3TablesCatalog {
             .metadata_location(metadata_location)
             .file_io(self.file_io.clone())
             .build()?;
-        Ok((table, resp.version_token))
+        Ok((table, version_token))
+    }
+
+    /// Resolve the base table for a commit: GetTable for the pointer + version_token, then either
+    /// reuse a pre-loaded base (skip S3 metadata parse), conflict early, or full-load metadata.
+    async fn resolve_commit_base(
+        &self,
+        table_ident: &TableIdent,
+        commit: &mut TableCommit,
+    ) -> Result<(Table, String /* version_token */)> {
+        let (service_location, version_token) = self.get_table_pointer(table_ident).await?;
+        let base_loc = commit.base_metadata_location().map(str::to_string);
+        let provided = commit.take_base_table();
+        let provided_loc = provided
+            .as_ref()
+            .and_then(|t| t.metadata_location().map(str::to_string));
+
+        match plan_commit_base_load(
+            &service_location,
+            base_loc.as_deref(),
+            provided_loc.as_deref(),
+        ) {
+            CommitBaseLoadPlan::ReuseProvided => {
+                let provided = provided.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "commit base-load plan is ReuseProvided but no base table was supplied",
+                    )
+                })?;
+                // Rebind catalog FileIO + commit identifier (defense in depth vs forged base).
+                let table = Table::builder()
+                    .identifier(table_ident.clone())
+                    .metadata(provided.metadata_ref())
+                    .metadata_location(service_location)
+                    .file_io(self.file_io.clone())
+                    .build()?;
+                Ok((table, version_token))
+            }
+            CommitBaseLoadPlan::Conflict => Err(commit_base_conflict_error(
+                table_ident,
+                base_loc.as_deref(),
+                &service_location,
+            )),
+            CommitBaseLoadPlan::FullLoad => {
+                let metadata = TableMetadata::read_from(&self.file_io, &service_location).await?;
+                let table = Table::builder()
+                    .identifier(table_ident.clone())
+                    .metadata(metadata)
+                    .metadata_location(service_location)
+                    .file_io(self.file_io.clone())
+                    .build()?;
+                Ok((table, version_token))
+            }
+        }
     }
 }
 
@@ -664,11 +731,13 @@ impl Catalog for S3TablesCatalog {
     }
 
     /// Updates an existing table within the s3tables catalog.
-    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         let table_namespace = table_ident.namespace();
+        // GetTable for version_token + pointer; skip the second full S3 metadata parse when the
+        // service pointer still matches the commit base and Transaction supplied a base table.
         let (current_table, version_token) =
-            self.load_table_with_version_token(&table_ident).await?;
+            self.resolve_commit_base(&table_ident, &mut commit).await?;
 
         let staged_table = commit.apply(current_table)?;
         let staged_metadata_location = staged_table.metadata_location_result()?;
@@ -698,6 +767,8 @@ impl Catalog for S3TablesCatalog {
     /// Optimistic concurrency: if `expected_base_metadata_location` is `Some` and does not
     /// match the service-current pointer, returns a retryable
     /// [`ErrorKind::CatalogCommitConflicts`] before sending the update.
+    ///
+    /// Only the service pointer + version_token are needed — no full TableMetadata S3 parse.
     async fn publish_replace_table(
         &self,
         table: Table,
@@ -705,9 +776,9 @@ impl Catalog for S3TablesCatalog {
     ) -> Result<Table> {
         let table_ident = table.identifier().clone();
         let table_namespace = table_ident.namespace();
-        let (current_table, version_token) =
-            self.load_table_with_version_token(&table_ident).await?;
-        let stored = current_table.metadata_location_result()?.to_string();
+        // Pointer-only GetTable: publish_replace only needs metadata_location + version_token
+        // for the location check and CAS — never the full metadata JSON.
+        let (stored, version_token) = self.get_table_pointer(&table_ident).await?;
 
         if let Some(expected) = expected_base_metadata_location.as_deref()
             && stored != expected

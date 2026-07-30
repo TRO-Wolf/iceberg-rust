@@ -575,9 +575,14 @@ async fn test_multi_file_grouping_one_partition() {
     assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
 }
 
-/// PARTITION ISOLATION. Two partitions, each with two pos-delete files. The action compacts EACH
-/// partition's group SEPARATELY (one compacted file per partition, never merging across partitions).
-/// Read identity per-partition must hold.
+/// PARTITION ISOLATION + MULTI-GROUP TABLE ADVANCE. Two partitions, each with two pos-delete
+/// files. The action compacts EACH partition's group SEPARATELY (one compacted file per
+/// partition, never merging across partitions). Read identity per-partition must hold.
+///
+/// Each group commits its own `Replace` snapshot; the action advances the base table after each
+/// group commit (mirrors `RewriteDataFiles`) so the next `Transaction` is built on the prior
+/// group's tip. Without advance, `do_commit` still refreshes + re-applies (correctness holds;
+/// cost is extra re-apply work — not forced CAS conflict retries).
 ///
 /// MUTATION COVERAGE: collapse the `(spec, partition)` group key to spec-only and both partitions' files
 /// would merge into one group; the compacted file's partition would be wrong and the per-partition read
@@ -607,6 +612,7 @@ async fn test_partition_isolation_compacts_each_group_separately() {
         HashSet::from([10, 30]),
         "before: y=20 (part 0) and y=40 (part 1) masked"
     );
+    let history_before = table.metadata().history().len();
 
     let result = RewritePositionDeleteFiles::new(table.clone())
         .execute(&catalog)
@@ -629,6 +635,14 @@ async fn test_partition_isolation_compacts_each_group_separately() {
         count_pos(&live_delete_files(&reloaded).await),
         2,
         "exactly two compacted files (one per partition)"
+    );
+    // Two sequential group commits each append a snapshot log entry. (Advance is a re-apply
+    // avoidance / RewriteDataFiles parity seam; history +2 pins multi-group commits, not that
+    // CAS would fail without advance — `do_commit` refreshes a stale base on first attempt.)
+    assert_eq!(
+        reloaded.metadata().history().len(),
+        history_before + 2,
+        "two group commits must each produce a Replace snapshot"
     );
 }
 

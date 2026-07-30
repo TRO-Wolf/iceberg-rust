@@ -30,6 +30,7 @@ use arrow_array::types::{
     Time64MicrosecondType, TimestampMicrosecondType,
 };
 use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, LargeBinaryArray, StringArray};
+use bytes::Bytes;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::*;
@@ -42,6 +43,12 @@ use crate::spec::NestedField;
 
 /// The Java-Iceberg 1.10.0 golden ORC file (ZLIB-compressed, 14 columns, 3 rows).
 const FIXTURE: &[u8] = include_bytes!("../../testdata/orc/iceberg_primitives.orc");
+
+/// Owned view of the static fixture — zero-copy into `read_orc_data_bytes` (Wave B: no
+/// `Bytes::copy_from_slice` of the full file in the production path either).
+fn fixture_bytes() -> Bytes {
+    Bytes::from_static(FIXTURE)
+}
 
 fn schema_of(fields: Vec<NestedField>) -> Schema {
     Schema::builder()
@@ -79,7 +86,8 @@ fn full_schema() -> Schema {
 
 /// Decode the fixture against `expected`, asserting a single batch and returning it.
 fn read_fixture(expected: &Schema) -> RecordBatch {
-    let mut batches = read_orc_data_bytes(FIXTURE, expected, 1024).expect("decode ORC fixture");
+    let mut batches =
+        read_orc_data_bytes(fixture_bytes(), expected, 1024).expect("decode ORC fixture");
     assert_eq!(batches.len(), 1, "fixture has one stripe → one batch");
     batches.pop().expect("one batch")
 }
@@ -261,7 +269,7 @@ fn test_missing_required_column_errors() {
         NestedField::required(1, "id", prim(PrimitiveType::Long)),
         NestedField::required(999, "must_exist", prim(PrimitiveType::String)),
     ]);
-    let err = read_orc_data_bytes(FIXTURE, &schema, 1024)
+    let err = read_orc_data_bytes(fixture_bytes(), &schema, 1024)
         .expect_err("required-missing must error");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
     assert!(
@@ -327,7 +335,7 @@ fn test_incompatible_type_errors() {
         "int_col",
         prim(PrimitiveType::String),
     )]);
-    let err = read_orc_data_bytes(FIXTURE, &schema, 1024).expect_err("int→string must error");
+    let err = read_orc_data_bytes(fixture_bytes(), &schema, 1024).expect_err("int→string must error");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
     assert!(err.message().contains("Can not promote"), "Java-parity message: {err}");
 }
@@ -356,7 +364,7 @@ fn test_decimal_scale_mismatch_is_stricter_than_java() {
             scale: 3,
         }),
     )]);
-    let err = read_orc_data_bytes(FIXTURE, &schema, 1024)
+    let err = read_orc_data_bytes(fixture_bytes(), &schema, 1024)
         .expect_err("Rust rejects a decimal scale mismatch (stricter than Java)");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
     assert!(
@@ -373,7 +381,7 @@ fn test_decimal_scale_mismatch_is_stricter_than_java() {
 fn test_batch_size_splits_rows() {
     // batch_size 2 over 3 rows → batches of 2 + 1.
     let schema = schema_of(vec![NestedField::required(1, "id", prim(PrimitiveType::Long))]);
-    let batches = read_orc_data_bytes(FIXTURE, &schema, 2).expect("decode in batches of 2");
+    let batches = read_orc_data_bytes(fixture_bytes(), &schema, 2).expect("decode in batches of 2");
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 3);
     assert!(batches.len() >= 2, "expected the 3 rows split across ≥2 batches");
@@ -382,7 +390,7 @@ fn test_batch_size_splits_rows() {
 #[test]
 fn test_zero_batch_size_errors() {
     let schema = schema_of(vec![NestedField::required(1, "id", prim(PrimitiveType::Long))]);
-    let err = read_orc_data_bytes(FIXTURE, &schema, 0).expect_err("batch_size 0 must error");
+    let err = read_orc_data_bytes(fixture_bytes(), &schema, 0).expect_err("batch_size 0 must error");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
 }
 
@@ -398,7 +406,7 @@ fn test_nested_type_unsupported() {
         "nested",
         Type::Struct(inner),
     )]);
-    let err = read_orc_data_bytes(FIXTURE, &schema, 1024).expect_err("nested must error");
+    let err = read_orc_data_bytes(fixture_bytes(), &schema, 1024).expect_err("nested must error");
     assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
 }
 

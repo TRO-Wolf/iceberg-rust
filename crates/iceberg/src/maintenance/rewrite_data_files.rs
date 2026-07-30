@@ -550,6 +550,10 @@ impl RewriteDataFiles {
     /// applied via the attached delete files each task carries) and write them into target-sized
     /// data file(s) via the rolling data-file writer. Returns the written [`DataFile`]s.
     ///
+    /// Batches are streamed from the Arrow reader into the writer — never buffered as a full
+    /// `Vec<RecordBatch>` — so large groups stay memory-bounded by the rolling writer, not by the
+    /// full live row set.
+    ///
     /// All files in a single group share one partition tuple under the current spec (the planner
     /// groups by partition), so the output files are written under that one partition key.
     async fn write_compacted_files(
@@ -618,12 +622,13 @@ impl RewriteDataFiles {
             })
             .collect();
         let task_stream = Box::pin(futures::stream::iter(tasks)) as crate::scan::FileScanTaskStream;
-        let batch_stream = ArrowReaderBuilder::new(table.file_io().clone())
+        // Stream batches from the reader into the writer — do NOT collect the full group into a
+        // Vec first. Large compaction groups would otherwise hold every live row in memory at once.
+        let mut batch_stream = ArrowReaderBuilder::new(table.file_io().clone())
             .build()
             .read(task_stream)?;
-        let batches: Vec<_> = batch_stream.try_collect().await?;
 
-        for batch in batches {
+        while let Some(batch) = batch_stream.try_next().await? {
             // The scan read schema equals the table's current schema; the data-file writer's
             // parquet schema is the same — no projection needed.
             writer.write(batch).await?;

@@ -22,7 +22,7 @@ use futures::{SinkExt, TryFutureExt};
 
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::visitors::residual_evaluator::ResidualEvaluator;
-use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::expr::{BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
 use crate::scan::metrics_collector::ScanMetricsCollector;
 use crate::scan::{
@@ -274,15 +274,20 @@ impl ManifestEntryContext {
     /// `BoundPredicate::AlwaysTrue` (the reader applies no per-row filtering); an
     /// `AlwaysFalse` residual binds to `BoundPredicate::AlwaysFalse` (the file
     /// produces no rows).
+    ///
+    /// Residuals are memoized per partition on the shared [`ResidualEvaluator`] so
+    /// many files in the same partition do not re-run `residual_for` + bind.
     fn residual_predicate(&self) -> Result<Option<BoundPredicate>> {
         let Some(residual_evaluator) = self.residual_evaluator.as_ref() else {
             return Ok(None);
         };
 
-        let residual: Predicate =
-            residual_evaluator.residual_for(self.manifest_entry.data_file().partition())?;
-        let bound = residual.bind(self.snapshot_schema.clone(), self.case_sensitive)?;
-        Ok(Some(bound))
+        let bound = residual_evaluator.residual_bound_for(
+            self.manifest_entry.data_file().partition(),
+            self.snapshot_schema.clone(),
+            self.case_sensitive,
+        )?;
+        Ok(Some(bound.as_ref().clone()))
     }
 }
 
@@ -359,19 +364,19 @@ impl PlanContext {
     fn get_partition_filter(&self, manifest_file: &ManifestFile) -> Result<Arc<BoundPredicate>> {
         let partition_spec_id = manifest_file.partition_spec_id;
 
+        // Use the scan-level snapshot-bound predicate — do not re-bind the unbound filter
+        // on every manifest (the bind already ran once at `TableScanBuilder::build`).
+        let snapshot_bound = self.snapshot_bound_predicate.as_ref().ok_or(Error::new(
+            ErrorKind::Unexpected,
+            "Expected a snapshot-bound predicate but none present",
+        ))?;
+
         let partition_filter = self.partition_filter_cache.get(
             partition_spec_id,
             &self.table_metadata,
             &self.snapshot_schema,
             self.case_sensitive,
-            self.predicate
-                .as_ref()
-                .ok_or(Error::new(
-                    ErrorKind::Unexpected,
-                    "Expected a predicate but none present",
-                ))?
-                .as_ref()
-                .bind(self.snapshot_schema.clone(), self.case_sensitive)?,
+            snapshot_bound.as_ref(),
         )?;
 
         Ok(partition_filter)
@@ -480,13 +485,14 @@ impl PlanContext {
         sender: Sender<ManifestEntryContext>,
         delete_file_index: DeleteFileIndex,
     ) -> Result<ManifestFileContext> {
+        // Share the already-Arc'd predicates — do not deep-clone the bound trees per manifest.
         let bound_predicates =
-            if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
-                (partition_filter, &self.snapshot_bound_predicate)
+            if let (Some(partition_bound_predicate), Some(snapshot_bound_predicate)) =
+                (partition_filter, self.snapshot_bound_predicate.clone())
             {
                 Some(Arc::new(BoundPredicates {
-                    partition_bound_predicate: partition_bound_predicate.as_ref().clone(),
-                    snapshot_bound_predicate: snapshot_bound_predicate.as_ref().clone(),
+                    partition_bound_predicate,
+                    snapshot_bound_predicate,
                 }))
             } else {
                 None
@@ -512,9 +518,12 @@ impl PlanContext {
                 snapshot_bound_predicate.as_ref().clone(),
                 self.case_sensitive,
             )?)),
-            (Some(snapshot_bound_predicate), None) => Some(Arc::new(
-                ResidualEvaluator::unpartitioned(snapshot_bound_predicate.as_ref().clone()),
-            )),
+            (Some(snapshot_bound_predicate), None) => {
+                Some(Arc::new(ResidualEvaluator::unpartitioned(
+                    snapshot_bound_predicate.as_ref().clone(),
+                    self.case_sensitive,
+                )))
+            }
             (None, _) => None,
         };
 

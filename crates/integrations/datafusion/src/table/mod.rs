@@ -2167,12 +2167,18 @@ mod tests {
             .load_table(&TableIdent::new(namespace.clone(), table_name.clone()))
             .await
             .expect("load the seeded table");
-        let batches: Vec<_> = get_batch_stream(table, None, vec!["name".to_string()], None)
-            .await
-            .expect("open the scan stream")
-            .try_collect()
-            .await
-            .expect("read the scan stream");
+        let batches: Vec<_> = get_batch_stream(
+            table,
+            None,
+            vec!["name".to_string()],
+            None,
+            crate::physical_plan::scan::ScanKnobs::default(),
+        )
+        .await
+        .expect("open the scan stream")
+        .try_collect()
+        .await
+        .expect("read the scan stream");
 
         assert!(!batches.is_empty(), "the seeded row must produce a batch");
         for batch in &batches {

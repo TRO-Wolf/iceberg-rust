@@ -38,7 +38,7 @@ use parquet::file::statistics::Statistics;
 use super::{FileWriter, FileWriterBuilder};
 use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor, UTC_TIME_ZONE,
-    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
+    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum, schema_needs_nan_value_counts,
 };
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
@@ -101,6 +101,11 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        // Detect once at build time: only run the NaN visitor when the schema has float/double
+        // leaves under a counts-collecting metrics mode. Int/string/timestamp-only tables skip
+        // the full schema walk on every batch.
+        let collect_nan_value_counts =
+            schema_needs_nan_value_counts(self.schema.as_ref(), &self.metrics_config);
         Ok(ParquetWriter {
             schema: self.schema.clone(),
             writer_arrow_schema: Arc::new(self.schema.as_ref().try_into()?),
@@ -109,6 +114,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            collect_nan_value_counts,
             metrics_config: self.metrics_config.clone(),
         })
     }
@@ -244,6 +250,9 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+    /// When false the write path skips the NaN visitor entirely (no float/double leaves under a
+    /// counts-collecting metrics mode). Computed once in [`ParquetWriterBuilder::build`].
+    collect_nan_value_counts: bool,
     metrics_config: MetricsConfig,
 }
 
@@ -553,9 +562,12 @@ impl FileWriter for ParquetWriter {
 
         self.current_row_num += batch.num_rows();
 
-        let batch_c = batch.clone();
-        self.nan_value_count_visitor
-            .compute(self.schema.clone(), batch_c)?;
+        // Only walk the batch for NaN counts when the schema has float/double leaves under a
+        // counts-collecting metrics mode. The visitor takes `&RecordBatch` (no batch clone).
+        if self.collect_nan_value_counts {
+            self.nan_value_count_visitor
+                .compute(self.schema.clone(), batch)?;
+        }
 
         // Normalize UTC-alias timestamp timezones to the writer schema (metadata-only). Spark
         // tags Iceberg `timestamptz` batches `Timestamp(_, "UTC")`; the writer schema tags them
@@ -1086,11 +1098,422 @@ mod tests {
             HashMap::from([(0, Datum::long(1023))])
         );
         assert_eq!(*data_file.null_value_counts(), HashMap::from([(0, 1024)]));
+        // Int-only schema: NaN visitor is gated off; nan_value_counts stays empty (no full-batch walk).
+        assert!(
+            data_file.nan_value_counts().is_empty(),
+            "int-only schema must not produce nan_value_counts"
+        );
 
         // check the written file
         let expect_batch = concat_batches(&schema, vec![&to_write, &to_write_null]).unwrap();
         check_parquet_data_file(&file_io, &data_file, &expect_batch).await;
 
+        Ok(())
+    }
+
+    /// Pin the NaN-visitor gate: a writer built for an int-only schema has
+    /// `collect_nan_value_counts == false`, so the write path never walks batches for NaNs.
+    #[tokio::test]
+    async fn test_nan_visitor_gated_off_for_int_only_schema() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-gate".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = {
+            let fields =
+                vec![
+                    Field::new("col", DataType::Int64, true).with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "0".to_string(),
+                    )])),
+                ];
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let col = Arc::new(Int64Array::from_iter_values(0..8)) as ArrayRef;
+        let to_write = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+        let iceberg_schema: SchemaRef = Arc::new(
+            to_write
+                .schema()
+                .as_ref()
+                .try_into()
+                .expect("iceberg schema"),
+        );
+
+        assert!(
+            !schema_needs_nan_value_counts(
+                iceberg_schema.as_ref(),
+                &crate::spec::MetricsConfig::default()
+            ),
+            "gate must be false for int-only schema"
+        );
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .build(output_file)
+            .await?;
+        assert!(
+            !pw.collect_nan_value_counts,
+            "ParquetWriter must gate off NaN visitor for int-only schema"
+        );
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        assert!(
+            data_file.nan_value_counts().is_empty(),
+            "gated writer must emit empty nan_value_counts"
+        );
+        Ok(())
+    }
+
+    /// Two float columns: metrics default none + column `b` full. Gate on; only field b gets
+    /// nan_value_counts after retain (column `a` mode none is stripped).
+    #[tokio::test]
+    async fn test_mixed_float_metrics_modes_retain_only_collecting_column() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-modes".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = {
+            let fields = vec![
+                Field::new("a", DataType::Float32, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+                Field::new("b", DataType::Float64, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )])),
+            ];
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let to_write = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Float32Array::from(vec![f32::NAN, 1.0])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0_f64, f64::NAN])) as ArrayRef,
+        ])
+        .unwrap();
+        let iceberg_schema: SchemaRef = Arc::new(
+            to_write
+                .schema()
+                .as_ref()
+                .try_into()
+                .expect("iceberg schema"),
+        );
+        let metrics = crate::spec::MetricsConfig::from_properties(&HashMap::from([
+            (
+                "write.metadata.metrics.default".to_string(),
+                "none".to_string(),
+            ),
+            (
+                "write.metadata.metrics.column.b".to_string(),
+                "full".to_string(),
+            ),
+        ]));
+        assert!(schema_needs_nan_value_counts(
+            iceberg_schema.as_ref(),
+            &metrics
+        ));
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .with_metrics_config(metrics)
+            .build(output_file)
+            .await?;
+        assert!(pw.collect_nan_value_counts);
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        assert_eq!(
+            data_file.nan_value_counts().get(&2).copied(),
+            Some(1),
+            "column b (full) keeps nan count"
+        );
+        assert!(
+            !data_file.nan_value_counts().contains_key(&1),
+            "column a (none) must be stripped from nan_value_counts"
+        );
+        Ok(())
+    }
+
+    /// Mixed int+float schema: gate is on; nan_value_counts only for the float field id.
+    #[tokio::test]
+    async fn test_mixed_int_float_nan_counts_only_on_float_id() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-mixed".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = {
+            let fields = vec![
+                Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+                Field::new("score", DataType::Float32, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )])),
+            ];
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let to_write = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
+            Arc::new(Float32Array::from(vec![1.0_f32, f32::NAN, 3.0])) as ArrayRef,
+        ])
+        .unwrap();
+        let iceberg_schema: SchemaRef = Arc::new(
+            to_write
+                .schema()
+                .as_ref()
+                .try_into()
+                .expect("iceberg schema"),
+        );
+        assert!(schema_needs_nan_value_counts(
+            iceberg_schema.as_ref(),
+            &crate::spec::MetricsConfig::default()
+        ));
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .build(output_file)
+            .await?;
+        assert!(pw.collect_nan_value_counts);
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        assert_eq!(data_file.nan_value_counts().get(&2).copied(), Some(1));
+        assert!(
+            !data_file.nan_value_counts().contains_key(&1),
+            "int field id must not appear in nan_value_counts"
+        );
+        Ok(())
+    }
+
+    /// Empty batch under a gate-on float writer must not invent nan_value_counts entries.
+    #[tokio::test]
+    async fn test_empty_batch_under_gate_emits_no_nan_counts() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-empty".to_string(), None, DataFileFormat::Parquet);
+
+        let schema =
+            {
+                let fields = vec![Field::new("score", DataType::Float32, true).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+                )];
+                Arc::new(arrow_schema::Schema::new(fields))
+            };
+        let empty = RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(
+            Vec::<f32>::new(),
+        )) as ArrayRef])
+        .unwrap();
+        let non_empty =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(vec![
+                1.0_f32, 2.0,
+            ])) as ArrayRef])
+            .unwrap();
+        let iceberg_schema: SchemaRef =
+            Arc::new(empty.schema().as_ref().try_into().expect("iceberg schema"));
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .build(output_file)
+            .await?;
+        assert!(pw.collect_nan_value_counts);
+        pw.write(&empty).await?;
+        pw.write(&non_empty).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        // No NaNs written — map may be empty or zero; must not report positive nan counts.
+        assert!(
+            data_file.nan_value_counts().values().all(|&c| c == 0)
+                || data_file.nan_value_counts().is_empty(),
+            "empty+non-NaN batches must not produce positive nan_value_counts"
+        );
+        Ok(())
+    }
+
+    /// Multi-batch NaN accumulation under a gate-on float writer: counts sum across write() calls.
+    /// MUTATION: drop Occupied-branch add in `accumulate_nan_count` ⇒ second batch overwrites, pin fails.
+    #[tokio::test]
+    async fn test_nan_counts_accumulate_across_batches() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-accum".to_string(), None, DataFileFormat::Parquet);
+
+        let schema =
+            {
+                let fields = vec![Field::new("score", DataType::Float32, true).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+                )];
+                Arc::new(arrow_schema::Schema::new(fields))
+            };
+        let b1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(vec![
+            1.0_f32,
+            f32::NAN,
+        ])) as ArrayRef])
+        .unwrap();
+        let b2 = RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(vec![
+            f32::NAN,
+            f32::NAN,
+            3.0,
+        ])) as ArrayRef])
+        .unwrap();
+        let iceberg_schema: SchemaRef =
+            Arc::new(b1.schema().as_ref().try_into().expect("iceberg schema"));
+        assert!(
+            schema_needs_nan_value_counts(
+                iceberg_schema.as_ref(),
+                &crate::spec::MetricsConfig::default()
+            ),
+            "float schema must gate the visitor on"
+        );
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .build(output_file)
+            .await?;
+        assert!(pw.collect_nan_value_counts);
+        pw.write(&b1).await?;
+        pw.write(&b2).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        assert_eq!(
+            data_file.nan_value_counts().get(&1).copied(),
+            Some(3),
+            "1 NaN in batch1 + 2 NaNs in batch2 must accumulate to 3"
+        );
+        Ok(())
+    }
+
+    /// MetricsMode::None on a float schema must gate the visitor off even when the batch contains
+    /// NaNs — Iceberg persists no nan_value_counts under `none`.
+    #[tokio::test]
+    async fn test_nan_visitor_gated_off_when_metrics_none() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("nan-none".to_string(), None, DataFileFormat::Parquet);
+
+        let schema =
+            {
+                let fields = vec![Field::new("score", DataType::Float32, true).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+                )];
+                Arc::new(arrow_schema::Schema::new(fields))
+            };
+        let col = Arc::new(Float32Array::from(vec![1.0_f32, f32::NAN, 2.0])) as ArrayRef;
+        let to_write = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+        let iceberg_schema: SchemaRef = Arc::new(
+            to_write
+                .schema()
+                .as_ref()
+                .try_into()
+                .expect("iceberg schema"),
+        );
+        let metrics = crate::spec::MetricsConfig::from_properties(&HashMap::from([(
+            "write.metadata.metrics.default".to_string(),
+            "none".to_string(),
+        )]));
+        assert!(
+            !schema_needs_nan_value_counts(iceberg_schema.as_ref(), &metrics),
+            "gate must be false under MetricsMode::None"
+        );
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema)
+            .with_metrics_config(metrics)
+            .build(output_file)
+            .await?;
+        assert!(
+            !pw.collect_nan_value_counts,
+            "ParquetWriter must gate off NaN visitor when metrics default is none"
+        );
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .expect("one data file")
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        assert!(
+            data_file.nan_value_counts().is_empty(),
+            "MetricsMode::None must emit empty nan_value_counts even when batch has NaNs"
+        );
         Ok(())
     }
 

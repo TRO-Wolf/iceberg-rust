@@ -1034,10 +1034,7 @@ impl Catalog for SqlCatalog {
     }
 
     async fn load_table(&self, identifier: &TableIdent) -> Result<Table> {
-        if !self.table_exists(identifier).await? {
-            return no_such_table_err(identifier);
-        }
-
+        // Single SELECT: empty result ⇒ not found (avoids a separate table_exists round-trip).
         let rows = self
             .fetch_rows(
                 &format!(
