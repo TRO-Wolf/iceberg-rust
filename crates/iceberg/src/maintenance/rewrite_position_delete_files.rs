@@ -209,6 +209,12 @@ impl RewritePositionDeleteFiles {
         // Puffin DVs are SKIPPED (file-scoped, never bin-packed) — the documented V2-parquet-only scope.
         let groups = self.collect_position_delete_groups(&snapshot).await?;
 
+        // Advance the base table after each group commit so the next group's `Transaction` is
+        // built on the committed tip (mirrors RewriteDataFiles). Without this, groups 2..N still
+        // succeed via `Transaction::do_commit`'s stale-base refresh + re-apply, but each group
+        // pays a full rewrite re-apply against the refreshed tip. Advancing avoids that redundant
+        // re-apply work; it is not required for CAS correctness under the retry/refresh loop.
+        let mut table = self.table.clone();
         let mut result = RewritePositionDeleteFilesResult::default();
         for (key, entries) in groups {
             // Java's planner drops single-file groups (nothing to compact). A group must have at least
@@ -222,7 +228,15 @@ impl RewritePositionDeleteFiles {
                 continue;
             }
 
-            self.compact_group(catalog, &key, &entries, starting_snapshot_id, &mut result)
+            table = self
+                .compact_group(
+                    catalog,
+                    &table,
+                    &key,
+                    &entries,
+                    starting_snapshot_id,
+                    &mut result,
+                )
                 .await?;
         }
 
@@ -325,25 +339,29 @@ impl RewritePositionDeleteFiles {
     /// sort, write FEWER position-delete files, and commit ONE `RewriteFiles` that replaces the rewritten
     /// files with the new one, stamped with the group MAX rewritten data-seq and validated from the
     /// starting snapshot. Accumulates the four `Result` counts.
+    ///
+    /// Returns the committed [`Table`] so the caller can advance the base for the next group
+    /// (mirrors [`crate::maintenance::rewrite_data_files::RewriteDataFiles`]).
     async fn compact_group(
         &self,
         catalog: &dyn Catalog,
+        table: &Table,
         key: &GroupKey,
         entries: &[LiveDeleteEntry],
         starting_snapshot_id: i64,
         result: &mut RewritePositionDeleteFilesResult,
-    ) -> Result<()> {
+    ) -> Result<Table> {
         // (2) Read + concat the (file_path, pos) pairs across the group.
         let mut pairs: Vec<(String, i64)> = Vec::new();
         for entry in entries {
-            self.read_position_pairs(&entry.data_file, &mut pairs)
+            self.read_position_pairs(table, &entry.data_file, &mut pairs)
                 .await?;
         }
 
         // A group of live pos-delete files always carries rows (a position delete with no rows is
         // degenerate); if somehow empty, there is nothing to compact — leave the group untouched.
         if pairs.is_empty() {
-            return Ok(());
+            return Ok(table.clone());
         }
 
         // Spec-recommended position-delete ordering: sort by (file_path, pos). Java does NOT dedup within
@@ -351,7 +369,7 @@ impl RewritePositionDeleteFiles {
         pairs.sort();
 
         // (3) Write FEWER position-delete files (one per group) under the group spec + partition key.
-        let new_file = self.write_compacted_file(key, &pairs).await?;
+        let new_file = self.write_compacted_file(table, key, &pairs).await?;
 
         // (4) STALLER — the group MAX rewritten data sequence number. A position delete applies to data
         // with `data_seq < delete_seq`; stamping the MAX of the rewritten group preserves exactly which
@@ -378,14 +396,14 @@ impl RewritePositionDeleteFiles {
         // stamped with the group MAX rewritten data-seq via `add_delete_file_with_sequence_number` (NOT
         // the default-inherit add), validating from the starting snapshot (Java
         // `newRewrite().validateFromSnapshot(J).deleteFile(rewritten).addFile(added, J).commit()`).
-        let transaction = Transaction::new(&self.table);
+        let transaction = Transaction::new(table);
         let action = transaction
             .rewrite_files(Vec::new(), Vec::new())
             .delete_delete_files(rewritten_files)
             .add_delete_file_with_sequence_number(new_file, max_seq)
             .validate_from_snapshot(starting_snapshot_id);
         let transaction = action.apply(transaction)?;
-        transaction.commit(catalog).await?;
+        let committed = transaction.commit(catalog).await?;
 
         result.rewritten_delete_files_count += rewritten_count;
         result.added_delete_files_count += 1;
@@ -398,7 +416,7 @@ impl RewritePositionDeleteFiles {
             .checked_add(added_bytes)
             .ok_or_else(|| Error::new(ErrorKind::Unexpected, "added bytes count overflow"))?;
 
-        Ok(())
+        Ok(committed)
     }
 
     /// Read one parquet position-delete file's two RESERVED columns — `file_path` (field id
@@ -408,10 +426,11 @@ impl RewritePositionDeleteFiles {
     /// reads (interop-faithful).
     async fn read_position_pairs(
         &self,
+        table: &Table,
         delete_file: &DataFile,
         pairs: &mut Vec<(String, i64)>,
     ) -> Result<()> {
-        let loader = BasicDeleteFileLoader::new(self.table.file_io().clone());
+        let loader = BasicDeleteFileLoader::new(table.file_io().clone());
         let mut stream = loader
             .parquet_to_batch_stream(delete_file.file_path(), delete_file.file_size_in_bytes)
             .await?;
@@ -440,10 +459,11 @@ impl RewritePositionDeleteFiles {
     /// group's spec + partition key, returning the resulting [`DataFile`].
     async fn write_compacted_file(
         &self,
+        table: &Table,
         key: &GroupKey,
         pairs: &[(String, i64)],
     ) -> Result<DataFile> {
-        let metadata = self.table.metadata();
+        let metadata = table.metadata();
         let schema = metadata.current_schema().clone();
         let (spec_id, partition) = key;
         let spec = metadata
@@ -473,7 +493,7 @@ impl RewritePositionDeleteFiles {
         .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
-            self.table.file_io().clone(),
+            table.file_io().clone(),
             location_gen,
             file_name_gen,
         );
