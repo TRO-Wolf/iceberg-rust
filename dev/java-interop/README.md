@@ -183,8 +183,9 @@ so the offline suite is hermetic and never mutates the committed fixtures.
 
 ## Scheduled CI (the "Nightly Interop" workflow)
 
-Every `run-interop-*.sh` suite in this directory is run **unprompted every week** (Saturdays
-06:43 UTC; nightly until 2026-07-30 — the workflow keeps its historical name) by
+Every `run-interop-*.sh` suite in this directory is run **unprompted every week** (nightly
+until 2026-07-30; the exact slot lives in the workflow's cron, and the workflow keeps its
+historical name) by
 [`.github/workflows/nightly_interop.yml`](../../.github/workflows/nightly_interop.yml), which
 invokes the driver [`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh)
 (`make interop`). The driver's contract (house doctrine — hard-fail, never skip; no silent caps):
@@ -199,12 +200,12 @@ invokes the driver [`scripts/run_interop_suites.sh`](../../scripts/run_interop_s
   PASS/FAIL table lands in the job step summary.
 - The CI job always runs the **full discovered set**; the driver's `--only` subset flag is for
   local iteration only and logs every suite it drops.
-- Runner provisioning: all 50 suites default to `/opt/maven/bin/mvn` and
-  `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` (49 hardcode them outright; only
-  `run-interop-aggregate.sh` reads `$MVN`/`$JAVA_HOME`), so the workflow installs the apt
+- Runner provisioning: every suite defaults to `/opt/maven/bin/mvn` and
+  `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64` (most hardcode them outright; the rest read
+  `$MVN`/`$JAVA_HOME` with those defaults), so the workflow installs the apt
   `openjdk-11-jdk-headless` + `maven` and symlinks `/opt/maven` — and primes `~/.m2` online
-  once, because 49 of the 50 suites invoke `mvn -o` (offline).
-- Outside the nightly set (named deferral): `run.sh` (the metadata-evolution pass above) and
+  once, so the suites' offline `mvn -o` invocations find a fully-populated `~/.m2`.
+- Outside the scheduled set (named deferral): `run.sh` (the metadata-evolution pass above) and
   `run-inspection-manifests.sh` do not match the `run-interop-*.sh` glob.
 
 ## Layout

@@ -53,7 +53,7 @@ check-agent-artifacts:
 check-matrix-anchors:
 	./scripts/check_matrix_anchors.sh
 
-# The nightly Java-interop regression net (dev/java-interop/, discovered dynamically).
+# The scheduled Java-interop regression net (dev/java-interop/, discovered dynamically).
 # Full set — what .github/workflows/nightly_interop.yml runs. Needs mvn + JDK 11 + cargo
 # (hard-fails if absent, never skips). See scripts/run_interop_suites.sh for the contract.
 interop:

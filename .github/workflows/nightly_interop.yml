@@ -16,8 +16,10 @@
 # under the License.
 
 # Scheduled Java-interop regression net (bundle unit G3, 2026-07-10). WEEKLY since 2026-07-30
-# (nightly before that) — each run costs ~42 hosted-runner minutes, and a nightly cadence was
-# consuming ~1,100 Actions minutes/month on a repo whose main only moves via reviewed PRs.
+# (nightly before that) — each run costs ~42 hosted-runner minutes, so nightly consumed
+# ~1,280 Actions minutes/month on a repo whose main only moves via reviewed PRs; weekly is
+# ~180 (optimistic: the rust-cache key below sits on GitHub's 7-day cache-eviction boundary
+# at a strict weekly cadence, so runs may trend longer than the nightly baseline).
 #
 # The Java oracle under dev/java-interop/ is the parity mandate's ground truth; this workflow
 # runs the FULL dynamically-discovered suite set unprompted every week, so a regression that
@@ -31,7 +33,8 @@
 #
 # The workflow KEEPS its historical name "Nightly Interop" (and this file name): the identifier
 # is woven through the repo record (claim board, lessons, GAP_MATRIX provenance) and GitHub's
-# run history is keyed to it. The cadence fact has ONE home — the cron below.
+# run history is keyed to it. The cadence fact's AUTHORITATIVE home is the cron below —
+# prose elsewhere says "weekly" and defers the slot here.
 #
 # INVOCATION CONTRACT: this workflow runs `make interop` with NO arguments and NO
 # ICEBERG_INTEROP_* environment overrides — the driver's local-only `--only` subset flag is
@@ -96,9 +99,9 @@ jobs:
 
       - name: Install JDK 11 + Maven at the suites' hardcoded paths
         run: |
-          # All 48 suites default to /opt/maven/bin/mvn and
-          # JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 (47 hardcode them outright; only
-          # run-interop-aggregate.sh reads $MVN/$JAVA_HOME), so we install the apt JDK 11
+          # Every suite defaults to /opt/maven/bin/mvn and
+          # JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 (most hardcode them outright; the
+          # rest read $MVN/$JAVA_HOME with those defaults), so we install the apt JDK 11
           # (which owns exactly that JVM path on amd64) and symlink the apt Maven home to
           # /opt/maven — the suites themselves are not modified. setup-java would install to
           # a different path and NOT satisfy them.
@@ -108,7 +111,7 @@ jobs:
           /opt/maven/bin/mvn -version
           /usr/lib/jvm/java-11-openjdk-amd64/bin/java -version
 
-      - name: Prime the local Maven repository (47 of 48 suites run `mvn -o`, offline)
+      - name: Prime the local Maven repository (the suites' `mvn -o` runs are offline)
         run: |
           # Resolve every dependency + the exec plugin ONLINE once, so the offline (`-o`)
           # suite invocations find a fully-populated ~/.m2.

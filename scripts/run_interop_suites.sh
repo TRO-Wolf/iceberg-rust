@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# run_interop_suites.sh — the nightly Java-interop DRIVER (2026-07-10, bundle unit G3).
+# run_interop_suites.sh — the scheduled Java-interop DRIVER (2026-07-10, bundle unit G3).
 #
 # The Java oracle under dev/java-interop/ is the parity mandate's ground truth, but until this
 # driver existed every suite ran only when a human remembered to invoke it. This script turns the
