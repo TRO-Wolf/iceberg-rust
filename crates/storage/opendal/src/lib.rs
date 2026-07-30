@@ -138,6 +138,19 @@ fn list_entry_metadata_complete(meta: &opendal::Metadata) -> bool {
     !meta.is_deleted() && meta.content_length() > 0
 }
 
+/// Size + created-at millis taken from a **complete** list entry (no `stat`).
+///
+/// Call only when [`list_entry_metadata_complete`] is true. Missing
+/// `last_modified` becomes `created_at_millis = 0`.
+fn file_meta_from_complete_list_entry(meta: &opendal::Metadata) -> (u64, i64) {
+    let size = meta.content_length();
+    let created_at_millis = meta
+        .last_modified()
+        .map(opendal_timestamp_to_millis)
+        .unwrap_or(0);
+    (size, created_at_millis)
+}
+
 cfg_if! {
     if #[cfg(feature = "opendal-azdls")] {
         mod azdls;
@@ -516,12 +529,13 @@ impl OpenDalStorage {
                 config,
                 operator_cache,
             } => {
-                // `azdls_create_operator` validates the path and builds a raw Operator;
-                // we re-key it by the filesystem name so subsequent I/O reuses it.
-                let (raw_op, relative_path) =
-                    azdls_create_operator(path, config, configured_scheme)?;
-                let key = raw_op.info().name().to_string();
-                let op = operator_cache.get_or_insert_with(key, || Ok(raw_op))?;
+                // Parse/validate first so cache hits never construct an Operator.
+                // Key by filesystem name (OpenDAL `info().name()`); build only on miss.
+                let resolved = azdls_resolve(path, config, configured_scheme)?;
+                let relative_path = resolved.relative_path;
+                let op = operator_cache.get_or_insert_with(resolved.filesystem.clone(), || {
+                    resolved.build_operator(config)
+                })?;
                 Ok((op, relative_path))
             }
             #[cfg(all(
@@ -651,13 +665,7 @@ impl Storage for OpenDalStorage {
             }
 
             let (size, created_at_millis) = if list_entry_metadata_complete(list_meta) {
-                (
-                    list_meta.content_length(),
-                    list_meta
-                        .last_modified()
-                        .map(opendal_timestamp_to_millis)
-                        .unwrap_or(0),
-                )
+                file_meta_from_complete_list_entry(list_meta)
             } else {
                 let stat = op.stat(entry.path()).await.map_err(from_opendal_error)?;
                 (
@@ -843,6 +851,34 @@ mod tests {
         assert!(
             !list_entry_metadata_complete(&deleted),
             "delete markers must not be treated as complete live files"
+        );
+    }
+
+    /// Pins the complete-list-meta selection of `(size, created_at_millis)` so a
+    /// sabotage that drops mtime or size under the complete branch fails loudly.
+    #[test]
+    fn test_file_meta_from_complete_list_entry_size_and_mtime() {
+        use opendal::{EntryMode, Metadata};
+
+        let known_millis: i64 = 1_700_000_000_000;
+        let with_mtime = Metadata::new(EntryMode::FILE)
+            .with_content_length(99)
+            .with_last_modified(
+                opendal::raw::Timestamp::from_millisecond(known_millis).expect("ts"),
+            );
+        assert!(list_entry_metadata_complete(&with_mtime));
+        assert_eq!(
+            file_meta_from_complete_list_entry(&with_mtime),
+            (99, known_millis),
+            "complete entry must surface list size and mtime millis"
+        );
+
+        let size_only = Metadata::new(EntryMode::FILE).with_content_length(7);
+        assert!(list_entry_metadata_complete(&size_only));
+        assert_eq!(
+            file_meta_from_complete_list_entry(&size_only),
+            (7, 0),
+            "missing last_modified must report created_at_millis = 0"
         );
     }
 
