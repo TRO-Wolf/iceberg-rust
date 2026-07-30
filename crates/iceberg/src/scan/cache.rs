@@ -313,6 +313,61 @@ mod tests {
         );
     }
 
+    /// C1-L-002: projecting a snapshot-bound predicate via the cache matches
+    /// rebinding the same unbound predicate then projecting (semantic equality).
+    #[test]
+    fn test_partition_filter_cache_matches_project_after_rebind() {
+        let schema = table_schema();
+        let metadata = table_metadata_with_identity_spec(&schema);
+
+        // Snapshot-bound form (as scan planning holds it).
+        let snapshot_bound = bound_table_filter(&schema);
+        let cache = PartitionFilterCache::new();
+        let from_snapshot_bound = cache
+            .get(0, &metadata, &schema, true, &snapshot_bound)
+            .expect("project snapshot-bound filter");
+
+        // Re-bind the same unbound predicate, then project through a fresh cache.
+        let rebound = Reference::new("id")
+            .less_than(Datum::int(10))
+            .bind(schema.clone(), true)
+            .expect("rebind id < 10");
+        let cold = PartitionFilterCache::new();
+        let from_rebound = cold
+            .get(0, &metadata, &schema, true, &rebound)
+            .expect("project rebound filter");
+
+        assert_eq!(
+            from_snapshot_bound.as_ref(),
+            from_rebound.as_ref(),
+            "project(snapshot-bound) must equal project(rebind(same unbound))"
+        );
+    }
+
+    /// C1-L-003: case_sensitive=false partition-filter projection still succeeds
+    /// and is memoized by Arc identity.
+    #[test]
+    fn test_partition_filter_cache_case_insensitive_hit() {
+        let schema = table_schema();
+        let metadata = table_metadata_with_identity_spec(&schema);
+        let filter = Reference::new("id")
+            .less_than(Datum::int(10))
+            .bind(schema.clone(), false)
+            .expect("case-insensitive bind of id < 10");
+        let cache = PartitionFilterCache::new();
+
+        let first = cache
+            .get(0, &metadata, &schema, false, &filter)
+            .expect("case-insensitive project must succeed");
+        let second = cache
+            .get(0, &metadata, &schema, false, &filter)
+            .expect("case-insensitive cache hit");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "case_sensitive=false hits must reuse the same Arc"
+        );
+    }
+
     /// SAF-003 pin (P1a): `ManifestEvaluatorCache` must RECOVER from a poisoned lock on both
     /// the hit and the miss path (previously `map_err(..).unwrap()` — a guaranteed panic).
     #[test]

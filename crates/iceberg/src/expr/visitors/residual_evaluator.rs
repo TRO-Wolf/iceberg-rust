@@ -67,6 +67,17 @@ use crate::spec::{Datum, PartitionSpecRef, Schema, SchemaRef, Struct};
 /// When the evaluator is shared behind an `Arc` (scan planning),
 /// [`residual_bound_for`](Self::residual_bound_for) memoizes bound residuals by
 /// partition so many files in the same partition do not re-run residual evaluation.
+///
+/// # Memo contract
+///
+/// The memo is keyed **only by partition tuple**. That is safe because one
+/// [`ResidualEvaluator`] is constructed per scan-side filter/spec with fixed
+/// `case_sensitive` and filter; callers must not reuse the same evaluator across
+/// different snapshot schemas or bind-case settings. `residual_bound_for`'s
+/// `bind_case_sensitive` argument should match the evaluator's stored
+/// `case_sensitive` field (debug-asserted). Memo size is soft-capped
+/// ([`RESIDUAL_BOUND_MEMO_SOFT_CAP`]) so pathological partition cardinalities
+/// cannot grow unbounded within one scan.
 #[derive(Debug)]
 pub(crate) struct ResidualEvaluator {
     /// `Some(spec, partition_schema)` for a partitioned spec; `None` for an
@@ -82,6 +93,11 @@ pub(crate) struct ResidualEvaluator {
     residual_bound_memo: RwLock<HashMap<Struct, Arc<BoundPredicate>>>,
 }
 
+/// Soft cap on `residual_bound_memo` entries (C1-SEC-001). Beyond this, new
+/// residuals are still computed but not inserted — prevents unbounded growth
+/// on high-cardinality partition scans while keeping hot partitions memoized.
+const RESIDUAL_BOUND_MEMO_SOFT_CAP: usize = 8192;
+
 /// The state needed to evaluate residuals against a non-empty partition spec.
 #[derive(Debug, Clone)]
 struct PartitionedState {
@@ -95,11 +111,14 @@ struct PartitionedState {
 impl ResidualEvaluator {
     /// Returns a residual evaluator for an unpartitioned spec: every residual is
     /// the whole filter, unchanged (Java `ResidualEvaluator.unpartitioned`).
-    pub(crate) fn unpartitioned(filter: BoundPredicate) -> Self {
+    ///
+    /// `case_sensitive` is stored so [`residual_bound_for`](Self::residual_bound_for)
+    /// bind flags stay consistent with the scan (memo contract).
+    pub(crate) fn unpartitioned(filter: BoundPredicate, case_sensitive: bool) -> Self {
         Self {
             partitioned: None,
             filter,
-            case_sensitive: false,
+            case_sensitive,
             residual_bound_memo: RwLock::new(HashMap::new()),
         }
     }
@@ -118,7 +137,7 @@ impl ResidualEvaluator {
         case_sensitive: bool,
     ) -> Result<Self> {
         if spec.fields().is_empty() {
-            return Ok(Self::unpartitioned(filter));
+            return Ok(Self::unpartitioned(filter, case_sensitive));
         }
 
         let partition_type = spec.partition_type(schema)?;
@@ -159,14 +178,27 @@ impl ResidualEvaluator {
     /// Returns the residual of the filter for `partition`, already bound to
     /// `snapshot_schema` under `bind_case_sensitive`.
     ///
-    /// Results are memoized by partition tuple so many files that share a partition
-    /// reuse a single `residual_for` + bind. Poisoned memo locks are recovered.
+    /// Results are memoized by **partition tuple only**. Valid only while this
+    /// evaluator's filter / partition state stay fixed and `bind_case_sensitive`
+    /// matches the value used for the first insert of that partition (scan
+    /// planning always passes the same `case_sensitive` for the whole plan).
+    /// Poisoned memo locks are recovered. When the memo reaches
+    /// [`RESIDUAL_BOUND_MEMO_SOFT_CAP`], new partitions are still computed but
+    /// not inserted.
     pub(crate) fn residual_bound_for(
         &self,
         partition: &Struct,
         snapshot_schema: SchemaRef,
         bind_case_sensitive: bool,
     ) -> Result<Arc<BoundPredicate>> {
+        // Scan planning always uses one case-sensitivity for the evaluator and
+        // the bind step; a mismatch would make memo hits wrong if someone later
+        // called with a different bind flag (C1-Q-003 / C1-SEC-002).
+        debug_assert_eq!(
+            bind_case_sensitive, self.case_sensitive,
+            "residual_bound_for bind_case_sensitive must match ResidualEvaluator.case_sensitive"
+        );
+
         {
             let read = self
                 .residual_bound_memo
@@ -184,6 +216,10 @@ impl ResidualEvaluator {
             .residual_bound_memo
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Soft cap: skip insert when full so cardinality spikes cannot OOM the memo.
+        if write.len() >= RESIDUAL_BOUND_MEMO_SOFT_CAP {
+            return Ok(bound);
+        }
         Ok(write.entry(partition.clone()).or_insert(bound).clone())
     }
 }
@@ -805,7 +841,7 @@ mod tests {
             .greater_than(Datum::int(100))
             .bind(schema.clone(), true)
             .unwrap();
-        let evaluator = ResidualEvaluator::unpartitioned(filter);
+        let evaluator = ResidualEvaluator::unpartitioned(filter, true);
 
         let residual = evaluator
             .residual_for(&Struct::from_iter(Vec::<Option<Literal>>::new()))
@@ -826,7 +862,7 @@ mod tests {
             .not()
             .bind(schema.clone(), true)
             .unwrap();
-        let evaluator = ResidualEvaluator::unpartitioned(filter);
+        let evaluator = ResidualEvaluator::unpartitioned(filter, true);
 
         let residual = evaluator
             .residual_for(&Struct::from_iter(Vec::<Option<Literal>>::new()))
@@ -1302,6 +1338,94 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &other),
             "different partitions must not share the same memo entry"
+        );
+    }
+
+    /// C1-L-001 / C1-Q-004: for a *boundary* day residual (not AlwaysTrue),
+    /// `residual_bound_for` equals `bind(residual_for(...))` on first call and
+    /// the second call is a memo hit (same Arc, same semantic value).
+    #[test]
+    fn test_residual_bound_for_boundary_day_matches_residual_for_bind() {
+        let schema = day_example_schema();
+        let spec = day_partition_spec(schema.clone());
+        let filter =
+            ts_between_filter(schema.clone(), "2021-01-01T10:00:00", "2021-01-31T10:00:00");
+        let evaluator =
+            ResidualEvaluator::of(spec, &schema, filter, true).expect("evaluator must build");
+
+        // Lower-bound day keeps `ts >= a` — a non-trivial residual.
+        let partition = day_partition("2021-01-01");
+        let expected_unbound = evaluator
+            .residual_for(&partition)
+            .expect("residual_for on boundary day must succeed");
+        assert_ne!(
+            expected_unbound,
+            Predicate::AlwaysTrue,
+            "boundary day must not collapse to AlwaysTrue"
+        );
+        let expected_bound = expected_unbound
+            .bind(schema.clone(), true)
+            .expect("binding residual must succeed");
+
+        let first = evaluator
+            .residual_bound_for(&partition, schema.clone(), true)
+            .expect("first residual_bound_for must succeed");
+        assert_eq!(
+            first.as_ref(),
+            &expected_bound,
+            "first residual_bound_for must equal bind(residual_for)"
+        );
+
+        let second = evaluator
+            .residual_bound_for(&partition, schema, true)
+            .expect("second residual_bound_for must succeed");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second call must hit the memo (same Arc)"
+        );
+        assert_eq!(
+            second.as_ref(),
+            &expected_bound,
+            "memo hit must retain the same bound residual"
+        );
+    }
+
+    /// C1-L-003: case_sensitive=false path for residual_bound_for still produces
+    /// a residual that matches residual_for + bind under the same flag.
+    #[test]
+    fn test_residual_bound_for_case_insensitive_matches_residual_for_bind() {
+        let schema = day_example_schema();
+        let spec = day_partition_spec(schema.clone());
+        // Bind the filter case-insensitively so it matches evaluator.case_sensitive.
+        let filter = Reference::new("ts")
+            .greater_than_or_equal_to(Datum::timestamp_micros(micros("2021-01-01T10:00:00")))
+            .and(
+                Reference::new("ts")
+                    .less_than_or_equal_to(Datum::timestamp_micros(micros("2021-01-31T10:00:00"))),
+            )
+            .bind(schema.clone(), false)
+            .expect("case-insensitive filter binds");
+        let evaluator =
+            ResidualEvaluator::of(spec, &schema, filter, false).expect("evaluator must build");
+
+        let partition = day_partition("2021-01-01");
+        let expected = evaluator
+            .residual_for(&partition)
+            .expect("residual_for")
+            .bind(schema.clone(), false)
+            .expect("bind residual case-insensitively");
+
+        let bound = evaluator
+            .residual_bound_for(&partition, schema, false)
+            .expect("residual_bound_for case-insensitive");
+        assert_eq!(
+            bound.as_ref(),
+            &expected,
+            "case_sensitive=false residual_bound_for must match residual_for+bind"
+        );
+        assert!(
+            !matches!(bound.as_ref(), BoundPredicate::AlwaysTrue),
+            "boundary residual under case_insensitive bind must stay non-trivial"
         );
     }
 

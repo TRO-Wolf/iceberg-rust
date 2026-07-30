@@ -31,13 +31,22 @@ const DEFAULT_CACHE_SIZE_BYTES: u64 = 32 * 1024 * 1024; // 32MB
 /// `size_of_val` only measures the shallow `Manifest` shell (metadata + `Vec` header), not
 /// the heap-backed entry list. Entry count × this constant is a stable capacity-accounting
 /// proxy so large manifests weigh more than tiny ones under moka's weighted eviction.
+///
+/// Note: 768 is intentionally a coarse under-account for large nested partition stats;
+/// correcting it is deferred (C1-SEC-003) — prefer re-tuning after real production
+/// eviction metrics rather than over-weighting every list entry.
 const ROUGH_MANIFEST_ENTRY_BYTES: u64 = 768;
 
-/// Fallback per-entry estimate for a [`ManifestList`] when `manifest_length` is absent or
-/// non-positive on every entry. Prefer summing declared `manifest_length` when present.
+/// Per-entry resident estimate for a parsed [`ManifestList`].
+///
+/// A manifest list holds only [`ManifestFile`] metadata rows (path, counts, partition
+/// summaries) — not the child manifests themselves. Do **not** sum child
+/// `manifest_length` values: those are on-disk sizes of separate objects and would
+/// thrash the 32 MiB budget when one list points at many large manifests (C1-Q-001).
 const ROUGH_MANIFEST_LIST_ENTRY_BYTES: u64 = 256;
 
 /// Floor at 1 and clamp to `u32::MAX` for moka's weigher signature.
+/// Accumulation paths must use saturating arithmetic before calling this (C1-Q-002).
 fn clamp_cache_weight(bytes: u64) -> u32 {
     let clamped = bytes.clamp(1, u32::MAX as u64);
     // Domain is bounded to `[1, u32::MAX]` by the clamp above.
@@ -52,28 +61,11 @@ fn estimate_manifest_weight(manifest: &Manifest) -> u32 {
 
 /// Estimated resident weight of a parsed manifest list for the object cache.
 ///
-/// Prefers the sum of each entry's declared `manifest_length` (on-disk Avro size) when at
-/// least one positive length is present; otherwise falls back to entry-count × a rough
-/// per-entry constant.
+/// Weight = `entry_count.max(1) × ROUGH_MANIFEST_LIST_ENTRY_BYTES`, then clamped to
+/// `[1, u32::MAX]`. Uses saturating multiply so huge entry counts never panic.
 fn estimate_manifest_list_weight(list: &ManifestList) -> u32 {
-    let sum_lengths: u64 = list
-        .entries()
-        .iter()
-        .map(|e| {
-            if e.manifest_length > 0 {
-                // Positive on-disk length is a bounded domain for cache accounting.
-                e.manifest_length as u64
-            } else {
-                0
-            }
-        })
-        .sum();
-    if sum_lengths > 0 {
-        clamp_cache_weight(sum_lengths)
-    } else {
-        let n = (list.entries().len() as u64).max(1);
-        clamp_cache_weight(n.saturating_mul(ROUGH_MANIFEST_LIST_ENTRY_BYTES))
-    }
+    let n = (list.entries().len() as u64).max(1);
+    clamp_cache_weight(n.saturating_mul(ROUGH_MANIFEST_LIST_ENTRY_BYTES))
 }
 
 #[derive(Clone, Debug)]
@@ -471,6 +463,11 @@ mod tests {
             "more entries must weigh more: one={one} ten={ten}"
         );
         assert_eq!(one, ROUGH_MANIFEST_ENTRY_BYTES as u32);
+
+        // Saturating multiply before clamp must not panic and must cap at u32::MAX.
+        let overflow_weight =
+            clamp_cache_weight(u64::MAX.saturating_mul(ROUGH_MANIFEST_LIST_ENTRY_BYTES));
+        assert_eq!(overflow_weight, u32::MAX);
     }
 
     /// Wave A: loaded manifest / manifest-list weights use real estimates (≥ 1, and
@@ -498,16 +495,31 @@ mod tests {
             list_weight >= 1,
             "manifest list weight must floor at 1, got {list_weight}"
         );
-        // One-entry fixture: if lengths are present, weight equals that length; else
-        // falls back to one rough list-entry estimate.
+        // List weight is entry_count × list-entry estimate — never the sum of child
+        // manifest_length values (those are separate cached objects).
         let entry = manifest_list
             .entries()
             .first()
             .expect("fixture list has one entry");
-        if entry.manifest_length > 0 {
-            assert_eq!(list_weight, entry.manifest_length as u32);
-        } else {
-            assert_eq!(list_weight, ROUGH_MANIFEST_LIST_ENTRY_BYTES as u32);
+        let expected_list = clamp_cache_weight(
+            (manifest_list.entries().len() as u64)
+                .max(1)
+                .saturating_mul(ROUGH_MANIFEST_LIST_ENTRY_BYTES),
+        );
+        assert_eq!(
+            list_weight, expected_list,
+            "list weight must be entry_count × list-entry estimate, not child manifest_length"
+        );
+        // Sanity: when the child has a declared length, it must NOT equal the list weight
+        // (unless by coincidence the length equals the list-entry constant).
+        if entry.manifest_length > 0
+            && entry.manifest_length as u64 != ROUGH_MANIFEST_LIST_ENTRY_BYTES
+        {
+            assert_ne!(
+                list_weight,
+                clamp_cache_weight(entry.manifest_length as u64),
+                "list weight must not use child manifest_length"
+            );
         }
 
         let manifest = object_cache

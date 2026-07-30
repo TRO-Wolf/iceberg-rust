@@ -518,9 +518,12 @@ impl PlanContext {
                 snapshot_bound_predicate.as_ref().clone(),
                 self.case_sensitive,
             )?)),
-            (Some(snapshot_bound_predicate), None) => Some(Arc::new(
-                ResidualEvaluator::unpartitioned(snapshot_bound_predicate.as_ref().clone()),
-            )),
+            (Some(snapshot_bound_predicate), None) => {
+                Some(Arc::new(ResidualEvaluator::unpartitioned(
+                    snapshot_bound_predicate.as_ref().clone(),
+                    self.case_sensitive,
+                )))
+            }
             (None, _) => None,
         };
 
