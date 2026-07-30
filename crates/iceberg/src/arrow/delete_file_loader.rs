@@ -77,8 +77,8 @@ impl BasicDeleteFileLoader {
     ///
     /// Projection is best-effort (Wave B): when field ids are present in the Parquet/Arrow
     /// metadata we build a [`ProjectionMask`]; if the mask cannot be built safely (missing
-    /// field-id metadata, incomplete match), we fall back to a full read rather than risk a
-    /// mis-parse. Name-based fallback for positional-delete reserved columns (`file_path` /
+    /// field-id metadata, incomplete match), we fall back to a full read rather than risk
+    /// misreading columns. Name-based fallback for positional-delete reserved columns (`file_path` /
     /// `pos`) is attempted when field ids are absent but writers emitted the standard names.
     pub(crate) async fn parquet_to_batch_stream_with_projection(
         &self,
