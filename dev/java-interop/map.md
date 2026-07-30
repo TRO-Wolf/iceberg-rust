@@ -100,8 +100,9 @@ fixed machine-independent root via `gen/`, or (c) `RewriteTablePath`, which is R
 re-emits manifests through this crate's own `ManifestWriter`, destroying the very provenance the
 1.4.3 table exists to pin. Committing the bytes needs explicit user approval.
 
-**Nightly CI (2026-07-10):** every `run-interop-*.sh` above is discovered DYNAMICALLY (glob at run
-time — a new suite is picked up with zero maintenance) and run unprompted every night by
+**Scheduled CI (2026-07-10; weekly since 2026-07-30, the "Nightly Interop" workflow keeps its
+historical name):** every `run-interop-*.sh` above is discovered DYNAMICALLY (glob at run
+time — a new suite is picked up with zero maintenance) and run unprompted every week by
 [`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh) (`make interop`) via
 [`.github/workflows/nightly_interop.yml`](../../.github/workflows/nightly_interop.yml). The driver
 hard-fails on missing prerequisites (never skips), fails if discovery drops below its suite-count

@@ -24,7 +24,8 @@
 # dev/java-interop/run-interop-*.sh at run time (zero maintenance when suites are added), runs
 # EACH one to completion (continue-on-failure ACROSS suites, so one red suite cannot hide the
 # others), prints a per-suite PASS/FAIL summary table, and exits non-zero if ANY suite failed.
-# Invoked nightly by .github/workflows/nightly_interop.yml via `make interop`.
+# Invoked weekly (nightly until 2026-07-30 — cadence lives in the workflow's cron) by
+# .github/workflows/nightly_interop.yml via `make interop`.
 #
 # House doctrine encoded here (CLAUDE.md working conventions + the G3 brief):
 #   * HARD-FAIL, never SKIP. Missing prerequisites (mvn / the JDK-11 home / cargo) are an error

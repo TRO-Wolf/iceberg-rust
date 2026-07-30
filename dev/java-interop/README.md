@@ -181,9 +181,10 @@ so the offline suite is hermetic and never mutates the committed fixtures.
 - **Java 11+** (Iceberg 1.10 requires Java 11+).
 - A Rust toolchain (the repo's pinned nightly via `rust-toolchain.toml`).
 
-## Nightly CI
+## Scheduled CI (the "Nightly Interop" workflow)
 
-Every `run-interop-*.sh` suite in this directory is run **unprompted every night** by
+Every `run-interop-*.sh` suite in this directory is run **unprompted every week** (Saturdays
+06:43 UTC; nightly until 2026-07-30 — the workflow keeps its historical name) by
 [`.github/workflows/nightly_interop.yml`](../../.github/workflows/nightly_interop.yml), which
 invokes the driver [`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh)
 (`make interop`). The driver's contract (house doctrine — hard-fail, never skip; no silent caps):

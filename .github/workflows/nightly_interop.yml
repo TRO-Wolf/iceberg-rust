@@ -15,21 +15,32 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Nightly Java-interop regression net (bundle unit G3, 2026-07-10).
+# Scheduled Java-interop regression net (bundle unit G3, 2026-07-10). WEEKLY since 2026-07-30
+# (nightly before that) — each run costs ~42 hosted-runner minutes, and a nightly cadence was
+# consuming ~1,100 Actions minutes/month on a repo whose main only moves via reviewed PRs.
 #
 # The Java oracle under dev/java-interop/ is the parity mandate's ground truth; this workflow
-# runs the FULL dynamically-discovered suite set unprompted every night, so a regression that
-# breaks cross-engine byte-level compatibility surfaces within a day instead of waiting for a
-# human to remember a manual run. The driver (scripts/run_interop_suites.sh) hard-fails on
-# missing prerequisites, fails if discovery drops below its floor, continues across failing
-# suites, and writes a per-suite PASS/FAIL table to the job step summary.
+# runs the FULL dynamically-discovered suite set unprompted every week, so a regression that
+# breaks cross-engine byte-level compatibility surfaces within a week instead of waiting for a
+# human to remember a manual run. The cadence trade is deliberate: in-PR evidence stays the
+# first line of defense (run `make interop` — or a targeted local `--only` subset — whenever a
+# unit touches interop-bearing surfaces), and `workflow_dispatch` remains available for
+# on-demand live proof. The driver (scripts/run_interop_suites.sh) hard-fails on missing
+# prerequisites, fails if discovery drops below its floor, continues across failing suites, and
+# writes a per-suite PASS/FAIL table to the job step summary.
+#
+# The workflow KEEPS its historical name "Nightly Interop" (and this file name): the identifier
+# is woven through the repo record (claim board, lessons, GAP_MATRIX provenance) and GitHub's
+# run history is keyed to it. The cadence fact has ONE home — the cron below.
 #
 # INVOCATION CONTRACT: this workflow runs `make interop` with NO arguments and NO
 # ICEBERG_INTEROP_* environment overrides — the driver's local-only `--only` subset flag is
 # deliberately unreachable from here (the no-silent-caps doctrine).
 #
-# No `if: github.repository == ...` guard on purpose: this is an owned fork (the guard in
-# audit.yml is an upstream artifact that DISABLES that job here); the cron must actually fire.
+# No `if: github.repository == ...` guard on purpose: this is an owned fork; the cron must
+# actually fire. (An earlier revision of this comment claimed audit.yml's cron is guarded off
+# on the fork — false: audit.yml carries no repository guard and its daily advisory cron runs
+# here too, deliberately, because new RUSTSEC advisories land independent of repo activity.)
 # Note GitHub disables cron schedules after ~60 days without repository activity, and a
 # scheduled workflow only fires once this file is on the default branch.
 
@@ -37,9 +48,10 @@ name: Nightly Interop
 
 on:
   schedule:
-    # 06:43 UTC — a quiet hour for this repo's workflows (audit/stale run at 00:00,
-    # codeql Mondays 04:16) and off the top of the hour, when GitHub delays cron jobs.
-    - cron: '43 6 * * *'
+    # Saturdays 06:43 UTC — WEEKLY (nightly until 2026-07-30; see the header). A quiet slot for
+    # this repo's workflows (audit/stale run daily at 00:00, codeql Mondays 04:16) and off the
+    # top of the hour, when GitHub delays cron jobs.
+    - cron: '43 6 * * 6'
   workflow_dispatch:
 
 concurrency:
