@@ -835,6 +835,31 @@ mod tests {
         );
     }
 
+    /// Pin: same catalog pointer + divergent TableMetadata content still forces re-base.
+    /// Without this arm, Transaction would ship a stale in-memory base as `base_table` and
+    /// metastore catalogs would ReuseProvided (location match) — silent wrong apply under a
+    /// malformed catalog that rewrote metadata in place.
+    #[test]
+    fn test_is_transaction_base_stale_same_location_content_diverges() {
+        // Fixtures intentionally share the same metadata_location string with different content.
+        let v1 = make_v1_table();
+        let v2 = make_v2_table();
+        assert_eq!(
+            v1.metadata_location(),
+            v2.metadata_location(),
+            "fixture precondition: same pointer string, different content"
+        );
+        assert_ne!(
+            v1.metadata(),
+            v2.metadata(),
+            "fixture precondition: content must differ"
+        );
+        assert!(
+            super::is_transaction_base_stale(&v1, &v2),
+            "equal location + divergent content must mark the base stale"
+        );
+    }
+
     /// Helper function to create a test table with retry properties
     pub(super) fn setup_test_table(num_retries: &str) -> Table {
         let table = make_v2_table();

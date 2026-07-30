@@ -633,6 +633,11 @@ pub enum CommitBaseLoadPlan {
 ///   parameters / S3 Tables GetTable).
 /// * `base_metadata_location` — [`TableCommit::base_metadata_location`].
 /// * `provided_base_metadata_location` — location on the optional pre-loaded base table.
+///
+/// **OCC contract:** a mismatched commit base vs service pointer is always [`Conflict`], even if
+/// a provided table's location already matches the service (stale base + "current" forge). Reuse
+/// is location-only and assumes Iceberg metadata immutability at a given path; callers must not
+/// supply a `base_table` whose content does not match that location.
 pub fn plan_commit_base_load(
     service_metadata_location: &str,
     base_metadata_location: Option<&str>,
@@ -2940,6 +2945,24 @@ mod tests {
         assert_eq!(
             plan_commit_base_load(service, Some(service), Some("s3://b/m/stale.json")),
             CommitBaseLoadPlan::FullLoad
+        );
+        // Concurrent forge matrix: commit base is stale (L0) while a provided table points at the
+        // *current* service pointer (L1). Must Conflict — never Reuse — or L0-planned updates
+        // would be applied against L1 content under a location-only match arm.
+        let service_l1 = "s3://b/m/v2.json";
+        assert_eq!(
+            plan_commit_base_load(service_l1, Some(service), Some(service_l1)),
+            CommitBaseLoadPlan::Conflict,
+            "stale base_metadata_location must win over a provided table at the current pointer"
+        );
+        // Empty-string locations: still location-equality only (no special-case silent reuse).
+        assert_eq!(
+            plan_commit_base_load("", Some(""), Some("")),
+            CommitBaseLoadPlan::ReuseProvided
+        );
+        assert_eq!(
+            plan_commit_base_load(service, Some(""), Some(service)),
+            CommitBaseLoadPlan::Conflict
         );
     }
 
