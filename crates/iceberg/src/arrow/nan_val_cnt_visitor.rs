@@ -532,4 +532,44 @@ mod tests {
             .expect("compute nan counts");
         assert_eq!(visitor.nan_value_counts.get(&1).copied(), Some(2));
     }
+
+    /// Inf/-Inf are not NaN; the buffer walk must not treat them as NaN.
+    #[test]
+    fn infinity_is_not_counted_as_nan() {
+        use arrow_array::{Float32Array, Float64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+        let iceberg = Arc::new(schema_with_fields(vec![
+            NestedField::optional(1, "f", Type::Primitive(PrimitiveType::Float)),
+            NestedField::optional(2, "d", Type::Primitive(PrimitiveType::Double)),
+        ]));
+        let f32 = Float32Array::from(vec![f32::INFINITY, f32::NEG_INFINITY, 0.0, f32::NAN]);
+        let f64 = Float64Array::from(vec![f64::INFINITY, f64::NEG_INFINITY, 0.0, f64::NAN]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("f", DataType::Float32, true).with_metadata(
+                std::collections::HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )]),
+            ),
+            Field::new("d", DataType::Float64, true).with_metadata(
+                std::collections::HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )]),
+            ),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(f32) as ArrayRef,
+            Arc::new(f64) as ArrayRef,
+        ])
+        .expect("batch");
+        let mut visitor = NanValueCountVisitor::new();
+        visitor
+            .compute(iceberg, &batch)
+            .expect("compute nan counts");
+        assert_eq!(visitor.nan_value_counts.get(&1).copied(), Some(1));
+        assert_eq!(visitor.nan_value_counts.get(&2).copied(), Some(1));
+    }
 }
