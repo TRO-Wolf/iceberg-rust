@@ -5087,14 +5087,8 @@ pub mod tests {
                                 .file_size_in_bytes(100)
                                 .record_count(10)
                                 .partition(Struct::empty())
-                                .lower_bounds(HashMap::from([(
-                                    y_field_id,
-                                    Datum::long(lo),
-                                )]))
-                                .upper_bounds(HashMap::from([(
-                                    y_field_id,
-                                    Datum::long(hi),
-                                )]))
+                                .lower_bounds(HashMap::from([(y_field_id, Datum::long(lo))]))
+                                .upper_bounds(HashMap::from([(y_field_id, Datum::long(hi))]))
                                 .build()
                                 .expect("data file"),
                         )
