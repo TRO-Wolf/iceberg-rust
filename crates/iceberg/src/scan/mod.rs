@@ -53,7 +53,13 @@ use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::metrics::{MetricsReport, MetricsReporter, ScanReport, TimeUnit, TimerResult};
 use crate::runtime::spawn;
 use crate::scan::metrics_collector::ScanMetricsCollector;
-use crate::spec::{DataContentType, ManifestContentType, SnapshotRef};
+use crate::spec::{DataContentType, DataFileFormat, ManifestContentType, SnapshotRef};
+
+/// True when `offsets` is strictly ascending (each value > previous). Used to gate within-file
+/// expand so we only take the offsets-aware split branch, never fixed-size windows.
+fn is_strictly_ascending_offsets(offsets: &[i64]) -> bool {
+    offsets.windows(2).all(|w| w[1] > w[0])
+}
 use crate::table::Table;
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind, Result};
@@ -99,6 +105,17 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    /// When true (default) and [`concurrency_limit_data_files`](Self::concurrency_limit_data_files)
+    /// is greater than 1, [`TableScan::to_arrow`] expands whole-file tasks that carry Parquet
+    /// `split_offsets` into per-row-group sub-tasks so concurrent readers issue parallel ranged
+    /// GETs inside a single data file (RePark within-file parallel reads). Disabled when the
+    /// scan projects `_pos` (absolute ordinals require whole-file sequential decode).
+    within_file_read_parallelism: bool,
+    /// Override for Parquet coalesced range-fetch concurrency (column-chunk / footer ranges).
+    /// `None` ⇒ ArrowReader default (10).
+    range_fetch_concurrency: Option<usize>,
+    /// Override for Parquet nearby-range coalesce threshold in bytes. `None` ⇒ default 1 MiB.
+    range_coalesce_bytes: Option<u64>,
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
     /// Scan-time OVERRIDE for the split target size (Java `TableScanContext.option(SPLIT_SIZE)`).
     /// `None` ⇒ fall back to the table property then the Java default at [`plan_tasks`] time.
@@ -129,6 +146,9 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            within_file_read_parallelism: true,
+            range_fetch_concurrency: None,
+            range_coalesce_bytes: None,
             metrics_reporter: None,
             split_size: None,
             split_lookback: None,
@@ -289,6 +309,34 @@ impl<'a> TableScanBuilder<'a> {
     /// Sets the data file concurrency limit for this scan
     pub fn with_data_file_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit_data_files = limit;
+        self
+    }
+
+    /// Enable or disable within-file read parallelism for [`TableScan::to_arrow`].
+    ///
+    /// When enabled (default) and the data-file concurrency limit is greater than 1, whole-file
+    /// tasks that carry Parquet row-group `split_offsets` are expanded into per-offset sub-tasks
+    /// and read under the same concurrency budget as cross-file tasks. That turns a monolithic
+    /// multi-row-group file into concurrent ranged GETs (the RePark MERGE target-scan lever).
+    ///
+    /// Batch order across sub-tasks of one file is **not** preserved (same as multi-file
+    /// concurrent reads). Automatically suppressed when the scan projects `_pos`.
+    pub fn with_within_file_read_parallelism(mut self, enabled: bool) -> Self {
+        self.within_file_read_parallelism = enabled;
+        self
+    }
+
+    /// Sets how many coalesced Parquet byte-ranges may be fetched concurrently inside one open
+    /// file (column chunks / footer). Defaults to the Arrow reader default (10) when unset.
+    pub fn with_range_fetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.range_fetch_concurrency = Some(concurrency);
+        self
+    }
+
+    /// Sets the gap threshold (bytes) for merging nearby Parquet byte-ranges into one request.
+    /// Defaults to 1 MiB when unset.
+    pub fn with_range_coalesce_bytes(mut self, bytes: u64) -> Self {
+        self.range_coalesce_bytes = Some(bytes);
         self
     }
 
@@ -453,6 +501,9 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        within_file_read_parallelism: self.within_file_read_parallelism,
+                        range_fetch_concurrency: self.range_fetch_concurrency,
+                        range_coalesce_bytes: self.range_coalesce_bytes,
                         metrics: None,
                         split_config,
                     });
@@ -595,6 +646,9 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            within_file_read_parallelism: self.within_file_read_parallelism,
+            range_fetch_concurrency: self.range_fetch_concurrency,
+            range_coalesce_bytes: self.range_coalesce_bytes,
             metrics,
             split_config,
         })
@@ -640,6 +694,9 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    within_file_read_parallelism: bool,
+    range_fetch_concurrency: Option<usize>,
+    range_coalesce_bytes: Option<u64>,
 
     /// Everything needed to collect and emit a [`ScanReport`], present only when the scan
     /// opted in via [`TableScanBuilder::with_metrics_reporter`] AND the table has a
@@ -911,6 +968,12 @@ impl TableScan {
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
+    ///
+    /// When [`within_file_read_parallelism`](TableScanBuilder::with_within_file_read_parallelism)
+    /// is enabled (default), the data-file concurrency limit is greater than 1, and the scan does
+    /// not project `_pos`, whole-file tasks with Parquet `split_offsets` are expanded into
+    /// per-row-group sub-tasks before concurrent read — so a single multi-row-group file can issue
+    /// multiple ranged GETs in parallel under the same concurrency budget as cross-file reads.
     pub async fn to_arrow(&self) -> Result<ArrowRecordBatchStream> {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
@@ -920,8 +983,64 @@ impl TableScan {
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
         }
+        if let Some(concurrency) = self.range_fetch_concurrency {
+            arrow_reader_builder = arrow_reader_builder.with_range_fetch_concurrency(concurrency);
+        }
+        if let Some(bytes) = self.range_coalesce_bytes {
+            arrow_reader_builder = arrow_reader_builder.with_range_coalesce_bytes(bytes);
+        }
 
-        arrow_reader_builder.build().read(self.plan_files().await?)
+        let tasks = self.plan_files().await?;
+        let tasks = self.expand_within_file_parallel_tasks(tasks)?;
+        arrow_reader_builder.build().read(tasks)
+    }
+
+    /// Expand whole-file tasks into per-`split_offsets` sub-tasks for concurrent within-file
+    /// reads when enabled. No-op when concurrency is 1, the feature is off, or the scan
+    /// projects `_pos` (absolute ordinals require sequential whole-file decode).
+    fn expand_within_file_parallel_tasks(
+        &self,
+        tasks: FileScanTaskStream,
+    ) -> Result<FileScanTaskStream> {
+        use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+
+        let enabled = self.within_file_read_parallelism
+            && self.concurrency_limit_data_files > 1
+            && !self
+                .plan_context
+                .as_ref()
+                .map(|ctx| ctx.field_ids.contains(&RESERVED_FIELD_ID_POS))
+                .unwrap_or(false);
+
+        if !enabled {
+            return Ok(tasks);
+        }
+
+        // Offsets-aware split ignores target; any positive value is valid.
+        let split_target = self.split_config.split_size.max(1);
+
+        Ok(Box::pin(
+            tasks
+                .and_then(move |task| async move {
+                    // Only expand whole-file Parquet tasks whose split_offsets are the
+                    // offsets-aware (strictly ascending) row-group grid. Never call
+                    // FileScanTask::split's fixed-size fallback from this path — non-aligned
+                    // windows can re-select the same row group and duplicate rows.
+                    let can_expand = task.start == 0
+                        && task.data_file_format == DataFileFormat::Parquet
+                        && task.split_offsets.as_ref().is_some_and(|offsets| {
+                            offsets.len() > 1 && is_strictly_ascending_offsets(offsets)
+                        });
+
+                    let subtasks = if can_expand {
+                        task.split(split_target)?
+                    } else {
+                        vec![task]
+                    };
+                    Ok(futures::stream::iter(subtasks.into_iter().map(Ok)))
+                })
+                .try_flatten(),
+        ))
     }
 
     /// Returns a reference to the column names of the table scan.
@@ -6382,6 +6501,260 @@ pub mod tests {
             sink.lock().unwrap().is_empty(),
             "a snapshotless scan must fire no ScanEvent"
         );
+    }
+
+    /// Within-file parallel expansion: a whole-file task with multiple `split_offsets` expands
+    /// into one sub-task per offset when concurrency > 1 (used by `to_arrow` before concurrent
+    /// read). Pins the expansion contract without requiring multi-RG parquet bytes.
+    #[tokio::test]
+    async fn test_within_file_parallel_expands_split_offset_tasks() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .with_within_file_read_parallelism(true)
+            .build()
+            .expect("build");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+        let with_offsets: Vec<_> = whole
+            .iter()
+            .filter(|t| t.split_offsets.as_ref().is_some_and(|o| o.len() > 1))
+            .collect();
+        assert_eq!(
+            with_offsets.len(),
+            1,
+            "fixture declares one multi-offset file"
+        );
+        let parent = with_offsets[0];
+        let expected_subs = parent.split(128).expect("split").len();
+        assert!(
+            expected_subs > 1,
+            "offsets-aware split must yield >1 subtask"
+        );
+
+        // Drive the same expand helper used by to_arrow.
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.expect("plan2"))
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect expanded");
+
+        // Expansion adds (expected_subs - 1) tasks for the multi-offset file.
+        assert_eq!(
+            expanded.len(),
+            whole.len() + expected_subs - 1,
+            "multi-offset whole-file task must expand to {expected_subs} subtasks"
+        );
+        // Exact windows for the multi-offset parent (fixture offsets [0,400,800], length 1000).
+        let mut windows: Vec<(u64, u64)> = expanded
+            .iter()
+            .filter(|t| {
+                t.data_file_path == parent.data_file_path
+                    && t.split_offsets.is_none()
+                    && t.file_size_in_bytes == parent.file_size_in_bytes
+            })
+            .map(|t| (t.start, t.length))
+            .collect();
+        windows.sort_unstable();
+        assert_eq!(
+            windows,
+            vec![(0, 400), (400, 400), (800, 200)],
+            "offsets-aware windows for the multi-offset entry only"
+        );
+    }
+
+    /// Non-ascending multi-offsets must NOT expand (fixed-size split would risk duplicate RGs).
+    #[tokio::test]
+    async fn test_within_file_parallel_skips_non_ascending_offsets() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Build a synthetic task stream by planning then mutating one entry's offsets is hard;
+        // instead unit-test the gate helper + split interaction via a constructed FileScanTask.
+        let base = {
+            let mut tasks: Vec<FileScanTask> = fixture
+                .table
+                .scan()
+                .build()
+                .unwrap()
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            tasks.pop().expect("at least one task")
+        };
+        let mut bad = base.clone();
+        bad.split_offsets = Some(vec![0, 500, 400]); // not strictly ascending
+        bad.data_file_format = DataFileFormat::Parquet;
+        bad.start = 0;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .build()
+            .unwrap();
+        let stream = Box::pin(futures::stream::iter(vec![Ok(bad.clone())])) as FileScanTaskStream;
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(stream)
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect");
+        assert_eq!(expanded.len(), 1, "non-ascending must not expand");
+        assert_eq!(expanded[0].start, 0);
+        assert_eq!(expanded[0].length, bad.length);
+    }
+
+    /// Avro tasks never expand even with multi-offsets.
+    #[tokio::test]
+    async fn test_within_file_parallel_skips_non_parquet() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let mut task: FileScanTask = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        task.data_file_format = DataFileFormat::Avro;
+        task.split_offsets = Some(vec![0, 100, 200]);
+        task.start = 0;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .build()
+            .unwrap();
+        let stream = Box::pin(futures::stream::iter(vec![Ok(task.clone())])) as FileScanTaskStream;
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(stream)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(expanded.len(), 1, "Avro must not expand");
+    }
+
+    /// Projecting `_pos` suppresses expand (absolute ordinals need whole-file decode).
+    #[tokio::test]
+    async fn test_within_file_parallel_suppressed_when_pos_projected() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .select(["x", "_pos"])
+            .with_data_file_concurrency_limit(4)
+            .with_within_file_read_parallelism(true)
+            .build()
+            .expect("build with _pos");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.unwrap())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            expanded.len(),
+            whole.len(),
+            "_pos projection must suppress within-file expand"
+        );
+    }
+
+    /// Disabled within-file parallelism leaves plan_files task count unchanged.
+    #[tokio::test]
+    async fn test_within_file_parallel_disabled_no_expand() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .with_within_file_read_parallelism(false)
+            .build()
+            .expect("build");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.expect("plan2"))
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect expanded");
+        assert_eq!(
+            expanded.len(),
+            whole.len(),
+            "disabled expand must be a no-op"
+        );
+    }
+
+    /// Concurrency=1 never expands (serial path).
+    #[tokio::test]
+    async fn test_within_file_parallel_concurrency_one_no_expand() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(1)
+            .with_within_file_read_parallelism(true)
+            .build()
+            .expect("build");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.expect("plan2"))
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect expanded");
+        assert_eq!(expanded.len(), whole.len());
     }
 
     /// Risk: the scan emit silently swallows a panicking listener (Java `SnapshotScan.planFiles`

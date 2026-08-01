@@ -256,6 +256,27 @@ impl<'a> BatchScan<'a> {
         self
     }
 
+    /// Within-file row-group parallel reads. Forwards to
+    /// [`TableScanBuilder::with_within_file_read_parallelism`].
+    pub fn with_within_file_read_parallelism(mut self, enabled: bool) -> Self {
+        self.builder = self.builder.with_within_file_read_parallelism(enabled);
+        self
+    }
+
+    /// Parquet range-fetch concurrency. Forwards to
+    /// [`TableScanBuilder::with_range_fetch_concurrency`].
+    pub fn with_range_fetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.builder = self.builder.with_range_fetch_concurrency(concurrency);
+        self
+    }
+
+    /// Parquet range coalesce threshold. Forwards to
+    /// [`TableScanBuilder::with_range_coalesce_bytes`].
+    pub fn with_range_coalesce_bytes(mut self, bytes: u64) -> Self {
+        self.builder = self.builder.with_range_coalesce_bytes(bytes);
+        self
+    }
+
     /// Override the split target size in bytes (Java `Scan.option(SPLIT_SIZE, ...)`). Forwards to
     /// [`TableScanBuilder::with_split_size`].
     pub fn with_split_size(mut self, split_size: u64) -> Self {
