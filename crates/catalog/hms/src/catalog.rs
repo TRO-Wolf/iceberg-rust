@@ -388,8 +388,8 @@ impl Catalog for HmsCatalog {
     /// meet validation criteria.
     /// - Errors from `convert_to_database` if the properties cannot be
     /// successfully converted into a database configuration.
-    /// - Thrift user exceptions via [`from_create_database_exception`]
-    /// (`AlreadyExistsException` → [`ErrorKind::NamespaceAlreadyExists`]; other
+    /// - Thrift user exceptions via `from_create_database_exception`
+    /// (`AlreadyExistsException` → `ErrorKind::NamespaceAlreadyExists`; other
     /// exceptions → Unexpected) or transport failures via `from_thrift_error`.
     async fn create_namespace(
         &self,
@@ -416,8 +416,8 @@ impl Catalog for HmsCatalog {
     ///
     /// This function can return an error in any of the following situations:
     /// - If the provided namespace identifier fails validation checks
-    /// - Thrift user exceptions via [`from_get_database_exception`]
-    /// (`NoSuchObjectException` → [`ErrorKind::NamespaceNotFound`]; other
+    /// - Thrift user exceptions via `from_get_database_exception`
+    /// (`NoSuchObjectException` → `ErrorKind::NamespaceNotFound`; other
     /// exceptions → Unexpected) or transport failures via `from_thrift_error`.
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
         let name = validate_namespace(namespace)?;
@@ -445,7 +445,7 @@ impl Catalog for HmsCatalog {
     /// - `Ok(true)` if the namespace exists.
     /// - `Ok(false)` if the namespace does not exist (`NoSuchObjectException` /
     /// thrift `GetDatabase` `O1`). Existence probes must return a bool, not
-    /// [`ErrorKind::NamespaceNotFound`] — that typed kind is for `get_namespace`
+    /// `ErrorKind::NamespaceNotFound` — that typed kind is for `get_namespace`
     /// / `drop_namespace` / `alter_database` (and create-table parent-missing).
     /// - `Err(...)` if validation fails, the transport fails, or a non-not-found
     /// thrift user exception is raised (e.g. `MetaException` → Unexpected).
@@ -692,7 +692,7 @@ impl Catalog for HmsCatalog {
     /// - `Ok(true)` if the table exists in the database.
     /// - `Ok(false)` if the table does not exist (`NoSuchObjectException` /
     /// thrift `GetTable` `O2`). Existence probes return a bool, not
-    /// [`ErrorKind::TableNotFound`] — that typed kind is for `load_table` /
+    /// `ErrorKind::TableNotFound` — that typed kind is for `load_table` /
     /// `drop_table` / rename source lookup.
     /// - `Err(...)` if validation fails, the transport fails, or a non-not-found
     /// thrift user exception is raised (e.g. `MetaException` → Unexpected).
@@ -921,7 +921,7 @@ mod tests {
 
     /// Config error (unit E residual): a malformed catalog address is a construction
     /// failure, not a thrift catalog-object outcome. It must stay
-    /// [`ErrorKind::Unexpected`] — do NOT map it to NamespaceNotFound / TableNotFound /
+    /// `ErrorKind::Unexpected` — do NOT map it to NamespaceNotFound / TableNotFound /
     /// AlreadyExists. Mutation: change the kind to a typed catalog kind → RED.
     #[test]
     fn test_invalid_address_stays_unexpected() {
@@ -945,7 +945,7 @@ mod tests {
     }
 
     /// Config error (unit E residual): omitting `with_storage_factory` is a builder wiring
-    /// mistake, not a thrift exception. Keep [`ErrorKind::Unexpected`]. Mutation: map to a
+    /// mistake, not a thrift exception. Keep `ErrorKind::Unexpected`. Mutation: map to a
     /// typed catalog kind → RED.
     #[tokio::test]
     async fn test_missing_storage_factory_stays_unexpected() {
@@ -965,6 +965,38 @@ mod tests {
             err.kind(),
             ErrorKind::Unexpected,
             "missing StorageFactory is a genuine config error and must stay Unexpected, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("StorageFactory"),
+            "error must name StorageFactory, got: {err}"
+        );
+    }
+
+    /// Same config contract via the public builder surface (C1-Q-002): `load` without
+    /// `with_storage_factory` must fail Unexpected naming StorageFactory — not a typed
+    /// catalog kind. Mutation: default a Memory factory inside `load` → RED.
+    #[tokio::test]
+    async fn test_builder_load_without_storage_factory_stays_unexpected() {
+        let err = HmsCatalogBuilder::default()
+            .load(
+                "hms",
+                HashMap::from([
+                    (
+                        HMS_CATALOG_PROP_URI.to_string(),
+                        "127.0.0.1:9083".to_string(),
+                    ),
+                    (
+                        HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+                        "s3://warehouse".to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .expect_err("builder load without StorageFactory must fail");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Unexpected,
+            "missing StorageFactory via builder must stay Unexpected, got: {err}"
         );
         assert!(
             err.to_string().contains("StorageFactory"),
