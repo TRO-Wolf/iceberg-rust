@@ -145,7 +145,6 @@ impl ExecutionPlan for IcebergWriteExec {
         "IcebergWriteExec"
     }
 
-
     /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
@@ -308,7 +307,7 @@ impl ExecutionPlan for IcebergWriteExec {
 
 #[cfg(test)]
 mod tests {
-        use std::collections::HashMap;
+    use std::collections::HashMap;
     use std::fmt::{Debug, Formatter};
     use std::sync::Arc;
 
@@ -379,7 +378,6 @@ mod tests {
         fn name(&self) -> &str {
             "MockExecutionPlan"
         }
-
 
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties

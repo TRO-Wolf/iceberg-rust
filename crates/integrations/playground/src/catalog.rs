@@ -112,7 +112,6 @@ impl IcebergCatalogList {
 }
 
 impl CatalogProviderList for IcebergCatalogList {
-
     fn register_catalog(
         &self,
         _name: String,

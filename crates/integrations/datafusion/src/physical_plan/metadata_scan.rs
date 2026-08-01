@@ -16,6 +16,7 @@
 // under the License.
 
 use std::sync::Arc;
+
 use datafusion::catalog::TableProvider;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -60,7 +61,6 @@ impl ExecutionPlan for IcebergMetadataScan {
     fn name(&self) -> &str {
         "IcebergMetadataScan"
     }
-
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties

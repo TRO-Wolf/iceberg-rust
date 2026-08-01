@@ -354,7 +354,7 @@ async fn write_stats_file(
     let mut writer = PuffinWriter::new(&output_file, HashMap::new(), false).await?;
     let mut blob_metadata = Vec::with_capacity(columns.len());
 
-    for (column, sketch) in columns.iter().zip(sketches.into_iter()) {
+    for (column, sketch) in columns.iter().zip(sketches) {
         let payload = sketch.serialize_compact().map_err(|error| {
             Error::new(
                 ErrorKind::Unexpected,

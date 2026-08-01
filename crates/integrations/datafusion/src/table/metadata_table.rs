@@ -85,7 +85,6 @@ impl IcebergMetadataTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergMetadataTableProvider {
-
     fn schema(&self) -> ArrowSchemaRef {
         // Resolved (and validated) eagerly in `try_new`; this trait method must not fail.
         self.schema.clone()

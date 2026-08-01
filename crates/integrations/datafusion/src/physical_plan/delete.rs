@@ -282,7 +282,6 @@ impl ExecutionPlan for IcebergDeleteExec {
         "IcebergDeleteExec"
     }
 
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
@@ -1372,7 +1371,6 @@ impl ExecutionPlan for IcebergUpdateExec {
     fn name(&self) -> &str {
         "IcebergUpdateExec"
     }
-
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties

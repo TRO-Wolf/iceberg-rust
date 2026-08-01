@@ -272,7 +272,6 @@ impl PartialEq for PartitionExpr {
 impl Eq for PartitionExpr {}
 
 impl PhysicalExpr for PartitionExpr {
-
     fn data_type(&self, _input_schema: &ArrowSchema) -> DFResult<DataType> {
         Ok(self.calculator.partition_arrow_type().clone())
     }
@@ -610,9 +609,7 @@ mod tests {
         let rebuilt_children = rebuilt.children();
         assert_eq!(rebuilt_children.len(), 2);
         assert!(
-            rebuilt_children[0]
-                .downcast_ref::<Literal>()
-                .is_some(),
+            rebuilt_children[0].downcast_ref::<Literal>().is_some(),
             "rebuilt child 0 must be the substituted literal"
         );
 

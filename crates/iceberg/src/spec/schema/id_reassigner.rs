@@ -699,11 +699,8 @@ impl<'a, 'b> ReassignIds<'a, 'b> {
 
         // Phase 2: each field's own id (in field order).
         let mut new_fields = Vec::with_capacity(struct_type.fields().len());
-        for ((field, source_field), new_type) in struct_type
-            .fields()
-            .iter()
-            .zip(matched.into_iter())
-            .zip(new_types.into_iter())
+        for ((field, source_field), new_type) in
+            struct_type.fields().iter().zip(matched).zip(new_types)
         {
             let new_id = match source_field {
                 Some(source_field) => source_field.id,

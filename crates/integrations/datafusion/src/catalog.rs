@@ -71,7 +71,7 @@ impl IcebergCatalogProvider {
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
             .into_iter()
-            .zip(providers.into_iter())
+            .zip(providers)
             .map(|(name, provider)| {
                 let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
                 (name, provider)
@@ -83,7 +83,6 @@ impl IcebergCatalogProvider {
 }
 
 impl CatalogProvider for IcebergCatalogProvider {
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
     }

@@ -392,7 +392,6 @@ impl ExecutionPlan for IcebergTableScan {
         "IcebergTableScan"
     }
 
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]
     }

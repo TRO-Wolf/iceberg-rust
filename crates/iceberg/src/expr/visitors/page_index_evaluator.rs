@@ -736,26 +736,21 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
                 }
 
                 match (min, max) {
-                    (Some(min), Some(max)) => {
+                    (Some(min), Some(max))
                         if literals
                             .iter()
-                            .all(|datum| datum.lt(&min) || datum.gt(&max))
-                        {
-                            // if all values are outside the bounds, rows cannot match.
-                            return Ok(false);
-                        }
+                            .all(|datum| datum.lt(&min) || datum.gt(&max)) =>
+                    {
+                        // if all values are outside the bounds, rows cannot match.
+                        return Ok(false);
                     }
-                    (Some(min), _) => {
-                        if !literals.iter().any(|datum| datum.ge(&min)) {
-                            // if none of the values are greater than the min bound, rows cant match
-                            return Ok(false);
-                        }
+                    (Some(min), _) if !literals.iter().any(|datum| datum.ge(&min)) => {
+                        // if none of the values are greater than the min bound, rows cant match
+                        return Ok(false);
                     }
-                    (_, Some(max)) => {
-                        if !literals.iter().any(|datum| datum.le(&max)) {
-                            // if all values are greater than upper bound, rows cannot match.
-                            return Ok(false);
-                        }
+                    (_, Some(max)) if !literals.iter().any(|datum| datum.le(&max)) => {
+                        // if all values are greater than upper bound, rows cannot match.
+                        return Ok(false);
                     }
 
                     _ => {}
@@ -782,7 +777,6 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
 
 #[cfg(test)]
 mod tests {
-    use parquet::file::metadata::PageIndexPolicy;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -792,7 +786,7 @@ mod tests {
     use parquet::arrow::arrow_reader::{
         ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelector,
     };
-    use parquet::file::metadata::ParquetMetaData;
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
     use parquet::file::properties::WriterProperties;
     use rand::Rng;
     use tempfile::NamedTempFile;

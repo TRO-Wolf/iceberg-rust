@@ -29,3 +29,21 @@
 
 - Actor build: in progress → cargo check --workspace --all-targets green (pre-test)
 - Octo: pending
+
+## Actor gate (pre-octo)
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --all-targets` | green |
+| `cargo test -p iceberg --lib --all-features` | **3068 passed** |
+| `cargo test -p iceberg-datafusion --all-features` | green (incl. nested insert re-pin + doctest) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | green (new nightly lints auto-fixed) |
+| `make interop` | deferred to octo / pre-push (needs JDK/mvn) |
+
+### Behavior re-pins (cited)
+
+1. **test_insert_into_nested** — DF54 field-aware `CastExpr` + `validate_field_compatibility` rejects nullable SQL `named_struct` leaves → non-null nested Iceberg required fields. Fixture leaves under `address` re-pinned OPTIONAL; zip literal cast to INT; expect! snapshot updated. Citation: DF 54 upgrade guide (CastColumnExpr → field-aware CastExpr); datafusion-common `nested_struct.rs` nullability rule. Required-nested SQL insert follow-up out of family-bump scope.
+
+## Octo
+
+Pending: 8× critic-octo early_stop=false
