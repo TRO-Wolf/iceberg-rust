@@ -189,7 +189,8 @@ mod tests {
         let partition_value =
             crate::spec::Struct::from_iter([Some(crate::spec::Literal::string("US"))]);
         let partition_key =
-            crate::spec::PartitionKey::new(partition_spec, schema.clone(), partition_value.clone());
+            crate::spec::PartitionKey::new(partition_spec, schema.clone(), partition_value.clone())
+                .expect("PartitionKey::new: valid partition tuple");
 
         // Create writer builder
         let parquet_writer_builder =
@@ -291,7 +292,8 @@ mod tests {
             partition_spec.clone(),
             schema.clone(),
             partition_value_asia.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let partition_value_eu =
             crate::spec::Struct::from_iter([Some(crate::spec::Literal::string("EU"))]);
@@ -299,7 +301,8 @@ mod tests {
             partition_spec.clone(),
             schema.clone(),
             partition_value_eu.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let partition_value_us =
             crate::spec::Struct::from_iter([Some(crate::spec::Literal::string("US"))]);
@@ -307,7 +310,8 @@ mod tests {
             partition_spec.clone(),
             schema.clone(),
             partition_value_us.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         // Create writer builder
         let parquet_writer_builder =
@@ -432,7 +436,8 @@ mod tests {
             partition_spec.clone(),
             schema.clone(),
             partition_value_us.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let partition_value_eu =
             crate::spec::Struct::from_iter([Some(crate::spec::Literal::string("EU"))]);
@@ -440,7 +445,8 @@ mod tests {
             partition_spec.clone(),
             schema.clone(),
             partition_value_eu.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         // Create writer builder
         let parquet_writer_builder =

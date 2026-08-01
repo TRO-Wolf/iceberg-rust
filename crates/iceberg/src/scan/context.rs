@@ -91,7 +91,9 @@ pub(crate) struct ManifestFileContext {
 
     /// The residual evaluator for this manifest's (spec, snapshot filter) pair,
     /// built once per manifest file and shared across its entries. `None` when the
-    /// scan has no row filter (every task then carries no per-row predicate).
+    /// scan has no row filter **or** residual application is disabled via
+    /// [`TableScanBuilder::with_file_prune_only`](crate::scan::TableScanBuilder::with_file_prune_only)
+    /// (plan-time prune still runs; every task then carries no per-row residual).
     residual_evaluator: Option<Arc<ResidualEvaluator>>,
 
     /// The partition spec this manifest's files were written under (Java `file.spec()`),
@@ -126,7 +128,8 @@ pub(crate) struct ManifestEntryContext {
     pub case_sensitive: bool,
 
     /// The residual evaluator for the scan's (spec, snapshot filter) pair, shared
-    /// across the manifest's entries. `None` when the scan has no row filter.
+    /// across the manifest's entries. `None` when the scan has no row filter or
+    /// residual application is disabled (`with_file_prune_only`).
     pub residual_evaluator: Option<Arc<ResidualEvaluator>>,
 
     /// The partition spec this entry's file was written under, shared from the
@@ -267,12 +270,13 @@ impl ManifestEntryContext {
     /// partition-reduced residual of the scan's snapshot filter for this file's
     /// partition tuple.
     ///
-    /// Returns `None` when the scan has no filter. Otherwise it evaluates the
-    /// pre-built [`ResidualEvaluator`] against this file's partition and binds the
-    /// resulting (unbound) residual `Predicate` back to the snapshot schema — the
-    /// `BoundPredicate` the reader consumes. A residual of `AlwaysTrue` binds to
-    /// `BoundPredicate::AlwaysTrue` (the reader applies no per-row filtering); an
-    /// `AlwaysFalse` residual binds to `BoundPredicate::AlwaysFalse` (the file
+    /// Returns `None` when the scan has no filter **or** residual application is
+    /// disabled (`with_file_prune_only` / `apply_residual_filter = false`). Otherwise
+    /// it evaluates the pre-built [`ResidualEvaluator`] against this file's partition
+    /// and binds the resulting (unbound) residual `Predicate` back to the snapshot
+    /// schema — the `BoundPredicate` the reader consumes. A residual of `AlwaysTrue`
+    /// binds to `BoundPredicate::AlwaysTrue` (the reader applies no per-row filtering);
+    /// an `AlwaysFalse` residual binds to `BoundPredicate::AlwaysFalse` (the file
     /// produces no rows).
     ///
     /// Residuals are memoized per partition on the shared [`ResidualEvaluator`] so
@@ -302,6 +306,10 @@ pub(crate) struct PlanContext {
     pub case_sensitive: bool,
     pub predicate: Option<Arc<Predicate>>,
     pub snapshot_bound_predicate: Option<Arc<BoundPredicate>>,
+    /// When `false`, plan-time pruning still uses [`snapshot_bound_predicate`], but no
+    /// residual evaluator is built and [`FileScanTask`] carries `predicate: None`. Set by
+    /// [`TableScanBuilder::with_file_prune_only`](crate::scan::TableScanBuilder::with_file_prune_only).
+    pub apply_residual_filter: bool,
     pub object_cache: Arc<ObjectCache>,
     pub field_ids: Arc<Vec<i32>>,
 
@@ -508,23 +516,30 @@ impl PlanContext {
 
         // Build the residual evaluator once per manifest file, sharing it across all
         // entries (the spec + snapshot filter are constant within a manifest). It is
-        // only needed when the scan has a row filter — `snapshot_bound_predicate` is
-        // `Some` exactly then. When the spec is unpartitioned (or missing) the
-        // evaluator returns the filter verbatim, so each task keeps the full filter.
-        let residual_evaluator = match (&self.snapshot_bound_predicate, &partition_spec) {
-            (Some(snapshot_bound_predicate), Some(spec)) => Some(Arc::new(ResidualEvaluator::of(
-                spec.clone(),
-                &self.snapshot_schema,
-                snapshot_bound_predicate.as_ref().clone(),
-                self.case_sensitive,
-            )?)),
-            (Some(snapshot_bound_predicate), None) => {
-                Some(Arc::new(ResidualEvaluator::unpartitioned(
-                    snapshot_bound_predicate.as_ref().clone(),
-                    self.case_sensitive,
-                )))
+        // only needed when the scan has a row filter AND residual application is
+        // enabled (`apply_residual_filter`; cleared by `with_file_prune_only`).
+        // When the spec is unpartitioned (or missing) the evaluator returns the filter
+        // verbatim, so each task keeps the full filter.
+        let residual_evaluator = if self.apply_residual_filter {
+            match (&self.snapshot_bound_predicate, &partition_spec) {
+                (Some(snapshot_bound_predicate), Some(spec)) => {
+                    Some(Arc::new(ResidualEvaluator::of(
+                        spec.clone(),
+                        &self.snapshot_schema,
+                        snapshot_bound_predicate.as_ref().clone(),
+                        self.case_sensitive,
+                    )?))
+                }
+                (Some(snapshot_bound_predicate), None) => {
+                    Some(Arc::new(ResidualEvaluator::unpartitioned(
+                        snapshot_bound_predicate.as_ref().clone(),
+                        self.case_sensitive,
+                    )))
+                }
+                (None, _) => None,
             }
-            (None, _) => None,
+        } else {
+            None
         };
 
         Ok(ManifestFileContext {

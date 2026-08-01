@@ -1013,7 +1013,8 @@ mod test {
             identity_dept_spec(&schema, 3),
             schema.clone(),
             key_partition.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
             .with_partition_spec(configured)

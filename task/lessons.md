@@ -687,3 +687,43 @@ From the closing-Critic remediation of the engine-trust bundle.
   CLOSED (here, make `display_bytes` emit Java's base64 for the pinned bytes) and prove the alarm
   goes RED. Order it BEFORE the value pin in the same test, or the byte-stability `assert_eq!` fires
   first and the alarm's own coverage stays unproven.
+
+### 2026-07-31 — D11: Grok octo Actor + critic-octo 8× early_stop=false for the plan_tasks slate (deviation from AC·OO)
+
+Recorded on WG0 (rebase + re-gate of parked WG1/WG2) before flagship G1 lands, so the cadence
+deviation is on the ledger even if G1 never touches `task/`.
+
+- **DO treat D11 as a written, slate-scoped deviation from `CLAUDE.md` §subagent_policy AC·OO.**
+  For units WG0, G1 (plan_tasks multi-partition), G2 (PartitionKey::Result + toHumanString), and
+  G3 (HMS typed errors): the Actor is Grok-class under `/sepmo-octo`, and the Critic engine is
+  standalone `/critic-octo` with **8 cycles and `early_stop=false`**. Convergence claims without
+  green named-RED mutation runs at the **actual tip** are slate-failing (a mutation that was RED
+  three commits ago is not RED).
+- **DO NOT invent an external Opus Critic mid-run for this slate.** The orchestrator's morning
+  review is the independent Opus-class pass before any merge recommendation. Grok critic-octo is
+  intentional overnight hardening, not a substitute for that pass.
+- **Why:** QD/QE + perf-wave A–E precedent on this fork; G1's merge gate is objective (14 pins +
+  named mutations HARD-FAIL never SKIP). Source: `~/.claude/plans/2026-08-02-grok-fork-plantasks-slate.md`
+  D11; dossier `~/Desktop/iceberg-rust-overnight-work-slate-2026-07-31.md`.
+
+### 2026-08-01 — Default EXPLAIN is a GOLDEN-MATCHED surface: no per-run-random values in it, and the suite that pins it is NOT in the chained gate
+
+Caught by CI on the slate union branch (`df_binary/boolean_predicate_pushdown.slt` failed;
+`like`/`timestamp` were in the 51 fail-fast-cancelled tests and pin the same line).
+
+- **DO NOT render a per-run-random value (a snapshot id) in an `ExecutionPlan`'s DEFAULT
+  `DisplayAs` form.** The sqllogictest goldens exact-match physical-plan lines and the fork's
+  harness has NO normalization layer, so `snapshot_id=1601068411408991295` can never re-match a
+  golden. *Apply:* gate nondeterministic display fields on
+  `DisplayFormatType::Verbose` (EXPLAIN VERBOSE) and keep only deterministic fields (`N=`) in the
+  default form; pin the split both ways in one test (default must NOT contain it, verbose MUST).
+- **DO run `cargo test --workspace --all-features --test sqllogictests` whenever a change
+  alters EXPLAIN / `DisplayAs` shape.** The standard chained gate excludes that suite (the
+  `protoc` caveat), so a display change gates green locally and fails CI's full-workspace
+  nextest. Four slt files pin `IcebergTableScan` plan lines (`binary`/`boolean`/`like`/
+  `timestamp` predicate-pushdown); `protoc` IS installed on this box. The `--workspace` is
+  load-bearing, not ceremony: ANY single-package invocation — even
+  `-p iceberg-sqllogictest --all-features` — FAILS TO COMPILE
+  (`tokio::runtime::Builder::new_multi_thread` missing): the crate free-rides on
+  WORKSPACE-WIDE feature unification for tokio `rt-multi-thread` (the F3 tokio
+  under-declaration backlog item; the Cargo.toml fix needs explicit approval).

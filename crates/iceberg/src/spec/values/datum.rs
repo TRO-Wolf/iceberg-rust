@@ -1283,11 +1283,22 @@ impl Datum {
 
     /// Returns a human-readable string representation of this literal.
     ///
-    /// For string literals, this returns the raw string value without quotes.
-    /// For all other literals, it falls back to [`to_string()`].
+    /// Matches Java `Transform.toHumanString(Type, T)` (iceberg-api 1.10.0):
+    ///
+    /// * **String** — the raw string value without quotes.
+    /// * **Binary / Fixed** — standard Base64 (`java.util.Base64.getEncoder()` via
+    ///   `TransformUtil.base64encode`), NOT uppercase hex. [`Display`] for these types still
+    ///   renders hex; only the human-string / partition-path seam uses base64.
+    /// * **Everything else** — falls back to [`to_string()`] (chrono / Rust `Display` forms).
     pub fn to_human_string(&self) -> String {
         match self.literal() {
             PrimitiveLiteral::String(s) => s.to_string(),
+            PrimitiveLiteral::Binary(bytes)
+                if matches!(self.r#type, PrimitiveType::Binary | PrimitiveType::Fixed(_)) =>
+            {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            }
             _ => self.to_string(),
         }
     }

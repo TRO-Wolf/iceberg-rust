@@ -75,6 +75,7 @@ use crate::{Error, ErrorKind, Result};
 /// selectors ([`use_snapshot`](Self::use_snapshot) / [`use_ref`](Self::use_ref) /
 /// [`as_of_time`](Self::as_of_time)) and re-exposes the inherited scan knobs
 /// ([`select`](Self::select) / [`with_filter`](Self::with_filter) /
+/// [`with_file_prune_only`](Self::with_file_prune_only) /
 /// [`with_case_sensitive`](Self::with_case_sensitive) / the split-config setters) by forwarding
 /// to the wrapped [`TableScanBuilder`]. [`plan_files`](Self::plan_files) /
 /// [`plan_tasks`](Self::plan_tasks) DELEGATE to the underlying
@@ -230,8 +231,21 @@ impl<'a> BatchScan<'a> {
     }
 
     /// Apply a row filter (Java `Scan.filter`). Forwards to [`TableScanBuilder::with_filter`].
+    ///
+    /// **COW MERGE footgun:** residual filtering drops co-located non-matching rows.
+    /// For copy-on-write MERGE target scans use
+    /// [`with_file_prune_only`](Self::with_file_prune_only) instead.
     pub fn with_filter(mut self, predicate: crate::expr::Predicate) -> Self {
         self.builder = self.builder.with_filter(predicate);
+        self
+    }
+
+    /// Metrics-only file prune (no residual row filter). Forwards to
+    /// [`TableScanBuilder::with_file_prune_only`].
+    ///
+    /// Surviving files return **all** rows — required for COW MERGE rewrite targets.
+    pub fn with_file_prune_only(mut self, predicate: crate::expr::Predicate) -> Self {
+        self.builder = self.builder.with_file_prune_only(predicate);
         self
     }
 
@@ -239,6 +253,27 @@ impl<'a> BatchScan<'a> {
     /// [`TableScanBuilder::with_case_sensitive`].
     pub fn with_case_sensitive(mut self, case_sensitive: bool) -> Self {
         self.builder = self.builder.with_case_sensitive(case_sensitive);
+        self
+    }
+
+    /// Within-file row-group parallel reads. Forwards to
+    /// [`TableScanBuilder::with_within_file_read_parallelism`].
+    pub fn with_within_file_read_parallelism(mut self, enabled: bool) -> Self {
+        self.builder = self.builder.with_within_file_read_parallelism(enabled);
+        self
+    }
+
+    /// Parquet range-fetch concurrency. Forwards to
+    /// [`TableScanBuilder::with_range_fetch_concurrency`].
+    pub fn with_range_fetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.builder = self.builder.with_range_fetch_concurrency(concurrency);
+        self
+    }
+
+    /// Parquet range coalesce threshold. Forwards to
+    /// [`TableScanBuilder::with_range_coalesce_bytes`].
+    pub fn with_range_coalesce_bytes(mut self, bytes: u64) -> Self {
+        self.builder = self.builder.with_range_coalesce_bytes(bytes);
         self
     }
 

@@ -358,6 +358,9 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
             case_sensitive: self.case_sensitive,
             predicate: self.filter.map(Arc::new),
             snapshot_bound_predicate: snapshot_bound_predicate.map(Arc::new),
+            // Incremental scans always apply residuals when a filter is set (no
+            // file-prune-only mode on this surface).
+            apply_residual_filter: true,
             object_cache: self.table.object_cache(),
             field_ids: Arc::new(field_ids),
             // Parse the table's default name mapping once per plan (Java

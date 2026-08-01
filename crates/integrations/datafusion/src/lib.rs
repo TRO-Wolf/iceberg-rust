@@ -22,6 +22,8 @@ mod error;
 pub use error::*;
 
 pub mod physical_plan;
+/// Multi-partition scan knobs (pin 13 off-switch + pin 14 distinct `L`) and the scan plan node.
+pub use physical_plan::{IcebergScanOptions, IcebergTableScan, ensure_iceberg_scan_options};
 mod schema;
 pub mod table;
 pub use table::table_provider_factory::IcebergTableProviderFactory;

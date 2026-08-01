@@ -165,7 +165,8 @@ mod tests {
         let partition_spec = PartitionSpec::builder(schema.clone()).build()?;
         let partition_value = Struct::from_iter([Some(Literal::string("US"))]);
         let partition_key =
-            PartitionKey::new(partition_spec, schema.clone(), partition_value.clone());
+            PartitionKey::new(partition_spec, schema.clone(), partition_value.clone())
+                .expect("PartitionKey::new: valid partition tuple");
 
         // Create writer builder
         let parquet_writer_builder =
@@ -266,21 +267,24 @@ mod tests {
             partition_spec.clone(),
             schema.clone(),
             partition_value_us.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let partition_value_eu = Struct::from_iter([Some(Literal::string("EU"))]);
         let partition_key_eu = PartitionKey::new(
             partition_spec.clone(),
             schema.clone(),
             partition_value_eu.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let partition_value_asia = Struct::from_iter([Some(Literal::string("ASIA"))]);
         let partition_key_asia = PartitionKey::new(
             partition_spec.clone(),
             schema.clone(),
             partition_value_asia.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         // Create writer builder
         let parquet_writer_builder =

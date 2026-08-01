@@ -27,6 +27,7 @@ mod incremental;
 pub use batch::*;
 pub use incremental::*;
 mod metrics_collector;
+mod partition_work;
 mod task;
 mod task_group;
 
@@ -38,6 +39,7 @@ use arrow_array::RecordBatch;
 use futures::channel::mpsc::{Sender, channel};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt, TryStreamExt};
+pub use partition_work::*;
 pub use task::*;
 pub use task_group::*;
 
@@ -51,7 +53,13 @@ use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::metrics::{MetricsReport, MetricsReporter, ScanReport, TimeUnit, TimerResult};
 use crate::runtime::spawn;
 use crate::scan::metrics_collector::ScanMetricsCollector;
-use crate::spec::{DataContentType, ManifestContentType, SnapshotRef};
+use crate::spec::{DataContentType, DataFileFormat, ManifestContentType, SnapshotRef};
+
+/// True when `offsets` is strictly ascending (each value > previous). Used to gate within-file
+/// expand so we only take the offsets-aware split branch, never fixed-size windows.
+fn is_strictly_ascending_offsets(offsets: &[i64]) -> bool {
+    offsets.windows(2).all(|w| w[1] > w[0])
+}
 use crate::table::Table;
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind, Result};
@@ -85,11 +93,29 @@ pub struct TableScanBuilder<'a> {
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
+    /// When true, [`filter`](Self::filter) is used only for planning-time file / manifest
+    /// pruning (partition summaries + inclusive metrics). Surviving files return **all** rows:
+    /// no residual is attached to [`FileScanTask`] and therefore no row-group / per-row residual
+    /// filtering is applied. Required for copy-on-write MERGE target scans that must keep
+    /// co-located survivor rows. Set by [`with_file_prune_only`](Self::with_file_prune_only);
+    /// cleared by [`with_filter`](Self::with_filter).
+    file_prune_only: bool,
     concurrency_limit_data_files: usize,
     concurrency_limit_manifest_entries: usize,
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    /// When true (default) and [`concurrency_limit_data_files`](Self::concurrency_limit_data_files)
+    /// is greater than 1, [`TableScan::to_arrow`] expands whole-file tasks that carry Parquet
+    /// `split_offsets` into per-row-group sub-tasks so concurrent readers issue parallel ranged
+    /// GETs inside a single data file (RePark within-file parallel reads). Disabled when the
+    /// scan projects `_pos` (absolute ordinals require whole-file sequential decode).
+    within_file_read_parallelism: bool,
+    /// Override for Parquet coalesced range-fetch concurrency (column-chunk / footer ranges).
+    /// `None` ⇒ ArrowReader default (10).
+    range_fetch_concurrency: Option<usize>,
+    /// Override for Parquet nearby-range coalesce threshold in bytes. `None` ⇒ default 1 MiB.
+    range_coalesce_bytes: Option<u64>,
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
     /// Scan-time OVERRIDE for the split target size (Java `TableScanContext.option(SPLIT_SIZE)`).
     /// `None` ⇒ fall back to the table property then the Java default at [`plan_tasks`] time.
@@ -114,11 +140,15 @@ impl<'a> TableScanBuilder<'a> {
             batch_size: None,
             case_sensitive: true,
             filter: None,
+            file_prune_only: false,
             concurrency_limit_data_files: num_cpus,
             concurrency_limit_manifest_entries: num_cpus,
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            within_file_read_parallelism: true,
+            range_fetch_concurrency: None,
+            range_coalesce_bytes: None,
             metrics_reporter: None,
             split_size: None,
             split_lookback: None,
@@ -172,10 +202,42 @@ impl<'a> TableScanBuilder<'a> {
     }
 
     /// Specifies a predicate to use as a filter
+    ///
+    /// The predicate is applied at **plan time** (manifest / partition / inclusive-metrics
+    /// pruning) **and** as a residual row filter on each surviving [`FileScanTask`] (and
+    /// therefore as row-group filtering when enabled). This matches Java `Scan.filter`.
+    ///
+    /// **COW MERGE footgun:** this applies a residual that drops co-located non-matching
+    /// rows inside surviving files. For copy-on-write MERGE target scans that need file pruning
+    /// without dropping survivors, use [`with_file_prune_only`](Self::with_file_prune_only)
+    /// instead — never this method.
+    ///
+    /// Calling this clears any prior [`with_file_prune_only`](Self::with_file_prune_only) mode
+    /// (last call wins).
     pub fn with_filter(mut self, predicate: Predicate) -> Self {
         // calls rewrite_not to remove Not nodes, which must be absent
         // when applying the manifest evaluator
         self.filter = Some(predicate.rewrite_not());
+        self.file_prune_only = false;
+        self
+    }
+
+    /// Specifies a predicate used **only** for planning-time file / manifest pruning.
+    ///
+    /// Manifests and data files are still pruned via partition summaries and inclusive column
+    /// metrics exactly as with [`with_filter`](Self::with_filter), but surviving files return
+    /// **every row** — no residual is attached to [`FileScanTask`], so residual row filters and
+    /// predicate-driven row-group filtering do not run. This is the mode COW MERGE needs: prune
+    /// files that cannot contain any ON-clause match, then rewrite whole surviving files
+    /// including unmatched co-located survivors.
+    ///
+    /// Spark's MERGE target planning applies a runtime file filter while keeping full file
+    /// contents for the rewrite (`SparkCopyOnWrite` scan-task filtering).
+    ///
+    /// Calling this replaces any prior [`with_filter`](Self::with_filter) (last call wins).
+    pub fn with_file_prune_only(mut self, predicate: Predicate) -> Self {
+        self.filter = Some(predicate.rewrite_not());
+        self.file_prune_only = true;
         self
     }
 
@@ -247,6 +309,34 @@ impl<'a> TableScanBuilder<'a> {
     /// Sets the data file concurrency limit for this scan
     pub fn with_data_file_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit_data_files = limit;
+        self
+    }
+
+    /// Enable or disable within-file read parallelism for [`TableScan::to_arrow`].
+    ///
+    /// When enabled (default) and the data-file concurrency limit is greater than 1, whole-file
+    /// tasks that carry Parquet row-group `split_offsets` are expanded into per-offset sub-tasks
+    /// and read under the same concurrency budget as cross-file tasks. That turns a monolithic
+    /// multi-row-group file into concurrent ranged GETs (the RePark MERGE target-scan lever).
+    ///
+    /// Batch order across sub-tasks of one file is **not** preserved (same as multi-file
+    /// concurrent reads). Automatically suppressed when the scan projects `_pos`.
+    pub fn with_within_file_read_parallelism(mut self, enabled: bool) -> Self {
+        self.within_file_read_parallelism = enabled;
+        self
+    }
+
+    /// Sets how many coalesced Parquet byte-ranges may be fetched concurrently inside one open
+    /// file (column chunks / footer). Defaults to the Arrow reader default (10) when unset.
+    pub fn with_range_fetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.range_fetch_concurrency = Some(concurrency);
+        self
+    }
+
+    /// Sets the gap threshold (bytes) for merging nearby Parquet byte-ranges into one request.
+    /// Defaults to 1 MiB when unset.
+    pub fn with_range_coalesce_bytes(mut self, bytes: u64) -> Self {
+        self.range_coalesce_bytes = Some(bytes);
         self
     }
 
@@ -411,6 +501,9 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        within_file_read_parallelism: self.within_file_read_parallelism,
+                        range_fetch_concurrency: self.range_fetch_concurrency,
+                        range_coalesce_bytes: self.range_coalesce_bytes,
                         metrics: None,
                         split_config,
                     });
@@ -477,6 +570,11 @@ impl<'a> TableScanBuilder<'a> {
         }
 
         let snapshot_bound_predicate = if let Some(ref predicates) = self.filter {
+            // Honor the builder's case-sensitivity for plan-time metrics prune (and residual
+            // construction when apply_residual_filter is true). Partition-filter rebinding in
+            // PlanContext already used `case_sensitive`; binding with a hardcoded `true` here
+            // made InclusiveMetricsEvaluator disagree with partition prune under
+            // `.with_case_sensitive(false)`.
             Some(predicates.bind(schema.clone(), self.case_sensitive)?)
         } else {
             None
@@ -525,6 +623,9 @@ impl<'a> TableScanBuilder<'a> {
             case_sensitive: self.case_sensitive,
             predicate: self.filter.map(Arc::new),
             snapshot_bound_predicate: snapshot_bound_predicate.map(Arc::new),
+            // File-prune-only scans keep plan-time pruning but skip residual attachment so
+            // co-located survivors remain (COW MERGE). Default `with_filter` applies residuals.
+            apply_residual_filter: !self.file_prune_only,
             object_cache: self.table.object_cache(),
             field_ids,
             name_mapping,
@@ -545,6 +646,9 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            within_file_read_parallelism: self.within_file_read_parallelism,
+            range_fetch_concurrency: self.range_fetch_concurrency,
+            range_coalesce_bytes: self.range_coalesce_bytes,
             metrics,
             split_config,
         })
@@ -590,6 +694,9 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    within_file_read_parallelism: bool,
+    range_fetch_concurrency: Option<usize>,
+    range_coalesce_bytes: Option<u64>,
 
     /// Everything needed to collect and emit a [`ScanReport`], present only when the scan
     /// opted in via [`TableScanBuilder::with_metrics_reporter`] AND the table has a
@@ -861,6 +968,12 @@ impl TableScan {
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
+    ///
+    /// When [`within_file_read_parallelism`](TableScanBuilder::with_within_file_read_parallelism)
+    /// is enabled (default), the data-file concurrency limit is greater than 1, and the scan does
+    /// not project `_pos`, whole-file tasks with Parquet `split_offsets` are expanded into
+    /// per-row-group sub-tasks before concurrent read — so a single multi-row-group file can issue
+    /// multiple ranged GETs in parallel under the same concurrency budget as cross-file reads.
     pub async fn to_arrow(&self) -> Result<ArrowRecordBatchStream> {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
@@ -870,8 +983,64 @@ impl TableScan {
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
         }
+        if let Some(concurrency) = self.range_fetch_concurrency {
+            arrow_reader_builder = arrow_reader_builder.with_range_fetch_concurrency(concurrency);
+        }
+        if let Some(bytes) = self.range_coalesce_bytes {
+            arrow_reader_builder = arrow_reader_builder.with_range_coalesce_bytes(bytes);
+        }
 
-        arrow_reader_builder.build().read(self.plan_files().await?)
+        let tasks = self.plan_files().await?;
+        let tasks = self.expand_within_file_parallel_tasks(tasks)?;
+        arrow_reader_builder.build().read(tasks)
+    }
+
+    /// Expand whole-file tasks into per-`split_offsets` sub-tasks for concurrent within-file
+    /// reads when enabled. No-op when concurrency is 1, the feature is off, or the scan
+    /// projects `_pos` (absolute ordinals require sequential whole-file decode).
+    fn expand_within_file_parallel_tasks(
+        &self,
+        tasks: FileScanTaskStream,
+    ) -> Result<FileScanTaskStream> {
+        use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+
+        let enabled = self.within_file_read_parallelism
+            && self.concurrency_limit_data_files > 1
+            && !self
+                .plan_context
+                .as_ref()
+                .map(|ctx| ctx.field_ids.contains(&RESERVED_FIELD_ID_POS))
+                .unwrap_or(false);
+
+        if !enabled {
+            return Ok(tasks);
+        }
+
+        // Offsets-aware split ignores target; any positive value is valid.
+        let split_target = self.split_config.split_size.max(1);
+
+        Ok(Box::pin(
+            tasks
+                .and_then(move |task| async move {
+                    // Only expand whole-file Parquet tasks whose split_offsets are the
+                    // offsets-aware (strictly ascending) row-group grid. Never call
+                    // FileScanTask::split's fixed-size fallback from this path — non-aligned
+                    // windows can re-select the same row group and duplicate rows.
+                    let can_expand = task.start == 0
+                        && task.data_file_format == DataFileFormat::Parquet
+                        && task.split_offsets.as_ref().is_some_and(|offsets| {
+                            offsets.len() > 1 && is_strictly_ascending_offsets(offsets)
+                        });
+
+                    let subtasks = if can_expand {
+                        task.split(split_target)?
+                    } else {
+                        vec![task]
+                    };
+                    Ok(futures::stream::iter(subtasks.into_iter().map(Ok)))
+                })
+                .try_flatten(),
+        ))
     }
 
     /// Returns a reference to the column names of the table scan.
@@ -4795,6 +4964,407 @@ pub mod tests {
         }
     }
 
+    /// COW MERGE target-scan mode: plan-time prune only, no residual on tasks.
+    ///
+    /// Pins the RePark R-PERF-MERGE-PRUNE STOP: `with_filter` would attach a residual that
+    /// drops co-located survivors; `with_file_prune_only` must prune the same files while
+    /// leaving `FileScanTask.predicate = None`.
+    #[tokio::test]
+    async fn test_file_prune_only_prunes_files_but_attaches_no_residual() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let prune = Reference::new("x").equal_to(Datum::long(1));
+
+        let filtered_tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_filter(prune.clone())
+            .build()
+            .expect("build with_filter")
+            .plan_files()
+            .await
+            .expect("plan with_filter")
+            .try_collect()
+            .await
+            .expect("collect with_filter");
+
+        let prune_only_tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_file_prune_only(prune)
+            .build()
+            .expect("build with_file_prune_only")
+            .plan_files()
+            .await
+            .expect("plan with_file_prune_only")
+            .try_collect()
+            .await
+            .expect("collect with_file_prune_only");
+
+        // Same surviving file set as full filter (partition prune of x==2).
+        assert_eq!(filtered_tasks.len(), 1, "with_filter keeps only x==1 file");
+        assert_eq!(
+            prune_only_tasks.len(),
+            1,
+            "with_file_prune_only keeps the same file set"
+        );
+        assert_eq!(
+            filtered_tasks[0].data_file_path, prune_only_tasks[0].data_file_path,
+            "prune-only and filter must select the same surviving path"
+        );
+        assert!(
+            filtered_tasks[0].data_file_path.ends_with("p1.parquet"),
+            "x==1 file survives"
+        );
+
+        // Full filter attaches a residual; prune-only must not.
+        assert!(
+            filtered_tasks[0].predicate.is_some(),
+            "with_filter attaches residual"
+        );
+        assert_eq!(
+            prune_only_tasks[0].predicate, None,
+            "with_file_prune_only must leave task.predicate = None so survivors are kept"
+        );
+    }
+
+    /// Mutation pin: if file-prune-only incorrectly attached the residual (or used
+    /// `with_filter` semantics), an unpartitioned scan of co-located keys would drop
+    /// non-matching rows. Pins that ALL rows from surviving files are returned.
+    #[tokio::test]
+    async fn test_file_prune_only_returns_all_rows_in_surviving_files() {
+        // Unpartitioned fixture: residual == full filter under with_filter. Filter y == 2
+        // would drop y == 3 rows on the residual path; prune-only must keep every row in
+        // the file (metrics cannot drop a mixed-y file).
+        let mut fixture = TableTestFixture::new_unpartitioned();
+        fixture.setup_unpartitioned_manifest_files().await;
+
+        let filter = Reference::new("y").equal_to(Datum::long(2));
+
+        let residual_scan = fixture
+            .table
+            .scan()
+            .with_filter(filter.clone())
+            .with_row_selection_enabled(true)
+            .build()
+            .expect("build residual scan");
+        let residual_batches: Vec<_> = residual_scan
+            .to_arrow()
+            .await
+            .expect("to_arrow residual")
+            .try_collect()
+            .await
+            .expect("collect residual");
+        let residual_rows: usize = residual_batches.iter().map(|b| b.num_rows()).sum();
+
+        let prune_scan = fixture
+            .table
+            .scan()
+            .with_file_prune_only(filter)
+            .with_row_selection_enabled(true)
+            .build()
+            .expect("build prune-only scan");
+        let prune_batches: Vec<_> = prune_scan
+            .to_arrow()
+            .await
+            .expect("to_arrow prune-only")
+            .try_collect()
+            .await
+            .expect("collect prune-only");
+        let prune_rows: usize = prune_batches.iter().map(|b| b.num_rows()).sum();
+
+        // Fixture files carry y in {2, 3} (and more); residual filter keeps only y==2.
+        assert!(
+            residual_rows > 0,
+            "residual path must still return matching rows"
+        );
+        assert!(
+            prune_rows > residual_rows,
+            "prune-only must keep co-located non-matching rows (got prune={prune_rows} residual={residual_rows})"
+        );
+
+        // Explicit COW survivor class: some y != 2 rows must appear under prune-only.
+        let mut saw_non_match = false;
+        for batch in &prune_batches {
+            let y = batch
+                .column_by_name("y")
+                .expect("y column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("y Int64");
+            for i in 0..y.len() {
+                if y.value(i) != 2 {
+                    saw_non_match = true;
+                    break;
+                }
+            }
+            if saw_non_match {
+                break;
+            }
+        }
+        assert!(
+            saw_non_match,
+            "prune-only scan must surface at least one y!=2 survivor row in a surviving file"
+        );
+    }
+
+    /// Last-call wins: `with_filter` after `with_file_prune_only` restores residual mode.
+    #[tokio::test]
+    async fn test_with_filter_after_file_prune_only_restores_residual() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let pred = Reference::new("x").equal_to(Datum::long(1));
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_file_prune_only(pred.clone())
+            .with_filter(pred)
+            .build()
+            .expect("build")
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            tasks[0].predicate.is_some(),
+            "with_filter last must re-enable residual attachment"
+        );
+    }
+
+    /// Reverse last-call: `with_file_prune_only` after `with_filter` clears residual mode
+    /// (the COW-relevant order when a helper first sets a generic filter).
+    #[tokio::test]
+    async fn test_file_prune_only_after_with_filter_clears_residual() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let pred = Reference::new("x").equal_to(Datum::long(1));
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_filter(pred.clone())
+            .with_file_prune_only(pred)
+            .build()
+            .expect("build")
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].predicate, None,
+            "with_file_prune_only last must clear residual attachment"
+        );
+    }
+
+    /// Mutation pin for inclusive-metrics under prune-only: two unpartitioned files with
+    /// disjoint `y` bounds; prune-only on `y == 2` must drop the y∈[10,20] file via metrics
+    /// (not partition), keep the y∈[1,3] file, and attach no residual.
+    ///
+    /// If residual-skip incorrectly cleared `bound_predicates` / skipped
+    /// InclusiveMetricsEvaluator, both files would survive and this test would RED.
+    #[tokio::test]
+    async fn test_file_prune_only_still_applies_inclusive_metrics_prune() {
+        let fixture = TableTestFixture::new_unpartitioned();
+        let current_snapshot = fixture.table.metadata().current_snapshot().unwrap();
+        let current_schema = current_snapshot.schema(fixture.table.metadata()).unwrap();
+        let current_partition_spec = fixture.table.metadata().default_partition_spec();
+
+        // field id 2 = y in the fixture schema
+        let y_field_id = 2i32;
+        let mut writer = ManifestWriterBuilder::new(
+            fixture.next_manifest_file(),
+            Some(current_snapshot.snapshot_id()),
+            None,
+            current_schema.clone(),
+            current_partition_spec.as_ref().clone(),
+        )
+        .build_v2_data();
+
+        for (name, lo, hi) in [
+            ("metrics_y_low.parquet", 1i64, 3i64),
+            ("metrics_y_high.parquet", 10i64, 20i64),
+        ] {
+            let path = format!("{}/{}", &fixture.table_location, name);
+            writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(0)
+                                .content(DataContentType::Data)
+                                .file_path(path)
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(100)
+                                .record_count(10)
+                                .partition(Struct::empty())
+                                .lower_bounds(HashMap::from([(y_field_id, Datum::long(lo))]))
+                                .upper_bounds(HashMap::from([(y_field_id, Datum::long(hi))]))
+                                .build()
+                                .expect("data file"),
+                        )
+                        .build(),
+                )
+                .expect("add entry");
+        }
+        let data_manifest = writer.write_manifest_file().await.expect("write manifest");
+        let mut manifest_list_write = ManifestListWriter::v2(
+            fixture
+                .table
+                .file_io()
+                .new_output(current_snapshot.manifest_list())
+                .expect("manifest list output"),
+            current_snapshot.snapshot_id(),
+            current_snapshot.parent_snapshot_id(),
+            current_snapshot.sequence_number(),
+        );
+        manifest_list_write
+            .add_manifests(vec![data_manifest].into_iter())
+            .expect("add manifests");
+        manifest_list_write.close().await.expect("close list");
+
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_file_prune_only(Reference::new("y").equal_to(Datum::long(2)))
+            .build()
+            .expect("build")
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(
+            tasks.len(),
+            1,
+            "inclusive metrics must drop metrics_y_high under prune-only"
+        );
+        assert!(
+            tasks[0].data_file_path.ends_with("metrics_y_low.parquet"),
+            "surviving path = low-y bounds file, got {}",
+            tasks[0].data_file_path
+        );
+        assert_eq!(
+            tasks[0].predicate, None,
+            "metrics prune must not re-attach residual under prune-only"
+        );
+    }
+
+    /// BatchScan forwards with_file_prune_only (residual none).
+    #[tokio::test]
+    async fn test_batch_scan_file_prune_only_forwards() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .batch_scan()
+            .with_file_prune_only(Reference::new("x").equal_to(Datum::long(1)))
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].predicate, None);
+    }
+
+    /// Mutation pin for cycle-1 case_sensitive bind fix: wrong-cased column name must
+    /// bind under `.with_case_sensitive(false)` for both filter modes. Reverting
+    /// `bind(..., self.case_sensitive)` to `bind(..., true)` makes `build()` fail.
+    #[tokio::test]
+    async fn test_case_insensitive_bind_works_for_filter_and_file_prune_only() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        // Schema field is lowercase `x`; Reference uses uppercase `X`.
+        let wrong_case = Reference::new("X").equal_to(Datum::long(1));
+
+        let residual_tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_case_sensitive(false)
+            .with_filter(wrong_case.clone())
+            .build()
+            .expect("case-insensitive with_filter must bind")
+            .plan_files()
+            .await
+            .expect("plan filter")
+            .try_collect()
+            .await
+            .expect("collect filter");
+        assert_eq!(residual_tasks.len(), 1);
+        assert!(residual_tasks[0].predicate.is_some());
+
+        let prune_tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .with_case_sensitive(false)
+            .with_file_prune_only(wrong_case)
+            .build()
+            .expect("case-insensitive with_file_prune_only must bind")
+            .plan_files()
+            .await
+            .expect("plan prune")
+            .try_collect()
+            .await
+            .expect("collect prune");
+        assert_eq!(prune_tasks.len(), 1);
+        assert_eq!(prune_tasks[0].predicate, None);
+    }
+
+    /// Polarity pin: `case_sensitive=true` must reject wrong-cased references at `build()`.
+    /// Guards against a hollow fix that hardcodes `bind(..., false)` forever.
+    #[tokio::test]
+    async fn test_case_sensitive_true_rejects_wrong_case_filter_and_prune_only() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_two_data_manifests_distinct_partitions().await;
+
+        let wrong_case = Reference::new("X").equal_to(Datum::long(1));
+
+        let filter_err = fixture
+            .table
+            .scan()
+            .with_case_sensitive(true)
+            .with_filter(wrong_case.clone())
+            .build()
+            .expect_err("case-sensitive with_filter must reject wrong-case column");
+        assert!(
+            filter_err.to_string().to_lowercase().contains("x")
+                || filter_err.to_string().to_lowercase().contains("column")
+                || filter_err.to_string().to_lowercase().contains("field"),
+            "error should name the missing column, got: {filter_err}"
+        );
+
+        let prune_err = fixture
+            .table
+            .scan()
+            .with_case_sensitive(true)
+            .with_file_prune_only(wrong_case)
+            .build()
+            .expect_err("case-sensitive with_file_prune_only must reject wrong-case column");
+        assert!(
+            prune_err.to_string().to_lowercase().contains("x")
+                || prune_err.to_string().to_lowercase().contains("column")
+                || prune_err.to_string().to_lowercase().contains("field"),
+            "error should name the missing column, got: {prune_err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_filter_excluding_the_partition_prunes_the_file_entirely() {
         // Filter `x == 999`: no live file is in partition x == 999, so the
@@ -5931,6 +6501,260 @@ pub mod tests {
             sink.lock().unwrap().is_empty(),
             "a snapshotless scan must fire no ScanEvent"
         );
+    }
+
+    /// Within-file parallel expansion: a whole-file task with multiple `split_offsets` expands
+    /// into one sub-task per offset when concurrency > 1 (used by `to_arrow` before concurrent
+    /// read). Pins the expansion contract without requiring multi-RG parquet bytes.
+    #[tokio::test]
+    async fn test_within_file_parallel_expands_split_offset_tasks() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .with_within_file_read_parallelism(true)
+            .build()
+            .expect("build");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+        let with_offsets: Vec<_> = whole
+            .iter()
+            .filter(|t| t.split_offsets.as_ref().is_some_and(|o| o.len() > 1))
+            .collect();
+        assert_eq!(
+            with_offsets.len(),
+            1,
+            "fixture declares one multi-offset file"
+        );
+        let parent = with_offsets[0];
+        let expected_subs = parent.split(128).expect("split").len();
+        assert!(
+            expected_subs > 1,
+            "offsets-aware split must yield >1 subtask"
+        );
+
+        // Drive the same expand helper used by to_arrow.
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.expect("plan2"))
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect expanded");
+
+        // Expansion adds (expected_subs - 1) tasks for the multi-offset file.
+        assert_eq!(
+            expanded.len(),
+            whole.len() + expected_subs - 1,
+            "multi-offset whole-file task must expand to {expected_subs} subtasks"
+        );
+        // Exact windows for the multi-offset parent (fixture offsets [0,400,800], length 1000).
+        let mut windows: Vec<(u64, u64)> = expanded
+            .iter()
+            .filter(|t| {
+                t.data_file_path == parent.data_file_path
+                    && t.split_offsets.is_none()
+                    && t.file_size_in_bytes == parent.file_size_in_bytes
+            })
+            .map(|t| (t.start, t.length))
+            .collect();
+        windows.sort_unstable();
+        assert_eq!(
+            windows,
+            vec![(0, 400), (400, 400), (800, 200)],
+            "offsets-aware windows for the multi-offset entry only"
+        );
+    }
+
+    /// Non-ascending multi-offsets must NOT expand (fixed-size split would risk duplicate RGs).
+    #[tokio::test]
+    async fn test_within_file_parallel_skips_non_ascending_offsets() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        // Build a synthetic task stream by planning then mutating one entry's offsets is hard;
+        // instead unit-test the gate helper + split interaction via a constructed FileScanTask.
+        let base = {
+            let mut tasks: Vec<FileScanTask> = fixture
+                .table
+                .scan()
+                .build()
+                .unwrap()
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            tasks.pop().expect("at least one task")
+        };
+        let mut bad = base.clone();
+        bad.split_offsets = Some(vec![0, 500, 400]); // not strictly ascending
+        bad.data_file_format = DataFileFormat::Parquet;
+        bad.start = 0;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .build()
+            .unwrap();
+        let stream = Box::pin(futures::stream::iter(vec![Ok(bad.clone())])) as FileScanTaskStream;
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(stream)
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect");
+        assert_eq!(expanded.len(), 1, "non-ascending must not expand");
+        assert_eq!(expanded[0].start, 0);
+        assert_eq!(expanded[0].length, bad.length);
+    }
+
+    /// Avro tasks never expand even with multi-offsets.
+    #[tokio::test]
+    async fn test_within_file_parallel_skips_non_parquet() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let mut task: FileScanTask = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        task.data_file_format = DataFileFormat::Avro;
+        task.split_offsets = Some(vec![0, 100, 200]);
+        task.start = 0;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .build()
+            .unwrap();
+        let stream = Box::pin(futures::stream::iter(vec![Ok(task.clone())])) as FileScanTaskStream;
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(stream)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(expanded.len(), 1, "Avro must not expand");
+    }
+
+    /// Projecting `_pos` suppresses expand (absolute ordinals need whole-file decode).
+    #[tokio::test]
+    async fn test_within_file_parallel_suppressed_when_pos_projected() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .select(["x", "_pos"])
+            .with_data_file_concurrency_limit(4)
+            .with_within_file_read_parallelism(true)
+            .build()
+            .expect("build with _pos");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.unwrap())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            expanded.len(),
+            whole.len(),
+            "_pos projection must suppress within-file expand"
+        );
+    }
+
+    /// Disabled within-file parallelism leaves plan_files task count unchanged.
+    #[tokio::test]
+    async fn test_within_file_parallel_disabled_no_expand() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .with_within_file_read_parallelism(false)
+            .build()
+            .expect("build");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.expect("plan2"))
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect expanded");
+        assert_eq!(
+            expanded.len(),
+            whole.len(),
+            "disabled expand must be a no-op"
+        );
+    }
+
+    /// Concurrency=1 never expands (serial path).
+    #[tokio::test]
+    async fn test_within_file_parallel_concurrency_one_no_expand() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(1)
+            .with_within_file_read_parallelism(true)
+            .build()
+            .expect("build");
+
+        let whole: Vec<FileScanTask> = scan
+            .plan_files()
+            .await
+            .expect("plan")
+            .try_collect()
+            .await
+            .expect("collect");
+        let expanded: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(scan.plan_files().await.expect("plan2"))
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect expanded");
+        assert_eq!(expanded.len(), whole.len());
     }
 
     /// Risk: the scan emit silently swallows a panicking listener (Java `SnapshotScan.planFiles`

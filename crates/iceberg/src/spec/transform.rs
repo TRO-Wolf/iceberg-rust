@@ -180,17 +180,31 @@ impl Transform {
     }
 
     /// Returns a human-readable String representation of a transformed value.
+    ///
+    /// Java-parity with `Transform.toHumanString(Type, T)` (iceberg-api 1.10.0): a null value
+    /// (and the [`Transform::Void`] transform) renders the literal `"null"`; FIXED/BINARY values
+    /// render as standard Base64 via [`Datum::to_human_string`]; other primitives use their
+    /// [`Display`] form. A non-primitive field type is treated like a null (cannot form a
+    /// partition human string).
     pub fn to_human_string(&self, field_type: &Type, value: Option<&Literal>) -> String {
         let Some(value) = value else {
             return "null".to_string();
         };
 
         if let Some(value) = value.as_primitive_literal() {
-            let field_type = field_type.as_primitive_type().unwrap();
-            let datum = Datum::new(field_type.clone(), value);
+            let Some(primitive_type) = field_type.as_primitive_type() else {
+                // Partition fields are always primitive-typed; a non-primitive type here is a
+                // caller/contract defect. Prefer a null human string over panicking (matches the
+                // null-value arm's leniency).
+                return "null".to_string();
+            };
+            let datum = Datum::new(primitive_type.clone(), value);
 
             match self {
                 Self::Void => "null".to_string(),
+                // Unknown transforms still have a string result type on both sides (Java
+                // `UnknownTransform.getResultType` → `Types.StringType`); route through the same
+                // human-string path as every other non-void transform.
                 _ => datum.to_human_string(),
             }
         } else {

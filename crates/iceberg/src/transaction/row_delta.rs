@@ -1964,7 +1964,8 @@ mod tests {
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
             Struct::from_iter([Some(Literal::long(part_value))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
             .build(Some(partition_key))
             .await
@@ -5255,7 +5256,8 @@ mod tests {
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
             Struct::from_iter([Some(Literal::long(0))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let dv_path = format!("{}/data/deletes-dv.puffin", table.metadata().location());
         let output_file = table.file_io().new_output(&dv_path).unwrap();
         let mut dv_writer = DVFileWriter::new(output_file);
@@ -5600,7 +5602,8 @@ mod tests {
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
             Struct::from_iter([Some(Literal::long(part_value))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let dv_path = format!("{}/data/{}", table.metadata().location(), file_name);
         let output_file = table.file_io().new_output(&dv_path).unwrap();
         let mut dv_writer = DVFileWriter::new(output_file);
@@ -5842,7 +5845,8 @@ mod tests {
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
             Struct::from_iter([Some(Literal::long(part_value))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let dv_path = format!("{}/data/{}", table.metadata().location(), file_name);
         let output_file = table.file_io().new_output(&dv_path).unwrap();
         let previous = PreviousDeletes::new(previous_positions, vec![previous_dv]);

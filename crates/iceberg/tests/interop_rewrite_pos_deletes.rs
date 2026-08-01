@@ -139,6 +139,7 @@ fn partition_key_for(table: &Table, cat: &str) -> PartitionKey {
         table.metadata().current_schema().clone(),
         Struct::from_iter([Some(Literal::string(cat))]),
     )
+    .expect("PartitionKey::new: valid partition tuple")
 }
 
 async fn write_data_file(table: &Table, cat: &str, rows: &[(i64, i64)]) -> DataFile {

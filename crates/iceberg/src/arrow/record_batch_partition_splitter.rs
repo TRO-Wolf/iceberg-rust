@@ -212,7 +212,7 @@ impl RecordBatchPartitionSplitter {
                 self.partition_spec.as_ref().clone(),
                 self.schema.clone(),
                 row,
-            );
+            )?;
 
             // filter the RecordBatch
             partition_batches.push((partition_key, filter_record_batch(batch, &filter_array)?));

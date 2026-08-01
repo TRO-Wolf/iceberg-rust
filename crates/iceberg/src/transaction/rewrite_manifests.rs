@@ -1903,7 +1903,8 @@ mod tests {
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
             Struct::from_iter([Some(Literal::long(part_value))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
             .build(Some(partition_key))
             .await
