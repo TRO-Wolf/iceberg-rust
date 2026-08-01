@@ -285,6 +285,9 @@ impl HmsCatalog {
         config: HmsCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
     ) -> Result<Self> {
+        // Config / construction failures stay `ErrorKind::Unexpected` — they are not thrift
+        // catalog-object outcomes (no NamespaceNotFound / TableAlreadyExists mapping applies).
+        // Empty or unresolvable `uri` is a client configuration error, not a metastore exception.
         let address = config
             .address
             .as_str()
@@ -309,6 +312,8 @@ impl HmsCatalog {
                 .build(),
         };
 
+        // Missing `StorageFactory` is a builder wiring error (genuine config), not a thrift
+        // user-exception; keep Unexpected (mirrors invalid-address above).
         let factory = storage_factory.ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -383,8 +388,9 @@ impl Catalog for HmsCatalog {
     /// meet validation criteria.
     /// - Errors from `convert_to_database` if the properties cannot be
     /// successfully converted into a database configuration.
-    /// - Errors from the underlying database creation process, converted using
-    /// `from_thrift_error`.
+    /// - Thrift user exceptions via `from_create_database_exception`
+    /// (`AlreadyExistsException` → `ErrorKind::NamespaceAlreadyExists`; other
+    /// exceptions → Unexpected) or transport failures via `from_thrift_error`.
     async fn create_namespace(
         &self,
         namespace: &NamespaceIdent,
@@ -410,8 +416,9 @@ impl Catalog for HmsCatalog {
     ///
     /// This function can return an error in any of the following situations:
     /// - If the provided namespace identifier fails validation checks
-    /// - If there is an error querying the database, returned by
-    /// `from_thrift_error`.
+    /// - Thrift user exceptions via `from_get_database_exception`
+    /// (`NoSuchObjectException` → `ErrorKind::NamespaceNotFound`; other
+    /// exceptions → Unexpected) or transport failures via `from_thrift_error`.
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
         let name = validate_namespace(namespace)?;
 
@@ -436,10 +443,12 @@ impl Catalog for HmsCatalog {
     /// # Returns
     /// A `Result<bool>` indicating the outcome of the check:
     /// - `Ok(true)` if the namespace exists.
-    /// - `Ok(false)` if the namespace does not exist, identified by a specific
-    /// `UserException` variant.
-    /// - `Err(...)` if an error occurs during validation or the Hive Metastore
-    /// query, with the error encapsulating the issue.
+    /// - `Ok(false)` if the namespace does not exist (`NoSuchObjectException` /
+    /// thrift `GetDatabase` `O1`). Existence probes must return a bool, not
+    /// `ErrorKind::NamespaceNotFound` — that typed kind is for `get_namespace`
+    /// / `drop_namespace` / `alter_database` (and create-table parent-missing).
+    /// - `Err(...)` if validation fails, the transport fails, or a non-not-found
+    /// thrift user exception is raised (e.g. `MetaException` → Unexpected).
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
         let name = validate_namespace(namespace)?;
 
@@ -447,9 +456,12 @@ impl Catalog for HmsCatalog {
 
         match resp {
             Ok(MaybeException::Ok(_)) => Ok(true),
+            // NoSuchObjectException (O1): absent namespace → false (existence API).
             Ok(MaybeException::Exception(ThriftHiveMetastoreGetDatabaseException::O1(_))) => {
                 Ok(false)
             }
+            // MetaException (O2) and any other thrift user exception: server-side
+            // failure with no not-found semantics → Unexpected (not a typed kind).
             Ok(MaybeException::Exception(exception)) => Err(Error::new(
                 ErrorKind::Unexpected,
                 "Operation failed for hitting thrift error".to_string(),
@@ -678,8 +690,12 @@ impl Catalog for HmsCatalog {
     ///
     /// # Returns
     /// - `Ok(true)` if the table exists in the database.
-    /// - `Ok(false)` if the table does not exist in the database.
-    /// - `Err(...)` if an error occurs during the process
+    /// - `Ok(false)` if the table does not exist (`NoSuchObjectException` /
+    /// thrift `GetTable` `O2`). Existence probes return a bool, not
+    /// `ErrorKind::TableNotFound` — that typed kind is for `load_table` /
+    /// `drop_table` / rename source lookup.
+    /// - `Err(...)` if validation fails, the transport fails, or a non-not-found
+    /// thrift user exception is raised (e.g. `MetaException` → Unexpected).
     async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
         let db_name = validate_namespace(table.namespace())?;
         let table_name = table.name.clone();
@@ -692,7 +708,11 @@ impl Catalog for HmsCatalog {
 
         match resp {
             Ok(MaybeException::Ok(_)) => Ok(true),
+            // NoSuchObjectException (O2 on get_table — IDL ordinal differs from get_database):
+            // absent table → false (existence API).
             Ok(MaybeException::Exception(ThriftHiveMetastoreGetTableException::O2(_))) => Ok(false),
+            // MetaException (O1) and any other thrift user exception: server-side failure
+            // with no not-found semantics → Unexpected (not a typed kind).
             Ok(MaybeException::Exception(exception)) => Err(Error::new(
                 ErrorKind::Unexpected,
                 "Operation failed for hitting thrift error".to_string(),
@@ -897,5 +917,147 @@ mod tests {
             "key dropped: {debug}"
         );
         assert!(debug.contains("***"), "expected redaction marker: {debug}");
+    }
+
+    /// Config error (unit E residual): a malformed catalog address is a construction
+    /// failure, not a thrift catalog-object outcome. It must stay
+    /// `ErrorKind::Unexpected` — do NOT map it to NamespaceNotFound / TableNotFound /
+    /// AlreadyExists. Mutation: change the kind to a typed catalog kind → RED.
+    #[test]
+    fn test_invalid_address_stays_unexpected() {
+        let config = HmsCatalogConfig {
+            name: Some("hms".to_string()),
+            // No host:port form → `to_socket_addrs` fails; `from_io_error` wraps as Unexpected.
+            address: "not-a-socket-address".to_string(),
+            thrift_transport: HmsThriftTransport::Buffered,
+            warehouse: "s3://warehouse".to_string(),
+            hive_version: HiveVersion::Hive3Plus,
+            props: HashMap::new(),
+        };
+
+        let err = HmsCatalog::new(config, Some(Arc::new(iceberg::io::MemoryStorageFactory)))
+            .expect_err("malformed address must fail construction");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Unexpected,
+            "invalid address is a genuine config error and must stay Unexpected, got: {err}"
+        );
+    }
+
+    /// Config error (unit E residual): omitting `with_storage_factory` is a builder wiring
+    /// mistake, not a thrift exception. Keep `ErrorKind::Unexpected`. Mutation: map to a
+    /// typed catalog kind → RED.
+    #[tokio::test]
+    async fn test_missing_storage_factory_stays_unexpected() {
+        let config = HmsCatalogConfig {
+            name: Some("hms".to_string()),
+            // Loopback parses without DNS; thrift client is lazy so construction reaches
+            // the storage-factory check offline (needs a Tokio reactor for client build).
+            address: "127.0.0.1:9083".to_string(),
+            thrift_transport: HmsThriftTransport::Buffered,
+            warehouse: "s3://warehouse".to_string(),
+            hive_version: HiveVersion::Hive3Plus,
+            props: HashMap::new(),
+        };
+
+        let err = HmsCatalog::new(config, None).expect_err("missing StorageFactory must fail");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Unexpected,
+            "missing StorageFactory is a genuine config error and must stay Unexpected, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("StorageFactory"),
+            "error must name StorageFactory, got: {err}"
+        );
+    }
+
+    /// Same config contract via the public builder surface (C1-Q-002): `load` without
+    /// `with_storage_factory` must fail Unexpected naming StorageFactory — not a typed
+    /// catalog kind. Mutation: default a Memory factory inside `load` → RED.
+    #[tokio::test]
+    async fn test_builder_load_without_storage_factory_stays_unexpected() {
+        let err = HmsCatalogBuilder::default()
+            .load(
+                "hms",
+                HashMap::from([
+                    (
+                        HMS_CATALOG_PROP_URI.to_string(),
+                        "127.0.0.1:9083".to_string(),
+                    ),
+                    (
+                        HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+                        "s3://warehouse".to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .expect_err("builder load without StorageFactory must fail");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Unexpected,
+            "missing StorageFactory via builder must stay Unexpected, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("StorageFactory"),
+            "error must name StorageFactory, got: {err}"
+        );
+    }
+
+    /// Public builder: a non-empty but malformed `uri` reaches `HmsCatalog::new` and must
+    /// stay `ErrorKind::Unexpected` (genuine config / resolve failure). Contrast empty
+    /// address, which fails earlier as `DataInvalid` ("Catalog address is required").
+    /// Mutation: map resolve failures to a typed catalog kind → RED.
+    #[tokio::test]
+    async fn test_builder_load_malformed_uri_stays_unexpected() {
+        let err = HmsCatalogBuilder::default()
+            .with_storage_factory(Arc::new(iceberg::io::MemoryStorageFactory))
+            .load(
+                "hms",
+                HashMap::from([
+                    (
+                        HMS_CATALOG_PROP_URI.to_string(),
+                        "not-a-socket-address".to_string(),
+                    ),
+                    (
+                        HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+                        "s3://warehouse".to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .expect_err("malformed uri must fail builder load");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Unexpected,
+            "malformed uri is a genuine config error and must stay Unexpected, got: {err}"
+        );
+    }
+
+    /// Companion to the malformed-uri Unexpected pin: omitting `uri` leaves address empty and
+    /// must fail as `DataInvalid` ("Catalog address is required") — NOT Unexpected and NOT a
+    /// thrift typed kind. Guards the ledger distinction (C2-Q-002 / cycle-3).
+    #[tokio::test]
+    async fn test_builder_load_missing_uri_is_data_invalid() {
+        let err = HmsCatalogBuilder::default()
+            .with_storage_factory(Arc::new(iceberg::io::MemoryStorageFactory))
+            .load(
+                "hms",
+                HashMap::from([(
+                    HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+                    "s3://warehouse".to_string(),
+                )]),
+            )
+            .await
+            .expect_err("missing uri must fail builder load");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "empty catalog address must be DataInvalid, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("address"),
+            "error must mention address, got: {err}"
+        );
     }
 }
