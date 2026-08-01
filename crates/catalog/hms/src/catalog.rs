@@ -1003,4 +1003,34 @@ mod tests {
             "error must name StorageFactory, got: {err}"
         );
     }
+
+    /// Public builder: a non-empty but malformed `uri` reaches `HmsCatalog::new` and must
+    /// stay `ErrorKind::Unexpected` (genuine config / resolve failure). Contrast empty
+    /// address, which fails earlier as `DataInvalid` ("Catalog address is required").
+    /// Mutation: map resolve failures to a typed catalog kind → RED.
+    #[tokio::test]
+    async fn test_builder_load_malformed_uri_stays_unexpected() {
+        let err = HmsCatalogBuilder::default()
+            .with_storage_factory(Arc::new(iceberg::io::MemoryStorageFactory))
+            .load(
+                "hms",
+                HashMap::from([
+                    (
+                        HMS_CATALOG_PROP_URI.to_string(),
+                        "not-a-socket-address".to_string(),
+                    ),
+                    (
+                        HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+                        "s3://warehouse".to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .expect_err("malformed uri must fail builder load");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Unexpected,
+            "malformed uri is a genuine config error and must stay Unexpected, got: {err}"
+        );
+    }
 }

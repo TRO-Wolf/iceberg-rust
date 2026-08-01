@@ -152,9 +152,10 @@ GAP_MATRIX before starting one. Full context:
       `crates/catalog/hms/src/error.rs` + call-site wiring in `catalog.rs` map
       `NoSuchObjectException` / `AlreadyExistsException` (and drop-namespace not-empty) to
       `NamespaceNotFound` / `TableNotFound` / `NamespaceAlreadyExists` / `TableAlreadyExists` /
-      `NamespaceNotEmpty`. Config construction failures (invalid address, missing
-      StorageFactory) stay `Unexpected`. Unit G3 (`fix/hms-typed-error-kinds`) closed the
-      ledger + residual config pins; mapper unit tests offline.
+      `NamespaceNotEmpty`. Config: empty required fields → `DataInvalid`; malformed/
+      unresolvable address and missing StorageFactory → `Unexpected`. Unit G3
+      (`fix/hms-typed-error-kinds`) closed the ledger + residual config pins; mapper unit
+      tests offline.
 - [ ] **2. Multi-spec write interop** — STILL OPEN (reconciled 2026-07-01; citations corrected
       same day). TWO distinct residues: (a) the manifest-merge LAYOUT gap —
       `MergeManifestProcess` is not routed into the non-append merging actions (the `RowDelta`
