@@ -1033,4 +1033,31 @@ mod tests {
             "malformed uri is a genuine config error and must stay Unexpected, got: {err}"
         );
     }
+
+    /// Companion to the malformed-uri Unexpected pin: omitting `uri` leaves address empty and
+    /// must fail as `DataInvalid` ("Catalog address is required") — NOT Unexpected and NOT a
+    /// thrift typed kind. Guards the ledger distinction (C2-Q-002 / cycle-3).
+    #[tokio::test]
+    async fn test_builder_load_missing_uri_is_data_invalid() {
+        let err = HmsCatalogBuilder::default()
+            .with_storage_factory(Arc::new(iceberg::io::MemoryStorageFactory))
+            .load(
+                "hms",
+                HashMap::from([(
+                    HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+                    "s3://warehouse".to_string(),
+                )]),
+            )
+            .await
+            .expect_err("missing uri must fail builder load");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "empty catalog address must be DataInvalid, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("address"),
+            "error must mention address, got: {err}"
+        );
+    }
 }
