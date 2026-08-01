@@ -665,8 +665,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_static_provider_scan() {
-        let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
+        // Use a real empty table (readable warehouse) — incomplete metadata fixtures that
+        // point at missing object-store paths must fail closed at plan, not demote to N=1.
+        let (_catalog, _ns, _name, table, _tmp) = get_static_test_table().await;
+        let table_provider = IcebergStaticTableProvider::try_new_from_table(table)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -749,6 +751,231 @@ mod tests {
 
         // The execution should succeed
         assert!(execution_result.is_ok());
+    }
+
+    /// Pin 13 DF: multi_partition_scan=false forces T=1 (N=1) while target_partitions > 1.
+    #[tokio::test]
+    async fn test_pin13_off_switch_forces_n1_with_target_partitions_gt1() {
+        use datafusion::prelude::SessionConfig;
+
+        use crate::physical_plan::scan::{IcebergScanOptions, IcebergTableScan};
+
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
+                .await
+                .expect("provider");
+
+        let mut config = SessionConfig::new().with_target_partitions(8);
+        config.options_mut().extensions.insert(IcebergScanOptions {
+            multi_partition_scan: false,
+            data_file_concurrency: 8,
+        });
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("test_table", Arc::new(provider))
+            .expect("register");
+
+        // Multiple files so multi-partition would otherwise engage when ON.
+        for sql in [
+            "INSERT INTO test_table VALUES (1, 'a')",
+            "INSERT INTO test_table VALUES (2, 'b')",
+            "INSERT INTO test_table VALUES (3, 'c')",
+        ] {
+            ctx.sql(sql)
+                .await
+                .expect("insert plan")
+                .collect()
+                .await
+                .expect("insert");
+        }
+
+        let plan = ctx
+            .sql("SELECT id FROM test_table")
+            .await
+            .expect("select")
+            .create_physical_plan()
+            .await
+            .expect("physical");
+        fn find_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergTableScan> {
+            if let Some(s) = plan.as_any().downcast_ref::<IcebergTableScan>() {
+                return Some(s);
+            }
+            for c in plan.children() {
+                if let Some(s) = find_scan(c) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        let scan = find_scan(&plan).expect("IcebergTableScan present");
+        assert_eq!(
+            scan.partition_work().len(),
+            1,
+            "pin 13: off-switch must force N=1 even with multi-file + target_partitions=8"
+        );
+        assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
+        // Multiset still complete (pin 4 under off-switch)
+        let rows: usize = ctx
+            .sql("SELECT id FROM test_table")
+            .await
+            .expect("sel")
+            .collect()
+            .await
+            .expect("collect")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 3, "pin 13/4: off-switch must not drop rows");
+    }
+
+    /// Pins 1 + 5 (DF): multi-file + tiny split props force N>1; LIMIT k card + sub-multiset.
+    #[tokio::test]
+    async fn test_pin1_pin5_multi_file_partitioning_and_limit() {
+        use datafusion::prelude::SessionConfig;
+
+        use crate::physical_plan::scan::{IcebergScanOptions, IcebergTableScan};
+
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("pin15_ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        let table_creation = TableCreation::builder()
+            .name("pin15".to_string())
+            .location(format!("{warehouse_path}/pin15"))
+            .schema(schema)
+            .properties(HashMap::from([
+                ("read.split.target-size".to_string(), "1".to_string()),
+                ("read.split.open-file-cost".to_string(), "1".to_string()),
+                (
+                    "read.split.planning-lookback".to_string(),
+                    "100".to_string(),
+                ),
+            ]))
+            .build();
+        catalog
+            .create_table(&namespace, table_creation)
+            .await
+            .unwrap();
+        let catalog = Arc::new(catalog);
+        let provider = IcebergTableProvider::try_new(catalog, namespace, "pin15".to_string())
+            .await
+            .expect("provider");
+
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config.options_mut().extensions.insert(IcebergScanOptions {
+            multi_partition_scan: true,
+            data_file_concurrency: 4,
+        });
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("test_table", Arc::new(provider))
+            .expect("register");
+
+        for sql in [
+            "INSERT INTO test_table VALUES (1, 'a'), (2, 'b')",
+            "INSERT INTO test_table VALUES (3, 'c'), (4, 'd')",
+            "INSERT INTO test_table VALUES (5, 'e')",
+        ] {
+            ctx.sql(sql)
+                .await
+                .expect("insert plan")
+                .collect()
+                .await
+                .expect("insert");
+        }
+
+        let unlimited = ctx
+            .sql("SELECT id FROM test_table")
+            .await
+            .expect("select")
+            .collect()
+            .await
+            .expect("collect unlimited");
+        let unlimited_rows: usize = unlimited.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(unlimited_rows, 5, "seeded 5 rows");
+
+        let df = ctx
+            .sql("SELECT id FROM test_table LIMIT 2")
+            .await
+            .expect("limit sql");
+        let plan = df.create_physical_plan().await.expect("physical plan");
+        fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergTableScan> {
+            if let Some(s) = plan.as_any().downcast_ref::<IcebergTableScan>() {
+                return Some(s);
+            }
+            for c in plan.children() {
+                if let Some(s) = find_iceberg_scan(c) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        let scan = find_iceberg_scan(&plan).expect("IcebergTableScan in plan");
+        let n = scan.partition_work().len();
+        assert!(
+            n > 1,
+            "pin 1: multi-file + tiny split props must yield N>1, got N={n}"
+        );
+        assert_eq!(scan.limit(), None, "pin 5: provider limit demoted when N>1");
+        assert!(
+            scan.properties().output_partitioning().partition_count() > 1,
+            "pin 1: UnknownPartitioning(N>1)"
+        );
+
+        let limited = ctx
+            .sql("SELECT id FROM test_table LIMIT 2")
+            .await
+            .expect("limit2")
+            .collect()
+            .await
+            .expect("collect limit");
+        let limited_rows: usize = limited.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            limited_rows, 2,
+            "pin 5: LIMIT 2 must return exactly min(2, 5)=2 rows, got {limited_rows}"
+        );
+
+        let mut unlimited_ids = std::collections::HashSet::new();
+        for b in &unlimited {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .expect("id int");
+            for i in 0..col.len() {
+                unlimited_ids.insert(col.value(i));
+            }
+        }
+        for b in &limited {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .expect("id int");
+            for i in 0..col.len() {
+                assert!(
+                    unlimited_ids.contains(&col.value(i)),
+                    "pin 5: limited row must be sub-multiset of unlimited"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -934,12 +1161,22 @@ mod tests {
         );
     }
 
+    /// Empty table with a local warehouse path — safe for eager `plan_tasks` (G1 fail-closed).
+    async fn get_static_test_table() -> (Arc<dyn Catalog>, NamespaceIdent, String, Table, TempDir) {
+        let (catalog, namespace, table_name, temp_dir) = get_test_catalog_and_table().await;
+        let table = catalog
+            .load_table(&TableIdent::new(namespace.clone(), table_name.clone()))
+            .await
+            .expect("load empty test table");
+        (catalog, namespace, table_name, table, temp_dir)
+    }
+
     #[tokio::test]
     async fn test_limit_pushdown_static_provider() {
         use datafusion::datasource::TableProvider;
 
-        let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
+        let (_catalog, _ns, _name, table, _tmp) = get_static_test_table().await;
+        let table_provider = IcebergStaticTableProvider::try_new_from_table(table)
             .await
             .unwrap();
 
@@ -2209,8 +2446,8 @@ mod tests {
     async fn test_no_limit_pushdown() {
         use datafusion::datasource::TableProvider;
 
-        let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
+        let (_catalog, _ns, _name, table, _tmp) = get_static_test_table().await;
+        let table_provider = IcebergStaticTableProvider::try_new_from_table(table)
             .await
             .unwrap();
 
@@ -2231,6 +2468,33 @@ mod tests {
             iceberg_scan.limit(),
             None,
             "Limit should be None when not specified"
+        );
+    }
+
+    /// G1 fail-closed: incomplete metadata (snapshot → missing object-store paths) must
+    /// surface a planning error, not silently demote to UnknownPartitioning(1).
+    #[tokio::test]
+    async fn test_plan_tasks_failure_fail_closed_not_n1_demote() {
+        use datafusion::datasource::TableProvider;
+
+        let table = get_test_table_from_metadata_file().await;
+        let table_provider = IcebergStaticTableProvider::try_new_from_table(table)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let err = table_provider
+            .scan(&state, None, &[], None)
+            .await
+            .expect_err("incomplete fixture must fail plan, not demote to N=1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manifest")
+                || msg.contains("file")
+                || msg.contains("Failed")
+                || msg.contains("not found")
+                || msg.contains("No such"),
+            "expected planning/IO root cause, got: {msg}"
         );
     }
 }

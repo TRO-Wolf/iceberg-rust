@@ -28,4 +28,4 @@ pub(crate) mod write;
 pub(crate) const DATA_FILES_COL_NAME: &str = "data_files";
 
 pub use project::project_with_partition;
-pub use scan::IcebergTableScan;
+pub use scan::{IcebergScanOptions, IcebergTableScan, ensure_iceberg_scan_options};

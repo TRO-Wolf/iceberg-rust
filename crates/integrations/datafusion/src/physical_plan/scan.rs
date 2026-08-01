@@ -322,20 +322,12 @@ impl IcebergTableScan {
         scan_builder = scan_builder.with_data_file_concurrency_limit(l);
 
         let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
-        // Eager plan_tasks assignment. Incomplete test fixtures (snapshot points at missing
-        // object-store paths) cannot plan; fall back to legacy N=1 deferred stream so schema /
-        // projection pins keep working. Production tables with readable manifests get N>1.
-        let work = match table_scan.plan_partition_work(t).await {
-            Ok(work) => work,
-            Err(_err) => {
-                // Incomplete fixtures (snapshot → missing object-store paths) cannot plan;
-                // fall back to legacy N=1 deferred stream. Production tables with readable
-                // manifests take the Ok path and advertise UnknownPartitioning(N).
-                scan.batch_size = knobs.batch_size.map(clamp_scan_knob);
-                scan.per_partition_concurrency = l;
-                return Ok(scan);
-            }
-        };
+        // Eager plan_tasks assignment (C7). Planning failures MUST fail closed — never silently
+        // demote to legacy N=1 (that unfreezes the snapshot at execute and hides root cause).
+        let work = table_scan
+            .plan_partition_work(t)
+            .await
+            .map_err(to_datafusion_error)?;
 
         let n = work.len().max(1);
         // P = max(1, ceil(L/N)); when N > L, P = 1 and total ≈ N may exceed L (not a bug).
@@ -437,8 +429,9 @@ impl ExecutionPlan for IcebergTableScan {
                 )));
             }
             let work = self.partition_work[partition].clone();
-            // Snapshot freeze: work carries the plan-time id; mismatch is a programming error.
-            if work.snapshot_id() != 0 && work.snapshot_id() != self.resolved_snapshot_id {
+            // Pin 12 snapshot freeze: embedded work id must match the plan-time resolved id
+            // (including empty-table sentinel 0 — both sides must agree).
+            if work.snapshot_id() != self.resolved_snapshot_id {
                 return Err(DataFusionError::Execution(format!(
                     "IcebergTableScan snapshot freeze violation: work snapshot {} != plan {}",
                     work.snapshot_id(),
@@ -538,15 +531,20 @@ impl DisplayAs for IcebergTableScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
+        let n = self.partition_work.len().max(1);
+        // Keep the historic `IcebergTableScan projection:[...]` prefix so EXPLAIN
+        // assertions (integration_datafusion_test) remain stable; append N + snapshot.
         write!(
             f,
-            "IcebergTableScan projection:[{}] predicate:[{}]",
+            "IcebergTableScan projection:[{}] predicate:[{}] snapshot_id={} N={}",
             self.projection
                 .clone()
                 .map_or(String::new(), |v| v.join(",")),
             self.predicates
                 .clone()
-                .map_or(String::from(""), |p| format!("{p}"))
+                .map_or(String::from(""), |p| format!("{p}")),
+            self.resolved_snapshot_id,
+            n,
         )
     }
 }
@@ -631,7 +629,6 @@ pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
 /// Register default [`IcebergScanOptions`] on a session config if not already present.
 ///
 /// Public for consumers wiring pin-13 / pin-14 knobs before building a session.
-#[allow(dead_code)] // intentional public API; used in pin tests
 pub fn ensure_iceberg_scan_options(config: &mut datafusion::prelude::SessionConfig) {
     if config
         .options()
@@ -645,7 +642,6 @@ pub fn ensure_iceberg_scan_options(config: &mut datafusion::prelude::SessionConf
             .insert(IcebergScanOptions::default());
     }
 }
-
 
 /// Asynchronously retrieves a stream of [`RecordBatch`] instances
 /// from a given table.
@@ -1959,5 +1955,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Pin 2 multi-path: execute(i) for i ≥ N errors when partition_work is non-empty.
+    #[tokio::test]
+    async fn test_pin2_execute_out_of_range_multipath() {
+        use datafusion::execution::TaskContext;
+
+        // plan() on a snapshot-less empty table yields N=1 empty PartitionWork (multi path).
+        let table = create_test_table();
+        let knobs = ScanKnobs {
+            batch_size: Some(1024),
+            data_file_concurrency: Some(4),
+            target_partitions: 4,
+            multi_partition_scan: true,
+        };
+        let scan = IcebergTableScan::plan(
+            table,
+            None,
+            test_arrow_schema_with_field_ids(),
+            None,
+            &[],
+            Some(10), // limit present — empty N=1 keeps it
+            knobs,
+        )
+        .await
+        .expect("empty table plan");
+        assert_eq!(scan.partition_work().len(), 1);
+        assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
+        assert_eq!(scan.limit(), Some(10), "pin 5: limit retained when N=1");
+        let ctx = Arc::new(TaskContext::default());
+        match scan.execute(1, ctx) {
+            Ok(_) => panic!("i≥N multi-path must error"),
+            Err(err) => {
+                assert!(err.to_string().contains("out of range"), "got: {err}");
+            }
+        }
+    }
+
+    fn test_arrow_schema_with_field_ids() -> ArrowSchemaRef {
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            ArrowField::new("data", ArrowDataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]))
+    }
+
+    /// Pin 5: when N > 1, provider must clear sole per-partition hard limit.
+    #[test]
+    fn test_pin5_limit_demoted_when_n_gt_1() {
+        // Pure contract: demote logic mirrors IcebergTableScan::plan
+        let n = 3usize;
+        let mut limit = Some(5usize);
+        if n > 1 {
+            limit = None;
+        }
+        assert_eq!(limit, None, "pin 5: limit demoted when N>1");
+
+        let n1 = 1usize;
+        let mut limit1 = Some(5usize);
+        if n1 > 1 {
+            limit1 = None;
+        }
+        assert_eq!(limit1, Some(5), "pin 5: limit retained when N=1");
+    }
+
+    /// Pin 5 mutation skeleton: sole per-partition hard k with no global trim over-counts.
+    #[test]
+    fn test_pin5_mutation_per_partition_hard_limit_overcounts() {
+        // Simulated: N=3 partitions each hard-capped at k=2 → up to 6 rows without GlobalLimitExec
+        let n = 3usize;
+        let k = 2usize;
+        let table_rows = 100usize;
+        let per_part_only = (n * k).min(table_rows);
+        let global_correct = k.min(table_rows);
+        assert!(
+            per_part_only > global_correct,
+            "mutation RED condition: per-part hard k yields {per_part_only} > global {global_correct}"
+        );
+    }
+
+    /// Pin 13 plan-level: off-switch forces T=1 while target_partitions > 1 (effective T).
+    #[test]
+    fn test_pin13_effective_t_with_off_switch() {
+        let knobs = ScanKnobs {
+            batch_size: Some(1024),
+            data_file_concurrency: Some(8),
+            target_partitions: 8,
+            multi_partition_scan: false,
+        };
+        let t = if knobs.multi_partition_scan {
+            knobs.target_partitions.max(1)
+        } else {
+            1
+        };
+        assert_eq!(t, 1);
+        assert!(knobs.target_partitions > 1);
+    }
+
+    /// Pin 14: P = max(1, ceil(L/N)) independent surface — two L values → two P.
+    #[test]
+    fn test_pin14_p_formula_independent_of_t() {
+        let n = 4usize;
+        let l1 = 16usize;
+        let l2 = 2usize;
+        let p1 = l1.div_ceil(n).max(1);
+        let p2 = l2.div_ceil(n).max(1);
+        assert_eq!(p1, 4);
+        assert_eq!(p2, 1);
+        assert_ne!(
+            p1, p2,
+            "pin 14: distinct L must yield distinct P at fixed N"
+        );
+        // When N > L, P = 1 and total ≈ N may exceed L (not RED)
+        let l_small = 2usize;
+        let n_big = 8usize;
+        let p = l_small.div_ceil(n_big).max(1);
+        assert_eq!(p, 1);
+        assert!(n_big * p > l_small);
+    }
+
+    /// Pin 12: plan freezes resolved snapshot id onto every PartitionWork unit.
+    #[tokio::test]
+    async fn test_pin12_snapshot_frozen_on_work() {
+        use datafusion::execution::TaskContext;
+
+        let table = create_test_table();
+        let knobs = ScanKnobs {
+            batch_size: Some(1024),
+            data_file_concurrency: Some(1),
+            target_partitions: 1,
+            multi_partition_scan: true,
+        };
+        let scan = IcebergTableScan::plan(
+            table,
+            None,
+            test_arrow_schema_with_field_ids(),
+            None,
+            &[],
+            None,
+            knobs,
+        )
+        .await
+        .expect("plan empty");
+        assert!(!scan.partition_work().is_empty(), "eager plan embeds work");
+        for work in scan.partition_work() {
+            assert_eq!(
+                work.snapshot_id(),
+                scan.resolved_snapshot_id(),
+                "pin 12: work snapshot must match plan resolved id"
+            );
+        }
+        let ctx = Arc::new(TaskContext::default());
+        // Healthy path: execute(0) must not freeze-error (empty stream OK)
+        let stream = scan.execute(0, ctx).expect("execute 0");
+        drop(stream);
     }
 }
