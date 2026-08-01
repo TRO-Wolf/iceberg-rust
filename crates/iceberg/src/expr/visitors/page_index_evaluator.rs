@@ -21,7 +21,6 @@ use std::collections::HashMap;
 
 use fnv::FnvHashSet;
 use ordered_float::OrderedFloat;
-use parquet::file::metadata::PageIndexPolicy;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
@@ -783,6 +782,7 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
 
 #[cfg(test)]
 mod tests {
+    use parquet::file::metadata::PageIndexPolicy;
     use std::collections::HashMap;
     use std::sync::Arc;
 
