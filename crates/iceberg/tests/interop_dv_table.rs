@@ -233,6 +233,7 @@ fn category_partition_key(schema: SchemaRef, spec: PartitionSpec, category: &str
         schema,
         Struct::from_iter([Some(Literal::string(category))]),
     )
+    .expect("PartitionKey::new: valid partition tuple")
 }
 
 /// Write a REAL parquet DATA file for ONE partition via the production `DataFileWriter` built

@@ -503,7 +503,7 @@ impl RewritePositionDeleteFiles {
         let partition_key = if spec.is_unpartitioned() {
             None
         } else {
-            Some(PartitionKey::new(spec, schema.clone(), partition.clone()))
+            Some(PartitionKey::new(spec, schema.clone(), partition.clone())?)
         };
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
             .build(partition_key)

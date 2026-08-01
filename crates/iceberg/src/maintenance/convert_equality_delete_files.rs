@@ -527,7 +527,7 @@ impl ConvertEqualityDeleteFiles {
                 spec,
                 schema.clone(),
                 eq.data_file.partition().clone(),
-            ))
+            )?)
         };
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
             .build(partition_key)
