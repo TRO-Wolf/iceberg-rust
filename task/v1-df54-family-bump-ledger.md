@@ -64,4 +64,4 @@ Pending: 8× critic-octo early_stop=false
 2. **quick-xml ≥0.41** — when object_store unlocks, remove advisories.
 
 ### Tip SHA
-
+`81a6ff8f9a274180d399281578de122fe9e1fcfb`
