@@ -705,3 +705,25 @@ deviation is on the ledger even if G1 never touches `task/`.
 - **Why:** QD/QE + perf-wave A–E precedent on this fork; G1's merge gate is objective (14 pins +
   named mutations HARD-FAIL never SKIP). Source: `~/.claude/plans/2026-08-02-grok-fork-plantasks-slate.md`
   D11; dossier `~/Desktop/iceberg-rust-overnight-work-slate-2026-07-31.md`.
+
+### 2026-08-01 — Default EXPLAIN is a GOLDEN-MATCHED surface: no per-run-random values in it, and the suite that pins it is NOT in the chained gate
+
+Caught by CI on the slate union branch (`df_binary/boolean_predicate_pushdown.slt` failed;
+`like`/`timestamp` were in the 51 fail-fast-cancelled tests and pin the same line).
+
+- **DO NOT render a per-run-random value (a snapshot id) in an `ExecutionPlan`'s DEFAULT
+  `DisplayAs` form.** The sqllogictest goldens exact-match physical-plan lines and the fork's
+  harness has NO normalization layer, so `snapshot_id=1601068411408991295` can never re-match a
+  golden. *Apply:* gate nondeterministic display fields on
+  `DisplayFormatType::Verbose` (EXPLAIN VERBOSE) and keep only deterministic fields (`N=`) in the
+  default form; pin the split both ways in one test (default must NOT contain it, verbose MUST).
+- **DO run `cargo test --workspace --all-features --test sqllogictests` whenever a change
+  alters EXPLAIN / `DisplayAs` shape.** The standard chained gate excludes that suite (the
+  `protoc` caveat), so a display change gates green locally and fails CI's full-workspace
+  nextest. Four slt files pin `IcebergTableScan` plan lines (`binary`/`boolean`/`like`/
+  `timestamp` predicate-pushdown); `protoc` IS installed on this box. The `--workspace` is
+  load-bearing, not ceremony: ANY single-package invocation — even
+  `-p iceberg-sqllogictest --all-features` — FAILS TO COMPILE
+  (`tokio::runtime::Builder::new_multi_thread` missing): the crate free-rides on
+  WORKSPACE-WIDE feature unification for tokio `rt-multi-thread` (the F3 tokio
+  under-declaration backlog item; the Cargo.toml fix needs explicit approval).

@@ -528,24 +528,30 @@ impl ExecutionPlan for IcebergTableScan {
 impl DisplayAs for IcebergTableScan {
     fn fmt_as(
         &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
+        t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         let n = self.partition_work.len().max(1);
         // Keep the historic `IcebergTableScan projection:[...]` prefix so EXPLAIN
-        // assertions (integration_datafusion_test) remain stable; append N + snapshot.
+        // assertions (integration_datafusion_test) and the sqllogictest goldens stay
+        // stable. `N` is deterministic for a fixed fixture and stays in the default
+        // form; the resolved snapshot id is PER-RUN RANDOM (snapshot ids are generated
+        // at commit time), so it renders only under EXPLAIN VERBOSE — a golden-matched
+        // default EXPLAIN can never pin it (the fork's slt harness has no normalizer).
         write!(
             f,
-            "IcebergTableScan projection:[{}] predicate:[{}] snapshot_id={} N={}",
+            "IcebergTableScan projection:[{}] predicate:[{}]",
             self.projection
                 .clone()
                 .map_or(String::new(), |v| v.join(",")),
             self.predicates
                 .clone()
                 .map_or(String::from(""), |p| format!("{p}")),
-            self.resolved_snapshot_id,
-            n,
-        )
+        )?;
+        if matches!(t, datafusion::physical_plan::DisplayFormatType::Verbose) {
+            write!(f, " snapshot_id={}", self.resolved_snapshot_id)?;
+        }
+        write!(f, " N={n}")
     }
 }
 
@@ -2116,5 +2122,45 @@ mod tests {
         // Healthy path: execute(0) must not freeze-error (empty stream OK)
         let stream = scan.execute(0, ctx).expect("execute 0");
         drop(stream);
+    }
+
+    /// EXPLAIN display split: the DEFAULT form is a golden-matched surface (sqllogictest
+    /// exact-matches physical-plan lines, no normalizer) so it must carry only deterministic
+    /// fields (`N=`); the PER-RUN-RANDOM snapshot id renders under Verbose ONLY.
+    /// Mutations: render snapshot_id in Default → first assert REDs; drop it from Verbose →
+    /// third assert REDs; drop N from Default → second assert REDs.
+    #[test]
+    fn test_display_default_deterministic_snapshot_id_verbose_only() {
+        use datafusion::physical_plan::displayable;
+
+        let scan = IcebergTableScan::new(
+            create_test_table(),
+            None,
+            test_arrow_schema(),
+            None,
+            &[],
+            None,
+        )
+        .expect("scan");
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(scan);
+        let default_form = displayable(plan.as_ref()).indent(false).to_string();
+        let verbose_form = displayable(plan.as_ref()).indent(true).to_string();
+
+        assert!(
+            !default_form.contains("snapshot_id="),
+            "default EXPLAIN must not carry the per-run-random snapshot id: {default_form}"
+        );
+        assert!(
+            default_form.contains(" N=1"),
+            "default EXPLAIN keeps deterministic N: {default_form}"
+        );
+        assert!(
+            verbose_form.contains("snapshot_id="),
+            "EXPLAIN VERBOSE must expose the frozen snapshot id: {verbose_form}"
+        );
+        assert!(
+            verbose_form.contains(" N=1"),
+            "EXPLAIN VERBOSE keeps N too: {verbose_form}"
+        );
     }
 }
