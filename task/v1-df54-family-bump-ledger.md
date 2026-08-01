@@ -64,4 +64,4 @@ Pending: 8× critic-octo early_stop=false
 2. **quick-xml ≥0.41** — when object_store unlocks, remove advisories.
 
 ### Tip SHA
-`81a6ff8f9a274180d399281578de122fe9e1fcfb`
+`cbf1d2f5fe6e1ff053daffd8402716a75be8d91a` (branch HEAD at OCTO-CONVERGED push; if advanced by docs-only tip-stamp, use `git rev-parse origin/chore/df54-family-bump`)
