@@ -47,3 +47,21 @@
 ## Octo
 
 Pending: 8× critic-octo early_stop=false
+
+## Final gate (OCTO-CONVERGED)
+
+| Gate | Result |
+|---|---|
+| make check | **green** |
+| cargo test -p iceberg --lib --all-features | **3068 passed** |
+| cargo test -p iceberg-datafusion --all-features | **green** |
+| make interop | **52 passed, 0 failed** (floor 52) |
+| cargo audit | quick-xml RUSTSEC-2026-0194/0195 **survive** (versions 0.37–0.39; fix ≥0.41 unreachable) |
+| critic-octo 8× early_stop=false | **OCTO-CONVERGED** |
+
+### Residual product seeds (not ship blockers)
+1. **SEED-df54-required-nested-sql-insert** — required nested leaves + SQL named_struct need engine cast path under DF54 field-aware CastExpr.
+2. **quick-xml ≥0.41** — when object_store unlocks, remove advisories.
+
+### Tip SHA
+(set at push)
