@@ -91,9 +91,15 @@ surfaced two new items. Statuses live ONLY in
       S3 Tables, whose service-side maintenance ALSO commits concurrently — an ambiguous outcome
       today risks a duplicate commit (see the row cell). The credentialed conformance slice
       stays with item 6.
-- [ ] **2. CDC row-level changelog** (re-anchor item 2) — `UpdateBefore`/`UpdateAfter` + accepting
-      ranges that carry row-level DELETE manifests (`IncrementalChangelogScan` is
-      whole-data-file-level today).
+- [ ] **2. CDC row-level changelog** (re-anchor item 2) — **RE-CHARACTERIZED 2026-07-31 (G3
+      ledger):** mostly **parity-correct as-is**. `ChangelogOperation::UpdateBefore` /
+      `UpdateAfter` are declared for API parity (`scan/task.rs`) but are **never emitted by the
+      core planner** — Java 1.10.0 `BaseIncrementalChangelogScan` only produces INSERT/DELETE
+      task kinds; collapsing delete+insert into update pairs is an **engine-side** step (Spark
+      `ChangelogIterator`), not owed by `iceberg-core`/`iceberg-api`. Residual (if any engine
+      pull) is accepting ranges that carry row-level DELETE manifests
+      (`IncrementalChangelogScan` is whole-data-file-level today) — engine-gated, not a
+      library correctness hole.
 - [ ] **3. ORC/Avro DATA-read residue** (re-anchor item 3) — footer codec / nested + V3 types /
       the Avro `timestamptz` mapping — pull only if the engine queries non-parquet tables.
 - [ ] **4. ENGINE_CONTRACT.md recipes → NORMATIVE** — bytecode/oracle-verify the
@@ -133,20 +139,22 @@ GAP_MATRIX before starting one. Full context:
 [todo-archive/2026-06_charter-8hour-blocks.md](todo-archive/2026-06_charter-8hour-blocks.md)
 (the "SUPERSEDED 2026-07-01" queue + "BLOCK 10").
 
-- [ ] **B (OO max): MoR eq-delete panic/hang** — branch `fix/audit-mor-eqdel-panic-hang`.
-      `equality_ids.unwrap()` (`caching_delete_file_loader.rs:298`) → DataInvalid; oneshot
-      sender-drop must reach a terminal state + notify (kills the forever-hang,
-      `delete_filter.rs:340`); unify the 13 poison-unwrap sites in
-      `delete_filter.rs`/`delete_file_index.rs` onto the crate's poison-recovery policy;
-      `scan/cache.rs` (SAF-006) in-scope stretch.
-- [ ] **C (OO max): predicate serde arity validation (SAF-004)** — branch
-      `fix/audit-predicate-serde-arity`. Derived `Deserialize` on Unary/Binary/Set expressions
-      bypasses ctor debug_asserts (gone in release) → wire-reachable visitor `panic!`s. Validate
-      op/arity at deserialize; visitor dispatch panics → typed `Err`. Fallible `new` = out of scope
-      (breaking surface).
-- [ ] **E (OO max, run even over budget per user): typed error kinds** — branch
-      `fix/audit-typed-error-kinds`. CQ-002/CQ-003: SQL + HMS catalogs emit
-      TableNotFound/NamespaceNotFound/TableAlreadyExists instead of Unexpected.
+- [x] **B (OO max): MoR eq-delete panic/hang** — **LANDED** (reconciled 2026-07-31 G3). Cite
+      `caching_delete_file_loader.rs` (`equality_ids: None` → `DataInvalid`, not unwrap) and
+      `delete_filter.rs` (oneshot sender-drop → terminal `Failed` + `notify_waiters`). Merged
+      with the 07-18 audit bundle (#160 / follow-ons); content-verified on main.
+- [x] **C (OO max): predicate serde arity validation (SAF-004)** — **LANDED** (reconciled
+      2026-07-31 G3). Custom `Deserialize` on Unary/Binary/Set validates op/arity at the wire
+      boundary; visitor dispatch returns typed `Err` instead of `panic!`. Pins in
+      `expr/predicate.rs` `serde_arity_pins`.
+- [x] **E (OO max): typed error kinds** — **LANDED** (reconciled 2026-07-31 G3). SQL helpers
+      (`no_such_*` / `*_already_exists_*`) emit typed kinds; HMS thrift mappers in
+      `crates/catalog/hms/src/error.rs` + call-site wiring in `catalog.rs` map
+      `NoSuchObjectException` / `AlreadyExistsException` (and drop-namespace not-empty) to
+      `NamespaceNotFound` / `TableNotFound` / `NamespaceAlreadyExists` / `TableAlreadyExists` /
+      `NamespaceNotEmpty`. Config construction failures (invalid address, missing
+      StorageFactory) stay `Unexpected`. Unit G3 (`fix/hms-typed-error-kinds`) closed the
+      ledger + residual config pins; mapper unit tests offline.
 - [ ] **2. Multi-spec write interop** — STILL OPEN (reconciled 2026-07-01; citations corrected
       same day). TWO distinct residues: (a) the manifest-merge LAYOUT gap —
       `MergeManifestProcess` is not routed into the non-append merging actions (the `RowDelta`
