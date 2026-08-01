@@ -6077,11 +6077,7 @@ pub mod tests {
             .expect("collect");
         let with_offsets: Vec<_> = whole
             .iter()
-            .filter(|t| {
-                t.split_offsets
-                    .as_ref()
-                    .is_some_and(|o| o.len() > 1)
-            })
+            .filter(|t| t.split_offsets.as_ref().is_some_and(|o| o.len() > 1))
             .collect();
         assert_eq!(
             with_offsets.len(),
@@ -6090,7 +6086,10 @@ pub mod tests {
         );
         let parent = with_offsets[0];
         let expected_subs = parent.split(128).expect("split").len();
-        assert!(expected_subs > 1, "offsets-aware split must yield >1 subtask");
+        assert!(
+            expected_subs > 1,
+            "offsets-aware split must yield >1 subtask"
+        );
 
         // Drive the same expand helper used by to_arrow.
         let expanded: Vec<FileScanTask> = scan
