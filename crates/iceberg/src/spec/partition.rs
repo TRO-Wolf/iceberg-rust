@@ -233,6 +233,22 @@ impl PartitionSpec {
         Ok(rendered.join("/"))
     }
 
+    /// Validates that `(self, schema, data)` is a self-consistent partition triple without
+    /// building a path string. Same acceptance rules as [`Self::try_partition_to_path`].
+    ///
+    /// Used by [`PartitionKey::new`] so key construction does not pay for human-string rendering
+    /// and escaping on every write-path construction. Crate-private: not part of the public
+    /// breaking surface of Unit 3.
+    pub(crate) fn validate_partition_data(&self, data: &Struct, schema: &Schema) -> Result<()> {
+        let partition_type = self.partition_type(schema)?;
+        for (index, (field, field_type)) in
+            self.fields.iter().zip(partition_type.fields()).enumerate()
+        {
+            Self::check_partition_field(field, Some(&field_type.field_type), data, index)?;
+        }
+        Ok(())
+    }
+
     /// Per-field partition types for the TOTAL path: the same computation
     /// [`PartitionSpec::partition_type`] performs, but per field and lenient — a field whose source
     /// column is absent from `schema` (or whose transform rejects that column's type) yields `None`
@@ -249,25 +265,21 @@ impl PartitionSpec {
             .collect()
     }
 
-    /// Render one escaped `name=value` pair, or describe why it cannot be rendered. `field_type` is
-    /// `None` when the field's partition type could not be derived under the schema in use.
-    ///
-    /// Every `Ok` return is a pair that renders without aborting: the value is either absent/NULL
-    /// (rendered `null`) or a primitive literal whose kind `PrimitiveType::compatible` accepts for
-    /// the field's primitive partition type — a strict subset of the pairs `Display for Datum` can
-    /// format, which is what [`Transform::to_human_string`] ultimately calls.
-    fn render_partition_field(
+    /// Shared acceptance check for one partition field. Returns the checked `(field_type, literal)`
+    /// when a non-null value is present, or `None` when the rendered human string is the literal
+    /// `"null"` (missing void slot, NULL slot). Errors match [`Self::try_partition_to_path`].
+    fn check_partition_field<'a>(
         field: &PartitionField,
-        field_type: Option<&Type>,
-        data: &Struct,
+        field_type: Option<&'a Type>,
+        data: &'a Struct,
         index: usize,
-    ) -> Result<String> {
+    ) -> Result<Option<(&'a Type, &'a super::Literal)>> {
         let Some(slot) = data.fields().get(index) else {
             // Past the end of the tuple. A `void` field's value is always null, so a missing slot
             // for one carries no information — not an anomaly (this is the pair an all-`void`
             // spec's `is_unpartitioned()` callers legitimately produce).
             if field.transform == Transform::Void {
-                return Ok(escaped_partition_pair(&field.name, "null"));
+                return Ok(None);
             }
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -292,7 +304,7 @@ impl PartitionSpec {
 
         // A NULL partition value is legal and renders `null` (Java `toHumanString(type, null)`).
         let Some(literal) = slot.as_ref() else {
-            return Ok(escaped_partition_pair(&field.name, "null"));
+            return Ok(None);
         };
 
         let Some(primitive_value) = literal.as_primitive_literal() else {
@@ -325,10 +337,29 @@ impl PartitionSpec {
             ));
         }
 
-        Ok(escaped_partition_pair(
-            &field.name,
-            &field.transform.to_human_string(field_type, Some(literal)),
-        ))
+        Ok(Some((field_type, literal)))
+    }
+
+    /// Render one escaped `name=value` pair, or describe why it cannot be rendered. `field_type` is
+    /// `None` when the field's partition type could not be derived under the schema in use.
+    ///
+    /// Every `Ok` return is a pair that renders without aborting: the value is either absent/NULL
+    /// (rendered `null`) or a primitive literal whose kind `PrimitiveType::compatible` accepts for
+    /// the field's primitive partition type — a strict subset of the pairs `Display for Datum` can
+    /// format, which is what [`Transform::to_human_string`] ultimately calls.
+    fn render_partition_field(
+        field: &PartitionField,
+        field_type: Option<&Type>,
+        data: &Struct,
+        index: usize,
+    ) -> Result<String> {
+        match Self::check_partition_field(field, field_type, data, index)? {
+            None => Ok(escaped_partition_pair(&field.name, "null")),
+            Some((field_type, literal)) => Ok(escaped_partition_pair(
+                &field.name,
+                &field.transform.to_human_string(field_type, Some(literal)),
+            )),
+        }
     }
 }
 
@@ -402,19 +433,19 @@ impl PartitionKey {
     /// Creates a new partition key with the given spec, schema, and data.
     ///
     /// Validates that `(spec, schema, data)` is self-consistent using the same rules as
-    /// [`PartitionSpec::try_partition_to_path`]: the partition type must be derivable under
-    /// `schema`, the tuple must cover every non-`void` field, each present value must be a
-    /// primitive literal, and each value's literal kind must be compatible with its partition
-    /// field's type. A NULL slot is legal. An all-`void` (or unpartitioned) spec may pair with an
-    /// empty tuple.
+    /// [`PartitionSpec::try_partition_to_path`] (via an internal validate-only path that does not
+    /// allocate a rendered path string): the partition type must be derivable under `schema`, the
+    /// tuple must cover every non-`void` field, each present value must be a primitive literal, and
+    /// each value's literal kind must be compatible with its partition field's type. A NULL slot is
+    /// legal. An all-`void` (or unpartitioned) spec may pair with an empty tuple.
     ///
     /// Returns [`ErrorKind::DataInvalid`] or [`ErrorKind::Unexpected`] when validation fails —
     /// an invalid partition tuple is unrepresentable as a [`PartitionKey`] (Java-parity posture:
     /// `StructTransform` sizes the tuple from the spec and rejects a missing source accessor).
     pub fn new(spec: PartitionSpec, schema: SchemaRef, data: Struct) -> Result<Self> {
-        // Reuse the fallible partition-path validator so the constructor and the path renderer
-        // cannot drift on what constitutes a legal triple.
-        let _ = spec.try_partition_to_path(&data, schema.clone())?;
+        // Validate without building a path string so write-path construction does not pay for
+        // human-string rendering + escaping on every key. Same rules as try_partition_to_path.
+        spec.validate_partition_data(&data, schema.as_ref())?;
         Ok(Self { spec, schema, data })
     }
 
@@ -3542,6 +3573,32 @@ mod partition_path_escaping_tests {
             "Display for Binary stays UPPERCASE hex; only to_human_string is base64"
         );
         assert_eq!(datum.to_human_string(), "YS9i");
+
+        // Empty binary → empty human string (Java: `toHumanString(Binary, empty ByteBuffer)` → "").
+        assert_eq!(
+            render_one(
+                "bn",
+                "b",
+                PrimitiveType::Binary,
+                Transform::Identity,
+                Literal::binary(Vec::<u8>::new()),
+            ),
+            "b=",
+            "empty binary human string is empty (Java jar-oracle)"
+        );
+
+        // UUID is NOT base64 — Java uses UUID.toString(); fork uses Display for UInt128.
+        assert_eq!(
+            render_one(
+                "u",
+                "u",
+                PrimitiveType::Uuid,
+                Transform::Identity,
+                Literal::uuid(uuid::Uuid::from_u128(1)),
+            ),
+            "u=00000000-0000-0000-0000-000000000001",
+            "identity(uuid) must not be routed through base64"
+        );
     }
 
     /// R161 restores INJECTIVITY of partition tuple → directory, which is the data-trust half of

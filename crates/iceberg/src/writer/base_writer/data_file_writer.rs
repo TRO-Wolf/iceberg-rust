@@ -325,6 +325,24 @@ mod test {
         assert_eq!(data_file.content, DataContentType::Data);
         assert_eq!(data_file.partition, Struct::empty());
 
+        // Post-close CurrentFileStatus must not panic (inner writer is taken on close).
+        use crate::writer::CurrentFileStatus;
+        assert_eq!(
+            data_file_writer.current_file_path(),
+            "",
+            "closed DataFileWriter reports empty path"
+        );
+        assert_eq!(
+            data_file_writer.current_row_num(),
+            0,
+            "closed DataFileWriter reports zero rows"
+        );
+        assert_eq!(
+            data_file_writer.current_written_size(),
+            0,
+            "closed DataFileWriter reports zero size"
+        );
+
         let input_file = file_io.new_input(data_file.file_path.clone())?;
         let input_content = input_file.read().await?;
 
