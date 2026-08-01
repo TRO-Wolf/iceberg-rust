@@ -272,9 +272,6 @@ impl PartialEq for PartitionExpr {
 impl Eq for PartitionExpr {}
 
 impl PhysicalExpr for PartitionExpr {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn data_type(&self, _input_schema: &ArrowSchema) -> DFResult<DataType> {
         Ok(self.calculator.partition_arrow_type().clone())
@@ -569,7 +566,6 @@ mod tests {
         );
         for (i, (child, field)) in children.iter().zip(arrow_schema.fields()).enumerate() {
             let column = child
-                .as_any()
                 .downcast_ref::<Column>()
                 .expect("initial children are Column references");
             assert_eq!(column.name(), field.name().as_str(), "child {i} name");
@@ -615,7 +611,6 @@ mod tests {
         assert_eq!(rebuilt_children.len(), 2);
         assert!(
             rebuilt_children[0]
-                .as_any()
                 .downcast_ref::<Literal>()
                 .is_some(),
             "rebuilt child 0 must be the substituted literal"
@@ -671,7 +666,6 @@ mod tests {
             .with_new_children(same_children)
             .expect("rebuild with same-shaped children");
         let rebuilt_same = rebuilt_same
-            .as_any()
             .downcast_ref::<PartitionExpr>()
             .expect("rebuilt expr is a PartitionExpr")
             .clone();
@@ -685,7 +679,6 @@ mod tests {
             .with_new_children(different_children)
             .expect("rebuild with different children");
         let rebuilt_different = rebuilt_different
-            .as_any()
             .downcast_ref::<PartitionExpr>()
             .expect("rebuilt expr is a PartitionExpr")
             .clone();

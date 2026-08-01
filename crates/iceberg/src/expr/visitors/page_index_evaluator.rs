@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use fnv::FnvHashSet;
 use ordered_float::OrderedFloat;
+use parquet::file::metadata::PageIndexPolicy;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
@@ -895,7 +896,7 @@ mod tests {
         writer.close().unwrap();
 
         let file = temp_file.reopen().unwrap();
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
         let metadata = reader.metadata().clone();
 
@@ -936,7 +937,7 @@ mod tests {
         writer.close().unwrap();
 
         let file = temp_file.reopen().unwrap();
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
         let metadata = reader.metadata();
 

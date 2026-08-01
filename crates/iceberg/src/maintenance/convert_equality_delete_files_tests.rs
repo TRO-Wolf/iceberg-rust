@@ -174,7 +174,7 @@ async fn write_data_file_rg(
     let output = table.file_io().new_output(file_path).unwrap();
     let mut props = parquet::file::properties::WriterProperties::builder();
     if let Some(rg) = max_row_group_size {
-        props = props.set_max_row_group_size(rg);
+        props = props.set_max_row_group_row_count(Some(rg));
     }
     let parquet_builder = ParquetWriterBuilder::new(props.build(), schema.clone());
     let mut writer = parquet_builder.build(output).await.unwrap();

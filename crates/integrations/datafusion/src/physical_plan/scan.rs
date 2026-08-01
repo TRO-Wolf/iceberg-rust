@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -166,7 +165,7 @@ pub struct IcebergTableScan {
     resolved_snapshot_id: i64,
     /// Stores certain, often expensive to compute,
     /// plan properties used in query optimization.
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     /// Projection column names, None means all columns
     projection: Option<Vec<String>>,
     /// The column names actually selected from the table — the SCANNED snapshot schema's name for
@@ -378,13 +377,13 @@ impl IcebergTableScan {
     }
 
     /// Computes [`PlanProperties`] with `UnknownPartitioning(n)`.
-    fn compute_properties(schema: ArrowSchemaRef, n: usize) -> PlanProperties {
-        PlanProperties::new(
+    fn compute_properties(schema: ArrowSchemaRef, n: usize) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(n.max(1)),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        )
+        ))
     }
 }
 
@@ -393,9 +392,6 @@ impl ExecutionPlan for IcebergTableScan {
         "IcebergTableScan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]
@@ -408,7 +404,7 @@ impl ExecutionPlan for IcebergTableScan {
         Ok(self)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
