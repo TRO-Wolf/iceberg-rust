@@ -249,6 +249,7 @@ async fn write_data_file(table: &Table, rows: &[(i64, &str)]) -> DataFile {
 
 fn unpartitioned_key(schema: SchemaRef, spec: PartitionSpec) -> PartitionKey {
     PartitionKey::new(spec, schema, Struct::empty())
+        .expect("PartitionKey::new: valid partition tuple")
 }
 
 /// Write a fresh DV for `data_file_path` at `positions` (no merge) via `DVFileWriter`.

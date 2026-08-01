@@ -242,6 +242,7 @@ async fn write_eq_delete_inner(
             schema.clone(),
             Struct::from_iter([Some(Literal::long(pv))]),
         )
+        .expect("PartitionKey::new: valid partition tuple")
     });
     let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
         .build(partition_key)

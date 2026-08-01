@@ -326,6 +326,7 @@ fn partition_key(schema: SchemaRef, spec: PartitionSpec, category: &str) -> Part
         schema,
         Struct::from_iter([Some(Literal::string(category))]),
     )
+    .expect("PartitionKey::new: valid partition tuple")
 }
 
 /// Build a `MemoryCatalog` over local-FS storage rooted at `warehouse`.

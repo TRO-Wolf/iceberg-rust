@@ -266,7 +266,8 @@ pub(crate) mod test {
             Struct::from_iter([Some(Literal::int(42)), Some(Literal::string("alice"))]);
 
         // Create a partition key
-        let partition_key = PartitionKey::new(partition_spec, schema, partition_data);
+        let partition_key = PartitionKey::new(partition_spec, schema, partition_data)
+            .expect("PartitionKey::new: valid partition tuple");
 
         let location_gen = DefaultLocationGenerator::with_data_location("/base/path".to_string());
         let file_name = "data-00000.parquet";

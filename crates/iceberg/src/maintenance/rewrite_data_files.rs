@@ -580,7 +580,8 @@ impl RewriteDataFiles {
         // The group's partition tuple — every task in the group shares it (planner groups by
         // partition), validated against the OUTPUT spec before it is stamped onto anything.
         let partition_key = group_partition_tuple(group, &spec)?
-            .map(|partition| PartitionKey::new(spec, schema.clone(), partition));
+            .map(|partition| PartitionKey::new(spec, schema.clone(), partition))
+            .transpose()?;
 
         // Build the rolling data-file writer rolling at the target size.
         let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
@@ -1012,7 +1013,8 @@ mod tests {
             table.metadata().default_partition_spec().as_ref().clone(),
             schema.clone(),
             Struct::from_iter([Some(Literal::long(part_value))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
             .build(Some(partition_key))
             .await
@@ -1062,7 +1064,8 @@ mod tests {
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
             Struct::from_iter([Some(Literal::long(part_value))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
             .build(Some(partition_key))
             .await

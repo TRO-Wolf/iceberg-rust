@@ -723,12 +723,14 @@ mod tests {
             spec.clone(),
             schema.clone(),
             Struct::from_iter([Some(Literal::string("a"))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let partition_b = PartitionKey::new(
             spec,
             schema,
             Struct::from_iter([Some(Literal::string("b"))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
         writer

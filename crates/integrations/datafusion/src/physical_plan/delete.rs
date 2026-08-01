@@ -1062,7 +1062,7 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         let partition_key = if spec.is_unpartitioned() {
             None
         } else {
-            Some(PartitionKey::new(spec, schema.clone(), partition))
+            Some(PartitionKey::new(spec, schema.clone(), partition).map_err(to_datafusion_error)?)
         };
 
         let files =

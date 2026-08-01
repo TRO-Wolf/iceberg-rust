@@ -241,6 +241,7 @@ fn partition_key(table: &Table, x: i64) -> PartitionKey {
         table.metadata().current_schema().clone(),
         Struct::from_iter([Some(Literal::long(x))]),
     )
+    .expect("PartitionKey::new: valid partition tuple")
 }
 
 /// Build a `MemoryCatalog` over local-FS storage rooted at `warehouse`.

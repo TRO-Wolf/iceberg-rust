@@ -206,7 +206,7 @@
 //!         table.metadata().default_partition_spec().as_ref().clone(),
 //!         table.metadata().current_schema().clone(),
 //!         Struct::from_iter(vec![Some(Literal::string("Seattle"))]),
-//!     );
+//!     )?;
 //!     let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
 //!     let file_name_generator = DefaultFileNameGenerator::new(
 //!         "test".to_string(),
@@ -294,13 +294,13 @@
 //!     partition_spec.clone(),
 //!     schema.clone(),
 //!     Struct::from_iter([Some(Literal::string("US"))]),
-//! );
+//! )?;
 //!
 //! let partition_key_eu = PartitionKey::new(
 //!     partition_spec.clone(),
 //!     schema.clone(),
 //!     Struct::from_iter([Some(Literal::string("EU"))]),
-//! );
+//! )?;
 //!
 //! // Write to different partitions in any order - can interleave partition writes
 //! // fanout_writer.write(partition_key_us.clone(), batch_us1).await?;
@@ -358,19 +358,19 @@
 //!     partition_spec.clone(),
 //!     schema.clone(),
 //!     Struct::from_iter([Some(Literal::string("ASIA"))]),
-//! );
+//! )?;
 //!
 //! let partition_key_eu = PartitionKey::new(
 //!     partition_spec.clone(),
 //!     schema.clone(),
 //!     Struct::from_iter([Some(Literal::string("EU"))]),
-//! );
+//! )?;
 //!
 //! let partition_key_us = PartitionKey::new(
 //!     partition_spec.clone(),
 //!     schema.clone(),
 //!     Struct::from_iter([Some(Literal::string("US"))]),
-//! );
+//! )?;
 //!
 //! // Write to partitions in sorted order (ASIA -> EU -> US)
 //! // clustered_writer.write(partition_key_asia, batch_asia).await?;

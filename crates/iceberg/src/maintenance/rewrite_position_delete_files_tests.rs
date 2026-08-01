@@ -221,6 +221,7 @@ async fn write_position_delete_file(
             schema.clone(),
             Struct::from_iter([Some(Literal::long(pv))]),
         )
+        .expect("PartitionKey::new: valid partition tuple")
     });
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
         .build(partition_key)
@@ -778,7 +779,8 @@ async fn write_deletion_vector(table: &Table, target_path: &str, positions: &[u6
         table.metadata().default_partition_spec().as_ref().clone(),
         table.metadata().current_schema().clone(),
         Struct::from_iter([Some(Literal::long(0))]),
-    );
+    )
+    .expect("PartitionKey::new: valid partition tuple");
     let mut writer = DVFileWriter::new(output);
     for &pos in positions {
         writer

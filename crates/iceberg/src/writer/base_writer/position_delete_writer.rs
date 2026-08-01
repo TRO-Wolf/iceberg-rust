@@ -1003,7 +1003,8 @@ mod spec_stamp_e2e_test {
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
             partition,
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let data = write_data_file(&table, None, Some(partition_key), &[
             (1, "eng"),
             (2, "eng"),
@@ -1050,7 +1051,8 @@ mod spec_stamp_e2e_test {
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
             Struct::from_iter([Some(Literal::string("eng"))]),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let correct_delete = write_pos_delete(&table, None, Some(correct_key), &[
             (data_path.as_str(), 0),
             (data_path.as_str(), 1),
@@ -1191,11 +1193,14 @@ mod spec_stamp_e2e_test {
         let data = write_data_file(
             &table,
             None,
-            Some(PartitionKey::new(
-                cur_spec.clone(),
-                table.metadata().current_schema().clone(),
-                tuple.clone(),
-            )),
+            Some(
+                PartitionKey::new(
+                    cur_spec.clone(),
+                    table.metadata().current_schema().clone(),
+                    tuple.clone(),
+                )
+                .expect("PartitionKey::new: valid partition tuple"),
+            ),
             &[(1, "eng"), (2, "eng")],
         )
         .await;
@@ -1215,7 +1220,8 @@ mod spec_stamp_e2e_test {
             old_spec,
             table.metadata().current_schema().clone(),
             tuple.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
         let delete = write_pos_delete(&table, None, Some(wrong_key), &[
             (data_path.as_str(), 0),
             (data_path.as_str(), 1),
@@ -1240,7 +1246,8 @@ mod spec_stamp_e2e_test {
 
         // POSITIVE CONTROL: the same positions, the same tuple, the CURRENT spec id ⇒ applied.
         let correct_key =
-            PartitionKey::new(cur_spec, table.metadata().current_schema().clone(), tuple);
+            PartitionKey::new(cur_spec, table.metadata().current_schema().clone(), tuple)
+                .expect("PartitionKey::new: valid partition tuple");
         let correct_delete = write_pos_delete(&table, None, Some(correct_key), &[
             (data_path.as_str(), 0),
             (data_path.as_str(), 1),
@@ -1284,22 +1291,28 @@ mod spec_stamp_e2e_test {
         let eng = write_data_file(
             &table,
             None,
-            Some(PartitionKey::new(
-                cur_spec.clone(),
-                schema.clone(),
-                Struct::from_iter([Some(Literal::string("eng"))]),
-            )),
+            Some(
+                PartitionKey::new(
+                    cur_spec.clone(),
+                    schema.clone(),
+                    Struct::from_iter([Some(Literal::string("eng"))]),
+                )
+                .expect("PartitionKey::new: valid partition tuple"),
+            ),
             &[(1, "eng"), (2, "eng")],
         )
         .await;
         let ops = write_data_file(
             &table,
             None,
-            Some(PartitionKey::new(
-                cur_spec,
-                schema,
-                Struct::from_iter([Some(Literal::string("ops"))]),
-            )),
+            Some(
+                PartitionKey::new(
+                    cur_spec,
+                    schema,
+                    Struct::from_iter([Some(Literal::string("ops"))]),
+                )
+                .expect("PartitionKey::new: valid partition tuple"),
+            ),
             &[(1, "ops"), (3, "ops")],
         )
         .await;
@@ -1351,22 +1364,24 @@ mod spec_stamp_e2e_test {
         let eng = write_data_file(
             &table,
             None,
-            Some(PartitionKey::new(
-                cur_spec.clone(),
-                schema.clone(),
-                eng_tuple.clone(),
-            )),
+            Some(
+                PartitionKey::new(cur_spec.clone(), schema.clone(), eng_tuple.clone())
+                    .expect("PartitionKey::new: valid partition tuple"),
+            ),
             &[(1, "eng"), (2, "eng")],
         )
         .await;
         let ops = write_data_file(
             &table,
             None,
-            Some(PartitionKey::new(
-                cur_spec.clone(),
-                schema.clone(),
-                Struct::from_iter([Some(Literal::string("ops"))]),
-            )),
+            Some(
+                PartitionKey::new(
+                    cur_spec.clone(),
+                    schema.clone(),
+                    Struct::from_iter([Some(Literal::string("ops"))]),
+                )
+                .expect("PartitionKey::new: valid partition tuple"),
+            ),
             &[(1, "ops"), (3, "ops")],
         )
         .await;
@@ -1378,7 +1393,10 @@ mod spec_stamp_e2e_test {
         let delete = write_eq_delete_on_id(
             &table,
             None,
-            Some(PartitionKey::new(cur_spec, schema, eng_tuple.clone())),
+            Some(
+                PartitionKey::new(cur_spec, schema, eng_tuple.clone())
+                    .expect("PartitionKey::new: valid partition tuple"),
+            ),
             &[(1, "eng")],
         )
         .await;

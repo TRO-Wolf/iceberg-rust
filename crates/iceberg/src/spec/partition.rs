@@ -400,17 +400,29 @@ pub struct PartitionKey {
 
 impl PartitionKey {
     /// Creates a new partition key with the given spec, schema, and data.
-    pub fn new(spec: PartitionSpec, schema: SchemaRef, data: Struct) -> Self {
-        Self { spec, schema, data }
+    ///
+    /// Validates that `(spec, schema, data)` is self-consistent using the same rules as
+    /// [`PartitionSpec::try_partition_to_path`]: the partition type must be derivable under
+    /// `schema`, the tuple must cover every non-`void` field, each present value must be a
+    /// primitive literal, and each value's literal kind must be compatible with its partition
+    /// field's type. A NULL slot is legal. An all-`void` (or unpartitioned) spec may pair with an
+    /// empty tuple.
+    ///
+    /// Returns [`ErrorKind::DataInvalid`] or [`ErrorKind::Unexpected`] when validation fails —
+    /// an invalid partition tuple is unrepresentable as a [`PartitionKey`] (Java-parity posture:
+    /// `StructTransform` sizes the tuple from the spec and rejects a missing source accessor).
+    pub fn new(spec: PartitionSpec, schema: SchemaRef, data: Struct) -> Result<Self> {
+        // Reuse the fallible partition-path validator so the constructor and the path renderer
+        // cannot drift on what constitutes a legal triple.
+        let _ = spec.try_partition_to_path(&data, schema.clone())?;
+        Ok(Self { spec, schema, data })
     }
 
     /// Creates a new partition key from another partition key, with a new data field.
-    pub fn copy_with_data(&self, data: Struct) -> Self {
-        Self {
-            spec: self.spec.clone(),
-            schema: self.schema.clone(),
-            data,
-        }
+    ///
+    /// Validates the new data against this key's spec and schema (same rules as [`Self::new`]).
+    pub fn copy_with_data(&self, data: Struct) -> Result<Self> {
+        Self::new(self.spec.clone(), self.schema.clone(), data)
     }
 
     /// Generates a partition path based on the partition values.
@@ -2412,7 +2424,8 @@ mod partition_path_totalisation_tests {
     fn partition_key_new_accepts_null_value() {
         let (schema, spec) = two_field_spec();
         let data = Struct::from_iter([Some(Literal::long(5)), None]);
-        let key = PartitionKey::new(spec.clone(), schema.clone(), data.clone());
+        let key = PartitionKey::new(spec.clone(), schema.clone(), data.clone())
+            .expect("PartitionKey::new: valid partition tuple");
 
         assert_eq!(key.to_path(), "x=5/y=null");
         assert_eq!(
@@ -2420,6 +2433,48 @@ mod partition_path_totalisation_tests {
                 .expect("a NULL partition value is legal, not an anomaly"),
             "x=5/y=null"
         );
+    }
+
+    /// Unit 3: `PartitionKey::new` rejects an invalid triple (short non-void tuple) with a typed
+    /// error — an invalid partition key is unrepresentable.
+    #[test]
+    fn partition_key_new_rejects_short_non_void_tuple() {
+        let (schema, spec) = two_field_spec();
+        let data = Struct::from_iter([Some(Literal::long(5))]); // missing y
+        let err = PartitionKey::new(spec, schema, data)
+            .expect_err("a short non-void tuple must not construct a PartitionKey");
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+    }
+
+    /// Unit 3: `PartitionKey::new` rejects an incompatible literal kind.
+    #[test]
+    fn partition_key_new_rejects_incompatible_literal() {
+        let (schema, spec) = two_field_spec();
+        let data = Struct::from_iter([Some(Literal::long(5)), Some(Literal::int(7))]);
+        let err = PartitionKey::new(spec, schema, data)
+            .expect_err("an Int in a Long partition slot must not construct a PartitionKey");
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+    }
+
+    /// Unit 3: all-void + empty tuple remains constructible (the void trap).
+    #[test]
+    fn partition_key_new_accepts_all_void_empty_tuple() {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .expect("one-column schema must build"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("x", "x_void", Transform::Void)
+            .expect("void(x) is a legal partition field")
+            .build()
+            .expect("the all-void spec must build");
+        let key = PartitionKey::new(spec, schema, Struct::empty())
+            .expect("all-void + empty tuple is a legitimate PartitionKey");
+        assert_eq!(key.to_path(), "x_void=null");
     }
 
     // ============================================================================================
@@ -2786,7 +2841,9 @@ mod partition_path_escaping_tests {
         let fallible = spec
             .try_partition_to_path(&data, schema.clone())
             .expect("a well-formed (spec, schema, tuple) triple must not error");
-        let via_key = PartitionKey::new(spec, schema, data).to_path();
+        let via_key = PartitionKey::new(spec, schema, data)
+            .expect("PartitionKey::new: valid partition tuple")
+            .to_path();
 
         assert_eq!(
             total, fallible,
@@ -3322,16 +3379,13 @@ mod partition_path_escaping_tests {
     /// `truncate_string` in the LIVE interop battery, where Java's own `partitionToPath` emits
     /// `s_trunc=a%2Fb+c` — the same bytes this pin asserts.
     ///
-    /// The binary leg carries a second, DIFFERENT assertion. It is byte-stable under the ESCAPER
-    /// (hex holds nothing outside the safe set), but its HUMAN STRING is not Java's: Java's default
-    /// `Transform.toHumanString(Type, T)` routes FIXED and BINARY to `TransformUtil.base64encode`
-    /// before the default arm, and `Truncate` declares NO override, so EVERY transform whose output
-    /// type is binary renders base64 there — `truncate(binary, 2)`, `identity(binary)` and
-    /// `identity(fixed[3])` over these very bytes all emit `YS9i` from Java's own `partitionToPath`
-    /// (JVM-measured 2026-07-25, `iceberg-api-1.10.0` on JDK 11). That is the SAME hex-vs-base64
-    /// residue row R161 names for `identity(binary)`/`fixed`, so it gets the same ALARM the four
-    /// temporal divergences carry: when the `assert_ne!` becomes equal, the base64 residue has been
-    /// closed and row R161 must be updated in the same change.
+    /// Binary/fixed human strings use Java's standard Base64 (`TransformUtil.base64encode` =
+    /// `java.util.Base64.getEncoder()`), closed 2026-07-31 as QC on row R161. `Truncate` declares
+    /// NO override on either side, so `truncate(binary, 2)`, `identity(binary)`, and
+    /// `identity(fixed[3])` over the bytes `61 2F 62` all emit `YS9i` (JVM-measured 2026-07-25,
+    /// `iceberg-api-1.10.0` on JDK 11). Base64 alphabet characters outside the URLEncoder safe set
+    /// (`+`, `/`, `=`) are then escaped by `escape_partition_path_component` — the same as any other
+    /// human-string character; `YS9i` itself is fully inside the safe set.
     #[test]
     fn truncate_is_byte_stable_except_over_string() {
         let moving = [
@@ -3363,9 +3417,7 @@ mod partition_path_escaping_tests {
             );
         }
 
-        // The human-string ALARM for the binary leg, asserted BEFORE its byte-stability pin so
-        // that a change adopting Java's base64 reds THIS assertion first and names the residue in
-        // the failure message, rather than surfacing as a bare byte mismatch.
+        // CLOSED 2026-07-31 (QC / R161): Java base64 for binary partition values.
         let truncated_binary = render_one(
             "bn",
             "tb",
@@ -3373,11 +3425,10 @@ mod partition_path_escaping_tests {
             Transform::Truncate(2),
             Literal::binary(vec![0x61, 0x2F, 0x62]),
         );
-        assert_ne!(
+        assert_eq!(
             truncated_binary, "tb=YS9i",
-            "residue R161: Java renders base64 for a binary partition value (its own \
-             `partitionToPath` emits `tb=YS9i` for these bytes), the fork renders UPPERCASE HEX — \
-             closing that residue must update row R161 in the same change"
+            "Java `partitionToPath` emits `tb=YS9i` for truncate(binary,2) over bytes 61 2F 62 \
+             (TransformUtil.base64encode / java.util.Base64.getEncoder)"
         );
 
         let stable = [
@@ -3424,15 +3475,73 @@ mod partition_path_escaping_tests {
                 ),
                 "td=123.45",
             ),
-            (truncated_binary.clone(), "tb=612F62"),
+            // Base64 `YS9i` is inside the URLEncoder safe set — no further escaping.
+            (truncated_binary.clone(), "tb=YS9i"),
         ];
         for (rendered, expected) in &stable {
             assert_eq!(
                 rendered, expected,
-                "this truncate output holds no character outside the safe set — it must be \
-                 byte-identical to pre-R161"
+                "this truncate output holds no character outside the safe set after the human \
+                 string is formed"
             );
         }
+    }
+
+    /// QC pin: `identity(binary)` and `identity(fixed[N])` use the same Base64 human string as
+    /// Java (not UPPERCASE hex). Display for `Datum` still renders hex — only the human-string /
+    /// partition-path seam is base64.
+    #[test]
+    fn identity_binary_and_fixed_render_java_base64() {
+        let bytes = vec![0x61, 0x2F, 0x62]; // ASCII "a/b" → base64 "YS9i"
+        assert_eq!(
+            render_one(
+                "bn",
+                "b",
+                PrimitiveType::Binary,
+                Transform::Identity,
+                Literal::binary(bytes.clone()),
+            ),
+            "b=YS9i",
+            "identity(binary) must match Java TransformUtil.base64encode"
+        );
+        assert_eq!(
+            render_one(
+                "fx",
+                "f",
+                PrimitiveType::Fixed(3),
+                Transform::Identity,
+                Literal::fixed(bytes.clone()),
+            ),
+            "f=YS9i",
+            "identity(fixed[3]) must match Java TransformUtil.base64encode"
+        );
+
+        // Standard Base64 (NOT URL-safe): bytes that produce `+`/`/`/`=` must then be URL-escaped
+        // by the partition-path escaper (Java URLEncoder).
+        // 0xFB 0xFF → base64 "+/8=" → escaped "%2B%2F8%3D"
+        assert_eq!(
+            render_one(
+                "bn",
+                "b",
+                PrimitiveType::Binary,
+                Transform::Identity,
+                Literal::binary(vec![0xFB, 0xFF]),
+            ),
+            "b=%2B%2F8%3D",
+            "base64 alphabet chars outside the URLEncoder safe set must be escaped"
+        );
+
+        // Display stays hex (orthogonal surface).
+        let datum = crate::spec::Datum::new(
+            PrimitiveType::Binary,
+            crate::spec::PrimitiveLiteral::Binary(vec![0x61, 0x2F, 0x62]),
+        );
+        assert_eq!(
+            datum.to_string(),
+            "612F62",
+            "Display for Binary stays UPPERCASE hex; only to_human_string is base64"
+        );
+        assert_eq!(datum.to_human_string(), "YS9i");
     }
 
     /// R161 restores INJECTIVITY of partition tuple → directory, which is the data-trust half of

@@ -220,15 +220,26 @@ where
     F: FileNameGenerator,
 {
     fn current_file_path(&self) -> String {
-        self.inner.as_ref().unwrap().current_file_path()
+        // Post-`close()` the inner writer is taken; report empty rather than panicking on a
+        // status query against a closed writer (same posture as `RollingFileWriter`).
+        self.inner
+            .as_ref()
+            .map(|inner| inner.current_file_path())
+            .unwrap_or_default()
     }
 
     fn current_row_num(&self) -> usize {
-        self.inner.as_ref().unwrap().current_row_num()
+        self.inner
+            .as_ref()
+            .map(|inner| inner.current_row_num())
+            .unwrap_or(0)
     }
 
     fn current_written_size(&self) -> usize {
-        self.inner.as_ref().unwrap().current_written_size()
+        self.inner
+            .as_ref()
+            .map(|inner| inner.current_written_size())
+            .unwrap_or(0)
     }
 }
 
@@ -359,7 +370,8 @@ mod test {
             PartitionSpec::builder(schema_ref.clone()).build()?,
             schema_ref.clone(),
             partition_value.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let parquet_writer_builder =
             ParquetWriterBuilder::new(WriterProperties::builder().build(), schema_ref.clone());
@@ -625,7 +637,8 @@ mod test {
         let schema = stamp_test_schema();
         let void_spec = dept_spec(&schema, 5, Transform::Void);
         let null_tuple = Struct::from_iter([None]);
-        let partition_key = PartitionKey::new(void_spec, schema.clone(), null_tuple.clone());
+        let partition_key = PartitionKey::new(void_spec, schema.clone(), null_tuple.clone())
+            .expect("PartitionKey::new: valid partition tuple");
 
         let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
             .build(Some(partition_key))
@@ -658,7 +671,8 @@ mod test {
             dept_spec(&schema, 3, Transform::Identity),
             schema.clone(),
             key_partition.clone(),
-        );
+        )
+        .expect("PartitionKey::new: valid partition tuple");
 
         let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
             .with_partition_spec(configured)

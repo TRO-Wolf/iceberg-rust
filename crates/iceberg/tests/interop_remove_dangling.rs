@@ -408,6 +408,7 @@ fn partition_key_for(table: &Table, cat: &str) -> PartitionKey {
         table.metadata().current_schema().clone(),
         Struct::from_iter([Some(Literal::string(cat))]),
     )
+    .expect("PartitionKey::new: valid partition tuple")
 }
 
 /// Write a REAL parquet POSITION-delete file in partition `cat` deleting the given `(path, pos)` pairs.

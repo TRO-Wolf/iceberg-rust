@@ -1148,6 +1148,7 @@ fn category_partition_key(schema: SchemaRef, spec: PartitionSpec, category: &str
         schema,
         Struct::from_iter([Some(Literal::string(category))]),
     )
+    .expect("PartitionKey::new: valid partition tuple")
 }
 
 /// Write a REAL parquet DATA file for ONE partition via the production `DataFileWriter` built with the
@@ -2457,6 +2458,7 @@ fn truncate_partition_key(schema: SchemaRef, spec: PartitionSpec, value: i64) ->
         schema,
         Struct::from_iter([Some(Literal::long(value))]),
     )
+    .expect("PartitionKey::new: valid partition tuple")
 }
 
 /// Write a REAL parquet DATA file for ONE `truncate[10](id)` partition via the production `DataFileWriter`
