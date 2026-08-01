@@ -183,7 +183,7 @@ impl TableProvider for IcebergTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -199,14 +199,22 @@ impl TableProvider for IcebergTableProvider {
         // resolved against `schema()`, and this instance's schema cannot have moved since (see the
         // type docs). `IcebergTableScan` binds that schema to the freshly loaded table by FIELD ID,
         // so the emitted batches match what this plan advertises even when the table has evolved.
-        Ok(Arc::new(IcebergTableScan::new(
-            table,
-            None, // Always use current snapshot for catalog-backed provider
-            self.schema.clone(),
-            projection,
-            filters,
-            limit,
-        )?))
+        //
+        // Eager multi-partition plan via plan_tasks (G1): UnknownPartitioning(N) with fixed-T
+        // round-robin assignment. Knobs from session (T/L/off-switch).
+        let knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
+        Ok(Arc::new(
+            IcebergTableScan::plan(
+                table,
+                None, // Always use current snapshot for catalog-backed provider
+                self.schema.clone(),
+                projection,
+                filters,
+                limit,
+                knobs,
+            )
+            .await?,
+        ))
     }
 
     fn supports_filters_pushdown(
@@ -456,20 +464,25 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Use cached table (no refresh)
-        Ok(Arc::new(IcebergTableScan::new(
-            self.table.clone(),
-            self.snapshot_id,
-            self.schema.clone(),
-            projection,
-            filters,
-            limit,
-        )?))
+        // Use cached table (no refresh); multi-partition plan via plan_tasks (G1).
+        let knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
+        Ok(Arc::new(
+            IcebergTableScan::plan(
+                self.table.clone(),
+                self.snapshot_id,
+                self.schema.clone(),
+                projection,
+                filters,
+                limit,
+                knobs,
+            )
+            .await?,
+        ))
     }
 
     fn supports_filters_pushdown(

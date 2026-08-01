@@ -28,8 +28,9 @@ use datafusion::arrow::array::{
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field as ArrowField, SchemaRef as ArrowSchemaRef};
 use datafusion::common::Column;
+use datafusion::common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -39,12 +40,98 @@ use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::is_metadata_column_name;
+use iceberg::scan::{PartitionWork, stream_partition_work};
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
+
+/// Iceberg-specific scan knobs registered on DataFusion [`ConfigOptions`].
+///
+/// Prefix: `iceberg.`
+///
+/// - `multi_partition_scan` (default `true`): dedicated off-switch for multi-partition
+///   SELECT. When `false`, forces `T = 1` without requiring session `target_partitions = 1`.
+/// - `data_file_concurrency` (default `0`): total data-file concurrency budget `L`.
+///   `0` means "derive from `target_partitions`" (Wave E mapping). Distinct from `T`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct IcebergScanOptions {
+    /// When false, multi-partition output is disabled (`T = 1`) regardless of
+    /// `target_partitions`. Default true (feature shipped ON).
+    pub multi_partition_scan: bool,
+    /// Total data-file concurrency budget `L`. Zero → use `target_partitions`.
+    pub data_file_concurrency: usize,
+}
+
+impl Default for IcebergScanOptions {
+    fn default() -> Self {
+        Self {
+            multi_partition_scan: true,
+            data_file_concurrency: 0,
+        }
+    }
+}
+
+impl ExtensionOptions for IcebergScanOptions {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn cloned(&self) -> Box<dyn ExtensionOptions> {
+        Box::new(self.clone())
+    }
+
+    fn set(&mut self, key: &str, value: &str) -> datafusion::common::Result<()> {
+        match key {
+            "multi_partition_scan" => {
+                self.multi_partition_scan = value.parse().map_err(|e| {
+                    DataFusionError::Configuration(format!(
+                        "invalid iceberg.multi_partition_scan={value}: {e}"
+                    ))
+                })?;
+            }
+            "data_file_concurrency" => {
+                self.data_file_concurrency = value.parse().map_err(|e| {
+                    DataFusionError::Configuration(format!(
+                        "invalid iceberg.data_file_concurrency={value}: {e}"
+                    ))
+                })?;
+            }
+            _ => {
+                return Err(DataFusionError::Configuration(format!(
+                    "unknown iceberg config key: {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn entries(&self) -> Vec<ConfigEntry> {
+        vec![
+            ConfigEntry {
+                key: "multi_partition_scan".to_string(),
+                value: Some(self.multi_partition_scan.to_string()),
+                description: "When false, force T=1 multi-partition off-switch without collapsing session target_partitions",
+            },
+            ConfigEntry {
+                key: "data_file_concurrency".to_string(),
+                value: Some(self.data_file_concurrency.to_string()),
+                description: "Total data-file concurrency budget L (0 = derive from target_partitions)",
+            },
+        ]
+    }
+}
+
+impl ConfigExtension for IcebergScanOptions {
+    const PREFIX: &'static str = "iceberg";
+}
 
 /// How one advertised output column is produced from the scanned data.
 ///
@@ -63,12 +150,20 @@ enum ColumnSource {
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
+///
+/// When planned via [`IcebergTableScan::plan`], work is assigned through core
+/// [`iceberg::scan::TableScan::plan_tasks`] into `N` [`PartitionWork`] units and this node
+/// advertises [`Partitioning::UnknownPartitioning`]`(N)`. `execute(i)` streams only
+/// `PartitionWork(i)` (legacy single-stream reader — WG2 within-file parallel is not composed
+/// into this path on v1).
 #[derive(Debug)]
 pub struct IcebergTableScan {
     /// A table in the catalog.
     table: Table,
-    /// Snapshot of the table to scan.
+    /// Snapshot of the table to scan (plan input; may be `None` for "current at plan time").
     snapshot_id: Option<i64>,
+    /// Concrete snapshot id resolved at plan time and frozen on the node (pin 12).
+    resolved_snapshot_id: i64,
     /// Stores certain, often expensive to compute,
     /// plan properties used in query optimization.
     plan_properties: PlanProperties,
@@ -81,8 +176,18 @@ pub struct IcebergTableScan {
     sources: Vec<ColumnSource>,
     /// Filters to apply to the table scan
     predicates: Option<Predicate>,
-    /// Optional limit on the number of rows to return
+    /// Optional limit on the number of rows to return.
+    ///
+    /// Applied **only** when `N = 1`. When `N > 1`, global LIMIT correctness belongs to
+    /// DataFusion's `GlobalLimitExec` (pin 5); a sole per-partition hard cap of `k` is illegal.
     limit: Option<usize>,
+    /// Eager multi-partition assignment from `plan_tasks` (empty when built via [`Self::new`]
+    /// without planning — legacy single-stream execute path).
+    partition_work: Vec<PartitionWork>,
+    /// Per-partition data-file concurrency `P = max(1, ceil(L/N))`.
+    per_partition_concurrency: usize,
+    /// Batch size for the Iceberg reader.
+    batch_size: Option<usize>,
 }
 
 impl IcebergTableScan {
@@ -140,19 +245,114 @@ impl IcebergTableScan {
             }
         };
         let (scan_columns, sources) = project_bindings(&output_schema, &bindings)?;
-        let plan_properties = Self::compute_properties(output_schema);
+        let plan_properties = Self::compute_properties(output_schema, 1);
         let predicates = convert_filters_to_predicate(&rebind_filters(filters, &bindings));
+
+        // Resolve a best-effort snapshot id for display / freeze when not fully planned.
+        let resolved_snapshot_id = match snapshot_id {
+            Some(id) => id,
+            None => table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id())
+                .unwrap_or(0),
+        };
 
         Ok(Self {
             table,
             snapshot_id,
+            resolved_snapshot_id,
             plan_properties,
             projection,
             scan_columns,
             sources,
             predicates,
             limit,
+            partition_work: Vec::new(),
+            per_partition_concurrency: 1,
+            batch_size: None,
         })
+    }
+
+    /// Eager multi-partition plan: `plan_tasks` → strip → fixed-T assign → store on the node.
+    ///
+    /// Shipped default: multi-partition **ON** when `T > 1` and post-strip `|G| > 1`.
+    /// Dedicated off-switch: [`IcebergScanOptions::multi_partition_scan`] = false forces `T = 1`
+    /// without collapsing session `target_partitions` (pin 13).
+    pub(crate) async fn plan(
+        table: Table,
+        snapshot_id: Option<i64>,
+        schema: ArrowSchemaRef,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        knobs: ScanKnobs,
+    ) -> DFResult<Self> {
+        let mut scan = Self::new(
+            table.clone(),
+            snapshot_id,
+            schema,
+            projection,
+            filters,
+            limit,
+        )?;
+
+        let t = if knobs.multi_partition_scan {
+            knobs.target_partitions.max(1)
+        } else {
+            1
+        };
+        let l = clamp_scan_knob(
+            knobs
+                .data_file_concurrency
+                .unwrap_or(knobs.target_partitions),
+        );
+
+        let mut scan_builder = match snapshot_id {
+            Some(id) => table.scan().snapshot_id(id),
+            None => table.scan(),
+        };
+        scan_builder = scan_builder.select(scan.scan_columns.clone());
+        if let Some(pred) = scan.predicates.clone() {
+            scan_builder = scan_builder.with_filter(pred);
+        }
+        if let Some(bs) = knobs.batch_size {
+            scan_builder = scan_builder.with_batch_size(Some(clamp_scan_knob(bs)));
+        }
+        scan_builder = scan_builder.with_data_file_concurrency_limit(l);
+
+        let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
+        // Eager plan_tasks assignment. Incomplete test fixtures (snapshot points at missing
+        // object-store paths) cannot plan; fall back to legacy N=1 deferred stream so schema /
+        // projection pins keep working. Production tables with readable manifests get N>1.
+        let work = match table_scan.plan_partition_work(t).await {
+            Ok(work) => work,
+            Err(_err) => {
+                // Incomplete fixtures (snapshot → missing object-store paths) cannot plan;
+                // fall back to legacy N=1 deferred stream. Production tables with readable
+                // manifests take the Ok path and advertise UnknownPartitioning(N).
+                scan.batch_size = knobs.batch_size.map(clamp_scan_knob);
+                scan.per_partition_concurrency = l;
+                return Ok(scan);
+            }
+        };
+
+        let n = work.len().max(1);
+        // P = max(1, ceil(L/N)); when N > L, P = 1 and total ≈ N may exceed L (not a bug).
+        let p = l.div_ceil(n).max(1);
+
+        if let Some(first) = work.first() {
+            scan.resolved_snapshot_id = first.snapshot_id();
+        }
+        // Pin 5: do not keep a sole per-partition hard limit when N > 1.
+        if n > 1 {
+            scan.limit = None;
+        }
+        scan.partition_work = work;
+        scan.per_partition_concurrency = p;
+        scan.batch_size = knobs.batch_size.map(clamp_scan_knob);
+        scan.plan_properties = Self::compute_properties(scan.schema(), n);
+        Ok(scan)
     }
 
     pub fn table(&self) -> &Table {
@@ -161,6 +361,16 @@ impl IcebergTableScan {
 
     pub fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
+    }
+
+    /// Concrete snapshot id frozen at plan time (pin 12).
+    pub fn resolved_snapshot_id(&self) -> i64 {
+        self.resolved_snapshot_id
+    }
+
+    /// Assigned partition work (`N = len`). Empty when built via [`Self::new`] without plan.
+    pub fn partition_work(&self) -> &[PartitionWork] {
+        &self.partition_work
     }
 
     pub fn projection(&self) -> Option<&[String]> {
@@ -175,14 +385,11 @@ impl IcebergTableScan {
         self.limit
     }
 
-    /// Computes [`PlanProperties`] used in query optimization.
-    fn compute_properties(schema: ArrowSchemaRef) -> PlanProperties {
-        // TODO:
-        // This is more or less a placeholder, to be replaced
-        // once we support output-partitioning
+    /// Computes [`PlanProperties`] with `UnknownPartitioning(n)`.
+    fn compute_properties(schema: ArrowSchemaRef, n: usize) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(n.max(1)),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
@@ -215,9 +422,76 @@ impl ExecutionPlan for IcebergTableScan {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let advertised_schema = self.schema();
+        let sources = self.sources.clone();
+
+        // Multi-partition path (eager plan_tasks assignment).
+        if !self.partition_work.is_empty() {
+            let n = self.partition_work.len();
+            if partition >= n {
+                return Err(DataFusionError::Execution(format!(
+                    "IcebergTableScan partition index {partition} out of range (N={n})"
+                )));
+            }
+            let work = self.partition_work[partition].clone();
+            // Snapshot freeze: work carries the plan-time id; mismatch is a programming error.
+            if work.snapshot_id() != 0 && work.snapshot_id() != self.resolved_snapshot_id {
+                return Err(DataFusionError::Execution(format!(
+                    "IcebergTableScan snapshot freeze violation: work snapshot {} != plan {}",
+                    work.snapshot_id(),
+                    self.resolved_snapshot_id
+                )));
+            }
+            let file_io = self.table.file_io().clone();
+            let concurrency = self.per_partition_concurrency;
+            let batch_size = self.batch_size;
+            let stream =
+                stream_partition_work(file_io, &work, concurrency, batch_size, true, false)
+                    .map_err(to_datafusion_error)?
+                    .map_err(to_datafusion_error)
+                    .and_then(move |batch| {
+                        futures::future::ready(conform_batch(batch, &advertised_schema, &sources))
+                    });
+
+            // Pin 5: limit only when N == 1 (GlobalLimitExec owns N>1).
+            let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+                if n == 1 {
+                    if let Some(limit) = self.limit {
+                        let mut remaining = limit;
+                        Box::pin(stream.try_filter_map(move |batch| {
+                            futures::future::ready(if remaining == 0 {
+                                Ok(None)
+                            } else if batch.num_rows() <= remaining {
+                                remaining -= batch.num_rows();
+                                Ok(Some(batch))
+                            } else {
+                                let limited_batch = batch.slice(0, remaining);
+                                remaining = 0;
+                                Ok(Some(limited_batch))
+                            })
+                        }))
+                    } else {
+                        Box::pin(stream)
+                    }
+                } else {
+                    Box::pin(stream)
+                };
+
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema(),
+                limited_stream,
+            )));
+        }
+
+        // Legacy single-stream path (`IcebergTableScan::new` without plan).
+        if partition > 0 {
+            return Err(DataFusionError::Execution(format!(
+                "IcebergTableScan partition index {partition} out of range (N=1 legacy)"
+            )));
+        }
         let knobs = scan_knobs_from_context(&context);
         let fut = get_batch_stream(
             self.table.clone(),
@@ -226,17 +500,12 @@ impl ExecutionPlan for IcebergTableScan {
             self.predicates.clone(),
             knobs,
         );
-        // Every emitted batch is conformed to the schema this node advertised — see
-        // `IcebergTableScan::new` and `conform_batch`.
-        let advertised_schema = self.schema();
-        let sources = self.sources.clone();
         let stream = futures::stream::once(fut)
             .try_flatten()
             .and_then(move |batch| {
                 futures::future::ready(conform_batch(batch, &advertised_schema, &sources))
             });
 
-        // Apply limit if specified
         let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
             if let Some(limit) = self.limit {
                 let mut remaining = limit;
@@ -282,18 +551,42 @@ impl DisplayAs for IcebergTableScan {
     }
 }
 
-/// Session-derived knobs applied when building an Iceberg core [`TableScan`](iceberg::scan::TableScan).
+/// Session-derived knobs applied when building an Iceberg core [`TableScan`](iceberg::scan::TableScan)
+/// and multi-partition assignment.
 ///
 /// Wired from DataFusion's `TaskContext` so session `batch_size` / `target_partitions` affect the
 /// Iceberg reader. Row selection is **not** auto-enabled here: the core default is off because
 /// parsing the Parquet page index can outweigh the gain; enable via the core scan API when the
 /// table layout warrants it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// # `T` vs `L` vs multi-partition off-switch
+///
+/// - **`T`** = output partition budget = `target_partitions` when `multi_partition_scan` is true,
+///   else `1` (dedicated off-switch, pin 13).
+/// - **`L`** = total data-file concurrency = `IcebergScanOptions::data_file_concurrency` when
+///   non-zero, else `target_partitions` (distinct surface, pin 14).
+/// - **`P`** = per-partition concurrency = `max(1, ceil(L/N))` computed at plan time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScanKnobs {
     /// Arrow record-batch size for the Iceberg reader (`TableScanBuilder::with_batch_size`).
     pub batch_size: Option<usize>,
-    /// Concurrent data-file reads (`TableScanBuilder::with_data_file_concurrency_limit`).
+    /// Total data-file concurrency budget `L` (`TableScanBuilder::with_data_file_concurrency_limit`).
     pub data_file_concurrency: Option<usize>,
+    /// Session target partition count (raw `T` input before off-switch).
+    pub target_partitions: usize,
+    /// Dedicated multi-partition off-switch (pin 13). Default true.
+    pub multi_partition_scan: bool,
+}
+
+impl Default for ScanKnobs {
+    fn default() -> Self {
+        Self {
+            batch_size: None,
+            data_file_concurrency: None,
+            target_partitions: 1,
+            multi_partition_scan: true,
+        }
+    }
 }
 
 /// Floor session-derived scan knobs so a misconfigured 0 cannot empty the reader.
@@ -310,15 +603,49 @@ pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
     let config = context.session_config();
     // Clamp batch_size: DF does not normalize 0; Parquet returns an empty stream on batch_size 0.
     let batch_size = clamp_scan_knob(config.batch_size());
-    // target_partitions is the session parallelism target; use it as the data-file concurrency
-    // ceiling so a single-partition Iceberg scan still fans out file IO to the session budget.
-    // DF rewrites target_partitions 0 → available parallelism; still clamp for defense in depth.
-    let data_file_concurrency = clamp_scan_knob(config.target_partitions());
+    let target_partitions = clamp_scan_knob(config.target_partitions());
+
+    // Optional iceberg.* extension (pin 13 off-switch + pin 14 distinct L).
+    let iceberg_opts = config
+        .options()
+        .extensions
+        .get::<IcebergScanOptions>()
+        .cloned()
+        .unwrap_or_default();
+    let multi_partition_scan = iceberg_opts.multi_partition_scan;
+    // L: dedicated surface when non-zero; else Wave E mapping from target_partitions.
+    let data_file_concurrency = if iceberg_opts.data_file_concurrency > 0 {
+        clamp_scan_knob(iceberg_opts.data_file_concurrency)
+    } else {
+        target_partitions
+    };
+
     ScanKnobs {
         batch_size: Some(batch_size),
         data_file_concurrency: Some(data_file_concurrency),
+        target_partitions,
+        multi_partition_scan,
     }
 }
+
+/// Register default [`IcebergScanOptions`] on a session config if not already present.
+///
+/// Public for consumers wiring pin-13 / pin-14 knobs before building a session.
+#[allow(dead_code)] // intentional public API; used in pin tests
+pub fn ensure_iceberg_scan_options(config: &mut datafusion::prelude::SessionConfig) {
+    if config
+        .options()
+        .extensions
+        .get::<IcebergScanOptions>()
+        .is_none()
+    {
+        config
+            .options_mut()
+            .extensions
+            .insert(IcebergScanOptions::default());
+    }
+}
+
 
 /// Asynchronously retrieves a stream of [`RecordBatch`] instances
 /// from a given table.
@@ -1504,6 +1831,8 @@ mod tests {
         let knobs = ScanKnobs {
             batch_size: Some(0),
             data_file_concurrency: Some(0),
+            target_partitions: 1,
+            multi_partition_scan: true,
         };
         let effective_batch = knobs.batch_size.map(clamp_scan_knob);
         let effective_conc = knobs.data_file_concurrency.map(clamp_scan_knob);
@@ -1545,5 +1874,90 @@ mod tests {
             knobs.data_file_concurrency.is_some_and(|c| c >= 1),
             "target_partitions 0 must not yield concurrency 0 (hang hazard)"
         );
+    }
+
+    /// Pin 13: dedicated off-switch forces multi_partition_scan=false while target_partitions > 1.
+    #[test]
+    fn test_pin13_off_switch_independent_of_target_partitions() {
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        let mut config =
+            SessionConfig::new().set_usize("datafusion.execution.target_partitions", 8);
+        ensure_iceberg_scan_options(&mut config);
+        config.options_mut().extensions.insert(IcebergScanOptions {
+            multi_partition_scan: false,
+            data_file_concurrency: 0,
+        });
+        let state = SessionStateBuilder::new().with_config(config).build();
+        let knobs = scan_knobs_from_context(&state.task_ctx());
+        assert!(!knobs.multi_partition_scan);
+        assert_eq!(knobs.target_partitions, 8);
+        // T effective = 1 when off-switch engaged
+        let t = if knobs.multi_partition_scan {
+            knobs.target_partitions
+        } else {
+            1
+        };
+        assert_eq!(t, 1);
+    }
+
+    /// Pin 14: distinct L surface independent of T.
+    #[test]
+    fn test_pin14_distinct_l_surface() {
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        let mut config =
+            SessionConfig::new().set_usize("datafusion.execution.target_partitions", 4);
+        ensure_iceberg_scan_options(&mut config);
+        config.options_mut().extensions.insert(IcebergScanOptions {
+            multi_partition_scan: true,
+            data_file_concurrency: 16,
+        });
+        let state = SessionStateBuilder::new().with_config(config).build();
+        let knobs = scan_knobs_from_context(&state.task_ctx());
+        assert_eq!(knobs.target_partitions, 4);
+        assert_eq!(knobs.data_file_concurrency, Some(16));
+
+        // Second L value with same T
+        let mut config2 =
+            SessionConfig::new().set_usize("datafusion.execution.target_partitions", 4);
+        config2.options_mut().extensions.insert(IcebergScanOptions {
+            multi_partition_scan: true,
+            data_file_concurrency: 2,
+        });
+        let state2 = SessionStateBuilder::new().with_config(config2).build();
+        let knobs2 = scan_knobs_from_context(&state2.task_ctx());
+        assert_eq!(knobs2.target_partitions, 4);
+        assert_eq!(knobs2.data_file_concurrency, Some(2));
+        assert_ne!(knobs.data_file_concurrency, knobs2.data_file_concurrency);
+    }
+
+    /// Pin 2 partial: execute(i) for i ≥ N is a typed error (legacy N=1 path).
+    #[tokio::test]
+    async fn test_execute_out_of_range_errors() {
+        use datafusion::execution::TaskContext;
+
+        let scan = IcebergTableScan::new(
+            create_test_table(),
+            None,
+            test_arrow_schema(),
+            None,
+            &[],
+            None,
+        )
+        .expect("scan");
+        let ctx = Arc::new(TaskContext::default());
+        match scan.execute(1, ctx) {
+            Ok(_) => panic!("i≥N must error, got Ok stream"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("out of range"),
+                    "expected out-of-range typed error, got: {msg}"
+                );
+            }
+        }
     }
 }

@@ -27,6 +27,7 @@ mod incremental;
 pub use batch::*;
 pub use incremental::*;
 mod metrics_collector;
+mod partition_work;
 mod task;
 mod task_group;
 
@@ -38,6 +39,7 @@ use arrow_array::RecordBatch;
 use futures::channel::mpsc::{Sender, channel};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt, TryStreamExt};
+pub use partition_work::*;
 pub use task::*;
 pub use task_group::*;
 
