@@ -2311,12 +2311,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// Critic-octo FK1 cycle 1: I64 store drops null delete cells; if `delete_mask` short-circuits
-    /// on `is_empty()` *before* the null-data bail, a null-only Long delete file returns
-    /// `Some(all-false)` and under-deletes null data. Null bail must win so the predicate's
-    /// `col IS NULL` leaf still applies.
+    /// Critic-octo FK1 cycle 1+2: I64 store drops null delete cells. Null-only Long delete files
+    /// must (a) not report `is_empty()` (apply seam must not skip them), and (b) `delete_mask`
+    /// null-bail so the predicate's `col IS NULL` leaf still applies.
     ///
-    /// **MUTATION:** restore empty-before-null order in `delete_mask` → this test goes RED.
+    /// **MUTATION:** empty-before-null order in `delete_mask`, or treat null-only I64 as
+    /// `is_empty()==true` without null-bail → this test goes RED.
     #[test]
     fn test_h6_set_null_only_i64_delete_bails_on_null_data() {
         let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
@@ -2326,8 +2326,9 @@ pub(crate) mod tests {
         let set =
             EqDeleteKeySet::try_build(key_columns, delete_rows.clone()).expect("Long set builds");
         assert!(
-            set.is_empty(),
-            "null-only I64 deletes must produce an empty specialized store"
+            !set.is_empty(),
+            "null-only I64 deletes drop nulls from the store but must NOT report is_empty — \
+             apply seams that skip empty sets would under-delete null data"
         );
 
         let data: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None, Some(2)]));
@@ -2348,7 +2349,7 @@ pub(crate) mod tests {
             "predicate oracle: null-only delete set deletes null data rows only"
         );
 
-        // Non-null data: empty set correctly deletes nothing (null deletes never match values).
+        // Non-null data: null deletes never match values → nothing deleted.
         let non_null: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), Some(2)]));
         let non_null_batch = batch_with_field_ids(vec![("v", non_null)]);
         assert_eq!(
@@ -2356,6 +2357,45 @@ pub(crate) mod tests {
             Some(vec![false, false]),
             "null-only I64 deletes delete nothing among fully non-null data"
         );
+    }
+
+    /// Critic-octo FK1 cycle 2: simulate the apply-seam keep-mask loop (reader
+    /// `eq_delete_keep_mask`) over a null-only I64 set. Skipping `is_empty` sets without calling
+    /// `delete_mask` would yield keep-all; the production loop must call `delete_mask` and fall
+    /// back when it returns `None`.
+    #[test]
+    fn test_h6_apply_seam_null_only_i64_does_not_keep_all() {
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Long)];
+        let delete_rows = vec![vec![None]];
+        let set = EqDeleteKeySet::try_build(key_columns, delete_rows).expect("Long set builds");
+        let sets = [set];
+
+        let data: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None]));
+        let batch = batch_with_field_ids(vec![("v", data)]);
+        let num_rows = batch.num_rows();
+
+        // Mirror reader::eq_delete_keep_mask (always call delete_mask; no empty-skip).
+        let mut keep = vec![true; num_rows];
+        let mut all_sets_safe = true;
+        for set in &sets {
+            match set.delete_mask(&batch).expect("delete_mask") {
+                Some(deleted) => {
+                    for (k, d) in keep.iter_mut().zip(deleted.iter()) {
+                        *k &= !*d;
+                    }
+                }
+                None => {
+                    all_sets_safe = false;
+                    break;
+                }
+            }
+        }
+        assert!(
+            !all_sets_safe,
+            "null-only I64 + null data must force predicate fallback at the apply seam"
+        );
+        // And is_empty must not invite a skip:
+        assert!(!sets[0].is_empty());
     }
 
     /// THE GATE: Float / Double key columns must NOT build a set (route to the predicate fallback),

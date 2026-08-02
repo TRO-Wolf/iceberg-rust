@@ -83,6 +83,11 @@ pub(crate) struct EqDeleteKeySet {
     key_columns: Vec<(i32, String, PrimitiveType)>,
     /// Compact membership store — see [`KeyStore`].
     store: KeyStore,
+    /// True when at least one delete tuple carried a NULL cell that the I64 store could not
+    /// retain (nulls are dropped there). The Bytes store encodes null tags, so this flag stays
+    /// false for Bytes builds. Callers must not treat an I64-empty set as “deletes nothing” when
+    /// this is true — null data still needs the predicate path (`col IS NULL`).
+    i64_dropped_null_deletes: bool,
 }
 
 /// Membership backend. Single integer-like keys use `I64` (no alloc per key); everything else
@@ -153,8 +158,11 @@ impl EqDeleteKeySet {
     /// predicate path" — if ANY key column type is ineligible. Duplicate tuples collapse (a set),
     /// matching the predicate path where duplicate delete rows are redundant.
     ///
-    /// Rows with any NULL cell are retained in the set (encoded with a null tag) so membership
-    /// stays complete for a future null-aware probe; tonight's probe still bails on null data.
+    /// **Null cells:** the Bytes store retains them (null tag) for a future null-aware probe. The
+    /// I64 specialized store cannot represent null — those cells are dropped and an internal
+    /// `i64_dropped_null_deletes` flag is set so [`is_empty`](Self::is_empty) stays false and
+    /// callers still route null data to the predicate path. Probe still bails on any null in the
+    /// data batch (conservative 3VL boundary).
     pub(crate) fn try_build(
         key_columns: Vec<(i32, String, PrimitiveType)>,
         rows: Vec<Vec<Option<Datum>>>,
@@ -169,6 +177,7 @@ impl EqDeleteKeySet {
             return None;
         }
 
+        let mut i64_dropped_null_deletes = false;
         let store = if key_columns.len() == 1 && Self::is_i64_family(&key_columns[0].2) {
             let mut set = HashSet::with_capacity(rows.len());
             for row in rows {
@@ -176,10 +185,12 @@ impl EqDeleteKeySet {
                     return None;
                 }
                 match &row[0] {
-                    // Null delete keys cannot hit the i64 specialized store; drop them — a
-                    // non-null data batch never matches a null delete key, and null data batches
-                    // bail to the predicate path which still carries the null-delete leaf.
-                    None => {}
+                    // Null delete keys cannot hit the i64 specialized store; drop them and
+                    // remember — a non-null data batch never matches a null delete key, and null
+                    // data batches must still reach the predicate path (null-delete leaf).
+                    None => {
+                        i64_dropped_null_deletes = true;
+                    }
                     Some(d) => {
                         set.insert(literal_as_i64(d.literal())?);
                     }
@@ -205,7 +216,11 @@ impl EqDeleteKeySet {
             KeyStore::Bytes(set)
         };
 
-        Some(Self { key_columns, store })
+        Some(Self {
+            key_columns,
+            store,
+            i64_dropped_null_deletes,
+        })
     }
 
     /// The ordered key field ids — used to confirm a task's eq-delete files share a key schema before
@@ -214,9 +229,14 @@ impl EqDeleteKeySet {
         self.key_columns.iter().map(|(id, _, _)| *id).collect()
     }
 
-    /// `true` if the set has no delete tuples (an eq-delete file that deletes nothing). Such a file
-    /// never deletes a row, exactly like its `AlwaysTrue` survival predicate.
+    /// `true` if this file cannot delete any data row — empty membership store **and** no I64-dropped
+    /// null deletes. A null-only I64 file has an empty store but `i64_dropped_null_deletes`, so this
+    /// is `false`: null data rows can still be deleted via the predicate fallback. Matches the
+    /// predicate path where a pure-`IS NULL` delete file is not a no-op.
     pub(crate) fn is_empty(&self) -> bool {
+        if self.i64_dropped_null_deletes {
+            return false;
+        }
         match &self.store {
             KeyStore::I64(s) => s.is_empty(),
             KeyStore::Bytes(s) => s.is_empty(),

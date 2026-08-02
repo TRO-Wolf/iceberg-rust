@@ -1101,9 +1101,11 @@ impl ArrowReader {
             let mut keep = vec![true; num_rows];
             let mut all_sets_safe = true;
             for set in sets {
-                if set.is_empty() {
-                    continue;
-                }
+                // Always call `delete_mask` — do not skip on `is_empty()`. The I64 store drops
+                // null delete cells; a null-only Long eq-delete file reports store-empty but still
+                // must null-bail (or hit the predicate) so `col IS NULL` deletes apply. Skipping
+                // empty sets produced a keep-all mask and under-deleted null data (FK1 critic-octo
+                // cycle 2). Truly empty sets return `Some(all-false)` after the null check.
                 match set.delete_mask(batch)? {
                     Some(deleted) => {
                         for (k, d) in keep.iter_mut().zip(deleted.iter()) {
