@@ -2050,6 +2050,23 @@ pub(crate) mod tests {
         assert_eq!(mask, vec![true, true, false]);
     }
 
+    /// Timestamp (micros) key — I64 store path for TimestampMicrosecondArray.
+    #[test]
+    fn test_h6_set_timestamp_matches_oracle() {
+        use arrow_array::TimestampMicrosecondArray;
+        let schema = opt_schema(vec![(1, "ts", PrimitiveType::Timestamp)]);
+        let key_columns = vec![(1, "ts".to_string(), PrimitiveType::Timestamp)];
+        let delete_rows = vec![vec![Some(Datum::timestamp_micros(1_000_000))]];
+        let data: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(1_000_000i64),
+            Some(2_000_000),
+        ]));
+        let mask = assert_set_matches_oracle(schema, key_columns, &["ts"], delete_rows, vec![(
+            "ts", data,
+        )]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
     /// String key — empty string, no-match. (Non-null data → set path.)
     #[test]
     fn test_h6_set_string_matches_oracle() {
