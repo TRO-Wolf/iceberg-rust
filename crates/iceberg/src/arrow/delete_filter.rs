@@ -2036,6 +2036,20 @@ pub(crate) mod tests {
         assert_eq!(mask, vec![true, true, false, false]);
     }
 
+    /// Int key (Int32Array → I64 store) — pins i32→i64 widen on both build (`literal_as_i64`) and
+    /// probe (`i64_column_values`) so the specialized store stays oracle-identical for Int.
+    #[test]
+    fn test_h6_set_int_matches_oracle() {
+        use arrow_array::Int32Array;
+        let schema = opt_schema(vec![(1, "v", PrimitiveType::Int)]);
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Int)];
+        let delete_rows = vec![vec![Some(Datum::int(3))], vec![Some(Datum::int(7))]];
+        let data: ArrayRef = Arc::new(Int32Array::from(vec![Some(3i32), Some(7), Some(9)]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["v"], delete_rows, vec![("v", data)]);
+        assert_eq!(mask, vec![true, true, false]);
+    }
+
     /// String key — empty string, no-match. (Non-null data → set path.)
     #[test]
     fn test_h6_set_string_matches_oracle() {
