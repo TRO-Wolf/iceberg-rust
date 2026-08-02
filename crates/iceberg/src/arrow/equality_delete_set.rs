@@ -294,6 +294,16 @@ impl EqDeleteKeySet {
                 debug_assert_eq!(self.key_columns.len(), 1);
                 let ty = &self.key_columns[0].2;
                 let values = i64_column_values(&columns[0], ty)?;
+                if values.len() != num_rows {
+                    return Err(Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "equality-delete set fast path: i64 key column length {} != batch \
+                             num_rows {num_rows}",
+                            values.len()
+                        ),
+                    ));
+                }
                 let mut mask = Vec::with_capacity(num_rows);
                 for v in values {
                     mask.push(set.contains(&v));

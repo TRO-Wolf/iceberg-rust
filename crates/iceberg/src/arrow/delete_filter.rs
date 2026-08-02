@@ -2136,6 +2136,29 @@ pub(crate) mod tests {
         assert_eq!(mask, vec![true, false]);
     }
 
+    /// Uuid key — pins LE `UInt128` encode on the Datum side against Arrow FixedSizeBinary(16)
+    /// via `Uuid::from_bytes`/`as_u128` on the probe side (critic-octo FK1 cycle 3 coverage).
+    #[test]
+    fn test_h6_set_uuid_matches_oracle() {
+        use arrow_array::FixedSizeBinaryArray;
+        use uuid::Uuid;
+
+        let u_hit = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").expect("uuid");
+        let u_miss = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").expect("uuid");
+        let schema = opt_schema(vec![(1, "u", PrimitiveType::Uuid)]);
+        let key_columns = vec![(1, "u".to_string(), PrimitiveType::Uuid)];
+        let delete_rows = vec![vec![Some(Datum::uuid(u_hit))]];
+        let data: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(
+                vec![u_hit.as_bytes().to_vec(), u_miss.as_bytes().to_vec()].into_iter(),
+            )
+            .expect("build Uuid data column"),
+        );
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["u"], delete_rows, vec![("u", data)]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
     /// THE KEY-NULL BAIL FOR THE NEW TYPES: a Time / Fixed batch with a NULL in the key column makes
     /// the fast path return `None`, and the predicate fallback — which previously ERRORED for
     /// Time/Fixed — SUCCEEDS (the `get_arrow_datum` arms) and, under Java nulls-first semantics
