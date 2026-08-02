@@ -2275,6 +2275,11 @@ pub(crate) mod tests {
     /// matches it — the Java `StructLikeSet` verdict. The bail stays mandatory (conservative:
     /// the predicate path is the oracle); extending the set path to null keys is a possible
     /// future optimization now that the two agree.
+    ///
+    /// **MUTATION (FK1 P0):** delete the `column.null_count() > 0 { return Ok(None) }` bail in
+    /// `EqDeleteKeySet::delete_mask` → this test must go RED (returns `Some(...)` instead of
+    /// `None`). Re-run at tip during critic-octo; a mutation that was RED three commits ago is
+    /// not RED.
     #[test]
     fn test_h6_set_returns_none_when_key_column_has_null() {
         let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
@@ -2311,6 +2316,12 @@ pub(crate) mod tests {
     /// case on the untouched predicate path. (Time and Fixed are NOT excluded — they gained a
     /// `get_arrow_datum` arm and their equality is integer-/byte-identical; see the eligible-type
     /// assertions below and `test_h6_set_time_matches_oracle` / `test_h6_set_fixed_matches_oracle`.)
+    ///
+    /// **MUTATION (FK1 P0):** admit `PrimitiveType::Float`/`Double` in
+    /// `EqDeleteKeySet::is_eligible_type` → `try_build` returns `Some` for a Double key and
+    /// `test_h6_naive_set_diverges_on_negative_zero` documents the semantic break. This gate test
+    /// must go RED on the `is_none()` assertions. Float Java-Comparator hashing remains a named
+    /// follow-up seed (not tonight).
     #[test]
     fn test_h6_gate_excludes_float_double_decimal_unknown() {
         assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Float));

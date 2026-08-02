@@ -783,32 +783,61 @@ impl CachingDeleteFileLoader {
                 key_columns = Some(columns);
             }
 
-            // Process the collected columns in lockstep
+            // Process the collected columns in lockstep.
+            // FK1: when every key column is set-eligible, skip per-row survival-predicate
+            // construction during the stream (the Θ(E) tree is built once after, from the
+            // collected tuples, and only because the null-batch fallback still needs it).
+            // When ineligible, collect predicates only (no set tuples).
             #[allow(clippy::len_zero)]
             while datum_columns_with_names[0].0.len() > 0 {
-                let mut row_predicate = AlwaysTrue;
-                let mut tuple: Vec<Option<Datum>> =
-                    Vec::with_capacity(datum_columns_with_names.len());
-                for &mut (ref mut column, _, ref field_name, _) in &mut datum_columns_with_names {
-                    if let Some(item) = column.next() {
-                        let cell = item?;
-                        let cell_predicate = if let Some(datum) = &cell {
-                            Reference::new(field_name.clone()).equal_to(datum.clone())
-                        } else {
-                            Reference::new(field_name.clone()).is_null()
-                        };
-                        row_predicate = row_predicate.and(cell_predicate);
-                        tuple.push(cell);
+                if set_eligible {
+                    let mut tuple: Vec<Option<Datum>> =
+                        Vec::with_capacity(datum_columns_with_names.len());
+                    for &mut (ref mut column, _, _, _) in &mut datum_columns_with_names {
+                        if let Some(item) = column.next() {
+                            tuple.push(item?);
+                        }
                     }
+                    delete_tuples.push(tuple);
+                } else {
+                    let mut row_predicate = AlwaysTrue;
+                    for &mut (ref mut column, _, ref field_name, _) in &mut datum_columns_with_names
+                    {
+                        if let Some(item) = column.next() {
+                            let cell = item?;
+                            let cell_predicate = if let Some(datum) = &cell {
+                                Reference::new(field_name.clone()).equal_to(datum.clone())
+                            } else {
+                                Reference::new(field_name.clone()).is_null()
+                            };
+                            row_predicate = row_predicate.and(cell_predicate);
+                        }
+                    }
+                    row_predicates.push(row_predicate.not().rewrite_not());
                 }
-                row_predicates.push(row_predicate.not().rewrite_not());
-                delete_tuples.push(tuple);
             }
         }
 
         // Build the set accelerator iff every key column was eligible. `try_build` re-checks the
         // gate (defence in depth) and returns `None` for an empty / ineligible key schema.
         let key_set = if set_eligible {
+            // Rebuild the survival predicate from the same tuples the set encodes — needed for
+            // null-batch fallback (delete_mask → None). Distinct from the old path only in that
+            // intermediate per-row Predicate objects were not allocated during the stream.
+            if let Some(columns) = key_columns.as_ref() {
+                for tuple in &delete_tuples {
+                    let mut row_predicate = AlwaysTrue;
+                    for (cell, (_, field_name, _)) in tuple.iter().zip(columns.iter()) {
+                        let cell_predicate = if let Some(datum) = cell {
+                            Reference::new(field_name.clone()).equal_to(datum.clone())
+                        } else {
+                            Reference::new(field_name.clone()).is_null()
+                        };
+                        row_predicate = row_predicate.and(cell_predicate);
+                    }
+                    row_predicates.push(row_predicate.not().rewrite_not());
+                }
+            }
             key_columns.and_then(|columns| EqDeleteKeySet::try_build(columns, delete_tuples))
         } else {
             None

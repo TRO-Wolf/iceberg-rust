@@ -45,20 +45,32 @@
 //! satisfy (b); they are admitted. An eq-delete file with ANY excluded key column routes the whole
 //! task back to the untouched predicate path. The matrix of admitted types is proven identical to
 //! the predicate path in `delete_filter.rs`'s harness.
+//!
+//! ## Columnar encoding (FK1 / scout #3)
+//!
+//! Keys are stored as a compact byte encoding (or a specialized `HashSet<i64>` for a single
+//! integer-like column), not as `HashSet<Vec<Option<Datum>>>`. Probe-side `delete_mask` hashes /
+//! encodes directly from Arrow arrays without a per-cell `Datum` decode + clone storm. Build still
+//! accepts the loader's `Vec<Option<Datum>>` rows (decoded once at parse) and re-encodes them into
+//! the compact form. NULL data cells still bail to the predicate path (conservative 3VL boundary —
+//! null-aware set membership is a follow-up seed).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, Int32Array,
+    Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::arrow::arrow_primitive_to_literal;
-use crate::spec::{Datum, PrimitiveType, Type};
+use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType};
 use crate::{Error, ErrorKind, Result};
 
 /// One equality-delete file represented as a hashed set of its delete-key tuples, for `O(R)`
 /// membership application. A data row is DELETED by this file iff, for the file's ordered key
-/// columns, the row's value tuple is present in [`tuples`](Self::tuples) — exactly the condition the
+/// columns, the row's value tuple is present in the set — exactly the condition the
 /// per-delete-row survival predicate encodes (`NOT(AND col_i = v_i)`), but tested by hash lookup
 /// instead of by evaluating an `E`-leaf boolean tree.
 ///
@@ -67,15 +79,20 @@ use crate::{Error, ErrorKind, Result};
 /// column is ineligible the caller keeps the predicate path.
 #[derive(Debug, Clone)]
 pub(crate) struct EqDeleteKeySet {
-    /// The key columns in file order: `(iceberg field id, iceberg field name, primitive type)`. The
-    /// field id resolves the data column at apply time; the name/type are retained for diagnostics
-    /// and to re-decode the data column with the SAME `arrow_primitive_to_literal` conversion the
-    /// delete tuples were built with (so both sides are compared as identically-produced [`Datum`]s).
+    /// The key columns in file order: `(iceberg field id, iceberg field name, primitive type)`.
     key_columns: Vec<(i32, String, PrimitiveType)>,
-    /// The distinct delete-key tuples. Each tuple has one entry per key column, in `key_columns`
-    /// order; `None` is a NULL delete cell (which the predicate path encodes as `col IS NULL` and so
-    /// deletes data rows that are NULL in that column).
-    tuples: HashSet<Vec<Option<Datum>>>,
+    /// Compact membership store — see [`KeyStore`].
+    store: KeyStore,
+}
+
+/// Membership backend. Single integer-like keys use `I64` (no alloc per key); everything else
+/// uses length-tagged byte encodings compatible with [`encode_literal`] / Arrow probe encoding.
+#[derive(Debug, Clone)]
+enum KeyStore {
+    /// Single-column boolean / int32 / int64-family key.
+    I64(HashSet<i64>),
+    /// Multi-column keys, or string/binary/uuid/fixed single-column keys.
+    Bytes(HashSet<Vec<u8>>),
 }
 
 impl EqDeleteKeySet {
@@ -115,10 +132,29 @@ impl EqDeleteKeySet {
         }
     }
 
+    /// `true` when a single key column can use the specialized `HashSet<i64>` store.
+    fn is_i64_family(ty: &PrimitiveType) -> bool {
+        matches!(
+            ty,
+            PrimitiveType::Boolean
+                | PrimitiveType::Int
+                | PrimitiveType::Long
+                | PrimitiveType::Date
+                | PrimitiveType::Time
+                | PrimitiveType::Timestamp
+                | PrimitiveType::Timestamptz
+                | PrimitiveType::TimestampNs
+                | PrimitiveType::TimestamptzNs
+        )
+    }
+
     /// Build a set from the ordered key columns and the per-row delete tuples (each inner `Vec` has
     /// one entry per key column, in `key_columns` order). Returns `None` — signalling "use the
     /// predicate path" — if ANY key column type is ineligible. Duplicate tuples collapse (a set),
     /// matching the predicate path where duplicate delete rows are redundant.
+    ///
+    /// Rows with any NULL cell are retained in the set (encoded with a null tag) so membership
+    /// stays complete for a future null-aware probe; tonight's probe still bails on null data.
     pub(crate) fn try_build(
         key_columns: Vec<(i32, String, PrimitiveType)>,
         rows: Vec<Vec<Option<Datum>>>,
@@ -132,11 +168,44 @@ impl EqDeleteKeySet {
         {
             return None;
         }
-        let tuples: HashSet<Vec<Option<Datum>>> = rows.into_iter().collect();
-        Some(Self {
-            key_columns,
-            tuples,
-        })
+
+        let store = if key_columns.len() == 1 && Self::is_i64_family(&key_columns[0].2) {
+            let mut set = HashSet::with_capacity(rows.len());
+            for row in rows {
+                if row.len() != 1 {
+                    return None;
+                }
+                match &row[0] {
+                    // Null delete keys cannot hit the i64 specialized store; drop them — a
+                    // non-null data batch never matches a null delete key, and null data batches
+                    // bail to the predicate path which still carries the null-delete leaf.
+                    None => {}
+                    Some(d) => {
+                        set.insert(literal_as_i64(d.literal())?);
+                    }
+                }
+            }
+            KeyStore::I64(set)
+        } else {
+            let mut set = HashSet::with_capacity(rows.len());
+            let mut buf = Vec::with_capacity(64);
+            for row in rows {
+                if row.len() != key_columns.len() {
+                    return None;
+                }
+                buf.clear();
+                for (cell, (_, _, ty)) in row.iter().zip(key_columns.iter()) {
+                    match cell {
+                        None => encode_null(&mut buf),
+                        Some(d) => encode_literal(ty, d.literal(), &mut buf)?,
+                    }
+                }
+                set.insert(buf.clone());
+            }
+            KeyStore::Bytes(set)
+        };
+
+        Some(Self { key_columns, store })
     }
 
     /// The ordered key field ids — used to confirm a task's eq-delete files share a key schema before
@@ -148,40 +217,36 @@ impl EqDeleteKeySet {
     /// `true` if the set has no delete tuples (an eq-delete file that deletes nothing). Such a file
     /// never deletes a row, exactly like its `AlwaysTrue` survival predicate.
     pub(crate) fn is_empty(&self) -> bool {
-        self.tuples.is_empty()
+        match &self.store {
+            KeyStore::I64(s) => s.is_empty(),
+            KeyStore::Bytes(s) => s.is_empty(),
+        }
     }
 
     /// Per-row DELETE mask over `batch`: `out[i] == true` ⇒ row `i` matches some delete tuple (is
     /// deleted by this file). Resolves each key column in `batch` by Iceberg field id
-    /// (`PARQUET_FIELD_ID_META_KEY`), decodes it to [`Datum`]s with the SAME
-    /// `arrow_primitive_to_literal` conversion the delete tuples used, assembles each row's tuple,
-    /// and tests membership.
+    /// (`PARQUET_FIELD_ID_META_KEY`) and probes the compact key store via columnar accessors —
+    /// no per-cell [`Datum`] allocation on the probe path.
     ///
     /// Returns `Ok(None)` — meaning "fall back to the predicate path for this batch" — when ANY key
     /// column has a NULL in `batch`. This is the soundness boundary: null-key rows are governed by
     /// the predicate path's Java nulls-first semantics (unit A2: a NULL cell survives a value
     /// delete — `NULL != v` is TRUE — and is deleted only by a matching NULL delete tuple via
     /// `not_null`, the Java `StructLikeSet` verdict). The bail keeps this path conservative: the
-    /// predicate path is the oracle for every null-carrying batch. (Set membership over
-    /// `Option<Datum>` tuples now agrees with those verdicts in principle — extending the fast path
-    /// to null keys is a possible future optimization, deliberately not taken here.) For batches
-    /// with NO key-column NULLs, set membership is byte-identical to the predicate deletion (proven
-    /// in `delete_filter.rs`'s harness): a fully-non-null row's tuple equals a stored delete tuple
-    /// iff the predicate `OR_j (AND_i col_i = v_i)` is TRUE for it.
+    /// predicate path is the oracle for every null-carrying batch. Null-aware columnar membership
+    /// is a deliberate follow-up (FK1 residual seed).
     ///
     /// A key column ABSENT from the batch returns an error rather than silently disagreeing with the
     /// predicate path (the apply seam guarantees the eq-delete columns are projected).
     pub(crate) fn delete_mask(&self, batch: &RecordBatch) -> Result<Option<Vec<bool>>> {
         let num_rows = batch.num_rows();
-        if self.tuples.is_empty() {
+        if self.is_empty() {
             return Ok(Some(vec![false; num_rows]));
         }
 
-        // Decode each key column to per-row Datums, in key_columns order. If any key column carries a
-        // NULL, bail to the predicate path (3VL boundary above).
-        let mut decoded_columns: Vec<Vec<Option<Datum>>> =
-            Vec::with_capacity(self.key_columns.len());
-        for (field_id, field_name, primitive_type) in &self.key_columns {
+        // Resolve columns + null bail first.
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.key_columns.len());
+        for (field_id, field_name, _) in &self.key_columns {
             let column = resolve_column_by_field_id(batch, *field_id).ok_or_else(|| {
                 Error::new(
                     ErrorKind::Unexpected,
@@ -191,49 +256,329 @@ impl EqDeleteKeySet {
                     ),
                 )
             })?;
-
             if column.null_count() > 0 {
                 return Ok(None);
             }
-
-            let literals =
-                arrow_primitive_to_literal(&column, &Type::Primitive(primitive_type.clone()))?;
-            let datums: Vec<Option<Datum>> = literals
-                .into_iter()
-                .map(|maybe_literal| {
-                    maybe_literal
-                        .map(|literal| {
-                            literal
-                                .as_primitive_literal()
-                                .map(|prim| Datum::new(primitive_type.clone(), prim))
-                                .ok_or_else(|| {
-                                    Error::new(
-                                        ErrorKind::Unexpected,
-                                        "equality-delete set fast path: data cell is not a \
-                                         primitive literal",
-                                    )
-                                })
-                        })
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?;
-            decoded_columns.push(datums);
+            columns.push(column);
         }
 
-        // Assemble each row's key tuple and test membership. No key column has NULLs here, so every
-        // decoded cell is `Some` and a row's tuple matches a stored tuple only when that stored tuple
-        // is itself all-non-null and equal — exactly the predicate path's non-null deletion.
-        let mut mask = Vec::with_capacity(num_rows);
-        let mut tuple_buf: Vec<Option<Datum>> = Vec::with_capacity(self.key_columns.len());
-        for row in 0..num_rows {
-            tuple_buf.clear();
-            for column in &decoded_columns {
-                tuple_buf.push(column[row].clone());
+        match &self.store {
+            KeyStore::I64(set) => {
+                debug_assert_eq!(self.key_columns.len(), 1);
+                let ty = &self.key_columns[0].2;
+                let values = i64_column_values(&columns[0], ty)?;
+                let mut mask = Vec::with_capacity(num_rows);
+                for v in values {
+                    mask.push(set.contains(&v));
+                }
+                Ok(Some(mask))
             }
-            mask.push(self.tuples.contains(&tuple_buf));
+            KeyStore::Bytes(set) => {
+                let mut mask = Vec::with_capacity(num_rows);
+                let mut buf = Vec::with_capacity(64);
+                for row in 0..num_rows {
+                    buf.clear();
+                    for (col, (_, _, ty)) in columns.iter().zip(self.key_columns.iter()) {
+                        encode_arrow_cell(col, ty, row, &mut buf)?;
+                    }
+                    mask.push(set.contains(&buf));
+                }
+                Ok(Some(mask))
+            }
         }
-        Ok(Some(mask))
     }
+}
+
+// ===========================================================================
+// Encoding — Datum/Literal side and Arrow probe side share the same layout
+// ===========================================================================
+
+/// Null cell tag (only used when encoding delete-side nulls into the Bytes store).
+const TAG_NULL: u8 = 0;
+const TAG_PRESENT: u8 = 1;
+
+fn encode_null(out: &mut Vec<u8>) {
+    out.push(TAG_NULL);
+}
+
+/// Encode a present primitive literal into `out`. Returns `None` if the literal shape does not
+/// match the declared column type (build-time refuse → fall back to predicate path).
+fn encode_literal(ty: &PrimitiveType, lit: &PrimitiveLiteral, out: &mut Vec<u8>) -> Option<()> {
+    out.push(TAG_PRESENT);
+    match (ty, lit) {
+        (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(v)) => {
+            out.push(u8::from(*v));
+            Some(())
+        }
+        (PrimitiveType::Int | PrimitiveType::Date, PrimitiveLiteral::Int(v)) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            Some(())
+        }
+        (
+            PrimitiveType::Long
+            | PrimitiveType::Time
+            | PrimitiveType::Timestamp
+            | PrimitiveType::Timestamptz
+            | PrimitiveType::TimestampNs
+            | PrimitiveType::TimestamptzNs,
+            PrimitiveLiteral::Long(v),
+        ) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            Some(())
+        }
+        (PrimitiveType::String, PrimitiveLiteral::String(s)) => {
+            let bytes = s.as_bytes();
+            let len = u32::try_from(bytes.len()).ok()?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(bytes);
+            Some(())
+        }
+        (PrimitiveType::Binary | PrimitiveType::Fixed(_), PrimitiveLiteral::Binary(b)) => {
+            let len = u32::try_from(b.len()).ok()?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(b);
+            Some(())
+        }
+        (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(v)) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            Some(())
+        }
+        // Int128 path for UUID is not expected from Datum::new on Uuid, but refuse rather than
+        // silently mis-encode.
+        _ => None,
+    }
+}
+
+fn literal_as_i64(lit: &PrimitiveLiteral) -> Option<i64> {
+    match lit {
+        PrimitiveLiteral::Boolean(v) => Some(i64::from(*v)),
+        PrimitiveLiteral::Int(v) => Some(i64::from(*v)),
+        PrimitiveLiteral::Long(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Extract non-null i64-family values from an Arrow column (nulls already refused by caller).
+fn i64_column_values(column: &ArrayRef, ty: &PrimitiveType) -> Result<Vec<i64>> {
+    match ty {
+        PrimitiveType::Boolean => {
+            let a = column
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| type_mismatch("BooleanArray", column))?;
+            Ok((0..a.len()).map(|i| i64::from(a.value(i))).collect())
+        }
+        PrimitiveType::Int => {
+            let a = column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| type_mismatch("Int32Array", column))?;
+            Ok((0..a.len()).map(|i| i64::from(a.value(i))).collect())
+        }
+        PrimitiveType::Date => {
+            let a = column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| type_mismatch("Date32Array", column))?;
+            Ok((0..a.len()).map(|i| i64::from(a.value(i))).collect())
+        }
+        PrimitiveType::Long => {
+            let a = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| type_mismatch("Int64Array", column))?;
+            Ok((0..a.len()).map(|i| a.value(i)).collect())
+        }
+        PrimitiveType::Time => {
+            if let Some(a) = column.as_any().downcast_ref::<Time64MicrosecondArray>() {
+                Ok((0..a.len()).map(|i| a.value(i)).collect())
+            } else if let Some(a) = column.as_any().downcast_ref::<Int64Array>() {
+                Ok((0..a.len()).map(|i| a.value(i)).collect())
+            } else {
+                Err(type_mismatch("Time64MicrosecondArray|Int64Array", column))
+            }
+        }
+        PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+            if let Some(a) = column.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                Ok((0..a.len()).map(|i| a.value(i)).collect())
+            } else if let Some(a) = column.as_any().downcast_ref::<Int64Array>() {
+                Ok((0..a.len()).map(|i| a.value(i)).collect())
+            } else {
+                Err(type_mismatch(
+                    "TimestampMicrosecondArray|Int64Array",
+                    column,
+                ))
+            }
+        }
+        PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
+            if let Some(a) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                Ok((0..a.len()).map(|i| a.value(i)).collect())
+            } else if let Some(a) = column.as_any().downcast_ref::<Int64Array>() {
+                Ok((0..a.len()).map(|i| a.value(i)).collect())
+            } else {
+                Err(type_mismatch("TimestampNanosecondArray|Int64Array", column))
+            }
+        }
+        other => Err(Error::new(
+            ErrorKind::Unexpected,
+            format!("equality-delete set: i64 store used for non-i64 type {other:?}"),
+        )),
+    }
+}
+
+/// Encode one non-null Arrow cell at `row` into `out` with the same layout as [`encode_literal`].
+fn encode_arrow_cell(
+    column: &ArrayRef,
+    ty: &PrimitiveType,
+    row: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.push(TAG_PRESENT);
+    match ty {
+        PrimitiveType::Boolean => {
+            let a = column
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| type_mismatch("BooleanArray", column))?;
+            out.push(u8::from(a.value(row)));
+        }
+        PrimitiveType::Int => {
+            let a = column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| type_mismatch("Int32Array", column))?;
+            out.extend_from_slice(&a.value(row).to_le_bytes());
+        }
+        PrimitiveType::Date => {
+            let a = column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| type_mismatch("Date32Array", column))?;
+            out.extend_from_slice(&a.value(row).to_le_bytes());
+        }
+        PrimitiveType::Long => {
+            let a = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| type_mismatch("Int64Array", column))?;
+            out.extend_from_slice(&a.value(row).to_le_bytes());
+        }
+        PrimitiveType::Time => {
+            let v = if let Some(a) = column.as_any().downcast_ref::<Time64MicrosecondArray>() {
+                a.value(row)
+            } else if let Some(a) = column.as_any().downcast_ref::<Int64Array>() {
+                a.value(row)
+            } else {
+                return Err(type_mismatch("Time64MicrosecondArray|Int64Array", column));
+            };
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+            let v = if let Some(a) = column.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                a.value(row)
+            } else if let Some(a) = column.as_any().downcast_ref::<Int64Array>() {
+                a.value(row)
+            } else {
+                return Err(type_mismatch(
+                    "TimestampMicrosecondArray|Int64Array",
+                    column,
+                ));
+            };
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
+            let v = if let Some(a) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                a.value(row)
+            } else if let Some(a) = column.as_any().downcast_ref::<Int64Array>() {
+                a.value(row)
+            } else {
+                return Err(type_mismatch("TimestampNanosecondArray|Int64Array", column));
+            };
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        PrimitiveType::String => {
+            let bytes = if let Some(a) = column.as_any().downcast_ref::<StringArray>() {
+                a.value(row).as_bytes()
+            } else if let Some(a) = column.as_any().downcast_ref::<LargeStringArray>() {
+                a.value(row).as_bytes()
+            } else {
+                return Err(type_mismatch("StringArray|LargeStringArray", column));
+            };
+            let len = u32::try_from(bytes.len()).map_err(|_| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "equality-delete set: string key longer than u32::MAX",
+                )
+            })?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        PrimitiveType::Binary | PrimitiveType::Fixed(_) => {
+            let bytes = if let Some(a) = column.as_any().downcast_ref::<BinaryArray>() {
+                a.value(row)
+            } else if let Some(a) = column.as_any().downcast_ref::<LargeBinaryArray>() {
+                a.value(row)
+            } else if let Some(a) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                a.value(row)
+            } else {
+                return Err(type_mismatch(
+                    "BinaryArray|LargeBinaryArray|FixedSizeBinaryArray",
+                    column,
+                ));
+            };
+            let len = u32::try_from(bytes.len()).map_err(|_| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "equality-delete set: binary key longer than u32::MAX",
+                )
+            })?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        PrimitiveType::Uuid => {
+            // UUID is FixedSizeBinary(16) on the Arrow side; Datum stores `uuid.as_u128()`.
+            let bytes = if let Some(a) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                a.value(row)
+            } else if let Some(a) = column.as_any().downcast_ref::<BinaryArray>() {
+                a.value(row)
+            } else {
+                return Err(type_mismatch(
+                    "FixedSizeBinaryArray|BinaryArray (uuid)",
+                    column,
+                ));
+            };
+            let arr: [u8; 16] = bytes.try_into().map_err(|_| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "equality-delete set: uuid key must be 16 bytes, got {}",
+                        bytes.len()
+                    ),
+                )
+            })?;
+            let v = uuid::Uuid::from_bytes(arr).as_u128();
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        other => {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "equality-delete set: encode_arrow_cell on ineligible/unhandled type {other:?}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn type_mismatch(expected: &str, column: &ArrayRef) -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        format!(
+            "equality-delete set fast path: expected {expected}, got {:?}",
+            column.data_type()
+        ),
+    )
 }
 
 /// Resolve a batch column by its Iceberg field id (`PARQUET_FIELD_ID_META_KEY` field metadata),
@@ -249,4 +594,62 @@ fn resolve_column_by_field_id(batch: &RecordBatch, field_id: i32) -> Option<Arra
         }
     }
     None
+}
+
+#[cfg(test)]
+mod fk1_microbench {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    use super::EqDeleteKeySet;
+    use crate::spec::{Datum, PrimitiveType};
+
+    fn long_batch(values: Vec<i64>, field_id: i32) -> RecordBatch {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+        let field = Field::new("id", DataType::Int64, false).with_metadata(metadata);
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
+            .expect("batch")
+    }
+
+    /// Hour-0 / after wall for single-column Long keyset apply.
+    /// Run: `cargo test -p iceberg --lib fk1_eq_delete_apply_microbench -- --nocapture --ignored`
+    #[test]
+    #[ignore = "manual hour-0 / after microbench — not part of the default gate"]
+    fn fk1_eq_delete_apply_microbench() {
+        let n_data: i64 = 1_000_000;
+        for n_del in [100_000i64, 1_000_000i64] {
+            let delete_rows: Vec<Vec<Option<Datum>>> =
+                (0..n_del).map(|i| vec![Some(Datum::long(i * 2))]).collect();
+            let set = EqDeleteKeySet::try_build(
+                vec![(1, "id".to_string(), PrimitiveType::Long)],
+                delete_rows,
+            )
+            .expect("Long set builds");
+
+            let data: Vec<i64> = (0..n_data).collect();
+            let batch = long_batch(data, 1);
+
+            // Warmup
+            let _ = set.delete_mask(&batch).expect("mask");
+
+            let t0 = Instant::now();
+            let mask = set.delete_mask(&batch).expect("mask").expect("non-null");
+            let elapsed = t0.elapsed();
+            let ns_per_row = elapsed.as_nanos() as f64 / n_data as f64;
+            let deleted: usize = mask.iter().filter(|d| **d).count();
+            eprintln!(
+                "FK1 microbench: data={n_data} deletes={n_del} wall={elapsed:?} \
+                 ns/row={ns_per_row:.2} deleted={deleted}"
+            );
+            assert_eq!(mask.len(), n_data as usize);
+            // Every even key in [0, n_del*2) that is also < n_data is deleted.
+            assert!(deleted > 0);
+        }
+    }
 }
