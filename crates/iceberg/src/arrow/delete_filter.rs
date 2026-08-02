@@ -2067,6 +2067,57 @@ pub(crate) mod tests {
         assert_eq!(mask, vec![true, false]);
     }
 
+    /// Timestamptz (micros) — same physical I64 path as Timestamp; pins the type arm.
+    #[test]
+    fn test_h6_set_timestamptz_matches_oracle() {
+        use arrow_array::TimestampMicrosecondArray;
+        let schema = opt_schema(vec![(1, "tsz", PrimitiveType::Timestamptz)]);
+        let key_columns = vec![(1, "tsz".to_string(), PrimitiveType::Timestamptz)];
+        let delete_rows = vec![vec![Some(Datum::timestamptz_micros(5_000_000))]];
+        let data: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![Some(5_000_000i64), Some(6_000_000)])
+                .with_timezone("UTC"),
+        );
+        let mask = assert_set_matches_oracle(schema, key_columns, &["tsz"], delete_rows, vec![(
+            "tsz", data,
+        )]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// Multi-column Bytes store retains null tags (unlike I64). Null-only delete tuples must
+    /// keep the set non-empty and null-bail so the predicate `IS NULL` leaves still apply.
+    #[test]
+    fn test_h6_set_multi_column_null_only_bails_on_null_data() {
+        use arrow_array::StringArray;
+        let schema = opt_schema(vec![
+            (1, "id", PrimitiveType::Long),
+            (2, "name", PrimitiveType::String),
+        ]);
+        let key_columns = vec![
+            (1, "id".to_string(), PrimitiveType::Long),
+            (2, "name".to_string(), PrimitiveType::String),
+        ];
+        // Full-null delete tuple — Bytes encodes TAG_NULL per cell.
+        let delete_rows = vec![vec![None, None]];
+        let set = EqDeleteKeySet::try_build(key_columns, delete_rows.clone()).expect("set builds");
+        assert!(
+            !set.is_empty(),
+            "Bytes null-only multi-col set must be non-empty (null tags retained)"
+        );
+
+        let id: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None]));
+        let name: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
+        let batch = batch_with_field_ids(vec![("id", id), ("name", name)]);
+        assert_eq!(
+            set.delete_mask(&batch).expect("delete_mask"),
+            None,
+            "null data must bail for Bytes null-only multi-col deletes"
+        );
+        let oracle = multi_col_oracle_deleted_mask(&["id", "name"], schema, &delete_rows, &batch);
+        // Only the all-null data row matches the all-null delete tuple.
+        assert_eq!(oracle, vec![false, true]);
+    }
+
     /// String key — empty string, no-match. (Non-null data → set path.)
     #[test]
     fn test_h6_set_string_matches_oracle() {
