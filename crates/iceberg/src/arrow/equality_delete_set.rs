@@ -240,11 +240,12 @@ impl EqDeleteKeySet {
     /// predicate path (the apply seam guarantees the eq-delete columns are projected).
     pub(crate) fn delete_mask(&self, batch: &RecordBatch) -> Result<Option<Vec<bool>>> {
         let num_rows = batch.num_rows();
-        if self.is_empty() {
-            return Ok(Some(vec![false; num_rows]));
-        }
 
-        // Resolve columns + null bail first.
+        // Resolve columns + null bail BEFORE the empty short-circuit. The I64 store drops null
+        // delete cells (they cannot be represented as i64); a file whose only deletes are NULL
+        // therefore builds an empty I64 set. Empty-first would return `Some(all-false)` and skip
+        // the predicate fallback, under-deleting null data rows that the survival predicate's
+        // `col IS NULL` leaf must remove. Null-carrying batches always route to the oracle.
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.key_columns.len());
         for (field_id, field_name, _) in &self.key_columns {
             let column = resolve_column_by_field_id(batch, *field_id).ok_or_else(|| {
@@ -260,6 +261,12 @@ impl EqDeleteKeySet {
                 return Ok(None);
             }
             columns.push(column);
+        }
+
+        // No key-column NULLs: an empty set deletes nothing among non-null data (null-only
+        // delete files also correctly delete nothing here — null deletes never match non-null).
+        if self.is_empty() {
+            return Ok(Some(vec![false; num_rows]));
         }
 
         match &self.store {

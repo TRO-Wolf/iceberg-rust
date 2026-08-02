@@ -2311,6 +2311,53 @@ pub(crate) mod tests {
         );
     }
 
+    /// Critic-octo FK1 cycle 1: I64 store drops null delete cells; if `delete_mask` short-circuits
+    /// on `is_empty()` *before* the null-data bail, a null-only Long delete file returns
+    /// `Some(all-false)` and under-deletes null data. Null bail must win so the predicate's
+    /// `col IS NULL` leaf still applies.
+    ///
+    /// **MUTATION:** restore empty-before-null order in `delete_mask` → this test goes RED.
+    #[test]
+    fn test_h6_set_null_only_i64_delete_bails_on_null_data() {
+        let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Long)];
+        // Only NULL delete keys — I64 store ends empty (nulls cannot be stored as i64).
+        let delete_rows = vec![vec![None], vec![None]];
+        let set =
+            EqDeleteKeySet::try_build(key_columns, delete_rows.clone()).expect("Long set builds");
+        assert!(
+            set.is_empty(),
+            "null-only I64 deletes must produce an empty specialized store"
+        );
+
+        let data: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None, Some(2)]));
+        let batch = batch_with_field_ids(vec![("v", data)]);
+
+        assert_eq!(
+            set.delete_mask(&batch).expect("delete_mask"),
+            None,
+            "null-only I64 delete file + null data batch must bail to the predicate path \
+             (empty short-circuit must not run first)"
+        );
+
+        // Oracle: NULL delete deletes only the NULL data row.
+        let oracle = multi_col_oracle_deleted_mask(&["v"], schema, &delete_rows, &batch);
+        assert_eq!(
+            oracle,
+            vec![false, true, false],
+            "predicate oracle: null-only delete set deletes null data rows only"
+        );
+
+        // Non-null data: empty set correctly deletes nothing (null deletes never match values).
+        let non_null: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), Some(2)]));
+        let non_null_batch = batch_with_field_ids(vec![("v", non_null)]);
+        assert_eq!(
+            set.delete_mask(&non_null_batch).expect("delete_mask"),
+            Some(vec![false, false]),
+            "null-only I64 deletes delete nothing among fully non-null data"
+        );
+    }
+
     /// THE GATE: Float / Double key columns must NOT build a set (route to the predicate fallback),
     /// and Decimal / Unknown are likewise excluded. This is what keeps the proven-divergent float
     /// case on the untouched predicate path. (Time and Fixed are NOT excluded — they gained a
