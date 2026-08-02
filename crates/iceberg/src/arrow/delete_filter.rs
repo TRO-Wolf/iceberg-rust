@@ -2084,6 +2084,23 @@ pub(crate) mod tests {
         assert_eq!(mask, vec![true, false]);
     }
 
+    /// TimestampNs — I64 store via TimestampNanosecondArray.
+    #[test]
+    fn test_h6_set_timestamp_ns_matches_oracle() {
+        use arrow_array::TimestampNanosecondArray;
+        let schema = opt_schema(vec![(1, "tsn", PrimitiveType::TimestampNs)]);
+        let key_columns = vec![(1, "tsn".to_string(), PrimitiveType::TimestampNs)];
+        let delete_rows = vec![vec![Some(Datum::timestamp_nanos(1_000_000_000))]];
+        let data: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+            Some(1_000_000_000i64),
+            Some(2_000_000_000),
+        ]));
+        let mask = assert_set_matches_oracle(schema, key_columns, &["tsn"], delete_rows, vec![(
+            "tsn", data,
+        )]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
     /// Multi-column Bytes store retains null tags (unlike I64). Null-only delete tuples must
     /// keep the set non-empty and null-bail so the predicate `IS NULL` leaves still apply.
     #[test]
