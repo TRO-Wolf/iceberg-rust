@@ -91,25 +91,30 @@ Streaming is a memory / peak-RSS win (no full-file `Vec` of decoded batches on t
 - Shared: `build_scan_task_transformer`, `resolve_whole_file_delete_context`, `apply_pos_aware_batch`
 - Avro/ORC `finish_whole_file_scan_task` uses the same per-batch apply
 
-### Pins green
+### Pins green (12)
 - `fk5_pos_projection_multi_batch_continuity`
 - `fk5_pos_oracle_dense_pos_deletes`
 - `fk5_pos_oracle_sparse_pos_deletes_multi_rg`
 - `fk5_pos_oracle_residual_and_pos_deletes`
 - `fk5_pos_mutation_absolute_pos_advances_by_full_batch`
 - `fk5_merge_shaped_pos_delete_from_streamed_identity_scan`
+- `fk5_pos_residual_empties_first_batch_preserves_physical_pos`
+- `fk5_pos_all_rows_position_deleted`
+- `fk5_pos_single_vs_multi_batch_identity`
+- `fk5_pos_with_equality_deletes`
+- `fk5_pos_with_file_metadata_column`
+- `fk5_pos_residual_and_pos_and_eq_deletes`
 - pre-existing `test_scan_projects_pos_metadata_column` + avro/orc pos-delete suite
 
-### Mutation RED (pre-commit)
-Advance `absolute_pos` by **filtered survivor count** instead of pre-filter `row_count` in `apply_pos_aware_batch` →  
-`fk5_pos_mutation_absolute_pos_advances_by_full_batch` **FAILED**:
-```
-left:  [(2, 2), (4, 4), (5, 5)]
-right: [(2, 2), (3, 3), (4, 4), (5, 5)]
-```
-(batch-1 pos-delete base shifted; over-deleted id 3). Restored before commit.
+### Mutation RED (within octo)
+1. Advance `absolute_pos` by **filtered survivor count** → mutation bait RED (over-delete id 3)
+2. Off-by-one `batch_base` (advance before use) → dense oracle RED (under-delete)
+3. Skip `absolute_pos` advance → dual-counter `debug_assert` RED
 
-Note: `_pos` *column* values are assigned by `RecordBatchTransformer::next_row_position` (full-batch advance, independently tested); `absolute_pos` drives pos-delete `survival_mask` base. Both must stay physical-ordinal-aligned.
+Note: `_pos` *column* values are assigned by `RecordBatchTransformer::next_row_position` (full-batch advance); `absolute_pos` drives pos-delete `survival_mask` base. `debug_assert` pins first `_pos` == `batch_base` when projected.
 
 ### Critic-octo
-See `/tmp/critic-octo-fk5-2026-08-08/OCTO-REPORT.md`
+**Label:** OCTO-CONVERGED (8/8, `early_stop=false`)  
+**Actor tip:** `b89c8409`  
+**Critic tip:** `41b0448a`  
+Scratch: `/tmp/critic-octo-fk5-2026-08-08/OCTO-REPORT.md`
