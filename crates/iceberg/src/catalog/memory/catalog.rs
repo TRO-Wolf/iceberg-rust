@@ -460,11 +460,15 @@ impl Catalog for MemoryCatalog {
     /// Drop a table from the catalog.
     ///
     /// Removes the pointer under a short lock, then deletes the metadata file outside it.
+    /// Evicts the opt-in pointer-cache entry for the dropped location (if a cache is injected).
     async fn drop_table(&self, table_ident: &TableIdent) -> Result<()> {
         let metadata_location = {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
             root_namespace_state.remove_existing_table(table_ident)?
         };
+        if let Some(cache) = self.table_metadata_cache.as_ref() {
+            cache.invalidate(&metadata_location);
+        }
         self.file_io.delete(&metadata_location).await
     }
 
@@ -3348,6 +3352,23 @@ pub(crate) mod tests {
             cache.stats().body_fetches,
             0,
             "commit-retry refresh of unchanged pointer must not re-GET body"
+        );
+    }
+
+    /// `drop_table` must evict the pointer-cache entry so a recycled location cannot soft-reuse.
+    #[tokio::test]
+    async fn test_fk4_1_drop_table_evicts_cache_entry() {
+        let cache = Arc::new(TableMetadataCache::new());
+        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
+        let table = create_table_with_namespace(&catalog).await;
+        let ident = table.identifier().clone();
+        let pointer = table.metadata_location().unwrap().to_string();
+        assert!(cache.lookup(&pointer, None).is_some());
+
+        catalog.drop_table(&ident).await.expect("drop");
+        assert!(
+            cache.lookup(&pointer, None).is_none(),
+            "drop_table must invalidate the metadata-location cache entry"
         );
     }
 
