@@ -838,9 +838,19 @@ impl TableScan {
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
-        // Process the delete file [`ManifestEntry`] stream in parallel.
-        // Entry work runs inline under `try_for_each_concurrent` — a nested per-entry
-        // `spawn` only added task overhead without extra parallelism beyond the concurrent limit.
+        // Process delete-file and data-file [`ManifestEntry`] streams CONCURRENTLY (FK2.2 /
+        // scout #14). The previous barrier (awaiting all delete entries before starting data
+        // processing) was not correctness-required: `DeleteFileIndex::get_deletes_for_data_file`
+        // already parks on `Notify` until the index is published (all delete senders drop →
+        // populate task collects → `PopulateGuard::publish` → `notify_waiters`). Overlapping the
+        // two streams lets plan latency approach max(T_del, T_data) instead of T_del + T_data.
+        //
+        // Hang classes (lost-wakeup after publish; failed-populate leaving state stranded at
+        // `Populating`) are pinned by inject-only deterministic tests in `delete_file_index.rs`
+        // with generous bounded timeouts — no loom, no stress harness.
+        //
+        // Entry work runs inline under `try_for_each_concurrent` — a nested per-entry `spawn`
+        // only added task overhead without extra parallelism beyond the concurrent limit.
         spawn(async move {
             let result = manifest_entry_delete_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
@@ -857,10 +867,11 @@ impl TableScan {
                     .send(Err(error))
                     .await;
             }
-        })
-        .await;
+        });
 
-        // Process the data file [`ManifestEntry`] stream in parallel (inline under concurrent limit).
+        // Process the data file [`ManifestEntry`] stream in parallel (inline under concurrent
+        // limit). Data entries that reach `into_file_scan_task` park on the delete index until
+        // it is populated — concurrent with the delete-entry processor above.
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))

@@ -7,9 +7,9 @@
 
 ## Sequencing
 FK2 is three cuts; **strict serial** per campaign brief:
-1. **FK2.1** Arc-share `FileScanTask` innards (scout #5) — this unit
-2. FK2.2 overlap delete/data manifest planning (scout #14) — **after FK3 / FK4.1**
-3. FK2.3 delete-index keys (scout #15) — **after FK3 / FK4.1**
+1. **FK2.1** Arc-share `FileScanTask` innards (scout #5) — done (mid-unit was 2.1)
+2. **FK2.2** overlap delete/data manifest planning (scout #14) — **this unit** (after FK3 / FK4.1)
+3. **FK2.3** delete-index keys (scout #15) — **this unit** (after FK3 / FK4.1)
 
 ---
 
@@ -75,7 +75,93 @@ Scratch: `/tmp/critic-octo-fk2_1-2026-08-08/`
 | 5–7 | concurrency / reader / changelog alias attacks | no OPEN ≥ S1 |
 | 8 | gate re-proof | OCTO-REPORT |
 
-### Not in this unit
+### Not in this unit (FK2.1)
 - FK2.2 / FK2.3
 - Cargo.toml (frozen)
 - Delete-index / planning overlap
+
+---
+
+## FK2.2 — overlap delete/data manifest planning (scout #14)
+
+**Worktree:** `/tmp/iceberg-rust-fk2_23`  
+**Base tip:** `23867023` (includes FK1, FK2.1, FK3, FK4.1)
+
+### Change
+`crates/iceberg/src/scan/mod.rs` `TableScan::plan_files`:
+
+- **Removed** the correctness-unnecessary barrier that `.await`ed the delete-entry
+  processor before starting the data-entry processor.
+- Delete-entry + data-entry streams now run **concurrently** (both fire-and-forget
+  `spawn`s, same shape as the pre-existing data path).
+- Data-entry processing that reaches `into_file_scan_task` parks on the existing
+  `DeleteFileIndex` `Notify` until the index is published (all delete senders drop →
+  populate task collects → `PopulateGuard::publish` → `notify_waiters`).
+- Plan latency approaches `max(T_del, T_data)` instead of `T_del + T_data`.
+
+### Hang-test design (inject-only, bounded timeouts; NO loom, NO stress harness)
+
+| Pin | Hang class | Mechanism |
+|---|---|---|
+| `test_fk2_2_get_deletes_does_not_lose_wakeup_when_publish_races` | lost-wakeup | Concurrent waiter on `get_deletes_for_data_file`; yield to arm under read lock; publish via `PopulateGuard`; 5s timeout must complete |
+| `test_fk2_2_failed_populate_wakes_concurrent_waiters_with_typed_error` | failed-populate | Two concurrent waiters; inject `Failed` via production publisher; both must error (not hang) under 5s |
+| `test_fk2_2_sender_drop_publishes_and_wakes_waiter` | natural concurrent path | Send one delete context, concurrent waiter, drop sender → populate publishes → waiter gets the delete |
+| Pre-existing SAF-007 suite | lost-wakeup + dead/never-polled/unwind populate | `test_waiter_is_armed_*`, `test_dead_populate_*`, `test_never_polled_*`, `test_unwinding_*` |
+
+Mutation RED: arming `Notified` after releasing the read lock → lost-wakeup timeout; removing
+`Failed` terminal → hang.
+
+### Public API
+None. Internal plan-path concurrency only.
+
+---
+
+## FK2.3 — delete-index keys (scout #15)
+
+### Change
+`crates/iceberg/src/delete_file_index.rs` `PopulatedDeleteFileIndex`:
+
+- Partition maps keyed by **`(partition_spec_id, Struct)`** (`PartitionDeleteKey`) — was
+  `Struct` alone with a post-filter linear `spec_id` compare.
+- Global / eq-partition / pos-partition / pos-path lists **sorted by data sequence once**
+  at build (`sort_deletes_by_sequence`).
+- Lookup uses **`partition_point`** via `applicable_eq_deletes` (`delete_seq > data_seq`)
+  and `applicable_pos_deletes` (`delete_seq >= data_seq`) — Java `findStartIndex` shape.
+- Wrong key = delete resurrection across evolved specs that share partition values.
+
+### Multi-spec identical-result-set pins
+
+| Pin | Bar |
+|---|---|
+| `test_fk2_3_multi_spec_identical_result_sets_no_cross_spec_resurrection` | Same partition tuple under specs 1 and 2; each data file gets ONLY its own spec's eq+pos deletes; cross-spec paths must not appear |
+| `test_fk2_3_multi_spec_seq_sorted_partition_point_identical_sets` | Multi-seq tails under two specs; insertion order reversed at build; applicable sets at `data_seq=4` match exact ordered paths (eq `>` / pos `>=`) |
+| Pre-existing | `test_partition_scoped_pos_delete_still_requires_matching_partition_and_spec`, different-spec empty set in `test_delete_file_index_partitioned` |
+
+Mutation RED: key by `Struct` alone → cross-spec resurrection; off-by-one on eq/pos seq
+predicate → boundary delete moves; skip sort-at-build → partition_point wrong on reversed insert.
+
+### Public API
+None. `DeleteFileIndex` remains `pub(crate)`.
+
+---
+
+## Mid-unit gate (FK2.2 + FK2.3)
+
+| Gate | Command | Exit |
+|---|---|---|
+| delete_file_index | `cargo test -p iceberg --lib delete_file_index` | **0** (28 passed, incl. FK2.2 hang + FK2.3 multi-spec pins) |
+| scan module | `cargo test -p iceberg --lib scan::` | **0** (196 passed) |
+| clippy lib | `cargo clippy -p iceberg --lib -- -D warnings` | **0** |
+
+### map.md
+`crates/iceberg/src/scan/map.md` updated: plan_files concurrent delete/data (FK2.2); delete-index
+composite keys + hang/resurrection failure modes (FK2.3).
+
+### Critic-octo FK2.2+2.3 (8 cycles) — see OCTO-REPORT
+Scratch: `/tmp/critic-octo-fk2_23-2026-08-08/`
+
+### Not in this unit
+- FK4.2 / FK5
+- Cargo.toml (frozen)
+- Plan-wide projection Arc residual (FK2.1 S3 seed)
+- Hour-0 plan_files wall-time bench (structural win; measure deferred)
