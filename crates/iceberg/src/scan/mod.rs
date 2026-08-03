@@ -3123,7 +3123,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let mut paths: Vec<String> =
-                tasks.into_iter().map(|task| task.data_file_path).collect();
+                tasks.into_iter().map(|task| task.data_file_path.to_string()).collect();
             paths.sort();
             paths
         }
@@ -3190,7 +3190,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let mut paths: Vec<String> =
-                tasks.into_iter().map(|task| task.data_file_path).collect();
+                tasks.into_iter().map(|task| task.data_file_path.to_string()).collect();
             paths.sort();
             paths
         }
@@ -3240,15 +3240,11 @@ pub mod tests {
         tasks.sort_by_key(|t| t.data_file_path.to_string());
 
         // Check first task is added data file
-        assert_eq!(
-            tasks[0].data_file_path,
-            format!("{}/1.parquet", &fixture.table_location)
+        assert_eq!(tasks[0].data_file_path.as_ref(), format!("{}/1.parquet", &fixture.table_location)
         );
 
         // Check second task is existing data file
-        assert_eq!(
-            tasks[1].data_file_path,
-            format!("{}/3.parquet", &fixture.table_location)
+        assert_eq!(tasks[1].data_file_path.as_ref(), format!("{}/3.parquet", &fixture.table_location)
         );
     }
 
@@ -3507,13 +3503,9 @@ pub mod tests {
         // Identical to `test_plan_files_no_deletions`: 1.parquet (Added) + 3.parquet
         // (Existing); the 2.parquet Deleted tombstone is filtered out.
         assert_eq!(tasks.len(), 2);
-        assert_eq!(
-            tasks[0].data_file_path,
-            format!("{}/1.parquet", &fixture.table_location)
+        assert_eq!(tasks[0].data_file_path.as_ref(), format!("{}/1.parquet", &fixture.table_location)
         );
-        assert_eq!(
-            tasks[1].data_file_path,
-            format!("{}/3.parquet", &fixture.table_location)
+        assert_eq!(tasks[1].data_file_path.as_ref(), format!("{}/3.parquet", &fixture.table_location)
         );
     }
 
@@ -3665,9 +3657,7 @@ pub mod tests {
 
         // Only the `x == 1` file survives; the `x == 2` file's manifest was pruned.
         assert_eq!(tasks.len(), 1);
-        assert_eq!(
-            tasks[0].data_file_path,
-            format!("{}/p1.parquet", &fixture.table_location)
+        assert_eq!(tasks[0].data_file_path.as_ref(), format!("{}/p1.parquet", &fixture.table_location)
         );
         assert!(
             !tasks
@@ -4777,7 +4767,7 @@ pub mod tests {
             .unwrap();
         for task in &tasks {
             assert_eq!(
-                task.predicate.as_ref(),
+                task.predicate.as_deref(),
                 Some(&expected_residual),
                 "task predicate must be the reduced residual `y > 0`, not the full \
                  `x == 1 AND y > 0` filter"
@@ -4794,9 +4784,7 @@ pub mod tests {
 
         assert_eq!(tasks.len(), 2);
         for task in &tasks {
-            assert_eq!(
-                task.predicate,
-                Some(BoundPredicate::AlwaysTrue),
+            assert_eq!(task.predicate.as_deref(), Some(&BoundPredicate::AlwaysTrue),
                 "a filter fully implied by the partition must reduce to AlwaysTrue"
             );
         }
@@ -4837,9 +4825,7 @@ pub mod tests {
         // the table default (unpartitioned) spec instead would leave the residual as the
         // full `x == 1` (no reduction), so this predicate assertion pins that the residual
         // is computed from the FILE's own `partition_spec_id`, not the table default.
-        assert_eq!(
-            task.predicate,
-            Some(BoundPredicate::AlwaysTrue),
+        assert_eq!(task.predicate.as_deref(), Some(&BoundPredicate::AlwaysTrue),
             "residual must be reduced by the file's own identity(x) spec (0), not \
              the unpartitioned default spec (1)"
         );
@@ -4868,7 +4854,7 @@ pub mod tests {
             .less_than(Datum::long(3))
             .bind(tasks[0].schema.clone(), true)
             .unwrap();
-        assert_eq!(tasks[0].predicate.as_ref(), Some(&expected_residual));
+        assert_eq!(tasks[0].predicate.as_deref(), Some(&expected_residual));
 
         // Now read through the residual and assert the known-correct row set.
         let mut fixture = TableTestFixture::new();
@@ -4935,7 +4921,7 @@ pub mod tests {
         let expected = filter.bind(tasks[0].schema.clone(), true).unwrap();
         for task in &tasks {
             assert_eq!(
-                task.predicate.as_ref(),
+                task.predicate.as_deref(),
                 Some(&expected),
                 "an unpartitioned table's residual is the full filter, unchanged"
             );
@@ -5407,7 +5393,7 @@ pub mod tests {
             .bind(tasks[0].schema.clone(), true)
             .unwrap();
         assert_eq!(
-            tasks[0].predicate.as_ref(),
+            tasks[0].predicate.as_deref(),
             Some(&expected_residual),
             "truncate(x,100)==0 strictly implies x < 100, so the residual is `y > 0`"
         );
@@ -5586,16 +5572,16 @@ pub mod tests {
                 .unwrap(),
         );
         let task = FileScanTask {
-            data_file_path: "data_file_path".to_string(),
+            data_file_path: Arc::from("data_file_path"),
             file_size_in_bytes: 0,
             start: 0,
             length: 100,
-            project_field_ids: vec![1, 2, 3],
+            project_field_ids: Arc::from(vec![1, 2, 3]),
             predicate: None,
             schema: schema.clone(),
             record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -5606,16 +5592,16 @@ pub mod tests {
 
         // with predicate
         let task = FileScanTask {
-            data_file_path: "data_file_path".to_string(),
+            data_file_path: Arc::from("data_file_path"),
             file_size_in_bytes: 0,
             start: 0,
             length: 100,
-            project_field_ids: vec![1, 2, 3],
-            predicate: Some(BoundPredicate::AlwaysTrue),
+            project_field_ids: Arc::from(vec![1, 2, 3]),
+            predicate: Some(Arc::new(BoundPredicate::AlwaysTrue)),
             schema,
             record_count: None,
             data_file_format: DataFileFormat::Avro,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,

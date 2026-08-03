@@ -679,7 +679,7 @@ impl DeleteFilter {
     ) -> Option<Vec<EqDeleteKeySet>> {
         let mut sets: Vec<EqDeleteKeySet> = Vec::new();
         let mut shared_key_ids: Option<Vec<i32>> = None;
-        for delete in &task.deletes {
+        for delete in task.deletes.iter() {
             if !is_equality_delete(delete) {
                 continue;
             }
@@ -708,7 +708,7 @@ impl DeleteFilter {
         // * Bind the predicate to the task's schema to get a `BoundPredicate`
 
         let mut combined_predicate = AlwaysTrue;
-        for delete in &file_scan_task.deletes {
+        for delete in file_scan_task.deletes.iter() {
             if !is_equality_delete(delete) {
                 continue;
             }
@@ -1167,12 +1167,15 @@ pub(crate) mod tests {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{}/1.parquet", table_location.to_str().unwrap()),
+                data_file_path: Arc::from(format!(
+                    "{}/1.parquet",
+                    table_location.to_str().unwrap()
+                )),
                 data_file_format: DataFileFormat::Parquet,
                 schema: data_file_schema.clone(),
-                project_field_ids: vec![],
+                project_field_ids: Arc::from(vec![]),
                 predicate: None,
-                deletes: vec![pos_del_1, pos_del_2.clone()],
+                deletes: Arc::from(vec![pos_del_1, pos_del_2.clone()]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -1184,12 +1187,15 @@ pub(crate) mod tests {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{}/2.parquet", table_location.to_str().unwrap()),
+                data_file_path: Arc::from(format!(
+                    "{}/2.parquet",
+                    table_location.to_str().unwrap()
+                )),
                 data_file_format: DataFileFormat::Parquet,
                 schema: data_file_schema.clone(),
-                project_field_ids: vec![],
+                project_field_ids: Arc::from(vec![]),
                 predicate: None,
-                deletes: vec![pos_del_3],
+                deletes: Arc::from(vec![pos_del_3]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -1260,12 +1266,12 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: "data.parquet".to_string(),
+            data_file_path: Arc::from("data.parquet"),
             data_file_format: crate::spec::DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![],
+            project_field_ids: Arc::from(vec![]),
             predicate: None,
-            deletes: vec![FileScanTaskDeleteFile {
+            deletes: Arc::from(vec![FileScanTaskDeleteFile {
                 file_path: "eq-del.parquet".to_string(),
                 file_size_in_bytes: 1, // never read; this test fails before opening the file
                 file_type: DataContentType::EqualityDeletes,
@@ -1276,7 +1282,7 @@ pub(crate) mod tests {
                 content_offset: None,
                 content_size_in_bytes: None,
                 record_count: None,
-            }],
+            }]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -1391,12 +1397,12 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: "data.parquet".to_string(),
+            data_file_path: Arc::from("data.parquet"),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![],
+            project_field_ids: Arc::from(vec![]),
             predicate: None,
-            deletes: vec![FileScanTaskDeleteFile {
+            deletes: Arc::from(vec![FileScanTaskDeleteFile {
                 file_path: "eq-del.parquet".to_string(),
                 file_size_in_bytes: 1,
                 file_type: DataContentType::EqualityDeletes,
@@ -1407,7 +1413,7 @@ pub(crate) mod tests {
                 content_offset: None,
                 content_size_in_bytes: None,
                 record_count: None,
-            }],
+            }]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -1606,12 +1612,12 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: data_file_path.to_string(),
+            data_file_path: Arc::from(data_file_path),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![],
+            project_field_ids: Arc::from(vec![]),
             predicate: None,
-            deletes,
+            deletes: Arc::from(deletes),
             partition: None,
             partition_spec: None,
             name_mapping: None,

@@ -436,7 +436,7 @@ fn prepare_read_task(task: &FileScanTask, apply_deletes: bool) -> FileScanTask {
     task.partition_spec = None;
     task.predicate = None;
     if !apply_deletes {
-        task.deletes = Vec::new();
+        task.deletes = Arc::from(Vec::new());
     }
     task
 }

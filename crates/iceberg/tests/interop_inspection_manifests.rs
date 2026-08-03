@@ -65,6 +65,7 @@
 //! in CONTENT, the contract is to STOP and report it — never to hide a column. These two are content-equal.)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::fs;
 use std::path::PathBuf;
 
@@ -1874,7 +1875,7 @@ impl From<JavaScanRow> for ScanRow {
         let mut delete_file_paths = java.delete_file_paths;
         delete_file_paths.sort();
         ScanRow {
-            data_file_path: java.data_file_path,
+            data_file_path: Arc::from(java.data_file_path),
             delete_file_paths,
             residual_always_true: java.residual_always_true,
         }
@@ -1899,7 +1900,7 @@ fn task_to_scan_row(task: &FileScanTask) -> ScanRow {
         .collect();
     delete_file_paths.sort();
     ScanRow {
-        data_file_path: task.data_file_path().to_string(),
+        data_file_path: Arc::from(task.data_file_path()),
         delete_file_paths,
         residual_always_true: residual_always_true(task),
     }

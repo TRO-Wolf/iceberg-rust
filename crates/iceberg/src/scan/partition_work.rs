@@ -55,7 +55,7 @@ impl FileScanTaskId {
     /// Build an identity from a planned task.
     pub fn from_task(task: &FileScanTask) -> Self {
         Self {
-            data_file_path: task.data_file_path.clone(),
+            data_file_path: task.data_file_path().to_string(),
             start: task.start,
             length: task.length,
         }
@@ -322,12 +322,12 @@ mod tests {
             start,
             length,
             record_count: None,
-            data_file_path: path.to_string(),
+            data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Parquet,
             schema,
-            project_field_ids: vec![1],
+            project_field_ids: Arc::from(vec![1]),
             predicate: None,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -661,9 +661,9 @@ mod tests {
     #[test]
     fn pin6_r117_deletes_stay_per_task_after_assign() {
         let mut t0 = dummy_task("a.parquet", 0, 100);
-        t0.deletes = vec![pos_delete("a-pos.parquet")];
+        t0.deletes = Arc::from(vec![pos_delete("a-pos.parquet")]);
         let mut t1 = dummy_task("b.parquet", 0, 100);
-        t1.deletes = vec![pos_delete("b-pos.parquet")];
+        t1.deletes = Arc::from(vec![pos_delete("b-pos.parquet")]);
         let parts = assign_partition_work(
             1,
             ScanFilterMode::Residual,
@@ -693,10 +693,10 @@ mod tests {
     #[test]
     fn pin9_split_ranges_distinct_and_keep_deletes() {
         let mut s0 = dummy_task("f.parquet", 0, 50);
-        s0.deletes = vec![pos_delete("f-pos.parquet")];
+        s0.deletes = Arc::from(vec![pos_delete("f-pos.parquet")]);
         s0.split_offsets = None; // sub-tasks must not re-split
         let mut s1 = dummy_task("f.parquet", 50, 50);
-        s1.deletes = vec![pos_delete("f-pos.parquet")];
+        s1.deletes = Arc::from(vec![pos_delete("f-pos.parquet")]);
         s1.split_offsets = None;
         let parts = assign_partition_work(
             3,
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn pin6_equality_deletes_stay_per_task() {
         let mut t0 = dummy_task("a.parquet", 0, 100);
-        t0.deletes = vec![crate::scan::FileScanTaskDeleteFile {
+        t0.deletes = Arc::from(vec![crate::scan::FileScanTaskDeleteFile {
             file_path: "a-eq.parquet".to_string(),
             file_size_in_bytes: 20,
             file_type: crate::spec::DataContentType::EqualityDeletes,
@@ -752,9 +752,9 @@ mod tests {
             content_offset: None,
             content_size_in_bytes: None,
             record_count: None,
-        }];
+        }]);
         let mut t1 = dummy_task("b.parquet", 0, 100);
-        t1.deletes = vec![];
+        t1.deletes = Arc::from(vec![]);
         let parts = assign_partition_work(
             1,
             ScanFilterMode::Residual,
