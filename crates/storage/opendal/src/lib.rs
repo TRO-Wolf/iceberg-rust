@@ -1854,6 +1854,19 @@ mod tests {
         );
     }
 
+    /// FK4.2: empty need_stat is a successful no-op (complete-list-meta only path).
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_fk4_2_stat_empty_need_stat_is_noop() {
+        let mut ready_meta: Vec<Option<(u64, i64)>> = vec![Some((1, 0)), Some((2, 0))];
+        // Operator unused when need_stat is empty — use a fresh memory op anyway.
+        let op = memory_config_build().expect("memory op");
+        stat_incomplete_list_entries(&op, &[], 16, &mut ready_meta)
+            .await
+            .expect("empty need_stat must succeed");
+        assert_eq!(ready_meta, vec![Some((1, 0)), Some((2, 0))]);
+    }
+
     /// FK4.2: concurrent stats fill only incomplete slots and must not clobber
     /// already-complete list-meta slots (interleaved ready/need_stat).
     #[cfg(feature = "opendal-memory")]
