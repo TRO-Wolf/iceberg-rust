@@ -1854,6 +1854,49 @@ mod tests {
         );
     }
 
+    /// FK4.2: concurrent stats fill only incomplete slots and must not clobber
+    /// already-complete list-meta slots (interleaved ready/need_stat).
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_fk4_2_stat_does_not_clobber_complete_slots() {
+        let storage = memory_storage();
+        storage
+            .write("memory:/mix/a", Bytes::from("aa"))
+            .await
+            .expect("write a");
+        storage
+            .write("memory:/mix/b", Bytes::from("bbbb"))
+            .await
+            .expect("write b");
+        let (op, _) = storage.create_operator(&"memory:/mix/a").expect("op");
+        // Slots: 0 complete, 1 need stat(a), 2 complete, 3 need stat(b)
+        let mut ready_meta = vec![Some((10, 100)), None, Some((30, 300)), None];
+        let need_stat = vec![(1, "mix/a".to_string()), (3, "mix/b".to_string())];
+        stat_incomplete_list_entries(&op, &need_stat, 8, &mut ready_meta)
+            .await
+            .expect("mixed slots");
+        assert_eq!(
+            ready_meta[0],
+            Some((10, 100)),
+            "complete slot 0 must be untouched"
+        );
+        assert_eq!(
+            ready_meta[2],
+            Some((30, 300)),
+            "complete slot 2 must be untouched"
+        );
+        assert_eq!(
+            ready_meta[1].expect("slot 1 filled").0,
+            2,
+            "stat size for mix/a"
+        );
+        assert_eq!(
+            ready_meta[3].expect("slot 3 filled").0,
+            4,
+            "stat size for mix/b"
+        );
+    }
+
     /// Operator cache reuses the same finished Operator for two paths on the same
     /// memory backend, and clones of storage share the cache.
     #[cfg(feature = "opendal-memory")]
