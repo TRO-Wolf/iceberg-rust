@@ -206,6 +206,8 @@ pub trait Catalog: Debug + Sync + Send {
     /// `false` and a `CREATE TABLE IF NOT EXISTS` retry / re-create of the same identifier succeeds.
     /// The default implementation satisfies this by reading the metadata before inserting the
     /// pointer (see [`Catalog::register_table`]); an override MUST preserve the guarantee.
+    /// Implementations MAY release any catalog mutex across the FileIO read (I/O outside the
+    /// lock) so long as a failed read still inserts nothing.
     async fn publish_create_table(
         &self,
         table: crate::table::Table,

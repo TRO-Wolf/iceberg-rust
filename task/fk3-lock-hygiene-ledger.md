@@ -109,4 +109,26 @@ No `map.md` under `arrow/` or `catalog/` (convention not present) — no map upd
 
 ## Critic-octo
 Scratch: `/tmp/critic-octo-fk3-2026-08-08/`  
-Label / tip stamp: see OCTO-REPORT after 8 cycles (`early_stop=false`).
+**Label:** **OCTO-CONVERGED** (8/8, `early_stop=false`)  
+**Actor tip:** `5e0181ed`  
+**Critic tip:** (this commit / tip stamp below)
+
+### Critic fixes (by cycle)
+| Cycle | Finding | Fix |
+|------:|---|---|
+| 1 | S2 multi-source OR unpinned; S2 orphan before flip | `test_multi_source_resolve_ors_by_ref_into_frozen_arc`; mid-point CAS recheck before write (table+view) |
+| 1 | S3 trait atomicity prose | `Catalog::publish_create_table` note: FileIO may leave the lock |
+| 2–3 | create orphan-on-lose; concurrent load isolation | WITHDRAWN intentional / pre-existing |
+| 4–8 | API disclosure / concurrency / reader / view / gate | ledger + CLEAN re-proof |
+
+### Mutation RED
+| Gate | Break | Pin turns RED |
+|---|---|---|
+| Freeze Arc share | fresh `Arc` per resolve / no memo | `test_resolved_pos_del_vector_is_frozen_arc_shared` |
+| Multi-source OR | merge only first contribution | `test_multi_source_resolve_ors_by_ref_into_frozen_arc` |
+| Half-create refuse | insert pointer before FileIO read | `test_register_table_unreachable_metadata_refuses_half_create` |
+| Stale CAS | skip flip-time location compare | `test_table_stale_*` / view stale pin |
+
+### Residual OPEN (≥ S1: **none**)
+- **S3 seed:** residual orphan metadata file if a concurrent winner lands between mid-point recheck and flip CAS (pointer never half-flips)
+- **S3 seed:** create_table loser after write leaves orphan metadata (pre-existing shape under full-lock write-then-insert too)

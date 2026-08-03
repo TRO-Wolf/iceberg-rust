@@ -1611,6 +1611,53 @@ pub(crate) mod tests {
         assert!(a.contains(1) && a.contains(3));
     }
 
+    /// FK3 / scout #12: multi-source resolve ORs by reference (no per-contribution roaring clone)
+    /// into one frozen Arc. Positions from BOTH sources must appear; a second resolve of the
+    /// same key shares the Arc. MUTATION: only merging the first contribution (skip the loop's
+    /// later sources) turns the cardinality/contains asserts RED.
+    #[test]
+    fn test_multi_source_resolve_ors_by_ref_into_frozen_arc() {
+        let filter = DeleteFilter::default();
+
+        let mut dv_a = DeleteVector::default();
+        dv_a.insert(1);
+        dv_a.insert(5);
+        let guard_a = claim_pos_del(&filter, "pos-a.parquet");
+        filter.install_pos_del_contribution(
+            &guard_a,
+            HashMap::from([("data.parquet".to_string(), dv_a)]),
+        );
+        guard_a.publish_loaded();
+
+        let mut dv_b = DeleteVector::default();
+        dv_b.insert(5); // overlap with A
+        dv_b.insert(9);
+        let guard_b = claim_pos_del(&filter, "pos-b.parquet");
+        filter.install_pos_del_contribution(
+            &guard_b,
+            HashMap::from([("data.parquet".to_string(), dv_b)]),
+        );
+        guard_b.publish_loaded();
+
+        let deletes = [
+            parquet_pos_del_entry("pos-a.parquet"),
+            parquet_pos_del_entry("pos-b.parquet"),
+        ];
+        let merged = filter
+            .resolve_delete_vector(&deletes, "data.parquet")
+            .expect("union must resolve");
+        assert_eq!(merged.len(), 3, "union of {{1,5}} and {{5,9}} is {{1,5,9}}");
+        assert!(merged.contains(1) && merged.contains(5) && merged.contains(9));
+
+        let again = filter
+            .resolve_delete_vector(&deletes, "data.parquet")
+            .expect("memoized re-resolve");
+        assert!(
+            Arc::ptr_eq(&merged, &again),
+            "multi-source memo must freeze as one shared Arc"
+        );
+    }
+
     /// EQ-DELETE SWEEP for the R117 class (documents that the equality path does NOT share the
     /// cross-task defect): equality-delete state is a pure load-cache keyed by DELETE FILE path,
     /// and APPLICATION (`build_equality_delete_predicate`, `collect_equality_delete_keysets`)

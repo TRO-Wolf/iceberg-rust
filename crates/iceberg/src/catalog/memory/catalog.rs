@@ -538,8 +538,8 @@ impl Catalog for MemoryCatalog {
         let staged_table = commit.apply(current_table)?;
         let new_metadata_location = staged_table.metadata_location_result()?.to_string();
 
-        // Early CAS against the snapshot we loaded — cheap reject before writing when already stale.
-        // The authoritative CAS is step 3 (re-read under the lock at flip time).
+        // Early CAS against the load snapshot — cheap reject when the commit was already stale
+        // at start (no FileIO).
         check_no_concurrent_modification(
             "table",
             staged_table.identifier(),
@@ -547,6 +547,24 @@ impl Catalog for MemoryCatalog {
             base_metadata_location.as_deref(),
             &new_metadata_location,
         )?;
+
+        // Mid-point recheck under a short lock BEFORE writing: if a concurrent winner advanced the
+        // pointer during load/apply, refuse without writing an orphan metadata file. A race can
+        // still open between this recheck and the flip CAS (step 3); that loser may leave one
+        // orphan file — acceptable for I/O-outside-lock, and the pointer never half-flips.
+        {
+            let root_namespace_state = self.root_namespace_state.lock().await;
+            let stored_mid = root_namespace_state
+                .get_existing_table_location(&table_ident)?
+                .clone();
+            check_no_concurrent_modification(
+                "table",
+                staged_table.identifier(),
+                &stored_mid,
+                base_metadata_location.as_deref(),
+                &new_metadata_location,
+            )?;
+        }
 
         staged_table
             .metadata()
@@ -665,7 +683,7 @@ impl Catalog for MemoryCatalog {
         let staged_view = commit.apply(current_view)?;
         let new_metadata_location = staged_view.metadata_location_result()?.to_string();
 
-        // Early CAS against the snapshot we loaded (authoritative re-check at flip below).
+        // Early CAS against the load snapshot — cheap reject when already stale at start.
         check_no_concurrent_modification(
             "view",
             staged_view.identifier(),
@@ -673,6 +691,21 @@ impl Catalog for MemoryCatalog {
             base_metadata_location.as_deref(),
             &new_metadata_location,
         )?;
+
+        // Mid-point recheck under a short lock BEFORE writing (same orphan-reduction as tables).
+        {
+            let root_namespace_state = self.root_namespace_state.lock().await;
+            let stored_mid = root_namespace_state
+                .get_existing_view_location(&view_ident)?
+                .clone();
+            check_no_concurrent_modification(
+                "view",
+                staged_view.identifier(),
+                &stored_mid,
+                base_metadata_location.as_deref(),
+                &new_metadata_location,
+            )?;
+        }
 
         staged_view
             .metadata()
