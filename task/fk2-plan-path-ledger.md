@@ -160,8 +160,22 @@ None. `DeleteFileIndex` remains `pub(crate)`.
 `crates/iceberg/src/scan/map.md` updated: plan_files concurrent delete/data (FK2.2); delete-index
 composite keys + hang/resurrection failure modes (FK2.3).
 
-### Critic-octo FK2.2+2.3 (8 cycles) — see OCTO-REPORT
-Scratch: `/tmp/critic-octo-fk2_23-2026-08-08/`
+### Critic-octo FK2.2+2.3 (8 cycles) — OCTO-CONVERGED
+**Tip:** eb2b166e (docs) / fa2ae981 (last code)  
+Scratch: `/tmp/critic-octo-fk2_23-2026-08-08/`  
+**Label:** **OCTO-CONVERGED** (8/8, `early_stop=false`)
+
+| Cycle | Finding | Fix |
+|------:|---|---|
+| 1 | S2 flat (i32,Struct) clone on lookup | nested PartitionDeleteMap + hang pin strengthen |
+| 2 | S2 ledger/map key-shape drift | docs |
+| 3–7 | hang / cross-spec / seq boundary / DV attacks | no OPEN ≥ S1 |
+| 8 | gate re-proof | OCTO-REPORT |
+
+### Residual OPEN (none ≥ S1)
+- S3: incremental empty-delete-index path (out of FK2.2 TableScan scope)
+- S3: plan wall-time bench deferred
+- S3: FK2.1 plan-wide projection Arc seed
 
 ### Not in this unit
 - FK4.2 / FK5
