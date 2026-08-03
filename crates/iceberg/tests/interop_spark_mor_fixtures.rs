@@ -378,7 +378,7 @@ fn assert_routing(tasks: &[FileScanTask], fixture: &Fixture) {
                 );
                 assert_eq!(
                     delete.referenced_data_file.as_deref(),
-                    Some(task.data_file_path.as_str()),
+                    Some(task.data_file_path.as_ref()),
                     "{name}: a DV is routed by its explicit back-reference (the ONLY shape any \
                      Java writer sets `referenced_data_file` on)"
                 );
@@ -461,7 +461,7 @@ async fn test_spark_mor_legacy_manifest_without_referenced_data_file_field() {
 
     assert_eq!(tasks.len(), 2, "the 1.4.3 fixture plans its two data files");
     for task in &tasks {
-        for delete in &task.deletes {
+        for delete in task.deletes.iter() {
             assert!(
                 delete.referenced_data_file.is_none(),
                 "a field absent from the manifest AVRO SCHEMA must decode to None, got {:?}",

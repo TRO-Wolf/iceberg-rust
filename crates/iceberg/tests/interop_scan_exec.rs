@@ -1628,10 +1628,9 @@ async fn test_engine_deletefilter_equivalence_position_deletes() {
         let positions = deletes
             .deleted_row_positions(&tasks[0])
             .expect("a positional delete vector is present");
-        let guard = positions.lock().expect("lock the delete vector");
-        assert_eq!(guard.len(), 2, "exactly two positions are deleted");
+        assert_eq!(positions.len(), 2, "exactly two positions are deleted");
         assert!(
-            guard.contains(1) && guard.contains(3),
+            positions.contains(1) && positions.contains(3),
             "positions 1 and 3 (ids 20, 40) are the deleted positions"
         );
     }
@@ -1705,7 +1704,7 @@ async fn test_engine_deletefilter_equivalence_equality_deletes() {
         );
         let positions = deletes.deleted_row_positions(&tasks[0]);
         assert!(
-            positions.is_none_or(|dv| dv.lock().expect("lock the delete vector").is_empty()),
+            positions.is_none_or(|dv| dv.is_empty()),
             "an equality-only task has no positional deletes"
         );
     }

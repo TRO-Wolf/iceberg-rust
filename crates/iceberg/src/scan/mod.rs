@@ -838,9 +838,31 @@ impl TableScan {
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
-        // Process the delete file [`ManifestEntry`] stream in parallel.
-        // Entry work runs inline under `try_for_each_concurrent` — a nested per-entry
-        // `spawn` only added task overhead without extra parallelism beyond the concurrent limit.
+        // Process delete-file and data-file [`ManifestEntry`] streams CONCURRENTLY (FK2.2 /
+        // scout #14). The previous barrier (awaiting all delete entries before starting data
+        // processing) was not correctness-required: `DeleteFileIndex::get_deletes_for_data_file`
+        // already parks on `Notify` until the index is published (all delete senders drop →
+        // populate task collects → `PopulateGuard::publish` → `notify_waiters`). Overlapping the
+        // two streams lets plan latency approach max(T_del, T_data) instead of T_del + T_data.
+        //
+        // Hang classes (lost-wakeup after publish; failed-populate leaving state stranded at
+        // `Populating`) are pinned by inject-only deterministic tests in `delete_file_index.rs`
+        // with generous bounded timeouts — no loom, no stress harness.
+        //
+        // Entry work runs inline under `try_for_each_concurrent` — a nested per-entry `spawn`
+        // only added task overhead without extra parallelism beyond the concurrent limit.
+        // Review rider (2026-08-03): a delete-entry error must FAIL the index, never let a
+        // PARTIAL delete set publish as `Populated`. Under FK2.2's concurrency, data tasks can
+        // stream before the `Err` reaches the consumer; if the senders dropped on the error
+        // short-circuit, the populate task would see a normal end-of-channel and publish the
+        // partial index — silent row resurrection for an early-terminating (LIMIT-k) consumer.
+        // `tx_keepalive` holds the delete channel open past the error check, so `mark_failed`
+        // is GUARANTEED to land while the state is still `Populating`; the populate task's
+        // later publish finds a terminal state and leaves it (respect-terminal). Pre-FK2.2 the
+        // barrier made a delete error precede every data task (Java plans deletes first); this
+        // restores that fail-before-results property under concurrent planning.
+        let delete_index_for_failure = delete_file_idx.clone();
+        let tx_keepalive = delete_file_tx.clone();
         spawn(async move {
             let result = manifest_entry_delete_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
@@ -853,14 +875,21 @@ impl TableScan {
                 .await;
 
             if let Err(error) = result {
+                // Order matters: mark BEFORE dropping the keepalive sender (see above).
+                delete_index_for_failure
+                    .mark_failed(&format!("delete manifest entry processing failed: {error}"));
+                drop(tx_keepalive);
                 let _ = channel_for_delete_manifest_entry_error
                     .send(Err(error))
                     .await;
+            } else {
+                drop(tx_keepalive);
             }
-        })
-        .await;
+        });
 
-        // Process the data file [`ManifestEntry`] stream in parallel (inline under concurrent limit).
+        // Process the data file [`ManifestEntry`] stream in parallel (inline under concurrent
+        // limit). Data entries that reach `into_file_scan_task` park on the delete index until
+        // it is populated — concurrent with the delete-entry processor above.
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
@@ -3122,8 +3151,10 @@ pub mod tests {
                 .try_collect()
                 .await
                 .unwrap();
-            let mut paths: Vec<String> =
-                tasks.into_iter().map(|task| task.data_file_path).collect();
+            let mut paths: Vec<String> = tasks
+                .into_iter()
+                .map(|task| task.data_file_path.to_string())
+                .collect();
             paths.sort();
             paths
         }
@@ -3189,8 +3220,10 @@ pub mod tests {
                 .try_collect()
                 .await
                 .unwrap();
-            let mut paths: Vec<String> =
-                tasks.into_iter().map(|task| task.data_file_path).collect();
+            let mut paths: Vec<String> = tasks
+                .into_iter()
+                .map(|task| task.data_file_path.to_string())
+                .collect();
             paths.sort();
             paths
         }
@@ -3241,13 +3274,13 @@ pub mod tests {
 
         // Check first task is added data file
         assert_eq!(
-            tasks[0].data_file_path,
+            tasks[0].data_file_path.as_ref(),
             format!("{}/1.parquet", &fixture.table_location)
         );
 
         // Check second task is existing data file
         assert_eq!(
-            tasks[1].data_file_path,
+            tasks[1].data_file_path.as_ref(),
             format!("{}/3.parquet", &fixture.table_location)
         );
     }
@@ -3508,11 +3541,11 @@ pub mod tests {
         // (Existing); the 2.parquet Deleted tombstone is filtered out.
         assert_eq!(tasks.len(), 2);
         assert_eq!(
-            tasks[0].data_file_path,
+            tasks[0].data_file_path.as_ref(),
             format!("{}/1.parquet", &fixture.table_location)
         );
         assert_eq!(
-            tasks[1].data_file_path,
+            tasks[1].data_file_path.as_ref(),
             format!("{}/3.parquet", &fixture.table_location)
         );
     }
@@ -3666,7 +3699,7 @@ pub mod tests {
         // Only the `x == 1` file survives; the `x == 2` file's manifest was pruned.
         assert_eq!(tasks.len(), 1);
         assert_eq!(
-            tasks[0].data_file_path,
+            tasks[0].data_file_path.as_ref(),
             format!("{}/p1.parquet", &fixture.table_location)
         );
         assert!(
@@ -4777,12 +4810,20 @@ pub mod tests {
             .unwrap();
         for task in &tasks {
             assert_eq!(
-                task.predicate.as_ref(),
+                task.predicate.as_deref(),
                 Some(&expected_residual),
                 "task predicate must be the reduced residual `y > 0`, not the full \
                  `x == 1 AND y > 0` filter"
             );
         }
+        // FK2.1: co-partition residual memo ⇒ Arc identity shared across both live files.
+        assert!(
+            Arc::ptr_eq(
+                tasks[0].predicate.as_ref().expect("residual set"),
+                tasks[1].predicate.as_ref().expect("residual set"),
+            ),
+            "co-partition files must Arc-share the reduced residual (not deep-clone per file)"
+        );
     }
 
     #[tokio::test]
@@ -4795,11 +4836,20 @@ pub mod tests {
         assert_eq!(tasks.len(), 2);
         for task in &tasks {
             assert_eq!(
-                task.predicate,
-                Some(BoundPredicate::AlwaysTrue),
+                task.predicate.as_deref(),
+                Some(&BoundPredicate::AlwaysTrue),
                 "a filter fully implied by the partition must reduce to AlwaysTrue"
             );
         }
+        // FK2.1 critic-octo: residual memo Arc-clones onto co-partition tasks (same partition
+        // x==1 ⇒ same Arc identity; deep clone would allocate distinct AlwaysTrue Arcs).
+        assert!(
+            Arc::ptr_eq(
+                tasks[0].predicate.as_ref().expect("residual set"),
+                tasks[1].predicate.as_ref().expect("residual set"),
+            ),
+            "co-partition files must Arc-share the memoized residual"
+        );
     }
 
     #[tokio::test]
@@ -4838,8 +4888,8 @@ pub mod tests {
         // full `x == 1` (no reduction), so this predicate assertion pins that the residual
         // is computed from the FILE's own `partition_spec_id`, not the table default.
         assert_eq!(
-            task.predicate,
-            Some(BoundPredicate::AlwaysTrue),
+            task.predicate.as_deref(),
+            Some(&BoundPredicate::AlwaysTrue),
             "residual must be reduced by the file's own identity(x) spec (0), not \
              the unpartitioned default spec (1)"
         );
@@ -4868,7 +4918,7 @@ pub mod tests {
             .less_than(Datum::long(3))
             .bind(tasks[0].schema.clone(), true)
             .unwrap();
-        assert_eq!(tasks[0].predicate.as_ref(), Some(&expected_residual));
+        assert_eq!(tasks[0].predicate.as_deref(), Some(&expected_residual));
 
         // Now read through the residual and assert the known-correct row set.
         let mut fixture = TableTestFixture::new();
@@ -4935,7 +4985,7 @@ pub mod tests {
         let expected = filter.bind(tasks[0].schema.clone(), true).unwrap();
         for task in &tasks {
             assert_eq!(
-                task.predicate.as_ref(),
+                task.predicate.as_deref(),
                 Some(&expected),
                 "an unpartitioned table's residual is the full filter, unchanged"
             );
@@ -5407,7 +5457,7 @@ pub mod tests {
             .bind(tasks[0].schema.clone(), true)
             .unwrap();
         assert_eq!(
-            tasks[0].predicate.as_ref(),
+            tasks[0].predicate.as_deref(),
             Some(&expected_residual),
             "truncate(x,100)==0 strictly implies x < 100, so the residual is `y > 0`"
         );
@@ -5586,16 +5636,16 @@ pub mod tests {
                 .unwrap(),
         );
         let task = FileScanTask {
-            data_file_path: "data_file_path".to_string(),
+            data_file_path: Arc::from("data_file_path"),
             file_size_in_bytes: 0,
             start: 0,
             length: 100,
-            project_field_ids: vec![1, 2, 3],
+            project_field_ids: Arc::from(vec![1, 2, 3]),
             predicate: None,
             schema: schema.clone(),
             record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -5606,16 +5656,16 @@ pub mod tests {
 
         // with predicate
         let task = FileScanTask {
-            data_file_path: "data_file_path".to_string(),
+            data_file_path: Arc::from("data_file_path"),
             file_size_in_bytes: 0,
             start: 0,
             length: 100,
-            project_field_ids: vec![1, 2, 3],
-            predicate: Some(BoundPredicate::AlwaysTrue),
+            project_field_ids: Arc::from(vec![1, 2, 3]),
+            predicate: Some(Arc::new(BoundPredicate::AlwaysTrue)),
             schema,
             record_count: None,
             data_file_format: DataFileFormat::Avro,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,

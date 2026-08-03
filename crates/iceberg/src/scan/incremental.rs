@@ -1461,7 +1461,7 @@ impl IncrementalChangelogScan {
         // (Java `DeletedRowsScanTask.existingDeletes()` "must be applied prior to
         // determining which records are deleted"); the engine then uses `added_deletes`
         // as the SELECTOR of which of those rows became deleted.
-        file_scan_task.deletes = existing_deletes.clone();
+        file_scan_task.deletes = Arc::from(existing_deletes.clone());
 
         Ok(Some(ChangelogScanTask {
             change_ordinal,
@@ -1566,12 +1566,12 @@ impl IncrementalChangelogScan {
             // task (yielding the NET inserted rows) and the existing deletes for a
             // `DeletedDataFile` task (yielding the rows live at removal). In default mode
             // the pipeline's empty index already left `deletes` empty — untouched.
-            file_scan_task.deletes = match kind {
+            file_scan_task.deletes = Arc::from(match kind {
                 ChangelogTaskKind::AddedRows => added_deletes.clone(),
                 ChangelogTaskKind::DeletedDataFile | ChangelogTaskKind::DeletedRows => {
                     existing_deletes.clone()
                 }
-            };
+            });
         }
 
         Ok(Some(ChangelogScanTask {
@@ -1764,7 +1764,10 @@ mod tests {
             .try_collect()
             .await
             .expect("collecting file scan tasks should succeed");
-        tasks.into_iter().map(|t| t.data_file_path).collect()
+        tasks
+            .into_iter()
+            .map(|t| t.data_file_path.to_string())
+            .collect()
     }
 
     /// CORE BEHAVIOR: from=S0(exclusive) to=S2(inclusive) returns ONLY the files appended

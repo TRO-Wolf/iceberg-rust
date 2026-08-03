@@ -1562,7 +1562,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_iter()
-                .map(|t| t.data_file_path)
+                .map(|t| t.data_file_path.to_string())
                 .collect()
         };
         assert!(
@@ -2545,12 +2545,12 @@ mod tests {
             start: 0,
             length: size,
             record_count: Some(1),
-            data_file_path: path.to_string(),
+            data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![1, 2, 3],
+            project_field_ids: Arc::from(vec![1, 2, 3]),
             predicate: None,
-            deletes,
+            deletes: Arc::from(deletes),
             partition: Some(Struct::from_iter([Some(Literal::long(part_value))])),
             partition_spec: Some(spec.clone()),
             name_mapping: None,

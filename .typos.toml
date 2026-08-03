@@ -27,3 +27,6 @@ extend-exclude = ["**/testdata", "CHANGELOG.md"]
 # abbreviation is load-bearing in that file's name, its env-var gate, and its string literals.
 [default.extend-words]
 mor = "mor"
+# `TRO` — the GitHub org of this owned fork (`TRO-Wolf/iceberg-rust`); appears in task/
+# docs that cite the remote by name.
+TRO = "TRO"

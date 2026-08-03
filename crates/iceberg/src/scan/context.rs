@@ -228,14 +228,17 @@ impl ManifestEntryContext {
             length: self.manifest_entry.file_size_in_bytes(),
             record_count: Some(self.manifest_entry.record_count()),
 
-            data_file_path: self.manifest_entry.file_path().to_string(),
+            // Arc-share path/projection/deletes so split/sub_task only pointer-clones them
+            // (FK2.1). Path comes from the already-owned manifest entry string.
+            data_file_path: Arc::from(self.manifest_entry.file_path()),
             data_file_format: self.manifest_entry.file_format(),
 
             schema: self.snapshot_schema.clone(),
-            project_field_ids: self.field_ids.to_vec(),
+            // field_ids is already Arc<Vec<i32>> on the plan context — share the slice.
+            project_field_ids: Arc::from(self.field_ids.as_slice()),
             predicate,
 
-            deletes,
+            deletes: Arc::from(deletes),
 
             // Include partition data and spec from manifest entry. The spec activates the
             // reader's identity-partition constant-materialization path (Java
@@ -280,8 +283,10 @@ impl ManifestEntryContext {
     /// produces no rows).
     ///
     /// Residuals are memoized per partition on the shared [`ResidualEvaluator`] so
-    /// many files in the same partition do not re-run `residual_for` + bind.
-    fn residual_predicate(&self) -> Result<Option<BoundPredicate>> {
+    /// many files in the same partition do not re-run `residual_for` + bind. The
+    /// memo already returns [`Arc<BoundPredicate>`] — we Arc-clone it onto the task
+    /// (FK2.1) instead of deep-cloning the tree.
+    fn residual_predicate(&self) -> Result<Option<Arc<BoundPredicate>>> {
         let Some(residual_evaluator) = self.residual_evaluator.as_ref() else {
             return Ok(None);
         };
@@ -291,7 +296,7 @@ impl ManifestEntryContext {
             self.snapshot_schema.clone(),
             self.case_sensitive,
         )?;
-        Ok(Some(bound.as_ref().clone()))
+        Ok(Some(bound))
     }
 }
 

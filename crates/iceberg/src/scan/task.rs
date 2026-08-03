@@ -219,7 +219,7 @@ impl ChangelogScanTask {
 
     /// Returns the data file path of the changed file.
     pub fn data_file_path(&self) -> &str {
-        &self.file_scan_task.data_file_path
+        self.file_scan_task.data_file_path()
     }
 }
 
@@ -241,7 +241,52 @@ where D: serde::Deserializer<'de> {
     ))
 }
 
+/// Serde for [`Arc<str>`] as a JSON string (byte-identical to plain [`String`]).
+mod serde_arc_str {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        serializer.serialize_str(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Arc<str>, D::Error>
+    where D: Deserializer<'de> {
+        String::deserialize(deserializer).map(Arc::from)
+    }
+}
+
+/// Serde for [`Arc<[T]>`] as a JSON array (byte-identical to plain [`Vec<T>`]).
+mod serde_arc_slice {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, T>(value: &Arc<[T]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Serialize,
+    {
+        value.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Arc<[T]>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Vec::<T>::deserialize(deserializer).map(Arc::from)
+    }
+}
+
 /// A task to scan part of file.
+///
+/// Shared innards (`data_file_path`, `project_field_ids`, `predicate`, `deletes`) are
+/// [`Arc`]-backed so [`FileScanTask::split`] / [`FileScanTask::sub_task`] clone cheaply
+/// (pointer share). JSON serde still emits plain string/array shapes — see the
+/// `serde_*` helpers — so wire format stays byte-compatible with pre-Arc tasks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileScanTask {
     /// The total size of the data file in bytes, from the manifest entry.
@@ -258,7 +303,10 @@ pub struct FileScanTask {
     pub record_count: Option<u64>,
 
     /// The data file path corresponding to the task.
-    pub data_file_path: String,
+    ///
+    /// Arc-shared across split sub-tasks; serializes as a JSON string.
+    #[serde(with = "serde_arc_str")]
+    pub data_file_path: Arc<str>,
 
     /// The format of the file to scan.
     pub data_file_format: DataFileFormat,
@@ -266,13 +314,23 @@ pub struct FileScanTask {
     /// The schema of the file to scan.
     pub schema: SchemaRef,
     /// The field ids to project.
-    pub project_field_ids: Vec<i32>,
-    /// The predicate to filter.
+    ///
+    /// Arc-shared across split sub-tasks; serializes as a JSON array.
+    #[serde(with = "serde_arc_slice")]
+    pub project_field_ids: Arc<[i32]>,
+    /// The residual predicate to filter rows while reading this task.
+    ///
+    /// Arc-shared across co-partition files (via residual memo) and split sub-tasks;
+    /// serializes as the bare [`BoundPredicate`] (or absent when `None`).
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub predicate: Option<BoundPredicate>,
+    pub predicate: Option<Arc<BoundPredicate>>,
 
-    /// The list of delete files that may need to be applied to this data file
-    pub deletes: Vec<FileScanTaskDeleteFile>,
+    /// The list of delete files that may need to be applied to this data file.
+    ///
+    /// Arc-shared across split sub-tasks; serializes as a JSON array.
+    #[serde(with = "serde_arc_slice")]
+    pub deletes: Arc<[FileScanTaskDeleteFile]>,
 
     /// Partition data from the manifest entry, used to identify which columns can use
     /// constant values from partition metadata vs. reading from the data file.
@@ -326,7 +384,7 @@ pub struct FileScanTask {
 impl FileScanTask {
     /// Returns the data file path of this file scan task.
     pub fn data_file_path(&self) -> &str {
-        &self.data_file_path
+        self.data_file_path.as_ref()
     }
 
     /// Returns the byte length of the data file region this task reads.
@@ -431,25 +489,28 @@ impl FileScanTask {
         sub_tasks
     }
 
-    /// Builds one sub-task covering `[start, start + length)`, cloning every parent field but
-    /// `start`/`length` (Java's split task delegates all but the byte window to its parent). The
-    /// `record_count` is dropped (only meaningful for the whole file) and `split_offsets` is
-    /// cleared (a sub-task window is not the file's row-group grid).
+    /// Builds one sub-task covering `[start, start + length)`.
+    ///
+    /// Shared innards (`data_file_path`, `project_field_ids`, `predicate`, `deletes`, schema,
+    /// partition, name mapping) are **Arc-cloned** — pointer share, no deep copy — matching
+    /// Java's split task that delegates every field but the byte window to its parent. Only
+    /// `start`/`length` change; `record_count` is dropped (only meaningful for the whole file)
+    /// and `split_offsets` is cleared (a sub-task window is not the file's row-group grid).
     fn sub_task(&self, start: u64, length: u64) -> FileScanTask {
         FileScanTask {
             file_size_in_bytes: self.file_size_in_bytes,
             start,
             length,
             record_count: None,
-            data_file_path: self.data_file_path.clone(),
+            data_file_path: Arc::clone(&self.data_file_path),
             data_file_format: self.data_file_format,
-            schema: self.schema.clone(),
-            project_field_ids: self.project_field_ids.clone(),
-            predicate: self.predicate.clone(),
-            deletes: self.deletes.clone(),
+            schema: Arc::clone(&self.schema),
+            project_field_ids: Arc::clone(&self.project_field_ids),
+            predicate: self.predicate.as_ref().map(Arc::clone),
+            deletes: Arc::clone(&self.deletes),
             partition: self.partition.clone(),
-            partition_spec: self.partition_spec.clone(),
-            name_mapping: self.name_mapping.clone(),
+            partition_spec: self.partition_spec.as_ref().map(Arc::clone),
+            name_mapping: self.name_mapping.as_ref().map(Arc::clone),
             case_sensitive: self.case_sensitive,
             split_offsets: None,
         }
@@ -514,12 +575,12 @@ impl FileScanTask {
 
     /// Returns the project field id of this file scan task.
     pub fn project_field_ids(&self) -> &[i32] {
-        &self.project_field_ids
+        self.project_field_ids.as_ref()
     }
 
     /// Returns the predicate of this file scan task.
     pub fn predicate(&self) -> Option<&BoundPredicate> {
-        self.predicate.as_ref()
+        self.predicate.as_deref()
     }
 
     /// Returns the schema of this file scan task as a reference
@@ -706,12 +767,12 @@ mod tests {
             start: 0,
             length,
             record_count: Some(1000),
-            data_file_path: "memory://t/data/1.parquet".to_string(),
+            data_file_path: Arc::from("memory://t/data/1.parquet"),
             data_file_format: format,
             schema,
-            project_field_ids: vec![1],
+            project_field_ids: Arc::from(vec![1]),
             predicate: None,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -757,7 +818,7 @@ mod tests {
     /// tests. Only `data_file_path` / `start` / `length` / `deletes` are load-bearing here.
     fn split_like(path: &str, start: u64, length: u64) -> FileScanTask {
         let mut t = task(length, DataFileFormat::Parquet, None);
-        t.data_file_path = path.to_string();
+        t.data_file_path = Arc::from(path);
         t.start = start;
         t.record_count = None;
         t
@@ -789,14 +850,14 @@ mod tests {
     #[test]
     fn merge_with_sums_length_keeps_start_and_carries_parent_fields() {
         let mut a = split_like("f.parquet", 0, 100);
-        a.deletes = vec![pos_delete(50)];
+        a.deletes = Arc::from(vec![pos_delete(50)]);
         let merged = a.merge_with(&split_like("f.parquet", 100, 50));
         assert_eq!(
             (merged.start, merged.length),
             (0, 150),
             "start stays at self's; length is self+other"
         );
-        assert_eq!(merged.data_file_path, "f.parquet");
+        assert_eq!(merged.data_file_path.as_ref(), "f.parquet");
         assert_eq!(
             merged.deletes.len(),
             1,
@@ -865,16 +926,84 @@ mod tests {
     #[test]
     fn split_sub_tasks_inherit_parent_fields_and_clear_record_count_and_offsets() {
         let mut t = task(1000, DataFileFormat::Parquet, None);
-        t.deletes = vec![pos_delete(50)];
+        t.deletes = Arc::from(vec![pos_delete(50)]);
         let parts = t.split(400).expect("split ok");
         assert_eq!(parts.len(), 3);
         for p in &parts {
             // Deletes / schema / projection carried; record_count + offsets cleared on a sub-task.
             assert_eq!(p.deletes.len(), 1);
-            assert_eq!(p.project_field_ids, vec![1]);
+            assert_eq!(p.project_field_ids.as_ref(), &[1][..]);
             assert_eq!(p.record_count, None);
             assert_eq!(p.split_offsets, None);
             assert_eq!(p.file_size_in_bytes, 1000);
+        }
+    }
+
+    /// FK2.1 pin: split sub-tasks Arc-share path / projection / deletes (and residual when set).
+    #[test]
+    fn split_sub_tasks_arc_share_path_projection_deletes_and_predicate() {
+        let mut t = task(1000, DataFileFormat::Parquet, None);
+        t.deletes = Arc::from(vec![pos_delete(50), pos_delete(75)]);
+        t.predicate = Some(Arc::new(BoundPredicate::AlwaysTrue));
+        let parts = t.split(400).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            3,
+            "fixed-size split of 1000/400 yields 3 sub-tasks"
+        );
+        for p in &parts {
+            assert!(
+                Arc::ptr_eq(&p.data_file_path, &t.data_file_path),
+                "sub-task path must Arc-share parent"
+            );
+            assert!(
+                Arc::ptr_eq(&p.project_field_ids, &t.project_field_ids),
+                "sub-task project_field_ids must Arc-share parent"
+            );
+            assert!(
+                Arc::ptr_eq(&p.deletes, &t.deletes),
+                "sub-task deletes must Arc-share parent"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    p.predicate.as_ref().expect("predicate set"),
+                    t.predicate.as_ref().expect("predicate set")
+                ),
+                "sub-task residual must Arc-share parent"
+            );
+            // Window fields are the only ones that change.
+            assert_eq!(p.record_count, None);
+            assert_eq!(p.split_offsets, None);
+        }
+        // Sibling sub-tasks share with each other too (same parent Arc).
+        assert!(Arc::ptr_eq(&parts[0].deletes, &parts[1].deletes));
+        assert!(Arc::ptr_eq(
+            &parts[0].project_field_ids,
+            &parts[2].project_field_ids
+        ));
+        assert!(Arc::ptr_eq(
+            &parts[0].data_file_path,
+            &parts[2].data_file_path
+        ));
+    }
+
+    /// FK2.1 critic-octo: offsets-aware split must Arc-share the same way as fixed-size.
+    #[test]
+    fn split_offsets_aware_sub_tasks_arc_share_innards() {
+        let mut t = task(1000, DataFileFormat::Parquet, Some(vec![0, 300, 700]));
+        t.deletes = Arc::from(vec![pos_delete(50)]);
+        t.predicate = Some(Arc::new(BoundPredicate::AlwaysFalse));
+        let parts = t.split(1).expect("offsets-aware ignores target");
+        assert_eq!(parts.len(), 3);
+        for p in &parts {
+            assert!(Arc::ptr_eq(&p.deletes, &t.deletes));
+            assert!(Arc::ptr_eq(&p.project_field_ids, &t.project_field_ids));
+            assert!(Arc::ptr_eq(&p.data_file_path, &t.data_file_path));
+            assert!(Arc::ptr_eq(
+                p.predicate.as_ref().expect("set"),
+                t.predicate.as_ref().expect("set")
+            ));
+            assert_eq!(p.split_offsets, None);
         }
     }
 
@@ -897,7 +1026,7 @@ mod tests {
     #[test]
     fn weight_adds_position_delete_bytes() {
         let mut t = task(1000, DataFileFormat::Parquet, None);
-        t.deletes = vec![pos_delete(200), pos_delete(300)];
+        t.deletes = Arc::from(vec![pos_delete(200), pos_delete(300)]);
         // size term = 1000 + 200 + 300 = 1500; floor = (1 + 2) * 100 = 300 ⇒ max = 1500.
         assert_eq!(t.weight(100), 1500);
         // With a big open cost the floor dominates: (1 + 2) * 1000 = 3000.
@@ -908,7 +1037,7 @@ mod tests {
     fn weight_dv_charges_blob_size_not_file_size() {
         let mut t = task(1000, DataFileFormat::Parquet, None);
         // DV: whole puffin file is 9_000_000 bytes but the DV blob is only 64 bytes.
-        t.deletes = vec![dv_delete(9_000_000, 64)];
+        t.deletes = Arc::from(vec![dv_delete(9_000_000, 64)]);
         // size term must use the BLOB size: 1000 + 64 = 1064 (NOT 1000 + 9_000_000).
         assert_eq!(
             t.weight(0),
@@ -948,5 +1077,95 @@ mod tests {
         );
         let back_none: FileScanTask = serde_json::from_str(&json_none).expect("deserialize none");
         assert_eq!(back_none.split_offsets, None);
+    }
+
+    /// FK2.1 STOP bar: Arc wrappers must not change the JSON shape of FileScanTask fields
+    /// that engines serialize (path string, projection array, deletes array, residual).
+    #[test]
+    fn arc_fields_serialize_as_plain_string_and_arrays() {
+        let mut t = task(1000, DataFileFormat::Parquet, None);
+        t.deletes = Arc::from(vec![pos_delete(50)]);
+        t.predicate = Some(Arc::new(BoundPredicate::AlwaysTrue));
+        t.project_field_ids = Arc::from(vec![1, 2, 3]);
+
+        let json = serde_json::to_string(&t).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+
+        // Path is a JSON string, not an object.
+        assert!(
+            v["data_file_path"].is_string(),
+            "data_file_path must serialize as a JSON string, got {json}"
+        );
+        assert_eq!(
+            v["data_file_path"].as_str(),
+            Some("memory://t/data/1.parquet")
+        );
+
+        // Projection / deletes are JSON arrays (not Arc-tagged objects).
+        assert!(
+            v["project_field_ids"].is_array(),
+            "project_field_ids must serialize as a JSON array"
+        );
+        assert_eq!(v["project_field_ids"], serde_json::json!([1, 2, 3]));
+        assert!(
+            v["deletes"].is_array(),
+            "deletes must serialize as a JSON array"
+        );
+        assert_eq!(v["deletes"].as_array().expect("arr").len(), 1);
+
+        // Residual serializes as the bare BoundPredicate variant name, not Arc-wrapped.
+        assert_eq!(v["predicate"], serde_json::json!("AlwaysTrue"));
+
+        // Round-trip restores values (new Arcs, same content).
+        let back: FileScanTask = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.data_file_path.as_ref(), t.data_file_path.as_ref());
+        assert_eq!(
+            back.project_field_ids.as_ref(),
+            t.project_field_ids.as_ref()
+        );
+        assert_eq!(back.deletes.as_ref(), t.deletes.as_ref());
+        assert_eq!(back.predicate.as_deref(), t.predicate.as_deref());
+    }
+
+    /// FK2.1 critic-octo STOP bar: frozen golden JSON (pre-Arc field shapes) must match
+    /// exactly for a representative task — not just Value-level type checks.
+    #[test]
+    fn arc_fields_json_matches_pre_arc_golden_bytes() {
+        // A task with no residual / no deletes / no split_offsets — the common engine
+        // wire shape. Field order follows the struct declaration (serde_json preserves it).
+        let t = task(1000, DataFileFormat::Parquet, None);
+        let json = serde_json::to_string(&t).expect("serialize");
+        // Golden: plain string path, plain array projection, plain array deletes, no
+        // predicate key (None), no split_offsets key (None). Arc must not wrap any of these.
+        let golden = concat!(
+            r#"{"file_size_in_bytes":1000,"start":0,"length":1000,"record_count":1000,"#,
+            r#""data_file_path":"memory://t/data/1.parquet","data_file_format":"parquet","#,
+            r#""schema":{"#,
+        );
+        assert!(
+            json.starts_with(golden),
+            "JSON prefix must match pre-Arc shape; got {json}"
+        );
+        assert!(
+            json.contains(r#""project_field_ids":[1]"#),
+            "project_field_ids must be a bare JSON array [1], got {json}"
+        );
+        assert!(
+            json.contains(r#""deletes":[]"#),
+            "deletes must be a bare JSON array [], got {json}"
+        );
+        assert!(
+            !json.contains("predicate"),
+            "None residual must omit the predicate key, got {json}"
+        );
+        assert!(
+            !json.contains("split_offsets"),
+            "None split_offsets must omit the key, got {json}"
+        );
+        // No Arc-tagged / newtype object wrappers around shared fields.
+        assert!(
+            !json.contains("Arc") && !json.contains("\"ptr\""),
+            "JSON must not expose Arc internals, got {json}"
+        );
     }
 }

@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use arrow_arith::boolean::and;
 use arrow_array::{Array, BooleanArray, RecordBatch};
@@ -111,7 +111,11 @@ struct DeleteFileFilterState {
     /// Memoized per-task merged vectors — see [`PosDelResolutionKey`]. Entries are only installed
     /// once every claim key they depend on is present in `pos_del_contributions`, and contributions
     /// are immutable once installed, so a memoized union can never go stale.
-    resolved_pos_dels: HashMap<PosDelResolutionKey, Arc<Mutex<DeleteVector>>>,
+    ///
+    /// Frozen as [`Arc<DeleteVector>`] (not `Arc<Mutex<…>>`): audit of the load → install →
+    /// resolve path shows no post-publish mutation of a memoized vector — only reads
+    /// (`contains` / `iter` / `is_empty` / range-walk keep-masks). See FK3 scout #12.
+    resolved_pos_dels: HashMap<PosDelResolutionKey, Arc<DeleteVector>>,
     equality_deletes: HashMap<String, EqDelState>,
     positional_deletes: HashMap<String, PosDelState>,
 }
@@ -329,13 +333,13 @@ enum EqDelLookup<T> {
 
 /// Recover a poisoned lock guard instead of cascading the panic to every subsequent scan.
 ///
-/// The guarded [`DeleteFileFilterState`] is a set of `HashMap`s (and the per-file delete-vector
-/// `Mutex`es) whose critical sections perform only `insert`/`get`/`clone`/bitmap-union — no
-/// re-entrant user code that could tear a collection mid-mutation — so a guard left behind by a
-/// panicked holder still wraps a structurally coherent state. Recovering it via
-/// [`std::sync::PoisonError::into_inner`] keeps concurrent scans alive rather than turning one
-/// thread's panic into a poison-panic in every reader/writer. This is the crate's established
-/// policy for these delete-path locks (see `arrow/reader.rs`, the positional delete-vector mutex).
+/// The guarded [`DeleteFileFilterState`] is a set of `HashMap`s whose critical sections perform
+/// only `insert`/`get`/`clone` — no re-entrant user code that could tear a collection
+/// mid-mutation — so a guard left behind by a panicked holder still wraps a structurally coherent
+/// state. Recovering it via [`std::sync::PoisonError::into_inner`] keeps concurrent scans alive
+/// rather than turning one thread's panic into a poison-panic in every reader/writer. This is the
+/// crate's established policy for these delete-path locks (see `arrow/reader.rs`). Memoized
+/// positional delete vectors are frozen as [`Arc<DeleteVector>`] and are not themselves locked.
 fn recover_poison<G>(result: std::sync::LockResult<G>) -> G {
     result.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -372,7 +376,7 @@ impl DeleteFilter {
     pub(crate) fn get_delete_vector(
         &self,
         file_scan_task: &FileScanTask,
-    ) -> Option<Arc<Mutex<DeleteVector>>> {
+    ) -> Option<Arc<DeleteVector>> {
         self.resolve_delete_vector(&file_scan_task.deletes, file_scan_task.data_file_path())
     }
 
@@ -404,7 +408,7 @@ impl DeleteFilter {
         &self,
         deletes: &[FileScanTaskDeleteFile],
         data_file_path: &str,
-    ) -> Option<Arc<Mutex<DeleteVector>>> {
+    ) -> Option<Arc<DeleteVector>> {
         let mut claim_keys: Vec<String> = Vec::new();
         for delete in deletes {
             if delete.file_type != DataContentType::PositionDeletes {
@@ -464,18 +468,22 @@ impl DeleteFilter {
             }
         }
 
+        // OR-by-reference (no roaring clone of each contribution): each contribution is frozen
+        // after install, and the memoized merge is published as `Arc<DeleteVector>` once.
         let mut merged: Option<DeleteVector> = None;
         for contribution in &contributions {
             if let Some(vector) = contribution.get(data_file_path) {
-                *merged.get_or_insert_with(DeleteVector::default) |= vector.clone();
+                merged
+                    .get_or_insert_with(DeleteVector::default)
+                    .merge(vector);
             }
         }
-        let merged = Arc::new(Mutex::new(merged?));
+        let merged = Arc::new(merged?);
 
         if every_source_installed {
             // Double-checked install: a concurrent resolver may have memoized the same key while
             // the union above ran outside the lock — return THEIRS so every resolver of one task
-            // shape shares a single vector.
+            // shape shares a single frozen Arc.
             let mut state = recover_poison(self.state.write());
             let entry = state
                 .resolved_pos_dels
@@ -679,7 +687,7 @@ impl DeleteFilter {
     ) -> Option<Vec<EqDeleteKeySet>> {
         let mut sets: Vec<EqDeleteKeySet> = Vec::new();
         let mut shared_key_ids: Option<Vec<i32>> = None;
-        for delete in &task.deletes {
+        for delete in task.deletes.iter() {
             if !is_equality_delete(delete) {
                 continue;
             }
@@ -708,7 +716,7 @@ impl DeleteFilter {
         // * Bind the predicate to the task's schema to get a `BoundPredicate`
 
         let mut combined_predicate = AlwaysTrue;
-        for delete in &file_scan_task.deletes {
+        for delete in file_scan_task.deletes.iter() {
             if !is_equality_delete(delete) {
                 continue;
             }
@@ -804,7 +812,7 @@ impl DeleteFilter {
     /// positions (parquet position deletes and/or a deletion vector, already merged) — or `None`.
     /// Mirrors Java `DeleteFilter.deletedRowPositions()`. Synchronous: fully populated once
     /// [`load`](Self::load) returns.
-    pub fn deleted_row_positions(&self, task: &FileScanTask) -> Option<Arc<Mutex<DeleteVector>>> {
+    pub fn deleted_row_positions(&self, task: &FileScanTask) -> Option<Arc<DeleteVector>> {
         self.get_delete_vector(task)
     }
 
@@ -842,20 +850,19 @@ impl DeleteFilter {
         let num_rows = batch.num_rows();
 
         // Positional deletes → a keep-mask of `!deleted` over [row_base, row_base + num_rows).
+        // The memoized vector is frozen (`Arc<DeleteVector>`); apply is lock-free on the bitmap.
         let positional_mask: Option<BooleanArray> = match self.get_delete_vector(task) {
             Some(deletes) => {
-                let deletes = deletes.lock().map_err(|_| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "positional delete vector mutex was poisoned",
-                    )
-                })?;
                 if deletes.is_empty() {
                     None
                 } else {
                     // Range-walk the delete window — byte-identical to the per-row `!contains` probe,
                     // O(D_window) instead of O(num_rows). See `positional_delete_keep_mask`.
-                    Some(positional_delete_keep_mask(&deletes, row_base, num_rows))
+                    Some(positional_delete_keep_mask(
+                        deletes.as_ref(),
+                        row_base,
+                        num_rows,
+                    ))
                 }
             }
             None => None,
@@ -1039,7 +1046,7 @@ pub(crate) mod tests {
         let result = delete_filter
             .get_delete_vector(&file_scan_tasks[0])
             .unwrap();
-        assert_eq!(result.lock().unwrap().len(), 12); // pos dels from pos del file 1 and 2
+        assert_eq!(result.len(), 12); // pos dels from pos del file 1 and 2
 
         let delete_filter = delete_file_loader
             .load_deletes(&file_scan_tasks[1].deletes, file_scan_tasks[1].schema_ref())
@@ -1050,7 +1057,7 @@ pub(crate) mod tests {
         let result = delete_filter
             .get_delete_vector(&file_scan_tasks[1])
             .unwrap();
-        assert_eq!(result.lock().unwrap().len(), 8); // no pos dels for file 3
+        assert_eq!(result.len(), 8); // no pos dels for file 3
     }
 
     pub(crate) fn setup(table_location: &Path) -> Vec<FileScanTask> {
@@ -1167,12 +1174,15 @@ pub(crate) mod tests {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{}/1.parquet", table_location.to_str().unwrap()),
+                data_file_path: Arc::from(format!(
+                    "{}/1.parquet",
+                    table_location.to_str().unwrap()
+                )),
                 data_file_format: DataFileFormat::Parquet,
                 schema: data_file_schema.clone(),
-                project_field_ids: vec![],
+                project_field_ids: Arc::from(vec![]),
                 predicate: None,
-                deletes: vec![pos_del_1, pos_del_2.clone()],
+                deletes: Arc::from(vec![pos_del_1, pos_del_2.clone()]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -1184,12 +1194,15 @@ pub(crate) mod tests {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{}/2.parquet", table_location.to_str().unwrap()),
+                data_file_path: Arc::from(format!(
+                    "{}/2.parquet",
+                    table_location.to_str().unwrap()
+                )),
                 data_file_format: DataFileFormat::Parquet,
                 schema: data_file_schema.clone(),
-                project_field_ids: vec![],
+                project_field_ids: Arc::from(vec![]),
                 predicate: None,
-                deletes: vec![pos_del_3],
+                deletes: Arc::from(vec![pos_del_3]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -1260,12 +1273,12 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: "data.parquet".to_string(),
+            data_file_path: Arc::from("data.parquet"),
             data_file_format: crate::spec::DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![],
+            project_field_ids: Arc::from(vec![]),
             predicate: None,
-            deletes: vec![FileScanTaskDeleteFile {
+            deletes: Arc::from(vec![FileScanTaskDeleteFile {
                 file_path: "eq-del.parquet".to_string(),
                 file_size_in_bytes: 1, // never read; this test fails before opening the file
                 file_type: DataContentType::EqualityDeletes,
@@ -1276,7 +1289,7 @@ pub(crate) mod tests {
                 content_offset: None,
                 content_size_in_bytes: None,
                 record_count: None,
-            }],
+            }]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -1333,7 +1346,7 @@ pub(crate) mod tests {
 
         // Positional deletes for data file 1: {0,1,3,5,6,8,20,21,22,23,1022,1023} = 12 distinct.
         let positions = filter.deleted_row_positions(&tasks[0]).unwrap();
-        assert_eq!(positions.lock().unwrap().len(), 12);
+        assert_eq!(positions.len(), 12);
         // The fixture has no equality deletes.
         assert!(
             filter
@@ -1391,12 +1404,12 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: "data.parquet".to_string(),
+            data_file_path: Arc::from("data.parquet"),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![],
+            project_field_ids: Arc::from(vec![]),
             predicate: None,
-            deletes: vec![FileScanTaskDeleteFile {
+            deletes: Arc::from(vec![FileScanTaskDeleteFile {
                 file_path: "eq-del.parquet".to_string(),
                 file_size_in_bytes: 1,
                 file_type: DataContentType::EqualityDeletes,
@@ -1407,7 +1420,7 @@ pub(crate) mod tests {
                 content_offset: None,
                 content_size_in_bytes: None,
                 record_count: None,
-            }],
+            }]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -1519,12 +1532,13 @@ pub(crate) mod tests {
     /// `resolve_delete_vector` return `None` for a present contribution. A `None` is read by the
     /// reader / `apply` as "no positional deletes here", so a poison-induced `None` would silently
     /// DROP the file's positional deletes and RESURRECT deleted rows. The resolver must recover the
-    /// poison (`into_inner`) and still hand back the delete vector.
+    /// poison (`into_inner`) and still hand back the frozen delete vector.
     /// MUTATION: reverting the resolver's state read to `self.state.read().ok()` + early-`None`
     /// swallows the poison as `None` and this test FAILS (the `expect` below trips) — RED.
     /// (Adapted for R117: the accessor under test was `get_delete_vector_for_path` until the
     /// per-task scoping change replaced it with the task-scoped resolver — the pinned risk, a
-    /// poisoned read failing open as "no deletes", is unchanged.)
+    /// poisoned read failing open as "no deletes", is unchanged. FK3: memoized vectors are
+    /// `Arc<DeleteVector>` — poison recovery remains only on the outer state `RwLock`.)
     #[test]
     fn test_get_delete_vector_survives_poisoned_lock() {
         let filter = DeleteFilter::default();
@@ -1560,8 +1574,87 @@ pub(crate) mod tests {
             .resolve_delete_vector(&[parquet_pos_del_entry("pos-del.parquet")], "data.parquet")
             .expect("a present delete vector must survive a poisoned state lock, not read as None");
         assert!(
-            recover_poison(dv.lock()).contains(7),
+            dv.contains(7),
             "the recovered delete vector must still carry its deleted positions"
+        );
+    }
+
+    /// FK3 / scout #12: memoized positional vectors freeze as `Arc<DeleteVector>` and are shared
+    /// by pointer across resolvers of the same task shape. MUTATION: re-wrap every resolve in a
+    /// fresh `Arc::new(...)` (no memo install, or clone the inner bitmap into a new Arc each
+    /// time) turns `Arc::ptr_eq` RED.
+    #[test]
+    fn test_resolved_pos_del_vector_is_frozen_arc_shared() {
+        let filter = DeleteFilter::default();
+        let mut dv = DeleteVector::default();
+        dv.insert(1);
+        dv.insert(3);
+        let guard = claim_pos_del(&filter, "pos-del.parquet");
+        filter.install_pos_del_contribution(
+            &guard,
+            HashMap::from([("data.parquet".to_string(), dv)]),
+        );
+        guard.publish_loaded();
+
+        let deletes = [parquet_pos_del_entry("pos-del.parquet")];
+        let a = filter
+            .resolve_delete_vector(&deletes, "data.parquet")
+            .expect("vector must resolve");
+        let b = filter
+            .resolve_delete_vector(&deletes, "data.parquet")
+            .expect("vector must resolve again");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "repeated resolve of one task shape must share one frozen Arc"
+        );
+        assert_eq!(a.len(), 2);
+        assert!(a.contains(1) && a.contains(3));
+    }
+
+    /// FK3 / scout #12: multi-source resolve ORs by reference (no per-contribution roaring clone)
+    /// into one frozen Arc. Positions from BOTH sources must appear; a second resolve of the
+    /// same key shares the Arc. MUTATION: only merging the first contribution (skip the loop's
+    /// later sources) turns the cardinality/contains asserts RED.
+    #[test]
+    fn test_multi_source_resolve_ors_by_ref_into_frozen_arc() {
+        let filter = DeleteFilter::default();
+
+        let mut dv_a = DeleteVector::default();
+        dv_a.insert(1);
+        dv_a.insert(5);
+        let guard_a = claim_pos_del(&filter, "pos-a.parquet");
+        filter.install_pos_del_contribution(
+            &guard_a,
+            HashMap::from([("data.parquet".to_string(), dv_a)]),
+        );
+        guard_a.publish_loaded();
+
+        let mut dv_b = DeleteVector::default();
+        dv_b.insert(5); // overlap with A
+        dv_b.insert(9);
+        let guard_b = claim_pos_del(&filter, "pos-b.parquet");
+        filter.install_pos_del_contribution(
+            &guard_b,
+            HashMap::from([("data.parquet".to_string(), dv_b)]),
+        );
+        guard_b.publish_loaded();
+
+        let deletes = [
+            parquet_pos_del_entry("pos-a.parquet"),
+            parquet_pos_del_entry("pos-b.parquet"),
+        ];
+        let merged = filter
+            .resolve_delete_vector(&deletes, "data.parquet")
+            .expect("union must resolve");
+        assert_eq!(merged.len(), 3, "union of {{1,5}} and {{5,9}} is {{1,5,9}}");
+        assert!(merged.contains(1) && merged.contains(5) && merged.contains(9));
+
+        let again = filter
+            .resolve_delete_vector(&deletes, "data.parquet")
+            .expect("memoized re-resolve");
+        assert!(
+            Arc::ptr_eq(&merged, &again),
+            "multi-source memo must freeze as one shared Arc"
         );
     }
 
@@ -1606,12 +1699,12 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: data_file_path.to_string(),
+            data_file_path: Arc::from(data_file_path),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![],
+            project_field_ids: Arc::from(vec![]),
             predicate: None,
-            deletes,
+            deletes: Arc::from(deletes),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -2036,6 +2129,105 @@ pub(crate) mod tests {
         assert_eq!(mask, vec![true, true, false, false]);
     }
 
+    /// Int key (Int32Array → I64 store) — pins i32→i64 widen on both build (`literal_as_i64`) and
+    /// probe (`i64_column_values`) so the specialized store stays oracle-identical for Int.
+    #[test]
+    fn test_h6_set_int_matches_oracle() {
+        use arrow_array::Int32Array;
+        let schema = opt_schema(vec![(1, "v", PrimitiveType::Int)]);
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Int)];
+        let delete_rows = vec![vec![Some(Datum::int(3))], vec![Some(Datum::int(7))]];
+        let data: ArrayRef = Arc::new(Int32Array::from(vec![Some(3i32), Some(7), Some(9)]));
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["v"], delete_rows, vec![("v", data)]);
+        assert_eq!(mask, vec![true, true, false]);
+    }
+
+    /// Timestamp (micros) key — I64 store path for TimestampMicrosecondArray.
+    #[test]
+    fn test_h6_set_timestamp_matches_oracle() {
+        use arrow_array::TimestampMicrosecondArray;
+        let schema = opt_schema(vec![(1, "ts", PrimitiveType::Timestamp)]);
+        let key_columns = vec![(1, "ts".to_string(), PrimitiveType::Timestamp)];
+        let delete_rows = vec![vec![Some(Datum::timestamp_micros(1_000_000))]];
+        let data: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(1_000_000i64),
+            Some(2_000_000),
+        ]));
+        let mask = assert_set_matches_oracle(schema, key_columns, &["ts"], delete_rows, vec![(
+            "ts", data,
+        )]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// Timestamptz (micros) — same physical I64 path as Timestamp; pins the type arm.
+    #[test]
+    fn test_h6_set_timestamptz_matches_oracle() {
+        use arrow_array::TimestampMicrosecondArray;
+        let schema = opt_schema(vec![(1, "tsz", PrimitiveType::Timestamptz)]);
+        let key_columns = vec![(1, "tsz".to_string(), PrimitiveType::Timestamptz)];
+        let delete_rows = vec![vec![Some(Datum::timestamptz_micros(5_000_000))]];
+        let data: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![Some(5_000_000i64), Some(6_000_000)])
+                .with_timezone("UTC"),
+        );
+        let mask = assert_set_matches_oracle(schema, key_columns, &["tsz"], delete_rows, vec![(
+            "tsz", data,
+        )]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// TimestampNs — I64 store via TimestampNanosecondArray.
+    #[test]
+    fn test_h6_set_timestamp_ns_matches_oracle() {
+        use arrow_array::TimestampNanosecondArray;
+        let schema = opt_schema(vec![(1, "tsn", PrimitiveType::TimestampNs)]);
+        let key_columns = vec![(1, "tsn".to_string(), PrimitiveType::TimestampNs)];
+        let delete_rows = vec![vec![Some(Datum::timestamp_nanos(1_000_000_000))]];
+        let data: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+            Some(1_000_000_000i64),
+            Some(2_000_000_000),
+        ]));
+        let mask = assert_set_matches_oracle(schema, key_columns, &["tsn"], delete_rows, vec![(
+            "tsn", data,
+        )]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// Multi-column Bytes store retains null tags (unlike I64). Null-only delete tuples must
+    /// keep the set non-empty and null-bail so the predicate `IS NULL` leaves still apply.
+    #[test]
+    fn test_h6_set_multi_column_null_only_bails_on_null_data() {
+        use arrow_array::StringArray;
+        let schema = opt_schema(vec![
+            (1, "id", PrimitiveType::Long),
+            (2, "name", PrimitiveType::String),
+        ]);
+        let key_columns = vec![
+            (1, "id".to_string(), PrimitiveType::Long),
+            (2, "name".to_string(), PrimitiveType::String),
+        ];
+        // Full-null delete tuple — Bytes encodes TAG_NULL per cell.
+        let delete_rows = vec![vec![None, None]];
+        let set = EqDeleteKeySet::try_build(key_columns, delete_rows.clone()).expect("set builds");
+        assert!(
+            !set.is_empty(),
+            "Bytes null-only multi-col set must be non-empty (null tags retained)"
+        );
+
+        let id: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None]));
+        let name: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
+        let batch = batch_with_field_ids(vec![("id", id), ("name", name)]);
+        assert_eq!(
+            set.delete_mask(&batch).expect("delete_mask"),
+            None,
+            "null data must bail for Bytes null-only multi-col deletes"
+        );
+        let oracle = multi_col_oracle_deleted_mask(&["id", "name"], schema, &delete_rows, &batch);
+        // Only the all-null data row matches the all-null delete tuple.
+        assert_eq!(oracle, vec![false, true]);
+    }
+
     /// String key — empty string, no-match. (Non-null data → set path.)
     #[test]
     fn test_h6_set_string_matches_oracle() {
@@ -2133,6 +2325,29 @@ pub(crate) mod tests {
         );
         let mask =
             assert_set_matches_oracle(schema, key_columns, &["f"], delete_rows, vec![("f", data)]);
+        assert_eq!(mask, vec![true, false]);
+    }
+
+    /// Uuid key — pins LE `UInt128` encode on the Datum side against Arrow FixedSizeBinary(16)
+    /// via `Uuid::from_bytes`/`as_u128` on the probe side (critic-octo FK1 cycle 3 coverage).
+    #[test]
+    fn test_h6_set_uuid_matches_oracle() {
+        use arrow_array::FixedSizeBinaryArray;
+        use uuid::Uuid;
+
+        let u_hit = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").expect("uuid");
+        let u_miss = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").expect("uuid");
+        let schema = opt_schema(vec![(1, "u", PrimitiveType::Uuid)]);
+        let key_columns = vec![(1, "u".to_string(), PrimitiveType::Uuid)];
+        let delete_rows = vec![vec![Some(Datum::uuid(u_hit))]];
+        let data: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(
+                vec![u_hit.as_bytes().to_vec(), u_miss.as_bytes().to_vec()].into_iter(),
+            )
+            .expect("build Uuid data column"),
+        );
+        let mask =
+            assert_set_matches_oracle(schema, key_columns, &["u"], delete_rows, vec![("u", data)]);
         assert_eq!(mask, vec![true, false]);
     }
 
@@ -2275,6 +2490,11 @@ pub(crate) mod tests {
     /// matches it — the Java `StructLikeSet` verdict. The bail stays mandatory (conservative:
     /// the predicate path is the oracle); extending the set path to null keys is a possible
     /// future optimization now that the two agree.
+    ///
+    /// **MUTATION (FK1 P0):** delete the `column.null_count() > 0 { return Ok(None) }` bail in
+    /// `EqDeleteKeySet::delete_mask` → this test must go RED (returns `Some(...)` instead of
+    /// `None`). Re-run at tip during critic-octo; a mutation that was RED three commits ago is
+    /// not RED.
     #[test]
     fn test_h6_set_returns_none_when_key_column_has_null() {
         let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
@@ -2306,11 +2526,104 @@ pub(crate) mod tests {
         );
     }
 
+    /// Critic-octo FK1 cycle 1+2: I64 store drops null delete cells. Null-only Long delete files
+    /// must (a) not report `is_empty()` (apply seam must not skip them), and (b) `delete_mask`
+    /// null-bail so the predicate's `col IS NULL` leaf still applies.
+    ///
+    /// **MUTATION:** empty-before-null order in `delete_mask`, or treat null-only I64 as
+    /// `is_empty()==true` without null-bail → this test goes RED.
+    #[test]
+    fn test_h6_set_null_only_i64_delete_bails_on_null_data() {
+        let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Long)];
+        // Only NULL delete keys — I64 store ends empty (nulls cannot be stored as i64).
+        let delete_rows = vec![vec![None], vec![None]];
+        let set =
+            EqDeleteKeySet::try_build(key_columns, delete_rows.clone()).expect("Long set builds");
+        assert!(
+            !set.is_empty(),
+            "null-only I64 deletes drop nulls from the store but must NOT report is_empty — \
+             apply seams that skip empty sets would under-delete null data"
+        );
+
+        let data: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None, Some(2)]));
+        let batch = batch_with_field_ids(vec![("v", data)]);
+
+        assert_eq!(
+            set.delete_mask(&batch).expect("delete_mask"),
+            None,
+            "null-only I64 delete file + null data batch must bail to the predicate path \
+             (empty short-circuit must not run first)"
+        );
+
+        // Oracle: NULL delete deletes only the NULL data row.
+        let oracle = multi_col_oracle_deleted_mask(&["v"], schema, &delete_rows, &batch);
+        assert_eq!(
+            oracle,
+            vec![false, true, false],
+            "predicate oracle: null-only delete set deletes null data rows only"
+        );
+
+        // Non-null data: null deletes never match values → nothing deleted.
+        let non_null: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), Some(2)]));
+        let non_null_batch = batch_with_field_ids(vec![("v", non_null)]);
+        assert_eq!(
+            set.delete_mask(&non_null_batch).expect("delete_mask"),
+            Some(vec![false, false]),
+            "null-only I64 deletes delete nothing among fully non-null data"
+        );
+    }
+
+    /// Critic-octo FK1 cycle 2: simulate the apply-seam keep-mask loop (reader
+    /// `eq_delete_keep_mask`) over a null-only I64 set. Skipping `is_empty` sets without calling
+    /// `delete_mask` would yield keep-all; the production loop must call `delete_mask` and fall
+    /// back when it returns `None`.
+    #[test]
+    fn test_h6_apply_seam_null_only_i64_does_not_keep_all() {
+        let key_columns = vec![(1, "v".to_string(), PrimitiveType::Long)];
+        let delete_rows = vec![vec![None]];
+        let set = EqDeleteKeySet::try_build(key_columns, delete_rows).expect("Long set builds");
+        let sets = [set];
+
+        let data: ArrayRef = Arc::new(Int64Array::from(vec![Some(1i64), None]));
+        let batch = batch_with_field_ids(vec![("v", data)]);
+        let num_rows = batch.num_rows();
+
+        // Mirror reader::eq_delete_keep_mask (always call delete_mask; no empty-skip).
+        let mut keep = vec![true; num_rows];
+        let mut all_sets_safe = true;
+        for set in &sets {
+            match set.delete_mask(&batch).expect("delete_mask") {
+                Some(deleted) => {
+                    for (k, d) in keep.iter_mut().zip(deleted.iter()) {
+                        *k &= !*d;
+                    }
+                }
+                None => {
+                    all_sets_safe = false;
+                    break;
+                }
+            }
+        }
+        assert!(
+            !all_sets_safe,
+            "null-only I64 + null data must force predicate fallback at the apply seam"
+        );
+        // And is_empty must not invite a skip:
+        assert!(!sets[0].is_empty());
+    }
+
     /// THE GATE: Float / Double key columns must NOT build a set (route to the predicate fallback),
     /// and Decimal / Unknown are likewise excluded. This is what keeps the proven-divergent float
     /// case on the untouched predicate path. (Time and Fixed are NOT excluded — they gained a
     /// `get_arrow_datum` arm and their equality is integer-/byte-identical; see the eligible-type
     /// assertions below and `test_h6_set_time_matches_oracle` / `test_h6_set_fixed_matches_oracle`.)
+    ///
+    /// **MUTATION (FK1 P0):** admit `PrimitiveType::Float`/`Double` in
+    /// `EqDeleteKeySet::is_eligible_type` → `try_build` returns `Some` for a Double key and
+    /// `test_h6_naive_set_diverges_on_negative_zero` documents the semantic break. This gate test
+    /// must go RED on the `is_none()` assertions. Float Java-Comparator hashing remains a named
+    /// follow-up seed (not tonight).
     #[test]
     fn test_h6_gate_excludes_float_double_decimal_unknown() {
         assert!(!EqDeleteKeySet::is_eligible_type(&PrimitiveType::Float));

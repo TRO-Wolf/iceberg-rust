@@ -34,7 +34,7 @@ use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
@@ -55,7 +55,9 @@ use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::record_batch_predicate::{
     evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask, null_filled,
 };
-use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::record_batch_transformer::{
+    RecordBatchTransformer, RecordBatchTransformerBuilder,
+};
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
@@ -516,22 +518,45 @@ impl ArrowReader {
         // and the scan predicate via `RowSelection`, which SKIPS rows at the decode layer, making
         // the surviving rows' physical positions unrecoverable. So when `_pos` is projected we
         // decode the file in order with NO row-skipping (no RowFilter / RowSelection / row-group
-        // pruning) and route the batches through the shared whole-file tail
-        // (`finish_whole_file_scan_task`, also used by the Avro / ORC paths), which applies the
-        // predicate + merge-on-read deletes post-decode via a survival mask while the transformer
-        // assigns `_pos` = 0-based file ordinal. Pushdown is unaffected for scans that do not
-        // request `_pos`.
+        // pruning). FK5 streaming half: stream batches through transform + post-decode survival
+        // (pos-deletes / residual / eq-deletes) instead of whole-file `try_collect` — memory is
+        // O(batch), not O(file). The transformer assigns `_pos` = 0-based file ordinal. Selection-
+        // aware ordinal pushdown is STOP-gated (see `task/fk5-pos-projection-ledger.md`): a
+        // `RowFilter` does not expose physical ordinals of undelivered rows. Pushdown is unaffected
+        // for scans that do not request `_pos`.
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS) {
+            // Review rider (2026-08-03): this path decodes the WHOLE file in physical order with
+            // ordinals from 0 (see `stream_pos_projection_scan_task`); a RANGED split task here
+            // would re-emit the full file per split — duplicate rows with wrong `_pos`, which
+            // corrupts written position deletes. Whole-file tasks carry `start == 0` with
+            // `length == 0` (legacy sentinel) or `length == file_size_in_bytes`; anything else
+            // is a `plan_tasks`/split product and is rejected loud. (The `to_arrow` within-file
+            // expand already suppresses itself under `_pos`; this guards the public
+            // `PartitionWork` / direct-reader seam.)
+            let whole_file =
+                task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes);
+            if !whole_file {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "`_pos` projection over a ranged split task is unsupported: task covers \
+                         {}..{} of {} bytes of '{}', but the `_pos` path decodes whole files with \
+                         ordinals from 0 (each split would duplicate every row). Plan without \
+                         splitting, or drop `_pos` from the projection.",
+                        task.start,
+                        task.start.saturating_add(task.length),
+                        task.file_size_in_bytes,
+                        task.data_file_path
+                    ),
+                ));
+            }
             if let Some(batch_size) = batch_size {
                 record_batch_stream_builder =
                     record_batch_stream_builder.with_batch_size(batch_size);
             }
-            let batches: Vec<RecordBatch> = record_batch_stream_builder
-                .build()?
-                .map(|batch| batch.map_err(Error::from))
-                .try_collect()
-                .await?;
-            return Self::finish_whole_file_scan_task(task, batches, delete_filter_rx).await;
+            let parquet_stream = record_batch_stream_builder.build()?;
+            return Self::stream_pos_projection_scan_task(task, parquet_stream, delete_filter_rx)
+                .await;
         }
 
         // RecordBatchTransformer performs any transformations required on the RecordBatches
@@ -592,29 +617,26 @@ impl ArrowReader {
 
         // Residual pushed into RowFilter / RG skip / page selection: scan predicate always; AND
         // eq-delete predicate only when the post-decode keyset path is NOT taken.
-        let final_predicate = if keyset_post_decode {
-            task.predicate.clone()
+        // Normalize to owned BoundPredicate: task residual is Arc-shared, delete predicate is not.
+        //
+        // Owned state for the post-decode keyset apply (only when the routing above selected it).
+        let (final_predicate, post_decode_eq_sets, post_decode_eq_predicate) = if keyset_post_decode
+        {
+            (
+                task.predicate.as_deref().cloned(),
+                eq_delete_sets,
+                delete_predicate,
+            )
         } else {
-            match (&task.predicate, &delete_predicate) {
+            let final_predicate = match (task.predicate.as_deref(), delete_predicate) {
                 (None, None) => None,
                 (Some(predicate), None) => Some(predicate.clone()),
-                (None, Some(predicate)) => Some(predicate.clone()),
+                (None, Some(predicate)) => Some(predicate),
                 (Some(filter_predicate), Some(delete_predicate)) => {
-                    Some(filter_predicate.clone().and(delete_predicate.clone()))
+                    Some(filter_predicate.clone().and(delete_predicate))
                 }
-            }
-        };
-
-        // Owned state for the post-decode keyset apply (only when the routing above selected it).
-        let post_decode_eq_sets = if keyset_post_decode {
-            eq_delete_sets
-        } else {
-            None
-        };
-        let post_decode_eq_predicate = if keyset_post_decode {
-            delete_predicate
-        } else {
-            None
+            };
+            (final_predicate, None, None)
         };
 
         // There are three possible sources for potential lists of selected RowGroup indices,
@@ -697,17 +719,12 @@ impl ArrowReader {
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);
 
         if let Some(positional_delete_indexes) = positional_delete_indexes {
-            let delete_row_selection = {
-                let positional_delete_indexes = positional_delete_indexes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-                Self::build_deletes_row_selection(
-                    record_batch_stream_builder.metadata().row_groups(),
-                    &selected_row_group_indices,
-                    &positional_delete_indexes,
-                )
-            }?;
+            // Frozen `Arc<DeleteVector>` — no mutex; apply/row-selection is lock-free on the bitmap.
+            let delete_row_selection = Self::build_deletes_row_selection(
+                record_batch_stream_builder.metadata().row_groups(),
+                &selected_row_group_indices,
+                positional_delete_indexes.as_ref(),
+            )?;
 
             // merge the row selection from the delete files with the row selection
             // from the filter predicate, if there is one from the filter predicate
@@ -852,6 +869,41 @@ impl ArrowReader {
         Self::finish_whole_file_scan_task(task, batches, delete_filter_rx).await
     }
 
+    /// Parquet path when `_pos` is projected (FK5 streaming half): decode in physical order with
+    /// **no** `RowFilter` / `RowSelection` / RG prune, but stream batches through
+    /// [`Self::apply_pos_aware_batch`] instead of whole-file `try_collect`. Memory is O(batch).
+    /// Selection-aware ordinal pushdown remains STOP-gated — see ledger.
+    async fn stream_pos_projection_scan_task<S>(
+        task: FileScanTask,
+        parquet_stream: S,
+        delete_filter_rx: tokio::sync::oneshot::Receiver<
+            Result<crate::arrow::delete_filter::DeleteFilter>,
+        >,
+    ) -> Result<ArrowRecordBatchStream>
+    where
+        S: Stream<Item = parquet::errors::Result<RecordBatch>> + Send + 'static,
+    {
+        let mut record_batch_transformer = Self::build_scan_task_transformer(&task)?;
+        let (positional_deletes, residual_predicate, eq_delete_predicate, eq_delete_sets) =
+            Self::resolve_whole_file_delete_context(&task, delete_filter_rx).await?;
+
+        let mut absolute_pos: u64 = 0;
+        let record_batch_stream = parquet_stream.map(move |batch_result| {
+            let batch = batch_result.map_err(Error::from)?;
+            Self::apply_pos_aware_batch(
+                batch,
+                &mut record_batch_transformer,
+                &mut absolute_pos,
+                positional_deletes.as_ref(),
+                residual_predicate.as_deref(),
+                eq_delete_predicate.as_ref(),
+                eq_delete_sets.as_deref(),
+            )
+        });
+
+        Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
+    }
+
     /// The format-agnostic tail shared by [`Self::process_avro_file_scan_task`] and
     /// [`Self::process_orc_file_scan_task`]: everything after a whole-file reader has MATERIALIZED
     /// `batches` (the decoded data columns, by field id, in projection order). Given the in-flight
@@ -868,8 +920,9 @@ impl ArrowReader {
     ///    [`evaluate_predicate_to_mask`] / [`filter_record_batch`] kernels the Parquet
     ///    `RowFilter`/`RowSelection` use.
     ///
-    /// This is the ONE copy of the whole-file delete-application logic; the two callers differ only
-    /// in which U1 reader decoded `batches`.
+    /// Per-batch apply is shared with the Parquet `_pos` streaming path
+    /// ([`Self::apply_pos_aware_batch`]). Avro/ORC still materialize decode first (format limit);
+    /// the eager output `Vec` here is fine because `batches` is already fully in memory.
     async fn finish_whole_file_scan_task(
         task: FileScanTask,
         batches: Vec<RecordBatch>,
@@ -877,8 +930,37 @@ impl ArrowReader {
             Result<crate::arrow::delete_filter::DeleteFilter>,
         >,
     ) -> Result<ArrowRecordBatchStream> {
-        // Build the SAME RecordBatchTransformer the Parquet path uses (schema evolution + reorder +
-        // `_file` / identity-partition constants).
+        let mut record_batch_transformer = Self::build_scan_task_transformer(&task)?;
+        let (positional_deletes, residual_predicate, eq_delete_predicate, eq_delete_sets) =
+            Self::resolve_whole_file_delete_context(&task, delete_filter_rx).await?;
+
+        // File already fully decoded — eager loop is fine; counters stay simplest on owned batches.
+        let mut output: Vec<Result<RecordBatch>> = Vec::with_capacity(batches.len());
+        let mut absolute_pos: u64 = 0;
+        for batch in batches {
+            match Self::apply_pos_aware_batch(
+                batch,
+                &mut record_batch_transformer,
+                &mut absolute_pos,
+                positional_deletes.as_ref(),
+                residual_predicate.as_deref(),
+                eq_delete_predicate.as_ref(),
+                eq_delete_sets.as_deref(),
+            ) {
+                Ok(b) => output.push(Ok(b)),
+                Err(e) => {
+                    output.push(Err(e));
+                    break;
+                }
+            }
+        }
+
+        Ok(Box::pin(futures::stream::iter(output)) as ArrowRecordBatchStream)
+    }
+
+    /// Build the [`RecordBatchTransformer`] shared by Parquet `_pos` streaming and Avro/ORC
+    /// whole-file tails (schema evolution, reorder, `_file` / identity-partition constants).
+    fn build_scan_task_transformer(task: &FileScanTask) -> Result<RecordBatchTransformer> {
         let mut record_batch_transformer_builder =
             RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -892,11 +974,22 @@ impl ArrowReader {
             record_batch_transformer_builder =
                 record_batch_transformer_builder.with_partition(partition_spec, partition_data)?;
         }
-        let mut record_batch_transformer = record_batch_transformer_builder.build();
+        Ok(record_batch_transformer_builder.build())
+    }
 
-        // Resolve the deletes (positional vector + the equality-delete predicate), then AND the
-        // equality-delete predicate with the scan residual into one per-batch survival predicate —
-        // the same single predicate the Parquet path forms before pushing it into the RowFilter.
+    /// Resolve positional delete vector + residual + eq-delete set/predicate for whole-file /
+    /// `_pos` post-decode apply. Delete load was started concurrently with the data read.
+    async fn resolve_whole_file_delete_context(
+        task: &FileScanTask,
+        delete_filter_rx: tokio::sync::oneshot::Receiver<
+            Result<crate::arrow::delete_filter::DeleteFilter>,
+        >,
+    ) -> Result<(
+        Option<Arc<DeleteVector>>,
+        Option<Arc<BoundPredicate>>,
+        Option<BoundPredicate>,
+        Option<Vec<EqDeleteKeySet>>,
+    )> {
         let delete_filter = delete_filter_rx.await.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -911,64 +1004,78 @@ impl ArrowReader {
         // eq-delete predicate is the fallback. The scan residual (`task.predicate`) and the eq-delete
         // predicate are kept available for the predicate path; the set only accelerates the common
         // case. `eq_delete_predicate` is `None` when the task has no eq-deletes.
-        let eq_delete_sets = delete_filter.collect_equality_delete_keysets(&task).await;
-        let eq_delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let eq_delete_sets = delete_filter.collect_equality_delete_keysets(task).await;
+        let eq_delete_predicate = delete_filter.build_equality_delete_predicate(task).await?;
         let residual_predicate = task.predicate.clone();
+        let positional_deletes = delete_filter.get_delete_vector(task);
+        Ok((
+            positional_deletes,
+            residual_predicate,
+            eq_delete_predicate,
+            eq_delete_sets,
+        ))
+    }
 
-        // The positional-delete vector for this data file (cloned out so the stream owns it).
-        let positional_deletes = delete_filter.get_delete_vector(&task);
+    /// Transform one decoded batch, assign `_pos` from the running physical counter (via the
+    /// transformer), apply MoR survival (positional / residual / eq), advance `absolute_pos` by the
+    /// **full pre-filter** row count. Shared by Parquet `_pos` streaming and Avro/ORC whole-file.
+    ///
+    /// Correctness: `absolute_pos` / transformer `next_row_position` must track the same physical
+    /// file ordinal base. Skipping rows at decode (RowSelection/RowFilter) would desync them —
+    /// callers that project `_pos` must not enable decode-layer row skips.
+    fn apply_pos_aware_batch(
+        batch: RecordBatch,
+        transformer: &mut RecordBatchTransformer,
+        absolute_pos: &mut u64,
+        positional_deletes: Option<&Arc<DeleteVector>>,
+        residual_predicate: Option<&BoundPredicate>,
+        eq_delete_predicate: Option<&BoundPredicate>,
+        eq_delete_sets: Option<&[EqDeleteKeySet]>,
+    ) -> Result<RecordBatch> {
+        let row_count = batch.num_rows();
+        let batch_base = *absolute_pos;
+        let transformed = transformer.process_record_batch(batch)?;
+        // Dual-counter invariant: `absolute_pos` (pos-delete base) and the transformer's
+        // `next_row_position` (feeds `_pos` values) must stay aligned. When `_pos` is projected,
+        // the first surviving ordinal in the transformed batch must equal `batch_base`. A
+        // desync here corrupts WRITTEN position deletes (MERGE identity).
+        debug_assert!(
+            {
+                use arrow_array::Int64Array;
 
-        // Materialize every transformed + delete-filtered batch eagerly: the file is already fully
-        // decoded in memory, so there is no streaming benefit to a lazy adapter, and the absolute
-        // row-position counter for positional deletes is simplest to thread over an owned loop.
-        let mut output: Vec<Result<RecordBatch>> = Vec::with_capacity(batches.len());
-        let mut absolute_pos: u64 = 0;
-        for batch in batches {
-            let row_count = batch.num_rows();
-
-            let transformed = match record_batch_transformer.process_record_batch(batch) {
-                Ok(b) => b,
-                Err(e) => {
-                    output.push(Err(e));
-                    break;
+                use crate::metadata_columns::RESERVED_COL_NAME_POS;
+                match transformed.column_by_name(RESERVED_COL_NAME_POS) {
+                    Some(col) if row_count > 0 => col
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .is_some_and(|a| a.value(0) as u64 == batch_base),
+                    _ => true,
                 }
-            };
-
-            let mask = match Self::survival_mask(
-                &transformed,
-                row_count,
-                absolute_pos,
-                positional_deletes.as_ref(),
-                residual_predicate.as_ref(),
-                eq_delete_predicate.as_ref(),
-                eq_delete_sets.as_deref(),
-            ) {
-                Ok(mask) => mask,
-                Err(e) => {
-                    output.push(Err(e));
-                    break;
-                }
-            };
-
-            absolute_pos = absolute_pos.saturating_add(row_count as u64);
-
-            match mask {
-                // No deletes / residual touch this batch: emit it unchanged.
-                None => output.push(Ok(transformed)),
-                Some(mask) => {
-                    let filtered = filter_record_batch(&transformed, &mask).map_err(|e| {
-                        Error::new(
-                            ErrorKind::Unexpected,
-                            "Failed to apply merge-on-read deletes to a materialized data batch",
-                        )
-                        .with_source(e)
-                    });
-                    output.push(filtered);
-                }
-            }
+            },
+            "absolute_pos desynced from transformer _pos (batch_base={batch_base}, rows={row_count})"
+        );
+        let mask = Self::survival_mask(
+            &transformed,
+            row_count,
+            batch_base,
+            positional_deletes,
+            residual_predicate,
+            eq_delete_predicate,
+            eq_delete_sets,
+        )?;
+        // Advance by FULL batch before any mask filter so the next batch's physical ordinals
+        // continue correctly (matches RecordBatchTransformer::next_row_position advance).
+        *absolute_pos = absolute_pos.saturating_add(row_count as u64);
+        match mask {
+            None => Ok(transformed),
+            Some(mask) => filter_record_batch(&transformed, &mask).map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to apply merge-on-read deletes to a data batch under _pos / whole-file scan",
+                )
+                .with_source(e)
+            }),
         }
-
-        Ok(Box::pin(futures::stream::iter(output)) as ArrowRecordBatchStream)
     }
 
     /// The projected Iceberg [`Schema`] a whole-file (Avro / ORC) data reader resolves the file
@@ -1020,26 +1127,25 @@ impl ArrowReader {
         batch: &RecordBatch,
         num_rows: usize,
         batch_base: u64,
-        positional_deletes: Option<&Arc<std::sync::Mutex<DeleteVector>>>,
+        positional_deletes: Option<&Arc<DeleteVector>>,
         residual_predicate: Option<&BoundPredicate>,
         eq_delete_predicate: Option<&BoundPredicate>,
         eq_delete_sets: Option<&[EqDeleteKeySet]>,
     ) -> Result<Option<BooleanArray>> {
         // Positional deletes → a keep-mask of `!deleted` over this batch's absolute position window.
+        // The memoized vector is frozen (`Arc<DeleteVector>`); no mutex on the apply path.
         let positional_mask: Option<BooleanArray> = match positional_deletes {
             Some(deletes) => {
-                let deletes = deletes.lock().map_err(|_| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "positional delete vector mutex was poisoned",
-                    )
-                })?;
                 if deletes.is_empty() {
                     None
                 } else {
                     // Range-walk the delete window — byte-identical to the per-row `!contains` probe,
                     // O(D_window) instead of O(num_rows). See `positional_delete_keep_mask`.
-                    Some(positional_delete_keep_mask(&deletes, batch_base, num_rows))
+                    Some(positional_delete_keep_mask(
+                        deletes.as_ref(),
+                        batch_base,
+                        num_rows,
+                    ))
                 }
             }
             None => None,
@@ -1101,9 +1207,11 @@ impl ArrowReader {
             let mut keep = vec![true; num_rows];
             let mut all_sets_safe = true;
             for set in sets {
-                if set.is_empty() {
-                    continue;
-                }
+                // Always call `delete_mask` — do not skip on `is_empty()`. The I64 store drops
+                // null delete cells; a null-only Long eq-delete file reports store-empty but still
+                // must null-bail (or hit the predicate) so `col IS NULL` deletes apply. Skipping
+                // empty sets produced a keep-all mask and under-deleted null data (FK1 critic-octo
+                // cycle 2). Truly empty sets return `Some(all-false)` after the null check.
                 match set.delete_mask(batch)? {
                     Some(deleted) => {
                         for (k, d) in keep.iter_mut().zip(deleted.iter()) {
@@ -2663,6 +2771,7 @@ mod tests {
         SetExpression,
     };
     use crate::io::FileIO;
+    use crate::metadata_columns::RESERVED_FIELD_ID_POS;
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveLiteral, PrimitiveType,
@@ -3035,12 +3144,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1],
-                predicate: Some(predicate.bind(schema, true).unwrap()),
-                deletes: vec![],
+                project_field_ids: Arc::from(vec![1]),
+                predicate: Some(Arc::new(predicate.bind(schema, true).unwrap())),
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -3383,12 +3492,12 @@ message schema {
             start: rg0_start,
             length: row_group_0.compressed_size() as u64,
             record_count: Some(100),
-            data_file_path: file_path.clone(),
+            data_file_path: Arc::from(file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![1],
+            project_field_ids: Arc::from(vec![1]),
             predicate: None,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -3402,12 +3511,12 @@ message schema {
             start: rg1_start,
             length: file_end - rg1_start,
             record_count: Some(200),
-            data_file_path: file_path.clone(),
+            data_file_path: Arc::from(file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
-            project_field_ids: vec![1],
+            project_field_ids: Arc::from(vec![1]),
             predicate: None,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -3534,12 +3643,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/old_file.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/old_file.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: new_schema.clone(),
-                project_field_ids: vec![1, 2], // Request both columns 'a' and 'b'
+                project_field_ids: Arc::from(vec![1, 2]), // Request both columns 'a' and 'b'
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -3630,12 +3739,15 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/data.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/data.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, crate::metadata_columns::RESERVED_FIELD_ID_POS],
+                project_field_ids: Arc::from(vec![
+                    1,
+                    crate::metadata_columns::RESERVED_FIELD_ID_POS,
+                ]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -3669,6 +3781,848 @@ message schema {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(pos_col.values(), &[0, 1, 2, 3, 4]);
+    }
+
+    // ===========================================================================================
+    // FK5 — `_pos` projection streaming half (scout #16)
+    //
+    // Bar: dense + sparse pos-deletes + residual; row sets AND `_pos` values vs unpruned physical
+    // oracle; multi-batch continuity; MERGE-shaped write pin; mutation bait on ordinal advance.
+    // Selection-aware pushdown is STOP-gated (ledger).
+    // ===========================================================================================
+
+    /// Collect `(id, _pos)` pairs from a scan projecting field 1 + `_pos`, sorted by id.
+    fn collect_id_pos_pairs(batches: &[RecordBatch]) -> Vec<(i32, i64)> {
+        use arrow_array::{Int32Array, Int64Array};
+        let mut out = Vec::new();
+        for batch in batches {
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id Int32");
+            let pos = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("_pos Int64");
+            assert_eq!(id.len(), pos.len());
+            for i in 0..id.len() {
+                out.push((id.value(i), pos.value(i)));
+            }
+        }
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// Write a single-column Int32 parquet file (field id 1 = `id`) with optional multi-RG layout.
+    fn write_id_parquet_for_pos(path: &str, ids: &[i32], max_row_group_size: usize) {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(arrow_array::Int32Array::from(ids.to_vec())) as ArrayRef,
+            ])
+            .expect("id batch");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(max_row_group_size)
+            .build();
+        let file = File::create(path).expect("create data");
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    fn id_schema_for_pos() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        )
+    }
+
+    fn pos_scan_task(
+        data_path: &str,
+        schema: SchemaRef,
+        deletes: Vec<FileScanTaskDeleteFile>,
+        predicate: Option<BoundPredicate>,
+    ) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: std::fs::metadata(data_path).expect("stat").len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(data_path.to_string()),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: Arc::from(vec![1, RESERVED_FIELD_ID_POS]),
+            predicate: predicate.map(Arc::new),
+            deletes: Arc::from(deletes),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        }
+    }
+
+    /// Local pos-delete writer for FK5 pins (nested avro test helper is not visible here).
+    fn fk5_write_pos_delete_file(
+        path: &str,
+        referenced_data_path: &str,
+        positions: &[i64],
+    ) -> FileScanTaskDeleteFile {
+        use arrow_array::Int64Array;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                (i32::MAX - 101).to_string(),
+            )])),
+            Field::new("pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                (i32::MAX - 102).to_string(),
+            )])),
+        ]));
+        let paths: Vec<&str> = positions.iter().map(|_| referenced_data_path).collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(paths)) as ArrayRef,
+            Arc::new(Int64Array::from(positions.to_vec())) as ArrayRef,
+        ])
+        .expect("build pos-delete batch");
+        let file = File::create(path).expect("create pos-delete file");
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(WriterProperties::builder().build()))
+                .expect("pos-delete writer");
+        writer.write(&batch).expect("write pos-delete batch");
+        writer.close().expect("close pos-delete writer");
+        FileScanTaskDeleteFile {
+            file_path: path.to_string(),
+            file_size_in_bytes: std::fs::metadata(path).expect("stat").len(),
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        }
+    }
+
+    async fn run_pos_scan(task: FileScanTask, batch_size: Option<usize>) -> Vec<RecordBatch> {
+        let file_io = FileIO::new_with_fs();
+        let mut builder = ArrowReaderBuilder::new(file_io);
+        if let Some(bs) = batch_size {
+            builder = builder.with_batch_size(bs);
+        }
+        // Enable row selection / RG filter so a REGRESSION that accidentally pushes them on the
+        // `_pos` path would be exercised (and fail the ordinal oracle).
+        let reader = builder
+            .with_row_group_filtering_enabled(true)
+            .with_row_selection_enabled(true)
+            .build();
+        reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("read")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("collect")
+    }
+
+    /// FK5: multi-batch streaming still assigns continuous physical `_pos` 0..N-1.
+    #[tokio::test]
+    async fn fk5_pos_projection_multi_batch_continuity() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..20).map(|i| (i + 1) * 10).collect(); // 10,20,...,200
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![], None);
+        let batches = run_pos_scan(task, Some(3)).await;
+        assert!(
+            batches.len() > 1,
+            "expected multi-batch stream, got {} batch(es)",
+            batches.len()
+        );
+        let pairs = collect_id_pos_pairs(&batches);
+        let expected: Vec<(i32, i64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(pos, id)| (*id, pos as i64))
+            .collect();
+        assert_eq!(
+            pairs, expected,
+            "physical _pos must be 0..N-1 across batches"
+        );
+    }
+
+    /// Review rider (2026-08-03): a RANGED split task must NOT take the `_pos` streaming path —
+    /// it decodes the WHOLE file with ordinals from 0, so each split of one file would re-emit
+    /// every row (duplicates) with wrong `_pos`. Fail loud instead. (Hazard-2 of the 2026-08-01
+    /// plan_tasks review: reachable via the public `PartitionWork` seam / direct reader use, not
+    /// via the DF provider, whose schema does not expose metadata columns.)
+    #[tokio::test]
+    async fn fk5_pos_ranged_split_task_is_rejected_fail_loud() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..20).collect();
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+
+        // A plan_tasks-shaped split window: start 0, length strictly inside the file.
+        let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        ranged.length = ranged.file_size_in_bytes / 2;
+        assert!(ranged.length > 0, "fixture file must be non-trivial");
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let err = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
+            .expect("stream construction")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect_err("a ranged task projecting `_pos` must fail loud, not duplicate rows");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            err.to_string().contains("ranged split task is unsupported"),
+            "typed error must name the ranged-split rejection, got: {err}"
+        );
+
+        // Control: the SAME file as a whole-file task (0,0 legacy sentinel) still streams fine —
+        // the guard must reject ONLY ranged windows.
+        let whole = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(whole, Some(7)).await);
+        assert_eq!(pairs.len(), 20, "whole-file control still reads all rows");
+        // Control 2: explicit full-length window (plan_files shape) is also whole-file.
+        let mut full = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        full.length = full.file_size_in_bytes;
+        let pairs = collect_id_pos_pairs(&run_pos_scan(full, Some(7)).await);
+        assert_eq!(pairs.len(), 20, "explicit full-length window is whole-file");
+    }
+
+    /// FK5 oracle: dense pos-deletes (every other row) — survivors keep TRUE physical `_pos`.
+    #[tokio::test]
+    async fn fk5_pos_oracle_dense_pos_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..10).map(|i| i * 10).collect(); // 0,10,...,90 at pos 0..9
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[0, 2, 4, 6, 8]);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![del], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(2)).await);
+        assert_eq!(
+            pairs,
+            vec![(10, 1), (30, 3), (50, 5), (70, 7), (90, 9)],
+            "dense pos-deletes must leave true physical _pos on survivors"
+        );
+    }
+
+    /// FK5 oracle: sparse pos-deletes across multi-RG file.
+    #[tokio::test]
+    async fn fk5_pos_oracle_sparse_pos_deletes_multi_rg() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (1..=200).collect();
+        write_id_parquet_for_pos(&data_path, &ids, 100);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[0, 50, 100, 199]);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![del], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(17)).await);
+        assert_eq!(pairs.len(), 196);
+        assert!(pairs.contains(&(2, 1)), "pos 1 (id=2) survives");
+        assert!(!pairs.contains(&(51, 50)), "pos 50 deleted");
+        assert!(pairs.contains(&(50, 49)), "pos 49 survives with _pos=49");
+        assert!(!pairs.contains(&(101, 100)), "pos 100 deleted");
+        assert!(
+            pairs.contains(&(102, 101)),
+            "pos 101 survives with _pos=101"
+        );
+        assert!(!pairs.contains(&(200, 199)), "pos 199 deleted");
+        assert!(
+            pairs.contains(&(199, 198)),
+            "pos 198 survives with _pos=198"
+        );
+        let deleted: HashSet<i64> = [0i64, 50, 100, 199].into_iter().collect();
+        let expected: Vec<(i32, i64)> = (0i64..200)
+            .filter(|p| !deleted.contains(p))
+            .map(|p| ((p + 1) as i32, p))
+            .collect();
+        assert_eq!(pairs, expected);
+    }
+
+    /// FK5 oracle: residual filter AND sparse pos-deletes — row set + `_pos` vs physical baseline.
+    #[tokio::test]
+    async fn fk5_pos_oracle_residual_and_pos_deletes() {
+        use crate::expr::{Bind, Reference};
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..20).collect(); // id == physical pos
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[3, 7, 15]);
+        let schema = id_schema_for_pos();
+        let residual = Reference::new("id")
+            .greater_than_or_equal_to(Datum::int(5))
+            .and(Reference::new("id").less_than(Datum::int(18)));
+        let bound = residual.bind(schema.clone(), true).expect("bind");
+        let task = pos_scan_task(&data_path, schema, vec![del], Some(bound));
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(4)).await);
+        let expected: Vec<(i32, i64)> = (5i64..18)
+            .filter(|p| *p != 7 && *p != 15)
+            .map(|p| (p as i32, p))
+            .collect();
+        assert_eq!(
+            pairs, expected,
+            "residual∩¬pos-delete must keep true physical _pos (unpruned baseline)"
+        );
+    }
+
+    /// FK5 mutation bait: absolute_pos must advance by full pre-filter batch size.
+    ///
+    /// MUTATION: in `apply_pos_aware_batch`, advance by filtered survivor count instead of
+    /// pre-filter `row_count` → this test RED (second batch `_pos` shifts).
+    #[tokio::test]
+    async fn fk5_pos_mutation_absolute_pos_advances_by_full_batch() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = vec![0, 1, 2, 3, 4, 5];
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[0, 1]);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![del], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(3)).await);
+        assert_eq!(
+            pairs,
+            vec![(2, 2), (3, 3), (4, 4), (5, 5)],
+            "absolute_pos must advance by full pre-filter batch size (mutation bait)"
+        );
+    }
+
+    /// Critic-octo C1: residual drops the entire first batch; later batches must still carry
+    /// physical `_pos` (not renumbered from 0).
+    #[tokio::test]
+    async fn fk5_pos_residual_empties_first_batch_preserves_physical_pos() {
+        use crate::expr::{Bind, Reference};
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        // 6 rows; batch_size=3 → batch0 ids 0,1,2 and batch1 ids 3,4,5. Residual keeps id >= 3.
+        let ids: Vec<i32> = vec![0, 1, 2, 3, 4, 5];
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let schema = id_schema_for_pos();
+        let residual = Reference::new("id").greater_than_or_equal_to(Datum::int(3));
+        let bound = residual.bind(schema.clone(), true).expect("bind");
+        let task = pos_scan_task(&data_path, schema, vec![], Some(bound));
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(3)).await);
+        assert_eq!(
+            pairs,
+            vec![(3, 3), (4, 4), (5, 5)],
+            "after residual empties batch0, batch1 _pos must remain physical 3..5 not 0..2"
+        );
+    }
+
+    /// Critic-octo C1: every row position-deleted → empty result (no panic / bogus _pos).
+    #[tokio::test]
+    async fn fk5_pos_all_rows_position_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = vec![10, 20, 30];
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[0, 1, 2]);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![del], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(1)).await);
+        assert!(
+            pairs.is_empty(),
+            "all-deleted file must yield no (id,_pos) pairs, got {pairs:?}"
+        );
+    }
+
+    /// Critic-octo C1: single-batch vs multi-batch streaming must yield identical (id,_pos) sets
+    /// under dense pos-deletes + residual (unpruned baseline identity).
+    #[tokio::test]
+    async fn fk5_pos_single_vs_multi_batch_identity() {
+        use crate::expr::{Bind, Reference};
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..30).collect();
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[1, 5, 11, 22, 29]);
+        let schema = id_schema_for_pos();
+        let residual = Reference::new("id")
+            .greater_than_or_equal_to(Datum::int(2))
+            .and(Reference::new("id").less_than(Datum::int(28)));
+        let bound = residual.bind(schema.clone(), true).expect("bind");
+
+        let task_multi = pos_scan_task(
+            &data_path,
+            schema.clone(),
+            vec![fk5_write_pos_delete_file(
+                &tmp.path().join("d1.parquet").to_string_lossy(),
+                &data_path,
+                &[1, 5, 11, 22, 29],
+            )],
+            Some(bound.clone()),
+        );
+        let task_single = pos_scan_task(&data_path, schema, vec![del], Some(bound));
+        let multi = collect_id_pos_pairs(&run_pos_scan(task_multi, Some(4)).await);
+        let single = collect_id_pos_pairs(&run_pos_scan(task_single, Some(10_000)).await);
+        assert_eq!(
+            multi, single,
+            "streamed multi-batch must match single-batch (id,_pos) under residual∩pos-deletes"
+        );
+        // Unpruned oracle
+        let deleted: HashSet<i64> = [1i64, 5, 11, 22, 29].into_iter().collect();
+        let expected: Vec<(i32, i64)> = (2i64..28)
+            .filter(|p| !deleted.contains(p))
+            .map(|p| (p as i32, p))
+            .collect();
+        assert_eq!(single, expected);
+    }
+
+    /// Critic-octo C2: `_file` + `_pos` together under multi-batch streaming (constants + ordinals).
+    #[tokio::test]
+    async fn fk5_pos_with_file_metadata_column() {
+        use arrow_array::{Int32Array, Int64Array};
+
+        use crate::metadata_columns::RESERVED_FIELD_ID_FILE;
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids = vec![10, 20, 30, 40];
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let schema = id_schema_for_pos();
+        let del = fk5_write_pos_delete_file(
+            &tmp.path().join("d.parquet").to_string_lossy(),
+            &data_path,
+            &[1],
+        );
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(data_path.clone()),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: Arc::from(vec![1, RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS]),
+            predicate: None,
+            deletes: Arc::from(vec![del]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        };
+        let batches = run_pos_scan(task, Some(2)).await;
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 3);
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let pos = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                // _file is constant path for the task
+                pairs.push((id.value(i), pos.value(i)));
+            }
+        }
+        pairs.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            pairs,
+            vec![(10, 0), (30, 2), (40, 3)],
+            "_file+_pos stream must drop pos 1 and keep physical ordinals"
+        );
+    }
+
+    /// Critic-octo C2: equality-delete + `_pos` streaming path (survival_mask eq branch).
+    #[tokio::test]
+    async fn fk5_pos_with_equality_deletes() {
+        // Two-column schema so eq-delete on `id` is well-formed; project id + _pos.
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("data", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(arrow_array::Int32Array::from(vec![10, 20, 30, 40, 50])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])) as ArrayRef,
+        ])
+        .expect("batch");
+        let file = File::create(&data_path).unwrap();
+        let mut writer = ArrowWriter::try_new(
+            file,
+            arrow_schema,
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Eq-delete file: delete id=20 and id=40 (field id 1)
+        let eq_path = tmp
+            .path()
+            .join("eq-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let eq_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let eq_batch =
+            RecordBatch::try_new(eq_schema.clone(), vec![
+                Arc::new(arrow_array::Int32Array::from(vec![20, 40])) as ArrayRef,
+            ])
+            .unwrap();
+        let eq_file = File::create(&eq_path).unwrap();
+        let mut eq_writer = ArrowWriter::try_new(
+            eq_file,
+            eq_schema,
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        eq_writer.write(&eq_batch).unwrap();
+        eq_writer.close().unwrap();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let eq_del = FileScanTaskDeleteFile {
+            file_path: eq_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&eq_path).unwrap().len(),
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: 0,
+            equality_ids: Some(vec![1]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(data_path),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: Arc::from(vec![1, RESERVED_FIELD_ID_POS]),
+            predicate: None,
+            deletes: Arc::from(vec![eq_del]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        };
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(2)).await);
+        // Survivors keep physical positions: 10@0, 30@2, 50@4
+        assert_eq!(
+            pairs,
+            vec![(10, 0), (30, 2), (50, 4)],
+            "eq-deletes under _pos stream must drop keys and keep physical ordinals"
+        );
+    }
+
+    /// Critic-octo C5: residual ∩ pos-delete ∩ eq-delete under streaming `_pos`.
+    #[tokio::test]
+    async fn fk5_pos_residual_and_pos_and_eq_deletes() {
+        use crate::expr::{Bind, Reference};
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(arrow_array::Int32Array::from((0..10).collect::<Vec<i32>>())) as ArrayRef,
+            ])
+            .unwrap();
+        let file = File::create(&data_path).unwrap();
+        let mut writer = ArrowWriter::try_new(
+            file,
+            arrow_schema,
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // pos-delete 1, 8; eq-delete id=4; residual id >= 2 && id < 9
+        let pos_del = fk5_write_pos_delete_file(
+            &tmp.path().join("pos.parquet").to_string_lossy(),
+            &data_path,
+            &[1, 8],
+        );
+        let eq_path = tmp.path().join("eq.parquet").to_string_lossy().to_string();
+        let eq_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let eq_batch =
+            RecordBatch::try_new(eq_schema.clone(), vec![
+                Arc::new(arrow_array::Int32Array::from(vec![4])) as ArrayRef,
+            ])
+            .unwrap();
+        let eq_file = File::create(&eq_path).unwrap();
+        let mut eq_writer = ArrowWriter::try_new(
+            eq_file,
+            eq_schema,
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        eq_writer.write(&eq_batch).unwrap();
+        eq_writer.close().unwrap();
+        let eq_del = FileScanTaskDeleteFile {
+            file_path: eq_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&eq_path).unwrap().len(),
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: 0,
+            equality_ids: Some(vec![1]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+
+        let schema = id_schema_for_pos();
+        let residual = Reference::new("id")
+            .greater_than_or_equal_to(Datum::int(2))
+            .and(Reference::new("id").less_than(Datum::int(9)));
+        let bound = residual.bind(schema.clone(), true).unwrap();
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(data_path),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: Arc::from(vec![1, RESERVED_FIELD_ID_POS]),
+            predicate: Some(Arc::new(bound)),
+            deletes: Arc::from(vec![pos_del, eq_del]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        };
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(3)).await);
+        // residual [2,9) minus pos{1,8} minus eq{4} → 2,3,5,6,7 (pos 1,8 outside residual for 1)
+        // pos 8 is in residual range and deleted; pos 1 is outside residual.
+        assert_eq!(
+            pairs,
+            vec![(2, 2), (3, 3), (5, 5), (6, 6), (7, 7)],
+            "residual∩¬pos∩¬eq must keep true physical _pos"
+        );
+    }
+
+    /// FK5 MERGE-shaped pin: streamed `(_file,_pos)` scan → write pos deletes → MoR omits rows.
+    #[tokio::test]
+    async fn fk5_merge_shaped_pos_delete_from_streamed_identity_scan() {
+        use arrow_array::{Int32Array, Int64Array};
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids = vec![10, 20, 30, 40, 50];
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let schema = id_schema_for_pos();
+
+        let discover_task = pos_scan_task(&data_path, schema.clone(), vec![], None);
+        let discover_batches = run_pos_scan(discover_task, Some(2)).await;
+        let all_pairs = collect_id_pos_pairs(&discover_batches);
+        assert_eq!(
+            all_pairs,
+            vec![(10, 0), (20, 1), (30, 2), (40, 3), (50, 4)],
+            "identity scan must report true physical positions"
+        );
+        let mutate_pos: Vec<i64> = all_pairs
+            .iter()
+            .filter(|(id, _)| *id == 20 || *id == 40)
+            .map(|(_, p)| *p)
+            .collect();
+        assert_eq!(mutate_pos, vec![1, 3]);
+
+        let del_path = tmp
+            .path()
+            .join("merge-pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &mutate_pos);
+
+        let file_io = FileIO::new_with_fs();
+        let reader = ArrowReaderBuilder::new(file_io)
+            .with_row_selection_enabled(true)
+            .build();
+        let mor_task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(data_path.clone()),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: Arc::from(vec![1]),
+            predicate: None,
+            deletes: Arc::from(vec![del]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        };
+        let batches = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(mor_task)])) as FileScanTaskStream)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        let mut live: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            live.extend(col.values().iter().copied());
+        }
+        live.sort();
+        assert_eq!(
+            live,
+            vec![10, 30, 50],
+            "position deletes written from streamed _pos scan must remove exactly ids 20 and 40"
+        );
+
+        let with_pos = pos_scan_task(
+            &data_path,
+            schema,
+            vec![fk5_write_pos_delete_file(
+                &tmp.path().join("del2.parquet").to_string_lossy(),
+                &data_path,
+                &mutate_pos,
+            )],
+            None,
+        );
+        let pairs = collect_id_pos_pairs(&run_pos_scan(with_pos, Some(2)).await);
+        assert_eq!(pairs, vec![(10, 0), (30, 2), (50, 4)]);
+        let _ = std::mem::size_of::<Int64Array>();
     }
 
     /// Test for bug where position deletes in later row groups are not applied correctly.
@@ -3794,12 +4748,12 @@ message schema {
             start: 0,
             length: 0,
             record_count: Some(200),
-            data_file_path: data_file_path.clone(),
+            data_file_path: Arc::from(data_file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
-            project_field_ids: vec![1],
+            project_field_ids: Arc::from(vec![1]),
             predicate: None,
-            deletes: vec![FileScanTaskDeleteFile {
+            deletes: Arc::from(vec![FileScanTaskDeleteFile {
                 file_size_in_bytes: std::fs::metadata(&delete_file_path).unwrap().len(),
                 file_path: delete_file_path,
                 file_type: DataContentType::PositionDeletes,
@@ -3810,7 +4764,7 @@ message schema {
                 content_offset: None,
                 content_size_in_bytes: None,
                 record_count: None,
-            }],
+            }]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -4020,12 +4974,12 @@ message schema {
             start: rg1_start,
             length: rg1_length,
             record_count: Some(100), // Row group 1 has 100 rows
-            data_file_path: data_file_path.clone(),
+            data_file_path: Arc::from(data_file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
-            project_field_ids: vec![1],
+            project_field_ids: Arc::from(vec![1]),
             predicate: None,
-            deletes: vec![FileScanTaskDeleteFile {
+            deletes: Arc::from(vec![FileScanTaskDeleteFile {
                 file_size_in_bytes: std::fs::metadata(&delete_file_path).unwrap().len(),
                 file_path: delete_file_path,
                 file_type: DataContentType::PositionDeletes,
@@ -4036,7 +4990,7 @@ message schema {
                 content_offset: None,
                 content_size_in_bytes: None,
                 record_count: None,
-            }],
+            }]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -4239,12 +5193,12 @@ message schema {
             start: rg1_start,
             length: rg1_length,
             record_count: Some(100), // Row group 1 has 100 rows
-            data_file_path: data_file_path.clone(),
+            data_file_path: Arc::from(data_file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
-            project_field_ids: vec![1],
+            project_field_ids: Arc::from(vec![1]),
             predicate: None,
-            deletes: vec![FileScanTaskDeleteFile {
+            deletes: Arc::from(vec![FileScanTaskDeleteFile {
                 file_size_in_bytes: std::fs::metadata(&delete_file_path).unwrap().len(),
                 file_path: delete_file_path,
                 file_type: DataContentType::PositionDeletes,
@@ -4255,7 +5209,7 @@ message schema {
                 content_offset: None,
                 content_size_in_bytes: None,
                 record_count: None,
-            }],
+            }]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -4358,12 +5312,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2],
+                project_field_ids: Arc::from(vec![1, 2]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -4460,12 +5414,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 3],
+                project_field_ids: Arc::from(vec![1, 3]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -4551,12 +5505,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2, 3],
+                project_field_ids: Arc::from(vec![1, 2, 3]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -4656,12 +5610,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2],
+                project_field_ids: Arc::from(vec![1, 2]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -4790,12 +5744,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2],
+                project_field_ids: Arc::from(vec![1, 2]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -4891,12 +5845,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 5, 2],
+                project_field_ids: Arc::from(vec![1, 5, 2]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -5005,12 +5959,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2, 3],
-                predicate: Some(predicate.bind(schema, true).unwrap()),
-                deletes: vec![],
+                project_field_ids: Arc::from(vec![1, 2, 3]),
+                predicate: Some(Arc::new(predicate.bind(schema, true).unwrap())),
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -5100,12 +6054,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/file_0.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/file_0.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2],
+                project_field_ids: Arc::from(vec![1, 2]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -5119,12 +6073,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/file_1.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/file_1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2],
+                project_field_ids: Arc::from(vec![1, 2]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -5138,12 +6092,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/file_2.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/file_2.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2],
+                project_field_ids: Arc::from(vec![1, 2]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -5321,12 +6275,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: format!("{table_location}/data.parquet"),
+                data_file_path: Arc::from(format!("{table_location}/data.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: vec![1, 2],
+                project_field_ids: Arc::from(vec![1, 2]),
                 predicate: None,
-                deletes: vec![],
+                deletes: Arc::from(vec![]),
                 partition: Some(partition_data),
                 partition_spec: Some(partition_spec),
                 name_mapping: None,
@@ -5738,12 +6692,12 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
-                data_file_path: file_path,
+                data_file_path: Arc::from(file_path),
                 data_file_format: DataFileFormat::Parquet,
                 schema: iceberg_schema.clone(),
-                project_field_ids: vec![4],
-                predicate: Some(predicate.bind(iceberg_schema, true).unwrap()),
-                deletes: vec![],
+                project_field_ids: Arc::from(vec![4]),
+                predicate: Some(Arc::new(predicate.bind(iceberg_schema, true).unwrap())),
+                deletes: Arc::from(vec![]),
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
@@ -5807,12 +6761,13 @@ message schema {
             start: 0,
             length: file_size,
             record_count: None,
-            data_file_path: file_path.to_string(),
+            data_file_path: Arc::from(file_path),
             data_file_format: DataFileFormat::Parquet,
             schema,
-            project_field_ids,
+            project_field_ids: Arc::from(project_field_ids),
+
             predicate: None,
-            deletes: vec![],
+            deletes: Arc::from(vec![]),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -6429,12 +7384,13 @@ mod avro_scan_tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: path.to_string(),
+            data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Avro,
             schema,
-            project_field_ids,
+            project_field_ids: Arc::from(project_field_ids),
+
             predicate: None,
-            deletes,
+            deletes: Arc::from(deletes),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -6601,12 +7557,13 @@ mod avro_scan_tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: path.to_string(),
+            data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Orc,
             schema,
-            project_field_ids,
+            project_field_ids: Arc::from(project_field_ids),
+
             predicate: None,
-            deletes,
+            deletes: Arc::from(deletes),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -7080,12 +8037,13 @@ mod parquet_eq_keyset_mor_tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: path.to_string(),
+            data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Parquet,
             schema,
-            project_field_ids,
+            project_field_ids: Arc::from(project_field_ids),
+
             predicate: None,
-            deletes,
+            deletes: Arc::from(deletes),
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -7365,7 +8323,7 @@ mod parquet_eq_keyset_mor_tests {
         let bound = residual.bind(schema.clone(), true).expect("bind residual");
 
         let mut task = parquet_task(&data_path, schema, vec![1, 2], vec![eq_del]);
-        task.predicate = Some(bound);
+        task.predicate = Some(Arc::new(bound));
 
         let batches = run_scan(task).await;
         // Residual keeps a,b,c (ids 10,20,30); eq-delete drops 20 → 10,30.

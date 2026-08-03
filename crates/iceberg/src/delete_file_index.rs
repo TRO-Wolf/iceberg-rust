@@ -84,17 +84,23 @@ impl PopulateGuard {
     }
 
     /// Publish `terminal` and wake every waiter, disarming the guard.
+    ///
+    /// Respects an EXISTING terminal state: if another writer already moved the index out of
+    /// `Populating` — [`DeleteFileIndex::mark_failed`] on a delete-entry processing error — the
+    /// earlier terminal wins and this publish only disarms + re-notifies (harmless). Behavior-
+    /// identical for the pre-existing single-writer paths, which both publish from `Populating`.
     fn publish(&mut self, terminal: DeleteFileIndexState) {
         {
-            // Recover a poisoned guard rather than cascading the panic: this is the sole writer
-            // and it runs once, so recovering and completing the transition is always the right
-            // move (a stranded `Populating` state would hang every waiting scan on the notifier
-            // below).
+            // Recover a poisoned guard rather than cascading the panic: recovering and completing
+            // the transition is always the right move (a stranded `Populating` state would hang
+            // every waiting scan on the notifier below).
             let mut guard = self
                 .state
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *guard = terminal;
+            if matches!(*guard, DeleteFileIndexState::Populating(_)) {
+                *guard = terminal;
+            }
         }
         self.armed = false;
         self.notify.notify_waiters();
@@ -121,12 +127,29 @@ enum IndexLookup {
     Wait(OwnedNotified),
 }
 
+/// Partition delete maps are nested `spec_id → partition → deletes` so lookup is
+/// `get(spec_id).get(partition)` without cloning the partition `Struct` (FK2.3 / scout #15).
+///
+/// Java `DeleteFileIndex` / `PartitionMap` keys by the composite `(spec_id, partition)` — never by
+/// partition tuple alone. A flat `HashMap<Struct, _>` forced a post-filter linear scan on `spec_id`
+/// and, on a wrong-key bug, resurrects deletes onto data files of a different evolved spec that
+/// share the same partition values. A flat `HashMap<(i32, Struct), _>` is correct but clones the
+/// partition on every lookup; the nested form is equivalent and keeps the pre-FK2.3 zero-clone
+/// `get(partition)` hot path.
+type PartitionDeleteMap = HashMap<i32, HashMap<Struct, Vec<Arc<DeleteFileContext>>>>;
+
 #[derive(Debug)]
 struct PopulatedDeleteFileIndex {
-    #[allow(dead_code)]
+    /// Global equality deletes (unpartitioned). Sorted ascending by data sequence number so
+    /// [`applicable_eq_deletes`] can `partition_point` the applicable tail (Java
+    /// `EqualityDeletes.filter` / `findStartIndex` shape).
     global_equality_deletes: Vec<Arc<DeleteFileContext>>,
-    eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
-    pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
+    /// Equality deletes keyed by `(spec_id, partition)` via nested maps (FK2.3). Each list is
+    /// seq-sorted.
+    eq_deletes_by_partition: PartitionDeleteMap,
+    /// Partition-scoped position deletes keyed by `(spec_id, partition)` via nested maps (FK2.3).
+    /// Each list is seq-sorted.
+    pos_deletes_by_partition: PartitionDeleteMap,
     /// FILE-SCOPED position deletes keyed by the data file they reference, mirroring Java
     /// `DeleteFileIndex.posDeletesByPath` (`Builder.add(Map<String, PositionDeletes>,
     /// PartitionMap<PositionDeletes>, DeleteFile)`: when
@@ -138,6 +161,9 @@ struct PopulatedDeleteFileIndex {
     /// this is the common shape in Java-written merge-on-read tables; before this map existed such a
     /// delete was indexed by its own `(spec_id, partition)` and a data file whose partition or spec
     /// differed never found it — the masked rows silently resurrected.
+    ///
+    /// Each list is seq-sorted so [`applicable_pos_deletes`] can `partition_point` the applicable
+    /// tail (Java `PositionDeletes.filter` / `findStartIndex`).
     pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
     /// Deletion vectors keyed by the data file they apply to (the DV's
     /// `referenced_data_file`), mirroring Java `DeleteFileIndex.dvByPath`
@@ -149,6 +175,49 @@ struct PopulatedDeleteFileIndex {
     /// index's lookup signature is infallible, so duplicates are kept HERE and rejected
     /// fail-loud at the load door instead (`CachingDeleteFileLoader::load_deletes`).
     dv_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
+}
+
+/// Sort a delete-file list by data sequence number ascending (`None` first — Option order).
+/// Stable: equal sequences keep insert order so multi-delete same-seq fixtures stay deterministic.
+fn sort_deletes_by_sequence(deletes: &mut [Arc<DeleteFileContext>]) {
+    deletes.sort_by_key(|d| d.manifest_entry.sequence_number());
+}
+
+/// Equality-delete applicability: `delete_seq > data_seq` (Java strict-greater). Lists must be
+/// sorted by [`sort_deletes_by_sequence`]. When `seq_num` is `None` (unit fixtures), every delete
+/// applies.
+fn applicable_eq_deletes(
+    deletes: &[Arc<DeleteFileContext>],
+    seq_num: Option<i64>,
+) -> &[Arc<DeleteFileContext>] {
+    let Some(data_seq) = seq_num else {
+        return deletes;
+    };
+    // partition_point: first index where the predicate is false.
+    // Predicate "not yet applicable" ≡ delete_seq is None or delete_seq <= data_seq.
+    let idx = deletes.partition_point(|d| match d.manifest_entry.sequence_number() {
+        None => true,
+        Some(s) => s <= data_seq,
+    });
+    &deletes[idx..]
+}
+
+/// Position-delete applicability: `delete_seq >= data_seq` (Java `findStartIndex`). Lists must be
+/// sorted by [`sort_deletes_by_sequence`]. When `seq_num` is `None` (unit fixtures), every delete
+/// applies.
+fn applicable_pos_deletes(
+    deletes: &[Arc<DeleteFileContext>],
+    seq_num: Option<i64>,
+) -> &[Arc<DeleteFileContext>] {
+    let Some(data_seq) = seq_num else {
+        return deletes;
+    };
+    // Predicate "not yet applicable" ≡ delete_seq is None or delete_seq < data_seq.
+    let idx = deletes.partition_point(|d| match d.manifest_entry.sequence_number() {
+        None => true,
+        Some(s) => s < data_seq,
+    });
+    &deletes[idx..]
 }
 
 /// Whether a delete file is a deletion vector. Java `ContentFileUtil.isDV` (L142-144):
@@ -221,6 +290,43 @@ pub(crate) fn referenced_data_file_location(delete_file: &DataFile) -> Option<St
 const DELETE_FILE_INDEX_CHANNEL_CAPACITY: usize = 1024;
 
 impl DeleteFileIndex {
+    /// Move a still-`Populating` index to `Failed` and wake every parked waiter (review rider,
+    /// 2026-08-03). Used by the plan path when DELETE-ENTRY processing errors: without this the
+    /// entry error only reaches the task channel — the delete senders drop, the populate task
+    /// sees a normal end-of-channel, and a PARTIAL delete set publishes as `Populated`. Data
+    /// tasks streamed before the consumer observes the `Err` would read with missing deletes —
+    /// silent row resurrection for an early-terminating (e.g. LIMIT-k) consumer. Java plans
+    /// deletes before emitting any task; this restores fail-before-results under FK2.2's
+    /// concurrent planning.
+    ///
+    /// No-op when the state is already terminal (`Populated` / `Failed`): the first terminal
+    /// state wins, matching [`PopulateGuard::publish`]'s respect-terminal rule. Callers that
+    /// need the failure to win DETERMINISTICALLY must call this while they still hold a live
+    /// delete-channel sender — the populate task cannot publish before the channel closes, so
+    /// `Failed` is guaranteed to land first.
+    pub(crate) fn mark_failed(&self, reason: &str) {
+        let notify = {
+            let mut guard = self
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &*guard {
+                DeleteFileIndexState::Populating(notify) => {
+                    let notify = notify.clone();
+                    *guard = DeleteFileIndexState::Failed(format!(
+                        "the delete file index was marked failed before population completed: \
+                         {reason}"
+                    ));
+                    Some(notify)
+                }
+                _ => None,
+            }
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+
     /// create a new `DeleteFileIndex` along with the sender that populates it with delete files
     pub(crate) fn new() -> (DeleteFileIndex, Sender<DeleteFileContext>) {
         let (tx, rx) = channel(DELETE_FILE_INDEX_CHANNEL_CAPACITY);
@@ -329,10 +435,8 @@ impl PopulatedDeleteFileIndex {
     ///    [`referenced_data_file_location`]) is added to `pos_deletes_by_path`, keyed by that file.
     /// 4. Otherwise, the delete file is added to one of two hash maps based on its content type.
     fn new(files: Vec<DeleteFileContext>) -> PopulatedDeleteFileIndex {
-        let mut eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
-            HashMap::default();
-        let mut pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
-            HashMap::default();
+        let mut eq_deletes_by_partition: PartitionDeleteMap = HashMap::default();
+        let mut pos_deletes_by_partition: PartitionDeleteMap = HashMap::default();
         let mut pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>> =
             HashMap::default();
         let mut dv_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>> = HashMap::default();
@@ -403,13 +507,33 @@ impl PopulatedDeleteFileIndex {
                 DataContentType::Data => return,
             };
 
+            // FK2.3: nested `(spec_id → partition)` — DeleteFileContext's manifest spec id matches
+            // the lookup key `data_file.partition_spec_id` (what the pre-FK2.3 linear post-filter
+            // compared). Partition is cloned only on first insert into a bucket, not on lookup.
             destination_map
+                .entry(arc_ctx.partition_spec_id)
+                .or_default()
                 .entry(partition.clone())
-                .and_modify(|entry| {
-                    entry.push(arc_ctx.clone());
-                })
-                .or_insert(vec![arc_ctx.clone()]);
+                .or_default()
+                .push(arc_ctx);
         });
+
+        // Sort once at build time so lookup can `partition_point` the applicable tail
+        // (Java `EqualityDeletes` / `PositionDeletes` keep seq-sorted lists + `findStartIndex`).
+        sort_deletes_by_sequence(&mut global_equality_deletes);
+        for by_partition in eq_deletes_by_partition.values_mut() {
+            for list in by_partition.values_mut() {
+                sort_deletes_by_sequence(list);
+            }
+        }
+        for by_partition in pos_deletes_by_partition.values_mut() {
+            for list in by_partition.values_mut() {
+                sort_deletes_by_sequence(list);
+            }
+        }
+        for list in pos_deletes_by_path.values_mut() {
+            sort_deletes_by_sequence(list);
+        }
 
         PopulatedDeleteFileIndex {
             global_equality_deletes,
@@ -438,27 +562,21 @@ impl PopulatedDeleteFileIndex {
     ) -> Result<Vec<FileScanTaskDeleteFile>> {
         let mut results = vec![];
 
-        self.global_equality_deletes
-            .iter()
-            // filter that returns true if the provided delete file's sequence number is **greater than** `seq_num`
-            .filter(|&delete| {
-                seq_num
-                    .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
-                    .unwrap_or_else(|| true)
-            })
-            .for_each(|delete| results.push(delete.as_ref().into()));
+        // Global equality: seq-sorted + partition_point for `delete_seq > data_seq`.
+        for delete in applicable_eq_deletes(&self.global_equality_deletes, seq_num) {
+            results.push(delete.as_ref().into());
+        }
 
-        if let Some(deletes) = self.eq_deletes_by_partition.get(data_file.partition()) {
-            deletes
-                .iter()
-                // filter that returns true if the provided delete file's sequence number is **greater than** `seq_num`
-                .filter(|&delete| {
-                    seq_num
-                        .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
-                        .unwrap_or_else(|| true)
-                        && data_file.partition_spec_id == delete.partition_spec_id
-                })
-                .for_each(|delete| results.push(delete.as_ref().into()));
+        // FK2.3: nested `(spec_id → partition)` lookup — no post-filter linear scan on
+        // spec_id, no partition Struct clone on the hot path.
+        if let Some(by_partition) = self
+            .eq_deletes_by_partition
+            .get(&data_file.partition_spec_id)
+            && let Some(deletes) = by_partition.get(data_file.partition())
+        {
+            for delete in applicable_eq_deletes(deletes, seq_num) {
+                results.push(delete.as_ref().into());
+            }
         }
 
         // A data file with a DELETION VECTOR uses the DV INSTEAD of any parquet position
@@ -496,18 +614,16 @@ impl PopulatedDeleteFileIndex {
         }
 
         // Java `findPosPartitionDeletes` (L304-328): the `(spec_id, partition)`-keyed position
-        // deletes — the ones with no derivable referenced data file.
-        if let Some(deletes) = self.pos_deletes_by_partition.get(data_file.partition()) {
-            deletes
-                .iter()
-                // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
-                .filter(|&delete| {
-                    seq_num
-                        .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
-                        .unwrap_or_else(|| true)
-                        && data_file.partition_spec_id == delete.partition_spec_id
-                })
-                .for_each(|delete| results.push(delete.as_ref().into()));
+        // deletes — the ones with no derivable referenced data file. Seq-sorted +
+        // `partition_point` for `delete_seq >= data_seq`.
+        if let Some(by_partition) = self
+            .pos_deletes_by_partition
+            .get(&data_file.partition_spec_id)
+            && let Some(deletes) = by_partition.get(data_file.partition())
+        {
+            for delete in applicable_pos_deletes(deletes, seq_num) {
+                results.push(delete.as_ref().into());
+            }
         }
 
         // Java `findPathDeletes` (L355-377): the FILE-SCOPED position deletes, looked up by the data
@@ -521,14 +637,9 @@ impl PopulatedDeleteFileIndex {
         // Appended after the partition-keyed deletes to mirror Java's
         // `concat(global, eqPartition, posPartition, posPath)` result order.
         if let Some(deletes) = self.pos_deletes_by_path.get(data_file.file_path()) {
-            deletes
-                .iter()
-                .filter(|&delete| {
-                    seq_num
-                        .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
-                        .unwrap_or_else(|| true)
-                })
-                .for_each(|delete| results.push(delete.as_ref().into()));
+            for delete in applicable_pos_deletes(deletes, seq_num) {
+                results.push(delete.as_ref().into());
+            }
         }
 
         Ok(results)
@@ -1702,6 +1813,460 @@ mod tests {
                 "the error must carry the recorded reason, got: {error}"
             );
         }
+    }
+
+    // =========================================================================================
+    // FK2.2 — overlap hang classes (inject-only, bounded timeouts; no loom / stress harness)
+    // =========================================================================================
+
+    /// FK2.2 hang class: lost-wakeup under the concurrent plan path.
+    ///
+    /// Data-entry processing parks on `get_deletes_for_data_file` while delete-entry processing
+    /// populates. The full public await path (not just `lookup_or_arm`) must wake when publish
+    /// races after the waiter has armed. Inject-only: keep the real populate task parked (sender
+    /// alive), arm via a concurrent waiter, publish through `PopulateGuard`, assert the waiter
+    /// completes under a generous timeout.
+    ///
+    /// MUTATION: arming the `Notified` AFTER releasing the read lock (raw `Arc<Notify>` +
+    /// `.notified()` at the await site) loses the wakeup when publish races into that window —
+    /// the timeout below fires (RED).
+    #[tokio::test]
+    async fn test_fk2_2_get_deletes_does_not_lose_wakeup_when_publish_races() {
+        let (index, _tx) = DeleteFileIndex::new();
+        let data_file = build_unpartitioned_data_file();
+
+        // Deterministic arm FIRST (production handshake under the read lock) — yield-races are
+        // not a substitute for proving the Notified exists before publish.
+        let notified = match index
+            .lookup_or_arm(&data_file, Some(0))
+            .expect("arming a populating index must not error")
+        {
+            IndexLookup::Wait(n) => n,
+            IndexLookup::Ready(_) => {
+                panic!("the index must still be populating while the sender is alive")
+            }
+        };
+
+        // Concurrent full-path waiter (second arm via `get_deletes_for_data_file`).
+        let waiter_index = index.clone();
+        let waiter = tokio::spawn(async move {
+            let probe = build_unpartitioned_data_file();
+            waiter_index
+                .get_deletes_for_data_file(&probe, Some(0))
+                .await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let notifier = {
+            let guard = index.state.read().expect("read the index state");
+            match &*guard {
+                DeleteFileIndexState::Populating(notifier) => notifier.clone(),
+                other => panic!("expected a populating index, got {other:?}"),
+            }
+        };
+        PopulateGuard::new(index.state.clone(), notifier).publish(DeleteFileIndexState::Populated(
+            PopulatedDeleteFileIndex::new(vec![]),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), notified)
+            .await
+            .expect("publish after arm must wake the Notified, not be lost");
+
+        let deletes = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("publish after arm must wake get_deletes_for_data_file, not hang")
+            .expect("waiter task must not panic")
+            .expect("the published empty index must succeed");
+        assert!(
+            deletes.is_empty(),
+            "empty published index must yield no deletes"
+        );
+    }
+
+    /// FK2.2 hang class: failed-populate under the concurrent plan path.
+    ///
+    /// If the populate task dies without publishing (sender dropped after a Forced `Failed`
+    /// injection, or real teardown), every concurrent data-entry waiter must get a typed error
+    /// under a bounded timeout — never hang on a `Notify` that can no longer fire.
+    ///
+    /// MUTATION: removing the `Failed` terminal state leaves waiters parked forever (timeout RED).
+    #[tokio::test]
+    async fn test_fk2_2_failed_populate_wakes_concurrent_waiters_with_typed_error() {
+        let (index, _tx) = DeleteFileIndex::new();
+
+        let waiter_a = {
+            let index = index.clone();
+            tokio::spawn(async move {
+                let probe = build_unpartitioned_data_file();
+                index.get_deletes_for_data_file(&probe, Some(0)).await
+            })
+        };
+        let waiter_b = {
+            let index = index.clone();
+            tokio::spawn(async move {
+                let probe = build_unpartitioned_data_file();
+                index.get_deletes_for_data_file(&probe, Some(0)).await
+            })
+        };
+
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // Inject Failed via the production publisher (same write-lock-then-notify handshake as a
+        // dead populate task's PopulateGuard::Drop).
+        let notifier = {
+            let guard = index.state.read().expect("read the index state");
+            match &*guard {
+                DeleteFileIndexState::Populating(notifier) => notifier.clone(),
+                other => panic!("expected a populating index, got {other:?}"),
+            }
+        };
+        PopulateGuard::new(index.state.clone(), notifier).publish(DeleteFileIndexState::Failed(
+            "the delete file index populate task terminated before publishing an index \
+             (it panicked, or the runtime was shut down)"
+                .to_string(),
+        ));
+
+        for (label, waiter) in [("a", waiter_a), ("b", waiter_b)] {
+            let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .unwrap_or_else(|_| panic!("waiter {label} must not hang on Failed populate"))
+                .unwrap_or_else(|_| panic!("waiter {label} task must not panic"))
+                .expect_err("Failed populate must surface a typed error");
+            assert_eq!(error.kind(), ErrorKind::Unexpected);
+            assert!(
+                error.to_string().contains("populate task"),
+                "waiter {label} error must name the dead populate task, got: {error}"
+            );
+        }
+    }
+
+    /// Review rider: `mark_failed` while `Populating` wakes a parked waiter with a typed error
+    /// carrying the injected cause (a delete-entry processing error must fail the index, not
+    /// let a partial delete set publish as `Populated`).
+    #[tokio::test]
+    async fn test_mark_failed_wakes_waiter_with_typed_error() {
+        let (index, tx) = DeleteFileIndex::new();
+
+        let waiter = {
+            let index = index.clone();
+            tokio::spawn(async move {
+                let probe = build_unpartitioned_data_file();
+                index.get_deletes_for_data_file(&probe, Some(0)).await
+            })
+        };
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // Mark while the delete channel is still open (the caller-holds-a-sender contract).
+        index.mark_failed("injected delete-entry processing error");
+        drop(tx);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must not hang after mark_failed")
+            .expect("waiter task must not panic")
+            .expect_err("mark_failed must surface a typed error to parked waiters");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error
+                .to_string()
+                .contains("injected delete-entry processing error"),
+            "the error must carry the injected cause, got: {error}"
+        );
+    }
+
+    /// Review rider — the RACE-ORDER property: `mark_failed` called while the caller still holds
+    /// a live sender lands strictly BEFORE the populate task can publish; the populate task's
+    /// later `Populated` publish must NOT clobber it (respect-terminal). Mutation: revert
+    /// `PopulateGuard::publish` to the unconditional overwrite → this test REDs (the partial
+    /// index would win and `get_deletes_for_data_file` would succeed).
+    #[tokio::test]
+    async fn test_mark_failed_wins_over_later_populate_publish() {
+        let (index, tx) = DeleteFileIndex::new();
+
+        // Failure first, while the channel is provably open.
+        index.mark_failed("boom before channel close");
+        // NOW let the populate task complete its collect and attempt Populated.
+        drop(tx);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        let probe = build_unpartitioned_data_file();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&probe, Some(0)),
+        )
+        .await
+        .expect("must not hang")
+        .expect_err("Failed must win over the later Populated publish");
+        assert!(
+            error.to_string().contains("boom before channel close"),
+            "the FIRST terminal state (Failed) must stick, got: {error}"
+        );
+    }
+
+    /// Review rider — the no-op direction: `mark_failed` after a successful publish must not
+    /// disturb a `Populated` index (first terminal state wins in both directions).
+    #[tokio::test]
+    async fn test_mark_failed_after_populated_is_noop() {
+        let (index, tx) = DeleteFileIndex::new();
+        drop(tx); // empty index populates immediately
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let probe = build_unpartitioned_data_file();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&probe, Some(0)),
+        )
+        .await
+        .expect("must not hang")
+        .expect("empty index must be Populated and queryable");
+
+        index.mark_failed("too late — already populated");
+
+        let deletes = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&probe, Some(0)),
+        )
+        .await
+        .expect("must not hang")
+        .expect("mark_failed after Populated must be a no-op");
+        assert!(deletes.is_empty());
+    }
+
+    /// FK2.2 natural path: dropping the last delete-context sender closes the channel, the
+    /// populate task publishes, and a concurrent waiter wakes with the collected deletes.
+    #[tokio::test]
+    async fn test_fk2_2_sender_drop_publishes_and_wakes_waiter() {
+        let (index, mut tx) = DeleteFileIndex::new();
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+        let data_file = build_partitioned_data_file(&partition, spec_id);
+        let delete = build_partitioned_eq_delete(&partition, spec_id);
+        let delete_path = delete.file_path().to_string();
+
+        tx.try_send(DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(4, &delete).into(),
+            partition_spec_id: spec_id,
+        })
+        .expect("channel has capacity for one delete context");
+
+        let waiter_index = index.clone();
+        let probe_partition = partition.clone();
+        let waiter = tokio::spawn(async move {
+            let probe = build_partitioned_data_file(&probe_partition, spec_id);
+            waiter_index
+                .get_deletes_for_data_file(&probe, Some(0))
+                .await
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Dropping the last sender closes the channel → populate collects → publishes.
+        drop(tx);
+
+        let deletes = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("sender drop must publish and wake the waiter, not hang")
+            .expect("waiter task must not panic")
+            .expect("populated index lookup must succeed");
+        let paths: Vec<String> = deletes.into_iter().map(|d| d.file_path).collect();
+        assert_eq!(
+            paths,
+            vec![delete_path],
+            "the delete sent before the sender drop must apply to the data file"
+        );
+        let _ = data_file;
+    }
+
+    // =========================================================================================
+    // FK2.3 — multi-spec composite keys: wrong-key = delete resurrection
+    // =========================================================================================
+
+    /// FK2.3 bar: identical result sets across a multi-spec fixture that shares the same
+    /// partition tuple under two specs. Each data file must receive ONLY its own spec's deletes;
+    /// attaching the other spec's deletes is delete resurrection.
+    ///
+    /// MUTATION: keying partition maps by `Struct` alone (dropping `spec_id` from the key) and
+    /// forgetting the post-filter makes BOTH data files receive ALL four deletes (RED on both
+    /// exact-set asserts). Keying by `(spec_id, partition)` keeps the sets disjoint.
+    #[test]
+    fn test_fk2_3_multi_spec_identical_result_sets_no_cross_spec_resurrection() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+
+        let eq_s1 = build_partitioned_eq_delete(&partition, 1);
+        let pos_s1 = build_partitioned_pos_delete(&partition, 1);
+        let eq_s2 = build_partitioned_eq_delete(&partition, 2);
+        let pos_s2 = build_partitioned_pos_delete(&partition, 2);
+
+        let eq_s1_path = eq_s1.file_path().to_string();
+        let pos_s1_path = pos_s1.file_path().to_string();
+        let eq_s2_path = eq_s2.file_path().to_string();
+        let pos_s2_path = pos_s2.file_path().to_string();
+
+        let contexts = vec![
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(2, &eq_s1).into(),
+                partition_spec_id: 1,
+            },
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(2, &pos_s1).into(),
+                partition_spec_id: 1,
+            },
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(2, &eq_s2).into(),
+                partition_spec_id: 2,
+            },
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(2, &pos_s2).into(),
+                partition_spec_id: 2,
+            },
+        ];
+        let index = PopulatedDeleteFileIndex::new(contexts);
+
+        let data_s1 = build_partitioned_data_file(&partition, 1);
+        let data_s2 = build_partitioned_data_file(&partition, 2);
+
+        let paths_s1: Vec<String> = index
+            .get_deletes_for_data_file(&data_s1, Some(0))
+            .expect("spec-1 lookup")
+            .into_iter()
+            .map(|d| d.file_path)
+            .collect();
+        let paths_s2: Vec<String> = index
+            .get_deletes_for_data_file(&data_s2, Some(0))
+            .expect("spec-2 lookup")
+            .into_iter()
+            .map(|d| d.file_path)
+            .collect();
+
+        assert_eq!(
+            paths_s1,
+            vec![eq_s1_path.clone(), pos_s1_path.clone()],
+            "spec-1 data file must receive ONLY spec-1 deletes (eq then pos), never spec-2"
+        );
+        assert_eq!(
+            paths_s2,
+            vec![eq_s2_path.clone(), pos_s2_path.clone()],
+            "spec-2 data file must receive ONLY spec-2 deletes (eq then pos), never spec-1"
+        );
+        assert!(
+            !paths_s1.contains(&eq_s2_path) && !paths_s1.contains(&pos_s2_path),
+            "cross-spec resurrection: spec-1 must not see any spec-2 delete"
+        );
+        assert!(
+            !paths_s2.contains(&eq_s1_path) && !paths_s2.contains(&pos_s1_path),
+            "cross-spec resurrection: spec-2 must not see any spec-1 delete"
+        );
+    }
+
+    /// FK2.3 bar: seq-sorted lists + `partition_point` preserve the pre-FK2.3 applicable set
+    /// under multi-spec + multi-sequence. Spec-1 deletes at seq {3,5,7} and spec-2 at {4,6};
+    /// a data file at seq 4 under each spec must see the correct tail of ITS OWN list only.
+    ///
+    /// MUTATION: off-by-one in equality (`>=` instead of `>`) or position (`>` instead of `>=`)
+    /// shifts a boundary delete into/out of the set (RED). Keying by Struct alone mixes both
+    /// specs' tails (RED).
+    #[test]
+    fn test_fk2_3_multi_spec_seq_sorted_partition_point_identical_sets() {
+        let partition = Struct::from_iter([Some(Literal::long(42))]);
+
+        // Spec 1: eq@3, eq@5, eq@7, pos@3, pos@5, pos@7
+        let s1_eq: Vec<DataFile> = [3i64, 5, 7]
+            .into_iter()
+            .map(|_| build_partitioned_eq_delete(&partition, 1))
+            .collect();
+        let s1_pos: Vec<DataFile> = [3i64, 5, 7]
+            .into_iter()
+            .map(|_| build_partitioned_pos_delete(&partition, 1))
+            .collect();
+        // Spec 2: eq@4, eq@6, pos@4, pos@6
+        let s2_eq: Vec<DataFile> = [4i64, 6]
+            .into_iter()
+            .map(|_| build_partitioned_eq_delete(&partition, 2))
+            .collect();
+        let s2_pos: Vec<DataFile> = [4i64, 6]
+            .into_iter()
+            .map(|_| build_partitioned_pos_delete(&partition, 2))
+            .collect();
+
+        let mut contexts = Vec::new();
+        for (seq, file) in [3i64, 5, 7].into_iter().zip(s1_eq.iter()) {
+            contexts.push(DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(seq, file).into(),
+                partition_spec_id: 1,
+            });
+        }
+        for (seq, file) in [3i64, 5, 7].into_iter().zip(s1_pos.iter()) {
+            contexts.push(DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(seq, file).into(),
+                partition_spec_id: 1,
+            });
+        }
+        for (seq, file) in [4i64, 6].into_iter().zip(s2_eq.iter()) {
+            contexts.push(DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(seq, file).into(),
+                partition_spec_id: 2,
+            });
+        }
+        for (seq, file) in [4i64, 6].into_iter().zip(s2_pos.iter()) {
+            contexts.push(DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(seq, file).into(),
+                partition_spec_id: 2,
+            });
+        }
+        // Shuffle insertion order so a missing sort-at-build would expose order-dependent bugs
+        // if the partition_point assumed sorted input that wasn't sorted.
+        contexts.reverse();
+
+        let index = PopulatedDeleteFileIndex::new(contexts);
+        let data_s1 = build_partitioned_data_file(&partition, 1);
+        let data_s2 = build_partitioned_data_file(&partition, 2);
+
+        // data_seq = 4:
+        //   s1 eq (>4): eq@5, eq@7 ; s1 pos (>=4): pos@5, pos@7  (pos@3 drops)
+        //   s2 eq (>4): eq@6       ; s2 pos (>=4): pos@4, pos@6
+        let paths_s1: Vec<String> = index
+            .get_deletes_for_data_file(&data_s1, Some(4))
+            .expect("s1")
+            .into_iter()
+            .map(|d| d.file_path)
+            .collect();
+        let paths_s2: Vec<String> = index
+            .get_deletes_for_data_file(&data_s2, Some(4))
+            .expect("s2")
+            .into_iter()
+            .map(|d| d.file_path)
+            .collect();
+
+        assert_eq!(
+            paths_s1,
+            vec![
+                s1_eq[1].file_path().to_string(),  // eq@5
+                s1_eq[2].file_path().to_string(),  // eq@7
+                s1_pos[1].file_path().to_string(), // pos@5
+                s1_pos[2].file_path().to_string(), // pos@7
+            ],
+            "spec-1 seq-4 applicable tail must be eq{{5,7}} + pos{{5,7}}"
+        );
+        assert_eq!(
+            paths_s2,
+            vec![
+                s2_eq[1].file_path().to_string(),  // eq@6
+                s2_pos[0].file_path().to_string(), // pos@4
+                s2_pos[1].file_path().to_string(), // pos@6
+            ],
+            "spec-2 seq-4 applicable tail must be eq{{6}} + pos{{4,6}}"
+        );
     }
 
     fn build_unpartitioned_data_file() -> DataFile {
