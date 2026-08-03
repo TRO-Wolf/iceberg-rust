@@ -64,6 +64,7 @@ Accessors (`data_file_path()`, `project_field_ids()`, `predicate()`) still retur
 `crates/iceberg/src/scan/map.md` updated: task Arc-share + context residual Arc-clone (FK2.1).
 
 ### Critic-octo FK2.1 (8 cycles) — OCTO-CONVERGED
+**Tip:** `ad196f4f`  
 Scratch: `/tmp/critic-octo-fk2_1-2026-08-08/`
 
 | Cycle | Finding | Fix |
