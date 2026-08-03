@@ -1,0 +1,33 @@
+# U1 ledger — QB + BUG-001 (2026-08-03)
+
+**Branch:** `fix/qb-posdelete-bounds-and-partition-stamp` off `0421ae15`
+**Tag:** `[fork]`
+
+## Actor build
+
+### Leg A (BUG-001)
+- Fast path: `position_delete_unpartitioned_fast_path(spec_count, default_unpartitioned)` =
+  `spec_count == 1 && default_unpartitioned` (Option A).
+- Doc comment fixed (unpartitioned *table* ≠ unpartitioned *default*).
+- Pins: unit predicate + mutation twin; e2e `test_delete_mread_after_drop_partition_field_no_resurrection`.
+
+### Leg B (QB bounds)
+- `position_delete_writer_properties()` → `set_statistics_truncate_length(None)`.
+- Wired: DF `write_position_deletes_for_partition`, rewrite_pos/convert_eq/rewrite_table_path maintenance,
+  remove_dangling fixture, pos-delete unit `make_writer_builder`.
+- MetricsConfig::for_position_delete already present on DF path (Full on file_path/pos).
+- Pin: `test_position_delete_long_file_path_bounds_are_full_and_equal` (120-char path, full equal bounds).
+- Does **not** write `referenced_data_file` (Java-parity).
+
+### Matrix
+- R113: prose note 2026-08-03; stays 🟡 (Java-read interop of evolved-DROP leg still owed for flip).
+- R117: note path-leg now has real full bounds.
+- anchors OK.
+
+### Interop
+- Primary: e2e DF DELETE after Rust `update_partition_spec().remove_field` + live scan (zero resurrection).
+- Java-read evolved-DROP suite: follow-up if not landed before push (Q9 fallback accepted).
+
+## Mutations (in-octo)
+- Restore unconditional `default_is_unpartitioned` only → unit `test_pos_delete_fast_path_mutation_default_only_is_wrong` RED design.
+- Drop `set_statistics_truncate_length(None)` → long-path bounds pin RED.

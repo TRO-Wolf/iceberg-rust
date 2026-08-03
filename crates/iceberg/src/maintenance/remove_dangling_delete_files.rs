@@ -422,6 +422,7 @@ mod tests {
     };
     use crate::writer::base_writer::position_delete_writer::{
         PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+        position_delete_writer_properties,
     };
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
@@ -1087,22 +1088,12 @@ mod tests {
             Some(uuid::Uuid::now_v7().to_string()),
             DataFileFormat::Parquet,
         );
-        // `set_statistics_truncate_length(None)`: parquet-rs truncates byte-array statistics at 64
-        // bytes by DEFAULT, and the metrics aggregator drops any bound whose parquet statistic is
-        // not exact (`min_is_exact`) — so with the stock properties a `file_path` bound simply never
-        // survives for a realistic (>64-byte) data-file location, whatever the MetricsConfig says.
-        // Java's parquet-mr does not truncate row-group statistics, which is why Java-written
-        // file-granularity position deletes DO carry these bounds. That asymmetry is a WRITE-side
-        // residue named in this group's PR body (the writer is out of scope here); this fixture
-        // opts out of the truncation so the READ path is exercised through metrics the parquet
-        // writer really computed rather than a hand-set field.
-        let parquet_builder = ParquetWriterBuilder::new(
-            parquet::file::properties::WriterProperties::builder()
-                .set_statistics_truncate_length(None)
-                .build(),
-            config.schema().clone(),
-        )
-        .with_metrics_config(MetricsConfig::for_position_delete());
+        // Production path: position_delete_writer_properties() disables the 64-byte parquet stats
+        // truncate so file_path bounds stay exact (QB / R113); MetricsConfig::for_position_delete
+        // keeps Full mode. See position_delete_writer module docs.
+        let parquet_builder =
+            ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
+                .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             table.file_io().clone(),

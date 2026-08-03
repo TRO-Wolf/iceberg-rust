@@ -98,7 +98,7 @@ use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -988,8 +988,18 @@ async fn write_partitioned_data_files(
 ///
 /// **Partition-aware.** Position-delete files are associated with the `(spec_id, partition)` of the
 /// DATA file they delete from — the Iceberg commit validates that the delete file's partition matches the
-/// registered spec for `partition_spec_id`. For UNPARTITIONED tables the partition key is `None`
-/// (existing behavior). For PARTITIONED tables:
+/// registered spec for `partition_spec_id`.
+///
+/// **Fast path (never-evolved unpartitioned tables only).** When the table has exactly one partition
+/// spec AND that spec is unpartitioned (`is_empty` or all-Void — see
+/// [`PartitionSpec::is_unpartitioned`]), every data file carries an empty partition tuple and we write
+/// a single delete file with `partition_key = None`. This is **not** the same as "the default spec is
+/// unpartitioned": after `DROP PARTITION FIELD` / `updateSpec().removeField(...)` the default becomes
+/// unpartitioned while older data files still carry their original `(spec_id, partition)`. Stamping
+/// those deletes with `None` makes the read-side `(spec_id, partition)` attach miss and resurrects
+/// rows (BUG-001). In any multi-spec shape we always walk manifests and stamp per data-file group.
+///
+/// For (still-)partitioned default specs:
 ///
 /// 1. The current snapshot manifests are scanned once to build a `path → (spec_id, Struct)` map.
 /// 2. The `(path, pos)` pairs are grouped by their data file's `(spec_id, Struct)`.
@@ -997,14 +1007,30 @@ async fn write_partitioned_data_files(
 ///
 /// This mirrors Java `PositionDeleteWriter` which always carries a per-data-file `PartitionKey` and
 /// `RewritePositionDeleteFiles` which groups delete files by `(spec_id, partition)`.
+/// Whether position deletes may take the unpartitioned fast path (`partition_key = None`).
+///
+/// Option A (BUG-001): only when the table has **exactly one** partition spec AND that spec is
+/// unpartitioned (empty or all-Void). A multi-spec table whose *default* is unpartitioned after
+/// evolution still has partitioned data under older specs and must take the manifest walk.
+pub(crate) fn position_delete_unpartitioned_fast_path(
+    spec_count: usize,
+    default_is_unpartitioned: bool,
+) -> bool {
+    spec_count == 1 && default_is_unpartitioned
+}
+
 async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFResult<Vec<DataFile>> {
     let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
     let metadata = table.metadata();
     let default_spec = metadata.default_partition_spec();
     let schema = metadata.current_schema();
 
-    // For unpartitioned tables, write a single delete file with no partition key — the fast path.
-    if default_spec.is_unpartitioned() {
+    // Never-evolved unpartitioned (incl. V1 all-Void) tables only: one empty-partition delete file.
+    // Multi-spec tables whose *default* is unpartitioned still need the manifest walk (BUG-001).
+    if position_delete_unpartitioned_fast_path(
+        metadata.partition_specs_iter().len(),
+        default_spec.is_unpartitioned(),
+    ) {
         return write_position_deletes_for_partition(table, &config, pairs, None).await;
     }
 
@@ -1127,13 +1153,13 @@ async fn write_position_deletes_for_partition(
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
-    // Keep the position-delete `file_path` / `pos` bounds FULL (Java `MetricsConfig.forPositionDelete`)
-    // so delete-file path pruning stays precise — the default `truncate(16)` would widen the path range.
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
-        config.schema().clone(),
-    )
-    .with_metrics_config(MetricsConfig::for_position_delete());
+    // Keep the position-delete `file_path` / `pos` bounds FULL and EXACT:
+    // - MetricsConfig::for_position_delete → Full mode (Java MetricsConfig.forPositionDelete)
+    // - position_delete_writer_properties → no 64-byte parquet stats truncate (so min_is_exact /
+    //   max_is_exact stay true and equal-bounds path routing works for long S3 URIs)
+    let parquet_builder =
+        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
+            .with_metrics_config(MetricsConfig::for_position_delete());
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),
@@ -1851,7 +1877,8 @@ mod tests {
 
     use super::{
         IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch,
-        decode_position, group_pairs_by_partition, sort_position_delete_pairs,
+        decode_position, group_pairs_by_partition, position_delete_unpartitioned_fast_path,
+        sort_position_delete_pairs,
     };
 
     // =============================================================================================
@@ -2162,6 +2189,38 @@ mod tests {
         assert!(
             IsolationLevel::parse("none").is_err(),
             "'none' must be rejected for row-level operations"
+        );
+    }
+
+    // ============================================================================================
+    // BUG-001 Option A — unpartitioned fast-path predicate (mutation-proven).
+    // ============================================================================================
+
+    #[test]
+    fn test_pos_delete_fast_path_only_for_single_unpartitioned_spec() {
+        // Never-evolved unpartitioned (incl. V1 all-Void, which is_unpartitioned() == true).
+        assert!(position_delete_unpartitioned_fast_path(1, true));
+        // Partitioned default: always walk manifests.
+        assert!(!position_delete_unpartitioned_fast_path(1, false));
+        // Evolved: multi-spec + unpartitioned default (DROP PARTITION FIELD) — MUST NOT fast-path.
+        assert!(
+            !position_delete_unpartitioned_fast_path(2, true),
+            "BUG-001: multi-spec with unpartitioned default must take the manifest walk"
+        );
+        assert!(!position_delete_unpartitioned_fast_path(2, false));
+        // Zero specs is not a real table shape; refuse the fast path.
+        assert!(!position_delete_unpartitioned_fast_path(0, true));
+    }
+
+    /// Mutation twin: weakening to `default_is_unpartitioned` alone (the pre-fix bug) would make
+    /// this assert fail — keeps Option A load-bearing.
+    #[test]
+    fn test_pos_delete_fast_path_mutation_default_only_is_wrong() {
+        // If the condition were only `default_is_unpartitioned`, this would incorrectly return true.
+        let evolved_unpartitioned_default = position_delete_unpartitioned_fast_path(2, true);
+        assert!(
+            !evolved_unpartitioned_default,
+            "mutation RED: default-only condition would take the fast path here"
         );
     }
 

@@ -112,7 +112,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
@@ -486,11 +486,9 @@ impl RewritePositionDeleteFiles {
         );
         // Position-delete files keep `file_path`/`pos` bounds FULL (Java `MetricsConfig.forPositionDelete`)
         // so delete-file path pruning stays precise — the default `truncate(16)` would widen the path range.
-        let parquet_builder = ParquetWriterBuilder::new(
-            parquet::file::properties::WriterProperties::builder().build(),
-            config.schema().clone(),
-        )
-        .with_metrics_config(MetricsConfig::for_position_delete());
+        let parquet_builder =
+            ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
+                .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             table.file_io().clone(),
