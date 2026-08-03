@@ -111,7 +111,7 @@ No `map.md` under `arrow/` or `catalog/` (convention not present) — no map upd
 Scratch: `/tmp/critic-octo-fk3-2026-08-08/`  
 **Label:** **OCTO-CONVERGED** (8/8, `early_stop=false`)  
 **Actor tip:** `5e0181ed`  
-**Critic tip:** `b04b3c38`
+**Critic tip:** `32e92712`
 
 ### Critic fixes (by cycle)
 | Cycle | Finding | Fix |
