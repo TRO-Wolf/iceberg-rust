@@ -3411,4 +3411,34 @@ pub(crate) mod tests {
             "invalidate of missing table must not clear sibling pointer entries"
         );
     }
+
+    /// Successful update must drop the prior pointer key from the session cache.
+    #[tokio::test]
+    async fn test_fk4_1_update_evicts_prior_pointer() {
+        let cache = Arc::new(TableMetadataCache::new());
+        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
+        let table = create_table_with_namespace(&catalog).await;
+        let ident = table.identifier().clone();
+        let base = table.metadata_location().unwrap().to_string();
+
+        let commit = TableCommit::builder()
+            .ident(ident.clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([("c6".to_string(), "1".to_string())]),
+            }])
+            .base_metadata_location(Some(base.clone()))
+            .build();
+        let updated = catalog.update_table(commit).await.expect("update");
+        let new_loc = updated.metadata_location().unwrap().to_string();
+        assert_ne!(base, new_loc);
+        assert!(
+            cache.lookup(&base, None).is_none(),
+            "prior pointer must be evicted after successful update"
+        );
+        assert!(
+            cache.lookup(&new_loc, None).is_some(),
+            "new pointer must be seeded"
+        );
+    }
 }
