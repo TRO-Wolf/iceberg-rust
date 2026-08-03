@@ -229,10 +229,37 @@ Incomplete-list backends (OpenDAL memory, FS list, empty objects, some LIST shap
 ### Critic-octo
 
 Scratch: `/tmp/critic-octo-fk4_2-2026-08-08/`  
-**Label:** _(pending)_  
-**Actor tip:** _(pending)_  
+**Label:** **OCTO-CONVERGED** (8/8, `early_stop=false`)  
+**Actor tip:** `3527bf75`  
+**Critic tip:** `8f7f0ed2` (last code; branch tip advances on stamp commits)
 
-### Residual OPEN (≥ S1: **none** at Actor ship)
+### Critic fixes (by cycle)
 
-- **S3 seed:** real-object-store HEAD QPS bench not in offline gate (memory 10k is the cheap proxy)
+| Cycle | Finding | Fix |
+|------:|---|---|
+| 1 | S1 temporary outer-loop hang risk | fail-fast on any list-stat Err |
+| 1 | S2 silent OOB slot | hard-fail out-of-range slot index |
+| 1 | S2 weak factory pin | FileIOBuilder list end-to-end |
+| 2 | S2 fail-closed / OOB unpinned | missing-object + OOB pins |
+| 3 | S2 complete-slot clobber unpinned | interleaved slot pin |
+| 4 | S2 empty need_stat unpinned | noop pin |
+| 5 | S2 clone drops concurrency | clone pin |
+| 6–8 | — | CLEAN re-proof |
+
+### Mutation RED
+
+| Gate | Break | Pin |
+|---|---|---|
+| Concurrent sizes | sequential diverge / skip stat | `test_fk4_2_concurrent_list_stat_*` / 10k |
+| Zero-copy contiguous | force consolidate wrong ptr | `test_fk4_2_buffer_to_bytes_*` |
+| Default 16 | change default / bad parse | `test_fk4_2_parse_*` / factory |
+| Fail-closed missing | swallow stat Err | `test_fk4_2_list_stat_missing_*` |
+| OOB slot | silent skip | `test_fk4_2_list_stat_oob_*` |
+| No clobber complete | overwrite ready slots | `test_fk4_2_stat_does_not_clobber_*` |
+
+### Residual OPEN (≥ S1: **none**)
+
+- **S3 seed:** real-object-store HEAD QPS bench not in offline gate (memory 10k is the cheap proxy; HEAD-count == N on incomplete LIST)
 - **S3 seed:** multi-part non-contiguous `Buffer` still consolidates (API returns single `Bytes`)
+- **S3 seed:** serde `OperatorCache` skip resets concurrency to default 16 (live FileIO is not serde-roundtripped for this knob)
+- **S3 seed:** user concurrency unbounded above outer `ConcurrentLimitLayer(64)` — excess only queues; rate-limit disclosure in this ledger
