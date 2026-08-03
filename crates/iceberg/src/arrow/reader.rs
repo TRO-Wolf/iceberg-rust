@@ -34,7 +34,7 @@ use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
@@ -55,7 +55,9 @@ use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::record_batch_predicate::{
     evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask, null_filled,
 };
-use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::record_batch_transformer::{
+    RecordBatchTransformer, RecordBatchTransformerBuilder,
+};
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
@@ -516,22 +518,20 @@ impl ArrowReader {
         // and the scan predicate via `RowSelection`, which SKIPS rows at the decode layer, making
         // the surviving rows' physical positions unrecoverable. So when `_pos` is projected we
         // decode the file in order with NO row-skipping (no RowFilter / RowSelection / row-group
-        // pruning) and route the batches through the shared whole-file tail
-        // (`finish_whole_file_scan_task`, also used by the Avro / ORC paths), which applies the
-        // predicate + merge-on-read deletes post-decode via a survival mask while the transformer
-        // assigns `_pos` = 0-based file ordinal. Pushdown is unaffected for scans that do not
-        // request `_pos`.
+        // pruning). FK5 streaming half: stream batches through transform + post-decode survival
+        // (pos-deletes / residual / eq-deletes) instead of whole-file `try_collect` — memory is
+        // O(batch), not O(file). The transformer assigns `_pos` = 0-based file ordinal. Selection-
+        // aware ordinal pushdown is STOP-gated (see `task/fk5-pos-projection-ledger.md`): a
+        // `RowFilter` does not expose physical ordinals of undelivered rows. Pushdown is unaffected
+        // for scans that do not request `_pos`.
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS) {
             if let Some(batch_size) = batch_size {
                 record_batch_stream_builder =
                     record_batch_stream_builder.with_batch_size(batch_size);
             }
-            let batches: Vec<RecordBatch> = record_batch_stream_builder
-                .build()?
-                .map(|batch| batch.map_err(Error::from))
-                .try_collect()
-                .await?;
-            return Self::finish_whole_file_scan_task(task, batches, delete_filter_rx).await;
+            let parquet_stream = record_batch_stream_builder.build()?;
+            return Self::stream_pos_projection_scan_task(task, parquet_stream, delete_filter_rx)
+                .await;
         }
 
         // RecordBatchTransformer performs any transformations required on the RecordBatches
@@ -844,6 +844,41 @@ impl ArrowReader {
         Self::finish_whole_file_scan_task(task, batches, delete_filter_rx).await
     }
 
+    /// Parquet path when `_pos` is projected (FK5 streaming half): decode in physical order with
+    /// **no** `RowFilter` / `RowSelection` / RG prune, but stream batches through
+    /// [`Self::apply_pos_aware_batch`] instead of whole-file `try_collect`. Memory is O(batch).
+    /// Selection-aware ordinal pushdown remains STOP-gated — see ledger.
+    async fn stream_pos_projection_scan_task<S>(
+        task: FileScanTask,
+        parquet_stream: S,
+        delete_filter_rx: tokio::sync::oneshot::Receiver<
+            Result<crate::arrow::delete_filter::DeleteFilter>,
+        >,
+    ) -> Result<ArrowRecordBatchStream>
+    where
+        S: Stream<Item = parquet::errors::Result<RecordBatch>> + Send + 'static,
+    {
+        let mut record_batch_transformer = Self::build_scan_task_transformer(&task)?;
+        let (positional_deletes, residual_predicate, eq_delete_predicate, eq_delete_sets) =
+            Self::resolve_whole_file_delete_context(&task, delete_filter_rx).await?;
+
+        let mut absolute_pos: u64 = 0;
+        let record_batch_stream = parquet_stream.map(move |batch_result| {
+            let batch = batch_result.map_err(Error::from)?;
+            Self::apply_pos_aware_batch(
+                batch,
+                &mut record_batch_transformer,
+                &mut absolute_pos,
+                positional_deletes.as_ref(),
+                residual_predicate.as_deref(),
+                eq_delete_predicate.as_ref(),
+                eq_delete_sets.as_deref(),
+            )
+        });
+
+        Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
+    }
+
     /// The format-agnostic tail shared by [`Self::process_avro_file_scan_task`] and
     /// [`Self::process_orc_file_scan_task`]: everything after a whole-file reader has MATERIALIZED
     /// `batches` (the decoded data columns, by field id, in projection order). Given the in-flight
@@ -860,8 +895,9 @@ impl ArrowReader {
     ///    [`evaluate_predicate_to_mask`] / [`filter_record_batch`] kernels the Parquet
     ///    `RowFilter`/`RowSelection` use.
     ///
-    /// This is the ONE copy of the whole-file delete-application logic; the two callers differ only
-    /// in which U1 reader decoded `batches`.
+    /// Per-batch apply is shared with the Parquet `_pos` streaming path
+    /// ([`Self::apply_pos_aware_batch`]). Avro/ORC still materialize decode first (format limit);
+    /// the eager output `Vec` here is fine because `batches` is already fully in memory.
     async fn finish_whole_file_scan_task(
         task: FileScanTask,
         batches: Vec<RecordBatch>,
@@ -869,8 +905,37 @@ impl ArrowReader {
             Result<crate::arrow::delete_filter::DeleteFilter>,
         >,
     ) -> Result<ArrowRecordBatchStream> {
-        // Build the SAME RecordBatchTransformer the Parquet path uses (schema evolution + reorder +
-        // `_file` / identity-partition constants).
+        let mut record_batch_transformer = Self::build_scan_task_transformer(&task)?;
+        let (positional_deletes, residual_predicate, eq_delete_predicate, eq_delete_sets) =
+            Self::resolve_whole_file_delete_context(&task, delete_filter_rx).await?;
+
+        // File already fully decoded — eager loop is fine; counters stay simplest on owned batches.
+        let mut output: Vec<Result<RecordBatch>> = Vec::with_capacity(batches.len());
+        let mut absolute_pos: u64 = 0;
+        for batch in batches {
+            match Self::apply_pos_aware_batch(
+                batch,
+                &mut record_batch_transformer,
+                &mut absolute_pos,
+                positional_deletes.as_ref(),
+                residual_predicate.as_deref(),
+                eq_delete_predicate.as_ref(),
+                eq_delete_sets.as_deref(),
+            ) {
+                Ok(b) => output.push(Ok(b)),
+                Err(e) => {
+                    output.push(Err(e));
+                    break;
+                }
+            }
+        }
+
+        Ok(Box::pin(futures::stream::iter(output)) as ArrowRecordBatchStream)
+    }
+
+    /// Build the [`RecordBatchTransformer`] shared by Parquet `_pos` streaming and Avro/ORC
+    /// whole-file tails (schema evolution, reorder, `_file` / identity-partition constants).
+    fn build_scan_task_transformer(task: &FileScanTask) -> Result<RecordBatchTransformer> {
         let mut record_batch_transformer_builder =
             RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -884,11 +949,22 @@ impl ArrowReader {
             record_batch_transformer_builder =
                 record_batch_transformer_builder.with_partition(partition_spec, partition_data)?;
         }
-        let mut record_batch_transformer = record_batch_transformer_builder.build();
+        Ok(record_batch_transformer_builder.build())
+    }
 
-        // Resolve the deletes (positional vector + the equality-delete predicate), then AND the
-        // equality-delete predicate with the scan residual into one per-batch survival predicate —
-        // the same single predicate the Parquet path forms before pushing it into the RowFilter.
+    /// Resolve positional delete vector + residual + eq-delete set/predicate for whole-file /
+    /// `_pos` post-decode apply. Delete load was started concurrently with the data read.
+    async fn resolve_whole_file_delete_context(
+        task: &FileScanTask,
+        delete_filter_rx: tokio::sync::oneshot::Receiver<
+            Result<crate::arrow::delete_filter::DeleteFilter>,
+        >,
+    ) -> Result<(
+        Option<Arc<DeleteVector>>,
+        Option<Arc<BoundPredicate>>,
+        Option<BoundPredicate>,
+        Option<Vec<EqDeleteKeySet>>,
+    )> {
         let delete_filter = delete_filter_rx.await.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -903,64 +979,59 @@ impl ArrowReader {
         // eq-delete predicate is the fallback. The scan residual (`task.predicate`) and the eq-delete
         // predicate are kept available for the predicate path; the set only accelerates the common
         // case. `eq_delete_predicate` is `None` when the task has no eq-deletes.
-        let eq_delete_sets = delete_filter.collect_equality_delete_keysets(&task).await;
-        let eq_delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let eq_delete_sets = delete_filter.collect_equality_delete_keysets(task).await;
+        let eq_delete_predicate = delete_filter.build_equality_delete_predicate(task).await?;
         let residual_predicate = task.predicate.clone();
+        let positional_deletes = delete_filter.get_delete_vector(task);
+        Ok((
+            positional_deletes,
+            residual_predicate,
+            eq_delete_predicate,
+            eq_delete_sets,
+        ))
+    }
 
-        // The positional-delete vector for this data file (cloned out so the stream owns it).
-        let positional_deletes = delete_filter.get_delete_vector(&task);
-
-        // Materialize every transformed + delete-filtered batch eagerly: the file is already fully
-        // decoded in memory, so there is no streaming benefit to a lazy adapter, and the absolute
-        // row-position counter for positional deletes is simplest to thread over an owned loop.
-        let mut output: Vec<Result<RecordBatch>> = Vec::with_capacity(batches.len());
-        let mut absolute_pos: u64 = 0;
-        for batch in batches {
-            let row_count = batch.num_rows();
-
-            let transformed = match record_batch_transformer.process_record_batch(batch) {
-                Ok(b) => b,
-                Err(e) => {
-                    output.push(Err(e));
-                    break;
-                }
-            };
-
-            let mask = match Self::survival_mask(
-                &transformed,
-                row_count,
-                absolute_pos,
-                positional_deletes.as_ref(),
-                residual_predicate.as_deref(),
-                eq_delete_predicate.as_ref(),
-                eq_delete_sets.as_deref(),
-            ) {
-                Ok(mask) => mask,
-                Err(e) => {
-                    output.push(Err(e));
-                    break;
-                }
-            };
-
-            absolute_pos = absolute_pos.saturating_add(row_count as u64);
-
-            match mask {
-                // No deletes / residual touch this batch: emit it unchanged.
-                None => output.push(Ok(transformed)),
-                Some(mask) => {
-                    let filtered = filter_record_batch(&transformed, &mask).map_err(|e| {
-                        Error::new(
-                            ErrorKind::Unexpected,
-                            "Failed to apply merge-on-read deletes to a materialized data batch",
-                        )
-                        .with_source(e)
-                    });
-                    output.push(filtered);
-                }
-            }
+    /// Transform one decoded batch, assign `_pos` from the running physical counter (via the
+    /// transformer), apply MoR survival (positional / residual / eq), advance `absolute_pos` by the
+    /// **full pre-filter** row count. Shared by Parquet `_pos` streaming and Avro/ORC whole-file.
+    ///
+    /// Correctness: `absolute_pos` / transformer `next_row_position` must track the same physical
+    /// file ordinal base. Skipping rows at decode (RowSelection/RowFilter) would desync them —
+    /// callers that project `_pos` must not enable decode-layer row skips.
+    fn apply_pos_aware_batch(
+        batch: RecordBatch,
+        transformer: &mut RecordBatchTransformer,
+        absolute_pos: &mut u64,
+        positional_deletes: Option<&Arc<DeleteVector>>,
+        residual_predicate: Option<&BoundPredicate>,
+        eq_delete_predicate: Option<&BoundPredicate>,
+        eq_delete_sets: Option<&[EqDeleteKeySet]>,
+    ) -> Result<RecordBatch> {
+        let row_count = batch.num_rows();
+        let batch_base = *absolute_pos;
+        let transformed = transformer.process_record_batch(batch)?;
+        let mask = Self::survival_mask(
+            &transformed,
+            row_count,
+            batch_base,
+            positional_deletes,
+            residual_predicate,
+            eq_delete_predicate,
+            eq_delete_sets,
+        )?;
+        // Advance by FULL batch before any mask filter so the next batch's physical ordinals
+        // continue correctly (matches RecordBatchTransformer::next_row_position advance).
+        *absolute_pos = absolute_pos.saturating_add(row_count as u64);
+        match mask {
+            None => Ok(transformed),
+            Some(mask) => filter_record_batch(&transformed, &mask).map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to apply merge-on-read deletes to a data batch under _pos / whole-file scan",
+                )
+                .with_source(e)
+            }),
         }
-
-        Ok(Box::pin(futures::stream::iter(output)) as ArrowRecordBatchStream)
     }
 
     /// The projected Iceberg [`Schema`] a whole-file (Avro / ORC) data reader resolves the file
@@ -2656,6 +2727,7 @@ mod tests {
         SetExpression,
     };
     use crate::io::FileIO;
+    use crate::metadata_columns::RESERVED_FIELD_ID_POS;
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveLiteral, PrimitiveType,
@@ -3665,6 +3737,418 @@ message schema {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(pos_col.values(), &[0, 1, 2, 3, 4]);
+    }
+
+    // ===========================================================================================
+    // FK5 — `_pos` projection streaming half (scout #16)
+    //
+    // Bar: dense + sparse pos-deletes + residual; row sets AND `_pos` values vs unpruned physical
+    // oracle; multi-batch continuity; MERGE-shaped write pin; mutation bait on ordinal advance.
+    // Selection-aware pushdown is STOP-gated (ledger).
+    // ===========================================================================================
+
+    /// Collect `(id, _pos)` pairs from a scan projecting field 1 + `_pos`, sorted by id.
+    fn collect_id_pos_pairs(batches: &[RecordBatch]) -> Vec<(i32, i64)> {
+        use arrow_array::{Int32Array, Int64Array};
+        let mut out = Vec::new();
+        for batch in batches {
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id Int32");
+            let pos = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("_pos Int64");
+            assert_eq!(id.len(), pos.len());
+            for i in 0..id.len() {
+                out.push((id.value(i), pos.value(i)));
+            }
+        }
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// Write a single-column Int32 parquet file (field id 1 = `id`) with optional multi-RG layout.
+    fn write_id_parquet_for_pos(path: &str, ids: &[i32], max_row_group_size: usize) {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(arrow_array::Int32Array::from(ids.to_vec())) as ArrayRef,
+            ])
+            .expect("id batch");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(max_row_group_size)
+            .build();
+        let file = File::create(path).expect("create data");
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    fn id_schema_for_pos() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        )
+    }
+
+    fn pos_scan_task(
+        data_path: &str,
+        schema: SchemaRef,
+        deletes: Vec<FileScanTaskDeleteFile>,
+        predicate: Option<BoundPredicate>,
+    ) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: std::fs::metadata(data_path).expect("stat").len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(data_path.to_string()),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: Arc::from(vec![1, RESERVED_FIELD_ID_POS]),
+            predicate: predicate.map(Arc::new),
+            deletes: Arc::from(deletes),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        }
+    }
+
+    /// Local pos-delete writer for FK5 pins (nested avro test helper is not visible here).
+    fn fk5_write_pos_delete_file(
+        path: &str,
+        referenced_data_path: &str,
+        positions: &[i64],
+    ) -> FileScanTaskDeleteFile {
+        use arrow_array::Int64Array;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                (i32::MAX - 101).to_string(),
+            )])),
+            Field::new("pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                (i32::MAX - 102).to_string(),
+            )])),
+        ]));
+        let paths: Vec<&str> = positions.iter().map(|_| referenced_data_path).collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(paths)) as ArrayRef,
+            Arc::new(Int64Array::from(positions.to_vec())) as ArrayRef,
+        ])
+        .expect("build pos-delete batch");
+        let file = File::create(path).expect("create pos-delete file");
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(WriterProperties::builder().build()))
+                .expect("pos-delete writer");
+        writer.write(&batch).expect("write pos-delete batch");
+        writer.close().expect("close pos-delete writer");
+        FileScanTaskDeleteFile {
+            file_path: path.to_string(),
+            file_size_in_bytes: std::fs::metadata(path).expect("stat").len(),
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        }
+    }
+
+    async fn run_pos_scan(task: FileScanTask, batch_size: Option<usize>) -> Vec<RecordBatch> {
+        let file_io = FileIO::new_with_fs();
+        let mut builder = ArrowReaderBuilder::new(file_io);
+        if let Some(bs) = batch_size {
+            builder = builder.with_batch_size(bs);
+        }
+        // Enable row selection / RG filter so a REGRESSION that accidentally pushes them on the
+        // `_pos` path would be exercised (and fail the ordinal oracle).
+        let reader = builder
+            .with_row_group_filtering_enabled(true)
+            .with_row_selection_enabled(true)
+            .build();
+        reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("read")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("collect")
+    }
+
+    /// FK5: multi-batch streaming still assigns continuous physical `_pos` 0..N-1.
+    #[tokio::test]
+    async fn fk5_pos_projection_multi_batch_continuity() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..20).map(|i| (i + 1) * 10).collect(); // 10,20,...,200
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![], None);
+        let batches = run_pos_scan(task, Some(3)).await;
+        assert!(
+            batches.len() > 1,
+            "expected multi-batch stream, got {} batch(es)",
+            batches.len()
+        );
+        let pairs = collect_id_pos_pairs(&batches);
+        let expected: Vec<(i32, i64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(pos, id)| (*id, pos as i64))
+            .collect();
+        assert_eq!(
+            pairs, expected,
+            "physical _pos must be 0..N-1 across batches"
+        );
+    }
+
+    /// FK5 oracle: dense pos-deletes (every other row) — survivors keep TRUE physical `_pos`.
+    #[tokio::test]
+    async fn fk5_pos_oracle_dense_pos_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..10).map(|i| i * 10).collect(); // 0,10,...,90 at pos 0..9
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[0, 2, 4, 6, 8]);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![del], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(2)).await);
+        assert_eq!(
+            pairs,
+            vec![(10, 1), (30, 3), (50, 5), (70, 7), (90, 9)],
+            "dense pos-deletes must leave true physical _pos on survivors"
+        );
+    }
+
+    /// FK5 oracle: sparse pos-deletes across multi-RG file.
+    #[tokio::test]
+    async fn fk5_pos_oracle_sparse_pos_deletes_multi_rg() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (1..=200).collect();
+        write_id_parquet_for_pos(&data_path, &ids, 100);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[0, 50, 100, 199]);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![del], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(17)).await);
+        assert_eq!(pairs.len(), 196);
+        assert!(pairs.contains(&(2, 1)), "pos 1 (id=2) survives");
+        assert!(!pairs.contains(&(51, 50)), "pos 50 deleted");
+        assert!(pairs.contains(&(50, 49)), "pos 49 survives with _pos=49");
+        assert!(!pairs.contains(&(101, 100)), "pos 100 deleted");
+        assert!(
+            pairs.contains(&(102, 101)),
+            "pos 101 survives with _pos=101"
+        );
+        assert!(!pairs.contains(&(200, 199)), "pos 199 deleted");
+        assert!(
+            pairs.contains(&(199, 198)),
+            "pos 198 survives with _pos=198"
+        );
+        let deleted: HashSet<i64> = [0i64, 50, 100, 199].into_iter().collect();
+        let expected: Vec<(i32, i64)> = (0i64..200)
+            .filter(|p| !deleted.contains(p))
+            .map(|p| ((p + 1) as i32, p))
+            .collect();
+        assert_eq!(pairs, expected);
+    }
+
+    /// FK5 oracle: residual filter AND sparse pos-deletes — row set + `_pos` vs physical baseline.
+    #[tokio::test]
+    async fn fk5_pos_oracle_residual_and_pos_deletes() {
+        use crate::expr::{Bind, Reference};
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..20).collect(); // id == physical pos
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[3, 7, 15]);
+        let schema = id_schema_for_pos();
+        let residual = Reference::new("id")
+            .greater_than_or_equal_to(Datum::int(5))
+            .and(Reference::new("id").less_than(Datum::int(18)));
+        let bound = residual.bind(schema.clone(), true).expect("bind");
+        let task = pos_scan_task(&data_path, schema, vec![del], Some(bound));
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(4)).await);
+        let expected: Vec<(i32, i64)> = (5i64..18)
+            .filter(|p| *p != 7 && *p != 15)
+            .map(|p| (p as i32, p))
+            .collect();
+        assert_eq!(
+            pairs, expected,
+            "residual∩¬pos-delete must keep true physical _pos (unpruned baseline)"
+        );
+    }
+
+    /// FK5 mutation bait: absolute_pos must advance by full pre-filter batch size.
+    ///
+    /// MUTATION: in `apply_pos_aware_batch`, advance by filtered survivor count instead of
+    /// pre-filter `row_count` → this test RED (second batch `_pos` shifts).
+    #[tokio::test]
+    async fn fk5_pos_mutation_absolute_pos_advances_by_full_batch() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = vec![0, 1, 2, 3, 4, 5];
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let del_path = tmp
+            .path()
+            .join("pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &[0, 1]);
+        let schema = id_schema_for_pos();
+        let task = pos_scan_task(&data_path, schema, vec![del], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(3)).await);
+        assert_eq!(
+            pairs,
+            vec![(2, 2), (3, 3), (4, 4), (5, 5)],
+            "absolute_pos must advance by full pre-filter batch size (mutation bait)"
+        );
+    }
+
+    /// FK5 MERGE-shaped pin: streamed `(_file,_pos)` scan → write pos deletes → MoR omits rows.
+    #[tokio::test]
+    async fn fk5_merge_shaped_pos_delete_from_streamed_identity_scan() {
+        use arrow_array::{Int32Array, Int64Array};
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids = vec![10, 20, 30, 40, 50];
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+        let schema = id_schema_for_pos();
+
+        let discover_task = pos_scan_task(&data_path, schema.clone(), vec![], None);
+        let discover_batches = run_pos_scan(discover_task, Some(2)).await;
+        let all_pairs = collect_id_pos_pairs(&discover_batches);
+        assert_eq!(
+            all_pairs,
+            vec![(10, 0), (20, 1), (30, 2), (40, 3), (50, 4)],
+            "identity scan must report true physical positions"
+        );
+        let mutate_pos: Vec<i64> = all_pairs
+            .iter()
+            .filter(|(id, _)| *id == 20 || *id == 40)
+            .map(|(_, p)| *p)
+            .collect();
+        assert_eq!(mutate_pos, vec![1, 3]);
+
+        let del_path = tmp
+            .path()
+            .join("merge-pos-del.parquet")
+            .to_string_lossy()
+            .to_string();
+        let del = fk5_write_pos_delete_file(&del_path, &data_path, &mutate_pos);
+
+        let file_io = FileIO::new_with_fs();
+        let reader = ArrowReaderBuilder::new(file_io)
+            .with_row_selection_enabled(true)
+            .build();
+        let mor_task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(data_path.clone()),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: Arc::from(vec![1]),
+            predicate: None,
+            deletes: Arc::from(vec![del]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        };
+        let batches = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(mor_task)])) as FileScanTaskStream)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        let mut live: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            live.extend(col.values().iter().copied());
+        }
+        live.sort();
+        assert_eq!(
+            live,
+            vec![10, 30, 50],
+            "position deletes written from streamed _pos scan must remove exactly ids 20 and 40"
+        );
+
+        let with_pos = pos_scan_task(
+            &data_path,
+            schema,
+            vec![fk5_write_pos_delete_file(
+                &tmp.path().join("del2.parquet").to_string_lossy(),
+                &data_path,
+                &mutate_pos,
+            )],
+            None,
+        );
+        let pairs = collect_id_pos_pairs(&run_pos_scan(with_pos, Some(2)).await);
+        assert_eq!(pairs, vec![(10, 0), (30, 2), (50, 4)]);
+        let _ = std::mem::size_of::<Int64Array>();
     }
 
     /// Test for bug where position deletes in later row groups are not applied correctly.
