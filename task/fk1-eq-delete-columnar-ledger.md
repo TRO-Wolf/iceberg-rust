@@ -45,3 +45,6 @@ Hot-path drop confirmed → ships (no minimum threshold).
 - True deferral of survival-predicate materialization until first null-batch fallback
   (tonight still builds predicate at parse for fallback readiness)
 - (S2 residual) Dictionary/Utf8View probe hard-error vs predicate fallback — pre-FK1 class
+
+## Critic-octo
+OCTO-CONVERGED tip `46443118` — 8/8 cycles; mutation RED null+float at tip; H6 24/24.
