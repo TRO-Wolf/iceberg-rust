@@ -24,7 +24,14 @@ Hot-path drop confirmed → ships (no minimum threshold).
 ## Soundness gates (mutation-RED at tip)
 - Null bail: mutate `null_count() > 0` → `test_h6_set_returns_none_when_key_column_has_null` RED
 - Float gate: admit Float/Double in `is_eligible_type` → `test_h6_gate_excludes_float_*` RED
-- Full H6 harness: 16/16 green
+- Full H6 harness: **24/24 green** (critic-octo expanded type matrix + null-only pins)
+
+## Critic-octo FK1 (8 cycles) — soundness fixes
+- **C1:** `delete_mask` null bail **before** empty short-circuit (I64 drops null deletes → empty store)
+- **C2:** `i64_dropped_null_deletes` so `is_empty()` stays false for null-only I64; apply seam
+  (`eq_delete_keep_mask`) always calls `delete_mask` (no empty-skip → keep-all)
+- **C3–C7:** coverage pins (Uuid, Int, Timestamp/tz/ns, multi-col null-only Bytes) + i64 len guard
+- **C4/C8:** mutation RED re-proven at tip for null bail + float gate
 
 ## Java cite (actor-found, 1.10.0 surface)
 - Membership model: Iceberg `StructLikeSet` / equality-delete apply path (hashed set vs
@@ -37,3 +44,4 @@ Hot-path drop confirmed → ships (no minimum threshold).
 - Float/Double Java-Comparator hashing with bytecode class+method cite
 - True deferral of survival-predicate materialization until first null-batch fallback
   (tonight still builds predicate at parse for fallback readiness)
+- (S2 residual) Dictionary/Utf8View probe hard-error vs predicate fallback — pre-FK1 class
