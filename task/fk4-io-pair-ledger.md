@@ -127,7 +127,7 @@ No `map.md` under `catalog/` (convention not present) — no map update.
 Scratch: `/tmp/critic-octo-fk4_1-2026-08-08/`  
 **Label:** **OCTO-CONVERGED** (8/8, `early_stop=false`)  
 **Actor tip:** `52905e65`  
-**Critic tip:** _(final docs stamp — see git log on branch)_
+**Critic tip:** `a7a402ec`
 
 ### Critic fixes (by cycle)
 
