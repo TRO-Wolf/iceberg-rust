@@ -727,3 +727,20 @@ Caught by CI on the slate union branch (`df_binary/boolean_predicate_pushdown.sl
   (`tokio::runtime::Builder::new_multi_thread` missing): the crate free-rides on
   WORKSPACE-WIDE feature unification for tokio `rt-multi-thread` (the F3 tokio
   under-declaration backlog item; the Cargo.toml fix needs explicit approval).
+
+### 2026-08-03 — Two CI-only checks the local chained gate never runs: `typos .` must be IN every unit gate, and every NEW file needs the ASF header at creation
+
+Both caught on the FK campaign PR (#183) by the morning review / CI, not by the overnight
+per-unit gates.
+
+- **DO keep `typos .` in every unit's chained gate — it is the FIRST link of the fork's
+  canonical chain, and the overnight per-unit gates dropped it.** `ci_typos.yml` runs on every
+  push/PR, so a violation that gates green locally fails the PR minutes later. When a legit
+  term trips it (the `TRO-Wolf` org name), extend `[default.extend-words]` in `.typos.toml` in
+  the same commit — do not reword truth to appease the linter.
+- **DO give every NEW file the ASF license header at creation** — `license-eye` (the
+  `skywalking-eyes` header check) has NO local gate leg, so missing headers surface only on the
+  PR. Markdown uses the `<!-- ~ Licensed to the Apache Software Foundation ... -->` HTML-comment
+  form; Rust uses the `//` form — copy from any sibling file, never hand-vary the text. New
+  `task/` ledgers and `dev/` scripts are files too; the checker exempts only what
+  `.licenserc.yaml` ignores.
