@@ -1854,6 +1854,21 @@ mod tests {
         );
     }
 
+    /// FK4.2: list_stat_concurrency is preserved across OpenDalStorage clone
+    /// (copied with OperatorCache; not reset to default).
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_fk4_2_concurrency_survives_storage_clone() {
+        let storage = OpenDalStorage::Memory {
+            operator: memory_config_build().expect("op"),
+            operator_cache: OperatorCache::default().with_list_stat_concurrency(7),
+        };
+        assert_eq!(storage.list_stat_concurrency(), 7);
+        let cloned = storage.clone();
+        assert_eq!(cloned.list_stat_concurrency(), 7);
+        assert_eq!(storage.list_stat_concurrency(), 7);
+    }
+
     /// FK4.2: empty need_stat is a successful no-op (complete-list-meta only path).
     #[cfg(feature = "opendal-memory")]
     #[tokio::test]
