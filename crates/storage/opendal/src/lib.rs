@@ -1690,11 +1690,11 @@ mod tests {
 
         for (path, body) in &payloads {
             sequential
-                .write(*path, body.clone())
+                .write(path, body.clone())
                 .await
                 .expect("seq write");
             concurrent
-                .write(*path, body.clone())
+                .write(path, body.clone())
                 .await
                 .expect("conc write");
         }
