@@ -25,6 +25,7 @@ use futures::lock::Mutex;
 use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
+use crate::catalog::table_metadata_cache::{TableMetadataCache, load_or_fetch_table_metadata};
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
 use crate::spec::{TableMetadata, TableMetadataBuilder, ViewMetadata, ViewMetadataBuilder};
 use crate::table::Table;
@@ -45,6 +46,8 @@ const LOCATION: &str = "location";
 pub struct MemoryCatalogBuilder {
     config: MemoryCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    /// Opt-in session metadata-pointer cache (FK4.1). Default `None` = OFF.
+    table_metadata_cache: Option<Arc<TableMetadataCache>>,
 }
 
 impl Default for MemoryCatalogBuilder {
@@ -56,7 +59,19 @@ impl Default for MemoryCatalogBuilder {
                 props: HashMap::new(),
             },
             storage_factory: None,
+            table_metadata_cache: None,
         }
+    }
+}
+
+impl MemoryCatalogBuilder {
+    /// Inject a session-scoped [`TableMetadataCache`] consulted on `load_table`.
+    ///
+    /// **Opt-in — default OFF.** No global/thread-local state; the caller owns the `Arc`
+    /// and may share it across catalogs in one session. See FK4.1 / scout #7.
+    pub fn with_table_metadata_cache(mut self, cache: Arc<TableMetadataCache>) -> Self {
+        self.table_metadata_cache = Some(cache);
+        self
     }
 }
 
@@ -100,7 +115,7 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                     "Catalog warehouse is required",
                 ))
             } else {
-                MemoryCatalog::new(self.config, self.storage_factory)
+                MemoryCatalog::new(self.config, self.storage_factory, self.table_metadata_cache)
             }
         };
 
@@ -123,6 +138,8 @@ pub struct MemoryCatalog {
     file_io: FileIO,
     warehouse_location: String,
     properties: HashMap<String, String>,
+    /// Opt-in metadata-pointer cache (FK4.1). `None` = default OFF.
+    table_metadata_cache: Option<Arc<TableMetadataCache>>,
 }
 
 impl MemoryCatalog {
@@ -130,6 +147,7 @@ impl MemoryCatalog {
     fn new(
         config: MemoryCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
+        table_metadata_cache: Option<Arc<TableMetadataCache>>,
     ) -> Result<Self> {
         // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
@@ -145,6 +163,7 @@ impl MemoryCatalog {
             file_io: FileIOBuilder::new(factory).with_props(config.props).build(),
             warehouse_location: config.warehouse,
             properties,
+            table_metadata_cache,
         })
     }
 
@@ -164,13 +183,32 @@ impl MemoryCatalog {
             .cloned()
     }
 
-    /// Load table metadata from FileIO and assemble a [`Table`] — no catalog lock held.
+    /// Publish parsed metadata into the optional session cache (no-op when cache is OFF).
+    fn cache_put(&self, metadata_location: &str, metadata: &TableMetadata) {
+        if let Some(cache) = self.table_metadata_cache.as_ref() {
+            cache.put(
+                metadata_location.to_string(),
+                Arc::new(metadata.clone()),
+                None,
+            );
+        }
+    }
+
+    /// Load table metadata from FileIO (or the opt-in pointer cache) and assemble a [`Table`].
+    /// No catalog lock held.
     async fn load_table_from_location(
         &self,
         table_ident: &TableIdent,
         metadata_location: &str,
     ) -> Result<Table> {
-        let metadata = TableMetadata::read_from(&self.file_io, metadata_location).await?;
+        // v1: location string equality only; MemoryCatalog has no service version token.
+        let metadata = load_or_fetch_table_metadata(
+            &self.file_io,
+            metadata_location,
+            self.table_metadata_cache.as_deref(),
+            None,
+        )
+        .await?;
 
         Table::builder()
             .identifier(table_ident.clone())
@@ -390,6 +428,8 @@ impl Catalog for MemoryCatalog {
 
         // Write outside the lock so concurrent catalog ops are not serialized on FileIO.
         metadata.write_to(&self.file_io, &metadata_location).await?;
+        // Seed the opt-in pointer cache so a subsequent load_table of the same pointer is a hit.
+        self.cache_put(&metadata_location, &metadata);
 
         {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
@@ -408,6 +448,9 @@ impl Catalog for MemoryCatalog {
     ///
     /// Snapshots the metadata pointer under a short lock, then reads FileIO outside it so concurrent
     /// loads/commits are not serialized on metadata I/O (FK3 / scout #13).
+    ///
+    /// When a [`TableMetadataCache`] was injected at construction (FK4.1), an unchanged
+    /// metadata-location pointer reuses the cached `Arc` and skips the body GET + re-parse.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
         let metadata_location = self.table_metadata_location(table_ident).await?;
         self.load_table_from_location(table_ident, &metadata_location)
@@ -471,7 +514,14 @@ impl Catalog for MemoryCatalog {
     ) -> Result<Table> {
         // Read (and validate reachability of) the metadata BEFORE claiming the pointer, so a reload
         // failure cannot leave a half-created table. See the atomicity guarantee above.
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        // Goes through the opt-in pointer cache (miss path still fail-closed on unreadable files).
+        let metadata = load_or_fetch_table_metadata(
+            &self.file_io,
+            &metadata_location,
+            self.table_metadata_cache.as_deref(),
+            None,
+        )
+        .await?;
 
         {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
@@ -584,8 +634,30 @@ impl Catalog for MemoryCatalog {
             &new_metadata_location,
         )?;
         let updated_table = root_namespace_state.commit_table_update(staged_table)?;
+        // Seed cache with the newly published pointer so the next load_table is a hit.
+        self.cache_put(
+            updated_table
+                .metadata_location()
+                .unwrap_or(new_metadata_location.as_str()),
+            updated_table.metadata(),
+        );
 
         Ok(updated_table)
+    }
+
+    /// Evict the cached entry for this table's current metadata location when a cache is
+    /// injected; no-op when the cache is OFF (default) or the table does not exist.
+    async fn invalidate_table(&self, table: &TableIdent) -> Result<()> {
+        let Some(cache) = self.table_metadata_cache.as_ref() else {
+            return Ok(());
+        };
+        match self.table_metadata_location(table).await {
+            Ok(location) => cache.invalidate(&location),
+            // Fail closed: if we cannot resolve a location, drop the whole session cache
+            // rather than risk serving a stale Arc under a recycled location string.
+            Err(_) => cache.clear(),
+        }
+        Ok(())
     }
 
     async fn list_views(&self, namespace_ident: &NamespaceIdent) -> Result<Vec<TableIdent>> {
@@ -3107,6 +3179,174 @@ pub(crate) mod tests {
         assert!(
             loaded.metadata_location().is_some(),
             "concurrent load must return a table with a metadata location"
+        );
+    }
+
+    // ========================================================================
+    // FK4.1 / scout #7 — metadata-pointer cache (opt-in, default OFF).
+    // ========================================================================
+
+    async fn new_memory_catalog_with_cache(cache: Arc<TableMetadataCache>) -> MemoryCatalog {
+        let warehouse_location = temp_path();
+        MemoryCatalogBuilder::default()
+            .with_table_metadata_cache(cache)
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_location)]),
+            )
+            .await
+            .expect("build memory catalog with table metadata cache")
+    }
+
+    /// Two loads of an unchanged pointer with the opt-in cache: create seeds the cache, so both
+    /// loads are hits and body_fetches stay 0. MUTATION: skip cache lookup on load → misses > 0
+    /// / body_fetches > 0 turns this RED.
+    #[tokio::test]
+    async fn test_fk4_1_two_loads_unchanged_pointer_zero_body_fetch() {
+        let cache = Arc::new(TableMetadataCache::new());
+        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
+        let table = create_table_with_namespace(&catalog).await;
+        let ident = table.identifier().clone();
+        let pointer = table.metadata_location().expect("pointer").to_string();
+
+        cache.reset_stats();
+        let first = catalog.load_table(&ident).await.expect("load 1");
+        let second = catalog.load_table(&ident).await.expect("load 2");
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.body_fetches, 0,
+            "unchanged pointer after create-seed must not body-GET on load"
+        );
+        assert_eq!(stats.hits, 2, "both loads must hit the pointer cache");
+        assert_eq!(stats.misses, 0);
+        assert_eq!(
+            first.metadata_location().unwrap(),
+            pointer.as_str(),
+            "load must surface the same catalog pointer"
+        );
+        assert_eq!(second.metadata_location().unwrap(), pointer.as_str());
+        // Shared Arc from the cache (create seeded a distinct Arc; loads share the cached one).
+        assert!(
+            std::sync::Arc::ptr_eq(&first.metadata_ref(), &second.metadata_ref()),
+            "two loads must share the cached TableMetadata Arc"
+        );
+    }
+
+    /// Default OFF: builder without `with_table_metadata_cache` never records cache traffic and
+    /// still loads correctly. (No injected Arc ⇒ no global/thread-local fallback.)
+    #[tokio::test]
+    async fn test_fk4_1_default_off_loads_without_cache() {
+        let catalog = new_memory_catalog().await;
+        let table = create_table_with_namespace(&catalog).await;
+        let loaded = catalog
+            .load_table(table.identifier())
+            .await
+            .expect("load without cache");
+        assert_eq!(
+            loaded.metadata_location(),
+            table.metadata_location(),
+            "default-OFF path must still resolve the catalog pointer"
+        );
+    }
+
+    /// Commit advances the metadata location → new key → miss on next load (fail closed: never
+    /// serve the previous pointer's Arc under a new location). Create+update seed the new key so
+    /// the load after update is a hit on the *new* pointer; a second load is also a hit.
+    #[tokio::test]
+    async fn test_fk4_1_pointer_change_on_update_is_new_key() {
+        let cache = Arc::new(TableMetadataCache::new());
+        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
+        let table = create_table_with_namespace(&catalog).await;
+        let ident = table.identifier().clone();
+        let base_location = table.metadata_location().unwrap().to_string();
+
+        let commit = TableCommit::builder()
+            .ident(ident.clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([("fk4".to_string(), "1".to_string())]),
+            }])
+            .base_metadata_location(Some(base_location.clone()))
+            .build();
+        let updated = catalog.update_table(commit).await.expect("update");
+        let new_location = updated.metadata_location().unwrap().to_string();
+        assert_ne!(
+            new_location, base_location,
+            "commit must publish a new metadata pointer"
+        );
+
+        cache.reset_stats();
+        let loaded = catalog.load_table(&ident).await.expect("load after update");
+        assert_eq!(loaded.metadata_location().unwrap(), new_location.as_str());
+        assert_eq!(
+            loaded
+                .metadata()
+                .properties()
+                .get("fk4")
+                .map(String::as_str),
+            Some("1")
+        );
+        // update_table seeded the new pointer; load is a hit (zero body fetch).
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().body_fetches, 0);
+        assert_eq!(cache.stats().misses, 0);
+    }
+
+    /// `invalidate_table` drops the location entry so the next load body-fetches again.
+    #[tokio::test]
+    async fn test_fk4_1_invalidate_table_evicts_pointer_entry() {
+        let cache = Arc::new(TableMetadataCache::new());
+        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
+        let table = create_table_with_namespace(&catalog).await;
+        let ident = table.identifier().clone();
+        let pointer = table.metadata_location().unwrap().to_string();
+
+        // Confirm a hit first.
+        cache.reset_stats();
+        let _ = catalog.load_table(&ident).await.expect("warm");
+        assert_eq!(cache.stats().hits, 1);
+
+        catalog.invalidate_table(&ident).await.expect("invalidate");
+        assert!(
+            cache.lookup(&pointer, None).is_none(),
+            "invalidate_table must drop the location entry"
+        );
+
+        cache.reset_stats();
+        let _ = catalog
+            .load_table(&ident)
+            .await
+            .expect("reload after invalidate");
+        assert_eq!(
+            cache.stats().body_fetches,
+            1,
+            "load after invalidate must body-GET (fail closed)"
+        );
+        assert_eq!(cache.stats().misses, 1);
+    }
+
+    /// Commit-retry note (structural pin): a retryable conflict reloads via `load_table`. With the
+    /// cache, a reload of an *unchanged* pointer (loser still on base) is a hit — zero extra body
+    /// GET. When the winner advanced the pointer, location string inequality forces a miss (correct
+    /// fail-closed). This pin covers the unchanged-pointer leg only.
+    #[tokio::test]
+    async fn test_fk4_1_reload_same_pointer_is_cache_hit_commit_retry_leg() {
+        let cache = Arc::new(TableMetadataCache::new());
+        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
+        let table = create_table_with_namespace(&catalog).await;
+        let ident = table.identifier().clone();
+
+        cache.reset_stats();
+        // Simulate commit-retry refresh: load, load again, same pointer.
+        let a = catalog.load_table(&ident).await.expect("retry load 1");
+        let b = catalog.load_table(&ident).await.expect("retry load 2");
+        assert_eq!(a.metadata_location(), b.metadata_location());
+        assert_eq!(cache.stats().hits, 2);
+        assert_eq!(
+            cache.stats().body_fetches,
+            0,
+            "commit-retry refresh of unchanged pointer must not re-GET body"
         );
     }
 }

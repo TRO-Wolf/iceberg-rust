@@ -20,6 +20,7 @@
 pub mod lock;
 pub mod memory;
 mod metadata_location;
+mod table_metadata_cache;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
@@ -37,6 +38,9 @@ pub use metadata_location::*;
 #[cfg(test)]
 use mockall::automock;
 use serde_derive::{Deserialize, Serialize};
+pub use table_metadata_cache::{
+    TableMetadataCache, TableMetadataCacheStats, load_or_fetch_table_metadata,
+};
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
