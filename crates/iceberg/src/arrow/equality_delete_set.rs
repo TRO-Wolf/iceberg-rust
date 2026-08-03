@@ -381,7 +381,7 @@ fn encode_literal(ty: &PrimitiveType, lit: &PrimitiveLiteral, out: &mut Vec<u8>)
             Some(())
         }
         // Int128 path for UUID is not expected from Datum::new on Uuid, but refuse rather than
-        // silently mis-encode.
+        // silently emit a wrong encoding.
         _ => None,
     }
 }

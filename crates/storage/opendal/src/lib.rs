@@ -49,7 +49,7 @@ const OPERATOR_CONCURRENT_LIMIT: usize = 64;
 
 /// Parse [`CLIENT_LIST_STAT_CONCURRENCY`] from FileIO props.
 ///
-/// Missing / unparseable → [`DEFAULT_LIST_STAT_CONCURRENCY`] (16). `0` clamps to `1`.
+/// Missing / unparsable → [`DEFAULT_LIST_STAT_CONCURRENCY`] (16). `0` clamps to `1`.
 fn parse_list_stat_concurrency(props: &HashMap<String, String>) -> usize {
     match props.get(CLIENT_LIST_STAT_CONCURRENCY) {
         Some(raw) => match raw.parse::<usize>() {

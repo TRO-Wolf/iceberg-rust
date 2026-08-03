@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 /// Max concurrent `stat` (HEAD) requests when list entries lack size metadata.
 ///
 /// Used by OpenDAL-backed `FileIO` list (FK4.2 / scout #30). Value is a positive
-/// integer string; missing or unparseable values use
+/// integer string; missing or unparsable values use
 /// [`DEFAULT_LIST_STAT_CONCURRENCY`]. `0` is clamped to `1` (sequential).
 ///
 /// Raising this can reduce orphan/GC list latency on backends whose LIST omits

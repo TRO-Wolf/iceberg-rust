@@ -525,6 +525,31 @@ impl ArrowReader {
         // `RowFilter` does not expose physical ordinals of undelivered rows. Pushdown is unaffected
         // for scans that do not request `_pos`.
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS) {
+            // Review rider (2026-08-03): this path decodes the WHOLE file in physical order with
+            // ordinals from 0 (see `stream_pos_projection_scan_task`); a RANGED split task here
+            // would re-emit the full file per split — duplicate rows with wrong `_pos`, which
+            // corrupts written position deletes. Whole-file tasks carry `start == 0` with
+            // `length == 0` (legacy sentinel) or `length == file_size_in_bytes`; anything else
+            // is a `plan_tasks`/split product and is rejected loud. (The `to_arrow` within-file
+            // expand already suppresses itself under `_pos`; this guards the public
+            // `PartitionWork` / direct-reader seam.)
+            let whole_file =
+                task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes);
+            if !whole_file {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "`_pos` projection over a ranged split task is unsupported: task covers \
+                         {}..{} of {} bytes of '{}', but the `_pos` path decodes whole files with \
+                         ordinals from 0 (each split would duplicate every row). Plan without \
+                         splitting, or drop `_pos` from the projection.",
+                        task.start,
+                        task.start.saturating_add(task.length),
+                        task.file_size_in_bytes,
+                        task.data_file_path
+                    ),
+                ));
+            }
             if let Some(batch_size) = batch_size {
                 record_batch_stream_builder =
                     record_batch_stream_builder.with_batch_size(batch_size);
@@ -3942,6 +3967,52 @@ message schema {
             pairs, expected,
             "physical _pos must be 0..N-1 across batches"
         );
+    }
+
+    /// Review rider (2026-08-03): a RANGED split task must NOT take the `_pos` streaming path —
+    /// it decodes the WHOLE file with ordinals from 0, so each split of one file would re-emit
+    /// every row (duplicates) with wrong `_pos`. Fail loud instead. (Hazard-2 of the 2026-08-01
+    /// plan_tasks review: reachable via the public `PartitionWork` seam / direct reader use, not
+    /// via the DF provider, whose schema does not expose metadata columns.)
+    #[tokio::test]
+    async fn fk5_pos_ranged_split_task_is_rejected_fail_loud() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..20).collect();
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+
+        // A plan_tasks-shaped split window: start 0, length strictly inside the file.
+        let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        ranged.length = ranged.file_size_in_bytes / 2;
+        assert!(ranged.length > 0, "fixture file must be non-trivial");
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let err = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
+            .expect("stream construction")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect_err("a ranged task projecting `_pos` must fail loud, not duplicate rows");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            err.to_string().contains("ranged split task is unsupported"),
+            "typed error must name the ranged-split rejection, got: {err}"
+        );
+
+        // Control: the SAME file as a whole-file task (0,0 legacy sentinel) still streams fine —
+        // the guard must reject ONLY ranged windows.
+        let whole = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        let pairs = collect_id_pos_pairs(&run_pos_scan(whole, Some(7)).await);
+        assert_eq!(pairs.len(), 20, "whole-file control still reads all rows");
+        // Control 2: explicit full-length window (plan_files shape) is also whole-file.
+        let mut full = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        full.length = full.file_size_in_bytes;
+        let pairs = collect_id_pos_pairs(&run_pos_scan(full, Some(7)).await);
+        assert_eq!(pairs.len(), 20, "explicit full-length window is whole-file");
     }
 
     /// FK5 oracle: dense pos-deletes (every other row) — survivors keep TRUE physical `_pos`.

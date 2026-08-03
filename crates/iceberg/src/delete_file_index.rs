@@ -84,17 +84,23 @@ impl PopulateGuard {
     }
 
     /// Publish `terminal` and wake every waiter, disarming the guard.
+    ///
+    /// Respects an EXISTING terminal state: if another writer already moved the index out of
+    /// `Populating` — [`DeleteFileIndex::mark_failed`] on a delete-entry processing error — the
+    /// earlier terminal wins and this publish only disarms + re-notifies (harmless). Behavior-
+    /// identical for the pre-existing single-writer paths, which both publish from `Populating`.
     fn publish(&mut self, terminal: DeleteFileIndexState) {
         {
-            // Recover a poisoned guard rather than cascading the panic: this is the sole writer
-            // and it runs once, so recovering and completing the transition is always the right
-            // move (a stranded `Populating` state would hang every waiting scan on the notifier
-            // below).
+            // Recover a poisoned guard rather than cascading the panic: recovering and completing
+            // the transition is always the right move (a stranded `Populating` state would hang
+            // every waiting scan on the notifier below).
             let mut guard = self
                 .state
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *guard = terminal;
+            if matches!(*guard, DeleteFileIndexState::Populating(_)) {
+                *guard = terminal;
+            }
         }
         self.armed = false;
         self.notify.notify_waiters();
@@ -284,6 +290,43 @@ pub(crate) fn referenced_data_file_location(delete_file: &DataFile) -> Option<St
 const DELETE_FILE_INDEX_CHANNEL_CAPACITY: usize = 1024;
 
 impl DeleteFileIndex {
+    /// Move a still-`Populating` index to `Failed` and wake every parked waiter (review rider,
+    /// 2026-08-03). Used by the plan path when DELETE-ENTRY processing errors: without this the
+    /// entry error only reaches the task channel — the delete senders drop, the populate task
+    /// sees a normal end-of-channel, and a PARTIAL delete set publishes as `Populated`. Data
+    /// tasks streamed before the consumer observes the `Err` would read with missing deletes —
+    /// silent row resurrection for an early-terminating (e.g. LIMIT-k) consumer. Java plans
+    /// deletes before emitting any task; this restores fail-before-results under FK2.2's
+    /// concurrent planning.
+    ///
+    /// No-op when the state is already terminal (`Populated` / `Failed`): the first terminal
+    /// state wins, matching [`PopulateGuard::publish`]'s respect-terminal rule. Callers that
+    /// need the failure to win DETERMINISTICALLY must call this while they still hold a live
+    /// delete-channel sender — the populate task cannot publish before the channel closes, so
+    /// `Failed` is guaranteed to land first.
+    pub(crate) fn mark_failed(&self, reason: &str) {
+        let notify = {
+            let mut guard = self
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &*guard {
+                DeleteFileIndexState::Populating(notify) => {
+                    let notify = notify.clone();
+                    *guard = DeleteFileIndexState::Failed(format!(
+                        "the delete file index was marked failed before population completed: \
+                         {reason}"
+                    ));
+                    Some(notify)
+                }
+                _ => None,
+            }
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+
     /// create a new `DeleteFileIndex` along with the sender that populates it with delete files
     pub(crate) fn new() -> (DeleteFileIndex, Sender<DeleteFileContext>) {
         let (tx, rx) = channel(DELETE_FILE_INDEX_CHANNEL_CAPACITY);
@@ -1899,6 +1942,103 @@ mod tests {
                 "waiter {label} error must name the dead populate task, got: {error}"
             );
         }
+    }
+
+    /// Review rider: `mark_failed` while `Populating` wakes a parked waiter with a typed error
+    /// carrying the injected cause (a delete-entry processing error must fail the index, not
+    /// let a partial delete set publish as `Populated`).
+    #[tokio::test]
+    async fn test_mark_failed_wakes_waiter_with_typed_error() {
+        let (index, tx) = DeleteFileIndex::new();
+
+        let waiter = {
+            let index = index.clone();
+            tokio::spawn(async move {
+                let probe = build_unpartitioned_data_file();
+                index.get_deletes_for_data_file(&probe, Some(0)).await
+            })
+        };
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // Mark while the delete channel is still open (the caller-holds-a-sender contract).
+        index.mark_failed("injected delete-entry processing error");
+        drop(tx);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must not hang after mark_failed")
+            .expect("waiter task must not panic")
+            .expect_err("mark_failed must surface a typed error to parked waiters");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(
+            error
+                .to_string()
+                .contains("injected delete-entry processing error"),
+            "the error must carry the injected cause, got: {error}"
+        );
+    }
+
+    /// Review rider — the RACE-ORDER property: `mark_failed` called while the caller still holds
+    /// a live sender lands strictly BEFORE the populate task can publish; the populate task's
+    /// later `Populated` publish must NOT clobber it (respect-terminal). Mutation: revert
+    /// `PopulateGuard::publish` to the unconditional overwrite → this test REDs (the partial
+    /// index would win and `get_deletes_for_data_file` would succeed).
+    #[tokio::test]
+    async fn test_mark_failed_wins_over_later_populate_publish() {
+        let (index, tx) = DeleteFileIndex::new();
+
+        // Failure first, while the channel is provably open.
+        index.mark_failed("boom before channel close");
+        // NOW let the populate task complete its collect and attempt Populated.
+        drop(tx);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        let probe = build_unpartitioned_data_file();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&probe, Some(0)),
+        )
+        .await
+        .expect("must not hang")
+        .expect_err("Failed must win over the later Populated publish");
+        assert!(
+            error.to_string().contains("boom before channel close"),
+            "the FIRST terminal state (Failed) must stick, got: {error}"
+        );
+    }
+
+    /// Review rider — the no-op direction: `mark_failed` after a successful publish must not
+    /// disturb a `Populated` index (first terminal state wins in both directions).
+    #[tokio::test]
+    async fn test_mark_failed_after_populated_is_noop() {
+        let (index, tx) = DeleteFileIndex::new();
+        drop(tx); // empty index populates immediately
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let probe = build_unpartitioned_data_file();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&probe, Some(0)),
+        )
+        .await
+        .expect("must not hang")
+        .expect("empty index must be Populated and queryable");
+
+        index.mark_failed("too late — already populated");
+
+        let deletes = tokio::time::timeout(
+            Duration::from_secs(5),
+            index.get_deletes_for_data_file(&probe, Some(0)),
+        )
+        .await
+        .expect("must not hang")
+        .expect("mark_failed after Populated must be a no-op");
+        assert!(deletes.is_empty());
     }
 
     /// FK2.2 natural path: dropping the last delete-context sender closes the channel, the

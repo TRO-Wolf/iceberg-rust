@@ -851,6 +851,18 @@ impl TableScan {
         //
         // Entry work runs inline under `try_for_each_concurrent` — a nested per-entry `spawn`
         // only added task overhead without extra parallelism beyond the concurrent limit.
+        // Review rider (2026-08-03): a delete-entry error must FAIL the index, never let a
+        // PARTIAL delete set publish as `Populated`. Under FK2.2's concurrency, data tasks can
+        // stream before the `Err` reaches the consumer; if the senders dropped on the error
+        // short-circuit, the populate task would see a normal end-of-channel and publish the
+        // partial index — silent row resurrection for an early-terminating (LIMIT-k) consumer.
+        // `tx_keepalive` holds the delete channel open past the error check, so `mark_failed`
+        // is GUARANTEED to land while the state is still `Populating`; the populate task's
+        // later publish finds a terminal state and leaves it (respect-terminal). Pre-FK2.2 the
+        // barrier made a delete error precede every data task (Java plans deletes first); this
+        // restores that fail-before-results property under concurrent planning.
+        let delete_index_for_failure = delete_file_idx.clone();
+        let tx_keepalive = delete_file_tx.clone();
         spawn(async move {
             let result = manifest_entry_delete_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, delete_file_tx.clone())))
@@ -863,9 +875,15 @@ impl TableScan {
                 .await;
 
             if let Err(error) = result {
+                // Order matters: mark BEFORE dropping the keepalive sender (see above).
+                delete_index_for_failure
+                    .mark_failed(&format!("delete manifest entry processing failed: {error}"));
+                drop(tx_keepalive);
                 let _ = channel_for_delete_manifest_entry_error
                     .send(Err(error))
                     .await;
+            } else {
+                drop(tx_keepalive);
             }
         });
 
