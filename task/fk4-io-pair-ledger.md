@@ -125,10 +125,34 @@ No `map.md` under `catalog/` (convention not present) — no map update.
 ### Critic-octo
 
 Scratch: `/tmp/critic-octo-fk4_1-2026-08-08/`  
-**Label:** _(filled after octo)_  
-**Actor tip:** _(filled after actor commit)_  
-**Critic tip:** _(filled after octo)_
+**Label:** **OCTO-CONVERGED** (8/8, `early_stop=false`)  
+**Actor tip:** `52905e65`  
+**Critic tip:** _(final docs stamp — see git log on branch)_
 
-### Residual OPEN (≥ S1)
+### Critic fixes (by cycle)
 
-_(filled after octo)_
+| Cycle | Finding | Fix |
+|------:|---|---|
+| 1 | S2 missing invalidate cleared session | no-op on missing ident |
+| 1 | S2 version guard never armed after seed | learn guard; mismatch fail-closes |
+| 2 | S1 stale Arc after mismatch + failed GET | invalidate on miss before re-fetch |
+| 3 | S2 drop left cache entry | drop_table invalidates |
+| 4 | S2 seed before pointer claim | post-insert seed; register invalidate on insert Err |
+| 5 | S2 prior pointer retained forever | evict prior on successful update |
+| 6 | S2 eviction unpinned | `test_fk4_1_update_evicts_prior_pointer` |
+| 7–8 | — | CLEAN re-proof |
+
+### Mutation RED
+
+| Gate | Break | Pin |
+|---|---|---|
+| Zero body GET | always fetch | op-count + `test_fk4_1_two_loads_*` |
+| Guard mismatch | soft-reuse | `object_version_mismatch_*` / failed-refetch pin |
+| Missing invalidate thrash | `clear()` | `test_fk4_1_invalidate_missing_*` |
+| Drop / update eviction | skip invalidate | drop + update prior pins |
+
+### Residual OPEN (≥ S1: **none**)
+
+- **S3 seed:** no LRU / capacity bound
+- **S3 seed:** only MemoryCatalog builder wired (helper shared)
+- **S3 seed:** `publish_replace` does not seed (miss then fetch)
