@@ -121,8 +121,11 @@ None. Internal plan-path concurrency only.
 ### Change
 `crates/iceberg/src/delete_file_index.rs` `PopulatedDeleteFileIndex`:
 
-- Partition maps keyed by **`(partition_spec_id, Struct)`** (`PartitionDeleteKey`) — was
-  `Struct` alone with a post-filter linear `spec_id` compare.
+- Partition maps keyed by **`(partition_spec_id, partition)`** via nested
+  `HashMap<i32, HashMap<Struct, Vec<_>>>` (`PartitionDeleteMap`) — was `Struct` alone with
+  a post-filter linear `spec_id` compare. Nested form matches the composite key semantics
+  without cloning the partition `Struct` on every lookup (critic cycle 1: flat
+  `HashMap<(i32, Struct), _>` was correct but regressed the hot path).
 - Global / eq-partition / pos-partition / pos-path lists **sorted by data sequence once**
   at build (`sort_deletes_by_sequence`).
 - Lookup uses **`partition_point`** via `applicable_eq_deletes` (`delete_seq > data_seq`)
