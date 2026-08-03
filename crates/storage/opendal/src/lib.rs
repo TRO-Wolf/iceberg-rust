@@ -113,27 +113,28 @@ async fn stat_incomplete_list_entries(
     }
     let concurrency = concurrency.max(1);
     let mut tasks = ConcurrentTasks::new(Executor::new(), concurrency, concurrency, list_stat_task);
+    // Fail-closed: any stat error fails the whole list. OpenDAL's RetryLayer on
+    // the Operator already retried transport blips; do **not** outer-loop on
+    // `is_temporary` here — ConcurrentTasks re-queues temporary failures and an
+    // unbounded continue would hang orphan/GC list forever (C1-Q-001 / C1-L-001).
     for &(slot_idx, ref path) in need_stat {
-        // ConcurrentTasks may return a temporary error from a previously
-        // submitted task without consuming this input — retry with a fresh
-        // clone (same pattern as OpenDAL's own ConcurrentTasks tests).
-        loop {
-            match tasks.execute((op.clone(), path.clone(), slot_idx)).await {
-                Ok(()) => break,
-                Err(err) if err.is_temporary() => continue,
-                Err(err) => return Err(from_opendal_error(err)),
-            }
-        }
+        tasks
+            .execute((op.clone(), path.clone(), slot_idx))
+            .await
+            .map_err(from_opendal_error)?;
     }
     loop {
         match tasks.next().await {
             None => break,
             Some(Ok((slot_idx, size, created_at_millis))) => {
-                if let Some(slot) = ready_meta.get_mut(slot_idx) {
-                    *slot = Some((size, created_at_millis));
-                }
+                let slot = ready_meta.get_mut(slot_idx).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("list stat returned out-of-range slot index {slot_idx}"),
+                    )
+                })?;
+                *slot = Some((size, created_at_millis));
             }
-            Some(Err(err)) if err.is_temporary() => continue,
             Some(Err(err)) => return Err(from_opendal_error(err)),
         }
     }
@@ -1625,20 +1626,17 @@ mod tests {
         );
     }
 
-    /// FK4.2: factory wires the knob from StorageConfig into the storage instance.
+    /// FK4.2: factory wires the knob from StorageConfig into the storage instance,
+    /// and FileIOBuilder→list exercises the factory-built `Arc<dyn Storage>` path.
     #[cfg(feature = "opendal-memory")]
-    #[test]
-    fn test_fk4_2_factory_honors_list_stat_concurrency_prop() {
-        let factory = OpenDalStorageFactory::Memory;
+    #[tokio::test]
+    async fn test_fk4_2_factory_honors_list_stat_concurrency_prop() {
         let config = StorageConfig::new().with_prop(CLIENT_LIST_STAT_CONCURRENCY, "4");
-        let storage = factory.build(&config).expect("memory factory builds");
-        // Downcast via debug is unavailable; rebuild the concrete type the factory uses.
         let concrete = OpenDalStorage::Memory {
             operator: memory_config_build().expect("memory op"),
             operator_cache: operator_cache_from_config(&config),
         };
         assert_eq!(concrete.list_stat_concurrency(), 4);
-        // Default-off props → 16.
         let defaulted = OpenDalStorage::Memory {
             operator: memory_config_build().expect("memory op"),
             operator_cache: operator_cache_from_config(&StorageConfig::new()),
@@ -1647,8 +1645,24 @@ mod tests {
             defaulted.list_stat_concurrency(),
             DEFAULT_LIST_STAT_CONCURRENCY
         );
-        // Arc<dyn Storage> from factory must list successfully (smoke).
-        let _ = storage;
+
+        // End-to-end: factory.build props flow into list (incomplete-stat path).
+        use iceberg::io::FileIOBuilder;
+        let file_io = FileIOBuilder::new(std::sync::Arc::new(OpenDalStorageFactory::Memory))
+            .with_prop(CLIENT_LIST_STAT_CONCURRENCY, "4")
+            .build();
+        file_io
+            .new_output("memory:/fk42-factory/a.txt")
+            .expect("output")
+            .write(Bytes::from("hi"))
+            .await
+            .expect("write");
+        let listed = file_io
+            .list("memory:/fk42-factory")
+            .await
+            .expect("list via factory-built FileIO");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].size, 2);
     }
 
     /// FK4.2: concurrent incomplete stats (concurrency=1 and default) return the same
