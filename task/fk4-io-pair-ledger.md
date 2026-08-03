@@ -4,7 +4,8 @@
 **Tag:** `[fork]`  
 **Base (campaign):** `a966055e` (#182)  
 **FK3 tip before this unit:** `fa067b48` (OCTO-CONVERGED)  
-**Worktree:** `/tmp/iceberg-rust-fk4_1`
+**Worktree (FK4.1):** `/tmp/iceberg-rust-fk4_1`  
+**Worktree (FK4.2):** `/tmp/iceberg-rust-fk4_2`
 
 ## Sequencing
 
@@ -12,10 +13,10 @@ Campaign brief: **FK4.1** (scout #7 metadata-pointer cache) **before** FK4.2 (sc
 
 | Unit | Status | Notes |
 |---|---|---|
-| **FK4.1** metadata-pointer cache | **THIS UNIT** | opt-in session cache at catalog `load_table` |
-| **FK4.2** OpenDAL list concurrent stat | **NOT STARTED** | do not begin from this unit |
+| **FK4.1** metadata-pointer cache | **SHIPPED** (OCTO-CONVERGED) | opt-in session cache at catalog `load_table` |
+| **FK4.2** OpenDAL list concurrent stat | **THIS UNIT** | concurrent bounded incomplete list `stat` |
 
-Also do **not** start FK2.2 / FK2.3 from this unit.
+Also do **not** start **FK5** from this unit.
 
 ---
 
@@ -156,3 +157,82 @@ Scratch: `/tmp/critic-octo-fk4_1-2026-08-08/`
 - **S3 seed:** no LRU / capacity bound
 - **S3 seed:** only MemoryCatalog builder wired (helper shared)
 - **S3 seed:** `publish_replace` does not seed (miss then fetch)
+
+---
+
+## FK4.2 — OpenDAL list concurrent stat (scout #30)
+
+**Worktree:** `/tmp/iceberg-rust-fk4_2`  
+**Base tip entering unit:** `6cb9642f`  
+**OpenDAL version:** `0.55.0` (in-tree) — list `Entry` / `Metadata` shape sufficient; **no Cargo bump** (SHIPPED, not STOP-and-ledger).
+
+### Design (locked)
+
+| Rule | Implementation |
+|---|---|
+| Concurrent bounded `stat` for incomplete list entries | Slot-index pass + `opendal::raw::ConcurrentTasks` + `Executor` (no new deps; Cargo.toml frozen) |
+| Prefer contiguous zero-copy `Bytes` | `buffer_to_bytes` → `Buffer::to_bytes()` (zero-copy when contiguous / single-part; consolidates only multi-part) |
+| Hard knob, default **16**, named config key | `client.list-stat-concurrency` (`CLIENT_LIST_STAT_CONCURRENCY`); default `DEFAULT_LIST_STAT_CONCURRENCY = 16`; `0` → `1`; bad parse → default |
+| Completeness rule unchanged | Positive `content_length` only; empty / unknown always `stat` |
+| Order preserved | Results keyed by slot index, not completion order |
+
+### Config key
+
+```text
+CLIENT_LIST_STAT_CONCURRENCY = "client.list-stat-concurrency"
+DEFAULT_LIST_STAT_CONCURRENCY = 16
+```
+
+Set via `FileIOBuilder::with_prop(CLIENT_LIST_STAT_CONCURRENCY, "32")` / catalog FileIO props.
+Stored on `OperatorCache.list_stat_concurrency` at factory `build` time (every `OpenDalStorage` arm holds a cache).
+
+### Rate-limit disclosure
+
+Incomplete-list backends (OpenDAL memory, FS list, empty objects, some LIST shapes) issue **one HEAD/`stat` per file**. Concurrent window defaults to **16** and can amplify object-store QPS (S3 `SlowDown` / 503). Outer per-Operator `ConcurrentLimitLayer` remains **64**. Tune **down** under rate-limit pressure; tune **up** only when HEAD latency dominates and the store allows it. Memory 10k pin: HEAD-count == key count (always incomplete list meta).
+
+### Files
+
+| Path | Change |
+|---|---|
+| `crates/iceberg/src/io/storage/config/mod.rs` | `CLIENT_LIST_STAT_CONCURRENCY` + `DEFAULT_LIST_STAT_CONCURRENCY` + pin |
+| `crates/storage/opendal/src/lib.rs` | concurrent incomplete stat; `buffer_to_bytes`; factory wiring; FK4.2 pins |
+| `task/fk4-io-pair-ledger.md` | this section |
+
+### Pins
+
+| Pin | Claim |
+|---|---|
+| `test_fk4_2_parse_list_stat_concurrency` | default 16; 0→1; bad→default |
+| `test_fk4_2_factory_honors_list_stat_concurrency_prop` | factory / `operator_cache_from_config` wires prop |
+| `test_fk4_2_concurrent_list_stat_sizes_match_sequential` | concurrency 1 vs 16 same sizes/locations |
+| `test_fk4_2_list_10k_keys_incomplete_stat_all_sizes` | 10k keys, HEAD-count=N, all sizes correct |
+| `test_fk4_2_buffer_to_bytes_contiguous_zero_copy` | contiguous Buffer → same ptr as source Bytes |
+| `test_client_list_stat_concurrency_key_and_default` | public key + default constants |
+
+### Mid-unit gate
+
+| Gate | Command | Exit |
+|---|---|---|
+| FK4.2 + list pins | `cargo test -p iceberg-storage-opendal --lib` | **0** (36 passed) |
+| config key pin | `cargo test -p iceberg --lib -- client_list_stat` | **0** |
+| clippy | `cargo clippy -p iceberg-storage-opendal --lib -- -D warnings` | **0** |
+| clippy core | `cargo clippy -p iceberg --lib -- -D warnings` | **0** |
+
+### Not in this unit
+
+- **FK5** `_pos` projection pushdown
+- Cargo.toml / OpenDAL version bump
+- GAP_MATRIX (perf only)
+- Changing list completeness rule
+- Real S3 rate-limit integration (disclosed only)
+
+### Critic-octo
+
+Scratch: `/tmp/critic-octo-fk4_2-2026-08-08/`  
+**Label:** _(pending)_  
+**Actor tip:** _(pending)_  
+
+### Residual OPEN (≥ S1: **none** at Actor ship)
+
+- **S3 seed:** real-object-store HEAD QPS bench not in offline gate (memory 10k is the cheap proxy)
+- **S3 seed:** multi-part non-contiguous `Buffer` still consolidates (API returns single `Bytes`)

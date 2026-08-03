@@ -31,12 +31,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cfg_if::cfg_if;
 use iceberg::io::{
-    FileInfo, FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
-    StorageFactory,
+    CLIENT_LIST_STAT_CONCURRENCY, DEFAULT_LIST_STAT_CONCURRENCY, FileInfo, FileMetadata, FileRead,
+    FileWrite, InputFile, OutputFile, Storage, StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
-use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
+use opendal::raw::ConcurrentTasks;
+use opendal::{Executor, Operator};
 use serde::{Deserialize, Serialize};
 use utils::from_opendal_error;
 
@@ -45,6 +46,99 @@ use utils::from_opendal_error;
 /// Each cached Operator gets its own [`ConcurrentLimitLayer`] (independent semaphore).
 /// Chosen as a conservative default; not a global process-wide limit.
 const OPERATOR_CONCURRENT_LIMIT: usize = 64;
+
+/// Parse [`CLIENT_LIST_STAT_CONCURRENCY`] from FileIO props.
+///
+/// Missing / unparseable → [`DEFAULT_LIST_STAT_CONCURRENCY`] (16). `0` clamps to `1`.
+fn parse_list_stat_concurrency(props: &HashMap<String, String>) -> usize {
+    match props.get(CLIENT_LIST_STAT_CONCURRENCY) {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(0) => 1,
+            Ok(n) => n,
+            Err(_) => DEFAULT_LIST_STAT_CONCURRENCY,
+        },
+        None => DEFAULT_LIST_STAT_CONCURRENCY,
+    }
+}
+
+/// Convert OpenDAL [`opendal::Buffer`] to contiguous [`Bytes`].
+///
+/// Prefers the zero-copy path: [`opendal::Buffer::to_bytes`] clones the inner
+/// `Bytes` when the buffer is already contiguous (or a single part). Multi-part
+/// non-contiguous buffers must consolidate into one `Bytes` — unavoidable for
+/// the Iceberg `FileRead` / `Storage::read` API, which returns a single
+/// contiguous buffer.
+#[inline]
+fn buffer_to_bytes(buf: opendal::Buffer) -> Bytes {
+    buf.to_bytes()
+}
+
+/// Input to a concurrent list-`stat` task: (operator, relative path, slot index).
+type ListStatIn = (Operator, String, usize);
+/// Output of a concurrent list-`stat` task: (slot index, size, created_at_millis).
+type ListStatOut = (usize, u64, i64);
+
+/// Factory for [`ConcurrentTasks`] — must be a function pointer (no captures).
+fn list_stat_task(
+    input: ListStatIn,
+) -> opendal::raw::BoxedStaticFuture<(ListStatIn, opendal::Result<ListStatOut>)> {
+    Box::pin(async move {
+        let (op, path, slot_idx) = input;
+        let result = match op.stat(&path).await {
+            Ok(meta) => Ok((
+                slot_idx,
+                meta.content_length(),
+                meta.last_modified()
+                    .map(opendal_timestamp_to_millis)
+                    .unwrap_or(0),
+            )),
+            Err(err) => Err(err),
+        };
+        ((op, path, slot_idx), result)
+    })
+}
+
+/// Run `stat` for incomplete list entries with a bounded concurrency window.
+///
+/// Results are applied into `ready_meta[slot_idx]`. Order of the parent list is
+/// preserved by slot index (not by completion order).
+async fn stat_incomplete_list_entries(
+    op: &Operator,
+    need_stat: &[(usize, String)],
+    concurrency: usize,
+    ready_meta: &mut [Option<(u64, i64)>],
+) -> Result<()> {
+    if need_stat.is_empty() {
+        return Ok(());
+    }
+    let concurrency = concurrency.max(1);
+    let mut tasks = ConcurrentTasks::new(Executor::new(), concurrency, concurrency, list_stat_task);
+    for &(slot_idx, ref path) in need_stat {
+        // ConcurrentTasks may return a temporary error from a previously
+        // submitted task without consuming this input — retry with a fresh
+        // clone (same pattern as OpenDAL's own ConcurrentTasks tests).
+        loop {
+            match tasks.execute((op.clone(), path.clone(), slot_idx)).await {
+                Ok(()) => break,
+                Err(err) if err.is_temporary() => continue,
+                Err(err) => return Err(from_opendal_error(err)),
+            }
+        }
+    }
+    loop {
+        match tasks.next().await {
+            None => break,
+            Some(Ok((slot_idx, size, created_at_millis))) => {
+                if let Some(slot) = ready_meta.get_mut(slot_idx) {
+                    *slot = Some((size, created_at_millis));
+                }
+            }
+            Some(Err(err)) if err.is_temporary() => continue,
+            Some(Err(err)) => return Err(from_opendal_error(err)),
+        }
+    }
+    Ok(())
+}
 
 /// Apply transport layers once at Operator construction / cache insertion.
 ///
@@ -62,12 +156,27 @@ fn finish_operator(op: Operator) -> Operator {
 /// Cloning shares the map via [`Arc`] so `OpenDalStorage` clones (e.g. per
 /// `InputFile` / `OutputFile`) reuse Operators.
 ///
+/// Also carries list-path tuning ([`OperatorCache::list_stat_concurrency`]) set
+/// once at storage construction from FileIO props — every [`OpenDalStorage`]
+/// variant holds a cache, so this avoids duplicating the knob on each arm.
+///
 /// Public only because it appears on [`OpenDalStorage`] enum fields (serde +
 /// construction); the map itself is an implementation detail.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 #[doc(hidden)]
 pub struct OperatorCache {
     inner: Arc<Mutex<HashMap<String, Operator>>>,
+    /// Max concurrent `stat` HEADs for incomplete list entries (FK4.2).
+    list_stat_concurrency: usize,
+}
+
+impl Default for OperatorCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            list_stat_concurrency: DEFAULT_LIST_STAT_CONCURRENCY,
+        }
+    }
 }
 
 impl std::fmt::Debug for OperatorCache {
@@ -75,11 +184,18 @@ impl std::fmt::Debug for OperatorCache {
         let len = self.inner.lock().map(|g| g.len()).unwrap_or(0);
         f.debug_struct("OperatorCache")
             .field("entries", &len)
+            .field("list_stat_concurrency", &self.list_stat_concurrency)
             .finish()
     }
 }
 
 impl OperatorCache {
+    /// Set list incomplete-entry `stat` concurrency (clamped to at least 1).
+    fn with_list_stat_concurrency(mut self, n: usize) -> Self {
+        self.list_stat_concurrency = n.max(1);
+        self
+    }
+
     /// Return a cached finished Operator for `key`, building and finishing it on miss.
     fn get_or_insert_with(
         &self,
@@ -103,6 +219,11 @@ impl OperatorCache {
         guard.insert(key, op.clone());
         Ok(op)
     }
+}
+
+/// Build an [`OperatorCache`] from FileIO [`StorageConfig`] props (list-stat knob).
+fn operator_cache_from_config(config: &StorageConfig) -> OperatorCache {
+    OperatorCache::default().with_list_stat_concurrency(parse_list_stat_concurrency(config.props()))
 }
 
 /// Convert an OpenDAL last-modified timestamp into milliseconds since the Unix epoch.
@@ -238,16 +359,15 @@ pub enum OpenDalStorageFactory {
 impl StorageFactory for OpenDalStorageFactory {
     #[allow(unused_variables)]
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        let operator_cache = operator_cache_from_config(config);
         match self {
             #[cfg(feature = "opendal-memory")]
             OpenDalStorageFactory::Memory => Ok(Arc::new(OpenDalStorage::Memory {
                 operator: memory_config_build()?,
-                operator_cache: OperatorCache::default(),
+                operator_cache,
             })),
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs {
-                operator_cache: OperatorCache::default(),
-            })),
+            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs { operator_cache })),
             #[cfg(feature = "opendal-s3")]
             OpenDalStorageFactory::S3 {
                 configured_scheme,
@@ -256,24 +376,24 @@ impl StorageFactory for OpenDalStorageFactory {
                 configured_scheme: configured_scheme.clone(),
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
-                operator_cache: OperatorCache::default(),
+                operator_cache,
             })),
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
-                operator_cache: OperatorCache::default(),
+                operator_cache,
             })),
             #[cfg(feature = "opendal-oss")]
             OpenDalStorageFactory::Oss => Ok(Arc::new(OpenDalStorage::Oss {
                 config: oss_config_parse(config.props().clone())?.into(),
-                operator_cache: OperatorCache::default(),
+                operator_cache,
             })),
             #[cfg(feature = "opendal-azdls")]
             OpenDalStorageFactory::Azdls { configured_scheme } => {
                 Ok(Arc::new(OpenDalStorage::Azdls {
                     configured_scheme: configured_scheme.clone(),
                     config: azdls_config_parse(config.props().clone())?.into(),
-                    operator_cache: OperatorCache::default(),
+                    operator_cache,
                 }))
             }
             #[cfg(all(
@@ -371,6 +491,33 @@ pub enum OpenDalStorage {
 }
 
 impl OpenDalStorage {
+    /// List incomplete-entry `stat` concurrency for this storage instance.
+    fn list_stat_concurrency(&self) -> usize {
+        match self {
+            #[cfg(feature = "opendal-memory")]
+            OpenDalStorage::Memory { operator_cache, .. } => operator_cache.list_stat_concurrency,
+            #[cfg(feature = "opendal-fs")]
+            OpenDalStorage::LocalFs { operator_cache } => operator_cache.list_stat_concurrency,
+            #[cfg(feature = "opendal-s3")]
+            OpenDalStorage::S3 { operator_cache, .. } => operator_cache.list_stat_concurrency,
+            #[cfg(feature = "opendal-gcs")]
+            OpenDalStorage::Gcs { operator_cache, .. } => operator_cache.list_stat_concurrency,
+            #[cfg(feature = "opendal-oss")]
+            OpenDalStorage::Oss { operator_cache, .. } => operator_cache.list_stat_concurrency,
+            #[cfg(feature = "opendal-azdls")]
+            OpenDalStorage::Azdls { operator_cache, .. } => operator_cache.list_stat_concurrency,
+            #[cfg(all(
+                not(feature = "opendal-memory"),
+                not(feature = "opendal-fs"),
+                not(feature = "opendal-s3"),
+                not(feature = "opendal-gcs"),
+                not(feature = "opendal-oss"),
+                not(feature = "opendal-azdls"),
+            ))]
+            _ => DEFAULT_LIST_STAT_CONCURRENCY,
+        }
+    }
+
     /// Creates operator from path.
     ///
     /// # Arguments
@@ -572,11 +719,9 @@ impl Storage for OpenDalStorage {
 
     async fn read(&self, path: &str) -> Result<Bytes> {
         let (op, relative_path) = self.create_operator(&path)?;
-        Ok(op
-            .read(relative_path)
-            .await
-            .map_err(from_opendal_error)?
-            .to_bytes())
+        Ok(buffer_to_bytes(
+            op.read(relative_path).await.map_err(from_opendal_error)?,
+        ))
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
@@ -637,6 +782,12 @@ impl Storage for OpenDalStorage {
     /// non-zero Size skip the N HEAD round-trips for data files. Empty objects
     /// always `stat` so size 0 is authoritative. A file with no last-modified
     /// is reported with `created_at_millis = 0`.
+    ///
+    /// Incomplete-entry `stat`s run concurrently with a bound of
+    /// [`CLIENT_LIST_STAT_CONCURRENCY`] (default
+    /// [`DEFAULT_LIST_STAT_CONCURRENCY`] = 16). Raising the knob amplifies HEAD
+    /// QPS and can hit object-store rate limits; the outer
+    /// [`ConcurrentLimitLayer`] (64) still caps total in-flight ops per Operator.
     async fn list(&self, path: &str) -> Result<Vec<FileInfo>> {
         let (op, relative_path) = self.create_operator(&path)?;
         // The base is the part of the caller-supplied `path` that precedes the
@@ -656,7 +807,13 @@ impl Storage for OpenDalStorage {
             .await
             .map_err(from_opendal_error)?;
 
-        let mut files = Vec::with_capacity(entries.len());
+        // Slot-oriented pass: complete list meta is ready immediately; incomplete
+        // entries collect a concurrent `stat` job keyed by slot index so order is
+        // preserved regardless of HEAD completion order.
+        let mut locations: Vec<String> = Vec::with_capacity(entries.len());
+        let mut ready_meta: Vec<Option<(u64, i64)>> = Vec::with_capacity(entries.len());
+        let mut need_stat: Vec<(usize, String)> = Vec::new();
+
         for entry in entries {
             let list_meta = entry.metadata();
             // Skip directory markers and delete-marker entries (not live files).
@@ -664,23 +821,35 @@ impl Storage for OpenDalStorage {
                 continue;
             }
 
-            let (size, created_at_millis) = if list_entry_metadata_complete(list_meta) {
-                file_meta_from_complete_list_entry(list_meta)
+            let location = format!("{base}{}", entry.path());
+            if list_entry_metadata_complete(list_meta) {
+                locations.push(location);
+                ready_meta.push(Some(file_meta_from_complete_list_entry(list_meta)));
             } else {
-                let stat = op.stat(entry.path()).await.map_err(from_opendal_error)?;
-                (
-                    stat.content_length(),
-                    stat.last_modified()
-                        .map(opendal_timestamp_to_millis)
-                        .unwrap_or(0),
-                )
-            };
+                let slot_idx = locations.len();
+                need_stat.push((slot_idx, entry.path().to_string()));
+                locations.push(location);
+                ready_meta.push(None);
+            }
+        }
 
-            files.push(FileInfo::new(
-                format!("{base}{}", entry.path()),
-                size,
-                created_at_millis,
-            ));
+        stat_incomplete_list_entries(
+            &op,
+            &need_stat,
+            self.list_stat_concurrency(),
+            &mut ready_meta,
+        )
+        .await?;
+
+        let mut files = Vec::with_capacity(locations.len());
+        for (location, meta) in locations.into_iter().zip(ready_meta.into_iter()) {
+            let (size, created_at_millis) = meta.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("list stat did not produce metadata for {location}"),
+                )
+            })?;
+            files.push(FileInfo::new(location, size, created_at_millis));
         }
         Ok(files)
     }
@@ -706,10 +875,11 @@ pub(crate) struct OpenDalReader(pub(crate) opendal::Reader);
 #[async_trait]
 impl FileRead for OpenDalReader {
     async fn read(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
-        Ok(opendal::Reader::read(&self.0, range)
-            .await
-            .map_err(from_opendal_error)?
-            .to_bytes())
+        Ok(buffer_to_bytes(
+            opendal::Reader::read(&self.0, range)
+                .await
+                .map_err(from_opendal_error)?,
+        ))
     }
 }
 
@@ -1420,6 +1590,199 @@ mod tests {
         assert_eq!(listed[0].size, 0, "empty file size via stat");
         assert_eq!(listed[1].location, "memory:/meta/payload.txt");
         assert_eq!(listed[1].size, 5, "payload size via stat");
+    }
+
+    /// FK4.2: parse `client.list-stat-concurrency` (default 16; 0 → 1; bad → default).
+    #[test]
+    fn test_fk4_2_parse_list_stat_concurrency() {
+        assert_eq!(
+            parse_list_stat_concurrency(&HashMap::new()),
+            DEFAULT_LIST_STAT_CONCURRENCY
+        );
+        let mut props = HashMap::new();
+        props.insert(CLIENT_LIST_STAT_CONCURRENCY.to_string(), "32".to_string());
+        assert_eq!(parse_list_stat_concurrency(&props), 32);
+        props.insert(CLIENT_LIST_STAT_CONCURRENCY.to_string(), "0".to_string());
+        assert_eq!(
+            parse_list_stat_concurrency(&props),
+            1,
+            "0 clamps to sequential"
+        );
+        props.insert(CLIENT_LIST_STAT_CONCURRENCY.to_string(), "nope".to_string());
+        assert_eq!(
+            parse_list_stat_concurrency(&props),
+            DEFAULT_LIST_STAT_CONCURRENCY
+        );
+        assert_eq!(
+            OperatorCache::default().list_stat_concurrency,
+            DEFAULT_LIST_STAT_CONCURRENCY
+        );
+        assert_eq!(
+            OperatorCache::default()
+                .with_list_stat_concurrency(0)
+                .list_stat_concurrency,
+            1
+        );
+    }
+
+    /// FK4.2: factory wires the knob from StorageConfig into the storage instance.
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_fk4_2_factory_honors_list_stat_concurrency_prop() {
+        let factory = OpenDalStorageFactory::Memory;
+        let config = StorageConfig::new().with_prop(CLIENT_LIST_STAT_CONCURRENCY, "4");
+        let storage = factory.build(&config).expect("memory factory builds");
+        // Downcast via debug is unavailable; rebuild the concrete type the factory uses.
+        let concrete = OpenDalStorage::Memory {
+            operator: memory_config_build().expect("memory op"),
+            operator_cache: operator_cache_from_config(&config),
+        };
+        assert_eq!(concrete.list_stat_concurrency(), 4);
+        // Default-off props → 16.
+        let defaulted = OpenDalStorage::Memory {
+            operator: memory_config_build().expect("memory op"),
+            operator_cache: operator_cache_from_config(&StorageConfig::new()),
+        };
+        assert_eq!(
+            defaulted.list_stat_concurrency(),
+            DEFAULT_LIST_STAT_CONCURRENCY
+        );
+        // Arc<dyn Storage> from factory must list successfully (smoke).
+        let _ = storage;
+    }
+
+    /// FK4.2: concurrent incomplete stats (concurrency=1 and default) return the same
+    /// ordered sizes for a multi-file memory list (all entries incomplete → all HEADs).
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_fk4_2_concurrent_list_stat_sizes_match_sequential() {
+        let payloads: Vec<(&str, Bytes)> = vec![
+            ("memory:/cstat/a", Bytes::from("a")),
+            ("memory:/cstat/b", Bytes::from("bb")),
+            ("memory:/cstat/c", Bytes::from("ccc")),
+            ("memory:/cstat/sub/d", Bytes::from("dddd")),
+            ("memory:/cstat/empty", Bytes::from("")),
+        ];
+
+        let sequential = OpenDalStorage::Memory {
+            operator: memory_config_build().expect("op"),
+            operator_cache: OperatorCache::default().with_list_stat_concurrency(1),
+        };
+        let concurrent = OpenDalStorage::Memory {
+            operator: memory_config_build().expect("op"),
+            operator_cache: OperatorCache::default()
+                .with_list_stat_concurrency(DEFAULT_LIST_STAT_CONCURRENCY),
+        };
+
+        for (path, body) in &payloads {
+            sequential
+                .write(*path, body.clone())
+                .await
+                .expect("seq write");
+            concurrent
+                .write(*path, body.clone())
+                .await
+                .expect("conc write");
+        }
+
+        let mut seq_listed = sequential.list("memory:/cstat").await.expect("seq list");
+        let mut conc_listed = concurrent.list("memory:/cstat").await.expect("conc list");
+        seq_listed.sort_by(|a, b| a.location.cmp(&b.location));
+        conc_listed.sort_by(|a, b| a.location.cmp(&b.location));
+
+        assert_eq!(seq_listed.len(), payloads.len());
+        assert_eq!(
+            seq_listed
+                .iter()
+                .map(|f| (f.location.as_str(), f.size))
+                .collect::<Vec<_>>(),
+            conc_listed
+                .iter()
+                .map(|f| (f.location.as_str(), f.size))
+                .collect::<Vec<_>>(),
+            "concurrent stats must match sequential sizes and locations"
+        );
+        assert_eq!(
+            seq_listed
+                .iter()
+                .find(|f| f.location.ends_with("/a"))
+                .unwrap()
+                .size,
+            1
+        );
+        assert_eq!(
+            seq_listed
+                .iter()
+                .find(|f| f.location.ends_with("/empty"))
+                .unwrap()
+                .size,
+            0
+        );
+    }
+
+    /// FK4.2 cheap 10k-key list: every incomplete entry stats; all sizes correct.
+    ///
+    /// Memory LIST never carries size, so this is an N-HEAD workload (HEAD-count = N).
+    /// Concurrent window defaults to 16; pin proves no dropped/duplicated keys under load.
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_fk4_2_list_10k_keys_incomplete_stat_all_sizes() {
+        const N: usize = 10_000;
+        let storage = OpenDalStorage::Memory {
+            operator: memory_config_build().expect("op"),
+            operator_cache: OperatorCache::default()
+                .with_list_stat_concurrency(DEFAULT_LIST_STAT_CONCURRENCY),
+        };
+        for i in 0..N {
+            // Vary sizes 0..15 so a wrong/skipped stat is visible.
+            let size = i % 16;
+            let body = Bytes::from(vec![b'x'; size]);
+            storage
+                .write(&format!("memory:/bulk10k/{i:05}"), body)
+                .await
+                .unwrap_or_else(|e| panic!("write {i}: {e}"));
+        }
+
+        let listed = storage
+            .list("memory:/bulk10k")
+            .await
+            .expect("10k list via concurrent incomplete stat");
+        assert_eq!(
+            listed.len(),
+            N,
+            "must return exactly N keys (no drop/dup under concurrent stat)"
+        );
+        // HEAD-count disclosure for the ledger: memory incomplete ⇒ one stat per key.
+        let head_count = listed.len();
+        assert_eq!(
+            head_count, N,
+            "HEAD-count == key count on incomplete-list backend"
+        );
+
+        let mut by_name: HashMap<String, u64> = HashMap::with_capacity(N);
+        for f in &listed {
+            by_name.insert(f.location.clone(), f.size);
+        }
+        for i in 0..N {
+            let loc = format!("memory:/bulk10k/{i:05}");
+            let expected = (i % 16) as u64;
+            assert_eq!(
+                by_name.get(&loc).copied(),
+                Some(expected),
+                "size mismatch at {loc}"
+            );
+        }
+    }
+
+    /// FK4.2: buffer_to_bytes is zero-copy for contiguous / single-part Buffers.
+    #[test]
+    fn test_fk4_2_buffer_to_bytes_contiguous_zero_copy() {
+        let payload = Bytes::from_static(b"contiguous-payload");
+        let buf = opendal::Buffer::from(payload.clone());
+        let out = buffer_to_bytes(buf);
+        assert_eq!(out, payload);
+        // Contiguous path shares the same allocation (Bytes refcount clone).
+        assert_eq!(out.as_ptr(), payload.as_ptr());
     }
 
     /// Operator cache reuses the same finished Operator for two paths on the same

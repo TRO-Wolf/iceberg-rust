@@ -43,6 +43,20 @@ pub use oss::*;
 pub use s3::*;
 use serde::{Deserialize, Serialize};
 
+/// Max concurrent `stat` (HEAD) requests when list entries lack size metadata.
+///
+/// Used by OpenDAL-backed `FileIO` list (FK4.2 / scout #30). Value is a positive
+/// integer string; missing or unparseable values use
+/// [`DEFAULT_LIST_STAT_CONCURRENCY`]. `0` is clamped to `1` (sequential).
+///
+/// Raising this can reduce orphan/GC list latency on backends whose LIST omits
+/// size (or for empty objects), but amplifies HEAD QPS and may hit object-store
+/// rate limits — tune down under `SlowDown` / 503 pressure.
+pub const CLIENT_LIST_STAT_CONCURRENCY: &str = "client.list-stat-concurrency";
+
+/// Default for [`CLIENT_LIST_STAT_CONCURRENCY`] when the property is absent.
+pub const DEFAULT_LIST_STAT_CONCURRENCY: usize = 16;
+
 /// Configuration properties for storage backends.
 ///
 /// This struct contains only configuration properties without specifying
@@ -242,6 +256,17 @@ mod tests {
 
         assert_eq!(config.get("key1"), Some(&"value1".to_string()));
         assert_eq!(config.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_client_list_stat_concurrency_key_and_default() {
+        assert_eq!(CLIENT_LIST_STAT_CONCURRENCY, "client.list-stat-concurrency");
+        assert_eq!(DEFAULT_LIST_STAT_CONCURRENCY, 16);
+        let config = StorageConfig::new().with_prop(CLIENT_LIST_STAT_CONCURRENCY, "32");
+        assert_eq!(
+            config.get(CLIENT_LIST_STAT_CONCURRENCY),
+            Some(&"32".to_string())
+        );
     }
 
     #[test]
