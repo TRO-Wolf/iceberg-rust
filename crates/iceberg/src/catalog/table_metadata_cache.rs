@@ -211,6 +211,10 @@ pub async fn load_or_fetch_table_metadata(
             return Ok(hit);
         }
         cache.record_miss();
+        // Fail closed: drop any pre-existing entry for this location *before* the body GET.
+        // Covers version-guard mismatch (stale Arc must not remain hittable if the re-fetch
+        // errors) and is a no-op when the key was simply absent.
+        cache.invalidate(metadata_location);
         let metadata = fetch_table_metadata(file_io, metadata_location).await?;
         cache.record_body_fetch();
         let metadata = Arc::new(metadata);
@@ -461,6 +465,39 @@ mod tests {
             .expect("hit");
         assert_eq!(body_reads.load(Ordering::Relaxed), 2);
         assert_eq!(cache.stats().hits, 1);
+    }
+
+    /// Guard mismatch + failed re-fetch must not leave the old Arc hittable under the prior version.
+    #[tokio::test]
+    async fn version_mismatch_failed_refetch_evicts_stale_entry() {
+        let (factory, _body_reads) = CountingStorageFactory::new();
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(factory)).build();
+        let location = "memory://warehouse/t/metadata/gone.metadata.json";
+        sample_metadata("memory://warehouse/t")
+            .write_to(&file_io, location)
+            .await
+            .expect("write");
+
+        let cache = TableMetadataCache::new();
+        let _ = load_or_fetch_table_metadata(&file_io, location, Some(&cache), Some("v1"))
+            .await
+            .expect("seed");
+        // Delete the body so re-fetch fails.
+        file_io.delete(location).await.expect("delete");
+
+        let err = load_or_fetch_table_metadata(&file_io, location, Some(&cache), Some("v2"))
+            .await
+            .expect_err("re-fetch must fail after delete");
+        let _ = err;
+
+        assert!(
+            cache.lookup(location, Some("v1")).is_none(),
+            "after guard-mismatch miss + failed fetch, old version must not hit"
+        );
+        assert!(
+            cache.lookup(location, Some("v2")).is_none(),
+            "failed fetch must not install a new entry"
+        );
     }
 
     #[tokio::test]
