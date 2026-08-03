@@ -977,6 +977,26 @@ mod tests {
         assert!(Arc::ptr_eq(&parts[0].data_file_path, &parts[2].data_file_path));
     }
 
+    /// FK2.1 critic-octo: offsets-aware split must Arc-share the same way as fixed-size.
+    #[test]
+    fn split_offsets_aware_sub_tasks_arc_share_innards() {
+        let mut t = task(1000, DataFileFormat::Parquet, Some(vec![0, 300, 700]));
+        t.deletes = Arc::from(vec![pos_delete(50)]);
+        t.predicate = Some(Arc::new(BoundPredicate::AlwaysFalse));
+        let parts = t.split(1).expect("offsets-aware ignores target");
+        assert_eq!(parts.len(), 3);
+        for p in &parts {
+            assert!(Arc::ptr_eq(&p.deletes, &t.deletes));
+            assert!(Arc::ptr_eq(&p.project_field_ids, &t.project_field_ids));
+            assert!(Arc::ptr_eq(&p.data_file_path, &t.data_file_path));
+            assert!(Arc::ptr_eq(
+                p.predicate.as_ref().expect("set"),
+                t.predicate.as_ref().expect("set")
+            ));
+            assert_eq!(p.split_offsets, None);
+        }
+    }
+
     #[test]
     fn split_zero_target_is_an_error() {
         let t = task(1000, DataFileFormat::Parquet, None);
@@ -1095,5 +1115,47 @@ mod tests {
         assert_eq!(back.project_field_ids.as_ref(), t.project_field_ids.as_ref());
         assert_eq!(back.deletes.as_ref(), t.deletes.as_ref());
         assert_eq!(back.predicate.as_deref(), t.predicate.as_deref());
+    }
+
+    /// FK2.1 critic-octo STOP bar: frozen golden JSON (pre-Arc field shapes) must match
+    /// exactly for a representative task — not just Value-level type checks.
+    #[test]
+    fn arc_fields_json_matches_pre_arc_golden_bytes() {
+        // A task with no residual / no deletes / no split_offsets — the common engine
+        // wire shape. Field order follows the struct declaration (serde_json preserves it).
+        let t = task(1000, DataFileFormat::Parquet, None);
+        let json = serde_json::to_string(&t).expect("serialize");
+        // Golden: plain string path, plain array projection, plain array deletes, no
+        // predicate key (None), no split_offsets key (None). Arc must not wrap any of these.
+        let golden = concat!(
+            r#"{"file_size_in_bytes":1000,"start":0,"length":1000,"record_count":1000,"#,
+            r#""data_file_path":"memory://t/data/1.parquet","data_file_format":"parquet","#,
+            r#""schema":{"#,
+        );
+        assert!(
+            json.starts_with(golden),
+            "JSON prefix must match pre-Arc shape; got {json}"
+        );
+        assert!(
+            json.contains(r#""project_field_ids":[1]"#),
+            "project_field_ids must be a bare JSON array [1], got {json}"
+        );
+        assert!(
+            json.contains(r#""deletes":[]"#),
+            "deletes must be a bare JSON array [], got {json}"
+        );
+        assert!(
+            !json.contains("predicate"),
+            "None residual must omit the predicate key, got {json}"
+        );
+        assert!(
+            !json.contains("split_offsets"),
+            "None split_offsets must omit the key, got {json}"
+        );
+        // No Arc-tagged / newtype object wrappers around shared fields.
+        assert!(
+            !json.contains("Arc") && !json.contains("\"ptr\""),
+            "JSON must not expose Arc internals, got {json}"
+        );
     }
 }

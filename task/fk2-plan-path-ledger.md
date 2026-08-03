@@ -63,6 +63,17 @@ Accessors (`data_file_path()`, `project_field_ids()`, `predicate()`) still retur
 ### map.md
 `crates/iceberg/src/scan/map.md` updated: task Arc-share + context residual Arc-clone (FK2.1).
 
+### Critic-octo FK2.1 (8 cycles) — OCTO-CONVERGED
+Scratch: `/tmp/critic-octo-fk2_1-2026-08-08/`
+
+| Cycle | Finding | Fix |
+|------:|---|---|
+| 1 | S2 offsets-aware Arc share unpinned; co-partition residual Arc unpinned | pins in `task.rs` + residual tests |
+| 2 | S2 serde STOP bar lacked frozen golden | `arc_fields_json_matches_pre_arc_golden_bytes` |
+| 3–4 | S3 plan-wide projection Arc residual; mutation-RED docs | ledger seeds |
+| 5–7 | concurrency / reader / changelog alias attacks | no OPEN ≥ S1 |
+| 8 | gate re-proof | OCTO-REPORT |
+
 ### Not in this unit
 - FK2.2 / FK2.3
 - Cargo.toml (frozen)

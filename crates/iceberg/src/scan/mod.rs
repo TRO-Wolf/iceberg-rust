@@ -4773,6 +4773,14 @@ pub mod tests {
                  `x == 1 AND y > 0` filter"
             );
         }
+        // FK2.1: co-partition residual memo ⇒ Arc identity shared across both live files.
+        assert!(
+            Arc::ptr_eq(
+                tasks[0].predicate.as_ref().expect("residual set"),
+                tasks[1].predicate.as_ref().expect("residual set"),
+            ),
+            "co-partition files must Arc-share the reduced residual (not deep-clone per file)"
+        );
     }
 
     #[tokio::test]
@@ -4788,6 +4796,15 @@ pub mod tests {
                 "a filter fully implied by the partition must reduce to AlwaysTrue"
             );
         }
+        // FK2.1 critic-octo: residual memo Arc-clones onto co-partition tasks (same partition
+        // x==1 ⇒ same Arc identity; deep clone would allocate distinct AlwaysTrue Arcs).
+        assert!(
+            Arc::ptr_eq(
+                tasks[0].predicate.as_ref().expect("residual set"),
+                tasks[1].predicate.as_ref().expect("residual set"),
+            ),
+            "co-partition files must Arc-share the memoized residual"
+        );
     }
 
     #[tokio::test]
