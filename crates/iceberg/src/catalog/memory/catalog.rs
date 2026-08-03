@@ -428,13 +428,14 @@ impl Catalog for MemoryCatalog {
 
         // Write outside the lock so concurrent catalog ops are not serialized on FileIO.
         metadata.write_to(&self.file_io, &metadata_location).await?;
-        // Seed the opt-in pointer cache so a subsequent load_table of the same pointer is a hit.
-        self.cache_put(&metadata_location, &metadata);
 
         {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
             root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
         }
+        // Seed only after the pointer is claimed — a failed insert must not leave a cache entry
+        // for a location the catalog does not own (FK4.1 critic-octo c4).
+        self.cache_put(&metadata_location, &metadata);
 
         Table::builder()
             .file_io(self.file_io.clone())
@@ -529,7 +530,16 @@ impl Catalog for MemoryCatalog {
 
         {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
-            root_namespace_state.insert_new_table(table_ident, metadata_location.clone())?;
+            if let Err(e) =
+                root_namespace_state.insert_new_table(table_ident, metadata_location.clone())
+            {
+                // load_or_fetch may have installed a cache entry; do not keep it if the pointer
+                // was never claimed (e.g. table already exists).
+                if let Some(cache) = self.table_metadata_cache.as_ref() {
+                    cache.invalidate(&metadata_location);
+                }
+                return Err(e);
+            }
         }
 
         Table::builder()
