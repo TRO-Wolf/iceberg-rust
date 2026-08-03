@@ -694,17 +694,12 @@ impl ArrowReader {
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);
 
         if let Some(positional_delete_indexes) = positional_delete_indexes {
-            let delete_row_selection = {
-                let positional_delete_indexes = positional_delete_indexes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-                Self::build_deletes_row_selection(
-                    record_batch_stream_builder.metadata().row_groups(),
-                    &selected_row_group_indices,
-                    &positional_delete_indexes,
-                )
-            }?;
+            // Frozen `Arc<DeleteVector>` — no mutex; apply/row-selection is lock-free on the bitmap.
+            let delete_row_selection = Self::build_deletes_row_selection(
+                record_batch_stream_builder.metadata().row_groups(),
+                &selected_row_group_indices,
+                positional_delete_indexes.as_ref(),
+            )?;
 
             // merge the row selection from the delete files with the row selection
             // from the filter predicate, if there is one from the filter predicate
@@ -1017,26 +1012,25 @@ impl ArrowReader {
         batch: &RecordBatch,
         num_rows: usize,
         batch_base: u64,
-        positional_deletes: Option<&Arc<std::sync::Mutex<DeleteVector>>>,
+        positional_deletes: Option<&Arc<DeleteVector>>,
         residual_predicate: Option<&BoundPredicate>,
         eq_delete_predicate: Option<&BoundPredicate>,
         eq_delete_sets: Option<&[EqDeleteKeySet]>,
     ) -> Result<Option<BooleanArray>> {
         // Positional deletes → a keep-mask of `!deleted` over this batch's absolute position window.
+        // The memoized vector is frozen (`Arc<DeleteVector>`); no mutex on the apply path.
         let positional_mask: Option<BooleanArray> = match positional_deletes {
             Some(deletes) => {
-                let deletes = deletes.lock().map_err(|_| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "positional delete vector mutex was poisoned",
-                    )
-                })?;
                 if deletes.is_empty() {
                     None
                 } else {
                     // Range-walk the delete window — byte-identical to the per-row `!contains` probe,
                     // O(D_window) instead of O(num_rows). See `positional_delete_keep_mask`.
-                    Some(positional_delete_keep_mask(&deletes, batch_base, num_rows))
+                    Some(positional_delete_keep_mask(
+                        deletes.as_ref(),
+                        batch_base,
+                        num_rows,
+                    ))
                 }
             }
             None => None,
@@ -3632,7 +3626,10 @@ message schema {
                 data_file_path: Arc::from(format!("{table_location}/data.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
-                project_field_ids: Arc::from(vec![1, crate::metadata_columns::RESERVED_FIELD_ID_POS]),
+                project_field_ids: Arc::from(vec![
+                    1,
+                    crate::metadata_columns::RESERVED_FIELD_ID_POS,
+                ]),
                 predicate: None,
                 deletes: Arc::from(vec![]),
                 partition: None,

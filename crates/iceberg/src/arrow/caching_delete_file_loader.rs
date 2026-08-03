@@ -1483,13 +1483,12 @@ mod tests {
         let vector = delete_filter
             .get_delete_vector(&task)
             .expect("delete vector for data file");
-        let locked = vector.lock().expect("lock");
-        assert!(locked.contains(0), "pos 0 must be deleted");
-        assert!(locked.contains(3), "pos 3 must be deleted");
-        assert!(locked.contains(7), "pos 7 must be deleted");
-        assert!(!locked.contains(1), "pos 1 must NOT be deleted");
+        assert!(vector.contains(0), "pos 0 must be deleted");
+        assert!(vector.contains(3), "pos 3 must be deleted");
+        assert!(vector.contains(7), "pos 7 must be deleted");
+        assert!(!vector.contains(1), "pos 1 must NOT be deleted");
         assert_eq!(
-            locked.len(),
+            vector.len(),
             3,
             "exactly three positions from the projected file"
         );
@@ -1776,7 +1775,7 @@ mod tests {
         let vector = delete_filter
             .resolve_delete_vector(&tasks, &data_file)
             .expect("delete vector installed under the data file");
-        let positions: Vec<u64> = vector.lock().expect("vector lock").iter().collect();
+        let positions: Vec<u64> = vector.iter().collect();
         assert_eq!(
             positions,
             vec![0, 3],
@@ -1891,7 +1890,7 @@ mod tests {
         // union of pos dels from pos del file 1 and 2, ie
         // [0, 1, 3, 5, 6, 8, 1022, 1023] | [0, 1, 3, 5, 20, 21, 22, 23]
         // = [0, 1, 3, 5, 6, 8, 20, 21, 22, 23, 1022, 1023]
-        assert_eq!(result.lock().unwrap().len(), 12);
+        assert_eq!(result.len(), 12);
 
         let result = delete_filter.get_delete_vector(&file_scan_tasks[1]);
         assert!(result.is_none()); // no pos dels for file 3
@@ -2350,7 +2349,7 @@ mod tests {
         let vector = delete_filter
             .resolve_delete_vector(&tasks, &data_file_a)
             .expect("vector must be keyed by the referenced data file");
-        let positions: Vec<u64> = vector.lock().unwrap().iter().collect();
+        let positions: Vec<u64> = vector.iter().collect();
         assert_eq!(positions, vec![1, 3]);
 
         assert!(
@@ -2407,7 +2406,7 @@ mod tests {
             "the second load must reuse the cached vector"
         );
         assert_eq!(
-            vector_1.lock().unwrap().len(),
+            vector_1.len(),
             3,
             "re-loading must not union a second copy into the vector"
         );
@@ -2476,13 +2475,13 @@ mod tests {
         let vector_a = delete_filter
             .resolve_delete_vector(&tasks, &data_file_a)
             .expect("blob 1 must land under data file A");
-        let positions_a: Vec<u64> = vector_a.lock().unwrap().iter().collect();
+        let positions_a: Vec<u64> = vector_a.iter().collect();
         assert_eq!(positions_a, vec![1, 3]);
 
         let vector_b = delete_filter
             .resolve_delete_vector(&tasks, &data_file_b)
             .expect("blob 2 must land under data file B (not be marked already-loaded)");
-        let positions_b: Vec<u64> = vector_b.lock().unwrap().iter().collect();
+        let positions_b: Vec<u64> = vector_b.iter().collect();
         assert_eq!(positions_b, vec![0, 2, 4]);
     }
 
@@ -2849,11 +2848,7 @@ mod tests {
         let vector_a = filter_a
             .get_delete_vector(&task_a)
             .expect("task A has a delete of its own");
-        let positions_a: Vec<u64> = vector_a
-            .lock()
-            .expect("task A delete vector mutex")
-            .iter()
-            .collect();
+        let positions_a: Vec<u64> = vector_a.iter().collect();
         assert_eq!(
             positions_a,
             vec![1],
@@ -2864,11 +2859,7 @@ mod tests {
         let vector_b = filter_b
             .get_delete_vector(&task_b)
             .expect("task B has a delete of its own");
-        let positions_b: Vec<u64> = vector_b
-            .lock()
-            .expect("task B delete vector mutex")
-            .iter()
-            .collect();
+        let positions_b: Vec<u64> = vector_b.iter().collect();
         assert_eq!(
             positions_b,
             vec![1],
@@ -2942,8 +2933,6 @@ mod tests {
         let positions_a: Vec<u64> = filter_a
             .get_delete_vector(&task_a)
             .expect("the shared delete names a row of file A")
-            .lock()
-            .expect("task A delete vector mutex")
             .iter()
             .collect();
         assert_eq!(
@@ -2955,8 +2944,6 @@ mod tests {
         let positions_b: Vec<u64> = filter_b
             .get_delete_vector(&task_b)
             .expect("the shared delete names a row of file B")
-            .lock()
-            .expect("task B delete vector mutex")
             .iter()
             .collect();
         assert_eq!(
@@ -3149,7 +3136,7 @@ mod tests {
             "both loads must observe the one shared delete vector"
         );
         assert_eq!(
-            vector_a.lock().expect("delete vector mutex").len(),
+            vector_a.len(),
             2,
             "the one shared vector must hold both deleted positions"
         );
@@ -3331,7 +3318,7 @@ mod tests {
             .resolve_delete_vector(&tasks, &data_file)
             .expect("the waiter must see the published vector");
         assert_eq!(
-            vector.lock().expect("delete vector mutex").len(),
+            vector.len(),
             2,
             "the waiter must observe the fully populated vector"
         );
@@ -3461,7 +3448,7 @@ mod tests {
             .resolve_delete_vector(&tasks, &data_file)
             .expect("the waiter must see the published positions");
         assert_eq!(
-            vector.lock().expect("delete vector mutex").len(),
+            vector.len(),
             2,
             "the waiter must observe the fully populated position set"
         );

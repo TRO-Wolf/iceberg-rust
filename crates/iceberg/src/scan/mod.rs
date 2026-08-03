@@ -3122,8 +3122,10 @@ pub mod tests {
                 .try_collect()
                 .await
                 .unwrap();
-            let mut paths: Vec<String> =
-                tasks.into_iter().map(|task| task.data_file_path.to_string()).collect();
+            let mut paths: Vec<String> = tasks
+                .into_iter()
+                .map(|task| task.data_file_path.to_string())
+                .collect();
             paths.sort();
             paths
         }
@@ -3189,8 +3191,10 @@ pub mod tests {
                 .try_collect()
                 .await
                 .unwrap();
-            let mut paths: Vec<String> =
-                tasks.into_iter().map(|task| task.data_file_path.to_string()).collect();
+            let mut paths: Vec<String> = tasks
+                .into_iter()
+                .map(|task| task.data_file_path.to_string())
+                .collect();
             paths.sort();
             paths
         }
@@ -3240,11 +3244,15 @@ pub mod tests {
         tasks.sort_by_key(|t| t.data_file_path.to_string());
 
         // Check first task is added data file
-        assert_eq!(tasks[0].data_file_path.as_ref(), format!("{}/1.parquet", &fixture.table_location)
+        assert_eq!(
+            tasks[0].data_file_path.as_ref(),
+            format!("{}/1.parquet", &fixture.table_location)
         );
 
         // Check second task is existing data file
-        assert_eq!(tasks[1].data_file_path.as_ref(), format!("{}/3.parquet", &fixture.table_location)
+        assert_eq!(
+            tasks[1].data_file_path.as_ref(),
+            format!("{}/3.parquet", &fixture.table_location)
         );
     }
 
@@ -3503,9 +3511,13 @@ pub mod tests {
         // Identical to `test_plan_files_no_deletions`: 1.parquet (Added) + 3.parquet
         // (Existing); the 2.parquet Deleted tombstone is filtered out.
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].data_file_path.as_ref(), format!("{}/1.parquet", &fixture.table_location)
+        assert_eq!(
+            tasks[0].data_file_path.as_ref(),
+            format!("{}/1.parquet", &fixture.table_location)
         );
-        assert_eq!(tasks[1].data_file_path.as_ref(), format!("{}/3.parquet", &fixture.table_location)
+        assert_eq!(
+            tasks[1].data_file_path.as_ref(),
+            format!("{}/3.parquet", &fixture.table_location)
         );
     }
 
@@ -3657,7 +3669,9 @@ pub mod tests {
 
         // Only the `x == 1` file survives; the `x == 2` file's manifest was pruned.
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].data_file_path.as_ref(), format!("{}/p1.parquet", &fixture.table_location)
+        assert_eq!(
+            tasks[0].data_file_path.as_ref(),
+            format!("{}/p1.parquet", &fixture.table_location)
         );
         assert!(
             !tasks
@@ -4792,7 +4806,9 @@ pub mod tests {
 
         assert_eq!(tasks.len(), 2);
         for task in &tasks {
-            assert_eq!(task.predicate.as_deref(), Some(&BoundPredicate::AlwaysTrue),
+            assert_eq!(
+                task.predicate.as_deref(),
+                Some(&BoundPredicate::AlwaysTrue),
                 "a filter fully implied by the partition must reduce to AlwaysTrue"
             );
         }
@@ -4842,7 +4858,9 @@ pub mod tests {
         // the table default (unpartitioned) spec instead would leave the residual as the
         // full `x == 1` (no reduction), so this predicate assertion pins that the residual
         // is computed from the FILE's own `partition_spec_id`, not the table default.
-        assert_eq!(task.predicate.as_deref(), Some(&BoundPredicate::AlwaysTrue),
+        assert_eq!(
+            task.predicate.as_deref(),
+            Some(&BoundPredicate::AlwaysTrue),
             "residual must be reduced by the file's own identity(x) spec (0), not \
              the unpartitioned default spec (1)"
         );

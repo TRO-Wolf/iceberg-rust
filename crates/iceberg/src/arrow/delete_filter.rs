@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use arrow_arith::boolean::and;
 use arrow_array::{Array, BooleanArray, RecordBatch};
@@ -111,7 +111,11 @@ struct DeleteFileFilterState {
     /// Memoized per-task merged vectors — see [`PosDelResolutionKey`]. Entries are only installed
     /// once every claim key they depend on is present in `pos_del_contributions`, and contributions
     /// are immutable once installed, so a memoized union can never go stale.
-    resolved_pos_dels: HashMap<PosDelResolutionKey, Arc<Mutex<DeleteVector>>>,
+    ///
+    /// Frozen as [`Arc<DeleteVector>`] (not `Arc<Mutex<…>>`): audit of the load → install →
+    /// resolve path shows no post-publish mutation of a memoized vector — only reads
+    /// (`contains` / `iter` / `is_empty` / range-walk keep-masks). See FK3 scout #12.
+    resolved_pos_dels: HashMap<PosDelResolutionKey, Arc<DeleteVector>>,
     equality_deletes: HashMap<String, EqDelState>,
     positional_deletes: HashMap<String, PosDelState>,
 }
@@ -329,13 +333,13 @@ enum EqDelLookup<T> {
 
 /// Recover a poisoned lock guard instead of cascading the panic to every subsequent scan.
 ///
-/// The guarded [`DeleteFileFilterState`] is a set of `HashMap`s (and the per-file delete-vector
-/// `Mutex`es) whose critical sections perform only `insert`/`get`/`clone`/bitmap-union — no
-/// re-entrant user code that could tear a collection mid-mutation — so a guard left behind by a
-/// panicked holder still wraps a structurally coherent state. Recovering it via
-/// [`std::sync::PoisonError::into_inner`] keeps concurrent scans alive rather than turning one
-/// thread's panic into a poison-panic in every reader/writer. This is the crate's established
-/// policy for these delete-path locks (see `arrow/reader.rs`, the positional delete-vector mutex).
+/// The guarded [`DeleteFileFilterState`] is a set of `HashMap`s whose critical sections perform
+/// only `insert`/`get`/`clone` — no re-entrant user code that could tear a collection
+/// mid-mutation — so a guard left behind by a panicked holder still wraps a structurally coherent
+/// state. Recovering it via [`std::sync::PoisonError::into_inner`] keeps concurrent scans alive
+/// rather than turning one thread's panic into a poison-panic in every reader/writer. This is the
+/// crate's established policy for these delete-path locks (see `arrow/reader.rs`). Memoized
+/// positional delete vectors are frozen as [`Arc<DeleteVector>`] and are not themselves locked.
 fn recover_poison<G>(result: std::sync::LockResult<G>) -> G {
     result.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -372,7 +376,7 @@ impl DeleteFilter {
     pub(crate) fn get_delete_vector(
         &self,
         file_scan_task: &FileScanTask,
-    ) -> Option<Arc<Mutex<DeleteVector>>> {
+    ) -> Option<Arc<DeleteVector>> {
         self.resolve_delete_vector(&file_scan_task.deletes, file_scan_task.data_file_path())
     }
 
@@ -404,7 +408,7 @@ impl DeleteFilter {
         &self,
         deletes: &[FileScanTaskDeleteFile],
         data_file_path: &str,
-    ) -> Option<Arc<Mutex<DeleteVector>>> {
+    ) -> Option<Arc<DeleteVector>> {
         let mut claim_keys: Vec<String> = Vec::new();
         for delete in deletes {
             if delete.file_type != DataContentType::PositionDeletes {
@@ -464,18 +468,22 @@ impl DeleteFilter {
             }
         }
 
+        // OR-by-reference (no roaring clone of each contribution): each contribution is frozen
+        // after install, and the memoized merge is published as `Arc<DeleteVector>` once.
         let mut merged: Option<DeleteVector> = None;
         for contribution in &contributions {
             if let Some(vector) = contribution.get(data_file_path) {
-                *merged.get_or_insert_with(DeleteVector::default) |= vector.clone();
+                merged
+                    .get_or_insert_with(DeleteVector::default)
+                    .merge(vector);
             }
         }
-        let merged = Arc::new(Mutex::new(merged?));
+        let merged = Arc::new(merged?);
 
         if every_source_installed {
             // Double-checked install: a concurrent resolver may have memoized the same key while
             // the union above ran outside the lock — return THEIRS so every resolver of one task
-            // shape shares a single vector.
+            // shape shares a single frozen Arc.
             let mut state = recover_poison(self.state.write());
             let entry = state
                 .resolved_pos_dels
@@ -804,7 +812,7 @@ impl DeleteFilter {
     /// positions (parquet position deletes and/or a deletion vector, already merged) — or `None`.
     /// Mirrors Java `DeleteFilter.deletedRowPositions()`. Synchronous: fully populated once
     /// [`load`](Self::load) returns.
-    pub fn deleted_row_positions(&self, task: &FileScanTask) -> Option<Arc<Mutex<DeleteVector>>> {
+    pub fn deleted_row_positions(&self, task: &FileScanTask) -> Option<Arc<DeleteVector>> {
         self.get_delete_vector(task)
     }
 
@@ -842,20 +850,19 @@ impl DeleteFilter {
         let num_rows = batch.num_rows();
 
         // Positional deletes → a keep-mask of `!deleted` over [row_base, row_base + num_rows).
+        // The memoized vector is frozen (`Arc<DeleteVector>`); apply is lock-free on the bitmap.
         let positional_mask: Option<BooleanArray> = match self.get_delete_vector(task) {
             Some(deletes) => {
-                let deletes = deletes.lock().map_err(|_| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "positional delete vector mutex was poisoned",
-                    )
-                })?;
                 if deletes.is_empty() {
                     None
                 } else {
                     // Range-walk the delete window — byte-identical to the per-row `!contains` probe,
                     // O(D_window) instead of O(num_rows). See `positional_delete_keep_mask`.
-                    Some(positional_delete_keep_mask(&deletes, row_base, num_rows))
+                    Some(positional_delete_keep_mask(
+                        deletes.as_ref(),
+                        row_base,
+                        num_rows,
+                    ))
                 }
             }
             None => None,
@@ -1039,7 +1046,7 @@ pub(crate) mod tests {
         let result = delete_filter
             .get_delete_vector(&file_scan_tasks[0])
             .unwrap();
-        assert_eq!(result.lock().unwrap().len(), 12); // pos dels from pos del file 1 and 2
+        assert_eq!(result.len(), 12); // pos dels from pos del file 1 and 2
 
         let delete_filter = delete_file_loader
             .load_deletes(&file_scan_tasks[1].deletes, file_scan_tasks[1].schema_ref())
@@ -1050,7 +1057,7 @@ pub(crate) mod tests {
         let result = delete_filter
             .get_delete_vector(&file_scan_tasks[1])
             .unwrap();
-        assert_eq!(result.lock().unwrap().len(), 8); // no pos dels for file 3
+        assert_eq!(result.len(), 8); // no pos dels for file 3
     }
 
     pub(crate) fn setup(table_location: &Path) -> Vec<FileScanTask> {
@@ -1339,7 +1346,7 @@ pub(crate) mod tests {
 
         // Positional deletes for data file 1: {0,1,3,5,6,8,20,21,22,23,1022,1023} = 12 distinct.
         let positions = filter.deleted_row_positions(&tasks[0]).unwrap();
-        assert_eq!(positions.lock().unwrap().len(), 12);
+        assert_eq!(positions.len(), 12);
         // The fixture has no equality deletes.
         assert!(
             filter
@@ -1525,12 +1532,13 @@ pub(crate) mod tests {
     /// `resolve_delete_vector` return `None` for a present contribution. A `None` is read by the
     /// reader / `apply` as "no positional deletes here", so a poison-induced `None` would silently
     /// DROP the file's positional deletes and RESURRECT deleted rows. The resolver must recover the
-    /// poison (`into_inner`) and still hand back the delete vector.
+    /// poison (`into_inner`) and still hand back the frozen delete vector.
     /// MUTATION: reverting the resolver's state read to `self.state.read().ok()` + early-`None`
     /// swallows the poison as `None` and this test FAILS (the `expect` below trips) — RED.
     /// (Adapted for R117: the accessor under test was `get_delete_vector_for_path` until the
     /// per-task scoping change replaced it with the task-scoped resolver — the pinned risk, a
-    /// poisoned read failing open as "no deletes", is unchanged.)
+    /// poisoned read failing open as "no deletes", is unchanged. FK3: memoized vectors are
+    /// `Arc<DeleteVector>` — poison recovery remains only on the outer state `RwLock`.)
     #[test]
     fn test_get_delete_vector_survives_poisoned_lock() {
         let filter = DeleteFilter::default();
@@ -1566,9 +1574,41 @@ pub(crate) mod tests {
             .resolve_delete_vector(&[parquet_pos_del_entry("pos-del.parquet")], "data.parquet")
             .expect("a present delete vector must survive a poisoned state lock, not read as None");
         assert!(
-            recover_poison(dv.lock()).contains(7),
+            dv.contains(7),
             "the recovered delete vector must still carry its deleted positions"
         );
+    }
+
+    /// FK3 / scout #12: memoized positional vectors freeze as `Arc<DeleteVector>` and are shared
+    /// by pointer across resolvers of the same task shape. MUTATION: re-wrap every resolve in a
+    /// fresh `Arc::new(...)` (no memo install, or clone the inner bitmap into a new Arc each
+    /// time) turns `Arc::ptr_eq` RED.
+    #[test]
+    fn test_resolved_pos_del_vector_is_frozen_arc_shared() {
+        let filter = DeleteFilter::default();
+        let mut dv = DeleteVector::default();
+        dv.insert(1);
+        dv.insert(3);
+        let guard = claim_pos_del(&filter, "pos-del.parquet");
+        filter.install_pos_del_contribution(
+            &guard,
+            HashMap::from([("data.parquet".to_string(), dv)]),
+        );
+        guard.publish_loaded();
+
+        let deletes = [parquet_pos_del_entry("pos-del.parquet")];
+        let a = filter
+            .resolve_delete_vector(&deletes, "data.parquet")
+            .expect("vector must resolve");
+        let b = filter
+            .resolve_delete_vector(&deletes, "data.parquet")
+            .expect("vector must resolve again");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "repeated resolve of one task shape must share one frozen Arc"
+        );
+        assert_eq!(a.len(), 2);
+        assert!(a.contains(1) && a.contains(3));
     }
 
     /// EQ-DELETE SWEEP for the R117 class (documents that the equality path does NOT share the

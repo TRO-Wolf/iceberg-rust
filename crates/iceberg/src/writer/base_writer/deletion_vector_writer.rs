@@ -848,13 +848,13 @@ mod tests {
         let vector_x = delete_filter
             .resolve_delete_vector(&tasks, data_file_x)
             .expect("vector for data file x");
-        let positions_x: Vec<u64> = vector_x.lock().expect("lock x").iter().collect();
+        let positions_x: Vec<u64> = vector_x.iter().collect();
         assert_eq!(positions_x, vec![0, 5, (1u64 << 32) + 7]);
 
         let vector_y = delete_filter
             .resolve_delete_vector(&tasks, data_file_y)
             .expect("vector for data file y");
-        let positions_y: Vec<u64> = vector_y.lock().expect("lock y").iter().collect();
+        let positions_y: Vec<u64> = vector_y.iter().collect();
         assert_eq!(positions_y, (100u64..200).collect::<Vec<_>>());
     }
 

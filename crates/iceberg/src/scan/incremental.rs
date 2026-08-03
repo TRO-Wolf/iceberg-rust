@@ -1764,7 +1764,10 @@ mod tests {
             .try_collect()
             .await
             .expect("collecting file scan tasks should succeed");
-        tasks.into_iter().map(|t| t.data_file_path.to_string()).collect()
+        tasks
+            .into_iter()
+            .map(|t| t.data_file_path.to_string())
+            .collect()
     }
 
     /// CORE BEHAVIOR: from=S0(exclusive) to=S2(inclusive) returns ONLY the files appended

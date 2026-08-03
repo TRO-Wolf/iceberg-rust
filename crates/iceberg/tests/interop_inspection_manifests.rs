@@ -65,9 +65,9 @@
 //! in CONTENT, the contract is to STOP and report it — never to hide a column. These two are content-equal.)
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::lock::{Mutex, MutexGuard};
+use futures::lock::Mutex;
 use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
@@ -148,13 +148,28 @@ impl MemoryCatalog {
         })
     }
 
-    /// Loads a table from the locked namespace state.
-    async fn load_table_from_locked_state(
+    /// Snapshot a table's stored metadata location under a short lock (no FileIO).
+    async fn table_metadata_location(&self, table_ident: &TableIdent) -> Result<String> {
+        let root_namespace_state = self.root_namespace_state.lock().await;
+        root_namespace_state
+            .get_existing_table_location(table_ident)
+            .cloned()
+    }
+
+    /// Snapshot a view's stored metadata location under a short lock (no FileIO).
+    async fn view_metadata_location(&self, view_ident: &TableIdent) -> Result<String> {
+        let root_namespace_state = self.root_namespace_state.lock().await;
+        root_namespace_state
+            .get_existing_view_location(view_ident)
+            .cloned()
+    }
+
+    /// Load table metadata from FileIO and assemble a [`Table`] — no catalog lock held.
+    async fn load_table_from_location(
         &self,
         table_ident: &TableIdent,
-        root_namespace_state: &MutexGuard<'_, NamespaceState>,
+        metadata_location: &str,
     ) -> Result<Table> {
-        let metadata_location = root_namespace_state.get_existing_table_location(table_ident)?;
         let metadata = TableMetadata::read_from(&self.file_io, metadata_location).await?;
 
         Table::builder()
@@ -165,13 +180,12 @@ impl MemoryCatalog {
             .build()
     }
 
-    /// Loads a view from the locked namespace state.
-    async fn load_view_from_locked_state(
+    /// Load view metadata from FileIO and assemble a [`View`] — no catalog lock held.
+    async fn load_view_from_location(
         &self,
         view_ident: &TableIdent,
-        root_namespace_state: &MutexGuard<'_, NamespaceState>,
+        metadata_location: &str,
     ) -> Result<View> {
-        let metadata_location = root_namespace_state.get_existing_view_location(view_ident)?;
         let metadata = ViewMetadata::read_from(&self.file_io, metadata_location).await?;
 
         View::builder()
@@ -338,32 +352,33 @@ impl Catalog for MemoryCatalog {
     }
 
     /// Create a new table inside the namespace.
+    ///
+    /// FileIO (metadata write) runs **outside** the catalog lock. The pointer insert is a short
+    /// critical section after a successful write — a failed write leaves no catalog entry
+    /// (half-create refused). Concurrent creates of the same name race at `insert_new_table`.
     async fn create_table(
         &self,
         namespace_ident: &NamespaceIdent,
         table_creation: TableCreation,
     ) -> Result<Table> {
-        let mut root_namespace_state = self.root_namespace_state.lock().await;
-
         let table_name = table_creation.name.clone();
         let table_ident = TableIdent::new(namespace_ident.clone(), table_name);
 
+        // Resolve the table location under a short lock (may need namespace properties).
         let (table_creation, location) = match table_creation.location.clone() {
             Some(location) => (table_creation, location),
             None => {
+                let root_namespace_state = self.root_namespace_state.lock().await;
                 let namespace_properties = root_namespace_state.get_properties(namespace_ident)?;
                 let location_prefix = match namespace_properties.get(LOCATION) {
                     Some(namespace_location) => namespace_location.clone(),
                     None => format!("{}/{}", self.warehouse_location, namespace_ident.join("/")),
                 };
-
                 let location = format!("{}/{}", location_prefix, table_ident.name());
-
                 let new_table_creation = TableCreation {
                     location: Some(location.clone()),
                     ..table_creation
                 };
-
                 (new_table_creation, location)
             }
         };
@@ -373,9 +388,13 @@ impl Catalog for MemoryCatalog {
             .metadata;
         let metadata_location = MetadataLocation::new_with_table_location(location).to_string();
 
+        // Write outside the lock so concurrent catalog ops are not serialized on FileIO.
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
-        root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
+        {
+            let mut root_namespace_state = self.root_namespace_state.lock().await;
+            root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
+        }
 
         Table::builder()
             .file_io(self.file_io.clone())
@@ -386,18 +405,23 @@ impl Catalog for MemoryCatalog {
     }
 
     /// Load table from the catalog.
+    ///
+    /// Snapshots the metadata pointer under a short lock, then reads FileIO outside it so concurrent
+    /// loads/commits are not serialized on metadata I/O (FK3 / scout #13).
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
-        let root_namespace_state = self.root_namespace_state.lock().await;
-
-        self.load_table_from_locked_state(table_ident, &root_namespace_state)
+        let metadata_location = self.table_metadata_location(table_ident).await?;
+        self.load_table_from_location(table_ident, &metadata_location)
             .await
     }
 
     /// Drop a table from the catalog.
+    ///
+    /// Removes the pointer under a short lock, then deletes the metadata file outside it.
     async fn drop_table(&self, table_ident: &TableIdent) -> Result<()> {
-        let mut root_namespace_state = self.root_namespace_state.lock().await;
-
-        let metadata_location = root_namespace_state.remove_existing_table(table_ident)?;
+        let metadata_location = {
+            let mut root_namespace_state = self.root_namespace_state.lock().await;
+            root_namespace_state.remove_existing_table(table_ident)?
+        };
         self.file_io.delete(&metadata_location).await
     }
 
@@ -433,24 +457,26 @@ impl Catalog for MemoryCatalog {
     /// # Atomicity guarantee
     ///
     /// Registration is all-or-nothing: the metadata at `metadata_location` is read (and thereby
-    /// proven reachable by this catalog's [`FileIO`]) **before** the pointer is inserted, both under
-    /// the same lock. A read failure — e.g. staged metadata written through a `FileIO` this catalog
-    /// cannot read, the real staged-CTAS failure — therefore leaves catalog state unchanged:
-    /// `table_exists` stays `false` and a subsequent create of the same identifier succeeds.
-    /// Inserting first would leave a half-created table (pointer present, `load_table` failing) and
-    /// break `CREATE TABLE IF NOT EXISTS` idempotency on retry.
+    /// proven reachable by this catalog's [`FileIO`]) **before** the pointer is inserted. FileIO
+    /// runs outside the catalog lock (FK3 / scout #13); the pointer insert is a short critical
+    /// section after a successful read. A read failure — e.g. staged metadata written through a
+    /// `FileIO` this catalog cannot read, the real staged-CTAS failure — therefore leaves catalog
+    /// state unchanged: `table_exists` stays `false` and a subsequent create of the same identifier
+    /// succeeds. Inserting first would leave a half-created table (pointer present, `load_table`
+    /// failing) and break `CREATE TABLE IF NOT EXISTS` idempotency on retry.
     async fn register_table(
         &self,
         table_ident: &TableIdent,
         metadata_location: String,
     ) -> Result<Table> {
-        let mut root_namespace_state = self.root_namespace_state.lock().await;
-
         // Read (and validate reachability of) the metadata BEFORE claiming the pointer, so a reload
         // failure cannot leave a half-created table. See the atomicity guarantee above.
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
 
-        root_namespace_state.insert_new_table(&table_ident.clone(), metadata_location.clone())?;
+        {
+            let mut root_namespace_state = self.root_namespace_state.lock().await;
+            root_namespace_state.insert_new_table(table_ident, metadata_location.clone())?;
+        }
 
         Table::builder()
             .file_io(self.file_io.clone())
@@ -489,40 +515,56 @@ impl Catalog for MemoryCatalog {
     }
 
     /// Update a table in the catalog.
+    ///
+    /// Optimistic CAS over short critical sections (FK3 / scout #13):
+    /// 1. Snapshot the stored metadata pointer under the lock.
+    /// 2. Load + apply + write metadata **outside** the lock (FileIO free of the global mutex).
+    /// 3. Re-read the stored pointer under the lock, CAS against the commit base, flip on match.
+    ///
+    /// A concurrent winner advances the stored location so step 3 rejects with
+    /// [`ErrorKind::CatalogCommitConflicts`] (retryable) — same outcome as holding the lock for the
+    /// whole body, without serializing FileIO across sessions.
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
-        let mut root_namespace_state = self.root_namespace_state.lock().await;
-
-        let current_table = self
-            .load_table_from_locked_state(commit.identifier(), &root_namespace_state)
-            .await?;
-        // The location currently stored for this table — Java's `tables.get(identifier)`, the value
-        // the `compute` lambda compares against the commit's base.
-        let stored_metadata_location = current_table.metadata_location_result()?.to_string();
+        let table_ident = commit.identifier().clone();
         let base_metadata_location = commit.base_metadata_location().map(str::to_string);
 
-        // Apply TableCommit to get staged table
+        // 1. Snapshot pointer under a short lock.
+        let stored_at_start = self.table_metadata_location(&table_ident).await?;
+
+        // 2. Load + apply + write outside the lock.
+        let current_table = self
+            .load_table_from_location(&table_ident, &stored_at_start)
+            .await?;
         let staged_table = commit.apply(current_table)?;
         let new_metadata_location = staged_table.metadata_location_result()?.to_string();
 
-        // Optimistic-concurrency CAS BEFORE the write — reject a stale commit (built from a
-        // superseded base) rather than silently last-write-win. Java `InMemoryTableOperations
-        // .doCommit` does the same equality check inside `tables.compute`. The whole `update_table`
-        // body holds the catalog lock, so the check and the pointer flip are atomic.
+        // Early CAS against the snapshot we loaded — cheap reject before writing when already stale.
+        // The authoritative CAS is step 3 (re-read under the lock at flip time).
         check_no_concurrent_modification(
             "table",
             staged_table.identifier(),
-            &stored_metadata_location,
+            &stored_at_start,
             base_metadata_location.as_deref(),
             &new_metadata_location,
         )?;
 
-        // Write table metadata to the new location
         staged_table
             .metadata()
             .write_to(staged_table.file_io(), &new_metadata_location)
             .await?;
 
-        // Flip the pointer to reference the new metadata file.
+        // 3. Authoritative pointer CAS under a short lock (I/O already complete).
+        let mut root_namespace_state = self.root_namespace_state.lock().await;
+        let stored_now = root_namespace_state
+            .get_existing_table_location(&table_ident)?
+            .clone();
+        check_no_concurrent_modification(
+            "table",
+            staged_table.identifier(),
+            &stored_now,
+            base_metadata_location.as_deref(),
+            &new_metadata_location,
+        )?;
         let updated_table = root_namespace_state.commit_table_update(staged_table)?;
 
         Ok(updated_table)
@@ -546,8 +588,6 @@ impl Catalog for MemoryCatalog {
         namespace_ident: &NamespaceIdent,
         view_creation: ViewCreation,
     ) -> Result<View> {
-        let mut root_namespace_state = self.root_namespace_state.lock().await;
-
         let view_name = view_creation.name.clone();
         let view_ident = TableIdent::new(namespace_ident.clone(), view_name);
         let location = view_creation.location.clone();
@@ -557,9 +597,13 @@ impl Catalog for MemoryCatalog {
             .metadata;
         let metadata_location = MetadataLocation::new_with_table_location(location).to_string();
 
+        // Write outside the lock (same half-create refusal as create_table: insert only after write).
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
-        root_namespace_state.insert_new_view(&view_ident, metadata_location.clone())?;
+        {
+            let mut root_namespace_state = self.root_namespace_state.lock().await;
+            root_namespace_state.insert_new_view(&view_ident, metadata_location.clone())?;
+        }
 
         View::builder()
             .file_io(self.file_io.clone())
@@ -570,9 +614,8 @@ impl Catalog for MemoryCatalog {
     }
 
     async fn load_view(&self, view_ident: &TableIdent) -> Result<View> {
-        let root_namespace_state = self.root_namespace_state.lock().await;
-
-        self.load_view_from_locked_state(view_ident, &root_namespace_state)
+        let metadata_location = self.view_metadata_location(view_ident).await?;
+        self.load_view_from_location(view_ident, &metadata_location)
             .await
     }
 
@@ -609,38 +652,45 @@ impl Catalog for MemoryCatalog {
     }
 
     async fn update_view(&self, commit: ViewCommit) -> Result<View> {
-        let mut root_namespace_state = self.root_namespace_state.lock().await;
-
-        let current_view = self
-            .load_view_from_locked_state(commit.identifier(), &root_namespace_state)
-            .await?;
-        // The location currently stored for this view — Java's `views.get(identifier)`, the value
-        // the `compute` lambda compares against the commit's base.
-        let stored_metadata_location = current_view.metadata_location_result()?.to_string();
+        let view_ident = commit.identifier().clone();
         let base_metadata_location = commit.base_metadata_location().map(str::to_string);
 
-        // Apply the commit (checks requirements + applies updates, bumping the version).
+        // 1. Snapshot pointer under a short lock.
+        let stored_at_start = self.view_metadata_location(&view_ident).await?;
+
+        // 2. Load + apply + write outside the lock.
+        let current_view = self
+            .load_view_from_location(&view_ident, &stored_at_start)
+            .await?;
         let staged_view = commit.apply(current_view)?;
         let new_metadata_location = staged_view.metadata_location_result()?.to_string();
 
-        // Optimistic-concurrency CAS BEFORE the write. For a view the `[AssertViewUUID]` requirement
-        // is invariant across replaces, so the location-CAS is the ONLY mechanism that detects a
-        // stale concurrent commit — Java `InMemoryViewOperations.doCommit` does the same equality
-        // check inside `views.compute`. The catalog lock makes the check + pointer flip atomic.
+        // Early CAS against the snapshot we loaded (authoritative re-check at flip below).
         check_no_concurrent_modification(
             "view",
             staged_view.identifier(),
-            &stored_metadata_location,
+            &stored_at_start,
             base_metadata_location.as_deref(),
             &new_metadata_location,
         )?;
 
-        // Write the new metadata file before flipping the catalog pointer.
         staged_view
             .metadata()
             .write_to(staged_view.file_io(), &new_metadata_location)
             .await?;
 
+        // 3. Authoritative pointer CAS under a short lock.
+        let mut root_namespace_state = self.root_namespace_state.lock().await;
+        let stored_now = root_namespace_state
+            .get_existing_view_location(&view_ident)?
+            .clone();
+        check_no_concurrent_modification(
+            "view",
+            staged_view.identifier(),
+            &stored_now,
+            base_metadata_location.as_deref(),
+            &new_metadata_location,
+        )?;
         root_namespace_state.commit_view_update(staged_view.identifier(), new_metadata_location)?;
 
         Ok(staged_view)
@@ -2879,5 +2929,151 @@ pub(crate) mod tests {
             .invalidate_view(&ident)
             .await
             .expect("invalidate_view default must be a no-op");
+    }
+
+    // ========================================================================
+    // FK3 / scout #13 — lock hygiene: I/O outside the catalog mutex; atomicity pins.
+    // ========================================================================
+
+    /// RISK: a `register_table` whose metadata path is UNREACHABLE must leave NO catalog pointer
+    /// (half-create refused). Read-before-insert is the guarantee; FileIO now runs outside the
+    /// lock, so a failing read must still not insert. MUTATION: insert before read turns
+    /// `table_exists` true and this test RED.
+    #[tokio::test]
+    async fn test_register_table_unreachable_metadata_refuses_half_create() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("ns".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident, "half_create".into());
+        let missing = format!("{}/definitely-missing/v1.metadata.json", temp_path());
+
+        let err = catalog
+            .register_table(&table_ident, missing)
+            .await
+            .expect_err("unreachable metadata must fail the register");
+        // Any FileIO / parse failure is acceptable; the pin is catalog state, not error kind.
+        let _ = err;
+
+        assert!(
+            !catalog
+                .table_exists(&table_ident)
+                .await
+                .expect("table_exists"),
+            "failed register must leave no catalog pointer (half-create refused)"
+        );
+        // Retry / create of the same identifier must still be possible.
+        create_table(&catalog, &table_ident).await;
+        assert!(
+            catalog
+                .table_exists(&table_ident)
+                .await
+                .expect("table_exists after create"),
+            "after a failed register, a fresh create of the same ident must succeed"
+        );
+    }
+
+    /// RISK: two stale property commits from the same base still conflict when FileIO is outside
+    /// the lock — the flip-time CAS is the sole atomicity seam. (Re-asserts the O1 pin under the
+    /// short-critical-section shape.)
+    #[tokio::test]
+    async fn test_table_stale_commit_conflicts_with_io_outside_lock() {
+        let catalog = new_memory_catalog().await;
+        let table = create_table_with_namespace(&catalog).await;
+        let base_location = table.metadata_location().unwrap().to_string();
+
+        let first_commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([("round".to_string(), "first".to_string())]),
+            }])
+            .base_metadata_location(Some(base_location.clone()))
+            .build();
+        let second_commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([("round".to_string(), "second".to_string())]),
+            }])
+            .base_metadata_location(Some(base_location))
+            .build();
+
+        let winner = catalog.update_table(first_commit).await.unwrap();
+        let error = catalog.update_table(second_commit).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable());
+
+        let loaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            loaded.metadata().properties().get("round").unwrap(),
+            "first"
+        );
+        assert_eq!(loaded.metadata_location(), winner.metadata_location());
+    }
+
+    /// Latency / concurrency note (structural, not a microbench): concurrent `load_table` while
+    /// another task runs `update_table` must both complete. With I/O outside the lock the load is
+    /// not serialized behind the update's metadata write — only the short pointer snapshot/CAS
+    /// sections contend. This pin asserts liveness + winner visibility, not a wall-time histogram.
+    #[tokio::test]
+    async fn test_concurrent_load_during_update_completes() {
+        let warehouse_location = temp_path();
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_location)]),
+                )
+                .await
+                .expect("build memory catalog"),
+        );
+        let table = create_table_with_namespace(catalog.as_ref()).await;
+        let ident = table.identifier().clone();
+        let base_location = table.metadata_location().unwrap().to_string();
+
+        let catalog_update = catalog.clone();
+        let ident_update = ident.clone();
+        let update = tokio::spawn(async move {
+            let commit = TableCommit::builder()
+                .ident(ident_update)
+                .requirements(vec![])
+                .updates(vec![TableUpdate::SetProperties {
+                    updates: HashMap::from([("concurrent".to_string(), "yes".to_string())]),
+                }])
+                .base_metadata_location(Some(base_location))
+                .build();
+            catalog_update.update_table(commit).await
+        });
+
+        let catalog_load = catalog.clone();
+        let ident_load = ident.clone();
+        let load = tokio::spawn(async move { catalog_load.load_table(&ident_load).await });
+
+        let updated = update
+            .await
+            .expect("update join")
+            .expect("update must succeed");
+        let loaded = load.await.expect("load join").expect("load must succeed");
+
+        // Either the pre- or post-update pointer is a valid load; the update must have landed.
+        assert_eq!(
+            updated.metadata().properties().get("concurrent").unwrap(),
+            "yes"
+        );
+        let final_table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(
+            final_table
+                .metadata()
+                .properties()
+                .get("concurrent")
+                .unwrap(),
+            "yes"
+        );
+        // Loaded table is a coherent snapshot of some metadata location known to the catalog.
+        assert!(
+            loaded.metadata_location().is_some(),
+            "concurrent load must return a table with a metadata location"
+        );
     }
 }

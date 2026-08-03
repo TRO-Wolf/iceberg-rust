@@ -5821,8 +5821,7 @@ mod tests {
         let vector = delete_filter
             .resolve_delete_vector(std::slice::from_ref(&task), referenced_data_file)
             .expect("a delete vector for the referenced data file");
-        let guard = vector.lock().expect("lock delete vector");
-        DeleteVector::new(guard.iter().collect())
+        DeleteVector::new(vector.iter().collect())
     }
 
     /// Write a DV via the WRITER-side MERGE hook (`DVFileWriter::with_previous_deletes`): the writer

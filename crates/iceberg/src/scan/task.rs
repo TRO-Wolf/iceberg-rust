@@ -946,7 +946,11 @@ mod tests {
         t.deletes = Arc::from(vec![pos_delete(50), pos_delete(75)]);
         t.predicate = Some(Arc::new(BoundPredicate::AlwaysTrue));
         let parts = t.split(400).expect("split ok");
-        assert_eq!(parts.len(), 3, "fixed-size split of 1000/400 yields 3 sub-tasks");
+        assert_eq!(
+            parts.len(),
+            3,
+            "fixed-size split of 1000/400 yields 3 sub-tasks"
+        );
         for p in &parts {
             assert!(
                 Arc::ptr_eq(&p.data_file_path, &t.data_file_path),
@@ -973,8 +977,14 @@ mod tests {
         }
         // Sibling sub-tasks share with each other too (same parent Arc).
         assert!(Arc::ptr_eq(&parts[0].deletes, &parts[1].deletes));
-        assert!(Arc::ptr_eq(&parts[0].project_field_ids, &parts[2].project_field_ids));
-        assert!(Arc::ptr_eq(&parts[0].data_file_path, &parts[2].data_file_path));
+        assert!(Arc::ptr_eq(
+            &parts[0].project_field_ids,
+            &parts[2].project_field_ids
+        ));
+        assert!(Arc::ptr_eq(
+            &parts[0].data_file_path,
+            &parts[2].data_file_path
+        ));
     }
 
     /// FK2.1 critic-octo: offsets-aware split must Arc-share the same way as fixed-size.
@@ -1096,10 +1106,7 @@ mod tests {
             v["project_field_ids"].is_array(),
             "project_field_ids must serialize as a JSON array"
         );
-        assert_eq!(
-            v["project_field_ids"],
-            serde_json::json!([1, 2, 3])
-        );
+        assert_eq!(v["project_field_ids"], serde_json::json!([1, 2, 3]));
         assert!(
             v["deletes"].is_array(),
             "deletes must serialize as a JSON array"
@@ -1112,7 +1119,10 @@ mod tests {
         // Round-trip restores values (new Arcs, same content).
         let back: FileScanTask = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.data_file_path.as_ref(), t.data_file_path.as_ref());
-        assert_eq!(back.project_field_ids.as_ref(), t.project_field_ids.as_ref());
+        assert_eq!(
+            back.project_field_ids.as_ref(),
+            t.project_field_ids.as_ref()
+        );
         assert_eq!(back.deletes.as_ref(), t.deletes.as_ref());
         assert_eq!(back.predicate.as_deref(), t.predicate.as_deref());
     }
