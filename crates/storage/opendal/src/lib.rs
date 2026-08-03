@@ -1799,6 +1799,61 @@ mod tests {
         assert_eq!(out.as_ptr(), payload.as_ptr());
     }
 
+    /// FK4.2: missing object during incomplete stat fails the whole list (fail-closed;
+    /// no hang / no partial success). Mutation: swallow stat Err → this pin RED.
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_fk4_2_list_stat_missing_object_fails_closed() {
+        let storage = OpenDalStorage::Memory {
+            operator: memory_config_build().expect("op"),
+            operator_cache: OperatorCache::default().with_list_stat_concurrency(4),
+        };
+        // Write one live object, then inject a need_stat path that does not exist.
+        storage
+            .write("memory:/miss/live.txt", Bytes::from("ok"))
+            .await
+            .expect("write live");
+        let (op, _) = storage
+            .create_operator(&"memory:/miss/live.txt")
+            .expect("op");
+        let need_stat = vec![
+            (0, "miss/live.txt".to_string()),
+            (1, "miss/does-not-exist.txt".to_string()),
+        ];
+        let mut ready_meta = vec![None, None];
+        let err = stat_incomplete_list_entries(&op, &need_stat, 4, &mut ready_meta)
+            .await
+            .expect_err("missing object must fail list-stat");
+        assert!(
+            format!("{err:#}").contains("Failure in doing io operation")
+                || format!("{err}").contains("Failure in doing io operation"),
+            "unexpected error shape: {err:#}"
+        );
+    }
+
+    /// FK4.2: out-of-range slot index from a stat result hard-fails (C1-Q-002).
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_fk4_2_list_stat_oob_slot_hard_fails() {
+        let storage = memory_storage();
+        storage
+            .write("memory:/oob/x", Bytes::from("x"))
+            .await
+            .expect("write");
+        let (op, _) = storage.create_operator(&"memory:/oob/x").expect("op");
+        // Slot 99 does not exist in ready_meta of length 1.
+        let need_stat = vec![(99, "oob/x".to_string())];
+        let mut ready_meta = vec![None];
+        let err = stat_incomplete_list_entries(&op, &need_stat, 1, &mut ready_meta)
+            .await
+            .expect_err("OOB slot must hard-fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("out-of-range slot index"),
+            "expected OOB slot message, got: {msg}"
+        );
+    }
+
     /// Operator cache reuses the same finished Operator for two paths on the same
     /// memory backend, and clones of storage share the cache.
     #[cfg(feature = "opendal-memory")]
