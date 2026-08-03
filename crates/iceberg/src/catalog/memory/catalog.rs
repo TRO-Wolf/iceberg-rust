@@ -647,15 +647,16 @@ impl Catalog for MemoryCatalog {
 
     /// Evict the cached entry for this table's current metadata location when a cache is
     /// injected; no-op when the cache is OFF (default) or the table does not exist.
+    ///
+    /// Mirrors Java `Catalog.invalidateTable`: unknown tables are a no-op for other keys —
+    /// we do **not** `clear()` the whole session cache on a missing ident (that would thrash
+    /// unrelated pointer entries).
     async fn invalidate_table(&self, table: &TableIdent) -> Result<()> {
         let Some(cache) = self.table_metadata_cache.as_ref() else {
             return Ok(());
         };
-        match self.table_metadata_location(table).await {
-            Ok(location) => cache.invalidate(&location),
-            // Fail closed: if we cannot resolve a location, drop the whole session cache
-            // rather than risk serving a stale Arc under a recycled location string.
-            Err(_) => cache.clear(),
+        if let Ok(location) = self.table_metadata_location(table).await {
+            cache.invalidate(&location);
         }
         Ok(())
     }
@@ -3347,6 +3348,30 @@ pub(crate) mod tests {
             cache.stats().body_fetches,
             0,
             "commit-retry refresh of unchanged pointer must not re-GET body"
+        );
+    }
+
+    /// Invalidating an unknown table must not thrash other tables' pointer entries
+    /// (Java `invalidateTable` is a no-op for absent idents — not a session-wide clear).
+    #[tokio::test]
+    async fn test_fk4_1_invalidate_missing_table_does_not_clear_session() {
+        let cache = Arc::new(TableMetadataCache::new());
+        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
+        let table = create_table_with_namespace(&catalog).await;
+        let pointer = table.metadata_location().unwrap().to_string();
+        assert!(
+            cache.lookup(&pointer, None).is_some(),
+            "create must seed the cache"
+        );
+
+        let missing = TableIdent::new(NamespaceIdent::new("nope".into()), "ghost".into());
+        catalog
+            .invalidate_table(&missing)
+            .await
+            .expect("missing invalidate is Ok");
+        assert!(
+            cache.lookup(&pointer, None).is_some(),
+            "invalidate of missing table must not clear sibling pointer entries"
         );
     }
 }

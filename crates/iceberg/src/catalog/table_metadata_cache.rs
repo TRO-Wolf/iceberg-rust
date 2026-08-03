@@ -135,24 +135,48 @@ impl TableMetadataCache {
     ///
     /// Returns `Some` only when:
     /// 1. an entry exists for exact `metadata_location`, AND
-    /// 2. if **both** the cached entry and `object_version` are `Some`, they are equal.
+    /// 2. the optional object-version guard does not disagree (see below).
     ///
-    /// Otherwise returns `None` (caller must full-fetch). A present caller guard with a
-    /// cached entry that has **no** stored guard still hits on location alone — version is
-    /// never the sole check, and absence of a stored guard does not poison the pointer hit.
+    /// Guard rules (version is **never** the sole check — location must match first):
+    /// * both cached and caller `Some` and equal → hit
+    /// * both `Some` and **not** equal → miss (fail closed)
+    /// * caller `None` → hit on location alone (guard not required)
+    /// * cached `None`, caller `Some` → hit on location, and **learn** the caller's guard
+    ///   into the entry so a later different version fail-closes (create-seed often puts
+    ///   `None`; a subsequent service version must still be able to arm the guard)
+    ///
+    /// Otherwise returns `None` (caller must full-fetch).
     pub fn lookup(
         &self,
         metadata_location: &str,
         object_version: Option<&str>,
     ) -> Option<TableMetadataRef> {
-        let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.get(metadata_location)?;
-        if let (Some(cached_v), Some(given_v)) = (entry.object_version.as_deref(), object_version)
-            && cached_v != given_v
+        // Fast path under read lock when no learn-upgrade is needed.
         {
-            return None;
+            let guard = self.entries.read().unwrap_or_else(|e| e.into_inner());
+            let entry = guard.get(metadata_location)?;
+            match (entry.object_version.as_deref(), object_version) {
+                (Some(cached_v), Some(given_v)) if cached_v != given_v => return None,
+                (Some(_), Some(_)) | (Some(_), None) | (None, None) => {
+                    return Some(entry.metadata.clone());
+                }
+                (None, Some(_)) => {
+                    // Need write lock to learn the guard — drop read lock first.
+                }
+            }
         }
-        Some(entry.metadata.clone())
+
+        // Learn path: cached guard absent, caller supplied one. Re-check under write lock.
+        let mut guard = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.get_mut(metadata_location)?;
+        match (entry.object_version.as_deref(), object_version) {
+            (Some(cached_v), Some(given_v)) if cached_v != given_v => None,
+            (None, Some(given_v)) => {
+                entry.object_version = Some(given_v.to_string());
+                Some(entry.metadata.clone())
+            }
+            _ => Some(entry.metadata.clone()),
+        }
     }
 
     fn record_hit(&self) {
@@ -498,6 +522,29 @@ mod tests {
         assert!(cache.lookup("memory://a", Some("etag-1")).is_some());
         // Right location, no caller version → hit (version not required).
         assert!(cache.lookup("memory://a", None).is_some());
+    }
+
+    /// Create-seed often puts `object_version=None`. The first caller-supplied version must
+    /// **learn** into the entry; a later different version must fail-close (miss).
+    #[test]
+    fn learn_version_guard_then_mismatch_fail_closed() {
+        let cache = TableMetadataCache::new();
+        let meta = Arc::new(sample_metadata("memory://warehouse/t"));
+        cache.put("memory://a".to_string(), meta, None);
+
+        assert!(
+            cache.lookup("memory://a", Some("v1")).is_some(),
+            "first versioned lookup on unguarded entry must hit and learn"
+        );
+        // Learned: mismatch must miss.
+        assert!(
+            cache.lookup("memory://a", Some("v2")).is_none(),
+            "after learn, disagreeing version must fail closed"
+        );
+        assert!(
+            cache.lookup("memory://a", Some("v1")).is_some(),
+            "matching learned version still hits"
+        );
     }
 
     #[test]
