@@ -4359,6 +4359,110 @@ message schema {
         );
     }
 
+    /// Critic-octo C5: residual ∩ pos-delete ∩ eq-delete under streaming `_pos`.
+    #[tokio::test]
+    async fn fk5_pos_residual_and_pos_and_eq_deletes() {
+        use crate::expr::{Bind, Reference};
+
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(arrow_array::Int32Array::from((0..10).collect::<Vec<i32>>())) as ArrayRef,
+            ])
+            .unwrap();
+        let file = File::create(&data_path).unwrap();
+        let mut writer = ArrowWriter::try_new(
+            file,
+            arrow_schema,
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // pos-delete 1, 8; eq-delete id=4; residual id >= 2 && id < 9
+        let pos_del = fk5_write_pos_delete_file(
+            &tmp.path().join("pos.parquet").to_string_lossy(),
+            &data_path,
+            &[1, 8],
+        );
+        let eq_path = tmp.path().join("eq.parquet").to_string_lossy().to_string();
+        let eq_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let eq_batch =
+            RecordBatch::try_new(eq_schema.clone(), vec![
+                Arc::new(arrow_array::Int32Array::from(vec![4])) as ArrayRef,
+            ])
+            .unwrap();
+        let eq_file = File::create(&eq_path).unwrap();
+        let mut eq_writer = ArrowWriter::try_new(
+            eq_file,
+            eq_schema,
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        eq_writer.write(&eq_batch).unwrap();
+        eq_writer.close().unwrap();
+        let eq_del = FileScanTaskDeleteFile {
+            file_path: eq_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&eq_path).unwrap().len(),
+            file_type: DataContentType::EqualityDeletes,
+            partition_spec_id: 0,
+            equality_ids: Some(vec![1]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+
+        let schema = id_schema_for_pos();
+        let residual = Reference::new("id")
+            .greater_than_or_equal_to(Datum::int(2))
+            .and(Reference::new("id").less_than(Datum::int(9)));
+        let bound = residual.bind(schema.clone(), true).unwrap();
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(data_path),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: Arc::from(vec![1, RESERVED_FIELD_ID_POS]),
+            predicate: Some(Arc::new(bound)),
+            deletes: Arc::from(vec![pos_del, eq_del]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        };
+        let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(3)).await);
+        // residual [2,9) minus pos{1,8} minus eq{4} → 2,3,5,6,7 (pos 1,8 outside residual for 1)
+        // pos 8 is in residual range and deleted; pos 1 is outside residual.
+        assert_eq!(
+            pairs,
+            vec![(2, 2), (3, 3), (5, 5), (6, 6), (7, 7)],
+            "residual∩¬pos∩¬eq must keep true physical _pos"
+        );
+    }
+
     /// FK5 MERGE-shaped pin: streamed `(_file,_pos)` scan → write pos deletes → MoR omits rows.
     #[tokio::test]
     async fn fk5_merge_shaped_pos_delete_from_streamed_identity_scan() {
