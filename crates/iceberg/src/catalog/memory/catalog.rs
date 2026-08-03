@@ -648,7 +648,13 @@ impl Catalog for MemoryCatalog {
             &new_metadata_location,
         )?;
         let updated_table = root_namespace_state.commit_table_update(staged_table)?;
-        // Seed cache with the newly published pointer so the next load_table is a hit.
+        // Evict the prior pointer (limit session retention) and seed the new one so the next
+        // load_table is a hit without re-GET.
+        if let Some(cache) = self.table_metadata_cache.as_ref()
+            && stored_at_start != new_metadata_location
+        {
+            cache.invalidate(&stored_at_start);
+        }
         self.cache_put(
             updated_table
                 .metadata_location()
