@@ -31,3 +31,10 @@
 ## Mutations (in-octo)
 - Restore unconditional `default_is_unpartitioned` only → unit `test_pos_delete_fast_path_mutation_default_only_is_wrong` RED design.
 - Drop `set_statistics_truncate_length(None)` → long-path bounds pin RED.
+
+## Octo (8× early_stop=false) — OCTO-CONVERGED
+
+Tip: `1a18e718`. Mutations RED: Option A weaken; Leg B re-enable 64-byte truncate.
+Scratch: `/tmp/critic-octo-u1-qb-bug001-2026-08-03/OCTO-REPORT.md`
+
+R113 stays 🟡 (Java-read interop evolved-DROP still a seed under Q9 fallback).
