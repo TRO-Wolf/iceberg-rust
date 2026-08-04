@@ -496,15 +496,13 @@ impl RewritePositionDeleteFiles {
             file_name_gen,
         );
 
-        // The new pos-delete must live in the SAME partition + spec as the files it replaces (so it lands
-        // in the same bucket and applies to the same data files). An unpartitioned spec takes no key.
-        let partition_key = if spec.is_unpartitioned() {
-            None
-        } else {
-            Some(PartitionKey::new(spec, schema.clone(), partition.clone())?)
-        };
+        // The new pos-delete must live in the SAME partition + spec as the files it replaces (so it
+        // lands in the same bucket and applies to the same data files). Always pass a PartitionKey —
+        // including empty/unpartitioned and all-Void null tuples — so we never fabricate spec_id 0
+        // via `build(None)` without `with_partition_spec` (C2-L-001 / C1-L-001 class).
+        let partition_key = PartitionKey::new(spec, schema.clone(), partition.clone())?;
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
-            .build(partition_key)
+            .build(Some(partition_key))
             .await?;
 
         let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();

@@ -516,19 +516,13 @@ impl ConvertEqualityDeleteFiles {
         );
 
         // The new pos-delete must live in the SAME partition as the eq-delete it replaces (so it lands
-        // in the same partition+spec bucket and applies to the same data files). An unpartitioned spec
-        // takes no partition key.
-        let partition_key = if spec.is_unpartitioned() {
-            None
-        } else {
-            Some(PartitionKey::new(
-                spec,
-                schema.clone(),
-                eq.data_file.partition().clone(),
-            )?)
-        };
+        // in the same partition+spec bucket and applies to the same data files). Always pass a
+        // PartitionKey (empty/unpartitioned/all-Void included) so we never fabricate spec_id 0
+        // via `build(None)` without `with_partition_spec` (C2-L-001 / C1-L-001 class).
+        let partition_key =
+            PartitionKey::new(spec, schema.clone(), eq.data_file.partition().clone())?;
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
-            .build(partition_key)
+            .build(Some(partition_key))
             .await?;
 
         let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
