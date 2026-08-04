@@ -862,7 +862,11 @@ impl StreamingDataFileWriter {
             location_gen,
             file_name_gen,
         );
-        let builder = DataFileWriterBuilder::new(rolling);
+        // Always configure the default partition spec so an unpartitioned build(None) stamps the
+        // real default_spec_id (post–DROP PARTITION FIELD may be non-zero empty), never fabricated 0
+        // (C5-L-001 / C6-L-001 DATA dual of BUG-001). PartitionKey still wins when present.
+        let builder = DataFileWriterBuilder::new(rolling)
+            .with_partition_spec(partition_spec.as_ref().clone());
 
         let calculator = if partition_spec.is_unpartitioned() {
             None
@@ -1190,6 +1194,13 @@ async fn write_position_deletes_for_partition(
         location_gen,
         file_name_gen,
     );
+    if partition_key.is_none() && configured_spec.is_none() {
+        return Err(DataFusionError::Internal(
+            "position-delete: write_position_deletes_for_partition requires either a PartitionKey \
+             or a configured_spec; both None would fabricate partition_spec_id 0"
+                .to_string(),
+        ));
+    }
     let mut builder = PositionDeleteFileWriterBuilder::new(rolling, config.clone());
     if let Some(spec) = configured_spec {
         builder = builder.with_partition_spec(spec);
