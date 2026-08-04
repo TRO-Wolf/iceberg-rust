@@ -253,12 +253,14 @@ impl ExecutionPlan for IcebergWriteExec {
             location_generator,
             file_name_generator,
         );
-        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
-
         // Create TaskWriter
         let fanout_enabled = table_props.write_datafusion_fanout_enabled;
         let schema = self.table.metadata().current_schema().clone();
         let partition_spec = self.table.metadata().default_partition_spec().clone();
+        // Stamp the real default_spec_id when built without a PartitionKey (post–DROP empty
+        // default may be non-zero; bare new() would fabricate 0 — C5-L-001 / C6-L-001).
+        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder)
+            .with_partition_spec(partition_spec.as_ref().clone());
         let task_writer = TaskWriter::try_new(
             data_file_writer_builder,
             fanout_enabled,

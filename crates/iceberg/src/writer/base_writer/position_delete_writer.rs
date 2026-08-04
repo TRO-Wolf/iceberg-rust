@@ -53,6 +53,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
+use parquet::file::properties::WriterProperties;
 
 use crate::arrow::schema_to_arrow_schema;
 use crate::metadata_columns::{delete_file_path_field, delete_file_pos_field};
@@ -75,6 +76,24 @@ pub fn pos_delete_schema() -> Result<Schema> {
             delete_file_path_field().clone(),
             delete_file_pos_field().clone(),
         ])
+        .build()
+}
+
+/// Parquet [`WriterProperties`] for position-delete files.
+///
+/// Disables parquet-rs's default 64-byte statistics truncation
+/// (`WriterPropertiesBuilder::set_statistics_truncate_length(None)`) so footer min/max for the
+/// reserved `file_path` column stay exact. Combined with [`crate::spec::MetricsConfig::for_position_delete`]
+/// (Full mode on `file_path`/`pos`), this makes Iceberg DataFile lower/upper bounds equal to the
+/// full path — the load-bearing leg of [`crate::delete_file_index::referenced_data_file_location`]'s
+/// equal-bounds routing (Java `PositionDeleteWriter` never sets `referenced_data_file` on v2 parquet
+/// deletes; path identity rides the bounds alone).
+///
+/// Without this, realistic S3 URIs longer than 64 bytes yield non-exact footer stats; the exactness
+/// guard in the metrics aggregator drops the bounds, and equal-bounds routing silently misses.
+pub fn position_delete_writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_statistics_truncate_length(None)
         .build()
 }
 
@@ -286,16 +305,20 @@ mod test {
     use arrow_schema::DataType;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
-    use super::{PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, pos_delete_schema};
+    use super::{
+        PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, pos_delete_schema,
+        position_delete_writer_properties,
+    };
     use crate::ErrorKind;
     use crate::io::FileIO;
     use crate::metadata_columns::{
         RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
     };
-    use crate::spec::{DataContentType, DataFileFormat, PrimitiveType, Type};
+    use crate::spec::{
+        DataContentType, DataFileFormat, MetricsConfig, PrimitiveLiteral, PrimitiveType, Type,
+    };
     use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
@@ -332,7 +355,8 @@ mod test {
 
         let config = PositionDeleteWriterConfig::new().unwrap();
         let parquet_writer_builder =
-            ParquetWriterBuilder::new(WriterProperties::builder().build(), config.schema().clone());
+            ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
+                .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_writer_builder,
             file_io.clone(),
@@ -340,6 +364,52 @@ mod test {
             file_name_gen,
         );
         PositionDeleteFileWriterBuilder::new(rolling_writer_builder, config)
+    }
+
+    /// QB / R113: a realistic (>64-byte) S3-shaped path must survive as equal lower/upper bounds
+    /// so equal-bounds routing can recover `referenced_data_file_location` without the DV field.
+    #[tokio::test]
+    async fn test_position_delete_long_file_path_bounds_are_full_and_equal()
+    -> Result<(), anyhow::Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let mut writer = make_writer_builder(&file_io, &temp_dir).build(None).await?;
+
+        // 120-char path (well past parquet's default 64-byte stats truncate).
+        let long_path = format!(
+            "s3://bucket-name/warehouse/ns/table/data/{}",
+            "a".repeat(80)
+        );
+        assert!(
+            long_path.len() > 64,
+            "fixture must exceed default statistics_truncate_length"
+        );
+        let batch = pos_delete_batch(&[(&long_path, 0), (&long_path, 1)]);
+        writer.write(batch).await?;
+        let data_files = writer.close().await?;
+        assert_eq!(data_files.len(), 1);
+        let df = &data_files[0];
+
+        let lower = df
+            .lower_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
+            .expect("file_path lower bound must be present (Full + exact stats)");
+        let upper = df
+            .upper_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
+            .expect("file_path upper bound must be present (Full + exact stats)");
+        assert_eq!(lower, upper, "single-path delete must have equal bounds");
+        match lower.literal() {
+            PrimitiveLiteral::String(s) => {
+                assert_eq!(
+                    s.as_str(),
+                    long_path.as_str(),
+                    "bound must be the FULL path, not a 64-byte truncated prefix"
+                );
+            }
+            other => panic!("expected string bound, got {other:?}"),
+        }
+        Ok(())
     }
 
     /// The schema this writer advertises must be exactly the Iceberg position-delete schema, with

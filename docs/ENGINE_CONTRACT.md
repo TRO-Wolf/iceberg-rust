@@ -312,14 +312,16 @@ partition, …)` — so a Java-written file can never claim a spec the table doe
   carrying an empty tuple. The check is keyed on partition-field **arity**, not on
   `PartitionSpec::is_unpartitioned()`, which also reports `true` for an ALL-VOID spec whose partition
   type still has fields.
-- **Neither routing leg rescues a wrongly stamped position delete this crate writes.** The read side can
-  bind a position delete to one data file by the `referenced_data_file` field or by EQUAL `file_path`
-  column bounds — and a delete this crate writes offers neither: it does not set the field (nor does
-  Java through 1.11.0 for parquet position deletes; only the V3 DV writer does), and parquet-rs
-  truncates byte-array statistics at 64 bytes so the metrics aggregator drops the `file_path` bounds
-  as non-exact. A fork-written position delete is therefore routed by `(spec_id, partition)` ALONE. A
-  wrong stamp is a silent under-delete with no fallback — which is why the stamping rules above are
-  MUSTs, not hygiene.
+- **Path-leg equal-bounds routing is load-bearing for file-granularity deletes; the stamp is still a MUST.**
+  The read side can bind a position delete to one data file by the `referenced_data_file` field or by
+  EQUAL `file_path` column bounds. Fork writers (2026-08-03 QB Leg B) **do** emit exact full
+  `file_path` bounds via `position_delete_writer_properties()` (`set_statistics_truncate_length(None)`)
+  combined with `MetricsConfig::for_position_delete` (Full mode) — so the equal-bounds leg works for
+  single-path / file-granularity deletes. They still do **not** set `referenced_data_file` (Java
+  `PositionDeleteWriter` through 1.11.0 never does for parquet position deletes; only the V3 DV
+  writer does). A multi-file partition-granularity delete with unequal path bounds still routes by
+  `(spec_id, partition)` alone — a wrong stamp remains a silent under-delete for that class. Stamping
+  rules above stay MUSTs.
 - **Delete granularity is the ENGINE's choice; the core has no knob.** This crate neither reads nor
   persists `write.delete.granularity`, so nothing infers granularity for you: you get what your
   grouping produces — one delete file per `(spec_id, partition)` group is PARTITION granularity, one
@@ -327,8 +329,8 @@ partition, …)` — so a Java-written file can never claim a spec the table doe
   did: the property is not persisted when unset and the two Java defaults DISAGREE —
   `TableProperties.DELETE_GRANULARITY_DEFAULT` is PARTITION while `SparkWriteConf.deleteGranularity()`
   defaults to FILE, and Spark writes FILE. (Bytecode-verified by the RePark consumer, 2026-07-25.)
-- Keep `MetricsConfig::for_position_delete` so `file_path`/`pos` bounds stay Full (pruning
-  precision).
+- Keep `MetricsConfig::for_position_delete` **and** `position_delete_writer_properties()` so
+  `file_path`/`pos` bounds stay Full **and** exact (pruning + equal-bounds routing).
 
 ## 8. Commit semantics
 

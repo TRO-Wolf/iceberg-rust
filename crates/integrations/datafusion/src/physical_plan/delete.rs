@@ -98,7 +98,7 @@ use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -862,7 +862,11 @@ impl StreamingDataFileWriter {
             location_gen,
             file_name_gen,
         );
-        let builder = DataFileWriterBuilder::new(rolling);
+        // Always configure the default partition spec so an unpartitioned build(None) stamps the
+        // real default_spec_id (post–DROP PARTITION FIELD may be non-zero empty), never fabricated 0
+        // (C5-L-001 / C6-L-001 DATA dual of BUG-001). PartitionKey still wins when present.
+        let builder = DataFileWriterBuilder::new(rolling)
+            .with_partition_spec(partition_spec.as_ref().clone());
 
         let calculator = if partition_spec.is_unpartitioned() {
             None
@@ -988,8 +992,20 @@ async fn write_partitioned_data_files(
 ///
 /// **Partition-aware.** Position-delete files are associated with the `(spec_id, partition)` of the
 /// DATA file they delete from — the Iceberg commit validates that the delete file's partition matches the
-/// registered spec for `partition_spec_id`. For UNPARTITIONED tables the partition key is `None`
-/// (existing behavior). For PARTITIONED tables:
+/// registered spec for `partition_spec_id`.
+///
+/// **Fast path (never-evolved empty-spec tables only).** When the table has exactly one partition
+/// spec AND that spec has **zero fields**, every data file carries an empty partition tuple and we
+/// write a single delete file stamped via `with_partition_spec(default)` (so the real spec id is
+/// kept — never a hard-coded 0). This is **not** the same as "the default spec is unpartitioned":
+/// after `DROP PARTITION FIELD` / `updateSpec().removeField(...)` the default becomes unpartitioned
+/// while older data files still carry their original `(spec_id, partition)`. Stamping those deletes
+/// with fabricated `None`/spec-0 makes the read-side attach miss and resurrects rows (BUG-001).
+/// All-Void single-spec tables also skip the fast path (need null-tuple arity). Multi-spec and
+/// partitioned shapes always walk manifests and stamp each group with
+/// `PartitionKey::new(data_file_spec, schema, partition)`.
+///
+/// For (still-)partitioned default specs:
 ///
 /// 1. The current snapshot manifests are scanned once to build a `path → (spec_id, Struct)` map.
 /// 2. The `(path, pos)` pairs are grouped by their data file's `(spec_id, Struct)`.
@@ -997,15 +1013,44 @@ async fn write_partitioned_data_files(
 ///
 /// This mirrors Java `PositionDeleteWriter` which always carries a per-data-file `PartitionKey` and
 /// `RewritePositionDeleteFiles` which groups delete files by `(spec_id, partition)`.
+/// Whether position deletes may take the empty-partition fast path.
+///
+/// Option A (BUG-001), refined for all-Void arity (C1-L-002): only when the table has **exactly
+/// one** partition spec AND that spec has **zero fields** (truly unpartitioned).  
+/// - Multi-spec tables whose *default* is unpartitioned after evolution still have partitioned
+///   data under older specs → manifest walk.  
+/// - Single-spec all-Void (`is_unpartitioned()` true but non-empty fields) needs a null-tuple
+///   `PartitionKey` matching the void arity, not `None`/empty → also takes the walk.
+pub(crate) fn position_delete_unpartitioned_fast_path(
+    spec_count: usize,
+    default_field_count: usize,
+) -> bool {
+    spec_count == 1 && default_field_count == 0
+}
+
 async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFResult<Vec<DataFile>> {
     let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
     let metadata = table.metadata();
     let default_spec = metadata.default_partition_spec();
     let schema = metadata.current_schema();
 
-    // For unpartitioned tables, write a single delete file with no partition key — the fast path.
-    if default_spec.is_unpartitioned() {
-        return write_position_deletes_for_partition(table, &config, pairs, None).await;
+    // Never-evolved empty-spec tables only: one delete file under that sole empty spec.
+    // Multi-spec / all-Void / partitioned → manifest walk + per-group PartitionKey (C1-L-001).
+    if position_delete_unpartitioned_fast_path(
+        metadata.partition_specs_iter().len(),
+        default_spec.fields().len(),
+    ) {
+        // Stamp the real default spec id (not a hard-coded 0): build with_partition_spec so
+        // resolve_partition_spec_id does not fabricate DEFAULT_PARTITION_SPEC_ID when the sole
+        // empty spec happens to carry a non-zero id.
+        return write_position_deletes_for_partition(
+            table,
+            &config,
+            pairs,
+            None,
+            Some(default_spec.as_ref().clone()),
+        )
+        .await;
     }
 
     // Partitioned: build path → (spec_id, partition Struct) from the current snapshot manifests.
@@ -1059,15 +1104,20 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
             })?
             .as_ref()
             .clone();
-        let partition_key = if spec.is_unpartitioned() {
-            None
-        } else {
-            Some(PartitionKey::new(spec, schema.clone(), partition).map_err(to_datafusion_error)?)
-        };
+        // Always carry the data file's own (spec, partition) — including empty/unpartitioned and
+        // all-Void null tuples. `partition_key = None` without with_partition_spec would fabricate
+        // spec_id 0 and under-attach or fail commit after DROP PARTITION FIELD (C1-L-001).
+        let partition_key =
+            PartitionKey::new(spec, schema.clone(), partition).map_err(to_datafusion_error)?;
 
-        let files =
-            write_position_deletes_for_partition(table, &config, &group_pairs, partition_key)
-                .await?;
+        let files = write_position_deletes_for_partition(
+            table,
+            &config,
+            &group_pairs,
+            Some(partition_key),
+            None,
+        )
+        .await?;
         all_delete_files.extend(files);
     }
 
@@ -1111,14 +1161,18 @@ fn group_pairs_by_partition(
     Ok(groups)
 }
 
-/// Write one position-delete file for a SINGLE `(spec_id, partition)` group. When `partition_key`
-/// is `None` the file is unpartitioned (spec_id 0, empty struct). The caller must have pre-sorted
-/// `pairs` by `(path, pos)`.
+/// Write one position-delete file for a SINGLE `(spec_id, partition)` group.
+///
+/// Prefer `Some(partition_key)` carrying the data file's own spec (always, on the multi-path).
+/// When `partition_key` is `None`, `configured_spec` MUST be `Some` so the writer stamps that
+/// spec's id via `with_partition_spec` instead of fabricating `DEFAULT_PARTITION_SPEC_ID` (0).
+/// The caller must have pre-sorted `pairs` by `(path, pos)`.
 async fn write_position_deletes_for_partition(
     table: &Table,
     config: &PositionDeleteWriterConfig,
     pairs: &[(String, i64)],
     partition_key: Option<PartitionKey>,
+    configured_spec: Option<iceberg::spec::PartitionSpec>,
 ) -> DFResult<Vec<DataFile>> {
     let location_gen =
         DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
@@ -1127,20 +1181,31 @@ async fn write_position_deletes_for_partition(
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
-    // Keep the position-delete `file_path` / `pos` bounds FULL (Java `MetricsConfig.forPositionDelete`)
-    // so delete-file path pruning stays precise — the default `truncate(16)` would widen the path range.
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
-        config.schema().clone(),
-    )
-    .with_metrics_config(MetricsConfig::for_position_delete());
+    // Keep the position-delete `file_path` / `pos` bounds FULL and EXACT:
+    // - MetricsConfig::for_position_delete → Full mode (Java MetricsConfig.forPositionDelete)
+    // - position_delete_writer_properties → no 64-byte parquet stats truncate (so min_is_exact /
+    //   max_is_exact stay true and equal-bounds path routing works for long S3 URIs)
+    let parquet_builder =
+        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
+            .with_metrics_config(MetricsConfig::for_position_delete());
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),
         location_gen,
         file_name_gen,
     );
-    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+    if partition_key.is_none() && configured_spec.is_none() {
+        return Err(DataFusionError::Internal(
+            "position-delete: write_position_deletes_for_partition requires either a PartitionKey \
+             or a configured_spec; both None would fabricate partition_spec_id 0"
+                .to_string(),
+        ));
+    }
+    let mut builder = PositionDeleteFileWriterBuilder::new(rolling, config.clone());
+    if let Some(spec) = configured_spec {
+        builder = builder.with_partition_spec(spec);
+    }
+    let mut writer = builder
         .build(partition_key)
         .await
         .map_err(to_datafusion_error)?;
@@ -1851,7 +1916,8 @@ mod tests {
 
     use super::{
         IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch,
-        decode_position, group_pairs_by_partition, sort_position_delete_pairs,
+        decode_position, group_pairs_by_partition, position_delete_unpartitioned_fast_path,
+        sort_position_delete_pairs,
     };
 
     // =============================================================================================
@@ -2162,6 +2228,47 @@ mod tests {
         assert!(
             IsolationLevel::parse("none").is_err(),
             "'none' must be rejected for row-level operations"
+        );
+    }
+
+    // ============================================================================================
+    // BUG-001 Option A — unpartitioned fast-path predicate (mutation-proven).
+    // ============================================================================================
+
+    #[test]
+    fn test_pos_delete_fast_path_only_for_single_empty_spec() {
+        // Never-evolved empty partition type (field_count == 0).
+        assert!(position_delete_unpartitioned_fast_path(1, 0));
+        // Partitioned or all-Void (non-zero fields): always walk manifests.
+        assert!(!position_delete_unpartitioned_fast_path(1, 1));
+        // Evolved: multi-spec + empty default (DROP PARTITION FIELD) — MUST NOT fast-path.
+        assert!(
+            !position_delete_unpartitioned_fast_path(2, 0),
+            "BUG-001: multi-spec with empty default must take the manifest walk"
+        );
+        assert!(!position_delete_unpartitioned_fast_path(2, 1));
+        // Zero specs is not a real table shape; refuse the fast path.
+        assert!(!position_delete_unpartitioned_fast_path(0, 0));
+    }
+
+    /// Mutation twin: weakening to "default is empty" alone (forgetting multi-spec) would make
+    /// this assert fail — keeps Option A load-bearing.
+    #[test]
+    fn test_pos_delete_fast_path_mutation_field_count_only_is_wrong() {
+        let evolved_empty_default = position_delete_unpartitioned_fast_path(2, 0);
+        assert!(
+            !evolved_empty_default,
+            "mutation RED: field_count-only condition would take the fast path here"
+        );
+    }
+
+    /// C1-L-002: all-Void is_unpartitioned but has fields — must NOT fast-path.
+    #[test]
+    fn test_pos_delete_fast_path_rejects_all_void_single_spec() {
+        // One void field ⇒ field_count 1.
+        assert!(
+            !position_delete_unpartitioned_fast_path(1, 1),
+            "all-Void needs a null-tuple PartitionKey, not the empty fast path"
         );
     }
 

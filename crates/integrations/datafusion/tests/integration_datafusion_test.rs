@@ -3992,6 +3992,271 @@ async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()
 }
 
 // =================================================================================================
+// BUG-001 — evolved unpartitioned *default* still has partitioned data under older specs.
+// The fast path must NOT stamp partition_key=None solely because default_spec.is_unpartitioned();
+// Option A: fast path only when partition_specs.len()==1 && default is unpartitioned.
+// =================================================================================================
+
+/// After DROP PARTITION FIELD (default becomes unpartitioned) a MoR DELETE must still stamp
+/// each position-delete file with the data file's own `(spec_id, partition)` so the read-side
+/// attach does not miss and resurrect rows.
+#[tokio::test]
+async fn test_delete_mread_after_drop_partition_field_no_resurrection() -> Result<()> {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+    let (ctx, client) = make_partitioned_mread_ctx("bug001_evolved_unpart", "items").await?;
+
+    ctx.sql(
+        "INSERT INTO catalog.bug001_evolved_unpart.items VALUES \
+         (1, 'electronics', 'laptop'), \
+         (2, 'electronics', 'phone'), \
+         (3, 'books', 'novel'), \
+         (4, 'books', 'textbook')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let ns = NamespaceIdent::new("bug001_evolved_unpart".to_string());
+    let tbl_id = TableIdent::new(ns.clone(), "items".to_string());
+
+    // Evolve: remove identity(category) → new default spec is unpartitioned, but data files
+    // remain under the original partitioned spec.
+    let table = client.load_table(&tbl_id).await?;
+    assert_eq!(
+        table.metadata().partition_specs_iter().len(),
+        1,
+        "fixture: one spec before evolution"
+    );
+    assert!(
+        !table.metadata().default_partition_spec().is_unpartitioned(),
+        "fixture: default is partitioned before DROP"
+    );
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_partition_spec()
+        .remove_field("category")
+        .apply(tx)
+        .expect("apply remove_field(category)");
+    let table = tx.commit(client.as_ref()).await.expect("commit evolution");
+    assert!(
+        table.metadata().default_partition_spec().is_unpartitioned(),
+        "fixture: default is unpartitioned after DROP PARTITION FIELD"
+    );
+    assert!(
+        table.metadata().partition_specs_iter().len() > 1,
+        "fixture: multi-spec after evolution (old partitioned + new unpartitioned default)"
+    );
+
+    // Re-register so DF sees the evolved metadata (provider caches per-load schema).
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let _ = ctx.register_catalog("catalog", catalog);
+
+    // Collect pre-evolution data-file (spec_id, partition) for equality assert after DELETE.
+    let mut data_stamps: HashMap<String, (i32, iceberg::spec::Struct)> = HashMap::new();
+    {
+        let snap = table.metadata().current_snapshot().expect("snapshot");
+        let ml = snap
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await?;
+        for mf in ml.entries() {
+            let m = mf.load_manifest(table.file_io()).await?;
+            for entry in m.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                let df = entry.data_file();
+                if df.content_type() == iceberg::spec::DataContentType::Data {
+                    data_stamps.insert(
+                        df.file_path().to_string(),
+                        (df.partition_spec_id(), df.partition().clone()),
+                    );
+                }
+            }
+        }
+    }
+
+    // DELETE half the pre-evolution rows — under BUG-001 the unconditional default-unpartitioned
+    // fast path stamps partition_key=None and the deletes never attach → full resurrection.
+    let batches = ctx
+        .sql("DELETE FROM catalog.bug001_evolved_unpart.items WHERE id IN (1, 3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(deleted, 2, "two rows matched for delete");
+
+    // Live scan: zero resurrection.
+    let live = ctx
+        .sql("SELECT id FROM catalog.bug001_evolved_unpart.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = live
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![2, 4],
+        "ids 1 and 3 must stay deleted (no resurrection under evolved unpartitioned default)"
+    );
+
+    // Manifest-level: every position-delete file must equal some data file's (spec_id, partition).
+    let table_after = client.load_table(&tbl_id).await?;
+    let snap = table_after
+        .metadata()
+        .current_snapshot()
+        .expect("snapshot after delete");
+    let ml = snap
+        .load_manifest_list(table_after.file_io(), table_after.metadata())
+        .await?;
+    let mut pos_del_count = 0usize;
+    for mf in ml.entries() {
+        let m = mf.load_manifest(table_after.file_io()).await?;
+        for entry in m.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let df = entry.data_file();
+            if df.content_type() != iceberg::spec::DataContentType::PositionDeletes {
+                continue;
+            }
+            pos_del_count += 1;
+            let stamp = (df.partition_spec_id(), df.partition().clone());
+            assert!(
+                data_stamps.values().any(|d| d == &stamp),
+                "pos-delete stamp (spec_id={}, partition={:?}) must equal a live data file's stamp; \
+                 data_stamps={data_stamps:?}",
+                stamp.0,
+                stamp.1
+            );
+        }
+    }
+    assert!(
+        pos_del_count >= 1,
+        "at least one position-delete file must have been written"
+    );
+
+    // C1-L-001: INSERT under the new unpartitioned default, then DELETE — stamps must match
+    // the post-DROP data file's (non-zero empty-spec id), not fabricated spec 0.
+    ctx.sql(
+        "INSERT INTO catalog.bug001_evolved_unpart.items VALUES \
+         (10, 'post', 'row-a'), (11, 'post', 'row-b')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let table_mid = client.load_table(&tbl_id).await?;
+    let default_spec_id = table_mid.metadata().default_partition_spec_id();
+    assert!(
+        table_mid
+            .metadata()
+            .default_partition_spec()
+            .is_unpartitioned(),
+        "default still unpartitioned"
+    );
+
+    let batches = ctx
+        .sql("DELETE FROM catalog.bug001_evolved_unpart.items WHERE id = 10")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+
+    let live2 = ctx
+        .sql("SELECT id FROM catalog.bug001_evolved_unpart.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids2: Vec<i32> = live2
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        ids2,
+        vec![2, 4, 11],
+        "id 10 deleted under post-DROP unpartitioned default; 11 survives"
+    );
+
+    // At least one pos-delete must claim the current default_spec_id (empty tuple under that id).
+    let table_final = client.load_table(&tbl_id).await?;
+    let snap_f = table_final
+        .metadata()
+        .current_snapshot()
+        .expect("final snap");
+    let ml_f = snap_f
+        .load_manifest_list(table_final.file_io(), table_final.metadata())
+        .await?;
+    let mut saw_default_spec_delete = false;
+    for mf in ml_f.entries() {
+        let m = mf.load_manifest(table_final.file_io()).await?;
+        for entry in m.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let df = entry.data_file();
+            if df.content_type() == iceberg::spec::DataContentType::PositionDeletes
+                && df.partition_spec_id() == default_spec_id
+            {
+                saw_default_spec_delete = true;
+                assert!(
+                    df.partition().fields().is_empty(),
+                    "post-DROP empty-spec delete must carry empty partition tuple"
+                );
+            }
+        }
+    }
+    assert!(
+        saw_default_spec_delete,
+        "C1-L-001: post-DROP DELETE must stamp pos-deletes with default_spec_id={default_spec_id}, \
+         not fabricated 0"
+    );
+
+    Ok(())
+}
+
+// =================================================================================================
 // NULL three-valued-logic — a predicate evaluating to NULL is NOT a match (the row is neither
 // deleted nor updated). The implementation enforces this with `mask.is_valid(row) && mask.value(row)`
 // in every DML path; these tests make that guard load-bearing (inverting it goes RED here).

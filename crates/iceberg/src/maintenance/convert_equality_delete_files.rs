@@ -109,7 +109,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
@@ -505,11 +505,9 @@ impl ConvertEqualityDeleteFiles {
         // The converted position-delete files keep `file_path`/`pos` bounds FULL (Java
         // `MetricsConfig.forPositionDelete`) so delete-file path pruning stays precise — the default
         // `truncate(16)` would widen the path range.
-        let parquet_builder = ParquetWriterBuilder::new(
-            parquet::file::properties::WriterProperties::builder().build(),
-            config.schema().clone(),
-        )
-        .with_metrics_config(MetricsConfig::for_position_delete());
+        let parquet_builder =
+            ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
+                .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.table.file_io().clone(),
@@ -518,19 +516,13 @@ impl ConvertEqualityDeleteFiles {
         );
 
         // The new pos-delete must live in the SAME partition as the eq-delete it replaces (so it lands
-        // in the same partition+spec bucket and applies to the same data files). An unpartitioned spec
-        // takes no partition key.
-        let partition_key = if spec.is_unpartitioned() {
-            None
-        } else {
-            Some(PartitionKey::new(
-                spec,
-                schema.clone(),
-                eq.data_file.partition().clone(),
-            )?)
-        };
+        // in the same partition+spec bucket and applies to the same data files). Always pass a
+        // PartitionKey (empty/unpartitioned/all-Void included) so we never fabricate spec_id 0
+        // via `build(None)` without `with_partition_spec` (C2-L-001 / C1-L-001 class).
+        let partition_key =
+            PartitionKey::new(spec, schema.clone(), eq.data_file.partition().clone())?;
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
-            .build(partition_key)
+            .build(Some(partition_key))
             .await?;
 
         let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
