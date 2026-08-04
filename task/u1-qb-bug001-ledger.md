@@ -6,8 +6,9 @@
 ## Actor build
 
 ### Leg A (BUG-001)
-- Fast path: `position_delete_unpartitioned_fast_path(spec_count, default_unpartitioned)` =
-  `spec_count == 1 && default_unpartitioned` (Option A).
+- Fast path: `position_delete_unpartitioned_fast_path(spec_count, default_field_count)` =
+  `spec_count == 1 && default_field_count == 0` (Option A, C1-L-002-refined: zero FIELDS, not
+  `is_unpartitioned()` — single-spec all-Void walks for null-tuple arity).
 - Doc comment fixed (unpartitioned *table* ≠ unpartitioned *default*).
 - Pins: unit predicate + mutation twin; e2e `test_delete_mread_after_drop_partition_field_no_resurrection`.
 
