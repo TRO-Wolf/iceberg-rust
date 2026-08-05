@@ -799,7 +799,7 @@ async fn write_data_file(table: &Table, basename: &str, shape: FixtureShape) -> 
 
     let mut props = parquet::file::properties::WriterProperties::builder();
     if let Some(rows_per_group) = shape.max_row_group_rows {
-        props = props.set_max_row_group_size(rows_per_group);
+        props = props.set_max_row_group_row_count(Some(rows_per_group));
     }
     let file_path = format!("{}/data/{}", table.metadata().location(), basename);
     let output = table

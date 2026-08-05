@@ -84,7 +84,7 @@ impl<'a> RefsTable<'a> {
 
         // Sort by ref name for deterministic output (the underlying map is unordered).
         let mut refs: Vec<_> = metadata.refs.iter().collect();
-        refs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        refs.sort_by_key(|(a, _)| *a);
 
         for (ref_name, reference) in refs {
             name.append_value(ref_name);

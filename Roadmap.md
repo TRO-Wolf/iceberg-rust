@@ -196,7 +196,7 @@ every GAP_MATRIX capability status are unchanged.
 > status lives ONLY in the
 > [GAP_MATRIX](docs/parity/GAP_MATRIX.md); this screen is a one-paragraph orientation that links there.
 
-**Base:** upstream `iceberg` 0.9.1 (datafusion 52.2 / arrow 57.3 / parquet 57.3, MSRV 1.92), owned
+**Base:** upstream `iceberg` 0.9.1, dependency family at datafusion 54.1 / arrow 58.4 / parquet 58.4 (MSRV 1.94, bumped 2026-08-05), owned
 fork on `main` since 2026-06-07. No Python layers. Offline lib suite green (**2,593 `#[test]`/`#[tokio::test]`
 in the `iceberg` crate `src/`; ≈3,125 workspace-wide** — measured 2026-06-19);
 Docker suites via `make test`; `sqllogictest` needs `protoc`.
@@ -218,7 +218,7 @@ chain); their **conflict validations are now interop-proven both directions (202
 DELETE-file-rewrite interop slices, not conflict validation; residual evaluation;
 scan-metrics model + emission; views (memory + REST + SQL landed, interop'd I2 — Glue/S3Tables view
 ops are parity-correct-unsupported, NOT a gap — rows R126/R127); `variant` (binary read+write byte-exact
-both sides; shredded-parquet FILE I/O externally blocked by the parquet 57.3 pin); **ORC + Avro
+both sides; shredded-parquet FILE I/O gated behind parquet's opt-in `variant_experimental` feature, not a version floor — see row R88); **ORC + Avro
 DATA-file READ** (landed + Java→Rust interop-proven — rows R118/R119; the WRITE half is the 🟡 residue).
 Per-row status + residue: the matrix.
 
@@ -265,7 +265,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 - **Gates on:** —
 - **Key deliverables:**
   - **Sync** to upstream `iceberg` 0.9.x; bump datafusion / arrow / parquet / object_store / opendal /
-    AWS SDK / MSRV / toolchain to the family 0.9.x targets (≈ datafusion 52 / arrow 57); regenerate
+    AWS SDK / MSRV / toolchain to the family 0.9.x targets (now datafusion 54.1 / arrow 58.4); regenerate
     `Cargo.lock`; `cargo build` + `cargo test` green.
   - **Re-audit** the GAP_MATRIX against the 0.9.x base; strike rows already solved by 0.8 / 0.9.
   - **Delete** `iceberg-spark-python/`, `iceberg-spark-pyspark/`, `bindings/python/` and their CI/workspace
@@ -332,7 +332,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   (incl. shredding), geometry/geography + geospatial predicates, `unknown`.
 - **Where it stands:** `timestamp_ns` ✅ and column default values ✅ landed in the 0.9.1 base;
   `variant` is 🟡 (binary format read+write byte-exact BOTH sides — shredded-parquet FILE I/O is
-  externally blocked by the parquet 57.1 pin, no variant support upstream). `unknown` is ✅ at the
+  gated behind parquet's opt-in `variant_experimental` feature — not a version floor; see row R88). `unknown` is ✅ at the
   metadata level (schema-type entry + V3 gate + metadata-only schema round-trip interop; data-file
   always-null I/O deferred-loud — a no-physical-column type's contract is the metadata round-trip).
   Genuinely ❌: `geometry`/`geography` + geospatial predicates, ORC + Avro DATA files. Per-row status:
@@ -453,7 +453,7 @@ format-sensitive work still leads; well-templated breadth follows.
 | GAP_MATRIX drifts from reality as work lands or Java evolves | One home per fact (statuses ONLY in the matrix); re-audit after every sync and every phase; Phase 7 automates Java-release tracking. |
 | Parity claimed without true 1:1 evidence | Definition of Done requires an interop test (Java↔Rust round-trip) before a row flips to ✅. |
 | Status narratives regrow in this file | The de-triplication rule in [CLAUDE.md](CLAUDE.md): never write a capability's status outside the matrix — link instead. Archived narrative: [task/todo-archive/](task/todo-archive/). |
-| Dependency treadmill: the arrow / parquet / datafusion cadence (a fork-and-own cost) | Named policy (2026-07-01): evaluate each upstream FAMILY bump on a schedule — the parquet 57 pin already blocks variant shredding, and the downstream engine will eventually drag a newer DataFusion (⇒ arrow major) through the core. Budget one sync-spike per family release; record the take/skip decision per crate in `task/todo.md`. |
+| Dependency treadmill: the arrow / parquet / datafusion cadence (a fork-and-own cost) | Named policy (2026-07-01): evaluate each upstream FAMILY bump on a schedule — the downstream engine will eventually drag a newer DataFusion (⇒ arrow major) through the core. First exercise of this policy: the DF 54.1 / arrow 58.4 bump, 2026-08-05. Budget one sync-spike per family release; record the take/skip decision per crate in `task/todo.md`. |
 | Upstream `apache/iceberg-rust` divergence compounds (cherry-pick cost grows superlinearly, worst on the write path) | Scheduled upstream-evaluation cadence: on each upstream minor, take io / catalog / reader fixes, skip write-path changes unless load-bearing — and record a DATED take/skip decision per release. Deciding not to sync is also a decision; leaving it implicit is how the option silently expires. |
 
 ---

@@ -155,7 +155,7 @@ Or the `Makefile` targets: `make check` (fmt + clippy + TOML + unused-deps) and 
 ### Environmental prerequisites (offline vs full)
 
 - The lint gate uses the pinned nightly in [rust-toolchain.toml](../rust-toolchain.toml) (rustup
-  fetches it automatically); downstream only needs MSRV **1.92**.
+  fetches it automatically); downstream only needs MSRV **1.94**.
 - **`protoc`** is required by `crates/sqllogictest` (transitively via `datafusion-substrait`). Without
   it, the core surface still builds/tests via `cargo test --workspace --exclude iceberg-sqllogictest`.
 - **Docker** is required by `make test` (`docker-up`) for the service-bound integration suites

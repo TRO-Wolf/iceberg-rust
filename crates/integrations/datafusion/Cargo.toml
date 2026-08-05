@@ -43,3 +43,10 @@ uuid = { workspace = true }
 expect-test = { workspace = true }
 parquet = { workspace = true }
 tempfile = { workspace = true }
+# `macros` + `rt-multi-thread` are needed only by the `#[tokio::main]` doctest in
+# `table/table_provider_factory.rs`. Kept out of `[dependencies]` so feature unification does not
+# force the multi-threaded runtime onto downstream consumers; library code uses
+# `runtime::Builder::new_current_thread` (`schema.rs`). Verified with
+# `cargo tree -e features,normal`: `rt-multi-thread` is absent from the normal graph. (`macros`
+# stays on there regardless — datafusion itself enables it — so only the runtime half is at stake.)
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

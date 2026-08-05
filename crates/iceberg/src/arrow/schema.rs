@@ -613,15 +613,18 @@ impl SchemaVisitor for ToArrowSchemaConverter {
     /// Java parity: `ArrowSchemaUtil`'s converter does not override the visitor default, so Java
     /// throws `UnsupportedOperationException("Unsupported type: variant")` (the 1.10.0
     /// `TypeUtil.SchemaVisitor.variant` default) on the same conversion. This override exists
-    /// only to NAME the Rust-side limitation: the pinned arrow-rs 57.1 / parquet 57.1 crates
-    /// expose no variant extension type this fork could emit without a dependency change. A
+    /// only to NAME the Rust-side limitation: `arrow-schema` ships no canonical variant extension
+    /// type, and the one `parquet` uses comes from `parquet-variant-compute`, behind its opt-in
+    /// `variant_experimental` feature — so there is nothing this fork could emit without a
+    /// dependency change. This is a feature-gate boundary, not a version floor (see GAP_MATRIX
+    /// row R88); the DF-54 / arrow-58 bump did not move it. A
     /// silent fallback (e.g. binary or a metadata/value struct) would let a scan or writer treat
     /// variant bytes as a plain column and corrupt the on-disk contract.
     fn variant(&mut self) -> crate::Result<ArrowSchemaOrFieldOrType> {
         Err(Error::new(
             ErrorKind::FeatureUnsupported,
-            "Unsupported type: variant (Iceberg-to-Arrow conversion: the pinned arrow-rs 57.1 \
-             has no variant extension type; file-level variant I/O is deferred)",
+            "Unsupported type: variant (Iceberg-to-Arrow conversion: arrow-rs exposes \
+             no variant extension type; file-level variant I/O is deferred)",
         ))
     }
 
@@ -1985,7 +1988,7 @@ mod tests {
         assert_eq!(converted_arrow_schema, arrow_schema);
     }
 
-    // RISK: variant has NO Arrow representation under the pinned arrow-rs 57.1 — the conversion
+    // RISK: variant has NO Arrow representation under the pinned arrow-rs — the conversion
     // must ERROR LOUDLY (Java parity: `ArrowSchemaUtil` inherits the 1.10.0
     // `TypeUtil.SchemaVisitor.variant` default throw "Unsupported type: variant"), never fall
     // back to binary/struct. A silent fallback would let scans/writes treat raw variant bytes as
@@ -2003,8 +2006,8 @@ mod tests {
             error.message()
         );
         assert!(
-            error.message().contains("arrow-rs 57.1"),
-            "message must NAME the pinned-crate limitation, got: {}",
+            error.message().contains("no variant extension type"),
+            "message must NAME the missing-extension-type limitation, got: {}",
             error.message()
         );
 
