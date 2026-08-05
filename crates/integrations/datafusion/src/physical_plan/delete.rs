@@ -49,7 +49,10 @@
 //! per affected FILE) plus a row counter; pass 2 RE-SCANS the same snapshot and feeds each batch's
 //! rewrite rows straight into [`StreamingDataFileWriter`]. Peak is O(#affected files) + one batch +
 //! the writer's own buffers. **The named cost is a second full read of the live data** — the accepted
-//! price of bounded memory. Restricting pass 2 to the affected files is not possible through the
+//! price of bounded memory, and one extra `ScanReport` per statement for catalogs with a metrics
+//! reporter installed. (Two shapes skip pass 2 outright: a zero-match DML, and a predicate-less
+//! `DELETE FROM t`, whose pass 2 is provably empty because every row is deleted.)
+//! Restricting pass 2 to the affected files is not possible through the
 //! public scan API today (`_file` is a reserved metadata column, not a pushdown-able predicate term);
 //! that is a follow-up. Both passes are snapshot-consistent by construction: `Table` is a frozen
 //! handle (`metadata` is a plain `TableMetadataRef` with no interior mutability, and the only mutator
@@ -644,6 +647,12 @@ async fn copy_on_write_delete(
         }
     }
 
+    // Pass 1's stream is EXHAUSTED but its scan state (plan context, task state, channels) would live
+    // to the end of the function body if it were merely shadowed by pass 2's binding — Rust drops a
+    // shadowed value at scope end, not at the shadowing point. Release it explicitly so the peak really
+    // is "one scan + one batch", as the module note claims.
+    drop(stream);
+
     // 2. No deleted rows → no-op (avoid a pointless snapshot). This now also skips the SECOND scan
     //    entirely — a zero-match DELETE reads the table exactly once.
     if deleted == 0 {
@@ -658,39 +667,65 @@ async fn copy_on_write_delete(
     //
     //    The affected set is complete before any survivor is emitted, which is why COW needs two
     //    passes at all (a file becomes affected on its LAST row just as easily as its first).
-    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
-    let mut data_writer = StreamingDataFileWriter::try_new(table)?;
+    //
+    //    `DELETE FROM t` (no predicate) is short-circuited: every row is deleted, so pass 2's keep-mask
+    //    is all-false for every batch and the whole table would be re-read to produce nothing. The
+    //    result is EXACT, not an approximation — with `predicate == None`, `match_mask` is all-true by
+    //    construction, so `!deleted && affected.contains(..)` cannot be true for any row.
+    let new_files = if predicate.is_none() {
+        Vec::new()
+    } else {
+        let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
+        // The writer is built on the FIRST batch that actually has survivors, not up front. That keeps
+        // this path byte-identical to the pre-H7-S2 form, where `write_partitioned_data_files` returned
+        // early on an empty survivor slice and never ran `DefaultLocationGenerator::new` /
+        // `PartitionValueCalculator::try_new` — so a DELETE that fully empties every affected file
+        // still cannot fail in a constructor it never needed. (COW UPDATE has no such case: an affected
+        // file always yields rewrite rows, so its writer was always constructed.)
+        let mut data_writer: Option<StreamingDataFileWriter> = None;
 
-    while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
-        let num_rows = batch.num_rows();
-        let file_col = batch
-            .column_by_name(RESERVED_COL_NAME_FILE)
-            .ok_or_else(|| {
-                DataFusionError::Internal("delete scan missing _file column".to_string())
-            })?;
-        let table_batch = table_column_batch(&batch, table_schema)?;
-        // Re-evaluated (not cached from pass 1): pass 2 is a fresh scan, so no per-batch state from
-        // pass 1 could be aligned to it. Same row-wise function, same rows ⇒ same mask.
-        let delete_mask = match_mask(&predicate, &table_batch)?;
+        while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
+            let num_rows = batch.num_rows();
+            let file_col = batch
+                .column_by_name(RESERVED_COL_NAME_FILE)
+                .ok_or_else(|| {
+                    DataFusionError::Internal("delete scan missing _file column".to_string())
+                })?;
+            let table_batch = table_column_batch(&batch, table_schema)?;
+            // Re-evaluated (not cached from pass 1): pass 2 is a fresh scan, so no per-batch state from
+            // pass 1 could be aligned to it. Same row-wise function, same rows ⇒ same mask.
+            let delete_mask = match_mask(&predicate, &table_batch)?;
 
-        let paths = decode_file_paths_batch(file_col)?;
-        let keep: BooleanArray = (0..num_rows)
-            .map(|row| !delete_mask.value(row) && affected.contains(paths[row]))
-            .collect();
-        if keep.true_count() == 0 {
-            // Nothing to rewrite from this batch — leave the writer lazily uncreated.
-            continue;
+            let paths = decode_file_paths_batch(file_col)?;
+            let keep: BooleanArray = (0..num_rows)
+                .map(|row| !delete_mask.value(row) && affected.contains(paths[row]))
+                .collect();
+            if keep.true_count() == 0 {
+                // Nothing to rewrite from this batch — leave the writer uncreated.
+                continue;
+            }
+
+            let surviving = filter_record_batch(&table_batch, &keep)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            if data_writer.is_none() {
+                data_writer = Some(StreamingDataFileWriter::try_new(table)?);
+            }
+            let Some(writer) = data_writer.as_mut() else {
+                return Err(DataFusionError::Internal(
+                    "copy-on-write DELETE writer was not initialized".to_string(),
+                ));
+            };
+            writer.write_batch(surviving).await?;
         }
 
-        let surviving = filter_record_batch(&table_batch, &keep)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        data_writer.write_batch(surviving).await?;
-    }
-
-    // 4. Close the writer. When there were no survivors to rewrite (e.g. every affected file was fully
-    //    deleted) the `TaskWriter` was never created and this yields an empty Vec — no empty data file
-    //    is committed, matching the previous buffering form's `batches.is_empty()` contract.
-    let new_files = data_writer.finish().await?;
+        // 4. Close the writer. When there were no survivors to rewrite (e.g. every affected file was
+        //    fully deleted) no writer was ever built and this yields an empty Vec — no empty data file
+        //    is committed, matching the previous buffering form's `batches.is_empty()` contract.
+        match data_writer {
+            Some(writer) => writer.finish().await?,
+            None => Vec::new(),
+        }
+    };
 
     // 5. Commit: delete the affected source files, add the rewritten files. The removals carry FULL
     //    `DataFile` metadata (`delete_data_files`, resolved from the scanned snapshot's manifests) so
@@ -1737,6 +1772,10 @@ async fn copy_on_write_update(
         }
     }
 
+    // Release pass 1's exhausted scan explicitly — a shadowed binding would otherwise keep its state
+    // alive for all of pass 2 (see the same note in `copy_on_write_delete`).
+    drop(stream);
+
     // 2. No updated rows → no-op (avoid a pointless rewrite of unchanged data). Also skips the second
     //    scan entirely.
     if updated == 0 {
@@ -1751,6 +1790,9 @@ async fn copy_on_write_update(
     //    Rows from unaffected files are NOT included — their source files are untouched. Each rewritten
     //    batch goes straight to the writer and is dropped; nothing accumulates.
     let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
+    // Eager construction is behaviour-preserving here (unlike the DELETE path): `updated > 0` means at
+    // least one file is affected, and every row of an affected file is rewritten, so pass 2 always
+    // feeds the writer at least one batch — the pre-H7-S2 form always constructed it too.
     let mut data_writer = StreamingDataFileWriter::try_new(table)?;
 
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {

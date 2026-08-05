@@ -183,13 +183,22 @@ const PAYLOAD_LEN: usize = 100;
 /// buffered path.
 const ROW_BYTES_FLOOR: usize = 4 + PAYLOAD_LEN + 4;
 
-fn temp_path() -> String {
-    let temp_dir = TempDir::new().expect("create temp dir");
-    temp_dir
+/// A temp directory and its path, with the GUARD RETURNED so the caller can keep it alive and let it
+/// clean up.
+///
+/// Deliberately NOT the `temp_path()` idiom used elsewhere in this crate's tests (which drops the
+/// guard immediately and leaks the recreated directory): this binary writes ~490 MB of Parquet per
+/// run across seven fixtures, so leaking would be a per-invocation, permanent cost. The guards travel
+/// out of [`setup`] and are dropped AFTER the measured region closes, so the recursive delete's own
+/// allocations cannot land in the measurement.
+fn temp_dir() -> (String, TempDir) {
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir
         .path()
         .to_str()
         .expect("temp dir path is valid UTF-8")
-        .to_string()
+        .to_string();
+    (path, dir)
 }
 
 /// Rows per data file — **held CONSTANT across both scales**, so the two runs differ only in how
@@ -216,14 +225,22 @@ fn files(rows: usize) -> usize {
 /// `merge_on_read` selects the table's row-level write mode: `false` (empty properties) is
 /// copy-on-write, the path under test; `true` builds the merge-on-read baseline fixture.
 ///
-/// Returns the context plus the number of live data files, which the caller pins — the memory
-/// margin depends on the fixture really being multi-file, so it must be verified, not assumed.
-async fn setup(ns: &str, rows: usize, merge_on_read: bool) -> (SessionContext, usize) {
+/// Returns the context, the number of live data files (which the caller pins — the memory margin
+/// depends on the fixture really being multi-file, so it must be verified, not assumed), and the
+/// `TempDir` guards, which the caller keeps alive for the DML and drops afterwards.
+async fn setup(
+    ns: &str,
+    rows: usize,
+    merge_on_read: bool,
+) -> (SessionContext, usize, Vec<TempDir>) {
+    let (warehouse_path, warehouse_dir) = temp_dir();
+    let (table_path, table_dir) = temp_dir();
+
     let iceberg_catalog = MemoryCatalogBuilder::default()
         .with_storage_factory(Arc::new(LocalFsStorageFactory))
         .load(
             "memory",
-            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), temp_path())]),
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path)]),
         )
         .await
         .expect("build memory catalog");
@@ -245,7 +262,7 @@ async fn setup(ns: &str, rows: usize, merge_on_read: bool) -> (SessionContext, u
 
     let creation = TableCreation::builder()
         .name("t".to_string())
-        .location(temp_path())
+        .location(table_path)
         .schema(schema)
         // Empty properties ⇒ copy-on-write for both DELETE and UPDATE. The CONTROL table instead
         // asks for merge-on-read, which streams (H7-S1) and is untouched by this unit.
@@ -347,7 +364,7 @@ async fn setup(ns: &str, rows: usize, merge_on_read: bool) -> (SessionContext, u
         data_files += manifest.entries().iter().filter(|e| e.is_alive()).count();
     }
 
-    (ctx, data_files)
+    (ctx, data_files, vec![warehouse_dir, table_dir])
 }
 
 /// One measured run.
@@ -367,7 +384,7 @@ async fn measure_dml(ns: &str, rows: usize, sql: &str) -> Measured {
 
 /// As [`measure_dml`], but selects the table's row-level write mode.
 async fn measure_dml_mode(ns: &str, rows: usize, sql: &str, merge_on_read: bool) -> Measured {
-    let (ctx, files_before) = setup(ns, rows, merge_on_read).await;
+    let (ctx, files_before, temp_dirs) = setup(ns, rows, merge_on_read).await;
 
     let base = begin_measure();
     let batches = ctx.sql(sql).await.expect("plan dml").collect().await;
@@ -382,6 +399,12 @@ async fn measure_dml_mode(ns: &str, rows: usize, sql: &str, merge_on_read: bool)
         .downcast_ref::<UInt64Array>()
         .expect("dml count column is UInt64")
         .value(0);
+
+    // Fixture teardown, OUTSIDE the measured region (`end_measure` has already read the high-water
+    // mark, so the recursive delete's allocations cannot affect the verdict). Dropping the context
+    // first releases the catalog's handles on the files before the directories go.
+    drop(ctx);
+    drop(temp_dirs);
 
     Measured {
         peak,

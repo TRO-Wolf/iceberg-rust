@@ -265,8 +265,54 @@ new `cow_memory_bound` binary's 1.
    the double-read cost as well as the second scan's share of seed 3.
 5. **`MemoryReservation` / DataFusion `MemoryPool` integration** for the DML paths — a real idea, named
    in scope §6.1 as production scope creep, still open.
-6. **COW has no NULL-into-required-column UPDATE test.** Worth adding a copy-on-write variant of
-   `test_update_null_into_required_is_rejected`, which would also pin the orphan-staged-file behaviour
-   named in §6.
-7. **This memory harness is reusable** — H7-P1 and the QB writer-bounds unit both make streaming claims
+6. ~~**COW has no NULL-into-required-column UPDATE test.**~~ **CLOSED in remediation (§8, R4)** —
+   `test_update_cow_null_into_required_is_rejected` added.
+7. **COW 3VL had no non-vacuous guard test** — CLOSED in remediation (§8, R3): the Falsifier proved the
+   `=`-only COW tests cannot falsify `match_mask`'s `is_valid` guard.
+8. **This memory harness is reusable** — H7-P1 and the QB writer-bounds unit both make streaming claims
    with no way to evidence them today.
+
+## 8. Remediation — 2026-08-05 (two independent Critics + Falsifier)
+
+Both Critics **CONVERGED with zero blocking findings**; the Falsifier applied 10 mutations, reproduced
+the headline M1 number independently (29,528,102 B vs the ledger's 29,526,932 B), **closed the M2 gap**
+(the UPDATE arm of `assert_marginal_bound` reds at 29,527,334 B when B1 is reinstated in
+`copy_on_write_update`, so both arms are now falsifiable and cleanly attributed), and held the negative
+control (removing the explicit `.snapshot_id()` pin left 268/268 green — the "documented no-op, not a
+bug fix" framing is honest). One mutation exposed a real coverage gap (R3 below).
+
+### Dispositions
+
+| # | Finding (source) | Disposition |
+|---|---|---|
+| **R1** | Pass 1's exhausted scan stream is *shadowed*, not dropped, so it lives through pass 2 (correctness Critic) | **FIXED** — explicit `drop(stream)` after pass 1 in BOTH `copy_on_write_delete` and `copy_on_write_update`, with a comment naming the shadowing rule. The module doc's "peak is O(#affected files) + one batch" is now literally true. |
+| **R2** | The memory binary leaks ~490 MB of `/tmp` per run (correctness Critic) | **FIXED** — `temp_path()` (drop-the-guard idiom) replaced by `temp_dir() -> (String, TempDir)`; `setup` returns the guards, `measure_dml_mode` drops the context and then the guards **after** `end_measure`, so teardown allocations cannot enter the measurement. Verified: `du -sm /tmp` unchanged (8431 MB → 8431 MB) across a full run, and the assertion stays green. |
+| **R3** | The COW 3VL tests are `=`-only and cannot falsify `match_mask`'s `is_valid` guard — **Falsifier M-B went RED only via a merge-on-read test** (Critic + Falsifier finding 1) | **FIXED — mandatory coverage gap.** Added `test_delete_cow_null_neq_predicate_isvalid_guard` and `test_update_cow_null_neq_predicate_isvalid_guard` (`<>` over a NULL operand ⇒ validity=false, value=TRUE, so the guard is load-bearing). **Mutation-proved:** dropping `is_valid` from `match_mask` now reds **3** tests — both new COW tests plus the pre-existing MoR one — where before it red only the MoR one. |
+| **R4** | Mid-pass-2 failure orphans staged Parquet files; the behaviour is safe but COW had no NULL-into-required test, so nothing pinned either the old or the new timing (both Critics; seed 6) | **FIXED (scheduled, not seeded)** — `test_update_cow_null_into_required_is_rejected` added: the statement must error AND the table must be byte-unchanged (`[1, 2]` intact). The staged-file *timing* change is real and remains disclosed in §6; what the test pins is the invariant that survived it (error + no commit + no partial rewrite). |
+| **R5** | `StreamingDataFileWriter::try_new` moved before the pass-2 loop — a new error surface on a COW DML that fully empties every affected file (correctness Critic) | **FIXED by restoring the old behaviour** rather than by disclosure. DELETE's pass-2 writer is now built lazily on the first batch that actually has survivors, exactly as the deleted `write_partitioned_data_files` did (it returned `Ok(vec![])` before touching `DefaultLocationGenerator::new` / `PartitionValueCalculator::try_new`). UPDATE keeps eager construction and the reason is now in a code comment: `updated > 0` ⇒ some file is affected ⇒ every row of that file is rewritten ⇒ the writer is always fed, so its construction was always reached before this change too. |
+| **R6** | `DELETE FROM t` (no predicate) pays a full second scan that provably yields nothing (correctness Critic) | **FIXED** — `predicate.is_none()` short-circuits pass 2 entirely (`new_files = vec![]`). Exact, not heuristic: with no predicate `match_mask` is all-true by construction, so `!deleted && affected.contains(..)` is false for every row. **Mutation-proved non-vacuous:** widening the condition to `true` reds **6** tests (`test_delete_from_copy_on_write`, `..._unpartitioned_exact_filter_preserved`, `..._non_identity_transform_truncate`, both COW-DELETE 3VL tests, `test_s5_cow_delete_snapshot_allows_concurrent_append`). This also removes the single most common shape from R5's residue. |
+| **R7** | COW DML now emits two `ScanReport`s per statement for catalogs with a metrics reporter (evidence Critic) | **FIXED (disclosure)** — named in the module-level *Memory* note beside the double read, and carried into the PR body. No reporter is installed anywhere in `crates/integrations/datafusion`, so no test moves. |
+| **R8** | UPDATE newly inherits the volatile-predicate divergence (correctness Critic) | **DECLINED — already disclosed, no code change.** §6 states it plainly. Bounded harm: no row is lost (a row pass 2 judges non-matching is still rewritten with its original values); only the reported count can disagree. Removing it would require re-introducing a cross-pass mask cache, which is exactly what this unit retired as unsound across independent batch boundaries. |
+| **R9** | The memory assertion has only ever run on this 64-core host; the baseline subtraction cancels 99.89% of the measured quantity (both Critics) | **DECLINED as a code change; ACCEPTED as a claim limit.** The evidence Critic independently measured the baseline term collapsing to 0.40 MB under `taskset -c 0-3`, i.e. discrimination *improves* on small hosts; the FALSE-RED direction remains unmeasured off this host. Seed 3 already names it. The PR body claims only what was measured and flags the first CI run as the real proof. Not `#[ignore]`-ing it stays correct per scope §7.1. |
+| **R10** | Falsifier M-D (removing the `keep.true_count() == 0` early-continue) stayed **GREEN** | **DECLINED — not a coverage gap, and the Falsifier agrees.** It chased the green rather than accepting it: a stacked probe proved zero-row batches genuinely reach the writer under M-D (6 tests hit it), yet the manifest-level assertions still held — the `TaskWriter` stack already swallows zero-row batches and commits no data file. So §3's zero-empty-file claim is true and independently pinned; the guard is an optimization with no distinct behavioural signature. Adding a test for it would pin an implementation detail, not a contract. |
+| **R11** | `task/todo.md` still lists H7-S2 as pending (evidence Critic) | **DECLINED in-unit, by repo convention** — the queue file is reconciled at merge, and editing it here would put the unit's status in two places (CLAUDE.md's one-home-per-fact rule). Flagged for the merge commit. |
+
+### Gate after remediation
+
+| Command | Result |
+|---|---|
+| `typos .` | **pass** (exit 0, clean tree) |
+| `cargo fmt --all -- --check` | **pass** |
+| `cargo clippy --all-targets --workspace -- -D warnings` | **pass**, zero warnings |
+| `cargo test -p iceberg-datafusion --all-targets` | **271 passed, 0 failed** (176 lib + 1 `cow_memory_bound` + 76 integration + 2 interop + 4 lazy + 12 partitioned_insert_select) — 268 → 271, exactly the three tests added by R3/R4 |
+| `cargo test -p iceberg --lib` | **3137 passed, 0 failed, 1 ignored** |
+| `cargo check -p iceberg-datafusion --no-default-features` | **pass** |
+
+Memory assertion after remediation (same host, unchanged verdict, `/tmp` no longer growing):
+
+```text
+added=41,472,000 B, threshold=10,368,000 B
+BASELINE (merge-on-read, zero match): peak(N)=30,172,720 peak(4N)=44,219,858 delta=14,047,138
+DELETE: peak(N)=30,403,418 peak(4N)=44,457,037 delta=14,053,619 excess=6,481
+UPDATE: peak(N)=30,437,808 peak(4N)=44,492,173 delta=14,054,365 excess=7,227
+```
