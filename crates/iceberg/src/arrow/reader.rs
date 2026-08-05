@@ -3136,28 +3136,25 @@ message schema {
         table_location: String,
         reader: ArrowReader,
     ) -> Vec<Option<String>> {
-        let tasks = Box::pin(futures::stream::iter(
-            vec![Ok(FileScanTask {
-                file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
-                    .unwrap()
-                    .len(),
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: Arc::from(format!("{table_location}/1.parquet")),
-                data_file_format: DataFileFormat::Parquet,
-                schema: schema.clone(),
-                project_field_ids: Arc::from(vec![1]),
-                predicate: Some(Arc::new(predicate.bind(schema, true).unwrap())),
-                deletes: Arc::from(vec![]),
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                case_sensitive: false,
-                split_offsets: None,
-            })]
-            .into_iter(),
-        )) as FileScanTaskStream;
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(FileScanTask {
+            file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
+                .unwrap()
+                .len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: Arc::from(format!("{table_location}/1.parquet")),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: Arc::from(vec![1]),
+            predicate: Some(Arc::new(predicate.bind(schema, true).unwrap())),
+            deletes: Arc::from(vec![]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        })])) as FileScanTaskStream;
 
         let result = reader
             .read(tasks)
@@ -3436,7 +3433,7 @@ message schema {
 
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
 
         let file = File::create(&file_path).unwrap();
@@ -3830,7 +3827,7 @@ message schema {
             .expect("id batch");
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(max_row_group_size)
+            .set_max_row_group_row_count(Some(max_row_group_size))
             .build();
         let file = File::create(path).expect("create data");
         let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).expect("writer");
@@ -4690,7 +4687,7 @@ message schema {
         // Force each batch into its own row group
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
 
         let file = File::create(&data_file_path).unwrap();
@@ -4892,7 +4889,7 @@ message schema {
         // Force each batch into its own row group
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
 
         let file = File::create(&data_file_path).unwrap();
@@ -5122,7 +5119,7 @@ message schema {
         // Force each batch into its own row group
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(100)
+            .set_max_row_group_row_count(Some(100))
             .build();
 
         let file = File::create(&data_file_path).unwrap();
@@ -5579,7 +5576,7 @@ message schema {
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .set_write_batch_size(2)
-            .set_max_row_group_size(2)
+            .set_max_row_group_row_count(Some(2))
             .build();
 
         let file = File::create(format!("{table_location}/1.parquet")).unwrap();
@@ -7402,8 +7399,7 @@ mod avro_scan_tests {
     /// Drive a one-task scan and collect the resulting batches.
     async fn run_scan(file_io: FileIO, task: FileScanTask) -> Vec<RecordBatch> {
         let reader = ArrowReaderBuilder::new(file_io).build();
-        let tasks =
-            Box::pin(futures::stream::iter(vec![Ok(task)].into_iter())) as FileScanTaskStream;
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
         reader
             .read(tasks)
             .expect("build scan stream")
@@ -8054,8 +8050,7 @@ mod parquet_eq_keyset_mor_tests {
 
     async fn run_scan(task: FileScanTask) -> Vec<RecordBatch> {
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
-        let tasks =
-            Box::pin(futures::stream::iter(vec![Ok(task)].into_iter())) as FileScanTaskStream;
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
         reader
             .read(tasks)
             .expect("build scan stream")

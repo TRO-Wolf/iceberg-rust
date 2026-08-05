@@ -28,7 +28,6 @@
 pub mod metadata_table;
 pub mod table_provider_factory;
 
-use std::any::Any;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -169,10 +168,6 @@ impl IcebergTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -450,10 +445,6 @@ impl IcebergStaticTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergStaticTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -797,7 +788,7 @@ mod tests {
             .await
             .expect("physical");
         fn find_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergTableScan> {
-            if let Some(s) = plan.as_any().downcast_ref::<IcebergTableScan>() {
+            if let Some(s) = plan.downcast_ref::<IcebergTableScan>() {
                 return Some(s);
             }
             for c in plan.children() {
@@ -917,7 +908,7 @@ mod tests {
             .expect("limit sql");
         let plan = df.create_physical_plan().await.expect("physical plan");
         fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergTableScan> {
-            if let Some(s) = plan.as_any().downcast_ref::<IcebergTableScan>() {
+            if let Some(s) = plan.downcast_ref::<IcebergTableScan>() {
                 return Some(s);
             }
             for c in plan.children() {
@@ -1191,7 +1182,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
@@ -1222,7 +1212,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
@@ -2459,7 +2448,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 

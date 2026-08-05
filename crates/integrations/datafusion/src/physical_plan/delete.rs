@@ -71,7 +71,6 @@
 //!
 //! The plan emits a single `UInt64` `count` row (rows affected), per DataFusion's DML contract.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -202,7 +201,7 @@ pub(crate) struct IcebergDeleteExec {
     /// bound to.
     table_schema: SchemaRef,
     count_schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl IcebergDeleteExec {
@@ -228,13 +227,13 @@ impl IcebergDeleteExec {
         }
     }
 
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
-        PlanProperties::new(
+    fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        )
+        ))
     }
 
     fn make_count_schema() -> SchemaRef {
@@ -283,11 +282,7 @@ impl ExecutionPlan for IcebergDeleteExec {
         "IcebergDeleteExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -1386,7 +1381,7 @@ pub(crate) struct IcebergUpdateExec {
     isolation: IsolationLevel,
     table_schema: SchemaRef,
     count_schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl IcebergUpdateExec {
@@ -1442,11 +1437,7 @@ impl ExecutionPlan for IcebergUpdateExec {
         "IcebergUpdateExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

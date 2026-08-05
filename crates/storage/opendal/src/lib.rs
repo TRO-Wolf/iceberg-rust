@@ -843,7 +843,7 @@ impl Storage for OpenDalStorage {
         .await?;
 
         let mut files = Vec::with_capacity(locations.len());
-        for (location, meta) in locations.into_iter().zip(ready_meta.into_iter()) {
+        for (location, meta) in locations.into_iter().zip(ready_meta) {
             let (size, created_at_millis) = meta.ok_or_else(|| {
                 Error::new(
                     ErrorKind::Unexpected,

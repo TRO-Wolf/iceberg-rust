@@ -36,7 +36,7 @@ datafusion = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
 parquet = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }
 
 [dev-dependencies]

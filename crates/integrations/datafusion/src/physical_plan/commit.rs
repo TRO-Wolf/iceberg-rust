@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -92,7 +91,7 @@ pub(crate) struct IcebergCommitExec {
     /// [`OPERATION_ID_PROP`].
     insert_op: InsertOp,
     count_schema: ArrowSchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl IcebergCommitExec {
@@ -119,13 +118,13 @@ impl IcebergCommitExec {
     }
 
     // Compute the plan properties for this execution plan
-    fn compute_properties(schema: ArrowSchemaRef) -> PlanProperties {
-        PlanProperties::new(
+    fn compute_properties(schema: ArrowSchemaRef) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        )
+        ))
     }
 
     // Create a record batch with just the count of rows written
@@ -176,11 +175,7 @@ impl ExecutionPlan for IcebergCommitExec {
         "IcebergCommitExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -415,7 +410,7 @@ mod tests {
     struct MockWriteExec {
         schema: Arc<ArrowSchema>,
         data_files_json: Vec<String>,
-        plan_properties: PlanProperties,
+        plan_properties: Arc<PlanProperties>,
     }
 
     impl MockWriteExec {
@@ -426,12 +421,12 @@ mod tests {
                 false,
             )]));
 
-            let plan_properties = PlanProperties::new(
+            let plan_properties = Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema.clone()),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            );
+            ));
 
             Self {
                 schema,
@@ -446,15 +441,11 @@ mod tests {
             "MockWriteExec"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> Arc<ArrowSchema> {
             self.schema.clone()
         }
 
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.plan_properties
         }
 
