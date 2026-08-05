@@ -68,9 +68,32 @@ Unit 3. Mode A per-unit PRs; SEPMO v2.3 duties. Context at signing: nightly inte
       merges; RoadMapSync warning to RePark BEFORE their next repin.
 - [ ] **QC — toHumanString parity** (D8-approved, format-visible; FIXED/BINARY hex→base64 +
       Unknown taxonomy + identity(float/double)): alongside Unit 3; format-stability attestation.
-- [ ] **QB — delete-writer file_path bounds** (fork file-scoped deletes must self-identify;
+- [x] **QB — delete-writer file_path bounds** (fork file-scoped deletes must self-identify;
       parquet-rs 64-byte stat truncation; investigate-first, STOP on any Cargo.toml need).
+      **MERGED #184 (`7e26c2a0`) 2026-08-03**, content-verified R4. Landed with BUG-001 (the
+      evolved-spec partition stamp) as one PR — both legs of position-delete attachment were
+      broken simultaneously and each masked the other. No Cargo.toml need materialised
+      (`set_statistics_truncate_length` was already on the pinned parquet). R113 stays 🟡 (owes
+      the Java-read interop leg on the evolved-DROP shape); R117 note added.
 - [ ] **H7-S2 → H7-P1** (re-scope at signing; P1's footgun pre-condition unchanged).
+
+**Queue state 2026-08-05.** Since signing, the line has also absorbed: QD/QE (#178/#179, the two
+RePark filings — manifest schema tolerance + s3tables replace), the ledger archive (#177), interop
+weekly cadence (#180), perf waves A–E (#181), the 07-31 slate (#182), the FK1–FK5 MoR perf campaign
+(#183), the V0 DF 52→54 churn map (#185), and the **DF 54.1 / arrow 58.4 family bump re-cut
+(#187)** — which moved MSRV 1.92 → 1.94 and toolchain to nightly-2026-03-05.
+
+**Remaining in signed order: Unit 3 (breaking) + QC alongside → H7-S2 → H7-P1.**
+
+Two things now owed that were not at signing:
+
+1. **RoadMapSync comms for MSRV 1.92 → 1.94 and the DF/arrow/parquet floors** (#187). Downstream-
+   visible; RePark must see this before its next repin. Unit 3's own RoadMapSync warning
+   (`PartitionKey::new -> Result` + `CurrentFileStatus`) should go out in the same message.
+2. **RePark is still pinned at `b009ac15`** — the tip of the superseded pre-recut df54 branch,
+   which predates BUG-001 (#184) and the FK campaign (#183). That branch was deleted 2026-08-05;
+   the pinned commit is preserved by tag `archive/df54-family-bump-b009ac15` so the pin stays
+   reachable. **Retire that tag once RePark repins to main.** Repin target: `3f63a6c7` (#187).
 
 ## ACTIVE (2026-07-01): Engine-first closeout — re-ranked open queue
 

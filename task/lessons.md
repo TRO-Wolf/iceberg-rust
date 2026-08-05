@@ -744,3 +744,69 @@ per-unit gates.
   form; Rust uses the `//` form — copy from any sibling file, never hand-vary the text. New
   `task/` ledgers and `dev/` scripts are files too; the checker exempts only what
   `.licenserc.yaml` ignores.
+
+### 2026-08-05 — A stale branch that duplicates already-merged work wants a RE-CUT, not a conflict resolution; and "main is a superset" must be proven by hunk accounting, never by name-matching
+
+`chore/df54-family-bump` (18 commits off #181) showed 7 conflicts against main. Six of the seven
+were a stale duplicate colliding with its own merged descendant: 9 of its 18 commits were the
+WG0/G1 `plan_tasks` scan work that had **already landed on main via #182**, and 6 more were its own
+ledger commits. `partition_work.rs` looked like a scary add/add; its entire diff was 11 lines of
+FK2.1 `Arc` sharing.
+
+- **DO read the conflict COUNT as a symptom and check provenance first.** Before resolving
+  anything, ask whether the branch's commits are already on main by another route
+  (`git log --oneline BRANCH ^main` next to `git log --oneline main ^BRANCH`, then grep main for
+  the branch's headline symbols). Cherry-picking the 3 genuine commits onto current main took
+  7 conflicts → 1, and that one had no semantic payload. Resolving in place would have meant
+  reviewing 15 commits of code already merged, on a stale base, and would have kept the branch
+  from inheriting #182–#184.
+- **DON'T offer a `fn`-name subset as proof that nothing was lost.** It is blind to changed
+  function BODIES, removed tests, consts, statics, struct fields, match arms, and to every file
+  that did not conflict. The real proof is directional and hunk-level: take the dropped commits'
+  cumulative tree change, diff it FORWARD into the merge that superseded them, and account for
+  every removed line in-hunk. Here that was exactly 13 lines, each explained (a ctor became
+  fallible, a fn was split and expanded, 5 display lines deliberately superseded).
+- **DO preserve a consumer's pinned commit before deleting its branch.** RePark pinned
+  `b009ac15` — the superseded branch's tip. Deleting local + remote refs would have made the
+  pinned commit unreachable and GC-eligible. Tag it (`archive/<branch>-<sha>`) and push the tag
+  BEFORE the branch delete; retire the tag when the consumer repins.
+
+### 2026-08-05 — When a dependency bump changes a golden EXPLAIN, trace the optimizer rule before re-baselining — a fixture rewrite is how a real regression gets papered over
+
+The DF 52→54 bump dropped `CooperativeExec` from 4 sqllogictest schedules (10 plan blocks). The
+easy move — accept the new output — would have been indistinguishable from silently losing
+cooperative yielding on the scan leaf.
+
+- **DO read the rule's source and prove the property still holds by a DIFFERENT mechanism.**
+  DF54's `EnsureCooperative` (`ensure_coop.rs:70-119`) wraps a leaf only when it is not already
+  cooperative **and** `!is_under_cooperative_context`; wrapping is the FALLBACK, so a leaf with no
+  cooperative ancestor is still wrapped. `IcebergTableScan` stays `NonCooperative` and sits under
+  `RepartitionExec`, so budget is consumed at the repartition boundary. Property intact — but only
+  a source read shows that.
+- **DON'T let the causal story be a guess dressed as a citation.** The first write-up blamed
+  "`RepartitionExec` NOW declares `SchedulingType::Cooperative` in DF54". DF52 already declared it
+  (`repartition/mod.rs:1261`), byte-identical. The conclusion survived; the stated reason was
+  false and would have misled the next reader. The real cause was the rule's `transform_up` →
+  `transform_down_up` + ancestry-stack rewrite.
+- **DO verify the rewrite is tree-preserving**, not just green: node removed, subtree renumbered
+  and dedented to describe the SAME tree minus that node, and no other expectation altered
+  (10 blocks × −2/+1 = 10 insertions / 20 deletions).
+
+### 2026-08-05 — The recurring failure mode of a strong unit: correct conclusion, supporting fact asserted as verified without being verified
+
+An independent Critic caught this THREE times in one unit, each time with the conclusion intact and
+the evidence unchecked: the `fn`-name subset "proof"; "`RepartitionExec` now declares Cooperative";
+and "`basic.rs` and `extension.rs` are identical across parquet 57.3.1/58.4.0" (`basic.rs` IS
+byte-identical — `extension.rs` is 187 vs 197 lines with a behavior-preserving refactor).
+
+- **DO treat a load-bearing supporting fact as a claim that needs its own check**, at the same
+  bar as the conclusion. Being right about the outcome is not evidence that the reason is right,
+  and the reason is what the next reader inherits — in a repo where CLAUDE.md says the code wins
+  over docs, a wrong reason in a module doc actively misdirects.
+- **DO name the PATTERN in the ledger when the same failure recurs**, rather than filing N
+  isolated corrections. Three corrections read as three slips; one named pattern changes the next
+  unit's behavior.
+- **DO sweep repo-wide across ALL file types, not just markdown, when retiring a stale fact.** The
+  first F2 pass fixed 5 `.md` files and missed 5 sites in `crates/` — including a SHIPPED
+  user-facing error message naming a crate version the build no longer used, and a module doc that
+  contradicted the `map.md` the same change had just rewritten, on the very topic being adjudicated.
