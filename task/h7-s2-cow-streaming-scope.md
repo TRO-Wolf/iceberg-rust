@@ -71,28 +71,36 @@ inherent to MoR (a position delete per deleted row). Do not cite S1 as "already 
 
 Peak memory becomes `O(#affected files)` + one batch + writer buffers.
 
-## 4. THE hazard this refactor introduces — snapshot pinning (blocking, must be designed first)
+## 4. The snapshot hazard — INVESTIGATED 2026-08-05, and it is NOT real
 
-**One scan sees one snapshot. Two scans do not.** `table.scan()` resolves the current snapshot at
-build time, so a concurrent commit landing between pass 1 and pass 2 gives pass 2 a *different*
-table. The commit then deletes every affected source file and adds only what pass 2 wrote —
-so any row pass 1 counted as a survivor that pass 2 does not see is **silently destroyed**.
+An earlier revision of this scope led with a blocking hazard: that splitting one buffered scan into
+two scans replaces one snapshot with two, so a concurrent commit between the passes could make pass 2
+miss a survivor that pass 1 saw — and since the commit deletes every affected source file and adds
+only what pass 2 wrote, that survivor would be silently destroyed.
 
-That is a data-loss class the buffered version structurally cannot have. It is the single reason
-this unit is not a mechanical refactor, and it must be closed in the design, not discovered in
-review.
+**That analysis was wrong.** Traced through the source rather than reasoned about:
 
-**Mitigation:** pin *both* passes to the snapshot already captured for the §5 anchor —
-`let scan_snapshot_id = table.metadata().current_snapshot_id();` (`:552`) — via
-`TableScanBuilder::snapshot_id` (`scan/mod.rs:268`). Two details:
+1. `copy_on_write_delete(table: &Table, ..)` receives a **frozen handle**. `Table.metadata` is a
+   plain `TableMetadataRef` field (`table.rs:157-164`) with **no interior mutability**, and the only
+   mutator, `with_metadata` (`:168`), takes `mut self` by value — so nothing can change it through a
+   shared `&Table` for the lifetime of the call.
+2. `TableScanBuilder::build()` resolves an unpinned scan's snapshot from
+   `self.table.metadata().current_snapshot()` (`scan/mod.rs:487`) — the frozen metadata, **never a
+   fresh catalog read**.
 
-1. `scan_snapshot_id` is `Option<i64>`; `None` means an empty table at read time. Decide the branch
-   explicitly — an empty table has no rows, so pass 1 finds nothing and `deleted == 0` exits before
-   pass 2. Assert that rather than leaving it implicit.
-2. Pinning pass **1** as well is not optional. If pass 1 floats and pass 2 is pinned, the affected
-   set can reference files absent from the pinned snapshot, and `resolve_affected_data_files`
-   ("every affected path MUST resolve … a missing path is an internal invariant breach", `:757`)
-   turns a concurrency race into an internal error.
+Therefore two `table.scan()` calls on the same handle resolve the **identical** snapshot no matter
+what commits concurrently. The two-scan refactor is snapshot-consistent by construction, and the
+S5 suite already covers the real concurrency surface (see §6).
+
+**Residual, minor and pre-existing:** pass 2 re-reads the same physical data files. A concurrent
+`expire_snapshots` + orphan-file deletion could delete them mid-DML, failing pass 2's reads. That
+hazard applies to *any* scan, including today's single-pass one, and fails **loud** (an IO error),
+never silently. Not a blocker; note it in the PR body.
+
+**Optional, recommended anyway:** pass `.snapshot_id(scan_snapshot_id)` on both scans explicitly.
+It is a no-op given the above, but it documents the invariant at the call site and makes the
+property robust if `Table` ever gains a refresh path. Costs nothing; do not present it as a fix for
+a live bug.
 
 ## 5. Named costs and non-goals
 
@@ -110,27 +118,43 @@ review.
 
 ## 6. Open questions — answer before signing
 
-1. **Isolation semantics of the double read.** Pinning both scans makes the DML read a fixed
-   snapshot, which is *stronger* and matches Java (`SparkWrite` reads the scan snapshot). Confirm
-   no fork caller depends on the current float-to-latest behavior between passes.
-2. **Is there an existing OCC test that would catch a wrongly-pinned pass 2?** If not, this unit owes a
-   RED-first concurrency pin — commit between the passes, assert survivors are not lost. That pin is
-   the deliverable that justifies the unit; without it the hazard is only argued.
-3. **Memory assertion strategy.** A bounded-memory claim needs evidence. Options: a row-count-scaled
-   test asserting peak batch retention is O(1), or an instrumented counter. Decide, because "it
-   streams now" is not testable and would repeat the tautology finding from #187.
+Questions 1 and 2 of the earlier revision are **CLOSED by the §4 investigation**; recorded here so
+the reasoning is not redone.
+
+- ~~*Does any caller depend on float-to-latest between passes?*~~ **Moot** — the handle is frozen,
+  so there is no float-to-latest behavior to depend on.
+- ~~*Is there an OCC test that would catch a wrongly-pinned pass 2?*~~ **No such test exists, and
+  none is needed.** The S5 isolation suite (`integration_datafusion_test.rs:5490-6230`, 15 tests
+  incl. 5 CoW-specific) commits concurrently between `s5_freeze_plan` (physical-plan creation,
+  which freezes the table handle) and `s5_execute_frozen` — i.e. **before pass 1**, exercising the
+  §5 commit-time OCC validations. That is the correct surface for those tests and it is unaffected
+  by this refactor. A between-the-passes test would be testing an impossibility.
+
+**Remaining open — one question:**
+
+1. **How does the bounded-memory claim get evidence?** "It streams now" is not testable, and the
+   existing COW suites will pass identically before and after (they are small-fixture functional
+   tests), so a green run proves nothing about memory. Options: (a) a row-count-scaled test that
+   asserts peak retained batches stays O(1) via an instrumented counter on the scan stream;
+   (b) a `#[cfg(test)]` high-water-mark counter incremented in the pass loops; (c) accept a
+   code-shape argument and state explicitly in the PR that memory is unproven. **(a) or (b) —
+   #187's Critic caught exactly this shape of tautology (identical test counts on a change that
+   added zero tests), and a "streaming" claim with no memory evidence is the same error.**
+
+**Consequence for scoping:** with §4 closed, H7-S2 is a genuine mechanical refactor plus one
+memory-evidence test. It no longer needs a RED-first concurrency pin, and the unit is materially
+smaller than the earlier revision implied.
 
 ## 7. Test plan (draft)
 
-- **RED-first concurrency pin** (per §6.2): concurrent commit between passes → survivors intact.
-  Must red on an unpinned pass 2.
+- **Memory evidence** (per §6.1) — the one test that justifies the unit.
 - Behavior-invariance: the existing COW DELETE/UPDATE suites pass unchanged.
 - Empty-table / `deleted == 0` early exit (pass 2 never runs).
 - Every-row-deleted (affected files fully emptied → writer produces zero files — already handled
   at `:723`, keep the pin).
 - Partitioned COW through the partition-aware writer.
-- Mutation proofs: unpin pass 2 → concurrency pin reds; drop the `affected.contains` term → an
-  over-rewrite pin reds.
+- Mutation proof: drop the `affected.contains` term → an over-rewrite pin reds (rows from
+  unaffected files get needlessly rewritten).
 
 ## 8. Gate
 
