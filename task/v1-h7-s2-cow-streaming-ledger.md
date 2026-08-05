@@ -275,9 +275,12 @@ new `cow_memory_bound` binary's 1.
 ## 8. Remediation — 2026-08-05 (two independent Critics + Falsifier)
 
 Both Critics **CONVERGED with zero blocking findings**; the Falsifier applied 10 mutations, reproduced
-the headline M1 number independently (29,528,102 B vs the ledger's 29,526,932 B), **closed the M2 gap**
-(the UPDATE arm of `assert_marginal_bound` reds at 29,527,334 B when B1 is reinstated in
-`copy_on_write_update`, so both arms are now falsifiable and cleanly attributed), and held the negative
+the headline M1 number independently (29,528,102 B vs the ledger's 29,526,932 B), **closed the UPDATE-arm
+attribution gap for B1** (the UPDATE arm of `assert_marginal_bound` reds at 29,527,334 B when B1 is
+reinstated in `copy_on_write_update`, so both arms are now falsifiable and cleanly attributed —
+note this is *not* §4/M2's gap, which is that the test cannot discriminate **B2**, the survivor
+vector; that one remains open by design and §4's "this test proves B1, it does not prove B2"
+conclusion stands), and held the negative
 control (removing the explicit `.snapshot_id()` pin left 268/268 green — the "documented no-op, not a
 bug fix" framing is honest). One mutation exposed a real coverage gap (R3 below).
 
@@ -316,3 +319,59 @@ BASELINE (merge-on-read, zero match): peak(N)=30,172,720 peak(4N)=44,219,858 del
 DELETE: peak(N)=30,403,418 peak(4N)=44,457,037 delta=14,053,619 excess=6,481
 UPDATE: peak(N)=30,437,808 peak(4N)=44,492,173 delta=14,054,365 excess=7,227
 ```
+
+## 9. Remediation round 2 — 2026-08-05 (post-remediation review: 2 Critics + Falsifier)
+
+**Both Critics CONVERGED with ZERO blocking findings** ("I would let this merge" / "I found no blocking
+defect"). Twelve non-blocking findings were raised across the two lenses (several are the same item seen
+twice). The **Falsifier report in this round was executed against `7e04b7b5` — the pre-remediation
+commit** — so its one substantive finding (the COW 3VL guard gap) is the finding that round 1's R3
+already fixed. That is not taken on trust: see R2.1.
+
+### Dispositions
+
+| # | Finding (source) | Disposition |
+|---|---|---|
+| **R2.1** | Falsifier finding 1 — M-B (dropping `is_valid` from `match_mask`) reds only a *merge-on-read* test; both COW 3VL tests stay GREEN because they are `=`-only (the repo's known vacuity trap). Mandatory coverage gap. | **ALREADY FIXED by round-1 R3, and RE-PROVED AT HEAD this round.** The Falsifier ran at `7e04b7b5`; the `<>` COW tests landed in `78c87af4`. Re-applied the exact M-B mutation (`.map(\|row\| raw.is_valid(row) && raw.value(row))` → `.map(\|row\| raw.value(row))`) on the current tree and re-ran the 8 NULL-predicate tests: **3 RED — `test_delete_cow_null_neq_predicate_isvalid_guard` (left 3, right 2), `test_update_cow_null_neq_predicate_isvalid_guard` (left 3, right 2), `test_update_mread_null_neq_predicate_isvalid_guard`** — 5 passed. Mutation reverted, tree verified clean by `git status --porcelain` + grep. The COW arms are now load-bearing pins, not coincidental passengers on the MoR test. |
+| **R2.2** | Falsifier M-D stayed GREEN (the `keep.true_count() == 0` early-continue) | **DECLINED — unchanged from round-1 R10**, and the Falsifier itself concurs after stacking a probe: zero-row batches genuinely reach the writer under M-D, the `TaskWriter` stack swallows them, and the manifest-level assertions independently pin the no-empty-file contract. The guard is an optimization with no distinct behavioural signature. |
+| **R2.3** | Module doc's "Peak is O(#affected files) + one batch + the writer's own buffers" omits the dominant measured term — the scan's own in-flight row groups (evidence Critic) | **FIXED (doc).** The sentence now says explicitly that this is the *DML path's own contribution*, not the total, and names the scan term: up to `concurrency_limit_data_files` (default `num_cpus`) in-flight Parquet row groups plus per-file task state, dominant on a many-core host, **bounded by concurrency not by row count — which is exactly why it cancels out of the marginal assertion**. This repo's rule is that a wrong reason in a doc actively misdirects; the fix is one clause and costs nothing. |
+| **R2.4** | Ledger §8 says the Falsifier "closed the M2 gap" — it closed a different gap (evidence Critic) | **FIXED (ledger).** §8 now reads "closed the UPDATE-arm attribution gap for B1" and states in-line that §4/M2's gap — the test cannot discriminate **B2**, the survivor vector — **remains open by design**, with §4's "this test proves B1; it does not prove B2" standing. The correction matters: a reader must not come away believing B2 acquired memory evidence it does not have. |
+| **R2.5** | Memory test verified host-robust beyond the single-host claim: GREEN under `taskset -c 0-3` **and** `taskset -c 0,1`; baseline_delta collapses 14,047,138 → 394,467 → 393,654 B, and the `assert_fixture` file-count pins (64 files at N, 256 at 4N) hold at 2 cores, so DataFusion does not coalesce the MemTable partitions on a small runner (both Critics) | **ACCEPTED — no code change; claim STRENGTHENED and its residual named.** Round-1 R9 declined host-dependence as unmeasured; it is now measured at 2, 4 and 64 cores and discrimination *improves* as cores fall. Residual is FALSE-GREEN only: `excess = delta.saturating_sub(baseline_delta)` floors at zero, so a host where the merge-on-read baseline over-measures relative to the COW run by >29 MB would mask a reinstated B1. Not observed at 2/4/64 cores. → PR body. |
+| **R2.6** | The DELETE arm's printed `excess` is a `saturating_sub` clamp to 0 (`delta = 13,984,083` vs `baseline_delta = 14,046,987`), so the *printed* line shows no positive margin (evidence Critic) | **ACCEPTED — no code change.** The clamp is the streaming signature, not a measurement failure, and the DELETE arm's discriminating power is established directly by mutation M1 (excess 29,528,102 B, 2.85× the threshold), not by an in-band margin. → PR body, so the printed `0` is not read as "nothing measured". Removing the clamp would make a *negative* excess printable but would not add evidence. |
+| **R2.7** | UPDATE newly inherits the volatile-predicate divergence (correctness Critic, confirming round-1 R8) | **DECLINED as a code change — disclosure only, unchanged.** Both Critics independently reached round-1 R8's conclusion: harm is bounded to the reported count (a row pass 2 judges non-matching is still rewritten carrying its ORIGINAL values, because its file is affected — no row lost or duplicated), and the only alternative is the position-indexed cross-pass cache this unit retired as unsound across two independent scans. DELETE already had it. → PR body. |
+| **R2.8** | Mid-pass-2 failure orphans staged Parquet files (both Critics, twice) | **DECLINED as a code change — disclosed + invariant pinned.** No commit occurs either way, so the table is unchanged; `merge_on_read_update` has always had this shape; `test_update_cow_null_into_required_is_rejected` (round-1 R4) pins what matters (statement errors, table byte-unchanged). `DeleteOrphanFiles` (R134) is the recovery path. Pinning the *absence* of staged files would pin an implementation detail of writer construction order. → PR body. |
+| **R2.9** | Two `ScanReport`s per COW statement — the one externally-visible non-memory behaviour change (correctness Critic) | **ACCEPTED — already in the module doc (round-1 R7); PROMOTED to the PR body** as its own line rather than a clause, since it is the only behaviour change a downstream consumer can observe without measuring memory. |
+| **R2.10** | `cow_memory_bound` dominates crate test wall-clock (~20–21 s vs ~0.7 s for the other 270), I/O-bound not core-bound (20.68 s @64c, 19.68 s @4c, 19.89 s @2c), writes ~490 MB of temp Parquet per run (both Critics) | **ACCEPTED — no change.** Correctly NOT `#[ignore]`d per scope §7.1 (an ignored memory test is the exact false-green this unit closes); the temp files are cleaned up (round-1 R2, re-confirmed by the evidence Critic — the `TempDir` guards do travel out of `setup` and drop after `end_measure`). → PR body, so the CI-time jump is a chosen price and not something a future reader investigates. |
+| **R2.11** | Output row order within rewritten data files changes (pass-2 scan order, not pass-1 buffer order) (correctness Critic) | **NO ACTION — already in §6.** Both orders were already nondeterministic (`try_flatten_unordered` + within-file parallel task expansion), no Iceberg contract depends on it, the table has no sort order, and the pre-existing code honoured none. The Critic re-ran `interop_partitioned_dml` (the Java-reads-Rust COW direction) and it passes, so nothing byte-pinned depends on it. |
+| **R2.12** | `task/todo.md` still lists H7-S2 as pending (evidence Critic, accepting round-1 R11's reasoning but requiring it be flagged) | **DECLINED in-unit, ESCALATED to the PR.** Unchanged reasoning (one-home-per-fact; the queue file is reconciled at merge). The Critic's condition is met by listing it explicitly in the PR body as a merge-time obligation. |
+
+### What the PR body must state (consolidated)
+
+1. The double read — pass 2 re-reads the whole live table; accepted price of bounded memory (scope §5).
+2. **Two `ScanReport`s per COW statement** — the only externally-visible non-memory behaviour change.
+3. Volatile predicates (`random()`, `now()`) in a COW UPDATE `WHERE` can now make the reported count
+   disagree with the applied row set; no row is lost or duplicated. DELETE already behaved this way.
+4. Mid-pass-2 failure can leave staged, uncommitted Parquet files (DELETE and UPDATE); the table is
+   unchanged; `DeleteOrphanFiles` (R134) recovers.
+5. `cow_memory_bound` costs ~20 s of CI wall-clock and ~490 MB of transient temp space (cleaned up),
+   and is deliberately not `#[ignore]`d.
+6. The memory test is GREEN at 2, 4 and 64 cores with discrimination *improving* as cores fall; the
+   residual risk is false-GREEN only (`saturating_sub` clamp), never false-RED as first feared.
+7. The DELETE arm's printed `excess = 0` is a clamp artifact of the streaming signature; that arm's
+   discrimination is proven by mutation M1 (29,528,102 B), not by the printed margin.
+8. Row order within rewritten data files changes; both orders were already nondeterministic.
+9. Pass 2 re-reading the same physical files means a concurrent `expire_snapshots` + orphan deletion
+   fails pass 2 LOUD (IO error), never silently — pre-existing for any scan (scope §4).
+10. **Merge-time obligation:** reconcile `task/todo.md`'s H7-S2 entry.
+11. No GAP_MATRIX row flips — engine-side memory profile, not a capability (scope §8).
+
+### Gate after round 2
+
+| Command | Result |
+|---|---|
+| `typos .` | **pass** |
+| `cargo fmt --all -- --check` | **pass** |
+| `cargo clippy --all-targets --workspace -- -D warnings` | **pass**, zero warnings |
+| `cargo test -p iceberg-datafusion --all-targets` | **271 passed, 0 failed** (unchanged — round 2 changed only doc/ledger prose) |
+| `cargo check -p iceberg-datafusion --no-default-features` | **pass** |
+| M-B re-mutation at HEAD (R2.1) | **3 RED / 5 pass**, reverted, tree clean |

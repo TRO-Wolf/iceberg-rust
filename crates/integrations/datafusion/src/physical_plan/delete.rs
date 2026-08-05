@@ -47,8 +47,12 @@
 //! batch, so the affected set must be COMPLETE before the first survivor may be emitted — but neither
 //! pass buffers rows. Pass 1 streams the scan and retains only `affected: HashSet<String>` (one entry
 //! per affected FILE) plus a row counter; pass 2 RE-SCANS the same snapshot and feeds each batch's
-//! rewrite rows straight into [`StreamingDataFileWriter`]. Peak is O(#affected files) + one batch +
-//! the writer's own buffers. **The named cost is a second full read of the live data** — the accepted
+//! rewrite rows straight into [`StreamingDataFileWriter`]. The DML path's own contribution to peak is
+//! O(#affected files) + one batch + the writer's own buffers — but that is NOT the total: the scan
+//! underneath holds up to `concurrency_limit_data_files` (default `num_cpus`) in-flight Parquet row
+//! groups plus per-file task state, and on a many-core host that term DOMINATES the absolute peak. It
+//! is bounded by concurrency, not by row count, which is why it cancels out of the marginal assertion
+//! in `tests/cow_memory_bound.rs`. **The named cost is a second full read of the live data** — the accepted
 //! price of bounded memory, and one extra `ScanReport` per statement for catalogs with a metrics
 //! reporter installed. (Two shapes skip pass 2 outright: a zero-match DML, and a predicate-less
 //! `DELETE FROM t`, whose pass 2 is provably empty because every row is deleted.)
