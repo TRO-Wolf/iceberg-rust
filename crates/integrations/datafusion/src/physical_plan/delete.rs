@@ -40,9 +40,23 @@
 //! they never hold the whole live row set. MoR DELETE buffers only the matched `(path, pos)` pairs
 //! (two small fields per deleted row); MoR UPDATE additionally streams the new data rows straight into
 //! the writer. The floor is O(matched rows), not O(1) — `write_position_deletes` must group + sort the
-//! whole pair set before writing (the default scan interleaves files unordered). The **copy-on-write**
-//! paths still buffer the full live row set (their two-pass affected-file rewrite) — streaming COW is a
-//! follow-up (H7-S2).
+//! whole pair set before writing (the default scan interleaves files unordered).
+//!
+//! The **copy-on-write** paths STREAM both of their passes (H7-S2). COW is inherently two-pass — a
+//! source file is "affected" the moment *any* of its rows matches, possibly the last row of the last
+//! batch, so the affected set must be COMPLETE before the first survivor may be emitted — but neither
+//! pass buffers rows. Pass 1 streams the scan and retains only `affected: HashSet<String>` (one entry
+//! per affected FILE) plus a row counter; pass 2 RE-SCANS the same snapshot and feeds each batch's
+//! rewrite rows straight into [`StreamingDataFileWriter`]. Peak is O(#affected files) + one batch +
+//! the writer's own buffers. **The named cost is a second full read of the live data** — the accepted
+//! price of bounded memory. Restricting pass 2 to the affected files is not possible through the
+//! public scan API today (`_file` is a reserved metadata column, not a pushdown-able predicate term);
+//! that is a follow-up. Both passes are snapshot-consistent by construction: `Table` is a frozen
+//! handle (`metadata` is a plain `TableMetadataRef` with no interior mutability, and the only mutator
+//! takes `mut self` by value), and an unpinned `TableScanBuilder::build()` resolves from that frozen
+//! metadata, never a fresh catalog read — so two `table.scan()` calls on one handle resolve the
+//! IDENTICAL snapshot regardless of concurrent commits. Both scans additionally pin the snapshot id
+//! explicitly; that is documentation of the invariant, NOT a fix for a live bug.
 //!
 //! **Concurrency — the ENGINE_CONTRACT §5 recipes are ARMED (2026-07-18).** Every DELETE/UPDATE commit
 //! enables the per-operation isolation validations with **Java's per-operation defaults as the oracle**
@@ -67,7 +81,10 @@
 //!     *current* partition spec (as Java does) and merge-on-read stamps each position-delete file with
 //!     its target data file's *own* `(spec_id, partition)`; both are exercised on single-spec tables but
 //!     a table whose specs have evolved is not yet covered by a test.
-//!   * **Streaming** — merge-on-read streams (see *Memory* above); copy-on-write does not yet.
+//!   * **Streaming** — both merge-on-read and copy-on-write stream their scans (see *Memory* above).
+//!     Neither is O(1): MoR holds one `(path, pos)` pair per matched row, COW holds one path per
+//!     affected file. Writer-side buffering (a fanout `TaskWriter` holds one open writer per
+//!     partition) is a separate, still-unbounded axis — see the QB writer-bounds unit.
 //!
 //! The plan emits a single `UInt64` `count` row (rows affected), per DataFusion's DML contract.
 
@@ -530,6 +547,44 @@ async fn merge_on_read_delete(
     Ok(deleted)
 }
 
+/// Open ONE copy-on-write scan stream: every live row, projecting the table columns PLUS the reserved
+/// `_file` path (not `_pos` — COW does not need positions).
+///
+/// We do NOT push the filter into the scan — Iceberg pushdown is inexact (see the module note); the
+/// exact `PhysicalExpr` evaluation in the caller is the correctness contract.
+///
+/// **On the explicit snapshot pin.** `scan_snapshot_id` is the caller's `current_snapshot_id()`, which
+/// is exactly what an UNPINNED `build()` would resolve from the same frozen `Table` handle
+/// (`scan/mod.rs`: `metadata().current_snapshot()`, never a fresh catalog read). Passing it is
+/// therefore a **no-op today**, not a bug fix: it documents at the call site that the two COW passes
+/// read one snapshot, and keeps that true if `Table` ever gains a refresh path. `None` (a snapshotless
+/// table) is left unpinned, which yields the same empty scan.
+async fn cow_scan_stream(
+    table: &Table,
+    table_schema: &SchemaRef,
+    scan_snapshot_id: Option<i64>,
+) -> DFResult<iceberg::scan::ArrowRecordBatchStream> {
+    let mut projection: Vec<String> = table_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    projection.push(RESERVED_COL_NAME_FILE.to_string());
+
+    let mut builder = table.scan().select(projection);
+    if let Some(snapshot_id) = scan_snapshot_id {
+        builder = builder.snapshot_id(snapshot_id);
+    }
+    // Awaiting `try_next()` on the returned stream polls the scan only as batches are consumed, so
+    // the scan is naturally back-pressured — no unbounded producer.
+    builder
+        .build()
+        .map_err(to_datafusion_error)?
+        .to_arrow()
+        .await
+        .map_err(to_datafusion_error)
+}
+
 /// Copy-on-write DELETE: **file-level** rewrite — scan every live row projecting the table columns
 /// PLUS the reserved `_file` path, identify which source data files contain at least one deleted row
 /// (the "affected" set), rewrite only those files' surviving rows through the partition-aware
@@ -541,6 +596,11 @@ async fn merge_on_read_delete(
 /// and a scan batch may interleave rows from several files — so the rewrite routes through a
 /// `TaskWriter` with `fanout_enabled = true`, which sends each row to its correct partition writer
 /// without requiring the survivors to be pre-sorted by partition.
+///
+/// **Streaming (H7-S2).** Neither pass buffers rows. Pass 1 streams the scan and retains only the
+/// affected-file path set and the deleted-row count; pass 2 RE-SCANS the same snapshot and streams
+/// each batch's survivors straight into [`StreamingDataFileWriter`]. The cost is a second full read
+/// of the live data — see the module-level *Memory* note.
 async fn copy_on_write_delete(
     table: &Table,
     catalog: &dyn Catalog,
@@ -549,172 +609,90 @@ async fn copy_on_write_delete(
     isolation: IsolationLevel,
 ) -> DFResult<u64> {
     // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor (Java sets it only
-    // when the scan captured one: `SparkWrite.java` L470-472 / L493-495).
+    // when the scan captured one: `SparkWrite.java` L470-472 / L493-495). Both passes below pin this
+    // same snapshot, so they read the identical row set.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
-    // 1. Scan EVERY live row, projecting the table columns PLUS `_file` (not `_pos` — COW doesn't need
-    //    positions). We do NOT push the filter into the scan — Iceberg pushdown is inexact (see the
-    //    module note); the exact `PhysicalExpr` evaluation here is the correctness contract.
-    let mut projection: Vec<String> = table_schema
-        .fields()
-        .iter()
-        .map(|field| field.name().clone())
-        .collect();
-    projection.push(RESERVED_COL_NAME_FILE.to_string());
 
-    let batches: Vec<RecordBatch> = table
-        .scan()
-        .select(projection)
-        .build()
-        .map_err(to_datafusion_error)?
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .try_collect()
-        .await
-        .map_err(to_datafusion_error)?;
-
-    // 2. Collect all batches into memory (documented: full-table buffer, fits in executor memory).
-
-    // 3. Pass 1 — affected-file detection. A source file is AFFECTED iff at least one of its rows
-    //    matches the predicate (or the predicate is None → all rows deleted → all files affected).
-    //    Also counts total deleted rows for the return value.
+    // 1. Pass 1 — affected-file detection, STREAMED. A source file is AFFECTED iff at least one of its
+    //    rows matches the predicate (or the predicate is None → all rows deleted → all files affected).
+    //    Also counts total deleted rows for the return value. The ONLY state retained across the pass
+    //    is `affected` (one path per affected FILE) and the counter — no rows are buffered.
+    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
     let mut deleted: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
 
-    for batch in &batches {
-        let num_rows = batch.num_rows();
+    while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
         let file_col = batch
             .column_by_name(RESERVED_COL_NAME_FILE)
             .ok_or_else(|| {
                 DataFusionError::Internal("delete scan missing _file column".to_string())
             })?;
-
-        // Build a table-column-only sub-batch for predicate evaluation (by name, robust to ordering).
-        let columns: Vec<ArrayRef> = table_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                batch.column_by_name(field.name()).cloned().ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "delete scan is missing table column '{}'",
-                        field.name()
-                    ))
-                })
-            })
-            .collect::<DFResult<_>>()?;
-        let table_batch = RecordBatch::try_new(Arc::clone(table_schema), columns)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        // Table-column-only sub-batch for predicate evaluation (by name, robust to scan ordering).
+        let table_batch = table_column_batch(&batch, table_schema)?;
+        // `match_mask` already collapses NULL → false (SQL three-valued logic: a NULL predicate
+        // result does NOT delete the row) and returns all-true for `DELETE FROM t` (no predicate).
+        let mask = match_mask(&predicate, &table_batch)?;
 
         let paths = decode_file_paths_batch(file_col)?;
-        match &predicate {
-            None => {
-                // DELETE FROM t — every row is deleted; every source file is affected.
-                deleted += num_rows as u64;
-                for path in &paths {
-                    if !affected.contains(*path) {
-                        affected.insert((*path).to_string());
-                    }
-                }
-            }
-            Some(physical_expr) => {
-                let evaluated = physical_expr.evaluate(&table_batch)?;
-                let array = evaluated.into_array(num_rows)?;
-                let mask = array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "DELETE filter did not evaluate to a boolean".to_string(),
-                        )
-                    })?
-                    .clone();
-
-                for (row, path) in paths.iter().enumerate() {
-                    // A row is deleted iff the predicate is TRUE (NULL → SQL three-valued logic → NOT deleted).
-                    let is_deleted = mask.is_valid(row) && mask.value(row);
-                    if is_deleted {
-                        deleted += 1;
-                        if !affected.contains(*path) {
-                            affected.insert((*path).to_string());
-                        }
-                    }
+        for (row, path) in paths.iter().enumerate() {
+            if mask.value(row) {
+                deleted += 1;
+                if !affected.contains(*path) {
+                    affected.insert((*path).to_string());
                 }
             }
         }
     }
 
-    // 4. No deleted rows → no-op (avoid a pointless snapshot).
+    // 2. No deleted rows → no-op (avoid a pointless snapshot). This now also skips the SECOND scan
+    //    entirely — a zero-match DELETE reads the table exactly once.
     if deleted == 0 {
         return Ok(0);
     }
 
-    // 5. Pass 2 — collect survivor rows from AFFECTED files only. Rows from unaffected files are left
-    //    in place (their source files are unchanged). For each batch, build a keep-mask for rows that
-    //    are (a) NOT deleted AND (b) from an affected file (those are the rows that need a new home).
-    let mut survivors_to_rewrite: Vec<RecordBatch> = Vec::new();
+    // 3. Pass 2 — RE-SCAN the same snapshot and stream the survivors of AFFECTED files straight into
+    //    the writer. Rows from unaffected files are left in place (their source files are unchanged).
+    //    Per batch, a row is kept iff it is (a) NOT deleted AND (b) from an affected file — those are
+    //    exactly the rows that need a new home. Nothing is accumulated: each filtered batch is handed
+    //    to the writer and dropped.
+    //
+    //    The affected set is complete before any survivor is emitted, which is why COW needs two
+    //    passes at all (a file becomes affected on its LAST row just as easily as its first).
+    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
+    let mut data_writer = StreamingDataFileWriter::try_new(table)?;
 
-    for batch in &batches {
+    while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
         let num_rows = batch.num_rows();
         let file_col = batch
             .column_by_name(RESERVED_COL_NAME_FILE)
             .ok_or_else(|| {
                 DataFusionError::Internal("delete scan missing _file column".to_string())
             })?;
+        let table_batch = table_column_batch(&batch, table_schema)?;
+        // Re-evaluated (not cached from pass 1): pass 2 is a fresh scan, so no per-batch state from
+        // pass 1 could be aligned to it. Same row-wise function, same rows ⇒ same mask.
+        let delete_mask = match_mask(&predicate, &table_batch)?;
 
-        let columns: Vec<ArrayRef> = table_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                batch.column_by_name(field.name()).cloned().ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "delete scan is missing table column '{}'",
-                        field.name()
-                    ))
-                })
-            })
-            .collect::<DFResult<_>>()?;
-        let table_batch = RecordBatch::try_new(Arc::clone(table_schema), columns)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-        // Determine the delete-mask for this batch (same logic as pass 1, recomputed).
-        let delete_mask: Vec<bool> = match &predicate {
-            None => vec![true; num_rows],
-            Some(physical_expr) => {
-                let evaluated = physical_expr.evaluate(&table_batch)?;
-                let array = evaluated.into_array(num_rows)?;
-                let mask = array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "DELETE filter did not evaluate to a boolean".to_string(),
-                        )
-                    })?
-                    .clone();
-                (0..num_rows)
-                    .map(|row| mask.is_valid(row) && mask.value(row))
-                    .collect()
-            }
-        };
-
-        // Keep a row iff: it is NOT deleted AND its source file is in the affected set.
         let paths = decode_file_paths_batch(file_col)?;
         let keep: BooleanArray = (0..num_rows)
-            .map(|row| !delete_mask[row] && affected.contains(paths[row]))
+            .map(|row| !delete_mask.value(row) && affected.contains(paths[row]))
             .collect();
+        if keep.true_count() == 0 {
+            // Nothing to rewrite from this batch — leave the writer lazily uncreated.
+            continue;
+        }
 
         let surviving = filter_record_batch(&table_batch, &keep)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        if surviving.num_rows() > 0 {
-            survivors_to_rewrite.push(surviving);
-        }
+        data_writer.write_batch(surviving).await?;
     }
 
-    // 6. Write survivors through the partition-aware TaskWriter. When there are no survivors-to-rewrite
-    //    (e.g. every affected file was fully deleted), this produces an empty Vec — correct.
-    let new_files = write_partitioned_data_files(table, &survivors_to_rewrite).await?;
+    // 4. Close the writer. When there were no survivors to rewrite (e.g. every affected file was fully
+    //    deleted) the `TaskWriter` was never created and this yields an empty Vec — no empty data file
+    //    is committed, matching the previous buffering form's `batches.is_empty()` contract.
+    let new_files = data_writer.finish().await?;
 
-    // 7. Commit: delete the affected source files, add the rewritten files. The removals carry FULL
+    // 5. Commit: delete the affected source files, add the rewritten files. The removals carry FULL
     //    `DataFile` metadata (`delete_data_files`, resolved from the scanned snapshot's manifests) so
     //    the §5 conflicting-deletes validation is LIVE — it tests concurrently-added delete files
     //    against the removed files' partition + metrics, which a bare path cannot carry (Java validates
@@ -959,25 +937,6 @@ impl StreamingDataFileWriter {
             Some(writer) => writer.close().await.map_err(to_datafusion_error),
         }
     }
-}
-
-/// Write data file(s) partition-correctly through the production `TaskWriter`, buffering-slice form.
-/// Retained for the copy-on-write paths (which pre-buffer their survivor/rewrite batches); the
-/// merge-on-read UPDATE path streams via [`StreamingDataFileWriter`] instead.
-///
-/// Returns every `DataFile` the (possibly rolling) writer produced — correctly partitioned.
-async fn write_partitioned_data_files(
-    table: &Table,
-    batches: &[RecordBatch],
-) -> DFResult<Vec<DataFile>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut writer = StreamingDataFileWriter::try_new(table)?;
-    for batch in batches {
-        writer.write_batch(batch.clone()).await?;
-    }
-    writer.finish().await
 }
 
 /// Write REAL parquet position-delete file(s) from sorted `(data_file_path, position)` pairs via the
@@ -1590,9 +1549,10 @@ fn apply_assignments(
 
 /// Merge-on-read UPDATE: position-delete the OLD matching rows and insert NEW rows carrying the updated
 /// values, in one `RowDelta`. Returns the number of rows updated. Works for both partitioned and
-/// unpartitioned tables: the NEW rows are routed through the partition-aware [`write_partitioned_data_files`]
-/// helper, which computes partition values from the POST-assignment column values. Position deletes are
-/// keyed by (data-file path, position) and are partition-agnostic, so the delete side is unchanged.
+/// unpartitioned tables: the NEW rows are routed through the partition-aware
+/// [`StreamingDataFileWriter`], which computes partition values from the POST-assignment column values.
+/// Position deletes are keyed by (data-file path, position) and are partition-agnostic, so the delete
+/// side is unchanged.
 async fn merge_on_read_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -1731,7 +1691,11 @@ async fn merge_on_read_update(
 ///
 /// Works for BOTH partitioned and unpartitioned tables. When the SET expression changes a
 /// partition-key column, the rewritten row is routed to its NEW partition automatically because
-/// `write_partitioned_data_files` computes partition values from the post-assignment column values.
+/// [`StreamingDataFileWriter`] computes partition values from the post-assignment column values.
+///
+/// **Streaming (H7-S2).** Same two-pass streaming shape as [`copy_on_write_delete`]: pass 1 retains
+/// only the affected-file set and the counter, pass 2 re-scans and streams each rewritten batch into
+/// the writer. The cost is a second full read — see the module-level *Memory* note.
 async fn copy_on_write_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -1741,47 +1705,24 @@ async fn copy_on_write_update(
     isolation: IsolationLevel,
 ) -> DFResult<u64> {
     // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor (`SparkWrite.java`
-    // L470-472 / L493-495).
+    // L470-472 / L493-495). Both passes below pin this same snapshot.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
-    // 1. Scan EVERY live row projecting the table columns PLUS `_file` (not `_pos` — COW does not
-    //    need positions). We do NOT push the filter into the scan — Iceberg pushdown is inexact (see
-    //    the module note); the exact `PhysicalExpr` evaluation here is the correctness contract.
-    let mut projection: Vec<String> = table_schema
-        .fields()
-        .iter()
-        .map(|field| field.name().clone())
-        .collect();
-    projection.push(RESERVED_COL_NAME_FILE.to_string());
 
-    let batches: Vec<RecordBatch> = table
-        .scan()
-        .select(projection)
-        .build()
-        .map_err(to_datafusion_error)?
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .try_collect()
-        .await
-        .map_err(to_datafusion_error)?;
-
-    // 2. Pass 1 — affected-file detection. A source file is AFFECTED iff at least one of its rows
-    //    matches the predicate (or the predicate is None → all rows match → all files affected).
-    //    Also counts total updated rows for the return value.
+    // 1. Pass 1 — affected-file detection, STREAMED. A source file is AFFECTED iff at least one of its
+    //    rows matches the predicate (or the predicate is None → all rows match → all files affected).
+    //    Also counts total updated rows for the return value. Only `affected` (one path per affected
+    //    FILE) and the counter survive the pass — no rows and no per-batch masks are retained.
+    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
     let mut updated: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
-    // M7: cache the per-batch WHERE match mask computed here so pass 2 can REUSE it (filtered to the
-    // affected rows) instead of re-evaluating the predicate a second time. `match_mask` already
-    // collapses NULL→false (three-valued logic), so the cached mask is the final 2-valued mask.
-    let mut batch_masks: Vec<BooleanArray> = Vec::with_capacity(batches.len());
 
-    for batch in &batches {
+    while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
         let file_col = batch
             .column_by_name(RESERVED_COL_NAME_FILE)
             .ok_or_else(|| {
                 DataFusionError::Internal("update scan missing _file column".to_string())
             })?;
-        let table_batch = table_column_batch(batch, table_schema)?;
+        let table_batch = table_column_batch(&batch, table_schema)?;
         let mask = match_mask(&predicate, &table_batch)?;
 
         let paths = decode_file_paths_batch(file_col)?;
@@ -1794,23 +1735,25 @@ async fn copy_on_write_update(
                 }
             }
         }
-        batch_masks.push(mask);
     }
 
-    // 3. No updated rows → no-op (avoid a pointless rewrite of unchanged data).
+    // 2. No updated rows → no-op (avoid a pointless rewrite of unchanged data). Also skips the second
+    //    scan entirely.
     if updated == 0 {
         return Ok(0);
     }
 
-    // 4. Pass 2 — build rewrite content for affected files only.
+    // 3. Pass 2 — RE-SCAN the same snapshot and stream the rewrite content for affected files only.
     //    For each batch: filter down to rows whose source file is in the affected set, then apply
     //    the assignments with the per-row match mask so that:
     //      * matched rows (WHERE = TRUE) take the new SET values
     //      * other rows of the SAME affected file keep their original values (carried unchanged)
-    //    Rows from unaffected files are NOT included — their source files are untouched.
-    let mut rewritten_batches: Vec<RecordBatch> = Vec::new();
+    //    Rows from unaffected files are NOT included — their source files are untouched. Each rewritten
+    //    batch goes straight to the writer and is dropped; nothing accumulates.
+    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
+    let mut data_writer = StreamingDataFileWriter::try_new(table)?;
 
-    for (batch_idx, batch) in batches.iter().enumerate() {
+    while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
         let num_rows = batch.num_rows();
         let file_col = batch
             .column_by_name(RESERVED_COL_NAME_FILE)
@@ -1819,36 +1762,29 @@ async fn copy_on_write_update(
             })?;
 
         // Build table-column sub-batch (rows from the FULL batch including unaffected-file rows).
-        let table_batch = table_column_batch(batch, table_schema)?;
+        let table_batch = table_column_batch(&batch, table_schema)?;
 
         // Keep-mask: only rows whose source file is in the affected set.
         let paths = decode_file_paths_batch(file_col)?;
         let keep_affected: BooleanArray = (0..num_rows)
             .map(|row| affected.contains(paths[row]))
             .collect();
+        if keep_affected.true_count() == 0 {
+            continue;
+        }
 
         // Filter down to affected-file rows (table columns only, no _file).
         let affected_batch = filter_record_batch(&table_batch, &keep_affected)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        if affected_batch.num_rows() == 0 {
-            continue;
-        }
 
-        // M7: the per-row WHERE match mask within the affected rows is exactly the pass-1 mask for
-        // this batch FILTERED by the same `keep_affected` predicate — `match_mask` is row-wise and
-        // arrow `filter` preserves row order, so this equals re-evaluating the predicate over
-        // `affected_batch` (proven by `test_m7_filtered_mask_equals_reeval`), without a second
-        // predicate evaluation.
-        let affected_match_mask =
-            datafusion::arrow::compute::filter(&batch_masks[batch_idx], &keep_affected)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        let affected_match_mask = affected_match_mask
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                DataFusionError::Internal("filtered match mask is not boolean".to_string())
-            })?
-            .clone();
+        // The per-row WHERE match mask WITHIN the affected rows, evaluated directly over
+        // `affected_batch`. The previous form (M7) instead cached pass 1's per-batch mask and filtered
+        // it by `keep_affected`; the two are equal because `match_mask` is a row-wise pure function and
+        // arrow `filter` preserves row order. The cache is GONE because it was indexed by batch
+        // POSITION, and pass 2 is now an independent scan whose batch boundaries and arrival order are
+        // not guaranteed to match pass 1's — indexing across them would silently apply one batch's mask
+        // to another batch's rows. The traded cost is one extra predicate evaluation per batch.
+        let affected_match_mask = match_mask(&predicate, &affected_batch)?;
 
         // Apply assignments: matched rows take new values; non-matched rows keep old values.
         let rewritten = apply_assignments(
@@ -1857,15 +1793,15 @@ async fn copy_on_write_update(
             table_schema,
             Some(&affected_match_mask),
         )?;
-        rewritten_batches.push(rewritten);
+        data_writer.write_batch(rewritten).await?;
     }
 
-    // 5. Write rewritten content via the partition-aware TaskWriter. Routes each row to its correct
-    //    partition by the POST-assignment column values — a partition-key-changing UPDATE automatically
-    //    moves the row to the new partition file.
-    let new_files = write_partitioned_data_files(table, &rewritten_batches).await?;
+    // 4. Close the writer. Routes each row to its correct partition by the POST-assignment column
+    //    values — a partition-key-changing UPDATE automatically moves the row to the new partition
+    //    file. A writer never fed a batch produces no file.
+    let new_files = data_writer.finish().await?;
 
-    // 6. Commit: delete the affected source files, add the rewritten files. Full-metadata removals
+    // 5. Commit: delete the affected source files, add the rewritten files. Full-metadata removals
     //    (`delete_data_files`, NOT `overwrite_by_row_filter` — unaffected files stay in place, and NOT
     //    bare paths — the §5 conflicting-deletes check needs partition + metrics). Same §5 CoW recipe
     //    as DELETE: Java's isolation `switch` does not branch on the command (`SparkWrite.java`
@@ -2089,42 +2025,6 @@ mod tests {
         let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
         let col: ArrayRef = Arc::new(ree);
         assert_batch_matches_per_row(&col);
-    }
-
-    /// M7 correctness property: the per-row WHERE match mask over the AFFECTED sub-batch equals the
-    /// full-batch match mask FILTERED by the same affected-keep mask. The COW UPDATE pass-2 reuse
-    /// relies on exactly this identity to avoid re-evaluating the predicate; `arrow::compute::filter`
-    /// preserving row order is what makes it hold. (`match_mask` is a row-wise pure function of the
-    /// table batch, so filtering the input batch then evaluating == evaluating then filtering.)
-    #[test]
-    fn test_m7_filtered_mask_equals_reeval() {
-        use datafusion::arrow::array::BooleanArray;
-        use datafusion::arrow::compute::filter;
-
-        // Full-batch match mask (what pass 1 cached) and the affected-keep mask.
-        let full_match = BooleanArray::from(vec![true, false, true, true, false, true]);
-        let keep_affected = BooleanArray::from(vec![true, true, false, true, true, false]);
-
-        // What pass 2 now computes: filter the cached mask by keep.
-        let reused = filter(&full_match, &keep_affected).expect("filter mask");
-        let reused = reused.as_any().downcast_ref::<BooleanArray>().unwrap();
-
-        // The reference (the pre-M7 form): the match values at the KEPT rows, in order.
-        let reference: Vec<bool> = (0..full_match.len())
-            .filter(|&i| keep_affected.value(i))
-            .map(|i| full_match.value(i))
-            .collect();
-        let reference = BooleanArray::from(reference);
-
-        assert_eq!(
-            reused, &reference,
-            "filtered cached mask must equal the affected-rows match mask, in order"
-        );
-        // Rows kept: 0,1,3,4 → their match values: true,false,true,false.
-        assert_eq!(
-            reference,
-            BooleanArray::from(vec![true, false, true, false])
-        );
     }
 
     #[test]
