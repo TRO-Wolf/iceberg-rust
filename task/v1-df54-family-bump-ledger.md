@@ -115,6 +115,7 @@ have failed there too. Recorded so the omission is not repeated.
 | `cargo test --workspace --all-features --test sqllogictests` | **9/9 schedules** |
 | `cargo check --workspace --no-default-features` | green |
 | `make check-matrix-anchors` | OK (75 rows) |
+| `make interop` | **52 passed, 0 failed** / 52 discovered (floor 52) |
 
 The two headline counts matching main exactly is the behavior-invariance evidence: the family bump
 moves no core or DataFusion-integration behavior.
