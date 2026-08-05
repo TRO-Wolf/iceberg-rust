@@ -24,8 +24,9 @@
 (`:1735`).
 **Predecessor:** H7-S1 (MoR streaming) merged #140 — the streaming idiom to match lives at
 `merge_on_read_delete:387`.
-**Cadence:** Mode A, AC·OO with an independent Critic. **NOT YET SIGNED — this document is the
-scoping deliverable; §6 open questions need answers before Actor work begins.**
+**Cadence:** Mode A, AC·OOO — one Opus Actor, **two** independent Opus Critics with distinct lenses
+(the H7-S1 build-phase ladder). **SIGNED 2026-08-05** — all §6 questions are closed; the
+memory-evidence form is decided in §6.1 and specified in §7.
 
 ## 1. What is actually buffered today — two distinct buffers, not one
 
@@ -130,29 +131,120 @@ the reasoning is not redone.
   §5 commit-time OCC validations. That is the correct surface for those tests and it is unaffected
   by this refactor. A between-the-passes test would be testing an impossibility.
 
-**Remaining open — one question:**
+### 6.1 How the bounded-memory claim gets evidence — DECIDED 2026-08-05
 
-1. **How does the bounded-memory claim get evidence?** "It streams now" is not testable, and the
-   existing COW suites will pass identically before and after (they are small-fixture functional
-   tests), so a green run proves nothing about memory. Options: (a) a row-count-scaled test that
-   asserts peak retained batches stays O(1) via an instrumented counter on the scan stream;
-   (b) a `#[cfg(test)]` high-water-mark counter incremented in the pass loops; (c) accept a
-   code-shape argument and state explicitly in the PR that memory is unproven. **(a) or (b) —
-   #187's Critic caught exactly this shape of tautology (identical test counts on a change that
-   added zero tests), and a "streaming" claim with no memory evidence is the same error.**
+The existing COW suites assert *which rows survive*; those assertions are byte-identical before and
+after this refactor, so the suite goes green either way. A "COW now streams" claim backed by that
+green run is exactly the tautology #187's Critic caught — evidence that would look the same if the
+claim were false.
+
+**The requirement is therefore not "add a memory test" but: produce a test that is RED against the
+buffered code and GREEN against the streaming code.** That criterion selects the form.
+
+**Chosen: a counting global allocator in a dedicated test binary, two data scales, assertion on the
+_marginal_ peak.** Specified in §7.1.
+
+Rejected, with reasons (do not re-litigate):
+
+| Option | Why not |
+|---|---|
+| Absolute byte threshold (`peak < 50 MB`) | A magic number encoding machine + allocator + arrow version. Flakes, gets bumped, stops discriminating. |
+| `#[cfg(test)]` high-water counter in the pass loops | Mutation-provable, but measures *the proxy we chose to instrument*, not the claim — blind to buffering inside the writer, inside the scan stream, or in any future regression. A code-shape argument wearing a test's clothes. |
+| DataFusion `MemoryPool` with a hard limit | **Cannot work.** Pool accounting only sees operators that register a `MemoryConsumer`; `try_collect()` into a plain `Vec` is invisible to it. Making the COW path hold a `MemoryReservation` is a real idea but is production-code scope creep plus a new failure mode — follow-up seed, not this unit. |
+| `dhat` | The standard tool, but a new `[dev-dependencies]` entry, and CLAUDE.md forbids dependency-file edits without explicit approval. The hand-rolled allocator is ~40 lines of `std::alloc` and needs no approval. |
 
 **Consequence for scoping:** with §4 closed, H7-S2 is a genuine mechanical refactor plus one
 memory-evidence test. It no longer needs a RED-first concurrency pin, and the unit is materially
 smaller than the earlier revision implied.
 
-## 7. Test plan (draft)
+## 7. Test plan
 
-- **Memory evidence** (per §6.1) — the one test that justifies the unit.
+### 7.1 The memory-evidence test — the one deliverable that justifies the unit
+
+**Location:** a NEW binary, `crates/integrations/datafusion/tests/cow_memory_bound.rs`. A `tests/*.rs`
+file compiles to its own binary and runs in its own process, so a `#[global_allocator]` declared
+there has **zero blast radius** on the library or any other test. The crate already carries four such
+binaries. There is no `#[global_allocator]` anywhere in `crates/` today (verified) — nothing to
+collide with.
+
+**Instrument.** `std::alloc` only, no new dependency:
+
+```rust
+struct Counting;
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            PEAK.fetch_max(LIVE.fetch_add(l.size(), Relaxed) + l.size(), Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        LIVE.fetch_sub(l.size(), Relaxed);
+        unsafe { System.dealloc(p, l) }
+    }
+}
+```
+(`realloc` must be handled too — either leave it to the default `GlobalAlloc` provided impl, which
+routes through `alloc`/`dealloc`, or account it explicitly. Whichever the Actor picks, say which.)
+
+**Assertion — marginal, never absolute.** Run the *same* COW DELETE at N and 4N rows: same schema,
+same file count, same deleted fraction, same affected-file fraction. Only the row count varies.
+
+```
+peak(4N) − peak(N)   <   ¼ × (added live bytes)
+```
+
+Constant overheads cancel exactly, so there is no magic number and no machine dependence. At
+N = 128k / 4N = 512k and ~128 B/row (an i64, a couple of i32s, a ~100-char string) the added volume
+is ≈ 48 MB:
+
+- **Buffered (today):** `batches` and `survivors_to_rewrite` are **both live at the peak** — pass 2
+  reads `&batches` while filling the survivor vec — so the delta lands at 48–96 MB against a 12 MB
+  threshold. **Fails by 4–8×.**
+- **Streaming (after):** the delta is a `HashSet<String>` of file paths plus one batch — well under
+  1 MB. **Passes with ~10× headroom.**
+
+That margin is deliberate: the counter races under a multi-thread runtime and the measurement is
+approximate by construction. An order-of-magnitude gap means the approximation cannot flip the
+verdict. **Warm up with one discarded small run** so tokio/planner/parquet one-time init is paid
+before either measurement.
+
+**Two fixture constraints, both to be restated in the PR body:**
+
+1. **Unpartitioned table.** `StreamingDataFileWriter` wraps `TaskWriter<DmlDataFileWriterBuilder>`
+   (`delete.rs:826`); a fanout task writer holds an open writer per partition, so partition
+   cardinality is a **second** memory variable. Holding it at zero isolates the row-count claim.
+   High-cardinality partitioned writes are a genuine separate unbounded-writer question — **name it
+   as a follow-up seed, do not fold it in.**
+2. **One test function per memory binary.** The counter is process-global, so anything concurrent in
+   the same binary pollutes it. DELETE-small / DELETE-large / UPDATE-small / UPDATE-large run
+   sequentially inside one `#[tokio::test]` — no lock needed and no `--test-threads` requirement to
+   forget. (There is no `serial_test` precedent in the repo; separate-binary isolation is the
+   mechanism.)
+
+**Cost:** the COW suites build on `MemoryCatalog` + `TempDir` — no Docker, no MinIO — so this stays a
+fast local test. It is **not** `#[ignore]`d: an ignored memory test is a false-green in CI, the exact
+failure mode being closed here.
+
+**The deliverable is the mutation proof, not the test.** Reinstating `try_collect()` is a one-line
+revert, so the PR body must record the RED run **with real observed numbers**. Without that, the
+test is unfalsifiable decoration and reproduces the #187 error one level up.
+
+*Amortization note:* H7-P1 and the QB writer-bounds unit both make streaming claims that today have
+no way to be evidenced. This harness serves them.
+
+### 7.2 The rest
+
 - Behavior-invariance: the existing COW DELETE/UPDATE suites pass unchanged.
 - Empty-table / `deleted == 0` early exit (pass 2 never runs).
 - Every-row-deleted (affected files fully emptied → writer produces zero files — already handled
   at `:723`, keep the pin).
-- Partitioned COW through the partition-aware writer.
+- Partitioned COW through the partition-aware writer (functional, small fixture — **not** the memory
+  test, per §7.1 constraint 1).
 - Mutation proof: drop the `affected.contains` term → an over-rewrite pin reds (rows from
   unaffected files get needlessly rewritten).
 
