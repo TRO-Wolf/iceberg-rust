@@ -199,11 +199,21 @@ unit; out of scope for a dependency bump.
 
 **R88 adjudicated (the finding behind F2).** The stale text said variant shredded-parquet was
 "blocked at the pinned parquet 57", which implied this bump would unblock it. It does not:
-`LogicalType::Variant` and the whole arrow-side extension path exist **identically** in parquet
-57.3.1 and 58.4.0 (`src/arrow/schema/extension.rs`), gated behind the opt-in `variant_experimental`
-feature that pulls `parquet-variant{,-json,-compute}` — absent from our lockfile. The blocker is a
-feature the workspace does not enable and that upstream marks experimental, **not** a version floor.
-R88 stays 🟡 with a corrected reason.
+`LogicalType::Variant` and the arrow-side extension path are equivalent across parquet 57.3.1 and
+58.4.0, gated behind the opt-in `variant_experimental` feature that pulls
+`parquet-variant{,-json,-compute}` — absent from our lockfile. Precisely: `src/basic.rs` is
+**byte-identical** between the two (`diff -q` silent), while `src/arrow/schema/extension.rs` differs
+(187 → 197 lines) by a behavior-preserving refactor only — `try_extension_type` →
+`has_valid_extension_type` and a `mut arrow_field` restructure. The blocker is a feature the
+workspace does not enable and that upstream marks experimental, **not** a version floor. Enabling it
+would be necessary but not sufficient: fork-side work is also owed (no Iceberg→`ShreddedSchemaBuilder`
+bridge, no file-level interop leg, and `arrow/schema.rs`'s `variant()` visitor hard-errors by
+design). R88 stays 🟡 with a corrected reason.
+
+*(The "identically" in an earlier revision of this paragraph was itself an unverified supporting
+claim — the third such in this unit, after the `fn`-name subset proof and the `RepartitionExec`
+causal story. All three had correct conclusions and unchecked evidence. Recorded as the pattern to
+watch, not just three separate corrections.)*
 
 ### Carried forward by the re-cut
 
