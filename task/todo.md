@@ -64,10 +64,30 @@ Unit 3. Mode A per-unit PRs; SEPMO v2.3 duties. Context at signing: nightly inte
       per-(file, claims) memo; the defect's unattributed path-keyed API REMOVED, `reader.rs`
       unchanged. Eq-deletes PROVEN not-same-class (pinned + mutation-proven); DVs covered.
       Interop crosstask leg added (id 30 survives == Java `{10,30,40,60}`). Lib 2977.
-- [ ] **Unit 3 — breaking** (`PartitionKey::new -> Result` + `CurrentFileStatus`): after QA
-      merges; RoadMapSync warning to RePark BEFORE their next repin.
-- [ ] **QC — toHumanString parity** (D8-approved, format-visible; FIXED/BINARY hex→base64 +
-      Unknown taxonomy + identity(float/double)): alongside Unit 3; format-stability attestation.
+- [x] **Unit 3 — breaking** (`PartitionKey::new -> Result` + `CurrentFileStatus`).
+      **ALREADY LANDED in #182 (`a966055e`) — verified 2026-08-05, no separate unit needed.**
+      `PartitionKey::new` returns `Result` (`spec/partition.rs:445`) and validates via
+      `validate_partition_data` → `check_partition_field`, covering all three specified rules:
+      ARITY (missing slot errors, with the `Transform::Void` exemption), SPEC/SCHEMA BINDING
+      (absent source column id errors — Java's missing-accessor throw, `StructTransform.java:57-58`),
+      and PER-VALUE TYPE COMPATIBILITY (`primitive_type.compatible`). All 58 call sites migrated
+      (main compiles, incl. the 6 `no_run` doc fences). `CurrentFileStatus`'s three post-`close()`
+      unwraps are gone (`data_file_writer.rs:222-236`) — closed NON-breakingly via
+      `unwrap_or_default()`/`unwrap_or(0)` rather than by making the trait fallible, so WG6's
+      predicted API break did not occur.
+      **Residual duty NOT discharged: the RoadMapSync breaking-surface announcement.** See below.
+- [x] **QC — toHumanString parity** (D8-approved, format-visible; FIXED/BINARY hex→base64 +
+      Unknown taxonomy + identity(float/double)).
+      **ALREADY LANDED in #182 (`a966055e`) — verified 2026-08-05.** R161 cell records
+      "CLOSED 2026-07-31 (QC, D8)": every transform whose OUTPUT type is `binary`/`fixed` renders
+      standard Base64 (`TransformUtil.base64encode` parity, NOT URL-safe), pinned by
+      `identity_binary_and_fixed_render_java_base64` with `truncate_is_byte_stable_except_over_string`
+      flipped to match; `Display for Datum` still renders UPPERCASE hex (orthogonal surface, pinned).
+      `Transform::Unknown` is named in the ESCAPER-SENSITIVE bucket (result type `string` both sides).
+      `identity(float)`/`identity(double)` adjudicated and DOCUMENTED as remaining open residue with
+      both sides measured (`1` vs `1.0`, `1.0E10` vs `10000000000`, `-0` vs `-0.0`, `inf` vs
+      `Infinity`; `1.5`/`NaN` agree) — needs its own approval to close. Format-stability attestation
+      present in the cell. 15/15 `partition_path_escaping_tests` green at `403625eb`.
 - [x] **QB — delete-writer file_path bounds** (fork file-scoped deletes must self-identify;
       parquet-rs 64-byte stat truncation; investigate-first, STOP on any Cargo.toml need).
       **MERGED #184 (`7e26c2a0`) 2026-08-03**, content-verified R4. Landed with BUG-001 (the
@@ -83,7 +103,35 @@ weekly cadence (#180), perf waves A–E (#181), the 07-31 slate (#182), the FK1�
 (#183), the V0 DF 52→54 churn map (#185), and the **DF 54.1 / arrow 58.4 family bump re-cut
 (#187)** — which moved MSRV 1.92 → 1.94 and toolchain to nightly-2026-03-05.
 
-**Remaining in signed order: Unit 3 (breaking) + QC alongside → H7-S2 → H7-P1.**
+**Remaining in signed order: H7-S2 → H7-P1.** Unit 3, QC and QB were all verified 2026-08-05 to
+have landed already (Unit 3 + QC inside #182; QB as #184) — the queue checkboxes simply predated
+those merges. The signed CODE queue is therefore complete; what remains from it is one coordination
+duty, below.
+
+### OWED NOW: one RoadMapSync announcement covering FOUR merges of unannounced surface
+
+Unit 3's coordination duty ("the PR body carries the full breaking-surface list, and the
+RoadMapSync announcement warns RePark BEFORE their next repin") was **never discharged** — the code
+landed inside the combined #182 slate, and #184's PR body already flagged the omission ("the Unit 0
+RoadMapSync comms — three unannounced breaking surfaces from #182/#183 — are still owed"). Three
+more merges have landed since. RePark is still pinned at `b009ac15`, which predates ALL of it, so
+one message can still get ahead of their repin. Draft: `roadmapsync-2026-08-05-repin-brief.md`.
+
+| Merge | Surface | Kind |
+|---|---|---|
+| #182 | `PartitionKey::new` → `Result` (58 call sites) | **BREAKING** |
+| #182 | `CurrentFileStatus` post-`close()`: panic → `""`/`0` defaults | behavior |
+| #182 | binary/fixed partition-path segments: UPPERCASE hex → standard Base64 (then URL-escaped) | **FORMAT-VISIBLE** |
+| #183 | `FileScanTask`: `data_file_path` → `Arc<str>`, `project_field_ids` → `Arc<[i32]>`, `predicate` → `Option<Arc<BoundPredicate>>`, `deletes` → `Arc<[FileScanTaskDeleteFile]>` (serde wire shape unchanged) | **BREAKING** |
+| #183 | `DeleteFilter::deleted_row_positions` → `Option<Arc<DeleteVector>>` (was `Arc<Mutex<..>>`) | **BREAKING** |
+| #183 | `TableMetadataCache` opt-in (default OFF); FileIO `client.list-stat-concurrency` (default 16) | additive |
+| #184 | `position_delete_writer_properties()` | additive |
+| #184 | position-delete `file_path` bounds now FULL (were 64-byte truncated); data/position files stamp the true `default_spec_id` instead of a fabricated `0` | behavior |
+| #187 | **MSRV 1.92 → 1.94**; datafusion 52.2→54.1, arrow 57.3→58.4, parquet 57.3→58.4, orc-rust 0.7→0.8; toolchain nightly-2026-03-05 | **BREAKING (toolchain)** |
+
+Repin target `403625eb` (#188). Why it matters beyond hygiene: `b009ac15` predates BUG-001 (#184),
+so RePark is shipping the position-delete resurrection defect today, and their repin is what
+actually delivers the fix.
 
 Two things now owed that were not at signing:
 
