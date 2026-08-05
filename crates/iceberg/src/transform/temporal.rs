@@ -24,7 +24,7 @@ use arrow_array::{
     Array, ArrayRef, Date32Array, Int32Array, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
-use chrono::{DateTime, Datelike, Duration};
+use chrono::{DateTime, Datelike, Duration, NaiveDate};
 
 use super::TransformFunction;
 use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType};
@@ -40,6 +40,21 @@ const UNIX_EPOCH_YEAR: i32 = 1970;
 const MICROS_PER_SECOND: i64 = 1_000_000;
 /// One second in nanos.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// Convert a `date` literal (days from 1970-01-01) to a [`NaiveDate`].
+///
+/// Returns [`ErrorKind::DataInvalid`] when the offset falls outside `NaiveDate`'s representable
+/// range rather than panicking: arrow 58 replaced the infallible `Date32Type::to_naive_date`
+/// (which panicked on overflow) with the `_opt` form, so the out-of-range literal is now
+/// reportable through the `Result` these transforms already return.
+fn date_literal_to_naive(v: i32) -> Result<NaiveDate> {
+    Date32Type::to_naive_date_opt(v).ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("Date literal out of representable range: {v} days from 1970-01-01"),
+        )
+    })
+}
 
 /// Extract a date or timestamp year, as years from 1970
 #[derive(Debug)]
@@ -81,7 +96,7 @@ impl TransformFunction for Year {
     fn transform_literal(&self, input: &crate::spec::Datum) -> Result<Option<crate::spec::Datum>> {
         let val = match (input.data_type(), input.literal()) {
             (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => {
-                Date32Type::to_naive_date_opt(*v).unwrap().year() - UNIX_EPOCH_YEAR
+                date_literal_to_naive(*v)?.year() - UNIX_EPOCH_YEAR
             }
             (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
                 Self::timestamp_to_year_micros(*v)?
@@ -178,8 +193,8 @@ impl TransformFunction for Month {
     fn transform_literal(&self, input: &crate::spec::Datum) -> Result<Option<crate::spec::Datum>> {
         let val = match (input.data_type(), input.literal()) {
             (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => {
-                (Date32Type::to_naive_date_opt(*v).unwrap().year() - UNIX_EPOCH_YEAR) * 12
-                    + Date32Type::to_naive_date_opt(*v).unwrap().month0() as i32
+                let date = date_literal_to_naive(*v)?;
+                (date.year() - UNIX_EPOCH_YEAR) * 12 + date.month0() as i32
             }
             (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
                 Self::timestamp_to_month_micros(*v)?
@@ -2737,6 +2752,45 @@ mod test {
             "1900-05-01T22:01:01.0000000000",
             &hour,
             Datum::int(-610706),
+        );
+    }
+
+    /// Out-of-range `date` literals must surface a typed error, never panic.
+    ///
+    /// arrow 58 replaced the infallible `Date32Type::to_naive_date` (which panicked when the
+    /// day offset overflowed `NaiveDate`) with the `_opt` form. `Year` / `Month`
+    /// `transform_literal` already return `Result`, so the overflow is reported, not aborted.
+    /// `i32::MAX` days is ~5.9M years past the epoch — far outside `NaiveDate`'s range.
+    #[test]
+    fn test_date_literal_out_of_range_errors_not_panics() {
+        for transform in [Transform::Year, Transform::Month] {
+            let func = super::super::create_transform_function(&transform)
+                .expect("create transform function");
+            for days in [i32::MAX, i32::MIN] {
+                let err = func
+                    .transform_literal(&Datum::date(days))
+                    .expect_err("out-of-range date literal must be an error");
+                assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+                assert!(
+                    err.message().contains("out of representable range"),
+                    "unexpected message for {transform:?} at {days}: {err}"
+                );
+            }
+        }
+    }
+
+    /// Control: in-range date literals still project, so the guard is not blanket-rejecting.
+    #[test]
+    fn test_date_literal_in_range_still_projects() {
+        let year = super::super::create_transform_function(&Transform::Year).expect("year");
+        assert_eq!(
+            year.transform_literal(&Datum::date(0)).expect("in range"),
+            Some(Datum::int(0))
+        );
+        let month = super::super::create_transform_function(&Transform::Month).expect("month");
+        assert_eq!(
+            month.transform_literal(&Datum::date(0)).expect("in range"),
+            Some(Datum::int(0))
         );
     }
 }

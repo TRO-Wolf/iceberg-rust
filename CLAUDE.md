@@ -133,8 +133,9 @@ Apache Iceberg Rust implements the **Iceberg table format spec** in Rust: readin
 metadata and data, expression/predicate handling, partition transforms, snapshot and schema
 evolution, and pluggable catalogs and object storage. It is a **library workspace**, not an
 application — most code is library crates consumed by downstream projects. **Rust** edition 2024, MSRV
-**1.92** (see [Cargo.toml](Cargo.toml) `rust-version`). Base synced to upstream **0.9.1** (datafusion
-52.2 / arrow 57.3 / parquet 57.3 — `orc-rust` 0.7 unified the patch level, #95).
+**1.94** (see [Cargo.toml](Cargo.toml) `rust-version`). Base synced to upstream **0.9.1**; the
+dependency family was bumped to **datafusion 54.1 / arrow 58.4 / parquet 58.4** on 2026-08-05
+(`orc-rust` 0.8; MSRV 1.92 → 1.94).
 
 ## Big-picture architecture
 
@@ -201,8 +202,8 @@ cargo fmt --all -- --check
 ```
 
 - **Toolchain:** the lint gate runs on a pinned nightly ([rust-toolchain.toml](rust-toolchain.toml),
-  currently `nightly-2025-10-27`, which `rustup` fetches automatically); downstream only needs MSRV
-  **1.92**. The pinned nightly declares the `rustfmt` and `clippy` components.
+  currently `nightly-2026-03-05`, which `rustup` fetches automatically); downstream only needs MSRV
+  **1.94**. The pinned nightly declares the `rustfmt` and `clippy` components.
 - **`protoc` prerequisite:** `crates/sqllogictest` transitively pulls `datafusion-substrait` →
   `substrait`, whose build needs the Protobuf compiler. If `protoc` is unavailable, the core surface
   still builds/tests via `cargo test --workspace --exclude iceberg-sqllogictest`. Install

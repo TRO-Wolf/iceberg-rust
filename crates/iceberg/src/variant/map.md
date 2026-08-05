@@ -33,7 +33,10 @@ unshredded backing with the `SerializedObject.sliceValue` verbatim-copy contract
 The `variant` SCHEMA-type entry landed 2026-06-11 (F1) and lives OUTSIDE this module:
 `Type::Variant` + serde in `spec/datatypes.rs`, the V3 gate in `spec/schema/mod.rs`, Avro/Arrow
 conversion in `avro/schema.rs` / `arrow/schema.rs`. Shredded-parquet FILE I/O + file-level
-interop are deferred (the pinned parquet 57.1 boundary). The Java→Rust mapping and every
+interop are deferred behind the `parquet` crate's opt-in `variant_experimental` feature (which
+pulls `parquet-variant{,-json,-compute}`), NOT behind a version floor — the feature is present
+and identical in both parquet 57.3.1 and 58.4.0, and this workspace does not enable it. The
+DF-54/arrow-58 bump therefore does not move this. The Java→Rust mapping and every
 deliberate divergence are documented in [mod.rs](mod.rs)'s module doc (read-side list),
 [write.rs](write.rs)'s module doc (write-side list), [shredded.rs](shredded.rs)'s module doc
 (overlay list incl. the two probe-verified 1.10.0 bugs this port does not mirror), and
