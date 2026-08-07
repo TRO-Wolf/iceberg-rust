@@ -1502,6 +1502,57 @@ async fn test_update_null_into_required_is_rejected() -> Result<()> {
     Ok(())
 }
 
+/// The COPY-ON-WRITE twin of the test above (H7-S2 follow-up seed 6, scheduled rather than deferred).
+///
+/// It pins the contract that survived the streaming refactor even though the FAILURE TIMING changed:
+/// before H7-S2 every rewrite batch was built before any Parquet I/O, so `apply_assignments` rejected
+/// the NULL with nothing written; now batch 1 may already be inside an open writer when a later batch
+/// trips the guard, and the writer is dropped without `close()` (leaving staged files that were never
+/// committed — the same shape `merge_on_read_update` has always had). What must NOT change, and is
+/// what this asserts, is that the statement ERRORS and the table is left exactly as it was.
+#[tokio::test]
+async fn test_update_cow_null_into_required_is_rejected() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_update_cow_null_req".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    // Empty properties ⇒ copy-on-write for UPDATE.
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_update_cow_null_req.my_table VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let outcome = ctx
+        .sql("UPDATE catalog.test_update_cow_null_req.my_table SET foo1 = NULL WHERE foo2 = 'a'")
+        .await;
+    let errored = match outcome {
+        Err(_) => true,
+        Ok(df) => df.collect().await.is_err(),
+    };
+    assert!(
+        errored,
+        "copy-on-write UPDATE assigning NULL to the required column foo1 must error, not write a null"
+    );
+
+    // Nothing was committed: both original rows are intact and unchanged.
+    let ids = select_foo1_sorted(&ctx, "catalog.test_update_cow_null_req.my_table").await;
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "a rejected copy-on-write UPDATE must leave the table exactly as it was — no commit, no \
+         partial rewrite"
+    );
+    Ok(())
+}
+
 fn get_nested_struct_type() -> StructType {
     // Create a nested struct type with:
     // - address: STRUCT<street: STRING, city: STRING, zip: INT>
@@ -4404,6 +4455,117 @@ async fn test_update_cow_null_predicate_three_valued_logic() -> Result<()> {
         ids,
         vec![2, 3, 99],
         "the NULL-foo2 row keeps foo1=2 (not updated to 99) — NULL predicate is not an update match"
+    );
+    Ok(())
+}
+
+// =================================================================================================
+// H7-S2 — NON-VACUOUS 3VL for the COPY-ON-WRITE paths.
+//
+// The two `=`-only COW tests above cannot falsify the `is_valid` guard: for `=`, Arrow yields
+// (valid=false, value=false) on a NULL operand, so `is_valid` is redundant there. The Falsifier
+// confirmed it — deleting the guard from `match_mask` left both of them GREEN, and only a
+// merge-on-read UPDATE test went red. H7-S2 routed COW DELETE's formerly-inline guard through the
+// shared `match_mask`, so ONE line now governs three of the four DML paths; these two `<>` tests make
+// it load-bearing on both COW paths. MUTATION PROOF (executed): dropping `is_valid` from `match_mask`
+// makes BOTH of these RED.
+// =================================================================================================
+
+/// COW DELETE with a `<>` predicate over a NULL operand: the NULL-`foo2` row evaluates to
+/// (valid=false, value=TRUE), so ONLY the `is_valid` guard in `match_mask` keeps it out of the
+/// affected/deleted set.
+#[tokio::test]
+async fn test_delete_cow_null_neq_predicate_isvalid_guard() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_del_cow_null_neq".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", Some(nullable_foo_schema()))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_del_cow_null_neq.my_table VALUES (1, 'alan'), (2, NULL), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = ctx
+        .sql("DELETE FROM catalog.test_del_cow_null_neq.my_table WHERE foo2 <> 'zzz'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let deleted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        deleted, 2,
+        "only the two non-NULL rows ('alan','bob') are deleted; the NULL row is UNKNOWN, not a match"
+    );
+
+    let survivors = select_foo1_sorted(&ctx, "catalog.test_del_cow_null_neq.my_table").await;
+    assert_eq!(
+        survivors,
+        vec![2],
+        "the NULL-foo2 row (foo1=2) is REWRITTEN as a survivor by the copy-on-write DELETE — the \
+         `is_valid` guard is load-bearing under `<>`"
+    );
+    Ok(())
+}
+
+/// COW UPDATE with a `<>` predicate over a NULL operand. The guard is load-bearing TWICE here: in
+/// pass 1 (would the NULL row make its file affected / bump the count) and in pass 2 (would the row
+/// take the SET value instead of being carried unchanged).
+#[tokio::test]
+async fn test_update_cow_null_neq_predicate_isvalid_guard() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_upd_cow_null_neq".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", Some(nullable_foo_schema()))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_upd_cow_null_neq.my_table VALUES (1, 'alan'), (2, NULL), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = ctx
+        .sql("UPDATE catalog.test_upd_cow_null_neq.my_table SET foo1 = 99 WHERE foo2 <> 'zzz'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let updated = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        updated, 2,
+        "only the two non-NULL rows are updated; the NULL row is UNKNOWN, not an update match"
+    );
+
+    let ids = select_foo1_sorted(&ctx, "catalog.test_upd_cow_null_neq.my_table").await;
+    assert_eq!(
+        ids,
+        vec![2, 99, 99],
+        "the NULL-foo2 row keeps foo1=2 through the copy-on-write rewrite — `is_valid` guards it"
     );
     Ok(())
 }
