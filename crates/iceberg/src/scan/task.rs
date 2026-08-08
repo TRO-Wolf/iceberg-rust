@@ -39,6 +39,30 @@ fn is_splittable(format: DataFileFormat) -> bool {
     }
 }
 
+/// Whether **this crate's reader** honours a task's `[start, start + length)` byte window for a
+/// data file in this format. This is a property of the READ path, not of the format, and it is
+/// deliberately narrower than [`is_splittable`].
+///
+/// Only the Parquet reader reads `FileScanTask::start` / `length` at all
+/// (`arrow::reader::ArrowReader::process_parquet_file_scan_task`, which selects row groups by
+/// midpoint). `process_avro_file_scan_task` and `process_orc_file_scan_task` materialize the WHOLE
+/// file and ignore the window, so handing them a split of a file would make every sub-task re-emit
+/// every row: an N-way split silently returns N copies of the file, with no error. Measured on a
+/// 500-row Avro OCF split four ways: 2,000 rows.
+///
+/// Java splits all three formats because parquet-mr / the Avro OCF reader / the ORC reader each
+/// seek to their own block boundaries inside the window. Until the Avro block and ORC stripe
+/// readers do the same here, the planner must not manufacture windows they cannot honour —
+/// declining to split is Java-divergent only in PARALLELISM, whereas splitting is Java-divergent
+/// in ROWS. [`ArrowReader`](crate::arrow::ArrowReader) additionally rejects a ranged AVRO/ORC task
+/// with a typed error, so any other route to one fails closed rather than duplicating.
+fn reader_honors_byte_range(format: DataFileFormat) -> bool {
+    match format {
+        DataFileFormat::Parquet => true,
+        DataFileFormat::Avro | DataFileFormat::Orc | DataFileFormat::Puffin => false,
+    }
+}
+
 /// Whether `values` is strictly ascending (each element strictly greater than its predecessor),
 /// porting Java `ArrayUtil.isStrictlyAscending(long[])` — the gate Java's offsets-aware split
 /// uses before trusting the split offsets. An empty or single-element array is vacuously
@@ -404,7 +428,11 @@ impl FileScanTask {
     ///
     /// 1. **Not splittable** (`!file.format().isSplittable()`): return `[self]` unchanged. Per the
     ///    Java `FileFormat` table, `PUFFIN` is the only non-splittable format a data file could
-    ///    carry; `PARQUET` / `AVRO` / `ORC` are splittable.
+    ///    carry; `PARQUET` / `AVRO` / `ORC` are splittable. **This branch is additionally taken
+    ///    for `AVRO` and `ORC`** — see [`reader_honors_byte_range`]: this crate's Avro and ORC
+    ///    readers materialize whole files and ignore `start`/`length`, so a split would return one
+    ///    full copy of the file PER SUB-TASK. Declining to split costs parallelism; splitting
+    ///    would cost correctness.
     /// 2. **Offsets-aware** (split offsets present AND strictly ascending —
     ///    `ArrayUtil.isStrictlyAscending`): emit ONE sub-task per offset. For `i in 0..n-1`,
     ///    `length[i] = offsets[i+1] - offsets[i]`; the LAST is `length[n-1] = fileLength - offsets[n-1]`,
@@ -426,8 +454,12 @@ impl FileScanTask {
             return Err(Error::new(ErrorKind::DataInvalid, "Split size must be > 0"));
         }
 
-        // (1) Non-splittable format ⇒ the whole file is one task.
-        if !is_splittable(self.data_file_format) {
+        // (1) Non-splittable format ⇒ the whole file is one task. AVRO/ORC are splittable per the
+        // Java `FileFormat` table but this crate's readers ignore the byte window
+        // (`reader_honors_byte_range`), so splitting them would silently duplicate every row once
+        // per sub-task; they take this branch too.
+        if !is_splittable(self.data_file_format) || !reader_honors_byte_range(self.data_file_format)
+        {
             return Ok(vec![self.clone()]);
         }
 
@@ -877,6 +909,41 @@ mod tests {
         assert_eq!(parts[0].length, 1000);
         // Passthrough returns self verbatim (record_count + offsets retained).
         assert_eq!(parts[0].record_count, Some(1000));
+    }
+
+    /// AVRO and ORC are splittable per the Java `FileFormat` table, but THIS crate's readers
+    /// materialize whole files and never read `start`/`length`
+    /// ([`reader_honors_byte_range`]), so a split would hand every sub-task the whole file: an
+    /// N-way split silently returns N copies, with no error. The planner must therefore decline
+    /// to split them — through BOTH the fixed-size branch and the offsets-aware branch, which is
+    /// the one a real Avro/ORC manifest entry with `split_offsets` would take.
+    #[test]
+    fn split_declines_formats_whose_reader_ignores_byte_ranges() {
+        for format in [DataFileFormat::Avro, DataFileFormat::Orc] {
+            // Non-vacuity: the same geometry MUST split for a format whose reader honours the
+            // window, otherwise this test would pass on a `split` that never splits anything.
+            for offsets in [None, Some(vec![0i64, 300, 700])] {
+                let parquet = task(1000, DataFileFormat::Parquet, offsets.clone());
+                assert!(
+                    parquet.split(100).expect("parquet split ok").len() > 1,
+                    "fixture is non-discriminating: parquet with offsets {offsets:?} must split"
+                );
+
+                let t = task(1000, format, offsets.clone());
+                let parts = t.split(100).expect("split ok");
+                assert_eq!(
+                    parts.len(),
+                    1,
+                    "{format:?} with offsets {offsets:?} must not be split into byte windows its \
+                     reader cannot honour"
+                );
+                assert_eq!(
+                    (parts[0].start, parts[0].length),
+                    (0, 1000),
+                    "{format:?} passthrough must cover the whole file"
+                );
+            }
+        }
     }
 
     // ---- split: offsets-aware ----

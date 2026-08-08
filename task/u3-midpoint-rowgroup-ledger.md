@@ -183,14 +183,29 @@ dependencies.
    loss** (Java-identical, therefore parity-correct, but new behaviour for this fork). A window that
    does not contain a row group's midpoint reads none of its rows: measured, a `[0, 1349)` window
    over a 3-row-group / 300-row file returns 200 rows with no error, where the deleted overlap rule
-   returned all 300. Callers whose windows do not TILE `[0, file_size)` — a manifest whose
-   `file_size_in_bytes` understates the file, or a `split_offsets[0]` above the first midpoint — now
-   lose rows silently. Named in the `filter_row_groups_by_byte_range` doc comment.
+   returned all 300. Callers whose windows do not TILE `[0, file_size)` — a window narrower than the
+   file with no sibling covering the rest, or a `split_offsets[0]` above the first midpoint — now
+   lose rows silently. Named in the `filter_row_groups_by_byte_range` doc comment. **Corrected in
+   cycle 3 (§12.4):** an understated manifest `file_size_in_bytes` is NOT one of those routes — the
+   footer read is anchored at that value, so it fails loudly at metadata decode. And on the
+   non-tiling `split_offsets` layout the deleted overlap rule loses the identical rows, so that
+   route is not a regression either.
 5. **Deliberate fail-closed divergences from Java on corrupt metadata.** A negative offset/size is a
    typed `DataInvalid` here; Java's `getOffset` has no non-negativity guard, so it computes a
    negative midpoint, fails `>= startOffset` and silently DROPS the row group. A column-less row
    group is likewise a typed error where Java throws `IndexOutOfBoundsException`. Rust is stricter in
-   both cases and never silently under-reads. Named in the doc comment (cycle-2 addition).
+   both cases and never silently under-reads. Named in the doc comment (cycle-2 addition). Cycle 3
+   adds a third: the row-group size is summed with `checked_add` into a typed `DataInvalid` rather
+   than through `RowGroupMetaData::compressed_size()`, whose unchecked `i64` `sum()` panics (debug)
+   or wraps (release) on a footer declaring several chunks near `i64::MAX`; Java sums into a `long`
+   and wraps silently. See §12.3.
+6. **AVRO and ORC data files are never split** (cycle 3, §12.1). Java's `FileFormat` calls them
+   splittable and parquet-mr's siblings seek to Avro block / ORC stripe boundaries inside the
+   window; this fork's Avro and ORC readers materialize whole files, so the planner declines the
+   split (`scan::task::reader_honors_byte_range`) rather than manufacture windows they cannot
+   honour. The cost is intra-file parallelism for those two formats; the alternative was silent
+   N-fold row duplication. Closing it means implementing block/stripe-range reads — a separate
+   unit, at which point flip `reader_honors_byte_range`, never `is_splittable`.
 
 ## 9 · Scope fence
 
@@ -251,3 +266,94 @@ one baseline run RED — mutation work must be done in an isolated copy or under
 (2) `git archive HEAD | tar -x` preserves COMMIT mtimes, so cargo skips the rebuild and runs a STALE
 test binary (it reported the pre-fix count 3138). Any restore-by-content step must bump mtimes —
 this cycle's harness `touch`es every restored file and md5-verifies against the pre-mutation baseline.
+
+## 12 · Remediation cycle 3 (2026-08-07) — closing the Falsifier counterexamples
+
+The independent Critic converged with **zero** findings and independently re-decoded parquet-mr,
+confirming the shipped rule Java-exact on all four axes. The Falsifier reported `broke_it = true`
+with one HIGH counterexample it actually RAN, two MEDIUM items, and one doc correction.
+
+### 12.1 · HIGH — AVRO/ORC ranged splits duplicate every row (same hazard class, live, pre-existing)
+
+`is_splittable` (`scan/task.rs`) calls AVRO/ORC splittable — a faithful port of the Java
+`FileFormat` table — and `TableScan::plan_tasks` (`scan/mod.rs`) calls `task.split(split_size)`
+unconditionally. But **only the Parquet reader reads the window**: a grep of every `task.start` /
+`task.length` read in `arrow/reader.rs` lands exclusively inside `process_parquet_file_scan_task`
+(the `_pos` guard and the byte-range filter call). `process_avro_file_scan_task` and
+`process_orc_file_scan_task` materialize whole files and drop straight into
+`finish_whole_file_scan_task`. So every sub-task re-emitted the entire file: the Falsifier measured
+a 500-row Avro OCF split four ways returning **2,000 rows**, silently, with no error — precisely
+the symptom this unit exists to eliminate, on a different format.
+
+Verified independently here by the grep above and by the new end-to-end pin, which is RED without
+the fix.
+
+**Fix, two layers:**
+
+1. **Planner (the real fix).** New `scan::task::reader_honors_byte_range(format)` — a property of
+   the READ path, deliberately separate from `is_splittable`, which keeps porting Java faithfully.
+   `FileScanTask::split` takes the passthrough branch when either predicate says no, so AVRO/ORC
+   are never split. This is Java-divergent in PARALLELISM; splitting was Java-divergent in ROWS.
+2. **Reader (defence in depth).** `ArrowReader::reject_ranged_whole_file_task` fails a ranged
+   AVRO/ORC task closed with a typed `FeatureUnsupported`, covering the public `PartitionWork` /
+   direct-reader seams exactly as the `_pos` guard does. Both whole-file spellings (`length == 0`
+   legacy sentinel, `length == file_size_in_bytes`) still pass.
+
+**Not fixed, named instead:** implementing real Avro block-range and ORC stripe-range reads is a
+separate unit. Until then AVRO/ORC scans are single-task per file.
+
+**Interop safety check.** The `run-interop-scan-plan` oracle's fixtures are all parquet
+(`merge.parquet` / `gap.parquet` / `big.parquet`), so the Rust-vs-Java `planTasks` comparison is
+untouched by the AVRO/ORC passthrough. If an AVRO or ORC data file is ever added to that oracle it
+WILL diverge, by design — Java splits, this fork does not.
+
+### 12.2 · MEDIUM — the negative-`compressed_size` guard was unpinned (MZ1 survived)
+
+Replacing the guard with `.unwrap_or(0)` left the full lib suite green. Under that mutation a
+corrupt size makes `midpoint == row_group_start`, i.e. **selection by START instead of midpoint** —
+wrong rows, no error. Worse, the in-tree comment justified the gap with a claim that is simply
+false: the public `ColumnChunkMetaData` builder *does* accept `set_total_compressed_size(-20)`.
+Closed by case **(h)** of the semantics matrix (with a fixture guard asserting the fabricated size
+really is negative, and a second window at the row-group start proving the error is the only thing
+preventing selection-by-start); the false claim is deleted.
+
+### 12.3 · MEDIUM — `RowGroupMetaData::compressed_size()` panics before any guard runs
+
+That accessor is an **unchecked** `i64` `sum()` over the column chunks, and parquet-rs applies no
+range validation when decoding the thrift field, so a corrupt footer declaring several chunks near
+`i64::MAX` aborts with `attempt to add with overflow` (debug) or wraps to a bogus/negative size
+(release) — reachable from a hostile file, and directly contradicting the doc comment's fail-closed
+claim. The size is now summed **here** with `checked_add` into a typed `DataInvalid`. Semantics are
+unchanged (still Java's else-branch, `Σ columns.total_compressed_size`). Pinned by case **(i)**.
+
+### 12.4 · LOW — the residue sentence over-claimed one route
+
+"a manifest whose `file_size_in_bytes` understates the file … loses rows silently" is wrong:
+`ArrowFileReader` anchors the footer read at that value, so an understated size fails **loudly** at
+metadata decode (`Invalid Parquet file. Corrupt footer`) long before selection. The silent-row-loss
+residue is real only for an under-covering WINDOW and for a `split_offsets` list that does not tile
+— and the Falsifier hand-computed the deleted overlap rule on the latter layout and got the same
+rows, so it is not a regression either. The doc comment now says exactly that.
+
+### 12.5 · Declined, with reason
+
+- **MZ3** (midpoint `checked_add` → `wrapping_add`) survives. This is not a coverage gap: both
+  inputs are `i64`-derived, so `offset + size/2 < 2^63 + 2^62 < u64::MAX` and the branch is
+  unreachable by construction. The Falsifier agrees ("confirming the Actor's call rather than a
+  coverage gap"). It stays as a defensive assertion — §8.6.
+- **MZ5** (`data_page_offset > dict` → `>=`) survives and is genuinely equivalent (both arms return
+  the same value when the two offsets are equal). The Falsifier ran it as its own harness control.
+- **`is_strictly_ascending` vacuity on a 1-element slice** stays untouched: it matches Java
+  `ArrayUtil.isStrictlyAscending`, and the resulting single sub-task `[0, file_len)` contains every
+  midpoint. Out of scope per the work order's risk list.
+- **Zero-size row group + `end - 1` underflow** in the `partition_work.rs` annotation (Falsifier's
+  "minor nit"): unreachable for that fixture (a parquet row group always has a positive compressed
+  size), and the assertion is a test annotation, not a production path.
+
+### 12.6 · Process
+
+Per the Falsifier's urgent process finding — the shared worktree was carrying a sibling agent's
+uncommitted `midpoint <= end` mutation during cycle-2 review — the entire cycle-3 gate and mutation
+sweep were run in an **isolated** `git archive | tar -x` tree with its own `CARGO_TARGET_DIR`, with
+`touch` after extraction (commit mtimes otherwise make cargo run a stale binary) and md5 restore
+verification after every mutant.

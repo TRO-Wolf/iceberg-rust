@@ -783,6 +783,43 @@ impl ArrowReader {
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
 
+    /// Fail closed on a task carrying a real byte sub-window for a format whose reader
+    /// materializes WHOLE files.
+    ///
+    /// [`Self::process_avro_file_scan_task`] and [`Self::process_orc_file_scan_task`] never read
+    /// `task.start` / `task.length` — the Avro OCF and ORC readers decode the entire file. So a
+    /// ranged sub-task would re-emit every row of the file, and an N-way split would return N
+    /// copies with no error at all (measured: a 500-row Avro OCF split four ways returned 2,000
+    /// rows). That is the same silent-duplication class the Parquet midpoint row-group selection
+    /// exists to eliminate, and it must not be reachable by any route.
+    ///
+    /// [`FileScanTask::split`] already declines to split these formats
+    /// (`scan::task::reader_honors_byte_range`), so the planner never produces such a task; this
+    /// guard covers the public `PartitionWork` / direct-reader seams, exactly as the `_pos` guard
+    /// in [`Self::process_parquet_file_scan_task`] does.
+    ///
+    /// Whole-file tasks carry `start == 0` with either `length == 0` (the legacy sentinel) or
+    /// `length == file_size_in_bytes`; anything else is a split product and is rejected loud.
+    fn reject_ranged_whole_file_task(task: &FileScanTask, format: &str) -> Result<()> {
+        let whole_file =
+            task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes);
+        if whole_file {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "a ranged split task over a {format} data file is unsupported: task covers {}..{} \
+                 of {} bytes of '{}', but the {format} reader decodes whole files (each split \
+                 would re-emit every row). Plan without splitting this file.",
+                task.start,
+                task.start.saturating_add(task.length),
+                task.file_size_in_bytes,
+                task.data_file_path
+            ),
+        ))
+    }
+
     /// Read one **Avro** data-file scan task into an [`ArrowRecordBatchStream`].
     ///
     /// Avro has no footer metadata, statistics, or row-group structure, so — unlike the Parquet
@@ -811,6 +848,8 @@ impl ArrowReader {
         file_io: FileIO,
         delete_file_loader: CachingDeleteFileLoader,
     ) -> Result<ArrowRecordBatchStream> {
+        Self::reject_ranged_whole_file_task(&task, "AVRO")?;
+
         // Kick off delete loading concurrently with the file read (as the Parquet path does).
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
@@ -851,6 +890,8 @@ impl ArrowReader {
         file_io: FileIO,
         delete_file_loader: CachingDeleteFileLoader,
     ) -> Result<ArrowRecordBatchStream> {
+        Self::reject_ranged_whole_file_task(&task, "ORC")?;
+
         // Kick off delete loading concurrently with the file read (as the Parquet path does).
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
@@ -1771,13 +1812,19 @@ impl ArrowReader {
     ///   and silently **drops** the row group. Rust is stricter and never silently under-reads.
     /// * A row group with no column chunks is a typed error; Java indexes `getColumns().get(0)`
     ///   unguarded and throws `IndexOutOfBoundsException`.
+    /// * The row-group size is summed with `checked_add` instead of through
+    ///   `RowGroupMetaData::compressed_size()`, whose unchecked `i64` `sum()` panics (debug) or
+    ///   wraps (release) on a footer declaring several column chunks near `i64::MAX`. Java sums
+    ///   into a `long` and wraps silently.
     ///
     /// Named residue (Java-identical, not a defect): because selection is midpoint-based, a window
     /// that does not cover a row group's midpoint reads none of its rows. A caller whose window set
-    /// under-covers the file — a manifest whose `file_size_in_bytes` understates the file, or a
-    /// `split_offsets[0]` above the first midpoint — therefore loses rows silently, where the old
-    /// overlap rule would have over-read. Java behaves the same way; the invariant callers must
-    /// preserve is that their windows TILE `[0, file_size)`.
+    /// under-covers the file — a window narrower than the file with no sibling covering the rest,
+    /// or a `split_offsets[0]` above the first midpoint — therefore loses rows silently, where the
+    /// old overlap rule would have over-read. Java behaves the same way; the invariant callers
+    /// must preserve is that their windows TILE `[0, file_size)`. (An understated manifest
+    /// `file_size_in_bytes` is *not* one of those routes: `ArrowFileReader` anchors the footer read
+    /// at that value, so it fails LOUDLY at metadata decode — measured — long before selection.)
     fn filter_row_groups_by_byte_range(
         parquet_metadata: &Arc<ParquetMetaData>,
         start: u64,
@@ -1812,10 +1859,25 @@ impl ArrowReader {
                     )
                 })?;
 
-            // `compressed_size()` is an `i64`; a corrupt negative size must not wrap when cast.
-            // It is `Σ columns.total_compressed_size`, i.e. Java's else-branch (parquet-rs does not
-            // decode the thrift `RowGroup.total_compressed_size` field Java prefers).
-            let row_group_size = u64::try_from(row_group.compressed_size()).map_err(|_| {
+            // `Σ columns.total_compressed_size`, i.e. Java's else-branch (parquet-rs does not
+            // decode the thrift `RowGroup.total_compressed_size` field Java prefers). Summed HERE
+            // with `checked_add` rather than via `RowGroupMetaData::compressed_size()`, whose
+            // `i64` `sum()` is unchecked: parquet-rs applies no range validation to that thrift
+            // field, so a corrupt footer declaring several chunks near `i64::MAX` PANICS there
+            // (debug) or wraps to a bogus/negative size (release) before any guard below runs.
+            let mut row_group_size_i64: i64 = 0;
+            for column in row_group.columns() {
+                row_group_size_i64 = row_group_size_i64
+                    .checked_add(column.compressed_size())
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Row group {idx} compressed size overflows i64"),
+                        )
+                    })?;
+            }
+            // A corrupt negative size must not wrap when converted.
+            let row_group_size = u64::try_from(row_group_size_i64).map_err(|_| {
                 Error::new(
                     ErrorKind::DataInvalid,
                     "Row-group compressed size is negative",
@@ -3442,9 +3504,9 @@ message schema {
 
     /// FIX (reader): `filter_row_groups_by_byte_range` guards `start + length` with
     /// `checked_add`; a split descriptor with `start = u64::MAX, length = 1` must return a typed
-    /// `DataInvalid` error rather than overflowing `u64`. (The negative-`compressed_size` branch
-    /// stays untested here — it needs fabricated row-group metadata with a negative size, which
-    /// the public `RowGroupMetaData` builder does not let us construct.)
+    /// `DataInvalid` error rather than overflowing `u64`. (The negative- and overflowing-
+    /// `compressed_size` branches are pinned by cases `(h)` / `(i)` of
+    /// `test_midpoint_selection_offset_and_boundary_semantics`.)
     #[test]
     fn test_filter_row_groups_by_byte_range_start_plus_length_overflow() {
         use parquet::file::metadata::{FileMetaData, ParquetMetaData};
@@ -4166,6 +4228,64 @@ message schema {
                 .expect("extreme but decodable offsets must not panic or error"),
             vec![0],
             "a midpoint inside [0, u64::MAX) must still be selected"
+        );
+
+        // (h) a NEGATIVE row-group compressed size is a typed error, not a silent selection by
+        //     START. Without the guard the `u64` conversion would be replaced by a 0-valued size,
+        //     making the midpoint equal the row-group start — wrong rows, no error. The public
+        //     `ColumnChunkMetaData` builder accepts a negative `total_compressed_size`, so this
+        //     branch IS constructible (an earlier revision of this file wrongly claimed otherwise).
+        let md = midpoint_test_metadata(&[(100, -20, None)]);
+        assert!(
+            md.row_group(0).compressed_size() < 0,
+            "fixture guard: the fabricated row group must really declare a negative size, got {}",
+            md.row_group(0).compressed_size()
+        );
+        let err = ArrowReader::filter_row_groups_by_byte_range(&md, 0, 1000)
+            .expect_err("a negative row-group compressed size must error");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("compressed size is negative"),
+            "the typed error must name the negative size, got: {err}"
+        );
+        // Non-vacuity: a window starting AT the row-group start would select it if the size
+        // collapsed to 0, so the error above is the only thing preventing selection-by-start.
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 100, 1).is_err(),
+            "the negative size must fail closed for every window, including one at the start"
+        );
+
+        // (i) a footer whose column chunks sum past `i64::MAX` is a typed error, not a panic.
+        //     `RowGroupMetaData::compressed_size()` sums the chunks with an UNCHECKED `i64`
+        //     `sum()` and parquet-rs applies no range validation when decoding the thrift field,
+        //     so calling it here would abort (debug) or wrap to a bogus size (release).
+        let schema_descr = schema_descr_with_columns(3);
+        let huge_columns: Vec<ColumnChunkMetaData> = (0..3)
+            .map(|col| {
+                ColumnChunkMetaData::builder(schema_descr.column(col))
+                    .set_data_page_offset(100)
+                    .set_total_compressed_size(i64::MAX)
+                    .build()
+                    .expect("huge column chunk metadata")
+            })
+            .collect();
+        let huge_group = RowGroupMetaData::builder(schema_descr.clone())
+            .set_num_rows(10)
+            .set_total_byte_size(0)
+            .set_column_metadata(huge_columns)
+            .set_ordinal(0)
+            .build()
+            .expect("row group with an overflowing column-size sum");
+        let md = Arc::new(ParquetMetaData::new(
+            FileMetaData::new(1, 0, None, None, schema_descr, None),
+            vec![huge_group],
+        ));
+        let err = ArrowReader::filter_row_groups_by_byte_range(&md, 0, u64::MAX)
+            .expect_err("an overflowing column-size sum must error, not panic");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("overflows i64"),
+            "the typed error must name the overflow, got: {err}"
         );
     }
 
@@ -8469,6 +8589,129 @@ mod avro_scan_tests {
             (20, Some("b".to_string())),
             (30, None),
         ]);
+    }
+
+    // -- U3 cycle 3 / hazard-1 sibling: AVRO must never be read through a byte sub-window. ------------
+
+    /// The AVRO reader decodes WHOLE files — it never reads `task.start` / `task.length`. So if
+    /// the planner split an Avro file into byte windows, every sub-task would re-emit every row
+    /// and an N-way split would silently return N copies of the file: the exact silent-duplication
+    /// class the Parquet midpoint row-group selection was written to eliminate, with no error at
+    /// any layer.
+    ///
+    /// This drives the REAL `FileScanTask::split` → `ArrowReader::read` path (what
+    /// `TableScan::plan_tasks` does at `scan/mod.rs`) and asserts the exactly-once property over
+    /// the whole split set. Before `scan::task::reader_honors_byte_range` this returned 4× the
+    /// file's rows.
+    #[tokio::test]
+    async fn avro_split_reads_every_row_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        let schema = test_schema();
+        let data_path = tmp.path().join("split.avro").to_string_lossy().to_string();
+        let rows: Vec<(i64, Option<&str>)> = (0..200i64)
+            .map(|i| (i, if i % 3 == 0 { None } else { Some("payload") }))
+            .collect();
+        write_avro_data_file(&data_path, &schema, &rows);
+
+        let whole = avro_task(&data_path, schema, vec![1, 2], vec![]);
+        let file_len = whole.file_size_in_bytes;
+        // `plan_tasks` hands `split` the file length as the task length; mirror that exactly.
+        let whole = FileScanTask {
+            length: file_len,
+            ..whole
+        };
+
+        // Non-vacuity: the target must be small enough that a split WOULD produce several windows.
+        // A PARQUET task with the same geometry does split, which is what makes this test able to
+        // fail when the AVRO gate is removed.
+        let target = file_len / 4 + 1;
+        assert!(
+            target < file_len,
+            "fixture is non-discriminating: the split target ({target}) must be well under the \
+             file length ({file_len}), otherwise a single window is the trivially correct answer"
+        );
+        let parquet_shaped = FileScanTask {
+            data_file_format: DataFileFormat::Parquet,
+            ..whole.clone()
+        };
+        assert!(
+            parquet_shaped.split(target).expect("parquet split").len() > 1,
+            "fixture is non-discriminating: this geometry must split into several windows for a \
+             format whose reader honours byte ranges"
+        );
+
+        let sub_tasks = whole.split(target).expect("avro split");
+        assert_eq!(
+            sub_tasks.len(),
+            1,
+            "an AVRO file must not be split into byte windows its reader cannot honour"
+        );
+
+        let mut all_ids = Vec::new();
+        for sub_task in sub_tasks {
+            let batches = run_scan(FileIO::new_with_fs(), sub_task).await;
+            all_ids.extend(rows_of(&batches).into_iter().map(|(id, _)| id));
+        }
+        all_ids.sort_unstable();
+        assert_eq!(
+            all_ids,
+            (0..200i64).collect::<Vec<_>>(),
+            "the union over every sub-task must be each row EXACTLY once, never a duplicate"
+        );
+    }
+
+    /// Defence in depth for the same hazard: even if a ranged AVRO/ORC task reaches the reader by
+    /// some other route (the public `PartitionWork` seam, a hand-built task), it must fail with a
+    /// typed error rather than silently re-emitting the whole file.
+    #[tokio::test]
+    async fn avro_ranged_task_is_rejected_with_a_typed_error() {
+        let tmp = TempDir::new().unwrap();
+        let schema = test_schema();
+        let data_path = tmp.path().join("ranged.avro").to_string_lossy().to_string();
+        write_avro_data_file(&data_path, &schema, &[(1, Some("a")), (2, Some("b"))]);
+
+        let whole = avro_task(&data_path, schema, vec![1, 2], vec![]);
+        let file_len = whole.file_size_in_bytes;
+        assert!(
+            file_len > 2,
+            "fixture guard: the Avro file must be non-trivial"
+        );
+
+        // A genuine sub-window: neither `start == 0 && length == 0` nor the full file length.
+        let ranged = FileScanTask {
+            start: 0,
+            length: file_len / 2,
+            ..whole.clone()
+        };
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream;
+        let err = reader
+            .read(tasks)
+            .expect("build scan stream")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect_err("a ranged AVRO task must fail closed, not re-emit the whole file");
+        assert_eq!(err.kind(), crate::ErrorKind::FeatureUnsupported);
+        assert!(
+            err.to_string().contains("ranged split task over a AVRO"),
+            "the typed error must name the ranged AVRO task, got: {err}"
+        );
+
+        // Both whole-file spellings must still be accepted: the legacy `length == 0` sentinel and
+        // an explicit `length == file_size_in_bytes`.
+        for length in [0, file_len] {
+            let batches = run_scan(FileIO::new_with_fs(), FileScanTask {
+                start: 0,
+                length,
+                ..whole.clone()
+            })
+            .await;
+            assert_eq!(
+                rows_of(&batches).len(),
+                2,
+                "a whole-file AVRO task (length {length}) must still read normally"
+            );
+        }
     }
 
     // -- Projection: only the projected field id materializes. ----------------------------------------

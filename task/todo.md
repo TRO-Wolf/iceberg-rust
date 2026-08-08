@@ -61,6 +61,27 @@ Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-ord
       ODD-size case so `/2 → div_ceil(2)` is RED; add a REAL multi-column pin; fix the stale
       "duplicate rows" rationale in `scan/mod.rs`; re-point the amplifier-4 annotation at the
       load-bearing quantity; name the silent-row-loss and fail-closed-divergence residue.
+- [x] **P9 — Remediation cycle 3** (Falsifier counterexamples; ledger §12). Plan:
+      - [x] **P9a — AVRO/ORC ranged splits duplicate every row (HIGH, live, same hazard class).**
+            `is_splittable` calls AVRO/ORC splittable (the Java `FileFormat` port) and
+            `plan_tasks` splits unconditionally, but `process_avro_file_scan_task` /
+            `process_orc_file_scan_task` never read `task.start`/`task.length` — every sub-task
+            re-reads the whole file. Stop the planner emitting ranged AVRO/ORC tasks, add a
+            fail-closed read guard (the `_pos` guard's shape) as defence in depth, and split the
+            `scan/map.md` Debug row that currently attributes the symptom solely to parquet.
+      - [x] **P9b — Pin the negative-`compressed_size` guard (MZ1 survived).** Add the case to
+            the `(a)`–`(g)` semantics matrix and delete the in-tree comment claiming the public
+            builder cannot construct a negative size — it can, and the Falsifier did.
+      - [x] **P9c — `compressed_size()` overflows before any guard runs.** parquet-rs sums the
+            column `total_compressed_size` values with an unchecked `i64` `sum()`; a corrupt
+            footer panics (debug) or wraps (release). Sum it here with `checked_add` → typed
+            `DataInvalid`.
+      - [x] **P9d — Narrow the over-stated residue sentence.** An understated manifest
+            `file_size_in_bytes` fails LOUDLY at footer decode, not silently; the silent-row-loss
+            residue is real only for under-covering windows / non-tiling `split_offsets`.
+      - [x] **P9e — Re-run the full gate and the whole mutation sweep in an ISOLATED tree**
+            (`git archive | tar -x`, own `CARGO_TARGET_DIR`, `touch` after extraction) — the
+            shared worktree was carrying a sibling agent's uncommitted mutation during cycle 2.
 
 ---
 
