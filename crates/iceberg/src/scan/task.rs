@@ -1571,6 +1571,55 @@ mod tests {
         assert_eq!(windows, vec![(0, 400), (400, 400), (800, 200)]);
     }
 
+    /// The fixed-size walk's loop BOUND is load-bearing at `remaining == 1`, and nothing pinned it.
+    ///
+    /// Measured: mutating `while remaining > 0` to `while remaining > 1` SURVIVED the whole suite.
+    /// Consequence on a parent whose `length` IS 1: the walk never runs, `split` returns an EMPTY
+    /// Vec, and `scan::mod`'s `split_tasks.extend(task.split(split_size)?)` then drops the file —
+    /// `plan_files` returns it, `plan_tasks` reads ZERO rows from it, and nothing errors. That is
+    /// the same silent-total-row-loss class as the `length == 0` sentinel (branch 1b) and the
+    /// empty-offsets fallback (branch 2), both of which ARE pinned.
+    ///
+    /// The pre-existing fixtures cannot see it: [`split_fixed_size_walks_the_file`] uses 1000/400
+    /// (last window 200, so `remaining > 1` still admits it) and
+    /// [`split_fixed_size_target_larger_than_file_is_one_task`] never loops twice. This test pins
+    /// BOTH halves of the boundary — a one-byte parent, and a walk whose LAST window is exactly one
+    /// byte. (U3 final round / F-A, 2026-08-08.)
+    #[test]
+    fn split_fixed_size_emits_the_final_one_byte_window_and_never_an_empty_vec() {
+        // Half 1 — a walk whose LAST window is exactly 1 byte: 1000 at target 333.
+        // This assertion is also the NON-VACUITY guard for half 2: a `split` that declined
+        // everything would return one task here, not four.
+        let t = task(1000, DataFileFormat::Parquet, None);
+        let windows: Vec<(u64, u64)> = t
+            .split(333)
+            .expect("split ok")
+            .iter()
+            .map(|p| (p.start, p.length))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![(0, 333), (333, 333), (666, 333), (999, 1)],
+            "the walk must emit its final ONE-byte window; dropping it loses the last byte of the \
+             file — and with it any row whose data lives there — with no error"
+        );
+
+        // Half 2 — a parent that IS one byte: exactly one `(0, 1)` window, never an empty Vec.
+        let one = task(1, DataFileFormat::Parquet, None);
+        let parts = one.split(4).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            1,
+            "a one-byte parent must split to ONE task; an empty Vec drops the file out of \
+             `plan_tasks` entirely, with no error anywhere"
+        );
+        assert_eq!(
+            (parts[0].start, parts[0].length),
+            (0, 1),
+            "the single window must cover the parent exactly"
+        );
+    }
+
     #[test]
     fn split_fixed_size_target_larger_than_file_is_one_task() {
         let t = task(300, DataFileFormat::Parquet, None);

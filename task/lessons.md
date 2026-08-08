@@ -890,3 +890,28 @@ missed it.
   masking the other.
 - **DO NOT read "suite still green, +N tests" as evidence a widening was safe** — it is exactly the
   signature this failure produces.
+
+### 2026-08-08 — A metadata-PRESERVING restore (`cp -p` / `shutil.copy2`) defeats cargo's freshness check: the "restored" run can be a mutant-era artifact reported as GREEN
+
+Context (U3 final round): the Falsifier's mutation harness restored each mutated source with
+`shutil.copy2` — the Python spelling of `cp -p` — which puts the ORIGINAL mtime back on the source
+file. Cargo's freshness check compares source mtime against artifact mtime, so the mutant-era
+artifact still looked fresh and the crate was NOT rebuilt: a mutation run can report the restored
+code GREEN having never compiled it, and — the worse direction — a full verification gate run in
+that checkout can be served entirely from a MUTANT binary and still print all-green. The content
+check everyone reaches for (`cmp` / md5) passes in both cases: it proves the SOURCE was restored, and
+says nothing about which bytes the artifact was built from.
+
+This is the same build-cache-is-part-of-the-state failure as the two entries above (2026-07-24 `cp -p`
++ `mv`, and the 2026-07-25 inherited warm `target/`), reached from a third direction — so treat it as
+the general rule, not three incidents.
+
+- **DO restore with plain `cp` (which stamps a NEW mtime), or `touch` the file immediately after
+  restoring.** Never `cp -p`, `shutil.copy2`, `install -p`, `rsync -t`, or anything else that
+  preserves times — a mutation harness has no reason to want the old mtime back.
+- **DO verify a restore on BOTH axes before believing any result: CONTENT (`cmp`/md5 against the
+  pre-mutation backup) AND REBUILD (cargo printed `Compiling <crate>`, or the artifact's mtime
+  moved).** Content alone is the trap; the artifact is the thing the test actually ran.
+- **DO NOT report a GREEN — gate or mutation leg — from a checkout whose last mutation restore you
+  did not confirm rebuilt.** A green produced from a mutant-era binary is indistinguishable from a
+  real one in the output, and it ships.

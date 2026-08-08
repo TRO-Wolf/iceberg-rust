@@ -3788,10 +3788,12 @@ message schema {
     /// `start != 0 || length != file_size_in_bytes`, and this fixture (`0, 0` over a REAL file
     /// size) trips the second disjunct, so it returns at (1a) and the `length == 0` sentinel is no
     /// longer what answers it — measured: both sentinel mutants leave this test green. Branch
-    /// (1b)'s only remaining reachable shape is `file_size_in_bytes == 0`, which cannot be built
-    /// here: `ArrowFileReader` anchors the footer read at `file_size_in_bytes`, so an understated
-    /// value fails loudly at metadata decode before any row is read (documented and measured on
-    /// `filter_row_groups_by_byte_range`). (1b) is therefore pinned at the unit level only, by
+    /// (1b)'s only remaining reachable shape is `file_size_in_bytes == 0`. That shape IS reachable —
+    /// `split` does return exactly one task `(start 0, length 0)` for it — but it cannot be exercised
+    /// END-TO-END at the reader level: `ArrowFileReader` anchors the footer read at
+    /// `file_size_in_bytes`, so the subsequent READ fails before any row is decoded, measured as
+    /// `ErrorKind::Unexpected` "Failed to load Parquet metadata" with source
+    /// "EOF: file size of 0 is less than footer". (1b) is therefore pinned at the unit level only, by
     /// `scan::task::tests::split_whole_file_sentinel_on_an_empty_file_is_one_task_not_zero`. What
     /// this test still pins end-to-end is the observable that matters: a sentinel-spelled task
     /// survives `split` as one task and reads every row. (Independent review of the reviewer rider,
