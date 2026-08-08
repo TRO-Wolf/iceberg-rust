@@ -841,3 +841,35 @@ exclusive-access protocol tells you to check.
   uncommitted: porcelain-empty proves you match HEAD, which is the wrong target mid-unit.
 - **DO re-run the full suite green on the restored source before the next mutant**, so a destroyed
   fix is caught by the count (3155 → 3153) instead of being blamed on the next mutation.
+
+### 2026-08-08 — Widening an early-return guard silently DE-PINS whatever used to fall past it: the suite goes greener while coverage shrinks
+
+A guard's tests reach it by falling THROUGH every guard above it. Widen an earlier condition and those
+fixtures now return early — the tests still pass, but they no longer exercise the branch they were
+written for, and the mutants that used to kill them survive. Nothing goes red. The test count does not
+move. `cargo test`, clippy, CI and a full gate all report a healthier tree than before, because the
+loss is in what the tests REACH, not in what they assert.
+
+U3 cycle 6 widened `FileScanTask::split`'s branch (1a) from `self.start != 0` to
+`self.start != 0 || self.length != self.file_size_in_bytes`, and de-pinned two guards it never edited:
+
+- the cycle-5 `self.start != 0` disjunct — every ranged fixture also trips the new disjunct, so dropping
+  the old one stayed GREEN while `start = 600, length = 1000, file_size = 1000` still produced three
+  sub-tasks relocated to offset 0 (the silent-corruption class the disjunct was added for);
+- the cycle-4 `length == 0` sentinel (branch 1b) — its fixture (`length = 0`, `file_size = 1000`) now
+  returns at (1a), leaving (1b)'s only reachable shape (`file_size_in_bytes == 0`) untested, so
+  corrupting the sentinel condition left the suite green.
+
+Both were caught only because that cycle's Falsifier was told to re-sweep mutants over code shipped in
+ALL cycles. The natural scoping — "attack this cycle's delta" — would have shipped both.
+
+- **DO re-run the EXISTING mutation catalogue after any change to an early-return chain**, not just
+  mutants for the new code. New-code mutants cannot see this class by construction.
+- **DO ask, for each guard above the one you widened *and each guard below it*: which test still
+  REACHES this branch?** If the answer is "the one named after it", verify it — the name outlives the
+  reachability.
+- **DO pin the new condition at a shape the OLD condition cannot see** (here: `start != 0` with
+  `length == file_size_in_bytes`), so the disjuncts stay independently load-bearing rather than one
+  masking the other.
+- **DO NOT read "suite still green, +N tests" as evidence a widening was safe** — it is exactly the
+  signature this failure produces.
