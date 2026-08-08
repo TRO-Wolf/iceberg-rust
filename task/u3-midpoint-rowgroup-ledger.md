@@ -598,3 +598,122 @@ scratch with the `cp`/`cmp` harness. Filed in `task/lessons.md` (2026-08-08).
 Every mutant was applied alone, run against the full `cargo test -p iceberg --lib`, restored from its
 `cp` backup, and the restore verified byte-for-byte with `cmp` before the next one; `git status
 --porcelain` showed only this cycle's own intended files throughout, and the tree is clean at commit.
+
+---
+
+## 15 · Cycle 6 — residue cleanup (Critic CONVERGED + Falsifier all-RED; six S3 items)
+
+Cycle 5 converged: an independent Critic would have merged `49ee3c5a` as-is, and an independent
+Falsifier ran 17 mutants over everything cycles 1-5 shipped, found them ALL RED, verified
+split→read is exactly-once across 2,340 split/read pairs (also under positional deletes and under
+page-index row selection), and drove the interop driver to `rc=0` with both sabotage legs RED. This
+cycle changes NO selection predicate and redesigns nothing. It closes six S3 residues: two
+repo-contract violations (`map.md` lockstep), one public-API inconsistency, one over-read shape the
+Critic disclosed, two unpinned pre-existing gates, and one comment.
+
+### 15.1 · R1 — the `_pos` rule moved to the split PRIMITIVE (branch 1c)
+
+Cycle 5 taught `TableScan::plan_tasks` to skip splitting under a `_pos` projection, but the PUBLIC
+`FileScanTask::split` still manufactured the shape the reader refuses. Measured by the Falsifier: a
+Parquet task projecting `[1, RESERVED_FIELD_ID_POS]` at `(0, file_size)` reads 60 rows, while
+`task.split(391)` returns 3 sub-tasks that ALL fail `FeatureUnsupported` — including the
+`start == 0` one, since the `_pos` guard requires `length == 0 || length == file_size_in_bytes`.
+Sixty rows become zero rows and three typed errors.
+
+It is LOUD and no in-tree caller reaches it (hence S3), but it was the one place the code did not
+follow its own stated principle: *the planner must not manufacture windows the reader cannot
+honour*. `split` now carries the rule as branch (1c). Both call-site guards are RETAINED and
+re-commented as defensive-but-redundant — the `plan_tasks` one additionally because it reads the
+SCAN's projection, which is the authority there even if a task's own `project_field_ids` drifted.
+Pinned by `split_of_a_pos_projecting_task_is_a_passthrough` (both offsets shapes, with a non-vacuity
+control proving the same geometry DOES split without `_pos`); mutant **M1** RED.
+
+### 15.2 · R2 — branch (1a) widened to the PARTIAL parent; taken, not deferred
+
+The Critic disclosed the last over-read shape as residue: `start == 0` with
+`0 < length < file_size_in_bytes` and manifest `split_offsets` still reached the offsets-aware
+branch, which takes the offsets VERBATIM and only clips the LAST window to `self.length`. Worked
+example: offsets `[0, 300, 700]`, length 500, file size 1000 ⇒ `(0,300) (300,400) (700,0)` —
+coverage of `[0, 700)` from a parent that owned `[0, 500)`, plus a degenerate empty window.
+
+**Chosen: extend branch (1a) to `self.start != 0 || self.length != self.file_size_in_bytes`** (the
+Critic's first option), NOT the last-window clip. Three reasons:
+
+* **Java.** Java forecloses re-splitting STRUCTURALLY on both axes: `BaseFileScanTask` is the only
+  `SplittableScanTask` and its `length()` is always `file.fileSizeInBytes()`, so the only shape Java
+  can split spans the whole file. There is no Java re-split semantics to port, so the clip would be
+  inventing one; the passthrough matches what Java can express.
+* **Failure direction.** Every passthrough branch returns `[self]`, so the guard's worst case is
+  bounded to LOST PARALLELISM, never lost or duplicated rows. The clip leaves a degenerate empty
+  window and still needs a rule for offsets beyond the parent's end — more surface, same class.
+* **Uniformity.** The fixed-size branch is already sound on this shape (it walks `self.length`), so
+  a clip would leave the invariant "a split product covers a sub-window of its parent" dependent on
+  which branch a manifest happens to select.
+
+No planner path changes: `scan/context.rs` sets `length = file_size_in_bytes` on every task it
+emits, and both in-tree callers of `split` (`plan_tasks`, `expand_within_file_parallel_tasks`) split
+only what `plan_files` produced. The `length == 0` sentinel still passes through — via (1a) when
+`file_size_in_bytes > 0`, via (1b) in the degenerate `file_size_in_bytes == 0` case; branch (1b) is
+retained and annotated, and its pin
+`split_whole_file_length_sentinel_is_one_task_not_zero` stays green. Pinned by
+`split_of_a_partial_parent_is_a_passthrough_not_an_over_read`; mutant **M2** RED.
+
+### 15.3 · R3/R4 — `map.md` lockstep (the repo-contract violations)
+
+* `crates/iceberg/src/scan/map.md`: the `task.rs` Contents cell listed four branches and called
+  branch (1) merely "non-splittable" — which by the code's own doc means PUFFIN ONLY, while the
+  AVRO/ORC decline is a separate `reader_honors_byte_range` predicate and is the
+  highest-consequence branch in the function. It now enumerates all six branches in order with the
+  consequence of each, and states the bounded failure mode. Two Debug rows added (the `_pos`
+  outage; the deliberate two-site offsets-gate disagreement) and the wrong-bytes row extended to
+  the partial parent.
+* `crates/iceberg/tests/map.md`: the `interop_ranged_read.rs` row still said the driver adds a
+  fail-closed source mutation — SINGULAR. Cycle 5 added leg 6 (the offset-source mutation, the leg
+  that proves the real-footer-offset HALF of the claim) and updated `dev/java-interop/map.md` but
+  not this file — the row a reader consults to decide whether the suite covers the offset SOURCE or
+  only the RULE. Now 6 steps / two mutations, with which half each leg proves.
+
+### 15.4 · R5 — the two surviving single-`split_offsets` mutants, PINNED (no behaviour change)
+
+Two pre-existing sites DISAGREE on the single-offset case, and both survived cycle 5's sweep:
+
+* **MX21** — `split`'s branch-(2) gate `!offsets.is_empty()` → `offsets.len() > 1` survived GREEN.
+* **MX19** — `can_expand`'s `offsets.len() > 1` → `!offsets.is_empty()` survived GREEN, and that
+  clause IS load-bearing: a hostile single offset `[585]` on a 1170-byte/60-row file makes `split`
+  emit `(585, 585)`, reading 0 of 60 rows SILENTLY, so `to_arrow()` and `plan_tasks()` would
+  disagree on the same file.
+
+Not a live bug — honest manifests always carry `offsets[0] == 4` and more than one entry, and Java
+loses the same rows on the hostile input (PARITY, not divergence) — so this is a PIN gap, not a
+defect. Behaviour unchanged at both sites. `split_single_offset_takes_the_offsets_aware_branch`
+pins the Java-faithful gate (mutant **M3** RED) and
+`test_within_file_parallel_declines_a_single_split_offset` pins the stricter fork-local one with a
+non-vacuity control that two offsets DO expand (mutant **M4** RED). Both tests, both `map.md` Debug
+rows, and both in-tree comments state that the divergence is DELIBERATE and neither site should be
+"fixed" to match the other.
+
+### 15.5 · R6 — the third `can_expand` conjunct marked defensive
+
+`can_expand`'s `task.data_file_format == DataFileFormat::Parquet` is a provable equivalent — branch
+(1) of `split` already declines AVRO/ORC (`reader_honors_byte_range`) and Puffin (`is_splittable`),
+so Parquet is the only format `split` ever splits — exactly like the `task.start == 0` conjunct
+cycle 5 annotated. Both are now marked, so a future reader can tell that after cycles 3-6 only the
+`split_offsets` conjunct is load-bearing. Mutant **E1** (drop BOTH defensive conjuncts) is GREEN at
+3,159/0, as claimed. Note the equivalence holds on the error path too: for a non-Parquet or ranged
+task, `split` returns before parsing offsets, so even a negative-offset manifest cannot turn the
+no-op into an `Err`.
+
+### 15.6 · Mutation table
+
+| # | Mutation | Expected | Result |
+|---|---|---|---|
+| M1 | disable `split`'s `_pos` guard (branch 1c) | RED | RED — `split_of_a_pos_projecting_task_is_a_passthrough` |
+| M2 | revert (1a) to `self.start != 0` (drop the partial-parent clause) | RED | RED — `split_of_a_partial_parent_is_a_passthrough_not_an_over_read` |
+| M3 | MX21: `split`'s `!offsets.is_empty()` → `offsets.len() > 1` | RED | RED — `split_single_offset_takes_the_offsets_aware_branch` |
+| M4 | MX19: `can_expand`'s `offsets.len() > 1` → `!offsets.is_empty()` | RED | RED — `test_within_file_parallel_declines_a_single_split_offset` |
+| E1 | drop BOTH defensive conjuncts (`start == 0`, `== Parquet`) from `can_expand` | GREEN (equivalent) | GREEN — 3159/0 |
+
+Every mutant was applied alone by an asserting script that HARD-FAILS (non-zero, restore first) if
+its target string is absent, run against the targeted test or the full `cargo test -p iceberg --lib`,
+restored from a `cp` backup, and the restore verified byte-for-byte with `cmp` before the next one.
+**No `git checkout --` was used at any point** — the cycle-5 lesson (§14.7) held.

@@ -983,6 +983,13 @@ impl TableScan {
         // itself the same way; this is the same rule at the other split site. Java has no such case
         // (`_pos` is a Spark-side metadata column there, and its readers carry the row-group start
         // ordinal into a split). Cost: whole-file tasks — parallelism, never rows. (U3 cycle 5 / F7.)
+        //
+        // Since U3 cycle 6 this guard is DEFENSIVE-but-redundant: `FileScanTask::split` carries the
+        // `_pos` rule itself (branch 1c), because `split` is `pub` and reachable without this
+        // caller. It stays for the same reason `expand_within_file_parallel_tasks`'s
+        // `task.start == 0` clause does — a local statement of the precondition this path relies on
+        // — and because it reads the SCAN's projection, which is the authority here even if a
+        // task's own `project_field_ids` were ever to drift from it.
         let projects_pos = {
             use crate::metadata_columns::RESERVED_FIELD_ID_POS;
             self.plan_context
@@ -1081,11 +1088,24 @@ impl TableScan {
                     // rather than useful work. Row DUPLICATION is no longer a reason: the midpoint
                     // rule assigns each row group to exactly one window, and the overlap rule that
                     // could duplicate is gone.
-                    // `task.start == 0` is DEFENSIVE, not load-bearing: since U3 cycle 5
-                    // `FileScanTask::split` itself returns `[self]` for an already-ranged parent
-                    // (rather than relocating its window to 0), so dropping this clause is a
-                    // provable no-op — the `else` branch below produces the same `vec![task]`.
-                    // It stays as a local statement of the precondition this path relies on.
+                    // Exactly ONE of the three conjuncts is load-bearing here — the `split_offsets`
+                    // one. The other two are DEFENSIVE restatements of preconditions
+                    // `FileScanTask::split` already enforces itself, so dropping either is a
+                    // provable no-op (the `else` branch below produces the same `vec![task]` that
+                    // `split` would return):
+                    //   * `task.start == 0` — since U3 cycle 5 `split` returns `[self]` for an
+                    //     already-ranged parent rather than relocating its window to 0 (and since
+                    //     cycle 6 for a partial-length parent too).
+                    //   * `data_file_format == Parquet` — since U3 cycle 3 `split`'s branch (1)
+                    //     declines AVRO and ORC via `reader_honors_byte_range`, and Puffin via
+                    //     `is_splittable`, so Parquet is the only format `split` ever splits.
+                    // They stay as a local statement of the preconditions this path relies on.
+                    //
+                    // The `offsets.len() > 1` clause IS load-bearing and deliberately STRICTER
+                    // than `split`'s own `!offsets.is_empty()` gate — see
+                    // `test_within_file_parallel_declines_a_single_split_offset` and
+                    // `scan::task::tests::split_single_offset_takes_the_offsets_aware_branch` for
+                    // why the two sites differ on purpose.
                     let can_expand = task.start == 0
                         && task.data_file_format == DataFileFormat::Parquet
                         && task.split_offsets.as_ref().is_some_and(|offsets| {
@@ -6737,6 +6757,95 @@ pub mod tests {
             .await
             .unwrap();
         assert_eq!(expanded.len(), 1, "Avro must not expand");
+    }
+
+    /// A SINGLE split offset must not expand: `can_expand` requires `offsets.len() > 1`, which is
+    /// deliberately STRICTER than `FileScanTask::split`'s own `!offsets.is_empty()` gate.
+    ///
+    /// The clause is load-bearing. `split` ports Java, whose offsets-aware branch accepts a
+    /// one-element offsets array and emits one window running from that offset to the end of the
+    /// file — so a hostile `[585]` on a 1170-byte file yields `(585, 585)`, and every row before
+    /// byte 585 is in NO sub-task. That is Java-faithful (Java loses the same rows on the same
+    /// input) and honest manifests never produce it (`offsets[0] == 4`, and a splittable file has
+    /// more than one row group), so `split` must NOT be "fixed". But this path is a fork-local
+    /// `to_arrow` optimisation with no Java counterpart: expanding here would make `to_arrow()` and
+    /// a whole-file read disagree on the same file, silently, for zero parallelism gain. Declining
+    /// is the only answer that keeps the two seams in agreement.
+    ///
+    /// Behaviour pin only. Companion:
+    /// `scan::task::tests::split_single_offset_takes_the_offsets_aware_branch`. (U3 cycle 6 / R5.)
+    #[tokio::test]
+    async fn test_within_file_parallel_declines_a_single_split_offset() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let base: FileScanTask = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("at least one task");
+
+        let scan = fixture
+            .table
+            .scan()
+            .with_data_file_concurrency_limit(4)
+            .with_within_file_read_parallelism(true)
+            .build()
+            .unwrap();
+
+        // Non-vacuity: the SAME task with TWO offsets DOES expand on this path, so a
+        // `expand_within_file_parallel_tasks` that never expands cannot pass this test.
+        let mut two = base.clone();
+        two.data_file_format = DataFileFormat::Parquet;
+        two.start = 0;
+        two.split_offsets = Some(vec![4, base.length as i64 / 2]);
+        let stream = Box::pin(futures::stream::iter(vec![Ok(two)])) as FileScanTaskStream;
+        let expanded_two: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(stream)
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect");
+        assert!(
+            expanded_two.len() > 1,
+            "fixture is non-discriminating: two ascending offsets must expand"
+        );
+
+        // A single HOSTILE offset (half-way into the file) must be declined, not expanded.
+        let hostile_offset = (base.length / 2) as i64;
+        let mut one = base.clone();
+        one.data_file_format = DataFileFormat::Parquet;
+        one.start = 0;
+        one.split_offsets = Some(vec![hostile_offset]);
+        let stream = Box::pin(futures::stream::iter(vec![Ok(one.clone())])) as FileScanTaskStream;
+        let expanded_one: Vec<FileScanTask> = scan
+            .expand_within_file_parallel_tasks(stream)
+            .expect("expand")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        assert_eq!(
+            expanded_one.len(),
+            1,
+            "one split offset must not expand — there is no parallelism to win"
+        );
+        assert_eq!(
+            (expanded_one[0].start, expanded_one[0].length),
+            (0, one.length),
+            "the declined task must pass through as the WHOLE file; the offsets-aware split would \
+             have handed back ({hostile_offset}, ..), dropping every row before that byte and \
+             making to_arrow() disagree with a whole-file read"
+        );
     }
 
     /// Projecting `_pos` suppresses expand (absolute ordinals need whole-file decode).

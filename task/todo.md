@@ -126,6 +126,37 @@ Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-ord
       - [x] **P11f — F8 and the `can_expand` pin DECLINED with executed equivalence proofs**
             (mutants E1/E2/E3 GREEN by construction — ledger §14.6).
 
+- [x] **P12 — Residue cleanup cycle 6** (Critic CONVERGED on `49ee3c5a`; Falsifier 17/17 RED,
+      2,340 split/read pairs exactly-once, interop rc=0 both sabotage legs RED — the core is
+      sound). SIX S3 items, no redesign, selection predicate untouched. Ledger §15. Plan:
+      - [x] **P12a — R1: hoist the `_pos` rule to the split PRIMITIVE** (new branch 1c). The
+            public `FileScanTask::split` still manufactured the shape the reader refuses: a task
+            projecting `[1, RESERVED_FIELD_ID_POS]` reads 60 rows whole-file but `split(391)`
+            returns 3 sub-tasks that ALL fail typed (even `start == 0`, whose length is no longer
+            the file size). Both call-site guards retained + re-commented as defensive. M1 RED.
+      - [x] **P12b — R2: widen branch (1a) to the PARTIAL parent** (`start != 0` OR
+            `length != file_size_in_bytes`). TAKEN, not deferred. The offsets-aware branch took
+            manifest offsets verbatim, so a parent owning `[0,500)` of a 1000-byte file with
+            offsets `[0,300,700]` covered `[0,700)` plus a degenerate empty window. Chose the
+            passthrough over the last-window clip: Java forecloses re-splitting structurally
+            (`BaseFileScanTask.length()` is always the file size), the failure direction stays
+            bounded to lost parallelism, and the clip would leave the invariant branch-dependent.
+            No planner path changes; the `length == 0` sentinel pin stays green. M2 RED.
+      - [x] **P12c — R3/R4: `map.md` lockstep** (the repo-contract violations). `scan/map.md`'s
+            `task.rs` cell now enumerates all six branches in order (it was short two and called
+            branch 1 merely "non-splittable", which means PUFFIN ONLY) + two new Debug rows;
+            `tests/map.md`'s `interop_ranged_read.rs` row now says 6 steps / TWO mutations and
+            which half of the claim each leg proves (it still said "a source mutation", singular).
+      - [x] **P12d — R5: pin BOTH surviving single-`split_offsets` mutants** (MX21 in `split`,
+            MX19 in `can_expand`). The two sites deliberately DISAGREE — `split` ports Java's
+            `!offsets.is_empty()` gate (Java loses the same rows on a hostile `[585]`, so it is
+            parity), `can_expand` requires `> 1` so `to_arrow()` never disagrees with a whole-file
+            read. Behaviour UNCHANGED at both; the disagreement is now stated in both tests, both
+            comments, and a `map.md` Debug row. M3 + M4 RED.
+      - [x] **P12e — R6: mark `can_expand`'s `== Parquet` conjunct defensive**, like the
+            `start == 0` one. After cycles 3-6 only the `split_offsets` conjunct is load-bearing.
+            E1 (drop both) GREEN at 3159/0 — an executed equivalence proof, error path included.
+
 ---
 
 
