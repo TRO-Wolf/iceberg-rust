@@ -55,6 +55,12 @@ Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-ord
       `max_row_group_row_count = None`) and mutation-prove it RED.
 - [x] **P7 — Gate + ledger + `[fork]` commit** in one `&&` chain. Interop leg: see ledger
       §Residue.
+- [x] **P8 — Remediation cycle 2** (Critic S3s + Falsifier counterexamples; ledger §11): make the
+      fabricated footer fixture multi-column and give it a distinct `total_byte_size` so
+      `columns().first()→last()` and `compressed_size()→total_byte_size()` are RED offline; add an
+      ODD-size case so `/2 → div_ceil(2)` is RED; add a REAL multi-column pin; fix the stale
+      "duplicate rows" rationale in `scan/mod.rs`; re-point the amplifier-4 annotation at the
+      load-bearing quantity; name the silent-row-loss and fail-closed-divergence residue.
 
 ---
 

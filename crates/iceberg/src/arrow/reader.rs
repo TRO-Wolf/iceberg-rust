@@ -1763,6 +1763,21 @@ impl ArrowReader {
     /// contiguous (padding, inline bloom filters, a non-4 first offset). It is also exactly Java's
     /// *degenerate error-recovery* path (`invalidFileOffset`), reachable only in the omitted-inline-
     /// `ColumnMetaData` regime, which parquet-rs refuses to decode without the `encryption` feature.
+    ///
+    /// Two deliberate, fail-closed divergences from Java on corrupt metadata:
+    ///
+    /// * A negative offset or size is a typed [`ErrorKind::DataInvalid`] here. Java's `getOffset`
+    ///   has no non-negativity guard, so it computes a negative midpoint, fails `>= startOffset`
+    ///   and silently **drops** the row group. Rust is stricter and never silently under-reads.
+    /// * A row group with no column chunks is a typed error; Java indexes `getColumns().get(0)`
+    ///   unguarded and throws `IndexOutOfBoundsException`.
+    ///
+    /// Named residue (Java-identical, not a defect): because selection is midpoint-based, a window
+    /// that does not cover a row group's midpoint reads none of its rows. A caller whose window set
+    /// under-covers the file — a manifest whose `file_size_in_bytes` understates the file, or a
+    /// `split_offsets[0]` above the first midpoint — therefore loses rows silently, where the old
+    /// overlap rule would have over-read. Java behaves the same way; the invariant callers must
+    /// preserve is that their windows TILE `[0, file_size)`.
     fn filter_row_groups_by_byte_range(
         parquet_metadata: &Arc<ParquetMetaData>,
         start: u64,
@@ -3848,24 +3863,57 @@ message schema {
         Arc::new(SchemaDescriptor::new(Arc::new(schema)))
     }
 
-    /// Builds single-column row groups from `(data_page_offset, compressed_size, dict_offset)`
-    /// triples so the selection rule can be probed at exact byte positions.
+    /// Distance between the fabricated first column chunk and each trailing one. Large enough that
+    /// selecting any column other than `columns()[0]` moves the midpoint out of every window the
+    /// semantics test declares.
+    const FABRICATED_COLUMN_STRIDE: i64 = 1_000_000;
+
+    /// Builds row groups from `(data_page_offset, compressed_size, dict_offset)` triples — the
+    /// triple always describes `columns()[0]` — so the selection rule can be probed at exact byte
+    /// positions.
+    ///
+    /// Two properties keep this fixture DISCRIMINATING; both were mutation-survivable gaps in the
+    /// first cut of this unit and are load-bearing, not incidental:
+    ///
+    /// * Each row group carries THREE column chunks, the trailing two placed
+    ///   [`FABRICATED_COLUMN_STRIDE`] bytes apart, so reading any column other than `columns()[0]`
+    ///   (Java's `getColumns().get(0)`) changes the answer. The trailing chunks declare a **zero**
+    ///   compressed size, so `RowGroupMetaData::compressed_size()` — the sum over columns —
+    ///   remains exactly the requested `compressed_size`.
+    /// * `total_byte_size` (the UNCOMPRESSED size) is set to a value clearly different from the
+    ///   compressed size, so reading it in place of `compressed_size()` (Java's `totalSize` is
+    ///   `total_compressed_size`) changes the answer.
     fn midpoint_test_metadata(groups: &[(i64, i64, Option<i64>)]) -> Arc<ParquetMetaData> {
-        let schema_descr = schema_descr_with_columns(1);
+        const TRAILING_COLUMNS: usize = 2;
+
+        let schema_descr = schema_descr_with_columns(1 + TRAILING_COLUMNS);
         let row_groups: Vec<RowGroupMetaData> = groups
             .iter()
             .enumerate()
             .map(|(idx, (data_page_offset, size, dict))| {
-                let column = ColumnChunkMetaData::builder(schema_descr.column(0))
-                    .set_data_page_offset(*data_page_offset)
-                    .set_dictionary_page_offset(*dict)
-                    .set_total_compressed_size(*size)
-                    .build()
-                    .expect("column chunk metadata");
+                let mut columns = vec![
+                    ColumnChunkMetaData::builder(schema_descr.column(0))
+                        .set_data_page_offset(*data_page_offset)
+                        .set_dictionary_page_offset(*dict)
+                        .set_total_compressed_size(*size)
+                        .build()
+                        .expect("column chunk metadata"),
+                ];
+                for col in 1..=TRAILING_COLUMNS {
+                    let stride = FABRICATED_COLUMN_STRIDE
+                        * i64::try_from(col).expect("column index fits i64");
+                    columns.push(
+                        ColumnChunkMetaData::builder(schema_descr.column(col))
+                            .set_data_page_offset(data_page_offset.saturating_add(stride))
+                            .set_total_compressed_size(0)
+                            .build()
+                            .expect("trailing column chunk metadata"),
+                    );
+                }
                 RowGroupMetaData::builder(schema_descr.clone())
                     .set_num_rows(10)
-                    .set_total_byte_size(*size)
-                    .set_column_metadata(vec![column])
+                    .set_total_byte_size(size.saturating_mul(4).saturating_add(7))
+                    .set_column_metadata(columns)
                     .set_ordinal(i16::try_from(idx).expect("ordinal fits i16"))
                     .build()
                     .expect("row group metadata")
@@ -3873,6 +3921,99 @@ message schema {
             .collect();
         let file_metadata = FileMetaData::new(1, 0, None, None, schema_descr, None);
         Arc::new(ParquetMetaData::new(file_metadata, row_groups))
+    }
+
+    /// U3 / T2b — the row-group start comes from the FIRST column chunk, proved on a REAL
+    /// multi-column file rather than fabricated metadata.
+    ///
+    /// Java is `getOffset(rowGroup.getColumns().get(0))`. On a many-column file the last column
+    /// chunk starts thousands of bytes downstream of the first, so a reader that indexes the wrong
+    /// column pushes every midpoint into the following window: the first window then reads
+    /// NOTHING and a later window claims two row groups — silent row loss plus duplication, with
+    /// no error. A single-column fixture cannot see that at all.
+    #[test]
+    fn test_midpoint_selection_uses_first_column_chunk_on_real_file() {
+        use arrow_array::{Int32Array, StringArray};
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("multi_column.parquet")
+            .to_string_lossy()
+            .to_string();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("payload", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let file = File::create(&path).expect("create multi-column fixture");
+        let mut writer =
+            ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).expect("arrow writer");
+        for group in 0..3i32 {
+            let base = group * 100;
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Int32Array::from_iter_values(base..base + 100)),
+                // Distinct, poorly compressible values so the payload column chunk is large and
+                // its start is far from the `id` chunk's.
+                Arc::new(StringArray::from_iter_values((base..base + 100).map(|i| {
+                    format!("payload-{i:09}-{:x}", i.wrapping_mul(2_654_435_i32))
+                }))),
+            ])
+            .expect("multi-column batch");
+            writer.write(&batch).expect("write row group");
+        }
+        writer.close().expect("close multi-column fixture");
+
+        let metadata = footer_metadata(&path);
+        assert_eq!(
+            metadata.num_row_groups(),
+            3,
+            "fixture must have 3 row groups"
+        );
+
+        let starts = footer_row_group_starts(&metadata);
+        let midpoints = footer_row_group_midpoints(&metadata);
+        for (idx, rg) in metadata.row_groups().iter().enumerate() {
+            let columns = rg.columns();
+            assert!(columns.len() > 1, "fixture must be multi-column");
+            let last_start = u64::try_from(
+                columns[columns.len() - 1]
+                    .dictionary_page_offset()
+                    .filter(|dict| *dict < columns[columns.len() - 1].data_page_offset())
+                    .unwrap_or_else(|| columns[columns.len() - 1].data_page_offset()),
+            )
+            .expect("non-negative offset");
+            // Non-vacuity guard: if the columns ever coincide this test degenerates.
+            assert!(
+                last_start > starts[idx],
+                "fixture is non-discriminating: row group {idx}'s last column chunk must start \
+                 well after its first ({last_start} vs {})",
+                starts[idx]
+            );
+        }
+
+        // A one-byte window at each row group's TRUE midpoint must select exactly that row group.
+        // Indexing any other column chunk moves the midpoint elsewhere and empties the window.
+        for (idx, mid) in midpoints.iter().enumerate() {
+            assert_eq!(
+                ArrowReader::filter_row_groups_by_byte_range(&metadata, *mid, 1)
+                    .expect("byte-range filter"),
+                vec![idx],
+                "the window [{mid}, {}) must select exactly row group {idx}; its start is the \
+                 FIRST column chunk's offset",
+                mid + 1
+            );
+        }
     }
 
     /// U3 / T4 — `getOffset` semantics, window bounds, and the typed-error paths, probed directly
@@ -3930,6 +4071,56 @@ message schema {
             ArrowReader::filter_row_groups_by_byte_range(&md, 110, 10).expect("filter"),
             vec![0],
             "the window STARTING at the midpoint claims it (low bound is inclusive)"
+        );
+
+        // (d2) the division on the SIZE TRUNCATES (Java `ldiv`). With an ODD size the truncating
+        //      and rounding-up forms differ by one byte: start 100, size 21 → midpoint 110, NOT
+        //      111. Every other case here uses an even size, so this is the only arm that can see
+        //      the difference.
+        let md = midpoint_test_metadata(&[(100, 21, None)]);
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 0, 111).expect("filter"),
+            vec![0],
+            "an odd compressed size must truncate: midpoint 110 lies inside [0, 111)"
+        );
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 111, 10)
+                .expect("filter")
+                .is_empty(),
+            "an odd compressed size must not round the midpoint up into [111, 121)"
+        );
+
+        // (d3) `totalSize` is the COMPRESSED size. The fabricated row groups declare a distinctly
+        //      larger `total_byte_size`, so reading the uncompressed size instead moves the
+        //      midpoint out of the window.
+        let md = midpoint_test_metadata(&[(100, 20, None)]);
+        assert_eq!(
+            md.row_group(0).compressed_size(),
+            20,
+            "fixture guard: the row-group compressed size must be the requested value"
+        );
+        assert_ne!(
+            md.row_group(0).total_byte_size(),
+            md.row_group(0).compressed_size(),
+            "fixture is non-discriminating: the uncompressed size must differ from the compressed \
+             size, otherwise reading the wrong one is invisible"
+        );
+
+        // (d4) the row-group start comes from `columns()[0]` (Java `getColumns().get(0)`). The
+        //      fabricated trailing chunks sit far downstream, so reading any other column moves
+        //      the midpoint out of the window.
+        let md = midpoint_test_metadata(&[(100, 20, None)]);
+        let columns = md.row_group(0).columns();
+        assert!(
+            columns.len() > 1
+                && columns[columns.len() - 1].data_page_offset() > columns[0].data_page_offset(),
+            "fixture is non-discriminating: row groups must carry several column chunks at \
+             different offsets, otherwise the column index is invisible"
+        );
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 105, 10).expect("filter"),
+            vec![0],
+            "the first column chunk determines the row-group start (midpoint 110)"
         );
 
         // (e) a row group with no column chunks is a typed error, not a panic. (Java indexes

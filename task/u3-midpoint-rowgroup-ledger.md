@@ -84,6 +84,7 @@ New (`crates/iceberg/src/arrow/reader.rs`), all expectations derived from **real
 | `test_midpoint_selection_straddling_splits_read_each_row_exactly_once` | 3 row groups, 800-byte tiling that straddles them: per-window id sets + the union is every row EXACTLY once. Asserts the fixture actually straddles (non-vacuity). |
 | `test_midpoint_selection_reads_real_offsets_on_padded_file` | Bloom-padded file, windows tiled at the file's OWN row-group starts. Asserts real starts ≠ `4 + Σ compressed_size` (non-vacuity) — the OFFSET-SOURCE pin. |
 | `test_midpoint_selection_partitions_row_groups_over_stride_sweep` | Both fixture shapes × strides {256, 512, 800, 1024, 4096}: selected index sets must PARTITION `0..n`. Plus an adversarial tiling whose boundaries sit EXACTLY on row-group midpoints (only `[start, end)` partitions there). |
+| `test_midpoint_selection_uses_first_column_chunk_on_real_file` | A REAL 2-column file: the row-group start is `columns()[0]`'s offset (Java `getColumns().get(0)`), not any later chunk's. Asserts the last chunk starts well after the first (non-vacuity), then pins a 1-byte window at each true midpoint. |
 | `test_midpoint_selection_offset_and_boundary_semantics` | `getOffset` (a) dict smaller wins, (b) dict NOT smaller ⇒ data page offset (the `min`, not "dict wins" — the arm a naive port gets wrong), (c) no dict; (d) a midpoint exactly on a boundary belongs to the HIGHER window; (e) column-less row group ⇒ typed `DataInvalid`; (f) negative offset ⇒ typed `DataInvalid`, no panic; (g) extreme `i64` offsets still answer. |
 
 Repaired (they built their windows with the same synthetic model the production code used, so they
@@ -151,9 +152,14 @@ dependencies.
    `[0,1024)/[1024,2048)/[2048,3003)` and the single midpoint 235 lands in window 0 under **both**
    rules. `main` did **not** duplicate rows through that fixture. The real risk was the opposite: the
    `partition_work.rs` "union of `stream_partition_work` bags ≡ `to_arrow`" pin being *cited* as
-   coverage. It is not — annotated in-tree by
-   `u3_annotation_planning_fixture_is_single_row_group_non_discriminating`, which asserts the
-   one-row-group fact from the footer so it stays measured rather than assumed.
+   coverage. It is not — annotated in-tree by `u3_annotation_planning_fixture_is_non_discriminating`,
+   which asserts the *load-bearing* fact from the footer (no row group crosses a 1,024-byte split
+   boundary) so it stays measured rather than assumed. **Cycle-2 correction:** the first cut asserted
+   `num_row_groups == 1`, which is the wrong fact — the fixture's `DataFile` carries no
+   `split_offsets`, so `plan_tasks(1024)` really does take the fixed-size branch and really does emit
+   three windows; the pin is blind only because that one row group ends at byte 467, well inside the
+   first window. Had the fixture's data grown past ~1 KiB, the old assertion would have stayed green
+   while its stated reason silently became false.
 3. **Amplifier 2 — `is_strictly_ascending` was NOT touched, deliberately.** Its vacuity on a
    1-element slice matches Java `ArrayUtil.isStrictlyAscending`; the `to_arrow` expansion already
    guards with `offsets.len() > 1`, and a 1-element offsets list through `plan_tasks` yields one
@@ -173,6 +179,18 @@ dependencies.
 3. The `checked_add` guard on the midpoint is **unreachable by construction** (both inputs are `i64`,
    so `offset + size/2 < 2^63 + 2^62 < u64::MAX`). It is kept as a defensive assertion and documented
    as such in the test.
+4. **Midpoint selection converts an under-covering window from a harmless over-read into silent row
+   loss** (Java-identical, therefore parity-correct, but new behaviour for this fork). A window that
+   does not contain a row group's midpoint reads none of its rows: measured, a `[0, 1349)` window
+   over a 3-row-group / 300-row file returns 200 rows with no error, where the deleted overlap rule
+   returned all 300. Callers whose windows do not TILE `[0, file_size)` — a manifest whose
+   `file_size_in_bytes` understates the file, or a `split_offsets[0]` above the first midpoint — now
+   lose rows silently. Named in the `filter_row_groups_by_byte_range` doc comment.
+5. **Deliberate fail-closed divergences from Java on corrupt metadata.** A negative offset/size is a
+   typed `DataInvalid` here; Java's `getOffset` has no non-negativity guard, so it computes a
+   negative midpoint, fails `>= startOffset` and silently DROPS the row group. A column-less row
+   group is likewise a typed error where Java throws `IndexOutOfBoundsException`. Rust is stricter in
+   both cases and never silently under-reads. Named in the doc comment (cycle-2 addition).
 
 ## 9 · Scope fence
 
@@ -191,3 +209,45 @@ the reader is through the decode BATCH boundaries — parquet-rs never spans a b
 group, so batch size 17 over 100-row groups yields `[17;5] + [15]`, twice, and `_pos` must run 0..199
 unbroken across that seam. (A row-group-*pruning* leg was drafted and **discarded as misleading**: it
 would have claimed pruning that this path does not perform.)
+
+## 11 · Remediation cycle 2 (2026-08-07) — closing the Critic/Falsifier findings
+
+The independent Critic converged with three S3 findings and the Falsifier demonstrated three
+SURVIVING mutations. Every one of them was a **coverage** gap, not a correctness gap — the shipped
+rule was confirmed Java-exact by both reviewers, independently re-decoded from the jar. What the
+suite failed to pin:
+
+| Surviving mutation | Why it survived | Closed by |
+|---|---|---|
+| `columns().first()` → `.last()` | every fixture was SINGLE-COLUMN (real and fabricated) | `midpoint_test_metadata` now builds **three** column chunks 1 MiB apart (trailing chunks declare size 0, so `compressed_size()` is unchanged) + new real 2-column fixture `test_midpoint_selection_uses_first_column_chunk_on_real_file` |
+| `compressed_size()` → `total_byte_size()` | the builder set `total_byte_size == total_compressed_size` | `total_byte_size` is now `4 × size + 7`, with an in-test `assert_ne!` guard so it cannot silently drift back |
+| `row_group_size / 2` → `div_ceil(2)` | every fabricated size was EVEN, so truncation never differed | new case (d2): an ODD size 21 → midpoint 110, pinned from both sides (`[0,111)` selects, `[111,121)` does not) |
+
+Each fixture guard is asserted in-test (`assert_ne!` on compressed-vs-uncompressed, `columns().len()
+> 1` with strictly increasing offsets, `last_start > starts[idx]` on the real file), so a future
+fixture change that re-degenerates the shape fails loudly instead of quietly restoring the blind
+spot.
+
+Also closed this cycle:
+
+- **Stale comment asserting the deleted defect.** `scan/mod.rs`'s `expand_within_file_parallel_tasks`
+  still justified its offsets-only guard with "non-aligned windows can re-select the same row group
+  and duplicate rows" — true only under the OVERLAP rule this unit deleted, and contradicting the
+  `scan/map.md` row added in the same commit. Rewritten to the real reason (byte-arbitrary windows
+  can produce EMPTY sub-tasks under midpoint selection — wasted parallelism, not duplication).
+- **The amplifier-4 annotation asserted the wrong fact** — see §7.2.
+- **Two residue lines added** (§8.4 silent row loss on an under-covering window, §8.5 the
+  fail-closed divergences), both also named in the production doc comment.
+
+Declined, with reason: the Critic's S3 on the rider's hardcoded decode-batch vector
+(`[17;5]+[15]` twice) — the Critic itself marked it "no action required to merge", the maintenance
+cost is documented in the test's own doc comment, and weakening it to "some batch boundary falls at
+row 100" would drop the `_pos`-continuity evidence that makes the rider non-vacuous. If a parquet-rs
+bump ever fires it, weaken it then.
+
+**Process note (from the Falsifier, worth keeping).** Two false-green mechanisms were hit during
+review, neither in the product: (1) a concurrent sibling agent mutating the same shared worktree made
+one baseline run RED — mutation work must be done in an isolated copy or under an exclusive claim;
+(2) `git archive HEAD | tar -x` preserves COMMIT mtimes, so cargo skips the rebuild and runs a STALE
+test binary (it reported the pre-fix count 3138). Any restore-by-content step must bump mtimes —
+this cycle's harness `touch`es every restored file and md5-verifies against the pre-mutation baseline.

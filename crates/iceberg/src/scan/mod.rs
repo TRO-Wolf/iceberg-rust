@@ -1052,9 +1052,14 @@ impl TableScan {
             tasks
                 .and_then(move |task| async move {
                     // Only expand whole-file Parquet tasks whose split_offsets are the
-                    // offsets-aware (strictly ascending) row-group grid. Never call
-                    // FileScanTask::split's fixed-size fallback from this path — non-aligned
-                    // windows can re-select the same row group and duplicate rows.
+                    // offsets-aware (strictly ascending) row-group grid, so each sub-task lines up
+                    // with exactly one row group. The fixed-size fallback in FileScanTask::split
+                    // is deliberately NOT used from this path: its windows are byte-arbitrary, so
+                    // a sub-task can end up empty (row-group selection is midpoint-based — see
+                    // `ArrowReader::filter_row_groups_by_byte_range`), which is wasted parallelism
+                    // rather than useful work. Row DUPLICATION is no longer a reason: the midpoint
+                    // rule assigns each row group to exactly one window, and the overlap rule that
+                    // could duplicate is gone.
                     let can_expand = task.start == 0
                         && task.data_file_format == DataFileFormat::Parquet
                         && task.split_offsets.as_ref().is_some_and(|offsets| {
