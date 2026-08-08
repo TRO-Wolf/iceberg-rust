@@ -908,7 +908,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+    use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS};
     use crate::spec::{DataContentType, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
 
     /// A bare whole-file [`FileScanTask`] for the split/weight unit tests: `length` byte file in
@@ -1237,6 +1237,111 @@ mod tests {
                 "the passthrough must not disturb the projection"
             );
         }
+    }
+
+    /// Branch (1a)'s `self.start != 0` disjunct must hold on its OWN, at the one shape the
+    /// `length != file_size_in_bytes` disjunct cannot see: a relocated left edge whose length still
+    /// spans the file (`start = 600`, `length = 1000`, `file_size_in_bytes = 1000`).
+    ///
+    /// Widening (1a) in cycle 6 masked the cycle-5 disjunct — every other ranged-task fixture trips
+    /// BOTH disjuncts, so dropping `self.start != 0` left the whole suite green while the
+    /// relocation-corruption class it was added for stayed reachable (measured under that mutant:
+    /// THREE sub-tasks over `[0, 1000)` from a parent that owned `[600, 1600)`). The shape is
+    /// self-inconsistent — the window runs past EOF — which is precisely why only the passthrough
+    /// can answer it safely. (Reviewer rider, 2026-08-08 / Falsifier F2.)
+    #[test]
+    fn split_of_a_relocated_parent_is_a_passthrough_even_when_length_spans_the_file() {
+        for offsets in [None, Some(vec![0i64, 300, 700])] {
+            // Non-vacuity: the SAME geometry at `start == 0` really does split.
+            let whole = task(1000, DataFileFormat::Parquet, offsets.clone());
+            assert!(
+                whole.split(200).expect("whole split ok").len() > 1,
+                "fixture is non-discriminating: offsets {offsets:?} must split from start 0"
+            );
+
+            let mut relocated = task(1000, DataFileFormat::Parquet, offsets.clone());
+            relocated.start = 600; // length stays 1000 == file_size_in_bytes
+
+            let parts = relocated.split(200).expect("split ok");
+            assert_eq!(
+                parts.len(),
+                1,
+                "a relocated parent (offsets {offsets:?}) must pass through split as ONE task even \
+                 when its length still equals the file size"
+            );
+            assert_eq!(
+                (parts[0].start, parts[0].length),
+                (600, 1000),
+                "the passthrough must keep the parent's own window; re-splitting would RELOCATE it \
+                 to offset 0 and read bytes the parent never owned"
+            );
+        }
+    }
+
+    /// Branch (1b) — the `length == 0` sentinel — must still be pinned at the ONLY shape that now
+    /// reaches it: a degenerate `file_size_in_bytes == 0` file (an empty file, or a task whose file
+    /// size was never populated).
+    ///
+    /// Cycle 6's widening of (1a) silently de-pinned it: the cycle-4 fixture (`length = 0`,
+    /// `file_size_in_bytes = 1000`) now returns at (1a) and never reaches (1b), so corrupting the
+    /// sentinel condition left the suite green while the fixed-size walk still emitted ZERO
+    /// sub-tasks for this shape — `plan_files` returns the file, `plan_tasks` reads no rows from it,
+    /// nothing errors. (Reviewer rider, 2026-08-08 / Falsifier F1.)
+    #[test]
+    fn split_whole_file_sentinel_on_an_empty_file_is_one_task_not_zero() {
+        // Non-vacuity: `split` really does split when there are bytes to split.
+        let sized = task(1000, DataFileFormat::Parquet, None);
+        assert!(
+            sized.split(100).expect("sized split ok").len() > 1,
+            "fixture is non-discriminating: a 1000-byte file must split at target 100"
+        );
+
+        // start == 0 and length == file_size_in_bytes == 0, so branch (1a)'s inequality is FALSE
+        // and only the sentinel branch can answer.
+        let empty = task(0, DataFileFormat::Parquet, None);
+        let parts = empty.split(100).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            1,
+            "the whole-file sentinel on an empty file must split to ONE task; an empty Vec drops \
+             the file from `plan_tasks` with no error"
+        );
+        assert_eq!((parts[0].start, parts[0].length), (0, 0));
+    }
+
+    /// A parent whose length OVERRUNS the file (`length > file_size_in_bytes`) is ranged in the
+    /// same sense as a truncated one, and (1a)'s `!=` — not a `<` — is what covers it. Without this
+    /// pin the inequality could be narrowed to `<` and the fixed-size walk would happily emit
+    /// windows past EOF. (Reviewer rider, 2026-08-08 / Falsifier F3b.)
+    #[test]
+    fn split_of_an_overlong_parent_is_a_passthrough() {
+        let mut overlong = task(1000, DataFileFormat::Parquet, None);
+        overlong.length = 1500; // file_size_in_bytes stays 1000
+
+        let parts = overlong.split(200).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            1,
+            "a parent whose window overruns the file must pass through as ONE task"
+        );
+        assert_eq!((parts[0].start, parts[0].length), (0, 1500));
+    }
+
+    /// Branch (1c) declines `_pos` SPECIFICALLY, not metadata columns in general. `_file`,
+    /// `_spec_id`, `_partition` and `_deleted` are constant-per-file or constant-per-task values
+    /// the ranged reader serves correctly, so declining to split them would cost parallelism for
+    /// nothing. Without this pin, widening the guard to "any metadata field" is invisible.
+    /// (Reviewer rider, 2026-08-08 / Falsifier F3a.)
+    #[test]
+    fn split_declines_pos_specifically_not_every_metadata_column() {
+        let mut file_col = task(1000, DataFileFormat::Parquet, None);
+        file_col.project_field_ids = Arc::from(vec![1, RESERVED_FIELD_ID_FILE]);
+
+        assert!(
+            file_col.split(200).expect("split ok").len() > 1,
+            "`_file` is served correctly over a ranged window — only `_pos` needs whole-file \
+             ordinals, so only `_pos` may suppress the split"
+        );
     }
 
     /// The Java `FileFormat` splittable table and this crate's READ-path predicate are separate

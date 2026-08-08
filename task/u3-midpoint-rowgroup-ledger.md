@@ -717,3 +717,34 @@ Every mutant was applied alone by an asserting script that HARD-FAILS (non-zero,
 its target string is absent, run against the targeted test or the full `cargo test -p iceberg --lib`,
 restored from a `cp` backup, and the restore verified byte-for-byte with `cmp` before the next one.
 **No `git checkout --` was used at any point** — the cycle-5 lesson (§14.7) held.
+
+## 16 · Reviewer rider (2026-08-08) — the guards cycle 6 silently DE-PINNED
+
+Cycle 6 converged (independent Critic `converged=true`, Falsifier `broke_it=false`), but the
+Falsifier's non-blocking residue named a real false-green class **introduced by cycle 6 itself**:
+widening branch (1a) to `self.start != 0 || self.length != self.file_size_in_bytes` made two
+*existing* guards unreachable from their own fixtures, so their mutants survived a full green suite.
+A guard whose mutant survives is not a guard. Closed here as a **reviewer rider** (test-only — no
+production line changed) rather than shipped as follow-up, because the branch would otherwise merge
+with the relocation-corruption guard unpinned.
+
+| Falsifier item | What had become invisible | New pin | Mutation → result |
+|---|---|---|---|
+| F2 | (1a)'s `self.start != 0` disjunct — every ranged fixture also trips the new `length != file_size` disjunct, so dropping the old one stayed green while `start = 600, length = 1000, file_size = 1000` still produced THREE relocated sub-tasks | `split_of_a_relocated_parent_is_a_passthrough_even_when_length_spans_the_file` | drop `self.start != 0` → **RED** |
+| F1 | branch (1b), the `length == 0` sentinel — the cycle-4 fixture (`length = 0`, `file_size = 1000`) now returns at (1a), so (1b)'s only reachable shape (`file_size_in_bytes == 0`) was untested | `split_whole_file_sentinel_on_an_empty_file_is_one_task_not_zero` | `length == 0` → `length == u64::MAX` → **RED** |
+| F3b | the `!=` in (1a)'s second disjunct — the `length > file_size_in_bytes` half was unpinned | `split_of_an_overlong_parent_is_a_passthrough` | `!=` → `<` → **RED** |
+| F3a | branch (1c)'s PRECISION — a guard widened to "any metadata field" would decline `_file`/`_spec_id`/`_partition`/`_deleted` scans (windows the reader honours) invisibly | `split_declines_pos_specifically_not_every_metadata_column` | `_pos` → any reserved id → **RED** |
+
+Also folded in: the Critic's S3 — R148's opening summary clause still named
+"an already-ranged `start != 0` parent", a condition cycle 6 superseded; it now reads "an
+already-ranged parent (EITHER endpoint moved off the whole file) and a `_pos`-projecting task".
+
+Gate at the rider: `typos` · `cargo fmt --check` · `clippy --all-targets --all-features -D warnings`
+· **lib 3163 passed / 0 failed / 1 ignored** (+4 over cycle 6's 3159) · `check --workspace
+--no-default-features` · `make check-matrix-anchors` = 75 rows green. Each mutant applied alone by an
+asserting harness (HARD-FAIL if the target string is absent or non-unique), restored from a `cp`
+backup, `cmp`-verified byte-identical; no `git checkout --`. Re-greened at 3163 after the sweep.
+
+**Disclosure:** these four tests were written by the reviewer, not the Actor. Drop this commit if
+stricter Actor/Critic separation is preferred — the four guards then ship unpinned and the four
+mutants above stay live.
