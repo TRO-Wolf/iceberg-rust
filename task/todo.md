@@ -82,6 +82,29 @@ Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-ord
       - [x] **P9e — Re-run the full gate and the whole mutation sweep in an ISOLATED tree**
             (`git archive | tar -x`, own `CARGO_TARGET_DIR`, `touch` after extraction) — the
             shared worktree was carrying a sibling agent's uncommitted mutation during cycle 2.
+- [x] **P10 — Remediation cycle 4** (Critic C-S2/C-S3 + Falsifier F-1..F-4; ledger §13). Plan:
+      - [x] **P10a — F-1: `split` evaporated a whole-file `length == 0` task (HIGH, silent total
+            row loss).** `split_fixed_size` starts `remaining = self.length` and loops
+            `while remaining > 0`, so the legacy sentinel returned ZERO sub-tasks and
+            `mod.rs`'s `split_tasks.extend(...)` dropped the file — `plan_files` returned it,
+            `plan_tasks` read 0 rows, no error. Cycle 3 made it an ASYMMETRY (AVRO passes such a
+            task through; both reader guards bless the spelling). Fixed by returning `[self]`,
+            pinned at the unit AND read level, mutation-proven RED.
+      - [x] **P10b — F-2: pin the byte-range ENTRY gate** (`task.start != 0 || task.length != 0`).
+            Weakening it to `task.length != 0` was GREEN across 3,146 tests: it turns the empty
+            window `[start, start)` into a whole-file read.
+      - [x] **P10c — F-3: pin the START half of both whole-file guards.** `start = 1,
+            length = file_size_in_bytes` is a genuine window that
+            `reject_ranged_whole_file_task` (and the copy-pasted `_pos` guard, which had the same
+            gap) would ACCEPT without the `task.start == 0 &&` clause.
+      - [x] **P10d — F-4: distinguish the two parquet-mr offset helpers.** `dict Some(0)` must
+            still win (`ParquetMetadataConverter.getOffset`, no `> 0`), unlike
+            `ColumnChunkMetaData.getStartingPos` which the split-offset WRITER uses.
+      - [x] **P10e — C-S2: GAP_MATRIX row R148** — corrected the `FileScanTask::split`
+            parenthetical and added the NAMED divergence for the AVRO/ORC decline + the sentinel
+            passthrough; anchors green at 75 rows.
+      - [x] **P10f — C-S3: lessons entry** — never pipe a gate command into `tail`/`grep`/`head`
+            in a verification `&&` chain (the pipeline's status is the LAST command's).
 
 ---
 

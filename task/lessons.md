@@ -810,3 +810,15 @@ byte-identical — `extension.rs` is 187 vs 197 lines with a behavior-preserving
   first F2 pass fixed 5 `.md` files and missed 5 sites in `crates/` — including a SHIPPED
   user-facing error message naming a crate version the build no longer used, and a module doc that
   contradicted the `map.md` the same change had just rewritten, on the very topic being adjudicated.
+
+### 2026-08-07 — Never pipe a gate command into `tail`/`grep`/`head` inside a verification `&&` chain
+
+A pipeline's exit status is its LAST command's, so `cargo test … | tail -5` exits 0 whenever `tail`
+succeeds — the gate step becomes structurally incapable of failing the chain, and the commit runs on
+a red suite. The cycle-3 gate chain of U3 did exactly this. Same family as the promoted rule "never
+put `git commit` on a separate line from the gate": both fail by putting something between the gate
+and its exit status.
+
+- **DO keep every gate step unpiped** in the chain, and capture counts with a SEPARATE, non-gating
+  run afterwards if you want a summary line.
+- **DO use `set -o pipefail` or `${PIPESTATUS[0]}`** when a pipe is genuinely unavoidable.

@@ -357,3 +357,110 @@ uncommitted `midpoint <= end` mutation during cycle-2 review — the entire cycl
 sweep were run in an **isolated** `git archive | tar -x` tree with its own `CARGO_TARGET_DIR`, with
 `touch` after extraction (commit mtimes otherwise make cargo run a stale binary) and md5 restore
 verification after every mutant.
+
+---
+
+## 13 · Cycle 4 — the independent Critic's two doc items and the Falsifier's four survivors
+
+Cycle 3's reviewers split cleanly: the Critic declined to converge on a matrix-accuracy item, and
+the Falsifier demonstrated four mutation survivors by execution — three of them in the *guards*
+this unit shipped, one a live silent-data-loss bug that cycle 3 had turned into an asymmetry.
+
+### 13.1 · HIGH — `split` returned ZERO sub-tasks for a whole-file `length == 0` task (F-1)
+
+`FileScanTask::split_fixed_size` starts `remaining = self.length` and loops `while remaining > 0`,
+so a PARQUET task carrying the legacy whole-file sentinel (`start == 0, length == 0`) produced an
+EMPTY sub-task vector. `scan/mod.rs`'s `split_tasks.extend(task.split(split_size)?)` then dropped
+the file outright: `plan_files` returned it, `plan_tasks` read **zero rows** from it, and nothing
+errored anywhere. The Falsifier demonstrated the pair — 60/60 rows whole-file, 0 sub-tasks and 0
+rows after `task.split(1024)`.
+
+It is externally reachable: `FileScanTask` is `pub` with `pub` fields and a derived `Deserialize`
+(reproduced through a serde_json round-trip), so any caller or persisted plan can carry the
+spelling.
+
+Cycle 3 turned it into an **asymmetry**, which is what makes it a defect rather than a policy: the
+new AVRO/ORC passthrough returns `[self]` for exactly the same input, and BOTH whole-file reader
+guards — `reject_ranged_whole_file_task` (cycle 3) and the `_pos` guard — explicitly accept
+`start == 0, length == 0` as a supported whole-file spelling. Three of the four sites agreed;
+`split` was the outlier, and it was the one that lost rows.
+
+**Fix:** `split` returns `[self]` for `length == 0`, ahead of both the offsets-aware and fixed-size
+branches (the offsets-aware branch is no better — it would derive its last window from a zero file
+length). Rejecting with a typed error was the alternative and was NOT chosen: three other sites
+already treat the spelling as valid, so an error would break callers that are correct today, and
+`[self]` loses nothing. Java never reaches this case at all — `BaseFileScanTask.length()` is always
+`file.fileSizeInBytes()` — so this is a fork-local branch, NAMED in GAP_MATRIX row R148.
+
+Pinned twice: `scan::task::tests::split_whole_file_length_sentinel_is_one_task_not_zero` (both
+branch orders, with a non-vacuity control that the same geometry DOES split when `length > 0`) and
+`arrow::reader::tests::test_whole_file_length_sentinel_survives_split_and_reads_every_row`, which
+drives the real `split` → `ArrowReader::read` path and asserts the union is all 60 rows.
+
+### 13.2 · MEDIUM — the byte-range ENTRY gate of this whole unit was unpinned (F-2)
+
+Mutating `if task.start != 0 || task.length != 0` to `if task.length != 0` left the entire lib
+suite green. It is not a no-op: it flips a `start > 0, length == 0` task from "select nothing"
+(Java `withRange(start, start)`, whose `contains` is never true) to "read the ENTIRE file" —
+the inverse of what this unit exists to guarantee. No test in the suite used that shape.
+Closed by `test_byte_range_gate_fires_on_a_zero_length_window_at_a_nonzero_start`, which asserts
+zero rows at three non-zero starts and keeps the `(0, 0)` sentinel full-file read as the
+non-vacuity control.
+
+### 13.3 · MEDIUM — both whole-file guards varied only the LENGTH axis (F-3)
+
+Dropping `task.start == 0 &&` from `reject_ranged_whole_file_task` — code shipped in cycle 3 —
+survived green, because the new test varied only `length`. A task with
+`start > 0 && length == file_size_in_bytes` is a genuine ranged window that the mutant ACCEPTS, and
+the Avro/ORC reader would then re-emit the whole file: precisely the silent-duplication class the
+guard was written to stop. The Falsifier's tell was the asymmetry — the LENGTH-axis mutation was
+RED with 12 killers, the START-axis one had none.
+
+The `_pos` guard at the top of `process_parquet_file_scan_task` is a copy of the same predicate and
+had the same gap; `fk5_pos_ranged_split_task_is_rejected_fail_loud` also varied only `length`. Both
+tests now sweep both axes (`(1, file_size)` and, for `_pos`, `(1, 0)`).
+
+### 13.4 · LOW — nothing distinguished the two parquet-mr offset helpers (F-4)
+
+Adding `dictionary_page_offset > 0 &&` to `parquet_column_chunk_offset` survived green. parquet-mr
+has two helpers differing at exactly that predicate, and they belong to different call sites:
+
+* `ParquetMetadataConverter.getOffset(ColumnChunk)` — `isSet`, **no** `> 0` — drives
+  `filterFileMetaDataByMidpoint`, i.e. the READ path this function serves.
+* `ColumnChunkMetaData.getStartingPos()` — `dictionaryPageOffset > 0 &&` — is what Iceberg's
+  split-offset WRITER uses.
+
+The fork already had the right one; nothing proved it. Case **(d5)** of the semantics matrix closes
+it: dict `Some(0)`, data 1000, size 100 ⇒ start 0, midpoint 50, selected by `[0, 51)` and NOT by
+`[1000, 1100)`.
+
+### 13.5 · Doc items from the independent Critic
+
+* **C-S2 — GAP_MATRIX row R148** was factually wrong after cycle 3: the `FileScanTask::split` cell
+  still read "(offsets-aware, Puffin non-splittable)" while split had begun declining AVRO and ORC,
+  and the string AVRO appeared nowhere in the matrix. The parenthetical is corrected and a NAMED
+  divergence clause added (why the decline exists, that `is_splittable` still ports Java's
+  `FileFormat` table faithfully and the gate is the separate `reader_honors_byte_range` predicate,
+  that the cost is intra-file parallelism only, and that closing it means flipping
+  `reader_honors_byte_range` and never `is_splittable`), plus the F-1 sentinel clause. Anchors
+  green at 75 rows.
+* **C-S3 — lessons** now carries the rule that a gate command must never be piped into
+  `tail`/`grep`/`head` inside a verification `&&` chain: the pipeline's exit status is the last
+  command's, so the gate step cannot fail the chain. The cycle-3 gate did exactly that.
+
+### 13.6 · Declined, with reason
+
+The Falsifier's own equivalent-survivor classifications are accepted and NOT "fixed": **MF4**
+(`split_at_offsets`' last window end `self.length` → `file_size_in_bytes` — equal for a whole-file
+parent, which is the only shape that reaches the offsets-aware branch), **MF7** (dropping
+`!is_splittable(...) ||` from `split`, redundant because `reader_honors_byte_range` is already false
+for Puffin), and **MF8** (`midpoint < end` → `end.max(start)`, equal because `end >= start` is
+already enforced by the `checked_add` guard).
+
+### 13.7 · Process
+
+This cycle was run STRICTLY SERIAL in the shared worktree, as the only agent touching it — cycle 3
+had a Critic and a Falsifier mutating it concurrently and each `git checkout --`-ing the other's
+in-flight mutant, which can turn a RED mutant into a false GREEN. Every mutation below was applied
+alone, run, restored with `git checkout --`, and `git status --porcelain` verified EMPTY before the
+next one.

@@ -441,6 +441,13 @@ impl FileScanTask {
     /// 3. **Fixed-size** (else): walk `0..length` emitting windows of
     ///    `min(target, remaining)` (Java `FixedSizeSplitScanTaskIterator`).
     ///
+    /// One FORK-LOCAL branch sits between (1) and (2): a task carrying the legacy whole-file
+    /// sentinel `length == 0` also returns `[self]` unchanged. Every read path in this crate spells
+    /// "whole file" as `start == 0` with either that sentinel or `length == file_size_in_bytes`, so
+    /// splitting it is meaningless — and branch (3) would emit ZERO sub-tasks for it, silently
+    /// dropping the file from `plan_tasks` while `plan_files` still returns it. Java has no such
+    /// case (`BaseFileScanTask.length()` is always the file size).
+    ///
     /// Every sub-task carries the SAME `deletes` / `predicate` (residual) / `partition` / spec /
     /// schema / projection as `self` — only `start` + `length` change (Java's split task delegates
     /// every field but `start`/`length` to its parent), and `record_count` is dropped (`None`,
@@ -460,6 +467,26 @@ impl FileScanTask {
         // per sub-task; they take this branch too.
         if !is_splittable(self.data_file_format) || !reader_honors_byte_range(self.data_file_format)
         {
+            return Ok(vec![self.clone()]);
+        }
+
+        // (1b) The legacy whole-file sentinel `length == 0` ⇒ the whole file is one task.
+        //
+        // Every READ path in this crate spells "whole file" as `start == 0` with EITHER
+        // `length == 0` (the sentinel) or `length == file_size_in_bytes`: the Parquet byte-range
+        // gate (`task.start != 0 || task.length != 0`), the `_pos` guard, and
+        // `reject_ranged_whole_file_task` all bless it. `split` must agree, because neither of
+        // the remaining branches can express "the whole file" from a zero length: the fixed-size
+        // walk starts `remaining = self.length` and loops `while remaining > 0`, so it emits ZERO
+        // sub-tasks, and `scan::mod`'s `split_tasks.extend(task.split(split_size)?)` then drops the
+        // task entirely — `plan_files` returns the file, `plan_tasks` reads NO rows from it, with
+        // no error anywhere. (The offsets-aware branch is no better: it would derive its last
+        // window from `self.length == 0`.) Returning `[self]` is the only answer that loses
+        // nothing, and it is the same answer the non-splittable passthrough above gives.
+        //
+        // Java never reaches this: `BaseFileScanTask.length()` is always `file.fileSizeInBytes()`,
+        // so the sentinel is a fork-local spelling that the fork must handle fork-locally.
+        if self.length == 0 {
             return Ok(vec![self.clone()]);
         }
 
@@ -943,6 +970,51 @@ mod tests {
                     "{format:?} passthrough must cover the whole file"
                 );
             }
+        }
+    }
+
+    /// A whole-file task spelled with the legacy `length == 0` sentinel must survive `split` as
+    /// ONE task, never as an empty Vec.
+    ///
+    /// Before the `length == 0` guard the fixed-size branch (`remaining = self.length`,
+    /// `while remaining > 0`) returned ZERO sub-tasks for such a task, so
+    /// `scan::mod`'s `split_tasks.extend(task.split(split_size)?)` dropped the file: `plan_files`
+    /// returned it, `plan_tasks` read no rows from it, and nothing errored. The reader agrees the
+    /// other way — `_pos` and `reject_ranged_whole_file_task` both accept `start == 0,
+    /// length == 0` as whole-file — so an empty Vec was pure silent row loss.
+    #[test]
+    fn split_whole_file_length_sentinel_is_one_task_not_zero() {
+        // The sentinel must win in BOTH the fixed-size branch and the offsets-aware branch (a
+        // manifest entry can carry split offsets alongside the sentinel length).
+        for offsets in [None, Some(vec![0i64, 300, 700])] {
+            let mut t = task(1000, DataFileFormat::Parquet, offsets.clone());
+            t.length = 0; // legacy whole-file sentinel; file_size_in_bytes stays 1000
+
+            // Non-vacuity: the SAME geometry with a real length does split into many windows, so
+            // this assertion cannot pass on a `split` that never splits anything.
+            let sized = task(1000, DataFileFormat::Parquet, offsets.clone());
+            assert!(
+                sized.split(100).expect("sized split ok").len() > 1,
+                "fixture is non-discriminating: offsets {offsets:?} must split when length > 0"
+            );
+
+            let parts = t.split(100).expect("split ok");
+            assert_eq!(
+                parts.len(),
+                1,
+                "the `length == 0` whole-file sentinel (offsets {offsets:?}) must split to ONE \
+                 task; an empty Vec loses every row of the file with no error"
+            );
+            assert_eq!(
+                (parts[0].start, parts[0].length),
+                (0, 0),
+                "the sentinel task must pass through verbatim, keeping the spelling the readers \
+                 accept as whole-file"
+            );
+            assert_eq!(
+                parts[0].file_size_in_bytes, 1000,
+                "passthrough must not disturb the file size"
+            );
         }
     }
 

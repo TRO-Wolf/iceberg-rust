@@ -3773,6 +3773,126 @@ message schema {
         );
     }
 
+    /// U3 cycle 4 / F-1 — a PARQUET task carrying the legacy whole-file sentinel
+    /// (`start == 0, length == 0`) must still read every row after going through
+    /// [`FileScanTask::split`], the way `TableScan::plan_tasks` does
+    /// (`scan/mod.rs`: `split_tasks.extend(task.split(split_size)?)`).
+    ///
+    /// Before the sentinel guard in `split`, the fixed-size branch (`remaining = self.length`,
+    /// `while remaining > 0`) returned ZERO sub-tasks for such a task: the file vanished from
+    /// `plan_tasks` while `plan_files` still returned it, and the scan read 0 rows with NO error.
+    /// The reader accepts the same spelling as whole-file (the byte-range gate below, the `_pos`
+    /// guard, `reject_ranged_whole_file_task`), so the two halves must agree.
+    #[tokio::test]
+    async fn test_whole_file_length_sentinel_survives_split_and_reads_every_row() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("sentinel.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_midpoint_fixture(&path, 3, 20, false);
+        let schema = id_schema_for_pos();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+
+        // The sentinel spelling: start 0, length 0, with the REAL file size alongside it.
+        let sentinel = midpoint_scan_task(&path, schema.clone(), 0, 0);
+        assert_eq!(
+            (sentinel.start, sentinel.length),
+            (0, 0),
+            "fixture guard: this task must carry the legacy whole-file sentinel"
+        );
+
+        // Non-vacuity: the same file spelled with an explicit length DOES split into several
+        // windows at this target, so a `split` that returned an empty Vec here would be a real
+        // asymmetry and not "this target never splits".
+        let target = file_size / 3 + 1;
+        let sized = midpoint_scan_task(&path, schema.clone(), 0, file_size);
+        assert!(
+            sized.split(target).expect("sized split").len() > 1,
+            "fixture is non-discriminating: target {target} must split a {file_size}-byte file"
+        );
+
+        let sub_tasks = sentinel.split(target).expect("sentinel split");
+        assert_eq!(
+            sub_tasks.len(),
+            1,
+            "the whole-file sentinel must survive split as ONE task, not evaporate"
+        );
+
+        let mut union: Vec<i32> = Vec::new();
+        for sub_task in sub_tasks {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let batches = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(sub_task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("sentinel read");
+            for batch in &batches {
+                union.extend(
+                    batch
+                        .column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        union.sort_unstable();
+        assert_eq!(
+            union,
+            (0..60).collect::<Vec<i32>>(),
+            "splitting a whole-file sentinel task must still read every row exactly once (an \
+             empty sub-task set reads ZERO rows and reports no error at all)"
+        );
+    }
+
+    /// U3 cycle 4 / F-2 — the byte-range ENTRY gate
+    /// (`if task.start != 0 || task.length != 0`) must fire on `start > 0, length == 0`.
+    ///
+    /// That disjunction is what makes `start == 0 && length == 0` — and ONLY that pair — mean
+    /// "whole file". A task with a non-zero start and a zero length is an EMPTY window
+    /// (`[start, start)`), which Java spells `withRange(start, start)`: `RangeMetadataFilter`'s
+    /// `contains` is never true, so nothing is selected. Weakening the gate to `task.length != 0`
+    /// silently turns that empty window into a full-file read — the whole point of this unit
+    /// inverted — and every other test in the suite stays green, because none of them uses that
+    /// shape.
+    #[tokio::test]
+    async fn test_byte_range_gate_fires_on_a_zero_length_window_at_a_nonzero_start() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("empty_window.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_midpoint_fixture(&path, 3, 20, false);
+        let schema = id_schema_for_pos();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(file_size > 1, "fixture guard: the file must be non-trivial");
+
+        // Non-vacuity control: the SENTINEL pair (0, 0) bypasses the gate and reads the file.
+        let whole = read_ids_for_window(&path, schema.clone(), 0, 0).await;
+        assert_eq!(
+            whole,
+            (0..60).collect::<Vec<i32>>(),
+            "the (0, 0) sentinel must bypass the gate and read the whole file"
+        );
+
+        // The pinned shape: a non-zero start with a zero length is an EMPTY window, so no row
+        // group's midpoint can lie in it and the read returns nothing.
+        for start in [1u64, file_size / 2, file_size - 1] {
+            let ids = read_ids_for_window(&path, schema.clone(), start, 0).await;
+            assert!(
+                ids.is_empty(),
+                "window [{start}, {start}) is empty and must select no row groups, got {} rows \
+                 (a full-file read here means the gate stopped distinguishing start == 0)",
+                ids.len()
+            );
+        }
+    }
+
     /// U3 / T2 — the OFFSET-SOURCE pin: a file whose row groups are NOT contiguous.
     ///
     /// parquet-rs writes bloom filters after each row group by default, so real row-group starts
@@ -4183,6 +4303,32 @@ message schema {
             ArrowReader::filter_row_groups_by_byte_range(&md, 105, 10).expect("filter"),
             vec![0],
             "the first column chunk determines the row-group start (midpoint 110)"
+        );
+
+        // (d5) a dictionary page offset of EXACTLY ZERO is still "set" and still wins. parquet-mr
+        //      has TWO offset helpers that differ at precisely this predicate, and this call site
+        //      must be the first one:
+        //        * `ParquetMetadataConverter.getOffset(ColumnChunk)` — `isSetDictionary_page_offset()`
+        //          with NO `> 0` test — is what drives `filterFileMetaDataByMidpoint`, i.e. the
+        //          rule Iceberg's `withRange` READ path uses (this function).
+        //        * `ColumnChunkMetaData.getStartingPos()` — `dictionaryPageOffset > 0 &&` — is the
+        //          rule Iceberg's split-offset WRITER uses.
+        //      Adding `> 0` here would push this row group's start from 0 to 1000 and its midpoint
+        //      from 50 to 1050, quietly moving it into a different split. (U3 cycle 4 / F-4.)
+        let md = midpoint_test_metadata(&[(1000, 100, Some(0))]);
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 0, 51).expect("filter"),
+            vec![0],
+            "a dictionary page offset of 0 is SET and below the data page offset, so the row group \
+             starts at 0 (midpoint 50) — the `getStartingPos` variant with `> 0` would start it at \
+             1000"
+        );
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 1000, 100)
+                .expect("filter")
+                .is_empty(),
+            "the window around the DATA page offset must select nothing once the zero dictionary \
+             offset is honoured"
         );
 
         // (e) a row group with no column chunks is a typed error, not a panic. (Java indexes
@@ -4887,23 +5033,36 @@ message schema {
         let ids: Vec<i32> = (0..20).collect();
         write_id_parquet_for_pos(&data_path, &ids, 1000);
 
-        // A plan_tasks-shaped split window: start 0, length strictly inside the file.
-        let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
-        ranged.length = ranged.file_size_in_bytes / 2;
-        assert!(ranged.length > 0, "fixture file must be non-trivial");
+        // Ranged shapes on BOTH axes of the guard (`start == 0 && (length == 0 || length ==
+        // file_size)`). Varying only the LENGTH leaves the `start == 0 &&` half unpinned:
+        // `(1, file_size)` is a genuine window that a start-blind guard would ACCEPT, and the
+        // `_pos` path would then decode the whole file with ordinals from 0. (U3 cycle 4 / F-3 —
+        // the sibling of the same gap in `reject_ranged_whole_file_task`.)
+        let file_size =
+            pos_scan_task(&data_path, id_schema_for_pos(), vec![], None).file_size_in_bytes;
+        assert!(file_size > 1, "fixture file must be non-trivial");
+        for (start, length) in [(0u64, file_size / 2), (1u64, file_size), (1u64, 0u64)] {
+            let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+            ranged.start = start;
+            ranged.length = length;
 
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
-        let err = reader
-            .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
-            .expect("stream construction")
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .expect_err("a ranged task projecting `_pos` must fail loud, not duplicate rows");
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            err.to_string().contains("ranged split task is unsupported"),
-            "typed error must name the ranged-split rejection, got: {err}"
-        );
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let err = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect_err("a ranged task projecting `_pos` must fail loud, not duplicate rows");
+            assert_eq!(
+                err.kind(),
+                ErrorKind::FeatureUnsupported,
+                "ranged `_pos` task ({start}, {length}) must fail loud, not duplicate rows"
+            );
+            assert!(
+                err.to_string().contains("ranged split task is unsupported"),
+                "typed error must name the ranged-split rejection ({start}, {length}), got: {err}"
+            );
+        }
 
         // Control: the SAME file as a whole-file task (0,0 legacy sentinel) still streams fine —
         // the guard must reject ONLY ranged windows.
@@ -8677,25 +8836,37 @@ mod avro_scan_tests {
             "fixture guard: the Avro file must be non-trivial"
         );
 
-        // A genuine sub-window: neither `start == 0 && length == 0` nor the full file length.
-        let ranged = FileScanTask {
-            start: 0,
-            length: file_len / 2,
-            ..whole.clone()
-        };
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
-        let tasks = Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream;
-        let err = reader
-            .read(tasks)
-            .expect("build scan stream")
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .expect_err("a ranged AVRO task must fail closed, not re-emit the whole file");
-        assert_eq!(err.kind(), crate::ErrorKind::FeatureUnsupported);
-        assert!(
-            err.to_string().contains("ranged split task over a AVRO"),
-            "the typed error must name the ranged AVRO task, got: {err}"
-        );
+        // Genuine sub-windows on BOTH axes of the guard. Varying only the LENGTH would leave the
+        // guard's `task.start == 0 &&` half unpinned: `(1, file_len)` is a real window that a
+        // start-blind guard would ACCEPT, and the Avro reader would then re-emit the whole file —
+        // the silent-duplication class this guard exists to stop. (U3 cycle 4 / F-3.)
+        for (start, length) in [(0u64, file_len / 2), (1u64, file_len)] {
+            let ranged = FileScanTask {
+                start,
+                length,
+                ..whole.clone()
+            };
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let tasks = Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream;
+            let result = reader
+                .read(tasks)
+                .expect("build scan stream")
+                .try_collect::<Vec<RecordBatch>>()
+                .await;
+            let err = match result {
+                Ok(batches) => panic!(
+                    "a ranged AVRO task ({start}, {length}) must fail closed, not re-emit the \
+                     whole file — got {} row(s)",
+                    rows_of(&batches).len()
+                ),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), crate::ErrorKind::FeatureUnsupported);
+            assert!(
+                err.to_string().contains("ranged split task over a AVRO"),
+                "the typed error must name the ranged AVRO task ({start}, {length}), got: {err}"
+            );
+        }
 
         // Both whole-file spellings must still be accepted: the legacy `length == 0` sentinel and
         // an explicit `length == file_size_in_bytes`.
