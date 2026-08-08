@@ -464,3 +464,137 @@ had a Critic and a Falsifier mutating it concurrently and each `git checkout --`
 in-flight mutant, which can turn a RED mutant into a false GREEN. Every mutation below was applied
 alone, run, restored with `git checkout --`, and `git status --porcelain` verified EMPTY before the
 next one.
+
+## 14 · Cycle 5 — the Critic's ORC S2 and the Falsifier's F5–F9
+
+Six items in, six closed: **two production fixes** (F5, F7), **three test pins** (the Critic's S2 /
+F9, plus two notes from the Falsifier's list), **one interop leg** (F6), and **two DECLINED with an
+executed equivalence proof** (F8 and the `can_expand` half of F5). Lib suite 3149 → **3155**.
+
+### 14.1 · F5 (S2) — `split` RELOCATED an already-ranged task's window
+
+`split`'s two real branches both treat the byte space as ABSOLUTE FROM ZERO: `split_fixed_size`
+started its walk at a literal `0` and `split_at_offsets` takes the manifest offsets verbatim, ending
+the last window at `self.length`. So a parent covering bytes 139..1185 of a 3-row-group / 60-row file
+(ids 20..59, which the production reader serves correctly) came back as `[(0, 1046)]` — or
+`[(0, 524), (524, 522)]` at a smaller target — and reading those products returned ids **0..59**:
+20 rows the parent never owned, with its own tail dropped. Silent corruption, one level worse than
+the row loss F-1 closed in cycle 4, and reachable through the same public route (`FileScanTask` is
+`pub` with `pub` fields and a derived `Deserialize`; `split` is `pub`).
+
+**Fix chosen: return `[self]` for `self.start != 0`**, ahead of both branches and of the cycle-4
+`length == 0` guard. The alternative — teaching both branches to anchor at `self.start` and clip to
+`[self.start, self.start + self.length)` — was rejected because Java forecloses the shape
+STRUCTURALLY rather than handling it: `BaseFileScanTask` implements `SplittableScanTask`, but the
+`SplitScanTask` its splitter emits does not, so a Java split product is never re-splittable. This
+crate uses one type for both, so it must say something; `[self]` is the lossless thing to say, it is
+the same answer branches (1) and (1b) already give, and it costs nothing in practice (no planner path
+produces a ranged parent). `split_fixed_size` is nevertheless re-anchored at `self.start` so the
+window stays absolute-correct if the guard ever moves — a documented no-op today (mutant **E3**).
+
+Pinned twice: `scan::task::tests::split_of_an_already_ranged_task_is_a_passthrough_not_a_relocation`
+(both branch orders, each with a non-vacuity control proving the same geometry DOES split from
+start 0) and `arrow::reader::tests::test_split_of_a_ranged_task_reads_the_parents_rows_not_the_whole_file`
+(drives the real `split` → `ArrowReader::read` path and asserts the union is exactly the parent's
+ids 20..59, never 0..59).
+
+### 14.2 · F7 (S3) — `plan_tasks` manufactured the shape the `_pos` reader refuses
+
+`expand_within_file_parallel_tasks` (the `to_arrow` seam) has always suppressed splitting under a
+`_pos` projection, because the `_pos` path decodes whole files with ordinals from 0. `plan_tasks`
+split unconditionally, and the reader's `_pos` guard rejects every `start != 0` task — so a `_pos`
+scan that `to_arrow()` served correctly was a TOTAL OUTAGE on the `plan_tasks` / `PartitionWork`
+seam (measured: 0 rows and two `FeatureUnsupported` errors), and the error told the caller to "plan
+without splitting" when the caller never chose to split. Fixed by hoisting the same suppression into
+`plan_tasks`: one layer must never manufacture what the next layer rejects. Fail-loud, not corruption
+— hence S3 — but a total outage of the FK5 row-identity surface on the documented multi-partition
+seam. Pin: `scan::tests::test_plan_tasks_does_not_split_when_pos_is_projected`, with a non-vacuity
+assertion that the same target DOES produce ranged sub-tasks without `_pos`.
+
+### 14.3 · Critic S2 / Falsifier F9 — the ORC call site of the duplication guard
+
+`reject_ranged_whole_file_task` is invoked from both `process_avro_file_scan_task` and
+`process_orc_file_scan_task`, but only the AVRO call site was pinned: deleting the ORC line left the
+whole suite green, so a future edit could re-open the N-copies-per-N-way-split class and ship. No
+production change was needed — the guard is correct — the exposure was pure coverage, and it left
+R148's and `scan/map.md`'s "fails a ranged AVRO/ORC task closed" claim resting on nothing for half
+the formats it names. `orc_ranged_task_is_rejected_with_a_typed_error` mirrors the AVRO test
+one-for-one: both axes of the predicate (`(0, len/2)` and `(1, len)`), `panic!`-with-row-count on an
+unexpected success so a duplicating mutant reports the duplication it caused, and both whole-file
+spellings kept as non-vacuity controls. `scan/map.md`'s Pins list now names it.
+
+### 14.4 · F6 (S2) — the interop driver's sabotage proved only the PREDICATE, not the OFFSET SOURCE
+
+Step [5/5] mutated one literal — the `midpoint >= start && midpoint < end` predicate — and re-ran
+only the D1 leg. Both Rust-side legs are BLIND to the other half of the claim: reverting
+`row_group_start` to the synthetic `4 + Σ compressed_size` model (the model the reader doc,
+`scan/map.md` and R148 all say is gone from the selection path) leaves D1 green AND the D2 GEN leg
+green, because the synthetic model still yields a partition of the rows, so `assert_exactly_once` and
+the bloom-drift guard both pass. Only the JAVA comparison catches it. Under this repo's promoted rule
+— a sabotage step that did not actually corrupt anything has proven nothing — the offset-source half
+was unproven. The driver now has a **step [6/6]**: mutate the offset SOURCE to the synthetic model,
+re-run the Rust GEN through the mutant, and require `verify-interop-ranged-read` to fail with a real
+PER-WINDOW comparison signal (`FAIL ranged-read-d2 <file>.parquet [...`). The "missing json" /
+"empty json" FAIL forms are explicitly NOT accepted, because a mutant that failed to compile would
+produce exactly those. Same HARD-FAIL-if-the-literal-is-absent, `|| rc=$?`, md5-verified-restore
+mechanics as step [5/6], then GEN + VERIFY re-run GREEN.
+
+Secondary point in the same finding, also fixed: `assert_exactly_once("java fixture", …)` derived its
+expected row count from the OBSERVED total, so a read that lost a suffix of ids satisfied it. It now
+takes a declared `JAVA_ROWS` constant mirroring `InteropOracle.RangedReadOracle.ROWS`, with the
+observed total asserted equal to it first.
+
+### 14.5 · Notes promoted from the Falsifier's non-finding list
+
+* `is_splittable` is behaviourally INERT as a single point (each format is masked by the other
+  predicate), so R148's "ports Java's `FileFormat` table" claim had no executable evidence.
+  `format_predicate_tables_match_java_and_the_read_path` asserts both four-arm tables directly;
+  mutant **M5** (`Puffin → true`) is RED against it and was GREEN before.
+* `split_at_offsets`' negative-offset typed error was unpinned (clamping to 0 survived) and is
+  reachable from a corrupt manifest whose offsets are strictly ascending but negative.
+  `split_negative_offsets_are_a_typed_error_not_a_clamp` pins it; mutant **M4** is RED.
+
+### 14.6 · Declined, with an EXECUTED equivalence proof
+
+* **F8 — the sentinel guard is "broader than its documentation".** Not fixed by narrowing the
+  condition; fixed by ORDERING. The new `start != 0` passthrough (14.1) sits ABOVE the `length == 0`
+  guard, so `start == 0` holds whenever the sentinel branch is reached and the shipped condition IS
+  the documented `start == 0, length == 0` sentinel. Mutant **E1** (narrowing it to spell that out)
+  is GREEN — an equivalent no-op, as claimed, not an unpinned choice. The three-layer disagreement
+  F8 described is gone with it: `(start > 0, length == 0)` now takes the ranged passthrough.
+* **F5's second half — "pin `can_expand`'s `task.start == 0` clause".** Impossible after the fix, and
+  the impossibility is the proof: with `split` returning `[self]` for a ranged parent, dropping the
+  clause routes the task into `task.split(target)` which returns `vec![task]` — byte-identical to the
+  `else` branch. Mutant **E2** is GREEN by construction. The clause is retained as a local statement
+  of the precondition and is now commented as defensive rather than load-bearing.
+* MF4 / MF7 / MF8 remain accepted equivalent survivors (see §13.6). The Falsifier's correction to the
+  MF4 rationale is recorded: a caller CAN construct `length != file_size_in_bytes` through the same
+  public route as F5, so MF4 is an unreachable-IN-PRACTICE survivor, not a true equivalent.
+
+### 14.7 · Process — and a lesson bought at the cost of a rewrite
+
+Strictly serial, single agent in the worktree. **Restores were done from `cp` backups and verified
+with `cmp`, never with `git checkout --`** — the first M1 attempt this cycle used
+`git checkout -- crates/iceberg/src/scan/task.rs` and, because the F5 fix and its tests were still
+uncommitted in that same file, the "restore" reverted the file to HEAD and DELETED the fix. The sweep
+looked healthy (porcelain clean for that path is exactly what the exclusive-access protocol asks
+for); the loss only surfaced when the NEXT mutant produced an extra, unrelated failure. All of
+`scan/task.rs` was re-applied, the suite re-greened at 3155, and the whole sweep was re-run from
+scratch with the `cp`/`cmp` harness. Filed in `task/lessons.md` (2026-08-08).
+
+### 14.8 · Mutation table (all re-run after the rewrite)
+
+| # | Mutation | Expected | Result |
+|---|---|---|---|
+| M1 | remove `if self.start != 0 { return Ok(vec![self.clone()]); }` from `split` | RED | RED — 2 killers (`split_of_an_already_ranged_task_is_a_passthrough_not_a_relocation`, `test_split_of_a_ranged_task_reads_the_parents_rows_not_the_whole_file`) |
+| M2 | delete `Self::reject_ranged_whole_file_task(&task, "ORC")?;` | RED | RED — `orc_ranged_task_is_rejected_with_a_typed_error` (was GREEN before this cycle) |
+| M3 | make `plan_tasks` split unconditionally again | RED | RED — `test_plan_tasks_does_not_split_when_pos_is_projected` |
+| M4 | clamp a negative split offset to 0 instead of erroring | RED | RED — `split_negative_offsets_are_a_typed_error_not_a_clamp` |
+| M5 | `is_splittable(Puffin) → true` | RED | RED — `format_predicate_tables_match_java_and_the_read_path` |
+| E1 | narrow the sentinel guard to `start == 0 && length == 0` | GREEN (equivalent) | GREEN — 3155/0 |
+| E2 | drop `task.start == 0 &&` from `can_expand` | GREEN (equivalent) | GREEN — 3155/0 |
+| E3 | re-anchor `split_fixed_size` at `0u64` instead of `self.start` | GREEN (equivalent) | GREEN — 3155/0 |
+
+Every mutant was applied alone, run against the full `cargo test -p iceberg --lib`, restored from its
+`cp` backup, and the restore verified byte-for-byte with `cmp` before the next one; `git status
+--porcelain` showed only this cycle's own intended files throughout, and the tree is clean at commit.

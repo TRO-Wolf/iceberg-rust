@@ -974,11 +974,32 @@ impl TableScan {
         // order-sensitive; Java drives the bin-packer over the in-order splitFiles(planFiles())).
         let file_scan_tasks: Vec<FileScanTask> = self.plan_files().await?.try_collect().await?;
 
+        // FORK-LOCAL: a scan projecting `_pos` must NOT be split. The `_pos` read path decodes the
+        // whole file in physical order with ordinals from 0, so it rejects every ranged task with a
+        // typed error (`arrow::reader`'s `_pos` guard) — which means an unconditional split here
+        // manufactures exactly the shape the next layer refuses, and a `_pos` scan that
+        // `to_arrow()` serves correctly becomes a total outage on the `plan_tasks` /
+        // `PartitionWork` seam. `to_arrow`'s `expand_within_file_parallel_tasks` already suppresses
+        // itself the same way; this is the same rule at the other split site. Java has no such case
+        // (`_pos` is a Spark-side metadata column there, and its readers carry the row-group start
+        // ordinal into a split). Cost: whole-file tasks — parallelism, never rows. (U3 cycle 5 / F7.)
+        let projects_pos = {
+            use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+            self.plan_context
+                .as_ref()
+                .map(|ctx| ctx.field_ids.contains(&RESERVED_FIELD_ID_POS))
+                .unwrap_or(false)
+        };
+
         // splitFiles: expand each whole-file task into its target-sized sub-tasks, preserving
         // arrival order (Java `FluentIterable.transformAndConcat`).
         let mut split_tasks: Vec<FileScanTask> = Vec::with_capacity(file_scan_tasks.len());
         for task in file_scan_tasks {
-            split_tasks.extend(task.split(split_size)?);
+            if projects_pos {
+                split_tasks.push(task);
+            } else {
+                split_tasks.extend(task.split(split_size)?);
+            }
         }
 
         // Bin-pack with largestBinFirst = true (the planTasks path). The weight is the
@@ -1060,6 +1081,11 @@ impl TableScan {
                     // rather than useful work. Row DUPLICATION is no longer a reason: the midpoint
                     // rule assigns each row group to exactly one window, and the overlap rule that
                     // could duplicate is gone.
+                    // `task.start == 0` is DEFENSIVE, not load-bearing: since U3 cycle 5
+                    // `FileScanTask::split` itself returns `[self]` for an already-ranged parent
+                    // (rather than relocating its window to 0), so dropping this clause is a
+                    // provable no-op — the `else` branch below produces the same `vec![task]`.
+                    // It stays as a local statement of the precondition this path relies on.
                     let can_expand = task.start == 0
                         && task.data_file_format == DataFileFormat::Parquet
                         && task.split_offsets.as_ref().is_some_and(|offsets| {
@@ -6746,6 +6772,83 @@ pub mod tests {
             whole.len(),
             "_pos projection must suppress within-file expand"
         );
+    }
+
+    /// U3 cycle 5 / F7 — `plan_tasks` must ALSO suppress splitting under a `_pos` projection.
+    ///
+    /// `expand_within_file_parallel_tasks` (the `to_arrow` seam) has always suppressed itself under
+    /// `_pos`, but `plan_tasks` used to split unconditionally — and the reader's `_pos` guard
+    /// rejects every `start != 0` task with `FeatureUnsupported`. So one layer manufactured exactly
+    /// the shape the next refuses: a `_pos` scan that `to_arrow()` serves correctly was a total
+    /// outage on the `plan_tasks` / `PartitionWork` seam (measured: 0 rows and two typed errors),
+    /// and the error told the caller to "plan without splitting" when the caller never asked to
+    /// split.
+    #[tokio::test]
+    async fn test_plan_tasks_does_not_split_when_pos_is_projected() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_for_planning().await;
+
+        // Non-vacuity: the SAME target really does split this fixture when `_pos` is absent.
+        let without_pos = fixture
+            .table
+            .scan()
+            .with_split_size(500)
+            .with_split_open_file_cost(0)
+            .build()
+            .expect("build without _pos");
+        let split_groups: Vec<CombinedScanTask> = without_pos
+            .plan_tasks()
+            .await
+            .expect("plan_tasks")
+            .try_collect()
+            .await
+            .expect("collect");
+        let split_sub_tasks: usize = split_groups.iter().map(|g| g.files_count()).sum();
+        assert!(
+            split_groups
+                .iter()
+                .flat_map(|g| g.tasks())
+                .any(|t| t.start != 0),
+            "fixture is non-discriminating: without `_pos` this target must produce ranged \
+             sub-tasks (got {split_sub_tasks} sub-tasks, all whole-file)"
+        );
+
+        let with_pos = fixture
+            .table
+            .scan()
+            .select(["x", "_pos"])
+            .with_split_size(500)
+            .with_split_open_file_cost(0)
+            .build()
+            .expect("build with _pos");
+        let whole: Vec<FileScanTask> = with_pos
+            .plan_files()
+            .await
+            .expect("plan_files")
+            .try_collect()
+            .await
+            .expect("collect plan_files");
+        let groups: Vec<CombinedScanTask> = with_pos
+            .plan_tasks()
+            .await
+            .expect("plan_tasks with _pos")
+            .try_collect()
+            .await
+            .expect("collect");
+
+        let tasks: Vec<&FileScanTask> = groups.iter().flat_map(|g| g.tasks()).collect();
+        assert_eq!(
+            tasks.len(),
+            whole.len(),
+            "a `_pos` scan must plan exactly the whole-file tasks `plan_files` produced"
+        );
+        for task in &tasks {
+            assert_eq!(
+                task.start, 0,
+                "a `_pos` scan must never be handed a ranged task — the reader rejects it with a \
+                 typed error, so splitting here is a total outage of the plan_tasks seam"
+            );
+        }
     }
 
     /// Disabled within-file parallelism leaves plan_files task count unchanged.

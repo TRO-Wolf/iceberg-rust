@@ -72,6 +72,11 @@ const STRIDE: u64 = 800;
 /// Rows in each Rust-written fixture.
 const ROWS: i64 = 400;
 
+/// Rows in the JAVA-written fixture. Mirrors `InteropOracle.RangedReadOracle.ROWS` — DECLARED, not
+/// derived from what the read returned: an expectation computed from the observed total is
+/// satisfied by a read that silently lost a suffix of ids.
+const JAVA_ROWS: i64 = 400;
+
 /// One `(file, window)` reading, as exchanged with the Java oracle.
 #[derive(Debug, Deserialize)]
 struct WindowRead {
@@ -222,7 +227,11 @@ async fn test_ranged_read_matches_java() {
         "the tiling must spread rows across MULTIPLE windows, else it cannot discriminate the \
          midpoint rule from an overlap rule"
     );
-    assert_exactly_once("java fixture", &readings, total_rows);
+    assert_eq!(
+        total_rows, JAVA_ROWS,
+        "the tiling must read every row of the Java fixture ({JAVA_ROWS} declared rows)"
+    );
+    assert_exactly_once("java fixture", &readings, JAVA_ROWS);
 }
 
 /// DIRECTION 2 (GEN) — write the fixtures Java replays, including the bloom-PADDED offset-drift leg.

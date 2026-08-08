@@ -822,3 +822,22 @@ and its exit status.
 - **DO keep every gate step unpiped** in the chain, and capture counts with a SEPARATE, non-gating
   run afterwards if you want a summary line.
 - **DO use `set -o pipefail` or `${PIPESTATUS[0]}`** when a pipe is genuinely unavoidable.
+
+### 2026-08-08 — Never restore a mutation with `git checkout --` while the unit's own work is uncommitted
+
+A mutation sweep restores each mutant before the next one. `git checkout -- <file>` restores the file
+to **HEAD**, not to the pre-mutation state — so if the file also carries the cycle's own uncommitted
+edits, the restore silently DELETES them. That happened here in U3 cycle 5: the F5 fix and its two
+unit tests lived in `scan/task.rs` alongside the mutation, and the restore wiped the fix while
+leaving the tests' sibling file untouched. The next mutation then ran against production code that no
+longer contained the thing under test, and its result (a second, unrelated test failing) was
+uninterpretable until the loss was noticed. Note the failure mode is asymmetric and nasty: the *sweep*
+looked healthy — `git status --porcelain` was "clean" for that path, which is exactly what the
+exclusive-access protocol tells you to check.
+
+- **DO restore from a `cp` backup taken immediately before the mutation** (`cp f f.bak` → mutate →
+  run → `cp f.bak f` → `cmp -s f f.bak`), and delete the backup only after `cmp` passes.
+- **DO verify the restore by CONTENT (`cmp`/md5), not by `git status`** while the unit is
+  uncommitted: porcelain-empty proves you match HEAD, which is the wrong target mid-unit.
+- **DO re-run the full suite green on the restored source before the next mutant**, so a destroyed
+  fix is caught by the count (3155 → 3153) instead of being blamed on the next mutation.

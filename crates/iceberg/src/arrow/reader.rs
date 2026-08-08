@@ -3849,6 +3849,89 @@ message schema {
         );
     }
 
+    /// U3 cycle 5 / F5 — splitting an ALREADY-RANGED task must not RELOCATE its byte window.
+    ///
+    /// `split`'s two real branches both treat the byte space as absolute from zero, so before the
+    /// `start != 0` passthrough a parent covering `[starts[1], file_size)` came back as windows
+    /// anchored at 0: the products re-read the prefix the parent never owned (ids 0..19 here) and
+    /// dropped the tail it did. That is silent CORRUPTION — strictly worse than the `length == 0`
+    /// row loss F-1 closed — and it is reachable through the `pub` struct / derived `Deserialize`.
+    #[tokio::test]
+    async fn test_split_of_a_ranged_task_reads_the_parents_rows_not_the_whole_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("ranged_parent.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_midpoint_fixture(&path, 3, 20, false);
+        let schema = id_schema_for_pos();
+        let metadata = footer_metadata(&path);
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let starts = footer_row_group_starts(&metadata);
+        assert_eq!(starts.len(), 3, "fixture must have 3 row groups");
+
+        // The parent: a genuine sub-window covering the LAST TWO row groups only.
+        let start = starts[1];
+        let length = file_size - start;
+        let parent_ids = read_ids_for_window(&path, schema.clone(), start, length).await;
+        assert_eq!(
+            parent_ids,
+            (20..60).collect::<Vec<i32>>(),
+            "fixture guard: the parent window must own the last two row groups only — a window \
+             that already owned every row could not detect a relocation"
+        );
+
+        // Non-vacuity: the SAME target really does split the whole-file parent into many windows.
+        let target = file_size / 3 + 1;
+        let whole = midpoint_scan_task(&path, schema.clone(), 0, file_size);
+        assert!(
+            whole.split(target).expect("whole split").len() > 1,
+            "fixture is non-discriminating: target {target} must split the whole-file parent"
+        );
+
+        let ranged = midpoint_scan_task(&path, schema.clone(), start, length);
+        let sub_tasks = ranged.split(target).expect("ranged split");
+        assert_eq!(
+            sub_tasks.len(),
+            1,
+            "an already-ranged parent must pass through split unchanged"
+        );
+        assert_eq!(
+            (sub_tasks[0].start, sub_tasks[0].length),
+            (start, length),
+            "the sub-task window must stay the parent's; a window anchored at 0 covers bytes the \
+             parent never owned"
+        );
+
+        let mut union: Vec<i32> = Vec::new();
+        for sub_task in sub_tasks {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let batches = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(sub_task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("ranged sub-task read");
+            for batch in &batches {
+                union.extend(
+                    batch
+                        .column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        union.sort_unstable();
+        assert_eq!(
+            union, parent_ids,
+            "the split of a ranged parent must read EXACTLY the parent's rows; reading the whole \
+             file here means the window was relocated to offset 0"
+        );
+    }
+
     /// U3 cycle 4 / F-2 — the byte-range ENTRY gate
     /// (`if task.start != 0 || task.length != 0`) must fire on `start > 0, length == 0`.
     ///
@@ -8999,6 +9082,73 @@ mod avro_scan_tests {
             (2, None),
             (3, Some(String::new())),
         ]);
+    }
+
+    /// The ORC half of the fail-closed guard, mirroring
+    /// [`avro_ranged_task_is_rejected_with_a_typed_error`] one-for-one.
+    ///
+    /// `reject_ranged_whole_file_task` is invoked from BOTH `process_avro_file_scan_task` and
+    /// `process_orc_file_scan_task`, but only the AVRO call site was pinned: deleting the ORC line
+    /// left the whole suite green (U3 cycle 5, the Critic's S2 / the Falsifier's F9). Since
+    /// `process_orc_file_scan_task` never reads `task.start` / `task.length`, an unguarded ranged
+    /// ORC task re-emits every row of the file — N copies per N-way split, with no error.
+    #[tokio::test]
+    async fn orc_ranged_task_is_rejected_with_a_typed_error() {
+        let tmp = TempDir::new().unwrap();
+        let path = orc_fixture_on_disk(&tmp);
+        let whole = orc_task(&path, orc_fixture_schema(), vec![1, 6], vec![]);
+        let file_len = whole.file_size_in_bytes;
+        assert!(
+            file_len > 2,
+            "fixture guard: the ORC file must be non-trivial"
+        );
+
+        // BOTH axes of the guard: `(0, file_len / 2)` varies only the length, `(1, file_len)` is a
+        // genuine window that a start-blind guard would ACCEPT — after which the whole-file ORC
+        // reader would re-emit every row.
+        for (start, length) in [(0u64, file_len / 2), (1u64, file_len)] {
+            let ranged = FileScanTask {
+                start,
+                length,
+                ..whole.clone()
+            };
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let tasks = Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream;
+            let result = reader
+                .read(tasks)
+                .expect("build scan stream")
+                .try_collect::<Vec<RecordBatch>>()
+                .await;
+            let err = match result {
+                Ok(batches) => panic!(
+                    "a ranged ORC task ({start}, {length}) must fail closed, not re-emit the whole \
+                     file — got {} row(s)",
+                    orc_id_string_rows(&batches).len()
+                ),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), crate::ErrorKind::FeatureUnsupported);
+            assert!(
+                err.to_string().contains("ranged split task over a ORC"),
+                "the typed error must name the ranged ORC task ({start}, {length}), got: {err}"
+            );
+        }
+
+        // Non-vacuity: both whole-file spellings must still stream, so this cannot pass on a reader
+        // that errors on everything.
+        for length in [0, file_len] {
+            let batches = run_scan(FileIO::new_with_fs(), FileScanTask {
+                start: 0,
+                length,
+                ..whole.clone()
+            })
+            .await;
+            assert_eq!(
+                orc_id_string_rows(&batches).len(),
+                3,
+                "a whole-file ORC task (length {length}) must still read normally"
+            );
+        }
     }
 
     // -- ORC projection: only the projected field id materializes (by field-id, not position). -------

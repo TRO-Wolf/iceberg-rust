@@ -106,6 +106,26 @@ Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-ord
       - [x] **P10f — C-S3: lessons entry** — never pipe a gate command into `tail`/`grep`/`head`
             in a verification `&&` chain (the pipeline's status is the LAST command's).
 
+- [x] **P11 — Remediation cycle 5** (Critic ORC-S2 + Falsifier F5..F9; ledger §14). Plan:
+      - [x] **P11a — F5: `split` RELOCATED an already-ranged task's window (HIGH, wrong bytes).**
+            Both real branches anchor at 0, so re-splitting a `start != 0` parent read bytes it
+            never owned and dropped its tail (measured: parent ids 20..59, products ids 0..59).
+            Fixed by returning `[self]` for `start != 0` — Java forecloses the shape structurally
+            (`SplitScanTask` is not `SplittableScanTask`); pinned at the unit AND read level.
+      - [x] **P11b — F7: `plan_tasks` split unconditionally under a `_pos` projection**, which the
+            reader then rejects — a total outage of `_pos` on the `plan_tasks` / `PartitionWork`
+            seam while `to_arrow()` worked. Suppression hoisted to `plan_tasks`.
+      - [x] **P11c — Critic S2 / F9: pin the ORC call site** of
+            `reject_ranged_whole_file_task` (deleting it was GREEN; only AVRO was pinned).
+      - [x] **P11d — F6: second interop sabotage leg** — mutate the OFFSET SOURCE to the synthetic
+            `4 + Σ compressed_size` model; the D2 JAVA verify must go RED with a per-window
+            comparison signal. Both Rust legs are blind to it. Plus `JAVA_ROWS` declared instead
+            of derived in `assert_exactly_once`.
+      - [x] **P11e — notes promoted**: direct four-arm tests for `is_splittable` /
+            `reader_honors_byte_range`; the negative-split-offset typed error.
+      - [x] **P11f — F8 and the `can_expand` pin DECLINED with executed equivalence proofs**
+            (mutants E1/E2/E3 GREEN by construction — ledger §14.6).
+
 ---
 
 
