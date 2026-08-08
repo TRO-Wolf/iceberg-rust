@@ -39,6 +39,30 @@ fn is_splittable(format: DataFileFormat) -> bool {
     }
 }
 
+/// Whether **this crate's reader** honours a task's `[start, start + length)` byte window for a
+/// data file in this format. This is a property of the READ path, not of the format, and it is
+/// deliberately narrower than [`is_splittable`].
+///
+/// Only the Parquet reader reads `FileScanTask::start` / `length` at all
+/// (`arrow::reader::ArrowReader::process_parquet_file_scan_task`, which selects row groups by
+/// midpoint). `process_avro_file_scan_task` and `process_orc_file_scan_task` materialize the WHOLE
+/// file and ignore the window, so handing them a split of a file would make every sub-task re-emit
+/// every row: an N-way split silently returns N copies of the file, with no error. Measured on a
+/// 500-row Avro OCF split four ways: 2,000 rows.
+///
+/// Java splits all three formats because parquet-mr / the Avro OCF reader / the ORC reader each
+/// seek to their own block boundaries inside the window. Until the Avro block and ORC stripe
+/// readers do the same here, the planner must not manufacture windows they cannot honour —
+/// declining to split is Java-divergent only in PARALLELISM, whereas splitting is Java-divergent
+/// in ROWS. [`ArrowReader`](crate::arrow::ArrowReader) additionally rejects a ranged AVRO/ORC task
+/// with a typed error, so any other route to one fails closed rather than duplicating.
+fn reader_honors_byte_range(format: DataFileFormat) -> bool {
+    match format {
+        DataFileFormat::Parquet => true,
+        DataFileFormat::Avro | DataFileFormat::Orc | DataFileFormat::Puffin => false,
+    }
+}
+
 /// Whether `values` is strictly ascending (each element strictly greater than its predecessor),
 /// porting Java `ArrayUtil.isStrictlyAscending(long[])` — the gate Java's offsets-aware split
 /// uses before trusting the split offsets. An empty or single-element array is vacuously
@@ -404,7 +428,11 @@ impl FileScanTask {
     ///
     /// 1. **Not splittable** (`!file.format().isSplittable()`): return `[self]` unchanged. Per the
     ///    Java `FileFormat` table, `PUFFIN` is the only non-splittable format a data file could
-    ///    carry; `PARQUET` / `AVRO` / `ORC` are splittable.
+    ///    carry; `PARQUET` / `AVRO` / `ORC` are splittable. **This branch is additionally taken
+    ///    for `AVRO` and `ORC`** — see [`reader_honors_byte_range`]: this crate's Avro and ORC
+    ///    readers materialize whole files and ignore `start`/`length`, so a split would return one
+    ///    full copy of the file PER SUB-TASK. Declining to split costs parallelism; splitting
+    ///    would cost correctness.
     /// 2. **Offsets-aware** (split offsets present AND strictly ascending —
     ///    `ArrayUtil.isStrictlyAscending`): emit ONE sub-task per offset. For `i in 0..n-1`,
     ///    `length[i] = offsets[i+1] - offsets[i]`; the LAST is `length[n-1] = fileLength - offsets[n-1]`,
@@ -412,6 +440,29 @@ impl FileScanTask {
     ///    `OffsetsAwareSplitScanTaskIterator` never reads it).
     /// 3. **Fixed-size** (else): walk `0..length` emitting windows of
     ///    `min(target, remaining)` (Java `FixedSizeSplitScanTaskIterator`).
+    ///
+    /// THREE FORK-LOCAL passthrough branches sit between (1) and (2). The first (1a): a task that
+    /// is ITSELF already ranged — `start != 0` OR `length != file_size_in_bytes` — returns `[self]`
+    /// unchanged. Java cannot reach it: its `SplitScanTask` does not implement
+    /// `SplittableScanTask`, so a split product is not re-splittable, and `BaseFileScanTask` (the
+    /// only splittable shape) always spans the whole file. This crate uses one type for both and
+    /// exposes `split` publicly. Branches (2) and (3) both treat the byte space as absolute from
+    /// zero and derive their extent from the FILE, so re-splitting a ranged parent reads bytes the
+    /// parent never owned.
+    ///
+    /// The second (1b): a task carrying the legacy whole-file
+    /// sentinel `length == 0` also returns `[self]` unchanged. Every read path in this crate spells
+    /// "whole file" as `start == 0` with either that sentinel or `length == file_size_in_bytes`, so
+    /// splitting it is meaningless — and branch (3) would emit ZERO sub-tasks for it, silently
+    /// dropping the file from `plan_tasks` while `plan_files` still returns it. Java has no such
+    /// case (`BaseFileScanTask.length()` is always the file size).
+    ///
+    /// The third (1c): a task whose projection includes
+    /// [`RESERVED_FIELD_ID_POS`](crate::metadata_columns::RESERVED_FIELD_ID_POS) returns `[self]`
+    /// unchanged. The `_pos` read path decodes the whole file in physical order with ordinals from
+    /// zero and REFUSES any ranged task with a typed error, so splitting a `_pos` task manufactures
+    /// exactly the shape the reader will not honour. Java has no such case (`_pos` is a Spark-side
+    /// metadata column there, and its readers carry the row-group start ordinal into a split).
     ///
     /// Every sub-task carries the SAME `deletes` / `predicate` (residual) / `partition` / spec /
     /// schema / projection as `self` — only `start` + `length` change (Java's split task delegates
@@ -426,8 +477,107 @@ impl FileScanTask {
             return Err(Error::new(ErrorKind::DataInvalid, "Split size must be > 0"));
         }
 
-        // (1) Non-splittable format ⇒ the whole file is one task.
-        if !is_splittable(self.data_file_format) {
+        // (1) Non-splittable format ⇒ the whole file is one task. AVRO/ORC are splittable per the
+        // Java `FileFormat` table but this crate's readers ignore the byte window
+        // (`reader_honors_byte_range`), so splitting them would silently duplicate every row once
+        // per sub-task; they take this branch too.
+        if !is_splittable(self.data_file_format) || !reader_honors_byte_range(self.data_file_format)
+        {
+            return Ok(vec![self.clone()]);
+        }
+
+        // (1a) An ALREADY-RANGED parent ⇒ return it unchanged. "Already ranged" is EITHER endpoint
+        // moved off the whole file: `start != 0` (a relocated left edge) or
+        // `length != file_size_in_bytes` (a truncated right edge). A partial parent IS a ranged
+        // task; only `[0, file_size)` is the whole file.
+        //
+        // Java forecloses BOTH shapes STRUCTURALLY: `BaseFileScanTask` implements
+        // `SplittableScanTask`, but the `SplitScanTask` its splitter emits does NOT, so a Java split
+        // product can never be re-split — and `BaseFileScanTask.length()` is always
+        // `file.fileSizeInBytes()`, so the only splittable Java shape spans the whole file. This
+        // crate uses ONE type for both, so the shape is reachable — `FileScanTask` is `pub` with
+        // `pub` fields and a derived `Deserialize`.
+        //
+        // Neither remaining branch can express "the sub-window of an already-ranged task": both
+        // treat the byte space as ABSOLUTE FROM ZERO and derive their extent from the FILE, not
+        // from the parent's window.
+        //
+        //   * `start != 0`: the fixed-size walk would start at 0 and the offsets-aware branch takes
+        //     the manifest offsets verbatim — so a parent covering `[139, 1185)` would be handed
+        //     back windows over `[0, 1046)`: the sub-tasks read bytes the parent never owned and
+        //     DROP the tail it did (measured on a 3-row-group / 60-row file: parent reads ids
+        //     20..59, the split products read ids 0..59).
+        //   * `length != file_size_in_bytes` with `start == 0`: the offsets-aware branch ends the
+        //     LAST window at `self.length`, but every EARLIER window comes from the manifest
+        //     offsets, which describe the whole file. Offsets `[0, 300, 700]` on a parent owning
+        //     `[0, 500)` yield `(0,300) (300,400) (700,0)` — coverage of `[0, 700)` from a parent
+        //     that owned `[0, 500)`, plus a degenerate empty window. (The fixed-size branch is
+        //     sound on this shape — it walks `self.length` — but the guard is uniform: the
+        //     invariant "a split product covers a sub-window of its parent" should not depend on
+        //     which branch a manifest happens to select.)
+        //
+        // Returning `[self]` is the lossless answer, and it is the same answer branches (1), (1b)
+        // and (1c) give: `split` is best-effort parallelism, never a correctness contract. Its
+        // failure mode is bounded to LOST PARALLELISM in every case, never lost or duplicated rows.
+        // It costs nothing in practice — no planner path produces a ranged parent (`scan::context`
+        // sets `length = file_size_in_bytes` on every task it emits, and `plan_tasks` /
+        // `expand_within_file_parallel_tasks` both split only what `plan_files` produced).
+        if self.start != 0 || self.length != self.file_size_in_bytes {
+            return Ok(vec![self.clone()]);
+        }
+
+        // (1b) The legacy whole-file sentinel `length == 0` ⇒ the whole file is one task.
+        // Branch (1a) above already returned for `start != 0`, so `start == 0` holds here and the
+        // condition IS the documented `start == 0, length == 0` sentinel; narrowing it to spell
+        // that out would be an equivalent no-op.
+        //
+        // Since (1a) also returns for `length != file_size_in_bytes`, the ONLY sentinel task that
+        // now reaches here is the degenerate `file_size_in_bytes == 0` one (an empty file, or a
+        // task whose file size was never populated). The branch stays: it is the reachable case for
+        // that shape, and it states the sentinel rule where a reader looks for it rather than
+        // leaving it as a corollary of (1a)'s inequality.
+        //
+        // Every READ path in this crate spells "whole file" as `start == 0` with EITHER
+        // `length == 0` (the sentinel) or `length == file_size_in_bytes`: the Parquet byte-range
+        // gate (`task.start != 0 || task.length != 0`), the `_pos` guard, and
+        // `reject_ranged_whole_file_task` all bless it. `split` must agree, because neither of
+        // the remaining branches can express "the whole file" from a zero length: the fixed-size
+        // walk starts `remaining = self.length` and loops `while remaining > 0`, so it emits ZERO
+        // sub-tasks, and `scan::mod`'s `split_tasks.extend(task.split(split_size)?)` then drops the
+        // task entirely — `plan_files` returns the file, `plan_tasks` reads NO rows from it, with
+        // no error anywhere. (The offsets-aware branch is no better: it would derive its last
+        // window from `self.length == 0`.) Returning `[self]` is the only answer that loses
+        // nothing, and it is the same answer the non-splittable passthrough above gives.
+        //
+        // Java never reaches this: `BaseFileScanTask.length()` is always `file.fileSizeInBytes()`,
+        // so the sentinel is a fork-local spelling that the fork must handle fork-locally.
+        if self.length == 0 {
+            return Ok(vec![self.clone()]);
+        }
+
+        // (1c) A `_pos`-projecting task ⇒ the whole file is one task.
+        //
+        // The `_pos` read path decodes the file in physical order and numbers rows from zero, so
+        // `arrow::reader`'s `_pos` guard admits ONLY a whole-file task (`start == 0` and
+        // `length == 0 || length == file_size_in_bytes`) and fails every other window closed with a
+        // typed `FeatureUnsupported`. Splitting therefore manufactures exactly the shape the reader
+        // refuses: measured on a 3-row-group / 60-row Parquet file projecting
+        // `[1, RESERVED_FIELD_ID_POS]`, the whole-file task reads 60 rows while `split(391)` yields
+        // three sub-tasks that ALL error — including the `start == 0` one, whose length is no
+        // longer the file size. Sixty rows become zero rows and three errors.
+        //
+        // `TableScan::plan_tasks` carries the same rule at its own call site (it skips splitting
+        // when the scan projects `_pos`). That guard is now DEFENSIVE-but-redundant, exactly like
+        // `expand_within_file_parallel_tasks`'s `task.start == 0` clause: the rule belongs on the
+        // split primitive, because `split` is `pub` and reachable without either caller.
+        //
+        // Java has no such case: `_pos` is a Spark-side metadata column there, and its readers
+        // carry the row-group start ordinal into a split, so a Java split can serve absolute
+        // positions. Cost here: whole-file tasks — parallelism, never rows.
+        if self
+            .project_field_ids
+            .contains(&crate::metadata_columns::RESERVED_FIELD_ID_POS)
+        {
             return Ok(vec![self.clone()]);
         }
 
@@ -444,7 +594,12 @@ impl FileScanTask {
     }
 
     /// The offsets-aware split (branch 2). Each sub-task starts at `offsets[i]` with length
-    /// `offsets[i+1] - offsets[i]`, the last running to `self.length` (the file length). Offsets
+    /// `offsets[i+1] - offsets[i]`, the last running to `self.length`. That last window is only
+    /// correct because the parent is the WHOLE file: `split` returns early (branch 1a) unless
+    /// `self.start == 0 && self.length == self.file_size_in_bytes`, so `self.length` IS the file
+    /// length here and the manifest offsets — which describe the whole file — are absolute in the
+    /// parent's own byte space. On a partial parent the earlier windows would still come from the
+    /// manifest and could run past the parent's end; branch (1a) is what forecloses that. Offsets
     /// are stored as `i64` in the manifest (Iceberg spec); they are guaranteed `>= 0` and strictly
     /// ascending here, so the `u64` conversion is on a bounded non-negative domain.
     fn split_at_offsets(&self, offsets: &[i64]) -> Result<Vec<FileScanTask>> {
@@ -476,9 +631,14 @@ impl FileScanTask {
     /// The fixed-size split (branch 3). Walks `0..self.length` emitting windows of
     /// `min(target, remaining)`, advancing `offset += len` and `remaining -= len` each step
     /// (Java `FixedSizeSplitScanTaskIterator`).
+    ///
+    /// The walk is ANCHORED at `self.start` rather than at a literal `0`: `split` returns early for
+    /// `self.start != 0` (branch 1a), so the two are equal on every call that reaches here, and
+    /// writing the anchor keeps the window absolute-correct if that guard ever moves. Java's
+    /// iterator anchors at 0 because its parent is always the whole file.
     fn split_fixed_size(&self, target: u64) -> Vec<FileScanTask> {
         let mut sub_tasks = Vec::new();
-        let mut offset = 0u64;
+        let mut offset = self.start;
         let mut remaining = self.length;
         while remaining > 0 {
             let len = target.min(remaining);
@@ -748,6 +908,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS};
     use crate::spec::{DataContentType, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
 
     /// A bare whole-file [`FileScanTask`] for the split/weight unit tests: `length` byte file in
@@ -879,6 +1040,396 @@ mod tests {
         assert_eq!(parts[0].record_count, Some(1000));
     }
 
+    /// AVRO and ORC are splittable per the Java `FileFormat` table, but THIS crate's readers
+    /// materialize whole files and never read `start`/`length`
+    /// ([`reader_honors_byte_range`]), so a split would hand every sub-task the whole file: an
+    /// N-way split silently returns N copies, with no error. The planner must therefore decline
+    /// to split them — through BOTH the fixed-size branch and the offsets-aware branch, which is
+    /// the one a real Avro/ORC manifest entry with `split_offsets` would take.
+    #[test]
+    fn split_declines_formats_whose_reader_ignores_byte_ranges() {
+        for format in [DataFileFormat::Avro, DataFileFormat::Orc] {
+            // Non-vacuity: the same geometry MUST split for a format whose reader honours the
+            // window, otherwise this test would pass on a `split` that never splits anything.
+            for offsets in [None, Some(vec![0i64, 300, 700])] {
+                let parquet = task(1000, DataFileFormat::Parquet, offsets.clone());
+                assert!(
+                    parquet.split(100).expect("parquet split ok").len() > 1,
+                    "fixture is non-discriminating: parquet with offsets {offsets:?} must split"
+                );
+
+                let t = task(1000, format, offsets.clone());
+                let parts = t.split(100).expect("split ok");
+                assert_eq!(
+                    parts.len(),
+                    1,
+                    "{format:?} with offsets {offsets:?} must not be split into byte windows its \
+                     reader cannot honour"
+                );
+                assert_eq!(
+                    (parts[0].start, parts[0].length),
+                    (0, 1000),
+                    "{format:?} passthrough must cover the whole file"
+                );
+            }
+        }
+    }
+
+    /// A whole-file task spelled with the legacy `length == 0` sentinel must survive `split` as
+    /// ONE task, never as an empty Vec.
+    ///
+    /// Before the `length == 0` guard the fixed-size branch (`remaining = self.length`,
+    /// `while remaining > 0`) returned ZERO sub-tasks for such a task, so
+    /// `scan::mod`'s `split_tasks.extend(task.split(split_size)?)` dropped the file: `plan_files`
+    /// returned it, `plan_tasks` read no rows from it, and nothing errored. The reader agrees the
+    /// other way — `_pos` and `reject_ranged_whole_file_task` both accept `start == 0,
+    /// length == 0` as whole-file — so an empty Vec was pure silent row loss.
+    #[test]
+    fn split_whole_file_length_sentinel_is_one_task_not_zero() {
+        // The sentinel must win in BOTH the fixed-size branch and the offsets-aware branch (a
+        // manifest entry can carry split offsets alongside the sentinel length).
+        for offsets in [None, Some(vec![0i64, 300, 700])] {
+            let mut t = task(1000, DataFileFormat::Parquet, offsets.clone());
+            t.length = 0; // legacy whole-file sentinel; file_size_in_bytes stays 1000
+
+            // Non-vacuity: the SAME geometry with a real length does split into many windows, so
+            // this assertion cannot pass on a `split` that never splits anything.
+            let sized = task(1000, DataFileFormat::Parquet, offsets.clone());
+            assert!(
+                sized.split(100).expect("sized split ok").len() > 1,
+                "fixture is non-discriminating: offsets {offsets:?} must split when length > 0"
+            );
+
+            let parts = t.split(100).expect("split ok");
+            assert_eq!(
+                parts.len(),
+                1,
+                "the `length == 0` whole-file sentinel (offsets {offsets:?}) must split to ONE \
+                 task; an empty Vec loses every row of the file with no error"
+            );
+            assert_eq!(
+                (parts[0].start, parts[0].length),
+                (0, 0),
+                "the sentinel task must pass through verbatim, keeping the spelling the readers \
+                 accept as whole-file"
+            );
+            assert_eq!(
+                parts[0].file_size_in_bytes, 1000,
+                "passthrough must not disturb the file size"
+            );
+        }
+    }
+
+    /// An ALREADY-RANGED task (`start != 0`) must pass through `split` verbatim — never be
+    /// RELOCATED to offset 0.
+    ///
+    /// Both real branches treat the byte space as absolute from zero: the fixed-size walk anchored
+    /// at 0 and the offsets-aware branch takes the manifest offsets verbatim. So a parent covering
+    /// `[600, 1000)` used to come back as windows over `[0, 400)` — the products read bytes the
+    /// parent never owned and dropped the tail it did. Java cannot reach the shape (its
+    /// `SplitScanTask` does not implement `SplittableScanTask`); this crate uses one `pub` type with
+    /// `pub` fields and a derived `Deserialize`, so it must handle it explicitly. (U3 cycle 5 / F5.)
+    #[test]
+    fn split_of_an_already_ranged_task_is_a_passthrough_not_a_relocation() {
+        for offsets in [None, Some(vec![0i64, 300, 700])] {
+            // Non-vacuity: the SAME geometry with `start == 0` really does split into several
+            // windows, so a `split` that never splits anything cannot pass this test.
+            let whole = task(1000, DataFileFormat::Parquet, offsets.clone());
+            assert!(
+                whole.split(200).expect("whole split ok").len() > 1,
+                "fixture is non-discriminating: offsets {offsets:?} must split from start 0"
+            );
+
+            let mut ranged = task(1000, DataFileFormat::Parquet, offsets.clone());
+            ranged.start = 600;
+            ranged.length = 400;
+
+            let parts = ranged.split(200).expect("split ok");
+            assert_eq!(
+                parts.len(),
+                1,
+                "an already-ranged task (offsets {offsets:?}) must pass through split as ONE task"
+            );
+            assert_eq!(
+                (parts[0].start, parts[0].length),
+                (600, 400),
+                "the sub-task window must stay EXACTLY the parent's; anything anchored at 0 reads \
+                 bytes the parent never owned and drops the tail it did"
+            );
+        }
+    }
+
+    /// A PARTIAL parent (`start == 0` but `length < file_size_in_bytes`) must pass through `split`
+    /// verbatim — it is an already-ranged task just as much as one with a moved left edge.
+    ///
+    /// The offsets-aware branch derives every window but the last from the MANIFEST offsets, which
+    /// describe the whole file, so a parent owning `[0, 500)` of a 1000-byte file with offsets
+    /// `[0, 300, 700]` came back as `(0,300) (300,400) (700,0)`: coverage of `[0, 700)` from a
+    /// parent that owned `[0, 500)`, plus a degenerate empty window. Same public route as the
+    /// `start != 0` case, same class. Java forecloses it structurally — `BaseFileScanTask` is the
+    /// only `SplittableScanTask` and its `length()` is always the file size. (U3 cycle 6 / R2.)
+    #[test]
+    fn split_of_a_partial_parent_is_a_passthrough_not_an_over_read() {
+        for offsets in [None, Some(vec![0i64, 300, 700])] {
+            // Non-vacuity: the SAME geometry spanning the WHOLE file really does split into
+            // several windows, so a `split` that never splits anything cannot pass this test.
+            let whole = task(1000, DataFileFormat::Parquet, offsets.clone());
+            assert!(
+                whole.split(200).expect("whole split ok").len() > 1,
+                "fixture is non-discriminating: offsets {offsets:?} must split from a whole-file \
+                 parent"
+            );
+
+            let mut partial = task(1000, DataFileFormat::Parquet, offsets.clone());
+            partial.length = 500; // file_size_in_bytes stays 1000 ⇒ the parent owns [0, 500)
+
+            let parts = partial.split(200).expect("split ok");
+            assert_eq!(
+                parts.len(),
+                1,
+                "a partial parent (offsets {offsets:?}) must pass through split as ONE task"
+            );
+            assert_eq!(
+                (parts[0].start, parts[0].length),
+                (0, 500),
+                "the sub-task window must stay EXACTLY the parent's; the manifest offsets describe \
+                 the whole FILE and would run past the parent's end"
+            );
+        }
+    }
+
+    /// A task projecting `_pos` must pass through `split` verbatim.
+    ///
+    /// The `_pos` read path decodes the whole file in physical order and numbers rows from zero, so
+    /// `arrow::reader`'s `_pos` guard rejects EVERY ranged task with a typed `FeatureUnsupported` —
+    /// including a `start == 0` sub-task, whose length is no longer the file size. Splitting a
+    /// `_pos` task therefore turns a scan that reads every row into one that reads none and errors
+    /// once per sub-task. `TableScan::plan_tasks` carries the same rule at its call site, but
+    /// `split` is `pub` and reachable without it, and the principle belongs on the primitive: the
+    /// planner must not manufacture windows the reader cannot honour. (U3 cycle 6 / R1.)
+    #[test]
+    fn split_of_a_pos_projecting_task_is_a_passthrough() {
+        for offsets in [None, Some(vec![0i64, 300, 700])] {
+            // Non-vacuity: the SAME geometry WITHOUT `_pos` in the projection really does split.
+            let plain = task(1000, DataFileFormat::Parquet, offsets.clone());
+            assert!(
+                plain.split(200).expect("plain split ok").len() > 1,
+                "fixture is non-discriminating: offsets {offsets:?} must split without `_pos`"
+            );
+
+            let mut pos = task(1000, DataFileFormat::Parquet, offsets.clone());
+            pos.project_field_ids = Arc::from(vec![1, RESERVED_FIELD_ID_POS]);
+
+            let parts = pos.split(200).expect("split ok");
+            assert_eq!(
+                parts.len(),
+                1,
+                "a `_pos`-projecting task (offsets {offsets:?}) must pass through split as ONE task"
+            );
+            assert_eq!(
+                (parts[0].start, parts[0].length),
+                (0, 1000),
+                "the passthrough must keep the whole-file spelling the `_pos` reader accepts"
+            );
+            assert_eq!(
+                parts[0].project_field_ids.as_ref(),
+                &[1, RESERVED_FIELD_ID_POS],
+                "the passthrough must not disturb the projection"
+            );
+        }
+    }
+
+    /// Branch (1c) must fire on a projection that is `_pos` and NOTHING ELSE — the shape both other
+    /// (1c) fixtures miss, because each pairs the metadata id with a data column
+    /// (`[1, _pos]` above, `[1, _file]` below). A guard narrowed to
+    /// `project_field_ids.len() > 1 && ...contains(&_pos)` therefore survives the whole suite.
+    ///
+    /// The shape is reachable from the PUBLIC builder, not merely through the `pub` struct:
+    /// `TableScan`'s column validation `continue`s past metadata-column names without requiring a
+    /// data column alongside them, and the field-id loop then pushes the reserved id on its own, so
+    /// `scan().select(["_pos"])` plans tasks whose `project_field_ids` is exactly
+    /// `[RESERVED_FIELD_ID_POS]` (`scan/mod.rs`, the `is_metadata_column_name` arms). Under the
+    /// narrowed guard such a task is SPLIT and `arrow::reader`'s `_pos` guard then rejects every
+    /// sub-task with a typed `FeatureUnsupported` — the total-outage class (1c) exists to prevent.
+    /// (Independent review of the reviewer rider, 2026-08-08 / Falsifier 1.)
+    #[test]
+    fn split_of_a_pos_only_projection_is_a_passthrough() {
+        // Non-vacuity: the same geometry with a lone DATA column really does split.
+        let plain = task(1000, DataFileFormat::Parquet, None);
+        assert!(
+            plain.split(200).expect("plain split ok").len() > 1,
+            "fixture is non-discriminating: a 1000-byte file must split at target 200"
+        );
+
+        let mut pos_only = task(1000, DataFileFormat::Parquet, None);
+        pos_only.project_field_ids = Arc::from(vec![RESERVED_FIELD_ID_POS]);
+
+        let parts = pos_only.split(200).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            1,
+            "a projection of `_pos` ALONE must pass through split as ONE task; a guard that also \
+             demanded a second projected column would split it and the reader would then reject \
+             every sub-task"
+        );
+        assert_eq!(
+            (parts[0].start, parts[0].length),
+            (0, 1000),
+            "the passthrough must keep the whole-file spelling the `_pos` reader accepts"
+        );
+    }
+
+    /// Branch (1a)'s `self.start != 0` disjunct must hold on its OWN, at the one shape the
+    /// `length != file_size_in_bytes` disjunct cannot see: a relocated left edge whose length still
+    /// spans the file (`start = 600`, `length = 1000`, `file_size_in_bytes = 1000`).
+    ///
+    /// Widening (1a) in cycle 6 masked the cycle-5 disjunct — every other ranged-task fixture trips
+    /// BOTH disjuncts, so dropping `self.start != 0` left the whole suite green while the
+    /// relocation-corruption class it was added for stayed reachable (measured under that mutant:
+    /// THREE sub-tasks over `[0, 1000)` from a parent that owned `[600, 1600)`). The shape is
+    /// self-inconsistent — the window runs past EOF — which is precisely why only the passthrough
+    /// can answer it safely. (Reviewer rider, 2026-08-08 / Falsifier F2.)
+    #[test]
+    fn split_of_a_relocated_parent_is_a_passthrough_even_when_length_spans_the_file() {
+        for offsets in [None, Some(vec![0i64, 300, 700])] {
+            // Non-vacuity: the SAME geometry at `start == 0` really does split.
+            let whole = task(1000, DataFileFormat::Parquet, offsets.clone());
+            assert!(
+                whole.split(200).expect("whole split ok").len() > 1,
+                "fixture is non-discriminating: offsets {offsets:?} must split from start 0"
+            );
+
+            let mut relocated = task(1000, DataFileFormat::Parquet, offsets.clone());
+            relocated.start = 600; // length stays 1000 == file_size_in_bytes
+
+            let parts = relocated.split(200).expect("split ok");
+            assert_eq!(
+                parts.len(),
+                1,
+                "a relocated parent (offsets {offsets:?}) must pass through split as ONE task even \
+                 when its length still equals the file size"
+            );
+            assert_eq!(
+                (parts[0].start, parts[0].length),
+                (600, 1000),
+                "the passthrough must keep the parent's own window; re-splitting would RELOCATE it \
+                 to offset 0 and read bytes the parent never owned"
+            );
+        }
+    }
+
+    /// Branch (1b) — the `length == 0` sentinel — must still be pinned at the ONLY shape that now
+    /// reaches it: a degenerate `file_size_in_bytes == 0` file (an empty file, or a task whose file
+    /// size was never populated).
+    ///
+    /// Cycle 6's widening of (1a) silently de-pinned it: the cycle-4 fixture (`length = 0`,
+    /// `file_size_in_bytes = 1000`) now returns at (1a) and never reaches (1b), so corrupting the
+    /// sentinel condition left the suite green while the fixed-size walk still emitted ZERO
+    /// sub-tasks for this shape — `plan_files` returns the file, `plan_tasks` reads no rows from it,
+    /// nothing errors. (Reviewer rider, 2026-08-08 / Falsifier F1.)
+    #[test]
+    fn split_whole_file_sentinel_on_an_empty_file_is_one_task_not_zero() {
+        // Non-vacuity: `split` really does split when there are bytes to split.
+        let sized = task(1000, DataFileFormat::Parquet, None);
+        assert!(
+            sized.split(100).expect("sized split ok").len() > 1,
+            "fixture is non-discriminating: a 1000-byte file must split at target 100"
+        );
+
+        // start == 0 and length == file_size_in_bytes == 0, so branch (1a)'s inequality is FALSE
+        // and only the sentinel branch can answer.
+        let empty = task(0, DataFileFormat::Parquet, None);
+        let parts = empty.split(100).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            1,
+            "the whole-file sentinel on an empty file must split to ONE task; an empty Vec drops \
+             the file from `plan_tasks` with no error"
+        );
+        assert_eq!((parts[0].start, parts[0].length), (0, 0));
+    }
+
+    /// A parent whose length OVERRUNS the file (`length > file_size_in_bytes`) is ranged in the
+    /// same sense as a truncated one, and (1a)'s `!=` — not a `<` — is what covers it. Without this
+    /// pin the inequality could be narrowed to `<` and the fixed-size walk would happily emit
+    /// windows past EOF. (Reviewer rider, 2026-08-08 / Falsifier F3b.)
+    #[test]
+    fn split_of_an_overlong_parent_is_a_passthrough() {
+        // Non-vacuity: without it, a `split` that declined EVERYTHING would satisfy the assertions
+        // below. (Measured: under a `target.min(remaining)` → `remaining` mutant this test alone of
+        // the rider's four stayed green.) Independent review of the rider, 2026-08-08 / Falsifier 4.
+        let sized = task(1000, DataFileFormat::Parquet, None);
+        assert!(
+            sized.split(200).expect("sized split ok").len() > 1,
+            "fixture is non-discriminating: a 1000-byte file must split at target 200"
+        );
+
+        let mut overlong = task(1000, DataFileFormat::Parquet, None);
+        overlong.length = 1500; // file_size_in_bytes stays 1000
+
+        let parts = overlong.split(200).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            1,
+            "a parent whose window overruns the file must pass through as ONE task"
+        );
+        assert_eq!((parts[0].start, parts[0].length), (0, 1500));
+    }
+
+    /// Branch (1c) declines `_pos` SPECIFICALLY, not metadata columns in general.
+    ///
+    /// The justification is checked for the one column this test exercises: on the Parquet path
+    /// `process_parquet_file_scan_task` strips every metadata field id out of the file projection
+    /// and then re-supplies `_file` as a per-FILE constant, so a byte window serves it exactly as
+    /// the whole file does — declining to split for `_file` would cost parallelism for nothing.
+    /// `_pos` is the one metadata column whose value depends on the window, because its ordinals
+    /// are counted from zero over the whole file. No claim is made here about `_spec_id`,
+    /// `_partition` or `_deleted`: they are not served on this path at all (the first two have no
+    /// references outside `metadata_columns`, and `_deleted` only in `arrow::avro_reader`, a format
+    /// branch (1) declines to split), so "splitting is safe for them" is not a fact this test
+    /// establishes. Without this pin, widening the guard to "any metadata field" is invisible.
+    /// (Reviewer rider, 2026-08-08 / Falsifier F3a; justification corrected by the independent
+    /// review of that rider, 2026-08-08 / Critic 2 + Falsifier 8.)
+    #[test]
+    fn split_declines_pos_specifically_not_every_metadata_column() {
+        let mut file_col = task(1000, DataFileFormat::Parquet, None);
+        file_col.project_field_ids = Arc::from(vec![1, RESERVED_FIELD_ID_FILE]);
+
+        assert!(
+            file_col.split(200).expect("split ok").len() > 1,
+            "`_file` is served correctly over a ranged window — only `_pos` needs whole-file \
+             ordinals, so only `_pos` may suppress the split"
+        );
+    }
+
+    /// The Java `FileFormat` splittable table and this crate's READ-path predicate are separate
+    /// facts, and the divergence is deliberate: `is_splittable` ports Java verbatim, while
+    /// `reader_honors_byte_range` is what actually gates `split`. Neither is observable on its own
+    /// through `split` (each format is masked by the other predicate), so assert the tables
+    /// directly — GAP_MATRIX row R148 claims parity for the Java table specifically.
+    #[test]
+    fn format_predicate_tables_match_java_and_the_read_path() {
+        assert!(is_splittable(DataFileFormat::Parquet));
+        assert!(is_splittable(DataFileFormat::Avro));
+        assert!(is_splittable(DataFileFormat::Orc));
+        assert!(
+            !is_splittable(DataFileFormat::Puffin),
+            "Java `FileFormat.PUFFIN` is not splittable"
+        );
+
+        assert!(reader_honors_byte_range(DataFileFormat::Parquet));
+        for format in [
+            DataFileFormat::Avro,
+            DataFileFormat::Orc,
+            DataFileFormat::Puffin,
+        ] {
+            assert!(
+                !reader_honors_byte_range(format),
+                "{format:?} is materialized whole-file by this crate's reader"
+            );
+        }
+    }
+
     // ---- split: offsets-aware ----
 
     #[test]
@@ -892,6 +1443,111 @@ mod tests {
         // length conservation: the windows tile the whole file with no gap/overlap.
         let total: u64 = parts.iter().map(|p| p.length).sum();
         assert_eq!(total, 1000);
+    }
+
+    /// A SINGLE split offset takes the offsets-aware branch — `split`'s gate is
+    /// `!offsets.is_empty()`, porting Java (`OffsetsAwareSplitScanTaskIterator` is chosen whenever
+    /// the offsets are non-null and `ArrayUtil.isStrictlyAscending`, which a one-element array is
+    /// vacuously). The one sub-task runs from that offset to the end of the file, so any bytes
+    /// BEFORE it are not covered by any sub-task.
+    ///
+    /// **This is deliberately NOT the same gate as
+    /// `TableScan::expand_within_file_parallel_tasks`, which requires `offsets.len() > 1`** (pinned
+    /// by `test_within_file_parallel_declines_a_single_split_offset`). The two sites answer
+    /// different questions. `split` ports Java's planner branch and must reproduce Java's answer on
+    /// every input, including a hostile manifest: on `[585]` over a 1170-byte file Java loses the
+    /// same leading rows, so matching it is PARITY, not divergence. `expand_within_file_parallel_tasks`
+    /// is a fork-local `to_arrow` optimisation with no Java counterpart, and it must never make
+    /// `to_arrow()` disagree with a whole-file read — one offset buys no parallelism anyway, so it
+    /// declines. Honest manifests always carry `offsets[0] == 4` (the Parquet magic) and more than
+    /// one entry per split file, so neither site's answer is observable in practice.
+    ///
+    /// Behaviour pin only — neither gate should be "fixed" to match the other. (U3 cycle 6 / R5.)
+    #[test]
+    fn split_single_offset_takes_the_offsets_aware_branch() {
+        let t = task(1000, DataFileFormat::Parquet, Some(vec![300]));
+        let parts = t.split(400).expect("split ok");
+        let windows: Vec<(u64, u64)> = parts.iter().map(|p| (p.start, p.length)).collect();
+        assert_eq!(
+            windows,
+            vec![(300, 700)],
+            "one offset ⇒ ONE offsets-aware window running to the end of the file; the fixed-size \
+             fallback would have emitted (0,400) (400,400) (800,200) instead"
+        );
+    }
+
+    /// A corrupt manifest can carry strictly-ascending but NEGATIVE split offsets (the field is
+    /// `i64` in the spec). Those pass the ascending gate and reach the `u64` conversion, which must
+    /// fail with a typed error rather than clamping — a clamped `0` would silently merge two
+    /// windows and misreport where the row group begins.
+    #[test]
+    fn split_negative_offsets_are_a_typed_error_not_a_clamp() {
+        let t = task(1000, DataFileFormat::Parquet, Some(vec![-10, 0, 100]));
+        let err = t
+            .split(100)
+            .expect_err("negative split offsets must not be accepted");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string()
+                .contains("split offset must be non-negative"),
+            "the error must name the offending offset, got: {err}"
+        );
+    }
+
+    /// The sibling hostile-manifest case: a strictly-ascending offsets vector whose LAST entry runs
+    /// PAST the end of the file. `split_at_offsets` derives the last window's length as
+    /// `self.length - offsets[last]`, which underflows `u64` there; the `saturating_sub` makes it a
+    /// zero-length trailing window that selects nothing, where a `wrapping_sub` would hand the
+    /// reader a ~2^64 length (turned into a typed `DataInvalid` by the row-group byte-range filter's
+    /// `checked_add`, so the consequence is a spurious error, not row loss).
+    ///
+    /// Strict ascent guarantees `end > start` for every EARLIER window, so this last offset is the
+    /// guard's only reachable shape. (Independent review of the reviewer rider, 2026-08-08 /
+    /// Falsifier 3.)
+    #[test]
+    fn split_offsets_running_past_eof_yield_an_empty_trailing_window_not_an_underflow() {
+        let t = task(1000, DataFileFormat::Parquet, Some(vec![0, 300, 2000]));
+        let parts = t.split(100).expect("split ok");
+        let windows: Vec<(u64, u64)> = parts.iter().map(|p| (p.start, p.length)).collect();
+        assert_eq!(
+            windows,
+            vec![(0, 300), (300, 1700), (2000, 0)],
+            "the past-EOF trailing offset must saturate to a ZERO-length window; wrapping would \
+             give it a ~2^64 length"
+        );
+    }
+
+    /// An EMPTY offsets vector must fall through to the fixed-size walk, not into the offsets-aware
+    /// branch — that is what `split`'s `!offsets.is_empty()` conjunct buys, and it is the same
+    /// silent-total-row-loss class branch (1b) exists for.
+    ///
+    /// Without the conjunct: `is_strictly_ascending(&[])` is vacuously true (`[].windows(2).all(..)`),
+    /// `split_at_offsets(&[])` loops zero times and returns `Ok(vec![])`, and `scan::mod`'s
+    /// `split_tasks.extend(task.split(split_size)?)` then DROPS the file — `plan_files` returns it,
+    /// `plan_tasks` reads ZERO rows from it, and nothing errors anywhere. (Measured under that
+    /// mutant: this assertion fails with `left: 0`.)
+    ///
+    /// The shape is reachable from a manifest rather than only through the `pub` struct:
+    /// `split_offsets` is an `Option<Vec<i64>>` decoded from an Avro array, and an empty Avro array
+    /// decodes to `Some(vec![])` — the in-tree manifest-read fixture in `spec::manifest` decodes a
+    /// sibling list field to `Some(Vec::new())`, proving empty lists survive this decoder as `Some`.
+    /// (Independent review of the reviewer rider, 2026-08-08 / Critic 1 + Falsifier 2.)
+    #[test]
+    fn split_empty_offsets_fall_back_to_fixed_size_and_never_drop_the_file() {
+        let t = task(1000, DataFileFormat::Parquet, Some(vec![]));
+        let parts = t.split(200).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            5,
+            "empty offsets must take the FIXED-SIZE branch — the offsets-aware branch returns an \
+             empty Vec, which drops the file out of `plan_tasks` with no error at all"
+        );
+        let windows: Vec<(u64, u64)> = parts.iter().map(|p| (p.start, p.length)).collect();
+        assert_eq!(
+            windows,
+            vec![(0, 200), (200, 200), (400, 200), (600, 200), (800, 200)],
+            "the fallback must tile the whole file at the target size"
+        );
     }
 
     #[test]
@@ -913,6 +1569,55 @@ mod tests {
         let windows: Vec<(u64, u64)> = parts.iter().map(|p| (p.start, p.length)).collect();
         // min(400, remaining): (0,400) (400,400) (800,200).
         assert_eq!(windows, vec![(0, 400), (400, 400), (800, 200)]);
+    }
+
+    /// The fixed-size walk's loop BOUND is load-bearing at `remaining == 1`, and nothing pinned it.
+    ///
+    /// Measured: mutating `while remaining > 0` to `while remaining > 1` SURVIVED the whole suite.
+    /// Consequence on a parent whose `length` IS 1: the walk never runs, `split` returns an EMPTY
+    /// Vec, and `scan::mod`'s `split_tasks.extend(task.split(split_size)?)` then drops the file —
+    /// `plan_files` returns it, `plan_tasks` reads ZERO rows from it, and nothing errors. That is
+    /// the same silent-total-row-loss class as the `length == 0` sentinel (branch 1b) and the
+    /// empty-offsets fallback (branch 2), both of which ARE pinned.
+    ///
+    /// The pre-existing fixtures cannot see it: [`split_fixed_size_walks_the_file`] uses 1000/400
+    /// (last window 200, so `remaining > 1` still admits it) and
+    /// [`split_fixed_size_target_larger_than_file_is_one_task`] never loops twice. This test pins
+    /// BOTH halves of the boundary — a one-byte parent, and a walk whose LAST window is exactly one
+    /// byte. (U3 final round / F-A, 2026-08-08.)
+    #[test]
+    fn split_fixed_size_emits_the_final_one_byte_window_and_never_an_empty_vec() {
+        // Half 1 — a walk whose LAST window is exactly 1 byte: 1000 at target 333.
+        // This assertion is also the NON-VACUITY guard for half 2: a `split` that declined
+        // everything would return one task here, not four.
+        let t = task(1000, DataFileFormat::Parquet, None);
+        let windows: Vec<(u64, u64)> = t
+            .split(333)
+            .expect("split ok")
+            .iter()
+            .map(|p| (p.start, p.length))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![(0, 333), (333, 333), (666, 333), (999, 1)],
+            "the walk must emit its final ONE-byte window; dropping it loses the last byte of the \
+             file — and with it any row whose data lives there — with no error"
+        );
+
+        // Half 2 — a parent that IS one byte: exactly one `(0, 1)` window, never an empty Vec.
+        let one = task(1, DataFileFormat::Parquet, None);
+        let parts = one.split(4).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            1,
+            "a one-byte parent must split to ONE task; an empty Vec drops the file out of \
+             `plan_tasks` entirely, with no error anywhere"
+        );
+        assert_eq!(
+            (parts[0].start, parts[0].length),
+            (0, 1),
+            "the single window must cover the parent exactly"
+        );
     }
 
     #[test]

@@ -31,6 +31,134 @@ How to use it (see the manuals' §1):
 
 ---
 
+## IN FLIGHT — U3 / hazard-1: midpoint row-group selection (branch `fix/ranged-read-midpoint-rowgroups`)
+
+Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-order.md) §6. Ledger:
+[u3-midpoint-rowgroup-ledger.md](u3-midpoint-rowgroup-ledger.md). Zero-dependency-change unit.
+
+- [x] **P1 — Replace the selection rule.** `ArrowReader::filter_row_groups_by_byte_range`: keep a
+      row group iff `rg_start + compressed_size/2 ∈ [start, start+length)`, with `rg_start` =
+      Java `getOffset(columns[0])` = `min(data_page_offset, dictionary_page_offset)` read from the
+      REAL footer. Delete the `4 + Σ compressed_size` accumulator entirely; no fallback branch.
+      Typed `DataInvalid` on zero-column row groups, negative offsets, and midpoint overflow.
+- [x] **P2 — New discriminating pins** (T1 straddling exactly-once, T2 bloom-padded offset drift,
+      T3 exactly-once partition property over a stride sweep, T4 `getOffset`/boundary/error unit
+      matrix). Expectations derived from real footer metadata, never from the synthetic model.
+- [x] **P3 — Repair the three self-blind tests** that build their windows with the same
+      `4 + Σ compressed_size` model the production code used (`reader.rs` ~3459 / ~4949 / ~5180).
+- [x] **P4 — Mutation proof** M1 (OVERLAP rule) · M2 (synthetic offsets, midpoint rule kept) ·
+      M3/M4 (boundary flips) · M5 (`getOffset` → dict-wins) · M6 control (must stay GREEN).
+- [x] **P5 — Amplifier 4 measured and reported**: annotate the `scan/partition_work.rs`
+      split-size-1024 fixture as NON-discriminating (single row group; no live duplication pin).
+- [x] **P6 — RIDER (h), reported separately**: make
+      `fk5_pos_oracle_sparse_pos_deletes_multi_rg` discriminating (it is green today with
+      `max_row_group_row_count = None`) and mutation-prove it RED.
+- [x] **P7 — Gate + ledger + `[fork]` commit** in one `&&` chain. Interop leg: see ledger
+      §Residue.
+- [x] **P8 — Remediation cycle 2** (Critic S3s + Falsifier counterexamples; ledger §11): make the
+      fabricated footer fixture multi-column and give it a distinct `total_byte_size` so
+      `columns().first()→last()` and `compressed_size()→total_byte_size()` are RED offline; add an
+      ODD-size case so `/2 → div_ceil(2)` is RED; add a REAL multi-column pin; fix the stale
+      "duplicate rows" rationale in `scan/mod.rs`; re-point the amplifier-4 annotation at the
+      load-bearing quantity; name the silent-row-loss and fail-closed-divergence residue.
+- [x] **P9 — Remediation cycle 3** (Falsifier counterexamples; ledger §12). Plan:
+      - [x] **P9a — AVRO/ORC ranged splits duplicate every row (HIGH, live, same hazard class).**
+            `is_splittable` calls AVRO/ORC splittable (the Java `FileFormat` port) and
+            `plan_tasks` splits unconditionally, but `process_avro_file_scan_task` /
+            `process_orc_file_scan_task` never read `task.start`/`task.length` — every sub-task
+            re-reads the whole file. Stop the planner emitting ranged AVRO/ORC tasks, add a
+            fail-closed read guard (the `_pos` guard's shape) as defence in depth, and split the
+            `scan/map.md` Debug row that currently attributes the symptom solely to parquet.
+      - [x] **P9b — Pin the negative-`compressed_size` guard (MZ1 survived).** Add the case to
+            the `(a)`–`(g)` semantics matrix and delete the in-tree comment claiming the public
+            builder cannot construct a negative size — it can, and the Falsifier did.
+      - [x] **P9c — `compressed_size()` overflows before any guard runs.** parquet-rs sums the
+            column `total_compressed_size` values with an unchecked `i64` `sum()`; a corrupt
+            footer panics (debug) or wraps (release). Sum it here with `checked_add` → typed
+            `DataInvalid`.
+      - [x] **P9d — Narrow the over-stated residue sentence.** An understated manifest
+            `file_size_in_bytes` fails LOUDLY at footer decode, not silently; the silent-row-loss
+            residue is real only for under-covering windows / non-tiling `split_offsets`.
+      - [x] **P9e — Re-run the full gate and the whole mutation sweep in an ISOLATED tree**
+            (`git archive | tar -x`, own `CARGO_TARGET_DIR`, `touch` after extraction) — the
+            shared worktree was carrying a sibling agent's uncommitted mutation during cycle 2.
+- [x] **P10 — Remediation cycle 4** (Critic C-S2/C-S3 + Falsifier F-1..F-4; ledger §13). Plan:
+      - [x] **P10a — F-1: `split` evaporated a whole-file `length == 0` task (HIGH, silent total
+            row loss).** `split_fixed_size` starts `remaining = self.length` and loops
+            `while remaining > 0`, so the legacy sentinel returned ZERO sub-tasks and
+            `mod.rs`'s `split_tasks.extend(...)` dropped the file — `plan_files` returned it,
+            `plan_tasks` read 0 rows, no error. Cycle 3 made it an ASYMMETRY (AVRO passes such a
+            task through; both reader guards bless the spelling). Fixed by returning `[self]`,
+            pinned at the unit AND read level, mutation-proven RED.
+      - [x] **P10b — F-2: pin the byte-range ENTRY gate** (`task.start != 0 || task.length != 0`).
+            Weakening it to `task.length != 0` was GREEN across 3,146 tests: it turns the empty
+            window `[start, start)` into a whole-file read.
+      - [x] **P10c — F-3: pin the START half of both whole-file guards.** `start = 1,
+            length = file_size_in_bytes` is a genuine window that
+            `reject_ranged_whole_file_task` (and the copy-pasted `_pos` guard, which had the same
+            gap) would ACCEPT without the `task.start == 0 &&` clause.
+      - [x] **P10d — F-4: distinguish the two parquet-mr offset helpers.** `dict Some(0)` must
+            still win (`ParquetMetadataConverter.getOffset`, no `> 0`), unlike
+            `ColumnChunkMetaData.getStartingPos` which the split-offset WRITER uses.
+      - [x] **P10e — C-S2: GAP_MATRIX row R148** — corrected the `FileScanTask::split`
+            parenthetical and added the NAMED divergence for the AVRO/ORC decline + the sentinel
+            passthrough; anchors green at 75 rows.
+      - [x] **P10f — C-S3: lessons entry** — never pipe a gate command into `tail`/`grep`/`head`
+            in a verification `&&` chain (the pipeline's status is the LAST command's).
+
+- [x] **P11 — Remediation cycle 5** (Critic ORC-S2 + Falsifier F5..F9; ledger §14). Plan:
+      - [x] **P11a — F5: `split` RELOCATED an already-ranged task's window (HIGH, wrong bytes).**
+            Both real branches anchor at 0, so re-splitting a `start != 0` parent read bytes it
+            never owned and dropped its tail (measured: parent ids 20..59, products ids 0..59).
+            Fixed by returning `[self]` for `start != 0` — Java forecloses the shape structurally
+            (`SplitScanTask` is not `SplittableScanTask`); pinned at the unit AND read level.
+      - [x] **P11b — F7: `plan_tasks` split unconditionally under a `_pos` projection**, which the
+            reader then rejects — a total outage of `_pos` on the `plan_tasks` / `PartitionWork`
+            seam while `to_arrow()` worked. Suppression hoisted to `plan_tasks`.
+      - [x] **P11c — Critic S2 / F9: pin the ORC call site** of
+            `reject_ranged_whole_file_task` (deleting it was GREEN; only AVRO was pinned).
+      - [x] **P11d — F6: second interop sabotage leg** — mutate the OFFSET SOURCE to the synthetic
+            `4 + Σ compressed_size` model; the D2 JAVA verify must go RED with a per-window
+            comparison signal. Both Rust legs are blind to it. Plus `JAVA_ROWS` declared instead
+            of derived in `assert_exactly_once`.
+      - [x] **P11e — notes promoted**: direct four-arm tests for `is_splittable` /
+            `reader_honors_byte_range`; the negative-split-offset typed error.
+      - [x] **P11f — F8 and the `can_expand` pin DECLINED with executed equivalence proofs**
+            (mutants E1/E2/E3 GREEN by construction — ledger §14.6).
+
+- [x] **P12 — Residue cleanup cycle 6** (Critic CONVERGED on `49ee3c5a`; Falsifier 17/17 RED,
+      2,340 split/read pairs exactly-once, interop rc=0 both sabotage legs RED — the core is
+      sound). SIX S3 items, no redesign, selection predicate untouched. Ledger §15. Plan:
+      - [x] **P12a — R1: hoist the `_pos` rule to the split PRIMITIVE** (new branch 1c). The
+            public `FileScanTask::split` still manufactured the shape the reader refuses: a task
+            projecting `[1, RESERVED_FIELD_ID_POS]` reads 60 rows whole-file but `split(391)`
+            returns 3 sub-tasks that ALL fail typed (even `start == 0`, whose length is no longer
+            the file size). Both call-site guards retained + re-commented as defensive. M1 RED.
+      - [x] **P12b — R2: widen branch (1a) to the PARTIAL parent** (`start != 0` OR
+            `length != file_size_in_bytes`). TAKEN, not deferred. The offsets-aware branch took
+            manifest offsets verbatim, so a parent owning `[0,500)` of a 1000-byte file with
+            offsets `[0,300,700]` covered `[0,700)` plus a degenerate empty window. Chose the
+            passthrough over the last-window clip: Java forecloses re-splitting structurally
+            (`BaseFileScanTask.length()` is always the file size), the failure direction stays
+            bounded to lost parallelism, and the clip would leave the invariant branch-dependent.
+            No planner path changes; the `length == 0` sentinel pin stays green. M2 RED.
+      - [x] **P12c — R3/R4: `map.md` lockstep** (the repo-contract violations). `scan/map.md`'s
+            `task.rs` cell now enumerates all six branches in order (it was short two and called
+            branch 1 merely "non-splittable", which means PUFFIN ONLY) + two new Debug rows;
+            `tests/map.md`'s `interop_ranged_read.rs` row now says 6 steps / TWO mutations and
+            which half of the claim each leg proves (it still said "a source mutation", singular).
+      - [x] **P12d — R5: pin BOTH surviving single-`split_offsets` mutants** (MX21 in `split`,
+            MX19 in `can_expand`). The two sites deliberately DISAGREE — `split` ports Java's
+            `!offsets.is_empty()` gate (Java loses the same rows on a hostile `[585]`, so it is
+            parity), `can_expand` requires `> 1` so `to_arrow()` never disagrees with a whole-file
+            read. Behaviour UNCHANGED at both; the disagreement is now stated in both tests, both
+            comments, and a `map.md` Debug row. M3 + M4 RED.
+      - [x] **P12e — R6: mark `can_expand`'s `== Parquet` conjunct defensive**, like the
+            `start == 0` one. After cycles 3-6 only the `split_offsets` conjunct is load-bearing.
+            E1 (drop both) GREEN at 3159/0 — an executed equivalence proof, error path included.
+
+---
+
 
 > **Archival log.** Last pass: 2026-07-26 (pass 6 — size trigger, 2,012 lines; run by the RePark
 > workstream under the hub concurrency-protocol claim of the same date) →

@@ -41,7 +41,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+    ColumnChunkMetaData, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use typed_builder::TypedBuilder;
@@ -783,6 +783,43 @@ impl ArrowReader {
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
 
+    /// Fail closed on a task carrying a real byte sub-window for a format whose reader
+    /// materializes WHOLE files.
+    ///
+    /// [`Self::process_avro_file_scan_task`] and [`Self::process_orc_file_scan_task`] never read
+    /// `task.start` / `task.length` — the Avro OCF and ORC readers decode the entire file. So a
+    /// ranged sub-task would re-emit every row of the file, and an N-way split would return N
+    /// copies with no error at all (measured: a 500-row Avro OCF split four ways returned 2,000
+    /// rows). That is the same silent-duplication class the Parquet midpoint row-group selection
+    /// exists to eliminate, and it must not be reachable by any route.
+    ///
+    /// [`FileScanTask::split`] already declines to split these formats
+    /// (`scan::task::reader_honors_byte_range`), so the planner never produces such a task; this
+    /// guard covers the public `PartitionWork` / direct-reader seams, exactly as the `_pos` guard
+    /// in [`Self::process_parquet_file_scan_task`] does.
+    ///
+    /// Whole-file tasks carry `start == 0` with either `length == 0` (the legacy sentinel) or
+    /// `length == file_size_in_bytes`; anything else is a split product and is rejected loud.
+    fn reject_ranged_whole_file_task(task: &FileScanTask, format: &str) -> Result<()> {
+        let whole_file =
+            task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes);
+        if whole_file {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "a ranged split task over a {format} data file is unsupported: task covers {}..{} \
+                 of {} bytes of '{}', but the {format} reader decodes whole files (each split \
+                 would re-emit every row). Plan without splitting this file.",
+                task.start,
+                task.start.saturating_add(task.length),
+                task.file_size_in_bytes,
+                task.data_file_path
+            ),
+        ))
+    }
+
     /// Read one **Avro** data-file scan task into an [`ArrowRecordBatchStream`].
     ///
     /// Avro has no footer metadata, statistics, or row-group structure, so — unlike the Parquet
@@ -811,6 +848,8 @@ impl ArrowReader {
         file_io: FileIO,
         delete_file_loader: CachingDeleteFileLoader,
     ) -> Result<ArrowRecordBatchStream> {
+        Self::reject_ranged_whole_file_task(&task, "AVRO")?;
+
         // Kick off delete loading concurrently with the file read (as the Parquet path does).
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
@@ -851,6 +890,8 @@ impl ArrowReader {
         file_io: FileIO,
         delete_file_loader: CachingDeleteFileLoader,
     ) -> Result<ArrowRecordBatchStream> {
+        Self::reject_ranged_whole_file_task(&task, "ORC")?;
+
         // Kick off delete loading concurrently with the file read (as the Parquet path does).
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
@@ -1717,10 +1758,73 @@ impl ArrowReader {
         Ok(results.into_iter().flatten().collect::<Vec<_>>().into())
     }
 
+    /// Java's `ParquetMetadataConverter.getOffset(ColumnChunk)`: the byte offset at which a column
+    /// chunk's data begins, which for the first column of a row group is that row group's real
+    /// start position in the file.
+    ///
+    /// The rule is `MIN(data_page_offset, dictionary_page_offset)` — the dictionary offset wins
+    /// only when it is *set* **and strictly smaller**. Writers that emit a dictionary offset which
+    /// is not smaller (or a garbage value with the `isSet` bit on) must still yield
+    /// `data_page_offset`.
+    ///
+    /// Deliberately hand-rolled rather than using `ColumnChunkMetaData::byte_range()`, which is
+    /// `dictionary_page_offset().unwrap_or(data_page_offset())` (no `min`, so it diverges from
+    /// Java) and which `assert!`s on negative offsets (a panic on corrupt metadata).
+    fn parquet_column_chunk_offset(column: &ColumnChunkMetaData) -> i64 {
+        let data_page_offset = column.data_page_offset();
+        match column.dictionary_page_offset() {
+            Some(dictionary_page_offset) if data_page_offset > dictionary_page_offset => {
+                dictionary_page_offset
+            }
+            _ => data_page_offset,
+        }
+    }
+
     /// Filters row groups by byte range to support Iceberg's file splitting.
     ///
-    /// Iceberg splits large files at row group boundaries, so we only read row groups
-    /// whose byte ranges overlap with [start, start+length).
+    /// A row group is kept iff its **midpoint** falls in the half-open window
+    /// `[start, start + length)`. This is parquet-mr's rule
+    /// (`ParquetMetadataConverter.filterFileMetaDataByMidpoint` + `RangeMetadataFilter.contains`),
+    /// which Iceberg drives through `Parquet.ReadBuilder.split(start, length)` →
+    /// `ParquetReadOptions.Builder.withRange(start, start + length)`. Because every row group
+    /// belongs to exactly one window, a full tiling of the file reads every row exactly once —
+    /// an *overlap* rule would instead hand a row group that straddles a split boundary to **both**
+    /// adjacent tasks, silently duplicating rows.
+    ///
+    /// Two details are load-bearing and must not be paraphrased:
+    ///
+    /// * The midpoint is `start_of_row_group + compressed_size / 2` with **truncating** integer
+    ///   division on the size (Java `ldiv`), not the average of the two endpoints.
+    /// * The window is inclusive at the low end and exclusive at the high end, so a midpoint
+    ///   landing exactly on a split boundary belongs to the **higher** split.
+    ///
+    /// Row-group start positions are read from the real footer metadata
+    /// ([`Self::parquet_column_chunk_offset`] over `columns()[0]`), never modelled as
+    /// `4 + Σ compressed_size` — that model drifts on any file whose row groups are not perfectly
+    /// contiguous (padding, inline bloom filters, a non-4 first offset). It is also exactly Java's
+    /// *degenerate error-recovery* path (`invalidFileOffset`), reachable only in the omitted-inline-
+    /// `ColumnMetaData` regime, which parquet-rs refuses to decode without the `encryption` feature.
+    ///
+    /// Two deliberate, fail-closed divergences from Java on corrupt metadata:
+    ///
+    /// * A negative offset or size is a typed [`ErrorKind::DataInvalid`] here. Java's `getOffset`
+    ///   has no non-negativity guard, so it computes a negative midpoint, fails `>= startOffset`
+    ///   and silently **drops** the row group. Rust is stricter and never silently under-reads.
+    /// * A row group with no column chunks is a typed error; Java indexes `getColumns().get(0)`
+    ///   unguarded and throws `IndexOutOfBoundsException`.
+    /// * The row-group size is summed with `checked_add` instead of through
+    ///   `RowGroupMetaData::compressed_size()`, whose unchecked `i64` `sum()` panics (debug) or
+    ///   wraps (release) on a footer declaring several column chunks near `i64::MAX`. Java sums
+    ///   into a `long` and wraps silently.
+    ///
+    /// Named residue (Java-identical, not a defect): because selection is midpoint-based, a window
+    /// that does not cover a row group's midpoint reads none of its rows. A caller whose window set
+    /// under-covers the file — a window narrower than the file with no sibling covering the rest,
+    /// or a `split_offsets[0]` above the first midpoint — therefore loses rows silently, where the
+    /// old overlap rule would have over-read. Java behaves the same way; the invariant callers
+    /// must preserve is that their windows TILE `[0, file_size)`. (An understated manifest
+    /// `file_size_in_bytes` is *not* one of those routes: `ArrowFileReader` anchors the footer read
+    /// at that value, so it fails LOUDLY at metadata decode — measured — long before selection.)
     fn filter_row_groups_by_byte_range(
         parquet_metadata: &Arc<ParquetMetaData>,
         start: u64,
@@ -1736,32 +1840,62 @@ impl ArrowReader {
             )
         })?;
 
-        // Row groups are stored sequentially after the 4-byte magic header.
-        let mut current_byte_offset = 4u64;
-
         for (idx, row_group) in row_groups.iter().enumerate() {
-            // `compressed_size()` is an `i64`; a corrupt negative size must not wrap when cast.
-            let row_group_size = u64::try_from(row_group.compressed_size()).map_err(|_| {
+            // Java reads `columns().get(0)` unguarded and throws IndexOutOfBounds on an empty row
+            // group; we fail with a typed error instead of panicking.
+            let first_column = row_group.columns().first().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Row group {idx} has no column chunks; its byte offset cannot be determined"
+                    ),
+                )
+            })?;
+            let row_group_start = u64::try_from(Self::parquet_column_chunk_offset(first_column))
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Row group {idx} has a negative byte offset"),
+                    )
+                })?;
+
+            // `Σ columns.total_compressed_size`, i.e. Java's else-branch (parquet-rs does not
+            // decode the thrift `RowGroup.total_compressed_size` field Java prefers). Summed HERE
+            // with `checked_add` rather than via `RowGroupMetaData::compressed_size()`, whose
+            // `i64` `sum()` is unchecked: parquet-rs applies no range validation to that thrift
+            // field, so a corrupt footer declaring several chunks near `i64::MAX` PANICS there
+            // (debug) or wraps to a bogus/negative size (release) before any guard below runs.
+            let mut row_group_size_i64: i64 = 0;
+            for column in row_group.columns() {
+                row_group_size_i64 = row_group_size_i64
+                    .checked_add(column.compressed_size())
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Row group {idx} compressed size overflows i64"),
+                        )
+                    })?;
+            }
+            // A corrupt negative size must not wrap when converted.
+            let row_group_size = u64::try_from(row_group_size_i64).map_err(|_| {
                 Error::new(
                     ErrorKind::DataInvalid,
                     "Row-group compressed size is negative",
                 )
             })?;
-            let row_group_end =
-                current_byte_offset
-                    .checked_add(row_group_size)
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            "Row-group byte offset overflows u64",
-                        )
-                    })?;
 
-            if current_byte_offset < end && start < row_group_end {
+            let midpoint = row_group_start
+                .checked_add(row_group_size / 2)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Row group {idx} midpoint overflows u64"),
+                    )
+                })?;
+
+            if midpoint >= start && midpoint < end {
                 selected.push(idx);
             }
-
-            current_byte_offset = row_group_end;
         }
 
         Ok(selected)
@@ -2751,7 +2885,9 @@ mod tests {
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
     use parquet::arrow::{ArrowWriter, ProjectionMask};
     use parquet::basic::Compression;
-    use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+    use parquet::file::metadata::{
+        ColumnChunkMetaData, FileMetaData, ParquetMetaData, RowGroupMetaData,
+    };
     use parquet::file::properties::WriterProperties;
     use parquet::schema::parser::parse_message_type;
     use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor};
@@ -3368,9 +3504,9 @@ message schema {
 
     /// FIX (reader): `filter_row_groups_by_byte_range` guards `start + length` with
     /// `checked_add`; a split descriptor with `start = u64::MAX, length = 1` must return a typed
-    /// `DataInvalid` error rather than overflowing `u64`. (The negative-`compressed_size` branch
-    /// stays untested here — it needs fabricated row-group metadata with a negative size, which
-    /// the public `RowGroupMetaData` builder does not let us construct.)
+    /// `DataInvalid` error rather than overflowing `u64`. (The negative- and overflowing-
+    /// `compressed_size` branches are pinned by cases `(h)` / `(i)` of
+    /// `test_midpoint_selection_offset_and_boundary_semantics`.)
     #[test]
     fn test_filter_row_groups_by_byte_range_start_plus_length_overflow() {
         use parquet::file::metadata::{FileMetaData, ParquetMetaData};
@@ -3387,6 +3523,1067 @@ message schema {
             err.kind(),
             ErrorKind::DataInvalid,
             "an overflowing byte range must be a typed DataInvalid error, got: {err}"
+        );
+    }
+
+    // ============================================================================================
+    // U3 / hazard-1 — midpoint row-group selection (parquet-mr
+    // `ParquetMetadataConverter.filterFileMetaDataByMidpoint`).
+    //
+    // Every helper below derives row-group positions from the REAL footer. NOTHING here may use
+    // the `4 + Σ compressed_size` model: that model is what the production code used to do, so a
+    // test that recomputes it is structurally incapable of catching offset drift.
+    // ============================================================================================
+
+    /// Writes `num_row_groups` row groups of `rows_per_group` sequential `id` values (ids start at
+    /// 0 and run across row-group boundaries).
+    ///
+    /// With `bloom_filters = true`, parquet-rs writes each row group's bloom filter immediately
+    /// after that row group ([`DEFAULT_BLOOM_FILTER_POSITION`] is `AfterRowGroup`), so the row
+    /// groups are **not** contiguous and their real start offsets diverge from
+    /// `4 + Σ compressed_size`.
+    ///
+    /// [`DEFAULT_BLOOM_FILTER_POSITION`]: parquet::file::properties::DEFAULT_BLOOM_FILTER_POSITION
+    fn write_midpoint_fixture(path: &str, num_row_groups: usize, rows_per_group: i32, bloom: bool) {
+        use arrow_array::Int32Array;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(
+                usize::try_from(rows_per_group).expect("positive rows_per_group"),
+            ))
+            .set_bloom_filter_enabled(bloom)
+            .build();
+        let file = File::create(path).expect("create midpoint fixture");
+        let mut writer =
+            ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).expect("arrow writer");
+        for group in 0..num_row_groups {
+            let base = i32::try_from(group).expect("group index fits i32") * rows_per_group;
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                Int32Array::from_iter_values(base..base + rows_per_group),
+            )])
+            .expect("id batch");
+            writer.write(&batch).expect("write row group");
+        }
+        writer.close().expect("close midpoint fixture");
+    }
+
+    fn footer_metadata(path: &str) -> Arc<ParquetMetaData> {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let file = File::open(path).expect("open fixture");
+        let reader = SerializedFileReader::new(file).expect("read footer");
+        Arc::new(reader.metadata().clone())
+    }
+
+    /// Java `getOffset(rg.getColumns().get(0))` — `min(data_page_offset, dictionary_page_offset)`
+    /// — read from the real footer, i.e. the true start position of each row group.
+    fn footer_row_group_starts(metadata: &ParquetMetaData) -> Vec<u64> {
+        metadata
+            .row_groups()
+            .iter()
+            .map(|rg| {
+                let col = rg.columns().first().expect("row group has a column chunk");
+                let data = col.data_page_offset();
+                let start = match col.dictionary_page_offset() {
+                    Some(dict) if data > dict => dict,
+                    _ => data,
+                };
+                u64::try_from(start).expect("non-negative offset")
+            })
+            .collect()
+    }
+
+    /// Java `startIndex + totalSize / 2` (truncating division on the SIZE).
+    fn footer_row_group_midpoints(metadata: &ParquetMetaData) -> Vec<u64> {
+        footer_row_group_starts(metadata)
+            .into_iter()
+            .zip(metadata.row_groups())
+            .map(|(start, rg)| {
+                start + u64::try_from(rg.compressed_size()).expect("non-negative size") / 2
+            })
+            .collect()
+    }
+
+    /// The DEFECTIVE model the production code used to synthesize (`4 + Σ compressed_size`). Only
+    /// ever used here to *assert that it drifts* on a padded file — never to build an expectation.
+    fn synthetic_row_group_starts(metadata: &ParquetMetaData) -> Vec<u64> {
+        let mut offset = 4u64;
+        metadata
+            .row_groups()
+            .iter()
+            .map(|rg| {
+                let start = offset;
+                offset += u64::try_from(rg.compressed_size()).expect("non-negative size");
+                start
+            })
+            .collect()
+    }
+
+    /// Tiles `[0, file_size)` into half-open windows of `stride` bytes; the last window is short.
+    fn tile_windows(file_size: u64, stride: u64) -> Vec<(u64, u64)> {
+        let mut windows = Vec::new();
+        let mut start = 0u64;
+        while start < file_size {
+            let length = stride.min(file_size - start);
+            windows.push((start, length));
+            start += length;
+        }
+        windows
+    }
+
+    fn midpoint_scan_task(path: &str, schema: SchemaRef, start: u64, length: u64) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: std::fs::metadata(path).expect("stat").len(),
+            start,
+            length,
+            record_count: None,
+            data_file_path: Arc::from(path.to_string()),
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: Arc::from(vec![1]),
+            predicate: None,
+            deletes: Arc::from(vec![]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            split_offsets: None,
+        }
+    }
+
+    async fn read_ids_for_window(
+        path: &str,
+        schema: SchemaRef,
+        start: u64,
+        length: u64,
+    ) -> Vec<i32> {
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let task = midpoint_scan_task(path, schema, start, length);
+        let batches = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("stream construction")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("ranged read");
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    /// Expected id multiset for a window under the JAVA rule, derived from real footer midpoints.
+    fn expected_ids_for_window(
+        metadata: &ParquetMetaData,
+        start: u64,
+        length: u64,
+        rows_per_group: i32,
+    ) -> Vec<i32> {
+        let end = start + length;
+        let mut ids = Vec::new();
+        for (idx, mid) in footer_row_group_midpoints(metadata).into_iter().enumerate() {
+            if mid >= start && mid < end {
+                let base = i32::try_from(idx).expect("index fits i32") * rows_per_group;
+                ids.extend(base..base + rows_per_group);
+            }
+        }
+        ids
+    }
+
+    /// U3 / T1 — a fixed-size split tiling that STRADDLES row groups must read every row EXACTLY
+    /// ONCE.
+    ///
+    /// Under the old OVERLAP rule the three 800-byte windows over this ~2.4 KiB file each claimed
+    /// every row group they touched, so ids 100..299 were returned TWICE (500 rows read from a
+    /// 300-row file) — a silent duplication, never an error. The midpoint rule assigns each row
+    /// group to exactly one window.
+    ///
+    /// Every expectation is derived from real footer offsets; no compressed size is hardcoded
+    /// (compression output is not contractually stable).
+    #[tokio::test]
+    async fn test_midpoint_selection_straddling_splits_read_each_row_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("straddle.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_midpoint_fixture(&path, 3, 100, false);
+
+        let metadata = footer_metadata(&path);
+        assert_eq!(
+            metadata.num_row_groups(),
+            3,
+            "fixture must have 3 row groups"
+        );
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let schema = id_schema_for_pos();
+
+        let windows = tile_windows(file_size, 800);
+        assert!(
+            windows.len() >= 3,
+            "the 800-byte tiling must produce several windows over a {file_size}-byte file"
+        );
+        // Non-vacuity: at least one row group must straddle a window boundary, otherwise this
+        // fixture cannot distinguish the OVERLAP rule from the midpoint rule.
+        let starts = footer_row_group_starts(&metadata);
+        let straddles = starts.iter().zip(metadata.row_groups()).any(|(s, rg)| {
+            let e = s + u64::try_from(rg.compressed_size()).unwrap();
+            windows
+                .iter()
+                .any(|(ws, wl)| *s < *ws && e > *ws && *wl > 0)
+        });
+        assert!(
+            straddles,
+            "fixture is non-discriminating: no row group straddles a window boundary \
+             (starts={starts:?}, windows={windows:?})"
+        );
+
+        let mut union: Vec<i32> = Vec::new();
+        for (start, length) in &windows {
+            let got = read_ids_for_window(&path, schema.clone(), *start, *length).await;
+            let want = expected_ids_for_window(&metadata, *start, *length, 100);
+            assert_eq!(
+                got,
+                want,
+                "window [{start}, {}) must contain exactly the row groups whose midpoint lands in it",
+                start + length
+            );
+            union.extend(got);
+        }
+
+        // The exactly-once tiling property — the invariant the OVERLAP rule violates. This
+        // assertion survives fixture drift (row-group sizes, stride, compression).
+        union.sort_unstable();
+        assert_eq!(
+            union,
+            (0..300).collect::<Vec<i32>>(),
+            "the union over a full tiling must be every row EXACTLY once (duplicates here mean a \
+             straddling row group was handed to two adjacent splits)"
+        );
+    }
+
+    /// U3 cycle 4 / F-1 — a PARQUET task carrying the legacy whole-file sentinel
+    /// (`start == 0, length == 0`) must still read every row after going through
+    /// [`FileScanTask::split`], the way `TableScan::plan_tasks` does
+    /// (`scan/mod.rs`: `split_tasks.extend(task.split(split_size)?)`).
+    ///
+    /// Before the sentinel guard in `split`, the fixed-size branch (`remaining = self.length`,
+    /// `while remaining > 0`) returned ZERO sub-tasks for such a task: the file vanished from
+    /// `plan_tasks` while `plan_files` still returned it, and the scan read 0 rows with NO error.
+    /// The reader accepts the same spelling as whole-file (the byte-range gate below, the `_pos`
+    /// guard, `reject_ranged_whole_file_task`), so the two halves must agree.
+    ///
+    /// **Which branch this now reaches: (1a), not (1b).** Cycle 6 widened (1a) to
+    /// `start != 0 || length != file_size_in_bytes`, and this fixture (`0, 0` over a REAL file
+    /// size) trips the second disjunct, so it returns at (1a) and the `length == 0` sentinel is no
+    /// longer what answers it — measured: both sentinel mutants leave this test green. Branch
+    /// (1b)'s only remaining reachable shape is `file_size_in_bytes == 0`. That shape IS reachable —
+    /// `split` does return exactly one task `(start 0, length 0)` for it — but it cannot be exercised
+    /// END-TO-END at the reader level: `ArrowFileReader` anchors the footer read at
+    /// `file_size_in_bytes`, so the subsequent READ fails before any row is decoded, measured as
+    /// `ErrorKind::Unexpected` "Failed to load Parquet metadata" with source
+    /// "EOF: file size of 0 is less than footer". (1b) is therefore pinned at the unit level only, by
+    /// `scan::task::tests::split_whole_file_sentinel_on_an_empty_file_is_one_task_not_zero`. What
+    /// this test still pins end-to-end is the observable that matters: a sentinel-spelled task
+    /// survives `split` as one task and reads every row. (Independent review of the reviewer rider,
+    /// 2026-08-08 / Falsifier 5b.)
+    #[tokio::test]
+    async fn test_whole_file_length_sentinel_survives_split_and_reads_every_row() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("sentinel.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_midpoint_fixture(&path, 3, 20, false);
+        let schema = id_schema_for_pos();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+
+        // The sentinel spelling: start 0, length 0, with the REAL file size alongside it.
+        let sentinel = midpoint_scan_task(&path, schema.clone(), 0, 0);
+        assert_eq!(
+            (sentinel.start, sentinel.length),
+            (0, 0),
+            "fixture guard: this task must carry the legacy whole-file sentinel"
+        );
+
+        // Non-vacuity: the same file spelled with an explicit length DOES split into several
+        // windows at this target, so a `split` that returned an empty Vec here would be a real
+        // asymmetry and not "this target never splits".
+        let target = file_size / 3 + 1;
+        let sized = midpoint_scan_task(&path, schema.clone(), 0, file_size);
+        assert!(
+            sized.split(target).expect("sized split").len() > 1,
+            "fixture is non-discriminating: target {target} must split a {file_size}-byte file"
+        );
+
+        let sub_tasks = sentinel.split(target).expect("sentinel split");
+        assert_eq!(
+            sub_tasks.len(),
+            1,
+            "the whole-file sentinel must survive split as ONE task, not evaporate"
+        );
+
+        let mut union: Vec<i32> = Vec::new();
+        for sub_task in sub_tasks {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let batches = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(sub_task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("sentinel read");
+            for batch in &batches {
+                union.extend(
+                    batch
+                        .column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        union.sort_unstable();
+        assert_eq!(
+            union,
+            (0..60).collect::<Vec<i32>>(),
+            "splitting a whole-file sentinel task must still read every row exactly once (an \
+             empty sub-task set reads ZERO rows and reports no error at all)"
+        );
+    }
+
+    /// U3 cycle 5 / F5 — splitting an ALREADY-RANGED task must not RELOCATE its byte window.
+    ///
+    /// `split`'s two real branches both treat the byte space as absolute from zero, so before the
+    /// `start != 0` passthrough a parent covering `[starts[1], file_size)` came back as windows
+    /// anchored at 0: the products re-read the prefix the parent never owned (ids 0..19 here) and
+    /// dropped the tail it did. That is silent CORRUPTION — strictly worse than the `length == 0`
+    /// row loss F-1 closed — and it is reachable through the `pub` struct / derived `Deserialize`.
+    ///
+    /// **Which branch each half reaches.** The first parent (`start = starts[1]`,
+    /// `length = file_size - start`) trips BOTH of (1a)'s disjuncts, so it cannot tell them apart;
+    /// the second half below keeps `length == file_size_in_bytes` and is answered by
+    /// `start != 0` ALONE. Both halves are needed — the first is the honest end-to-end geometry,
+    /// the second is the discriminating one.
+    #[tokio::test]
+    async fn test_split_of_a_ranged_task_reads_the_parents_rows_not_the_whole_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("ranged_parent.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_midpoint_fixture(&path, 3, 20, false);
+        let schema = id_schema_for_pos();
+        let metadata = footer_metadata(&path);
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let starts = footer_row_group_starts(&metadata);
+        assert_eq!(starts.len(), 3, "fixture must have 3 row groups");
+
+        // The parent: a genuine sub-window covering the LAST TWO row groups only.
+        let start = starts[1];
+        let length = file_size - start;
+        let parent_ids = read_ids_for_window(&path, schema.clone(), start, length).await;
+        assert_eq!(
+            parent_ids,
+            (20..60).collect::<Vec<i32>>(),
+            "fixture guard: the parent window must own the last two row groups only — a window \
+             that already owned every row could not detect a relocation"
+        );
+
+        // Non-vacuity: the SAME target really does split the whole-file parent into many windows.
+        let target = file_size / 3 + 1;
+        let whole = midpoint_scan_task(&path, schema.clone(), 0, file_size);
+        assert!(
+            whole.split(target).expect("whole split").len() > 1,
+            "fixture is non-discriminating: target {target} must split the whole-file parent"
+        );
+
+        let ranged = midpoint_scan_task(&path, schema.clone(), start, length);
+        let sub_tasks = ranged.split(target).expect("ranged split");
+        assert_eq!(
+            sub_tasks.len(),
+            1,
+            "an already-ranged parent must pass through split unchanged"
+        );
+        assert_eq!(
+            (sub_tasks[0].start, sub_tasks[0].length),
+            (start, length),
+            "the sub-task window must stay the parent's; a window anchored at 0 covers bytes the \
+             parent never owned"
+        );
+
+        let mut union: Vec<i32> = Vec::new();
+        for sub_task in sub_tasks {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let batches = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(sub_task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("ranged sub-task read");
+            for batch in &batches {
+                union.extend(
+                    batch
+                        .column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        union.sort_unstable();
+        assert_eq!(
+            union, parent_ids,
+            "the split of a ranged parent must read EXACTLY the parent's rows; reading the whole \
+             file here means the window was relocated to offset 0"
+        );
+
+        // ---- the `start != 0` disjunct, ON ITS OWN ----
+        //
+        // The fixture above trips BOTH disjuncts of (1a) (`start != 0` AND `length != file_size`),
+        // so dropping `self.start != 0` leaves it green — measured. This second parent keeps
+        // `length == file_size_in_bytes` and moves only the left edge, the one shape the
+        // `length != file_size` disjunct cannot see, so it is `start != 0` alone that must answer.
+        // (Independent review of the reviewer rider, 2026-08-08 / Falsifier 5a.)
+        let relocated = midpoint_scan_task(&path, schema.clone(), start, file_size);
+        let sub_tasks = relocated.split(target).expect("relocated split");
+        assert_eq!(
+            sub_tasks.len(),
+            1,
+            "a parent whose left edge moved must pass through split as ONE task even when its \
+             length still equals the file size"
+        );
+        assert_eq!(
+            (sub_tasks[0].start, sub_tasks[0].length),
+            (start, file_size),
+            "the passthrough must keep the parent's own window; re-splitting relocates it to 0"
+        );
+
+        let mut relocated_union: Vec<i32> = Vec::new();
+        for sub_task in sub_tasks {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let batches = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(sub_task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("relocated sub-task read");
+            for batch in &batches {
+                relocated_union.extend(
+                    batch
+                        .column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        relocated_union.sort_unstable();
+        assert_eq!(
+            relocated_union, parent_ids,
+            "a window anchored at `starts[1]` covers the last two row groups' midpoints however \
+             far past EOF it runs; splitting it would re-read the prefix the parent never owned"
+        );
+    }
+
+    /// U3 cycle 4 / F-2 — the byte-range ENTRY gate
+    /// (`if task.start != 0 || task.length != 0`) must fire on `start > 0, length == 0`.
+    ///
+    /// That disjunction is what makes `start == 0 && length == 0` — and ONLY that pair — mean
+    /// "whole file". A task with a non-zero start and a zero length is an EMPTY window
+    /// (`[start, start)`), which Java spells `withRange(start, start)`: `RangeMetadataFilter`'s
+    /// `contains` is never true, so nothing is selected. Weakening the gate to `task.length != 0`
+    /// silently turns that empty window into a full-file read — the whole point of this unit
+    /// inverted — and every other test in the suite stays green, because none of them uses that
+    /// shape.
+    #[tokio::test]
+    async fn test_byte_range_gate_fires_on_a_zero_length_window_at_a_nonzero_start() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("empty_window.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_midpoint_fixture(&path, 3, 20, false);
+        let schema = id_schema_for_pos();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(file_size > 1, "fixture guard: the file must be non-trivial");
+
+        // Non-vacuity control: the SENTINEL pair (0, 0) bypasses the gate and reads the file.
+        let whole = read_ids_for_window(&path, schema.clone(), 0, 0).await;
+        assert_eq!(
+            whole,
+            (0..60).collect::<Vec<i32>>(),
+            "the (0, 0) sentinel must bypass the gate and read the whole file"
+        );
+
+        // The pinned shape: a non-zero start with a zero length is an EMPTY window, so no row
+        // group's midpoint can lie in it and the read returns nothing.
+        for start in [1u64, file_size / 2, file_size - 1] {
+            let ids = read_ids_for_window(&path, schema.clone(), start, 0).await;
+            assert!(
+                ids.is_empty(),
+                "window [{start}, {start}) is empty and must select no row groups, got {} rows \
+                 (a full-file read here means the gate stopped distinguishing start == 0)",
+                ids.len()
+            );
+        }
+    }
+
+    /// U3 / T2 — the OFFSET-SOURCE pin: a file whose row groups are NOT contiguous.
+    ///
+    /// parquet-rs writes bloom filters after each row group by default, so real row-group starts
+    /// run ahead of `4 + Σ compressed_size`. The windows here are the file's OWN row-group
+    /// boundaries — exactly what `FileScanTask::split`'s offsets-aware branch produces from the
+    /// fork writer's `split_offsets` (`parquet_writer.rs` emits `RowGroupMetaData::file_offset()`,
+    /// i.e. the real starts). This refutes the work order's exposure note: offsets-ALIGNED splits
+    /// over a padded file were duplicating too, not only offsets-less external manifests.
+    #[tokio::test]
+    async fn test_midpoint_selection_reads_real_offsets_on_padded_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("padded.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_midpoint_fixture(&path, 3, 100, true);
+
+        let metadata = footer_metadata(&path);
+        assert_eq!(
+            metadata.num_row_groups(),
+            3,
+            "fixture must have 3 row groups"
+        );
+        let real = footer_row_group_starts(&metadata);
+        let synthetic = synthetic_row_group_starts(&metadata);
+        // Non-vacuity guard: if bloom filters ever stop padding the file this test silently
+        // degrades into a duplicate of T1, so assert the drift it exists to detect.
+        assert_ne!(
+            real, synthetic,
+            "fixture is non-discriminating: real row-group starts must differ from the \
+             `4 + Σ compressed_size` model (real={real:?})"
+        );
+
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let schema = id_schema_for_pos();
+        // Tile at the file's own row-group boundaries, last window running to EOF.
+        let windows: Vec<(u64, u64)> = real
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let end = real.get(i + 1).copied().unwrap_or(file_size);
+                (*start, end - start)
+            })
+            .collect();
+
+        let mut union: Vec<i32> = Vec::new();
+        for (i, (start, length)) in windows.iter().enumerate() {
+            let got = read_ids_for_window(&path, schema.clone(), *start, *length).await;
+            let base = i32::try_from(i).unwrap() * 100;
+            assert_eq!(
+                got,
+                (base..base + 100).collect::<Vec<i32>>(),
+                "offsets-aligned window {i} = [{start}, {}) must read exactly its own row group",
+                start + length
+            );
+            union.extend(got);
+        }
+        union.sort_unstable();
+        assert_eq!(
+            union,
+            (0..300).collect::<Vec<i32>>(),
+            "offsets-aligned tiling of a padded file must read every row exactly once"
+        );
+    }
+
+    /// U3 / T3 — the exactly-once property over a sweep of strides and both fixture shapes.
+    ///
+    /// For any tiling of `[0, file_size)`, the selected row-group index sets must PARTITION
+    /// `0..num_row_groups`: no index missing (silent under-read), no index selected twice (silent
+    /// duplication). Stride- and fixture-independent, so it survives any change to compression or
+    /// row-group sizing.
+    #[test]
+    fn test_midpoint_selection_partitions_row_groups_over_stride_sweep() {
+        let tmp = TempDir::new().unwrap();
+        for (name, bloom) in [("contig.parquet", false), ("padded.parquet", true)] {
+            let path = tmp.path().join(name).to_string_lossy().to_string();
+            write_midpoint_fixture(&path, 4, 100, bloom);
+            let metadata = footer_metadata(&path);
+            let num_row_groups = metadata.num_row_groups();
+            assert_eq!(num_row_groups, 4, "{name}: fixture must have 4 row groups");
+            let file_size = std::fs::metadata(&path).unwrap().len();
+
+            for stride in [256u64, 512, 800, 1024, 4096] {
+                let mut seen: Vec<usize> = Vec::new();
+                for (start, length) in tile_windows(file_size, stride) {
+                    seen.extend(
+                        ArrowReader::filter_row_groups_by_byte_range(&metadata, start, length)
+                            .expect("byte-range filter"),
+                    );
+                }
+                seen.sort_unstable();
+                assert_eq!(
+                    seen,
+                    (0..num_row_groups).collect::<Vec<usize>>(),
+                    "{name} @ stride {stride}: the tiling must select every row group exactly once"
+                );
+            }
+
+            // Adversarial tiling: put every window boundary EXACTLY on a row-group midpoint. Only
+            // the half-open `[start, end)` convention partitions here — a strict low bound drops
+            // every row group (silent under-read), an inclusive high bound selects each twice.
+            let mut boundaries = footer_row_group_midpoints(&metadata);
+            boundaries.retain(|b| *b > 0 && *b < file_size);
+            boundaries.insert(0, 0);
+            boundaries.push(file_size);
+            boundaries.dedup();
+            let mut seen: Vec<usize> = Vec::new();
+            for pair in boundaries.windows(2) {
+                seen.extend(
+                    ArrowReader::filter_row_groups_by_byte_range(
+                        &metadata,
+                        pair[0],
+                        pair[1] - pair[0],
+                    )
+                    .expect("byte-range filter"),
+                );
+            }
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                (0..num_row_groups).collect::<Vec<usize>>(),
+                "{name}: a tiling whose boundaries sit exactly on row-group midpoints must still \
+                 select every row group exactly once (half-open [start, end))"
+            );
+        }
+    }
+
+    /// A schema descriptor with `n` `INT32` leaf columns (`get_test_schema_descr` is fixed at two,
+    /// and `RowGroupMetaData::build` validates the column count against the descriptor).
+    fn schema_descr_with_columns(n: usize) -> SchemaDescPtr {
+        use parquet::schema::types::Type as SchemaType;
+
+        let fields = (0..n)
+            .map(|i| {
+                Arc::new(
+                    SchemaType::primitive_type_builder(
+                        &format!("c{i}"),
+                        parquet::basic::Type::INT32,
+                    )
+                    .build()
+                    .expect("primitive field"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let schema = SchemaType::group_type_builder("schema")
+            .with_fields(fields)
+            .build()
+            .expect("group type");
+        Arc::new(SchemaDescriptor::new(Arc::new(schema)))
+    }
+
+    /// Distance between the fabricated first column chunk and each trailing one. Large enough that
+    /// selecting any column other than `columns()[0]` moves the midpoint out of every window the
+    /// semantics test declares.
+    const FABRICATED_COLUMN_STRIDE: i64 = 1_000_000;
+
+    /// Builds row groups from `(data_page_offset, compressed_size, dict_offset)` triples — the
+    /// triple always describes `columns()[0]` — so the selection rule can be probed at exact byte
+    /// positions.
+    ///
+    /// Two properties keep this fixture DISCRIMINATING; both were mutation-survivable gaps in the
+    /// first cut of this unit and are load-bearing, not incidental:
+    ///
+    /// * Each row group carries THREE column chunks, the trailing two placed
+    ///   [`FABRICATED_COLUMN_STRIDE`] bytes apart, so reading any column other than `columns()[0]`
+    ///   (Java's `getColumns().get(0)`) changes the answer. The trailing chunks declare a **zero**
+    ///   compressed size, so `RowGroupMetaData::compressed_size()` — the sum over columns —
+    ///   remains exactly the requested `compressed_size`.
+    /// * `total_byte_size` (the UNCOMPRESSED size) is set to a value clearly different from the
+    ///   compressed size, so reading it in place of `compressed_size()` (Java's `totalSize` is
+    ///   `total_compressed_size`) changes the answer.
+    fn midpoint_test_metadata(groups: &[(i64, i64, Option<i64>)]) -> Arc<ParquetMetaData> {
+        const TRAILING_COLUMNS: usize = 2;
+
+        let schema_descr = schema_descr_with_columns(1 + TRAILING_COLUMNS);
+        let row_groups: Vec<RowGroupMetaData> = groups
+            .iter()
+            .enumerate()
+            .map(|(idx, (data_page_offset, size, dict))| {
+                let mut columns = vec![
+                    ColumnChunkMetaData::builder(schema_descr.column(0))
+                        .set_data_page_offset(*data_page_offset)
+                        .set_dictionary_page_offset(*dict)
+                        .set_total_compressed_size(*size)
+                        .build()
+                        .expect("column chunk metadata"),
+                ];
+                for col in 1..=TRAILING_COLUMNS {
+                    let stride = FABRICATED_COLUMN_STRIDE
+                        * i64::try_from(col).expect("column index fits i64");
+                    columns.push(
+                        ColumnChunkMetaData::builder(schema_descr.column(col))
+                            .set_data_page_offset(data_page_offset.saturating_add(stride))
+                            .set_total_compressed_size(0)
+                            .build()
+                            .expect("trailing column chunk metadata"),
+                    );
+                }
+                RowGroupMetaData::builder(schema_descr.clone())
+                    .set_num_rows(10)
+                    .set_total_byte_size(size.saturating_mul(4).saturating_add(7))
+                    .set_column_metadata(columns)
+                    .set_ordinal(i16::try_from(idx).expect("ordinal fits i16"))
+                    .build()
+                    .expect("row group metadata")
+            })
+            .collect();
+        let file_metadata = FileMetaData::new(1, 0, None, None, schema_descr, None);
+        Arc::new(ParquetMetaData::new(file_metadata, row_groups))
+    }
+
+    /// U3 / T2b — the row-group start comes from the FIRST column chunk, proved on a REAL
+    /// multi-column file rather than fabricated metadata.
+    ///
+    /// Java is `getOffset(rowGroup.getColumns().get(0))`. On a many-column file the last column
+    /// chunk starts thousands of bytes downstream of the first, so a reader that indexes the wrong
+    /// column pushes every midpoint into the following window: the first window then reads
+    /// NOTHING and a later window claims two row groups — silent row loss plus duplication, with
+    /// no error. A single-column fixture cannot see that at all.
+    #[test]
+    fn test_midpoint_selection_uses_first_column_chunk_on_real_file() {
+        use arrow_array::{Int32Array, StringArray};
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("multi_column.parquet")
+            .to_string_lossy()
+            .to_string();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("payload", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let file = File::create(&path).expect("create multi-column fixture");
+        let mut writer =
+            ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).expect("arrow writer");
+        for group in 0..3i32 {
+            let base = group * 100;
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Int32Array::from_iter_values(base..base + 100)),
+                // Distinct, poorly compressible values so the payload column chunk is large and
+                // its start is far from the `id` chunk's.
+                Arc::new(StringArray::from_iter_values((base..base + 100).map(|i| {
+                    format!("payload-{i:09}-{:x}", i.wrapping_mul(2_654_435_i32))
+                }))),
+            ])
+            .expect("multi-column batch");
+            writer.write(&batch).expect("write row group");
+        }
+        writer.close().expect("close multi-column fixture");
+
+        let metadata = footer_metadata(&path);
+        assert_eq!(
+            metadata.num_row_groups(),
+            3,
+            "fixture must have 3 row groups"
+        );
+
+        let starts = footer_row_group_starts(&metadata);
+        let midpoints = footer_row_group_midpoints(&metadata);
+        for (idx, rg) in metadata.row_groups().iter().enumerate() {
+            let columns = rg.columns();
+            assert!(columns.len() > 1, "fixture must be multi-column");
+            let last_start = u64::try_from(
+                columns[columns.len() - 1]
+                    .dictionary_page_offset()
+                    .filter(|dict| *dict < columns[columns.len() - 1].data_page_offset())
+                    .unwrap_or_else(|| columns[columns.len() - 1].data_page_offset()),
+            )
+            .expect("non-negative offset");
+            // Non-vacuity guard: if the columns ever coincide this test degenerates.
+            assert!(
+                last_start > starts[idx],
+                "fixture is non-discriminating: row group {idx}'s last column chunk must start \
+                 well after its first ({last_start} vs {})",
+                starts[idx]
+            );
+        }
+
+        // A one-byte window at each row group's TRUE midpoint must select exactly that row group.
+        // Indexing any other column chunk moves the midpoint elsewhere and empties the window.
+        for (idx, mid) in midpoints.iter().enumerate() {
+            assert_eq!(
+                ArrowReader::filter_row_groups_by_byte_range(&metadata, *mid, 1)
+                    .expect("byte-range filter"),
+                vec![idx],
+                "the window [{mid}, {}) must select exactly row group {idx}; its start is the \
+                 FIRST column chunk's offset",
+                mid + 1
+            );
+        }
+    }
+
+    /// U3 / T4 — `getOffset` semantics, window bounds, and the typed-error paths, probed directly
+    /// on fabricated footer metadata.
+    #[test]
+    fn test_midpoint_selection_offset_and_boundary_semantics() {
+        // (a) dictionary offset SMALLER than the data page offset wins: start = 100,
+        //     size = 20 → midpoint 110.
+        let md = midpoint_test_metadata(&[(140, 20, Some(100))]);
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 105, 10).expect("filter"),
+            vec![0],
+            "dictionary offset below the data page offset is the row-group start (midpoint 110)"
+        );
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 141, 100)
+                .expect("filter")
+                .is_empty(),
+            "a window past the dictionary-based midpoint must select nothing"
+        );
+
+        // (b) dictionary offset NOT smaller (Java takes the MIN, it is not "dict wins when set"):
+        //     start = 100, size = 20 → midpoint 110. A naive "dict wins" port would say 310.
+        let md = midpoint_test_metadata(&[(100, 20, Some(300))]);
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 105, 10).expect("filter"),
+            vec![0],
+            "when the dictionary offset is NOT smaller, the data page offset is the start"
+        );
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 300, 100)
+                .expect("filter")
+                .is_empty(),
+            "a larger dictionary offset must never become the row-group start"
+        );
+
+        // (c) no dictionary page: the data page offset is the start.
+        let md = midpoint_test_metadata(&[(100, 20, None)]);
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 110, 1).expect("filter"),
+            vec![0],
+            "without a dictionary page the data page offset is the start (midpoint 110)"
+        );
+
+        // (d) a midpoint landing EXACTLY on a split boundary belongs to the HIGHER window:
+        //     start 100, size 20 → midpoint exactly 110.
+        let md = midpoint_test_metadata(&[(100, 20, None)]);
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 0, 110)
+                .expect("filter")
+                .is_empty(),
+            "the window ENDING at the midpoint must not claim it (high bound is exclusive)"
+        );
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 110, 10).expect("filter"),
+            vec![0],
+            "the window STARTING at the midpoint claims it (low bound is inclusive)"
+        );
+
+        // (d2) the division on the SIZE TRUNCATES (Java `ldiv`). With an ODD size the truncating
+        //      and rounding-up forms differ by one byte: start 100, size 21 → midpoint 110, NOT
+        //      111. Every other case here uses an even size, so this is the only arm that can see
+        //      the difference.
+        let md = midpoint_test_metadata(&[(100, 21, None)]);
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 0, 111).expect("filter"),
+            vec![0],
+            "an odd compressed size must truncate: midpoint 110 lies inside [0, 111)"
+        );
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 111, 10)
+                .expect("filter")
+                .is_empty(),
+            "an odd compressed size must not round the midpoint up into [111, 121)"
+        );
+
+        // (d3) `totalSize` is the COMPRESSED size. The fabricated row groups declare a distinctly
+        //      larger `total_byte_size`, so reading the uncompressed size instead moves the
+        //      midpoint out of the window.
+        let md = midpoint_test_metadata(&[(100, 20, None)]);
+        assert_eq!(
+            md.row_group(0).compressed_size(),
+            20,
+            "fixture guard: the row-group compressed size must be the requested value"
+        );
+        assert_ne!(
+            md.row_group(0).total_byte_size(),
+            md.row_group(0).compressed_size(),
+            "fixture is non-discriminating: the uncompressed size must differ from the compressed \
+             size, otherwise reading the wrong one is invisible"
+        );
+
+        // (d4) the row-group start comes from `columns()[0]` (Java `getColumns().get(0)`). The
+        //      fabricated trailing chunks sit far downstream, so reading any other column moves
+        //      the midpoint out of the window.
+        let md = midpoint_test_metadata(&[(100, 20, None)]);
+        let columns = md.row_group(0).columns();
+        assert!(
+            columns.len() > 1
+                && columns[columns.len() - 1].data_page_offset() > columns[0].data_page_offset(),
+            "fixture is non-discriminating: row groups must carry several column chunks at \
+             different offsets, otherwise the column index is invisible"
+        );
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 105, 10).expect("filter"),
+            vec![0],
+            "the first column chunk determines the row-group start (midpoint 110)"
+        );
+
+        // (d5) a dictionary page offset of EXACTLY ZERO is still "set" and still wins. parquet-mr
+        //      has TWO offset helpers that differ at precisely this predicate, and this call site
+        //      must be the first one:
+        //        * `ParquetMetadataConverter.getOffset(ColumnChunk)` — `isSetDictionary_page_offset()`
+        //          with NO `> 0` test — is what drives `filterFileMetaDataByMidpoint`, i.e. the
+        //          rule Iceberg's `withRange` READ path uses (this function).
+        //        * `ColumnChunkMetaData.getStartingPos()` — `dictionaryPageOffset > 0 &&` — is the
+        //          rule Iceberg's split-offset WRITER uses.
+        //      Adding `> 0` here would push this row group's start from 0 to 1000 and its midpoint
+        //      from 50 to 1050, quietly moving it into a different split. (U3 cycle 4 / F-4.)
+        let md = midpoint_test_metadata(&[(1000, 100, Some(0))]);
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 0, 51).expect("filter"),
+            vec![0],
+            "a dictionary page offset of 0 is SET and below the data page offset, so the row group \
+             starts at 0 (midpoint 50) — the `getStartingPos` variant with `> 0` would start it at \
+             1000"
+        );
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 1000, 100)
+                .expect("filter")
+                .is_empty(),
+            "the window around the DATA page offset must select nothing once the zero dictionary \
+             offset is honoured"
+        );
+
+        // (e) a row group with no column chunks is a typed error, not a panic. (Java indexes
+        //     `getColumns().get(0)` unguarded and throws IndexOutOfBounds.)
+        let schema_descr = schema_descr_with_columns(0);
+        let empty_group = RowGroupMetaData::builder(schema_descr.clone())
+            .set_num_rows(10)
+            .set_total_byte_size(0)
+            .set_column_metadata(vec![])
+            .set_ordinal(0)
+            .build()
+            .expect("row group with no columns");
+        let md = Arc::new(ParquetMetaData::new(
+            FileMetaData::new(1, 0, None, None, schema_descr, None),
+            vec![empty_group],
+        ));
+        let err = ArrowReader::filter_row_groups_by_byte_range(&md, 0, 1000)
+            .expect_err("a column-less row group must error");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("no column chunks"),
+            "the typed error must name the missing column chunks, got: {err}"
+        );
+
+        // (f) a negative data page offset is a typed error, not a panic. (Routing through
+        //     `ColumnChunkMetaData::byte_range()` would abort here on its internal `assert!`.)
+        let md = midpoint_test_metadata(&[(-1, 20, None)]);
+        let err = ArrowReader::filter_row_groups_by_byte_range(&md, 0, 1000)
+            .expect_err("a negative row-group offset must error");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("negative byte offset"),
+            "the typed error must name the negative offset, got: {err}"
+        );
+
+        // (g) the largest footer values that can be decoded at all: both inputs are `i64`, so
+        //     `offset + size / 2` is bounded by `2^63 + 2^62 < u64::MAX` and the `checked_add`
+        //     midpoint guard is unreachable by construction — it stays as a defensive assertion.
+        //     What must hold here is that the extreme values still produce an ANSWER, not a panic.
+        let md = midpoint_test_metadata(&[(i64::MAX, i64::MAX, None)]);
+        assert_eq!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 0, u64::MAX)
+                .expect("extreme but decodable offsets must not panic or error"),
+            vec![0],
+            "a midpoint inside [0, u64::MAX) must still be selected"
+        );
+
+        // (h) a NEGATIVE row-group compressed size is a typed error, not a silent selection by
+        //     START. Without the guard the `u64` conversion would be replaced by a 0-valued size,
+        //     making the midpoint equal the row-group start — wrong rows, no error. The public
+        //     `ColumnChunkMetaData` builder accepts a negative `total_compressed_size`, so this
+        //     branch IS constructible (an earlier revision of this file wrongly claimed otherwise).
+        let md = midpoint_test_metadata(&[(100, -20, None)]);
+        assert!(
+            md.row_group(0).compressed_size() < 0,
+            "fixture guard: the fabricated row group must really declare a negative size, got {}",
+            md.row_group(0).compressed_size()
+        );
+        let err = ArrowReader::filter_row_groups_by_byte_range(&md, 0, 1000)
+            .expect_err("a negative row-group compressed size must error");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("compressed size is negative"),
+            "the typed error must name the negative size, got: {err}"
+        );
+        // Non-vacuity: a window starting AT the row-group start would select it if the size
+        // collapsed to 0, so the error above is the only thing preventing selection-by-start.
+        assert!(
+            ArrowReader::filter_row_groups_by_byte_range(&md, 100, 1).is_err(),
+            "the negative size must fail closed for every window, including one at the start"
+        );
+
+        // (i) a footer whose column chunks sum past `i64::MAX` is a typed error, not a panic.
+        //     `RowGroupMetaData::compressed_size()` sums the chunks with an UNCHECKED `i64`
+        //     `sum()` and parquet-rs applies no range validation when decoding the thrift field,
+        //     so calling it here would abort (debug) or wrap to a bogus size (release).
+        let schema_descr = schema_descr_with_columns(3);
+        let huge_columns: Vec<ColumnChunkMetaData> = (0..3)
+            .map(|col| {
+                ColumnChunkMetaData::builder(schema_descr.column(col))
+                    .set_data_page_offset(100)
+                    .set_total_compressed_size(i64::MAX)
+                    .build()
+                    .expect("huge column chunk metadata")
+            })
+            .collect();
+        let huge_group = RowGroupMetaData::builder(schema_descr.clone())
+            .set_num_rows(10)
+            .set_total_byte_size(0)
+            .set_column_metadata(huge_columns)
+            .set_ordinal(0)
+            .build()
+            .expect("row group with an overflowing column-size sum");
+        let md = Arc::new(ParquetMetaData::new(
+            FileMetaData::new(1, 0, None, None, schema_descr, None),
+            vec![huge_group],
+        ));
+        let err = ArrowReader::filter_row_groups_by_byte_range(&md, 0, u64::MAX)
+            .expect_err("an overflowing column-size sum must error, not panic");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("overflows i64"),
+            "the typed error must name the overflow, got: {err}"
         );
     }
 
@@ -3456,9 +4653,15 @@ message schema {
         let row_group_1 = metadata.row_group(1);
         let row_group_2 = metadata.row_group(2);
 
-        let rg0_start = 4u64; // Parquet files start with 4-byte magic "PAR1"
-        let rg1_start = rg0_start + row_group_0.compressed_size() as u64;
-        let rg2_start = rg1_start + row_group_1.compressed_size() as u64;
+        // U3 repair: the window boundaries are read from the REAL footer (Java `getOffset` =
+        // `min(data_page_offset, dictionary_page_offset)` of the first column chunk), not modelled
+        // as `4 + Σ compressed_size`. The old model happened to agree on this contiguous fixture,
+        // which is precisely why this test could never catch offset drift; derived offsets make it
+        // fail on a padded/bloom-filtered file.
+        let real_starts = footer_row_group_starts(metadata);
+        let rg0_start = real_starts[0];
+        let rg1_start = real_starts[1];
+        let rg2_start = real_starts[2];
         let file_end = rg2_start + row_group_2.compressed_size() as u64;
 
         println!(
@@ -3982,23 +5185,36 @@ message schema {
         let ids: Vec<i32> = (0..20).collect();
         write_id_parquet_for_pos(&data_path, &ids, 1000);
 
-        // A plan_tasks-shaped split window: start 0, length strictly inside the file.
-        let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
-        ranged.length = ranged.file_size_in_bytes / 2;
-        assert!(ranged.length > 0, "fixture file must be non-trivial");
+        // Ranged shapes on BOTH axes of the guard (`start == 0 && (length == 0 || length ==
+        // file_size)`). Varying only the LENGTH leaves the `start == 0 &&` half unpinned:
+        // `(1, file_size)` is a genuine window that a start-blind guard would ACCEPT, and the
+        // `_pos` path would then decode the whole file with ordinals from 0. (U3 cycle 4 / F-3 —
+        // the sibling of the same gap in `reject_ranged_whole_file_task`.)
+        let file_size =
+            pos_scan_task(&data_path, id_schema_for_pos(), vec![], None).file_size_in_bytes;
+        assert!(file_size > 1, "fixture file must be non-trivial");
+        for (start, length) in [(0u64, file_size / 2), (1u64, file_size), (1u64, 0u64)] {
+            let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+            ranged.start = start;
+            ranged.length = length;
 
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
-        let err = reader
-            .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
-            .expect("stream construction")
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .expect_err("a ranged task projecting `_pos` must fail loud, not duplicate rows");
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            err.to_string().contains("ranged split task is unsupported"),
-            "typed error must name the ranged-split rejection, got: {err}"
-        );
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let err = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect_err("a ranged task projecting `_pos` must fail loud, not duplicate rows");
+            assert_eq!(
+                err.kind(),
+                ErrorKind::FeatureUnsupported,
+                "ranged `_pos` task ({start}, {length}) must fail loud, not duplicate rows"
+            );
+            assert!(
+                err.to_string().contains("ranged split task is unsupported"),
+                "typed error must name the ranged-split rejection ({start}, {length}), got: {err}"
+            );
+        }
 
         // Control: the SAME file as a whole-file task (0,0 legacy sentinel) still streams fine —
         // the guard must reject ONLY ranged windows.
@@ -4039,9 +5255,19 @@ message schema {
         );
     }
 
-    /// FK5 oracle: sparse pos-deletes across multi-RG file.
+    /// FK5 oracle: sparse pos-deletes across a multi-row-group file.
+    ///
+    /// U3 rider (2026-08-07): this test used to be a FALSE GREEN for its own name — it passed
+    /// unchanged with `max_row_group_row_count = None` (one row group), so nothing in it depended
+    /// on the file being multi-RG. It now (a) asserts the fixture's row-group count from the real
+    /// footer, and (b) carries a second leg that PRUNES the first row group with a residual
+    /// predicate, so the surviving row group's `_pos` values must be offset by the pruned group's
+    /// row count. A reader that restarted ordinals per surviving row group passes leg 1 and fails
+    /// leg 2.
     #[tokio::test]
     async fn fk5_pos_oracle_sparse_pos_deletes_multi_rg() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
         let tmp = TempDir::new().unwrap();
         let data_path = tmp
             .path()
@@ -4050,6 +5276,15 @@ message schema {
             .to_string();
         let ids: Vec<i32> = (1..=200).collect();
         write_id_parquet_for_pos(&data_path, &ids, 100);
+        // Structural pin: the fixture must actually be multi-row-group. (Mutation: pass `None` for
+        // the row-group row count — this assertion goes RED, where before nothing did.)
+        let footer = SerializedFileReader::new(File::open(&data_path).expect("open fixture"))
+            .expect("read footer");
+        assert_eq!(
+            footer.metadata().num_row_groups(),
+            2,
+            "fixture must span 2 row groups for this oracle to mean anything"
+        );
         let del_path = tmp
             .path()
             .join("pos-del.parquet")
@@ -4079,6 +5314,32 @@ message schema {
             .map(|p| ((p + 1) as i32, p))
             .collect();
         assert_eq!(pairs, expected);
+
+        // Leg 2 — the BEHAVIOURAL discriminator. The `_pos` path deliberately decodes with no
+        // row-skipping (no RowSelection / RowFilter / row-group pruning), so the only way the
+        // multi-row-group shape reaches the reader is through the DECODE BATCH boundaries:
+        // parquet-rs never spans a batch across a row group, so a batch size that does not divide
+        // the row-group row count produces a SHORT batch at every row-group seam. That is exactly
+        // where the `absolute_pos` / transformer dual counter can desync, and it is the property
+        // this test's name claims to cover. With one row group the sequence would be
+        // `[17; 11] + [13]`; with two it is `[17; 5] + [15]`, twice.
+        let no_delete_task = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        let batches = run_pos_scan(no_delete_task, Some(17)).await;
+        let batch_lengths: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
+        assert_eq!(
+            batch_lengths,
+            vec![17, 17, 17, 17, 17, 15, 17, 17, 17, 17, 17, 15],
+            "decode batches must break at the row-group seam (a short batch at pos 100)"
+        );
+        // …and the `_pos` values must run 0..199 unbroken ACROSS that seam.
+        let pairs_no_delete = collect_id_pos_pairs(&batches);
+        assert_eq!(
+            pairs_no_delete,
+            (0i64..200)
+                .map(|p| ((p + 1) as i32, p))
+                .collect::<Vec<(i32, i64)>>(),
+            "_pos must be the absolute file ordinal across the row-group seam"
+        );
     }
 
     /// FK5 oracle: residual filter AND sparse pos-deletes — row set + `_pos` vs physical baseline.
@@ -4947,9 +6208,21 @@ message schema {
         let row_group_0 = metadata.row_group(0);
         let row_group_1 = metadata.row_group(1);
 
-        let rg0_start = 4u64; // Parquet files start with 4-byte magic "PAR1"
-        let rg1_start = rg0_start + row_group_0.compressed_size() as u64;
-        let rg1_length = row_group_1.compressed_size() as u64;
+        // U3 repair: the window is derived from the REAL footer offsets (Java `getOffset` =
+        // `min(data_page_offset, dictionary_page_offset)` of the first column chunk), never from
+        // the `4 + Σ compressed_size` model the production code used to synthesize — that model is
+        // what made this test blind to offset drift. The assertion below records that this
+        // particular fixture is contiguous (so both agree here); a padded/bloom-filtered file
+        // would now be caught.
+        let real_starts = footer_row_group_starts(metadata);
+        let rg0_start = real_starts[0];
+        let rg1_start = real_starts[1];
+        let rg1_length = u64::try_from(row_group_1.compressed_size()).expect("non-negative size");
+        assert_eq!(
+            rg1_start,
+            rg0_start + u64::try_from(row_group_0.compressed_size()).expect("non-negative size"),
+            "this fixture is expected to have contiguous row groups"
+        );
 
         println!(
             "Row group 0: starts at byte {}, {} bytes compressed",
@@ -5177,9 +6450,21 @@ message schema {
         let row_group_0 = metadata.row_group(0);
         let row_group_1 = metadata.row_group(1);
 
-        let rg0_start = 4u64; // Parquet files start with 4-byte magic "PAR1"
-        let rg1_start = rg0_start + row_group_0.compressed_size() as u64;
-        let rg1_length = row_group_1.compressed_size() as u64;
+        // U3 repair: the window is derived from the REAL footer offsets (Java `getOffset` =
+        // `min(data_page_offset, dictionary_page_offset)` of the first column chunk), never from
+        // the `4 + Σ compressed_size` model the production code used to synthesize — that model is
+        // what made this test blind to offset drift. The assertion below records that this
+        // particular fixture is contiguous (so both agree here); a padded/bloom-filtered file
+        // would now be caught.
+        let real_starts = footer_row_group_starts(metadata);
+        let rg0_start = real_starts[0];
+        let rg1_start = real_starts[1];
+        let rg1_length = u64::try_from(row_group_1.compressed_size()).expect("non-negative size");
+        assert_eq!(
+            rg1_start,
+            rg0_start + u64::try_from(row_group_0.compressed_size()).expect("non-negative size"),
+            "this fixture is expected to have contiguous row groups"
+        );
 
         let file_io = FileIO::new_with_fs();
         let reader = ArrowReaderBuilder::new(file_io).build();
@@ -7617,6 +8902,141 @@ mod avro_scan_tests {
         ]);
     }
 
+    // -- U3 cycle 3 / hazard-1 sibling: AVRO must never be read through a byte sub-window. ------------
+
+    /// The AVRO reader decodes WHOLE files — it never reads `task.start` / `task.length`. So if
+    /// the planner split an Avro file into byte windows, every sub-task would re-emit every row
+    /// and an N-way split would silently return N copies of the file: the exact silent-duplication
+    /// class the Parquet midpoint row-group selection was written to eliminate, with no error at
+    /// any layer.
+    ///
+    /// This drives the REAL `FileScanTask::split` → `ArrowReader::read` path (what
+    /// `TableScan::plan_tasks` does at `scan/mod.rs`) and asserts the exactly-once property over
+    /// the whole split set. Before `scan::task::reader_honors_byte_range` this returned 4× the
+    /// file's rows.
+    #[tokio::test]
+    async fn avro_split_reads_every_row_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        let schema = test_schema();
+        let data_path = tmp.path().join("split.avro").to_string_lossy().to_string();
+        let rows: Vec<(i64, Option<&str>)> = (0..200i64)
+            .map(|i| (i, if i % 3 == 0 { None } else { Some("payload") }))
+            .collect();
+        write_avro_data_file(&data_path, &schema, &rows);
+
+        let whole = avro_task(&data_path, schema, vec![1, 2], vec![]);
+        let file_len = whole.file_size_in_bytes;
+        // `plan_tasks` hands `split` the file length as the task length; mirror that exactly.
+        let whole = FileScanTask {
+            length: file_len,
+            ..whole
+        };
+
+        // Non-vacuity: the target must be small enough that a split WOULD produce several windows.
+        // A PARQUET task with the same geometry does split, which is what makes this test able to
+        // fail when the AVRO gate is removed.
+        let target = file_len / 4 + 1;
+        assert!(
+            target < file_len,
+            "fixture is non-discriminating: the split target ({target}) must be well under the \
+             file length ({file_len}), otherwise a single window is the trivially correct answer"
+        );
+        let parquet_shaped = FileScanTask {
+            data_file_format: DataFileFormat::Parquet,
+            ..whole.clone()
+        };
+        assert!(
+            parquet_shaped.split(target).expect("parquet split").len() > 1,
+            "fixture is non-discriminating: this geometry must split into several windows for a \
+             format whose reader honours byte ranges"
+        );
+
+        let sub_tasks = whole.split(target).expect("avro split");
+        assert_eq!(
+            sub_tasks.len(),
+            1,
+            "an AVRO file must not be split into byte windows its reader cannot honour"
+        );
+
+        let mut all_ids = Vec::new();
+        for sub_task in sub_tasks {
+            let batches = run_scan(FileIO::new_with_fs(), sub_task).await;
+            all_ids.extend(rows_of(&batches).into_iter().map(|(id, _)| id));
+        }
+        all_ids.sort_unstable();
+        assert_eq!(
+            all_ids,
+            (0..200i64).collect::<Vec<_>>(),
+            "the union over every sub-task must be each row EXACTLY once, never a duplicate"
+        );
+    }
+
+    /// Defence in depth for the same hazard: even if a ranged AVRO/ORC task reaches the reader by
+    /// some other route (the public `PartitionWork` seam, a hand-built task), it must fail with a
+    /// typed error rather than silently re-emitting the whole file.
+    #[tokio::test]
+    async fn avro_ranged_task_is_rejected_with_a_typed_error() {
+        let tmp = TempDir::new().unwrap();
+        let schema = test_schema();
+        let data_path = tmp.path().join("ranged.avro").to_string_lossy().to_string();
+        write_avro_data_file(&data_path, &schema, &[(1, Some("a")), (2, Some("b"))]);
+
+        let whole = avro_task(&data_path, schema, vec![1, 2], vec![]);
+        let file_len = whole.file_size_in_bytes;
+        assert!(
+            file_len > 2,
+            "fixture guard: the Avro file must be non-trivial"
+        );
+
+        // Genuine sub-windows on BOTH axes of the guard. Varying only the LENGTH would leave the
+        // guard's `task.start == 0 &&` half unpinned: `(1, file_len)` is a real window that a
+        // start-blind guard would ACCEPT, and the Avro reader would then re-emit the whole file —
+        // the silent-duplication class this guard exists to stop. (U3 cycle 4 / F-3.)
+        for (start, length) in [(0u64, file_len / 2), (1u64, file_len)] {
+            let ranged = FileScanTask {
+                start,
+                length,
+                ..whole.clone()
+            };
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let tasks = Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream;
+            let result = reader
+                .read(tasks)
+                .expect("build scan stream")
+                .try_collect::<Vec<RecordBatch>>()
+                .await;
+            let err = match result {
+                Ok(batches) => panic!(
+                    "a ranged AVRO task ({start}, {length}) must fail closed, not re-emit the \
+                     whole file — got {} row(s)",
+                    rows_of(&batches).len()
+                ),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), crate::ErrorKind::FeatureUnsupported);
+            assert!(
+                err.to_string().contains("ranged split task over a AVRO"),
+                "the typed error must name the ranged AVRO task ({start}, {length}), got: {err}"
+            );
+        }
+
+        // Both whole-file spellings must still be accepted: the legacy `length == 0` sentinel and
+        // an explicit `length == file_size_in_bytes`.
+        for length in [0, file_len] {
+            let batches = run_scan(FileIO::new_with_fs(), FileScanTask {
+                start: 0,
+                length,
+                ..whole.clone()
+            })
+            .await;
+            assert_eq!(
+                rows_of(&batches).len(),
+                2,
+                "a whole-file AVRO task (length {length}) must still read normally"
+            );
+        }
+    }
+
     // -- Projection: only the projected field id materializes. ----------------------------------------
 
     #[tokio::test]
@@ -7731,6 +9151,73 @@ mod avro_scan_tests {
             (2, None),
             (3, Some(String::new())),
         ]);
+    }
+
+    /// The ORC half of the fail-closed guard, mirroring
+    /// [`avro_ranged_task_is_rejected_with_a_typed_error`] one-for-one.
+    ///
+    /// `reject_ranged_whole_file_task` is invoked from BOTH `process_avro_file_scan_task` and
+    /// `process_orc_file_scan_task`, but only the AVRO call site was pinned: deleting the ORC line
+    /// left the whole suite green (U3 cycle 5, the Critic's S2 / the Falsifier's F9). Since
+    /// `process_orc_file_scan_task` never reads `task.start` / `task.length`, an unguarded ranged
+    /// ORC task re-emits every row of the file — N copies per N-way split, with no error.
+    #[tokio::test]
+    async fn orc_ranged_task_is_rejected_with_a_typed_error() {
+        let tmp = TempDir::new().unwrap();
+        let path = orc_fixture_on_disk(&tmp);
+        let whole = orc_task(&path, orc_fixture_schema(), vec![1, 6], vec![]);
+        let file_len = whole.file_size_in_bytes;
+        assert!(
+            file_len > 2,
+            "fixture guard: the ORC file must be non-trivial"
+        );
+
+        // BOTH axes of the guard: `(0, file_len / 2)` varies only the length, `(1, file_len)` is a
+        // genuine window that a start-blind guard would ACCEPT — after which the whole-file ORC
+        // reader would re-emit every row.
+        for (start, length) in [(0u64, file_len / 2), (1u64, file_len)] {
+            let ranged = FileScanTask {
+                start,
+                length,
+                ..whole.clone()
+            };
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let tasks = Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream;
+            let result = reader
+                .read(tasks)
+                .expect("build scan stream")
+                .try_collect::<Vec<RecordBatch>>()
+                .await;
+            let err = match result {
+                Ok(batches) => panic!(
+                    "a ranged ORC task ({start}, {length}) must fail closed, not re-emit the whole \
+                     file — got {} row(s)",
+                    orc_id_string_rows(&batches).len()
+                ),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), crate::ErrorKind::FeatureUnsupported);
+            assert!(
+                err.to_string().contains("ranged split task over a ORC"),
+                "the typed error must name the ranged ORC task ({start}, {length}), got: {err}"
+            );
+        }
+
+        // Non-vacuity: both whole-file spellings must still stream, so this cannot pass on a reader
+        // that errors on everything.
+        for length in [0, file_len] {
+            let batches = run_scan(FileIO::new_with_fs(), FileScanTask {
+                start: 0,
+                length,
+                ..whole.clone()
+            })
+            .await;
+            assert_eq!(
+                orc_id_string_rows(&batches).len(),
+                3,
+                "a whole-file ORC task (length {length}) must still read normally"
+            );
+        }
     }
 
     // -- ORC projection: only the projected field id materializes (by field-id, not position). -------

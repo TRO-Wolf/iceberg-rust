@@ -128,6 +128,23 @@ public final class InteropOracle {
         PartitionOracle.generate(partitionFixturesDir);
         SnapshotOracle.generate(snapshotFixturesDir);
         break;
+      case "generate-interop-ranged-read":
+        // RANGED-READ (midpoint row-group selection), DIRECTION 1 — "Rust selects what JAVA selects".
+        // Java writes a many-row-group parquet file, tiles it at the HAND-DECLARED stride, and reads each
+        // window through parquet-mr's REAL `filterFileMetaDataByMidpoint` (via `Parquet.read().split()`).
+        RangedReadOracle.generate(requireFixturesDir("interop.ranged_read.dir"));
+        break;
+      case "verify-interop-ranged-read":
+        // RANGED-READ, DIRECTION 2 — "Java selects what RUST selects". Replays the windows Rust declared
+        // over the RUST-written files (including a bloom-PADDED one whose real row-group starts run ahead
+        // of `4 + Σ compressed_size`) and asserts identical ids per window.
+        int rangedReadFailures =
+            RangedReadOracle.verify(requireFixturesDir("interop.ranged_read.dir"));
+        System.out.println("verify-interop-ranged-read: " + rangedReadFailures + " failures");
+        if (rangedReadFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-inspection":
         // A SEPARATE exec mode (its own fixtures dir) so the inspection increment never touches the
         // committed update_schema / update_partition_spec / manage_snapshots fixtures. The dir is supplied
@@ -25577,4 +25594,220 @@ public final class InteropOracle {
           true);
     }
   }
+
+  // ===========================================================================================
+  // RANGED-READ oracle — U3 / hazard-1: MIDPOINT row-group selection over a byte-range split.
+  //
+  // Proves the Rust `ArrowReader::filter_row_groups_by_byte_range` selects the SAME row groups as
+  // parquet-mr's REAL midpoint filter, which Iceberg drives through
+  // `Parquet.ReadBuilder.split(start, length)` → `ParquetReadOptions.Builder.withRange(start, start+length)`
+  // → `ParquetMetadataConverter.filterFileMetaDataByMidpoint` (a row group is kept iff
+  // `getOffset(columns[0]) + totalCompressedSize/2` lies in the HALF-OPEN `[start, start+length)`).
+  // This is the exact call `org.apache.iceberg.data.GenericReader.openFile` makes for a FileScanTask.
+  //
+  // ANTI-CIRCULARITY: the windows are NOT taken from either engine's splitter. Both sides tile
+  // `[0, fileLength)` at the HAND-DECLARED stride below, mirrored in
+  // crates/iceberg/tests/interop_ranged_read.rs. Deriving them from `split()` / `TableScanUtil.splitFiles`
+  // would make the comparison circular with respect to the split layer.
+  //
+  // TWO DIRECTIONS:
+  //   generate → Java writes java_ranged.parquet (many small row groups, so an 800-byte tiling STRADDLES
+  //              row groups), reads every window through the real filter, emits java_ranged_read.json.
+  //   verify   → Java replays the SAME windows over the RUST-written files listed in
+  //              rust_ranged_read.json and asserts identical id lists per window. The Rust side ships a
+  //              PADDED file (bloom filters after each row group ⇒ real row-group starts run ahead of
+  //              `4 + Σ compressed_size`), which is the leg that proves the OFFSET SOURCE, not just the rule.
+  // ===========================================================================================
+
+  /** The ranged-read (midpoint row-group selection) oracle — see the block comment above. */
+  static final class RangedReadOracle {
+    private RangedReadOracle() {}
+
+    /** HAND-DECLARED window stride (bytes). Mirrored EXACTLY in interop_ranged_read.rs. */
+    static final long STRIDE = 800L;
+
+    /** Rows in the Java-written fixture. */
+    private static final int ROWS = 400;
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()));
+
+    /** DIRECTION 1 — Java writes the fixture and emits its own per-window read. */
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Path file = dir.resolve("java_ranged.parquet");
+      writeFixture(file);
+
+      long length = Files.size(file);
+      List<long[]> windows = tile(length);
+      if (windows.size() < 3) {
+        throw new IllegalStateException(
+            "ranged-read fixture too small to tile: " + length + " bytes at stride " + STRIDE);
+      }
+      writeJson(dir.resolve("java_ranged_read.json"), windowsToJson(file, windows));
+      System.out.println(
+          "generated "
+              + file
+              + " ("
+              + length
+              + " bytes, "
+              + windows.size()
+              + " windows at stride "
+              + STRIDE
+              + ") + java_ranged_read.json");
+    }
+
+    /**
+     * DIRECTION 2 — replay the windows Rust declared over the RUST-written parquet files and assert Java's
+     * real midpoint filter returns the same ids. Returns the failure count.
+     */
+    static int verify(Path dir) throws IOException {
+      Path manifest = dir.resolve("rust_ranged_read.json");
+      if (!Files.exists(manifest)) {
+        System.out.println("FAIL ranged-read-d2: missing " + manifest + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      int failures = 0;
+      com.fasterxml.jackson.databind.JsonNode root =
+          JsonUtil.mapper().readTree(readString(manifest));
+      if (!root.isArray() || root.size() == 0) {
+        System.out.println("FAIL ranged-read-d2: rust_ranged_read.json is empty");
+        return 1;
+      }
+      for (com.fasterxml.jackson.databind.JsonNode entry : root) {
+        String path = entry.get("file").asText();
+        long start = entry.get("start").asLong();
+        long len = entry.get("length").asLong();
+        List<Long> expected = new ArrayList<>();
+        for (com.fasterxml.jackson.databind.JsonNode id : entry.get("ids")) {
+          expected.add(id.asLong());
+        }
+        List<Long> actual = readWindow(Paths.get(path), start, len);
+        if (actual.equals(expected)) {
+          System.out.println(
+              "PASS ranged-read-d2 " + new File(path).getName() + " [" + start + "," + (start + len) + ") -> " + actual.size() + " rows");
+        } else {
+          failures++;
+          System.out.println(
+              "FAIL ranged-read-d2 "
+                  + new File(path).getName()
+                  + " ["
+                  + start
+                  + ","
+                  + (start + len)
+                  + "): java="
+                  + actual
+                  + " rust="
+                  + expected);
+        }
+      }
+      return failures;
+    }
+
+    /** Tile `[0, length)` into half-open windows of STRIDE bytes; the final window is short. */
+    private static List<long[]> tile(long length) {
+      List<long[]> windows = new ArrayList<>();
+      long start = 0L;
+      while (start < length) {
+        long size = Math.min(STRIDE, length - start);
+        windows.add(new long[] {start, size});
+        start += size;
+      }
+      return windows;
+    }
+
+    /**
+     * Read one byte-range window through Iceberg's REAL parquet read path — the same
+     * `Parquet.read(...).split(start, length)` call `GenericReader.openFile` makes — and return the ids in
+     * physical order.
+     */
+    private static List<Long> readWindow(Path file, long start, long length) throws IOException {
+      List<Long> ids = new ArrayList<>();
+      InputFile input = org.apache.iceberg.Files.localInput(file.toFile());
+      try (CloseableIterable<Record> records =
+          org.apache.iceberg.parquet.Parquet.read(input)
+              .project(SCHEMA)
+              .createReaderFunc(
+                  fileSchema -> org.apache.iceberg.data.parquet.GenericParquetReaders.buildReader(SCHEMA, fileSchema))
+              .split(start, length)
+              .build()) {
+        for (Record record : records) {
+          ids.add((Long) record.getField("id"));
+        }
+      }
+      return ids;
+    }
+
+    /** Emit `[{file,start,length,ids:[...]}]` for every window, read through the real midpoint filter. */
+    private static String windowsToJson(Path file, List<long[]> windows) {
+      List<List<Long>> perWindow = new ArrayList<>();
+      for (long[] window : windows) {
+        try {
+          perWindow.add(readWindow(file, window[0], window[1]));
+        } catch (IOException error) {
+          throw new RuntimeException("failed to read window " + window[0] + "+" + window[1], error);
+        }
+      }
+      // Non-vacuity: the tiling must actually PARTITION the file's rows — every row exactly once.
+      Set<Long> seen = new TreeSet<>();
+      int total = 0;
+      for (List<Long> ids : perWindow) {
+        seen.addAll(ids);
+        total += ids.size();
+      }
+      if (total != ROWS || seen.size() != ROWS) {
+        throw new IllegalStateException(
+            "java midpoint tiling is not a partition: " + total + " rows, " + seen.size() + " distinct");
+      }
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (int i = 0; i < windows.size(); i++) {
+              gen.writeStartObject();
+              gen.writeStringField("file", file.toAbsolutePath().toString());
+              gen.writeNumberField("start", windows.get(i)[0]);
+              gen.writeNumberField("length", windows.get(i)[1]);
+              gen.writeArrayFieldStart("ids");
+              for (Long id : perWindow.get(i)) {
+                gen.writeNumber(id);
+              }
+              gen.writeEndArray();
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          true);
+    }
+
+    /**
+     * Write the fixture: {@value #ROWS} rows through Iceberg's generic parquet writer with a TINY row-group
+     * size, so the file carries many row groups and an 800-byte tiling straddles them.
+     */
+    private static void writeFixture(Path file) throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ROWS; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", (long) i);
+        record.setField("data", "row-" + i);
+        rows.add(record);
+      }
+      OutputFile out = org.apache.iceberg.Files.localOutput(file.toFile());
+      try (org.apache.iceberg.io.FileAppender<Record> appender =
+          org.apache.iceberg.parquet.Parquet.write(out)
+              .schema(SCHEMA)
+              .createWriterFunc(
+                  fileSchema ->
+                      org.apache.iceberg.data.parquet.GenericParquetWriter.create(SCHEMA, fileSchema))
+              .set(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "512")
+              .set(TableProperties.PARQUET_PAGE_SIZE_BYTES, "256")
+              .overwrite()
+              .build()) {
+        appender.addAll(rows);
+      }
+    }
+  }
+
 }

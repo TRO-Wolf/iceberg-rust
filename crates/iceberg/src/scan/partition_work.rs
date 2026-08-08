@@ -612,6 +612,64 @@ mod tests {
         assert!(!union_rows.is_empty(), "readable fixture must yield rows");
     }
 
+    /// U3 annotation (2026-08-07, MEASURED): the pin above is **NOT** coverage for row-group
+    /// byte-range selection, and must not be cited as such.
+    ///
+    /// `write_parquet_data_files` writes 1,024 rows at the default row-group size, producing a
+    /// **single** row group per file. Its `DataFile` carries no `split_offsets`, so
+    /// `plan_tasks(1024)` DOES take the fixed-size branch and DOES emit several windows — being
+    /// single-row-group is not by itself what makes the pin blind. The load-bearing quantity is
+    /// that the one row group ends well before the first split boundary (measured 2026-08-07:
+    /// start 4, compressed size 463, i.e. `[4, 467)` inside a 3,003-byte file split at 1,024), so
+    /// the midpoint rule and the old overlap rule select the same set and the "union ≡ `to_arrow`"
+    /// pin above stays green under both. In other words `main` never duplicated rows through this
+    /// fixture; the discriminating pins for that defect live in
+    /// `crate::arrow::reader::tests::test_midpoint_selection_*`.
+    ///
+    /// This test asserts the load-bearing quantity, not the incidental one: if the fixture's data
+    /// ever grows so a row group crosses a split boundary, the pin above becomes discriminating
+    /// and this assertion fails rather than silently keeping a stale rationale alive.
+    #[tokio::test]
+    async fn u3_annotation_planning_fixture_is_non_discriminating() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        use crate::scan::tests::TableTestFixture;
+
+        // The split size the pin above uses.
+        const SPLIT_SIZE: u64 = 1024;
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let path = format!("{}/1.parquet", fixture.table_location);
+        let file = std::fs::File::open(&path).expect("open fixture data file");
+        let reader = SerializedFileReader::new(file).expect("read footer");
+        let metadata = reader.metadata();
+
+        for idx in 0..metadata.num_row_groups() {
+            let row_group = metadata.row_group(idx);
+            let column = row_group
+                .columns()
+                .first()
+                .expect("row group has a column chunk");
+            let data = column.data_page_offset();
+            let start = u64::try_from(match column.dictionary_page_offset() {
+                Some(dict) if data > dict => dict,
+                _ => data,
+            })
+            .expect("non-negative offset");
+            let end = start
+                + u64::try_from(row_group.compressed_size()).expect("non-negative compressed size");
+            assert_eq!(
+                start / SPLIT_SIZE,
+                (end - 1) / SPLIT_SIZE,
+                "row group {idx} = [{start}, {end}) crosses a {SPLIT_SIZE}-byte split boundary: \
+                 the fixture is now DISCRIMINATING for midpoint row-group selection and the \
+                 non-coverage annotation on the pin above is stale"
+            );
+        }
+    }
+
     /// Pin 4: T=1 assigns all work to a single partition (legal N=1 form).
     #[tokio::test]
     async fn pin4_t1_single_partition_covers_all() {

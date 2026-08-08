@@ -810,3 +810,108 @@ byte-identical — `extension.rs` is 187 vs 197 lines with a behavior-preserving
   first F2 pass fixed 5 `.md` files and missed 5 sites in `crates/` — including a SHIPPED
   user-facing error message naming a crate version the build no longer used, and a module doc that
   contradicted the `map.md` the same change had just rewritten, on the very topic being adjudicated.
+
+### 2026-08-07 — Never pipe a gate command into `tail`/`grep`/`head` inside a verification `&&` chain
+
+A pipeline's exit status is its LAST command's, so `cargo test … | tail -5` exits 0 whenever `tail`
+succeeds — the gate step becomes structurally incapable of failing the chain, and the commit runs on
+a red suite. The cycle-3 gate chain of U3 did exactly this. Same family as the promoted rule "never
+put `git commit` on a separate line from the gate": both fail by putting something between the gate
+and its exit status.
+
+- **DO keep every gate step unpiped** in the chain, and capture counts with a SEPARATE, non-gating
+  run afterwards if you want a summary line.
+- **DO use `set -o pipefail` or `${PIPESTATUS[0]}`** when a pipe is genuinely unavoidable.
+
+### 2026-08-08 — Never restore a mutation with `git checkout --` while the unit's own work is uncommitted
+
+A mutation sweep restores each mutant before the next one. `git checkout -- <file>` restores the file
+to **HEAD**, not to the pre-mutation state — so if the file also carries the cycle's own uncommitted
+edits, the restore silently DELETES them. That happened here in U3 cycle 5: the F5 fix and its two
+unit tests lived in `scan/task.rs` alongside the mutation, and the restore wiped the fix while
+leaving the tests' sibling file untouched. The next mutation then ran against production code that no
+longer contained the thing under test, and its result (a second, unrelated test failing) was
+uninterpretable until the loss was noticed. Note the failure mode is asymmetric and nasty: the *sweep*
+looked healthy — `git status --porcelain` was "clean" for that path, which is exactly what the
+exclusive-access protocol tells you to check.
+
+- **DO restore from a `cp` backup taken immediately before the mutation** (`cp f f.bak` → mutate →
+  run → `cp f.bak f` → `cmp -s f f.bak`), and delete the backup only after `cmp` passes.
+- **DO verify the restore by CONTENT (`cmp`/md5), not by `git status`** while the unit is
+  uncommitted: porcelain-empty proves you match HEAD, which is the wrong target mid-unit.
+- **DO re-run the full suite green on the restored source before the next mutant**, so a destroyed
+  fix is caught by the count (3155 → 3153) instead of being blamed on the next mutation.
+
+### 2026-08-08 — Widening an early-return guard silently DE-PINS whatever used to fall past it: the suite goes greener while coverage shrinks
+
+A guard's tests reach it by falling THROUGH every guard above it. Widen an earlier condition and those
+fixtures now return early — the tests still pass, but they no longer exercise the branch they were
+written for, and the mutants that used to kill them survive. Nothing goes red. The test count does not
+move. `cargo test`, clippy, CI and a full gate all report a healthier tree than before, because the
+loss is in what the tests REACH, not in what they assert.
+
+U3 cycle 6 widened `FileScanTask::split`'s branch (1a) from `self.start != 0` to
+`self.start != 0 || self.length != self.file_size_in_bytes`, and de-pinned two guards whose own
+conditions it did not change (one of them — the `start != 0` disjunct — survives verbatim INSIDE the
+condition cycle 6 rewrote; the other is a separate branch further down the chain):
+
+- the cycle-5 `self.start != 0` disjunct — every ranged fixture also trips the new disjunct, so dropping
+  the old one stayed GREEN while `start = 600, length = 1000, file_size = 1000` still produced three
+  sub-tasks relocated to offset 0 (the silent-corruption class the disjunct was added for);
+- the cycle-4 `length == 0` sentinel (branch 1b) — its fixture (`length = 0`, `file_size = 1000`) now
+  returns at (1a), leaving (1b)'s only reachable shape (`file_size_in_bytes == 0`) untested, so
+  corrupting the sentinel condition left the suite green.
+
+The SENTINEL was caught only because that cycle's Falsifier was told to re-sweep mutants over code
+shipped in ALL cycles: (1b) is a different branch, on a line cycle 6 never touched, so the natural
+scoping — "attack this cycle's delta" — would have shipped it. The `start != 0` disjunct is a weaker
+claim, and worth stating precisely: it lives INSIDE the line cycle 6 edited, so a delta-scoped
+Falsifier could plausibly have found it — but only by mutating each disjunct of the new condition
+INDEPENDENTLY. A sweep that mutated only the NEW disjunct, or the condition as a whole, would have
+missed it.
+
+- **DO re-run the EXISTING mutation catalogue after any change to an early-return chain**, not just
+  mutants for the new code. New-code mutants cannot see this class by construction.
+- **DO re-DERIVE the mutant per SUB-EXPRESSION after a widening — one mutant per disjunct/conjunct,
+  each dropped on its own — and treat a catalogued mutant whose target string NO LONGER OCCURS as a
+  SIGNAL, never as a pass.** Re-running the catalogue verbatim is necessary but not sufficient: it
+  works for a guard the widening left alone (cycle 4's target `if self.length == 0 {` still occurs
+  exactly once at cycle 6 and at HEAD, so a verbatim re-run reports SURVIVED and the gap is caught),
+  and it FAILS for a guard the widening rewrote (cycle 5's target `if self.start != 0 {` occurs once
+  at 3e1c4b6b and ZERO times at 41d2c7a6 — all grep-verified). Under this repo's harness contract a
+  sabotage step that cannot be applied must HARD-FAIL, so that mutant exits "target absent", which
+  reads just as naturally as "retire this stale mutant" as it does as "the guard moved, re-derive it".
+  Say which: it is always the second.
+- **DO ask, for each guard above the one you widened *and each guard below it*: which test still
+  REACHES this branch?** If the answer is "the one named after it", verify it — the name outlives the
+  reachability.
+- **DO pin the new condition at a shape the OLD condition cannot see** (here: `start != 0` with
+  `length == file_size_in_bytes`), so the disjuncts stay independently load-bearing rather than one
+  masking the other.
+- **DO NOT read "suite still green, +N tests" as evidence a widening was safe** — it is exactly the
+  signature this failure produces.
+
+### 2026-08-08 — A metadata-PRESERVING restore (`cp -p` / `shutil.copy2`) defeats cargo's freshness check: the "restored" run can be a mutant-era artifact reported as GREEN
+
+Context (U3 final round): the Falsifier's mutation harness restored each mutated source with
+`shutil.copy2` — the Python spelling of `cp -p` — which puts the ORIGINAL mtime back on the source
+file. Cargo's freshness check compares source mtime against artifact mtime, so the mutant-era
+artifact still looked fresh and the crate was NOT rebuilt: a mutation run can report the restored
+code GREEN having never compiled it, and — the worse direction — a full verification gate run in
+that checkout can be served entirely from a MUTANT binary and still print all-green. The content
+check everyone reaches for (`cmp` / md5) passes in both cases: it proves the SOURCE was restored, and
+says nothing about which bytes the artifact was built from.
+
+This is the same build-cache-is-part-of-the-state failure as the two entries above (2026-07-24 `cp -p`
++ `mv`, and the 2026-07-25 inherited warm `target/`), reached from a third direction — so treat it as
+the general rule, not three incidents.
+
+- **DO restore with plain `cp` (which stamps a NEW mtime), or `touch` the file immediately after
+  restoring.** Never `cp -p`, `shutil.copy2`, `install -p`, `rsync -t`, or anything else that
+  preserves times — a mutation harness has no reason to want the old mtime back.
+- **DO verify a restore on BOTH axes before believing any result: CONTENT (`cmp`/md5 against the
+  pre-mutation backup) AND REBUILD (cargo printed `Compiling <crate>`, or the artifact's mtime
+  moved).** Content alone is the trap; the artifact is the thing the test actually ran.
+- **DO NOT report a GREEN — gate or mutation leg — from a checkout whose last mutation restore you
+  did not confirm rebuilt.** A green produced from a mutant-era binary is indistinguishable from a
+  real one in the output, and it ships.
