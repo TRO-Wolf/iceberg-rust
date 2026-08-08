@@ -31,6 +31,33 @@ How to use it (see the manuals' §1):
 
 ---
 
+## IN FLIGHT — U3 / hazard-1: midpoint row-group selection (branch `fix/ranged-read-midpoint-rowgroups`)
+
+Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-order.md) §6. Ledger:
+[u3-midpoint-rowgroup-ledger.md](u3-midpoint-rowgroup-ledger.md). Zero-dependency-change unit.
+
+- [x] **P1 — Replace the selection rule.** `ArrowReader::filter_row_groups_by_byte_range`: keep a
+      row group iff `rg_start + compressed_size/2 ∈ [start, start+length)`, with `rg_start` =
+      Java `getOffset(columns[0])` = `min(data_page_offset, dictionary_page_offset)` read from the
+      REAL footer. Delete the `4 + Σ compressed_size` accumulator entirely; no fallback branch.
+      Typed `DataInvalid` on zero-column row groups, negative offsets, and midpoint overflow.
+- [x] **P2 — New discriminating pins** (T1 straddling exactly-once, T2 bloom-padded offset drift,
+      T3 exactly-once partition property over a stride sweep, T4 `getOffset`/boundary/error unit
+      matrix). Expectations derived from real footer metadata, never from the synthetic model.
+- [x] **P3 — Repair the three self-blind tests** that build their windows with the same
+      `4 + Σ compressed_size` model the production code used (`reader.rs` ~3459 / ~4949 / ~5180).
+- [x] **P4 — Mutation proof** M1 (OVERLAP rule) · M2 (synthetic offsets, midpoint rule kept) ·
+      M3/M4 (boundary flips) · M5 (`getOffset` → dict-wins) · M6 control (must stay GREEN).
+- [x] **P5 — Amplifier 4 measured and reported**: annotate the `scan/partition_work.rs`
+      split-size-1024 fixture as NON-discriminating (single row group; no live duplication pin).
+- [x] **P6 — RIDER (h), reported separately**: make
+      `fk5_pos_oracle_sparse_pos_deletes_multi_rg` discriminating (it is green today with
+      `max_row_group_row_count = None`) and mutation-prove it RED.
+- [x] **P7 — Gate + ledger + `[fork]` commit** in one `&&` chain. Interop leg: see ledger
+      §Residue.
+
+---
+
 
 > **Archival log.** Last pass: 2026-07-26 (pass 6 — size trigger, 2,012 lines; run by the RePark
 > workstream under the hub concurrency-protocol claim of the same date) →

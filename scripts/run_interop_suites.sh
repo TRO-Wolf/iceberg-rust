@@ -71,11 +71,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
-# The discovery floor: the number of run-interop-*.sh suites (52 as of 2026-07-25, when
-# run-interop-file-scoped-deletes.sh was added for the path-keyed position-delete routing —
-# the 51st was run-interop-partition-path.sh, for GAP_MATRIX row R161). RATCHET THIS UP when a
-# suite is added (same change); lower it only with a deliberate removal.
-SUITE_FLOOR_DEFAULT=52
+# The discovery floor: the number of run-interop-*.sh suites (53 as of 2026-08-07, when
+# run-interop-ranged-read.sh was added for MIDPOINT row-group selection over a byte-range split —
+# the 52nd was run-interop-file-scoped-deletes.sh, for the path-keyed position-delete routing).
+# RATCHET THIS UP when a suite is added (same change); lower it only with a deliberate removal.
+SUITE_FLOOR_DEFAULT=53
 
 SUITES_DIR_DEFAULT="${REPO_ROOT}/dev/java-interop"
 MVN_DEFAULT="/opt/maven/bin/mvn"

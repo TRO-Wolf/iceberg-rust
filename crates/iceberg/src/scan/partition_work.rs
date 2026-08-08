@@ -612,6 +612,39 @@ mod tests {
         assert!(!union_rows.is_empty(), "readable fixture must yield rows");
     }
 
+    /// U3 annotation (2026-08-07, MEASURED): the pin above is **NOT** coverage for row-group
+    /// byte-range selection, and must not be cited as such.
+    ///
+    /// `write_parquet_data_files` writes 1,024 rows at the default row-group size, producing a
+    /// **single** row group per file. With `with_split_size(1024)` the file tiles into several
+    /// windows, but that one row group lies entirely inside the first window — so the midpoint
+    /// rule and the old overlap rule select the same set, and the "union ≡ `to_arrow`" pin above
+    /// stays green under both. In other words `main` never duplicated rows through this fixture;
+    /// the discriminating pins for that defect live in
+    /// `crate::arrow::reader::tests::test_midpoint_selection_*`.
+    ///
+    /// This test exists to keep that fact measured rather than assumed: if the fixture ever grows
+    /// past one row group it becomes discriminating, and this assertion says so out loud.
+    #[tokio::test]
+    async fn u3_annotation_planning_fixture_is_single_row_group_non_discriminating() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        use crate::scan::tests::TableTestFixture;
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let path = format!("{}/1.parquet", fixture.table_location);
+        let file = std::fs::File::open(&path).expect("open fixture data file");
+        let reader = SerializedFileReader::new(file).expect("read footer");
+        assert_eq!(
+            reader.metadata().num_row_groups(),
+            1,
+            "the planning fixture writes ONE row group per file, so no split boundary can \
+             straddle it — this pin is non-discriminating for midpoint row-group selection"
+        );
+    }
+
     /// Pin 4: T=1 assigns all work to a single partition (legal N=1 form).
     #[tokio::test]
     async fn pin4_t1_single_partition_covers_all() {
