@@ -748,3 +748,39 @@ backup, `cmp`-verified byte-identical; no `git checkout --`. Re-greened at 3163 
 **Disclosure:** these four tests were written by the reviewer, not the Actor. Drop this commit if
 stricter Actor/Critic separation is preferred — the four guards then ship unpinned and the four
 mutants above stay live.
+
+## 17 · Independent review OF the reviewer rider (2026-08-08)
+
+§16 was written by the orchestrating reviewer and had been seen by no independent agent. A fresh
+Critic + Falsifier reviewed exactly `395acff1..04b06d47` and did NOT converge. Their **premise
+verdict was UPHELD** — the Falsifier reproduced the masking mechanic at three commits by reinstalling
+the historic sources (at 3e1c4b6b both guards were genuinely pinned, at 41d2c7a6 both mutants
+SURVIVED at 3159/0), and confirmed each of the four new pins kills its claimed mutant as the SOLE
+killer — but they raised seven items, several landing on the rider's own work. All seven are
+test/doc only: **no production line is changed here either**, in any of the seven.
+
+| # | Sev | Source | What was wrong | Closed by | Mutation → result |
+|---|---|---|---|---|---|
+| P1 | S2 | Falsifier 1 | branch (1c) unpinned against a `_pos`-ONLY projection — both existing (1c) fixtures pair the reserved id with a data column (`[1, _pos]`, `[1, _file]`). Reachable from the PUBLIC builder: `scan().select(["_pos"])` yields `[RESERVED_FIELD_ID_POS]` alone (`scan/mod.rs` `continue`s past metadata names in validation and pushes the reserved id on its own) | `split_of_a_pos_only_projection_is_a_passthrough` | guard → `project_field_ids.len() > 1 && ...contains(&_pos)` → **RED**, sole killer (3165/1) |
+| P2 | S2 | Critic 1 + Falsifier 2 (independent repro) | branch (2)'s `!offsets.is_empty()` conjunct unpinned — `Some(vec![])` makes `is_strictly_ascending(&[])` vacuously true and `split_at_offsets(&[])` return `Ok(vec![])`, which `scan::mod`'s `split_tasks.extend(..)` DROPS: `plan_files` returns the file, `plan_tasks` reads zero rows, nothing errors | `split_empty_offsets_fall_back_to_fixed_size_and_never_drop_the_file` (exact count `== 5`, per the Falsifier — also catches an off-by-one walk) | delete `&& !offsets.is_empty()` → **RED** with `left: 0`, sole killer (3165/1) |
+| P3 | S2 | Critic 2 + Falsifier 8 (grep-confirmed) | the rider's doc on `split_declines_pos_specifically_not_every_metadata_column` asserted `_file`/`_spec_id`/`_partition`/`_deleted` are all "served correctly" over a ranged window. False for three of four: the Parquet path strips every metadata id from the file projection and re-supplies `_file` ONLY; `_spec_id`/`_partition` have no references outside `metadata_columns`, `_deleted` only in `avro_reader` (a format branch 1 declines to split) | doc narrowed to `_file` and made explicit that the other three are NOT a claim this test establishes | n/a (assertion unchanged and its mutation proof stands) |
+| P4 | S3 | Falsifier 4 | `split_of_an_overlong_parent_is_a_passthrough` was the only one of the four rider pins with NO in-test non-vacuity guard — a `split` that declined EVERYTHING satisfied it (demonstrated: under M16 the other three went RED and it stayed GREEN) | the sibling guard added: a whole-file `task(1000, Parquet, None)` must `split(200).len() > 1` | M16 `target.min(remaining)` → `remaining` → **RED** (was GREEN) |
+| P5 | S3 | Falsifier 5 | two reader-level tests named after branches they no longer reach. (a) `test_split_of_a_ranged_task_reads_the_parents_rows_not_the_whole_file` — its fixture trips BOTH (1a) disjuncts, so M03 left it GREEN; (b) `test_whole_file_length_sentinel_survives_split_and_reads_every_row` — its `(0, 0)` fixture over a real file size now returns at (1a), so both sentinel mutants left it GREEN | (a) FIXTURE REPAIRED — a second parent (`start = starts[1]`, `length == file_size_in_bytes`) added, answered by `start != 0` alone, read end-to-end; (b) NOT repairable at reader level — branch (1b) needs `file_size_in_bytes == 0`, and `ArrowFileReader` anchors the footer read at that value so it fails loudly at metadata decode (documented + measured on `filter_row_groups_by_byte_range`); doc amended to name the branch it actually reaches (1a) and to point at the unit test that pins (1b) | (a) M03 drop `self.start != 0` → **RED**, now a second killer alongside the unit pin (3164/2), restoring the pre-cycle-6 two-killer state; (b) doc-only |
+| P6 | S3 | Falsifier 3 | `split_at_offsets`'s `end.saturating_sub(start)` underflow guard unpinned. Reachable only on the LAST offset, when a manifest declares `split_offsets[last] > file_size_in_bytes`. Honest severity: NOT row loss — shipped yields a zero-length trailing window, the mutant a ~2^64 length the byte-range filter's `checked_add` turns into a typed `DataInvalid`. Reported because the sibling hostile-manifest case IS pinned | `split_offsets_running_past_eof_yield_an_empty_trailing_window_not_an_underflow` (`[0, 300, 2000]` over 1000 bytes ⇒ last window `(2000, 0)`) | `saturating_sub` → `wrapping_sub` → **RED**, `left: (2000, 18446744073709550616)`, sole killer (3165/1) |
+| P7 | S3 | Critic 3 + Falsifier 6 | the 2026-08-08 `task/lessons.md` entry overstated two things and its stated rule did not generalise: (a) "would have shipped both" holds for the sentinel but not for the `start != 0` disjunct, which is a mutation of the exact line cycle 6 edited; (b) "two guards it never edited" — cycle 6 rewrote the ENCLOSING condition of one; (c) "re-run the EXISTING mutation catalogue" works verbatim for the sentinel but NOT for the disjunct — grep-verified, `if self.start != 0 {` occurs 1× at 3e1c4b6b and 0× at 41d2c7a6, so under this repo's HARD-FAIL-not-SKIP contract the catalogued mutant exits "target absent", which reads as noise | entry reworded; credit for the all-cycles sweep attributed to the sentinel, the disjunct softened to "a sweep that mutated only the NEW disjunct, or the condition as a whole, would have missed it"; a new DO bullet added: re-DERIVE one mutant PER SUB-EXPRESSION after a widening, and treat an inapplicable catalogued mutant as a SIGNAL | n/a (doc) |
+
+Everything else in the rider was independently confirmed and is left intact: the four pins, their
+mutation proofs, the cycle attributions, both "stayed GREEN at 3159" claims, and the R148 summary
+clause correction.
+
+Gate at this review: `typos` · `cargo fmt --check` · `clippy --all-targets --all-features -D warnings`
+· **lib 3166 passed / 0 failed / 1 ignored** (+3 over the rider's 3163 — P4/P5 add assertions to
+existing tests rather than new ones) · `cargo test -p iceberg --tests` · `iceberg-datafusion
+--all-targets` · `check --workspace --no-default-features` · `make check-matrix-anchors`. Every
+mutant was applied alone by an asserting harness that HARD-FAILS (non-zero, restore first) if its
+target string is absent or non-unique, restored from a `cp` backup and `cmp`-verified byte-identical
+before the next one. **No `git checkout --` at any point** (§14.7).
+
+**Disclosure:** §17 closes findings raised against §16, which the reviewer authored. The Critic and
+Falsifier that produced these seven items were independent and had fresh context; the Actor closing
+them is not. A further independent pass over §17 is the honest next step.

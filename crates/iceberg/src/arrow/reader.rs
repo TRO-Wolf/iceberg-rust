@@ -3783,6 +3783,19 @@ message schema {
     /// `plan_tasks` while `plan_files` still returned it, and the scan read 0 rows with NO error.
     /// The reader accepts the same spelling as whole-file (the byte-range gate below, the `_pos`
     /// guard, `reject_ranged_whole_file_task`), so the two halves must agree.
+    ///
+    /// **Which branch this now reaches: (1a), not (1b).** Cycle 6 widened (1a) to
+    /// `start != 0 || length != file_size_in_bytes`, and this fixture (`0, 0` over a REAL file
+    /// size) trips the second disjunct, so it returns at (1a) and the `length == 0` sentinel is no
+    /// longer what answers it — measured: both sentinel mutants leave this test green. Branch
+    /// (1b)'s only remaining reachable shape is `file_size_in_bytes == 0`, which cannot be built
+    /// here: `ArrowFileReader` anchors the footer read at `file_size_in_bytes`, so an understated
+    /// value fails loudly at metadata decode before any row is read (documented and measured on
+    /// `filter_row_groups_by_byte_range`). (1b) is therefore pinned at the unit level only, by
+    /// `scan::task::tests::split_whole_file_sentinel_on_an_empty_file_is_one_task_not_zero`. What
+    /// this test still pins end-to-end is the observable that matters: a sentinel-spelled task
+    /// survives `split` as one task and reads every row. (Independent review of the reviewer rider,
+    /// 2026-08-08 / Falsifier 5b.)
     #[tokio::test]
     async fn test_whole_file_length_sentinel_survives_split_and_reads_every_row() {
         let tmp = TempDir::new().unwrap();
@@ -3856,6 +3869,12 @@ message schema {
     /// anchored at 0: the products re-read the prefix the parent never owned (ids 0..19 here) and
     /// dropped the tail it did. That is silent CORRUPTION — strictly worse than the `length == 0`
     /// row loss F-1 closed — and it is reachable through the `pub` struct / derived `Deserialize`.
+    ///
+    /// **Which branch each half reaches.** The first parent (`start = starts[1]`,
+    /// `length = file_size - start`) trips BOTH of (1a)'s disjuncts, so it cannot tell them apart;
+    /// the second half below keeps `length == file_size_in_bytes` and is answered by
+    /// `start != 0` ALONE. Both halves are needed — the first is the honest end-to-end geometry,
+    /// the second is the discriminating one.
     #[tokio::test]
     async fn test_split_of_a_ranged_task_reads_the_parents_rows_not_the_whole_file() {
         let tmp = TempDir::new().unwrap();
@@ -3929,6 +3948,54 @@ message schema {
             union, parent_ids,
             "the split of a ranged parent must read EXACTLY the parent's rows; reading the whole \
              file here means the window was relocated to offset 0"
+        );
+
+        // ---- the `start != 0` disjunct, ON ITS OWN ----
+        //
+        // The fixture above trips BOTH disjuncts of (1a) (`start != 0` AND `length != file_size`),
+        // so dropping `self.start != 0` leaves it green — measured. This second parent keeps
+        // `length == file_size_in_bytes` and moves only the left edge, the one shape the
+        // `length != file_size` disjunct cannot see, so it is `start != 0` alone that must answer.
+        // (Independent review of the reviewer rider, 2026-08-08 / Falsifier 5a.)
+        let relocated = midpoint_scan_task(&path, schema.clone(), start, file_size);
+        let sub_tasks = relocated.split(target).expect("relocated split");
+        assert_eq!(
+            sub_tasks.len(),
+            1,
+            "a parent whose left edge moved must pass through split as ONE task even when its \
+             length still equals the file size"
+        );
+        assert_eq!(
+            (sub_tasks[0].start, sub_tasks[0].length),
+            (start, file_size),
+            "the passthrough must keep the parent's own window; re-splitting relocates it to 0"
+        );
+
+        let mut relocated_union: Vec<i32> = Vec::new();
+        for sub_task in sub_tasks {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let batches = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(sub_task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("relocated sub-task read");
+            for batch in &batches {
+                relocated_union.extend(
+                    batch
+                        .column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        relocated_union.sort_unstable();
+        assert_eq!(
+            relocated_union, parent_ids,
+            "a window anchored at `starts[1]` covers the last two row groups' midpoints however \
+             far past EOF it runs; splitting it would re-read the prefix the parent never owned"
         );
     }
 

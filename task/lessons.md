@@ -851,7 +851,9 @@ move. `cargo test`, clippy, CI and a full gate all report a healthier tree than 
 loss is in what the tests REACH, not in what they assert.
 
 U3 cycle 6 widened `FileScanTask::split`'s branch (1a) from `self.start != 0` to
-`self.start != 0 || self.length != self.file_size_in_bytes`, and de-pinned two guards it never edited:
+`self.start != 0 || self.length != self.file_size_in_bytes`, and de-pinned two guards whose own
+conditions it did not change (one of them — the `start != 0` disjunct — survives verbatim INSIDE the
+condition cycle 6 rewrote; the other is a separate branch further down the chain):
 
 - the cycle-5 `self.start != 0` disjunct — every ranged fixture also trips the new disjunct, so dropping
   the old one stayed GREEN while `start = 600, length = 1000, file_size = 1000` still produced three
@@ -860,11 +862,26 @@ U3 cycle 6 widened `FileScanTask::split`'s branch (1a) from `self.start != 0` to
   returns at (1a), leaving (1b)'s only reachable shape (`file_size_in_bytes == 0`) untested, so
   corrupting the sentinel condition left the suite green.
 
-Both were caught only because that cycle's Falsifier was told to re-sweep mutants over code shipped in
-ALL cycles. The natural scoping — "attack this cycle's delta" — would have shipped both.
+The SENTINEL was caught only because that cycle's Falsifier was told to re-sweep mutants over code
+shipped in ALL cycles: (1b) is a different branch, on a line cycle 6 never touched, so the natural
+scoping — "attack this cycle's delta" — would have shipped it. The `start != 0` disjunct is a weaker
+claim, and worth stating precisely: it lives INSIDE the line cycle 6 edited, so a delta-scoped
+Falsifier could plausibly have found it — but only by mutating each disjunct of the new condition
+INDEPENDENTLY. A sweep that mutated only the NEW disjunct, or the condition as a whole, would have
+missed it.
 
 - **DO re-run the EXISTING mutation catalogue after any change to an early-return chain**, not just
   mutants for the new code. New-code mutants cannot see this class by construction.
+- **DO re-DERIVE the mutant per SUB-EXPRESSION after a widening — one mutant per disjunct/conjunct,
+  each dropped on its own — and treat a catalogued mutant whose target string NO LONGER OCCURS as a
+  SIGNAL, never as a pass.** Re-running the catalogue verbatim is necessary but not sufficient: it
+  works for a guard the widening left alone (cycle 4's target `if self.length == 0 {` still occurs
+  exactly once at cycle 6 and at HEAD, so a verbatim re-run reports SURVIVED and the gap is caught),
+  and it FAILS for a guard the widening rewrote (cycle 5's target `if self.start != 0 {` occurs once
+  at 3e1c4b6b and ZERO times at 41d2c7a6 — all grep-verified). Under this repo's harness contract a
+  sabotage step that cannot be applied must HARD-FAIL, so that mutant exits "target absent", which
+  reads just as naturally as "retire this stale mutant" as it does as "the guard moved, re-derive it".
+  Say which: it is always the second.
 - **DO ask, for each guard above the one you widened *and each guard below it*: which test still
   REACHES this branch?** If the answer is "the one named after it", verify it — the name outlives the
   reachability.

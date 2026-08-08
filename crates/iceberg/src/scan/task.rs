@@ -1239,6 +1239,46 @@ mod tests {
         }
     }
 
+    /// Branch (1c) must fire on a projection that is `_pos` and NOTHING ELSE — the shape both other
+    /// (1c) fixtures miss, because each pairs the metadata id with a data column
+    /// (`[1, _pos]` above, `[1, _file]` below). A guard narrowed to
+    /// `project_field_ids.len() > 1 && ...contains(&_pos)` therefore survives the whole suite.
+    ///
+    /// The shape is reachable from the PUBLIC builder, not merely through the `pub` struct:
+    /// `TableScan`'s column validation `continue`s past metadata-column names without requiring a
+    /// data column alongside them, and the field-id loop then pushes the reserved id on its own, so
+    /// `scan().select(["_pos"])` plans tasks whose `project_field_ids` is exactly
+    /// `[RESERVED_FIELD_ID_POS]` (`scan/mod.rs`, the `is_metadata_column_name` arms). Under the
+    /// narrowed guard such a task is SPLIT and `arrow::reader`'s `_pos` guard then rejects every
+    /// sub-task with a typed `FeatureUnsupported` — the total-outage class (1c) exists to prevent.
+    /// (Independent review of the reviewer rider, 2026-08-08 / Falsifier 1.)
+    #[test]
+    fn split_of_a_pos_only_projection_is_a_passthrough() {
+        // Non-vacuity: the same geometry with a lone DATA column really does split.
+        let plain = task(1000, DataFileFormat::Parquet, None);
+        assert!(
+            plain.split(200).expect("plain split ok").len() > 1,
+            "fixture is non-discriminating: a 1000-byte file must split at target 200"
+        );
+
+        let mut pos_only = task(1000, DataFileFormat::Parquet, None);
+        pos_only.project_field_ids = Arc::from(vec![RESERVED_FIELD_ID_POS]);
+
+        let parts = pos_only.split(200).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            1,
+            "a projection of `_pos` ALONE must pass through split as ONE task; a guard that also \
+             demanded a second projected column would split it and the reader would then reject \
+             every sub-task"
+        );
+        assert_eq!(
+            (parts[0].start, parts[0].length),
+            (0, 1000),
+            "the passthrough must keep the whole-file spelling the `_pos` reader accepts"
+        );
+    }
+
     /// Branch (1a)'s `self.start != 0` disjunct must hold on its OWN, at the one shape the
     /// `length != file_size_in_bytes` disjunct cannot see: a relocated left edge whose length still
     /// spans the file (`start = 600`, `length = 1000`, `file_size_in_bytes = 1000`).
@@ -1315,6 +1355,15 @@ mod tests {
     /// windows past EOF. (Reviewer rider, 2026-08-08 / Falsifier F3b.)
     #[test]
     fn split_of_an_overlong_parent_is_a_passthrough() {
+        // Non-vacuity: without it, a `split` that declined EVERYTHING would satisfy the assertions
+        // below. (Measured: under a `target.min(remaining)` → `remaining` mutant this test alone of
+        // the rider's four stayed green.) Independent review of the rider, 2026-08-08 / Falsifier 4.
+        let sized = task(1000, DataFileFormat::Parquet, None);
+        assert!(
+            sized.split(200).expect("sized split ok").len() > 1,
+            "fixture is non-discriminating: a 1000-byte file must split at target 200"
+        );
+
         let mut overlong = task(1000, DataFileFormat::Parquet, None);
         overlong.length = 1500; // file_size_in_bytes stays 1000
 
@@ -1327,11 +1376,20 @@ mod tests {
         assert_eq!((parts[0].start, parts[0].length), (0, 1500));
     }
 
-    /// Branch (1c) declines `_pos` SPECIFICALLY, not metadata columns in general. `_file`,
-    /// `_spec_id`, `_partition` and `_deleted` are constant-per-file or constant-per-task values
-    /// the ranged reader serves correctly, so declining to split them would cost parallelism for
-    /// nothing. Without this pin, widening the guard to "any metadata field" is invisible.
-    /// (Reviewer rider, 2026-08-08 / Falsifier F3a.)
+    /// Branch (1c) declines `_pos` SPECIFICALLY, not metadata columns in general.
+    ///
+    /// The justification is checked for the one column this test exercises: on the Parquet path
+    /// `process_parquet_file_scan_task` strips every metadata field id out of the file projection
+    /// and then re-supplies `_file` as a per-FILE constant, so a byte window serves it exactly as
+    /// the whole file does — declining to split for `_file` would cost parallelism for nothing.
+    /// `_pos` is the one metadata column whose value depends on the window, because its ordinals
+    /// are counted from zero over the whole file. No claim is made here about `_spec_id`,
+    /// `_partition` or `_deleted`: they are not served on this path at all (the first two have no
+    /// references outside `metadata_columns`, and `_deleted` only in `arrow::avro_reader`, a format
+    /// branch (1) declines to split), so "splitting is safe for them" is not a fact this test
+    /// establishes. Without this pin, widening the guard to "any metadata field" is invisible.
+    /// (Reviewer rider, 2026-08-08 / Falsifier F3a; justification corrected by the independent
+    /// review of that rider, 2026-08-08 / Critic 2 + Falsifier 8.)
     #[test]
     fn split_declines_pos_specifically_not_every_metadata_column() {
         let mut file_col = task(1000, DataFileFormat::Parquet, None);
@@ -1433,6 +1491,62 @@ mod tests {
             err.to_string()
                 .contains("split offset must be non-negative"),
             "the error must name the offending offset, got: {err}"
+        );
+    }
+
+    /// The sibling hostile-manifest case: a strictly-ascending offsets vector whose LAST entry runs
+    /// PAST the end of the file. `split_at_offsets` derives the last window's length as
+    /// `self.length - offsets[last]`, which underflows `u64` there; the `saturating_sub` makes it a
+    /// zero-length trailing window that selects nothing, where a `wrapping_sub` would hand the
+    /// reader a ~2^64 length (turned into a typed `DataInvalid` by the row-group byte-range filter's
+    /// `checked_add`, so the consequence is a spurious error, not row loss).
+    ///
+    /// Strict ascent guarantees `end > start` for every EARLIER window, so this last offset is the
+    /// guard's only reachable shape. (Independent review of the reviewer rider, 2026-08-08 /
+    /// Falsifier 3.)
+    #[test]
+    fn split_offsets_running_past_eof_yield_an_empty_trailing_window_not_an_underflow() {
+        let t = task(1000, DataFileFormat::Parquet, Some(vec![0, 300, 2000]));
+        let parts = t.split(100).expect("split ok");
+        let windows: Vec<(u64, u64)> = parts.iter().map(|p| (p.start, p.length)).collect();
+        assert_eq!(
+            windows,
+            vec![(0, 300), (300, 1700), (2000, 0)],
+            "the past-EOF trailing offset must saturate to a ZERO-length window; wrapping would \
+             give it a ~2^64 length"
+        );
+    }
+
+    /// An EMPTY offsets vector must fall through to the fixed-size walk, not into the offsets-aware
+    /// branch — that is what `split`'s `!offsets.is_empty()` conjunct buys, and it is the same
+    /// silent-total-row-loss class branch (1b) exists for.
+    ///
+    /// Without the conjunct: `is_strictly_ascending(&[])` is vacuously true (`[].windows(2).all(..)`),
+    /// `split_at_offsets(&[])` loops zero times and returns `Ok(vec![])`, and `scan::mod`'s
+    /// `split_tasks.extend(task.split(split_size)?)` then DROPS the file — `plan_files` returns it,
+    /// `plan_tasks` reads ZERO rows from it, and nothing errors anywhere. (Measured under that
+    /// mutant: this assertion fails with `left: 0`.)
+    ///
+    /// The shape is reachable from a manifest rather than only through the `pub` struct:
+    /// `split_offsets` is an `Option<Vec<i64>>` decoded from an Avro array, and an empty Avro array
+    /// decodes to `Some(vec![])` — the in-tree manifest-read fixture in `spec::manifest` decodes a
+    /// sibling list field to `Some(Vec::new())`, proving empty lists survive this decoder as `Some`.
+    /// (Independent review of the reviewer rider, 2026-08-08 / Critic 1 + Falsifier 2.)
+    #[test]
+    fn split_empty_offsets_fall_back_to_fixed_size_and_never_drop_the_file() {
+        let t = task(1000, DataFileFormat::Parquet, Some(vec![]));
+        let parts = t.split(200).expect("split ok");
+        assert_eq!(
+            parts.len(),
+            5,
+            "empty offsets must take the FIXED-SIZE branch — the offsets-aware branch returns an \
+             empty Vec, which drops the file out of `plan_tasks` with no error at all"
+        );
+        let windows: Vec<(u64, u64)> = parts.iter().map(|p| (p.start, p.length)).collect();
+        assert_eq!(
+            windows,
+            vec![(0, 200), (200, 200), (400, 200), (600, 200), (800, 200)],
+            "the fallback must tile the whole file at the target size"
         );
     }
 
