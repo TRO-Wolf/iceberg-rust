@@ -90,6 +90,26 @@ V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, 
       `crates/iceberg/src/transaction/update_schema.rs`, and affected `map.md`/adjacent tests. Return
       typed errors for short metadata and impose tested traversal limits. Unit gate → independent
       Critic → recorded disposition.
+      **R2 correction 2026-08-09, supersedes the predicate half of the G2 first pass (`de3961da`):**
+      an independent review filed S2s showing that pass had made the predicate recursion *worse*
+      than main. Remediated in this commit:
+      (a) making `predicate_visitor::visit` / `bound_predicate_visitor::visit` fallible turned the
+      two pre-existing `.expect("RewriteNotVisitor guarantees always success")` calls into a LIVE
+      PANIC reachable from `TableScanBuilder::with_filter`. `Predicate::rewrite_not`,
+      `BoundPredicate::rewrite_not`, both `negate`s and both `Display` impls are now
+      explicit-stack walks that neither recurse nor panic; `rewrite_not` no longer routes through
+      the depth-limited visitor at all, so the typed depth error surfaces at `bind()` where a
+      caller can handle it. The unbound `PredicateVisitor` and `RewriteNotVisitor` lost their last
+      production callers and are `#[cfg(test)]`-retained as the differential oracle.
+      (b) `MAX_PREDICATE_DEPTH` was 100 — copied from the JSON parser and BELOW what this crate's
+      own read path builds, so ~102 equality-delete files or 102 pushed-down conjuncts turned a
+      Java-readable table into a scan failure. It is now 1000, re-derived from a MEASURED
+      per-level stack cost (bisect against a known `stack_size`) sized for a 2 MiB tokio worker;
+      the measurement, the arithmetic and the dev-profile caveat are in the constant's doc
+      comment, and splitting the leaf arms out of the recursive `bind`/`visit` bodies halved the
+      per-level cost that number rests on.
+      STILL OPEN from the first pass: `assign_fresh_ids` is unbounded. NEW residue: the derived
+      `Drop`/`Clone`/`PartialEq` glue on `Predicate`/`BoundPredicate` still recurses.
 - [ ] **G3 — DataFusion namespaces (C-004, C-007).** In scope:
       `crates/integrations/datafusion/src/catalog.rs` and adjacent tests. Preserve full namespace
       identity, cover nesting/collisions/failures, and do not broaden DataFusion API scope. Unit gate
