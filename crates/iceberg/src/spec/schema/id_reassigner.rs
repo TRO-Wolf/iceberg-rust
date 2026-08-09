@@ -170,6 +170,53 @@ impl ReassignFieldIds {
 /// `reassignOrRefreshIds` "continue from the source's highest id" flow.
 pub type NextId<'a> = dyn FnMut() -> Result<i32> + 'a;
 
+/// Maximum type-nesting depth the raw-`Type` entry points of the assign-ids family will descend
+/// before returning a typed error instead of overflowing the thread stack.
+///
+/// **Why this recursion needs a bound at all.** Everything in this module that takes a [`Schema`]
+/// is already bounded by construction: a `Schema` can only be produced by `SchemaBuilder::build`,
+/// which runs `index_by_id` → `visit_struct` → the depth-checked `visit_type_at_depth`, so a type
+/// nested deeper than `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH` never reaches a `Schema`
+/// value. [`assign_fresh_ids`] and [`assign_ids`] are the exceptions — they take a **caller-supplied
+/// `Type`** that no builder has validated. `UpdateSchemaAction::add_column(name, field_type)` hands
+/// its argument straight through `SchemaEvolution::add_column` into [`assign_fresh_ids`], so a
+/// hostile or machine-generated `Type` reaches this recursion with nothing standing in front of it.
+///
+/// **Why `128`.** It keeps this door in lockstep with the rest of the crate's nesting bounds —
+/// `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH`, `avro::schema`'s `MAX_AVRO_SCHEMA_DEPTH`,
+/// `arrow::schema`'s `MAX_ARROW_SCHEMA_NESTING_DEPTH` and [`crate::variant::MAX_NESTING_DEPTH`] are
+/// all `128`. The depth convention is the schema visitor's too (the type handed in is depth `0`;
+/// each nested field / element / key / value recurses at `depth + 1`), which makes this bound
+/// strictly *looser* than the check the rebuilt schema will face: the added column's own field
+/// occupies one level, so `SchemaBuilder::build` rejects at 128 struct levels where this rejects at
+/// 129. The bound therefore can never be the thing that refuses an otherwise-legal column — it only
+/// converts a stack overflow into an error.
+///
+/// **A deliberate, documented divergence from Java, in the safe direction.** Java does NOT bound
+/// this. In `iceberg-api` 1.10.0, `TypeUtil.assignFreshIds(Type, NextID)` is
+/// `visit(type, new AssignFreshIds(nextId))` (bytecode offset 9), and
+/// `TypeUtil.visit(Type, CustomOrderSchemaVisitor)` is a bare `tableswitch` (offset 13, arms at
+/// 56/147/178/222/233) whose children are `VisitFuture` / `VisitFieldFuture` suppliers that call
+/// `TypeUtil.visit` again (`VisitFuture.get`, offset 8) — there is no depth counter anywhere on the
+/// path. Running it against those jars confirms the consequence: a struct chain 4096 levels deep
+/// through `TypeUtil.assignFreshIds` raises `StackOverflowError` on a 512 KiB thread, 200000 levels
+/// overflows even an 8 MiB thread, and 128/129 levels succeed. Java crashes the thread; we return a
+/// typed [`ErrorKind::DataInvalid`]. That is a divergence, not a parity break — it changes behavior
+/// only for inputs on which Java has no defined behavior at all.
+const MAX_ASSIGN_IDS_NESTING_DEPTH: usize = 128;
+
+/// The typed refusal raised when a caller-supplied `Type` nests deeper than
+/// [`MAX_ASSIGN_IDS_NESTING_DEPTH`]. Worded like the schema visitor's own depth error (and tagged
+/// with this door) so the two are greppable together.
+fn nesting_depth_exceeded() -> Error {
+    Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "Schema type nesting exceeds maximum depth {MAX_ASSIGN_IDS_NESTING_DEPTH} while assigning field ids"
+        ),
+    )
+}
+
 // =====================================================================================
 // assign-ids family — `TypeUtil.assignFreshIds` / `assignIds` / `assignIncreasingFreshIds`.
 //
@@ -185,18 +232,38 @@ pub type NextId<'a> = dyn FnMut() -> Result<i32> + 'a;
 /// This is the Rust port of `TypeUtil.assignFreshIds(Type, NextID)` (the no-base-schema overload,
 /// whose `idFor` always falls through to `nextId.get()`). A primitive — and `variant`, which Java
 /// 1.10.0 `AssignFreshIds.variant` returns unchanged — carries no ids and passes through.
+///
+/// `field_type` is caller-supplied and unvalidated (see [`MAX_ASSIGN_IDS_NESTING_DEPTH`]), so the
+/// walk is depth-bounded: nesting beyond that limit returns a typed error rather than overflowing
+/// the thread stack.
 pub fn assign_fresh_ids(field_type: &Type, next_id: &mut NextId<'_>) -> Result<Type> {
+    assign_fresh_ids_at_depth(field_type, next_id, 0)
+}
+
+/// Depth-bounded body of [`assign_fresh_ids`]. `depth` is the current nesting level (the type
+/// handed to the public entry point is `0`); each nested field / element / key / value recurses at
+/// `depth + 1`, matching `spec::schema::visitor`'s convention exactly.
+fn assign_fresh_ids_at_depth(
+    field_type: &Type,
+    next_id: &mut NextId<'_>,
+    depth: usize,
+) -> Result<Type> {
+    if depth > MAX_ASSIGN_IDS_NESTING_DEPTH {
+        return Err(nesting_depth_exceeded());
+    }
     match field_type {
         Type::Primitive(p) => Ok(Type::Primitive(p.clone())),
         Type::Variant => Ok(Type::Variant),
-        Type::Struct(s) => Ok(Type::Struct(assign_fresh_ids_to_fields(
+        Type::Struct(s) => Ok(Type::Struct(assign_fresh_ids_to_fields_at_depth(
             s.fields(),
             next_id,
+            depth,
         )?)),
         Type::List(l) => {
             // Level-order: the element id is the list's single immediate id; assign it first.
             let element_id = next_id()?;
-            let element_type = assign_fresh_ids(&l.element_field.field_type, next_id)?;
+            let element_type =
+                assign_fresh_ids_at_depth(&l.element_field.field_type, next_id, depth + 1)?;
             Ok(Type::List(ListType::new(Arc::new(
                 NestedField::list_element(element_id, element_type, l.element_field.required),
             ))))
@@ -205,8 +272,9 @@ pub fn assign_fresh_ids(field_type: &Type, next_id: &mut NextId<'_>) -> Result<T
             // Level-order: assign key id THEN value id (both immediate) before recursing either.
             let key_id = next_id()?;
             let value_id = next_id()?;
-            let key_type = assign_fresh_ids(&m.key_field.field_type, next_id)?;
-            let value_type = assign_fresh_ids(&m.value_field.field_type, next_id)?;
+            let key_type = assign_fresh_ids_at_depth(&m.key_field.field_type, next_id, depth + 1)?;
+            let value_type =
+                assign_fresh_ids_at_depth(&m.value_field.field_type, next_id, depth + 1)?;
             Ok(Type::Map(MapType::new(
                 Arc::new(NestedField::map_key_element(key_id, key_type)),
                 Arc::new(NestedField::map_value_element(
@@ -222,9 +290,27 @@ pub fn assign_fresh_ids(field_type: &Type, next_id: &mut NextId<'_>) -> Result<T
 /// The struct body of [`assign_fresh_ids`]: assign fresh ids for ALL immediate fields first (pass
 /// 1, level-order), then recurse into each field's type (pass 2). Doc and default attributes are
 /// preserved (Java rebuilds with `NestedField.from(field).withId(id).ofType(type)`).
+///
+/// Entered at depth `0` — the only caller that starts here is [`assign_fresh_ids_to_schema`], whose
+/// `Schema` argument is already builder-validated; the unvalidated raw-`Type` route arrives through
+/// [`assign_fresh_ids_at_depth`] carrying its running depth.
 fn assign_fresh_ids_to_fields(
     fields: &[NestedFieldRef],
     next_id: &mut NextId<'_>,
+) -> Result<StructType> {
+    assign_fresh_ids_to_fields_at_depth(fields, next_id, 0)
+}
+
+/// Depth-carrying body of [`assign_fresh_ids_to_fields`]; `depth` is the enclosing STRUCT's level,
+/// so each field's type is visited at `depth + 1` (the schema visitor's convention).
+///
+/// No depth check of its own: this function never recurses directly, and every path back into the
+/// recursion goes through [`assign_fresh_ids_at_depth`], which owns the single bound. A second
+/// check here would be unreachable duplicate logic that no test could kill.
+fn assign_fresh_ids_to_fields_at_depth(
+    fields: &[NestedFieldRef],
+    next_id: &mut NextId<'_>,
+    depth: usize,
 ) -> Result<StructType> {
     let new_ids = fields
         .iter()
@@ -232,7 +318,7 @@ fn assign_fresh_ids_to_fields(
         .collect::<Result<Vec<_>>>()?;
     let mut new_fields = Vec::with_capacity(fields.len());
     for (field, new_id) in fields.iter().zip(new_ids) {
-        let new_type = assign_fresh_ids(&field.field_type, next_id)?;
+        let new_type = assign_fresh_ids_at_depth(&field.field_type, next_id, depth + 1)?;
         let mut rebuilt = NestedField::new(new_id, field.name.clone(), new_type, field.required);
         rebuilt.doc = field.doc.clone();
         rebuilt.initial_default = field.initial_default.clone();
@@ -361,6 +447,11 @@ fn assign_fresh_ids_with_base_struct(
 /// Recurse [`assign_fresh_ids_with_base_struct`] into a nested type. Element/key/value ids reuse the
 /// base id of the same-named element/key/value (Java's `list`/`map` call `idFor(name(elementId))`
 /// etc.), else pull fresh.
+///
+/// Not depth-bounded, and deliberately so: unlike [`assign_fresh_ids`] this walk is only reachable
+/// from [`assign_fresh_ids_with_base`], whose inputs are `Schema` values, and a `Schema` cannot
+/// exist with nesting beyond `MAX_SCHEMA_NESTING_DEPTH` (`SchemaBuilder::build` runs `index_by_id`
+/// → the depth-checked visitor first). See [`MAX_ASSIGN_IDS_NESTING_DEPTH`] for the rule.
 fn assign_fresh_ids_with_base_type(
     field_type: &Type,
     visiting: &Schema,
@@ -414,7 +505,24 @@ fn assign_fresh_ids_with_base_type(
 /// `TypeUtil.assignIds(Type, GetID)`: unlike [`assign_fresh_ids`], the structure is preserved and
 /// EVERY id (including list element / map key+value) is rewritten by the caller-supplied function.
 /// A missing mapping is the caller's contract to handle (the closure returns the id to use).
+///
+/// Like [`assign_fresh_ids`], this takes a caller-supplied, unvalidated `Type`, so the walk is
+/// depth-bounded by [`MAX_ASSIGN_IDS_NESTING_DEPTH`] (Java's `TypeUtil.assignIds` is unbounded and
+/// `StackOverflowError`s — see that constant's doc for the bytecode and the measured divergence).
 pub fn assign_ids(field_type: &Type, get_id: &mut dyn FnMut(i32) -> i32) -> Result<Type> {
+    assign_ids_at_depth(field_type, get_id, 0)
+}
+
+/// Depth-bounded body of [`assign_ids`]; `depth` follows the same convention as
+/// [`assign_fresh_ids_at_depth`].
+fn assign_ids_at_depth(
+    field_type: &Type,
+    get_id: &mut dyn FnMut(i32) -> i32,
+    depth: usize,
+) -> Result<Type> {
+    if depth > MAX_ASSIGN_IDS_NESTING_DEPTH {
+        return Err(nesting_depth_exceeded());
+    }
     match field_type {
         Type::Primitive(p) => Ok(Type::Primitive(p.clone())),
         Type::Variant => Ok(Type::Variant),
@@ -422,7 +530,7 @@ pub fn assign_ids(field_type: &Type, get_id: &mut dyn FnMut(i32) -> i32) -> Resu
             let mut new_fields = Vec::with_capacity(s.fields().len());
             for field in s.fields() {
                 let new_id = get_id(field.id);
-                let new_type = assign_ids(&field.field_type, get_id)?;
+                let new_type = assign_ids_at_depth(&field.field_type, get_id, depth + 1)?;
                 let mut rebuilt =
                     NestedField::new(new_id, field.name.clone(), new_type, field.required);
                 rebuilt.doc = field.doc.clone();
@@ -434,7 +542,7 @@ pub fn assign_ids(field_type: &Type, get_id: &mut dyn FnMut(i32) -> i32) -> Resu
         }
         Type::List(l) => {
             let element_id = get_id(l.element_field.id);
-            let element_type = assign_ids(&l.element_field.field_type, get_id)?;
+            let element_type = assign_ids_at_depth(&l.element_field.field_type, get_id, depth + 1)?;
             Ok(Type::List(ListType::new(Arc::new(
                 NestedField::list_element(element_id, element_type, l.element_field.required),
             ))))
@@ -442,8 +550,8 @@ pub fn assign_ids(field_type: &Type, get_id: &mut dyn FnMut(i32) -> i32) -> Resu
         Type::Map(m) => {
             let key_id = get_id(m.key_field.id);
             let value_id = get_id(m.value_field.id);
-            let key_type = assign_ids(&m.key_field.field_type, get_id)?;
-            let value_type = assign_ids(&m.value_field.field_type, get_id)?;
+            let key_type = assign_ids_at_depth(&m.key_field.field_type, get_id, depth + 1)?;
+            let value_type = assign_ids_at_depth(&m.value_field.field_type, get_id, depth + 1)?;
             Ok(Type::Map(MapType::new(
                 Arc::new(NestedField::map_key_element(key_id, key_type)),
                 Arc::new(NestedField::map_value_element(
@@ -1574,5 +1682,153 @@ mod tests {
             "message was: {}",
             err.message()
         );
+    }
+
+    // ===== recursion safety: the caller-supplied raw `Type` doors =====
+
+    /// A chain of `depth` nested single-field structs wrapping a boolean leaf, built iteratively so
+    /// the FIXTURE never recurses. Ids are arbitrary — the assign-ids family replaces them. This is
+    /// the exact shape a caller can hand to the public `UpdateSchemaAction::add_column`.
+    fn deeply_nested_struct_type(depth: usize) -> Type {
+        let mut field_type = Type::Primitive(PrimitiveType::Boolean);
+        for level in (1..=depth).rev() {
+            let id = i32::try_from(level).expect("test depth fits i32");
+            field_type = Type::Struct(StructType::new(vec![
+                NestedField::optional(id, "nested", field_type).into(),
+            ]));
+        }
+        field_type
+    }
+
+    /// Run `call` on a thread with a KNOWN, deliberately bounded stack, handing `field_type` in and
+    /// back out so the deep fixture's RECURSIVE DROP happens on the harness's own stack rather than
+    /// this one (dropping it inside would overflow for reasons unrelated to what is under test).
+    ///
+    /// 3 MiB is chosen from a measurement, not a guess. Bisecting `stack_size` in the **dev**
+    /// profile (the profile with the fattest frames — every temporary gets its own slot) against a
+    /// struct chain: the DEPTH-BOUNDED walk, which unwinds after
+    /// `MAX_ASSIGN_IDS_NESTING_DEPTH + 1 = 129` levels, overflows at 1152 KiB and succeeds at
+    /// 1280 KiB, i.e. it needs ≈1.25 MiB (≈9.7 KiB per nesting level, two frames each). The 4096
+    /// levels these tests feed in would need ≈40 MiB unbounded. 3 MiB therefore sits ~2.4× above
+    /// what the fixed code needs and ~13× below what the unbounded code needs: removing the guard
+    /// turns these tests into a hard `fatal runtime error: stack overflow` abort.
+    fn on_bounded_stack(field_type: Type, call: fn(&Type) -> Result<Type>) -> (Type, Result<Type>) {
+        std::thread::Builder::new()
+            .name("assign-ids-bounded-stack".to_string())
+            .stack_size(3 * 1024 * 1024)
+            .spawn(move || {
+                let result = call(&field_type);
+                (field_type, result)
+            })
+            .expect("spawn the bounded-stack assign-ids thread")
+            .join()
+            .expect("assigning ids must not overflow or panic")
+    }
+
+    fn increasing_from_one(field_type: &Type) -> Result<Type> {
+        let counter = Cell::new(0_i32);
+        let mut next = || -> Result<i32> {
+            let n = counter.get() + 1;
+            counter.set(n);
+            Ok(n)
+        };
+        assign_fresh_ids(field_type, &mut next)
+    }
+
+    fn identity_remap(field_type: &Type) -> Result<Type> {
+        let mut get_id = |old: i32| old;
+        assign_ids(field_type, &mut get_id)
+    }
+
+    /// Assert a depth refusal, whatever produced it.
+    fn assert_depth_error(error: &Error) {
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains(
+                "Schema type nesting exceeds maximum depth 128 while assigning field ids"
+            ),
+            "message was: {}",
+            error.message()
+        );
+    }
+
+    // RISK (the reachable hazard): `assign_fresh_ids` receives a CALLER-SUPPLIED `Type` — the
+    // argument of the public `UpdateSchemaAction::add_column` — that no `SchemaBuilder` has ever
+    // validated. Unbounded, a hostile struct chain overflows the thread stack (Java does exactly
+    // that; see `MAX_ASSIGN_IDS_NESTING_DEPTH`). Catches: deleting the
+    // `depth > MAX_ASSIGN_IDS_NESTING_DEPTH` guard from `assign_fresh_ids_at_depth` — the bounded
+    // stack then aborts the process instead of returning.
+    #[test]
+    fn assign_fresh_ids_rejects_hostile_nesting_instead_of_overflowing() {
+        let (deep, result) = on_bounded_stack(deeply_nested_struct_type(4096), increasing_from_one);
+        let error = result.expect_err("a 4096-deep struct chain must be rejected");
+
+        assert_depth_error(&error);
+        drop(deep);
+    }
+
+    // RISK: `assign_ids` is the second public raw-`Type` door and must carry the same bound.
+    // Catches: deleting the guard from `assign_ids_at_depth`.
+    #[test]
+    fn assign_ids_rejects_hostile_nesting_instead_of_overflowing() {
+        let (deep, result) = on_bounded_stack(deeply_nested_struct_type(4096), identity_remap);
+        let error = result.expect_err("a 4096-deep struct chain must be rejected");
+
+        assert_depth_error(&error);
+        drop(deep);
+    }
+
+    // RISK: the bound must sit at EXACTLY `MAX_ASSIGN_IDS_NESTING_DEPTH` under the schema visitor's
+    // depth convention (the handed-in type is depth 0, each nested field/element/key/value is
+    // depth + 1), so it can never refuse a column `SchemaBuilder::build` would have accepted.
+    // Catches an off-by-one in either direction (`>=` for `>`, or passing `depth + 1` into
+    // `assign_fresh_ids_to_fields_at_depth`) and a changed constant.
+    #[test]
+    fn assign_fresh_ids_depth_bound_is_exactly_the_family_constant() {
+        assert_eq!(
+            MAX_ASSIGN_IDS_NESTING_DEPTH, 128,
+            "the bound must stay in lockstep with MAX_SCHEMA_NESTING_DEPTH / \
+             MAX_AVRO_SCHEMA_DEPTH / MAX_ARROW_SCHEMA_NESTING_DEPTH / MAX_NESTING_DEPTH"
+        );
+
+        let at_bound = deeply_nested_struct_type(MAX_ASSIGN_IDS_NESTING_DEPTH);
+        let fresh = increasing_from_one(&at_bound)
+            .expect("nesting exactly at the bound must still be assigned");
+        let Type::Struct(outer) = fresh else {
+            panic!("expected the outermost struct back")
+        };
+        assert_eq!(outer.fields()[0].id, 1, "ids are still assigned normally");
+
+        let over_bound = deeply_nested_struct_type(MAX_ASSIGN_IDS_NESTING_DEPTH + 1);
+        let error =
+            increasing_from_one(&over_bound).expect_err("one level past the bound is rejected");
+        assert_depth_error(&error);
+    }
+
+    // RISK: the bound must count LIST and MAP nesting too — a chain built only from containers
+    // reaches the same recursion through different match arms. Catches dropping the `depth + 1` on
+    // the list-element or the map key/value recursions, which would leave those arms unbounded.
+    #[test]
+    fn assign_fresh_ids_bounds_list_and_map_nesting_too() {
+        let mut list_chain = Type::Primitive(PrimitiveType::Boolean);
+        for level in (1..=(MAX_ASSIGN_IDS_NESTING_DEPTH + 1)).rev() {
+            let id = i32::try_from(level).expect("test depth fits i32");
+            list_chain = Type::List(ListType::new(
+                NestedField::list_element(id, list_chain, false).into(),
+            ));
+        }
+        let error = increasing_from_one(&list_chain).expect_err("deep list chain must be rejected");
+        assert_depth_error(&error);
+
+        let mut map_chain = Type::Primitive(PrimitiveType::Boolean);
+        for level in (1..=(MAX_ASSIGN_IDS_NESTING_DEPTH + 1)).rev() {
+            let key_id = i32::try_from(2 * level).expect("test depth fits i32");
+            map_chain = Type::Map(MapType::new(
+                NestedField::map_key_element(key_id, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::map_value_element(key_id + 1, map_chain, false).into(),
+            ));
+        }
+        let error = increasing_from_one(&map_chain).expect_err("deep map chain must be rejected");
+        assert_depth_error(&error);
     }
 }

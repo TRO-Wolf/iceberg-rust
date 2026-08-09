@@ -1058,8 +1058,19 @@ enum MoveKind<'a> {
 /// module's (crate-private) `index_parents`. A field's parent is the id of the nearest enclosing
 /// struct/list/map field; top-level fields have no entry.
 ///
-/// The traversal uses an explicit stack because schemas may be constructed from user-influenced
-/// metadata and do not have a guaranteed nesting bound.
+/// The traversal uses an explicit stack rather than recursion. **This is defence in depth, not the
+/// fix for a reachable hazard, and it should not be cited as one.** `index_parents` has exactly one
+/// caller — [`SchemaEvolution::new`], which passes `schema.as_struct()` — and a [`Schema`] value can
+/// only be produced by `SchemaBuilder::build`, which runs `index_by_id` → `visit_struct` → the
+/// depth-checked `visit_type_at_depth` and so refuses any type nested deeper than
+/// `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH` (`128`) before a `Schema` exists at all.
+/// This function therefore cannot receive an unbounded struct tree today.
+///
+/// The genuinely unbounded input on this file's public surface is the caller-supplied `Type` of
+/// [`UpdateSchemaAction::add_column`], which no builder validates and which flows into
+/// [`SchemaEvolution::assign_fresh_ids`]; that door is closed by `spec::schema::id_reassigner`'s
+/// `MAX_ASSIGN_IDS_NESTING_DEPTH`. The explicit stack is kept here so this walk stays correct
+/// independently of that bound and of any future change to what `SchemaBuilder::build` validates.
 fn index_parents(struct_type: &StructType, parent_id: Option<i32>, out: &mut HashMap<i32, i32>) {
     enum Pending<'a> {
         Field {
@@ -1484,6 +1495,13 @@ mod tests {
 
     /// Run parent indexing on a deliberately small stack, returning the input so its recursive drop
     /// happens safely on the test harness's normal-sized stack.
+    ///
+    /// The four tests below are IMPLEMENTATION pins on `index_parents`'s explicit-stack form, not
+    /// evidence about reachable input: `index_parents` only ever sees a `Schema`'s struct, and
+    /// `SchemaBuilder::build` caps nesting at `MAX_SCHEMA_NESTING_DEPTH` (128) long before one
+    /// exists, so no caller can hand it a 4096-deep tree (see the function's own doc). They stay
+    /// because reverting the explicit stack to recursion overflows this 64 KiB stack, which keeps
+    /// the defence-in-depth property from silently rotting away.
     fn index_parents_on_small_stack(struct_type: StructType) -> (StructType, HashMap<i32, i32>) {
         thread::Builder::new()
             .name("index-parents-small-stack".to_string())
@@ -1540,8 +1558,10 @@ mod tests {
         StructType::new(vec![NestedField::optional(1, "root", field_type).into()])
     }
 
-    // RISK: a maliciously deep struct chain must not overflow schema evolution's parent-indexing
-    // stack, while retaining the exact nearest-parent relationship at the deepest node.
+    // RISK (defence in depth, NOT a reachable input): the explicit-stack parent walk must survive a
+    // struct chain far deeper than any `Schema` this crate can build, and still retain the exact
+    // nearest-parent relationship at the deepest node. Reverting the explicit stack to recursion
+    // overflows the 64 KiB stack; a wrong parent link corrupts nested add/move resolution.
     #[test]
     fn deeply_nested_struct_parent_indexing_uses_bounded_call_stack() {
         let (struct_type, parents) =
@@ -1558,8 +1578,9 @@ mod tests {
         drop(struct_type);
     }
 
-    // RISK: list-element traversal is a separate recursive entry path and must remain stack-safe for
-    // malicious nesting without losing the element's owner relationship.
+    // RISK (defence in depth, NOT a reachable input): list-element traversal is a separate arm of
+    // the walk and must stay iterative — and must keep the element's owner relationship — under the
+    // same deeper-than-buildable chain.
     #[test]
     fn deeply_nested_list_parent_indexing_uses_bounded_call_stack() {
         let (struct_type, parents) =
@@ -1576,8 +1597,8 @@ mod tests {
         drop(struct_type);
     }
 
-    // RISK: map-key traversal must not recurse on the call stack, and both members at the deepest map
-    // must retain the enclosing key field as their parent.
+    // RISK (defence in depth, NOT a reachable input): map-key traversal must stay iterative, and both
+    // members at the deepest map must retain the enclosing key field as their parent.
     #[test]
     fn deeply_nested_map_key_parent_indexing_uses_bounded_call_stack() {
         let (struct_type, parents) =
@@ -1595,8 +1616,9 @@ mod tests {
         drop(struct_type);
     }
 
-    // RISK: map-value traversal is independent from map-key traversal and must remain stack-safe while
-    // preserving both deepest member links to the enclosing value field.
+    // RISK (defence in depth, NOT a reachable input): map-value traversal is an arm independent of
+    // map-key traversal and must stay iterative while preserving both deepest member links to the
+    // enclosing value field.
     #[test]
     fn deeply_nested_map_value_parent_indexing_uses_bounded_call_stack() {
         let (struct_type, parents) =
@@ -1612,6 +1634,65 @@ mod tests {
         assert_eq!(parents.get(&deepest_key_id), Some(&deepest_owner_id));
         assert_eq!(parents.get(&deepest_value_id), Some(&deepest_owner_id));
         drop(struct_type);
+    }
+
+    /// A chain of `depth` nested single-field structs wrapping a boolean leaf — the caller-supplied
+    /// `Type` shape that `add_column` accepts. Built iteratively so the FIXTURE never recurses.
+    fn deeply_nested_column_type(depth: i32) -> Type {
+        let mut field_type = Type::Primitive(PrimitiveType::Boolean);
+        for field_id in (1..=depth).rev() {
+            field_type = Type::Struct(StructType::new(vec![
+                NestedField::optional(field_id, "nested", field_type).into(),
+            ]));
+        }
+        field_type
+    }
+
+    // RISK (the reachable hazard, and the one C-003 actually has to close): `add_column` takes a
+    // caller-supplied `Type` that NO builder has validated and drives it into the recursive
+    // fresh-id assignment in `spec::schema::id_reassigner`. Unbounded,
+    // `Transaction::update_schema().add_column("deep", hostile)` overflows the thread stack on
+    // commit. Java's `SchemaUpdate` does exactly that — `TypeUtil.assignFreshIds` has no depth
+    // counter, and a 4096-deep chain raises `StackOverflowError` on a 512 KiB JVM thread — so the
+    // typed error asserted here is a deliberate divergence in the SAFE direction, not a parity
+    // break. Runs on a thread with a KNOWN 3 MiB stack: the bounded walk unwinds after 129 levels
+    // (≈1.25 MiB, measured by bisection in the dev profile) while the unbounded walk over 4096
+    // levels needs ≈40 MiB, so deleting the depth guard turns this test into a hard stack-overflow
+    // abort rather than a soft failure.
+    #[test]
+    fn deeply_nested_added_column_type_is_rejected_not_overflowed() {
+        let action = Arc::new(
+            UpdateSchemaAction::new()
+                .add_column("deep", deeply_nested_column_type(MALICIOUS_SCHEMA_DEPTH)),
+        );
+        // A second handle, so the deep type is torn down on the HARNESS stack, not the bounded one.
+        let retained = Arc::clone(&action);
+
+        let error = thread::Builder::new()
+            .name("add-column-bounded-stack".to_string())
+            .stack_size(3 * 1024 * 1024)
+            .spawn(move || {
+                let table = v2_table();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("build a current-thread runtime");
+                runtime
+                    .block_on(action.commit(&table))
+                    .err()
+                    .map(|error| error.to_string())
+            })
+            .expect("spawn the bounded-stack add-column thread")
+            .join()
+            .expect("committing a hostile add_column must not overflow or panic")
+            .expect("a hostile nested column type must be rejected");
+
+        assert!(
+            error.contains(
+                "Schema type nesting exceeds maximum depth 128 while assigning field ids"
+            ),
+            "expected the typed depth refusal, got: {error}"
+        );
+        drop(retained);
     }
 
     fn v2_table() -> Table {
