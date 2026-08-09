@@ -145,3 +145,55 @@ now lives in the *Debug* list of
 [skills/sepmo/binding-manifest.md](../skills/sepmo/binding-manifest.md). Version-controlling the
 master home **DEFERRED by the user** — it stays ungoverned, so a dated pre-change copy
 (`~/Desktop/Sepmo-v2.2-archive` for this one) is the only diff baseline a canon change gets.
+
+## 2026-08-09 — charter close: the 2026-08 audit-hardening bundle
+
+`kind: charter-close`. Charter and clauses C-001..C-008 in
+[todo.md](todo.md) § "ACTIVE (2026-08-08)"; evidence in
+[2026-08-audit-hardening-ledger.md](2026-08-audit-hardening-ledger.md); S3 register in
+[2026-08-audit-hardening-critic-verdicts.md](2026-08-audit-hardening-critic-verdicts.md).
+Filed at bundle close rather than at merge because C-008 names it as a G6 deliverable; **the PR does
+not exist yet** (charter forbids push/PR without a separate user request), so no merge-time
+double-count is possible.
+
+The distinguishing feature of this charter: it was **handed over mid-flight**. A prior session
+reported G1 committed-and-converged and G2 complete-but-uncommitted. An independent 20-agent review
+run before extending the work found 11 surviving findings — including two Java-parity READ
+regressions in the "converged" G1 that would have made Java-written tables unopenable, and a live
+panic introduced by G2's own hardening. Remediation units R1-R3 exist because of that review.
+
+```yaml
+METRICS:
+  charter: audit-hardening-2026-08
+  kind: charter-close
+  units_total: 8              # G1, G2 (inherited) + R1, R2, R3 (remediation) + G3, G4, G5
+  units_by_path: {STANDARD: 8, LIGHT: 0}
+  cycles_per_unit: [R1: 2, R2: 1, R3: 2, G4: 2, G3: 2, G5: 3]
+    # inherited G1/G2 carry no cycle record — their absence IS finding R-09.
+  units_remanded: 5           # all but R2
+  findings_filed: {S0: 0, S1: 0, S2: 17, S3: 37}
+    # 11 from the pre-work independent review (S2 x9, S3 x2)
+    # 6 from the C-008 bundle-scope Critic (all S2, all artifact defects, zero code defects)
+    # 31 S3 from the per-unit Critics + 6 S3 from the terminal round
+  findings_withdrawn: 4       # refuted under adversarial verification, recorded in ledger 3
+  noise_ratio: 0.27           # 4 refuted / 15 raised in the pre-work review
+  invariant_v_raised: 2       # expr/predicate.rs, spec/schema/id_reassigner.rs — both user-approved
+  dependency_changes: 0
+  breaking_public_api: 1      # datum_to_arrow_type_with_ree -> Result<DataType>, ledger 2.2
+  gate_gaps: ["make test (docker daemon down) — 8 integration binaries unexercised, ledger 4.2"]
+  escaped_defects_by_origin: []
+  environment_drift_events: []
+```
+
+**The signal worth carrying forward.** Five of six units were remanded, and in four the defect was
+test adequacy, not correctness: a test whose doc comment named a mutation that, when applied, left
+the suite green. An Actor writes the assertion and the claim from one mental model and never runs
+the negative case. The Critic-applies-the-mutation rule is now in
+[lessons.md](lessons.md) (2026-08-09).
+
+**The self-referential failure worth admitting.** The closing artifact — written to fix a missing
+evidence trail (R-09) — itself shipped three false claims about its own evidence across successive
+drafts: "zero assertion failures" among the 45 (there was one), "six for six" remands (R2 never
+blocked), then "four of six remanded" (five were; four is the defect-class size). Each was caught by
+a Critic, none by the author. An artifact asserting rigour is not exempt from the rigour it asserts,
+and prose counts over a small fixed population are where it fails.

@@ -220,7 +220,12 @@ The honest generalisation is narrower than the original and is in the 2026-08-09
 
 ### 4.2 Bundle gate (C-008)
 
-Run 2026-08-09 at tip `879bf55e` + this commit, in `iceberg-rust-ws`, each step unpiped.
+The full six-step battery was run 2026-08-09 over the last code-bearing tip, `879bf55e`, in
+`iceberg-rust-ws`, each step unpiped. Every commit after it is **documentation only** — no
+executable code changes — and steps 1, 2, 6a-equivalent (`cargo test -p iceberg --lib`) and the
+matrix-anchor check were re-run green at each of them, most recently at `1ea70cf5` by the terminal
+Critic: 3232/0/1, 75 anchors, bare `typos .` rc 0, `fmt --check` rc 0, clean tree, no manifest in
+the diff range.
 
 | # | step | result |
 |---|---|---|

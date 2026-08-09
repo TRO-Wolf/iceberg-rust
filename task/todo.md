@@ -159,11 +159,24 @@ V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, 
       per-key `is_secret_prop_key` redaction. NAMED residue: `Table`'s `{:?}` is still not wholesale
       credential-safe (snapshot summaries, encryption keys, statistics blob properties render in
       clear) and the rustdoc now says so instead of asserting a blanket invariant.
-- [ ] **G6 — bundle close (C-008).** Run the independent bundle Critic, disposition any remands,
+- [x] **G6 — bundle close (C-008).** Run the independent bundle Critic, disposition any remands,
       run `typos . && make check && make check-msrv && cargo build -p iceberg
       --no-default-features && cargo deny check advisories && make test`, execute targeted interop if
       a group changes an interop-bearing contract, file PR-readiness evidence, update this tracker,
       and file the SEPMO retrospective/metrics. No push or PR creation without separate user request.
+      **Done 2026-08-09.** Bundle Critic ran three lenses (cross-group interaction, ledger truth,
+      adversary) + two verification rounds, all serialized in the one worktree. It filed **six S2s
+      against the ARTIFACT and zero against the code** — including a breaking public API change
+      (`datum_to_arrow_type_with_ree -> Result<DataType>`, G1) that nothing had called out while a
+      downstream consumer is mid-repin, and two false statements in the gate evidence itself. All
+      dispositioned; terminal round CONVERGED with zero blocking findings and six ledgered.
+      Evidence: [2026-08-audit-hardening-ledger.md](2026-08-audit-hardening-ledger.md) ·
+      [critic verdicts / S3 register](2026-08-audit-hardening-critic-verdicts.md) ·
+      [sepmo-metrics.md](sepmo-metrics.md).
+      **GATE GAP CARRIED TO MERGE:** the Docker daemon was down, so `make test` did not run and
+      eight integration binaries are unexercised — including the REST end-to-end suite that covers
+      G5's changed error paths. Re-run `make test` with Docker up before merging. Nothing is pushed
+      and no PR exists, per this clause.
 
 Contingencies: a group that cannot converge is either REMOVED with an additive revert commit or
 REMANDED with enumerated findings to the closing Critic; no destructive reset/checkout is authorized.

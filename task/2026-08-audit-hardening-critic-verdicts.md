@@ -184,3 +184,28 @@ Critic verdict: **CONVERGED**, 3 S3.
 
    *Disposition:* Record in the mutation ledger that M10c covers the `statistics` field as a whole and that the `key_metadata` arm is asserted but not separately mutated, or add M10e (wrap `key_metadata` alone in a redacting adapter inside a temporary `StatisticsFile` Debug) when someone next touches this test.
 
+
+---
+
+## Bundle-scope Critic (C-008) — three lenses + two verification rounds
+
+The closing chain filed six S2s against the **artifact**, not the code (all three lenses reported
+zero S1/S2 code defects and re-derived every Java citation as accurate). Those six are dispositioned
+in the ledger; what follows are the non-blocking items the terminal round ledgered.
+
+1. **`crates/iceberg/src/expr/predicate.rs:45-48`** — the `MAX_PREDICATE_DEPTH` doc names Drop,
+   Clone and PartialEq as the remaining unbounded recursion. Derived `Debug`/`Serialize`/
+   `Deserialize`, and the hand-written `Debug` for `LogicalExpression` (`predicate.rs:129`), also
+   walk the tree. True read as a category statement ("the DERIVED glue"); not exhaustive read as a
+   list.
+2. **Same sentence** — calls `Drop` "derived glue". It is compiler-generated drop glue, not a
+   `#[derive]`. Conventional shorthand, carried unchanged from earlier wording.
+3. **R2 item 1, partly discharged** — that verdict also proposed recording the relative overflow
+   depths (Clone blows first at ~1,465 dev levels, then PartialEq, then Drop) so a reader knows
+   **Clone** is the binding constraint. The doc now names all three but not the ordering.
+4. **Citation form** — the ledger cites "G4 S3-1", "G4 S3-2", "S3-3(a)"; this register numbers
+   items `1..n` per unit with no prefix or sub-label. The mapping is one-to-one and inferable
+   (G4 item 3 is the README scope item) but is not literal.
+5. **`task/lessons.md`** — the R3 entry says a mutant "survived all 3226 tests". Correct as a
+   point-in-time figure at R3; the suite is 3232 at tip, which a reader could conflate.
+6. **Ledger §4.2 header** — see the note now inline in that section.
