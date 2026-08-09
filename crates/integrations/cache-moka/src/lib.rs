@@ -274,6 +274,128 @@ mod tests {
         Arc::new(Manifest::new(metadata, entries))
     }
 
+    /// Writer schema of the fixture below: the V2 `manifest_file` record.
+    ///
+    /// Field names and order match `_serde::ManifestFileV2` in
+    /// `crates/iceberg/src/spec/manifest_list.rs`; `partitions` / `key_metadata` are present as
+    /// nullable unions because that struct's `Option` fields carry no serde default and would
+    /// otherwise fail to deserialize.
+    const MANIFEST_FILE_V2_SCHEMA: &str = concat!(
+        r#"{"type":"record","name":"manifest_file","fields":["#,
+        r#"{"name":"manifest_path","type":"string"},"#,
+        r#"{"name":"manifest_length","type":"long"},"#,
+        r#"{"name":"partition_spec_id","type":"int"},"#,
+        r#"{"name":"content","type":"int"},"#,
+        r#"{"name":"sequence_number","type":"long"},"#,
+        r#"{"name":"min_sequence_number","type":"long"},"#,
+        r#"{"name":"added_snapshot_id","type":"long"},"#,
+        r#"{"name":"added_files_count","type":"int"},"#,
+        r#"{"name":"existing_files_count","type":"int"},"#,
+        r#"{"name":"deleted_files_count","type":"int"},"#,
+        r#"{"name":"added_rows_count","type":"long"},"#,
+        r#"{"name":"existing_rows_count","type":"long"},"#,
+        r#"{"name":"deleted_rows_count","type":"long"},"#,
+        r#"{"name":"partitions","type":["null",{"type":"array","items":"#,
+        r#"{"type":"record","name":"field_summary","fields":["#,
+        r#"{"name":"contains_null","type":"boolean"}]}}],"default":null},"#,
+        r#"{"name":"key_metadata","type":["null","bytes"],"default":null}]}"#,
+    );
+
+    /// Sync marker of the fixture container file. Any 16 bytes will do, as long as the header
+    /// and every block trailer agree.
+    const FIXTURE_SYNC_MARKER: [u8; 16] = [0x69; 16];
+
+    /// Appends an Avro `int`/`long`: zig-zag, then variable-length base-128.
+    fn push_avro_long(out: &mut Vec<u8>, value: i64) {
+        // Zig-zag is defined on the two's-complement bit pattern, so the reinterpreting cast
+        // to `u64` is the encoding, not a lossy conversion.
+        let mut n = ((value << 1) ^ (value >> 63)) as u64;
+        loop {
+            let low = u8::try_from(n & 0x7f).expect("masked to seven bits");
+            n >>= 7;
+            if n == 0 {
+                out.push(low);
+                break;
+            }
+            out.push(low | 0x80);
+        }
+    }
+
+    /// Appends an Avro `bytes`/`string`: a long length prefix, then the payload.
+    fn push_avro_bytes(out: &mut Vec<u8>, payload: &[u8]) {
+        push_avro_long(
+            out,
+            i64::try_from(payload.len()).expect("fixture payload length fits in an i64"),
+        );
+        out.extend_from_slice(payload);
+    }
+
+    /// One `manifest_file` datum, encoded in the field order of [`MANIFEST_FILE_V2_SCHEMA`].
+    fn manifest_file_datum(index: usize) -> Vec<u8> {
+        let mut datum = Vec::new();
+        push_avro_bytes(
+            &mut datum,
+            format!("memory:/t/metadata/m{index}.avro").as_bytes(),
+        );
+        push_avro_long(&mut datum, 1024); // manifest_length
+        push_avro_long(&mut datum, 0); // partition_spec_id
+        push_avro_long(&mut datum, 0); // content: 0 == data
+        push_avro_long(&mut datum, 1); // sequence_number
+        push_avro_long(&mut datum, 1); // min_sequence_number
+        push_avro_long(&mut datum, 42); // added_snapshot_id
+        push_avro_long(&mut datum, 1); // added_files_count
+        push_avro_long(&mut datum, 0); // existing_files_count
+        push_avro_long(&mut datum, 0); // deleted_files_count
+        push_avro_long(&mut datum, 1); // added_rows_count
+        push_avro_long(&mut datum, 0); // existing_rows_count
+        push_avro_long(&mut datum, 0); // deleted_rows_count
+        push_avro_long(&mut datum, 0); // partitions: union branch 0 == null
+        push_avro_long(&mut datum, 0); // key_metadata: union branch 0 == null
+        datum
+    }
+
+    /// A real [`ManifestList`] carrying exactly `entry_count` rows.
+    ///
+    /// Built as an Avro object-container file and parsed back through the public
+    /// [`ManifestList::parse_with_version`], so the value under test is one the production read
+    /// path would produce. Hand-encoding the container is what keeps this crate free of a
+    /// dev-dependency on an Avro writer.
+    fn manifest_list_with_entries(entry_count: usize) -> Arc<ManifestList> {
+        let mut file = Vec::new();
+        file.extend_from_slice(b"Obj\x01"); // magic
+        push_avro_long(&mut file, 1); // metadata map: one block of one entry
+        push_avro_bytes(&mut file, b"avro.schema");
+        push_avro_bytes(&mut file, MANIFEST_FILE_V2_SCHEMA.as_bytes());
+        push_avro_long(&mut file, 0); // end of the metadata map
+        file.extend_from_slice(&FIXTURE_SYNC_MARKER);
+
+        if entry_count > 0 {
+            let mut objects = Vec::new();
+            for i in 0..entry_count {
+                objects.extend_from_slice(&manifest_file_datum(i));
+            }
+            push_avro_long(
+                &mut file,
+                i64::try_from(entry_count).expect("fixture entry count fits in an i64"),
+            );
+            push_avro_long(
+                &mut file,
+                i64::try_from(objects.len()).expect("fixture block length fits in an i64"),
+            );
+            file.extend_from_slice(&objects);
+            file.extend_from_slice(&FIXTURE_SYNC_MARKER);
+        }
+
+        let list = ManifestList::parse_with_version(&file, FormatVersion::V2)
+            .expect("parse the hand-encoded V2 manifest-list fixture");
+        assert_eq!(
+            list.entries().len(),
+            entry_count,
+            "fixture must round-trip the requested row count"
+        );
+        Arc::new(list)
+    }
+
     /// The clamp floors at one weight unit and saturates at `u32::MAX`.
     ///
     /// Mutation caught: widening the floor to `0` (`bytes.clamp(0, ..)`) — a zero-weight entry
@@ -355,6 +477,28 @@ mod tests {
         );
     }
 
+    /// The manifest-list weigher reads the real entry count off a parsed `ManifestList`.
+    ///
+    /// Mutation caught: `estimate_manifest_list_weight` returning a constant (the two counts
+    /// below differ), or reaching for `ROUGH_MANIFEST_ENTRY_BYTES` instead of
+    /// `ROUGH_MANIFEST_LIST_ENTRY_BYTES` (768 vs 256 on the empty case).
+    #[test]
+    fn estimate_manifest_list_weight_tracks_entry_count() {
+        let empty = manifest_list_with_entries(0);
+        let three = manifest_list_with_entries(3);
+
+        assert_eq!(
+            estimate_manifest_list_weight(&empty),
+            ROUGH_MANIFEST_LIST_ENTRY_BYTES as u32,
+            "an empty list is floored at one row, at the manifest-LIST constant"
+        );
+        assert_eq!(
+            estimate_manifest_list_weight(&three),
+            3 * ROUGH_MANIFEST_LIST_ENTRY_BYTES as u32,
+            "weight must be entry_count x the per-entry constant"
+        );
+    }
+
     /// The byte budget actually binds: a budget that fits five empty manifests evicts when
     /// forty are inserted, even though forty is nowhere near an entry-count budget of 4096.
     ///
@@ -396,6 +540,48 @@ mod tests {
         assert!(
             entry_count > 0,
             "eviction must not empty the cache outright"
+        );
+    }
+
+    /// The same pin on the *manifest-list* cache: `new_with_capacity` must route it through
+    /// `build_weighted_cache` too, not just its manifest twin.
+    ///
+    /// Mutation caught: building `manifest_list_cache` as `moka::sync::Cache::new(cache_size_bytes)`
+    /// — the pre-fix line. Unweighted, each of the forty inserts weighs `1`, `max_capacity(1024)`
+    /// reads as "1024 entries", and all forty stay resident instead of four. Also caught: using
+    /// `ROUGH_MANIFEST_ENTRY_BYTES` in `estimate_manifest_list_weight`, which would settle the
+    /// cache at one resident row rather than four.
+    #[test]
+    fn manifest_list_byte_budget_evicts_where_an_entry_count_budget_would_not() {
+        // Four empty manifest lists (256 each) exactly fill 1024; the fifth does not fit.
+        const BUDGET_BYTES: u64 = 1024;
+        const INSERTS: usize = 40;
+        let fits = BUDGET_BYTES / ROUGH_MANIFEST_LIST_ENTRY_BYTES;
+        assert_eq!(fits, 4, "test arithmetic: 1024 / 256 == 4");
+        assert!(
+            (INSERTS as u64) < BUDGET_BYTES,
+            "the insert count must be far below the budget read as an entry count, \
+             otherwise the test cannot tell bytes from entries"
+        );
+
+        let provider = MokaObjectCacheProvider::new_with_capacity(BUDGET_BYTES);
+        let list = manifest_list_with_entries(0);
+        for i in 0..INSERTS {
+            provider
+                .manifest_list_cache()
+                .set(format!("manifest-list-{i}"), Arc::clone(&list));
+        }
+        provider.manifest_list_cache.0.run_pending_tasks();
+
+        assert_eq!(
+            provider.manifest_list_cache.0.entry_count(),
+            fits,
+            "the byte budget must cap the manifest-list cache at {fits} empty lists"
+        );
+        assert_eq!(
+            provider.manifest_list_cache.0.weighted_size(),
+            BUDGET_BYTES,
+            "the resident weight must be the budget, in bytes"
         );
     }
 
@@ -457,11 +643,16 @@ mod tests {
         assert_eq!(provider.manifest_list_cache.0.entry_count(), 0);
     }
 
-    /// The default provider is byte-bounded, not entry-bounded.
+    /// The default provider is byte-bounded, not entry-bounded — on **both** caches.
     ///
-    /// Mutation caught: reverting `new()` to `moka::sync::Cache::new(DEFAULT_CACHE_SIZE_BYTES)`
-    /// would leave `max_capacity` at 33,554,432 *entries*; here it is 33,554,432 *weight units*
-    /// and a single 43,691-entry manifest already accounts for more than 32 MiB of it.
+    /// `max_capacity()` alone cannot discriminate the two: it reports the same 33,554,432 whether
+    /// that number counts bytes or entries. What separates them is the weigher, so this test
+    /// observes `weighted_size()` after a real insert — 1 per entry with no weigher installed,
+    /// `entry_count × the per-entry constant` with one.
+    ///
+    /// Mutation caught: reverting `new()` to construct the caches directly as
+    /// `moka::sync::Cache::new(DEFAULT_CACHE_SIZE_BYTES)` — the pre-fix path. The resident weight
+    /// then collapses to 1 per entry and 33,554,432 becomes an entry count.
     #[test]
     fn default_provider_budget_is_bytes() {
         let provider = MokaObjectCacheProvider::new();
@@ -472,6 +663,26 @@ mod tests {
         assert_eq!(
             provider.manifest_list_cache.0.policy().max_capacity(),
             Some(DEFAULT_CACHE_SIZE_BYTES)
+        );
+
+        provider
+            .manifest_cache()
+            .set("m".to_string(), manifest_with_entries(10));
+        provider.manifest_cache.0.run_pending_tasks();
+        assert_eq!(
+            provider.manifest_cache.0.weighted_size(),
+            10 * ROUGH_MANIFEST_ENTRY_BYTES,
+            "the default manifest cache must charge bytes, not one unit per entry"
+        );
+
+        provider
+            .manifest_list_cache()
+            .set("l".to_string(), manifest_list_with_entries(3));
+        provider.manifest_list_cache.0.run_pending_tasks();
+        assert_eq!(
+            provider.manifest_list_cache.0.weighted_size(),
+            3 * ROUGH_MANIFEST_LIST_ENTRY_BYTES,
+            "the default manifest-list cache must charge bytes, not one unit per entry"
         );
 
         let entries_to_fill = DEFAULT_CACHE_SIZE_BYTES / ROUGH_MANIFEST_ENTRY_BYTES;
