@@ -66,8 +66,14 @@ const NAMESPACE_ALIAS_SEPARATOR: &str = ".";
 ///
 /// Namespace discovery walks a tree the *catalog server* controls, so it is untrusted input in
 /// exactly the sense AGENTS.md "Recursion Safety" means: the walk is an explicit-queue BFS (no
-/// stack recursion), but without a bound a cyclic or adversarial catalog — one that answers every
-/// child listing with a deeper namespace — would loop and issue round-trips forever.
+/// stack recursion), but without a bound an adversarial catalog that answers every child listing
+/// with a STRICTLY DEEPER namespace would keep producing never-before-seen identifiers and issue
+/// round-trips forever.
+///
+/// That is the only failure mode this cap addresses. It does NOT terminate a cycle, nor a catalog
+/// that re-answers with an already-visited namespace: neither increases depth, so the cap is never
+/// reached. Those are terminated by the `seen` visited-set in [`discover_namespaces`] — see that
+/// function for the two independent guarantees and their tests.
 ///
 /// 64 is this crate's existing nesting bound (`physical_plan::project`'s
 /// `MAX_WRITE_COMPATIBILITY_DEPTH`), and is far above anything real: Glue, HMS and S3 Tables
@@ -256,10 +262,19 @@ fn validate_namespace_renderable(namespace: &NamespaceIdent) -> Result<()> {
 
 /// Breadth-first walk of the whole namespace tree.
 ///
-/// Termination has two independent guarantees: `seen` means a namespace is expanded at most once
-/// (so a finite catalog always finishes, even one that answers a child listing with an unrelated
-/// or already-visited namespace), and [`MAX_NAMESPACE_DEPTH`] fails loudly on a catalog that keeps
-/// answering with strictly deeper namespaces.
+/// Termination rests on two guarantees that are NOT interchangeable — each covers a shape the
+/// other cannot:
+///
+/// 1. **`seen`** — a namespace is expanded at most once, so the walk finishes on any catalog that
+///    answers a child listing with an already-visited namespace. That covers a genuine cycle
+///    (`a → b → a`) and a server that ignores the parent filter and re-answers with the root list,
+///    which is what a REST catalog does when it drops an unrecognised `?parent=` query parameter.
+///    Neither shape ever increases depth, so [`MAX_NAMESPACE_DEPTH`] is never reached and `seen`
+///    is the SOLE defence; without it the constructor hangs and floods the catalog with
+///    round-trips. Pinned by `a_catalog_that_ignores_the_parent_filter_still_terminates` and
+///    `a_cyclic_catalog_still_terminates`.
+/// 2. **[`MAX_NAMESPACE_DEPTH`]** — fails loudly on a catalog that keeps answering with strictly
+///    deeper, never-before-seen namespaces, which `seen` alone would follow forever.
 async fn discover_namespaces(client: &Arc<dyn Catalog>) -> Result<Vec<NamespaceIdent>> {
     let mut seen: HashSet<NamespaceIdent> = HashSet::new();
     let mut discovered: Vec<NamespaceIdent> = Vec::new();
@@ -351,6 +366,8 @@ async fn build_schema_providers(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -453,47 +470,90 @@ mod tests {
         names
     }
 
+    /// The listing budget the non-delegating [`ParentScript`] arms enforce.
+    ///
+    /// A catalog that never terminates the BFS would otherwise HANG the test binary rather than
+    /// fail it, and a hung test reports nothing. Refusing further listings past this budget turns
+    /// the non-termination into a typed `Err` that the assertions can observe. Every scripted tree
+    /// here is 1–2 namespaces, so a correct walk spends 3 listings; 64 leaves two orders of
+    /// magnitude of headroom before the budget can produce a false RED.
+    const MAX_SCRIPTED_LISTINGS: usize = 64;
+
+    /// How [`ScriptedCatalog`] answers `list_namespaces`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ParentScript {
+        /// Pass the parent through to the in-memory catalog — a well-behaved server.
+        Delegate,
+        /// Answer EVERY child listing with the root list, ignoring the parent. This is what a REST
+        /// catalog server does when it drops an unrecognised `?parent=` query parameter.
+        IgnoreParent,
+        /// Answer with the next root in a ring: `ns1 → ns2 → ns1 → …`. A genuine cycle, in which
+        /// the reported depth never increases.
+        Cycle,
+    }
+
     /// A catalog that delegates everything to an in-memory catalog but scripts ONE listing:
-    /// either it fails, or it is delayed.
+    /// either it fails, or it is delayed, or the namespace tree it reports does not terminate.
     ///
     /// The failing arms prove the failure policy (a namespace whose children or tables cannot be
     /// listed fails construction loudly instead of vanishing). The delay arm makes provider
     /// construction complete OUT of request order, which is what makes the ordered-`buffered`
-    /// requirement observable.
+    /// requirement observable. The [`ParentScript`] arms prove the `seen` visited-set is what
+    /// terminates a walk whose depth never grows.
     #[derive(Debug)]
     struct ScriptedCatalog {
         inner: Arc<MemoryCatalog>,
         fail_children_of: Option<NamespaceIdent>,
         fail_tables_of: Option<NamespaceIdent>,
         delay_tables_of: Option<NamespaceIdent>,
+        parent_script: ParentScript,
+        /// Every `list_namespaces` call, so a test can pin the N+1 listing shape and the budget
+        /// can stop a non-terminating walk.
+        listing_calls: AtomicUsize,
     }
 
     impl ScriptedCatalog {
-        fn failing_children_of(inner: Arc<MemoryCatalog>, namespace: NamespaceIdent) -> Self {
+        fn delegating(inner: Arc<MemoryCatalog>) -> Self {
             Self {
                 inner,
-                fail_children_of: Some(namespace),
+                fail_children_of: None,
                 fail_tables_of: None,
                 delay_tables_of: None,
+                parent_script: ParentScript::Delegate,
+                listing_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn failing_children_of(inner: Arc<MemoryCatalog>, namespace: NamespaceIdent) -> Self {
+            Self {
+                fail_children_of: Some(namespace),
+                ..Self::delegating(inner)
             }
         }
 
         fn failing_tables_of(inner: Arc<MemoryCatalog>, namespace: NamespaceIdent) -> Self {
             Self {
-                inner,
-                fail_children_of: None,
                 fail_tables_of: Some(namespace),
-                delay_tables_of: None,
+                ..Self::delegating(inner)
             }
         }
 
         fn delaying_tables_of(inner: Arc<MemoryCatalog>, namespace: NamespaceIdent) -> Self {
             Self {
-                inner,
-                fail_children_of: None,
-                fail_tables_of: None,
                 delay_tables_of: Some(namespace),
+                ..Self::delegating(inner)
             }
+        }
+
+        fn scripting_parents(inner: Arc<MemoryCatalog>, parent_script: ParentScript) -> Self {
+            Self {
+                parent_script,
+                ..Self::delegating(inner)
+            }
+        }
+
+        fn listings_issued(&self) -> usize {
+            self.listing_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -503,6 +563,18 @@ mod tests {
             &self,
             parent: Option<&NamespaceIdent>,
         ) -> Result<Vec<NamespaceIdent>> {
+            let calls = self.listing_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.parent_script != ParentScript::Delegate && calls > MAX_SCRIPTED_LISTINGS {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "namespace discovery issued more than {MAX_SCRIPTED_LISTINGS} listings \
+                         against a {:?} catalog: the walk is not terminating",
+                        self.parent_script
+                    ),
+                ));
+            }
+
             if let (Some(parent), Some(target)) = (parent, self.fail_children_of.as_ref())
                 && parent == target
             {
@@ -511,11 +583,27 @@ mod tests {
                     "simulated child-listing failure",
                 ));
             }
+
+            let mut namespaces = match self.parent_script {
+                ParentScript::Delegate => self.inner.list_namespaces(parent).await?,
+                ParentScript::IgnoreParent => self.inner.list_namespaces(None).await?,
+                ParentScript::Cycle => {
+                    let mut roots = self.inner.list_namespaces(None).await?;
+                    roots.sort();
+                    match parent {
+                        // Enter the ring at its first element only.
+                        None => roots.into_iter().take(1).collect(),
+                        Some(parent) => match roots.iter().position(|root| root == parent) {
+                            Some(index) => vec![roots[(index + 1) % roots.len()].clone()],
+                            None => Vec::new(),
+                        },
+                    }
+                }
+            };
             // Sorted so the REQUEST order of provider construction is deterministic. Without this
             // the memory catalog yields namespaces in hash order, and
             // `providers_stay_bound_to_their_own_namespace_when_listings_finish_out_of_order`
             // would only sometimes be able to distinguish `buffered` from `buffer_unordered`.
-            let mut namespaces = self.inner.list_namespaces(parent).await?;
             namespaces.sort();
             Ok(namespaces)
         }
@@ -556,7 +644,7 @@ mod tests {
                 ));
             }
             if self.delay_tables_of.as_ref() == Some(namespace) {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
             }
             self.inner.list_tables(namespace).await
         }
@@ -893,6 +981,98 @@ mod tests {
         assert!(
             err.to_string().contains("beyond the supported maximum"),
             "the error does not name the depth cap: {err}"
+        );
+    }
+
+    /// Builds a two-root catalog whose child listings are scripted by `parent_script`, then runs
+    /// discovery under a wall-clock timeout so a non-terminating walk FAILS instead of wedging the
+    /// test binary. Returns the provider, the scripted catalog (so the caller can pin how many
+    /// listings the walk cost) and the warehouse dir, which must outlive both.
+    async fn discover_under_script(
+        parent_script: ParentScript,
+    ) -> (IcebergCatalogProvider, Arc<ScriptedCatalog>, TempDir) {
+        let (inner, warehouse) = memory_catalog().await;
+        let ns1 = create_namespace(&inner, &["ns1"]).await;
+        let ns2 = create_namespace(&inner, &["ns2"]).await;
+        create_table(&inner, &ns1, "t1").await;
+        create_table(&inner, &ns2, "t2").await;
+
+        let scripted = Arc::new(ScriptedCatalog::scripting_parents(inner, parent_script));
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+
+        let provider = tokio::time::timeout(
+            Duration::from_secs(30),
+            IcebergCatalogProvider::try_new(catalog),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("namespace discovery against a {parent_script:?} catalog never terminated")
+        })
+        .unwrap_or_else(|e| {
+            panic!("catalog provider construction failed against a {parent_script:?} catalog: {e}")
+        });
+
+        (provider, scripted, warehouse)
+    }
+
+    /// TERMINATION 1 — a server that ignores the parent filter and answers every child listing
+    /// with the ROOT list. This is exactly what a REST catalog does when it drops an unrecognised
+    /// `?parent=` query parameter, and the namespaces it re-reports are already visited, so the
+    /// walk's depth NEVER grows and [`MAX_NAMESPACE_DEPTH`] is never reached. The `seen`
+    /// visited-set is the only thing that stops it.
+    ///
+    /// Mutation this catches: replacing
+    /// `if seen.insert(namespace.clone()) { discovered.push(..); fresh.push(..); }` in
+    /// [`discover_namespaces`] with the unconditional `discovered.push(..); fresh.push(..);`
+    /// (equivalently: deleting `seen`). The frontier then never empties, the walk re-lists the same
+    /// two namespaces forever, [`MAX_SCRIPTED_LISTINGS`] trips, and construction returns `Err` —
+    /// RED. Against a real network catalog the same mutant is an unbounded request flood at
+    /// session construction.
+    #[tokio::test]
+    async fn a_catalog_that_ignores_the_parent_filter_still_terminates() {
+        let (provider, scripted, _warehouse) =
+            discover_under_script(ParentScript::IgnoreParent).await;
+
+        assert_eq!(sorted_schema_names(&provider), vec![
+            "ns1".to_string(),
+            "ns2".to_string()
+        ]);
+        // One root listing plus one child listing per namespace — the N+1 shape, walked ONCE.
+        assert_eq!(
+            scripted.listings_issued(),
+            3,
+            "the walk re-expanded an already-visited namespace"
+        );
+    }
+
+    /// TERMINATION 2 — a genuine cycle: the catalog reports `ns1`'s child as `ns2` and `ns2`'s
+    /// child as `ns1`. Depth never increases here either, so again only `seen` terminates the walk,
+    /// and both namespaces must still be discovered exactly once.
+    ///
+    /// Mutation this catches: the same `seen.insert` removal as
+    /// `a_catalog_that_ignores_the_parent_filter_still_terminates` — the ring is walked forever,
+    /// the listing budget trips and construction returns `Err`.
+    ///
+    /// Second mutation, applied and confirmed RED: moving `let mut seen = HashSet::new()` INSIDE
+    /// the `while` loop, so de-duplication is per-round rather than global. The frontier here is
+    /// one namespace wide at every round and never repeats WITHIN a round, so termination depends
+    /// on the visited-set surviving ACROSS rounds — which is the property the declaration site
+    /// carries. (That mutant is RED for the parent-ignoring shape too; the two tests are not
+    /// distinguished by it, they are distinguished by frontier width and by whether the repeat is
+    /// intra- or inter-round.)
+    #[tokio::test]
+    async fn a_cyclic_catalog_still_terminates() {
+        let (provider, scripted, _warehouse) = discover_under_script(ParentScript::Cycle).await;
+
+        assert_eq!(sorted_schema_names(&provider), vec![
+            "ns1".to_string(),
+            "ns2".to_string()
+        ]);
+        // Root listing, then one child listing for each of the two namespaces in the ring.
+        assert_eq!(
+            scripted.listings_issued(),
+            3,
+            "the walk went round the cycle more than once"
         );
     }
 
