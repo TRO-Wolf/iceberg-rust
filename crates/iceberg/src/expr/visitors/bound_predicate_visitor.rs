@@ -17,6 +17,7 @@
 
 use fnv::FnvHashSet;
 
+use super::predicate_visitor::MAX_PREDICATE_DEPTH;
 use crate::expr::{BoundPredicate, BoundReference, PredicateOperator};
 use crate::spec::Datum;
 use crate::{Error, ErrorKind, Result};
@@ -153,29 +154,44 @@ pub(crate) fn visit<V: BoundPredicateVisitor>(
     visitor: &mut V,
     predicate: &BoundPredicate,
 ) -> Result<V::T> {
+    visit_at_depth(visitor, predicate, 0)
+}
+
+fn visit_at_depth<V: BoundPredicateVisitor>(
+    visitor: &mut V,
+    predicate: &BoundPredicate,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_PREDICATE_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Bound predicate nesting exceeds maximum depth {MAX_PREDICATE_DEPTH}"),
+        ));
+    }
+
     match predicate {
         BoundPredicate::AlwaysTrue => visitor.always_true(),
         BoundPredicate::AlwaysFalse => visitor.always_false(),
         BoundPredicate::And(expr) => {
             let [left_pred, right_pred] = expr.inputs();
 
-            let left_result = visit(visitor, left_pred)?;
-            let right_result = visit(visitor, right_pred)?;
+            let left_result = visit_at_depth(visitor, left_pred, depth + 1)?;
+            let right_result = visit_at_depth(visitor, right_pred, depth + 1)?;
 
             visitor.and(left_result, right_result)
         }
         BoundPredicate::Or(expr) => {
             let [left_pred, right_pred] = expr.inputs();
 
-            let left_result = visit(visitor, left_pred)?;
-            let right_result = visit(visitor, right_pred)?;
+            let left_result = visit_at_depth(visitor, left_pred, depth + 1)?;
+            let right_result = visit_at_depth(visitor, right_pred, depth + 1)?;
 
             visitor.or(left_result, right_result)
         }
         BoundPredicate::Not(expr) => {
             let [inner_pred] = expr.inputs();
 
-            let inner_result = visit(visitor, inner_pred)?;
+            let inner_result = visit_at_depth(visitor, inner_pred, depth + 1)?;
 
             visitor.not(inner_result)
         }
@@ -237,10 +253,12 @@ mod tests {
 
     use fnv::FnvHashSet;
 
+    use crate::ErrorKind;
     use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
+    use crate::expr::visitors::predicate_visitor::MAX_PREDICATE_DEPTH;
     use crate::expr::{
-        BinaryExpression, Bind, BoundPredicate, BoundReference, Predicate, PredicateOperator,
-        Reference, SetExpression, UnaryExpression,
+        BinaryExpression, Bind, BoundPredicate, BoundReference, LogicalExpression, Predicate,
+        PredicateOperator, Reference, SetExpression, UnaryExpression,
     };
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
 
@@ -415,6 +433,36 @@ mod tests {
 
         let schema_arc = Arc::new(schema);
         schema_arc.clone()
+    }
+
+    fn nested_logical_predicate(depth: usize) -> BoundPredicate {
+        let mut predicate = BoundPredicate::AlwaysTrue;
+        for level in 0..depth {
+            predicate = match level % 3 {
+                0 => BoundPredicate::Not(LogicalExpression::new([Box::new(predicate)])),
+                1 => BoundPredicate::And(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(BoundPredicate::AlwaysTrue),
+                ])),
+                _ => BoundPredicate::Or(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(BoundPredicate::AlwaysFalse),
+                ])),
+            };
+        }
+        predicate
+    }
+
+    #[test]
+    fn logical_depth_limit_is_inclusive() {
+        let at_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH);
+        assert!(visit(&mut TestEvaluator {}, &at_limit).is_ok());
+
+        let beyond_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH + 1);
+        let error = visit(&mut TestEvaluator {}, &beyond_limit)
+            .expect_err("a bound predicate beyond the logical nesting limit must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("maximum depth"));
     }
 
     #[test]

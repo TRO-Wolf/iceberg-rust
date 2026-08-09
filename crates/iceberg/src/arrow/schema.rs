@@ -44,6 +44,13 @@ pub const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
 /// UTC time zone for Arrow timestamp type.
 pub const UTC_TIME_ZONE: &str = "+00:00";
 
+/// Maximum Arrow schema-type nesting depth the visitor will descend.
+///
+/// Arrow schemas can be constructed directly by callers and may therefore contain attacker-
+/// influenced nesting. Keep this aligned with the Iceberg schema visitor's 128-level policy: a
+/// type root is at depth `0`, while fields of a schema's implicit root struct are at depth `1`.
+const MAX_ARROW_SCHEMA_NESTING_DEPTH: usize = 128;
+
 fn decimal128_precision_and_scale(precision: u32, scale: u32, context: &str) -> Result<(u8, i8)> {
     let precision = u8::try_from(precision).map_err(|err| {
         Error::new(
@@ -145,25 +152,61 @@ pub trait ArrowSchemaVisitor {
 
 /// Visiting a type in post order.
 fn visit_type<V: ArrowSchemaVisitor>(r#type: &DataType, visitor: &mut V) -> Result<V::T> {
+    visit_type_at_depth(r#type, visitor, 0)
+}
+
+/// Depth-bounded body of [`visit_type`]. Each struct field, list element, map key/value, and
+/// dictionary value advances the depth by one.
+fn visit_type_at_depth<V: ArrowSchemaVisitor>(
+    r#type: &DataType,
+    visitor: &mut V,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_ARROW_SCHEMA_NESTING_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Arrow schema type nesting exceeds maximum depth {MAX_ARROW_SCHEMA_NESTING_DEPTH}"
+            ),
+        ));
+    }
+
     match r#type {
-        p if p.is_primitive()
-            || matches!(
-                p,
-                DataType::Boolean
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View
-                    | DataType::Binary
-                    | DataType::LargeBinary
-                    | DataType::BinaryView
-                    | DataType::FixedSizeBinary(_)
-            ) =>
-        {
-            visitor.primitive(p)
+        p @ (DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Timestamp(_, _)
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::Binary
+        | DataType::FixedSizeBinary(_)
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Decimal32(_, _)
+        | DataType::Decimal64(_, _)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _)) => visitor.primitive(p),
+        DataType::List(element_field) => visit_list(r#type, element_field, visitor, depth),
+        DataType::LargeList(element_field) => visit_list(r#type, element_field, visitor, depth),
+        DataType::FixedSizeList(element_field, _) => {
+            visit_list(r#type, element_field, visitor, depth)
         }
-        DataType::List(element_field) => visit_list(r#type, element_field, visitor),
-        DataType::LargeList(element_field) => visit_list(r#type, element_field, visitor),
-        DataType::FixedSizeList(element_field, _) => visit_list(r#type, element_field, visitor),
         DataType::Map(field, _) => match field.data_type() {
             DataType::Struct(fields) => {
                 if fields.len() != 2 {
@@ -178,14 +221,14 @@ fn visit_type<V: ArrowSchemaVisitor>(r#type: &DataType, visitor: &mut V) -> Resu
 
                 let key_result = {
                     visitor.before_map_key(key_field)?;
-                    let ret = visit_type(key_field.data_type(), visitor)?;
+                    let ret = visit_type_at_depth(key_field.data_type(), visitor, depth + 1)?;
                     visitor.after_map_key(key_field)?;
                     ret
                 };
 
                 let value_result = {
                     visitor.before_map_value(value_field)?;
-                    let ret = visit_type(value_field.data_type(), visitor)?;
+                    let ret = visit_type_at_depth(value_field.data_type(), visitor, depth + 1)?;
                     visitor.after_map_value(value_field)?;
                     ret
                 };
@@ -197,11 +240,32 @@ fn visit_type<V: ArrowSchemaVisitor>(r#type: &DataType, visitor: &mut V) -> Resu
                 "Map field must have struct type",
             )),
         },
-        DataType::Struct(fields) => visit_struct(fields, visitor),
-        DataType::Dictionary(_key_type, value_type) => visit_type(value_type, visitor),
-        other => Err(Error::new(
+        DataType::Struct(fields) => visit_struct(fields, visitor, depth),
+        DataType::Dictionary(_key_type, value_type) => {
+            visit_type_at_depth(value_type, visitor, depth + 1)
+        }
+        // These Arrow types contain recursively formatted child types in their Display
+        // implementations. Keep their diagnostics static: formatting an attacker-controlled,
+        // deeply nested child here can overflow the stack before the typed error is returned.
+        DataType::ListView(_) => Err(Error::new(
             ErrorKind::DataInvalid,
-            format!("Cannot visit Arrow data type: {other}"),
+            "Cannot visit Arrow data type: ListView",
+        )),
+        DataType::LargeListView(_) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Cannot visit Arrow data type: LargeListView",
+        )),
+        DataType::Union(_, _) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Cannot visit Arrow data type: Union",
+        )),
+        DataType::RunEndEncoded(_, _) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Cannot visit Arrow data type: RunEndEncoded",
+        )),
+        DataType::Null => Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Cannot visit Arrow data type: Null",
         )),
     }
 }
@@ -211,19 +275,24 @@ fn visit_list<V: ArrowSchemaVisitor>(
     data_type: &DataType,
     element_field: &Field,
     visitor: &mut V,
+    depth: usize,
 ) -> Result<V::T> {
     visitor.before_list_element(element_field)?;
-    let value = visit_type(element_field.data_type(), visitor)?;
+    let value = visit_type_at_depth(element_field.data_type(), visitor, depth + 1)?;
     visitor.after_list_element(element_field)?;
     visitor.list(data_type, value)
 }
 
 /// Visit struct type in post order.
-fn visit_struct<V: ArrowSchemaVisitor>(fields: &Fields, visitor: &mut V) -> Result<V::T> {
+fn visit_struct<V: ArrowSchemaVisitor>(
+    fields: &Fields,
+    visitor: &mut V,
+    depth: usize,
+) -> Result<V::T> {
     let mut results = Vec::with_capacity(fields.len());
     for field in fields {
         visitor.before_field(field)?;
-        let result = visit_type(field.data_type(), visitor)?;
+        let result = visit_type_at_depth(field.data_type(), visitor, depth + 1)?;
         visitor.after_field(field)?;
         results.push(result);
     }
@@ -239,7 +308,8 @@ pub(crate) fn visit_schema<V: ArrowSchemaVisitor>(
     let mut results = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         visitor.before_field(field)?;
-        let result = visit_type(field.data_type(), visitor)?;
+        // An Arrow schema is an implicit root struct at depth 0, matching Iceberg's schema visitor.
+        let result = visit_type_at_depth(field.data_type(), visitor, 1)?;
         visitor.after_field(field)?;
         results.push(result);
     }
@@ -1247,6 +1317,14 @@ impl MetadataStripVisitor {
             field_stack: Vec::new(),
         }
     }
+
+    fn push_field_info(&mut self, field: &Field) {
+        self.field_stack.push(Field::new(
+            field.name(),
+            DataType::Null, // Placeholder, will be replaced
+            field.is_nullable(),
+        ));
+    }
 }
 
 impl ArrowSchemaVisitor for MetadataStripVisitor {
@@ -1255,15 +1333,26 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
 
     fn before_field(&mut self, field: &Field) -> Result<()> {
         // Store field name and nullability for later reconstruction
-        self.field_stack.push(Field::new(
-            field.name(),
-            DataType::Null, // Placeholder, will be replaced
-            field.is_nullable(),
-        ));
+        self.push_field_info(field);
         Ok(())
     }
 
     fn after_field(&mut self, _field: &Field) -> Result<()> {
+        Ok(())
+    }
+
+    fn before_list_element(&mut self, field: &Field) -> Result<()> {
+        self.push_field_info(field);
+        Ok(())
+    }
+
+    fn before_map_key(&mut self, field: &Field) -> Result<()> {
+        self.push_field_info(field);
+        Ok(())
+    }
+
+    fn before_map_value(&mut self, field: &Field) -> Result<()> {
+        self.push_field_info(field);
         Ok(())
     }
 
@@ -1400,7 +1489,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit, UnionFields, UnionMode};
 
     use super::*;
     use crate::spec::decimal_utils::decimal_new;
@@ -1412,6 +1501,460 @@ mod tests {
             PARQUET_FIELD_ID_META_KEY.to_string(),
             value.to_string(),
         )]))
+    }
+
+    fn field_with_next_id(
+        name: &str,
+        ty: DataType,
+        nullable: bool,
+        next_field_id: &mut i32,
+    ) -> Field {
+        let field = simple_field(name, ty, nullable, &next_field_id.to_string());
+        *next_field_id += 1;
+        field
+    }
+
+    /// Wrap a primitive in a valid struct/list/map-value cycle. Each wrapper adds exactly one
+    /// visitor edge, while unique field IDs keep the converted Iceberg schema valid.
+    fn nested_composite_type(nesting: usize) -> DataType {
+        let mut data_type = DataType::Int32;
+        let mut next_field_id = 1;
+
+        for level in 0..nesting {
+            data_type = match level % 3 {
+                0 => DataType::List(Arc::new(field_with_next_id(
+                    "element",
+                    data_type,
+                    true,
+                    &mut next_field_id,
+                ))),
+                1 => DataType::Struct(Fields::from(vec![field_with_next_id(
+                    "nested",
+                    data_type,
+                    true,
+                    &mut next_field_id,
+                )])),
+                2 => {
+                    let key = field_with_next_id("key", DataType::Utf8, false, &mut next_field_id);
+                    let value = field_with_next_id("value", data_type, true, &mut next_field_id);
+                    DataType::Map(
+                        Arc::new(Field::new(
+                            DEFAULT_MAP_FIELD_NAME,
+                            DataType::Struct(Fields::from(vec![key, value])),
+                            false,
+                        )),
+                        false,
+                    )
+                }
+                _ => unreachable!(),
+            };
+        }
+
+        data_type
+    }
+
+    /// Build a malicious Arrow map chain through the key slot. Iceberg map keys cannot be nested,
+    /// but a caller can manually construct this Arrow type, so that recursion edge still needs the
+    /// same pre-conversion bound as the valid map-value path.
+    fn nested_map_key_type(nesting: usize) -> DataType {
+        let mut data_type = DataType::Int32;
+        let mut next_field_id = 1;
+
+        for _ in 0..nesting {
+            let key = field_with_next_id("key", data_type, false, &mut next_field_id);
+            let value = field_with_next_id("value", DataType::Int32, true, &mut next_field_id);
+            data_type = DataType::Map(
+                Arc::new(Field::new(
+                    DEFAULT_MAP_FIELD_NAME,
+                    DataType::Struct(Fields::from(vec![key, value])),
+                    false,
+                )),
+                false,
+            );
+        }
+
+        data_type
+    }
+
+    fn nested_list_type(nesting: usize, large: bool, fixed_size: bool) -> DataType {
+        let mut data_type = DataType::Int32;
+        let mut next_field_id = 1;
+
+        for _ in 0..nesting {
+            let element = Arc::new(field_with_next_id(
+                "element",
+                data_type,
+                true,
+                &mut next_field_id,
+            ));
+            data_type = if large {
+                DataType::LargeList(element)
+            } else if fixed_size {
+                DataType::FixedSizeList(element, 1)
+            } else {
+                DataType::List(element)
+            };
+        }
+
+        data_type
+    }
+
+    fn nested_dictionary_type(nesting: usize) -> DataType {
+        let mut data_type = DataType::Int32;
+        for _ in 0..nesting {
+            data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(data_type));
+        }
+        data_type
+    }
+
+    fn drop_dictionary_type_iteratively(data_type: DataType) {
+        let mut current = Some(data_type);
+        while let Some(data_type) = current.take() {
+            match data_type {
+                DataType::Dictionary(key_type, value_type) => {
+                    drop(key_type);
+                    current = Some(*value_type);
+                }
+                other => drop(other),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum UnsupportedRecursiveArrowType {
+        ListView,
+        LargeListView,
+        Union,
+        RunEndEncoded,
+    }
+
+    impl UnsupportedRecursiveArrowType {
+        fn diagnostic_name(self) -> &'static str {
+            match self {
+                Self::ListView => "ListView",
+                Self::LargeListView => "LargeListView",
+                Self::Union => "Union",
+                Self::RunEndEncoded => "RunEndEncoded",
+            }
+        }
+    }
+
+    struct RetainedDeepArrowType {
+        data_type: DataType,
+        /// One extra reference to each nested field, ordered innermost to outermost.
+        /// Popping reverses that order so dropping one field never recursively drops its child.
+        retained_fields: Vec<Arc<Field>>,
+    }
+
+    impl RetainedDeepArrowType {
+        fn into_schema(self) -> RetainedDeepArrowSchema {
+            let Self {
+                data_type,
+                mut retained_fields,
+            } = self;
+            let root_field = Arc::new(simple_field("root", data_type, true, "1"));
+            retained_fields.push(Arc::clone(&root_field));
+
+            RetainedDeepArrowSchema {
+                schema: ArrowSchema::new(vec![root_field]),
+                retained_fields,
+            }
+        }
+
+        fn drop_iteratively(self) {
+            let Self {
+                data_type,
+                mut retained_fields,
+            } = self;
+            drop(data_type);
+            while let Some(field) = retained_fields.pop() {
+                drop(field);
+            }
+        }
+    }
+
+    struct RetainedDeepArrowSchema {
+        schema: ArrowSchema,
+        retained_fields: Vec<Arc<Field>>,
+    }
+
+    impl RetainedDeepArrowSchema {
+        fn drop_iteratively(self) {
+            let Self {
+                schema,
+                mut retained_fields,
+            } = self;
+            drop(schema);
+            while let Some(field) = retained_fields.pop() {
+                drop(field);
+            }
+        }
+    }
+
+    fn nested_list_view_type(nesting: usize, is_large: bool) -> RetainedDeepArrowType {
+        let mut data_type = DataType::Int32;
+        let mut retained_fields = Vec::with_capacity(nesting);
+
+        for _ in 0..nesting {
+            let element = Arc::new(Field::new("item", data_type, true));
+            retained_fields.push(Arc::clone(&element));
+            data_type = if is_large {
+                DataType::LargeListView(element)
+            } else {
+                DataType::ListView(element)
+            };
+        }
+
+        RetainedDeepArrowType {
+            data_type,
+            retained_fields,
+        }
+    }
+
+    fn hostile_unsupported_type(
+        unsupported_type: UnsupportedRecursiveArrowType,
+        nesting: usize,
+    ) -> RetainedDeepArrowType {
+        match unsupported_type {
+            UnsupportedRecursiveArrowType::ListView => nested_list_view_type(nesting, false),
+            UnsupportedRecursiveArrowType::LargeListView => nested_list_view_type(nesting, true),
+            UnsupportedRecursiveArrowType::Union => {
+                let mut hostile = nested_list_view_type(nesting, false);
+                let union_field = Arc::new(Field::new("member", hostile.data_type, true));
+                let union_fields = UnionFields::try_new([0], [Arc::clone(&union_field)])
+                    .expect("one-field hostile union fixture must be valid");
+                hostile.retained_fields.push(union_field);
+                hostile.data_type = DataType::Union(union_fields, UnionMode::Dense);
+                hostile
+            }
+            UnsupportedRecursiveArrowType::RunEndEncoded => {
+                let mut hostile = nested_list_view_type(nesting, true);
+                let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
+                let values = Arc::new(Field::new("values", hostile.data_type, true));
+                hostile.retained_fields.push(Arc::clone(&values));
+                hostile.data_type = DataType::RunEndEncoded(run_ends, values);
+                hostile
+            }
+        }
+    }
+
+    fn assert_unsupported_recursive_error<T: std::fmt::Debug>(
+        result: Result<T>,
+        unsupported_type: UnsupportedRecursiveArrowType,
+    ) {
+        let error = result.expect_err("unsupported recursive Arrow type must return a typed error");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains(&format!(
+            "Cannot visit Arrow data type: {}",
+            unsupported_type.diagnostic_name()
+        )));
+    }
+
+    #[test]
+    fn deep_list_view_types_fail_safely_at_every_public_arrow_schema_entry() {
+        let mut checked_entries = 0;
+
+        for unsupported_type in [
+            UnsupportedRecursiveArrowType::ListView,
+            UnsupportedRecursiveArrowType::LargeListView,
+        ] {
+            let hostile = hostile_unsupported_type(unsupported_type, 10_000);
+            assert_unsupported_recursive_error(
+                arrow_type_to_type(&hostile.data_type),
+                unsupported_type,
+            );
+            hostile.drop_iteratively();
+            checked_entries += 1;
+
+            let hostile = hostile_unsupported_type(unsupported_type, 10_000).into_schema();
+            assert_unsupported_recursive_error(
+                arrow_schema_to_schema(&hostile.schema),
+                unsupported_type,
+            );
+            assert_unsupported_recursive_error(
+                arrow_schema_to_schema_auto_assign_ids(&hostile.schema),
+                unsupported_type,
+            );
+            assert_unsupported_recursive_error(
+                strip_metadata_from_schema(&hostile.schema),
+                unsupported_type,
+            );
+            hostile.drop_iteratively();
+            checked_entries += 3;
+        }
+
+        assert_eq!(checked_entries, 8);
+    }
+
+    #[test]
+    fn recursive_union_and_run_end_encoded_diagnostics_do_not_format_deep_children() {
+        let mut checked_entries = 0;
+
+        for unsupported_type in [
+            UnsupportedRecursiveArrowType::Union,
+            UnsupportedRecursiveArrowType::RunEndEncoded,
+        ] {
+            let hostile = hostile_unsupported_type(unsupported_type, 10_000);
+            assert_unsupported_recursive_error(
+                arrow_type_to_type(&hostile.data_type),
+                unsupported_type,
+            );
+            hostile.drop_iteratively();
+            checked_entries += 1;
+
+            let hostile = hostile_unsupported_type(unsupported_type, 10_000).into_schema();
+            assert_unsupported_recursive_error(
+                arrow_schema_to_schema(&hostile.schema),
+                unsupported_type,
+            );
+            assert_unsupported_recursive_error(
+                arrow_schema_to_schema_auto_assign_ids(&hostile.schema),
+                unsupported_type,
+            );
+            assert_unsupported_recursive_error(
+                strip_metadata_from_schema(&hostile.schema),
+                unsupported_type,
+            );
+            hostile.drop_iteratively();
+            checked_entries += 3;
+        }
+
+        assert_eq!(checked_entries, 8);
+    }
+
+    #[test]
+    fn shallow_unsupported_nested_types_keep_useful_variant_diagnostics() {
+        let mut checked_variants = 0;
+
+        for unsupported_type in [
+            UnsupportedRecursiveArrowType::ListView,
+            UnsupportedRecursiveArrowType::LargeListView,
+            UnsupportedRecursiveArrowType::Union,
+            UnsupportedRecursiveArrowType::RunEndEncoded,
+        ] {
+            let hostile = hostile_unsupported_type(unsupported_type, 1);
+            assert_unsupported_recursive_error(
+                arrow_type_to_type(&hostile.data_type),
+                unsupported_type,
+            );
+            hostile.drop_iteratively();
+            checked_variants += 1;
+        }
+
+        assert_eq!(checked_variants, 4);
+    }
+
+    #[test]
+    fn arrow_schema_visitors_accept_the_exact_nesting_boundary() {
+        // A standalone type starts at depth 0, so 128 composite edges put the primitive exactly at
+        // the accepted depth 128.
+        let boundary_type = nested_composite_type(MAX_ARROW_SCHEMA_NESTING_DEPTH);
+        let converted_type = arrow_type_to_type(&boundary_type)
+            .expect("standalone Arrow type at the exact nesting boundary must convert");
+        assert!(matches!(converted_type, Type::Struct(_)));
+
+        // A schema is an implicit root struct at depth 0. Its field starts at depth 1, so one fewer
+        // composite edge reaches the same exact boundary. Exercise every schema visitor consumer.
+        let boundary_schema = ArrowSchema::new(vec![simple_field(
+            "root",
+            nested_composite_type(MAX_ARROW_SCHEMA_NESTING_DEPTH - 1),
+            true,
+            "10000",
+        )]);
+        let converted = arrow_schema_to_schema(&boundary_schema)
+            .expect("explicit-ID schema at the exact nesting boundary must convert");
+        let auto_assigned = arrow_schema_to_schema_auto_assign_ids(&boundary_schema)
+            .expect("auto-ID schema at the exact nesting boundary must convert");
+        let stripped = strip_metadata_from_schema(&boundary_schema)
+            .expect("metadata stripping at the exact nesting boundary must succeed");
+
+        assert_eq!(converted.as_struct().fields().len(), 1);
+        assert_eq!(auto_assigned.as_struct().fields().len(), 1);
+        assert!(stripped.field(0).metadata().is_empty());
+    }
+
+    #[test]
+    fn arrow_schema_visitors_reject_one_level_beyond_every_public_entry() {
+        let expected_message = format!(
+            "Arrow schema type nesting exceeds maximum depth {MAX_ARROW_SCHEMA_NESTING_DEPTH}"
+        );
+
+        let overdeep_type = nested_composite_type(MAX_ARROW_SCHEMA_NESTING_DEPTH + 1);
+        let type_error = arrow_type_to_type(&overdeep_type)
+            .expect_err("standalone Arrow type one level beyond the limit must fail");
+        assert_eq!(type_error.kind(), ErrorKind::DataInvalid);
+        assert!(type_error.to_string().contains(&expected_message));
+
+        // A schema field starts one level below its implicit root, so 128 composite edges are one
+        // beyond the schema boundary. The Arrow-specific diagnostic proves these public converters
+        // fail at this visitor, rather than only at the downstream Iceberg schema builder.
+        let overdeep_schema = ArrowSchema::new(vec![simple_field(
+            "root",
+            nested_composite_type(MAX_ARROW_SCHEMA_NESTING_DEPTH),
+            true,
+            "10000",
+        )]);
+        let explicit_error = arrow_schema_to_schema(&overdeep_schema)
+            .expect_err("explicit-ID schema one level beyond the limit must fail");
+        assert_eq!(explicit_error.kind(), ErrorKind::DataInvalid);
+        assert!(explicit_error.to_string().contains(&expected_message));
+
+        let auto_error = arrow_schema_to_schema_auto_assign_ids(&overdeep_schema)
+            .expect_err("auto-ID schema one level beyond the limit must fail");
+        assert_eq!(auto_error.kind(), ErrorKind::DataInvalid);
+        assert!(auto_error.to_string().contains(&expected_message));
+
+        let strip_error = strip_metadata_from_schema(&overdeep_schema)
+            .expect_err("metadata stripping one level beyond the limit must fail");
+        assert_eq!(strip_error.kind(), ErrorKind::DataInvalid);
+        assert!(strip_error.to_string().contains(&expected_message));
+    }
+
+    #[test]
+    fn arrow_schema_visitor_bounds_every_recursive_arrow_edge() {
+        let expected_message = format!(
+            "Arrow schema type nesting exceeds maximum depth {MAX_ARROW_SCHEMA_NESTING_DEPTH}"
+        );
+        let overdeep = MAX_ARROW_SCHEMA_NESTING_DEPTH + 1;
+
+        // The mixed boundary tests cover struct fields, ordinary lists, and map values. Exercise
+        // manually constructible map-key, LargeList, FixedSizeList, and dictionary chains too, so
+        // no recursive Arrow edge can bypass the shared depth check.
+        for (name, data_type) in [
+            ("map key", nested_map_key_type(overdeep)),
+            (
+                "large-list element",
+                nested_list_type(overdeep, true, false),
+            ),
+            (
+                "fixed-size-list element",
+                nested_list_type(overdeep, false, true),
+            ),
+            ("dictionary value", nested_dictionary_type(overdeep)),
+        ] {
+            let error = arrow_type_to_type(&data_type)
+                .expect_err("every overdeep recursive Arrow edge must be rejected");
+            assert_eq!(error.kind(), ErrorKind::DataInvalid, "{name}");
+            assert!(error.to_string().contains(&expected_message), "{name}");
+        }
+    }
+
+    #[test]
+    fn malicious_arrow_dictionary_depth_errors_and_drops_iteratively() {
+        // Arrow permits callers to manually build far deeper trees than its normal producers emit.
+        // The visitor must stop after 128 edges, independent of the input's total depth. Tear down
+        // the synthetic 10,000-node Box chain iteratively after the call: recursively dropping the
+        // hostile fixture could itself overflow the test thread's stack and would test Arrow's Drop
+        // behavior rather than this borrowed visitor.
+        let hostile = nested_dictionary_type(10_000);
+        let result = arrow_type_to_type(&hostile);
+        drop_dictionary_type_iteratively(hostile);
+
+        let error = result.expect_err("hostile dictionary nesting must return a typed error");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains(&format!(
+            "Arrow schema type nesting exceeds maximum depth {MAX_ARROW_SCHEMA_NESTING_DEPTH}"
+        )));
     }
 
     fn arrow_schema_for_arrow_schema_to_schema_test() -> ArrowSchema {

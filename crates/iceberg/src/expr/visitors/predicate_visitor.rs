@@ -21,6 +21,12 @@ use crate::expr::{Predicate, PredicateOperator, Reference};
 use crate::spec::Datum;
 use crate::{Error, ErrorKind, Result};
 
+/// Maximum logical nesting accepted by predicate-tree walks.
+///
+/// This mirrors the expression JSON parser's limit. Real filters are shallow, while a bounded
+/// walk prevents hand-built or deserialized trees from overflowing the thread stack.
+pub(crate) const MAX_PREDICATE_DEPTH: usize = 100;
+
 /// A visitor for [`Predicate`]s. Visits in post-order.
 pub trait PredicateVisitor {
     /// The return type of this visitor
@@ -137,29 +143,44 @@ pub trait PredicateVisitor {
 /// Visits a [`Predicate`] with the provided visitor,
 /// in post-order
 pub(crate) fn visit<V: PredicateVisitor>(visitor: &mut V, predicate: &Predicate) -> Result<V::T> {
+    visit_at_depth(visitor, predicate, 0)
+}
+
+fn visit_at_depth<V: PredicateVisitor>(
+    visitor: &mut V,
+    predicate: &Predicate,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_PREDICATE_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Predicate nesting exceeds maximum depth {MAX_PREDICATE_DEPTH}"),
+        ));
+    }
+
     match predicate {
         Predicate::AlwaysTrue => visitor.always_true(),
         Predicate::AlwaysFalse => visitor.always_false(),
         Predicate::And(expr) => {
             let [left_pred, right_pred] = expr.inputs();
 
-            let left_result = visit(visitor, left_pred)?;
-            let right_result = visit(visitor, right_pred)?;
+            let left_result = visit_at_depth(visitor, left_pred, depth + 1)?;
+            let right_result = visit_at_depth(visitor, right_pred, depth + 1)?;
 
             visitor.and(left_result, right_result)
         }
         Predicate::Or(expr) => {
             let [left_pred, right_pred] = expr.inputs();
 
-            let left_result = visit(visitor, left_pred)?;
-            let right_result = visit(visitor, right_pred)?;
+            let left_result = visit_at_depth(visitor, left_pred, depth + 1)?;
+            let right_result = visit_at_depth(visitor, right_pred, depth + 1)?;
 
             visitor.or(left_result, right_result)
         }
         Predicate::Not(expr) => {
             let [inner_pred] = expr.inputs();
 
-            let inner_result = visit(visitor, inner_pred)?;
+            let inner_result = visit_at_depth(visitor, inner_pred, depth + 1)?;
 
             visitor.not(inner_result)
         }
@@ -220,9 +241,11 @@ mod tests {
 
     use fnv::FnvHashSet;
 
-    use crate::expr::visitors::predicate_visitor::{PredicateVisitor, visit};
+    use crate::ErrorKind;
+    use crate::expr::visitors::predicate_visitor::{MAX_PREDICATE_DEPTH, PredicateVisitor, visit};
     use crate::expr::{
-        BinaryExpression, Predicate, PredicateOperator, Reference, SetExpression, UnaryExpression,
+        BinaryExpression, LogicalExpression, Predicate, PredicateOperator, Reference,
+        SetExpression, UnaryExpression,
     };
     use crate::spec::Datum;
 
@@ -371,6 +394,36 @@ mod tests {
         ) -> crate::Result<bool> {
             Ok(false)
         }
+    }
+
+    fn nested_logical_predicate(depth: usize) -> Predicate {
+        let mut predicate = Predicate::AlwaysTrue;
+        for level in 0..depth {
+            predicate = match level % 3 {
+                0 => Predicate::Not(LogicalExpression::new([Box::new(predicate)])),
+                1 => Predicate::And(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(Predicate::AlwaysTrue),
+                ])),
+                _ => Predicate::Or(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(Predicate::AlwaysFalse),
+                ])),
+            };
+        }
+        predicate
+    }
+
+    #[test]
+    fn logical_depth_limit_is_inclusive() {
+        let at_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH);
+        assert!(visit(&mut TestEvaluator {}, &at_limit).is_ok());
+
+        let beyond_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH + 1);
+        let error = visit(&mut TestEvaluator {}, &beyond_limit)
+            .expect_err("a predicate beyond the logical nesting limit must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("maximum depth"));
     }
 
     #[test]

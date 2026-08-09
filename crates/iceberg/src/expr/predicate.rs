@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::visit as visit_bound;
-use crate::expr::visitors::predicate_visitor::visit;
+use crate::expr::visitors::predicate_visitor::{MAX_PREDICATE_DEPTH, visit};
 use crate::expr::visitors::rewrite_not::RewriteNotVisitor;
 use crate::expr::{Bind, BoundReference, PredicateOperator, Reference};
 use crate::spec::{Datum, PrimitiveLiteral, SchemaRef};
@@ -487,11 +487,34 @@ impl Bind for Predicate {
     type Bound = BoundPredicate;
 
     fn bind(&self, schema: SchemaRef, case_sensitive: bool) -> Result<BoundPredicate> {
+        self.bind_at_depth(schema, case_sensitive, 0)
+    }
+}
+
+impl Predicate {
+    fn bind_at_depth(
+        &self,
+        schema: SchemaRef,
+        case_sensitive: bool,
+        depth: usize,
+    ) -> Result<BoundPredicate> {
+        if depth > MAX_PREDICATE_DEPTH {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Predicate binding exceeds maximum depth {MAX_PREDICATE_DEPTH}"),
+            ));
+        }
+
         match self {
             Predicate::And(expr) => {
-                let bound_expr = expr.bind(schema, case_sensitive)?;
-
-                let [left, right] = bound_expr.inputs;
+                let [left_predicate, right_predicate] = expr.inputs();
+                let left = Box::new(left_predicate.bind_at_depth(
+                    schema.clone(),
+                    case_sensitive,
+                    depth + 1,
+                )?);
+                let right =
+                    Box::new(right_predicate.bind_at_depth(schema, case_sensitive, depth + 1)?);
                 Ok(match (left, right) {
                     (_, r) if matches!(&*r, &BoundPredicate::AlwaysFalse) => {
                         BoundPredicate::AlwaysFalse
@@ -505,8 +528,9 @@ impl Bind for Predicate {
                 })
             }
             Predicate::Not(expr) => {
-                let bound_expr = expr.bind(schema, case_sensitive)?;
-                let [inner] = bound_expr.inputs;
+                let [inner_predicate] = expr.inputs();
+                let inner =
+                    Box::new(inner_predicate.bind_at_depth(schema, case_sensitive, depth + 1)?);
                 Ok(match inner {
                     e if matches!(&*e, &BoundPredicate::AlwaysTrue) => BoundPredicate::AlwaysFalse,
                     e if matches!(&*e, &BoundPredicate::AlwaysFalse) => BoundPredicate::AlwaysTrue,
@@ -514,8 +538,14 @@ impl Bind for Predicate {
                 })
             }
             Predicate::Or(expr) => {
-                let bound_expr = expr.bind(schema, case_sensitive)?;
-                let [left, right] = bound_expr.inputs;
+                let [left_predicate, right_predicate] = expr.inputs();
+                let left = Box::new(left_predicate.bind_at_depth(
+                    schema.clone(),
+                    case_sensitive,
+                    depth + 1,
+                )?);
+                let right =
+                    Box::new(right_predicate.bind_at_depth(schema, case_sensitive, depth + 1)?);
                 Ok(match (left, right) {
                     (l, r)
                         if matches!(&*r, &BoundPredicate::AlwaysTrue)
@@ -968,8 +998,10 @@ mod tests {
     use std::ops::Not;
     use std::sync::Arc;
 
+    use crate::ErrorKind;
     use crate::expr::Predicate::{AlwaysFalse, AlwaysTrue};
-    use crate::expr::{Bind, BoundPredicate, Reference};
+    use crate::expr::visitors::predicate_visitor::MAX_PREDICATE_DEPTH;
+    use crate::expr::{Bind, BoundPredicate, LogicalExpression, Predicate, Reference};
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
 
     #[test]
@@ -1171,6 +1203,38 @@ mod tests {
         let serialized = serde_json::to_string(&bound_predicate).unwrap();
         let deserialized: BoundPredicate = serde_json::from_str(&serialized).unwrap();
         assert_eq!(bound_predicate, deserialized);
+    }
+
+    fn nested_logical_predicate(depth: usize) -> Predicate {
+        let mut predicate = Predicate::AlwaysTrue;
+        for level in 0..depth {
+            predicate = match level % 3 {
+                0 => Predicate::Not(LogicalExpression::new([Box::new(predicate)])),
+                1 => Predicate::And(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(Predicate::AlwaysTrue),
+                ])),
+                _ => Predicate::Or(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(Predicate::AlwaysFalse),
+                ])),
+            };
+        }
+        predicate
+    }
+
+    #[test]
+    fn bind_logical_depth_limit_is_inclusive() {
+        let schema = table_schema_simple();
+        let at_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH);
+        assert!(at_limit.bind(schema.clone(), true).is_ok());
+
+        let beyond_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH + 1);
+        let error = beyond_limit
+            .bind(schema, true)
+            .expect_err("binding beyond the logical nesting limit must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("maximum depth"));
     }
 
     #[test]
