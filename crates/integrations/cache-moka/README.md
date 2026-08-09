@@ -20,3 +20,17 @@
 # Apache Iceberg Rust Cache Moka
 
 This crate provides a [moka](https://github.com/moka-rs/moka) cache implementation for Apache Iceberg Rust. It is used to cache data in memory for faster access.
+
+## Capacity
+
+`MokaObjectCacheProvider::new_with_capacity` takes a **byte** budget, not an entry count. Each
+cached manifest / manifest list is weighed as `entry_count × a per-entry constant`, and the two
+caches the provider owns (manifests and manifest lists) each get the given budget — so the default
+provider's aggregate ceiling is `2 × 32 MiB`. A budget of `0` disables caching.
+
+The per-entry constants are owned by `crates/iceberg/src/io/object_cache.rs` and duplicated here
+across the crate boundary; keep the two copies in step.
+
+A cache supplied through `with_manifest_cache` / `with_manifest_list_cache` is used exactly as the
+caller built it. This crate attaches no weigher to it, so a cache built with
+`moka::sync::Cache::new(n)` is bounded by entry count.
