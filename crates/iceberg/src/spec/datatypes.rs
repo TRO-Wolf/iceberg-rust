@@ -193,6 +193,10 @@ impl Type {
             precision > 0 && precision <= MAX_DECIMAL_PRECISION,
             "Decimals with precision larger than {MAX_DECIMAL_PRECISION} are not supported: {precision}",
         );
+        ensure_data_valid!(
+            scale <= precision,
+            "Decimal scale must be less than or equal to precision: precision={precision}, scale={scale}",
+        );
         Ok(Type::Primitive(PrimitiveType::Decimal { precision, scale }))
     }
 
@@ -400,10 +404,17 @@ where D: Deserializer<'de> {
         .split_once(',')
         .ok_or_else(|| D::Error::custom(format!("Decimal requires precision and scale: {s}")))?;
 
-    Ok(PrimitiveType::Decimal {
-        precision: parse_unsigned_digits(precision, &s)?,
-        scale: parse_unsigned_digits(scale, &s)?,
-    })
+    let precision = parse_unsigned_digits(precision, &s)?;
+    let scale = parse_unsigned_digits(scale, &s)?;
+
+    Type::decimal(precision, scale)
+        .map_err(D::Error::custom)
+        .and_then(|ty| match ty {
+            Type::Primitive(primitive) => Ok(primitive),
+            _ => Err(D::Error::custom(
+                "Decimal type constructor returned a non-primitive type",
+            )),
+        })
 }
 
 /// Parses the `\d+` capture of Java's `fixed`/`decimal` regex: ASCII digits only after a `trim()`.
@@ -435,6 +446,7 @@ fn serialize_decimal<S>(
 where
     S: Serializer,
 {
+    Type::decimal(*precision, *scale).map_err(serde::ser::Error::custom)?;
     serializer.serialize_str(&format!("decimal({precision},{scale})"))
 }
 
@@ -1391,6 +1403,84 @@ mod tests {
     }
 
     #[test]
+    fn decimal_constructor_accepts_iceberg_precision_scale_boundaries() {
+        assert_eq!(
+            Type::decimal(1, 0).expect("decimal(1,0) is the minimum valid Iceberg decimal"),
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 1,
+                scale: 0,
+            })
+        );
+        assert_eq!(
+            Type::decimal(MAX_DECIMAL_PRECISION, MAX_DECIMAL_PRECISION)
+                .expect("decimal(38,38) is the maximum valid Iceberg Decimal128 shape"),
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: MAX_DECIMAL_PRECISION,
+                scale: MAX_DECIMAL_PRECISION,
+            })
+        );
+    }
+
+    #[test]
+    fn decimal_constructor_rejects_out_of_range_precision_and_scale() {
+        for (precision, scale, context) in [
+            (0, 0, "precision zero has no Iceberg decimal storage width"),
+            (
+                MAX_DECIMAL_PRECISION + 1,
+                0,
+                "precision above 38 cannot fit Iceberg decimal metadata",
+            ),
+            (
+                10,
+                11,
+                "scale greater than precision is not a valid decimal invariant",
+            ),
+        ] {
+            let error = match Type::decimal(precision, scale) {
+                Ok(_) => panic!("{context}: decimal({precision},{scale}) must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), crate::ErrorKind::DataInvalid, "{context}");
+        }
+    }
+
+    #[test]
+    fn decimal_type_serialization_rejects_manually_constructed_invalid_metadata() {
+        for decimal in [
+            PrimitiveType::Decimal {
+                precision: 0,
+                scale: 0,
+            },
+            PrimitiveType::Decimal {
+                precision: MAX_DECIMAL_PRECISION + 1,
+                scale: 0,
+            },
+            PrimitiveType::Decimal {
+                precision: 2,
+                scale: 3,
+            },
+        ] {
+            assert!(
+                serde_json::to_string(&decimal).is_err(),
+                "manually constructed invalid decimal metadata must not serialize: {decimal:?}"
+            );
+            assert!(
+                serde_json::to_string(&Type::Primitive(decimal.clone())).is_err(),
+                "invalid decimal metadata must not serialize through Type: {decimal:?}"
+            );
+        }
+
+        assert_eq!(
+            serde_json::to_string(&PrimitiveType::Decimal {
+                precision: 2,
+                scale: 2,
+            })
+            .expect("valid decimal metadata must preserve its type-string encoding"),
+            r#""decimal(2,2)""#
+        );
+    }
+
+    #[test]
     fn test_primitive_type_compatible() {
         let pairs = vec![
             (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(true)),
@@ -1846,6 +1936,9 @@ mod tests {
             "decimal(38,2,3)",
             "decimal( +38 , 2 )",
             "decimal(-38,2)",
+            "decimal(0,0)",
+            "decimal(39,0)",
+            "decimal(10,11)",
         ] {
             assert!(
                 serde_json::from_str::<Type>(&format!(r#""{bad}""#)).is_err(),

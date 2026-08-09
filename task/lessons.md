@@ -915,3 +915,13 @@ the general rule, not three incidents.
 - **DO NOT report a GREEN — gate or mutation leg — from a checkout whose last mutation restore you
   did not confirm rebuilt.** A green produced from a mutant-era binary is indistinguishable from a
   real one in the output, and it ships.
+
+### 2026-08-08 — Preserve independent Actor–Critic review at every granularity
+
+- **DO run an independent fresh-context Critic for every implementation group and every remediation
+  or scope-driven follow-up, including changes that appear too small to warrant separate review.**
+  *Why:* the user explicitly prioritizes preventing groupthink over process shortcuts; a tiny
+  call-site migration or fixture correction can carry the same public-API or data-integrity risk as
+  the originating change. *Apply:* never self-waive the Critic because a diff is small; record the
+  Actor artifact, execute the hard context break, and require the Critic's complete attestation
+  before advancing.

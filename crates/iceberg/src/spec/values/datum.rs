@@ -47,6 +47,61 @@ pub(crate) const MAX_TIME_VALUE: i64 = 24 * 60 * 60 * 1_000_000i64 - 1;
 pub(crate) const INT_MAX: i32 = 2147483647;
 pub(crate) const INT_MIN: i32 = -2147483648;
 
+fn validate_decimal_type(r#type: &PrimitiveType) -> Result<()> {
+    if let PrimitiveType::Decimal { precision, scale } = r#type {
+        Type::decimal(*precision, *scale).map_err(|source| {
+            let message = if *precision == 0 || *precision > MAX_DECIMAL_PRECISION {
+                format!(
+                    "PrimitiveType Decimal must have valid precision from 1 through {MAX_DECIMAL_PRECISION}, got {precision}"
+                )
+            } else {
+                format!(
+                    "PrimitiveType Decimal scale must not exceed precision, got precision={precision}, scale={scale}"
+                )
+            };
+            Error::new(ErrorKind::DataInvalid, message).with_source(source)
+        })?;
+    }
+    Ok(())
+}
+
+/// Validate a decimal's metadata and unscaled value against Iceberg's declared precision.
+///
+/// The absolute value is converted through `unsigned_abs`, which is defined for
+/// `i128::MIN` and therefore cannot overflow while checking the 38-digit boundary.
+pub(crate) fn validate_decimal_value(r#type: &PrimitiveType, value: i128) -> Result<()> {
+    let PrimitiveType::Decimal { precision, .. } = r#type else {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Decimal value {value} has non-decimal type {}", r#type),
+        ));
+    };
+    validate_decimal_type(r#type)?;
+
+    let actual_precision = value.unsigned_abs().to_string().len();
+    ensure_data_valid!(
+        actual_precision <= usize::try_from(*precision)?,
+        "Decimal value {value} is too large for precision {precision}",
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_decimal_literal(
+    r#type: &PrimitiveType,
+    literal: &PrimitiveLiteral,
+) -> Result<()> {
+    match (r#type, literal) {
+        (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int128(value)) => {
+            validate_decimal_value(r#type, *value)
+        }
+        (PrimitiveType::Decimal { .. }, _) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Decimal type {} requires an Int128 literal", r#type),
+        )),
+        _ => validate_decimal_type(r#type),
+    }
+}
+
 /// Literal associated with its type. The value and type pair is checked when construction, so the type and value is
 /// guaranteed to be correct when used.
 ///
@@ -63,6 +118,8 @@ impl Serialize for Datum {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
+        validate_decimal_literal(&self.r#type, &self.literal).map_err(serde::ser::Error::custom)?;
+
         let mut struct_ser = serializer
             .serialize_struct("Datum", 2)
             .map_err(serde::ser::Error::custom)?;
@@ -118,6 +175,7 @@ impl<'de> Deserialize<'de> for Datum {
                 else {
                     return Err(serde::de::Error::custom("Invalid value"));
                 };
+                validate_decimal_literal(&r#type, &primitive).map_err(serde::de::Error::custom)?;
 
                 Ok(Datum::new(r#type, primitive))
             }
@@ -155,6 +213,7 @@ impl<'de> Deserialize<'de> for Datum {
                 else {
                     return Err(serde::de::Error::custom("Invalid value"));
                 };
+                validate_decimal_literal(&r#type, &primitive).map_err(serde::de::Error::custom)?;
                 Ok(Datum::new(r#type, primitive))
             }
         }
@@ -372,6 +431,10 @@ impl From<Datum> for PrimitiveLiteral {
 }
 
 impl Datum {
+    pub(crate) fn validate_decimal(&self) -> Result<()> {
+        validate_decimal_literal(&self.r#type, &self.literal)
+    }
+
     /// Creates a `Datum` from a `PrimitiveType` and a `PrimitiveLiteral`
     pub(crate) fn new(r#type: PrimitiveType, literal: PrimitiveLiteral) -> Self {
         Datum { r#type, literal }
@@ -434,12 +497,17 @@ impl Datum {
             PrimitiveType::Fixed(_) => PrimitiveLiteral::Binary(Vec::from(bytes)),
             PrimitiveType::Binary => PrimitiveLiteral::Binary(Vec::from(bytes)),
             PrimitiveType::Decimal { .. } => {
-                PrimitiveLiteral::Int128(i128_from_be_bytes(bytes).ok_or_else(|| {
+                let value = i128_from_be_bytes(bytes).ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
                         format!("Can't convert bytes to i128: {bytes:?}"),
                     )
-                })?)
+                })?;
+                ensure_data_valid!(
+                    bytes == i128_to_be_bytes_min(value),
+                    "Decimal bytes must use the canonical minimal two's-complement big-endian encoding: {bytes:?}",
+                );
+                PrimitiveLiteral::Int128(value)
             }
             // `unknown` has no `PrimitiveLiteral` form — its values are always null, so there is no
             // single-value byte encoding to decode (Java keeps no value class for `UnknownType`).
@@ -450,6 +518,7 @@ impl Datum {
                 ));
             }
         };
+        validate_decimal_literal(&data_type, &literal)?;
         Ok(Datum::new(data_type, literal))
     }
 
@@ -457,6 +526,19 @@ impl Datum {
     ///
     /// See [this spec](https://iceberg.apache.org/spec/#binary-single-value-serialization) for reference.
     pub fn to_bytes(&self) -> Result<ByteBuf> {
+        // Preserve the diagnostic emitted by the original decimal byte encoder for invalid
+        // precision. Other metadata and value validation continues through the shared helper.
+        if matches!(&self.literal, PrimitiveLiteral::Int128(_))
+            && let PrimitiveType::Decimal { precision, .. } = &self.r#type
+            && (*precision == 0 || *precision > MAX_DECIMAL_PRECISION)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("PrimitiveType Decimal must has valid precision but got {precision}"),
+            ));
+        }
+        validate_decimal_literal(&self.r#type, &self.literal)?;
+
         let buf = match &self.literal {
             PrimitiveLiteral::Boolean(val) => {
                 if *val {
@@ -485,20 +567,13 @@ impl Datum {
 
                 // It's required by iceberg spec that we must keep the minimum
                 // number of bytes for the value
-                let Ok(required_bytes) = Type::decimal_required_bytes(precision) else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "PrimitiveType Decimal must has valid precision but got {precision}"
-                        ),
-                    ));
-                };
+                let required_bytes = Type::decimal_required_bytes(precision)?;
 
                 // The primitive literal is unscaled value.
                 // Convert into two's-complement byte representation in big-endian byte order.
                 let mut bytes = i128_to_be_bytes_min(*val);
                 // Truncate with required bytes to make sure.
-                bytes.truncate(required_bytes as usize);
+                bytes.truncate(required_bytes.try_into()?);
 
                 ByteBuf::from(bytes)
             }
@@ -1075,7 +1150,11 @@ impl Datum {
         let scale = decimal_scale(&value);
         let mantissa = decimal_mantissa(&value);
 
-        let available_bytes = Type::decimal_required_bytes(precision)? as usize;
+        // Validate the metadata before checking the value. In particular, a scale greater than
+        // the precision must not be accepted just because the value happens to fit in one byte.
+        validate_decimal_value(&PrimitiveType::Decimal { precision, scale }, mantissa)?;
+
+        let available_bytes = usize::try_from(Type::decimal_required_bytes(precision)?)?;
         let actual_bytes = i128_to_be_bytes_min(mantissa);
         if actual_bytes.len() > available_bytes {
             return Err(Error::new(

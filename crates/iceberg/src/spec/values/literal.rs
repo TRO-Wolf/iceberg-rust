@@ -26,6 +26,7 @@ use serde_json::{Map as JsonMap, Number, Value as JsonValue};
 use uuid::Uuid;
 
 use super::Map;
+use super::datum::validate_decimal_value;
 use super::decimal_utils::{
     decimal_from_str_exact, decimal_mantissa, decimal_rescale, try_decimal_from_i128_with_scale,
 };
@@ -523,17 +524,15 @@ impl Literal {
                     PrimitiveLiteral::Binary(hex_str_to_bytes(&s)?),
                 ))),
                 (
-                    PrimitiveType::Decimal {
-                        precision: _,
-                        scale,
-                    },
+                    primitive_type @ PrimitiveType::Decimal { precision, scale },
                     JsonValue::String(s),
                 ) => {
+                    Type::decimal(*precision, *scale)?;
                     let decimal = decimal_from_str_exact(&s)?;
                     let rescaled = decimal_rescale(decimal, *scale);
-                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Int128(
-                        decimal_mantissa(&rescaled),
-                    ))))
+                    let value = decimal_mantissa(&rescaled);
+                    validate_decimal_value(primitive_type, value)?;
+                    Ok(Some(Literal::decimal(value)))
                 }
                 (_, JsonValue::Null) => Ok(None),
                 (i, j) => Err(Error::new(
@@ -543,20 +542,15 @@ impl Literal {
             },
             Type::Struct(schema) => {
                 if let JsonValue::Object(mut object) = value {
-                    Ok(Some(Literal::Struct(Struct::from_iter(
-                        schema.fields().iter().map(|field| {
-                            object.remove(&field.id.to_string()).and_then(|value| {
-                                Literal::try_from_json(value, &field.field_type)
-                                    .and_then(|value| {
-                                        value.ok_or(Error::new(
-                                            ErrorKind::DataInvalid,
-                                            "Key of map cannot be null",
-                                        ))
-                                    })
-                                    .ok()
-                            })
-                        }),
-                    ))))
+                    let values = schema
+                        .fields()
+                        .iter()
+                        .map(|field| match object.remove(&field.id.to_string()) {
+                            Some(value) => Literal::try_from_json(value, &field.field_type),
+                            None => Ok(None),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Some(Literal::Struct(Struct::from_iter(values))))
                 } else {
                     Err(Error::new(
                         crate::ErrorKind::DataInvalid,
@@ -746,19 +740,18 @@ impl Literal {
                 (PrimitiveType::Binary, PrimitiveLiteral::Binary(val)) => {
                     Ok(JsonValue::String(bytes_to_hex_str(&val)))
                 }
-                (_, PrimitiveLiteral::Int128(val)) => match r#type {
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: _precision,
-                        scale,
-                    }) => {
-                        let decimal = try_decimal_from_i128_with_scale(val, *scale)?;
-                        Ok(JsonValue::String(decimal.to_string()))
-                    }
-                    _ => Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "The iceberg type for decimal literal must be decimal.",
-                    ))?,
-                },
+                (
+                    primitive_type @ PrimitiveType::Decimal { scale, .. },
+                    PrimitiveLiteral::Int128(val),
+                ) => {
+                    validate_decimal_value(primitive_type, val)?;
+                    let decimal = try_decimal_from_i128_with_scale(val, *scale)?;
+                    Ok(JsonValue::String(decimal.to_string()))
+                }
+                (_, PrimitiveLiteral::Int128(_)) => Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "The iceberg type for decimal literal must be decimal.",
+                )),
                 _ => Err(Error::new(
                     ErrorKind::DataInvalid,
                     "The iceberg value doesn't fit to the iceberg type.",

@@ -586,8 +586,8 @@ fn avro_bytes_decimal() {
         (vec![251u8, 46u8], -1234, 2, 38),
         (vec![4u8, 210u8], 1234, 3, 38),
         (vec![251u8, 46u8], -1234, 3, 38),
-        (vec![42u8], 42, 2, 1),
-        (vec![214u8], -42, 2, 1),
+        (vec![42u8], 42, 2, 2),
+        (vec![214u8], -42, 2, 2),
     ];
 
     for (input_bytes, decimal_num, expect_scale, expect_precision) in cases {
@@ -606,7 +606,7 @@ fn avro_bytes_decimal() {
 #[test]
 fn avro_bytes_decimal_expect_error() {
     // (decimal_num, expect_scale, expect_precision)
-    let cases = vec![(1234, 2, 1)];
+    let cases = vec![(1234, 0, 1), (42, 2, 1)];
 
     for (decimal_num, expect_scale, expect_precision) in cases {
         let result =
@@ -617,6 +617,264 @@ fn avro_bytes_decimal_expect_error() {
             ErrorKind::DataInvalid,
             "expect error DataInvalid",
         );
+    }
+}
+
+#[test]
+fn datum_decimal_precision_counts_digits_not_bytes() {
+    for (value, encoded) in [(99, vec![0x63]), (-99, vec![0x9d])] {
+        let datum = Datum::decimal_with_precision(decimal_new(value, 0), 2)
+            .expect("two-digit decimal must fit precision two");
+        assert_eq!(datum.to_bytes().expect("valid decimal bytes"), encoded);
+    }
+
+    for value in [100, -100] {
+        let result = Datum::decimal_with_precision(decimal_new(value, 0), 2);
+        assert_eq!(
+            result
+                .expect_err("three-digit decimal must exceed precision two")
+                .kind(),
+            ErrorKind::DataInvalid
+        );
+    }
+}
+
+#[test]
+fn datum_decimal_boundaries_preserve_negative_binary_encoding() {
+    for (value, scale, encoded) in [(99, 2, vec![0x63]), (-99, 2, vec![0x9d])] {
+        let datum = Datum::decimal_with_precision(decimal_new(value, scale), 2)
+            .expect("decimal precision and scale boundary must be valid");
+        assert_eq!(datum.to_bytes().expect("valid decimal bytes"), encoded);
+    }
+}
+
+#[test]
+fn datum_decimal_bytes_reject_invalid_metadata() {
+    for data_type in [
+        PrimitiveType::Decimal {
+            precision: 1,
+            scale: 2,
+        },
+        PrimitiveType::Decimal {
+            precision: 39,
+            scale: 0,
+        },
+    ] {
+        let error = Datum::try_from_bytes(&[0], data_type).expect_err("invalid metadata");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+}
+
+#[test]
+fn datum_decimal_byte_decode_enforces_unscaled_value_precision() {
+    let decimal_type = PrimitiveType::Decimal {
+        precision: 2,
+        scale: 0,
+    };
+
+    for (bytes, expected_value) in [([0x63], 99), ([0x9d], -99)] {
+        let datum = Datum::try_from_bytes(&bytes, decimal_type.clone())
+            .expect("two-digit decimal bytes must fit precision two");
+        assert_eq!(
+            datum,
+            Datum::new(
+                decimal_type.clone(),
+                PrimitiveLiteral::Int128(expected_value),
+            )
+        );
+        assert_eq!(
+            datum.to_bytes().expect("valid decimal must round-trip"),
+            bytes
+        );
+    }
+
+    for bytes in [[0x64], [0x9c]] {
+        let error = Datum::try_from_bytes(&bytes, decimal_type.clone())
+            .expect_err("three-digit decimal bytes must exceed precision two");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+}
+
+#[test]
+fn datum_decimal_byte_decode_requires_canonical_minimal_twos_complement() {
+    let decimal_type = PrimitiveType::Decimal {
+        precision: 2,
+        scale: 0,
+    };
+
+    for (bytes, expected_value) in [(vec![0x00], 0), (vec![0x63], 99), (vec![0x9d], -99)] {
+        let datum = Datum::try_from_bytes(&bytes, decimal_type.clone())
+            .expect("canonical minimal decimal bytes must decode");
+        assert_eq!(
+            datum,
+            Datum::new(
+                decimal_type.clone(),
+                PrimitiveLiteral::Int128(expected_value),
+            )
+        );
+        assert_eq!(
+            datum.to_bytes().expect("canonical bytes must re-encode"),
+            bytes
+        );
+    }
+
+    for bytes in [
+        vec![],
+        vec![0x00, 0x00],
+        vec![0x00, 0x63],
+        vec![0xff, 0x9d],
+        vec![0xff, 0xff],
+    ] {
+        let error = Datum::try_from_bytes(&bytes, decimal_type.clone())
+            .expect_err("empty or redundant sign-extension bytes must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid, "bytes={bytes:?}");
+        assert!(
+            error.message().contains("canonical minimal"),
+            "bytes={bytes:?}, error={error}"
+        );
+    }
+}
+
+#[test]
+fn datum_decimal_json_round_trip_enforces_unscaled_value_precision() {
+    let decimal_type = PrimitiveType::Decimal {
+        precision: 2,
+        scale: 0,
+    };
+
+    for value in [99_i128, -99_i128] {
+        let datum = Datum::new(decimal_type.clone(), PrimitiveLiteral::Int128(value));
+        let json = serde_json::to_value(&datum)
+            .expect("two-digit decimal must serialize at precision two");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "decimal(2,0)",
+                "literal": value.to_be_bytes(),
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<Datum>(json)
+                .expect("two-digit decimal JSON must deserialize at precision two"),
+            datum
+        );
+    }
+
+    for value in [100_i128, -100_i128] {
+        let invalid_datum = Datum::new(decimal_type.clone(), PrimitiveLiteral::Int128(value));
+        assert_eq!(
+            invalid_datum
+                .to_bytes()
+                .expect_err("manual three-digit decimal must not encode at precision two")
+                .kind(),
+            ErrorKind::DataInvalid
+        );
+        assert!(
+            serde_json::to_value(&invalid_datum).is_err(),
+            "manual three-digit decimal must not serialize at precision two"
+        );
+
+        let invalid_json = serde_json::json!({
+            "type": "decimal(2,0)",
+            "literal": value.to_be_bytes(),
+        });
+        assert!(
+            serde_json::from_value::<Datum>(invalid_json).is_err(),
+            "three-digit decimal JSON must not deserialize at precision two"
+        );
+    }
+}
+
+#[test]
+fn datum_decimal_precision_validation_handles_i128_min_without_overflow() {
+    let decimal_type = PrimitiveType::Decimal {
+        precision: 38,
+        scale: 0,
+    };
+    let invalid_datum = Datum::new(decimal_type.clone(), PrimitiveLiteral::Int128(i128::MIN));
+
+    assert_eq!(
+        invalid_datum
+            .to_bytes()
+            .expect_err("i128::MIN has 39 digits and must exceed Iceberg precision 38")
+            .kind(),
+        ErrorKind::DataInvalid
+    );
+    assert!(
+        serde_json::to_value(&invalid_datum).is_err(),
+        "i128::MIN must fail JSON serialization without overflowing validation"
+    );
+    assert_eq!(
+        Datum::try_from_bytes(&i128::MIN.to_be_bytes(), decimal_type)
+            .expect_err("i128::MIN bytes must exceed Iceberg precision 38")
+            .kind(),
+        ErrorKind::DataInvalid
+    );
+}
+
+#[test]
+fn datum_decimal_serialization_rejects_invalid_metadata() {
+    for data_type in [
+        PrimitiveType::Decimal {
+            precision: 1,
+            scale: 2,
+        },
+        PrimitiveType::Decimal {
+            precision: 39,
+            scale: 0,
+        },
+    ] {
+        let datum = Datum::new(data_type, PrimitiveLiteral::Int128(-1));
+
+        let error = datum.to_bytes().expect_err("invalid metadata");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        if let PrimitiveType::Decimal { precision: 39, .. } = datum.data_type() {
+            assert_eq!(
+                error.message(),
+                "PrimitiveType Decimal must has valid precision but got 39",
+                "Datum boundary must retain its compatibility diagnostic: {error}"
+            );
+        }
+
+        let error = serde_json::to_string(&datum).expect_err("invalid metadata");
+        assert!(error.to_string().contains("DataInvalid"));
+    }
+}
+
+#[test]
+fn datum_json_byte_lists_reject_out_of_range_elements_in_map_and_sequence_forms() {
+    for bad_byte in [-1_i64, 256, 257] {
+        let type_and_bytes = [
+            (serde_json::json!("binary"), vec![bad_byte]),
+            (serde_json::json!("fixed[1]"), vec![bad_byte]),
+            (
+                serde_json::json!("uuid"),
+                std::iter::once(bad_byte)
+                    .chain(std::iter::repeat_n(0, 15))
+                    .collect(),
+            ),
+            (
+                serde_json::json!("decimal(38,0)"),
+                std::iter::repeat_n(0, 15)
+                    .chain(std::iter::once(bad_byte))
+                    .collect(),
+            ),
+        ];
+
+        for (data_type, bytes) in type_and_bytes {
+            for datum_json in [
+                serde_json::json!({"type": data_type.clone(), "literal": bytes.clone()}),
+                serde_json::json!([data_type, bytes]),
+            ] {
+                let error = serde_json::from_value::<Datum>(datum_json)
+                    .expect_err("JSON byte values outside u8 must not truncate");
+                let message = error.to_string();
+                assert!(
+                    message.contains("DataInvalid") && message.contains(&bad_byte.to_string()),
+                    "bad byte {bad_byte} must produce a typed, value-bearing error: {message}"
+                );
+            }
+        }
     }
 }
 
@@ -818,6 +1076,199 @@ fn test_raw_literal_bytes_decimal_precision_1_negative() {
             scale: 0,
         }),
     );
+}
+
+#[test]
+fn raw_literal_decimal_decode_enforces_declared_precision() {
+    let decimal_type = Type::Primitive(PrimitiveType::Decimal {
+        precision: 2,
+        scale: 0,
+    });
+
+    for (bytes, expected) in [(vec![0x63], 99), (vec![0x9d], -99)] {
+        check_raw_literal_bytes_serde_via_avro(bytes, Literal::decimal(expected), &decimal_type);
+    }
+    for bytes in [vec![0x64], vec![0x9c]] {
+        check_raw_literal_bytes_error_via_avro(bytes, &decimal_type);
+    }
+}
+
+#[test]
+fn raw_literal_recursive_struct_route_enforces_decimal_precision() {
+    let decimal_type = Type::Primitive(PrimitiveType::Decimal {
+        precision: 2,
+        scale: 0,
+    });
+    let struct_type = Type::Struct(StructType::new(vec![
+        NestedField::required(1, "partition_decimal", decimal_type).into(),
+    ]));
+
+    for value in [99, -99] {
+        let literal = Literal::Struct(Struct::from_iter([Some(Literal::decimal(value))]));
+        assert!(
+            RawLiteral::try_from(literal, &struct_type).is_ok(),
+            "manifest-routed boundary decimal {value} must be accepted"
+        );
+    }
+    for value in [100, -100] {
+        let literal = Literal::Struct(Struct::from_iter([Some(Literal::decimal(value))]));
+        let error = RawLiteral::try_from(literal, &struct_type)
+            .expect_err("manifest-routed out-of-precision decimal must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains(&value.to_string()),
+            "error must name invalid decimal value {value}: {error}"
+        );
+    }
+}
+
+#[test]
+fn literal_decimal_json_boundaries_validate_direct_and_nested_values() {
+    let decimal_type = Type::Primitive(PrimitiveType::Decimal {
+        precision: 2,
+        scale: 0,
+    });
+
+    for value in [99, -99] {
+        let json = JsonValue::String(value.to_string());
+        assert_eq!(
+            Literal::try_from_json(json.clone(), &decimal_type).expect("valid direct decimal JSON"),
+            Some(Literal::decimal(value))
+        );
+        assert_eq!(
+            Literal::decimal(value)
+                .try_into_json(&decimal_type)
+                .expect("valid direct decimal literal"),
+            json
+        );
+    }
+    for value in [100, -100] {
+        assert_eq!(
+            Literal::try_from_json(JsonValue::String(value.to_string()), &decimal_type)
+                .expect_err("direct JSON decimal outside precision must fail")
+                .kind(),
+            ErrorKind::DataInvalid
+        );
+        assert_eq!(
+            Literal::decimal(value)
+                .try_into_json(&decimal_type)
+                .expect_err("direct decimal literal outside precision must fail")
+                .kind(),
+            ErrorKind::DataInvalid
+        );
+    }
+
+    let struct_type = Type::Struct(StructType::new(vec![
+        NestedField::optional(1, "decimal", decimal_type.clone()).into(),
+    ]));
+    let list_type = Type::List(ListType {
+        element_field: NestedField::list_element(2, decimal_type.clone(), false).into(),
+    });
+    let map_type = Type::Map(MapType {
+        key_field: NestedField::map_key_element(3, Type::Primitive(PrimitiveType::String)).into(),
+        value_field: NestedField::map_value_element(4, decimal_type.clone(), false).into(),
+    });
+
+    let valid_cases = [
+        (
+            serde_json::json!({"1": "99"}),
+            struct_type.clone(),
+            Literal::Struct(Struct::from_iter([Some(Literal::decimal(99))])),
+        ),
+        (
+            serde_json::json!(["-99"]),
+            list_type.clone(),
+            Literal::List(vec![Some(Literal::decimal(-99))]),
+        ),
+        (
+            serde_json::json!({"keys": ["k"], "values": ["99"]}),
+            map_type.clone(),
+            Literal::Map(Map::from_iter([(
+                Literal::string("k"),
+                Some(Literal::decimal(99)),
+            )])),
+        ),
+    ];
+    for (json, data_type, literal) in valid_cases {
+        assert_eq!(
+            Literal::try_from_json(json.clone(), &data_type).expect("nested valid decimal JSON"),
+            Some(literal.clone())
+        );
+        assert_eq!(
+            literal
+                .try_into_json(&data_type)
+                .expect("nested valid decimal literal"),
+            json
+        );
+    }
+
+    let invalid_cases = [
+        (
+            serde_json::json!({"1": "100"}),
+            struct_type,
+            Literal::Struct(Struct::from_iter([Some(Literal::decimal(100))])),
+        ),
+        (
+            serde_json::json!(["-100"]),
+            list_type,
+            Literal::List(vec![Some(Literal::decimal(-100))]),
+        ),
+        (
+            serde_json::json!({"keys": ["k"], "values": ["100"]}),
+            map_type,
+            Literal::Map(Map::from_iter([(
+                Literal::string("k"),
+                Some(Literal::decimal(100)),
+            )])),
+        ),
+    ];
+    for (json, data_type, literal) in invalid_cases {
+        assert_eq!(
+            Literal::try_from_json(json, &data_type)
+                .expect_err("nested JSON decimal outside precision must fail")
+                .kind(),
+            ErrorKind::DataInvalid
+        );
+        assert_eq!(
+            literal
+                .try_into_json(&data_type)
+                .expect_err("nested decimal literal outside precision must fail")
+                .kind(),
+            ErrorKind::DataInvalid
+        );
+    }
+}
+
+#[test]
+fn literal_decimal_json_rejects_invalid_decimal_metadata() {
+    for data_type in [
+        Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0,
+        }),
+        Type::Primitive(PrimitiveType::Decimal {
+            precision: 39,
+            scale: 0,
+        }),
+        Type::Primitive(PrimitiveType::Decimal {
+            precision: 2,
+            scale: 3,
+        }),
+    ] {
+        assert_eq!(
+            Literal::try_from_json(JsonValue::String("0".to_string()), &data_type)
+                .expect_err("invalid decimal type must reject JSON input")
+                .kind(),
+            ErrorKind::DataInvalid
+        );
+        assert_eq!(
+            Literal::decimal(0)
+                .try_into_json(&data_type)
+                .expect_err("invalid decimal type must reject JSON output")
+                .kind(),
+            ErrorKind::DataInvalid
+        );
+    }
 }
 
 #[test]

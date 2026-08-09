@@ -31,7 +31,72 @@ How to use it (see the manuals' §1):
 
 ---
 
-## IN FLIGHT — U3 / hazard-1: midpoint row-group selection (branch `fix/ranged-read-midpoint-rowgroups`)
+## ACTIVE (2026-08-08): 2026-08 audit hardening — SEPMO bundled branch
+
+Branch: `fix/2026-08-audit-hardening`. User approved the 8/8 proposition ledger on 2026-08-08.
+Delivery mode: one bundled branch/PR with clause-separated groups, an independent fresh-context
+Critic after every group, and an independent bundle-scope closing Critic. Every group is STANDARD
+(public API, data-integrity, or security surface); the repository severity floor is S2.
+
+Frozen charter clauses: C-001 decimal construction/conversion invariants; C-002 typed failures for
+short partition structs and manifest summaries; C-003 bounded predicate/Arrow/schema-evolution
+recursion; C-004 qualified DataFusion namespaces; C-005 byte-weighted cache-moka capacity; C-006
+REST Error/source and table/view Debug secret redaction; C-007 preserve the existing trusted-catalog,
+Java-parity, on-disk-format, and dependency contracts; C-008 deliver the bound SEPMO evidence and
+green gates. Explicit exclusions: REST endpoint/header trust redesign, LocalFS jail, HMS TLS/SASL,
+V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, dependency changes.
+
+- [x] **G1 — decimal invariants (C-001, C-007).** In scope:
+      `crates/iceberg/src/spec/datatypes.rs`, `crates/iceberg/src/arrow/schema.rs`,
+      `crates/iceberg/src/arrow/record_batch_transformer.rs`, affected decimal fixture tests in
+      `crates/iceberg/src/spec/values/tests.rs`, `crates/iceberg/src/spec/values/datum.rs`,
+      `crates/iceberg/src/spec/values/serde.rs`, `crates/iceberg/src/spec/values/literal.rs`, and
+      adjacent unit tests. Reject negative/unrepresentable/out-of-domain scale and precision without
+      numeric truncation; preserve valid encodings. The production caller, affected Avro-decimal
+      fixtures, and public Datum boundary additions were explicitly approved by the user on
+      2026-08-08; the RawLiteral and Literal JSON boundary expansion was explicitly approved on
+      2026-08-09 after the second independent Critic filed five S2 findings. Unit gate →
+      independent Critic → recorded disposition.
+      **Done 2026-08-09:** decimal type/value validation now spans constructors, Arrow conversion,
+      Datum/RawLiteral bytes, Serde/JSON, and nested literals without truncating casts; canonical
+      encodings and legacy diagnostics are pinned. Four independent remediation Critic cycles
+      closed all filed S1/S2 findings; final verdict CONVERGED (zero S1/S2).
+- [ ] **G2 — malformed metadata + recursion safety (C-002, C-003, C-007).** In scope:
+      `crates/iceberg/src/expr/accessor.rs`, `crates/iceberg/src/expr/visitors/{predicate_visitor.rs,
+      bound_predicate_visitor.rs,manifest_evaluator.rs}`, `crates/iceberg/src/arrow/schema.rs`,
+      `crates/iceberg/src/transaction/update_schema.rs`, and affected `map.md`/adjacent tests. Return
+      typed errors for short metadata and impose tested traversal limits. Unit gate → independent
+      Critic → recorded disposition.
+- [ ] **G3 — DataFusion namespaces (C-004, C-007).** In scope:
+      `crates/integrations/datafusion/src/catalog.rs` and adjacent tests. Preserve full namespace
+      identity, cover nesting/collisions/failures, and do not broaden DataFusion API scope. Unit gate
+      → independent Critic → recorded disposition.
+- [ ] **G4 — cache-moka byte capacity (C-005, C-007).** In scope:
+      `crates/integrations/cache-moka/src/lib.rs` and adjacent tests. Replace entry-count semantics
+      with deterministic byte weighting without dependency edits. Unit gate → independent Critic →
+      recorded disposition.
+- [ ] **G5 — secret rendering (C-006, C-007).** In scope:
+      `crates/catalog/rest/src/{client.rs,types.rs}`, core table/view metadata and facade types,
+      `crates/iceberg/src/error.rs`, a narrowly scoped shared redaction helper if required, affected
+      `map.md`, and adjacent tests. Preserve error chaining and non-sensitive diagnostics; eliminate
+      the enumerated credential render paths without changing catalog trust policy. Unit gate →
+      independent Critic → recorded disposition.
+- [ ] **G6 — bundle close (C-008).** Run the independent bundle Critic, disposition any remands,
+      run `typos . && make check && make check-msrv && cargo build -p iceberg
+      --no-default-features && cargo deny check advisories && make test`, execute targeted interop if
+      a group changes an interop-bearing contract, file PR-readiness evidence, update this tracker,
+      and file the SEPMO retrospective/metrics. No push or PR creation without separate user request.
+
+Contingencies: a group that cannot converge is either REMOVED with an additive revert commit or
+REMANDED with enumerated findings to the closing Critic; no destructive reset/checkout is authorized.
+Any dependency-file need, on-disk-format change, trust-model change, or unexpected-file requirement
+raises Invariant V and returns the affected scope to audit.
+
+---
+
+## DONE (2026-08-08) — U3 / hazard-1: midpoint row-group selection
+
+**MERGED as #190** (`e4f7f010` = main tip). Retained for its cycle record; the named residues live in the ledger.
 
 Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-order.md) §6. Ledger:
 [u3-midpoint-rowgroup-ledger.md](u3-midpoint-rowgroup-ledger.md). Zero-dependency-change unit.

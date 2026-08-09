@@ -44,6 +44,39 @@ pub const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
 /// UTC time zone for Arrow timestamp type.
 pub const UTC_TIME_ZONE: &str = "+00:00";
 
+fn decimal128_precision_and_scale(precision: u32, scale: u32, context: &str) -> Result<(u8, i8)> {
+    let precision = u8::try_from(precision).map_err(|err| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("{context}: decimal precision is out of Arrow Decimal128 range"),
+        )
+        .with_source(err)
+    })?;
+    let scale = i8::try_from(scale).map_err(|err| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("{context}: decimal scale is out of Arrow Decimal128 range"),
+        )
+        .with_source(err)
+    })?;
+
+    validate_decimal_precision_and_scale::<Decimal128Type>(precision, scale).map_err(|err| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("{context}: decimal precision/scale is not valid for Arrow Decimal128"),
+        )
+        .with_source(err)
+    })?;
+
+    Ok((precision, scale))
+}
+
+fn decimal128_arrow_type(precision: u32, scale: u32, context: &str) -> Result<DataType> {
+    let (precision, scale) = decimal128_precision_and_scale(precision, scale, context)?;
+
+    Ok(DataType::Decimal128(precision, scale))
+}
+
 /// A post order arrow schema visitor.
 ///
 /// For order of methods called, please refer to [`visit_schema`].
@@ -444,13 +477,22 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             }
             DataType::Float32 => Ok(Type::Primitive(PrimitiveType::Float)),
             DataType::Float64 => Ok(Type::Primitive(PrimitiveType::Double)),
-            DataType::Decimal128(p, s) => Type::decimal(*p as u32, *s as u32).map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Failed to create decimal type".to_string(),
-                )
-                .with_source(e)
-            }),
+            DataType::Decimal128(p, s) => {
+                let scale = u32::try_from(*s).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Arrow decimal scale must be non-negative: {s}"),
+                    )
+                    .with_source(e)
+                })?;
+                Type::decimal(u32::from(*p), scale).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Failed to create decimal type".to_string(),
+                    )
+                    .with_source(e)
+                })
+            }
             DataType::Date32 => Ok(Type::Primitive(PrimitiveType::Date)),
             DataType::Time64(unit) if unit == &TimeUnit::Microsecond => {
                 Ok(Type::Primitive(PrimitiveType::Time))
@@ -645,35 +687,11 @@ impl SchemaVisitor for ToArrowSchemaConverter {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Float64))
             }
             crate::spec::PrimitiveType::Decimal { precision, scale } => {
-                let (precision, scale) = {
-                    let precision: u8 = precision.to_owned().try_into().map_err(|err| {
-                        Error::new(
-                            crate::ErrorKind::DataInvalid,
-                            "incompatible precision for decimal type convert",
-                        )
-                        .with_source(err)
-                    })?;
-                    let scale = scale.to_owned().try_into().map_err(|err| {
-                        Error::new(
-                            crate::ErrorKind::DataInvalid,
-                            "incompatible scale for decimal type convert",
-                        )
-                        .with_source(err)
-                    })?;
-                    (precision, scale)
-                };
-                validate_decimal_precision_and_scale::<Decimal128Type>(precision, scale).map_err(
-                    |err| {
-                        Error::new(
-                            crate::ErrorKind::DataInvalid,
-                            "incompatible precision and scale for decimal type convert",
-                        )
-                        .with_source(err)
-                    },
-                )?;
-                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Decimal128(
-                    precision, scale,
-                )))
+                Ok(ArrowSchemaOrFieldOrType::Type(decimal128_arrow_type(
+                    *precision,
+                    *scale,
+                    "Iceberg-to-Arrow decimal type convert",
+                )?))
             }
             crate::spec::PrimitiveType::Date => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Date32))
@@ -780,32 +798,21 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
             TimestampNanosecondArray::new(vec![*value; 1].into(), None).with_timezone_utc(),
         ))),
         (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(value)) => {
-            // `precision`/`scale` are NOT bound-checked by the `decimal(P,S)` type-string
-            // deserializer nor by `Datum::try_from_bytes`, so a corrupt/hostile catalog or manifest
-            // can carry a precision/scale far outside Arrow's Decimal128 range. Reject in TWO stages,
+            // `precision`/`scale` can arrive here through bypass paths such as `Datum::new` or
+            // `Datum::try_from_bytes`, so a corrupt/hostile catalog or manifest can carry a
+            // precision/scale far outside Arrow's Decimal128 range. Reject in three stages,
             // each as a typed error (AGENTS.md: no bare unwrap AND no truncating `as` in production
             // paths):
             //   1. `u8::try_from` / `i8::try_from` — Arrow takes a `u8` precision + `i8` scale, so a
             //      plain `as` cast would WRAP (e.g. precision 294 → 38, scale 256 → 0) and SILENTLY
             //      ACCEPT an invalid value; `try_from` rejects anything outside the numeric range.
-            //   2. `with_precision_and_scale` — enforces Arrow's own rules (precision ≤ 38, and
-            //      scale ≤ precision) on the now in-range values.
-            let arrow_precision = u8::try_from(*precision).map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Decimal literal precision {precision} is out of Arrow Decimal128 range"
-                    ),
-                )
-                .with_source(e)
-            })?;
-            let arrow_scale = i8::try_from(*scale).map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Decimal literal scale {scale} is out of Arrow Decimal128 range"),
-                )
-                .with_source(e)
-            })?;
+            //   2. `validate_decimal_precision_and_scale` — enforces Arrow's own rules
+            //      (precision ≤ 38, and scale ≤ precision) on the now in-range values.
+            //   3. `validate_decimal_literal` — rejects a scalar whose unscaled value needs more
+            //      digits than the declared precision, which Arrow does not check for us here.
+            datum.validate_decimal()?;
+            let (arrow_precision, arrow_scale) =
+                decimal128_precision_and_scale(*precision, *scale, "Decimal literal type convert")?;
             let array = Decimal128Array::from_value(*value, 1)
                 .with_precision_and_scale(arrow_precision, arrow_scale)
                 .map_err(|e| {
@@ -1180,10 +1187,12 @@ impl TryFrom<&crate::spec::Schema> for ArrowSchema {
 /// use iceberg::spec::Datum;
 ///
 /// let datum = Datum::string("test_file.parquet");
-/// let ree_type = datum_to_arrow_type_with_ree(&datum);
+/// let ree_type = datum_to_arrow_type_with_ree(&datum).unwrap();
 /// // Returns: RunEndEncoded(Int32, Utf8)
 /// ```
-pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> DataType {
+pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> Result<DataType> {
+    datum.validate_decimal()?;
+
     // Helper to create REE type with the given values type.
     // Note: values field is nullable as Arrow expects this when building the
     // final Arrow schema with `RunArray::try_new`.
@@ -1195,28 +1204,30 @@ pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> DataType {
 
     // Match on the PrimitiveType from the Datum to determine the Arrow type
     match datum.data_type() {
-        PrimitiveType::Boolean => make_ree(DataType::Boolean),
-        PrimitiveType::Int => make_ree(DataType::Int32),
-        PrimitiveType::Long => make_ree(DataType::Int64),
-        PrimitiveType::Float => make_ree(DataType::Float32),
-        PrimitiveType::Double => make_ree(DataType::Float64),
-        PrimitiveType::Date => make_ree(DataType::Date32),
-        PrimitiveType::Time => make_ree(DataType::Int64),
-        PrimitiveType::Timestamp => make_ree(DataType::Int64),
-        PrimitiveType::Timestamptz => make_ree(DataType::Int64),
-        PrimitiveType::TimestampNs => make_ree(DataType::Int64),
-        PrimitiveType::TimestamptzNs => make_ree(DataType::Int64),
-        PrimitiveType::String => make_ree(DataType::Utf8),
-        PrimitiveType::Uuid => make_ree(DataType::Binary),
-        PrimitiveType::Fixed(_) => make_ree(DataType::Binary),
-        PrimitiveType::Binary => make_ree(DataType::Binary),
-        PrimitiveType::Decimal { precision, scale } => {
-            make_ree(DataType::Decimal128(*precision as u8, *scale as i8))
-        }
+        PrimitiveType::Boolean => Ok(make_ree(DataType::Boolean)),
+        PrimitiveType::Int => Ok(make_ree(DataType::Int32)),
+        PrimitiveType::Long => Ok(make_ree(DataType::Int64)),
+        PrimitiveType::Float => Ok(make_ree(DataType::Float32)),
+        PrimitiveType::Double => Ok(make_ree(DataType::Float64)),
+        PrimitiveType::Date => Ok(make_ree(DataType::Date32)),
+        PrimitiveType::Time => Ok(make_ree(DataType::Int64)),
+        PrimitiveType::Timestamp => Ok(make_ree(DataType::Int64)),
+        PrimitiveType::Timestamptz => Ok(make_ree(DataType::Int64)),
+        PrimitiveType::TimestampNs => Ok(make_ree(DataType::Int64)),
+        PrimitiveType::TimestamptzNs => Ok(make_ree(DataType::Int64)),
+        PrimitiveType::String => Ok(make_ree(DataType::Utf8)),
+        PrimitiveType::Uuid => Ok(make_ree(DataType::Binary)),
+        PrimitiveType::Fixed(_) => Ok(make_ree(DataType::Binary)),
+        PrimitiveType::Binary => Ok(make_ree(DataType::Binary)),
+        PrimitiveType::Decimal { precision, scale } => Ok(make_ree(decimal128_arrow_type(
+            *precision,
+            *scale,
+            "Run-end-encoded decimal datum type convert",
+        )?)),
         // `unknown` carries no `PrimitiveLiteral`, so a `Datum` of this type is unconstructable —
         // this arm is unreachable in practice. Keep it consistent with `type_to_arrow_type`
         // (`unknown` -> Arrow `Null`) rather than panicking.
-        PrimitiveType::Unknown => make_ree(DataType::Null),
+        PrimitiveType::Unknown => Ok(make_ree(DataType::Null)),
     }
 }
 
@@ -2054,6 +2065,115 @@ mod tests {
     }
 
     #[test]
+    fn arrow_to_iceberg_decimal_rejects_negative_scale_without_wrapping() {
+        let arrow_schema = ArrowSchema::new(vec![Field::new(
+            "bad_decimal",
+            DataType::Decimal128(10, -1),
+            false,
+        )]);
+
+        let error = arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
+            .expect_err("negative Arrow decimal scale must not wrap into a huge Iceberg scale");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("non-negative"),
+            "negative scale should be rejected at the Arrow boundary, got: {error}"
+        );
+    }
+
+    #[test]
+    fn arrow_to_iceberg_decimal_rejects_scale_greater_than_precision() {
+        let arrow_schema = ArrowSchema::new(vec![Field::new(
+            "bad_decimal",
+            DataType::Decimal128(10, 11),
+            false,
+        )]);
+
+        let error = arrow_schema_to_schema_auto_assign_ids(&arrow_schema).expect_err(
+            "Arrow decimal scale greater than precision must not become Iceberg decimal",
+        );
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn iceberg_to_arrow_decimal_rejects_unrepresentable_precision_scale() {
+        for (iceberg_type, context) in [
+            (
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 39,
+                    scale: 0,
+                }),
+                "precision above Arrow Decimal128 max",
+            ),
+            (
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 10,
+                    scale: 11,
+                }),
+                "scale greater than precision",
+            ),
+            (
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 10,
+                    scale: 256,
+                }),
+                "scale that would wrap to zero under `as i8`",
+            ),
+        ] {
+            let error = match type_to_arrow_type(&iceberg_type) {
+                Ok(_) => panic!("{context}: {iceberg_type:?} must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ErrorKind::DataInvalid, "{context}");
+        }
+    }
+
+    #[test]
+    fn run_end_encoded_decimal_preserves_valid_precision_scale() {
+        let datum = Datum::decimal_with_precision(decimal_new(123, 38), 38)
+            .expect("decimal(38,38) datum should be constructible");
+
+        let arrow_type = datum_to_arrow_type_with_ree(&datum)
+            .expect("valid decimal datum should produce a REE Arrow type");
+        let DataType::RunEndEncoded(_, values_field) = arrow_type else {
+            panic!("decimal datum must be wrapped in RunEndEncoded");
+        };
+        assert_eq!(values_field.data_type(), &DataType::Decimal128(38, 38));
+    }
+
+    #[test]
+    fn run_end_encoded_decimal_rejects_wrapping_precision_scale() {
+        for (datum, context) in [
+            (
+                Datum::new(
+                    PrimitiveType::Decimal {
+                        precision: 294,
+                        scale: 0,
+                    },
+                    PrimitiveLiteral::Int128(1234),
+                ),
+                "precision 294 wraps to valid precision 38 under `as u8`",
+            ),
+            (
+                Datum::new(
+                    PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 256,
+                    },
+                    PrimitiveLiteral::Int128(1234),
+                ),
+                "scale 256 wraps to valid scale 0 under `as i8`",
+            ),
+        ] {
+            let error = match datum_to_arrow_type_with_ree(&datum) {
+                Ok(_) => panic!("{context}: {datum:?} must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ErrorKind::DataInvalid, "{context}");
+        }
+    }
+
+    #[test]
     fn test_type_conversion() {
         // test primitive type
         {
@@ -2334,16 +2454,16 @@ mod tests {
         }
     }
 
-    /// A `Datum` can carry a decimal `precision > 38` — the type-string deserializer
-    /// (`decimal(P,S)`) and [`Datum::try_from_bytes`] do NOT bound-check precision, so a corrupt or
-    /// hostile catalog/manifest can hand the predicate path such a datum. Arrow's Decimal128 tops
-    /// out at precision 38, so `with_precision_and_scale` rejects it. `get_arrow_datum` must surface
-    /// that as a typed [`ErrorKind::DataInvalid`], never a panic (a predicate pushdown that panics
-    /// takes down the scan/worker instead of failing the one bad query).
+    /// A `Datum` can carry a decimal `precision > 38` through bypass paths such as
+    /// [`Datum::new`] or [`Datum::try_from_bytes`], so a corrupt or hostile catalog/manifest can
+    /// hand the predicate path such a datum. Arrow's Decimal128 tops out at precision 38, so
+    /// `with_precision_and_scale` rejects it. `get_arrow_datum` must surface that as a typed
+    /// [`ErrorKind::DataInvalid`], never a panic (a predicate pushdown that panics takes down the
+    /// scan/worker instead of failing the one bad query).
     #[test]
     fn get_arrow_datum_rejects_over_max_decimal_precision_without_panicking() {
         // precision 50 > Arrow's Decimal128 max of 38; built via the pub(crate) constructor to
-        // mirror what the unvalidated `decimal(50,0)` type-string deserializer produces.
+        // mirror what bypass paths can still produce from corrupt metadata.
         let datum = Datum::new(
             PrimitiveType::Decimal {
                 precision: 50,
@@ -2407,6 +2527,57 @@ mod tests {
         match get_arrow_datum(&wrapping_scale) {
             Ok(_) => panic!("decimal scale 256 wraps to i8 0 under `as i8` and must be rejected"),
             Err(err) => assert_eq!(err.kind(), ErrorKind::DataInvalid),
+        }
+    }
+
+    /// A decimal value whose unscaled magnitude needs more digits than the declared precision is
+    /// not representable by Arrow Decimal128 at that precision. `get_arrow_datum` must reject it
+    /// instead of accepting a value whose type metadata lies about its precision.
+    #[test]
+    fn get_arrow_datum_rejects_decimal_values_outside_declared_precision_and_accepts_boundaries() {
+        for (precision, value, context) in [
+            (2, 123, "positive value with too many digits"),
+            (2, -100, "negative value one past the precision boundary"),
+            (
+                38,
+                i128::MIN,
+                "i128::MIN cannot fit Arrow Decimal128's maximum precision",
+            ),
+        ] {
+            let datum = Datum::new(
+                PrimitiveType::Decimal {
+                    precision,
+                    scale: 0,
+                },
+                PrimitiveLiteral::Int128(value),
+            );
+            match get_arrow_datum(&datum) {
+                Ok(_) => panic!(
+                    "{context}: decimal({precision},0) cannot represent unscaled value {value}"
+                ),
+                Err(err) => assert_eq!(err.kind(), ErrorKind::DataInvalid, "{context}"),
+            }
+        }
+
+        for value in [99, -99] {
+            let boundary = Datum::new(
+                PrimitiveType::Decimal {
+                    precision: 2,
+                    scale: 0,
+                },
+                PrimitiveLiteral::Int128(value),
+            );
+            let arrow_datum =
+                get_arrow_datum(&boundary).expect("decimal(2,0) boundary must convert exactly");
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal datum must produce a Decimal128Array");
+            assert!(is_scalar);
+            assert_eq!(array.precision(), 2);
+            assert_eq!(array.scale(), 0);
+            assert_eq!(array.value(0), value);
         }
     }
 

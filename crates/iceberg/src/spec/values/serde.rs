@@ -24,6 +24,7 @@ pub(crate) mod _serde {
     use serde_bytes::ByteBuf;
     use serde_derive::{Deserialize as DeserializeDerive, Serialize as SerializeDerive};
 
+    use crate::spec::values::datum::validate_decimal_value;
     use crate::spec::values::{Literal, Map, PrimitiveLiteral, Struct};
     use crate::spec::{MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, PrimitiveType, Type};
     use crate::{Error, ErrorKind};
@@ -164,7 +165,11 @@ pub(crate) mod _serde {
                 /// Used in json
                 fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
                 where E: serde::de::Error {
-                    Ok(RawLiteralEnum::Long(v as i64))
+                    Ok(RawLiteralEnum::Long(i64::try_from(v).map_err(|_| {
+                        E::custom(format!(
+                            "Integer literal is outside the supported i64 range: {v}"
+                        ))
+                    })?))
                 }
 
                 fn visit_f32<E>(self, v: f32) -> Result<Self::Value, E>
@@ -252,6 +257,15 @@ pub(crate) mod _serde {
                     }
                     PrimitiveLiteral::Binary(v) => RawLiteralEnum::Bytes(ByteBuf::from(v)),
                     PrimitiveLiteral::Int128(v) => {
+                        let Type::Primitive(primitive_type) = ty else {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Literal decimal value {v} requires a decimal type, got {ty}"
+                                ),
+                            ));
+                        };
+                        validate_decimal_value(primitive_type, v)?;
                         RawLiteralEnum::Bytes(ByteBuf::from(v.to_be_bytes()))
                     }
                     PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => {
@@ -494,7 +508,8 @@ pub(crate) mod _serde {
                         }
                     }
                     Type::Primitive(PrimitiveType::Decimal { precision, .. }) => {
-                        let required_bytes = Type::decimal_required_bytes(*precision)? as usize;
+                        let required_bytes =
+                            usize::try_from(Type::decimal_required_bytes(*precision)?)?;
 
                         if v.len() == required_bytes {
                             // Pad the bytes to 16 bytes (i128 size) with sign extension
@@ -512,9 +527,12 @@ pub(crate) mod _serde {
                                 }
                             }
 
-                            Ok(Some(Literal::Primitive(PrimitiveLiteral::Int128(
-                                i128::from_be_bytes(padded_bytes),
-                            ))))
+                            let value = i128::from_be_bytes(padded_bytes);
+                            let Type::Primitive(primitive_type) = ty else {
+                                unreachable!("decimal match arm requires a primitive type")
+                            };
+                            validate_decimal_value(primitive_type, value)?;
+                            Ok(Some(Literal::decimal(value)))
                         } else {
                             Err(invalid_err_with_reason(
                                 "bytes",
@@ -611,7 +629,14 @@ pub(crate) mod _serde {
                         let mut bytes = [0u8; 16];
                         for (i, v) in v.list.iter().enumerate() {
                             if let Some(RawLiteralEnum::Long(v)) = v {
-                                bytes[i] = *v as u8;
+                                bytes[i] = u8::try_from(*v).map_err(|_| {
+                                    invalid_err_with_reason(
+                                        "list",
+                                        &format!(
+                                            "Byte list element must be between 0 and 255, got {v}"
+                                        ),
+                                    )
+                                })?;
                             } else {
                                 return Err(invalid_err_with_reason(
                                     "list",
@@ -621,10 +646,7 @@ pub(crate) mod _serde {
                         }
                         Ok(Some(Literal::uuid(uuid::Uuid::from_bytes(bytes))))
                     }
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: _,
-                        scale: _,
-                    }) => {
+                    Type::Primitive(primitive_type @ PrimitiveType::Decimal { .. }) => {
                         if v.list.len() != 16 {
                             return Err(invalid_err_with_reason(
                                 "list",
@@ -634,7 +656,14 @@ pub(crate) mod _serde {
                         let mut bytes = [0u8; 16];
                         for (i, v) in v.list.iter().enumerate() {
                             if let Some(RawLiteralEnum::Long(v)) = v {
-                                bytes[i] = *v as u8;
+                                bytes[i] = u8::try_from(*v).map_err(|_| {
+                                    invalid_err_with_reason(
+                                        "list",
+                                        &format!(
+                                            "Byte list element must be between 0 and 255, got {v}"
+                                        ),
+                                    )
+                                })?;
                             } else {
                                 return Err(invalid_err_with_reason(
                                     "list",
@@ -642,7 +671,9 @@ pub(crate) mod _serde {
                                 ));
                             }
                         }
-                        Ok(Some(Literal::decimal(i128::from_be_bytes(bytes))))
+                        let value = i128::from_be_bytes(bytes);
+                        validate_decimal_value(primitive_type, value)?;
+                        Ok(Some(Literal::decimal(value)))
                     }
                     Type::Primitive(PrimitiveType::Binary) => {
                         let bytes = v
@@ -650,7 +681,14 @@ pub(crate) mod _serde {
                             .into_iter()
                             .map(|v| {
                                 if let Some(RawLiteralEnum::Long(v)) = v {
-                                    Ok(v as u8)
+                                    u8::try_from(v).map_err(|_| {
+                                        invalid_err_with_reason(
+                                            "list",
+                                            &format!(
+                                                "Byte list element must be between 0 and 255, got {v}"
+                                            ),
+                                        )
+                                    })
                                 } else {
                                     Err(invalid_err_with_reason(
                                         "list",
@@ -673,7 +711,14 @@ pub(crate) mod _serde {
                             .into_iter()
                             .map(|v| {
                                 if let Some(RawLiteralEnum::Long(v)) = v {
-                                    Ok(v as u8)
+                                    u8::try_from(v).map_err(|_| {
+                                        invalid_err_with_reason(
+                                            "list",
+                                            &format!(
+                                                "Byte list element must be between 0 and 255, got {v}"
+                                            ),
+                                        )
+                                    })
                                 } else {
                                     Err(invalid_err_with_reason(
                                         "list",
