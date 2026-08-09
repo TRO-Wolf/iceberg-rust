@@ -1806,8 +1806,17 @@ mod tests {
     }
 
     // RISK: the bound must count LIST and MAP nesting too — a chain built only from containers
-    // reaches the same recursion through different match arms. Catches dropping the `depth + 1` on
-    // the list-element or the map key/value recursions, which would leave those arms unbounded.
+    // reaches the same recursion through different match arms, and a lost `depth + 1` on any one of
+    // them leaves that arm unbounded while every struct test stays green. One chain per container
+    // recursion in `assign_fresh_ids_at_depth`, so each arm is pinned INDEPENDENTLY: dropping the
+    // `depth + 1` on the list-element arm, on the map-KEY arm, or on the map-VALUE arm each turns
+    // exactly one of the three `expect_err`s below RED.
+    //
+    // A map KEY may itself be a nested type: Rust's `MapType::new` imposes no restriction, and
+    // neither does Java — `Types$MapType.ofOptional` / `ofRequired` (iceberg-api 1.10.0) only
+    // `Preconditions.checkNotNull(valueType, "Value type cannot be null")` at offsets 0–6 and then
+    // hand both types straight to `NestedField.required` / `optional`. So `map<map<map<…>,v>,v>` is
+    // constructible and reaches the key arm straight from the public `UpdateSchemaAction::add_column`.
     #[test]
     fn assign_fresh_ids_bounds_list_and_map_nesting_too() {
         let mut list_chain = Type::Primitive(PrimitiveType::Boolean);
@@ -1820,15 +1829,37 @@ mod tests {
         let error = increasing_from_one(&list_chain).expect_err("deep list chain must be rejected");
         assert_depth_error(&error);
 
-        let mut map_chain = Type::Primitive(PrimitiveType::Boolean);
+        // Nested through the VALUE position; every key is a shallow primitive.
+        let mut map_value_chain = Type::Primitive(PrimitiveType::Boolean);
         for level in (1..=(MAX_ASSIGN_IDS_NESTING_DEPTH + 1)).rev() {
             let key_id = i32::try_from(2 * level).expect("test depth fits i32");
-            map_chain = Type::Map(MapType::new(
+            map_value_chain = Type::Map(MapType::new(
                 NestedField::map_key_element(key_id, Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::map_value_element(key_id + 1, map_chain, false).into(),
+                NestedField::map_value_element(key_id + 1, map_value_chain, false).into(),
             ));
         }
-        let error = increasing_from_one(&map_chain).expect_err("deep map chain must be rejected");
+        let error = increasing_from_one(&map_value_chain)
+            .expect_err("deep map chain nested through VALUES must be rejected");
+        assert_depth_error(&error);
+
+        // Nested through the KEY position; every value is a shallow primitive. Without this chain
+        // the key arm is unpinned — the value chain above cannot reach it, because its keys are
+        // primitives that return before any depth can accumulate.
+        let mut map_key_chain = Type::Primitive(PrimitiveType::String);
+        for level in (1..=(MAX_ASSIGN_IDS_NESTING_DEPTH + 1)).rev() {
+            let key_id = i32::try_from(2 * level).expect("test depth fits i32");
+            map_key_chain = Type::Map(MapType::new(
+                NestedField::map_key_element(key_id, map_key_chain).into(),
+                NestedField::map_value_element(
+                    key_id + 1,
+                    Type::Primitive(PrimitiveType::String),
+                    false,
+                )
+                .into(),
+            ));
+        }
+        let error = increasing_from_one(&map_key_chain)
+            .expect_err("deep map chain nested through KEYS must be rejected");
         assert_depth_error(&error);
     }
 }
