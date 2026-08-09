@@ -74,7 +74,19 @@ fn validate_decimal_type(r#type: &PrimitiveType) -> Result<()> {
 /// `Conversions.toByteBuffer` re-emits `unscaledValue().toByteArray()` unchecked (live probe:
 /// `fromByteBuffer(DecimalType.of(2,0), 0x0F423F)` returns `999999`). The fork needs the check
 /// only where the encoder would otherwise silently TRUNCATE the two's-complement buffer to
-/// `decimal_required_bytes(precision)`. Read paths must not call this.
+/// `decimal_required_bytes(precision)`.
+///
+/// **It is NOT true that read paths never reach this.** `Datum::to_bytes` calls
+/// `validate_decimal_literal`, and `to_bytes` is reached from two pure READ paths —
+/// [`crate::inspect`]'s `readable_metrics` and `data_file` metadata tables — as well as from the
+/// manifest re-write path (`spec/manifest/_serde.rs::to_bytes_entry`). So a decimal bound whose
+/// unscaled magnitude exceeds its declared precision now SCANS fine (Java-exact, per the relaxation
+/// above) but makes those inspect tables and any manifest-copying maintenance return
+/// `DataInvalid`. That asymmetry is deliberate and fail-closed for now: at the merge base the same
+/// value was silently truncated instead (999999 at `decimal(2,0)` became 15 — a wrong bound written
+/// into metadata), so erroring is strictly safer than what it replaced. Closing it properly means
+/// giving the inspect/manifest-copy encoders a non-validating re-emit that mirrors Java's unchecked
+/// `unscaledValue().toByteArray()`; see the bundle ledger's residue section.
 ///
 /// The absolute value is converted through `unsigned_abs`, which is defined for
 /// `i128::MIN` and therefore cannot overflow while checking the 38-digit boundary.

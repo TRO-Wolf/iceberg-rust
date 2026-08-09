@@ -68,6 +68,33 @@ Two handover facts, recorded because both bear on what the prior "converged" cla
 | `crates/iceberg/src/expr/visitors/mod.rs` | R2 | ACCEPTED. Mechanical consequence of the iterative `rewrite_not`: `RewriteNotVisitor` lost its only production caller, so it and the unbound `predicate_visitor` became `#[cfg(test)]`. **No public API removed** — `expr/mod.rs` re-exports only `predicate::*` and `term::*`; the modules were `pub(crate)` and `PredicateVisitor` has no user outside them. `BoundPredicateVisitor` is untouched and still production. |
 | `crates/iceberg/src/expr/visitors/map.md` | R2 | ALWAYS IN SCOPE — CLAUDE.md's `map.md` lockstep rule. |
 | `crates/integrations/cache-moka/README.md` | G4 | ACCEPTED, documentation of a behaviour the clause mandates. Filed as S3-3(a) by G4's Critic and carried here. |
+| `docs/parity/GAP_MATRIX.md` | R1 | ACCEPTED. CLAUDE.md's de-triplication rule makes the matrix cell the **only** legal home for R87's corrected status, so a group that changes a capability's accuracy has nowhere else to record it. `make check-matrix-anchors` re-run green (75 rows). Added 2026-08-09 after the bundle Critic filed the omission as S2: the table's title asserts completeness, and it adjudicates `map.md` — which CLAUDE.md explicitly exempts — so leaving out GAP_MATRIX.md failed the section's own standard. |
+
+### 2.2 Breaking public API change — one, called out
+
+CLAUDE.md's prohibitions permit the public Rust API to evolve in service of parity but require any
+breaking surface change to be **called out so downstream pins can follow**. This bundle has exactly
+one, and the first draft of this ledger failed to record it (filed S2 by the bundle Critic):
+
+| item | before | after |
+|---|---|---|
+| `iceberg::arrow::datum_to_arrow_type_with_ree` | `pub fn(&Datum) -> DataType` | `pub fn(&Datum) -> Result<DataType>` |
+
+Publicly reachable via `pub mod arrow` (`lib.rs:99`) + `pub use schema::*` (`arrow/mod.rs:21`).
+Introduced by **G1**, because the decimal precision/scale validation added in the same commit is
+fallible. Migration is one character: `datum_to_arrow_type_with_ree(&d)` → `…(&d)?`.
+
+The other three public-surface deltas in the bundle are purely **additive** and break nothing:
+`REDACTED_PROP_VALUE`, `RedactedProps<'a>`, `MokaObjectCacheProvider::new_with_capacity`.
+(`Predicate::negate(self)` → `negate(mut self)` is *not* a signature change — `mut` on a by-value
+binding is internal to the body.)
+
+**This matters beyond the fork:** the RePark consumer is mid-repin. This row is the callout.
+
+Three API-stability statements elsewhere in this file are each true **on their own terms** but must
+not be read as covering the whole bundle — §2.1's "No public API removed" (about the `#[cfg(test)]`
+demotion), §4.1's R2 "with no signature change" (about `rewrite_not`), and todo.md's G3 "No public
+API added". §2.2 is the complete picture.
 
 ## 3. The 2026-08-09 independent review — findings and disposition
 
@@ -117,10 +144,20 @@ independently re-run by that unit's Critic. Bundle gate in §4.2.
 | G3 namespaces | `d99e56d6` `2556e109` | 2 | CONVERGED, zero S1/S2 | 5× S3 |
 | G5 secrets | `879bf55e` | 3 | CONVERGED, zero S1/S2 | 3× S3 |
 
-**Every one of the six units' first Critic cycle blocked on the same defect class**: a test whose
-doc comment named a mutation it did not actually catch. In each case the Critic applied the named
-mutation and the full suite stayed green. That is a systematic weakness in Actor self-certification,
-not six coincidences — see the lessons entry of 2026-08-09.
+**Four of the six units were remanded at least once, and the recurring defect was test adequacy —
+not correctness.** Corrected 2026-08-09 after the bundle Critic filed the original wording ("every
+one of the six … blocked") as S2: R2 converged on its first and only cycle with zero S1/S2 and never
+blocked at all (`fb11dc66` has identical author and committer timestamps, i.e. was never amended).
+The verified shape is:
+
+- **named-but-uncaught mutation** — R1 (`visit_seq` arm), R3 (map-KEY arm), G4 (`max_capacity`
+  cannot discriminate bytes from entries) — three units, each confirmed by applying the mutation.
+- **zero-coverage guard plus a false claim in PRODUCTION doc** — G3: `seen` in
+  `discover_namespaces` had no test at all, and the false claim was in the code's own doc, not a
+  test's.
+- **G5** was remanded twice on its own findings; **R2** was not remanded.
+
+The honest generalisation is narrower than the original and is in the 2026-08-09 lessons entry.
 
 ### 4.1 What each unit actually changed
 
@@ -169,7 +206,7 @@ Run 2026-08-09 at tip `879bf55e` + this commit, in `iceberg-rust-ws`, each step 
 | 4 | `cargo build -p iceberg --no-default-features` | **OK** |
 | 5 | `cargo deny check advisories` | **OK** |
 | 6a | `cargo test --no-fail-fast --doc --all-features --workspace` | **OK**, rc 0 |
-| 6b | `cargo test --no-fail-fast --all-targets --all-features --workspace` | **4210 passed / 45 failed** — every failure infrastructure, see below |
+| 6b | `cargo test --no-fail-fast --all-targets --all-features --workspace` | **4113 passed / 45 failed** — every failure infrastructure, see below |
 | 7 | `make test` | **NOT RUN** — see below |
 
 Per-crate unit tests for everything this bundle touched, all green:
@@ -184,16 +221,34 @@ could not be satisfied and step 7 was replaced by 6a+6b. All 45 failures land in
 `tests/*.rs` integration binaries and **none in any `unittests src/lib.rs`**:
 `conflict_commit_test`, `file_io_gcs_test`, `file_io_s3_test`, `glue_catalog_test`,
 `hms_catalog_test`, `read_evolved_schema`, `read_positional_deletes`, `rest_catalog_test`.
-Every one fails with `Connection refused` / `Os { code: 111 }` against the REST fixture, MinIO,
-fake-gcs or HMS. 119 `Connection refused` occurrences and zero assertion failures.
+**43 of the 45** fail with `Connection refused` / `os error 111` against the REST fixture, MinIO,
+`gcs-server` or HMS. The other **two do not**, and saying otherwise was a false statement of gate
+evidence — corrected 2026-08-09 after the bundle Critic filed it as S2, because the claim as
+originally written ("zero assertion failures") was exactly the tripwire that would catch a real
+regression hiding in these eight binaries, and it did not fire:
+
+1. `crates/catalog/rest/tests/rest_catalog_test.rs:90` — `test_get_non_exist_namespace` panics on
+   `assertion failed: result.unwrap_err().to_string().contains("does not exist")`. The refused
+   connection makes the `is_err()` precondition on the line above pass **for the wrong reason**, so
+   the test runs on to the message assertion and fails there. Neither `Connection refused` nor
+   `os error 111` appears anywhere in its output.
+2. `crates/storage/opendal/tests/file_io_s3_test.rs:168` —
+   `test_s3_with_custom_credential_loader_integration` panics on an opendal `send http request`
+   error rather than a bare refusal.
+
+Both are still downstream of the same absent services, so the CONCLUSION — all 45 are Docker-down
+infrastructure, none is a regression — holds and was independently re-derived by the bundle Critic
+at HEAD. But the method must be stated as it actually is: **43 by refusal string, 2 by tracing the
+failure to the same missing service.** A raw count of `Connection refused` occurrences was dropped
+from this record because it is retry-log dependent and does not reproduce run to run.
 
 Docker enters this gate transitively and at exactly one point: `Makefile:80` is `test: docker-up`,
-and `docker-up` (`Makefile:95`) brings up `dev/docker-compose.yaml`. No earlier unit gate touches it.
-The six services map one-to-one onto the eight failing binaries — `minio` → `file_io_s3_test`,
-`fake-gcs-server` → `file_io_gcs_test`, `rest` → `rest_catalog_test` + `conflict_commit_test`,
-`spark-iceberg`+`provision` → `read_evolved_schema` + `read_positional_deletes`, `moto` →
-`glue_catalog_test`, `hive-metastore` → `hms_catalog_test` — so the shortfall is bounded and
-enumerated, not open-ended.
+and `docker-up` (`Makefile:94`) brings up `dev/docker-compose.yaml`. No earlier unit gate touches it.
+The compose file defines eight services; the ones that strand a test map onto the eight failing
+binaries as `minio` → `file_io_s3_test`, `gcs-server` → `file_io_gcs_test`, `rest` →
+`rest_catalog_test` + `conflict_commit_test`, `spark-iceberg` + `provision` → `read_evolved_schema`
++ `read_positional_deletes`, `moto` → `glue_catalog_test`, `hive-metastore` → `hms_catalog_test`
+— so the shortfall is bounded and enumerated, not open-ended.
 
 **Runner caveat on the substitution.** `make test` runs `cargo nextest run --all-targets
 --all-features --workspace`; step 6b ran `cargo test --no-fail-fast` with the same target, feature
@@ -208,15 +263,36 @@ so SEC-001/SEC-009 are pinned by unit tests and not by an end-to-end run. `read_
 `read_positional_deletes` exercise read paths adjacent to R1's decimal decode. Re-run
 `make test` with Docker up before merge.
 
-**typos caveat.** The invocation was `typos --exclude repark-grok-catchup .`. That file is an
-untracked ~37k-line transcript in the repo root, unrelated to this work and never staged; a bare
-`typos .` fails on it. CI is unaffected — it only sees tracked files — and `git ls-files | xargs
-typos` is not equivalent because passing explicit paths bypasses `.typos.toml`'s
-`extend-exclude = ["**/testdata", "CHANGELOG.md"]`.
+**typos.** A bare `typos .` is **green in this worktree** — verified. The `--exclude
+repark-grok-catchup` flag used during the run was carried over from the primary checkout, where that
+untracked ~37k-line transcript lives; it does not exist in `iceberg-rust-ws` at all, so the exclusion
+is a no-op here and the charter's literal `typos .` passes unmodified. (Recorded because the first
+draft of this section presented the exclusion as a necessary caveat on the gate, which overstated
+it. Noted separately: `git ls-files | xargs typos` is NOT an equivalent substitute anywhere, because
+passing explicit paths bypasses `.typos.toml`'s `extend-exclude = ["**/testdata", "CHANGELOG.md"]`.)
 
 ## 5. Named residue — 31 S3 items carried forward
 
-Full text in the per-unit Critic verdicts; the load-bearing ones:
+**Full verbatim text: [2026-08-audit-hardening-critic-verdicts.md](2026-08-audit-hardening-critic-verdicts.md).**
+The first draft of this section sourced the 31 to "the per-unit Critic verdicts" with no such file on
+disk, leaving 25 of them as unauditable counts — the bundle Critic filed that as S2, correctly: it
+is the same unbacked-claim defect (R-09) this ledger exists to close, recurring inside it. The
+register is now committed alongside.
+
+The load-bearing ones:
+
+- **The decimal read/write asymmetry R1 opened.** `Datum::try_from_bytes` now accepts a decimal whose
+  unscaled magnitude exceeds its declared precision (Java-exact), but `Datum::to_bytes` still
+  rejects it — and `to_bytes` is reached from two pure READ paths (`inspect/readable_metrics.rs`,
+  `inspect/data_file.rs`) plus the manifest re-write path (`spec/manifest/_serde.rs::to_bytes_entry`).
+  So such a table SCANS fine but its `inspect` metadata tables error, and manifest-copying
+  maintenance aborts. Reproduced: `try_from_bytes(&[0x0F,0x42,0x3F], decimal(2,0))` → `Ok(999999)`,
+  then `.to_bytes()` → `DataInvalid`. **Not a regression** — at `e4f7f010` the same value was
+  silently truncated to one byte, turning 999999 into 15, a wrong bound written into metadata. So
+  the bundle is strictly safer and fail-closed. Closing it properly means a non-validating re-emit
+  for the inspect/manifest-copy encoders mirroring Java's unchecked `unscaledValue().toByteArray()`.
+  Found by the bundle Critic; the false "Read paths must not call this" rustdoc it rested on is
+  corrected in `spec/values/datum.rs`.
 
 - **No interop artifact for R1.** Everything is unit-level plus a live Java oracle run in-session.
   The parity mandate requires an interop test for a ✅ flip — which is why R87 was **corrected, not

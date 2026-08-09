@@ -926,15 +926,21 @@ the general rule, not three incidents.
   Actor artifact, execute the hard context break, and require the Critic's complete attestation
   before advancing.
 
-### 2026-08-09 — An Actor's "mutation caught: X" is a hypothesis, not a result — six for six
+### 2026-08-09 — An Actor's "mutation caught: X" is a hypothesis, not a result
 
-Across the 2026-08 audit-hardening bundle, **all six units' first Critic cycle blocked on the same
-defect**: a test carrying a doc comment naming the mutation it catches, where applying that exact
-mutation left the whole suite GREEN. Not six coincidences — a systematic property of how an Actor
-certifies its own tests. It writes the assertion and the claim in one motion, from the same mental
+Across the 2026-08 audit-hardening bundle, **four of six units were remanded, and the recurring
+defect was test adequacy rather than correctness**. In three of them the shape was identical: a test
+carrying a doc comment naming the mutation it catches, where applying that exact mutation left the
+whole suite GREEN. An Actor writes the assertion and the claim in one motion, from the same mental
 model, and never executes the negative case.
 
-The six, so the shape is unmistakable:
+> **This entry was itself over-general on first writing** — it said "six for six", which the bundle
+> Critic falsified from this repo's own record: R2 converged on its first and only cycle with zero
+> S1/S2 and never blocked (`fb11dc66`, identical author/committer timestamps, never amended). A
+> lesson about false claims that overstates its own evidence is the same defect it warns about.
+> Count before you generalise, and prefer the narrower claim that survives.
+
+The verified cases:
 
 - **R1** — "catches re-adding `validate_decimal_literal` to *either* `DatumVisitor` arm". Every
   pre-existing test feeds a JSON **object**, which serde routes to `visit_map`; the `visit_seq` arm
@@ -944,12 +950,18 @@ The six, so the shape is unmistakable:
 - **G4** — `default_provider_budget_is_bytes` named a mutation that `policy().max_capacity()` cannot
   possibly discriminate: the number is `Some(33_554_432)` both before and after the fix. The
   manifest-**list** cache was also entirely unpinned while its manifest twin was pinned.
-- **G3** — the `seen` visited-set was documented in-tree as one of *two* independent termination
-  guarantees; only one of them held.
-- **R2, G5** — same class, caught on the first pass.
+A fourth remand was a NEARBY but distinct shape, worth separating rather than lumping in:
 
-Note the recurring sub-shape: **the twin that was forgotten.** Key vs value, list vs manifest,
-seq vs map. When a guard has symmetric arms, coverage of one reads as coverage of both.
+- **G3** — the `seen` visited-set had **zero** test coverage, and the false claim lived in
+  PRODUCTION doc (it was documented in-tree as one of two independent termination guarantees) rather
+  than in a test comment. Same root cause — an unexecuted claim — but you find it by auditing
+  coverage, not by re-running catalogued mutants.
+
+(**G5** was remanded twice on findings of its own; **R2** was not remanded at all.)
+
+Note the recurring sub-shape in the first three: **the twin that was forgotten.** Key vs value,
+list vs manifest, seq vs map. When a guard has symmetric arms, coverage of one reads as coverage of
+both.
 
 - **DO make the Critic APPLY every mutation the Actor's comments name, not read them.** A named
   mutation is a testable claim about the suite; treat it as unverified until it goes RED.
