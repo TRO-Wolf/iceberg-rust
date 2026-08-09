@@ -648,104 +648,185 @@ fn datum_decimal_boundaries_preserve_negative_binary_encoding() {
     }
 }
 
+/// [`Datum::try_from_bytes`] is a metadata READ door, so it must accept every decimal type Java
+/// can build and reject only what Java itself refuses.
+///
+/// Live against iceberg-api-1.10.0: `DecimalType.of(1,2)` and `of(0,0)` construct without
+/// complaint (only `scale`/`precision` field writes follow the single `precision <= 38`
+/// precondition in `<init>`), while `of(39,0)` throws
+/// `IllegalArgumentException: Decimals with precision larger than 38 are not supported: 39`.
+///
+/// Mutation this catches: re-adding a `Type::decimal(precision, scale)` /
+/// `validate_decimal_literal` call to the decimal arm of `try_from_bytes` (which is exactly what
+/// made a `decimal(1,2)` column unreadable), or deleting the `ensure_java_decimal_precision` call
+/// that keeps precision 39 out.
 #[test]
-fn datum_decimal_bytes_reject_invalid_metadata() {
-    for data_type in [
-        PrimitiveType::Decimal {
-            precision: 1,
-            scale: 2,
-        },
-        PrimitiveType::Decimal {
-            precision: 39,
-            scale: 0,
-        },
-    ] {
-        let error = Datum::try_from_bytes(&[0], data_type).expect_err("invalid metadata");
-        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+fn datum_decimal_bytes_accept_java_legal_metadata_and_reject_precision_over_38() {
+    for (precision, scale) in [(1, 2), (0, 0), (10, 11), (38, 38), (2, 0)] {
+        let data_type = PrimitiveType::Decimal { precision, scale };
+        let datum = Datum::try_from_bytes(&[0], data_type.clone()).unwrap_or_else(|error| {
+            panic!("Java builds decimal({precision},{scale}), so we must read it: {error}")
+        });
+        assert_eq!(datum, Datum::new(data_type, PrimitiveLiteral::Int128(0)));
     }
+
+    let error = Datum::try_from_bytes(&[0], PrimitiveType::Decimal {
+        precision: 39,
+        scale: 0,
+    })
+    .expect_err("Java's DecimalType constructor refuses precision 39, so we must too");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
 }
 
+/// FINDING 1 pin: a NON-minimal (zero- or sign-padded) decimal bound decodes, exactly as it does
+/// in Java.
+///
+/// `Conversions.internalFromByteBuffer` (iceberg-api 1.10.0) DECIMAL arm, bytecode offsets
+/// 254-294, is `new BigInteger(new byte[buf.remaining()])` — no `remaining()` branch at all,
+/// unlike the LONG arm (152-177) and the DOUBLE arm (186-211) in the same `tableswitch`, which
+/// proves the omission is deliberate. Live output from the 1.10.0 jars:
+///
+/// ```text
+/// fromByteBuffer(decimal(9,2), 00 00 04 D2) -> 12.34
+/// fromByteBuffer(decimal(9,2), FF FF FB 2E) -> -12.34
+/// fromByteBuffer(decimal(9,2), <20 bytes, 04 D2 in the tail>) -> 12.34
+/// fromByteBuffer(decimal(9,2), <empty>) -> NumberFormatException: Zero length BigInteger
+/// ```
+///
+/// This matters far beyond one value: `manifest::_serde::parse_bytes_entry` propagates the error
+/// with `?`, so ONE padded bound would make the whole manifest unparsable and abort every scan.
+///
+/// Mutation this catches: restoring the `bytes == i128_to_be_bytes_min(value)` canonical-encoding
+/// check in `Datum::try_from_bytes`, or dropping the empty-buffer guard beside it.
 #[test]
-fn datum_decimal_byte_decode_enforces_unscaled_value_precision() {
-    let decimal_type = PrimitiveType::Decimal {
+fn datum_decimal_byte_decode_accepts_non_minimal_encodings_like_java() {
+    let decimal_9_2 = PrimitiveType::Decimal {
+        precision: 9,
+        scale: 2,
+    };
+    let decimal_2_0 = PrimitiveType::Decimal {
         precision: 2,
         scale: 0,
     };
 
-    for (bytes, expected_value) in [([0x63], 99), ([0x9d], -99)] {
-        let datum = Datum::try_from_bytes(&bytes, decimal_type.clone())
-            .expect("two-digit decimal bytes must fit precision two");
+    let mut padded_20 = vec![0x00; 20];
+    padded_20[18] = 0x04;
+    padded_20[19] = 0xd2;
+    let mut padded_20_negative = vec![0xffu8; 20];
+    padded_20_negative[18] = 0xfb;
+    padded_20_negative[19] = 0x2e;
+
+    for (data_type, bytes, expected) in [
+        // The finding's own example: Java decodes this to 12.34.
+        (decimal_9_2.clone(), vec![0x00, 0x00, 0x04, 0xd2], 1234),
+        (decimal_9_2.clone(), vec![0xff, 0xff, 0xfb, 0x2e], -1234),
+        (decimal_9_2.clone(), padded_20, 1234),
+        (decimal_9_2.clone(), padded_20_negative, -1234),
+        // Minimal encodings keep working.
+        (decimal_9_2, vec![0x04, 0xd2], 1234),
+        (decimal_2_0.clone(), vec![0x00], 0),
+        (decimal_2_0.clone(), vec![0x63], 99),
+        (decimal_2_0.clone(), vec![0x9d], -99),
+        // Redundant sign extension at every width.
+        (decimal_2_0.clone(), vec![0x00, 0x00], 0),
+        (decimal_2_0.clone(), vec![0x00, 0x63], 99),
+        (decimal_2_0.clone(), vec![0xff, 0x9d], -99),
+        (decimal_2_0.clone(), vec![0xff, 0xff], -1),
+    ] {
+        let datum = Datum::try_from_bytes(&bytes, data_type.clone()).unwrap_or_else(|error| {
+            panic!("Java decodes {bytes:?} as {data_type}, so we must too: {error}")
+        });
         assert_eq!(
             datum,
-            Datum::new(
-                decimal_type.clone(),
-                PrimitiveLiteral::Int128(expected_value),
-            )
-        );
-        assert_eq!(
-            datum.to_bytes().expect("valid decimal must round-trip"),
-            bytes
+            Datum::new(data_type, PrimitiveLiteral::Int128(expected)),
+            "bytes={bytes:?}"
         );
     }
 
-    for bytes in [[0x64], [0x9c]] {
-        let error = Datum::try_from_bytes(&bytes, decimal_type.clone())
-            .expect_err("three-digit decimal bytes must exceed precision two");
-        assert_eq!(error.kind(), ErrorKind::DataInvalid);
-    }
+    // The one byte-level input Java rejects: `new BigInteger(new byte[0])` throws
+    // `NumberFormatException: Zero length BigInteger` (verified live).
+    let error = Datum::try_from_bytes(&[], decimal_2_0.clone())
+        .expect_err("Java throws on a zero-length decimal buffer, so we must reject it");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(
+        error.message().contains("Zero length BigInteger"),
+        "the empty-buffer diagnostic should name Java's own failure: {error}"
+    );
+
+    // Still rejected: a magnitude that genuinely exceeds i128 (not mere sign padding).
+    let mut too_large = vec![0x00; 17];
+    too_large[1] = 0x80;
+    let error = Datum::try_from_bytes(&too_large, decimal_2_0)
+        .expect_err("2^127 is outside i128 and must not wrap");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
 }
 
+/// Java does not compare a decimal's magnitude against its declared precision on READ.
+///
+/// Live: `Conversions.fromByteBuffer(DecimalType.of(2,0), 0F 42 3F)` returns `999999`, and
+/// `fromByteBuffer(DecimalType.of(38,0), <i128::MIN bytes>)` decodes a 39-digit value.
+/// The fork keeps its precision gate only where the encoder would otherwise TRUNCATE — see
+/// `datum_decimal_write_path_still_rejects_values_wider_than_precision`.
+///
+/// Mutation this catches: re-adding `validate_decimal_literal` after the match in
+/// `Datum::try_from_bytes`.
 #[test]
-fn datum_decimal_byte_decode_requires_canonical_minimal_twos_complement() {
-    let decimal_type = PrimitiveType::Decimal {
+fn datum_decimal_byte_decode_accepts_values_wider_than_declared_precision() {
+    let decimal_2_0 = PrimitiveType::Decimal {
         precision: 2,
         scale: 0,
     };
-
-    for (bytes, expected_value) in [(vec![0x00], 0), (vec![0x63], 99), (vec![0x9d], -99)] {
-        let datum = Datum::try_from_bytes(&bytes, decimal_type.clone())
-            .expect("canonical minimal decimal bytes must decode");
+    for (bytes, expected) in [
+        (vec![0x0f, 0x42, 0x3f], 999_999_i128),
+        (vec![0x64], 100),
+        (vec![0x9c], -100),
+    ] {
+        let datum = Datum::try_from_bytes(&bytes, decimal_2_0.clone()).unwrap_or_else(|error| {
+            panic!("Java decodes {bytes:?} as decimal(2,0) without a precision check: {error}")
+        });
         assert_eq!(
             datum,
-            Datum::new(
-                decimal_type.clone(),
-                PrimitiveLiteral::Int128(expected_value),
-            )
-        );
-        assert_eq!(
-            datum.to_bytes().expect("canonical bytes must re-encode"),
-            bytes
+            Datum::new(decimal_2_0.clone(), PrimitiveLiteral::Int128(expected))
         );
     }
 
-    for bytes in [
-        vec![],
-        vec![0x00, 0x00],
-        vec![0x00, 0x63],
-        vec![0xff, 0x9d],
-        vec![0xff, 0xff],
-    ] {
-        let error = Datum::try_from_bytes(&bytes, decimal_type.clone())
-            .expect_err("empty or redundant sign-extension bytes must be rejected");
-        assert_eq!(error.kind(), ErrorKind::DataInvalid, "bytes={bytes:?}");
-        assert!(
-            error.message().contains("canonical minimal"),
-            "bytes={bytes:?}, error={error}"
-        );
-    }
+    let datum = Datum::try_from_bytes(&i128::MIN.to_be_bytes(), PrimitiveType::Decimal {
+        precision: 38,
+        scale: 0,
+    })
+    .expect("Java decodes a 39-digit BigInteger for a decimal(38,0) bound");
+    assert_eq!(
+        datum,
+        Datum::new(
+            PrimitiveType::Decimal {
+                precision: 38,
+                scale: 0,
+            },
+            PrimitiveLiteral::Int128(i128::MIN),
+        )
+    );
 }
 
+/// A `Datum` produced by the Java-permissive read path must survive its own serde round trip.
+///
+/// Scan tasks carry `Datum` bounds across process boundaries; if `Serialize` re-applied the
+/// precision gate that `try_from_bytes` deliberately drops, a table Java wrote would plan but fail
+/// to distribute. The `precision <= 38` invariant still holds, enforced by the `PrimitiveType`
+/// field's own `serialize_decimal`/`deserialize_decimal`.
+///
+/// Mutation this catches: re-adding `validate_decimal_literal` to `impl Serialize for Datum` or to
+/// either `DatumVisitor` arm.
 #[test]
-fn datum_decimal_json_round_trip_enforces_unscaled_value_precision() {
+fn datum_decimal_serde_round_trip_preserves_java_readable_values() {
     let decimal_type = PrimitiveType::Decimal {
         precision: 2,
         scale: 0,
     };
 
-    for value in [99_i128, -99_i128] {
+    for value in [99_i128, -99, 100, -100, 999_999] {
         let datum = Datum::new(decimal_type.clone(), PrimitiveLiteral::Int128(value));
         let json = serde_json::to_value(&datum)
-            .expect("two-digit decimal must serialize at precision two");
+            .unwrap_or_else(|error| panic!("decimal(2,0) datum {value} must serialize: {error}"));
         assert_eq!(
             json,
             serde_json::json!({
@@ -754,59 +835,71 @@ fn datum_decimal_json_round_trip_enforces_unscaled_value_precision() {
             })
         );
         assert_eq!(
-            serde_json::from_value::<Datum>(json)
-                .expect("two-digit decimal JSON must deserialize at precision two"),
+            serde_json::from_value::<Datum>(json).unwrap_or_else(|error| panic!(
+                "decimal(2,0) datum {value} must deserialize: {error}"
+            )),
             datum
         );
     }
 
-    for value in [100_i128, -100_i128] {
-        let invalid_datum = Datum::new(decimal_type.clone(), PrimitiveLiteral::Int128(value));
+    // Java-legal metadata the strict constructor refuses still round-trips as data.
+    let odd_type = PrimitiveType::Decimal {
+        precision: 10,
+        scale: 11,
+    };
+    let datum = Datum::new(odd_type, PrimitiveLiteral::Int128(7));
+    let json = serde_json::to_value(&datum).expect("decimal(10,11) is Java-legal metadata");
+    assert_eq!(json["type"], serde_json::json!("decimal(10,11)"));
+    assert_eq!(
+        serde_json::from_value::<Datum>(json).expect("decimal(10,11) must deserialize"),
+        datum
+    );
+}
+
+/// The write path keeps its gate, because `Datum::to_bytes` TRUNCATES the two's-complement buffer
+/// to `decimal_required_bytes(precision)` — silently corrupting a value that needs more.
+///
+/// Java has no equivalent check (`Conversions.toByteBuffer` is a bare
+/// `unscaledValue().toByteArray()`), but Java also never truncates, so refusing is the honest
+/// behavior rather than a parity loss.
+///
+/// Mutation this catches: deleting `validate_decimal_literal` from `Datum::to_bytes`.
+#[test]
+fn datum_decimal_write_path_still_rejects_values_wider_than_precision() {
+    let decimal_2_0 = PrimitiveType::Decimal {
+        precision: 2,
+        scale: 0,
+    };
+    for (value, encoded) in [(99_i128, vec![0x63]), (-99, vec![0x9d])] {
+        let datum = Datum::new(decimal_2_0.clone(), PrimitiveLiteral::Int128(value));
         assert_eq!(
-            invalid_datum
+            datum.to_bytes().expect("in-precision value encodes"),
+            encoded
+        );
+    }
+    for value in [100_i128, -100, 999_999] {
+        let datum = Datum::new(decimal_2_0.clone(), PrimitiveLiteral::Int128(value));
+        assert_eq!(
+            datum
                 .to_bytes()
-                .expect_err("manual three-digit decimal must not encode at precision two")
+                .expect_err("a value the encoder would truncate must be refused")
                 .kind(),
             ErrorKind::DataInvalid
         );
-        assert!(
-            serde_json::to_value(&invalid_datum).is_err(),
-            "manual three-digit decimal must not serialize at precision two"
-        );
-
-        let invalid_json = serde_json::json!({
-            "type": "decimal(2,0)",
-            "literal": value.to_be_bytes(),
-        });
-        assert!(
-            serde_json::from_value::<Datum>(invalid_json).is_err(),
-            "three-digit decimal JSON must not deserialize at precision two"
-        );
     }
-}
 
-#[test]
-fn datum_decimal_precision_validation_handles_i128_min_without_overflow() {
-    let decimal_type = PrimitiveType::Decimal {
-        precision: 38,
-        scale: 0,
-    };
-    let invalid_datum = Datum::new(decimal_type.clone(), PrimitiveLiteral::Int128(i128::MIN));
-
+    // `unsigned_abs` keeps the 39-digit `i128::MIN` check overflow-free.
+    let over_max = Datum::new(
+        PrimitiveType::Decimal {
+            precision: 38,
+            scale: 0,
+        },
+        PrimitiveLiteral::Int128(i128::MIN),
+    );
     assert_eq!(
-        invalid_datum
+        over_max
             .to_bytes()
-            .expect_err("i128::MIN has 39 digits and must exceed Iceberg precision 38")
-            .kind(),
-        ErrorKind::DataInvalid
-    );
-    assert!(
-        serde_json::to_value(&invalid_datum).is_err(),
-        "i128::MIN must fail JSON serialization without overflowing validation"
-    );
-    assert_eq!(
-        Datum::try_from_bytes(&i128::MIN.to_be_bytes(), decimal_type)
-            .expect_err("i128::MIN bytes must exceed Iceberg precision 38")
+            .expect_err("i128::MIN has 39 digits and cannot encode at precision 38")
             .kind(),
         ErrorKind::DataInvalid
     );
@@ -814,31 +907,65 @@ fn datum_decimal_precision_validation_handles_i128_min_without_overflow() {
 
 #[test]
 fn datum_decimal_serialization_rejects_invalid_metadata() {
-    for data_type in [
-        PrimitiveType::Decimal {
-            precision: 1,
-            scale: 2,
-        },
+    // `precision > 38` is the one decimal-metadata rule Java itself enforces
+    // (`Types$DecimalType.<init>`), so both the byte encoder and the JSON encoder still refuse it.
+    let over_max = Datum::new(
         PrimitiveType::Decimal {
             precision: 39,
             scale: 0,
         },
-    ] {
-        let datum = Datum::new(data_type, PrimitiveLiteral::Int128(-1));
+        PrimitiveLiteral::Int128(-1),
+    );
+    let error = over_max
+        .to_bytes()
+        .expect_err("precision 39 is not encodable");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "PrimitiveType Decimal must has valid precision but got 39",
+        "Datum boundary must retain its compatibility diagnostic: {error}"
+    );
+    let error = serde_json::to_string(&over_max).expect_err("precision 39 must not serialize");
+    assert!(error.to_string().contains("Decimals with precision larger"));
 
-        let error = datum.to_bytes().expect_err("invalid metadata");
-        assert_eq!(error.kind(), ErrorKind::DataInvalid);
-        if let PrimitiveType::Decimal { precision: 39, .. } = datum.data_type() {
-            assert_eq!(
-                error.message(),
-                "PrimitiveType Decimal must has valid precision but got 39",
-                "Datum boundary must retain its compatibility diagnostic: {error}"
-            );
-        }
+    // `precision = 0` has no byte width (`decimal_required_bytes` cannot serve it), so the ENCODER
+    // still refuses even though Java's `DecimalType.of(0,0)` constructs. The metadata itself
+    // remains readable and writable as a type string — see
+    // `datatypes::tests::java_legal_decimal_type_strings_still_deserialize`.
+    let zero_precision = Datum::new(
+        PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0,
+        },
+        PrimitiveLiteral::Int128(0),
+    );
+    assert_eq!(
+        zero_precision
+            .to_bytes()
+            .expect_err("precision 0 has no decimal byte width")
+            .kind(),
+        ErrorKind::DataInvalid
+    );
 
-        let error = serde_json::to_string(&datum).expect_err("invalid metadata");
-        assert!(error.to_string().contains("DataInvalid"));
-    }
+    // `scale > precision` is NOT a Java invariant (`DecimalType.of(1,2)` constructs live), so a
+    // value that fits the precision must still encode.
+    let odd_shape = Datum::new(
+        PrimitiveType::Decimal {
+            precision: 1,
+            scale: 2,
+        },
+        PrimitiveLiteral::Int128(-1),
+    );
+    assert_eq!(
+        odd_shape
+            .to_bytes()
+            .expect("decimal(1,2) is Java-legal and -1 fits precision 1"),
+        vec![0xffu8]
+    );
+    assert!(
+        serde_json::to_string(&odd_shape).is_ok(),
+        "decimal(1,2) is Java-legal metadata and must serialize"
+    );
 }
 
 #[test]
@@ -1078,23 +1205,37 @@ fn test_raw_literal_bytes_decimal_precision_1_negative() {
     );
 }
 
+/// The Avro `bytes` decimal decode is a READ door and carries no precision gate, matching Java's
+/// `new BigInteger(bytes)`; the surviving length rule (`v.len() == decimal_required_bytes`) is
+/// pre-existing and unrelated to this finding.
+///
+/// Mutation this catches: re-adding `validate_decimal_value` to the `RawLiteralEnum::Bytes`
+/// decimal arm in `spec::values::serde`.
 #[test]
-fn raw_literal_decimal_decode_enforces_declared_precision() {
+fn raw_literal_decimal_decode_accepts_values_wider_than_declared_precision() {
     let decimal_type = Type::Primitive(PrimitiveType::Decimal {
         precision: 2,
         scale: 0,
     });
 
-    for (bytes, expected) in [(vec![0x63], 99), (vec![0x9d], -99)] {
+    for (bytes, expected) in [
+        (vec![0x63], 99),
+        (vec![0x9d], -99),
+        // Java's decode of the same buffers: 100 and -100 at decimal(2,0), unchecked.
+        (vec![0x64], 100),
+        (vec![0x9c], -100),
+    ] {
         check_raw_literal_bytes_serde_via_avro(bytes, Literal::decimal(expected), &decimal_type);
-    }
-    for bytes in [vec![0x64], vec![0x9c]] {
-        check_raw_literal_bytes_error_via_avro(bytes, &decimal_type);
     }
 }
 
+/// The same absence of a precision gate on the recursive (struct/partition) route.
+///
+/// Mutation this catches: re-adding `validate_decimal_value` to the `PrimitiveLiteral::Int128`
+/// arm of `RawLiteral::try_from`, which would make a Java-written partition value unwritable on
+/// the way back out.
 #[test]
-fn raw_literal_recursive_struct_route_enforces_decimal_precision() {
+fn raw_literal_recursive_struct_route_accepts_java_written_decimals() {
     let decimal_type = Type::Primitive(PrimitiveType::Decimal {
         precision: 2,
         scale: 0,
@@ -1103,23 +1244,30 @@ fn raw_literal_recursive_struct_route_enforces_decimal_precision() {
         NestedField::required(1, "partition_decimal", decimal_type).into(),
     ]));
 
-    for value in [99, -99] {
+    for value in [99, -99, 100, -100, 999_999] {
         let literal = Literal::Struct(Struct::from_iter([Some(Literal::decimal(value))]));
         assert!(
             RawLiteral::try_from(literal, &struct_type).is_ok(),
-            "manifest-routed boundary decimal {value} must be accepted"
+            "manifest-routed decimal {value} is Java-legal and must be accepted"
         );
     }
-    for value in [100, -100] {
-        let literal = Literal::Struct(Struct::from_iter([Some(Literal::decimal(value))]));
-        let error = RawLiteral::try_from(literal, &struct_type)
-            .expect_err("manifest-routed out-of-precision decimal must be rejected");
-        assert_eq!(error.kind(), ErrorKind::DataInvalid);
-        assert!(
-            error.message().contains(&value.to_string()),
-            "error must name invalid decimal value {value}: {error}"
-        );
-    }
+
+    // An Int128 literal still has to be typed as a decimal.
+    let literal = Literal::Struct(Struct::from_iter([Some(Literal::decimal(1))]));
+    let wrong_type = Type::Struct(StructType::new(vec![
+        NestedField::required(
+            1,
+            "partition_decimal",
+            Type::Struct(StructType::new(vec![])),
+        )
+        .into(),
+    ]));
+    assert_eq!(
+        RawLiteral::try_from(literal, &wrong_type)
+            .expect_err("a decimal literal under a struct type is still invalid")
+            .kind(),
+        ErrorKind::DataInvalid
+    );
 }
 
 #[test]
@@ -1142,19 +1290,18 @@ fn literal_decimal_json_boundaries_validate_direct_and_nested_values() {
             json
         );
     }
-    for value in [100, -100] {
+    for value in [100, -100, 999_999] {
+        let json = JsonValue::String(value.to_string());
         assert_eq!(
-            Literal::try_from_json(JsonValue::String(value.to_string()), &decimal_type)
-                .expect_err("direct JSON decimal outside precision must fail")
-                .kind(),
-            ErrorKind::DataInvalid
+            Literal::try_from_json(json.clone(), &decimal_type)
+                .expect("Java's SingleValueParser applies no precision check on read"),
+            Some(Literal::decimal(value))
         );
         assert_eq!(
             Literal::decimal(value)
                 .try_into_json(&decimal_type)
-                .expect_err("direct decimal literal outside precision must fail")
-                .kind(),
-            ErrorKind::DataInvalid
+                .expect("Java's SingleValueParser applies no precision check on write"),
+            json
         );
     }
 
@@ -1202,10 +1349,11 @@ fn literal_decimal_json_boundaries_validate_direct_and_nested_values() {
         );
     }
 
-    let invalid_cases = [
+    // Values wider than the declared precision are Java-legal on this path too, nested or not.
+    let wide_cases = [
         (
             serde_json::json!({"1": "100"}),
-            struct_type,
+            struct_type.clone(),
             Literal::Struct(Struct::from_iter([Some(Literal::decimal(100))])),
         ),
         (
@@ -1222,25 +1370,41 @@ fn literal_decimal_json_boundaries_validate_direct_and_nested_values() {
             )])),
         ),
     ];
-    for (json, data_type, literal) in invalid_cases {
+    for (json, data_type, literal) in wide_cases {
         assert_eq!(
-            Literal::try_from_json(json, &data_type)
-                .expect_err("nested JSON decimal outside precision must fail")
-                .kind(),
-            ErrorKind::DataInvalid
+            Literal::try_from_json(json.clone(), &data_type)
+                .expect("Java parses this default without a precision check"),
+            Some(literal.clone())
         );
         assert_eq!(
             literal
                 .try_into_json(&data_type)
-                .expect_err("nested decimal literal outside precision must fail")
-                .kind(),
-            ErrorKind::DataInvalid
+                .expect("Java writes this default back without a precision check"),
+            json
         );
     }
+
+    // A genuinely malformed nested value must still surface as a typed error rather than being
+    // swallowed into a missing field (the struct route no longer discards errors with `.ok()`).
+    assert_eq!(
+        Literal::try_from_json(serde_json::json!({"1": 123}), &struct_type)
+            .expect_err("a non-string decimal default is not parseable")
+            .kind(),
+        ErrorKind::DataInvalid
+    );
 }
 
+/// The `decimal(P,S)` JSON value path applies Java's rules only.
+///
+/// Java 1.10.0 `SingleValueParser.fromJson` DECIMAL arm checks `isTextual`, then
+/// `new BigDecimal(text)`, then only `bigDecimal.scale() == decimalType.scale()`; `toJson` writes
+/// `value.toString()` with no gate at all. So `decimal(0,0)`, `decimal(39,0)` and `decimal(2,3)`
+/// — the three shapes the first hardening pass rejected — must not be refused here.
+///
+/// Mutation this catches: re-adding `Type::decimal(precision, scale)?` or `validate_decimal_value`
+/// to `Literal::try_from_json` / `Literal::try_into_json`.
 #[test]
-fn literal_decimal_json_rejects_invalid_decimal_metadata() {
+fn literal_decimal_json_applies_no_precision_gate_like_java() {
     for data_type in [
         Type::Primitive(PrimitiveType::Decimal {
             precision: 0,
@@ -1257,18 +1421,23 @@ fn literal_decimal_json_rejects_invalid_decimal_metadata() {
     ] {
         assert_eq!(
             Literal::try_from_json(JsonValue::String("0".to_string()), &data_type)
-                .expect_err("invalid decimal type must reject JSON input")
-                .kind(),
-            ErrorKind::DataInvalid
+                .expect("Java's SingleValueParser accepts this decimal default"),
+            Some(Literal::decimal(0))
         );
-        assert_eq!(
-            Literal::decimal(0)
-                .try_into_json(&data_type)
-                .expect_err("invalid decimal type must reject JSON output")
-                .kind(),
-            ErrorKind::DataInvalid
+        assert!(
+            Literal::decimal(0).try_into_json(&data_type).is_ok(),
+            "Java's SingleValueParser writes this decimal default back unchecked"
         );
     }
+
+    // The type still has to be a decimal for an Int128 literal.
+    assert_eq!(
+        Literal::decimal(0)
+            .try_into_json(&Type::Primitive(PrimitiveType::Int))
+            .expect_err("an Int128 literal is only valid under a decimal type")
+            .kind(),
+        ErrorKind::DataInvalid
+    );
 }
 
 #[test]

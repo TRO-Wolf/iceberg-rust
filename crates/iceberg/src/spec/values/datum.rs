@@ -38,7 +38,7 @@ use super::serde::_serde::RawLiteral;
 use super::temporal::{date, time, timestamp, timestamptz};
 use crate::error::Result;
 use crate::spec::MAX_DECIMAL_PRECISION;
-use crate::spec::datatypes::{PrimitiveType, Type};
+use crate::spec::datatypes::{PrimitiveType, Type, ensure_java_decimal_precision};
 use crate::{Error, ErrorKind, ensure_data_valid};
 
 /// Maximum value for [`PrimitiveType::Time`] type in microseconds, e.g. 23 hours 59 minutes 59 seconds 999999 microseconds.
@@ -47,25 +47,34 @@ pub(crate) const MAX_TIME_VALUE: i64 = 24 * 60 * 60 * 1_000_000i64 - 1;
 pub(crate) const INT_MAX: i32 = 2147483647;
 pub(crate) const INT_MIN: i32 = -2147483648;
 
+/// Metadata gate for the decimal **encode** paths.
+///
+/// Requires `1 <= precision <= 38`. The upper bound is Java's own
+/// (`Types$DecimalType.<init>`); the lower bound is a fork addition, because every encoder below
+/// needs [`Type::decimal_required_bytes`] to pick a byte width and precision `0` has none.
+///
+/// It deliberately does NOT require `scale <= precision`: Java has no such rule anywhere
+/// (`DecimalType.of(1,2)` and `of(10,11)` both construct against iceberg-api-1.10.0), so imposing
+/// it on a value path would reject data Java writes and reads. Arrow's `Decimal128` rule is
+/// enforced at the Arrow boundary instead (`crate::arrow::schema`).
 fn validate_decimal_type(r#type: &PrimitiveType) -> Result<()> {
-    if let PrimitiveType::Decimal { precision, scale } = r#type {
-        Type::decimal(*precision, *scale).map_err(|source| {
-            let message = if *precision == 0 || *precision > MAX_DECIMAL_PRECISION {
-                format!(
-                    "PrimitiveType Decimal must have valid precision from 1 through {MAX_DECIMAL_PRECISION}, got {precision}"
-                )
-            } else {
-                format!(
-                    "PrimitiveType Decimal scale must not exceed precision, got precision={precision}, scale={scale}"
-                )
-            };
-            Error::new(ErrorKind::DataInvalid, message).with_source(source)
-        })?;
+    if let PrimitiveType::Decimal { precision, .. } = r#type {
+        ensure_data_valid!(
+            *precision > 0 && *precision <= MAX_DECIMAL_PRECISION,
+            "PrimitiveType Decimal must have valid precision from 1 through {MAX_DECIMAL_PRECISION}, got {precision}",
+        );
     }
     Ok(())
 }
 
 /// Validate a decimal's metadata and unscaled value against Iceberg's declared precision.
+///
+/// **Encode/construction path only.** Java never checks a decimal's magnitude against its
+/// declared precision — `Conversions.internalFromByteBuffer` decodes any `BigInteger` and
+/// `Conversions.toByteBuffer` re-emits `unscaledValue().toByteArray()` unchecked (live probe:
+/// `fromByteBuffer(DecimalType.of(2,0), 0x0F423F)` returns `999999`). The fork needs the check
+/// only where the encoder would otherwise silently TRUNCATE the two's-complement buffer to
+/// `decimal_required_bytes(precision)`. Read paths must not call this.
 ///
 /// The absolute value is converted through `unsigned_abs`, which is defined for
 /// `i128::MIN` and therefore cannot overflow while checking the 38-digit boundary.
@@ -118,8 +127,11 @@ impl Serialize for Datum {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        validate_decimal_literal(&self.r#type, &self.literal).map_err(serde::ser::Error::custom)?;
-
+        // No decimal value gate here. A `Datum` built from a Java-written bound may legitimately
+        // carry an unscaled value wider than its declared precision (Java never checks), and this
+        // impl is one half of a lossless round trip with `Deserialize` — rejecting here would make
+        // such a scan task unserializable. The `precision <= 38` invariant still applies, via the
+        // `PrimitiveType` field below (`serialize_decimal`).
         let mut struct_ser = serializer
             .serialize_struct("Datum", 2)
             .map_err(serde::ser::Error::custom)?;
@@ -175,7 +187,6 @@ impl<'de> Deserialize<'de> for Datum {
                 else {
                     return Err(serde::de::Error::custom("Invalid value"));
                 };
-                validate_decimal_literal(&r#type, &primitive).map_err(serde::de::Error::custom)?;
 
                 Ok(Datum::new(r#type, primitive))
             }
@@ -213,7 +224,6 @@ impl<'de> Deserialize<'de> for Datum {
                 else {
                     return Err(serde::de::Error::custom("Invalid value"));
                 };
-                validate_decimal_literal(&r#type, &primitive).map_err(serde::de::Error::custom)?;
                 Ok(Datum::new(r#type, primitive))
             }
         }
@@ -496,17 +506,36 @@ impl Datum {
             }
             PrimitiveType::Fixed(_) => PrimitiveLiteral::Binary(Vec::from(bytes)),
             PrimitiveType::Binary => PrimitiveLiteral::Binary(Vec::from(bytes)),
-            PrimitiveType::Decimal { .. } => {
+            PrimitiveType::Decimal { precision, .. } => {
+                // Java parity — `Conversions.internalFromByteBuffer`, iceberg-api 1.10.0, DECIMAL
+                // arm at bytecode offsets 254-294: `new BigInteger(new byte[buf.remaining()])`
+                // then `new BigDecimal(bigint, scale)`. There is NO length check and NO minimality
+                // check, and the omission is deliberate — the LONG (152-177) and DOUBLE (186-211)
+                // arms in the same switch DO branch on `remaining()`. Live probe against the
+                // 1.10.0 jars:
+                //   fromByteBuffer(decimal(9,2), 00 00 04 D2) -> 12.34   (zero-padded)
+                //   fromByteBuffer(decimal(9,2), FF FF FB 2E) -> -12.34  (sign-extended)
+                //   fromByteBuffer(decimal(2,0), 0F 42 3F)    -> 999999  (exceeds precision)
+                // Rejecting any of these would make a single padded bound abort every scan of the
+                // table, because `manifest::_serde::parse_bytes_entry` propagates the error with
+                // `?` and one unparsable bound fails the whole manifest.
+                //
+                // Two things Java DOES reject, which we keep rejecting:
+                //   * an EMPTY buffer — `new BigInteger(new byte[0])` throws
+                //     `NumberFormatException: Zero length BigInteger` (verified live);
+                //   * `precision > 38` — unreachable in Java at all, since `DecimalType.<init>`
+                //     refuses to build the type.
+                ensure_java_decimal_precision(precision)?;
+                ensure_data_valid!(
+                    !bytes.is_empty(),
+                    "Zero length BigInteger: a decimal value must have at least one byte",
+                );
                 let value = i128_from_be_bytes(bytes).ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
                         format!("Can't convert bytes to i128: {bytes:?}"),
                     )
                 })?;
-                ensure_data_valid!(
-                    bytes == i128_to_be_bytes_min(value),
-                    "Decimal bytes must use the canonical minimal two's-complement big-endian encoding: {bytes:?}",
-                );
                 PrimitiveLiteral::Int128(value)
             }
             // `unknown` has no `PrimitiveLiteral` form — its values are always null, so there is no
@@ -518,7 +547,6 @@ impl Datum {
                 ));
             }
         };
-        validate_decimal_literal(&data_type, &literal)?;
         Ok(Datum::new(data_type, literal))
     }
 

@@ -137,18 +137,41 @@ pub fn decimal_rescale(d: Decimal, scale: u32) -> Decimal {
 
 /// Convert big-endian signed bytes to i128.
 ///
-/// This handles variable-length byte arrays (up to 16 bytes) with sign extension.
-/// Returns None if the byte array is longer than 16 bytes.
+/// This is the `new BigInteger(byte[])` half of Java's decimal decode, narrowed to the range an
+/// `i128` can hold. Java (`Conversions.internalFromByteBuffer`, iceberg-api 1.10.0, DECIMAL arm at
+/// bytecode offsets 254-294) imposes NO length limit and NO minimality requirement, so any
+/// two's-complement big-endian buffer — including one padded with redundant leading sign bytes —
+/// must decode to the same value it decodes to in Java. Verified live against the 1.10.0 jars:
+/// `fromByteBuffer(decimal(9,2), 00 00 04 D2)` is `12.34`, and a 20-byte zero-padded buffer with
+/// the same trailing `04 D2` is also `12.34`.
+///
+/// Returns `None` only when the value genuinely does not fit an `i128`: that is, when the bytes
+/// above the low 16 are not pure sign extension of them. (`Some(0)` for an empty slice matches
+/// `i128::from_be_bytes` on an all-zero buffer; callers that must reproduce Java's
+/// `NumberFormatException: Zero length BigInteger` reject the empty case themselves — see
+/// `Datum::try_from_bytes`.)
 pub fn i128_from_be_bytes(bytes: &[u8]) -> Option<i128> {
     if bytes.is_empty() {
         return Some(0);
     }
-    if bytes.len() > 16 {
-        return None; // Too large for i128
-    }
 
     // Check sign bit (most significant bit of first byte)
     let is_negative = bytes[0] & 0x80 != 0;
+
+    if bytes.len() > 16 {
+        // Everything above the low 16 bytes must be redundant sign extension, and the retained
+        // 16 bytes must still carry the same sign — otherwise the true value is outside i128.
+        let (prefix, low) = bytes.split_at(bytes.len() - 16);
+        let sign_byte = if is_negative { 0xFF } else { 0x00 };
+        if prefix.iter().any(|byte| *byte != sign_byte) {
+            return None;
+        }
+        let low: [u8; 16] = low.try_into().ok()?;
+        if (low[0] & 0x80 != 0) != is_negative {
+            return None;
+        }
+        return Some(i128::from_be_bytes(low));
+    }
 
     // Pad to 16 bytes with sign extension
     let mut padded = if is_negative { [0xFF; 16] } else { [0; 16] };
@@ -277,8 +300,31 @@ mod tests {
         assert_eq!(i128_from_be_bytes(&[0x80]), Some(-128));
         assert_eq!(i128_from_be_bytes(&[0xFB, 0x2E]), Some(-1234));
 
-        // Too large (> 16 bytes)
-        assert_eq!(i128_from_be_bytes(&[0; 17]), None);
+        // Redundant leading sign bytes are ACCEPTED, including past 16 bytes, because Java's
+        // `new BigInteger(bytes)` accepts them. Live probe against iceberg-api-1.10.0:
+        // `Conversions.fromByteBuffer(DecimalType.of(9,2), <20 bytes: 18 zeros, 04 D2>)` -> 12.34.
+        assert_eq!(i128_from_be_bytes(&[0x00, 0x00, 0x04, 0xD2]), Some(1234));
+        assert_eq!(i128_from_be_bytes(&[0xFF, 0xFF, 0xFB, 0x2E]), Some(-1234));
+        assert_eq!(i128_from_be_bytes(&[0; 17]), Some(0));
+        let mut padded_20 = [0u8; 20];
+        padded_20[18] = 0x04;
+        padded_20[19] = 0xD2;
+        assert_eq!(i128_from_be_bytes(&padded_20), Some(1234));
+        let mut padded_20_negative = [0xFFu8; 20];
+        padded_20_negative[18] = 0xFB;
+        padded_20_negative[19] = 0x2E;
+        assert_eq!(i128_from_be_bytes(&padded_20_negative), Some(-1234));
+
+        // Genuinely outside i128 — the bytes above the low 16 are NOT pure sign extension.
+        let mut too_large = [0u8; 17];
+        too_large[0] = 0x01;
+        assert_eq!(i128_from_be_bytes(&too_large), None);
+        let mut positive_overflow = [0u8; 17];
+        positive_overflow[1] = 0x80;
+        assert_eq!(i128_from_be_bytes(&positive_overflow), None);
+        let mut negative_overflow = [0xFFu8; 17];
+        negative_overflow[1] = 0x7F;
+        assert_eq!(i128_from_be_bytes(&negative_overflow), None);
     }
 
     #[test]

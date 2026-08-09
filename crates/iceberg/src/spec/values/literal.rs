@@ -26,7 +26,6 @@ use serde_json::{Map as JsonMap, Number, Value as JsonValue};
 use uuid::Uuid;
 
 use super::Map;
-use super::datum::validate_decimal_value;
 use super::decimal_utils::{
     decimal_from_str_exact, decimal_mantissa, decimal_rescale, try_decimal_from_i128_with_scale,
 };
@@ -523,16 +522,17 @@ impl Literal {
                 (PrimitiveType::Binary, JsonValue::String(s)) => Ok(Some(Literal::Primitive(
                     PrimitiveLiteral::Binary(hex_str_to_bytes(&s)?),
                 ))),
-                (
-                    primitive_type @ PrimitiveType::Decimal { precision, scale },
-                    JsonValue::String(s),
-                ) => {
-                    Type::decimal(*precision, *scale)?;
+                // Java 1.10.0 `SingleValueParser.fromJson` DECIMAL arm: `isTextual` check, then
+                // `new BigDecimal(text)`, then ONE further precondition —
+                // `bigDecimal.scale() == decimalType.scale()` ("the scale doesn't match", constant
+                // pool #129). There is NO precision check and no re-validation of the type, so a
+                // default/partition value must not be gated on either here. (The fork rescales
+                // instead of requiring an exact scale match; that pre-existing divergence is
+                // tracked separately and is not touched by this change.)
+                (PrimitiveType::Decimal { scale, .. }, JsonValue::String(s)) => {
                     let decimal = decimal_from_str_exact(&s)?;
                     let rescaled = decimal_rescale(decimal, *scale);
-                    let value = decimal_mantissa(&rescaled);
-                    validate_decimal_value(primitive_type, value)?;
-                    Ok(Some(Literal::decimal(value)))
+                    Ok(Some(Literal::decimal(decimal_mantissa(&rescaled))))
                 }
                 (_, JsonValue::Null) => Ok(None),
                 (i, j) => Err(Error::new(
@@ -740,11 +740,10 @@ impl Literal {
                 (PrimitiveType::Binary, PrimitiveLiteral::Binary(val)) => {
                     Ok(JsonValue::String(bytes_to_hex_str(&val)))
                 }
-                (
-                    primitive_type @ PrimitiveType::Decimal { scale, .. },
-                    PrimitiveLiteral::Int128(val),
-                ) => {
-                    validate_decimal_value(primitive_type, val)?;
+                // Java 1.10.0 `SingleValueParser.toJson` DECIMAL arm writes
+                // `value.toString()` unconditionally — no precision or metadata gate — so the
+                // reverse of the read above stays gate-free too.
+                (PrimitiveType::Decimal { scale, .. }, PrimitiveLiteral::Int128(val)) => {
                     let decimal = try_decimal_from_i128_with_scale(val, *scale)?;
                     Ok(JsonValue::String(decimal.to_string()))
                 }

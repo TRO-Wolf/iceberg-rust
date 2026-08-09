@@ -24,7 +24,6 @@ pub(crate) mod _serde {
     use serde_bytes::ByteBuf;
     use serde_derive::{Deserialize as DeserializeDerive, Serialize as SerializeDerive};
 
-    use crate::spec::values::datum::validate_decimal_value;
     use crate::spec::values::{Literal, Map, PrimitiveLiteral, Struct};
     use crate::spec::{MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, PrimitiveType, Type};
     use crate::{Error, ErrorKind};
@@ -257,7 +256,14 @@ pub(crate) mod _serde {
                     }
                     PrimitiveLiteral::Binary(v) => RawLiteralEnum::Bytes(ByteBuf::from(v)),
                     PrimitiveLiteral::Int128(v) => {
-                        let Type::Primitive(primitive_type) = ty else {
+                        // A decimal literal must be typed as a decimal, but its MAGNITUDE is not
+                        // checked against the declared precision: Java's
+                        // `Conversions.toByteBuffer` DECIMAL arm is a bare
+                        // `unscaledValue().toByteArray()` (iceberg-api 1.10.0, offsets 254-260)
+                        // with no precision gate, and this encoder is lossless — a fixed 16-byte
+                        // two's-complement buffer, never truncated. Gating it here would make a
+                        // value Java wrote unable to survive its own read/write round trip.
+                        let Type::Primitive(_) = ty else {
                             return Err(Error::new(
                                 ErrorKind::DataInvalid,
                                 format!(
@@ -265,7 +271,6 @@ pub(crate) mod _serde {
                                 ),
                             ));
                         };
-                        validate_decimal_value(primitive_type, v)?;
                         RawLiteralEnum::Bytes(ByteBuf::from(v.to_be_bytes()))
                     }
                     PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => {
@@ -527,11 +532,11 @@ pub(crate) mod _serde {
                                 }
                             }
 
+                            // READ path: no magnitude gate. Java's Avro/`Conversions` decimal
+                            // decode is `new BigInteger(bytes)` with no precision comparison
+                            // (live probe: `decimal(2,0)` decodes `0F 42 3F` to `999999`), and
+                            // the sign extension above is lossless.
                             let value = i128::from_be_bytes(padded_bytes);
-                            let Type::Primitive(primitive_type) = ty else {
-                                unreachable!("decimal match arm requires a primitive type")
-                            };
-                            validate_decimal_value(primitive_type, value)?;
                             Ok(Some(Literal::decimal(value)))
                         } else {
                             Err(invalid_err_with_reason(
@@ -646,7 +651,7 @@ pub(crate) mod _serde {
                         }
                         Ok(Some(Literal::uuid(uuid::Uuid::from_bytes(bytes))))
                     }
-                    Type::Primitive(primitive_type @ PrimitiveType::Decimal { .. }) => {
+                    Type::Primitive(PrimitiveType::Decimal { .. }) => {
                         if v.list.len() != 16 {
                             return Err(invalid_err_with_reason(
                                 "list",
@@ -671,8 +676,9 @@ pub(crate) mod _serde {
                                 ));
                             }
                         }
+                        // READ path: Java applies no precision gate when decoding a decimal
+                        // (see the `bytes` arm above); the 16-byte list decode is lossless.
                         let value = i128::from_be_bytes(bytes);
-                        validate_decimal_value(primitive_type, value)?;
                         Ok(Some(Literal::decimal(value)))
                     }
                     Type::Primitive(PrimitiveType::Binary) => {

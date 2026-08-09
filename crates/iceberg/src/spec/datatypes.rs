@@ -186,7 +186,21 @@ impl Type {
         Ok(REQUIRED_LENGTH[precision as usize - 1])
     }
 
-    /// Creates  decimal type.
+    /// Creates a decimal type.
+    ///
+    /// This is the **construction** door and it is deliberately STRICTER than Java's
+    /// `Types$DecimalType.<init>`, which only checks `precision <= 38` (iceberg-api 1.10.0
+    /// bytecode: `iload_1; bipush 38; if_icmpgt 14` →
+    /// `Preconditions.checkArgument(.., "Decimals with precision larger than 38 are not
+    /// supported: %s")`). A live run against the 1.10.0 jars accepts `DecimalType.of(0,0)`,
+    /// `of(1,2)` and `of(10,11)`. This constructor additionally requires `precision >= 1` (a
+    /// zero-precision decimal has no byte width — [`Type::decimal_required_bytes`] cannot serve
+    /// it) and `scale <= precision` (Arrow `Decimal128`, the fork's in-memory currency, rejects
+    /// anything else), so every type this constructor yields is representable end to end.
+    ///
+    /// Metadata READ paths must NOT route through here: a table Java can open must stay openable.
+    /// The `decimal(P,S)` type-string deserializer therefore applies Java's rule directly — see
+    /// `ensure_java_decimal_precision` in this module.
     #[inline(always)]
     pub fn decimal(precision: u32, scale: u32) -> Result<Self> {
         ensure_data_valid!(
@@ -387,6 +401,30 @@ impl Serialize for PrimitiveType {
     }
 }
 
+/// The ONLY invariant Java's `Types$DecimalType.<init>` enforces (iceberg-api 1.10.0).
+///
+/// Bytecode: `iload_1; bipush 38; if_icmpgt 14; iconst_1; goto 15; iconst_0` feeding
+/// `Preconditions.checkArgument(boolean, "Decimals with precision larger than 38 are not
+/// supported: %s", precision)`. There is NO `precision > 0` branch and NO `scale <= precision`
+/// branch. Live confirmation against iceberg-api-1.10.0 + iceberg-core-1.10.0:
+///
+/// ```text
+/// Types.fromPrimitiveString("decimal(0,0)")   -> decimal(0, 0)
+/// Types.fromPrimitiveString("decimal(1,2)")   -> decimal(1, 2)
+/// Types.fromPrimitiveString("decimal(10,11)") -> decimal(10, 11)
+/// Types.fromPrimitiveString("decimal(39,0)")  -> IllegalArgumentException
+/// ```
+///
+/// Every metadata READ path must use this rule, not [`Type::decimal`]: routing schema JSON
+/// through the stricter constructor makes a table Java can open completely unopenable here.
+pub(crate) fn ensure_java_decimal_precision(precision: u32) -> Result<()> {
+    ensure_data_valid!(
+        precision <= MAX_DECIMAL_PRECISION,
+        "Decimals with precision larger than {MAX_DECIMAL_PRECISION} are not supported: {precision}",
+    );
+    Ok(())
+}
+
 fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<PrimitiveType, D::Error>
 where D: Deserializer<'de> {
     // Java 1.10.0 `Types.fromTypeName` matches `decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)` against the
@@ -407,14 +445,12 @@ where D: Deserializer<'de> {
     let precision = parse_unsigned_digits(precision, &s)?;
     let scale = parse_unsigned_digits(scale, &s)?;
 
-    Type::decimal(precision, scale)
-        .map_err(D::Error::custom)
-        .and_then(|ty| match ty {
-            Type::Primitive(primitive) => Ok(primitive),
-            _ => Err(D::Error::custom(
-                "Decimal type constructor returned a non-primitive type",
-            )),
-        })
+    // Java parity: apply `Types$DecimalType.<init>`'s single check, NOT the stricter
+    // `Type::decimal` construction contract. `decimal(0,0)`, `decimal(1,2)` and `decimal(10,11)`
+    // all load in Java 1.10.0, so they must load here — otherwise the whole table is unopenable.
+    ensure_java_decimal_precision(precision).map_err(D::Error::custom)?;
+
+    Ok(PrimitiveType::Decimal { precision, scale })
 }
 
 /// Parses the `\d+` capture of Java's `fixed`/`decimal` regex: ASCII digits only after a `trim()`.
@@ -446,7 +482,10 @@ fn serialize_decimal<S>(
 where
     S: Serializer,
 {
-    Type::decimal(*precision, *scale).map_err(serde::ser::Error::custom)?;
+    // Mirror the read side: anything Java can hold in a `DecimalType` must round-trip back out.
+    // Only `precision > 38` — which Java's constructor itself refuses — is rejected here; a
+    // precision/scale pair like `decimal(10,11)` is Java-legal metadata and must re-serialize.
+    ensure_java_decimal_precision(*precision).map_err(serde::ser::Error::custom)?;
     serializer.serialize_str(&format!("decimal({precision},{scale})"))
 }
 
@@ -1421,6 +1460,10 @@ mod tests {
         );
     }
 
+    /// [`Type::decimal`] is the CONSTRUCTION door and is deliberately stricter than Java's
+    /// `Types$DecimalType.<init>` (which only rejects `precision > 38` — see
+    /// `ensure_java_decimal_precision`). The deserialization door is NOT allowed to be this
+    /// strict; `java_legal_decimal_type_strings_still_deserialize` pins the other half.
     #[test]
     fn decimal_constructor_rejects_out_of_range_precision_and_scale() {
         for (precision, scale, context) in [
@@ -1444,31 +1487,58 @@ mod tests {
         }
     }
 
+    /// Java-legal decimal metadata must survive a full JSON round trip.
+    ///
+    /// Live against iceberg-api-1.10.0 + iceberg-core-1.10.0:
+    /// `Types.fromPrimitiveString("decimal(0,0)")`, `("decimal(1,2)")`, `("decimal(10,11)")` and
+    /// `("decimal(38,38)")` all return a `DecimalType`; only `("decimal(39,0)")` throws
+    /// `IllegalArgumentException: Decimals with precision larger than 38 are not supported: 39`.
+    /// Routing this path through the stricter [`Type::decimal`] constructor (as the first pass of
+    /// this hardening did) makes such a table completely unopenable.
+    ///
+    /// Mutation this catches: swapping `ensure_java_decimal_precision` back to
+    /// `Type::decimal(precision, scale)` in either `deserialize_decimal` or `serialize_decimal`.
     #[test]
-    fn decimal_type_serialization_rejects_manually_constructed_invalid_metadata() {
-        for decimal in [
-            PrimitiveType::Decimal {
-                precision: 0,
-                scale: 0,
-            },
-            PrimitiveType::Decimal {
-                precision: MAX_DECIMAL_PRECISION + 1,
-                scale: 0,
-            },
-            PrimitiveType::Decimal {
-                precision: 2,
-                scale: 3,
-            },
+    fn java_legal_decimal_type_strings_still_deserialize() {
+        for (text, precision, scale) in [
+            ("decimal(0,0)", 0, 0),
+            ("decimal(1,2)", 1, 2),
+            ("decimal(10,11)", 10, 11),
+            ("decimal(38,38)", 38, 38),
+            ("decimal(1,0)", 1, 0),
         ] {
-            assert!(
-                serde_json::to_string(&decimal).is_err(),
-                "manually constructed invalid decimal metadata must not serialize: {decimal:?}"
+            let parsed = serde_json::from_str::<Type>(&format!(r#""{text}""#))
+                .unwrap_or_else(|error| panic!("Java loads {text}, so we must too: {error}"));
+            assert_eq!(
+                parsed,
+                Type::Primitive(PrimitiveType::Decimal { precision, scale }),
+                "{text} must keep both operands verbatim"
             );
-            assert!(
-                serde_json::to_string(&Type::Primitive(decimal.clone())).is_err(),
-                "invalid decimal metadata must not serialize through Type: {decimal:?}"
+            assert_eq!(
+                serde_json::to_string(&parsed)
+                    .unwrap_or_else(|error| panic!("{text} must re-serialize: {error}")),
+                format!(r#""{text}""#),
+                "{text} must round-trip byte for byte"
             );
         }
+    }
+
+    /// The one decimal-metadata rule Java DOES enforce (`precision <= 38`) stays enforced in both
+    /// directions, so `decimal(39,0)` can neither be read nor written.
+    #[test]
+    fn decimal_type_serialization_rejects_precision_java_also_rejects() {
+        let over_max = PrimitiveType::Decimal {
+            precision: MAX_DECIMAL_PRECISION + 1,
+            scale: 0,
+        };
+        assert!(
+            serde_json::to_string(&over_max).is_err(),
+            "precision 39 is rejected by Java's DecimalType constructor and must not serialize"
+        );
+        assert!(
+            serde_json::to_string(&Type::Primitive(over_max)).is_err(),
+            "precision 39 must not serialize through Type either"
+        );
 
         assert_eq!(
             serde_json::to_string(&PrimitiveType::Decimal {
@@ -1936,9 +2006,10 @@ mod tests {
             "decimal(38,2,3)",
             "decimal( +38 , 2 )",
             "decimal(-38,2)",
-            "decimal(0,0)",
+            // Java's `DecimalType.<init>` rejects precision > 38 and nothing else. `decimal(0,0)`
+            // and `decimal(10,11)` are Java-LEGAL and are pinned as ACCEPTED by
+            // `java_legal_decimal_type_strings_still_deserialize`.
             "decimal(39,0)",
-            "decimal(10,11)",
         ] {
             assert!(
                 serde_json::from_str::<Type>(&format!(r#""{bad}""#)).is_err(),
