@@ -42,9 +42,10 @@ use crate::{Error, ErrorKind};
 /// are *not* bounded do not need to be, because they were rewritten to an explicit stack —
 /// [`Predicate::negate`], [`BoundPredicate::negate`], [`Predicate::rewrite_not`],
 /// [`BoundPredicate::rewrite_not`] and both `Display` impls consume O(1) stack at any depth.
-/// The one remaining unbounded recursion in this module is the derived `Drop` glue: dropping a
-/// tree deeper than this limit still recurses, and no depth check can intercept it because the
-/// tree is destroyed after every gate has already run.
+/// The remaining unbounded recursion in this module is the DERIVED glue — `Drop`, and equally
+/// `Clone` and `PartialEq`, all of which walk the tree structurally. Dropping, cloning or comparing
+/// a tree deeper than this limit still recurses, and no depth check can intercept `Drop` because
+/// the tree is destroyed after every gate has already run.
 ///
 /// # Where the number comes from
 ///
@@ -1000,7 +1001,9 @@ impl Predicate {
     /// # Stack safety and infallibility
     ///
     /// This is an **explicit-stack** post-order rewrite; it deliberately does NOT route through
-    /// [`crate::expr::visitors::predicate_visitor::visit`]. That walk is recursive and
+    /// `expr::visitors::predicate_visitor::visit` (deliberately not an intra-doc link: that module
+    /// is `#[cfg(test)]` as of this rewrite, so a link would not resolve in published docs). That
+    /// walk is recursive and
     /// depth-limited, so driving `rewrite_not` through it would have made an infallible `pub`
     /// method — reachable from infallible builders such as `TableScanBuilder::with_filter` —
     /// abort the process on a deep filter. The iterative form neither overflows the stack nor

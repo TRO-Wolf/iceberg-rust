@@ -928,17 +928,25 @@ the general rule, not three incidents.
 
 ### 2026-08-09 — An Actor's "mutation caught: X" is a hypothesis, not a result
 
-Across the 2026-08 audit-hardening bundle, **four of six units were remanded, and the recurring
-defect was test adequacy rather than correctness**. In three of them the shape was identical: a test
-carrying a doc comment naming the mutation it catches, where applying that exact mutation left the
-whole suite GREEN. An Actor writes the assertion and the claim in one motion, from the same mental
-model, and never executes the negative case.
+Across the 2026-08 audit-hardening bundle, **five of six units were remanded at least once, and in
+four of them the defect was test adequacy rather than correctness**. In three of those four the
+shape was identical: a test carrying a doc comment naming the mutation it catches, where applying
+that exact mutation left the whole suite GREEN. An Actor writes the assertion and the claim in one
+motion, from the same mental model, and never executes the negative case.
 
-> **This entry was itself over-general on first writing** — it said "six for six", which the bundle
-> Critic falsified from this repo's own record: R2 converged on its first and only cycle with zero
-> S1/S2 and never blocked (`fb11dc66`, identical author/committer timestamps, never amended). A
-> lesson about false claims that overstates its own evidence is the same defect it warns about.
-> Count before you generalise, and prefer the narrower claim that survives.
+> **This entry got its own count wrong twice, and that is the more useful half of the lesson.**
+> Draft 1 said "six for six" — falsified from the repo's own record: R2 converged on its first and
+> only cycle (`fb11dc66`, identical author/committer timestamps, never amended). Draft 2 said "four
+> of six were remanded" — also false: **four** is the size of the test-adequacy CLASS (R1, R3, G4,
+> G3); **five** is the number remanded (G5 twice, on other findings). Fixing a conflation, I
+> substituted one count for the other. Both drafts were caught by a Critic, neither by me.
+>
+> - **DO name the population in the same sentence as the number** — "five of six units were
+>   remanded", not "four of six", when the four you are thinking of is a different set. Two true
+>   counts about the same six items are trivially swappable, and prose hides the swap.
+> - **DO check a count against the table you already wrote.** Both errors were refutable in seconds
+>   from the cycle column three lines above the claim.
+> - A lesson about false claims that overstates its own evidence is the defect it warns about.
 
 The verified cases:
 

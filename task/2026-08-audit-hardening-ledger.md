@@ -68,6 +68,7 @@ Two handover facts, recorded because both bear on what the prior "converged" cla
 | `crates/iceberg/src/expr/visitors/mod.rs` | R2 | ACCEPTED. Mechanical consequence of the iterative `rewrite_not`: `RewriteNotVisitor` lost its only production caller, so it and the unbound `predicate_visitor` became `#[cfg(test)]`. **No public API removed** — `expr/mod.rs` re-exports only `predicate::*` and `term::*`; the modules were `pub(crate)` and `PredicateVisitor` has no user outside them. `BoundPredicateVisitor` is untouched and still production. |
 | `crates/iceberg/src/expr/visitors/map.md` | R2 | ALWAYS IN SCOPE — CLAUDE.md's `map.md` lockstep rule. |
 | `crates/integrations/cache-moka/README.md` | G4 | ACCEPTED, documentation of a behaviour the clause mandates. Filed as S3-3(a) by G4's Critic and carried here. |
+| `task/{todo.md, lessons.md, 2026-08-audit-hardening-ledger.md, 2026-08-audit-hardening-critic-verdicts.md}` | G6 | ALWAYS IN SCOPE — C-008's own clause instructs "file PR-readiness evidence, update this tracker, and file the SEPMO retrospective/metrics", which cannot be done without them. Listed explicitly because this table's title asserts completeness and it had already failed that standard once. |
 | `docs/parity/GAP_MATRIX.md` | R1 | ACCEPTED. CLAUDE.md's de-triplication rule makes the matrix cell the **only** legal home for R87's corrected status, so a group that changes a capability's accuracy has nowhere else to record it. `make check-matrix-anchors` re-run green (75 rows). Added 2026-08-09 after the bundle Critic filed the omission as S2: the table's title asserts completeness, and it adjudicates `map.md` — which CLAUDE.md explicitly exempts — so leaving out GAP_MATRIX.md failed the section's own standard. |
 
 ### 2.2 Breaking public API change — one, called out
@@ -90,6 +91,20 @@ The other three public-surface deltas in the bundle are purely **additive** and 
 binding is internal to the body.)
 
 **This matters beyond the fork:** the RePark consumer is mid-repin. This row is the callout.
+
+**Behaviour changes on public APIs — no signature moves, but a pin-follower must know.** §2.2 above
+is a *surface* statement; a reader who stops there would miss three observable changes that compile
+fine and behave differently:
+
+1. `MokaObjectCacheProvider::new()` — `DEFAULT_CACHE_SIZE_BYTES` now means **bytes**, not entry
+   count. A provider that was effectively unbounded (~33.5M entries) is now a real 32 MiB budget per
+   cache, so a workload relying on the old non-eviction will start evicting. (§4.1 G4.)
+2. `Debug` for `TableMetadata` / `ViewMetadata` / `Table` now **redacts** secret-keyed property
+   values. Anything scraping `{:?}` output for property values will see `***`. (§4.1 G5.)
+3. `IcebergCatalogProvider::try_new` now discovers **nested** namespaces and names multi-level ones
+   with a `U+001F` join plus a dot alias. A caller that enumerated `schema_names()` will see more
+   schemas than before, and multi-level names are no longer silently exploded into bare components.
+   (§4.1 G3.)
 
 Three API-stability statements elsewhere in this file are each true **on their own terms** but must
 not be read as covering the whole bundle — §2.1's "No public API removed" (about the `#[cfg(test)]`
@@ -144,10 +159,19 @@ independently re-run by that unit's Critic. Bundle gate in §4.2.
 | G3 namespaces | `d99e56d6` `2556e109` | 2 | CONVERGED, zero S1/S2 | 5× S3 |
 | G5 secrets | `879bf55e` | 3 | CONVERGED, zero S1/S2 | 3× S3 |
 
-**Four of the six units were remanded at least once, and the recurring defect was test adequacy —
-not correctness.** Corrected 2026-08-09 after the bundle Critic filed the original wording ("every
-one of the six … blocked") as S2: R2 converged on its first and only cycle with zero S1/S2 and never
-blocked at all (`fb11dc66` has identical author and committer timestamps, i.e. was never amended).
+**Five of the six units were remanded at least once; in four of them the defect was test adequacy
+rather than correctness.** Only R2 converged on its first and only cycle with zero S1/S2
+(`fb11dc66`, identical author and committer timestamps, i.e. never amended) — read the cycle column
+of the table above: 2 · 1 · 2 · 2 · 2 · 3.
+
+This sentence has now been wrong twice, in the same artifact, in the same way. The first draft said
+"every one of the six … blocked" (S2, R2 never blocked); the correction said "four of the six were
+remanded" (S2 again — four is the size of the test-adequacy CLASS, five is the number remanded, and
+I substituted one count for the other while fixing a conflation). Both were caught by a Critic, not
+by me. The lesson is in the 2026-08-09 lessons entry and it is about counts specifically: state the
+population you are counting in the same sentence as the number, or you will silently answer a
+different question than the one you asked.
+
 The verified shape is:
 
 - **named-but-uncaught mutation** — R1 (`visit_seq` arm), R3 (map-KEY arm), G4 (`max_capacity`
