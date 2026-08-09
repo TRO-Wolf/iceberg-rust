@@ -39,7 +39,7 @@ use super::{
 };
 use crate::compression::CompressionCodec;
 use crate::error::{Result, timestamp_ms_to_utc};
-use crate::io::FileIO;
+use crate::io::{FileIO, RedactedProps};
 use crate::spec::EncryptedKey;
 use crate::{Error, ErrorKind};
 
@@ -56,7 +56,7 @@ pub const MIN_FORMAT_VERSION_ROW_LINEAGE: FormatVersion = FormatVersion::V3;
 /// Reference to [`TableMetadata`].
 pub type TableMetadataRef = Arc<TableMetadata>;
 
-#[derive(Debug, PartialEq, Deserialize, Eq, Clone)]
+#[derive(PartialEq, Deserialize, Eq, Clone)]
 #[serde(try_from = "TableMetadataEnum")]
 /// Fields for the version 2 of the table metadata.
 ///
@@ -134,6 +134,68 @@ pub struct TableMetadata {
     pub(crate) encryption_keys: HashMap<String, EncryptedKey>,
     /// Next row id to be assigned for Row Lineage (v3)
     pub(crate) next_row_id: u64,
+}
+
+impl std::fmt::Debug for TableMetadata {
+    /// Hand-written instead of derived so that `properties` renders through [`RedactedProps`].
+    ///
+    /// SECURITY (SEC-002): `properties` is an operator-controlled `String -> String` map, and
+    /// operators do store credentials in table properties. It reaches `Debug` from more places
+    /// than the type's own call sites — `Table` embeds a `TableMetadataRef` and derives `Debug`,
+    /// the REST `LoadTableResult` / `CommitTableResponse` carry a whole `TableMetadata`, and any
+    /// downstream struct that derives `Debug` around a table does too — so a single
+    /// `tracing::info!(?table)` in code this crate does not control printed them in clear. The
+    /// catalog and `FileIO` property maps were already redacted; this closes the table half.
+    ///
+    /// Every other field is rendered exactly as the derive did, in declaration order, so the view
+    /// stays useful. `Display` is unaffected (this type has none) and serde is unaffected (it goes
+    /// through `TableMetadataEnum`), so the on-disk format is untouched.
+    ///
+    /// NAMED RESIDUE, deliberately NOT masked here. `properties` is the ONLY map this impl
+    /// redacts; three nested maps owned by other spec types still print in clear through their
+    /// own derived `Debug`. Masking them only when nested under `TableMetadata` would be half a
+    /// fix — each belongs to a follow-up that gives its owning type its own `Debug`:
+    ///
+    /// * `snapshots[*].summary.additional_properties` — `Summary` in `spec/snapshot.rs` derives
+    ///   `Debug` over a `String -> String` map fed by the writing engine.
+    /// * `encryption_keys[*].properties`, plus the wrapped key bytes `encrypted_key_metadata` —
+    ///   [`EncryptedKey`](super::EncryptedKey) in `spec/encrypted_key.rs`.
+    /// * `statistics[*].blob_metadata[*].properties` and `statistics[*].key_metadata` —
+    ///   `StatisticsFile` / `BlobMetadata` in `spec/statistic_file.rs`. `partition_statistics` is
+    ///   clean: `PartitionStatisticsFile` carries neither.
+    ///
+    /// This is the authoritative ledger for the `TableMetadata` render path; the `Table` doc in
+    /// `table.rs` and the redaction banner in `crates/catalog/rest/src/types.rs` mirror it and
+    /// must be updated with it. Pinned as residue by
+    /// `test_named_residue_table_metadata_debug_renders_nested_property_maps`.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableMetadata")
+            .field("format_version", &self.format_version)
+            .field("table_uuid", &self.table_uuid)
+            .field("location", &self.location)
+            .field("last_sequence_number", &self.last_sequence_number)
+            .field("last_updated_ms", &self.last_updated_ms)
+            .field("last_column_id", &self.last_column_id)
+            .field("schemas", &self.schemas)
+            .field("current_schema_id", &self.current_schema_id)
+            .field("partition_specs", &self.partition_specs)
+            .field("default_spec", &self.default_spec)
+            .field("default_partition_type", &self.default_partition_type)
+            .field("last_partition_id", &self.last_partition_id)
+            .field("properties", &RedactedProps(&self.properties))
+            .field("current_snapshot_id", &self.current_snapshot_id)
+            .field("snapshots", &self.snapshots)
+            .field("snapshot_log", &self.snapshot_log)
+            .field("metadata_log", &self.metadata_log)
+            .field("sort_orders", &self.sort_orders)
+            .field("default_sort_order_id", &self.default_sort_order_id)
+            .field("refs", &self.refs)
+            .field("statistics", &self.statistics)
+            .field("partition_statistics", &self.partition_statistics)
+            .field("encryption_keys", &self.encryption_keys)
+            .field("next_row_id", &self.next_row_id)
+            .finish()
+    }
 }
 
 impl TableMetadata {
@@ -1617,6 +1679,192 @@ mod tests {
         let metadata: String = fs::read_to_string(path).unwrap();
 
         serde_json::from_str(&metadata).unwrap()
+    }
+
+    /// SECURITY (SEC-002): `TableMetadata` used to `#[derive(Debug)]`, printing its
+    /// operator-controlled `properties` map in clear at every `{:?}` / `tracing` site — including
+    /// sites in downstream code this crate does not control, and including the REST
+    /// `LoadTableResult` / `CommitTableResponse` that carry a whole `TableMetadata`. Operators do
+    /// store credentials in table properties.
+    ///
+    /// Pins that secret VALUES are masked per key through the canonical needle test while KEYS,
+    /// non-secret values, and every other field stay readable — an unusable `Debug` would be its
+    /// own defect.
+    ///
+    /// MUTATION (RED against the pre-change code): put `Debug` back in the `derive` list on
+    /// `TableMetadata` and delete the hand-written `impl std::fmt::Debug for TableMetadata`.
+    #[test]
+    fn test_table_metadata_debug_redacts_secret_properties() {
+        const SENTINEL: &str = "SENTINEL_TABLE_PROPERTY_MUST_NOT_LEAK";
+
+        let mut metadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        metadata
+            .properties
+            .insert("s3.secret-access-key".to_string(), SENTINEL.to_string());
+        metadata
+            .properties
+            .insert("adls.connection-string".to_string(), SENTINEL.to_string());
+        metadata
+            .properties
+            .insert("write.format.default".to_string(), "parquet".to_string());
+
+        let debug = format!("{metadata:?}");
+
+        assert!(
+            !debug.contains(SENTINEL),
+            "TableMetadata Debug leaked a secret table property: {debug}"
+        );
+        // Anti-over-redaction / anti-vacuity: presence is still signalled, the keys survive, and
+        // the rest of the metadata is still rendered.
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        for key in ["s3.secret-access-key", "adls.connection-string"] {
+            assert!(
+                debug.contains(key),
+                "expected secret key `{key}` to remain visible: {debug}"
+            );
+        }
+        assert!(
+            debug.contains("write.format.default") && debug.contains("parquet"),
+            "a non-secret property was over-redacted: {debug}"
+        );
+        assert!(
+            debug.contains("TableMetadata")
+                && debug.contains("table_uuid")
+                && debug.contains(&metadata.location),
+            "the hand-written Debug dropped identifying fields: {debug}"
+        );
+        assert!(
+            debug.contains("last_sequence_number") && debug.contains("current_schema_id"),
+            "the hand-written Debug dropped structural fields: {debug}"
+        );
+    }
+
+    /// Guards the "Debug only" claim of [`test_table_metadata_debug_redacts_secret_properties`]:
+    /// the redaction must NOT reach the serde output, or every table this fork writes would ship
+    /// `***` in place of its properties — an on-disk-format corruption. `TableMetadata` has no
+    /// `Display`, so `Debug` is the only render path that changed.
+    ///
+    /// MUTATION: redacting inside `TableMetadataEnum`'s serialization (rather than in `Debug`)
+    /// → RED.
+    #[test]
+    fn test_table_metadata_redaction_does_not_reach_serde() {
+        const SENTINEL: &str = "SENTINEL_TABLE_PROPERTY_MUST_NOT_LEAK";
+
+        let mut metadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        metadata
+            .properties
+            .insert("s3.secret-access-key".to_string(), SENTINEL.to_string());
+
+        let json = serde_json::to_string(&metadata).expect("serialize table metadata");
+        assert!(
+            json.contains(SENTINEL),
+            "serde output must be byte-faithful — redaction is a Debug-only concern: {json}"
+        );
+
+        let round_tripped: TableMetadata =
+            serde_json::from_str(&json).expect("round-trip table metadata");
+        assert_eq!(round_tripped, metadata);
+    }
+
+    /// KNOWN-RESIDUE PIN for the `NAMED RESIDUE` ledger on `impl std::fmt::Debug for
+    /// TableMetadata`. SEC-002 closed `properties` and NOTHING else: three nested
+    /// `String -> String` maps owned by other spec types still render in clear, so a
+    /// `tracing::info!(?table)` is not wholesale credential-safe and the docs must not claim it
+    /// is. Asserting the residue EXISTS makes the ledger self-enforcing — whoever closes any of
+    /// these three paths turns this test RED and is forced to update all three doc blocks
+    /// (`TableMetadata`'s `Debug`, `Table` in `table.rs`, the banner in
+    /// `crates/catalog/rest/src/types.rs`) in the same change.
+    ///
+    /// MUTATION (each independently RED): route `snapshots`, `encryption_keys` or `statistics`
+    /// through a redacting adapter in the `Debug` impl above without updating the ledger.
+    #[test]
+    fn test_named_residue_table_metadata_debug_renders_nested_property_maps() {
+        const SNAPSHOT_SUMMARY_SECRET: &str = "RESIDUE_SNAPSHOT_SUMMARY_VALUE";
+        const ENCRYPTION_KEY_SECRET: &str = "RESIDUE_ENCRYPTION_KEY_PROPERTY_VALUE";
+        const BLOB_PROPERTY_SECRET: &str = "RESIDUE_BLOB_METADATA_PROPERTY_VALUE";
+        const STATISTICS_KEY_METADATA: &str = "RESIDUE_STATISTICS_KEY_METADATA_VALUE";
+        const CLOSED_HALF_SENTINEL: &str = "SENTINEL_TABLE_PROPERTY_MUST_NOT_LEAK";
+        // The same key on every map, so the contrast below is about the RENDER PATH and not about
+        // the needle test disagreeing with itself.
+        const SECRET_KEY: &str = "s3.secret-access-key";
+
+        let mut metadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        metadata
+            .properties
+            .insert(SECRET_KEY.to_string(), CLOSED_HALF_SENTINEL.to_string());
+
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(4242)
+            .with_sequence_number(0)
+            .with_timestamp_ms(1662532818843)
+            .with_manifest_list("/wh/metadata/snap-4242.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::from_iter([(
+                    SECRET_KEY.to_string(),
+                    SNAPSHOT_SUMMARY_SECRET.to_string(),
+                )]),
+            })
+            .build();
+        metadata.snapshots.insert(4242, Arc::new(snapshot));
+
+        metadata.encryption_keys.insert(
+            "residue-key".to_string(),
+            EncryptedKey::builder()
+                .key_id("residue-key")
+                .encrypted_key_metadata(vec![1, 2, 3, 4])
+                .properties(HashMap::from_iter([(
+                    SECRET_KEY.to_string(),
+                    ENCRYPTION_KEY_SECRET.to_string(),
+                )]))
+                .build(),
+        );
+
+        metadata.statistics.insert(4242, StatisticsFile {
+            snapshot_id: 4242,
+            statistics_path: "/wh/metadata/stats-4242.puffin".to_string(),
+            file_size_in_bytes: 1,
+            file_footer_size_in_bytes: 1,
+            key_metadata: Some(STATISTICS_KEY_METADATA.to_string()),
+            blob_metadata: vec![BlobMetadata {
+                r#type: "apache-datasketches-theta-v1".to_string(),
+                snapshot_id: 4242,
+                sequence_number: 0,
+                fields: vec![1],
+                properties: HashMap::from_iter([(
+                    SECRET_KEY.to_string(),
+                    BLOB_PROPERTY_SECRET.to_string(),
+                )]),
+            }],
+        });
+
+        let debug = format!("{metadata:?}");
+
+        for (path, value) in [
+            (
+                "snapshots[*].summary.additional_properties",
+                SNAPSHOT_SUMMARY_SECRET,
+            ),
+            ("encryption_keys[*].properties", ENCRYPTION_KEY_SECRET),
+            (
+                "statistics[*].blob_metadata[*].properties",
+                BLOB_PROPERTY_SECRET,
+            ),
+            ("statistics[*].key_metadata", STATISTICS_KEY_METADATA),
+        ] {
+            assert!(
+                debug.contains(value),
+                "`{path}` no longer renders in clear — the residue was closed without updating \
+                 the three doc blocks that enumerate it: {debug}"
+            );
+        }
+
+        // Contrast (anti-vacuity): the half SEC-002 DID close stays closed, so this test cannot
+        // pass merely because the whole `Debug` stopped redacting.
+        assert!(
+            !debug.contains(CLOSED_HALF_SENTINEL),
+            "`TableMetadata.properties` must still redact: {debug}"
+        );
     }
 
     #[test]

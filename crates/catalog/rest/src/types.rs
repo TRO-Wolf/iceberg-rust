@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use iceberg::io::is_secret_prop_key;
+use iceberg::io::RedactedProps;
 use iceberg::spec::{
     Schema, SortOrder, TableMetadata, UnboundPartitionSpec, ViewMetadata, ViewVersion,
 };
@@ -40,10 +40,11 @@ use serde_derive::{Deserialize, Serialize};
 // downstream user code this crate does not control, so every secret-bearing type below
 // carries a hand-written `Debug` instead.
 //
-// Property maps are redacted PER KEY through the canonical needle test
-// `iceberg::io::is_secret_prop_key` (`crates/iceberg/src/io/storage/config/mod.rs`) — the
-// same superset `StorageConfig` and the Glue / HMS / S3Tables / SQL config `Debug` impls
-// use — so keys stay visible for diagnostics, only secret VALUES are masked, and there is
+// Property maps are redacted PER KEY through the canonical adapter `iceberg::io::RedactedProps`
+// and its needle test `iceberg::io::is_secret_prop_key`
+// (`crates/iceberg/src/io/storage/config/mod.rs`) — the same superset `StorageConfig`, the core
+// `TableMetadata`/`ViewMetadata` `Debug` impls and the Glue / HMS / S3Tables / SQL config `Debug`
+// impls use — so keys stay visible for diagnostics, only secret VALUES are masked, and there is
 // exactly ONE authoritative needle list to keep current instead of drifting copies. The
 // narrower REST-local exact-match list would miss precisely the vended FileIO credentials
 // this module receives (`s3.secret-access-key`, `s3.session-token`, `gcs.oauth2.token`,
@@ -63,61 +64,63 @@ use serde_derive::{Deserialize, Serialize};
 //     verbatim. They are server-controlled free text: a hostile or careless server can echo
 //     whatever it likes into `message`, and this is now the one channel by which content from
 //     a token-endpoint / catalog response body still reaches logs, since
-//     `deserialize_catalog_response` stopped attaching raw bodies (SEC-010/F1).
+//     `deserialize_catalog_response` stopped attaching raw bodies (SEC-010/F1) and
+//     `deserialize_unexpected_catalog_error` started key-redacting the non-2xx body (SEC-009).
+//     Key-based redaction cannot mask a secret a server splices into free text.
 //   * `OAuthError` — RFC 6749 §5.2 fields (`error` is a fixed error code, `error_description`
 //     is human-readable text, `error_uri` a documentation link), all three already surfaced by
 //     `From<OAuthError> for Error`. `error_description` is likewise server-controlled free
 //     text, so the same residue applies: the SHAPE carries no client secret, but the CONTENT
 //     is the server's to choose.
 //
-// NAMED RESIDUE (core crate, out of scope for this unit) — `String -> String` maps that still
-// derive `Debug` in `crates/iceberg` and print in clear:
+// CLOSED 2026-08-09 (SEC-002) — the core-crate property maps this banner used to name as
+// residue now redact through the same adapter:
 //   * `TableMetadata.properties` — reachable via `LoadTableResult.metadata` and
 //     `CommitTableResponse.metadata` (which is why `CommitTableResponse` is NOT in the
 //     all-clear list above: it carries a full `TableMetadata`).
 //   * `ViewMetadata.properties` — reachable via `LoadViewResult.metadata`.
-//   * `ViewVersion.summary` — reachable via `CreateViewRequest.view_version` and, nested,
-//     through both view-metadata paths.
-//   * `TableUpdate::SetProperties` / `ViewUpdate::SetProperties` — reachable via
-//     `CommitTableRequest.updates` / `CommitViewRequest.updates`.
-// So a `{:?}` of those fields can still surface a credential an operator stored as a TABLE or
-// VIEW property. Closing the core-crate property maps is a separate unit.
+//
+// STILL NAMED RESIDUE (out of scope for this unit) — `String -> String` maps that still derive
+// `Debug` and print in clear. The list spans BOTH crates; whoever closes it must fix both ends,
+// because masking only the core enum leaves the REST request types printing the same map:
+//   * `ViewVersion.summary` (`crates/iceberg`, `spec/view_version.rs`) — reachable via
+//     `CreateViewRequest.view_version` and, nested, through both view-metadata paths.
+//   * `TableUpdate::SetProperties` / `ViewUpdate::SetProperties` (`crates/iceberg`,
+//     `catalog/mod.rs`) — reachable via `CommitTableRequest.updates` / `CommitViewRequest.updates`.
+//     The core enums derive `Debug`, AND so do the REST-side `CommitTableRequest` /
+//     `CommitViewRequest` in THIS module (neither has a hand-written `Debug`; verified by probe —
+//     `{:?}` of a request carrying `SetProperties {"s3.secret-access-key": …}` prints the value in
+//     clear). Closing this means a hand-written `Debug` for both request types routing the maps
+//     through `RedactedProps` as well as redacting the core enums.
+//   * `EncryptedKey.properties` and its wrapped key bytes `encrypted_key_metadata`
+//     (`crates/iceberg`, `spec/encrypted_key.rs`) — `EncryptedKey` derives `Debug`, and
+//     `TableMetadata`'s hand-written `Debug` renders `encryption_keys` through it.
+//   * `Snapshot.summary.additional_properties` (`crates/iceberg`, `spec/snapshot.rs`) — `Summary`
+//     derives `Debug`, and `TableMetadata`'s hand-written `Debug` renders `snapshots` through it,
+//     so it is reachable via `LoadTableResult.metadata` / `CommitTableResponse.metadata` exactly
+//     as `TableMetadata.properties` was.
+//   * `StatisticsFile.key_metadata` and `StatisticsFile.blob_metadata[*].properties`
+//     (`crates/iceberg`, `spec/statistic_file.rs`) — likewise rendered through `statistics`.
+//     `partition_statistics` is clean: `PartitionStatisticsFile` carries neither.
+//
+// The `TableMetadata` half of that list is maintained on the `NAMED RESIDUE` note of
+// `impl std::fmt::Debug for TableMetadata` (`crates/iceberg`, `spec/table_metadata.rs`), which is
+// authoritative; this banner and the `Table` doc in `crates/iceberg/src/table.rs` mirror it.
 //
 // SCOPE OF THIS FIX — the REST server's own credential channels (`config`,
-// `storage-credentials`) are covered AT THE `Debug` LAYER, which is not the same as "covered".
-// A credential-bearing body that fails to PARSE can still reach logs through the
-// `serde_json` error attached as the `source` of the parse error, because `iceberg::Error`
-// renders its source verbatim; the echo is unbounded when the type mismatch sits at a
-// container boundary (double-encoded JSON). That path is documented on
-// `client.rs::deserialize_catalog_response` and pinned as known residue by
-// `test_known_residue_double_encoded_body_leaks_through_error_source`.
+// `storage-credentials`) are covered at the `Debug` layer AND, as of SEC-001/SEC-009, on the
+// error-rendering paths: `deserialize_catalog_response` (and both token-endpoint parses) attach a
+// sanitized `client.rs::SanitizedJsonError` instead of the raw `serde_json` error, so the
+// container-boundary echo (double-encoded JSON) no longer reaches `Display`/`Debug`, and
+// `deserialize_unexpected_catalog_error` key-redacts the non-2xx body. Pinned by
+// `test_double_encoded_body_does_not_leak_through_error_source`.
 // ============================================================================
 
 /// Marker written in place of a redacted secret value. Its presence also signals that the
-/// field/entry was populated, which is the only thing a debug view legitimately needs.
-const REDACTED: &str = "***";
-
-/// `Debug` adapter that renders a property map with secret-bearing VALUES masked.
-///
-/// Keys are always printed — they are diagnostic, not secret. A value whose key satisfies
-/// [`is_secret_prop_key`] is replaced by [`REDACTED`]. See the module's redaction banner for
-/// why the canonical (superset) needle test is used rather than a REST-local list.
-struct RedactedProps<'a>(&'a HashMap<String, String>);
-
-impl std::fmt::Debug for RedactedProps<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map()
-            .entries(self.0.iter().map(|(k, v)| {
-                let value = if is_secret_prop_key(k) {
-                    REDACTED
-                } else {
-                    v.as_str()
-                };
-                (k.as_str(), value)
-            }))
-            .finish()
-    }
-}
+/// field/entry was populated, which is the only thing a debug view legitimately needs. Re-exported
+/// from the core crate so the REST types and the core metadata types cannot drift apart on the
+/// marker they emit.
+const REDACTED: &str = iceberg::io::REDACTED_PROP_VALUE;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct CatalogConfig {
@@ -611,6 +614,8 @@ pub struct CommitViewRequest {
 
 #[cfg(test)]
 mod tests {
+    use iceberg::io::is_secret_prop_key;
+
     use super::*;
 
     // ========================================================================

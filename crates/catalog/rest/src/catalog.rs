@@ -2571,15 +2571,16 @@ mod tests {
         );
     }
 
-    /// KNOWN RESIDUE PIN — this test asserts that a leak **still happens**. It is not a guard; it
-    /// documents the boundary of the F1 fix so the gap cannot be quietly forgotten or over-claimed.
+    /// SECURITY (SEC-001) — the INVERTED form of the former
+    /// `test_known_residue_double_encoded_body_leaks_through_error_source`, which asserted the leak
+    /// still happened. The residue it pinned is now closed, so the same shape is asserted SAFE.
     ///
-    /// Withholding the raw body from the error CONTEXT does not close the `source` channel.
-    /// `deserialize_catalog_response` keeps `.with_source(e)` because AGENTS.md requires the error
-    /// chain to survive, and `iceberg::Error` renders the source VERBATIM (`, source: {source}`) in
-    /// both `Display` and `Debug` (`crates/iceberg/src/error.rs`). `serde_json`'s message echoes the
-    /// value AT THE FAILURE POSITION — and when the mismatch is at a CONTAINER boundary, that value
-    /// is an entire sub-document, echoed in full via `Unexpected::Str`.
+    /// Withholding the raw body from the error CONTEXT did not close the `source` channel:
+    /// `deserialize_catalog_response` kept `.with_source(e)` on the raw `serde_json::Error`, and
+    /// `iceberg::Error` renders the source VERBATIM (`, source: {source}` in `Display`,
+    /// `Source: {source:#}` in `Debug` — `crates/iceberg/src/error.rs`). `serde_json`'s message
+    /// echoes the value AT THE FAILURE POSITION, and when the mismatch is at a CONTAINER boundary
+    /// that value is an entire sub-document, echoed in full via `Unexpected::Str`.
     ///
     /// The shape below is a real, well-known bug class, not a contrivance: a server or API gateway
     /// that emits a nested object as a JSON *string* (`writeValueAsString` on a sub-map, a
@@ -2587,13 +2588,13 @@ mod tests {
     /// whole vended-credential map. `serde` then reports `invalid type: string "…", expected a map`
     /// with the credentials inline.
     ///
-    /// FIX OWNER: this is not closable in this crate without breaking the error chain. It belongs to
-    /// the core-crate residue unit that reworks `iceberg::Error`'s `Display`/`Debug` source
-    /// rendering (the chain obligation is satisfied by `source()` EXISTING; the leak is core's
-    /// verbatim interpolation of it). **When that unit lands, this test flips**: the assertions
-    /// invert to `!contains`, and this doc block is deleted.
+    /// The chain was NOT deleted to fix it — the source is now a `client.rs::SanitizedJsonError`,
+    /// which carries the failure category and position and nothing derived from the body.
+    ///
+    /// MUTATION (RED against the pre-change code): in `deserialize_catalog_response`, restore
+    /// `.with_source(e)` in place of `.with_source(SanitizedJsonError::new(&e))`.
     #[tokio::test]
-    async fn test_known_residue_double_encoded_body_leaks_through_error_source() {
+    async fn test_double_encoded_body_does_not_leak_through_error_source() {
         const SENTINEL: &str = "SENTINEL_LEAKS_VIA_SERDE_SOURCE_KNOWN_RESIDUE";
 
         let mut server = Server::new_async().await;
@@ -2642,17 +2643,184 @@ mod tests {
             "the safe diagnostics must still be attached: {rendered}"
         );
 
-        // ...but the secret still reaches the log through `source`. Asserting the leak keeps this
-        // documented and makes the eventual core fix observable here.
+        // ...and the container-boundary echo no longer reaches the log through `source`.
         assert!(
-            rendered.contains(SENTINEL),
-            "KNOWN RESIDUE no longer reproduces in Display — if the core `iceberg::Error` source \
-             rendering was fixed, invert these assertions and delete the residue doc block. \
-             Rendered: {rendered}"
+            !rendered.contains(SENTINEL),
+            "the double-encoded config leaked through `source` into Display: {rendered}"
         );
         assert!(
-            debug.contains(SENTINEL),
-            "KNOWN RESIDUE no longer reproduces in Debug — see the note above. Debug: {debug}"
+            !debug.contains(SENTINEL),
+            "the double-encoded config leaked through `source` into Debug: {debug}"
+        );
+
+        // Anti-vacuity: the chain is SANITIZED, not deleted. A source must still be attached and
+        // must still say what went wrong and where, or this test would pass against an error that
+        // simply dropped `with_source` — which is the fix AGENTS.md forbids.
+        let source = std::error::Error::source(&err)
+            .expect("the parse failure must still carry a source — the chain may not be deleted");
+        let source_text = source.to_string();
+        assert!(
+            source_text.contains("json data error"),
+            "the sanitized source must still classify the failure: {source_text}"
+        );
+        assert!(
+            source_text.contains("line 1 column "),
+            "the sanitized source must still carry the failure position: {source_text}"
+        );
+        assert!(
+            rendered.contains("json data error at line 1 column "),
+            "the sanitized source must be rendered into Display: {rendered}"
+        );
+    }
+
+    /// SECURITY (SEC-009): `deserialize_unexpected_catalog_error` attached the ENTIRE non-2xx body.
+    /// The response direction is credential-free (a failed request vends nothing), but the
+    /// REQUEST-ECHO direction is not: this function is the fallthrough for the WRITE routes, whose
+    /// request types carry operator property maps, and a validation failure that echoes the
+    /// offending request back is a common server pattern.
+    ///
+    /// Pins that the body is now key-redacted rather than raw: the secret VALUE is masked while the
+    /// server's `message` — the diagnostic Java surfaces to the caller — and every non-secret
+    /// property survive.
+    ///
+    /// MUTATION (RED against the pre-change code): in `deserialize_unexpected_catalog_error`,
+    /// restore `.with_context("json", String::from_utf8_lossy(&bytes))`.
+    #[tokio::test]
+    async fn test_non_2xx_body_masks_echoed_secret_properties() {
+        const SENTINEL: &str = "SENTINEL_ECHOED_BACK_BY_THE_SERVER";
+
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        // A 422 whose payload echoes the submitted property map back at the client.
+        let body = json!({
+            "error": {
+                "message": "Cannot create namespace: invalid property value",
+                "type": "BadRequestException",
+                "code": 422,
+                "submitted": {
+                    "properties": {
+                        "s3.secret-access-key": SENTINEL,
+                        "owner": "analytics-team"
+                    }
+                }
+            }
+        })
+        .to_string();
+        assert!(
+            body.contains(SENTINEL),
+            "precondition: the echoed body must actually carry the secret"
+        );
+
+        let ns_mock = server
+            .mock("POST", "/v1/namespaces")
+            .with_status(422)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let err = catalog
+            .create_namespace(
+                &NamespaceIdent::new("ns1".to_string()),
+                HashMap::from([("s3.secret-access-key".to_string(), SENTINEL.to_string())]),
+            )
+            .await
+            .expect_err("a 422 must surface an error");
+
+        config_mock.assert_async().await;
+        ns_mock.assert_async().await;
+
+        let rendered = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the echoed secret leaked into Display: {rendered}"
+        );
+        assert!(
+            !debug.contains(SENTINEL),
+            "the echoed secret leaked into Debug: {debug}"
+        );
+
+        // Anti-over-redaction: the diagnostic payload must survive, or the error says nothing and
+        // this test would pass vacuously against a body that was simply dropped.
+        assert!(
+            rendered.contains("Cannot create namespace: invalid property value"),
+            "the server's diagnostic message was dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("BadRequestException"),
+            "the server's error type was dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("s3.secret-access-key"),
+            "the secret KEY must stay visible for diagnostics: {rendered}"
+        );
+        assert!(
+            rendered.contains("analytics-team"),
+            "a non-secret echoed property was over-redacted: {rendered}"
+        );
+    }
+
+    /// SECURITY (SEC-009), the other arm: a body that is not JSON cannot be key-redacted, so it is
+    /// withheld down to its byte length. A gateway/proxy error page can quote the request it
+    /// forwarded, and over-redaction is the safe direction.
+    ///
+    /// MUTATION (RED against the pre-change code): in `deserialize_unexpected_catalog_error`,
+    /// restore `.with_context("json", String::from_utf8_lossy(&bytes))`.
+    #[tokio::test]
+    async fn test_non_2xx_non_json_body_is_withheld() {
+        const SENTINEL: &str = "SENTINEL_IN_A_GATEWAY_ERROR_PAGE";
+
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let body = format!(
+            "<html><body>502 Bad Gateway: upstream rejected s3.secret-access-key={SENTINEL}\
+             </body></html>"
+        );
+
+        let ns_mock = server
+            .mock("POST", "/v1/namespaces")
+            .with_status(502)
+            .with_body(&body)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let err = catalog
+            .create_namespace(&NamespaceIdent::new("ns1".to_string()), HashMap::new())
+            .await
+            .expect_err("a 502 must surface an error");
+
+        config_mock.assert_async().await;
+        ns_mock.assert_async().await;
+
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the non-JSON body leaked into Display: {rendered}"
+        );
+        // Anti-vacuity: presence and size are still reported, and so is the status.
+        assert!(
+            rendered.contains("<non-JSON body withheld"),
+            "the withheld-body marker is missing: {rendered}"
+        );
+        assert!(
+            rendered.contains(&body.len().to_string()),
+            "the body length diagnostic is missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("502"),
+            "the status diagnostic is missing: {rendered}"
         );
     }
 

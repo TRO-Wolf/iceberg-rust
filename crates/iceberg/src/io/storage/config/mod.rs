@@ -112,6 +112,48 @@ pub fn is_secret_prop_key(key: &str) -> bool {
         .any(|needle| key.contains(needle))
 }
 
+/// Marker written in place of a redacted secret value by [`RedactedProps`].
+pub const REDACTED_PROP_VALUE: &str = "***";
+
+/// `Debug` adapter that renders a `String -> String` property map with secret-bearing VALUES
+/// masked to [`REDACTED_PROP_VALUE`].
+///
+/// Keys are always printed — they are diagnostic, not secret — and only a value whose key
+/// satisfies [`is_secret_prop_key`] is masked. Over-redaction is the safe direction for a debug
+/// view: the needle test is deliberately a SUPERSET, so a non-secret key that merely contains a
+/// needle (e.g. `token-refresh-enabled`) renders as `***` too.
+///
+/// Exposed so every property map in the workspace redacts through ONE adapter and ONE needle list
+/// instead of drifting copies. Used by [`StorageConfig`]'s `Debug`, by the core
+/// `TableMetadata`/`ViewMetadata` `Debug` impls (SEC-002), and by the REST wire types (SEC-010).
+///
+/// ```
+/// use std::collections::HashMap;
+///
+/// use iceberg::io::RedactedProps;
+///
+/// let props = HashMap::from([("s3.session-token".to_string(), "live-secret".to_string())]);
+/// let rendered = format!("{:?}", RedactedProps(&props));
+/// assert!(!rendered.contains("live-secret"));
+/// assert!(rendered.contains("s3.session-token"));
+/// ```
+pub struct RedactedProps<'a>(pub &'a HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedProps<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(key, value)| {
+                let value = if is_secret_prop_key(key) {
+                    REDACTED_PROP_VALUE
+                } else {
+                    value.as_str()
+                };
+                (key.as_str(), value)
+            }))
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for StorageConfig {
     /// Hand-written so secret-bearing entries in the raw `props` map are redacted to `"***"`
     /// instead of printed in clear. Keys stay visible for diagnostics; only secret VALUES are
@@ -119,20 +161,8 @@ impl std::fmt::Debug for StorageConfig {
     /// `StorageConfig` — or of any struct that embeds a `FileIO` and derives `Debug` — cannot
     /// leak credentials.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted_props: HashMap<&str, &str> = self
-            .props
-            .iter()
-            .map(|(k, v)| {
-                if is_secret_prop_key(k) {
-                    (k.as_str(), "***")
-                } else {
-                    (k.as_str(), v.as_str())
-                }
-            })
-            .collect();
-
         f.debug_struct("StorageConfig")
-            .field("props", &redacted_props)
+            .field("props", &RedactedProps(&self.props))
             .finish()
     }
 }
