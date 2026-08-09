@@ -814,6 +814,11 @@ fn datum_decimal_byte_decode_accepts_values_wider_than_declared_precision() {
 /// to distribute. The `precision <= 38` invariant still holds, enforced by the `PrimitiveType`
 /// field's own `serialize_decimal`/`deserialize_decimal`.
 ///
+/// Both `DatumVisitor` arms are exercised: `visit_map` is the self-describing (JSON object) route,
+/// and `visit_seq` is the route taken by compact, non-self-describing formats — which is exactly
+/// the cross-process scan-task distribution this permissiveness exists for, so it needs its own
+/// pin rather than riding on the map arm's coverage.
+///
 /// Mutation this catches: re-adding `validate_decimal_literal` to `impl Serialize for Datum` or to
 /// either `DatumVisitor` arm.
 #[test]
@@ -842,16 +847,36 @@ fn datum_decimal_serde_round_trip_preserves_java_readable_values() {
         );
     }
 
+    // The sequence route (compact formats: bincode, MessagePack, postcard) must be just as
+    // permissive as the map route. A JSON array drives `DatumVisitor::visit_seq` directly.
+    for value in [99_i128, -99, 100, -100, 999_999] {
+        let seq = serde_json::json!(["decimal(2,0)", value.to_be_bytes()]);
+        assert_eq!(
+            serde_json::from_value::<Datum>(seq).unwrap_or_else(|error| panic!(
+                "Java-readable decimal(2,0) bound {value} must survive the seq route: {error}"
+            )),
+            Datum::new(decimal_type.clone(), PrimitiveLiteral::Int128(value))
+        );
+    }
+
     // Java-legal metadata the strict constructor refuses still round-trips as data.
     let odd_type = PrimitiveType::Decimal {
         precision: 10,
         scale: 11,
     };
-    let datum = Datum::new(odd_type, PrimitiveLiteral::Int128(7));
+    let datum = Datum::new(odd_type.clone(), PrimitiveLiteral::Int128(7));
     let json = serde_json::to_value(&datum).expect("decimal(10,11) is Java-legal metadata");
     assert_eq!(json["type"], serde_json::json!("decimal(10,11)"));
     assert_eq!(
         serde_json::from_value::<Datum>(json).expect("decimal(10,11) must deserialize"),
+        datum
+    );
+    assert_eq!(
+        serde_json::from_value::<Datum>(serde_json::json!([
+            "decimal(10,11)",
+            7_i128.to_be_bytes()
+        ]))
+        .expect("decimal(10,11) must deserialize through the seq route"),
         datum
     );
 }

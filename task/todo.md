@@ -57,10 +57,33 @@ V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, 
       2026-08-08; the RawLiteral and Literal JSON boundary expansion was explicitly approved on
       2026-08-09 after the second independent Critic filed five S2 findings. Unit gate →
       independent Critic → recorded disposition.
-      **Done 2026-08-09:** decimal type/value validation now spans constructors, Arrow conversion,
-      Datum/RawLiteral bytes, Serde/JSON, and nested literals without truncating casts; canonical
-      encodings and legacy diagnostics are pinned. Four independent remediation Critic cycles
-      closed all filed S1/S2 findings; final verdict CONVERGED (zero S1/S2).
+      **Done 2026-08-09:** decimal type/value validation covers the constructor/encode paths
+      (`Datum` constructors, `Datum::to_bytes`, Arrow conversion) without truncating casts, and the
+      legacy diagnostics are pinned. Four independent remediation Critic cycles closed all filed
+      S1/S2 findings; verdict at that point was CONVERGED (zero S1/S2).
+      **R1 correction 2026-08-09 (commit `ff53c252`), supersedes the two clauses struck above:** a
+      later independent review filed S2s showing G1 had imposed two invariants Java 1.10.0 does not
+      have, on paths that READ existing on-disk metadata. G1's read-path gates were therefore
+      DELIBERATELY REVERTED to Java permissiveness, so the earlier claims that "canonical encodings
+      are pinned" and that validation "spans Datum/RawLiteral bytes, Serde/JSON, and nested
+      literals" are no longer true of the shipped code and must not be relied on:
+      (a) `Datum::try_from_bytes` no longer requires the canonical minimal two's-complement
+      encoding — Java `Conversions.internalFromByteBuffer` is a bare `new BigInteger(bytes)` — and
+      the replacement test asserts padded encodings decode;
+      (b) `deserialize_decimal` is no longer routed through `Type::decimal`, and
+      `validate_decimal_type` no longer requires `scale <= precision` — Java
+      `Types$DecimalType.<init>` checks only `precision <= 38`;
+      (c) `validate_decimal_value` / `validate_decimal_literal` were removed from five read/JSON
+      doors: the `RawLiteral` bytes arm, the 16-byte list arm, the `RawLiteral` `Int128` write arm,
+      `Literal::try_from_json` / `Literal::try_into_json`, and both `Datum` serde impls.
+      The encode-side anti-truncation gate on `Datum::to_bytes` is RETAINED and mutation-proved.
+      Read/encode split and every Java citation are documented at the call sites. Capability status
+      stays in GAP_MATRIX R87 (already updated); this entry records only that R1 happened, so the
+      G6 bundle-close Critic adjudicates the corrected state rather than the struck clauses.
+      **R1 remediation cycle 1 (this branch):** added a `DatumVisitor::visit_seq` pin (the compact,
+      non-self-describing serde route) to
+      `datum_decimal_serde_round_trip_preserves_java_readable_values`; the previous test reached
+      `visit_map` only, so a re-added gate on the seq arm survived mutation.
 - [ ] **G2 — malformed metadata + recursion safety (C-002, C-003, C-007).** In scope:
       `crates/iceberg/src/expr/accessor.rs`, `crates/iceberg/src/expr/visitors/{predicate_visitor.rs,
       bound_predicate_visitor.rs,manifest_evaluator.rs}`, `crates/iceberg/src/arrow/schema.rs`,
