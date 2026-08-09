@@ -46,6 +46,11 @@ Java-parity, on-disk-format, and dependency contracts; C-008 deliver the bound S
 green gates. Explicit exclusions: REST endpoint/header trust redesign, LocalFS jail, HMS TLS/SASL,
 V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, dependency changes.
 
+> **Evidence lives in [2026-08-audit-hardening-ledger.md](2026-08-audit-hardening-ledger.md)** — gate
+> records, Critic dispositions, the Invariant V amendments, the scope-delta adjudications and all 31
+> named S3 residues. Per the de-triplication rule this tracker holds one-line statuses only; nothing
+> here restates capability STATUS (that stays in [GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md)).
+
 - [x] **G1 — decimal invariants (C-001, C-007).** In scope:
       `crates/iceberg/src/spec/datatypes.rs`, `crates/iceberg/src/arrow/schema.rs`,
       `crates/iceberg/src/arrow/record_batch_transformer.rs`, affected decimal fixture tests in
@@ -84,7 +89,7 @@ V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, 
       non-self-describing serde route) to
       `datum_decimal_serde_round_trip_preserves_java_readable_values`; the previous test reached
       `visit_map` only, so a re-added gate on the seq arm survived mutation.
-- [ ] **G2 — malformed metadata + recursion safety (C-002, C-003, C-007).** In scope:
+- [x] **G2 — malformed metadata + recursion safety (C-002, C-003, C-007).** In scope:
       `crates/iceberg/src/expr/accessor.rs`, `crates/iceberg/src/expr/visitors/{predicate_visitor.rs,
       bound_predicate_visitor.rs,manifest_evaluator.rs}`, `crates/iceberg/src/arrow/schema.rs`,
       `crates/iceberg/src/transaction/update_schema.rs`, and affected `map.md`/adjacent tests. Return
@@ -108,22 +113,52 @@ V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, 
       the measurement, the arithmetic and the dev-profile caveat are in the constant's doc
       comment, and splitting the leaf arms out of the recursive `bind`/`visit` bodies halved the
       per-level cost that number rests on.
-      STILL OPEN from the first pass: `assign_fresh_ids` is unbounded. NEW residue: the derived
-      `Drop`/`Clone`/`PartialEq` glue on `Predicate`/`BoundPredicate` still recurses.
-- [ ] **G3 — DataFusion namespaces (C-004, C-007).** In scope:
+      **R3 correction 2026-08-09 (`006dc721` + `340fa4ea`) — closes the line above:**
+      `assign_fresh_ids` is no longer unbounded. G2's first pass had hardened `index_parents`, which
+      only ever receives a `Schema` already validated by `SchemaBuilder` against
+      `MAX_SCHEMA_NESTING_DEPTH`, while the walk reachable from the public
+      `UpdateSchemaAction::add_column` took a caller-supplied `Type` with no bound at all. That walk
+      is now bounded at 128 (consistent with the crate's existing constant family) and proved on a
+      small-stack thread, with one independent chain per recursion arm. The false `index_parents`
+      rationale was corrected in the same pass: it is defence in depth, not the fix.
+      REMAINING residue: the derived `Drop`/`Clone`/`PartialEq` glue on `Predicate`/`BoundPredicate`
+      still recurses — nothing in this bundle can protect it.
+      **Done 2026-08-09.** Critic CONVERGED zero S1/S2 on R2 (1 cycle) and R3 (2 cycles); 11 S3
+      ledgered. Invariant V amendments for `expr/predicate.rs` and `spec/schema/id_reassigner.rs`
+      recorded in the ledger §2.
+- [x] **G3 — DataFusion namespaces (C-004, C-007).** In scope:
       `crates/integrations/datafusion/src/catalog.rs` and adjacent tests. Preserve full namespace
       identity, cover nesting/collisions/failures, and do not broaden DataFusion API scope. Unit gate
       → independent Critic → recorded disposition.
-- [ ] **G4 — cache-moka byte capacity (C-005, C-007).** In scope:
+      **Done 2026-08-09** (`d99e56d6` + `2556e109`, Critic CONVERGED cycle 2, 5 S3): nested
+      namespaces discovered by explicit-queue BFS with a depth cap and bounded concurrency; identity
+      preserved by joining levels on U+001F — the convention `NamespaceIdent::to_url_string()`
+      already uses and REST/S3 Tables already rely on — so `split('\u{1f}')` is a total inverse.
+      Collisions rejected rather than shadowed; a dot alias keeps nested namespaces SQL-typeable.
+      No public API added.
+- [x] **G4 — cache-moka byte capacity (C-005, C-007).** In scope:
       `crates/integrations/cache-moka/src/lib.rs` and adjacent tests. Replace entry-count semantics
       with deterministic byte weighting without dependency edits. Unit gate → independent Critic →
       recorded disposition.
-- [ ] **G5 — secret rendering (C-006, C-007).** In scope:
+      **Done 2026-08-09** (`cb489615` + `73ff5157`, Critic CONVERGED cycle 2, 6 S3): `weigher` +
+      `max_capacity` mirroring `io/object_cache.rs`, so 32 MiB means bytes rather than ~33.5M
+      entries. Operator-visible consequence recorded: the default aggregate ceiling is now
+      2 × 32 MiB = 64 MiB, twice the core cache's single budget for the same two object kinds
+      (merging them is ARCH-004, excluded).
+- [x] **G5 — secret rendering (C-006, C-007).** In scope:
       `crates/catalog/rest/src/{client.rs,types.rs}`, core table/view metadata and facade types,
       `crates/iceberg/src/error.rs`, a narrowly scoped shared redaction helper if required, affected
       `map.md`, and adjacent tests. Preserve error chaining and non-sensitive diagnostics; eliminate
       the enumerated credential render paths without changing catalog trust policy. Unit gate →
       independent Critic → recorded disposition.
+      **Done 2026-08-09** (`879bf55e`, Critic CONVERGED cycle 3, 3 S3): SEC-001 closed by replacing
+      the raw `serde_json::Error` source with a `SanitizedJsonError` carrying failure category and
+      position but nothing derived from the body — the chain obligation survives because `source()`
+      still EXISTS, which was the actual requirement. The former residue pin in
+      `crates/catalog/rest/src/catalog.rs` is INVERTED, not deleted. SEC-002 / SEC-009 closed via
+      per-key `is_secret_prop_key` redaction. NAMED residue: `Table`'s `{:?}` is still not wholesale
+      credential-safe (snapshot summaries, encryption keys, statistics blob properties render in
+      clear) and the rustdoc now says so instead of asserting a blanket invariant.
 - [ ] **G6 — bundle close (C-008).** Run the independent bundle Critic, disposition any remands,
       run `typos . && make check && make check-msrv && cargo build -p iceberg
       --no-default-features && cargo deny check advisories && make test`, execute targeted interop if
