@@ -187,6 +187,21 @@ could not be satisfied and step 7 was replaced by 6a+6b. All 45 failures land in
 Every one fails with `Connection refused` / `Os { code: 111 }` against the REST fixture, MinIO,
 fake-gcs or HMS. 119 `Connection refused` occurrences and zero assertion failures.
 
+Docker enters this gate transitively and at exactly one point: `Makefile:80` is `test: docker-up`,
+and `docker-up` (`Makefile:95`) brings up `dev/docker-compose.yaml`. No earlier unit gate touches it.
+The six services map one-to-one onto the eight failing binaries — `minio` → `file_io_s3_test`,
+`fake-gcs-server` → `file_io_gcs_test`, `rest` → `rest_catalog_test` + `conflict_commit_test`,
+`spark-iceberg`+`provision` → `read_evolved_schema` + `read_positional_deletes`, `moto` →
+`glue_catalog_test`, `hive-metastore` → `hms_catalog_test` — so the shortfall is bounded and
+enumerated, not open-ended.
+
+**Runner caveat on the substitution.** `make test` runs `cargo nextest run --all-targets
+--all-features --workspace`; step 6b ran `cargo test --no-fail-fast` with the same target, feature
+and workspace scope. Same test SELECTION, different runner: nextest executes each test in its own
+PROCESS, `cargo test` uses threads within one process per binary. That cannot change which tests
+run, but it can mask a test that depends on process isolation. Re-running under nextest is part of
+the pre-merge `make test`, not an extra step.
+
 **What that leaves genuinely unverified**, stated plainly rather than assumed benign: the REST
 catalog end-to-end suite is the one that exercises G5's changed error paths against a live server,
 so SEC-001/SEC-009 are pinned by unit tests and not by an end-to-end run. `read_evolved_schema` and
