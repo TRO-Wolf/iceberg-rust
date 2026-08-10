@@ -46,6 +46,7 @@ use std::fmt::{Debug, Formatter};
 use std::time::{Duration, Instant};
 
 use http::StatusCode;
+use iceberg::io::is_secret_prop_key;
 use iceberg::{Error, ErrorKind, Result};
 use reqwest::header::HeaderMap;
 use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
@@ -297,6 +298,8 @@ impl HttpClient {
                 // `access_token`. Never attach the raw body to the error context — it
                 // would be rendered by `Error`'s `Display` and leak the token into any
                 // `tracing::error!(?e)` / `{e}` log. Attach only the safe byte length.
+                // SEC-001: the `source` is the same channel — `serde`'s message echoes the
+                // value at the failure position — so it is reduced to `SanitizedJsonError`.
                 Error::new(
                     ErrorKind::Unexpected,
                     "Failed to parse response from rest catalog server!",
@@ -304,7 +307,7 @@ impl HttpClient {
                 .with_context("operation", "auth")
                 .with_context("url", auth_url.to_string())
                 .with_context("response_body_len", text.len().to_string())
-                .with_source(e)
+                .with_source(SanitizedJsonError::new(&e))
             })?)
         } else {
             let code = auth_resp.status();
@@ -315,13 +318,15 @@ impl HttpClient {
             let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
                 // SECURITY: this is still the token endpoint — a non-2xx body may echo
                 // submitted credentials or a partial grant. Keep the token path airtight
-                // by never attaching the raw body; surface only its byte length.
+                // by never attaching the raw body; surface only its byte length. SEC-001:
+                // the `source` echoes the value at the failure position, so it too is
+                // reduced to `SanitizedJsonError`.
                 Error::new(ErrorKind::Unexpected, "Received unexpected response")
                     .with_context("code", code.to_string())
                     .with_context("operation", "auth")
                     .with_context("url", auth_url.to_string())
                     .with_context("response_body_len", text.len().to_string())
-                    .with_source(e)
+                    .with_source(SanitizedJsonError::new(&e))
             })?;
             Err(Error::from(e))
         }?;
@@ -552,6 +557,140 @@ pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest:
     !(error.is_builder() || error.is_connect())
 }
 
+/// Marker written in place of a redacted secret value. Mirrors the `REDACTED` marker used by the
+/// wire types' `Debug` impls in `types.rs`; its presence signals that the entry was populated,
+/// which is the only thing a diagnostic view legitimately needs.
+const REDACTED_VALUE: &str = "***";
+
+/// A `serde_json` parse failure reduced to the facts that provably cannot carry payload.
+///
+/// SECURITY (SEC-001): `iceberg::Error` renders its `source` VERBATIM — `, source: {source}` in
+/// `Display` and `Source: {source:#}` in `Debug` (`crates/iceberg/src/error.rs`) — and
+/// `serde_json`'s message echoes the value AT THE FAILURE POSITION. The size of that value is NOT
+/// bounded to a scalar: when the type mismatch sits at a CONTAINER boundary, `serde` renders the
+/// offending value through `Unexpected::Str` and emits an entire sub-document inline. The
+/// load-bearing case is a well-known bug class rather than a contrivance — a server or API gateway
+/// that emits a nested object as a JSON *string* (`writeValueAsString` over a sub-map, a proxy
+/// integration stringifying the body) turns `config` into a string whose CONTENT is the whole
+/// vended-credential map, and `serde` reports `invalid type: string "…", expected a map` with those
+/// credentials inline. Attaching such an error as the `source` of a REST parse failure put live
+/// credentials into every `{e}` / `tracing::error!(?e)` site.
+///
+/// The chain is NOT deleted — AGENTS.md requires a wrapped cause to stay reachable through
+/// `Error::source()`, and it does: this type IS the source. What is dropped is `serde_json`'s free
+/// text, because it is the only part of the error whose content comes from the response body.
+/// Everything retained here is structural — a fixed category word plus two integers — so it is
+/// *incapable* of echoing the payload, rather than merely unlikely to. That is a deliberate choice
+/// of a provable rule over a message sanitizer: any attempt to scrub the free text would have to
+/// out-guess every `Unexpected` rendering (`string "…"`, `integer …`, `Other(…)`) forever.
+///
+/// What survives is still enough to act on: the failure CLASS (a syntax error means a malformed
+/// body / wrong content-type; a data error means version skew or a type mismatch; `eof` means a
+/// truncated response) and the exact position, alongside the caller-attached status, URL and body
+/// length. Operators who need the payload itself can capture it at the HTTP layer (a proxy or a
+/// `reqwest` middleware), where the exposure is a deliberate choice rather than an unconditional
+/// log write.
+#[derive(Debug)]
+pub(crate) struct SanitizedJsonError {
+    /// `serde_json`'s failure category, as a fixed word from a closed set.
+    category: &'static str,
+    /// 1-based line of the failure position (0 when unknown).
+    line: usize,
+    /// 1-based column of the failure position (0 when unknown).
+    column: usize,
+}
+
+impl SanitizedJsonError {
+    /// Extracts the non-echoing facts from a `serde_json` error and DROPS its message.
+    fn new(error: &serde_json::Error) -> Self {
+        Self {
+            category: match error.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            },
+            line: error.line(),
+            column: error.column(),
+        }
+    }
+}
+
+impl std::fmt::Display for SanitizedJsonError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "json {} error at line {} column {} (serde message withheld: it echoes the value at \
+             the failure position, which is a whole sub-document when the mismatch is at a \
+             container boundary)",
+            self.category, self.line, self.column
+        )
+    }
+}
+
+impl std::error::Error for SanitizedJsonError {}
+
+/// Depth cap for [`redact_secret_values`]'s walk over a server-supplied JSON document.
+///
+/// `serde_json`'s parser already rejects documents nested deeper than its own recursion limit, so
+/// a value that reaches this walk is already bounded; the cap is nonetheless explicit because
+/// AGENTS.md requires every user-influenced tree walk to carry one. Replacing a too-deep subtree
+/// wholesale is fail-closed — nothing from below the cap is rendered.
+const MAX_BODY_REDACTION_DEPTH: u32 = 64;
+
+/// Replaces, in place, every object value whose KEY is secret-bearing with [`REDACTED_VALUE`].
+///
+/// Redaction is PER KEY through the canonical needle test [`is_secret_prop_key`] — the same
+/// (deliberately superset) test the wire types' `Debug` impls in `types.rs`, `StorageConfig`, and
+/// the Glue / HMS / S3Tables / SQL config `Debug` impls use — so keys stay visible for diagnostics,
+/// only secret VALUES are masked, and there is exactly ONE authoritative needle list.
+fn redact_secret_values(value: &mut serde_json::Value, depth: u32) {
+    if depth >= MAX_BODY_REDACTION_DEPTH {
+        *value = serde_json::Value::String(format!("{REDACTED_VALUE} (nesting cap reached)"));
+        return;
+    }
+
+    match value {
+        serde_json::Value::Object(entries) => {
+            for (key, entry) in entries.iter_mut() {
+                if is_secret_prop_key(key) {
+                    *entry = serde_json::Value::String(REDACTED_VALUE.to_string());
+                } else {
+                    redact_secret_values(entry, depth + 1);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_secret_values(item, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Renders a non-2xx response body for attachment to an error, with secret-keyed values masked.
+///
+/// SECURITY (SEC-009): a JSON body is re-emitted with [`redact_secret_values`] applied, which keeps
+/// the whole diagnostic shape — including the Iceberg `ErrorResponse` `message` Java surfaces to
+/// the caller — while masking any property map the server echoed back from a WRITE request
+/// (`create_table`, `create_namespace`, `update_namespace_properties`, `create_view`), which is the
+/// channel by which submitted credentials can come back.
+///
+/// A body that is not JSON cannot be key-redacted at all, so it is withheld and only its byte
+/// length is reported: over-redaction is the safe direction, and the alternative is echoing
+/// arbitrary server text that may itself quote the submitted request. Status and (redacted)
+/// headers are attached separately by the caller, so the content-type remains visible.
+fn redacted_response_body(bytes: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(mut body) => {
+            redact_secret_values(&mut body, 0);
+            body.to_string()
+        }
+        Err(_) => format!("<non-JSON body withheld, {} bytes>", bytes.len()),
+    }
+}
+
 /// Deserializes a catalog response into the given [`DeserializedOwned`] type.
 ///
 /// Returns an error if unable to parse the response bytes.
@@ -574,29 +713,20 @@ pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest:
 /// the HTTP layer (a proxy or a `reqwest` middleware), where the exposure is a deliberate choice
 /// rather than an unconditional log write.
 ///
-/// RESIDUE — this fix closes the CONTEXT channel, not the `source` channel. `with_source(e)` is
-/// retained because AGENTS.md requires the error chain to survive, and `iceberg::Error` renders the
-/// source VERBATIM (`, source: {source}`) in both `Display` and `Debug`
-/// (`crates/iceberg/src/error.rs`). `serde_json`'s message echoes the value AT THE PARSE-FAILURE
-/// POSITION, and the size of that value is NOT bounded to a scalar: when the mismatch sits at a
-/// CONTAINER boundary, the echoed value is an entire sub-document, emitted in full through
-/// `Unexpected::Str`.
+/// SEC-001 — the `source` channel is closed too, and it is closed by SANITIZING rather than by
+/// dropping the chain. The earlier fix kept `.with_source(e)` on the raw `serde_json::Error`, which
+/// left a second, unbounded copy of the body reachable: `iceberg::Error` renders its source
+/// VERBATIM in both `Display` and `Debug`, and `serde`'s message echoes the value at the failure
+/// position — an entire sub-document when the mismatch is at a container boundary. The source is
+/// now a [`SanitizedJsonError`], which carries the failure category and line/column and nothing
+/// derived from the body; see that type for why a structural reduction is preferred over scrubbing
+/// serde's free text.
 ///
-/// The load-bearing case is a real, well-known bug class rather than a contrivance: a server or API
-/// gateway that emits a nested object as a JSON *string* (`writeValueAsString` over a sub-map, a
-/// proxy integration stringifying the body) turns `config` into a string whose CONTENT is the whole
-/// vended-credential map, and `serde` reports `invalid type: string "…", expected a map` with those
-/// credentials inline. So a malformed credential-bearing body CAN still leak through `source`.
-///
-/// FIX OWNER: not closable here without breaking the error chain — the chain obligation is satisfied
-/// by `source()` existing; the leak is core's verbatim interpolation of it into `Display`/`Debug`.
-/// It belongs to the core-crate residue unit that reworks `iceberg::Error`'s source rendering.
-///
-/// Both shapes are pinned in `catalog.rs`: the SAFE scalar-mismatch shape by
+/// All three shapes are pinned in `catalog.rs`: the scalar-mismatch shape by
 /// `test_config_parse_failure_does_not_leak_body` /
-/// `test_load_table_parse_failure_does_not_leak_vended_credentials`, and the LEAKY container-boundary
-/// shape by `test_known_residue_double_encoded_body_leaks_through_error_source`, which asserts the
-/// leak still happens so the gap cannot be silently forgotten or over-claimed as closed.
+/// `test_load_table_parse_failure_does_not_leak_vended_credentials`, and the container-boundary
+/// (double-encoded) shape by `test_double_encoded_body_does_not_leak_through_error_source` — the
+/// inverted form of the former known-residue pin, which asserted the leak.
 pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
     response: Response,
 ) -> Result<R> {
@@ -612,7 +742,7 @@ pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
         .with_context("status", status.to_string())
         .with_context("url", url.to_string())
         .with_context("response_body_len", bytes.len().to_string())
-        .with_source(e)
+        .with_source(SanitizedJsonError::new(&e))
     })
 }
 
@@ -676,12 +806,25 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
 ///   request back in its error payload (a common server pattern) therefore puts those submitted
 ///   values into this error context.
 ///
-/// The body is nonetheless retained: it is an `ErrorResponse` whose `message` is the whole
-/// diagnostic value, and Java surfaces exactly this to the caller (`ErrorHandlers` parse the payload
-/// and rethrow `ErrorResponse.message`), so withholding it would cost real debuggability and diverge
-/// from Java. The residual request-echo exposure is **parity-shared** — Java has it identically.
-/// The one non-2xx body that reliably carries submitted credentials — the token endpoint's — is
-/// handled separately in [`HttpClient::exchange_credential_for_token`], which withholds it.
+/// The body is nonetheless retained rather than withheld: it is an `ErrorResponse` whose `message`
+/// is the whole diagnostic value, and Java surfaces exactly this to the caller (`ErrorHandlers`
+/// parse the payload and rethrow `ErrorResponse.message`), so dropping it would cost real
+/// debuggability and diverge from Java. The one non-2xx body that reliably carries submitted
+/// credentials — the token endpoint's — is handled separately in
+/// [`HttpClient::exchange_credential_for_token`], which withholds it entirely.
+///
+/// SEC-009 — what changed: the body is no longer attached RAW. It goes through
+/// [`redacted_response_body`], which re-emits the JSON with every secret-keyed value masked per
+/// [`is_secret_prop_key`], and withholds a non-JSON body (which cannot be key-redacted) down to its
+/// byte length. That closes the request-echo direction — the property maps `types.rs` already masks
+/// in `Debug` are now masked here too — while keeping `message`, `type`, `code` and the rest of the
+/// diagnostic shape intact.
+///
+/// RESIDUE: key-based redaction cannot mask a secret a server splices into FREE TEXT (an
+/// `ErrorResponse.message` reading `invalid property s3.secret-access-key=AKIA…`). That channel is
+/// the `ErrorModel`/`ErrorResponse` residue already named in the `types.rs` redaction banner: the
+/// content is the server's to choose, `From<ErrorModel> for Error` surfaces it verbatim, and the
+/// exposure is parity-shared with Java.
 pub(crate) async fn deserialize_unexpected_catalog_error(
     response: Response,
     disable_header_redaction: bool,
@@ -704,12 +847,197 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
     if bytes.is_empty() {
         return err;
     }
-    err.with_context("json", String::from_utf8_lossy(&bytes))
+    err.with_context("json", redacted_response_body(&bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SECURITY (SEC-001), unit level: pins that the sanitized source DROPS `serde_json`'s message
+    /// — the only part of a parse error whose content comes from the response body — while keeping
+    /// the failure category and position that make the error actionable.
+    ///
+    /// The precondition assertion is the load-bearing half: it proves `serde` really does echo the
+    /// whole sub-document at a container boundary, so the test cannot pass vacuously against a
+    /// shape that never leaked.
+    ///
+    /// MUTATION: render `error.to_string()` from `SanitizedJsonError::new` (i.e. keep serde's
+    /// message) → RED.
+    #[test]
+    fn test_sanitized_json_error_withholds_the_serde_message() {
+        const SENTINEL: &str = "SENTINEL_INSIDE_A_DOUBLE_ENCODED_SUBDOCUMENT";
+
+        #[derive(Debug, serde::Deserialize)]
+        struct Wire {
+            #[allow(dead_code)]
+            config: HashMap<String, String>,
+        }
+
+        // `config` arrives DOUBLE-ENCODED: a JSON string whose content is the credential map.
+        let raw = serde_json::json!({
+            "config": format!(r#"{{"s3.secret-access-key":"{SENTINEL}"}}"#)
+        })
+        .to_string();
+
+        let error = serde_json::from_str::<Wire>(&raw)
+            .expect_err("a double-encoded `config` must fail to deserialize");
+        assert!(
+            error.to_string().contains(SENTINEL),
+            "precondition: serde must actually echo the sub-document, got: {error}"
+        );
+
+        let sanitized = SanitizedJsonError::new(&error);
+        let rendered = format!("{sanitized}");
+        let debug = format!("{sanitized:?}");
+
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the sanitized source leaked the echoed sub-document into Display: {rendered}"
+        );
+        assert!(
+            !debug.contains(SENTINEL),
+            "the sanitized source leaked the echoed sub-document into Debug: {debug}"
+        );
+        // Anti-vacuity: it must still say what failed and where.
+        assert_eq!(sanitized.category, "data");
+        assert_eq!(sanitized.line, error.line());
+        assert_eq!(sanitized.column, error.column());
+        assert!(
+            rendered.contains("json data error at line 1 column"),
+            "the sanitized source must still classify and locate the failure: {rendered}"
+        );
+    }
+
+    /// Every `serde_json` failure category maps to a distinct, fixed word — the category is the
+    /// operator's first branch (syntax = malformed body / wrong content-type, data = version skew
+    /// or type mismatch, eof = truncated response).
+    ///
+    /// MUTATION: collapse the `classify()` match to a single literal → RED.
+    #[test]
+    fn test_sanitized_json_error_reports_the_failure_category() {
+        let syntax = serde_json::from_str::<serde_json::Value>("{oops")
+            .expect_err("malformed JSON must fail");
+        assert_eq!(SanitizedJsonError::new(&syntax).category, "syntax");
+
+        let eof = serde_json::from_str::<serde_json::Value>("").expect_err("empty input must fail");
+        assert_eq!(SanitizedJsonError::new(&eof).category, "eof");
+
+        let data = serde_json::from_str::<HashMap<String, String>>(r#"{"a": 1}"#)
+            .expect_err("a type mismatch must fail");
+        assert_eq!(SanitizedJsonError::new(&data).category, "data");
+    }
+
+    /// SECURITY (SEC-009), unit level: a non-2xx body is key-redacted, not dropped. The secret
+    /// VALUE is masked wherever it sits — including nested inside arrays, the shape the vended
+    /// `storage-credentials` list uses — while the server's diagnostic message, the secret KEY and
+    /// every non-secret value survive.
+    ///
+    /// MUTATION: return `String::from_utf8_lossy(bytes).to_string()` from
+    /// `redacted_response_body` → RED.
+    #[test]
+    fn test_redacted_response_body_masks_secret_keys_only() {
+        const SENTINEL: &str = "SENTINEL_ECHOED_PROPERTY_VALUE";
+
+        let body = serde_json::json!({
+            "error": {
+                "message": "Cannot create table: invalid property value",
+                "type": "BadRequestException",
+                "code": 422,
+                "submitted": [
+                    { "properties": { "s3.session-token": SENTINEL, "owner": "analytics" } }
+                ]
+            }
+        })
+        .to_string();
+
+        let rendered = redacted_response_body(body.as_bytes());
+
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the echoed secret survived redaction: {rendered}"
+        );
+        assert!(
+            rendered.contains(REDACTED_VALUE),
+            "expected the redaction marker: {rendered}"
+        );
+        assert!(
+            rendered.contains("Cannot create table: invalid property value")
+                && rendered.contains("BadRequestException")
+                && rendered.contains("422"),
+            "the diagnostic payload Java surfaces was dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("s3.session-token"),
+            "the secret KEY must stay visible for diagnostics: {rendered}"
+        );
+        assert!(
+            rendered.contains("analytics"),
+            "a non-secret value was over-redacted: {rendered}"
+        );
+    }
+
+    /// A body that is not JSON cannot be key-redacted, so it is withheld down to its byte length.
+    ///
+    /// MUTATION: fall back to `String::from_utf8_lossy(bytes)` on the parse-failure arm → RED.
+    #[test]
+    fn test_redacted_response_body_withholds_a_non_json_body() {
+        const SENTINEL: &str = "SENTINEL_IN_A_GATEWAY_ERROR_PAGE";
+
+        let body = format!("<html>502: upstream rejected s3.secret-access-key={SENTINEL}</html>");
+        let rendered = redacted_response_body(body.as_bytes());
+
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the non-JSON body was attached verbatim: {rendered}"
+        );
+        assert!(
+            rendered.contains("<non-JSON body withheld")
+                && rendered.contains(&body.len().to_string()),
+            "presence and size must still be reported: {rendered}"
+        );
+    }
+
+    /// AGENTS.md recursion safety: the redaction walk runs over a SERVER-supplied document, so it
+    /// carries an explicit depth cap and a too-deep subtree is replaced wholesale (fail-closed —
+    /// nothing below the cap is rendered).
+    ///
+    /// The sentinel sits under a NON-secret key, so only the depth cap can remove it; a
+    /// key-redaction-only implementation would leak it.
+    ///
+    /// MUTATION: remove the `depth >= MAX_BODY_REDACTION_DEPTH` guard → RED.
+    #[test]
+    fn test_redact_secret_values_is_depth_bounded() {
+        const SENTINEL: &str = "SENTINEL_BELOW_THE_NESTING_CAP";
+
+        let depth =
+            usize::try_from(MAX_BODY_REDACTION_DEPTH).expect("the depth cap must fit in usize") + 8;
+        let mut body = serde_json::json!({ "deep": SENTINEL });
+        for _ in 0..depth {
+            body = serde_json::json!({ "nested": body });
+        }
+        let encoded = body.to_string();
+        assert!(
+            encoded.contains(SENTINEL),
+            "precondition: the document under test must carry the sentinel"
+        );
+
+        let rendered = redacted_response_body(encoded.as_bytes());
+
+        assert!(
+            !rendered.contains(SENTINEL),
+            "a value below the nesting cap was rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("nesting cap reached"),
+            "the cap marker must say why the subtree is missing: {rendered}"
+        );
+        // Anti-vacuity: everything ABOVE the cap is still rendered.
+        assert!(
+            rendered.contains("nested"),
+            "the walk dropped the levels above the cap: {rendered}"
+        );
+    }
 
     /// Risk (GAP_MATRIX row R157): a NEVER-SENT transport failure (connection refused — the TCP
     /// connection was never established, so the commit request cannot have reached the service)
@@ -1267,6 +1595,132 @@ mod tests {
             result.is_err(),
             "an initial token acquisition failure must propagate, not be swallowed"
         );
+        mock.assert_async().await;
+    }
+
+    // ========================================================================
+    // SEC-001 — the TOKEN endpoint's two parse sites, end to end
+    //
+    // `test_sanitized_json_error_withholds_the_serde_message` above pins the adapter, and
+    // `catalog.rs::test_double_encoded_body_does_not_leak_through_error_source` pins the
+    // `deserialize_catalog_response` site. These two pin the remaining pair — the 200-OK and
+    // non-2xx arms inside `exchange_credential_for_token` — which are the highest-value payload
+    // in the crate: the 200-OK body IS the document carrying `access_token`. They reuse the
+    // `refresh_client` helper above to aim the client's token endpoint at a mock server.
+    // ========================================================================
+
+    /// The shared shape both arms below exercise: an API gateway that stringifies the body, so the
+    /// document arrives DOUBLE-ENCODED and the type mismatch lands at the STRUCT boundary. `serde`
+    /// then renders the offending value through `Unexpected::Str` and echoes the entire document —
+    /// the container-boundary case `SanitizedJsonError` exists for.
+    fn double_encoded(inner: &str) -> String {
+        serde_json::Value::String(inner.to_string()).to_string()
+    }
+
+    /// Asserts the sanitized contract on an error that came off a token-endpoint parse failure:
+    /// the sentinel is gone from BOTH renderings, and — anti-vacuity — a `source` still exists and
+    /// still classifies and locates the failure.
+    fn assert_token_error_is_sanitized(error: &Error, sentinel: &str) {
+        use std::error::Error as _;
+
+        let display = format!("{error}");
+        let debug = format!("{error:?}");
+        assert!(
+            !display.contains(sentinel),
+            "the token-endpoint body leaked into Display: {display}"
+        );
+        assert!(
+            !debug.contains(sentinel),
+            "the token-endpoint body leaked into Debug: {debug}"
+        );
+
+        let source = error
+            .source()
+            .expect("the parse cause must stay reachable through source() (AGENTS.md)");
+        let rendered = format!("{source}");
+        assert!(
+            !rendered.contains(sentinel),
+            "the source itself leaked the body: {rendered}"
+        );
+        assert!(
+            rendered.contains("json data error at line 1 column"),
+            "the sanitized source must still classify and locate the failure: {rendered}"
+        );
+    }
+
+    /// SECURITY (SEC-001), 200-OK arm: a 200 body that fails to deserialize into `TokenResponse` at
+    /// a container boundary makes `serde` echo the whole document — here the one holding
+    /// `access_token`. Nothing of it may reach the caller's error.
+    ///
+    /// MUTATION: in `exchange_credential_for_token`'s 200-OK arm, `.with_source(SanitizedJsonError
+    /// ::new(&e))` → `.with_source(e)` → RED.
+    #[tokio::test]
+    async fn test_token_endpoint_ok_body_does_not_leak_through_error_source() {
+        const SENTINEL: &str = "SENTINEL_OAUTH_ACCESS_TOKEN_VALUE";
+
+        let body = double_encoded(&format!(
+            r#"{{"access_token":"{SENTINEL}","token_type":"Bearer","expires_in":3600}}"#
+        ));
+        // Precondition: the raw `serde` error really does echo the token, so a green assertion
+        // below cannot come from a shape that never leaked.
+        let raw = serde_json::from_str::<TokenResponse>(&body)
+            .expect_err("a double-encoded token document must fail to deserialize");
+        assert!(
+            raw.to_string().contains(SENTINEL),
+            "precondition: serde must echo the token document, got: {raw}"
+        );
+
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(200)
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = refresh_client(&server.url(), true)
+            .exchange_credential_for_token()
+            .await
+            .expect_err("an unparsable 200 token body must fail the exchange");
+        assert_token_error_is_sanitized(&error, SENTINEL);
+        mock.assert_async().await;
+    }
+
+    /// SECURITY (SEC-001), non-2xx arm: the token endpoint's error body can echo submitted
+    /// credentials or a partial grant. When it fails to deserialize into `ErrorResponse`, the same
+    /// container-boundary echo applies and must be sanitized too.
+    ///
+    /// MUTATION: in `exchange_credential_for_token`'s non-2xx arm, `.with_source(SanitizedJsonError
+    /// ::new(&e))` → `.with_source(e)` → RED.
+    #[tokio::test]
+    async fn test_token_endpoint_error_body_does_not_leak_through_error_source() {
+        const SENTINEL: &str = "SENTINEL_ECHOED_CLIENT_SECRET";
+
+        let body = double_encoded(&format!(
+            r#"{{"error":"invalid_client","error_description":"rejected client_secret={SENTINEL}"}}"#
+        ));
+        let raw = serde_json::from_str::<ErrorResponse>(&body)
+            .expect_err("a double-encoded error document must fail to deserialize");
+        assert!(
+            raw.to_string().contains(SENTINEL),
+            "precondition: serde must echo the error document, got: {raw}"
+        );
+
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(400)
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = refresh_client(&server.url(), true)
+            .exchange_credential_for_token()
+            .await
+            .expect_err("an unparsable non-2xx token body must fail the exchange");
+        assert_token_error_is_sanitized(&error, SENTINEL);
         mock.assert_async().await;
     }
 }

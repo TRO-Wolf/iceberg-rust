@@ -915,3 +915,71 @@ the general rule, not three incidents.
 - **DO NOT report a GREEN — gate or mutation leg — from a checkout whose last mutation restore you
   did not confirm rebuilt.** A green produced from a mutant-era binary is indistinguishable from a
   real one in the output, and it ships.
+
+### 2026-08-08 — Preserve independent Actor–Critic review at every granularity
+
+- **DO run an independent fresh-context Critic for every implementation group and every remediation
+  or scope-driven follow-up, including changes that appear too small to warrant separate review.**
+  *Why:* the user explicitly prioritizes preventing groupthink over process shortcuts; a tiny
+  call-site migration or fixture correction can carry the same public-API or data-integrity risk as
+  the originating change. *Apply:* never self-waive the Critic because a diff is small; record the
+  Actor artifact, execute the hard context break, and require the Critic's complete attestation
+  before advancing.
+
+### 2026-08-09 — An Actor's "mutation caught: X" is a hypothesis, not a result
+
+Across the 2026-08 audit-hardening bundle, **five of six units were remanded at least once, and in
+four of them the defect was test adequacy rather than correctness**. In three of those four the
+shape was identical: a test carrying a doc comment naming the mutation it catches, where applying
+that exact mutation left the whole suite GREEN. An Actor writes the assertion and the claim in one
+motion, from the same mental model, and never executes the negative case.
+
+> **This entry got its own count wrong twice, and that is the more useful half of the lesson.**
+> Draft 1 said "six for six" — falsified from the repo's own record: R2 converged on its first and
+> only cycle (`fb11dc66`, identical author/committer timestamps, never amended). Draft 2 said "four
+> of six were remanded" — also false: **four** is the size of the test-adequacy CLASS (R1, R3, G4,
+> G3); **five** is the number remanded (G5 twice, on other findings). Fixing a conflation, I
+> substituted one count for the other. Both drafts were caught by a Critic, neither by me.
+>
+> - **DO name the population in the same sentence as the number** — "five of six units were
+>   remanded", not "four of six", when the four you are thinking of is a different set. Two true
+>   counts about the same six items are trivially swappable, and prose hides the swap.
+> - **DO check a count against the table you already wrote.** Both errors were refutable in seconds
+>   from the cycle column three lines above the claim.
+> - A lesson about false claims that overstates its own evidence is the defect it warns about.
+
+The verified cases:
+
+- **R1** — "catches re-adding `validate_decimal_literal` to *either* `DatumVisitor` arm". Every
+  pre-existing test feeds a JSON **object**, which serde routes to `visit_map`; the `visit_seq` arm
+  — the compact/binary route the change exists to protect — had zero coverage.
+- **R3** — a map-nesting chain built only through the **value** position, so the map-**key**
+  recursion arm was unpinned and its mutant survived all 3226 tests.
+- **G4** — `default_provider_budget_is_bytes` named a mutation that `policy().max_capacity()` cannot
+  possibly discriminate: the number is `Some(33_554_432)` both before and after the fix. The
+  manifest-**list** cache was also entirely unpinned while its manifest twin was pinned.
+A fourth remand was a NEARBY but distinct shape, worth separating rather than lumping in:
+
+- **G3** — the `seen` visited-set had **zero** test coverage, and the false claim lived in
+  PRODUCTION doc (it was documented in-tree as one of two independent termination guarantees) rather
+  than in a test comment. Same root cause — an unexecuted claim — but you find it by auditing
+  coverage, not by re-running catalogued mutants.
+
+(**G5** was remanded twice on findings of its own; **R2** was not remanded at all.)
+
+Note the recurring sub-shape in the first three: **the twin that was forgotten.** Key vs value,
+list vs manifest, seq vs map. When a guard has symmetric arms, coverage of one reads as coverage of
+both.
+
+- **DO make the Critic APPLY every mutation the Actor's comments name, not read them.** A named
+  mutation is a testable claim about the suite; treat it as unverified until it goes RED.
+- **DO enumerate the recursion/dispatch arms of the thing under test and require one independent
+  chain per arm**, each failing exactly one assertion. That one-to-one correspondence is the proof
+  no chain is standing in for another — without it, a single chain silently covers for its twin.
+- **DO check the gate actually RUNS the new tests.** G4's eight tests live in `iceberg-cache-moka`;
+  the declared gate ended in `cargo test -p iceberg --lib`, which filters to `iceberg`. `clippy
+  --all-targets` compiled them and never ran them, so `gate_exit_zero: true` was true and meaningless.
+  When a group's tests land outside the crate the gate names, append that crate's test invocation.
+- **DO NOT let a false claim in a comment survive because the code is right.** Several of these had
+  correct production code and a lying comment. The comment is what the next maintainer will trust
+  when deciding whether a change is safe, so it is load-bearing on its own.

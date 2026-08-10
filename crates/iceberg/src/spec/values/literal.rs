@@ -522,18 +522,17 @@ impl Literal {
                 (PrimitiveType::Binary, JsonValue::String(s)) => Ok(Some(Literal::Primitive(
                     PrimitiveLiteral::Binary(hex_str_to_bytes(&s)?),
                 ))),
-                (
-                    PrimitiveType::Decimal {
-                        precision: _,
-                        scale,
-                    },
-                    JsonValue::String(s),
-                ) => {
+                // Java 1.10.0 `SingleValueParser.fromJson` DECIMAL arm: `isTextual` check, then
+                // `new BigDecimal(text)`, then ONE further precondition —
+                // `bigDecimal.scale() == decimalType.scale()` ("the scale doesn't match", constant
+                // pool #129). There is NO precision check and no re-validation of the type, so a
+                // default/partition value must not be gated on either here. (The fork rescales
+                // instead of requiring an exact scale match; that pre-existing divergence is
+                // tracked separately and is not touched by this change.)
+                (PrimitiveType::Decimal { scale, .. }, JsonValue::String(s)) => {
                     let decimal = decimal_from_str_exact(&s)?;
                     let rescaled = decimal_rescale(decimal, *scale);
-                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Int128(
-                        decimal_mantissa(&rescaled),
-                    ))))
+                    Ok(Some(Literal::decimal(decimal_mantissa(&rescaled))))
                 }
                 (_, JsonValue::Null) => Ok(None),
                 (i, j) => Err(Error::new(
@@ -543,20 +542,15 @@ impl Literal {
             },
             Type::Struct(schema) => {
                 if let JsonValue::Object(mut object) = value {
-                    Ok(Some(Literal::Struct(Struct::from_iter(
-                        schema.fields().iter().map(|field| {
-                            object.remove(&field.id.to_string()).and_then(|value| {
-                                Literal::try_from_json(value, &field.field_type)
-                                    .and_then(|value| {
-                                        value.ok_or(Error::new(
-                                            ErrorKind::DataInvalid,
-                                            "Key of map cannot be null",
-                                        ))
-                                    })
-                                    .ok()
-                            })
-                        }),
-                    ))))
+                    let values = schema
+                        .fields()
+                        .iter()
+                        .map(|field| match object.remove(&field.id.to_string()) {
+                            Some(value) => Literal::try_from_json(value, &field.field_type),
+                            None => Ok(None),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Some(Literal::Struct(Struct::from_iter(values))))
                 } else {
                     Err(Error::new(
                         crate::ErrorKind::DataInvalid,
@@ -746,19 +740,17 @@ impl Literal {
                 (PrimitiveType::Binary, PrimitiveLiteral::Binary(val)) => {
                     Ok(JsonValue::String(bytes_to_hex_str(&val)))
                 }
-                (_, PrimitiveLiteral::Int128(val)) => match r#type {
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: _precision,
-                        scale,
-                    }) => {
-                        let decimal = try_decimal_from_i128_with_scale(val, *scale)?;
-                        Ok(JsonValue::String(decimal.to_string()))
-                    }
-                    _ => Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "The iceberg type for decimal literal must be decimal.",
-                    ))?,
-                },
+                // Java 1.10.0 `SingleValueParser.toJson` DECIMAL arm writes
+                // `value.toString()` unconditionally — no precision or metadata gate — so the
+                // reverse of the read above stays gate-free too.
+                (PrimitiveType::Decimal { scale, .. }, PrimitiveLiteral::Int128(val)) => {
+                    let decimal = try_decimal_from_i128_with_scale(val, *scale)?;
+                    Ok(JsonValue::String(decimal.to_string()))
+                }
+                (_, PrimitiveLiteral::Int128(_)) => Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "The iceberg type for decimal literal must be decimal.",
+                )),
                 _ => Err(Error::new(
                     ErrorKind::DataInvalid,
                     "The iceberg value doesn't fit to the iceberg type.",

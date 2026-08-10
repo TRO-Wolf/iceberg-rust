@@ -28,12 +28,78 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::expr::visitors::bound_predicate_visitor::visit as visit_bound;
-use crate::expr::visitors::predicate_visitor::visit;
-use crate::expr::visitors::rewrite_not::RewriteNotVisitor;
 use crate::expr::{Bind, BoundReference, PredicateOperator, Reference};
 use crate::spec::{Datum, PrimitiveLiteral, SchemaRef};
 use crate::{Error, ErrorKind};
+
+/// The deepest logical nesting (`AND`/`OR`/`NOT` levels) that [`Predicate::bind`] and the
+/// predicate-tree visitors accept before returning `DataInvalid`.
+///
+/// # What this actually protects
+///
+/// It bounds the **recursive** walks only: [`Predicate::bind`],
+/// [`crate::expr::visitors::bound_predicate_visitor::visit`] and its unbound twin. The walks that
+/// are *not* bounded do not need to be, because they were rewritten to an explicit stack —
+/// [`Predicate::negate`], [`BoundPredicate::negate`], [`Predicate::rewrite_not`],
+/// [`BoundPredicate::rewrite_not`] and both `Display` impls consume O(1) stack at any depth.
+/// The remaining unbounded recursion in this module is the DERIVED glue — `Drop`, and equally
+/// `Clone` and `PartialEq`, all of which walk the tree structurally. Dropping, cloning or comparing
+/// a tree deeper than this limit still recurses, and no depth check can intercept `Drop` because
+/// the tree is destroyed after every gate has already run.
+///
+/// # Where the number comes from
+///
+/// It is a measured stack budget, not a copy of the JSON parser's limit. Each figure below is the
+/// bytes of stack one nesting level costs, obtained by spawning a thread with an exact
+/// `stack_size`, walking a left-spine `AND` chain of N binary leaves, and bisecting the largest N
+/// that returns instead of dying on the guard page (x86-64 Linux, rustc per
+/// `rust-toolchain.toml`). Repeating the bisect at 1/2/4/8 MiB reproduced each figure to within
+/// 1.2%, confirming the cost is linear in depth.
+///
+/// | recursive walk                        | dev profile | release profile |
+/// |---------------------------------------|-------------|-----------------|
+/// | `Predicate::bind`                     | 5,504 B     | 964 B           |
+/// | `bound_predicate_visitor::visit`      | 4,650 B     | 787 B           |
+/// | `predicate_visitor::visit`            | 4,245 B     | 771 B           |
+///
+/// Those `bind` figures are *after* splitting the leaf arms into the `#[inline(never)]`
+/// `Predicate::bind_leaf`; with the arms inlined into the recursive function the same bisect gave
+/// 12,336 B (dev) / 1,800 B (release) per level, so the split more than halved the cost.
+///
+/// The arithmetic, sized for the smallest stack a realistic caller has — a **tokio worker thread,
+/// which defaults to 2 MiB**, far below the 8 MiB main thread:
+///
+/// ```text
+///   2,097,152 B  (tokio worker stack)
+/// ÷           2  (safety factor: half the stack reserved for the scan/delete-filter frames
+///                 already live when the walk is entered)
+/// ÷         964  (worst recursive walk, release: Predicate::bind)
+/// = 1,087 levels → MAX_PREDICATE_DEPTH = 1000
+/// ```
+///
+/// **Dev-profile caveat, stated rather than hidden:** an unoptimized build costs 5,504 B per
+/// `bind` level, so a 2 MiB worker aborts near level 380 — before this limit can reject anything.
+/// A dev-profile caller that legitimately nests deeper must run on the main thread or raise
+/// `RUST_MIN_STACK` / the worker `stack_size`. Release builds — what the library ships as — have
+/// the 2× margin above.
+///
+/// # Why 1000 and not 100
+///
+/// The previous value, 100, was below what this crate's own read path constructs, so it turned
+/// working tables into scan failures:
+///
+/// * `DeleteFilter::build_equality_delete_predicate` LEFT-folds one conjunct per equality-delete
+///   file attached to a data file, on top of each file's own (balanced) fold. A Flink upsert
+///   table with ~102 single-row delete files, or ~87 delete files of 4,096 rows over a
+///   two-column key, exceeded 100. At 1000 the same shapes admit ~1000 and ~985 files.
+/// * `iceberg-datafusion`'s `expr_to_predicate` reduces the pushed-down filters with
+///   `Predicate::and`, so a query with N conjuncts nests N−1 levels deep.
+///
+/// Java has no counterpart limit at all: `Binder.bind` and `ExpressionVisitors.visit`
+/// (`iceberg-api` 1.10.0) carry no depth parameter, and a program built against those jars binds
+/// and visits a 5,000-deep left-folded `AND` on the default stack. This limit is therefore a
+/// stack-safety backstop that must stay far above real workloads, not a semantic constraint.
+pub(crate) const MAX_PREDICATE_DEPTH: usize = 1000;
 
 /// Logical expression, such as `AND`, `OR`, `NOT`.
 #[derive(PartialEq, Clone)]
@@ -487,11 +553,34 @@ impl Bind for Predicate {
     type Bound = BoundPredicate;
 
     fn bind(&self, schema: SchemaRef, case_sensitive: bool) -> Result<BoundPredicate> {
+        self.bind_at_depth(schema, case_sensitive, 0)
+    }
+}
+
+impl Predicate {
+    fn bind_at_depth(
+        &self,
+        schema: SchemaRef,
+        case_sensitive: bool,
+        depth: usize,
+    ) -> Result<BoundPredicate> {
+        if depth > MAX_PREDICATE_DEPTH {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Predicate binding exceeds maximum depth {MAX_PREDICATE_DEPTH}"),
+            ));
+        }
+
         match self {
             Predicate::And(expr) => {
-                let bound_expr = expr.bind(schema, case_sensitive)?;
-
-                let [left, right] = bound_expr.inputs;
+                let [left_predicate, right_predicate] = expr.inputs();
+                let left = Box::new(left_predicate.bind_at_depth(
+                    schema.clone(),
+                    case_sensitive,
+                    depth + 1,
+                )?);
+                let right =
+                    Box::new(right_predicate.bind_at_depth(schema, case_sensitive, depth + 1)?);
                 Ok(match (left, right) {
                     (_, r) if matches!(&*r, &BoundPredicate::AlwaysFalse) => {
                         BoundPredicate::AlwaysFalse
@@ -505,8 +594,9 @@ impl Bind for Predicate {
                 })
             }
             Predicate::Not(expr) => {
-                let bound_expr = expr.bind(schema, case_sensitive)?;
-                let [inner] = bound_expr.inputs;
+                let [inner_predicate] = expr.inputs();
+                let inner =
+                    Box::new(inner_predicate.bind_at_depth(schema, case_sensitive, depth + 1)?);
                 Ok(match inner {
                     e if matches!(&*e, &BoundPredicate::AlwaysTrue) => BoundPredicate::AlwaysFalse,
                     e if matches!(&*e, &BoundPredicate::AlwaysFalse) => BoundPredicate::AlwaysTrue,
@@ -514,8 +604,14 @@ impl Bind for Predicate {
                 })
             }
             Predicate::Or(expr) => {
-                let bound_expr = expr.bind(schema, case_sensitive)?;
-                let [left, right] = bound_expr.inputs;
+                let [left_predicate, right_predicate] = expr.inputs();
+                let left = Box::new(left_predicate.bind_at_depth(
+                    schema.clone(),
+                    case_sensitive,
+                    depth + 1,
+                )?);
+                let right =
+                    Box::new(right_predicate.bind_at_depth(schema, case_sensitive, depth + 1)?);
                 Ok(match (left, right) {
                     (l, r)
                         if matches!(&*r, &BoundPredicate::AlwaysTrue)
@@ -528,6 +624,26 @@ impl Bind for Predicate {
                     (left, right) => BoundPredicate::Or(LogicalExpression::new([left, right])),
                 })
             }
+            leaf => leaf.bind_leaf(schema, case_sensitive),
+        }
+    }
+
+    /// The non-recursive arms of [`Predicate::bind_at_depth`], deliberately **not inlined**.
+    ///
+    /// Keeping the leaf arms out of the recursive function keeps its stack frame small. An
+    /// unoptimized build gives every match arm's temporaries their own stack slot, so folding
+    /// these arms back in costs `bind` 12,336 bytes per level instead of 5,504 — see the
+    /// measurement recorded on [`MAX_PREDICATE_DEPTH`], which is derived from that figure.
+    #[inline(never)]
+    fn bind_leaf(&self, schema: SchemaRef, case_sensitive: bool) -> Result<BoundPredicate> {
+        match self {
+            // Structurally unreachable: `bind_at_depth` handles every logical node itself and
+            // only delegates the leaf arms here. Typed rather than `unreachable!()` so a future
+            // refactor that breaks the split cannot panic a caller.
+            Predicate::And(_) | Predicate::Or(_) | Predicate::Not(_) => Err(Error::new(
+                ErrorKind::Unexpected,
+                "bind_leaf reached a logical predicate node",
+            )),
             Predicate::Unary(expr) => {
                 let bound_expr = expr.bind(schema, case_sensitive)?;
 
@@ -656,34 +772,66 @@ impl Bind for Predicate {
     }
 }
 
+/// One item of the pending output of a predicate `Display` walk: either a subtree still to be
+/// rendered or a fixed separator already scheduled around it.
+enum DisplayToken<'a, P> {
+    /// A subtree whose rendering has not started.
+    Node(&'a P),
+    /// Literal text to emit verbatim.
+    Text(&'static str),
+}
+
 impl Display for Predicate {
+    /// Renders the predicate with an **explicit stack** rather than by recursing into the
+    /// children.
+    ///
+    /// `Display` cannot report an error of its own and is reachable from any `{}`/`{:?}` on a
+    /// user-supplied or deserialized predicate — including from inside the messages this crate
+    /// builds for depth failures — so a recursive impl would abort the process on exactly the
+    /// trees the depth limit exists to reject. The emitted text is byte-identical to the
+    /// recursive form.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Predicate::AlwaysTrue => {
-                write!(f, "TRUE")
-            }
-            Predicate::AlwaysFalse => {
-                write!(f, "FALSE")
-            }
-            Predicate::And(expr) => {
-                write!(f, "({}) AND ({})", expr.inputs()[0], expr.inputs()[1])
-            }
-            Predicate::Or(expr) => {
-                write!(f, "({}) OR ({})", expr.inputs()[0], expr.inputs()[1])
-            }
-            Predicate::Not(expr) => {
-                write!(f, "NOT ({})", expr.inputs()[0])
-            }
-            Predicate::Unary(expr) => {
-                write!(f, "{expr}")
-            }
-            Predicate::Binary(expr) => {
-                write!(f, "{expr}")
-            }
-            Predicate::Set(expr) => {
-                write!(f, "{expr}")
+        let mut pending = vec![DisplayToken::Node(self)];
+        while let Some(token) = pending.pop() {
+            let node = match token {
+                DisplayToken::Text(text) => {
+                    f.write_str(text)?;
+                    continue;
+                }
+                DisplayToken::Node(node) => node,
+            };
+            match node {
+                Predicate::AlwaysTrue => f.write_str("TRUE")?,
+                Predicate::AlwaysFalse => f.write_str("FALSE")?,
+                // Pushed in reverse: "(" left ") AND (" right ")".
+                Predicate::And(expr) => {
+                    let [left, right] = expr.inputs();
+                    pending.push(DisplayToken::Text(")"));
+                    pending.push(DisplayToken::Node(right));
+                    pending.push(DisplayToken::Text(") AND ("));
+                    pending.push(DisplayToken::Node(left));
+                    pending.push(DisplayToken::Text("("));
+                }
+                Predicate::Or(expr) => {
+                    let [left, right] = expr.inputs();
+                    pending.push(DisplayToken::Text(")"));
+                    pending.push(DisplayToken::Node(right));
+                    pending.push(DisplayToken::Text(") OR ("));
+                    pending.push(DisplayToken::Node(left));
+                    pending.push(DisplayToken::Text("("));
+                }
+                Predicate::Not(expr) => {
+                    let [inner] = expr.inputs();
+                    pending.push(DisplayToken::Text(")"));
+                    pending.push(DisplayToken::Node(inner));
+                    pending.push(DisplayToken::Text("NOT ("));
+                }
+                Predicate::Unary(expr) => write!(f, "{expr}")?,
+                Predicate::Binary(expr) => write!(f, "{expr}")?,
+                Predicate::Set(expr) => write!(f, "{expr}")?,
             }
         }
+        Ok(())
     }
 }
 
@@ -767,35 +915,69 @@ impl Predicate {
     /// let result = expr2.negate();
     /// assert_eq!(&format!("{result}"), "(b >= 5) OR (c >= 10)");
     /// ```
-    pub fn negate(self) -> Predicate {
-        match self {
-            Predicate::AlwaysTrue => Predicate::AlwaysFalse,
-            Predicate::AlwaysFalse => Predicate::AlwaysTrue,
-            Predicate::And(expr) => Predicate::Or(LogicalExpression::new(
-                expr.inputs.map(|expr| Box::new(expr.negate())),
-            )),
-            Predicate::Or(expr) => Predicate::And(LogicalExpression::new(
-                expr.inputs.map(|expr| Box::new(expr.negate())),
-            )),
-            Predicate::Not(expr) => {
-                let LogicalExpression { inputs: [input_0] } = expr;
-                *input_0
+    /// # Stack safety
+    ///
+    /// De Morgan's laws push the negation through every `AND`/`OR` level, so the walk is as deep
+    /// as the tree. It is written as an **in-place, explicit-stack** rewrite rather than a
+    /// recursion (CLAUDE.md "Recursion" rule, second alternative): `negate` is infallible and
+    /// public, so it has no way to report a depth error, and a recursive form would abort the
+    /// process on a deep hand-built or deserialized tree.
+    pub fn negate(mut self) -> Predicate {
+        // Every step relabels ONE node in place and, for `AND`/`OR` only, queues its two children.
+        // Correctness relies on `PredicateOperator::negate` being arity-preserving (unary↔unary,
+        // binary↔binary, set↔set), so no node ever changes shape.
+        let mut pending: Vec<&mut Predicate> = vec![&mut self];
+        while let Some(node) = pending.pop() {
+            // `AlwaysTrue` is a placeholder: it is overwritten before the loop can observe it.
+            let (negated, descend) = match std::mem::replace(node, Predicate::AlwaysTrue) {
+                Predicate::AlwaysTrue => (Predicate::AlwaysFalse, false),
+                Predicate::AlwaysFalse => (Predicate::AlwaysTrue, false),
+                Predicate::And(expr) => (Predicate::Or(expr), true),
+                Predicate::Or(expr) => (Predicate::And(expr), true),
+                // `NOT` cancels: the inner tree is spliced in UNCHANGED, so it must not be
+                // queued — descending into it would negate an already-correct subtree.
+                Predicate::Not(expr) => {
+                    let LogicalExpression { inputs: [input_0] } = expr;
+                    (*input_0, false)
+                }
+                Predicate::Unary(expr) => (
+                    Predicate::Unary(UnaryExpression::new(expr.op.negate(), expr.term)),
+                    false,
+                ),
+                Predicate::Binary(expr) => (
+                    Predicate::Binary(BinaryExpression::new(
+                        expr.op.negate(),
+                        expr.term,
+                        expr.literal,
+                    )),
+                    false,
+                ),
+                Predicate::Set(expr) => (
+                    Predicate::Set(SetExpression::new(
+                        expr.op.negate(),
+                        expr.term,
+                        expr.literals,
+                    )),
+                    false,
+                ),
+            };
+            *node = negated;
+
+            if descend {
+                match node {
+                    Predicate::And(expr) | Predicate::Or(expr) => {
+                        let [left, right] = &mut expr.inputs;
+                        pending.push(right);
+                        pending.push(left);
+                    }
+                    // Unreachable: `descend` is only set by the two arms above.
+                    _ => {}
+                }
             }
-            Predicate::Unary(expr) => {
-                Predicate::Unary(UnaryExpression::new(expr.op.negate(), expr.term))
-            }
-            Predicate::Binary(expr) => Predicate::Binary(BinaryExpression::new(
-                expr.op.negate(),
-                expr.term,
-                expr.literal,
-            )),
-            Predicate::Set(expr) => Predicate::Set(SetExpression::new(
-                expr.op.negate(),
-                expr.term,
-                expr.literals,
-            )),
         }
+        self
     }
+
     /// Simplifies the expression by removing `NOT` predicates,
     /// directly negating the inner expressions instead. The transformation
     /// applies logical laws (such as De Morgan's laws) to
@@ -815,9 +997,99 @@ impl Predicate {
     ///
     /// assert_eq!(&format!("{result}"), "a >= 5");
     /// ```
+    ///
+    /// # Stack safety and infallibility
+    ///
+    /// This is an **explicit-stack** post-order rewrite; it deliberately does NOT route through
+    /// `expr::visitors::predicate_visitor::visit` (deliberately not an intra-doc link: that module
+    /// is `#[cfg(test)]` as of this rewrite, so a link would not resolve in published docs). That
+    /// walk is recursive and
+    /// depth-limited, so driving `rewrite_not` through it would have made an infallible `pub`
+    /// method — reachable from infallible builders such as `TableScanBuilder::with_filter` —
+    /// abort the process on a deep filter. The iterative form neither overflows the stack nor
+    /// panics, and the depth limit still applies where it can be reported: at
+    /// [`Predicate::bind`].
+    ///
+    /// One deliberate consequence: the visitor form returned `DataInvalid` for a predicate
+    /// carrying an operator of the wrong arity (e.g. a unary node holding `Eq`), which
+    /// `rewrite_not` could only turn into a panic. Here such a node passes through untouched and
+    /// the typed error is raised by [`Predicate::bind`] or by the visitors, which can report it.
+    /// Outside `cfg(test)` such a value is unconstructable anyway: `UnaryExpression::new` and
+    /// friends guard arity, and the serde boundary rejects it.
     pub fn rewrite_not(self) -> Predicate {
-        visit(&mut RewriteNotVisitor::new(), &self)
-            .expect("RewriteNotVisitor guarantees always success")
+        /// A suspended parent waiting on the child currently being rewritten.
+        enum Frame {
+            /// An `AND` whose left child is being rewritten; holds the unvisited right child.
+            AndRight(Predicate),
+            /// An `AND` whose right child is being rewritten; holds the rewritten left child.
+            AndCombine(Predicate),
+            /// An `OR` whose left child is being rewritten; holds the unvisited right child.
+            OrRight(Predicate),
+            /// An `OR` whose right child is being rewritten; holds the rewritten left child.
+            OrCombine(Predicate),
+            /// A `NOT` whose inner child is being rewritten.
+            Negate,
+        }
+
+        let mut node = self;
+        let mut frames: Vec<Frame> = Vec::new();
+        let value: Predicate;
+
+        'descend: loop {
+            // Walk down the left spine, suspending each logical node, until a leaf is reached.
+            let mut leaf = loop {
+                match node {
+                    Predicate::And(expr) => {
+                        let LogicalExpression {
+                            inputs: [left, right],
+                        } = expr;
+                        frames.push(Frame::AndRight(*right));
+                        node = *left;
+                    }
+                    Predicate::Or(expr) => {
+                        let LogicalExpression {
+                            inputs: [left, right],
+                        } = expr;
+                        frames.push(Frame::OrRight(*right));
+                        node = *left;
+                    }
+                    Predicate::Not(expr) => {
+                        let LogicalExpression { inputs: [inner] } = expr;
+                        frames.push(Frame::Negate);
+                        node = *inner;
+                    }
+                    // `AlwaysTrue`/`AlwaysFalse`/`Unary`/`Binary`/`Set` rewrite to themselves,
+                    // exactly as `RewriteNotVisitor`'s leaf methods did (it cloned; we move).
+                    other => break other,
+                }
+            };
+
+            // Resume suspended parents while their result is complete. The loop returns when the
+            // frame stack empties, so the function is total without an `unwrap`/`expect`.
+            loop {
+                match frames.pop() {
+                    None => {
+                        value = leaf;
+                        break 'descend;
+                    }
+                    Some(Frame::AndRight(right)) => {
+                        frames.push(Frame::AndCombine(leaf));
+                        node = right;
+                        continue 'descend;
+                    }
+                    Some(Frame::AndCombine(left)) => leaf = left.and(leaf),
+                    Some(Frame::OrRight(right)) => {
+                        frames.push(Frame::OrCombine(leaf));
+                        node = right;
+                        continue 'descend;
+                    }
+                    Some(Frame::OrCombine(left)) => leaf = left.or(leaf),
+                    Some(Frame::Negate) => leaf = leaf.negate(),
+                }
+            }
+        }
+
+        value
     }
 }
 
@@ -878,34 +1150,58 @@ impl BoundPredicate {
         BoundPredicate::Or(LogicalExpression::new([Box::new(self), Box::new(other)]))
     }
 
-    pub(crate) fn negate(self) -> BoundPredicate {
-        match self {
-            BoundPredicate::AlwaysTrue => BoundPredicate::AlwaysFalse,
-            BoundPredicate::AlwaysFalse => BoundPredicate::AlwaysTrue,
-            BoundPredicate::And(expr) => BoundPredicate::Or(LogicalExpression::new(
-                expr.inputs.map(|expr| Box::new(expr.negate())),
-            )),
-            BoundPredicate::Or(expr) => BoundPredicate::And(LogicalExpression::new(
-                expr.inputs.map(|expr| Box::new(expr.negate())),
-            )),
-            BoundPredicate::Not(expr) => {
-                let LogicalExpression { inputs: [input_0] } = expr;
-                *input_0
+    /// In-place, explicit-stack negation — the bound twin of [`Predicate::negate`]; see that
+    /// method's `# Stack safety` note for why it is not recursive.
+    pub(crate) fn negate(mut self) -> BoundPredicate {
+        let mut pending: Vec<&mut BoundPredicate> = vec![&mut self];
+        while let Some(node) = pending.pop() {
+            // `AlwaysTrue` is a placeholder: it is overwritten before the loop can observe it.
+            let (negated, descend) = match std::mem::replace(node, BoundPredicate::AlwaysTrue) {
+                BoundPredicate::AlwaysTrue => (BoundPredicate::AlwaysFalse, false),
+                BoundPredicate::AlwaysFalse => (BoundPredicate::AlwaysTrue, false),
+                BoundPredicate::And(expr) => (BoundPredicate::Or(expr), true),
+                BoundPredicate::Or(expr) => (BoundPredicate::And(expr), true),
+                // `NOT` cancels: the inner tree is spliced in UNCHANGED and must not be queued.
+                BoundPredicate::Not(expr) => {
+                    let LogicalExpression { inputs: [input_0] } = expr;
+                    (*input_0, false)
+                }
+                BoundPredicate::Unary(expr) => (
+                    BoundPredicate::Unary(UnaryExpression::new(expr.op.negate(), expr.term)),
+                    false,
+                ),
+                BoundPredicate::Binary(expr) => (
+                    BoundPredicate::Binary(BinaryExpression::new(
+                        expr.op.negate(),
+                        expr.term,
+                        expr.literal,
+                    )),
+                    false,
+                ),
+                BoundPredicate::Set(expr) => (
+                    BoundPredicate::Set(SetExpression::new(
+                        expr.op.negate(),
+                        expr.term,
+                        expr.literals,
+                    )),
+                    false,
+                ),
+            };
+            *node = negated;
+
+            if descend {
+                match node {
+                    BoundPredicate::And(expr) | BoundPredicate::Or(expr) => {
+                        let [left, right] = &mut expr.inputs;
+                        pending.push(right);
+                        pending.push(left);
+                    }
+                    // Unreachable: `descend` is only set by the two arms above.
+                    _ => {}
+                }
             }
-            BoundPredicate::Unary(expr) => {
-                BoundPredicate::Unary(UnaryExpression::new(expr.op.negate(), expr.term))
-            }
-            BoundPredicate::Binary(expr) => BoundPredicate::Binary(BinaryExpression::new(
-                expr.op.negate(),
-                expr.term,
-                expr.literal,
-            )),
-            BoundPredicate::Set(expr) => BoundPredicate::Set(SetExpression::new(
-                expr.op.negate(),
-                expr.term,
-                expr.literals,
-            )),
         }
+        self
     }
 
     /// Simplifies the expression by removing `NOT` predicates,
@@ -926,40 +1222,128 @@ impl BoundPredicate {
     /// // let expression = bound_predicate.not();
     /// // let result = expression.rewrite_not();
     /// ```
+    ///
+    /// # Stack safety and infallibility
+    ///
+    /// Explicit-stack post-order rewrite, the bound twin of [`Predicate::rewrite_not`]; see that
+    /// method for why it does not route through the recursive, depth-limited bound visitor.
     pub fn rewrite_not(self) -> BoundPredicate {
-        visit_bound(&mut RewriteNotVisitor::new(), &self)
-            .expect("RewriteNotVisitor guarantees always success")
+        /// A suspended parent waiting on the child currently being rewritten.
+        enum Frame {
+            /// An `AND` whose left child is being rewritten; holds the unvisited right child.
+            AndRight(BoundPredicate),
+            /// An `AND` whose right child is being rewritten; holds the rewritten left child.
+            AndCombine(BoundPredicate),
+            /// An `OR` whose left child is being rewritten; holds the unvisited right child.
+            OrRight(BoundPredicate),
+            /// An `OR` whose right child is being rewritten; holds the rewritten left child.
+            OrCombine(BoundPredicate),
+            /// A `NOT` whose inner child is being rewritten.
+            Negate,
+        }
+
+        let mut node = self;
+        let mut frames: Vec<Frame> = Vec::new();
+        let value: BoundPredicate;
+
+        'descend: loop {
+            let mut leaf = loop {
+                match node {
+                    BoundPredicate::And(expr) => {
+                        let LogicalExpression {
+                            inputs: [left, right],
+                        } = expr;
+                        frames.push(Frame::AndRight(*right));
+                        node = *left;
+                    }
+                    BoundPredicate::Or(expr) => {
+                        let LogicalExpression {
+                            inputs: [left, right],
+                        } = expr;
+                        frames.push(Frame::OrRight(*right));
+                        node = *left;
+                    }
+                    BoundPredicate::Not(expr) => {
+                        let LogicalExpression { inputs: [inner] } = expr;
+                        frames.push(Frame::Negate);
+                        node = *inner;
+                    }
+                    other => break other,
+                }
+            };
+
+            loop {
+                match frames.pop() {
+                    None => {
+                        value = leaf;
+                        break 'descend;
+                    }
+                    Some(Frame::AndRight(right)) => {
+                        frames.push(Frame::AndCombine(leaf));
+                        node = right;
+                        continue 'descend;
+                    }
+                    Some(Frame::AndCombine(left)) => leaf = left.and(leaf),
+                    Some(Frame::OrRight(right)) => {
+                        frames.push(Frame::OrCombine(leaf));
+                        node = right;
+                        continue 'descend;
+                    }
+                    Some(Frame::OrCombine(left)) => leaf = left.or(leaf),
+                    Some(Frame::Negate) => leaf = leaf.negate(),
+                }
+            }
+        }
+
+        value
     }
 }
 
 impl Display for BoundPredicate {
+    /// Explicit-stack rendering, the bound twin of the [`Predicate`] impl; see it for why
+    /// `Display` must not recurse. The emitted text is byte-identical to the recursive form
+    /// (note the bound spelling `True`/`False`, which differs from the unbound `TRUE`/`FALSE`).
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BoundPredicate::AlwaysTrue => {
-                write!(f, "True")
-            }
-            BoundPredicate::AlwaysFalse => {
-                write!(f, "False")
-            }
-            BoundPredicate::And(expr) => {
-                write!(f, "({}) AND ({})", expr.inputs()[0], expr.inputs()[1])
-            }
-            BoundPredicate::Or(expr) => {
-                write!(f, "({}) OR ({})", expr.inputs()[0], expr.inputs()[1])
-            }
-            BoundPredicate::Not(expr) => {
-                write!(f, "NOT ({})", expr.inputs()[0])
-            }
-            BoundPredicate::Unary(expr) => {
-                write!(f, "{expr}")
-            }
-            BoundPredicate::Binary(expr) => {
-                write!(f, "{expr}")
-            }
-            BoundPredicate::Set(expr) => {
-                write!(f, "{expr}")
+        let mut pending = vec![DisplayToken::Node(self)];
+        while let Some(token) = pending.pop() {
+            let node = match token {
+                DisplayToken::Text(text) => {
+                    f.write_str(text)?;
+                    continue;
+                }
+                DisplayToken::Node(node) => node,
+            };
+            match node {
+                BoundPredicate::AlwaysTrue => f.write_str("True")?,
+                BoundPredicate::AlwaysFalse => f.write_str("False")?,
+                BoundPredicate::And(expr) => {
+                    let [left, right] = expr.inputs();
+                    pending.push(DisplayToken::Text(")"));
+                    pending.push(DisplayToken::Node(right));
+                    pending.push(DisplayToken::Text(") AND ("));
+                    pending.push(DisplayToken::Node(left));
+                    pending.push(DisplayToken::Text("("));
+                }
+                BoundPredicate::Or(expr) => {
+                    let [left, right] = expr.inputs();
+                    pending.push(DisplayToken::Text(")"));
+                    pending.push(DisplayToken::Node(right));
+                    pending.push(DisplayToken::Text(") OR ("));
+                    pending.push(DisplayToken::Node(left));
+                    pending.push(DisplayToken::Text("("));
+                }
+                BoundPredicate::Not(expr) => {
+                    let [inner] = expr.inputs();
+                    pending.push(DisplayToken::Text(")"));
+                    pending.push(DisplayToken::Node(inner));
+                    pending.push(DisplayToken::Text("NOT ("));
+                }
+                BoundPredicate::Unary(expr) => write!(f, "{expr}")?,
+                BoundPredicate::Binary(expr) => write!(f, "{expr}")?,
+                BoundPredicate::Set(expr) => write!(f, "{expr}")?,
             }
         }
+        Ok(())
     }
 }
 
@@ -968,9 +1352,20 @@ mod tests {
     use std::ops::Not;
     use std::sync::Arc;
 
+    use fnv::FnvHashSet;
+
+    use super::MAX_PREDICATE_DEPTH;
     use crate::expr::Predicate::{AlwaysFalse, AlwaysTrue};
-    use crate::expr::{Bind, BoundPredicate, Reference};
+    use crate::expr::visitors::bound_predicate_visitor::{
+        BoundPredicateVisitor, visit as visit_bound,
+    };
+    use crate::expr::visitors::predicate_visitor::visit as visit_unbound;
+    use crate::expr::visitors::rewrite_not::RewriteNotVisitor;
+    use crate::expr::{
+        Bind, BoundPredicate, BoundReference, LogicalExpression, Predicate, Reference,
+    };
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::{ErrorKind, Result};
 
     #[test]
     fn test_logical_or_rewrite_not() {
@@ -1171,6 +1566,448 @@ mod tests {
         let serialized = serde_json::to_string(&bound_predicate).unwrap();
         let deserialized: BoundPredicate = serde_json::from_str(&serialized).unwrap();
         assert_eq!(bound_predicate, deserialized);
+    }
+
+    fn nested_logical_predicate(depth: usize) -> Predicate {
+        let mut predicate = Predicate::AlwaysTrue;
+        for level in 0..depth {
+            predicate = match level % 3 {
+                0 => Predicate::Not(LogicalExpression::new([Box::new(predicate)])),
+                1 => Predicate::And(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(Predicate::AlwaysTrue),
+                ])),
+                _ => Predicate::Or(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(Predicate::AlwaysFalse),
+                ])),
+            };
+        }
+        predicate
+    }
+
+    /// The measured dev-profile cost of one `Predicate::bind` recursion level, in bytes — the
+    /// worst of the three recursive walks and the figure recorded on [`MAX_PREDICATE_DEPTH`].
+    ///
+    /// The depth tests below size their own thread from it rather than trusting whatever stack
+    /// the harness happens to give a test thread, so a raised limit shows up as a test failure
+    /// rather than as a stack-overflow abort on somebody else's machine.
+    const DEV_BYTES_PER_BIND_LEVEL: usize = 5_504;
+
+    /// Runs `body` on a thread whose stack is sized for `depth` levels of the deepest recursive
+    /// walk, with a 3× margin over the measured dev-profile cost.
+    fn with_stack_for_depth<T: Send + 'static>(
+        depth: usize,
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let stack_size = (3 * DEV_BYTES_PER_BIND_LEVEL * depth).max(2 * 1024 * 1024);
+        std::thread::Builder::new()
+            .stack_size(stack_size)
+            .spawn(body)
+            .expect("spawning the depth-test thread must succeed")
+            .join()
+            .expect("the depth-test thread must not panic or overflow its stack")
+    }
+
+    /// A left-spine `AND` chain of `conjuncts` binary leaves — the shape both
+    /// `DeleteFilter::build_equality_delete_predicate` (one conjunct per equality-delete file)
+    /// and `iceberg-datafusion`'s `expr_to_predicate` (one conjunct per pushed-down filter)
+    /// build, and therefore the shape whose depth `MAX_PREDICATE_DEPTH` has to clear.
+    fn left_folded_conjunction(conjuncts: usize) -> Predicate {
+        let mut predicate = Predicate::AlwaysTrue;
+        for i in 0..conjuncts {
+            let value = i32::try_from(i).expect("the test corpus stays inside i32");
+            predicate = predicate.and(Reference::new("bar").equal_to(Datum::int(value)));
+        }
+        predicate
+    }
+
+    /// FINDING 4 / FINDING 11 regression pin: the depth a realistic upsert table produces must
+    /// BIND and VISIT, not fail.
+    ///
+    /// 512 equality-delete files attached to one data file, each contributing a 12-level balanced
+    /// per-file fold (4,096 delete rows) plus the one level the cross-file LEFT fold adds. Java
+    /// reads this table — `Binder.bind` / `ExpressionVisitors.visit` in `iceberg-api` 1.10.0 have
+    /// no depth counter at all — so failing it is a parity break, not a safety win. RED at the
+    /// old `MAX_PREDICATE_DEPTH = 100`, and at anything below 524.
+    #[test]
+    fn eq_delete_fold_depth_binds_and_visits() {
+        const EQ_DELETE_FILES: usize = 512;
+        const PER_FILE_FOLD_LEVELS: usize = 12;
+        let depth = EQ_DELETE_FILES + PER_FILE_FOLD_LEVELS;
+        assert!(
+            depth <= MAX_PREDICATE_DEPTH,
+            "the eq-delete fold shape must stay inside the limit"
+        );
+
+        let schema = table_schema_simple();
+        with_stack_for_depth(depth, move || {
+            let predicate = left_folded_conjunction(depth);
+            let bound = predicate
+                .bind(schema, true)
+                .expect("a realistic equality-delete fold must bind");
+
+            let mut evaluator = DepthCountingVisitor { combinators: 0 };
+            let leaves = visit_bound(&mut evaluator, &bound)
+                .expect("a realistic equality-delete fold must visit");
+            assert_eq!(leaves, depth, "every conjunct must reach the visitor");
+        });
+    }
+
+    /// The limit is inclusive on both of the walks that enforce it, and rejecting is a typed
+    /// `DataInvalid` — never a panic. Catches `depth > MAX` drifting to `depth >= MAX`.
+    #[test]
+    fn bind_and_visit_depth_limit_is_inclusive() {
+        let schema = table_schema_simple();
+        with_stack_for_depth(MAX_PREDICATE_DEPTH + 2, move || {
+            let at_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH);
+            let bound = at_limit
+                .bind(schema.clone(), true)
+                .expect("binding exactly at the nesting limit must succeed");
+            let mut evaluator = DepthCountingVisitor { combinators: 0 };
+            assert!(visit_bound(&mut evaluator, &bound).is_ok());
+
+            let beyond_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH + 1);
+            let error = beyond_limit
+                .bind(schema, true)
+                .expect_err("binding beyond the logical nesting limit must be rejected");
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            assert!(error.to_string().contains("maximum depth"));
+        });
+    }
+
+    /// A trivial bound visitor that counts leaves; used to prove a deep tree is actually walked.
+    struct DepthCountingVisitor {
+        combinators: usize,
+    }
+
+    impl BoundPredicateVisitor for DepthCountingVisitor {
+        type T = usize;
+
+        fn always_true(&mut self) -> Result<usize> {
+            Ok(0)
+        }
+        fn always_false(&mut self) -> Result<usize> {
+            Ok(0)
+        }
+        fn and(&mut self, lhs: usize, rhs: usize) -> Result<usize> {
+            self.combinators += 1;
+            Ok(lhs + rhs)
+        }
+        fn or(&mut self, lhs: usize, rhs: usize) -> Result<usize> {
+            self.combinators += 1;
+            Ok(lhs + rhs)
+        }
+        fn not(&mut self, inner: usize) -> Result<usize> {
+            Ok(inner)
+        }
+        fn is_null(&mut self, _r: &BoundReference, _p: &BoundPredicate) -> Result<usize> {
+            Ok(1)
+        }
+        fn not_null(&mut self, _r: &BoundReference, _p: &BoundPredicate) -> Result<usize> {
+            Ok(1)
+        }
+        fn is_nan(&mut self, _r: &BoundReference, _p: &BoundPredicate) -> Result<usize> {
+            Ok(1)
+        }
+        fn not_nan(&mut self, _r: &BoundReference, _p: &BoundPredicate) -> Result<usize> {
+            Ok(1)
+        }
+        fn less_than(
+            &mut self,
+            _r: &BoundReference,
+            _l: &Datum,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+        fn less_than_or_eq(
+            &mut self,
+            _r: &BoundReference,
+            _l: &Datum,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+        fn greater_than(
+            &mut self,
+            _r: &BoundReference,
+            _l: &Datum,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+        fn greater_than_or_eq(
+            &mut self,
+            _r: &BoundReference,
+            _l: &Datum,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+        fn eq(&mut self, _r: &BoundReference, _l: &Datum, _p: &BoundPredicate) -> Result<usize> {
+            Ok(1)
+        }
+        fn not_eq(
+            &mut self,
+            _r: &BoundReference,
+            _l: &Datum,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+        fn starts_with(
+            &mut self,
+            _r: &BoundReference,
+            _l: &Datum,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+        fn not_starts_with(
+            &mut self,
+            _r: &BoundReference,
+            _l: &Datum,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+        fn r#in(
+            &mut self,
+            _r: &BoundReference,
+            _l: &FnvHashSet<Datum>,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+        fn not_in(
+            &mut self,
+            _r: &BoundReference,
+            _l: &FnvHashSet<Datum>,
+            _p: &BoundPredicate,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+    }
+
+    /// A corpus of unbound shapes that exercises every arm the rewrites can take: both logical
+    /// arities, `NOT` over each of them, stacked `NOT`s, the constant-folding doors in
+    /// `Predicate::and`/`or`, and one leaf of each expression kind.
+    fn rewrite_corpus() -> Vec<Predicate> {
+        let lt = || Reference::new("bar").less_than(Datum::int(40));
+        let gt = || Reference::new("bar").greater_than(Datum::int(3));
+        let null = || Reference::new("foo").is_null();
+        let set = || Reference::new("bar").is_in([Datum::int(1), Datum::int(2)]);
+
+        vec![
+            Predicate::AlwaysTrue,
+            Predicate::AlwaysFalse,
+            lt(),
+            null(),
+            set(),
+            lt().not(),
+            null().not(),
+            set().not(),
+            lt().not().not(),
+            lt().not().not().not(),
+            lt().and(gt()),
+            lt().or(gt()),
+            lt().and(gt()).not(),
+            lt().or(gt()).not(),
+            lt().and(gt()).not().not(),
+            lt().and(null().or(set())).not(),
+            lt().not().and(gt().not()).or(set().not()).not(),
+            Predicate::And(LogicalExpression::new([
+                Box::new(Predicate::AlwaysTrue),
+                Box::new(lt()),
+            ])),
+            Predicate::Or(LogicalExpression::new([
+                Box::new(Predicate::AlwaysFalse),
+                Box::new(lt()),
+            ])),
+            Predicate::Not(LogicalExpression::new([Box::new(Predicate::And(
+                LogicalExpression::new([Box::new(Predicate::AlwaysTrue), Box::new(lt())]),
+            ))])),
+            nested_logical_predicate(9),
+            left_folded_conjunction(6),
+        ]
+    }
+
+    /// Differential oracle for the explicit-stack `Predicate::rewrite_not`.
+    ///
+    /// The iterative walk must produce exactly what the `RewriteNotVisitor` post-order visit
+    /// produced before it replaced that route — that visitor is retained under `cfg(test)` for
+    /// precisely this comparison. Catches swapping `and`/`or` in the combine step, reversing the
+    /// child order, dropping the `Negate` frame, and splicing a cancelled `NOT` wrongly.
+    #[test]
+    fn rewrite_not_matches_the_visitor_oracle() {
+        for predicate in rewrite_corpus() {
+            let oracle = visit_unbound(&mut RewriteNotVisitor::new(), &predicate)
+                .expect("the corpus contains no malformed operators");
+            let iterative = predicate.clone().rewrite_not();
+            assert_eq!(
+                iterative, oracle,
+                "iterative rewrite_not diverged from the visitor on {predicate}"
+            );
+        }
+    }
+
+    /// Differential oracle for the explicit-stack `BoundPredicate::rewrite_not`.
+    #[test]
+    fn bound_rewrite_not_matches_the_visitor_oracle() {
+        let schema = table_schema_simple();
+        for predicate in rewrite_corpus() {
+            let bound = predicate
+                .bind(schema.clone(), true)
+                .expect("the corpus binds against the simple test schema");
+            let oracle = visit_bound(&mut RewriteNotVisitor::new(), &bound)
+                .expect("the corpus contains no malformed operators");
+            let iterative = bound.clone().rewrite_not();
+            assert_eq!(
+                iterative, oracle,
+                "iterative bound rewrite_not diverged from the visitor on {bound}"
+            );
+        }
+    }
+
+    /// `negate` must splice a cancelled `NOT`'s subtree in UNCHANGED.
+    ///
+    /// Catches queueing the spliced child in the explicit-stack walk (`descend = true` on the
+    /// `Not` arm), which would negate an already-correct subtree: `NOT((a < 40) AND (b > 3))`
+    /// would come back as `(a >= 40) OR (b <= 3)` instead of the inner conjunction.
+    #[test]
+    fn negate_splices_a_cancelled_not_without_descending() {
+        let inner = Reference::new("bar")
+            .less_than(Datum::int(40))
+            .and(Reference::new("foo").is_null());
+        let negated = inner.clone().not().negate();
+        assert_eq!(negated, inner);
+        assert_eq!(&format!("{negated}"), "(bar < 40) AND (foo IS NULL)");
+    }
+
+    /// A hand-written recursive renderer, used only as the `Display` oracle.
+    fn render_recursively(predicate: &Predicate) -> String {
+        match predicate {
+            Predicate::AlwaysTrue => "TRUE".to_string(),
+            Predicate::AlwaysFalse => "FALSE".to_string(),
+            Predicate::And(expr) => {
+                let [l, r] = expr.inputs();
+                format!(
+                    "({}) AND ({})",
+                    render_recursively(l),
+                    render_recursively(r)
+                )
+            }
+            Predicate::Or(expr) => {
+                let [l, r] = expr.inputs();
+                format!("({}) OR ({})", render_recursively(l), render_recursively(r))
+            }
+            Predicate::Not(expr) => {
+                let [inner] = expr.inputs();
+                format!("NOT ({})", render_recursively(inner))
+            }
+            Predicate::Unary(expr) => format!("{expr}"),
+            Predicate::Binary(expr) => format!("{expr}"),
+            Predicate::Set(expr) => format!("{expr}"),
+        }
+    }
+
+    /// The explicit-stack `Display` must be byte-identical to the recursive form it replaced.
+    ///
+    /// Catches an out-of-order token push (the stack is filled in reverse), a dropped parenthesis,
+    /// and the wrong separator on either logical arm.
+    #[test]
+    fn display_matches_the_recursive_rendering() {
+        for predicate in rewrite_corpus() {
+            assert_eq!(
+                format!("{predicate}"),
+                render_recursively(&predicate),
+                "explicit-stack Display diverged from the recursive rendering"
+            );
+        }
+    }
+
+    /// `rewrite_not`, `negate` and `Display` must consume O(1) stack — they are infallible and
+    /// `pub`, so they have no way to report a depth error and must not be depth-limited either.
+    ///
+    /// Run 50× beyond `MAX_PREDICATE_DEPTH` on a deliberately small 2 MiB stack (a tokio worker's
+    /// default). A recursive form of ANY of the three aborts the process here: even the cheapest
+    /// of them costs hundreds of bytes per level, so 2 MiB runs out around a few thousand levels.
+    #[test]
+    fn deep_trees_are_rewritten_negated_and_rendered_without_recursion() {
+        const DEPTH: usize = 50_000;
+        const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
+
+        let handle = std::thread::Builder::new()
+            .stack_size(TOKIO_WORKER_STACK)
+            .spawn(|| {
+                // `NOT` at every level, so `rewrite_not` must run its `Negate` frame 50,000 times
+                // and `negate` must walk the whole spine. Built fresh for each subject: the
+                // DERIVED `Clone`, `PartialEq` and `Drop` glue all recurse (see the residue note
+                // below), so a deep tree must never be cloned, compared or dropped here.
+                let build_deep = || {
+                    let mut deep = Reference::new("bar").less_than(Datum::int(40));
+                    for _ in 0..DEPTH {
+                        deep = deep.not();
+                    }
+                    deep
+                };
+
+                // Render / rewrite / negate FIRST, leak the tree, and only then assert: a failing
+                // assertion would otherwise unwind through the recursive derived `Drop` and abort
+                // the process instead of reporting the failure.
+                let subject = build_deep();
+                let rendered = format!("{subject}");
+                std::mem::forget(subject);
+
+                // 50,000 stacked NOTs cancel in pairs, leaving the original leaf.
+                let rewritten = build_deep().rewrite_not();
+                let rewritten_text = format!("{rewritten}");
+                std::mem::forget(rewritten);
+
+                // One NOT peeled off the front, nothing else touched.
+                let negated = build_deep().negate();
+                let negated_text = format!("{negated}");
+                std::mem::forget(negated);
+
+                // A `NOT` chain never makes `negate` recurse — its `Not` arm splices and stops —
+                // so the second subject is a left-spine `AND`, whose De Morgan rewrite descends
+                // every level. This is also the shape `Display` and `rewrite_not` recurse on.
+                let spine = left_folded_conjunction(DEPTH);
+                let spine_text = format!("{spine}");
+                std::mem::forget(spine);
+
+                let spine_negated = left_folded_conjunction(DEPTH).negate();
+                let spine_negated_text = format!("{spine_negated}");
+                std::mem::forget(spine_negated);
+
+                let spine_rewritten = left_folded_conjunction(DEPTH).rewrite_not();
+                let spine_rewritten_text = format!("{spine_rewritten}");
+                std::mem::forget(spine_rewritten);
+
+                assert!(rendered.starts_with("NOT (NOT ("));
+                assert_eq!(rendered.matches("NOT (").count(), DEPTH);
+                assert_eq!(rendered.matches("bar < 40").count(), 1);
+                assert_eq!(rendered.matches(')').count(), DEPTH);
+                assert_eq!(rewritten_text, "bar < 40");
+                assert_eq!(negated_text, rendered[5..rendered.len() - 1]);
+
+                // De Morgan turns every one of the 49,999 `AND`s into an `OR` and every `=` leaf
+                // into a `!=`; `rewrite_not` leaves a NOT-free tree alone.
+                assert_eq!(spine_text.matches(") AND (").count(), DEPTH - 1);
+                assert_eq!(spine_negated_text.matches(") OR (").count(), DEPTH - 1);
+                assert_eq!(spine_negated_text.matches(") AND (").count(), 0);
+                assert_eq!(spine_negated_text.matches("bar != ").count(), DEPTH);
+                assert_eq!(spine_rewritten_text, spine_text);
+
+                // Dropping a tree this deep still recurses — the derived `Drop` glue is the one
+                // walk no depth check can intercept (named as residue). Leaking is deliberate:
+                // the test measures the rewrites, not `Drop`.
+            })
+            .expect("spawning the deep-tree thread must succeed");
+        handle
+            .join()
+            .expect("the iterative walks must not overflow a 2 MiB stack");
     }
 
     #[test]

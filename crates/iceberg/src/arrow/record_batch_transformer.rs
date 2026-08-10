@@ -450,7 +450,7 @@ impl RecordBatchTransformer {
                             ErrorKind::Unexpected,
                             "constant field not found",
                         ))?;
-                        let arrow_type = datum_to_arrow_type_with_ree(datum);
+                        let arrow_type = datum_to_arrow_type_with_ree(datum)?;
                         let arrow_field =
                             Field::new(&iceberg_field.name, arrow_type, !iceberg_field.required)
                                 .with_metadata(HashMap::from([(
@@ -628,7 +628,7 @@ impl RecordBatchTransformer {
                     //    is a PLAIN repeated array of that type. Emitting REE for these is the bug
                     //    that broke `test_insert_into_partitioned`.
                     let target_type = if get_metadata_field(*field_id).is_ok() {
-                        datum_to_arrow_type_with_ree(datum)
+                        datum_to_arrow_type_with_ree(datum)?
                     } else {
                         field_id_to_mapped_schema_map
                             .get(field_id)

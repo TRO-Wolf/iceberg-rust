@@ -31,7 +31,164 @@ How to use it (see the manuals' §1):
 
 ---
 
-## IN FLIGHT — U3 / hazard-1: midpoint row-group selection (branch `fix/ranged-read-midpoint-rowgroups`)
+## ACTIVE (2026-08-08): 2026-08 audit hardening — SEPMO bundled branch
+
+Branch: `fix/2026-08-audit-hardening`. User approved the 8/8 proposition ledger on 2026-08-08.
+Delivery mode: one bundled branch/PR with clause-separated groups, an independent fresh-context
+Critic after every group, and an independent bundle-scope closing Critic. Every group is STANDARD
+(public API, data-integrity, or security surface); the repository severity floor is S2.
+
+Frozen charter clauses: C-001 decimal construction/conversion invariants; C-002 typed failures for
+short partition structs and manifest summaries; C-003 bounded predicate/Arrow/schema-evolution
+recursion; C-004 qualified DataFusion namespaces; C-005 byte-weighted cache-moka capacity; C-006
+REST Error/source and table/view Debug secret redaction; C-007 preserve the existing trusted-catalog,
+Java-parity, on-disk-format, and dependency contracts; C-008 deliver the bound SEPMO evidence and
+green gates. Explicit exclusions: REST endpoint/header trust redesign, LocalFS jail, HMS TLS/SASL,
+V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, dependency changes.
+
+> **Evidence lives in [2026-08-audit-hardening-ledger.md](2026-08-audit-hardening-ledger.md)** — gate
+> records, Critic dispositions, the Invariant V amendments, the scope-delta adjudications and all 31
+> named S3 residues. Per the de-triplication rule this tracker holds one-line statuses only; nothing
+> here restates capability STATUS (that stays in [GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md)).
+
+- [x] **G1 — decimal invariants (C-001, C-007).** In scope:
+      `crates/iceberg/src/spec/datatypes.rs`, `crates/iceberg/src/arrow/schema.rs`,
+      `crates/iceberg/src/arrow/record_batch_transformer.rs`, affected decimal fixture tests in
+      `crates/iceberg/src/spec/values/tests.rs`, `crates/iceberg/src/spec/values/datum.rs`,
+      `crates/iceberg/src/spec/values/serde.rs`, `crates/iceberg/src/spec/values/literal.rs`, and
+      adjacent unit tests. Reject negative/unrepresentable/out-of-domain scale and precision without
+      numeric truncation; preserve valid encodings. The production caller, affected Avro-decimal
+      fixtures, and public Datum boundary additions were explicitly approved by the user on
+      2026-08-08; the RawLiteral and Literal JSON boundary expansion was explicitly approved on
+      2026-08-09 after the second independent Critic filed five S2 findings. Unit gate →
+      independent Critic → recorded disposition.
+      **Done 2026-08-09:** decimal type/value validation covers the constructor/encode paths
+      (`Datum` constructors, `Datum::to_bytes`, Arrow conversion) without truncating casts, and the
+      legacy diagnostics are pinned. Four independent remediation Critic cycles closed all filed
+      S1/S2 findings; verdict at that point was CONVERGED (zero S1/S2).
+      **R1 correction 2026-08-09 (commit `ff53c252`), supersedes the two clauses struck above:** a
+      later independent review filed S2s showing G1 had imposed two invariants Java 1.10.0 does not
+      have, on paths that READ existing on-disk metadata. G1's read-path gates were therefore
+      DELIBERATELY REVERTED to Java permissiveness, so the earlier claims that "canonical encodings
+      are pinned" and that validation "spans Datum/RawLiteral bytes, Serde/JSON, and nested
+      literals" are no longer true of the shipped code and must not be relied on:
+      (a) `Datum::try_from_bytes` no longer requires the canonical minimal two's-complement
+      encoding — Java `Conversions.internalFromByteBuffer` is a bare `new BigInteger(bytes)` — and
+      the replacement test asserts padded encodings decode;
+      (b) `deserialize_decimal` is no longer routed through `Type::decimal`, and
+      `validate_decimal_type` no longer requires `scale <= precision` — Java
+      `Types$DecimalType.<init>` checks only `precision <= 38`;
+      (c) `validate_decimal_value` / `validate_decimal_literal` were removed from five read/JSON
+      doors: the `RawLiteral` bytes arm, the 16-byte list arm, the `RawLiteral` `Int128` write arm,
+      `Literal::try_from_json` / `Literal::try_into_json`, and both `Datum` serde impls.
+      The encode-side anti-truncation gate on `Datum::to_bytes` is RETAINED and mutation-proved.
+      Read/encode split and every Java citation are documented at the call sites. Capability status
+      stays in GAP_MATRIX R87 (already updated); this entry records only that R1 happened, so the
+      G6 bundle-close Critic adjudicates the corrected state rather than the struck clauses.
+      **R1 remediation cycle 1 (this branch):** added a `DatumVisitor::visit_seq` pin (the compact,
+      non-self-describing serde route) to
+      `datum_decimal_serde_round_trip_preserves_java_readable_values`; the previous test reached
+      `visit_map` only, so a re-added gate on the seq arm survived mutation.
+- [x] **G2 — malformed metadata + recursion safety (C-002, C-003, C-007).** In scope:
+      `crates/iceberg/src/expr/accessor.rs`, `crates/iceberg/src/expr/visitors/{predicate_visitor.rs,
+      bound_predicate_visitor.rs,manifest_evaluator.rs}`, `crates/iceberg/src/arrow/schema.rs`,
+      `crates/iceberg/src/transaction/update_schema.rs`, and affected `map.md`/adjacent tests. Return
+      typed errors for short metadata and impose tested traversal limits. Unit gate → independent
+      Critic → recorded disposition.
+      **R2 correction 2026-08-09, supersedes the predicate half of the G2 first pass (`de3961da`):**
+      an independent review filed S2s showing that pass had made the predicate recursion *worse*
+      than main. Remediated in this commit:
+      (a) making `predicate_visitor::visit` / `bound_predicate_visitor::visit` fallible turned the
+      two pre-existing `.expect("RewriteNotVisitor guarantees always success")` calls into a LIVE
+      PANIC reachable from `TableScanBuilder::with_filter`. `Predicate::rewrite_not`,
+      `BoundPredicate::rewrite_not`, both `negate`s and both `Display` impls are now
+      explicit-stack walks that neither recurse nor panic; `rewrite_not` no longer routes through
+      the depth-limited visitor at all, so the typed depth error surfaces at `bind()` where a
+      caller can handle it. The unbound `PredicateVisitor` and `RewriteNotVisitor` lost their last
+      production callers and are `#[cfg(test)]`-retained as the differential oracle.
+      (b) `MAX_PREDICATE_DEPTH` was 100 — copied from the JSON parser and BELOW what this crate's
+      own read path builds, so ~102 equality-delete files or 102 pushed-down conjuncts turned a
+      Java-readable table into a scan failure. It is now 1000, re-derived from a MEASURED
+      per-level stack cost (bisect against a known `stack_size`) sized for a 2 MiB tokio worker;
+      the measurement, the arithmetic and the dev-profile caveat are in the constant's doc
+      comment, and splitting the leaf arms out of the recursive `bind`/`visit` bodies halved the
+      per-level cost that number rests on.
+      **R3 correction 2026-08-09 (`006dc721` + `340fa4ea`) — closes the line above:**
+      `assign_fresh_ids` is no longer unbounded. G2's first pass had hardened `index_parents`, which
+      only ever receives a `Schema` already validated by `SchemaBuilder` against
+      `MAX_SCHEMA_NESTING_DEPTH`, while the walk reachable from the public
+      `UpdateSchemaAction::add_column` took a caller-supplied `Type` with no bound at all. That walk
+      is now bounded at 128 (consistent with the crate's existing constant family) and proved on a
+      small-stack thread, with one independent chain per recursion arm. The false `index_parents`
+      rationale was corrected in the same pass: it is defence in depth, not the fix.
+      REMAINING residue: the derived `Drop`/`Clone`/`PartialEq` glue on `Predicate`/`BoundPredicate`
+      still recurses — nothing in this bundle can protect it.
+      **Done 2026-08-09.** Critic CONVERGED zero S1/S2 on R2 (1 cycle) and R3 (2 cycles); 11 S3
+      ledgered. Invariant V amendments for `expr/predicate.rs` and `spec/schema/id_reassigner.rs`
+      recorded in the ledger §2.
+- [x] **G3 — DataFusion namespaces (C-004, C-007).** In scope:
+      `crates/integrations/datafusion/src/catalog.rs` and adjacent tests. Preserve full namespace
+      identity, cover nesting/collisions/failures, and do not broaden DataFusion API scope. Unit gate
+      → independent Critic → recorded disposition.
+      **Done 2026-08-09** (`d99e56d6` + `2556e109`, Critic CONVERGED cycle 2, 5 S3): nested
+      namespaces discovered by explicit-queue BFS with a depth cap and bounded concurrency; identity
+      preserved by joining levels on U+001F — the convention `NamespaceIdent::to_url_string()`
+      already uses and REST/S3 Tables already rely on — so `split('\u{1f}')` is a total inverse.
+      Collisions rejected rather than shadowed; a dot alias keeps nested namespaces SQL-typeable.
+      No public API added.
+- [x] **G4 — cache-moka byte capacity (C-005, C-007).** In scope:
+      `crates/integrations/cache-moka/src/lib.rs` and adjacent tests. Replace entry-count semantics
+      with deterministic byte weighting without dependency edits. Unit gate → independent Critic →
+      recorded disposition.
+      **Done 2026-08-09** (`cb489615` + `73ff5157`, Critic CONVERGED cycle 2, 6 S3): `weigher` +
+      `max_capacity` mirroring `io/object_cache.rs`, so 32 MiB means bytes rather than ~33.5M
+      entries. Operator-visible consequence recorded: the default aggregate ceiling is now
+      2 × 32 MiB = 64 MiB, twice the core cache's single budget for the same two object kinds
+      (merging them is ARCH-004, excluded).
+- [x] **G5 — secret rendering (C-006, C-007).** In scope:
+      `crates/catalog/rest/src/{client.rs,types.rs}`, core table/view metadata and facade types,
+      `crates/iceberg/src/error.rs`, a narrowly scoped shared redaction helper if required, affected
+      `map.md`, and adjacent tests. Preserve error chaining and non-sensitive diagnostics; eliminate
+      the enumerated credential render paths without changing catalog trust policy. Unit gate →
+      independent Critic → recorded disposition.
+      **Done 2026-08-09** (`879bf55e`, Critic CONVERGED cycle 3, 3 S3): SEC-001 closed by replacing
+      the raw `serde_json::Error` source with a `SanitizedJsonError` carrying failure category and
+      position but nothing derived from the body — the chain obligation survives because `source()`
+      still EXISTS, which was the actual requirement. The former residue pin in
+      `crates/catalog/rest/src/catalog.rs` is INVERTED, not deleted. SEC-002 / SEC-009 closed via
+      per-key `is_secret_prop_key` redaction. NAMED residue: `Table`'s `{:?}` is still not wholesale
+      credential-safe (snapshot summaries, encryption keys, statistics blob properties render in
+      clear) and the rustdoc now says so instead of asserting a blanket invariant.
+- [x] **G6 — bundle close (C-008).** Run the independent bundle Critic, disposition any remands,
+      run `typos . && make check && make check-msrv && cargo build -p iceberg
+      --no-default-features && cargo deny check advisories && make test`, execute targeted interop if
+      a group changes an interop-bearing contract, file PR-readiness evidence, update this tracker,
+      and file the SEPMO retrospective/metrics. No push or PR creation without separate user request.
+      **Done 2026-08-09.** Bundle Critic ran three lenses (cross-group interaction, ledger truth,
+      adversary) + two verification rounds, all serialized in the one worktree. It filed **six S2s
+      against the ARTIFACT and zero against the code** — including a breaking public API change
+      (`datum_to_arrow_type_with_ree -> Result<DataType>`, G1) that nothing had called out while a
+      downstream consumer is mid-repin, and two false statements in the gate evidence itself. All
+      dispositioned; terminal round CONVERGED with zero blocking findings and six ledgered.
+      Evidence: [2026-08-audit-hardening-ledger.md](2026-08-audit-hardening-ledger.md) ·
+      [critic verdicts / S3 register](2026-08-audit-hardening-critic-verdicts.md) ·
+      [sepmo-metrics.md](sepmo-metrics.md).
+      **Gate gap RESOLVED 2026-08-10 — it was local only.** The Docker daemon was down so `make
+      test` did not run here, but CI's `Tests (default)` job does `make docker-up` + full-workspace
+      nextest on every PR: **4158/4158 passed on #191**, including all eight binaries that failed
+      locally. Local `make test` is a pre-flight convenience, not a coverage requirement.
+      **PUSHED 2026-08-09 on user instruction; PR #191 open, CI 14/14 green.** Merging is the user's.
+
+Contingencies: a group that cannot converge is either REMOVED with an additive revert commit or
+REMANDED with enumerated findings to the closing Critic; no destructive reset/checkout is authorized.
+Any dependency-file need, on-disk-format change, trust-model change, or unexpected-file requirement
+raises Invariant V and returns the affected scope to audit.
+
+---
+
+## DONE (2026-08-08) — U3 / hazard-1: midpoint row-group selection
+
+**MERGED as #190** (`e4f7f010` = main tip). Retained for its cycle record; the named residues live in the ledger.
 
 Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-order.md) §6. Ledger:
 [u3-midpoint-rowgroup-ledger.md](u3-midpoint-rowgroup-ledger.md). Zero-dependency-change unit.

@@ -153,6 +153,24 @@ impl TableBuilder {
 }
 
 /// Table represents a table in the catalog.
+///
+/// SECURITY (SEC-002): the derived `Debug` is safe for the ENUMERATED maps below only — it does
+/// NOT make a `{:?}` / `tracing::info!(?table)` of a table wholesale credential-safe.
+///
+/// CLOSED: `metadata.properties` redacts through
+/// [`TableMetadata`](crate::spec::TableMetadata)'s hand-written `Debug`, and `file_io` (also the
+/// `FileIO` inside `object_cache`) redacts through `StorageConfig`'s. Both used to print table
+/// properties and vended storage credentials in clear.
+///
+/// STILL IN CLEAR through `metadata`, pending the follow-up that gives each owning type its own
+/// `Debug`: `snapshots[*].summary.additional_properties`, `encryption_keys[*].properties` and
+/// `encrypted_key_metadata`, and `statistics[*].blob_metadata[*].properties` plus
+/// `statistics[*].key_metadata`. The authoritative ledger is the `NAMED RESIDUE` note on
+/// `TableMetadata`'s `Debug`.
+///
+/// Keep the closed half closed: any new field here that carries a raw property map must redact
+/// through [`RedactedProps`](crate::io::RedactedProps), or this type needs its own `Debug`. Pinned
+/// by `test_table_debug_redacts_secret_table_properties`.
 #[derive(Debug, Clone)]
 pub struct Table {
     file_io: FileIO,
@@ -446,5 +464,70 @@ mod tests {
             .unwrap();
         assert!(!table.readonly());
         assert_eq!(table.identifier.name(), "table");
+    }
+
+    /// SECURITY (SEC-002): `Table` is the facade nearly every caller holds, it derives `Debug`, and
+    /// it embeds both a `TableMetadataRef` and a `FileIO`. A single `tracing::info!(?table)` —
+    /// including one in downstream code this crate does not control — used to print every table
+    /// property in clear. This pins the composition end-to-end for the two property maps SEC-002
+    /// closed — `TableMetadata.properties` and `StorageConfig.props` — whichever of the two
+    /// carries the secret. It is NOT a blanket claim about the facade: the nested maps enumerated
+    /// in the `NAMED RESIDUE` note on `TableMetadata`'s `Debug` still render through `metadata`.
+    ///
+    /// MUTATION (RED against the pre-change code): put `Debug` back in the `derive` list on
+    /// `TableMetadata` and delete its hand-written `impl std::fmt::Debug`. (The `FileIO` half is
+    /// separately RED under reverting `StorageConfig`'s hand-written `Debug`.)
+    #[tokio::test]
+    async fn test_table_debug_redacts_secret_table_properties() {
+        const TABLE_SENTINEL: &str = "SENTINEL_TABLE_PROPERTY_IN_TABLE_DEBUG";
+        const FILE_IO_SENTINEL: &str = "SENTINEL_VENDED_CREDENTIAL_IN_TABLE_DEBUG";
+
+        let metadata_file_path = format!(
+            "{}/testdata/table_metadata/TableMetadataV2Valid.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let metadata_file_content =
+            std::fs::read(&metadata_file_path).expect("read the v2 metadata fixture");
+        let mut table_metadata = serde_json::from_slice::<TableMetadata>(&metadata_file_content)
+            .expect("parse the v2 metadata fixture");
+        table_metadata
+            .properties
+            .insert("s3.session-token".to_string(), TABLE_SENTINEL.to_string());
+        table_metadata
+            .properties
+            .insert("write.format.default".to_string(), "parquet".to_string());
+
+        let file_io = crate::io::FileIOBuilder::new(Arc::new(crate::io::LocalFsStorageFactory))
+            .with_prop("s3.secret-access-key", FILE_IO_SENTINEL)
+            .with_prop("s3.endpoint", "http://localhost:9000")
+            .build();
+
+        let table = Table::builder()
+            .metadata(table_metadata)
+            .identifier(TableIdent::from_strs(["ns", "table"]).expect("build the identifier"))
+            .file_io(file_io)
+            .build()
+            .expect("build the table");
+
+        let debug = format!("{table:?}");
+
+        assert!(
+            !debug.contains(TABLE_SENTINEL),
+            "Table Debug leaked a secret TABLE property: {debug}"
+        );
+        assert!(
+            !debug.contains(FILE_IO_SENTINEL),
+            "Table Debug leaked a vended FileIO credential: {debug}"
+        );
+        // Anti-vacuity: the facade must still identify itself and keep its non-secret diagnostics,
+        // or this would pass against a Debug that rendered nothing.
+        assert!(
+            debug.contains("Table") && debug.contains("ns") && debug.contains("table"),
+            "Table Debug dropped its identifier: {debug}"
+        );
+        assert!(
+            debug.contains("parquet") && debug.contains("http://localhost:9000"),
+            "Table Debug over-redacted its non-secret properties: {debug}"
+        );
     }
 }

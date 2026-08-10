@@ -29,7 +29,8 @@ modules are `pub(crate)`.
 
 | File | Java analogue | Used for |
 |---|---|---|
-| `bound_predicate_visitor.rs` / `predicate_visitor.rs` | `ExpressionVisitors` | visitor traits |
+| `bound_predicate_visitor.rs` | `ExpressionVisitors` | the bound visitor trait + the recursive post-order `visit`; depth-capped by `MAX_PREDICATE_DEPTH` (defined in `../predicate.rs`, derived from a measured per-level stack cost) |
+| `predicate_visitor.rs` | `ExpressionVisitors` | the UNBOUND visitor trait + `visit`. **`#[cfg(test)]` only** — `RewriteNotVisitor` was its last implementor; retained as the differential oracle for the iterative `Predicate::rewrite_not` |
 | `manifest_evaluator.rs` | `ManifestEvaluator` | prune whole manifests via partition-summary bounds |
 | `expression_evaluator.rs` | `Evaluators` | evaluate a bound predicate against a concrete struct (e.g. a partition value) |
 | `inclusive_metrics_evaluator.rs` | `InclusiveMetricsEvaluator` | "might this FILE contain matching rows?" — file pruning AND write-side conflict detection (`first_conflicting_file`) |
@@ -37,7 +38,7 @@ modules are `pub(crate)`.
 | `aggregate_evaluator.rs` | `UnboundAggregate`/`BoundAggregate`/`AggregateEvaluator` (`CountStar`/`CountNonNull`/`MinAggregate`/`MaxAggregate`) | compute `count(*)`/`count(col)`/`min`/`max` from `DataFile` metrics with no data scan; a missing required metric invalidates the aggregate (not pushable → engine scans). `Extract` (variant shredding) is CUT. Not yet wired to a scan consumer. |
 | `inclusive_projection.rs` / `strict_projection.rs` | `Projections` | row filter → partition-space predicate via `Transform::project`/`strict_project` |
 | `residual_evaluator.rs` | `ResidualEvaluator` | partial-evaluate a row filter against partition values → residual (strict-true ⇒ `AlwaysTrue`, inclusive-false ⇒ `AlwaysFalse`, else keep); `residual_bound_for` binds to the snapshot schema and memoizes by partition only (`RwLock` map, poison-recovered, soft-cap 8192 inserts; bind case must match evaluator `case_sensitive`) for scan planning |
-| `rewrite_not.rs` | `RewriteNot` | NOT-elimination pre-pass (evaluators assume NOT-free input) |
+| `rewrite_not.rs` | `RewriteNot` | **`#[cfg(test)]` only.** The production NOT-elimination pre-pass now lives in `../predicate.rs` as the explicit-stack `Predicate::rewrite_not` / `BoundPredicate::rewrite_not`; this visitor is kept solely as their differential oracle |
 | `page_index_evaluator.rs` / `row_group_metrics_evaluator.rs` | (parquet) | Parquet-level pruning in the arrow reader |
 
 ## I want to...
@@ -63,7 +64,8 @@ modules are `pub(crate)`.
 | Over- or under-pruning files | Inclusive vs strict confusion — inclusive answers "might match" (prune only on definite NO), strict answers "all match"; swapping them is a known mutation target |
 | Missing-metrics file behavior wrong | A file with absent counts/bounds must be treated as "might match" (cannot prune) — check the `None` arms |
 | Residual keeps/drops the wrong branch | The strict-projection-true / inclusive-projection-false short-circuits are order-sensitive; the partition-value substitution must use the file's own spec |
-| Evaluator panics on NOT | Run `rewrite_not` first — evaluators assume NOT-free bound predicates |
+| Evaluator panics on NOT | Run `BoundPredicate::rewrite_not` first — evaluators assume NOT-free bound predicates |
+| `DataInvalid: ... exceeds maximum depth` from a scan | The filter nests deeper than `MAX_PREDICATE_DEPTH` (`../predicate.rs`). Java has no such limit, so treat it as OURS: check whether a caller is LEFT-folding conjuncts (one per equality-delete file, one per pushed-down filter) where a balanced fold would keep the tree shallow. The limit is a measured stack budget — raising it needs the measurement redone, not a bigger guess |
 | Aggregate returns a wrong number | A missing required metric must INVALIDATE the aggregate (`all_valid()`→false, `results()`→`None`), never produce a partial count/min/max. Check `aggregate_evaluator.rs::has_value` — `count(col)` needs both value+null counts; `min`/`max` need the bound or an all-null column |
 
 ### First checks

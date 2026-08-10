@@ -1058,38 +1058,87 @@ enum MoveKind<'a> {
 /// module's (crate-private) `index_parents`. A field's parent is the id of the nearest enclosing
 /// struct/list/map field; top-level fields have no entry.
 ///
-/// Recursion is used because the schema is a genuinely recursive tree; Iceberg schemas are shallow
-/// (depth is bounded by the nesting the user authored, in practice well under a hundred), so stack
-/// overflow is not a concern and an explicit stack would only obscure the parent-tracking.
+/// The traversal uses an explicit stack rather than recursion. **This is defence in depth, not the
+/// fix for a reachable hazard, and it should not be cited as one.** `index_parents` has exactly one
+/// caller — [`SchemaEvolution::new`], which passes `schema.as_struct()` — and a [`Schema`] value can
+/// only be produced by `SchemaBuilder::build`, which runs `index_by_id` → `visit_struct` → the
+/// depth-checked `visit_type_at_depth` and so refuses any type nested deeper than
+/// `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH` (`128`) before a `Schema` exists at all.
+/// This function therefore cannot receive an unbounded struct tree today.
+///
+/// The genuinely unbounded input on this file's public surface is the caller-supplied `Type` of
+/// [`UpdateSchemaAction::add_column`], which no builder validates and which flows into
+/// [`SchemaEvolution::assign_fresh_ids`]; that door is closed by `spec::schema::id_reassigner`'s
+/// `MAX_ASSIGN_IDS_NESTING_DEPTH`. The explicit stack is kept here so this walk stays correct
+/// independently of that bound and of any future change to what `SchemaBuilder::build` validates.
 fn index_parents(struct_type: &StructType, parent_id: Option<i32>, out: &mut HashMap<i32, i32>) {
-    for field in struct_type.fields() {
-        if let Some(parent_id) = parent_id {
-            out.insert(field.id, parent_id);
-        }
-        index_parents_in_type(field.id, &field.field_type, out);
+    enum Pending<'a> {
+        Field {
+            field: &'a NestedFieldRef,
+            parent_id: Option<i32>,
+        },
+        Type {
+            owner_id: i32,
+            field_type: &'a Type,
+        },
     }
-}
 
-/// Recurse into a field's type to record parent links for its nested children.
-fn index_parents_in_type(owner_id: i32, field_type: &Type, out: &mut HashMap<i32, i32>) {
-    match field_type {
-        Type::Primitive(_) => {}
-        // Leaf, like a primitive — variant has no nested fields to parent-link (Java 1.10.0
-        // `IndexParents.variant` returns the map unchanged).
-        Type::Variant => {}
-        Type::Struct(struct_type) => index_parents(struct_type, Some(owner_id), out),
-        Type::List(list_type) => {
-            let element = &list_type.element_field;
-            out.insert(element.id, owner_id);
-            index_parents_in_type(element.id, &element.field_type, out);
-        }
-        Type::Map(map_type) => {
-            let key = &map_type.key_field;
-            let value = &map_type.value_field;
-            out.insert(key.id, owner_id);
-            out.insert(value.id, owner_id);
-            index_parents_in_type(key.id, &key.field_type, out);
-            index_parents_in_type(value.id, &value.field_type, out);
+    let mut pending = Vec::with_capacity(struct_type.fields().len());
+    pending.extend(
+        struct_type
+            .fields()
+            .iter()
+            .rev()
+            .map(|field| Pending::Field { field, parent_id }),
+    );
+
+    while let Some(next) = pending.pop() {
+        match next {
+            Pending::Field { field, parent_id } => {
+                if let Some(parent_id) = parent_id {
+                    out.insert(field.id, parent_id);
+                }
+                pending.push(Pending::Type {
+                    owner_id: field.id,
+                    field_type: &field.field_type,
+                });
+            }
+            Pending::Type {
+                owner_id,
+                field_type,
+            } => match field_type {
+                Type::Primitive(_) | Type::Variant => {}
+                Type::Struct(nested) => {
+                    pending.extend(nested.fields().iter().rev().map(|field| Pending::Field {
+                        field,
+                        parent_id: Some(owner_id),
+                    }));
+                }
+                Type::List(list) => {
+                    let element = &list.element_field;
+                    out.insert(element.id, owner_id);
+                    pending.push(Pending::Type {
+                        owner_id: element.id,
+                        field_type: &element.field_type,
+                    });
+                }
+                Type::Map(map) => {
+                    let key = &map.key_field;
+                    let value = &map.value_field;
+                    out.insert(key.id, owner_id);
+                    out.insert(value.id, owner_id);
+                    // Push value first so the key subtree is visited first, preserving the previous
+                    // depth-first traversal order for well-formed schemas.
+                    pending.push(Pending::Type {
+                        owner_id: value.id,
+                        field_type: &value.field_type,
+                    });
+                    pending.push(Pending::Type {
+                        owner_id: key.id,
+                        field_type: &key.field_type,
+                    });
+                }
+            },
         }
     }
 }
@@ -1431,7 +1480,9 @@ fn is_ignorable_type_update(existing_type: &Type, incoming_type: &Type) -> bool 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::thread;
 
     use super::*;
     use crate::spec::{
@@ -1439,6 +1490,210 @@ mod tests {
     };
     use crate::table::Table;
     use crate::transaction::{Transaction, TransactionAction};
+
+    const MALICIOUS_SCHEMA_DEPTH: i32 = 4096;
+
+    /// Run parent indexing on a deliberately small stack, returning the input so its recursive drop
+    /// happens safely on the test harness's normal-sized stack.
+    ///
+    /// The four tests below are IMPLEMENTATION pins on `index_parents`'s explicit-stack form, not
+    /// evidence about reachable input: `index_parents` only ever sees a `Schema`'s struct, and
+    /// `SchemaBuilder::build` caps nesting at `MAX_SCHEMA_NESTING_DEPTH` (128) long before one
+    /// exists, so no caller can hand it a 4096-deep tree (see the function's own doc). They stay
+    /// because reverting the explicit stack to recursion overflows this 64 KiB stack, which keeps
+    /// the defence-in-depth property from silently rotting away.
+    fn index_parents_on_small_stack(struct_type: StructType) -> (StructType, HashMap<i32, i32>) {
+        thread::Builder::new()
+            .name("index-parents-small-stack".to_string())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut parents = HashMap::new();
+                index_parents(&struct_type, None, &mut parents);
+                (struct_type, parents)
+            })
+            .expect("spawn the small-stack parent-indexing thread")
+            .join()
+            .expect("parent indexing must not overflow or panic")
+    }
+
+    /// Build a manually nested struct chain with one parent link per level.
+    fn deeply_nested_struct(depth: i32) -> StructType {
+        let mut field_type = Type::Primitive(PrimitiveType::Boolean);
+        for field_id in (2..=depth + 1).rev() {
+            field_type = Type::Struct(StructType::new(vec![
+                NestedField::optional(field_id, "nested", field_type).into(),
+            ]));
+        }
+        StructType::new(vec![NestedField::optional(1, "root", field_type).into()])
+    }
+
+    /// Build a manually nested list chain with one element-parent link per level.
+    fn deeply_nested_list(depth: i32) -> StructType {
+        let mut field_type = Type::Primitive(PrimitiveType::Boolean);
+        for element_id in (2..=depth + 1).rev() {
+            field_type = Type::List(ListType::new(
+                NestedField::list_element(element_id, field_type, false).into(),
+            ));
+        }
+        StructType::new(vec![NestedField::optional(1, "root", field_type).into()])
+    }
+
+    /// Build a manually nested map chain through either every key or every value branch.
+    fn deeply_nested_map(depth: i32, nested_in_key: bool) -> StructType {
+        let mut field_type = Type::Primitive(PrimitiveType::Boolean);
+        for level in (1..=depth).rev() {
+            let key_id = 2 * level;
+            let value_id = key_id + 1;
+            let primitive = Type::Primitive(PrimitiveType::Boolean);
+            let (key_type, value_type) = if nested_in_key {
+                (field_type, primitive)
+            } else {
+                (primitive, field_type)
+            };
+            field_type = Type::Map(MapType::new(
+                NestedField::map_key_element(key_id, key_type).into(),
+                NestedField::map_value_element(value_id, value_type, false).into(),
+            ));
+        }
+        StructType::new(vec![NestedField::optional(1, "root", field_type).into()])
+    }
+
+    // RISK (defence in depth, NOT a reachable input): the explicit-stack parent walk must survive a
+    // struct chain far deeper than any `Schema` this crate can build, and still retain the exact
+    // nearest-parent relationship at the deepest node. Reverting the explicit stack to recursion
+    // overflows the 64 KiB stack; a wrong parent link corrupts nested add/move resolution.
+    #[test]
+    fn deeply_nested_struct_parent_indexing_uses_bounded_call_stack() {
+        let (struct_type, parents) =
+            index_parents_on_small_stack(deeply_nested_struct(MALICIOUS_SCHEMA_DEPTH));
+
+        assert_eq!(
+            parents.len(),
+            usize::try_from(MALICIOUS_SCHEMA_DEPTH).expect("depth fits usize")
+        );
+        assert_eq!(
+            parents.get(&(MALICIOUS_SCHEMA_DEPTH + 1)),
+            Some(&MALICIOUS_SCHEMA_DEPTH)
+        );
+        drop(struct_type);
+    }
+
+    // RISK (defence in depth, NOT a reachable input): list-element traversal is a separate arm of
+    // the walk and must stay iterative — and must keep the element's owner relationship — under the
+    // same deeper-than-buildable chain.
+    #[test]
+    fn deeply_nested_list_parent_indexing_uses_bounded_call_stack() {
+        let (struct_type, parents) =
+            index_parents_on_small_stack(deeply_nested_list(MALICIOUS_SCHEMA_DEPTH));
+
+        assert_eq!(
+            parents.len(),
+            usize::try_from(MALICIOUS_SCHEMA_DEPTH).expect("depth fits usize")
+        );
+        assert_eq!(
+            parents.get(&(MALICIOUS_SCHEMA_DEPTH + 1)),
+            Some(&MALICIOUS_SCHEMA_DEPTH)
+        );
+        drop(struct_type);
+    }
+
+    // RISK (defence in depth, NOT a reachable input): map-key traversal must stay iterative, and both
+    // members at the deepest map must retain the enclosing key field as their parent.
+    #[test]
+    fn deeply_nested_map_key_parent_indexing_uses_bounded_call_stack() {
+        let (struct_type, parents) =
+            index_parents_on_small_stack(deeply_nested_map(MALICIOUS_SCHEMA_DEPTH, true));
+        let deepest_key_id = 2 * MALICIOUS_SCHEMA_DEPTH;
+        let deepest_value_id = deepest_key_id + 1;
+        let deepest_owner_id = 2 * (MALICIOUS_SCHEMA_DEPTH - 1);
+
+        assert_eq!(
+            parents.len(),
+            usize::try_from(2 * MALICIOUS_SCHEMA_DEPTH).expect("map member count fits usize")
+        );
+        assert_eq!(parents.get(&deepest_key_id), Some(&deepest_owner_id));
+        assert_eq!(parents.get(&deepest_value_id), Some(&deepest_owner_id));
+        drop(struct_type);
+    }
+
+    // RISK (defence in depth, NOT a reachable input): map-value traversal is an arm independent of
+    // map-key traversal and must stay iterative while preserving both deepest member links to the
+    // enclosing value field.
+    #[test]
+    fn deeply_nested_map_value_parent_indexing_uses_bounded_call_stack() {
+        let (struct_type, parents) =
+            index_parents_on_small_stack(deeply_nested_map(MALICIOUS_SCHEMA_DEPTH, false));
+        let deepest_key_id = 2 * MALICIOUS_SCHEMA_DEPTH;
+        let deepest_value_id = deepest_key_id + 1;
+        let deepest_owner_id = 2 * (MALICIOUS_SCHEMA_DEPTH - 1) + 1;
+
+        assert_eq!(
+            parents.len(),
+            usize::try_from(2 * MALICIOUS_SCHEMA_DEPTH).expect("map member count fits usize")
+        );
+        assert_eq!(parents.get(&deepest_key_id), Some(&deepest_owner_id));
+        assert_eq!(parents.get(&deepest_value_id), Some(&deepest_owner_id));
+        drop(struct_type);
+    }
+
+    /// A chain of `depth` nested single-field structs wrapping a boolean leaf — the caller-supplied
+    /// `Type` shape that `add_column` accepts. Built iteratively so the FIXTURE never recurses.
+    fn deeply_nested_column_type(depth: i32) -> Type {
+        let mut field_type = Type::Primitive(PrimitiveType::Boolean);
+        for field_id in (1..=depth).rev() {
+            field_type = Type::Struct(StructType::new(vec![
+                NestedField::optional(field_id, "nested", field_type).into(),
+            ]));
+        }
+        field_type
+    }
+
+    // RISK (the reachable hazard, and the one C-003 actually has to close): `add_column` takes a
+    // caller-supplied `Type` that NO builder has validated and drives it into the recursive
+    // fresh-id assignment in `spec::schema::id_reassigner`. Unbounded,
+    // `Transaction::update_schema().add_column("deep", hostile)` overflows the thread stack on
+    // commit. Java's `SchemaUpdate` does exactly that — `TypeUtil.assignFreshIds` has no depth
+    // counter, and a 4096-deep chain raises `StackOverflowError` on a 512 KiB JVM thread — so the
+    // typed error asserted here is a deliberate divergence in the SAFE direction, not a parity
+    // break. Runs on a thread with a KNOWN 3 MiB stack: the bounded walk unwinds after 129 levels
+    // (≈1.25 MiB, measured by bisection in the dev profile) while the unbounded walk over 4096
+    // levels needs ≈40 MiB, so deleting the depth guard turns this test into a hard stack-overflow
+    // abort rather than a soft failure.
+    #[test]
+    fn deeply_nested_added_column_type_is_rejected_not_overflowed() {
+        let action = Arc::new(
+            UpdateSchemaAction::new()
+                .add_column("deep", deeply_nested_column_type(MALICIOUS_SCHEMA_DEPTH)),
+        );
+        // A second handle, so the deep type is torn down on the HARNESS stack, not the bounded one.
+        let retained = Arc::clone(&action);
+
+        let error = thread::Builder::new()
+            .name("add-column-bounded-stack".to_string())
+            .stack_size(3 * 1024 * 1024)
+            .spawn(move || {
+                let table = v2_table();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("build a current-thread runtime");
+                runtime
+                    .block_on(action.commit(&table))
+                    .err()
+                    .map(|error| error.to_string())
+            })
+            .expect("spawn the bounded-stack add-column thread")
+            .join()
+            .expect("committing a hostile add_column must not overflow or panic")
+            .expect("a hostile nested column type must be rejected");
+
+        assert!(
+            error.contains(
+                "Schema type nesting exceeds maximum depth 128 while assigning field ids"
+            ),
+            "expected the typed depth refusal, got: {error}"
+        );
+        drop(retained);
+    }
 
     fn v2_table() -> Table {
         crate::transaction::tests::make_v2_table()

@@ -17,6 +17,7 @@
 
 use fnv::FnvHashSet;
 
+use crate::expr::predicate::MAX_PREDICATE_DEPTH;
 use crate::expr::{Predicate, PredicateOperator, Reference};
 use crate::spec::Datum;
 use crate::{Error, ErrorKind, Result};
@@ -137,32 +138,64 @@ pub trait PredicateVisitor {
 /// Visits a [`Predicate`] with the provided visitor,
 /// in post-order
 pub(crate) fn visit<V: PredicateVisitor>(visitor: &mut V, predicate: &Predicate) -> Result<V::T> {
+    visit_at_depth(visitor, predicate, 0)
+}
+
+fn visit_at_depth<V: PredicateVisitor>(
+    visitor: &mut V,
+    predicate: &Predicate,
+    depth: usize,
+) -> Result<V::T> {
+    if depth > MAX_PREDICATE_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Predicate nesting exceeds maximum depth {MAX_PREDICATE_DEPTH}"),
+        ));
+    }
+
     match predicate {
-        Predicate::AlwaysTrue => visitor.always_true(),
-        Predicate::AlwaysFalse => visitor.always_false(),
         Predicate::And(expr) => {
             let [left_pred, right_pred] = expr.inputs();
 
-            let left_result = visit(visitor, left_pred)?;
-            let right_result = visit(visitor, right_pred)?;
+            let left_result = visit_at_depth(visitor, left_pred, depth + 1)?;
+            let right_result = visit_at_depth(visitor, right_pred, depth + 1)?;
 
             visitor.and(left_result, right_result)
         }
         Predicate::Or(expr) => {
             let [left_pred, right_pred] = expr.inputs();
 
-            let left_result = visit(visitor, left_pred)?;
-            let right_result = visit(visitor, right_pred)?;
+            let left_result = visit_at_depth(visitor, left_pred, depth + 1)?;
+            let right_result = visit_at_depth(visitor, right_pred, depth + 1)?;
 
             visitor.or(left_result, right_result)
         }
         Predicate::Not(expr) => {
             let [inner_pred] = expr.inputs();
 
-            let inner_result = visit(visitor, inner_pred)?;
+            let inner_result = visit_at_depth(visitor, inner_pred, depth + 1)?;
 
             visitor.not(inner_result)
         }
+        leaf => visit_leaf(visitor, leaf),
+    }
+}
+
+/// The non-recursive arms of [`visit_at_depth`], deliberately **not inlined**.
+///
+/// Keeping the leaf dispatch out of the recursive function keeps its stack frame small: an
+/// unoptimized build gives every match arm's temporaries their own slot, so folding these
+/// arms back in more than doubles the per-level cost of a deep walk (measured; see
+/// [`MAX_PREDICATE_DEPTH`]).
+#[inline(never)]
+fn visit_leaf<V: PredicateVisitor>(visitor: &mut V, predicate: &Predicate) -> Result<V::T> {
+    match predicate {
+        Predicate::And(_) | Predicate::Or(_) | Predicate::Not(_) => Err(Error::new(
+            ErrorKind::Unexpected,
+            "visit_leaf reached a logical predicate node",
+        )),
+        Predicate::AlwaysTrue => visitor.always_true(),
+        Predicate::AlwaysFalse => visitor.always_false(),
         Predicate::Unary(expr) => match expr.op() {
             PredicateOperator::IsNull => visitor.is_null(expr.term(), predicate),
             PredicateOperator::NotNull => visitor.not_null(expr.term(), predicate),
@@ -220,9 +253,11 @@ mod tests {
 
     use fnv::FnvHashSet;
 
-    use crate::expr::visitors::predicate_visitor::{PredicateVisitor, visit};
+    use crate::ErrorKind;
+    use crate::expr::visitors::predicate_visitor::{MAX_PREDICATE_DEPTH, PredicateVisitor, visit};
     use crate::expr::{
-        BinaryExpression, Predicate, PredicateOperator, Reference, SetExpression, UnaryExpression,
+        BinaryExpression, LogicalExpression, Predicate, PredicateOperator, Reference,
+        SetExpression, UnaryExpression,
     };
     use crate::spec::Datum;
 
@@ -371,6 +406,50 @@ mod tests {
         ) -> crate::Result<bool> {
             Ok(false)
         }
+    }
+
+    fn nested_logical_predicate(depth: usize) -> Predicate {
+        let mut predicate = Predicate::AlwaysTrue;
+        for level in 0..depth {
+            predicate = match level % 3 {
+                0 => Predicate::Not(LogicalExpression::new([Box::new(predicate)])),
+                1 => Predicate::And(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(Predicate::AlwaysTrue),
+                ])),
+                _ => Predicate::Or(LogicalExpression::new([
+                    Box::new(predicate),
+                    Box::new(Predicate::AlwaysFalse),
+                ])),
+            };
+        }
+        predicate
+    }
+
+    /// The unbound walk accepts exactly `MAX_PREDICATE_DEPTH` levels and rejects one more with a
+    /// typed `DataInvalid`. Catches `depth > MAX` drifting to `depth >= MAX`.
+    ///
+    /// Sized thread, for the reason given on the bound twin: at the measured 4,245 bytes per
+    /// level (unoptimized build) the walk needs ~4.2 MiB.
+    #[test]
+    fn logical_depth_limit_is_inclusive() {
+        const DEV_BYTES_PER_LEVEL: usize = 4_245;
+
+        std::thread::Builder::new()
+            .stack_size(3 * DEV_BYTES_PER_LEVEL * (MAX_PREDICATE_DEPTH + 2))
+            .spawn(|| {
+                let at_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH);
+                assert!(visit(&mut TestEvaluator {}, &at_limit).is_ok());
+
+                let beyond_limit = nested_logical_predicate(MAX_PREDICATE_DEPTH + 1);
+                let error = visit(&mut TestEvaluator {}, &beyond_limit)
+                    .expect_err("a predicate beyond the logical nesting limit must be rejected");
+                assert_eq!(error.kind(), ErrorKind::DataInvalid);
+                assert!(error.to_string().contains("maximum depth"));
+            })
+            .expect("spawning the depth-test thread must succeed")
+            .join()
+            .expect("the unbound depth walk must not overflow its sized stack");
     }
 
     #[test]

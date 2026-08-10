@@ -34,7 +34,7 @@ use super::view_version::{ViewVersionId, ViewVersionRef};
 use super::{SchemaId, SchemaRef};
 use crate::compression::CompressionCodec;
 use crate::error::{Result, timestamp_ms_to_utc};
-use crate::io::FileIO;
+use crate::io::{FileIO, RedactedProps};
 use crate::{Error, ErrorKind};
 
 /// Reference to [`ViewMetadata`].
@@ -52,7 +52,7 @@ pub const VIEW_PROPERTY_VERSION_HISTORY_SIZE: &str = "version.history.num-entrie
 /// Default value for the property key for the number of history entries to keep.
 pub const VIEW_PROPERTY_VERSION_HISTORY_SIZE_DEFAULT: usize = 10;
 
-#[derive(Debug, PartialEq, Deserialize, Eq, Clone)]
+#[derive(PartialEq, Deserialize, Eq, Clone)]
 #[serde(try_from = "ViewMetadataEnum", into = "ViewMetadataEnum")]
 /// Fields for the version 1 of the view metadata.
 ///
@@ -78,6 +78,37 @@ pub struct ViewMetadata {
     /// Properties are used for metadata such as comment and for settings that
     /// affect view maintenance. This is not intended to be used for arbitrary metadata.
     pub(crate) properties: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ViewMetadata {
+    /// Hand-written instead of derived so that `properties` renders through [`RedactedProps`].
+    ///
+    /// SECURITY (SEC-002): the view half of the same leak closed on
+    /// [`TableMetadata`](super::TableMetadata) — `properties` is an operator-controlled
+    /// `String -> String` map that can hold a credential, and it reaches `Debug` through the REST
+    /// `LoadViewResult.metadata` as well as through any downstream struct that derives `Debug`
+    /// around a view.
+    ///
+    /// Every other field is rendered exactly as the derive did, in declaration order. `Display` is
+    /// unaffected (this type has none) and serde is unaffected (it goes through
+    /// `ViewMetadataEnum`), so the on-disk format is untouched.
+    ///
+    /// NAMED RESIDUE, deliberately NOT masked here: each [`ViewVersion`](super::ViewVersion) in
+    /// `versions` carries its own `summary` `String -> String` map, printed in clear by that
+    /// type's derived `Debug` in `spec/view_version.rs`. Masking it only when nested under
+    /// `ViewMetadata` would be half a fix; it belongs to the same follow-up.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ViewMetadata")
+            .field("format_version", &self.format_version)
+            .field("view_uuid", &self.view_uuid)
+            .field("location", &self.location)
+            .field("current_version_id", &self.current_version_id)
+            .field("versions", &self.versions)
+            .field("version_log", &self.version_log)
+            .field("schemas", &self.schemas)
+            .field("properties", &RedactedProps(&self.properties))
+            .finish()
+    }
 }
 
 impl ViewMetadata {
@@ -485,6 +516,75 @@ pub(crate) mod tests {
         let metadata: String = fs::read_to_string(path).unwrap();
 
         serde_json::from_str(&metadata).unwrap()
+    }
+
+    /// SECURITY (SEC-002), the view half: `ViewMetadata` used to `#[derive(Debug)]`, printing its
+    /// operator-controlled `properties` map in clear — reachable through the REST
+    /// `LoadViewResult.metadata` and any downstream struct that derives `Debug` around a view.
+    ///
+    /// Pins that secret VALUES are masked per key while KEYS, non-secret values and the rest of the
+    /// metadata stay readable.
+    ///
+    /// MUTATION (RED against the pre-change code): put `Debug` back in the `derive` list on
+    /// `ViewMetadata` and delete the hand-written `impl std::fmt::Debug for ViewMetadata`.
+    #[test]
+    fn test_view_metadata_debug_redacts_secret_properties() {
+        const SENTINEL: &str = "SENTINEL_VIEW_PROPERTY_MUST_NOT_LEAK";
+
+        let mut metadata = get_test_view_metadata("ViewMetadataV1Valid.json");
+        metadata
+            .properties
+            .insert("gcs.oauth2.token".to_string(), SENTINEL.to_string());
+        metadata
+            .properties
+            .insert("comment".to_string(), "daily event counts".to_string());
+
+        let debug = format!("{metadata:?}");
+
+        assert!(
+            !debug.contains(SENTINEL),
+            "ViewMetadata Debug leaked a secret view property: {debug}"
+        );
+        assert!(debug.contains("***"), "expected redaction marker: {debug}");
+        assert!(
+            debug.contains("gcs.oauth2.token"),
+            "expected the secret key to remain visible: {debug}"
+        );
+        assert!(
+            debug.contains("daily event counts"),
+            "a non-secret property was over-redacted: {debug}"
+        );
+        assert!(
+            debug.contains("ViewMetadata")
+                && debug.contains("view_uuid")
+                && debug.contains("current_version_id"),
+            "the hand-written Debug dropped identifying fields: {debug}"
+        );
+    }
+
+    /// Guards the "Debug only" claim: the redaction must not reach the serde output, or every view
+    /// this fork writes would ship `***` in place of its properties. `ViewMetadata` has no
+    /// `Display`, so `Debug` is the only render path that changed.
+    ///
+    /// MUTATION: redacting inside `ViewMetadataEnum`'s serialization → RED.
+    #[test]
+    fn test_view_metadata_redaction_does_not_reach_serde() {
+        const SENTINEL: &str = "SENTINEL_VIEW_PROPERTY_MUST_NOT_LEAK";
+
+        let mut metadata = get_test_view_metadata("ViewMetadataV1Valid.json");
+        metadata
+            .properties
+            .insert("gcs.oauth2.token".to_string(), SENTINEL.to_string());
+
+        let json = serde_json::to_string(&metadata).expect("serialize view metadata");
+        assert!(
+            json.contains(SENTINEL),
+            "serde output must be byte-faithful — redaction is a Debug-only concern: {json}"
+        );
+
+        let round_tripped: ViewMetadata =
+            serde_json::from_str(&json).expect("round-trip view metadata");
+        assert_eq!(round_tripped, metadata);
     }
 
     #[test]

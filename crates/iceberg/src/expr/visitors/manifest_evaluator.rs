@@ -82,21 +82,21 @@ impl ManifestEvaluator {
     /// the scan's filter.
     pub(crate) fn eval(&self, manifest_file: &ManifestFile) -> Result<bool> {
         match &manifest_file.partitions {
-            Some(p) if !p.is_empty() => {
+            Some(p) => {
                 let mut evaluator = ManifestFilterVisitor::new(p);
                 visit(&mut evaluator, &self.partition_filter)
             }
-            _ => Ok(true),
+            None => Ok(true),
         }
     }
 }
 
 struct ManifestFilterVisitor<'a> {
-    partitions: &'a Vec<FieldSummary>,
+    partitions: &'a [FieldSummary],
 }
 
 impl<'a> ManifestFilterVisitor<'a> {
-    fn new(partitions: &'a Vec<FieldSummary>) -> Self {
+    fn new(partitions: &'a [FieldSummary]) -> Self {
         ManifestFilterVisitor { partitions }
     }
 }
@@ -136,7 +136,7 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        Ok(self.field_summary_for_reference(reference).contains_null)
+        Ok(self.field_summary_for_reference(reference)?.contains_null)
     }
 
     fn not_null(
@@ -144,7 +144,7 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
 
         // contains_null encodes whether at least one partition value is null,
         // lowerBound is null if all partition values are null
@@ -160,7 +160,7 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
         if let Some(contains_nan) = field.contains_nan
             && !contains_nan
         {
@@ -179,7 +179,7 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
         if let Some(contains_nan) = field.contains_nan {
             // check if all values are nan
             if contains_nan && !field.contains_null && field.lower_bound.is_none() {
@@ -195,14 +195,11 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
 
         match &field.lower_bound {
             Some(bound_bytes) => {
-                let bound = ManifestFilterVisitor::bytes_to_datum(
-                    bound_bytes,
-                    *reference.field().field_type.clone(),
-                );
+                let bound = ManifestFilterVisitor::bytes_to_datum(bound_bytes, reference, "lower")?;
                 if datum <= &bound {
                     ROWS_CANNOT_MATCH
                 } else {
@@ -219,13 +216,10 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
         match &field.lower_bound {
             Some(bound_bytes) => {
-                let bound = ManifestFilterVisitor::bytes_to_datum(
-                    bound_bytes,
-                    *reference.field().field_type.clone(),
-                );
+                let bound = ManifestFilterVisitor::bytes_to_datum(bound_bytes, reference, "lower")?;
                 if datum < &bound {
                     ROWS_CANNOT_MATCH
                 } else {
@@ -242,13 +236,10 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
         match &field.upper_bound {
             Some(bound_bytes) => {
-                let bound = ManifestFilterVisitor::bytes_to_datum(
-                    bound_bytes,
-                    *reference.field().field_type.clone(),
-                );
+                let bound = ManifestFilterVisitor::bytes_to_datum(bound_bytes, reference, "upper")?;
                 if datum >= &bound {
                     ROWS_CANNOT_MATCH
                 } else {
@@ -265,13 +256,10 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
         match &field.upper_bound {
             Some(bound_bytes) => {
-                let bound = ManifestFilterVisitor::bytes_to_datum(
-                    bound_bytes,
-                    *reference.field().field_type.clone(),
-                );
+                let bound = ManifestFilterVisitor::bytes_to_datum(bound_bytes, reference, "upper")?;
                 if datum > &bound {
                     ROWS_CANNOT_MATCH
                 } else {
@@ -288,27 +276,23 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
 
         if field.lower_bound.is_none() || field.upper_bound.is_none() {
             return ROWS_CANNOT_MATCH;
         }
 
         if let Some(lower_bound_bytes) = &field.lower_bound {
-            let lower_bound = ManifestFilterVisitor::bytes_to_datum(
-                lower_bound_bytes,
-                *reference.field().field_type.clone(),
-            );
+            let lower_bound =
+                ManifestFilterVisitor::bytes_to_datum(lower_bound_bytes, reference, "lower")?;
             if &lower_bound > datum {
                 return ROWS_CANNOT_MATCH;
             }
         }
 
         if let Some(upper_bound_bytes) = &field.upper_bound {
-            let upper_bound = ManifestFilterVisitor::bytes_to_datum(
-                upper_bound_bytes,
-                *reference.field().field_type.clone(),
-            );
+            let upper_bound =
+                ManifestFilterVisitor::bytes_to_datum(upper_bound_bytes, reference, "upper")?;
             if &upper_bound < datum {
                 return ROWS_CANNOT_MATCH;
             }
@@ -334,7 +318,7 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
 
         if field.lower_bound.is_none() || field.upper_bound.is_none() {
             return ROWS_CANNOT_MATCH;
@@ -369,7 +353,7 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
 
         if field.contains_null || field.lower_bound.is_none() || field.upper_bound.is_none() {
             return ROWS_MIGHT_MATCH;
@@ -412,7 +396,7 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         literals: &FnvHashSet<Datum>,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field = self.field_summary_for_reference(reference);
+        let field = self.field_summary_for_reference(reference)?;
         if field.lower_bound.is_none() {
             return ROWS_CANNOT_MATCH;
         }
@@ -422,20 +406,16 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
         }
 
         if let Some(lower_bound) = &field.lower_bound {
-            let lower_bound = ManifestFilterVisitor::bytes_to_datum(
-                lower_bound,
-                *reference.field().clone().field_type,
-            );
+            let lower_bound =
+                ManifestFilterVisitor::bytes_to_datum(lower_bound, reference, "lower")?;
             if literals.iter().all(|datum| &lower_bound > datum) {
                 return ROWS_CANNOT_MATCH;
             }
         }
 
         if let Some(upper_bound) = &field.upper_bound {
-            let upper_bound = ManifestFilterVisitor::bytes_to_datum(
-                upper_bound,
-                *reference.field().clone().field_type,
-            );
+            let upper_bound =
+                ManifestFilterVisitor::bytes_to_datum(upper_bound, reference, "upper")?;
             if literals.iter().all(|datum| &upper_bound < datum) {
                 return ROWS_CANNOT_MATCH;
             }
@@ -457,9 +437,19 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
 }
 
 impl ManifestFilterVisitor<'_> {
-    fn field_summary_for_reference(&self, reference: &BoundReference) -> &FieldSummary {
+    fn field_summary_for_reference(&self, reference: &BoundReference) -> Result<&FieldSummary> {
         let pos = reference.accessor().position();
-        &self.partitions[pos]
+        self.partitions.get(pos).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot access partition summary at position {} for field '{}' from manifest with {} partition summaries",
+                    pos,
+                    reference,
+                    self.partitions.len()
+                ),
+            )
+        })
     }
 
     fn are_all_null(field: &FieldSummary, r#type: &Type) -> bool {
@@ -486,9 +476,27 @@ impl ManifestFilterVisitor<'_> {
         Ok(bound)
     }
 
-    fn bytes_to_datum(bytes: &ByteBuf, t: Type) -> Datum {
-        let p = t.as_primitive_type().unwrap();
-        Datum::try_from_bytes(bytes, p.clone()).unwrap()
+    fn bytes_to_datum(
+        bytes: &ByteBuf,
+        reference: &BoundReference,
+        bound_kind: &'static str,
+    ) -> Result<Datum> {
+        let field_type = &reference.field().field_type;
+        let primitive_type = field_type.as_primitive_type().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot decode {bound_kind} partition bound for non-primitive field '{}' of type {field_type}",
+                    reference
+                ),
+            )
+        })?;
+
+        Datum::try_from_bytes(bytes, primitive_type.clone()).map_err(|error| {
+            error
+                .with_context("manifest bound", bound_kind)
+                .with_context("partition field", reference.to_string())
+        })
     }
 }
 
@@ -498,17 +506,19 @@ mod test {
     use std::sync::Arc;
 
     use fnv::FnvHashSet;
+    use serde_bytes::ByteBuf;
 
-    use crate::Result;
+    use crate::expr::accessor::StructAccessor;
     use crate::expr::visitors::manifest_evaluator::ManifestEvaluator;
     use crate::expr::{
-        BinaryExpression, Bind, Predicate, PredicateOperator, Reference, SetExpression,
-        UnaryExpression,
+        BinaryExpression, Bind, BoundPredicate, BoundReference, Predicate, PredicateOperator,
+        Reference, SetExpression, UnaryExpression,
     };
     use crate::spec::{
         Datum, FieldSummary, ManifestContentType, ManifestFile, NestedField, PrimitiveType, Schema,
-        SchemaRef, Type,
+        SchemaRef, StructType, Type,
     };
+    use crate::{ErrorKind, Result};
 
     const INT_MIN_VALUE: i32 = 30;
     const INT_MAX_VALUE: i32 = 79;
@@ -739,6 +749,211 @@ mod test {
                 .build()
                 .eval(&manifest_file)?
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_partition_summary_short_exact_extra_and_position_boundaries() -> Result<()> {
+        let summary = FieldSummary {
+            contains_null: true,
+            contains_nan: None,
+            lower_bound: None,
+            upper_bound: None,
+        };
+        let position_zero_evaluator =
+            ManifestEvaluator::builder(bound_is_null_at_position(0)).build();
+
+        let short_error = position_zero_evaluator
+            .eval(&create_manifest_file(Vec::new()))
+            .expect_err("a summary list without position zero must return a typed error");
+        assert_partition_position_error(&short_error, 0, 0);
+
+        assert!(position_zero_evaluator.eval(&create_manifest_file(vec![summary.clone()]))?);
+        assert!(position_zero_evaluator.eval(&create_manifest_file(vec![
+            summary.clone(),
+            summary.clone()
+        ]))?);
+
+        let summaries = vec![summary];
+        for position in [summaries.len(), usize::MAX] {
+            let error = ManifestEvaluator::builder(bound_is_null_at_position(position))
+                .build()
+                .eval(&create_manifest_file(summaries.clone()))
+                .expect_err("an out-of-range partition-summary position must return a typed error");
+            assert_partition_position_error(&error, position, summaries.len());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_absent_partition_summaries_might_match_but_empty_summaries_are_evaluated() -> Result<()>
+    {
+        let schema = create_schema()?;
+        let reference_filter = Predicate::Unary(UnaryExpression::new(
+            PredicateOperator::IsNull,
+            Reference::new("some_nulls"),
+        ))
+        .bind(schema.clone(), true)?;
+        let reference_evaluator = ManifestEvaluator::builder(reference_filter).build();
+        let always_false_evaluator =
+            ManifestEvaluator::builder(Predicate::AlwaysFalse.bind(schema, true)?).build();
+
+        let mut absent = create_manifest_file(Vec::new());
+        absent.partitions = None;
+        let empty = create_manifest_file(Vec::new());
+
+        assert!(always_false_evaluator.eval(&absent)?);
+        assert!(!always_false_evaluator.eval(&empty)?);
+
+        let error = reference_evaluator
+            .eval(&empty)
+            .expect_err("an empty present summary list must visit reference predicates");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            error.message(),
+            "Cannot access partition summary at position 2 for field 'some_nulls' from manifest with 0 partition summaries"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_malformed_bounds_return_contextual_typed_errors_for_every_decoding_operator()
+    -> Result<()> {
+        let schema = create_schema()?;
+        let binary_cases = [
+            (PredicateOperator::LessThan, true, "lower"),
+            (PredicateOperator::LessThanOrEq, true, "lower"),
+            (PredicateOperator::GreaterThan, false, "upper"),
+            (PredicateOperator::GreaterThanOrEq, false, "upper"),
+            (PredicateOperator::Eq, true, "lower"),
+            (PredicateOperator::Eq, false, "upper"),
+        ];
+
+        for (operator, corrupt_lower, bound_kind) in binary_cases {
+            let filter = Predicate::Binary(BinaryExpression::new(
+                operator,
+                Reference::new("id"),
+                Datum::int(INT_MIN_VALUE),
+            ))
+            .bind(schema.clone(), true)?;
+            assert_malformed_int_bound_error(filter, corrupt_lower, bound_kind)?;
+        }
+
+        for (corrupt_lower, bound_kind) in [(true, "lower"), (false, "upper")] {
+            let filter = Predicate::Set(SetExpression::new(
+                PredicateOperator::In,
+                Reference::new("id"),
+                FnvHashSet::from_iter([Datum::int(INT_MIN_VALUE)]),
+            ))
+            .bind(schema.clone(), true)?;
+            assert_malformed_int_bound_error(filter, corrupt_lower, bound_kind)?;
+        }
+
+        assert_eq!(
+            binary_cases.len() + 2,
+            8,
+            "all bound-decode paths must remain covered"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_primitive_bound_type_returns_typed_error_through_operator_evaluation() -> Result<()>
+    {
+        let reference = BoundReference::new(
+            "nested",
+            Arc::new(NestedField::required(
+                100,
+                "nested",
+                Type::Struct(StructType::new(Vec::new())),
+            )),
+            Arc::new(StructAccessor::new(0, PrimitiveType::Int)),
+        );
+        let filter = BoundPredicate::Binary(BinaryExpression::new(
+            PredicateOperator::LessThan,
+            reference,
+            Datum::int(1),
+        ));
+        let summary = FieldSummary {
+            contains_null: false,
+            contains_nan: None,
+            lower_bound: Some(Datum::int(0).to_bytes()?),
+            upper_bound: Some(Datum::int(2).to_bytes()?),
+        };
+
+        let error = ManifestEvaluator::builder(filter)
+            .build()
+            .eval(&create_manifest_file(vec![summary]))
+            .expect_err("operator evaluation must reject a non-primitive bound type");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            error.message(),
+            "Cannot decode lower partition bound for non-primitive field 'nested' of type struct<>"
+        );
+
+        Ok(())
+    }
+
+    fn bound_is_null_at_position(position: usize) -> BoundPredicate {
+        BoundPredicate::Unary(UnaryExpression::new(
+            PredicateOperator::IsNull,
+            BoundReference::new(
+                "partition",
+                Arc::new(NestedField::optional(
+                    100,
+                    "partition",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(StructAccessor::new(position, PrimitiveType::Int)),
+            ),
+        ))
+    }
+
+    fn assert_partition_position_error(
+        error: &crate::Error,
+        position: usize,
+        summary_count: usize,
+    ) {
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            error.message(),
+            format!(
+                "Cannot access partition summary at position {position} for field 'partition' from manifest with {summary_count} partition summaries"
+            )
+        );
+    }
+
+    fn assert_malformed_int_bound_error(
+        filter: crate::expr::BoundPredicate,
+        corrupt_lower: bool,
+        bound_kind: &str,
+    ) -> Result<()> {
+        let mut partitions = create_partitions();
+        if corrupt_lower {
+            partitions[0].lower_bound = Some(ByteBuf::from(vec![0]));
+        } else {
+            partitions[0].upper_bound = Some(ByteBuf::from(vec![0]));
+        }
+
+        let error = ManifestEvaluator::builder(filter)
+            .build()
+            .eval(&create_manifest_file(partitions))
+            .expect_err("a malformed manifest bound must return a typed error");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert_eq!(error.message(), "failed to convert byte slice to array");
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the byte conversion source must be preserved"
+        );
+        let display = error.to_string();
+        assert!(display.contains(&format!("manifest bound: {bound_kind}")));
+        assert!(display.contains("partition field: id"));
 
         Ok(())
     }
