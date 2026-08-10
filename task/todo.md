@@ -173,10 +173,11 @@ V3 MoR, delete-sequence/partial-resolver redesign, architecture reorganization, 
       Evidence: [2026-08-audit-hardening-ledger.md](2026-08-audit-hardening-ledger.md) ·
       [critic verdicts / S3 register](2026-08-audit-hardening-critic-verdicts.md) ·
       [sepmo-metrics.md](sepmo-metrics.md).
-      **GATE GAP CARRIED TO MERGE:** the Docker daemon was down, so `make test` did not run and
-      eight integration binaries are unexercised — including the REST end-to-end suite that covers
-      G5's changed error paths. Re-run `make test` with Docker up before merging. Nothing is pushed
-      and no PR exists, per this clause.
+      **Gate gap RESOLVED 2026-08-10 — it was local only.** The Docker daemon was down so `make
+      test` did not run here, but CI's `Tests (default)` job does `make docker-up` + full-workspace
+      nextest on every PR: **4158/4158 passed on #191**, including all eight binaries that failed
+      locally. Local `make test` is a pre-flight convenience, not a coverage requirement.
+      **PUSHED 2026-08-09 on user instruction; PR #191 open, CI 14/14 green.** Merging is the user's.
 
 Contingencies: a group that cannot converge is either REMOVED with an additive revert commit or
 REMANDED with enumerated findings to the closing Critic; no destructive reset/checkout is authorized.

@@ -236,7 +236,7 @@ the diff range.
 | 5 | `cargo deny check advisories` | **OK** |
 | 6a | `cargo test --no-fail-fast --doc --all-features --workspace` | **OK**, rc 0 |
 | 6b | `cargo test --no-fail-fast --all-targets --all-features --workspace` | **4113 passed / 45 failed** — every failure infrastructure, see below |
-| 7 | `make test` | **NOT RUN** — see below |
+| 7 | `make test` | **NOT RUN locally** (Docker daemon down) — but CI's `Tests (default)` job runs `make docker-up` + the full nextest suite on every PR, and passed 4158/4158 on #191. See below. |
 
 Per-crate unit tests for everything this bundle touched, all green:
 `iceberg` **3232**/0 · `iceberg-datafusion` 191/0 · `iceberg-catalog-rest` 105/0 ·
@@ -286,11 +286,22 @@ PROCESS, `cargo test` uses threads within one process per binary. That cannot ch
 run, but it can mask a test that depends on process isolation. Re-running under nextest is part of
 the pre-merge `make test`, not an extra step.
 
-**What that leaves genuinely unverified**, stated plainly rather than assumed benign: the REST
-catalog end-to-end suite is the one that exercises G5's changed error paths against a live server,
-so SEC-001/SEC-009 are pinned by unit tests and not by an end-to-end run. `read_evolved_schema` and
-`read_positional_deletes` exercise read paths adjacent to R1's decimal decode. Re-run
-`make test` with Docker up before merge.
+**RESOLVED 2026-08-10 — the gap was local only, and CI had already closed it.** The paragraph that
+stood here said the REST end-to-end suite and the two read-path suites were "genuinely unverified"
+and asked for a local `make test` before merge. That was wrong, and wrong in the direction of
+overstating risk. **`.github/workflows/ci.yml:197` runs `make docker-up` inside the
+`Tests (default)` job**, executes the whole workspace under nextest, then `make docker-down` — so
+every PR already gets the full Docker-backed suite.
+
+Verified on PR #191's own run (job 93319707023), not inferred: **4158 tests across 85 binaries,
+4158 passed, 3 skipped**, and all eight binaries that failed locally appear in the log —
+`glue_catalog_test`, `hms_catalog_test`, `rest_catalog_test`, `file_io_s3_test`,
+`file_io_gcs_test`, `conflict_commit_test`, `read_evolved_schema`, `read_positional_deletes`. The
+arithmetic closes exactly: local 4113 passed + 45 failed = 4158, and CI passes all 4158.
+
+So step 7 is a **local pre-flight convenience**, not a coverage requirement: the only thing an
+unavailable Docker daemon costs is a faster signal than waiting for CI. SEC-001/SEC-009 and the
+decimal read paths ARE covered end-to-end.
 
 **typos.** A bare `typos .` is **green in this worktree** — verified. The `--exclude
 repark-grok-catchup` flag used during the run was carried over from the primary checkout, where that
