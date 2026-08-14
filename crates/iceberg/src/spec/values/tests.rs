@@ -1570,6 +1570,26 @@ fn avro_convert_test_timestamptz() {
 }
 
 #[test]
+fn avro_convert_test_timestamp_ns() {
+    // RISK: Long → timestamp_ns was missing from RawLiteralEnum::try_into, so a V3 identity
+    // partition written as Avro long could not be reloaded (inspect died before projection).
+    check_convert_with_avro(
+        Literal::Primitive(PrimitiveLiteral::Long(1_704_083_400_000_000_000)),
+        &Type::Primitive(PrimitiveType::TimestampNs),
+    );
+}
+
+#[test]
+fn avro_convert_test_timestamptz_ns() {
+    // RISK: same-class twin of Timestamptz — Long → timestamptz_ns must decode for inspect to
+    // reach the data_file projection arm.
+    check_convert_with_avro(
+        Literal::Primitive(PrimitiveLiteral::Long(1_704_083_400_000_000_000)),
+        &Type::Primitive(PrimitiveType::TimestamptzNs),
+    );
+}
+
+#[test]
 fn avro_convert_test_list() {
     check_convert_with_avro(
         Literal::List(vec![

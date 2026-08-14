@@ -31,6 +31,18 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-14): FW-1 timestamptz `data_file` metadata projection
+
+Branch: `repark/fw1-timestamptz-datafile-projection`. Charter: F-V4-1 / A7 — projection/read only.
+
+- [x] Add `Timestamptz` + `TimestamptzNs` arms in `inspect/data_file.rs` `append_partition_field` (mirror `readable_metrics.rs`). `Uuid`/`Fixed` stay in `other`.
+- [x] Confirm `type_to_arrow_type` already produces timestamptz partition children; fix only if it also refuses. (already produced `Timestamp(µs/ns, +00:00)`; Avro `Long` decode of `timestamp_ns`/`timestamptz_ns` was the inspect-read blocker and was added in `serde.rs`.)
+- [x] Tests (same commit): `.files` / `.partitions` over timestamptz-identity and `.files` over timestamptz_ns-identity asserting the projected value; Uuid + Fixed identity partitions still error on the existing needle (isolated + metadata-table).
+- [x] New GAP_MATRIX row R162 (do not overload R142). Update `crates/iceberg/src/inspect/map.md`. ENGINE_CONTRACT.md and repark pins untouched.
+- [x] A6 gates: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=2 — docker-up bind failed on host `:9000` (pre-existing host process, not this compose). A6 HALT; no push / no PR.
+
+---
+
 ## ACTIVE (2026-08-08): 2026-08 audit hardening — SEPMO bundled branch
 
 Branch: `fix/2026-08-audit-hardening`. User approved the 8/8 proposition ledger on 2026-08-08.
