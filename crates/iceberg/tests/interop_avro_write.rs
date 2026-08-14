@@ -51,7 +51,7 @@ use arrow_array::{
     LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::SchemaRef as ArrowSchemaRef;
-use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 use iceberg::io::FileIO;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::writer::file_writer::{AvroWriterBuilder, FileWriter, FileWriterBuilder};
@@ -136,8 +136,9 @@ fn fixture_batch(schema: &Schema) -> RecordBatch {
     let f64c = Arc::new(Float64Array::from(F64.to_vec())) as ArrayRef;
     let flag = Arc::new(BooleanArray::from(FLAG.to_vec())) as ArrayRef;
     let dt = Arc::new(Date32Array::from(DT_DAYS.to_vec())) as ArrayRef;
-    let ts = Arc::new(TimestampMicrosecondArray::from(TS_MICROS.to_vec()).with_timezone_utc())
-        as ArrayRef;
+    let ts =
+        Arc::new(TimestampMicrosecondArray::from(TS_MICROS.to_vec()).with_timezone(UTC_TIME_ZONE))
+            as ArrayRef;
     let dec = Arc::new(
         Decimal128Array::from(DEC_UNSCALED.to_vec())
             .with_precision_and_scale(9, 2)

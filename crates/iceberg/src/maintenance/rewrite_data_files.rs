@@ -1262,7 +1262,7 @@ mod tests {
         use arrow_array::{Decimal128Array, TimestampMicrosecondArray};
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-        use crate::arrow::schema_to_arrow_schema;
+        use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 
         let (catalog, _temp) = local_fs_catalog().await;
 
@@ -1316,7 +1316,7 @@ mod tests {
                 .with_precision_and_scale(9, 2)
                 .unwrap();
             let ts = TimestampMicrosecondArray::from(vec![1_700_000_000_000_000 + index])
-                .with_timezone_utc();
+                .with_timezone(UTC_TIME_ZONE);
             let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
                 Arc::new(Int64Array::from(vec![index])) as ArrayRef,
                 Arc::new(amount) as ArrayRef,

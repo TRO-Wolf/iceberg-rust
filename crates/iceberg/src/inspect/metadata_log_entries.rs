@@ -23,7 +23,7 @@ use arrow_array::types::TimestampMicrosecondType;
 use futures::{StreamExt, stream};
 
 use crate::Result;
-use crate::arrow::schema_to_arrow_schema;
+use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{NestedField, PrimitiveType, TableMetadata, Type};
 use crate::table::Table;
@@ -73,7 +73,7 @@ impl<'a> MetadataLogEntriesTable<'a> {
         let metadata = self.table.metadata();
 
         let mut timestamp =
-            PrimitiveBuilder::<TimestampMicrosecondType>::new().with_timezone("+00:00");
+            PrimitiveBuilder::<TimestampMicrosecondType>::new().with_timezone(UTC_TIME_ZONE);
         let mut file = StringBuilder::new();
         let mut latest_snapshot_id = Int64Builder::new();
         let mut latest_schema_id = Int32Builder::new();
@@ -224,13 +224,13 @@ mod tests {
         check_record_batches(
             batches,
             expect![[r#"
-                Field { "timestamp": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+                Field { "timestamp": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "file": Utf8, metadata: {"PARQUET:field_id": "2"} },
                 Field { "latest_snapshot_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
                 Field { "latest_schema_id": nullable Int32, metadata: {"PARQUET:field_id": "4"} },
                 Field { "latest_sequence_number": nullable Int64, metadata: {"PARQUET:field_id": "5"} }"#]],
             expect![[r#"
-                timestamp: PrimitiveArray<Timestamp(µs, "+00:00")>
+                timestamp: PrimitiveArray<Timestamp(µs, "UTC")>
                 [
                   2020-10-14T01:22:53.590+00:00,
                 ],

@@ -357,8 +357,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::arrow::DEFAULT_MAP_FIELD_NAME;
     use crate::arrow::avro_reader::read_avro_data_bytes;
+    use crate::arrow::{DEFAULT_MAP_FIELD_NAME, UTC_TIME_ZONE};
     use crate::io::FileIO;
     use crate::spec::{
         ListType, MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, MapType, NestedField, PrimitiveType,
@@ -492,7 +492,7 @@ mod tests {
         ])) as ArrayRef;
         let col10 = Arc::new(
             TimestampMicrosecondArray::from(vec![Some(0), Some(1), None, Some(3)])
-                .with_timezone_utc(),
+                .with_timezone(UTC_TIME_ZONE),
         ) as ArrayRef;
         let col11 = Arc::new(TimestampNanosecondArray::from(vec![
             Some(0),
@@ -502,7 +502,7 @@ mod tests {
         ])) as ArrayRef;
         let col12 = Arc::new(
             TimestampNanosecondArray::from(vec![Some(0), Some(1), None, Some(3)])
-                .with_timezone_utc(),
+                .with_timezone(UTC_TIME_ZONE),
         ) as ArrayRef;
         let col13 = Arc::new(
             Decimal128Array::from(vec![Some(1), Some(2), None, Some(100)])

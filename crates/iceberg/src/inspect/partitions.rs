@@ -57,7 +57,7 @@ use arrow_schema::{DataType, Fields};
 use futures::{StreamExt, stream};
 
 use super::data_file::append_partition;
-use crate::arrow::schema_to_arrow_schema;
+use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{
     DataContentType, Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Struct,
@@ -275,7 +275,7 @@ impl<'a> PartitionsTable<'a> {
         let mut position_delete_file_count = Int32Builder::new();
         let mut equality_delete_record_count = Int64Builder::new();
         let mut equality_delete_file_count = Int32Builder::new();
-        let mut last_updated_at = TimestampMicrosecondBuilder::new().with_timezone("+00:00");
+        let mut last_updated_at = TimestampMicrosecondBuilder::new().with_timezone(UTC_TIME_ZONE);
         let mut last_updated_snapshot_id = Int64Builder::new();
 
         for row in rows {
@@ -418,6 +418,7 @@ mod tests {
     use arrow_array::types::{Int32Type, Int64Type, TimestampMicrosecondType};
     use futures::TryStreamExt;
 
+    use crate::arrow::UTC_TIME_ZONE;
     use crate::scan::ArrowRecordBatchStream;
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
@@ -1192,7 +1193,10 @@ mod tests {
         let last_updated_at = arrow.field_with_name("last_updated_at").unwrap();
         assert_eq!(
             last_updated_at.data_type(),
-            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("+00:00".into()))
+            &DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(UTC_TIME_ZONE.into())
+            )
         );
         assert!(last_updated_at.is_nullable());
         assert!(

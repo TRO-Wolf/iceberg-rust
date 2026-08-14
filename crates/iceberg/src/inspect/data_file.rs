@@ -576,7 +576,7 @@ mod tests {
     use futures::TryStreamExt;
 
     use super::{append_partition, data_file_fields};
-    use crate::arrow::schema_to_arrow_schema;
+    use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(projected.len(), 1);
         assert_eq!(
             projected.column(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
+            &DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into()))
         );
         let values = projected
             .column(0)
@@ -786,7 +786,7 @@ mod tests {
         assert_eq!(projected.len(), 1);
         assert_eq!(
             projected.column(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()))
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into()))
         );
         let values = projected
             .column(0)
@@ -851,7 +851,7 @@ mod tests {
         };
         assert_eq!(
             partition_type,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
             "type_to_arrow_type must already produce a timestamptz partition child"
         );
 
@@ -927,7 +927,7 @@ mod tests {
                 .as_struct()
                 .column(0)
                 .data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()))
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into()))
         );
     }
 

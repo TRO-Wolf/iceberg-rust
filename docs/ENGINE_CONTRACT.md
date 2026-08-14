@@ -136,13 +136,13 @@ The engine-boundary proof (#116): scan `_file`/`_pos` → write position-delete 
 **Write-batch timezone coercion (F-A2-3).** The Parquet write funnel (`ParquetWriter::write`, the
 sole **Parquet** `FileWriter` impl every parquet-format data / delete / partitioning writer routes through; Avro is a separate `FileWriter` seam not covered by this coercion) normalizes a record
 batch whose columns differ from the file (writer) schema ONLY by a UTC-alias timezone string on a
-**top-level** timestamp — `Timestamp(_, "UTC")` (as Spark tags Iceberg `timestamptz`) vs the crate's
-canonical `Timestamp(_, "+00:00")` (`arrow::schema` `UTC_TIME_ZONE`) — via a metadata-only relabel
-(instants bit-identical), mirroring Java Iceberg's coercion of write batches to the file schema. The
-engine may therefore hand `"UTC"`-tagged batches directly. The alias set is CLOSED (`"UTC"` /
-`"+00:00"` only): a genuinely different timezone (`"+05:00"`), a naive-vs-`timestamptz` mismatch, or a
-**nested** alias mismatch (inside a struct/list) is NOT coerced and fails loud — nested normalization
-is a deferred fork follow-up.
+**top-level** timestamp — `Timestamp(_, "+00:00")` (the historical Iceberg-Rust annotation) vs the
+crate's canonical `Timestamp(_, "UTC")` (`arrow::schema` `UTC_TIME_ZONE`, matching Spark `toArrow`)
+— via a metadata-only relabel (instants bit-identical), mirroring Java Iceberg's coercion of write
+batches to the file schema. The engine may therefore hand either UTC-alias spelling. The alias set
+is CLOSED (`"UTC"` / `"+00:00"` only): a genuinely different timezone (`"+05:00"`), a
+naive-vs-`timestamptz` mismatch, or a **nested** alias mismatch (inside a struct/list) is NOT
+coerced and fails loud — nested normalization is a deferred fork follow-up.
 
 **Partition-tuple integrity.** A wrong partition tuple is *accepted* by every commit path (arity and
 types are validated, values are not) and is then silent in both engines: a pruned read drops the
