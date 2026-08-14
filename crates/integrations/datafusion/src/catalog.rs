@@ -113,9 +113,10 @@ const NAMESPACE_DISCOVERY_CONCURRENCY: usize = 16;
 /// Two rules keep one namespace from ever being served in place of another:
 ///
 /// 1. **Canonical names cannot collide.** A namespace whose level text contains
-///    [`NAMESPACE_SEPARATOR`] is rejected by [`Self::try_new`] with a typed
-///    [`ErrorKind::DataInvalid`] error, which makes the canonical join injective. (`["a\u{1f}b"]`
-///    and `["a", "b"]` would otherwise both render `a\u{1f}b`.)
+///    [`NAMESPACE_SEPARATOR`] is rejected at construction ([`Self::try_new`] /
+///    [`Self::try_new_with_namespace_scope`]) with a typed [`ErrorKind::DataInvalid`] error, which
+///    makes the canonical join injective. (`["a\u{1f}b"]` and `["a", "b"]` would otherwise both
+///    render `a\u{1f}b`.)
 /// 2. **An ambiguous alias is dropped, never resolved.** `["a", "b"]` and `["a.b"]` both alias to
 ///    `a.b`. An alias is registered only when it is unclaimed: if it equals ANY namespace's
 ///    canonical name, the canonical binding wins and the alias is not registered; if two distinct
@@ -141,6 +142,9 @@ impl IcebergCatalogProvider {
     /// The walk is bounded by [`MAX_NAMESPACE_DEPTH`] and issues at most
     /// [`NAMESPACE_DISCOVERY_CONCURRENCY`] listings concurrently.
     ///
+    /// This signature is unchanged. To snapshot only some namespaces — and avoid a catalog-wide
+    /// `list_namespaces(None)` — use [`Self::try_new_with_namespace_scope`].
+    ///
     /// # Failure policy — loud, never partial
     ///
     /// A namespace that cannot be listed, or whose [`SchemaProvider`] cannot be built, FAILS this
@@ -155,10 +159,38 @@ impl IcebergCatalogProvider {
     /// per-*table* contract documented in `docs/ENGINE_CONTRACT.md` §1: table metadata is still
     /// never read here, so an unreadable table still cannot brick construction.
     pub async fn try_new(client: Arc<dyn Catalog>) -> Result<Self> {
+        Self::try_new_with_scope(client, NamespaceWalkScope::Unscoped).await
+    }
+
+    /// Like [`Self::try_new`], but snapshots only `namespaces` and each of their descendants.
+    ///
+    /// The filter enters at discovery, not on the [`CatalogProvider`] trait: the named identifiers
+    /// seed the same #191 nested BFS (U+001F canonical names, depth cap, visited-set, loud
+    /// failure) and **`list_namespaces(None)` is never issued**. A sibling of a named root is
+    /// neither listed nor registered.
+    ///
+    /// An empty iterator walks nothing — no namespace listing, no table listing — and returns an
+    /// empty provider. That is distinct from [`Self::try_new`], which is the unset / full-catalog
+    /// walk and stays byte-compatible with historical construction.
+    pub async fn try_new_with_namespace_scope(
+        client: Arc<dyn Catalog>,
+        namespaces: impl IntoIterator<Item = NamespaceIdent>,
+    ) -> Result<Self> {
+        Self::try_new_with_scope(
+            client,
+            NamespaceWalkScope::Scoped(namespaces.into_iter().collect()),
+        )
+        .await
+    }
+
+    async fn try_new_with_scope(
+        client: Arc<dyn Catalog>,
+        scope: NamespaceWalkScope,
+    ) -> Result<Self> {
         // TODO:
         // Schemas and providers should be cached and evicted based on time
         // As of right now; schemas might become stale.
-        let namespaces = discover_namespaces(&client).await?;
+        let namespaces = discover_namespaces(&client, scope).await?;
         let providers = build_schema_providers(&client, &namespaces).await?;
 
         // Canonical bindings. `discover_namespaces` de-duplicates the identifiers and rejects any
@@ -260,7 +292,17 @@ fn validate_namespace_renderable(namespace: &NamespaceIdent) -> Result<()> {
     Ok(())
 }
 
-/// Breadth-first walk of the whole namespace tree.
+/// Where the namespace filter enters without changing [`CatalogProvider`].
+///
+/// [`NamespaceWalkScope::Unscoped`] is today's full BFS (`list_namespaces(None)` then descendants).
+/// [`NamespaceWalkScope::Scoped`] seeds that same BFS at the named identifiers and never lists the
+/// catalog root. An empty scoped list walks nothing.
+enum NamespaceWalkScope {
+    Unscoped,
+    Scoped(Vec<NamespaceIdent>),
+}
+
+/// Breadth-first walk of the namespace tree, optionally seeded at a named scope.
 ///
 /// Termination rests on two guarantees that are NOT interchangeable — each covers a shape the
 /// other cannot:
@@ -275,14 +317,34 @@ fn validate_namespace_renderable(namespace: &NamespaceIdent) -> Result<()> {
 ///    `a_cyclic_catalog_still_terminates`.
 /// 2. **[`MAX_NAMESPACE_DEPTH`]** — fails loudly on a catalog that keeps answering with strictly
 ///    deeper, never-before-seen namespaces, which `seen` alone would follow forever.
-async fn discover_namespaces(client: &Arc<dyn Catalog>) -> Result<Vec<NamespaceIdent>> {
+///
+/// A [`NamespaceWalkScope::Scoped`] walk uses the same loop and the same two guarantees. It differs
+/// in the initial frontier (caller-supplied identifiers, never `list_namespaces(None)`) and in a
+/// descendant filter: a listing that ignores the parent argument (a REST server that drops
+/// `?parent=`) must not pull a sibling into the snapshot.
+async fn discover_namespaces(
+    client: &Arc<dyn Catalog>,
+    scope: NamespaceWalkScope,
+) -> Result<Vec<NamespaceIdent>> {
     let mut seen: HashSet<NamespaceIdent> = HashSet::new();
     let mut discovered: Vec<NamespaceIdent> = Vec::new();
-    let mut frontier: Vec<NamespaceIdent> = client.list_namespaces(None).await?;
+    let (mut frontier, scope_seeds): (Vec<NamespaceIdent>, Option<Vec<NamespaceIdent>>) =
+        match scope {
+            NamespaceWalkScope::Unscoped => (client.list_namespaces(None).await?, None),
+            NamespaceWalkScope::Scoped(seeds) if seeds.is_empty() => return Ok(Vec::new()),
+            NamespaceWalkScope::Scoped(seeds) => (seeds.clone(), Some(seeds)),
+        };
 
     while !frontier.is_empty() {
         let mut fresh: Vec<NamespaceIdent> = Vec::with_capacity(frontier.len());
         for namespace in frontier {
+            if let Some(seeds) = scope_seeds.as_deref()
+                && !seeds
+                    .iter()
+                    .any(|seed| namespace_is_or_under(seed, &namespace))
+            {
+                continue;
+            }
             validate_namespace_renderable(&namespace)?;
             if seen.insert(namespace.clone()) {
                 discovered.push(namespace.clone());
@@ -298,6 +360,17 @@ async fn discover_namespaces(client: &Arc<dyn Catalog>) -> Result<Vec<NamespaceI
     }
 
     Ok(discovered)
+}
+
+/// True when `candidate` is `seed` or a descendant of `seed` (seed levels are a prefix).
+fn namespace_is_or_under(seed: &NamespaceIdent, candidate: &NamespaceIdent) -> bool {
+    let seed = seed.as_ref();
+    let candidate = candidate.as_ref();
+    candidate.len() >= seed.len()
+        && candidate
+            .iter()
+            .zip(seed.iter())
+            .all(|(left, right)| left == right)
 }
 
 /// Lists the direct children of every namespace in `parents`, at most
@@ -365,8 +438,8 @@ async fn build_schema_providers(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -510,6 +583,11 @@ mod tests {
         /// Every `list_namespaces` call, so a test can pin the N+1 listing shape and the budget
         /// can stop a non-terminating walk.
         listing_calls: AtomicUsize,
+        /// Parent argument of each `list_namespaces` call, in issuance order. `None` is the
+        /// catalog-root listing that a scoped walk must never issue.
+        listing_parents: Mutex<Vec<Option<NamespaceIdent>>>,
+        /// Namespace of each `list_tables` call, in issuance order.
+        table_listings: Mutex<Vec<NamespaceIdent>>,
     }
 
     impl ScriptedCatalog {
@@ -521,6 +599,8 @@ mod tests {
                 delay_tables_of: None,
                 parent_script: ParentScript::Delegate,
                 listing_calls: AtomicUsize::new(0),
+                listing_parents: Mutex::new(Vec::new()),
+                table_listings: Mutex::new(Vec::new()),
             }
         }
 
@@ -555,6 +635,20 @@ mod tests {
         fn listings_issued(&self) -> usize {
             self.listing_calls.load(Ordering::Relaxed)
         }
+
+        fn recorded_listing_parents(&self) -> Vec<Option<NamespaceIdent>> {
+            self.listing_parents
+                .lock()
+                .expect("listing_parents lock poisoned")
+                .clone()
+        }
+
+        fn recorded_table_listings(&self) -> Vec<NamespaceIdent> {
+            self.table_listings
+                .lock()
+                .expect("table_listings lock poisoned")
+                .clone()
+        }
     }
 
     #[async_trait]
@@ -564,6 +658,10 @@ mod tests {
             parent: Option<&NamespaceIdent>,
         ) -> Result<Vec<NamespaceIdent>> {
             let calls = self.listing_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            self.listing_parents
+                .lock()
+                .expect("listing_parents lock poisoned")
+                .push(parent.cloned());
             if self.parent_script != ParentScript::Delegate && calls > MAX_SCRIPTED_LISTINGS {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -637,6 +735,10 @@ mod tests {
         }
 
         async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+            self.table_listings
+                .lock()
+                .expect("table_listings lock poisoned")
+                .push(namespace.clone());
             if self.fail_tables_of.as_ref() == Some(namespace) {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -1181,5 +1283,352 @@ mod tests {
         assert!(provider.schema("nope").is_none());
         assert!(provider.schema("a.b.c").is_none());
         assert!(provider.schema(&canonical(&["a", "z"])).is_none());
+    }
+
+    /// Builds the F-1 fixture: two sibling roots (`keep`, `other`). `keep` is three levels deep
+    /// so a "descendants" pin cannot be satisfied by a one-level child-only walk. Each listed
+    /// namespace has a table; the scoped-walk pins assert the mock never lists `other`.
+    async fn scoped_walk_fixture() -> (
+        Arc<ScriptedCatalog>,
+        NamespaceIdent,
+        NamespaceIdent,
+        NamespaceIdent,
+        NamespaceIdent,
+        NamespaceIdent,
+        TempDir,
+    ) {
+        let (inner, warehouse) = memory_catalog().await;
+        let keep = create_namespace(&inner, &["keep"]).await;
+        let keep_child = create_namespace(&inner, &["keep", "child"]).await;
+        let keep_grand = create_namespace(&inner, &["keep", "child", "grand"]).await;
+        let other = create_namespace(&inner, &["other"]).await;
+        let other_child = create_namespace(&inner, &["other", "child"]).await;
+        create_table(&inner, &keep, "t_keep").await;
+        create_table(&inner, &keep_child, "t_keep_child").await;
+        create_table(&inner, &keep_grand, "t_keep_grand").await;
+        create_table(&inner, &other, "t_other").await;
+        create_table(&inner, &other_child, "t_other_child").await;
+        (
+            Arc::new(ScriptedCatalog::delegating(inner)),
+            keep,
+            keep_child,
+            keep_grand,
+            other,
+            other_child,
+            warehouse,
+        )
+    }
+
+    /// Unscoped `try_new` is the historical walk: it lists the catalog root and every namespace's
+    /// children and tables, including siblings the scoped constructor must not touch.
+    ///
+    /// Mutation this catches: changing `try_new` to seed an empty scope (so the full walk
+    /// disappears) — the root-listing assertion and the `other` schema assertion both go RED.
+    #[tokio::test]
+    async fn unscoped_try_new_still_walks_the_whole_catalog() {
+        let (scripted, keep, keep_child, keep_grand, other, other_child, _warehouse) =
+            scoped_walk_fixture().await;
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+
+        let provider = IcebergCatalogProvider::try_new(catalog)
+            .await
+            .expect("unscoped catalog provider construction failed");
+
+        assert_eq!(sorted_schema_names(&provider), vec![
+            "keep".to_string(),
+            canonical(&["keep", "child"]),
+            canonical(&["keep", "child", "grand"]),
+            "other".to_string(),
+            canonical(&["other", "child"]),
+        ]);
+        assert!(
+            scripted
+                .recorded_listing_parents()
+                .iter()
+                .any(|parent| parent.is_none()),
+            "unscoped try_new must still issue list_namespaces(None): {:?}",
+            scripted.recorded_listing_parents()
+        );
+        let table_listings = scripted.recorded_table_listings();
+        for namespace in [&keep, &keep_child, &keep_grand, &other, &other_child] {
+            assert!(
+                table_listings.contains(namespace),
+                "unscoped try_new never listed tables of {namespace:?}: {table_listings:?}"
+            );
+        }
+    }
+
+    /// A named scope walks that namespace and its descendants only — never the catalog root, never
+    /// a sibling tree. Nested names stay #191-canonical (U+001F) and the dot alias still resolves.
+    ///
+    /// Mutation this catches: implementing scope as a post-filter on a full walk (still calling
+    /// `list_namespaces(None)` / listing `other`) — the root-listing and `other` table-listing
+    /// assertions go RED. Deleting the BFS under the seed (descendants dropped) reds the child
+    /// schema / table assertions.
+    #[tokio::test]
+    async fn scoped_walk_touches_only_the_named_namespace_and_descendants() {
+        let (scripted, keep, keep_child, keep_grand, other, other_child, _warehouse) =
+            scoped_walk_fixture().await;
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+
+        let provider =
+            IcebergCatalogProvider::try_new_with_namespace_scope(catalog, [keep.clone()])
+                .await
+                .expect("scoped catalog provider construction failed");
+
+        assert_eq!(sorted_schema_names(&provider), vec![
+            "keep".to_string(),
+            canonical(&["keep", "child"]),
+            canonical(&["keep", "child", "grand"]),
+        ]);
+        assert!(provider.schema("other").is_none());
+        assert!(provider.schema(&canonical(&["other", "child"])).is_none());
+
+        let keep_provider = provider.schema("keep").expect("keep schema missing");
+        assert_eq!(base_table_names(&keep_provider), vec!["t_keep".to_string()]);
+        let keep_child_provider = provider
+            .schema(&canonical(&["keep", "child"]))
+            .expect("keep.child schema missing");
+        assert_eq!(base_table_names(&keep_child_provider), vec![
+            "t_keep_child".to_string()
+        ]);
+        let keep_grand_provider = provider
+            .schema(&canonical(&["keep", "child", "grand"]))
+            .expect("keep.child.grand schema missing");
+        assert_eq!(base_table_names(&keep_grand_provider), vec![
+            "t_keep_grand".to_string()
+        ]);
+        let via_alias = provider
+            .schema("keep.child.grand")
+            .expect("the grandchild's dot alias did not resolve");
+        assert_eq!(base_table_names(&via_alias), vec![
+            "t_keep_grand".to_string()
+        ]);
+
+        let listing_parents = scripted.recorded_listing_parents();
+        assert!(
+            listing_parents.iter().all(|parent| parent.is_some()),
+            "scoped walk issued list_namespaces(None): {listing_parents:?}"
+        );
+        assert!(
+            !listing_parents
+                .iter()
+                .any(|parent| parent.as_ref() == Some(&other)),
+            "scoped walk listed children of the sibling {other:?}: {listing_parents:?}"
+        );
+        assert!(
+            listing_parents
+                .iter()
+                .any(|parent| parent.as_ref() == Some(&keep)),
+            "scoped walk never listed children of the named root {keep:?}: {listing_parents:?}"
+        );
+        assert!(
+            listing_parents
+                .iter()
+                .any(|parent| parent.as_ref() == Some(&keep_child)),
+            "scoped walk never listed children of the descendant {keep_child:?}: {listing_parents:?}"
+        );
+        assert!(
+            listing_parents
+                .iter()
+                .any(|parent| parent.as_ref() == Some(&keep_grand)),
+            "scoped walk never listed children of the grandchild {keep_grand:?}: {listing_parents:?}"
+        );
+
+        let table_listings = scripted.recorded_table_listings();
+        assert!(
+            table_listings.contains(&keep)
+                && table_listings.contains(&keep_child)
+                && table_listings.contains(&keep_grand),
+            "scoped walk missed a table listing inside the scope: {table_listings:?}"
+        );
+        assert!(
+            !table_listings.contains(&other) && !table_listings.contains(&other_child),
+            "scoped walk listed tables outside the scope: {table_listings:?}"
+        );
+    }
+
+    /// Scoping to a nested namespace does not pull in its parent, and still does not list a
+    /// sibling tree.
+    #[tokio::test]
+    async fn scoped_walk_of_a_nested_namespace_excludes_its_parent() {
+        let (scripted, keep, keep_child, keep_grand, other, _other_child, _warehouse) =
+            scoped_walk_fixture().await;
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+
+        let provider =
+            IcebergCatalogProvider::try_new_with_namespace_scope(catalog, [keep_child.clone()])
+                .await
+                .expect("scoped catalog provider construction failed");
+
+        assert_eq!(sorted_schema_names(&provider), vec![
+            canonical(&["keep", "child"]),
+            canonical(&["keep", "child", "grand"]),
+        ]);
+        assert!(provider.schema("keep").is_none());
+        assert!(provider.schema("other").is_none());
+        assert_eq!(
+            base_table_names(
+                &provider
+                    .schema(&canonical(&["keep", "child", "grand"]))
+                    .expect("grandchild of the named nested scope missing")
+            ),
+            vec!["t_keep_grand".to_string()]
+        );
+
+        let listing_parents = scripted.recorded_listing_parents();
+        assert!(
+            listing_parents.iter().all(|parent| parent.is_some()),
+            "nested scoped walk issued list_namespaces(None): {listing_parents:?}"
+        );
+        assert!(
+            !listing_parents
+                .iter()
+                .any(|parent| parent.as_ref() == Some(&keep) || parent.as_ref() == Some(&other)),
+            "nested scoped walk listed a namespace outside the named subtree: {listing_parents:?}"
+        );
+        assert!(
+            listing_parents
+                .iter()
+                .any(|parent| parent.as_ref() == Some(&keep_grand)),
+            "nested scoped walk never listed children of the in-scope grandchild: {listing_parents:?}"
+        );
+        assert!(
+            !scripted.recorded_table_listings().contains(&keep),
+            "nested scoped walk listed tables of the excluded parent"
+        );
+    }
+
+    /// An empty scope is walk-nothing, not "fall back to the full catalog". Distinct from unset
+    /// [`IcebergCatalogProvider::try_new`].
+    ///
+    /// Mutation this catches: treating an empty iterator as `Unscoped` — the provider then
+    /// registers `keep`/`other` and `schema_names` is non-empty.
+    #[tokio::test]
+    async fn empty_scope_walks_nothing() {
+        let (scripted, _keep, _keep_child, _keep_grand, _other, _other_child, _warehouse) =
+            scoped_walk_fixture().await;
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+
+        let provider = IcebergCatalogProvider::try_new_with_namespace_scope(catalog, [])
+            .await
+            .expect("empty-scope construction failed");
+
+        assert!(
+            provider.schema_names().is_empty(),
+            "empty scope registered schemas: {:?}",
+            provider.schema_names()
+        );
+        assert_eq!(
+            scripted.listings_issued(),
+            0,
+            "empty scope issued list_namespaces: {:?}",
+            scripted.recorded_listing_parents()
+        );
+        assert!(
+            scripted.recorded_table_listings().is_empty(),
+            "empty scope issued list_tables: {:?}",
+            scripted.recorded_table_listings()
+        );
+    }
+
+    /// Two named roots are both walked, still without a catalog-root listing.
+    #[tokio::test]
+    async fn scoped_walk_accepts_multiple_named_roots() {
+        let (scripted, keep, _keep_child, _keep_grand, other, _other_child, _warehouse) =
+            scoped_walk_fixture().await;
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+
+        let provider = IcebergCatalogProvider::try_new_with_namespace_scope(catalog, [
+            keep.clone(),
+            other.clone(),
+        ])
+        .await
+        .expect("multi-root scoped construction failed");
+
+        assert_eq!(sorted_schema_names(&provider), vec![
+            "keep".to_string(),
+            canonical(&["keep", "child"]),
+            canonical(&["keep", "child", "grand"]),
+            "other".to_string(),
+            canonical(&["other", "child"]),
+        ]);
+        assert!(
+            scripted
+                .recorded_listing_parents()
+                .iter()
+                .all(|parent| parent.is_some()),
+            "multi-root scoped walk issued list_namespaces(None)"
+        );
+    }
+
+    /// A server that ignores `?parent=` and re-answers with the root list must still not register
+    /// a sibling of the named scope. Without the descendant filter, the first child listing would
+    /// ingest `ns2` and the scoped walk would become a full catalog snapshot.
+    ///
+    /// Mutation this catches: deleting the `namespace_is_or_under` guard — `ns2` appears in
+    /// `schema_names` and `list_tables(ns2)` is issued.
+    #[tokio::test]
+    async fn scoped_walk_rejects_siblings_when_the_catalog_ignores_the_parent_filter() {
+        let (inner, _warehouse) = memory_catalog().await;
+        let ns1 = create_namespace(&inner, &["ns1"]).await;
+        let ns2 = create_namespace(&inner, &["ns2"]).await;
+        create_table(&inner, &ns1, "t1").await;
+        create_table(&inner, &ns2, "t2").await;
+
+        let scripted = Arc::new(ScriptedCatalog::scripting_parents(
+            inner,
+            ParentScript::IgnoreParent,
+        ));
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+
+        let provider = tokio::time::timeout(
+            Duration::from_secs(30),
+            IcebergCatalogProvider::try_new_with_namespace_scope(catalog, [ns1.clone()]),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("scoped discovery against an IgnoreParent catalog never terminated")
+        })
+        .expect("scoped construction failed against an IgnoreParent catalog");
+
+        assert_eq!(sorted_schema_names(&provider), vec!["ns1".to_string()]);
+        assert!(provider.schema("ns2").is_none());
+        assert!(
+            !scripted.recorded_table_listings().contains(&ns2),
+            "scoped walk listed tables of a sibling the parent-ignoring catalog re-reported"
+        );
+        assert!(
+            scripted
+                .recorded_listing_parents()
+                .iter()
+                .all(|parent| parent.is_some()),
+            "scoped IgnoreParent walk issued list_namespaces(None)"
+        );
+    }
+
+    /// A sibling whose children cannot be listed must not be observed when it is outside the
+    /// scope — that is the point of not calling `list_namespaces(None)`.
+    ///
+    /// Mutation this catches: scoping implemented as "full walk then filter" — construction then
+    /// fails on `blocked` the same way unscoped `try_new` does.
+    #[tokio::test]
+    async fn scoped_walk_does_not_observe_a_sibling_listing_failure() {
+        let (inner, _dir) = memory_catalog().await;
+        let good = create_namespace(&inner, &["good"]).await;
+        create_namespace_chain(&inner, &["blocked", "hidden"]).await;
+        let blocked = NamespaceIdent::from_strs(["blocked"]).expect("bad namespace");
+        create_table(&inner, &good, "t_good").await;
+
+        let catalog: Arc<dyn Catalog> =
+            Arc::new(ScriptedCatalog::failing_children_of(inner, blocked));
+
+        let provider = IcebergCatalogProvider::try_new_with_namespace_scope(catalog, [good])
+            .await
+            .expect(
+                "a sibling listing failure must not be observed inside another namespace's scope",
+            );
+
+        assert_eq!(sorted_schema_names(&provider), vec!["good".to_string()]);
     }
 }
