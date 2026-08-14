@@ -484,9 +484,9 @@ fn append_partition_field(
         PrimitiveType::Date => append_typed!(Date32Builder, extract_i32),
         PrimitiveType::Time => append_typed!(Time64MicrosecondBuilder, extract_i64),
         PrimitiveType::Timestamp => append_typed!(TimestampMicrosecondBuilder, extract_i64),
-        PrimitiveType::TimestampNs => {
-            append_typed!(TimestampNanosecondBuilder, extract_i64)
-        }
+        PrimitiveType::Timestamptz => append_typed!(TimestampMicrosecondBuilder, extract_i64),
+        PrimitiveType::TimestampNs => append_typed!(TimestampNanosecondBuilder, extract_i64),
+        PrimitiveType::TimestamptzNs => append_typed!(TimestampNanosecondBuilder, extract_i64),
         PrimitiveType::String => append_typed!(StringBuilder, extract_string),
         PrimitiveType::Binary => append_typed!(BinaryBuilder, extract_binary),
         PrimitiveType::Decimal { .. } => append_typed!(Decimal128Builder, extract_i128),
@@ -562,5 +562,422 @@ fn extract_i128(primitive: &PrimitiveLiteral) -> Result<i128> {
     match primitive {
         PrimitiveLiteral::Int128(value) => Ok(*value),
         other => Err(type_mismatch(other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{TimestampMicrosecondType, TimestampNanosecondType};
+    use arrow_array::{Array, StructArray};
+    use arrow_schema::{DataType, TimeUnit};
+    use futures::TryStreamExt;
+
+    use super::{append_partition, data_file_fields};
+    use crate::arrow::schema_to_arrow_schema;
+    use crate::scan::tests::TableTestFixture;
+    use crate::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
+        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, NestedField, PrimitiveType,
+        Schema, Struct, StructType, Type,
+    };
+    use crate::{ErrorKind, Result};
+
+    /// Micros for `2024-01-01T04:30:00.000000Z` — the Java Spark example from F-V4-1.
+    const TIMESTAMPTZ_MICROS: i64 = 1_704_083_400_000_000;
+    /// Same instant as [`TIMESTAMPTZ_MICROS`], in nanoseconds.
+    const TIMESTAMPTZ_NANOS: i64 = 1_704_083_400_000_000_000;
+    const FILE_SIZE: u64 = 1024;
+
+    /// Projects one partition field through [`append_partition`] (the refuse site), using the same
+    /// Arrow child types `type_to_arrow_type` produces for `data_file_fields`.
+    fn project_one_partition_field(
+        primitive: PrimitiveType,
+        value: Option<Literal>,
+    ) -> Result<StructArray> {
+        let partition_type = StructType::new(vec![Arc::new(NestedField::optional(
+            1000,
+            "ts",
+            Type::Primitive(primitive),
+        ))]);
+        let iceberg_schema = Schema::builder()
+            .with_fields(data_file_fields(&partition_type))
+            .build()
+            .expect("data_file_fields schema is statically valid");
+        let arrow_schema =
+            schema_to_arrow_schema(&iceberg_schema).expect("data_file_fields convert to Arrow");
+        let partition_arrow = match arrow_schema
+            .field_with_name("partition")
+            .expect("data_file projection has a partition column")
+            .data_type()
+        {
+            DataType::Struct(fields) => fields.clone(),
+            other => panic!("partition column must be a struct, got {other:?}"),
+        };
+        let mut builder = arrow_array::builder::StructBuilder::from_fields(partition_arrow, 0);
+        append_partition(&mut builder, &partition_type, &Struct::from_iter([value]))?;
+        Ok(builder.finish())
+    }
+
+    /// Rewrites the example-table fixture so identity(`x`) is sourced from `primitive` and the
+    /// default partition type is recomputed. Writer/commit path is not used.
+    fn with_identity_partition_source_type(
+        fixture: TableTestFixture,
+        primitive: PrimitiveType,
+    ) -> TableTestFixture {
+        let mut metadata = fixture.table.metadata().clone();
+        let schema_ids: Vec<i32> = metadata.schemas.keys().copied().collect();
+        for schema_id in schema_ids {
+            let schema = metadata
+                .schemas
+                .get(&schema_id)
+                .expect("schema id taken from keys")
+                .clone();
+            let fields: Vec<_> = schema
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|field| {
+                    if field.id == 1 {
+                        Arc::new(NestedField::required(
+                            1,
+                            field.name.clone(),
+                            Type::Primitive(primitive.clone()),
+                        ))
+                    } else {
+                        field.clone()
+                    }
+                })
+                .collect();
+            let rebuilt = Schema::builder()
+                .with_schema_id(schema.schema_id())
+                .with_identifier_field_ids(schema.identifier_field_ids())
+                .with_fields(fields)
+                .build()
+                .expect("rebuild schema with swapped identity source type");
+            metadata.schemas.insert(schema_id, Arc::new(rebuilt));
+        }
+        let current_schema = metadata.current_schema().clone();
+        metadata.default_partition_type = metadata
+            .default_spec
+            .partition_type(current_schema.as_ref())
+            .expect("recompute default partition type after source-type swap");
+        let mut fixture = fixture;
+        fixture.table = fixture.table.clone().with_metadata(Arc::new(metadata));
+        fixture
+    }
+
+    /// Writes one Added DATA file with `partition` and stitches it into the current snapshot's
+    /// manifest list (inspect-test mold: no real parquet).
+    async fn write_one_partitioned_data_file(fixture: &TableTestFixture, partition: Struct) {
+        let metadata = fixture.table.metadata().clone();
+        let current_snapshot = metadata
+            .current_snapshot()
+            .expect("example fixture has a current snapshot");
+        let current_schema = current_snapshot
+            .schema(&metadata)
+            .expect("current snapshot schema");
+        let current_partition_spec = metadata.default_partition_spec();
+        let output = fixture
+            .table
+            .file_io()
+            .new_output(format!(
+                "{}/metadata/manifest_proj_{}.avro",
+                fixture.table_location,
+                uuid::Uuid::new_v4()
+            ))
+            .expect("create inspect-test manifest output");
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            Some(current_snapshot.snapshot_id()),
+            None,
+            current_schema.clone(),
+            current_partition_spec.as_ref().clone(),
+        )
+        .build_v2_data();
+        writer
+            .add_entry(
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(
+                        DataFileBuilder::default()
+                            .partition_spec_id(0)
+                            .content(DataContentType::Data)
+                            .file_path(format!("{}/proj.parquet", &fixture.table_location))
+                            .file_format(DataFileFormat::Parquet)
+                            .file_size_in_bytes(FILE_SIZE)
+                            .record_count(1)
+                            .partition(partition)
+                            .build()
+                            .expect("build inspect-test data file"),
+                    )
+                    .build(),
+            )
+            .expect("add inspect-test manifest entry");
+        let data_manifest = writer
+            .write_manifest_file()
+            .await
+            .expect("write inspect-test data manifest");
+        let mut manifest_list = ManifestListWriter::v2(
+            fixture
+                .table
+                .file_io()
+                .new_output(current_snapshot.manifest_list())
+                .expect("open current snapshot manifest list"),
+            current_snapshot.snapshot_id(),
+            current_snapshot.parent_snapshot_id(),
+            current_snapshot.sequence_number(),
+        );
+        manifest_list
+            .add_manifests(vec![data_manifest].into_iter())
+            .expect("add inspect-test manifest to list");
+        manifest_list
+            .close()
+            .await
+            .expect("close inspect-test manifest list");
+    }
+
+    async fn scan_files_single_batch(fixture: &TableTestFixture) -> arrow_array::RecordBatch {
+        let batches: Vec<_> = fixture
+            .table
+            .inspect()
+            .files()
+            .scan()
+            .await
+            .expect("files metadata-table scan")
+            .try_collect()
+            .await
+            .expect("collect files metadata-table batches");
+        arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
+            .expect("concat files metadata-table batches")
+    }
+
+    #[test]
+    fn append_partition_projects_timestamptz_micros() {
+        // RISK: Timestamptz falls through `other` and FeatureUnsupported's the `.files` / `.partitions`
+        // projection. The arm must emit the same i64 micros the sibling `readable_metrics` path uses.
+        let projected = project_one_partition_field(
+            PrimitiveType::Timestamptz,
+            Some(Literal::timestamptz(TIMESTAMPTZ_MICROS)),
+        )
+        .expect("Timestamptz identity partition must project");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected.column(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
+        );
+        let values = projected
+            .column(0)
+            .as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(values.value(0), TIMESTAMPTZ_MICROS);
+    }
+
+    #[test]
+    fn append_partition_projects_timestamptz_ns() {
+        // RISK: TimestamptzNs is the same-class twin of Timestamptz; leaving it in `other` reopens
+        // the F-V4-1 refuse on V3 tables. Pin the ns builder + extract_i64 arm.
+        let projected = project_one_partition_field(
+            PrimitiveType::TimestamptzNs,
+            Some(Literal::timestamptz_nano(TIMESTAMPTZ_NANOS)),
+        )
+        .expect("TimestamptzNs identity partition must project");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected.column(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()))
+        );
+        let values = projected
+            .column(0)
+            .as_primitive::<TimestampNanosecondType>();
+        assert_eq!(values.value(0), TIMESTAMPTZ_NANOS);
+    }
+
+    #[test]
+    fn append_partition_still_refuses_uuid() {
+        // RISK: A7 — Uuid stays refused. A drive-by "support every leftover primitive" would flip
+        // this silently; the existing needle must keep firing.
+        let error = project_one_partition_field(
+            PrimitiveType::Uuid,
+            Some(Literal::uuid(uuid::Uuid::nil())),
+        )
+        .expect_err("Uuid identity partition must stay unsupported");
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            error.message().contains(
+                "partition field type Uuid is not supported in the data_file metadata projection"
+            ),
+            "expected existing refuse needle, got: {}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn append_partition_still_refuses_fixed() {
+        // RISK: A7 — Fixed stays refused, independently of Uuid (one leftover-arm mutation must
+        // not be able to cover both negatives).
+        let error =
+            project_one_partition_field(PrimitiveType::Fixed(16), Some(Literal::fixed([0u8; 16])))
+                .expect_err("Fixed identity partition must stay unsupported");
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            error.message().contains(
+                "partition field type Fixed(16) is not supported in the data_file metadata projection"
+            ),
+            "expected existing refuse needle, got: {}",
+            error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn files_and_partitions_project_timestamptz_identity_value() {
+        // RISK: schema conversion can already emit timestamptz children while the append match
+        // still refuses. This is the metadata-table read over a timestamptz-identity-partitioned
+        // table (F-V4-1). Writer/commit path is not exercised.
+        let fixture = with_identity_partition_source_type(
+            TableTestFixture::new(),
+            PrimitiveType::Timestamptz,
+        );
+        let files_schema = schema_to_arrow_schema(&fixture.table.inspect().files().schema())
+            .expect("files metadata-table schema converts");
+        let partition_type = match files_schema
+            .field_with_name("partition")
+            .expect("files table has partition")
+            .data_type()
+        {
+            DataType::Struct(fields) => fields[0].data_type().clone(),
+            other => panic!("expected partition struct, got {other:?}"),
+        };
+        assert_eq!(
+            partition_type,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            "type_to_arrow_type must already produce a timestamptz partition child"
+        );
+
+        write_one_partitioned_data_file(
+            &fixture,
+            Struct::from_iter([Some(Literal::timestamptz(TIMESTAMPTZ_MICROS))]),
+        )
+        .await;
+
+        let files_batch = scan_files_single_batch(&fixture).await;
+        assert_eq!(files_batch.num_rows(), 1);
+        let files_partition = files_batch
+            .column_by_name("partition")
+            .expect("files.partition")
+            .as_struct();
+        let files_ts = files_partition
+            .column(0)
+            .as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(files_ts.value(0), TIMESTAMPTZ_MICROS);
+
+        let partitions_batches: Vec<_> = fixture
+            .table
+            .inspect()
+            .partitions()
+            .scan()
+            .await
+            .expect("partitions metadata-table scan")
+            .try_collect()
+            .await
+            .expect("collect partitions batches");
+        let partitions_batch = arrow_select::concat::concat_batches(
+            &partitions_batches[0].schema(),
+            &partitions_batches,
+        )
+        .expect("concat partitions batches");
+        assert_eq!(partitions_batch.num_rows(), 1);
+        let partitions_ts = partitions_batch
+            .column_by_name("partition")
+            .expect("partitions.partition")
+            .as_struct()
+            .column(0)
+            .as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(partitions_ts.value(0), TIMESTAMPTZ_MICROS);
+    }
+
+    #[tokio::test]
+    async fn files_table_projects_timestamptz_ns_identity_value() {
+        // RISK: same-class twin of Timestamptz. A V3 identity(timestamptz_ns) table must project
+        // the ns value through `.files`, not FeatureUnsupported.
+        let fixture = with_identity_partition_source_type(
+            TableTestFixture::new(),
+            PrimitiveType::TimestamptzNs,
+        );
+        write_one_partitioned_data_file(
+            &fixture,
+            Struct::from_iter([Some(Literal::timestamptz_nano(TIMESTAMPTZ_NANOS))]),
+        )
+        .await;
+
+        let batch = scan_files_single_batch(&fixture).await;
+        assert_eq!(batch.num_rows(), 1);
+        let ts = batch
+            .column_by_name("partition")
+            .expect("files.partition")
+            .as_struct()
+            .column(0)
+            .as_primitive::<TimestampNanosecondType>();
+        assert_eq!(ts.value(0), TIMESTAMPTZ_NANOS);
+        assert_eq!(
+            batch
+                .column_by_name("partition")
+                .expect("files.partition")
+                .as_struct()
+                .column(0)
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn files_table_still_refuses_uuid_identity_partition() {
+        // RISK: A7 negative pin — Uuid identity partition must keep the existing needle on the
+        // metadata-table path, not only on the isolated append helper.
+        let fixture =
+            with_identity_partition_source_type(TableTestFixture::new(), PrimitiveType::Uuid);
+        write_one_partitioned_data_file(
+            &fixture,
+            Struct::from_iter([Some(Literal::uuid(uuid::Uuid::nil()))]),
+        )
+        .await;
+        let error = match fixture.table.inspect().files().scan().await {
+            Ok(_) => panic!("Uuid identity partition must stay unsupported on .files"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            error.message().contains(
+                "partition field type Uuid is not supported in the data_file metadata projection"
+            ),
+            "expected existing refuse needle, got: {}",
+            error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn files_table_still_refuses_fixed_identity_partition() {
+        // RISK: A7 negative pin — Fixed identity partition must keep the existing needle on the
+        // metadata-table path.
+        let fixture =
+            with_identity_partition_source_type(TableTestFixture::new(), PrimitiveType::Fixed(16));
+        write_one_partitioned_data_file(
+            &fixture,
+            Struct::from_iter([Some(Literal::fixed([0u8; 16]))]),
+        )
+        .await;
+        let error = match fixture.table.inspect().files().scan().await {
+            Ok(_) => panic!("Fixed identity partition must stay unsupported on .files"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            error.message().contains(
+                "partition field type Fixed(16) is not supported in the data_file metadata projection"
+            ),
+            "expected existing refuse needle, got: {}",
+            error.message()
+        );
     }
 }

@@ -34,7 +34,7 @@ tables projecting table metadata as Arrow `RecordBatch`es. The full Java table s
 | `snapshots.rs` / `manifests.rs` | `SnapshotsTable` / `ManifestsTable` | pre-existing upstream pair; `manifests` count columns are **content-gated** (data vs delete) |
 | `files.rs` | `BaseFilesTable` | `files` / `data_files` / `delete_files` — differ only by manifest-content filter (`FilesTableKind`); also hosts the `all_*` variants via `MetadataScope` |
 | `entries.rs` | `ManifestEntriesTable` | every entry **including `Deleted` tombstones** (status==2); nests the shared data_file struct |
-| `data_file.rs` | `DataFile.getType` | shared data_file projection (`files` flattens it, `entries` nests it) |
+| `data_file.rs` | `DataFile.getType` | shared data_file projection (`files` flattens it, `entries` nests it). Partition-struct append: `Timestamptz` / `TimestamptzNs` project (row R162); `Uuid` / `Fixed` stay `FeatureUnsupported` |
 | `manifest_source.rs` | `BaseAllMetadataTableScan.reachableManifests` | `MetadataScope {CurrentSnapshot, AllSnapshots}` — all-snapshot manifest union, dedup by `manifest_path` (files NOT deduped) |
 | `all_manifests.rs` | `AllManifestsTable` | one row per (manifest × referencing snapshot), NO dedup; `reference_snapshot_id` column |
 | `history.rs` / `refs.rs` / `metadata_log_entries.rs` | `HistoryTable` / `RefsTable` / `MetadataLogEntriesTable` | pure-metadata (no manifest IO); `is_current_ancestor` = membership in the current parent chain |
@@ -49,7 +49,7 @@ tables projecting table metadata as Arrow `RecordBatch`es. The full Java table s
 | Add/modify an inspection table | the matching file above; field **ids and order are verbatim from Java** — check the Java `*Table` class first |
 | Change what counts as a "live" entry | `files.rs` (`is_alive()`) — mutation-pinned, touch with care |
 | Understand current-vs-all snapshot scope | `manifest_source.rs` (`MetadataScope`) |
-| See known divergences from Java | GAP_MATRIX inspection rows: empty-struct partition column on unpartitioned tables; cross-spec `Partitioning.partitionType` unification deferred; `readable_metrics` sub-field order is ascending-field-id (Java: HashMap order) |
+| See known divergences from Java | GAP_MATRIX inspection rows: empty-struct partition column on unpartitioned tables (row R142); timestamptz / timestamptz_ns now project from `.files` / `.partitions` (row R162; interop pending); cross-spec `Partitioning.partitionType` unification deferred; `readable_metrics` sub-field order is ascending-field-id (Java: HashMap order) |
 
 ## Pointers
 
@@ -68,6 +68,7 @@ tables projecting table metadata as Arrow `RecordBatch`es. The full Java table s
 | Inspection interop mismatch vs Java | Materialize expectations from a **re-parsed** base: Rust matches Java's on-disk round-trip (e.g. `operation` split out of the summary map), not Java's in-memory object |
 | Duplicate rows in `all_*` tables | Expected — Java javadoc says "may return duplicate rows"; manifests dedup by path, files do not |
 | `field_builder::<T>(i)` returns `None` / "child builder has unexpected type" at runtime | `StructBuilder::from_fields` builds Map/List children as BOXED builders (`MapBuilder<Box<dyn ArrayBuilder>, …>`); downcast the boxed inner builders. Compiles fine with the wrong typed builder — only fails on first append, so run the tests, don't trust a green build |
+| `FeatureUnsupported` `partition field type … is not supported in the data_file metadata projection` | `append_partition_field` still refuses `Uuid` / `Fixed` (row R162). `Timestamptz` / `TimestamptzNs` are projected; if those error, the append match drifted from `readable_metrics.rs` |
 | Scan panics "unmasked nulls for non-nullable StructArray field" | Java metadata-table `required` flags are NOMINAL (its `Object[]` rows emit nulls unchecked); Arrow ENFORCES them. If the Java producer can return null (boxed `Boolean`, `@Nullable`), the Arrow field must be nullable regardless of Java's schema flag |
 | Tie-break / per-snapshot test passes under inverted comparison | The fixture collapsed to one distinct commit time: `ManifestWriter::add_entry` RESTAMPS `snapshot_id` (and forces `Added`); write the older file with `add_existing_entry` to preserve the parent snapshot id |
 
