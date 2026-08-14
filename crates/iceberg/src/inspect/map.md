@@ -49,7 +49,7 @@ tables projecting table metadata as Arrow `RecordBatch`es. The full Java table s
 | Add/modify an inspection table | the matching file above; field **ids and order are verbatim from Java** — check the Java `*Table` class first |
 | Change what counts as a "live" entry | `files.rs` (`is_alive()`) — mutation-pinned, touch with care |
 | Understand current-vs-all snapshot scope | `manifest_source.rs` (`MetadataScope`) |
-| See known divergences from Java | GAP_MATRIX inspection rows: empty-struct partition column on unpartitioned tables (row R142); timestamptz / timestamptz_ns now project from `.files` / `.partitions` (row R162; interop pending); cross-spec `Partitioning.partitionType` unification deferred; `readable_metrics` sub-field order is ascending-field-id (Java: HashMap order) |
+| See known divergences from Java | GAP_MATRIX inspection rows: unpartitioned `partition` drop now matches Java on files/entries/partitions (row R142, 2026-08-14); timestamptz / timestamptz_ns now project from `.files` / `.partitions` (row R162; interop pending); cross-spec `Partitioning.partitionType` unification deferred; `readable_metrics` sub-field order is ascending-field-id (Java: HashMap order) |
 
 ## Pointers
 

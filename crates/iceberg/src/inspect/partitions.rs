@@ -28,13 +28,10 @@
 //!
 //! ## Scoping decisions (Java divergences, tested + documented)
 //!
-//! 1. **Unpartitioned partition column.** Java `PartitionsTable.schema()` DROPS the `partition` column for
-//!    an unpartitioned table (`TypeUtil.select` excludes it). This port KEEPS an empty-struct (`Struct([])`)
-//!    `partition` column — matching the `files`-family precedent
-//!    (`inspect/files.rs`, `test_files_table_unpartitioned_keeps_empty_partition_struct_known_divergence`)
-//!    so the whole `inspect` module has ONE consistent, documented unpartitioned-column divergence rather
-//!    than two different behaviors. Non-corrupting (the single root row + every other column is correct);
-//!    pinned by `test_partitions_table_unpartitioned_keeps_empty_partition_struct_known_divergence`.
+//! 1. **Unpartitioned columns.** Java `PartitionsTable.schema()` uses `TypeUtil.select` to keep
+//!    everything EXCEPT field id 1 (`partition`) AND field id 4 (`spec_id`) when the table is
+//!    unpartitioned (the unpartitioned scan also omits those cells from each `StaticDataTask.Row`).
+//!    This port matches that drop. The files/entries families drop only `partition` (field 102).
 //!
 //! 2. **Multi-spec partition evolution.** Java unifies all of a table's partition specs into ONE partition
 //!    type via `Partitioning.partitionType(table)` and coerces each file's partition into it
@@ -46,13 +43,13 @@
 //!    until a `Partitioning.partitionType` analogue lands (tracked in GAP_MATRIX + `task/todo.md`). The
 //!    per-file `spec_id` is still reported, so no data is silently misattributed within a single spec.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use arrow_array::builder::{
     Int32Builder, Int64Builder, StructBuilder, TimestampMicrosecondBuilder,
 };
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Fields};
 use futures::{StreamExt, stream};
 
@@ -61,7 +58,7 @@ use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{
     DataContentType, Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Struct,
-    StructType, Type,
+    StructType, Type, select,
 };
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
@@ -95,28 +92,17 @@ impl<'a> PartitionsTable<'a> {
     /// `equality_delete_record_count`/7 long, `equality_delete_file_count`/8 int, `last_updated_at`/9
     /// timestamptz OPTIONAL, `last_updated_snapshot_id`/10 long OPTIONAL.
     ///
-    /// For an UNPARTITIONED table the `partition` column is kept as an empty struct (a documented
-    /// divergence from Java, which drops it — see the module doc, decision 1).
+    /// For an UNPARTITIONED table Java `TypeUtil.select`s only the count/timestamp columns —
+    /// field ids 2, 3, 11, 5, 6, 7, 8, 9, 10 — dropping `partition`/1 and `spec_id`/4.
     pub fn schema(&self) -> Schema {
         let partition_type = self.table.metadata().default_partition_type().clone();
 
-        let mut fields = Vec::with_capacity(11);
-        if !self.is_unpartitioned() {
-            fields.push(Arc::new(NestedField::required(
+        let fields = vec![
+            Arc::new(NestedField::required(
                 1,
                 "partition",
                 Type::Struct(partition_type),
-            )));
-        } else {
-            // Decision 1: keep an empty-struct `partition` column (matches the `files` family), so the
-            // unpartitioned table still has a `partition` column rather than dropping it like Java.
-            fields.push(Arc::new(NestedField::required(
-                1,
-                "partition",
-                Type::Struct(StructType::new(vec![])),
-            )));
-        }
-        fields.extend([
+            )),
             Arc::new(NestedField::required(
                 4,
                 "spec_id",
@@ -167,12 +153,20 @@ impl<'a> PartitionsTable<'a> {
                 "last_updated_snapshot_id",
                 Type::Primitive(PrimitiveType::Long),
             )),
-        ]);
+        ];
 
-        Schema::builder()
+        let schema = Schema::builder()
             .with_fields(fields)
             .build()
-            .expect("partitions metadata table schema is statically valid")
+            .expect("partitions metadata table schema is statically valid");
+        if self.is_unpartitioned() {
+            // Java `PartitionsTable.schema()`: TypeUtil.select of the 9 remaining field ids.
+            select(&schema, &HashSet::from([2, 3, 11, 5, 6, 7, 8, 9, 10])).expect(
+                "TypeUtil.select of the unpartitioned PartitionsTable columns is statically valid",
+            )
+        } else {
+            schema
+        }
     }
 
     /// Scans the `partitions` metadata table.
@@ -253,21 +247,32 @@ impl<'a> PartitionsTable<'a> {
         rows.sort_by(|left, right| compare_partition_values(&left.key, &right.key));
 
         let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema())?);
-        let partition_fields = partition_arrow_fields(&arrow_schema)?;
-        let batch = self.build_batch(arrow_schema, &partition_type, &partition_fields, &rows)?;
+        let batch = self.build_batch(arrow_schema, &partition_type, &rows)?;
         Ok(stream::iter(vec![Ok(batch)]).boxed())
     }
 
     /// Builds the single output [`RecordBatch`] from the rolled-up partition rows.
+    ///
+    /// Unpartitioned tables omit `partition` and `spec_id` to match Java `PartitionsTable.task`
+    /// (`StaticDataTask.Row.of` without those two cells).
     fn build_batch(
         &self,
         arrow_schema: Arc<arrow_schema::Schema>,
         partition_type: &StructType,
-        partition_fields: &Fields,
         rows: &[Partition],
     ) -> Result<RecordBatch> {
-        let mut partition = StructBuilder::from_fields(partition_fields.clone(), rows.len());
-        let mut spec_id = Int32Builder::new();
+        let unpartitioned = self.is_unpartitioned();
+        let mut partition = if unpartitioned {
+            None
+        } else {
+            let partition_fields = partition_arrow_fields(&arrow_schema)?;
+            Some(StructBuilder::from_fields(partition_fields, rows.len()))
+        };
+        let mut spec_id = if unpartitioned {
+            None
+        } else {
+            Some(Int32Builder::new())
+        };
         let mut record_count = Int64Builder::new();
         let mut file_count = Int32Builder::new();
         let mut total_data_file_size_in_bytes = Int64Builder::new();
@@ -279,8 +284,12 @@ impl<'a> PartitionsTable<'a> {
         let mut last_updated_snapshot_id = Int64Builder::new();
 
         for row in rows {
-            append_partition(&mut partition, partition_type, &row.key)?;
-            spec_id.append_value(row.spec_id);
+            if let Some(partition) = partition.as_mut() {
+                append_partition(partition, partition_type, &row.key)?;
+            }
+            if let Some(spec_id) = spec_id.as_mut() {
+                spec_id.append_value(row.spec_id);
+            }
             record_count.append_value(row.data_record_count as i64);
             file_count.append_value(row.data_file_count);
             total_data_file_size_in_bytes.append_value(row.total_data_file_size_in_bytes as i64);
@@ -292,20 +301,23 @@ impl<'a> PartitionsTable<'a> {
             last_updated_snapshot_id.append_option(row.last_updated_snapshot_id);
         }
 
-        let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(partition.finish()),
-            Arc::new(spec_id.finish()),
-            Arc::new(record_count.finish()),
-            Arc::new(file_count.finish()),
-            Arc::new(total_data_file_size_in_bytes.finish()),
-            Arc::new(position_delete_record_count.finish()),
-            Arc::new(position_delete_file_count.finish()),
-            Arc::new(equality_delete_record_count.finish()),
-            Arc::new(equality_delete_file_count.finish()),
-            Arc::new(last_updated_at.finish()),
-            Arc::new(last_updated_snapshot_id.finish()),
-        ])?;
-        Ok(batch)
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
+        if let Some(mut partition) = partition {
+            columns.push(Arc::new(partition.finish()));
+        }
+        if let Some(mut spec_id) = spec_id {
+            columns.push(Arc::new(spec_id.finish()));
+        }
+        columns.push(Arc::new(record_count.finish()));
+        columns.push(Arc::new(file_count.finish()));
+        columns.push(Arc::new(total_data_file_size_in_bytes.finish()));
+        columns.push(Arc::new(position_delete_record_count.finish()));
+        columns.push(Arc::new(position_delete_file_count.finish()));
+        columns.push(Arc::new(equality_delete_record_count.finish()));
+        columns.push(Arc::new(equality_delete_file_count.finish()));
+        columns.push(Arc::new(last_updated_at.finish()));
+        columns.push(Arc::new(last_updated_snapshot_id.finish()));
+        Ok(RecordBatch::try_new(arrow_schema, columns)?)
     }
 }
 
@@ -1053,13 +1065,49 @@ mod tests {
         assert_eq!(total, 0);
     }
 
+    #[test]
+    fn test_partitions_table_unpartitioned_schema_drops_partition_and_spec_id() {
+        // RISK: Java `PartitionsTable.schema()` TypeUtil.select omits field 1 (`partition`) AND
+        // field 4 (`spec_id`) on an unpartitioned table. Partitioned tables keep both.
+        let partitioned = TableTestFixture::new()
+            .table
+            .inspect()
+            .partitions()
+            .schema();
+        let unpartitioned = TableTestFixture::new_unpartitioned()
+            .table
+            .inspect()
+            .partitions()
+            .schema();
+
+        assert!(partitioned.field_by_name("partition").is_some());
+        assert!(partitioned.field_by_name("spec_id").is_some());
+
+        let names: Vec<&str> = unpartitioned
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(names, vec![
+            "record_count",
+            "file_count",
+            "total_data_file_size_in_bytes",
+            "position_delete_record_count",
+            "position_delete_file_count",
+            "equality_delete_record_count",
+            "equality_delete_file_count",
+            "last_updated_at",
+            "last_updated_snapshot_id",
+        ]);
+        assert!(unpartitioned.field_by_name("partition").is_none());
+        assert!(unpartitioned.field_by_name("spec_id").is_none());
+    }
+
     #[tokio::test]
-    async fn test_partitions_table_unpartitioned_keeps_empty_partition_struct_known_divergence() {
-        // RISK / KNOWN DIVERGENCE (decision 1): Java `PartitionsTable.schema()` DROPS the `partition`
-        // column for an UNPARTITIONED table. The Rust port KEEPS an empty-struct `partition` column
-        // (matching the `files`-family precedent) so the module has ONE consistent unpartitioned-column
-        // behavior. There must be exactly ONE root row, and the partition column must be a 0-field struct.
-        // When the Java drop-empty-partition rule is implemented module-wide, this flips to assert-absent.
+    async fn test_partitions_table_unpartitioned_drops_partition_and_spec_id() {
+        // RISK: Java unpartitioned `PartitionsTable.task` emits one root row without `partition`
+        // or `spec_id`. The remaining aggregates still roll up both files.
         let fixture = TableTestFixture::new_unpartitioned();
         let metadata = fixture.table.metadata();
         let current_snapshot = metadata.current_snapshot().unwrap();
@@ -1113,13 +1161,13 @@ mod tests {
             .as_primitive::<Int32Type>();
         assert_eq!(record_count.value(0), 2);
         assert_eq!(file_count.value(0), 2);
-        // CURRENT (divergent) behavior: the partition column is present as an empty struct.
-        let partition = batch.column_by_name("partition").unwrap().as_struct();
-        assert_eq!(
-            partition.num_columns(),
-            0,
-            "unpartitioned partitions table currently keeps an empty-struct partition column \
-             (Java drops it) — see the GAP_MATRIX deferral"
+        assert!(
+            batch.column_by_name("partition").is_none(),
+            "unpartitioned partitions table must drop `partition` (Java TypeUtil.select)"
+        );
+        assert!(
+            batch.column_by_name("spec_id").is_none(),
+            "unpartitioned partitions table must drop `spec_id` (Java TypeUtil.select)"
         );
     }
 

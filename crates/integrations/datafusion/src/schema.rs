@@ -124,6 +124,38 @@ impl IcebergSchemaProvider {
     }
 }
 
+/// Synthesize the DataFusion name of a metadata table: `{base}${suffix}`.
+///
+/// `table_names` / `table_exist` / `table` share this so a suffix cannot drift from
+/// [`MetadataTableType::as_str`].
+fn metadata_table_ident(base: &str, ty: MetadataTableType) -> String {
+    format!("{}${}", base, ty.as_str())
+}
+
+/// Split `name` into `(base_table, metadata_table_type)` by the LAST `$` only when the
+/// suffix is a known [`MetadataTableType`].
+///
+/// Why last-`$` + vocabulary (not `split_once`):
+/// a base table literally named `a$b` must remain a base table. Splitting on the first `$`
+/// treats `a$b` as table `a` + suffix `b` (`table_exist` false; `table_names` then
+/// synthesizes `a$b$files`, which `split_once` parses as (`a`, `b$files`) and cannot
+/// resolve). Splitting on the last `$` *without* a vocabulary check still treats `a$b`
+/// as (`a`, `b`). Matching the suffix against [`MetadataTableType::try_from`] makes
+/// `a$b$files` unambiguously the `files` metadata table of `a$b`, while `a$b` stays a
+/// base table.
+///
+/// Residual (inherent in Spark's `$` convention): a base table literally named
+/// `foo$files` is indistinguishable from the `files` twin of `foo`.
+fn split_metadata_table_ref(name: &str) -> Option<(&str, MetadataTableType)> {
+    let (base, suffix) = name.rsplit_once('$')?;
+    if base.is_empty() {
+        return None;
+    }
+    MetadataTableType::try_from(suffix)
+        .ok()
+        .map(|ty| (base, ty))
+}
+
 #[async_trait]
 impl SchemaProvider for IcebergSchemaProvider {
     fn table_names(&self) -> Vec<String> {
@@ -131,30 +163,24 @@ impl SchemaProvider for IcebergSchemaProvider {
             .iter()
             .flat_map(|entry| {
                 let table_name = entry.key().clone();
-                [table_name.clone()]
-                    .into_iter()
-                    .chain(
-                        MetadataTableType::all_types().map(move |metadata_table_name| {
-                            format!("{}${}", table_name, metadata_table_name.as_str())
-                        }),
-                    )
+                [table_name.clone()].into_iter().chain(
+                    MetadataTableType::all_types()
+                        .map(move |ty| metadata_table_ident(&table_name, ty)),
+                )
             })
             .collect()
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        if let Some((table_name, metadata_table_name)) = name.split_once('$') {
+        if let Some((table_name, _)) = split_metadata_table_ref(name) {
             self.tables.contains_key(table_name)
-                && MetadataTableType::try_from(metadata_table_name).is_ok()
         } else {
             self.tables.contains_key(name)
         }
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        if let Some((table_name, metadata_table_name)) = name.split_once('$') {
-            let metadata_table_type =
-                MetadataTableType::try_from(metadata_table_name).map_err(DataFusionError::Plan)?;
+        if let Some((table_name, metadata_table_type)) = split_metadata_table_ref(name) {
             // Lazily resolve the BASE table, then build the requested metadata table over it. An
             // unloadable base errors loud (by name) here, exactly as a direct reference would.
             return match self.resolve_table(table_name).await? {
@@ -373,6 +399,9 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
+    use datafusion::execution::TaskContext;
+    use datafusion::prelude::SessionContext;
+    use futures::StreamExt;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
     use tempfile::TempDir;
@@ -614,5 +643,111 @@ mod tests {
             "expected dropped provider"
         );
         assert!(!schema_provider.table_exist("no_rt_table"));
+    }
+
+    fn empty_mem_table() -> Arc<MemTable> {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let empty_batch = RecordBatch::new_empty(arrow_schema.clone());
+        Arc::new(MemTable::try_new(arrow_schema, vec![vec![empty_batch]]).expect("empty MemTable"))
+    }
+
+    #[test]
+    fn test_split_metadata_table_ref_last_dollar_against_vocabulary() {
+        // First-`$` would parse `a$b` as (`a`, `b`) and `a$b$files` as (`a`, `b$files`).
+        assert!(split_metadata_table_ref("a$b").is_none());
+        assert!(split_metadata_table_ref("files").is_none());
+        assert!(split_metadata_table_ref("$files").is_none());
+        assert!(split_metadata_table_ref("foo$not_a_type").is_none());
+
+        let (base, ty) = split_metadata_table_ref("a$b$files").expect("a$b$files");
+        assert_eq!(base, "a$b");
+        assert_eq!(ty.as_str(), "files");
+
+        let (base, ty) = split_metadata_table_ref("my_table$snapshots").expect("snapshots");
+        assert_eq!(base, "my_table");
+        assert_eq!(ty.as_str(), "snapshots");
+
+        let (base, ty) = split_metadata_table_ref("a$b$all_data_files").expect("all_data_files");
+        assert_eq!(base, "a$b");
+        assert_eq!(ty.as_str(), "all_data_files");
+    }
+
+    #[tokio::test]
+    async fn test_dollar_in_base_table_name_enumeration_exist_resolve_and_read() {
+        // RISK: first-`$` split makes `table_exist("a$b")` false and synthesizes unresolvable
+        // `a$b$files`. Last-`$` + vocabulary keeps `a$b` as a base table.
+        let (schema_provider, _temp_dir) = create_test_schema_provider().await;
+        schema_provider
+            .register_table("a$b".to_string(), empty_mem_table())
+            .expect("register a$b");
+
+        assert!(
+            schema_provider.table_exist("a$b"),
+            "base table a$b must exist"
+        );
+        assert!(
+            schema_provider.table_exist("a$b$files"),
+            "a$b$files is the files metadata twin of a$b"
+        );
+        assert!(schema_provider.table_exist("a$b$snapshots"));
+        assert!(
+            !schema_provider.table_exist("a$b$not_a_type"),
+            "unknown suffix is not a metadata table; a$b$not_a_type is not listed"
+        );
+        assert!(!schema_provider.table_exist("missing$files"));
+
+        let names = schema_provider.table_names();
+        assert!(names.contains(&"a$b".to_string()));
+        for ty in MetadataTableType::all_types() {
+            let synthesized = metadata_table_ident("a$b", ty);
+            assert!(
+                names.contains(&synthesized),
+                "table_names must include {synthesized}"
+            );
+            assert!(
+                schema_provider.table_exist(&synthesized),
+                "table_exist must be true for synthesized {synthesized}"
+            );
+        }
+        assert!(
+            !names.iter().any(|name| name == "a$files"),
+            "must not invent a$files from a table named a$b"
+        );
+
+        let base = schema_provider
+            .table("a$b")
+            .await
+            .expect("resolve a$b")
+            .expect("a$b provider");
+        assert_eq!(base.schema().field(0).name(), "id");
+
+        let files = schema_provider
+            .table("a$b$files")
+            .await
+            .expect("resolve a$b$files")
+            .expect("a$b$files provider");
+        assert!(
+            files.schema().field_with_name("file_path").is_ok(),
+            "files metadata twin of a$b must resolve"
+        );
+
+        // Plain a$b read — empty table, zero rows.
+        let session_ctx = SessionContext::new();
+        let plan = base
+            .scan(&session_ctx.state(), None, &[], None)
+            .await
+            .expect("scan a$b");
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute a$b scan");
+        let batches: Vec<_> = stream.collect().await;
+        let rows: usize = batches
+            .into_iter()
+            .map(|batch| batch.expect("a$b batch").num_rows())
+            .sum();
+        assert_eq!(rows, 0, "empty a$b read returns zero rows");
     }
 }

@@ -52,9 +52,18 @@ Charter: F-V4-2 — schema annotation only; value/kernel CLOSED; repark harness 
 - [x] acc + C4, then A6 `make check && make unit-test && make test`. One `[repark]` PR. Report after `gh pr create`.
       **Done 2026-08-14:** `UTC_TIME_ZONE` is `"UTC"`; inverse still accepts `+00:00`; GAP_MATRIX R163; A6 green (first `make test` SQLITE_BUSY flake, retry 4162/4162).
 
+## ACTIVE (2026-08-14): FW-3 metadata-provider parity (F-2 + F-3)
+
+Branch: `repark/fw3-metadata-provider-parity` off freeze `1dae9b66`. Provider/read only.
+
+- [x] **F-3 `$`-name split.** Last `$` + `MetadataTableType` vocabulary. Tests: enumerate / exist / metadata twins / empty read of `a$b`.
+- [x] **F-2 unpartitioned `partition` column.** Java-cited drop on files+entries (id 102) and partitions (ids 1 and 4). `PositionDeletesTable` named residual (not ported).
+- [x] **R142 in place.** Empty-partition residual flipped; remaining: cross-spec unification, readable_metrics order, unported `position_deletes`. repark pin not flipped.
+- [x] **A6.** `make check` + `make unit-test` green; `make test` 4165 passed / 3 skipped after one SQLITE_BUSY retry.
+
 ---
 
-## ACTIVE (2026-08-08): 2026-08 audit hardening — SEPMO bundled branch
+## CLOSED (2026-08-08): 2026-08 audit hardening — SEPMO bundled branch
 
 Branch: `fix/2026-08-audit-hardening`. User approved the 8/8 proposition ledger on 2026-08-08.
 Delivery mode: one bundled branch/PR with clause-separated groups, an independent fresh-context

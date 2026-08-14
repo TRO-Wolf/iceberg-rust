@@ -61,7 +61,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::DataType;
 use futures::{StreamExt, stream};
 
-use super::data_file::{DataFileStructBuilder, data_file_fields};
+use super::data_file::{DataFileStructBuilder, data_file_fields, omit_empty_partition_field};
 use super::manifest_source::{MetadataScope, collect_manifest_files};
 use super::readable_metrics::{
     ReadableMetricsBuilder, readable_metrics_field, readable_metrics_struct_fields,
@@ -99,15 +99,16 @@ impl<'a> EntriesTable<'a> {
 
     /// Returns the iceberg schema of the `entries` metadata table.
     ///
-    /// Mirrors Java `ManifestEntry.getSchema(partitionType)`: `status`(0), `snapshot_id`(1),
-    /// `sequence_number`(3), `file_sequence_number`(4), `data_file`(2, struct = the shared `data_file`
-    /// projection over the table's DEFAULT partition type), then the appended `readable_metrics` struct.
+    /// Mirrors Java `BaseEntriesTable.schema()`: `ManifestEntry.getSchema(partitionType)`
+    /// (`status`/0, `snapshot_id`/1, `sequence_number`/3, `file_sequence_number`/4, `data_file`/2),
+    /// then `TypeUtil.selectNot(schema, DataFile.PARTITION_ID)` when the partition type is empty
+    /// (drops the nested `data_file.partition` field 102), then `readable_metrics`.
     pub fn schema(&self) -> Schema {
         let partition_type = self.table.metadata().default_partition_type();
         let data_file_type = Type::Struct(crate::spec::StructType::new(data_file_fields(
             partition_type,
         )));
-        let mut fields = vec![
+        let fields = vec![
             Arc::new(NestedField::required(
                 0,
                 "status",
@@ -131,12 +132,13 @@ impl<'a> EntriesTable<'a> {
             Arc::new(NestedField::required(2, "data_file", data_file_type)),
         ];
 
-        // Append `readable_metrics` (Java `BaseEntriesTable` joins it via `TypeUtil.join(...)`), its id
-        // counter seeded at the entries schema's highest field id (Java `metadataTableSchema.highestFieldId()`).
         let base_schema = Schema::builder()
-            .with_fields(fields.clone())
+            .with_fields(fields)
             .build()
             .expect("entries metadata table base schema is statically valid");
+        // Java: drop PARTITION_ID (nested under data_file) *before* joining readable_metrics.
+        let base_schema = omit_empty_partition_field(base_schema, partition_type);
+        let mut fields: Vec<_> = base_schema.as_struct().fields().to_vec();
         fields.push(readable_metrics_field(
             self.table.metadata().current_schema(),
             base_schema.highest_field_id(),
@@ -225,7 +227,7 @@ mod tests {
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
-        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Struct,
+        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Schema, Struct,
     };
 
     /// A known, fixed file size used for every file in the fixtures (the metadata table reads only the
@@ -811,6 +813,118 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(file_path_id, "100");
+    }
+
+    #[test]
+    fn test_entries_family_nested_partition_present_only_when_partitioned() {
+        // RISK: Java `BaseEntriesTable.schema()` drops DataFile.PARTITION_ID=102 from the nested
+        // `data_file` struct on an unpartitioned table. `entries` and `all_entries` share that schema.
+        fn nested_partition_present(schema: &Schema) -> bool {
+            schema.field_by_name("data_file").is_some_and(|field| {
+                matches!(
+                    field.field_type.as_ref(),
+                    crate::spec::Type::Struct(data_file)
+                        if data_file.field_by_name("partition").is_some()
+                )
+            })
+        }
+
+        let partitioned = TableTestFixture::new();
+        let unpartitioned = TableTestFixture::new_unpartitioned();
+        assert!(nested_partition_present(
+            &partitioned.table.inspect().entries().schema()
+        ));
+        assert!(nested_partition_present(
+            &partitioned.table.inspect().all_entries().schema()
+        ));
+        assert!(!nested_partition_present(
+            &unpartitioned.table.inspect().entries().schema()
+        ));
+        assert!(!nested_partition_present(
+            &unpartitioned.table.inspect().all_entries().schema()
+        ));
+        assert!(
+            unpartitioned
+                .table
+                .inspect()
+                .entries()
+                .schema()
+                .field_by_name("data_file")
+                .is_some_and(|field| {
+                    matches!(
+                        field.field_type.as_ref(),
+                        crate::spec::Type::Struct(data_file)
+                            if data_file.field_by_name("file_path").is_some()
+                                && data_file.field_by_name("spec_id").is_some()
+                    )
+                }),
+            "dropping nested partition must keep spec_id and the rest of data_file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entries_table_unpartitioned_scan_omits_nested_partition() {
+        // RISK: schema drop of field 102 must stay in lockstep with DataFileStructBuilder
+        // (name-keyed children). A leftover positional append would fail the batch build.
+        let fixture = TableTestFixture::new_unpartitioned();
+        let metadata = fixture.table.metadata().clone();
+        let current_snapshot = metadata.current_snapshot().unwrap();
+        let current_schema = current_snapshot.schema(&metadata).unwrap();
+        let current_partition_spec = metadata.default_partition_spec();
+
+        let output = fixture
+            .table
+            .file_io()
+            .new_output(format!(
+                "{}/metadata/manifest_unp_{}.avro",
+                fixture.table_location,
+                uuid::Uuid::new_v4()
+            ))
+            .unwrap();
+        let mut data_writer = ManifestWriterBuilder::new(
+            output,
+            Some(current_snapshot.snapshot_id()),
+            None,
+            current_schema.clone(),
+            current_partition_spec.as_ref().clone(),
+        )
+        .build_v2_data();
+        data_writer
+            .add_entry(
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(
+                        DataFileBuilder::default()
+                            .partition_spec_id(0)
+                            .content(DataContentType::Data)
+                            .file_path(format!("{}/u1.parquet", &fixture.table_location))
+                            .file_format(DataFileFormat::Parquet)
+                            .file_size_in_bytes(FILE_SIZE)
+                            .record_count(1)
+                            .partition(Struct::empty())
+                            .build()
+                            .unwrap(),
+                    )
+                    .build(),
+            )
+            .unwrap();
+        let data_manifest = data_writer.write_manifest_file().await.unwrap();
+        write_manifest_list(&fixture, current_snapshot, vec![data_manifest]).await;
+
+        let batch =
+            scan_single_batch(fixture.table.inspect().entries().scan().await.unwrap()).await;
+        assert_eq!(batch.num_rows(), 1);
+        let data_file = batch
+            .column_by_name("data_file")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(
+            data_file.column_by_name("partition").is_none(),
+            "unpartitioned entries scan must omit nested data_file.partition"
+        );
+        assert!(data_file.column_by_name("file_path").is_some());
     }
 
     #[tokio::test]

@@ -219,6 +219,59 @@ async fn test_provider_list_table_names() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_dollar_in_base_table_name_sql_read_and_metadata_twin() -> Result<()> {
+    // RISK: `split_once('$')` makes `table_exist("a$b")` false and `a$b$files` unresolvable.
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_dollar_name".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "a$b", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    let provider = ctx.catalog("catalog").unwrap();
+    let schema = provider.schema("test_dollar_name").unwrap();
+
+    assert!(schema.table_exist("a$b"));
+    assert!(schema.table_exist("a$b$snapshots"));
+    assert!(schema.table_exist("a$b$files"));
+    let names = schema.table_names();
+    assert!(names.contains(&"a$b".to_string()));
+    assert!(names.contains(&"a$b$files".to_string()));
+
+    // Plain a$b read (empty table).
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_dollar_name.\"a$b\"")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(rows, 0);
+
+    // Metadata twin of a table whose name already contains `$`.
+    let snapshots = ctx
+        .sql("SELECT * FROM catalog.test_dollar_name.\"a$b$snapshots\"")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert!(
+        snapshots[0].schema().field_with_name("snapshot_id").is_ok(),
+        "a$b$snapshots must resolve as the snapshots metadata table"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_provider_list_schema_names() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_provider_list_schema_names".to_string());

@@ -57,7 +57,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use futures::{StreamExt, stream};
 
-use super::data_file::{DataFileStructBuilder, data_file_fields};
+use super::data_file::{DataFileStructBuilder, data_file_fields, omit_empty_partition_field};
 use super::manifest_source::{MetadataScope, collect_manifest_files};
 use super::readable_metrics::{
     ReadableMetricsBuilder, readable_metrics_field, readable_metrics_struct_fields,
@@ -145,22 +145,23 @@ impl<'a> FilesTable<'a> {
 
     /// Returns the iceberg schema of the files metadata table.
     ///
-    /// Mirrors Java `DataFile.getType(partitionType).fields()` — the field ids are the canonical
-    /// `DataFile` ids from `api/DataFile.java`, built from the shared [`data_file_fields`] projection (the
-    /// `files` family exposes them FLAT as the table's top-level columns). The partition column carries the
-    /// table's DEFAULT partition type. The `readable_metrics` virtual STRUCT column is APPENDED last (Java
-    /// `BaseFilesTable` joins it via `TypeUtil.join(schema, readableMetricsSchema(...))`) — one sub-field per
-    /// leaf column of the DATA table, each a struct of human-readable per-column metrics.
+    /// Mirrors Java `BaseFilesTable.schema()`: `DataFile.getType(partitionType).fields()` (the
+    /// field ids are the canonical `DataFile` ids from `api/DataFile.java`), then
+    /// `TypeUtil.selectNot(schema, DataFile.PARTITION_ID)` when `partitionType.fields()` is empty
+    /// (so an empty struct is never advertised), then `TypeUtil.join` of `readable_metrics`.
+    /// The `files` family exposes the data_file projection FLAT as top-level columns.
     pub fn schema(&self) -> Schema {
         let partition_type = self.table.metadata().default_partition_type();
-        let mut fields = data_file_fields(partition_type);
+        let data_file_schema = Schema::builder()
+            .with_fields(data_file_fields(partition_type))
+            .build()
+            .expect("files metadata table data_file schema is statically valid");
+        // Java: drop PARTITION_ID *before* joining readable_metrics.
+        let data_file_schema = omit_empty_partition_field(data_file_schema, partition_type);
+        let mut fields: Vec<_> = data_file_schema.as_struct().fields().to_vec();
 
         // Append `readable_metrics`, its id counter seeded at the data_file projection's highest field id
         // (Java `metadataTableSchema.highestFieldId()`), over the DATA table's current schema.
-        let data_file_schema = Schema::builder()
-            .with_fields(fields.clone())
-            .build()
-            .expect("files metadata table data_file schema is statically valid");
         fields.push(readable_metrics_field(
             self.table.metadata().current_schema(),
             data_file_schema.highest_field_id(),
@@ -857,17 +858,56 @@ mod tests {
         assert_eq!(total, 0);
     }
 
+    #[test]
+    fn test_files_family_partition_column_present_only_when_partitioned() {
+        // RISK: Java `BaseFilesTable.schema()` drops `partition` (DataFile.PARTITION_ID=102) on an
+        // unpartitioned table. All six files-family tables share that schema().
+        let partitioned = TableTestFixture::new();
+        let unpartitioned = TableTestFixture::new_unpartitioned();
+        let inspect_partitioned = partitioned.table.inspect();
+        let inspect_unpartitioned = unpartitioned.table.inspect();
+        let partitioned_schemas = [
+            inspect_partitioned.files().schema(),
+            inspect_partitioned.data_files().schema(),
+            inspect_partitioned.delete_files().schema(),
+            inspect_partitioned.all_files().schema(),
+            inspect_partitioned.all_data_files().schema(),
+            inspect_partitioned.all_delete_files().schema(),
+        ];
+        let unpartitioned_schemas = [
+            inspect_unpartitioned.files().schema(),
+            inspect_unpartitioned.data_files().schema(),
+            inspect_unpartitioned.delete_files().schema(),
+            inspect_unpartitioned.all_files().schema(),
+            inspect_unpartitioned.all_data_files().schema(),
+            inspect_unpartitioned.all_delete_files().schema(),
+        ];
+        for schema in &partitioned_schemas {
+            assert!(
+                schema.field_by_name("partition").is_some(),
+                "partitioned files-family schema must keep `partition`"
+            );
+        }
+        for schema in &unpartitioned_schemas {
+            assert!(
+                schema.field_by_name("partition").is_none(),
+                "unpartitioned files-family schema must drop `partition` (Java BaseFilesTable)"
+            );
+            assert!(
+                schema.field_by_name("spec_id").is_some(),
+                "Java BaseFilesTable drops only PARTITION_ID, not spec_id"
+            );
+            assert!(
+                schema.field_by_name("file_path").is_some(),
+                "dropping partition must not drop the rest of the DataFile projection"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn test_files_table_unpartitioned_keeps_empty_partition_struct_known_divergence() {
-        // RISK / KNOWN DIVERGENCE from Java: for an UNPARTITIONED table Java `BaseFilesTable.schema()`
-        // DROPS the `partition` field entirely ("avoid returning an empty struct, which is not always
-        // supported. instead, drop the partition field" — `TypeUtil.selectNot(schema, PARTITION_ID)`).
-        // The Rust port currently KEEPS a `partition` column typed as an empty struct (`Struct([])`).
-        // This is non-corrupting (the file rows + every other column are correct, the row count is
-        // right) but is a schema-shape divergence that matters for eventual Java interop — tracked in
-        // GAP_MATRIX/todo as a deferral, NOT silently wrong. This test PINS the current behavior so the
-        // divergence cannot change unnoticed; when the Java drop-empty-partition rule is implemented,
-        // this test flips to assert the `partition` column is ABSENT.
+    async fn test_files_table_unpartitioned_drops_partition_column() {
+        // RISK: Java `BaseFilesTable.schema()` DROPS `partition` when `partitionType.fields()` is
+        // empty (`TypeUtil.selectNot(schema, DataFile.PARTITION_ID)`). The scan batch must match.
         let fixture = TableTestFixture::new_unpartitioned();
         let metadata = fixture.table.metadata().clone();
         let current_snapshot = metadata.current_snapshot().unwrap();
@@ -929,16 +969,13 @@ mod tests {
 
         let batch = scan_single_batch(fixture.table.inspect().files().scan().await.unwrap()).await;
 
-        // Does not panic; the single data file is listed.
+        // Does not panic; the single data file is listed; `partition` is absent (Java drop).
         assert_eq!(batch.num_rows(), 1);
-        // CURRENT (divergent) behavior: the partition column is present as an empty struct.
-        let partition = batch.column_by_name("partition").unwrap().as_struct();
-        assert_eq!(
-            partition.num_columns(),
-            0,
-            "unpartitioned files table currently keeps an empty-struct partition column \
-             (Java drops it) — see the GAP_MATRIX deferral"
+        assert!(
+            batch.column_by_name("partition").is_none(),
+            "unpartitioned files table must drop `partition` (Java BaseFilesTable.selectNot)"
         );
+        assert!(batch.column_by_name("file_path").is_some());
     }
 
     #[tokio::test]

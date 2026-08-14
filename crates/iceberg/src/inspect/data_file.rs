@@ -35,7 +35,7 @@
 //! `MetricsUtil.readableMetricsStruct` — the per-column typed/human-readable view of those metrics) is
 //! built by [`crate::inspect::readable_metrics`] and appended alongside this projection by both tables.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::StructArray;
@@ -49,9 +49,26 @@ use arrow_schema::Fields;
 
 use crate::spec::{
     Datum, ListType, Literal, MapType, NestedField, NestedFieldRef, PrimitiveLiteral,
-    PrimitiveType, StructType, Type,
+    PrimitiveType, Schema, StructType, Type, select_not,
 };
 use crate::{Error, ErrorKind, Result};
+
+/// Java `DataFile.PARTITION_ID` (`api/DataFile.java`). `BaseFilesTable.schema` and
+/// `BaseEntriesTable.schema` drop this field via `TypeUtil.selectNot` when the table's
+/// partition type is empty, so consumers never see an empty struct.
+pub(super) const DATA_FILE_PARTITION_ID: i32 = 102;
+
+/// Java `BaseFilesTable` / `BaseEntriesTable`: if `partitionType.fields()` is empty,
+/// `TypeUtil.selectNot(schema, DataFile.PARTITION_ID)` so an empty struct is never advertised.
+pub(super) fn omit_empty_partition_field(schema: Schema, partition_type: &StructType) -> Schema {
+    if partition_type.fields().is_empty() {
+        select_not(&schema, &HashSet::from([DATA_FILE_PARTITION_ID])).expect(
+            "TypeUtil.selectNot of DataFile.PARTITION_ID from a static metadata schema is valid",
+        )
+    } else {
+        schema
+    }
+}
 
 /// The boxed `MapBuilder` shape `StructBuilder::from_fields` produces for a `DataType::Map` child (its
 /// key/value field metadata is preserved by `make_builder`, so we only supply the values).
@@ -61,7 +78,8 @@ type DynListBuilder = ListBuilder<Box<dyn ArrayBuilder>>;
 
 /// The 21 `data_file` columns, mirroring Java `DataFile.getType(partitionType).fields()` — the
 /// canonical `DataFile` field ids from `api/DataFile.java`. The `partition` column carries the table's
-/// DEFAULT partition type. `readable_metrics` is deferred.
+/// DEFAULT partition type (always included here; [`omit_empty_partition_field`] drops field 102
+/// afterwards, matching Java `TypeUtil.selectNot`). `readable_metrics` is deferred.
 ///
 /// `files` uses these directly as its top-level columns; `entries` nests them under a `data_file` struct.
 pub(super) fn data_file_fields(partition_type: &StructType) -> Vec<NestedFieldRef> {
@@ -225,84 +243,124 @@ fn int_list(element_id: i32) -> Type {
 /// exactly the top-level columns the `files` table flattens. One builder, both shapes.
 pub(super) struct DataFileStructBuilder<'a> {
     partition_type: &'a StructType,
+    /// Child name → builder index. Name-keyed so dropping `partition` (Java empty-struct
+    /// `selectNot`) does not shift the remaining columns.
+    indices: HashMap<String, usize>,
     builder: StructBuilder,
 }
 
 impl<'a> DataFileStructBuilder<'a> {
-    /// Creates a builder over the given Arrow `data_file` struct fields (the converted [`data_file_fields`])
-    /// and the table's DEFAULT partition type (used to dispatch the partition tuple's per-field types).
+    /// Creates a builder over the given Arrow `data_file` struct fields (the converted [`data_file_fields`],
+    /// possibly without `partition`) and the table's DEFAULT partition type (used to dispatch the
+    /// partition tuple's per-field types when that column is present).
     pub(super) fn new(data_file_arrow_fields: &Fields, partition_type: &'a StructType) -> Self {
+        let indices = data_file_arrow_fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (field.name().clone(), index))
+            .collect();
         Self {
             partition_type,
+            indices,
             builder: StructBuilder::from_fields(data_file_arrow_fields.clone(), 0),
         }
     }
 
     /// Appends one row built from a [`crate::spec::DataFile`].
     pub(super) fn append(&mut self, data_file: &crate::spec::DataFile) -> Result<()> {
+        let i_content = field_index(&self.indices, "content")?;
+        let i_file_path = field_index(&self.indices, "file_path")?;
+        let i_file_format = field_index(&self.indices, "file_format")?;
+        let i_spec_id = field_index(&self.indices, "spec_id")?;
+        let i_partition = self.indices.get("partition").copied();
+        let i_record_count = field_index(&self.indices, "record_count")?;
+        let i_file_size = field_index(&self.indices, "file_size_in_bytes")?;
+        let i_column_sizes = field_index(&self.indices, "column_sizes")?;
+        let i_value_counts = field_index(&self.indices, "value_counts")?;
+        let i_null_value_counts = field_index(&self.indices, "null_value_counts")?;
+        let i_nan_value_counts = field_index(&self.indices, "nan_value_counts")?;
+        let i_lower_bounds = field_index(&self.indices, "lower_bounds")?;
+        let i_upper_bounds = field_index(&self.indices, "upper_bounds")?;
+        let i_key_metadata = field_index(&self.indices, "key_metadata")?;
+        let i_split_offsets = field_index(&self.indices, "split_offsets")?;
+        let i_equality_ids = field_index(&self.indices, "equality_ids")?;
+        let i_sort_order_id = field_index(&self.indices, "sort_order_id")?;
+        let i_first_row_id = field_index(&self.indices, "first_row_id")?;
+        let i_referenced_data_file = field_index(&self.indices, "referenced_data_file")?;
+        let i_content_offset = field_index(&self.indices, "content_offset")?;
+        let i_content_size = field_index(&self.indices, "content_size_in_bytes")?;
+
         let b = &mut self.builder;
 
-        struct_child::<Int32Builder>(b, 0)?.append_value(data_file.content_type() as i32);
-        struct_child::<StringBuilder>(b, 1)?.append_value(data_file.file_path());
+        struct_child::<Int32Builder>(b, i_content)?.append_value(data_file.content_type() as i32);
+        struct_child::<StringBuilder>(b, i_file_path)?.append_value(data_file.file_path());
         // Java's `FilesTable`/`ManifestEntriesTable` render `file_format` as the UPPERCASE `FileFormat`
         // enum NAME (`PARQUET`/`AVRO`/`ORC`) via `format.toString()`. `DataFileFormat`'s `Display` is
         // lowercase (the on-disk manifest string), so upper-case ONLY here in the inspection projection to
         // match Java exactly — the on-disk write path (Display/serde) is unchanged.
-        struct_child::<StringBuilder>(b, 2)?
+        struct_child::<StringBuilder>(b, i_file_format)?
             .append_value(data_file.file_format().to_string().to_uppercase());
-        struct_child::<Int32Builder>(b, 3)?.append_value(data_file.partition_spec_id);
+        struct_child::<Int32Builder>(b, i_spec_id)?.append_value(data_file.partition_spec_id);
 
-        let partition_builder = struct_child::<StructBuilder>(b, 4)?;
-        append_partition(
-            partition_builder,
-            self.partition_type,
-            data_file.partition(),
-        )?;
+        if let Some(i_partition) = i_partition {
+            let partition_builder = struct_child::<StructBuilder>(b, i_partition)?;
+            append_partition(
+                partition_builder,
+                self.partition_type,
+                data_file.partition(),
+            )?;
+        }
 
-        struct_child::<Int64Builder>(b, 5)?.append_value(data_file.record_count() as i64);
-        struct_child::<Int64Builder>(b, 6)?.append_value(data_file.file_size_in_bytes() as i64);
+        struct_child::<Int64Builder>(b, i_record_count)?
+            .append_value(data_file.record_count() as i64);
+        struct_child::<Int64Builder>(b, i_file_size)?
+            .append_value(data_file.file_size_in_bytes() as i64);
 
         append_count_map(
-            struct_child::<DynMapBuilder>(b, 7)?,
+            struct_child::<DynMapBuilder>(b, i_column_sizes)?,
             data_file.column_sizes(),
         )?;
         append_count_map(
-            struct_child::<DynMapBuilder>(b, 8)?,
+            struct_child::<DynMapBuilder>(b, i_value_counts)?,
             data_file.value_counts(),
         )?;
         append_count_map(
-            struct_child::<DynMapBuilder>(b, 9)?,
+            struct_child::<DynMapBuilder>(b, i_null_value_counts)?,
             data_file.null_value_counts(),
         )?;
         append_count_map(
-            struct_child::<DynMapBuilder>(b, 10)?,
+            struct_child::<DynMapBuilder>(b, i_nan_value_counts)?,
             data_file.nan_value_counts(),
         )?;
         append_bound_map(
-            struct_child::<DynMapBuilder>(b, 11)?,
+            struct_child::<DynMapBuilder>(b, i_lower_bounds)?,
             data_file.lower_bounds(),
         )?;
         append_bound_map(
-            struct_child::<DynMapBuilder>(b, 12)?,
+            struct_child::<DynMapBuilder>(b, i_upper_bounds)?,
             data_file.upper_bounds(),
         )?;
 
-        struct_child::<LargeBinaryBuilder>(b, 13)?.append_option(data_file.key_metadata());
+        struct_child::<LargeBinaryBuilder>(b, i_key_metadata)?
+            .append_option(data_file.key_metadata());
 
         append_i64_list(
-            struct_child::<DynListBuilder>(b, 14)?,
+            struct_child::<DynListBuilder>(b, i_split_offsets)?,
             data_file.split_offsets(),
         )?;
         append_i32_list(
-            struct_child::<DynListBuilder>(b, 15)?,
+            struct_child::<DynListBuilder>(b, i_equality_ids)?,
             data_file.equality_ids().as_deref(),
         )?;
 
-        struct_child::<Int32Builder>(b, 16)?.append_option(data_file.sort_order_id());
-        struct_child::<Int64Builder>(b, 17)?.append_option(data_file.first_row_id());
-        struct_child::<StringBuilder>(b, 18)?.append_option(data_file.referenced_data_file());
-        struct_child::<Int64Builder>(b, 19)?.append_option(data_file.content_offset());
-        struct_child::<Int64Builder>(b, 20)?.append_option(data_file.content_size_in_bytes());
+        struct_child::<Int32Builder>(b, i_sort_order_id)?.append_option(data_file.sort_order_id());
+        struct_child::<Int64Builder>(b, i_first_row_id)?.append_option(data_file.first_row_id());
+        struct_child::<StringBuilder>(b, i_referenced_data_file)?
+            .append_option(data_file.referenced_data_file());
+        struct_child::<Int64Builder>(b, i_content_offset)?
+            .append_option(data_file.content_offset());
+        struct_child::<Int64Builder>(b, i_content_size)?
+            .append_option(data_file.content_size_in_bytes());
 
         // The struct itself is always present (a row is never a null data_file).
         b.append(true);
@@ -322,6 +380,17 @@ impl<'a> DataFileStructBuilder<'a> {
     pub(super) fn finish(mut self) -> StructArray {
         self.builder.finish()
     }
+}
+
+/// Looks up a `data_file` child by column name. Missing names are a programming error (the
+/// builder was constructed from a schema that omitted a required DataFile column).
+fn field_index(indices: &HashMap<String, usize>, name: &str) -> Result<usize> {
+    indices.get(name).copied().ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("data_file struct is missing field `{name}`"),
+        )
+    })
 }
 
 /// Looks up a typed child builder of a [`StructBuilder`] by index, erroring (never panicking) if the
