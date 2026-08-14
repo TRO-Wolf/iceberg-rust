@@ -40,6 +40,17 @@ Branch: `repark/fw1-timestamptz-datafile-projection`. Charter: F-V4-1 / A7 — p
 - [x] Tests (same commit): `.files` / `.partitions` over timestamptz-identity and `.files` over timestamptz_ns-identity asserting the projected value; Uuid + Fixed identity partitions still error on the existing needle (isolated + metadata-table).
 - [x] New GAP_MATRIX row R162 (do not overload R142). Update `crates/iceberg/src/inspect/map.md`. ENGINE_CONTRACT.md and repark pins untouched.
 - [x] A6 gates: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=2 — docker-up bind failed on host `:9000` (pre-existing host process, not this compose). A6 HALT; no push / no PR.
+## ACTIVE (2026-08-14): FW-2 Arrow `UTC` annotation on timestamptz read
+
+Branch: `repark/fw2-arrow-utc-annotation` off freeze `1dae9b66`. Independent of FW-1 (#192).
+Charter: F-V4-2 — schema annotation only; value/kernel CLOSED; repark harness NOT edited.
+
+- [x] Flip `UTC_TIME_ZONE` `"+00:00"` → `"UTC"` and route every Arrow timestamptz *producer* through it (schema visitor, inspect builders, `get_arrow_datum`, `with_timezone_utc` fixtures that `try_new` against the Iceberg Arrow schema).
+- [x] Keep Arrow→Iceberg acceptance of BOTH `"UTC"` and `"+00:00"` (`is_utc_time_zone`); do not narrow. Writer `is_utc_alias` must not collapse when the constant flips.
+- [x] Tests same commit: Iceberg→Arrow emits `UTC` (µs + ns); `+00:00` input still maps; non-UTC tz still rejected; flip output pins (schema expect, inspect Debug, parquet writer, datafusion snapshots).
+- [x] GAP_MATRIX new row R163 (R162 reserved by independent FW-1). `writer/map.md` lockstep. ENGINE_CONTRACT §F-A2-3 sentence updated so the contract is not stale.
+- [x] acc + C4, then A6 `make check && make unit-test && make test`. One `[repark]` PR. Report after `gh pr create`.
+      **Done 2026-08-14:** `UTC_TIME_ZONE` is `"UTC"`; inverse still accepts `+00:00`; GAP_MATRIX R163; A6 green (first `make test` SQLITE_BUSY flake, retry 4162/4162).
 
 ---
 

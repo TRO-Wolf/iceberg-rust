@@ -41,8 +41,27 @@ use crate::{Error, ErrorKind};
 
 /// When iceberg map type convert to Arrow map type, the default map field name is "key_value".
 pub const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
-/// UTC time zone for Arrow timestamp type.
-pub const UTC_TIME_ZONE: &str = "+00:00";
+/// UTC timezone annotation produced for Iceberg `timestamptz` / `timestamptz_ns`
+/// Arrow fields. Matches Spark `toArrow` (`timestamp[us, tz=UTC]`).
+///
+/// The historical offset spelling `"+00:00"` is still **accepted** on the
+/// Arrow→Iceberg inverse (see [`is_utc_time_zone`]); it is never produced.
+pub const UTC_TIME_ZONE: &str = "UTC";
+
+/// Historical offset-form UTC alias this crate used to emit on Iceberg→Arrow.
+///
+/// Still accepted as Iceberg `timestamptz` so files and batches tagged under
+/// the old annotation continue to resolve. Never produced.
+pub const UTC_OFFSET_TIME_ZONE: &str = "+00:00";
+
+/// True if `zone` is an accepted UTC alias for Iceberg `timestamptz`.
+///
+/// The produced annotation is [`UTC_TIME_ZONE`]. [`UTC_OFFSET_TIME_ZONE`] remains
+/// accepted so the inverse mapping is never narrowed.
+#[inline]
+pub fn is_utc_time_zone(zone: &str) -> bool {
+    zone == UTC_TIME_ZONE || zone == UTC_OFFSET_TIME_ZONE
+}
 
 /// Maximum Arrow schema-type nesting depth the visitor will descend.
 ///
@@ -574,14 +593,12 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
                 Ok(Type::Primitive(PrimitiveType::TimestampNs))
             }
             DataType::Timestamp(unit, Some(zone))
-                if unit == &TimeUnit::Microsecond
-                    && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
+                if unit == &TimeUnit::Microsecond && is_utc_time_zone(zone.as_ref()) =>
             {
                 Ok(Type::Primitive(PrimitiveType::Timestamptz))
             }
             DataType::Timestamp(unit, Some(zone))
-                if unit == &TimeUnit::Nanosecond
-                    && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
+                if unit == &TimeUnit::Nanosecond && is_utc_time_zone(zone.as_ref()) =>
             {
                 Ok(Type::Primitive(PrimitiveType::TimestamptzNs))
             }
@@ -859,13 +876,15 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
             Ok(Arc::new(TimestampMicrosecondArray::new_scalar(*value)))
         }
         (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(value)) => Ok(Arc::new(Scalar::new(
-            TimestampMicrosecondArray::new(vec![*value; 1].into(), None).with_timezone_utc(),
+            TimestampMicrosecondArray::new(vec![*value; 1].into(), None)
+                .with_timezone(UTC_TIME_ZONE),
         ))),
         (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(value)) => {
             Ok(Arc::new(TimestampNanosecondArray::new_scalar(*value)))
         }
         (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(value)) => Ok(Arc::new(Scalar::new(
-            TimestampNanosecondArray::new(vec![*value; 1].into(), None).with_timezone_utc(),
+            TimestampNanosecondArray::new(vec![*value; 1].into(), None)
+                .with_timezone(UTC_TIME_ZONE),
         ))),
         (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(value)) => {
             // `precision`/`scale` can arrive here through bypass paths such as `Datum::new` or
@@ -2293,13 +2312,13 @@ mod tests {
             simple_field("i", DataType::Time64(TimeUnit::Microsecond), false, "9"),
             simple_field(
                 "j",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
                 false,
                 "10",
             ),
             simple_field(
                 "k",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
                 false,
                 "12",
             ),
@@ -2540,6 +2559,128 @@ mod tests {
         let schema = iceberg_schema_for_schema_to_arrow_schema();
         let converted_arrow_schema = schema_to_arrow_schema(&schema).unwrap();
         assert_eq!(converted_arrow_schema, arrow_schema);
+    }
+
+    /// RISK: Iceberg `timestamptz` / `timestamptz_ns` must emit Spark's `tz=UTC`
+    /// annotation, not the historical `+00:00`. Values are unchanged — this pins
+    /// the schema metadata only.
+    #[test]
+    fn schema_to_arrow_schema_annotates_timestamptz_as_utc() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "ts", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+                NestedField::required(2, "ts_ns", Type::Primitive(PrimitiveType::TimestamptzNs))
+                    .into(),
+            ])
+            .build()
+            .expect("static timestamptz schema");
+        let arrow = schema_to_arrow_schema(&schema).expect("Iceberg→Arrow");
+        assert_eq!(
+            arrow.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into()))
+        );
+        assert_eq!(
+            arrow.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into()))
+        );
+        assert_eq!(UTC_TIME_ZONE, "UTC");
+    }
+
+    /// RISK: narrowing the inverse to only `"UTC"` would refuse parquet/Arrow
+    /// written under the old `+00:00` annotation. Both aliases, both units,
+    /// both public converters must still resolve to Iceberg `timestamptz`.
+    #[test]
+    fn arrow_schema_to_schema_accepts_utc_and_offset_aliases() {
+        for (zone, unit, expected) in [
+            (
+                UTC_TIME_ZONE,
+                TimeUnit::Microsecond,
+                PrimitiveType::Timestamptz,
+            ),
+            (
+                UTC_OFFSET_TIME_ZONE,
+                TimeUnit::Microsecond,
+                PrimitiveType::Timestamptz,
+            ),
+            (
+                UTC_TIME_ZONE,
+                TimeUnit::Nanosecond,
+                PrimitiveType::TimestamptzNs,
+            ),
+            (
+                UTC_OFFSET_TIME_ZONE,
+                TimeUnit::Nanosecond,
+                PrimitiveType::TimestamptzNs,
+            ),
+        ] {
+            let arrow = ArrowSchema::new(vec![
+                Field::new("ts", DataType::Timestamp(unit, Some(zone.into())), true).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+                ),
+            ]);
+            let with_ids = arrow_schema_to_schema(&arrow)
+                .unwrap_or_else(|e| panic!("{zone:?}/{unit:?} with ids must resolve: {e}"));
+            let auto = arrow_schema_to_schema_auto_assign_ids(&arrow)
+                .unwrap_or_else(|e| panic!("{zone:?}/{unit:?} auto-assign must resolve: {e}"));
+            match with_ids.as_struct().fields()[0].field_type.as_ref() {
+                Type::Primitive(got) => assert_eq!(got, &expected, "with-ids {zone:?}/{unit:?}"),
+                other => panic!("with-ids {zone:?}/{unit:?} produced {other:?}"),
+            }
+            match auto.as_struct().fields()[0].field_type.as_ref() {
+                Type::Primitive(got) => assert_eq!(got, &expected, "auto {zone:?}/{unit:?}"),
+                other => panic!("auto {zone:?}/{unit:?} produced {other:?}"),
+            }
+        }
+        assert!(is_utc_time_zone(UTC_OFFSET_TIME_ZONE));
+        assert!(is_utc_time_zone("UTC"));
+        assert!(!is_utc_time_zone("+05:00"));
+    }
+
+    /// RISK: a genuinely different timezone must stay a loud type error, not
+    /// silently become `timestamptz` (the UTC-alias set is closed).
+    #[test]
+    fn arrow_schema_to_schema_rejects_non_utc_timezone() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+05:00".into())),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]);
+        let error = arrow_schema_to_schema(&arrow)
+            .expect_err("a non-UTC timezone must not map to Iceberg timestamptz");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.to_string().contains("Unsupported Arrow data type"),
+            "expected a type-rejection, got: {error}"
+        );
+    }
+
+    /// RISK: files written under the old `+00:00` annotation reach the scan
+    /// transformer as `Timestamp(_, "+00:00")` against a `UTC` target. The
+    /// Promote path (`arrow_cast::cast`) must succeed and keep the i64 instants
+    /// bit-identical — otherwise every previously-written timestamptz file
+    /// becomes unreadable.
+    #[test]
+    fn arrow_cast_from_offset_alias_to_utc_is_bit_identical() {
+        use arrow_array::TimestampMicrosecondArray;
+        use arrow_cast::cast;
+
+        let values = vec![Some(42_i64), None, Some(-1)];
+        let src =
+            TimestampMicrosecondArray::from(values.clone()).with_timezone(UTC_OFFSET_TIME_ZONE);
+        let target = DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into()));
+        let out = cast(&src, &target).expect("UTC-alias cast must succeed");
+        let out = out
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("cast must stay TimestampMicrosecondArray");
+        assert_eq!(out.timezone(), Some(UTC_TIME_ZONE));
+        assert_eq!(out.iter().collect::<Vec<_>>(), values);
     }
 
     // RISK: variant has NO Arrow representation under the pinned arrow-rs — the conversion
@@ -2946,7 +3087,7 @@ mod tests {
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
             assert!(is_scalar);
-            assert_eq!(array.timezone(), Some("+00:00"));
+            assert_eq!(array.timezone(), Some(UTC_TIME_ZONE));
             assert_eq!(array.value(0), 42);
         }
         {

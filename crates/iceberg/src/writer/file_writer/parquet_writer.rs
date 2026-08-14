@@ -37,8 +37,9 @@ use parquet::file::statistics::Statistics;
 
 use super::{FileWriter, FileWriterBuilder};
 use crate::arrow::{
-    ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor, UTC_TIME_ZONE,
-    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum, schema_needs_nan_value_counts,
+    ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
+    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum, is_utc_time_zone,
+    schema_needs_nan_value_counts,
 };
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
@@ -569,10 +570,11 @@ impl FileWriter for ParquetWriter {
                 .compute(self.schema.clone(), batch)?;
         }
 
-        // Normalize UTC-alias timestamp timezones to the writer schema (metadata-only). Spark
-        // tags Iceberg `timestamptz` batches `Timestamp(_, "UTC")`; the writer schema tags them
-        // `Timestamp(_, "+00:00")` (UTC_TIME_ZONE), and the Parquet writer's strict schema check
-        // is timezone-sensitive. The relabel reuses the values buffer (bit-identical instants);
+        // Normalize UTC-alias timestamp timezones to the writer schema (metadata-only). The
+        // writer schema tags Iceberg `timestamptz` `Timestamp(_, "UTC")` (UTC_TIME_ZONE);
+        // historical `"+00:00"` batches (and any remaining Spark alias spelling) still need
+        // a metadata-only relabel because the Parquet writer's schema check is timezone-
+        // sensitive. The relabel reuses the values buffer (bit-identical instants);
         // genuinely different timezones and nested mismatches are left to fail loudly below.
         let normalized = normalize_utc_alias_timestamps(batch, &self.writer_arrow_schema)?;
         let batch = normalized.as_ref().unwrap_or(batch);
@@ -646,23 +648,13 @@ impl FileWriter for ParquetWriter {
 // ==============================================================================================
 // UTC-alias timestamp normalization at the write funnel (F-A2-3)
 //
-// Spark-written parquet tags Iceberg `timestamptz` batches `Timestamp(_, "UTC")`. This crate's
-// Arrow->Iceberg conversion accepts both `"UTC"` and `"+00:00"` as `timestamptz`, but its
-// Iceberg->Arrow conversion canonicalizes to `"+00:00"` (UTC_TIME_ZONE) — so the writer schema
-// tags timestamptz `"+00:00"` while a Spark batch tags it `"UTC"`. The Parquet `ArrowWriter`'s
-// schema check (`types_compatible`) is timezone-sensitive for `Timestamp` and rejects the batch
-// even though both aliases denote UTC and carry identical instants. Java Iceberg coerces write
-// batches to the file schema; this normalizes the (closed) UTC-alias case metadata-only at the
-// single write funnel, leaving every genuine mismatch to fail loud.
+// Iceberg→Arrow now canonicalizes `timestamptz` to `Timestamp(_, "UTC")` (UTC_TIME_ZONE),
+// matching Spark `toArrow`. Arrow→Iceberg still accepts both `"UTC"` and the historical
+// `"+00:00"` alias. A batch tagged with the *other* UTC alias is therefore a schema-check
+// mismatch even though both denote UTC and carry identical instants. Java Iceberg coerces
+// write batches to the file schema; this normalizes the (closed) UTC-alias case metadata-only
+// at the single write funnel, leaving every genuine mismatch to fail loud.
 // ==============================================================================================
-
-/// The timezone strings this crate treats as interchangeable UTC aliases — exactly the set the
-/// Arrow->Iceberg conversion accepts as `timestamptz` (`arrow::schema`, the
-/// `zone == "UTC" || zone == "+00:00"` arms). The set is CLOSED: any other timezone (e.g.
-/// `"+05:00"`) is a genuinely different type and is never silently reinterpreted.
-fn is_utc_alias(tz: &str) -> bool {
-    tz == "UTC" || tz == UTC_TIME_ZONE
-}
 
 /// Relabel a timestamp array's timezone metadata to `tz`, reusing the values buffer.
 ///
@@ -717,8 +709,8 @@ fn utc_alias_relabel(
     ) = (batch_dt, writer_dt)
         && batch_unit == writer_unit
         && batch_tz.as_ref() != writer_tz.as_ref()
-        && is_utc_alias(batch_tz.as_ref())
-        && is_utc_alias(writer_tz.as_ref())
+        && is_utc_time_zone(batch_tz.as_ref())
+        && is_utc_time_zone(writer_tz.as_ref())
     {
         return Ok(Some(relabel_timestamp_timezone(
             col,
@@ -733,7 +725,7 @@ fn utc_alias_relabel(
 /// strings on TOP-LEVEL timestamp columns, via a metadata-only timezone relabel to the writer's
 /// timezone. Returns `Some(batch)` when at least one column was relabeled, else `None` (the caller
 /// writes the original batch unchanged — the common, zero-copy path taken by already-canonical
-/// `"+00:00"` batches, naive timestamps, and non-timestamp schemas).
+/// `"UTC"` batches, naive timestamps, and non-timestamp schemas).
 ///
 /// TOP-LEVEL only, by design: the Parquet writer applies its strict `types_compatible` check
 /// positionally per (writer field, column) pair and recurses into nested types itself, so a
@@ -871,7 +863,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::arrow::schema_to_arrow_schema;
+    use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
     use crate::io::FileIO;
     use crate::spec::decimal_utils::{decimal_mantissa, decimal_new, decimal_scale};
     use crate::spec::{PrimitiveLiteral, Struct, *};
@@ -1806,7 +1798,7 @@ mod tests {
         ])) as ArrayRef;
         let col10 = Arc::new(
             arrow_array::TimestampMicrosecondArray::from(vec![Some(0), Some(1), None, Some(3)])
-                .with_timezone_utc(),
+                .with_timezone(UTC_TIME_ZONE),
         ) as ArrayRef;
         let col11 = Arc::new(arrow_array::TimestampNanosecondArray::from(vec![
             Some(0),
@@ -1816,7 +1808,7 @@ mod tests {
         ])) as ArrayRef;
         let col12 = Arc::new(
             arrow_array::TimestampNanosecondArray::from(vec![Some(0), Some(1), None, Some(3)])
-                .with_timezone_utc(),
+                .with_timezone(UTC_TIME_ZONE),
         ) as ArrayRef;
         let col13 = Arc::new(
             arrow_array::Decimal128Array::from(vec![Some(1), Some(2), None, Some(100)])
@@ -3048,11 +3040,9 @@ mod tests {
     // ==========================================================================================
     // F-A2-3: timestamptz UTC-alias normalization at the parquet writer.
     //
-    // Spark-written parquet tags Iceberg `timestamptz` batches `Timestamp(_, "UTC")`; this crate
-    // canonicalizes `timestamptz` to `Timestamp(_, "+00:00")` (UTC_TIME_ZONE) on the
-    // Iceberg->Arrow path, and the Parquet `ArrowWriter`'s strict `types_compatible` check is
-    // timezone-sensitive for `Timestamp` — so a `"UTC"`-tagged batch is rejected against a
-    // `"+00:00"` writer schema even though both are the SAME Iceberg type and the SAME instants.
+    // Iceberg→Arrow now emits `Timestamp(_, "UTC")` (UTC_TIME_ZONE). Historical `"+00:00"`
+    // batches (and any remaining Spark alias spelling) still differ from the writer schema
+    // string-wise; the Parquet `ArrowWriter`'s `types_compatible` check is timezone-sensitive.
     // The write funnel `ParquetWriter::write` normalizes UTC-alias mismatches metadata-only.
     // ==========================================================================================
 
@@ -3115,10 +3105,10 @@ mod tests {
             .unwrap()
     }
 
-    /// Entry pin (F-A2-3 repro): a `Timestamp(µs, "UTC")` batch written against a
-    /// `timestamptz`-derived (`"+00:00"`) writer schema normalizes metadata-only and round-trips
-    /// with BIT-IDENTICAL microsecond integers (compared as `i64`, value AND null mask — never
-    /// display). Doubles as the load-bearing mutation proof.
+    /// Entry pin (F-A2-3): a `Timestamp(µs, "UTC")` batch written against a
+    /// `timestamptz`-derived (`"UTC"`) writer schema is already canonical (zero-copy)
+    /// and round-trips with BIT-IDENTICAL microsecond integers (compared as `i64`,
+    /// value AND null mask — never display).
     #[tokio::test]
     async fn test_write_utc_alias_timestamptz_normalizes_bit_identical() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
@@ -3159,17 +3149,20 @@ mod tests {
             .expect("read-back column is TimestampMicrosecondArray");
         // Bit-identical microsecond integers + null positions.
         assert_eq!(read_col.iter().collect::<Vec<_>>(), values);
-        // Normalized to the UTC alias the writer emits (canonical "+00:00").
+        // Writer emits the canonical UTC annotation.
         assert_eq!(
             read_col.data_type(),
-            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("+00:00".into()))
+            &DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(UTC_TIME_ZONE.into())
+            )
         );
         Ok(())
     }
 
-    /// Pin: the relabel is unit-generic — a `Timestamp(ns, "UTC")` batch against a
-    /// `timestamptz_ns`-derived (`"+00:00"`) writer schema normalizes and round-trips
-    /// bit-identical (nanosecond integers).
+    /// Pin: the ns unit is identical — a `Timestamp(ns, "UTC")` batch against a
+    /// `timestamptz_ns`-derived (`"UTC"`) writer schema round-trips bit-identical
+    /// (nanosecond integers).
     #[tokio::test]
     async fn test_write_utc_alias_timestamptz_ns_normalizes_bit_identical() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
@@ -3208,13 +3201,17 @@ mod tests {
         assert_eq!(read_col.iter().collect::<Vec<_>>(), values);
         assert_eq!(
             read_col.data_type(),
-            &DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("+00:00".into()))
+            &DataType::Timestamp(
+                arrow_schema::TimeUnit::Nanosecond,
+                Some(UTC_TIME_ZONE.into())
+            )
         );
         Ok(())
     }
 
-    /// Regression pin: an already-canonical `Timestamp(µs, "+00:00")` batch is written on the
-    /// zero-copy pass-through path (no relabel) and round-trips bit-identical.
+    /// Back-compat pin: a historical `Timestamp(µs, "+00:00")` batch is still accepted
+    /// (UTC-alias relabel to the writer schema) and round-trips bit-identical. The
+    /// written file carries the canonical `"UTC"` annotation.
     #[tokio::test]
     async fn test_write_canonical_utc_timestamptz_unchanged() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
@@ -3248,7 +3245,10 @@ mod tests {
         assert_eq!(read_col.iter().collect::<Vec<_>>(), values);
         assert_eq!(
             read_col.data_type(),
-            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("+00:00".into()))
+            &DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(UTC_TIME_ZONE.into())
+            )
         );
         Ok(())
     }
@@ -3335,7 +3335,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_io = FileIO::new_with_fs();
 
-        // Iceberg: struct { ts: timestamptz }. The writer's Arrow child tz is "+00:00".
+        // Iceberg: struct { ts: timestamptz }. The writer's Arrow child tz is "UTC".
         let schema = Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![
@@ -3352,10 +3352,14 @@ mod tests {
             .build()
             .unwrap();
 
-        // Batch: struct { ts: Timestamp(µs, "UTC") } — the NESTED child mismatches.
+        // Batch: struct { ts: Timestamp(µs, "+00:00") } — the NESTED child mismatches
+        // the writer's canonical "UTC" (normalization is top-level only).
         let child_field = Field::new(
             "ts",
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(crate::arrow::UTC_OFFSET_TIME_ZONE.into()),
+            ),
             true,
         )
         .with_metadata(HashMap::from([(
@@ -3370,7 +3374,7 @@ mod tests {
         let batch_schema = Arc::new(arrow_schema::Schema::new(vec![wrapper_field]));
         let ts_col = Arc::new(
             arrow_array::TimestampMicrosecondArray::from(vec![Some(0_i64), Some(1_i64)])
-                .with_timezone("UTC"),
+                .with_timezone(crate::arrow::UTC_OFFSET_TIME_ZONE),
         ) as ArrayRef;
         let struct_col = Arc::new(StructArray::new(struct_fields, vec![ts_col], None)) as ArrayRef;
         let batch = RecordBatch::try_new(batch_schema, vec![struct_col]).unwrap();
@@ -3379,7 +3383,7 @@ mod tests {
             .await
             .expect_err("a nested UTC-alias mismatch must fail loud (top-level-only seam)");
         // The writer rejects at the top-level struct field; crucially the rejected batch STILL
-        // carries the nested "UTC" against the writer's "+00:00" (both timezone strings appear) —
+        // carries the nested "+00:00" against the writer's "UTC" (both timezone strings appear) —
         // proving normalization never touched the nested child (no silent partial normalization).
         let rendered = format!("{err:?}");
         assert!(

@@ -61,7 +61,7 @@
 //! | `long` / `int` / `float` / `double` / `boolean` / `string` / `date` | matching primitive | as-is (+ int→long / float→double promotion) |
 //! | `time` | `Int64` (ORC LONG micros) | `Time64(µs)` |
 //! | `timestamp` | `Timestamp(ns, None)` | `Timestamp(µs, None)` (ns→µs down-cast) |
-//! | `timestamptz` | `Timestamp(ns, Some(UTC))` | `Timestamp(µs, Some("+00:00"))` |
+//! | `timestamptz` | `Timestamp(ns, Some(UTC))` | `Timestamp(µs, Some("UTC"))` |
 //! | `decimal(p,s)` | `Decimal128(p',s)` | `Decimal128(p,s)` (precision widened on promotion) |
 //! | `uuid` | `Binary` | `FixedSizeBinary(16)` |
 //! | `fixed[L]` | `Binary` | `FixedSizeBinary(L)` |
@@ -511,7 +511,7 @@ fn convert_orc_array(
 
         // ns→µs down-cast (Iceberg is micros; `orc-rust` yields nanos), tz None.
         PrimitiveType::Timestamp => Ok(timestamp_ns_to_us(raw, None, field_name)?),
-        // ns→µs down-cast, tz "+00:00".
+        // ns→µs down-cast, tz UTC_TIME_ZONE.
         PrimitiveType::Timestamptz => Ok(timestamp_ns_to_us(raw, Some(UTC_TIME_ZONE), field_name)?),
         // ns timestamps keep nanosecond precision; only re-stamp the tz to the canonical literal.
         PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => Ok(raw.clone()),

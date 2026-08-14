@@ -26,7 +26,7 @@ use futures::{StreamExt, stream};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::Result;
-use crate::arrow::{DEFAULT_MAP_FIELD_NAME, schema_to_arrow_schema};
+use crate::arrow::{DEFAULT_MAP_FIELD_NAME, UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{
     MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, MapType, NestedField, PrimitiveType, Type,
@@ -83,7 +83,7 @@ impl<'a> SnapshotsTable<'a> {
         let schema = schema_to_arrow_schema(&self.schema())?;
 
         let mut committed_at =
-            PrimitiveBuilder::<TimestampMicrosecondType>::new().with_timezone("+00:00");
+            PrimitiveBuilder::<TimestampMicrosecondType>::new().with_timezone(UTC_TIME_ZONE);
         let mut snapshot_id = PrimitiveBuilder::<Int64Type>::new();
         let mut parent_id = PrimitiveBuilder::<Int64Type>::new();
         let mut operation = StringBuilder::new();
@@ -151,14 +151,14 @@ mod tests {
         check_record_batches(
             batch_stream.try_collect::<Vec<_>>().await.unwrap(),
             expect![[r#"
-                Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+                Field { "committed_at": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
                 Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
                 Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} },
                 Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} },
                 Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
             expect![[r#"
-                committed_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+                committed_at: PrimitiveArray<Timestamp(µs, "UTC")>
                 [
                   2018-01-04T21:22:35.770+00:00,
                   2019-04-12T20:29:15.770+00:00,

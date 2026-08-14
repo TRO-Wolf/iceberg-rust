@@ -387,14 +387,14 @@ async fn test_metadata_table() -> Result<()> {
     check_record_batches(
         snapshots,
         expect![[r#"
-            Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+            Field { "committed_at": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
             Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
             Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
             Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} },
             Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} },
             Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
         expect![[r#"
-            committed_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+            committed_at: PrimitiveArray<Timestamp(µs, "UTC")>
             [
             ],
             snapshot_id: PrimitiveArray<Int64>
