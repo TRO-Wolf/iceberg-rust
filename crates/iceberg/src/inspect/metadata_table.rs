@@ -17,7 +17,7 @@
 
 use super::{
     AllManifestsTable, EntriesTable, FilesTable, HistoryTable, ManifestsTable,
-    MetadataLogEntriesTable, PartitionsTable, RefsTable, SnapshotsTable,
+    MetadataLogEntriesTable, PartitionsTable, PositionDeletesTable, RefsTable, SnapshotsTable,
 };
 use crate::table::Table;
 
@@ -65,6 +65,9 @@ pub enum MetadataTableType {
     /// [`AllManifestsTable`] — one row per (manifest × referencing snapshot) across ALL snapshots,
     /// NOT deduplicated (Java `all_manifests`).
     AllManifests,
+    /// [`PositionDeletesTable`] — SCHEMA ONLY (Java `position_deletes`; scan not ported, refused
+    /// loud — see the module doc).
+    PositionDeletes,
 }
 
 impl MetadataTableType {
@@ -86,6 +89,7 @@ impl MetadataTableType {
             MetadataTableType::MetadataLogEntries => "metadata_log_entries",
             MetadataTableType::Partitions => "partitions",
             MetadataTableType::AllManifests => "all_manifests",
+            MetadataTableType::PositionDeletes => "position_deletes",
         }
     }
 
@@ -116,6 +120,7 @@ impl TryFrom<&str> for MetadataTableType {
             "metadata_log_entries" => Ok(Self::MetadataLogEntries),
             "partitions" => Ok(Self::Partitions),
             "all_manifests" => Ok(Self::AllManifests),
+            "position_deletes" => Ok(Self::PositionDeletes),
             _ => Err(format!("invalid metadata table type: {value}")),
         }
     }
@@ -208,5 +213,11 @@ impl<'a> MetadataTable<'a> {
     /// snapshots, NOT deduplicated; each row tagged with its `reference_snapshot_id`.
     pub fn all_manifests(&self) -> AllManifestsTable<'_> {
         AllManifestsTable::new(self.0)
+    }
+
+    /// Get the `position_deletes` table — SCHEMA ONLY (scan refused loud; Java
+    /// `PositionDeletesTable`, whose `PositionDeletesBatchScan` has no Rust analogue yet).
+    pub fn position_deletes(&self) -> PositionDeletesTable<'_> {
+        PositionDeletesTable::new(self.0)
     }
 }

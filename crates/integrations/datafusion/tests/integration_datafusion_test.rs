@@ -211,6 +211,7 @@ async fn test_provider_list_table_names() -> Result<()> {
             "my_table$metadata_log_entries",
             "my_table$partitions",
             "my_table$all_manifests",
+            "my_table$position_deletes",
         ]
     "#]]
     .assert_debug_eq(&result);

@@ -566,3 +566,14 @@ Completed-increment narratives moved verbatim out of this file (see [skills/comp
 - [todo-archive/2026-06_charter-8hour-blocks.md](todo-archive/2026-06_charter-8hour-blocks.md)
   — the 2026-06-13 → 06-19 charter / 8-hour blocks / superseded queue (pass 6).
 - Index: [todo-archive/map.md](todo-archive/map.md).
+
+## ACTIVE (2026-08-15): FB-2 `position_deletes` schema-only stub
+
+Owner-authorized bounded increment (conductor-13F addendum, option (b)): the
+`MetadataTableType::PositionDeletes` variant + `inspect/position_deletes.rs` `schema()`
+transcribed from Java `PositionDeletesTable.calculateSchema` (fixed metadata-column ids,
+partition child-id reassignment, empty-partition drop; v3 DV columns behind the format
+gate). Scan refused loud (`FeatureUnsupported`). `$`-name resolution and the provider
+`table_names` enumeration extend automatically; the enumeration pin flip is declared.
+Partition type uses `default_partition_type` (cross-spec unification residual unchanged).
+Residual: `PositionDeletesBatchScan` port (R142).
