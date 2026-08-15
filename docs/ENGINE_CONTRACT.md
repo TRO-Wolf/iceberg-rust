@@ -69,18 +69,23 @@
   policy, and isolation-level selection remain engine-owned (§5–§6). The boundary rule: anything
   provable by the Java interop oracle lives in this fork (including engine-generic DataFusion
   execs); anything Spark-flavored lives in the consumer.
-- **Lazy, failure-tolerant catalog registration (2026-07-17).** `IcebergCatalogProvider::try_new`
-  lists namespaces and table *names* only — it reads **no** table metadata. Each table's metadata is
-  loaded on first reference in `SchemaProvider::table` (async), so a single foreign / unreadable /
-  IAM-blocked table cannot brick session construction (startup is O(#tables to *list*), not
-  O(#tables to *load*)); a good table queries while an unloadable one coexists; and the unloadable
-  table errors loud — **by name** — only when it is referenced. This mirrors Java/Spark lazy-by-name
-  resolution; `table_names()` / `table_exist()` report the full listing regardless of loadability.
-- **Namespace-scoped provider construction (2026-08-14, row R164).** `try_new` is still the full
-  catalog BFS (`list_namespaces(None)` then descendants) and is byte-compatible for existing
-  callers. `IcebergCatalogProvider::try_new_with_namespace_scope` snapshots only the named
-  namespace(s) **plus descendants** (same nested BFS + U+001F naming as #191). An empty scope walks
-  nothing. The DataFusion `CatalogProvider` trait is unchanged. Lazy per-namespace listing is a named residual.
+- **Lazy, failure-tolerant catalog registration (2026-07-17; table *names* lazy 2026-08-15).**
+  `IcebergCatalogProvider::try_new` lists **namespaces** only — it issues no `list_tables` and
+  reads **no** table metadata. Each namespace's table-name directory is populated on first
+  `SchemaProvider` access (`table_names` / `table_exist` / `table` / register / deregister);
+  each table's metadata is loaded on first `SchemaProvider::table` (async). A single foreign /
+  unreadable / IAM-blocked table cannot brick session construction (startup is O(#namespaces to
+  walk), not O(#tables to list or load)); a good table queries while an unloadable one coexists;
+  and the unloadable table errors loud — **by name** — only when it is referenced. This mirrors
+  Java/Spark lazy-by-name resolution. A successful per-namespace `list_tables` is cached forever;
+  a failed listing is not cached (`table()` / register / deregister surface it; `table_names()` /
+  `table_exist()` return empty/false and the next access retries).
+- **Namespace-scoped provider construction (2026-08-14, row R164; lazy `list_tables` 2026-08-15).**
+  `try_new` is still the full catalog BFS (`list_namespaces(None)` then descendants) and is
+  byte-compatible for existing callers. `IcebergCatalogProvider::try_new_with_namespace_scope`
+  snapshots only the named namespace(s) **plus descendants** (same nested BFS + U+001F naming as
+  #191). An empty scope walks nothing. The DataFusion `CatalogProvider` trait is unchanged.
+  Per-namespace `list_tables` is lazy (see the previous bullet).
 
 ## 2. Read surface
 

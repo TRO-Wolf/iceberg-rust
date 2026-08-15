@@ -41,8 +41,9 @@ pub(crate) struct IcebergSchemaProvider {
     catalog: Arc<dyn Catalog>,
     /// The namespace this schema represents
     namespace: NamespaceIdent,
-    /// Directory of the table names known in this namespace, captured from `list_tables` at
-    /// construction and updated by `register_table` / `deregister_table`.
+    /// Directory of the table names known in this namespace. Populated on first access by
+    /// [`Self::ensure_tables_listed`] (not at construction) and updated by
+    /// `register_table` / `deregister_table`.
     ///
     /// Names only — no provider is cached. A key's presence means the table was *listed*; it does
     /// NOT imply the table's metadata is loadable. The metadata read (an object-storage round-trip)
@@ -51,41 +52,62 @@ pub(crate) struct IcebergSchemaProvider {
     /// does not reference it, and errors loud — by name — only at reference. Wrapped in `Arc` to
     /// share across the async boundary in `register_table`.
     tables: Arc<DashMap<String, ()>>,
+    /// Set to `true` only after a *successful* `list_tables`. A failed listing is not cached
+    /// (the next access retries). Guarded so two concurrent first-accesses issue one listing.
+    tables_listed: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl IcebergSchemaProvider {
     /// Asynchronously constructs a new [`IcebergSchemaProvider`] for the given namespace.
     ///
-    /// Registration LISTS the namespace's table names only — it must NOT read any table's metadata.
-    /// Each listed name is recorded with an unresolved (`None`) provider; the metadata read is
-    /// deferred to [`SchemaProvider::table`] (see [`Self::resolve_table`]). This is Java/Spark
-    /// lazy-by-name parity: a foreign, unreadable, or IAM-blocked table never fails registration nor
-    /// any query that does not reference it (it errors loud, by name, only at reference), and
-    /// construction is O(#tables to *list*) rather than O(#tables to *load*).
+    /// Construction does **not** call `list_tables` and does **not** read any table's metadata.
+    /// The name directory is populated on first access ([`Self::ensure_tables_listed`]); the
+    /// metadata read stays deferred to [`SchemaProvider::table`] (see [`Self::resolve_table`]).
+    /// This is Java/Spark lazy-by-name parity: a foreign, unreadable, or IAM-blocked table never
+    /// fails registration nor any query that does not reference it (it errors loud, by name, only
+    /// at reference). Catalog construction is O(#namespaces to walk), not O(#tables to list or
+    /// load).
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
     ) -> Result<Self> {
-        // The listed name set is captured once here; a table created/dropped in the catalog after
-        // construction is not reflected until the provider is rebuilt (the pre-existing staleness
-        // note). Resolution of each name to a provider is lazy — see `resolve_table`.
-        let table_names: Vec<_> = client
-            .list_tables(&namespace)
-            .await?
-            .iter()
-            .map(|tbl| tbl.name().to_string())
-            .collect();
-
-        let tables = Arc::new(DashMap::new());
-        for name in table_names {
-            tables.insert(name, ());
-        }
-
         Ok(IcebergSchemaProvider {
             catalog: client,
             namespace,
-            tables,
+            tables: Arc::new(DashMap::new()),
+            tables_listed: Arc::new(tokio::sync::Mutex::new(false)),
         })
+    }
+
+    /// Populate [`Self::tables`] from `list_tables` on first successful access.
+    ///
+    /// A successful listing is cached forever (exactly one `list_tables` per namespace). A failed
+    /// listing is not cached — the next access retries. Concurrent first-accesses share one
+    /// in-flight listing via `tables_listed`.
+    async fn ensure_tables_listed(&self) -> Result<()> {
+        fill_table_name_directory(
+            &self.catalog,
+            &self.namespace,
+            &self.tables,
+            &self.tables_listed,
+        )
+        .await
+    }
+
+    /// Best-effort populate for the sync `table_names` / `table_exist` paths.
+    ///
+    /// A listing failure is swallowed (the directory stays empty; the caller reports empty /
+    /// false). Runtime-bridge failure is also swallowed — the caller still reads whatever names
+    /// are already cached. Result-bearing methods (`table` / register / deregister) must call
+    /// [`Self::ensure_tables_listed`] and propagate.
+    fn refresh_table_names_best_effort(&self) {
+        let catalog = self.catalog.clone();
+        let namespace = self.namespace.clone();
+        let tables = self.tables.clone();
+        let tables_listed = self.tables_listed.clone();
+        let _ = block_on_off_caller_runtime(async move {
+            let _ = fill_table_name_directory(&catalog, &namespace, &tables, &tables_listed).await;
+        });
     }
 
     /// Lazily resolves a base table name to a catalog-backed provider bound to FRESHLY loaded
@@ -156,9 +178,37 @@ fn split_metadata_table_ref(name: &str) -> Option<(&str, MetadataTableType)> {
         .map(|ty| (base, ty))
 }
 
+/// Fill `tables` from `catalog.list_tables(namespace)` once.
+///
+/// Success sets `*tables_listed = true`. Failure leaves the flag false and does not insert
+/// names (so a partial fill cannot look like a successful listing).
+async fn fill_table_name_directory(
+    catalog: &Arc<dyn Catalog>,
+    namespace: &NamespaceIdent,
+    tables: &DashMap<String, ()>,
+    tables_listed: &tokio::sync::Mutex<bool>,
+) -> Result<()> {
+    let mut listed = tables_listed.lock().await;
+    if *listed {
+        return Ok(());
+    }
+    let table_names: Vec<String> = catalog
+        .list_tables(namespace)
+        .await?
+        .iter()
+        .map(|tbl| tbl.name().to_string())
+        .collect();
+    for name in table_names {
+        tables.insert(name, ());
+    }
+    *listed = true;
+    Ok(())
+}
+
 #[async_trait]
 impl SchemaProvider for IcebergSchemaProvider {
     fn table_names(&self) -> Vec<String> {
+        self.refresh_table_names_best_effort();
         self.tables
             .iter()
             .flat_map(|entry| {
@@ -172,6 +222,7 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
+        self.refresh_table_names_best_effort();
         if let Some((table_name, _)) = split_metadata_table_ref(name) {
             self.tables.contains_key(table_name)
         } else {
@@ -180,6 +231,9 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.ensure_tables_listed()
+            .await
+            .map_err(to_datafusion_error)?;
         if let Some((table_name, metadata_table_type)) = split_metadata_table_ref(name) {
             // Lazily resolve the BASE table, then build the requested metadata table over it. An
             // unloadable base errors loud (by name) here, exactly as a direct reference would.
@@ -206,13 +260,6 @@ impl SchemaProvider for IcebergSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // Check if table already exists
-        if self.table_exist(name.as_str()) {
-            return Err(DataFusionError::Execution(format!(
-                "Table {name} already exists"
-            )));
-        }
-
         // Convert DataFusion schema to Iceberg schema
         // DataFusion schemas don't have field IDs, so we use the function that assigns them automatically
         let df_schema = table.schema();
@@ -237,6 +284,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         let catalog = self.catalog.clone();
         let namespace = self.namespace.clone();
         let tables = self.tables.clone();
+        let tables_listed = self.tables_listed.clone();
         let name_clone = name.clone();
 
         // Run the async catalog work on a runtime the *caller* does not own (see
@@ -246,6 +294,15 @@ impl SchemaProvider for IcebergSchemaProvider {
         // runtime risks deadlock. Executing on a separate OS thread with its own runtime is robust
         // across every caller context.
         block_on_off_caller_runtime(async move {
+            fill_table_name_directory(&catalog, &namespace, &tables, &tables_listed)
+                .await
+                .map_err(to_datafusion_error)?;
+            if tables.contains_key(name.as_str()) {
+                return Err(DataFusionError::Execution(format!(
+                    "Table {name} already exists"
+                )));
+            }
+
             // Verify the input table is empty - CREATE TABLE only accepts schema definition
             ensure_table_is_empty(&table)
                 .await
@@ -265,20 +322,23 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // Check if table exists
-        if !self.table_exist(name) {
-            return Ok(None);
-        }
-
         let catalog = self.catalog.clone();
         let namespace = self.namespace.clone();
         let tables = self.tables.clone();
+        let tables_listed = self.tables_listed.clone();
         let table_name = name.to_string();
 
         // Run on a runtime the caller does not own — see `register_table` and
         // `block_on_off_caller_runtime` for why running on the caller's runtime is unsafe (the old
         // bridge panics with no ambient runtime; nesting a `block_on` risks deadlock).
         block_on_off_caller_runtime(async move {
+            fill_table_name_directory(&catalog, &namespace, &tables, &tables_listed)
+                .await
+                .map_err(to_datafusion_error)?;
+            if !tables.contains_key(&table_name) {
+                return Ok(None);
+            }
+
             let table_ident = TableIdent::new(namespace.clone(), table_name.clone());
 
             // Build the provider to hand back BEFORE dropping the table — no provider is cached

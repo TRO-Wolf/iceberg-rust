@@ -147,17 +147,19 @@ impl IcebergCatalogProvider {
     ///
     /// # Failure policy — loud, never partial
     ///
-    /// A namespace that cannot be listed, or whose [`SchemaProvider`] cannot be built, FAILS this
-    /// call with a typed error that names the namespace; it is never dropped from the catalog.
+    /// A namespace that cannot be listed FAILS this call with a typed error that names the
+    /// namespace; it is never dropped from the catalog. Per-namespace `list_tables` is *not*
+    /// issued here (it runs on first schema access).
     /// The alternative the charter allows — skipping it with a `tracing` warning — is not
     /// available here: `iceberg-datafusion` does not depend on `tracing` (adding a dependency is
     /// out of scope), so a skip would be *silent*, and a namespace that silently vanishes is
     /// indistinguishable from one that does not exist. Failing loudly also preserves the
     /// pre-existing behaviour of this constructor, so no caller regresses.
     ///
-    /// Note this is a per-*namespace* policy and does not weaken the lazy, failure-tolerant
-    /// per-*table* contract documented in `docs/ENGINE_CONTRACT.md` §1: table metadata is still
-    /// never read here, so an unreadable table still cannot brick construction.
+    /// Note this is a per-*namespace-walk* policy and does not weaken the lazy, failure-tolerant
+    /// per-*table* contract documented in `docs/ENGINE_CONTRACT.md` §1: table *names* are listed
+    /// on first schema access and table metadata is still never read here, so an unreadable
+    /// table still cannot brick construction.
     pub async fn try_new(client: Arc<dyn Catalog>) -> Result<Self> {
         Self::try_new_with_scope(client, NamespaceWalkScope::Unscoped).await
     }
@@ -578,6 +580,10 @@ mod tests {
         inner: Arc<MemoryCatalog>,
         fail_children_of: Option<NamespaceIdent>,
         fail_tables_of: Option<NamespaceIdent>,
+        /// When set with [`Self::failing_tables_of`], fail every `list_tables` of that
+        /// namespace. When set with [`Self::failing_tables_once_of`], fail only the first call.
+        fail_tables_only_once: bool,
+        fail_tables_fired: AtomicUsize,
         delay_tables_of: Option<NamespaceIdent>,
         parent_script: ParentScript,
         /// Every `list_namespaces` call, so a test can pin the N+1 listing shape and the budget
@@ -596,6 +602,8 @@ mod tests {
                 inner,
                 fail_children_of: None,
                 fail_tables_of: None,
+                fail_tables_only_once: false,
+                fail_tables_fired: AtomicUsize::new(0),
                 delay_tables_of: None,
                 parent_script: ParentScript::Delegate,
                 listing_calls: AtomicUsize::new(0),
@@ -614,6 +622,14 @@ mod tests {
         fn failing_tables_of(inner: Arc<MemoryCatalog>, namespace: NamespaceIdent) -> Self {
             Self {
                 fail_tables_of: Some(namespace),
+                ..Self::delegating(inner)
+            }
+        }
+
+        fn failing_tables_once_of(inner: Arc<MemoryCatalog>, namespace: NamespaceIdent) -> Self {
+            Self {
+                fail_tables_of: Some(namespace),
+                fail_tables_only_once: true,
                 ..Self::delegating(inner)
             }
         }
@@ -740,10 +756,13 @@ mod tests {
                 .expect("table_listings lock poisoned")
                 .push(namespace.clone());
             if self.fail_tables_of.as_ref() == Some(namespace) {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "simulated table-listing failure",
-                ));
+                let fired = self.fail_tables_fired.fetch_add(1, Ordering::Relaxed);
+                if !self.fail_tables_only_once || fired == 0 {
+                    return Err(Error::new(
+                        ErrorKind::Unexpected,
+                        "simulated table-listing failure",
+                    ));
+                }
             }
             if self.delay_tables_of.as_ref() == Some(namespace) {
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1203,31 +1222,56 @@ mod tests {
         );
     }
 
-    /// A namespace whose TABLE listing fails must likewise fail construction and name itself.
+    /// A namespace whose TABLE listing fails must NOT fail construction (list_tables is lazy).
+    /// `table_names` / `table_exist` return empty/false without caching the failure; `table()`
+    /// surfaces the listing error loud.
     ///
-    /// Mutation this catches: replacing `try_collect` in `build_schema_providers` with a
-    /// filter-out-the-errors collect — `expect_err` goes RED.
+    /// Mutation this catches: re-introducing eager `list_tables` in
+    /// [`IcebergSchemaProvider::try_new`] — construction then `expect`s an error and this test
+    /// goes RED.
     #[tokio::test]
-    async fn a_table_listing_failure_fails_construction_and_names_the_namespace() {
+    async fn a_table_listing_failure_is_deferred_to_first_result_bearing_access() {
         let (inner, _dir) = memory_catalog().await;
         create_namespace_chain(&inner, &["good"]).await;
         create_namespace_chain(&inner, &["broken", "leaf"]).await;
         let broken = NamespaceIdent::from_strs(["broken", "leaf"]).expect("bad namespace");
 
-        let catalog: Arc<dyn Catalog> = Arc::new(ScriptedCatalog::failing_tables_of(inner, broken));
+        let scripted = Arc::new(ScriptedCatalog::failing_tables_of(inner, broken.clone()));
+        let catalog: Arc<dyn Catalog> = scripted.clone();
 
-        let err = IcebergCatalogProvider::try_new(catalog)
+        let provider = IcebergCatalogProvider::try_new(catalog)
             .await
-            .expect_err("a failing table listing must fail construction");
-
+            .expect("list_tables failure must not fail catalog construction");
         assert!(
-            err.to_string().contains("schema provider")
-                && err.to_string().contains("\"broken\", \"leaf\""),
-            "the error does not name the namespace whose provider failed: {err}"
+            scripted.recorded_table_listings().is_empty(),
+            "construction issued list_tables: {:?}",
+            scripted.recorded_table_listings()
+        );
+
+        let broken_name = canonical(&["broken", "leaf"]);
+        let broken_schema = provider
+            .schema(&broken_name)
+            .expect("broken namespace must still be registered");
+        assert!(
+            base_table_names(&broken_schema).is_empty(),
+            "table_names must swallow a listing failure"
         );
         assert!(
-            std::error::Error::source(&err).is_some(),
-            "the error chain to the underlying listing failure was broken"
+            !broken_schema.table_exist("anything"),
+            "table_exist must swallow a listing failure"
+        );
+        let err = broken_schema
+            .table("anything")
+            .await
+            .expect_err("table() must surface the listing failure");
+        assert!(
+            err.to_string().contains("simulated table-listing failure")
+                || err.to_string().contains("table-listing"),
+            "the error does not carry the listing failure: {err}"
+        );
+        assert!(
+            scripted.recorded_table_listings().contains(&broken),
+            "first access must have issued list_tables({broken:?})"
         );
     }
 
@@ -1349,11 +1393,26 @@ mod tests {
             "unscoped try_new must still issue list_namespaces(None): {:?}",
             scripted.recorded_listing_parents()
         );
-        let table_listings = scripted.recorded_table_listings();
-        for namespace in [&keep, &keep_child, &keep_grand, &other, &other_child] {
+        assert!(
+            scripted.recorded_table_listings().is_empty(),
+            "unscoped try_new must not list tables at construction: {:?}",
+            scripted.recorded_table_listings()
+        );
+        for (schema_name, namespace) in [
+            ("keep".to_string(), &keep),
+            (canonical(&["keep", "child"]), &keep_child),
+            (canonical(&["keep", "child", "grand"]), &keep_grand),
+            ("other".to_string(), &other),
+            (canonical(&["other", "child"]), &other_child),
+        ] {
+            let schema = provider
+                .schema(&schema_name)
+                .unwrap_or_else(|| panic!("{schema_name} schema missing"));
+            let _ = base_table_names(&schema);
             assert!(
-                table_listings.contains(namespace),
-                "unscoped try_new never listed tables of {namespace:?}: {table_listings:?}"
+                scripted.recorded_table_listings().contains(namespace),
+                "first table_names of {schema_name} never listed {namespace:?}: {:?}",
+                scripted.recorded_table_listings()
             );
         }
     }
@@ -1630,5 +1689,87 @@ mod tests {
             );
 
         assert_eq!(sorted_schema_names(&provider), vec!["good".to_string()]);
+    }
+
+    /// Construction of a populated catalog issues zero `list_tables`. The first successful
+    /// `table_names` issues exactly one; a later `table_names` issues none.
+    #[tokio::test]
+    async fn list_tables_is_lazy_per_namespace_and_cached_on_success() {
+        let (scripted, keep, _keep_child, _keep_grand, _other, _other_child, _warehouse) =
+            scoped_walk_fixture().await;
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+
+        let provider = IcebergCatalogProvider::try_new(catalog)
+            .await
+            .expect("catalog provider construction failed");
+        assert!(
+            scripted.recorded_table_listings().is_empty(),
+            "construction listed tables: {:?}",
+            scripted.recorded_table_listings()
+        );
+
+        let keep_schema = provider.schema("keep").expect("keep schema missing");
+        assert_eq!(base_table_names(&keep_schema), vec!["t_keep".to_string()]);
+        let after_first = scripted
+            .recorded_table_listings()
+            .iter()
+            .filter(|namespace| *namespace == &keep)
+            .count();
+        assert_eq!(
+            after_first, 1,
+            "first table_names must list keep exactly once"
+        );
+
+        assert_eq!(base_table_names(&keep_schema), vec!["t_keep".to_string()]);
+        let after_second = scripted
+            .recorded_table_listings()
+            .iter()
+            .filter(|namespace| *namespace == &keep)
+            .count();
+        assert_eq!(
+            after_second,
+            1,
+            "successful listing must be cached: {:?}",
+            scripted.recorded_table_listings()
+        );
+    }
+
+    /// A failed `list_tables` is not cached: the next access retries and can succeed.
+    #[tokio::test]
+    async fn a_failed_list_tables_is_retried_on_the_next_access() {
+        let (inner, _dir) = memory_catalog().await;
+        let ns = create_namespace(&inner, &["retry"]).await;
+        create_table(&inner, &ns, "t_retry").await;
+
+        let scripted = Arc::new(ScriptedCatalog::failing_tables_once_of(inner, ns.clone()));
+        let catalog: Arc<dyn Catalog> = scripted.clone();
+        let provider = IcebergCatalogProvider::try_new(catalog)
+            .await
+            .expect("construction must ignore the pending table-listing failure");
+
+        let schema = provider.schema("retry").expect("retry schema missing");
+        assert!(
+            base_table_names(&schema).is_empty(),
+            "first table_names must swallow the one-shot failure"
+        );
+        assert_eq!(
+            scripted
+                .recorded_table_listings()
+                .iter()
+                .filter(|namespace| *namespace == &ns)
+                .count(),
+            1
+        );
+
+        assert_eq!(base_table_names(&schema), vec!["t_retry".to_string()]);
+        assert_eq!(
+            scripted
+                .recorded_table_listings()
+                .iter()
+                .filter(|namespace| *namespace == &ns)
+                .count(),
+            2,
+            "the second access must retry the failed listing"
+        );
     }
 }

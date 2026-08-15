@@ -46,6 +46,20 @@ Branch: `repark/fb1-java-schema-shape` off freeze `0c5fd58d` (#195). Additive te
 - [x] A6: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=0 on retry
       (first attempt SQLITE_BUSY on REST `test_get_namespace`/`test_update_table`; retry
       4193 passed / 3 skipped). One `[repark]` PR. Report after `gh pr create`.
+## ACTIVE (2026-08-15): FB-3 lazy per-namespace `list_tables`
+
+Branch: `repark/fb3-lazy-list-tables` off freeze `0c5fd58d` (#195). Independent of FB-1 (#196).
+FB-2 skipped (conductor-13F A6).
+
+- [x] Remove eager `list_tables` from `IcebergSchemaProvider::try_new`; populate a once-success
+      directory on first access. Sync paths use existing `block_on_off_caller_runtime` only.
+- [x] Failed listing not cached; `table()` / register / deregister surface it; `table_names` /
+      `table_exist` return empty/false. `list_namespaces` failures still fail construction.
+- [x] Update `fail_tables_of` pins + ENGINE_CONTRACT §1 + GAP_MATRIX R164 in place (lazy residual
+      closed; 🟡→✅ — no other residual).
+- [x] A6: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=0 on retry
+      (first attempt SQLITE_BUSY on REST `test_update_table`/`test_register_table`; retry
+      4188 passed / 3 skipped). One `[repark]` PR.
 
 ## ACTIVE (2026-08-14): FW-1 timestamptz `data_file` metadata projection
 
