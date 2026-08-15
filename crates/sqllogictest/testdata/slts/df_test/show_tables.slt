@@ -39,6 +39,7 @@ default default test_binary_table$history BASE TABLE
 default default test_binary_table$manifests BASE TABLE
 default default test_binary_table$metadata_log_entries BASE TABLE
 default default test_binary_table$partitions BASE TABLE
+default default test_binary_table$position_deletes BASE TABLE
 default default test_binary_table$refs BASE TABLE
 default default test_binary_table$snapshots BASE TABLE
 default default test_partitioned_table BASE TABLE
@@ -55,6 +56,7 @@ default default test_partitioned_table$history BASE TABLE
 default default test_partitioned_table$manifests BASE TABLE
 default default test_partitioned_table$metadata_log_entries BASE TABLE
 default default test_partitioned_table$partitions BASE TABLE
+default default test_partitioned_table$position_deletes BASE TABLE
 default default test_partitioned_table$refs BASE TABLE
 default default test_partitioned_table$snapshots BASE TABLE
 default information_schema columns VIEW

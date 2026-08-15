@@ -99,7 +99,7 @@ fn files_family_schemas(table: &Table) -> [Schema; 6] {
 }
 
 /// Java `MetadataTableUtils.createMetadataTableInstance` switch — every type
-/// the Rust enum currently exposes (POSITION_DELETES is not in the enum; A4 OUT).
+/// the Rust enum currently exposes (POSITION_DELETES landed schema-only in FB-2).
 fn schema_for_metadata_table_type(table: &Table, table_type: MetadataTableType) -> Schema {
     let inspect = table.inspect();
     match table_type {
@@ -118,6 +118,7 @@ fn schema_for_metadata_table_type(table: &Table, table_type: MetadataTableType) 
         MetadataTableType::MetadataLogEntries => inspect.metadata_log_entries().schema(),
         MetadataTableType::Partitions => inspect.partitions().schema(),
         MetadataTableType::AllManifests => inspect.all_manifests().schema(),
+        MetadataTableType::PositionDeletes => inspect.position_deletes().schema(),
     }
 }
 
@@ -150,7 +151,7 @@ fn metadata_table_utils_create_instance_types_are_constructible() {
     // RISK: a MetadataTableUtils switch arm whose Rust analogue cannot produce a
     // schema means the increment-1 battery is not locking the Java type set.
     // Cite: MetadataTableUtils.createMetadataTableInstance (the private
-    // switch on MetadataTableType). POSITION_DELETES is OUT of this increment.
+    // switch on MetadataTableType). POSITION_DELETES joined schema-only in FB-2.
     let fixture = TableTestFixture::new();
     for table_type in MetadataTableType::all_types() {
         let schema = schema_for_metadata_table_type(&fixture.table, table_type.clone());
@@ -180,6 +181,7 @@ fn metadata_table_utils_create_instance_types_are_constructible() {
         "metadata_log_entries",
         "partitions",
         "all_manifests",
+        "position_deletes",
     ]);
 }
 

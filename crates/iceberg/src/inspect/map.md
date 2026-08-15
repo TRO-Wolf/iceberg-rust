@@ -23,7 +23,8 @@
 
 Metadata-inspection tables (Java `core/.../MetadataTableType` + the `*Table` classes): virtual
 tables projecting table metadata as Arrow `RecordBatch`es. The ported Java table set is the
-complete `MetadataTableType` vocabulary except unported `position_deletes` (row R142). Entry
+complete `MetadataTableType` vocabulary — `position_deletes` is schema-only (scan refused
+loud; row R142). Entry
 point: `MetadataTable` (`metadata_table.rs`), reached via `table.inspect()`.
 
 ## Contents
@@ -42,6 +43,7 @@ point: `MetadataTable` (`metadata_table.rs`), reached via `table.inspect()`.
 | `partition_summary.rs` | — | shared partition-summary builder (used by `manifests` + `all_manifests`) |
 | `readable_metrics.rs` | `MetricsUtil.readableMetricsStruct` | virtual per-leaf-column typed-metrics struct; bounds decoded via `Datum::try_from_bytes`; field ids seeded at host table's `highestFieldId()` |
 | `java_schema_shape.rs` | `MetadataTableUtils` / `BaseFilesTable.schema` / `PartitionsTable.schema` | **test-only** increment-1 battery: Java-cited field id/name/required pins for the files-family (all six analogues) and `partitions`. OUT: `position_deletes`, entries shape, cross-spec unification, `readable_metrics` interior field-id order |
+| `position_deletes.rs` | `PositionDeletesTable.calculateSchema` | **schema only** (FB-2): fixed `MetadataColumns` ids, partition child-id reassignment, empty-partition `partition` drop; `scan()` refused loud (`FeatureUnsupported`) — `PositionDeletesBatchScan` unported (row R142) |
 
 ## I want to...
 
