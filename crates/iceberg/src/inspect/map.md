@@ -22,9 +22,9 @@
 ## Purpose
 
 Metadata-inspection tables (Java `core/.../MetadataTableType` + the `*Table` classes): virtual
-tables projecting table metadata as Arrow `RecordBatch`es. The full Java table set is implemented
-(🟡 — inspection interop pending). Entry point: `MetadataTable` (`metadata_table.rs`), reached via
-`table.inspect()`.
+tables projecting table metadata as Arrow `RecordBatch`es. The ported Java table set is the
+complete `MetadataTableType` vocabulary except unported `position_deletes` (row R142). Entry
+point: `MetadataTable` (`metadata_table.rs`), reached via `table.inspect()`.
 
 ## Contents
 
@@ -41,6 +41,7 @@ tables projecting table metadata as Arrow `RecordBatch`es. The full Java table s
 | `partitions.rs` | `PartitionsTable` | the aggregating table: live entries grouped by partition struct; `last_updated_*` via strict-`>` tie-break |
 | `partition_summary.rs` | — | shared partition-summary builder (used by `manifests` + `all_manifests`) |
 | `readable_metrics.rs` | `MetricsUtil.readableMetricsStruct` | virtual per-leaf-column typed-metrics struct; bounds decoded via `Datum::try_from_bytes`; field ids seeded at host table's `highestFieldId()` |
+| `java_schema_shape.rs` | `MetadataTableUtils` / `BaseFilesTable.schema` / `PartitionsTable.schema` | **test-only** increment-1 battery: Java-cited field id/name/required pins for the files-family (all six analogues) and `partitions`. OUT: `position_deletes`, entries shape, cross-spec unification, `readable_metrics` interior field-id order |
 
 ## I want to...
 
@@ -49,7 +50,8 @@ tables projecting table metadata as Arrow `RecordBatch`es. The full Java table s
 | Add/modify an inspection table | the matching file above; field **ids and order are verbatim from Java** — check the Java `*Table` class first |
 | Change what counts as a "live" entry | `files.rs` (`is_alive()`) — mutation-pinned, touch with care |
 | Understand current-vs-all snapshot scope | `manifest_source.rs` (`MetadataScope`) |
-| See known divergences from Java | GAP_MATRIX inspection rows: unpartitioned `partition` drop now matches Java on files/entries/partitions (row R142, 2026-08-14); timestamptz / timestamptz_ns now project from `.files` / `.partitions` (row R162; interop pending); cross-spec `Partitioning.partitionType` unification deferred; `readable_metrics` sub-field order is ascending-field-id (Java: HashMap order) |
+| See known divergences from Java | GAP_MATRIX inspection rows: unpartitioned `partition` drop now matches Java on files/entries/partitions (row R142, 2026-08-14); timestamptz / timestamptz_ns now project from `.files` / `.partitions` (row R162; interop pending); cross-spec `Partitioning.partitionType` unification deferred; `readable_metrics` sub-field order is ascending-field-id (Java: HashMap order); `position_deletes` metadata table is unported (row R142) |
+| Lock Java files/partitions schema shape | `java_schema_shape.rs` (cite the Java class/method in the test) |
 
 ## Pointers
 

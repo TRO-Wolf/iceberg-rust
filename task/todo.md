@@ -31,6 +31,22 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-15): FB-1 Java inspect schema-shape battery (increment 1)
+
+Branch: `repark/fb1-java-schema-shape` off freeze `0c5fd58d` (#195). Additive tests only
+(conductor-13F A4/A5). No GAP_MATRIX cell edit.
+
+- [x] NEW `inspect/java_schema_shape.rs` citing `MetadataTableUtils.createMetadataTableInstance`,
+      `BaseFilesTable.schema` / `DataFile.getType`, and `PartitionsTable.schema`.
+- [x] Cover all six files-family analogues + partitioned/unpartitioned PartitionsTable field
+      id/name/required. OUT: `position_deletes`, entries shape, cross-spec unification,
+      `readable_metrics` interior field-id order.
+- [x] `#[cfg(test)] mod java_schema_shape;` hook + inspect/map.md row + doc-truth correction of
+      the false "full Java table set is implemented" sentence (row R142 residual).
+- [x] A6: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=0 on retry
+      (first attempt SQLITE_BUSY on REST `test_get_namespace`/`test_update_table`; retry
+      4193 passed / 3 skipped). One `[repark]` PR. Report after `gh pr create`.
+
 ## ACTIVE (2026-08-14): FW-1 timestamptz `data_file` metadata projection
 
 Branch: `repark/fw1-timestamptz-datafile-projection`. Charter: F-V4-1 / A7 — projection/read only.
