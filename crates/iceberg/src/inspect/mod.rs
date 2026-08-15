@@ -22,6 +22,8 @@ mod data_file;
 mod entries;
 mod files;
 mod history;
+#[cfg(test)]
+mod java_schema_shape;
 mod manifest_source;
 mod manifests;
 mod metadata_log_entries;
