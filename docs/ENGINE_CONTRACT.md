@@ -76,6 +76,11 @@
   O(#tables to *load*)); a good table queries while an unloadable one coexists; and the unloadable
   table errors loud — **by name** — only when it is referenced. This mirrors Java/Spark lazy-by-name
   resolution; `table_names()` / `table_exist()` report the full listing regardless of loadability.
+- **Namespace-scoped provider construction (2026-08-14, row R164).** `try_new` is still the full
+  catalog BFS (`list_namespaces(None)` then descendants) and is byte-compatible for existing
+  callers. `IcebergCatalogProvider::try_new_with_namespace_scope` snapshots only the named
+  namespace(s) **plus descendants** (same nested BFS + U+001F naming as #191). An empty scope walks
+  nothing. The DataFusion `CatalogProvider` trait is unchanged. Lazy per-namespace listing is a named residual.
 
 ## 2. Read surface
 
