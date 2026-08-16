@@ -31,6 +31,24 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-16): PT increment A — hoist `Partitioning` into `spec/partitioning.rs`
+
+Branch: `grok/c16-partitioning-analogue` off `250ea37f` (#201). First landable increment of
+the PT campaign (`PARTITIONING-UNIFICATION-DESIGN.md` §3.3 A). Inspect adoption is B/C/D.
+
+- [x] New `crates/iceberg/src/spec/partitioning.rs`: `partition_type`, `grouping_key_type`,
+      `union_partition_types` (`pub(crate)`), `is_partitioned`, `coerce_partition`, plus
+      `TableMetadata::unified_partition_type`. G1 unknown-transform refusal, G2 conflict
+      `DataInvalid`, G3 void-transform type repair, G4 per-field type resolution after the
+      id filter (dropped source is ignored, not `Err`).
+- [x] `maintenance/partition_stats.rs::unified_partition_type` is a thin delegate; private
+      `coerce_partition` deleted; stats collect path uses `spec::coerce_partition`.
+- [x] Shape pins + coerce units + mutation baits in `spec/partitioning.rs`; existing
+      partition_stats coerce tests retargeted; delegation-equivalence pin.
+- [x] `TableTestFixture::new_with_two_identity_specs` is a Java-invalid unifier input
+      (duplicate field id 1000, different sources) — not used here; stays scan-only.
+- [x] GAP_MATRIX R142 + `inspect/map.md` lockstep. ENGINE_CONTRACT untouched.
+
 ## ACTIVE (2026-08-15): PT-0 field-id partition-tuple projection in `data_file`
 
 Branch: `repark/pt0-positional-partition-walk` off `d3c30181` (#199). Interim correctness fix ahead of
