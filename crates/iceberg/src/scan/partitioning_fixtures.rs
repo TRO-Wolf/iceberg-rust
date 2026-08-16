@@ -343,6 +343,198 @@ impl TableTestFixture {
             .await
             .expect("close manifest list");
     }
+
+    /// Fixture 2 — v2 drop of a partition field.
+    ///
+    /// Spec 0: `identity(x)` @ 1000 + `identity(y)` @ 1001. Spec 1 (default):
+    /// `identity(x)` @ 1000 only. Unified type keeps both fields; a spec-1
+    /// file's 1-tuple null-fills `y`.
+    pub fn new_with_dropped_partition_field_v2() -> Self {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let table_location = tmp_dir.path().join("table1");
+        let (mut table_metadata, _meta_loc) = load_template_metadata(&table_location);
+        let schema = table_metadata.current_schema().clone();
+
+        let spec0 = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_unbound_fields(vec![
+                    UnboundPartitionField {
+                        source_id: 1,
+                        field_id: Some(1000),
+                        name: "x".to_string(),
+                        transform: Transform::Identity,
+                    },
+                    UnboundPartitionField {
+                        source_id: 2,
+                        field_id: Some(1001),
+                        name: "y".to_string(),
+                        transform: Transform::Identity,
+                    },
+                ])
+                .expect("add spec 0 fields")
+                .build()
+                .expect("bind spec 0"),
+        );
+        let spec1 = Arc::new(
+            PartitionSpec::builder(schema)
+                .with_spec_id(1)
+                .add_unbound_fields(vec![UnboundPartitionField {
+                    source_id: 1,
+                    field_id: Some(1000),
+                    name: "x".to_string(),
+                    transform: Transform::Identity,
+                }])
+                .expect("add spec 1 fields")
+                .build()
+                .expect("bind spec 1"),
+        );
+        let spec1_type = spec1
+            .partition_type(table_metadata.current_schema())
+            .expect("spec 1 partition type");
+        table_metadata.partition_specs.insert(0, spec0);
+        table_metadata.default_spec = spec1.clone();
+        table_metadata.default_partition_type = spec1_type;
+        table_metadata.partition_specs.insert(1, spec1);
+        table_metadata.last_partition_id = 1001;
+
+        build_fixture(table_location, table_metadata)
+    }
+
+    /// Writes one file per spec for fixture 2.
+    ///
+    /// * `1.parquet` under spec 0, partition `(x == 7, y == 9)`.
+    /// * `2.parquet` under spec 1, partition `x == 7`.
+    pub async fn setup_dropped_partition_field_v2_manifests(&mut self) {
+        write_two_spec_manifests(
+            self,
+            Struct::from_iter([Some(Literal::long(7)), Some(Literal::long(9))]),
+            Struct::from_iter([Some(Literal::long(7))]),
+        )
+        .await;
+    }
+
+    /// Fixture 3 — v1 drop-and-re-add (G3 void type repair).
+    ///
+    /// Spec 0: `bucket(y, 8)` @ 1000 (result `int`). Spec 1 (default):
+    /// `void(y)` @ 1000 + `identity(y)` @ 1001. Unified field 1000 takes
+    /// its **name** from spec 1 (`y_1000`) and its **type** from the
+    /// non-void spec-0 field (`int`).
+    pub fn new_with_void_dropped_field_v1() -> Self {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let table_location = tmp_dir.path().join("table1");
+        let (mut table_metadata, _meta_loc) = load_template_metadata(&table_location);
+        let schema = table_metadata.current_schema().clone();
+
+        let spec0 = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_unbound_fields(vec![UnboundPartitionField {
+                    source_id: 2,
+                    field_id: Some(1000),
+                    name: "y_bucket_8".to_string(),
+                    transform: Transform::Bucket(8),
+                }])
+                .expect("add spec 0 fields")
+                .build()
+                .expect("bind spec 0"),
+        );
+        let spec1 = Arc::new(
+            PartitionSpec::builder(schema)
+                .with_spec_id(1)
+                .add_unbound_fields(vec![
+                    UnboundPartitionField {
+                        source_id: 2,
+                        field_id: Some(1000),
+                        name: "y_1000".to_string(),
+                        transform: Transform::Void,
+                    },
+                    UnboundPartitionField {
+                        source_id: 2,
+                        field_id: Some(1001),
+                        name: "y".to_string(),
+                        transform: Transform::Identity,
+                    },
+                ])
+                .expect("add spec 1 fields")
+                .build()
+                .expect("bind spec 1"),
+        );
+        let spec1_type = spec1
+            .partition_type(table_metadata.current_schema())
+            .expect("spec 1 partition type");
+        table_metadata.partition_specs.insert(0, spec0);
+        table_metadata.default_spec = spec1.clone();
+        table_metadata.default_partition_type = spec1_type;
+        table_metadata.partition_specs.insert(1, spec1);
+        table_metadata.last_partition_id = 1001;
+
+        build_fixture(table_location, table_metadata)
+    }
+
+    /// Fixture 6 — same-typed swapped field ids (positional-read corruption bait).
+    ///
+    /// Spec 0: `identity(x): long` @ **1001**. Spec 1 (default): `identity(y):
+    /// long` @ **1000**. Unified type sorts by field id so `y` (1000) comes
+    /// first; a positional walk of a spec-0 file would write `x`'s value into
+    /// `y`. PT-0 already id-matches; increment C makes the projected type
+    /// the unified type so both columns exist.
+    pub fn new_with_same_typed_swapped_specs() -> Self {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let table_location = tmp_dir.path().join("table1");
+        let (mut table_metadata, _meta_loc) = load_template_metadata(&table_location);
+        let schema = table_metadata.current_schema().clone();
+
+        let spec0 = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_unbound_fields(vec![UnboundPartitionField {
+                    source_id: 1,
+                    field_id: Some(1001),
+                    name: "x".to_string(),
+                    transform: Transform::Identity,
+                }])
+                .expect("add spec 0 fields")
+                .build()
+                .expect("bind spec 0"),
+        );
+        let spec1 = Arc::new(
+            PartitionSpec::builder(schema)
+                .with_spec_id(1)
+                .add_unbound_fields(vec![UnboundPartitionField {
+                    source_id: 2,
+                    field_id: Some(1000),
+                    name: "y".to_string(),
+                    transform: Transform::Identity,
+                }])
+                .expect("add spec 1 fields")
+                .build()
+                .expect("bind spec 1"),
+        );
+        let spec1_type = spec1
+            .partition_type(table_metadata.current_schema())
+            .expect("spec 1 partition type");
+        table_metadata.partition_specs.insert(0, spec0);
+        table_metadata.default_spec = spec1.clone();
+        table_metadata.default_partition_type = spec1_type;
+        table_metadata.partition_specs.insert(1, spec1);
+        table_metadata.last_partition_id = 1001;
+
+        build_fixture(table_location, table_metadata)
+    }
+
+    /// Writes one file per spec for fixture 6.
+    ///
+    /// * `1.parquet` under spec 0, partition `x == 11`.
+    /// * `2.parquet` under spec 1, partition `y == 22`.
+    pub async fn setup_same_typed_swapped_spec_manifests(&mut self) {
+        write_two_spec_manifests(
+            self,
+            Struct::from_iter([Some(Literal::long(11))]),
+            Struct::from_iter([Some(Literal::long(22))]),
+        )
+        .await;
+    }
 }
 
 fn next_manifest_file(fixture: &TableTestFixture) -> crate::io::OutputFile {
@@ -355,4 +547,121 @@ fn next_manifest_file(fixture: &TableTestFixture) -> crate::io::OutputFile {
             Uuid::new_v4()
         ))
         .expect("manifest output")
+}
+
+/// Writes one Added data file per spec (0 then 1) into the current snapshot.
+async fn write_two_spec_manifests(
+    fixture: &TableTestFixture,
+    spec0_partition: Struct,
+    spec1_partition: Struct,
+) {
+    let current_snapshot = fixture
+        .table
+        .metadata()
+        .current_snapshot()
+        .expect("current snapshot")
+        .clone();
+    let current_schema = current_snapshot
+        .schema(fixture.table.metadata())
+        .expect("snapshot schema");
+    let spec_zero = fixture
+        .table
+        .metadata()
+        .partition_spec_by_id(0)
+        .expect("spec 0")
+        .clone();
+    let spec_one = fixture
+        .table
+        .metadata()
+        .partition_spec_by_id(1)
+        .expect("spec 1")
+        .clone();
+
+    let manifest_a = {
+        let mut writer = ManifestWriterBuilder::new(
+            next_manifest_file(fixture),
+            Some(current_snapshot.snapshot_id()),
+            None,
+            current_schema.clone(),
+            spec_zero.as_ref().clone(),
+        )
+        .build_v2_data();
+        writer
+            .add_entry(
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(
+                        DataFileBuilder::default()
+                            .partition_spec_id(0)
+                            .content(DataContentType::Data)
+                            .file_path(format!("{}/1.parquet", &fixture.table_location))
+                            .file_format(DataFileFormat::Parquet)
+                            .file_size_in_bytes(1024)
+                            .record_count(1)
+                            .partition(spec0_partition)
+                            .key_metadata(None)
+                            .build()
+                            .expect("spec 0 data file"),
+                    )
+                    .build(),
+            )
+            .expect("add spec 0 entry");
+        writer
+            .write_manifest_file()
+            .await
+            .expect("write manifest a")
+    };
+
+    let manifest_b = {
+        let mut writer = ManifestWriterBuilder::new(
+            next_manifest_file(fixture),
+            Some(current_snapshot.snapshot_id()),
+            None,
+            current_schema.clone(),
+            spec_one.as_ref().clone(),
+        )
+        .build_v2_data();
+        writer
+            .add_entry(
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(
+                        DataFileBuilder::default()
+                            .partition_spec_id(1)
+                            .content(DataContentType::Data)
+                            .file_path(format!("{}/2.parquet", &fixture.table_location))
+                            .file_format(DataFileFormat::Parquet)
+                            .file_size_in_bytes(1024)
+                            .record_count(1)
+                            .partition(spec1_partition)
+                            .key_metadata(None)
+                            .build()
+                            .expect("spec 1 data file"),
+                    )
+                    .build(),
+            )
+            .expect("add spec 1 entry");
+        writer
+            .write_manifest_file()
+            .await
+            .expect("write manifest b")
+    };
+
+    let mut manifest_list_write = ManifestListWriter::v2(
+        fixture
+            .table
+            .file_io()
+            .new_output(current_snapshot.manifest_list())
+            .expect("manifest list output"),
+        current_snapshot.snapshot_id(),
+        current_snapshot.parent_snapshot_id(),
+        current_snapshot.sequence_number(),
+    );
+    manifest_list_write
+        .add_manifests(vec![manifest_a, manifest_b].into_iter())
+        .expect("add manifests");
+    manifest_list_write
+        .close()
+        .await
+        .expect("close manifest list");
 }

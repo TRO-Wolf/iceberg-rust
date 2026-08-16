@@ -71,7 +71,7 @@ use super::readable_metrics::{
 };
 use crate::arrow::schema_to_arrow_schema;
 use crate::scan::ArrowRecordBatchStream;
-use crate::spec::{NestedField, PrimitiveType, Schema, Type};
+use crate::spec::{NestedField, PrimitiveType, Schema, StructType, Type};
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
 
@@ -80,23 +80,59 @@ use crate::{Error, ErrorKind, Result};
 pub struct EntriesTable<'a> {
     table: &'a Table,
     scope: MetadataScope,
+    /// Java `Partitioning.partitionType(table)` — stored so [`Self::schema`] stays infallible.
+    unified_partition_type: StructType,
 }
 
 impl<'a> EntriesTable<'a> {
+    /// Fallible constructor for the current-snapshot `entries` table.
+    ///
+    /// The DataFusion `IcebergMetadataTableProvider::try_new` is the public
+    /// fallible seam (A5).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::spec::TableMetadata::unified_partition_type`].
+    pub fn try_new(table: &'a Table) -> Result<Self> {
+        Self::try_construct(table, MetadataScope::CurrentSnapshot)
+    }
+
     /// Create a new `entries` table instance (the current snapshot's manifest entries).
+    ///
+    /// Signature stays infallible (A5). On a G1/G2 table this falls back to
+    /// [`crate::spec::TableMetadata::default_partition_type`].
     pub fn new(table: &'a Table) -> Self {
-        Self {
-            table,
-            scope: MetadataScope::CurrentSnapshot,
-        }
+        Self::construct(table, MetadataScope::CurrentSnapshot)
+    }
+
+    /// Fallible constructor for the cross-snapshot `all_entries` table.
+    pub fn try_all(table: &'a Table) -> Result<Self> {
+        Self::try_construct(table, MetadataScope::AllSnapshots)
     }
 
     /// Create an `all_entries` table instance — every manifest entry reachable from ANY snapshot (Java
     /// `AllEntriesTable`). Manifests are deduplicated across snapshots; the entries are not.
     pub fn all(table: &'a Table) -> Self {
-        Self {
+        Self::construct(table, MetadataScope::AllSnapshots)
+    }
+
+    fn try_construct(table: &'a Table, scope: MetadataScope) -> Result<Self> {
+        let unified_partition_type = table.metadata().unified_partition_type()?;
+        Ok(Self {
             table,
-            scope: MetadataScope::AllSnapshots,
+            scope,
+            unified_partition_type,
+        })
+    }
+
+    fn construct(table: &'a Table, scope: MetadataScope) -> Self {
+        match Self::try_construct(table, scope) {
+            Ok(this) => this,
+            Err(_) => Self {
+                table,
+                scope,
+                unified_partition_type: table.metadata().default_partition_type().clone(),
+            },
         }
     }
 
@@ -107,7 +143,7 @@ impl<'a> EntriesTable<'a> {
     /// then `TypeUtil.selectNot(schema, DataFile.PARTITION_ID)` when the partition type is empty
     /// (drops the nested `data_file.partition` field 102), then `readable_metrics`.
     pub fn schema(&self) -> Schema {
-        let partition_type = self.table.metadata().default_partition_type();
+        let partition_type = &self.unified_partition_type;
         let data_file_type = Type::Struct(crate::spec::StructType::new(data_file_fields(
             partition_type,
         )));
@@ -162,7 +198,7 @@ impl<'a> EntriesTable<'a> {
     /// snapshot / no snapshots) yields a single empty batch.
     pub async fn scan(&self) -> Result<ArrowRecordBatchStream> {
         let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema())?);
-        let partition_type = self.table.metadata().default_partition_type().clone();
+        let partition_type = self.unified_partition_type.clone();
         let data_schema = self.table.metadata().current_schema().clone();
         let data_file_arrow_fields = data_file_struct_fields(&arrow_schema)?;
         let readable_metrics_arrow_fields = readable_metrics_struct_fields(&arrow_schema)?;
@@ -234,6 +270,7 @@ mod tests {
     use arrow_array::{Array, StructArray};
     use futures::TryStreamExt;
 
+    use super::EntriesTable;
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
@@ -1153,5 +1190,92 @@ mod tests {
                 .data_type(),
             DataType::Struct(_)
         ));
+    }
+
+    fn nested_partition_type(schema: &Schema) -> &crate::spec::StructType {
+        let data_file = schema
+            .field_by_name("data_file")
+            .expect("data_file column present");
+        let crate::spec::Type::Struct(data_file_type) = data_file.field_type.as_ref() else {
+            panic!("data_file must be a struct");
+        };
+        let partition = data_file_type
+            .field_by_name("partition")
+            .expect("nested partition present");
+        match partition.field_type.as_ref() {
+            crate::spec::Type::Struct(partition_type) => partition_type,
+            other => panic!("partition must be a struct, got {other:?}"),
+        }
+    }
+
+    /// Increment C: entries schema nests the unified partition type.
+    #[test]
+    fn entries_schema_keeps_dropped_v2_field() {
+        let fixture = TableTestFixture::new_with_dropped_partition_field_v2();
+        let schema = fixture.table.inspect().entries().schema();
+        let partition_type = nested_partition_type(&schema);
+        assert_eq!(partition_type.fields().len(), 2);
+        assert_eq!(partition_type.fields()[0].name, "x");
+        assert_eq!(partition_type.fields()[1].name, "y");
+    }
+
+    /// Fixture 5: current spec unpartitioned, nested `partition` stays.
+    #[test]
+    fn entries_schema_keeps_partition_when_evolved_to_unpartitioned() {
+        let fixture = TableTestFixture::new_evolved_to_unpartitioned();
+        let schema = fixture.table.inspect().entries().schema();
+        let partition_type = nested_partition_type(&schema);
+        assert_eq!(partition_type.fields().len(), 1);
+        assert_eq!(partition_type.fields()[0].name, "x");
+    }
+
+    /// Fixture 6 through the nested `data_file.partition` column.
+    #[tokio::test]
+    async fn entries_scan_same_typed_swapped_specs_match_by_field_id() {
+        use arrow_array::types::Int64Type;
+        let mut fixture = TableTestFixture::new_with_same_typed_swapped_specs();
+        fixture.setup_same_typed_swapped_spec_manifests().await;
+        let batch =
+            scan_single_batch(fixture.table.inspect().entries().scan().await.unwrap()).await;
+        assert_eq!(batch.num_rows(), 2);
+
+        let data_file = batch.column_by_name("data_file").unwrap().as_struct();
+        let paths = data_file
+            .column_by_name("file_path")
+            .unwrap()
+            .as_string::<i32>();
+        let partition = data_file.column_by_name("partition").unwrap().as_struct();
+        assert_eq!(partition.num_columns(), 2);
+        let y = partition.column(0).as_primitive::<Int64Type>();
+        let x = partition.column(1).as_primitive::<Int64Type>();
+
+        let mut by_suffix = std::collections::HashMap::new();
+        for index in 0..paths.len() {
+            let suffix = paths.value(index).rsplit('/').next().unwrap().to_string();
+            by_suffix.insert(suffix, index);
+        }
+        let spec0 = by_suffix["1.parquet"];
+        let spec1 = by_suffix["2.parquet"];
+        assert!(partition.column(0).is_null(spec0));
+        assert_eq!(x.value(spec0), 11);
+        assert_eq!(y.value(spec1), 22);
+        assert!(partition.column(1).is_null(spec1));
+    }
+
+    /// `try_new` is the G2 refuse path. `new_with_two_identity_specs` is a
+    /// Java-invalid unifier input and is used here ONLY as a refusal pin.
+    #[test]
+    fn entries_try_new_refuses_conflicting_field_ids() {
+        let fixture = TableTestFixture::new_with_two_identity_specs();
+        let error = match EntriesTable::try_new(&fixture.table) {
+            Ok(_) => panic!("G2: conflicting field ids must refuse try_new"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error.message().starts_with("Conflicting partition fields"),
+            "message was: {}",
+            error.message()
+        );
     }
 }

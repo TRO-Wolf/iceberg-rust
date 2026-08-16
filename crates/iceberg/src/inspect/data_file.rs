@@ -98,9 +98,10 @@ type DynMapBuilder = MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>;
 type DynListBuilder = ListBuilder<Box<dyn ArrayBuilder>>;
 
 /// The 21 `data_file` columns, mirroring Java `DataFile.getType(partitionType).fields()` — the
-/// canonical `DataFile` field ids from `api/DataFile.java`. The `partition` column carries the table's
-/// DEFAULT partition type (always included here; [`omit_empty_partition_field`] drops field 102
-/// afterwards, matching Java `TypeUtil.selectNot`). `readable_metrics` is deferred.
+/// canonical `DataFile` field ids from `api/DataFile.java`. The `partition` column carries the
+/// projected partition type (the unified type after increment C; always included here;
+/// [`omit_empty_partition_field`] drops field 102 afterwards, matching Java `TypeUtil.selectNot`).
+/// `readable_metrics` is deferred.
 ///
 /// `files` uses these directly as its top-level columns; `entries` nests them under a `data_file` struct.
 pub(super) fn data_file_fields(partition_type: &StructType) -> Vec<NestedFieldRef> {
@@ -275,7 +276,7 @@ pub(super) struct DataFileStructBuilder<'a> {
 
 impl<'a> DataFileStructBuilder<'a> {
     /// Creates a builder over the given Arrow `data_file` struct fields (the converted [`data_file_fields`],
-    /// possibly without `partition`) and the table's DEFAULT partition type (used to dispatch the
+    /// possibly without `partition`) and the table's unified partition type (used to dispatch the
     /// partition tuple's per-field types when that column is present).
     ///
     /// `partition_field_ids_by_spec` ([`partition_field_ids_by_spec`]) resolves each appended file's OWN
@@ -544,11 +545,10 @@ fn append_i32_list(builder: &mut DynListBuilder, values: Option<&[i32]>) -> Resu
 /// POSITION instead silently writes one partition field's value into another field's column whenever
 /// the two specs agree on type but not on field id.
 ///
-/// The other half of Java's coercion — projecting into the cross-spec UNIFIED partition type rather
-/// than the table's default one — is still outstanding: `partition_type` here is
-/// `TableMetadata::default_partition_type`, so a partition field that exists only in an older spec has
-/// no column to land in and is dropped rather than surfaced. That is the
-/// `Partitioning.partitionType` unification tracked in GAP_MATRIX R142.
+/// The other half of Java's coercion — projecting into the cross-spec UNIFIED partition type —
+/// is increment C: callers pass [`crate::spec::TableMetadata::unified_partition_type`] so a
+/// partition field that exists only in an older spec has a column to land in. `append_partition`
+/// itself is unchanged (PT-0 field-id walk; A1).
 ///
 /// Shared in-module helper: `files`/`entries` reach it through [`DataFileStructBuilder::append`], and
 /// the `partitions` aggregating table reuses it directly for its `partition` column (Rule of Three).
@@ -1295,12 +1295,13 @@ mod tests {
 
     #[tokio::test]
     async fn files_table_projects_partition_values_by_field_id_under_spec_evolution() {
-        // RISK (PT-0): the end-to-end corruption. Spec 0's live file carries the 1-tuple `(x=777)`;
-        // the projected (default = spec 1) partition type is `{1001 y, 1000 x}`. Reading the tuple
-        // POSITIONALLY surfaces `y = 777` / `x = null` on the `files` table — an `x` value reported
-        // under `y`, silently, because both fields are `long`. Java coerces each file's partition into
-        // the projected type BY FIELD ID (`PartitionUtil.coercePartition` →
-        // `StructProjection.createAllowMissing`), which yields `y = null` / `x = 777`.
+        // RISK (PT-0 + increment C): spec 0's live file carries the 1-tuple `(x=777)`; spec 1's
+        // tuple order is `[identity(y), identity(x)]`. Cite Java `Partitioning.partitionType`
+        // (field-id ascending) + `PartitionUtil.coercePartition` /
+        // `StructProjection.createAllowMissing`. Increment C projects the unified type
+        // `{1000 x, 1001 y}` (not the default spec's `{1001 y, 1000 x}`). A positional walk
+        // of the spec-0 file would write 777 into whichever column is first; id-matching
+        // puts it under `x` and null-fills `y`.
         let fixture = with_reordered_evolved_spec(TableTestFixture::new());
         write_data_files_under_specs(&fixture, &[
             // Written under spec 0 = `[identity(x)]`.
@@ -1330,22 +1331,23 @@ mod tests {
             .column_by_name("partition")
             .expect("files.partition")
             .as_struct();
-        let y = partition.column(0).as_primitive::<Int64Type>();
-        let x = partition.column(1).as_primitive::<Int64Type>();
+        // Unified type is field-id ascending: `{1000 x, 1001 y}` (Java `Partitioning.partitionType`).
+        let x = partition.column(0).as_primitive::<Int64Type>();
+        let y = partition.column(1).as_primitive::<Int64Type>();
 
+        assert_eq!(
+            x.value(0),
+            777,
+            "the spec-0 file's field-1000 (`x`) value must land in the `x` column"
+        );
         assert!(
             y.is_null(0),
             "the spec-0 file has no field-1001 (`y`) partition value; positional reading reports {} \
              there, which is the spec-0 file's `x` value",
             y.value(0)
         );
-        assert_eq!(
-            x.value(0),
-            777,
-            "the spec-0 file's field-1000 (`x`) value must land in the `x` column"
-        );
 
-        assert_eq!(y.value(1), 888, "the spec-1 file's `y` value");
         assert_eq!(x.value(1), 999, "the spec-1 file's `x` value");
+        assert_eq!(y.value(1), 888, "the spec-1 file's `y` value");
     }
 }
