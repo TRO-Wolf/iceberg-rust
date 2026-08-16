@@ -31,6 +31,35 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-15): PT-0 field-id partition-tuple projection in `data_file`
+
+Branch: `repark/pt0-positional-partition-walk` off `d3c30181` (#199). Interim correctness fix ahead of
+the PT-1..4 `Partitioning.partitionType` unification campaign
+(`planning/hardening/PARTITIONING-UNIFICATION-DESIGN.md` §2.4, priority-1 break).
+
+- [x] REPRO PIN. Java-legal spec-evolution fixture in `inspect/data_file.rs` tests
+      (`with_reordered_evolved_spec`): spec 0 = `identity(x)`@1000; spec 1 (default) =
+      `identity(y)`@1001 THEN `identity(x)`@1000 — monotonic field ids (NOT built on
+      `TableTestFixture::new_with_two_identity_specs`, which reuses id 1000 across two source columns
+      and is a Java `"Conflicting partition fields"` refusal), tuple order ≠ field-id order, both
+      fields `long`. Verdict: the `files` scan reported the spec-0 file's `x` value (777) under the
+      `y` column and `null` under `x`. Silent — no error, because the types agree.
+- [x] INTERIM FIX. `append_partition` takes the source spec's field ids and matches each PROJECTED
+      field by id, null-filling what the source spec lacks — the field-id half of Java
+      `PartitionUtil.coercePartition` / `StructProjection.createAllowMissing`. New
+      `partition_field_ids_by_spec(&TableMetadata)`; `DataFileStructBuilder` resolves each file's own
+      spec via `DataFile::partition_spec_id` (unknown spec id → loud `DataInvalid`, Java NPEs there).
+      `files`/`entries`/`partitions` call sites updated. NOT the unification: the projected type is
+      still `default_partition_type`, so an older-spec-only partition field is dropped rather than
+      surfaced — named residue, PT-1..4.
+- [x] Tests same commit: two `append_partition` units (null-fill of an absent projected field;
+      full-tuple reorder) + the end-to-end `files` pin. Mutation bait: restoring the positional walk
+      reds all three.
+- [x] GAP_MATRIX R142 in place (finding + fix note; no new row). `inspect/map.md` lockstep
+      (`data_file.rs`/`partitions.rs` rows, divergence row, two new failure modes).
+- [x] Gates: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=0 on retry after one
+      `make docker-down` cycle (4211 passed / 3 skipped). One `[repark]` PR, no merge.
+
 ## ACTIVE (2026-08-15): FB-1 Java inspect schema-shape battery (increment 1)
 
 Branch: `repark/fb1-java-schema-shape` off freeze `0c5fd58d` (#195). Additive tests only

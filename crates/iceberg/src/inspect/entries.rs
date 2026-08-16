@@ -61,7 +61,10 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::DataType;
 use futures::{StreamExt, stream};
 
-use super::data_file::{DataFileStructBuilder, data_file_fields, omit_empty_partition_field};
+use super::data_file::{
+    DataFileStructBuilder, data_file_fields, omit_empty_partition_field,
+    partition_field_ids_by_spec,
+};
 use super::manifest_source::{MetadataScope, collect_manifest_files};
 use super::readable_metrics::{
     ReadableMetricsBuilder, readable_metrics_field, readable_metrics_struct_fields,
@@ -168,7 +171,14 @@ impl<'a> EntriesTable<'a> {
         let mut snapshot_id = Int64Builder::new();
         let mut sequence_number = Int64Builder::new();
         let mut file_sequence_number = Int64Builder::new();
-        let mut data_file = DataFileStructBuilder::new(&data_file_arrow_fields, &partition_type);
+        // Each file's partition tuple is read by field id against its OWN spec (Java
+        // `PartitionUtil.coercePartition`), not by position — see `data_file::append_partition`.
+        let partition_field_ids = partition_field_ids_by_spec(self.table.metadata());
+        let mut data_file = DataFileStructBuilder::new(
+            &data_file_arrow_fields,
+            &partition_type,
+            &partition_field_ids,
+        );
         let mut readable_metrics =
             ReadableMetricsBuilder::try_new(&readable_metrics_arrow_fields, &data_schema)?;
 
