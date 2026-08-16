@@ -59,6 +59,28 @@ the PT-1..4 `Partitioning.partitionType` unification campaign
       (`data_file.rs`/`partitions.rs` rows, divergence row, two new failure modes).
 - [x] Gates: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=0 on retry after one
       `make docker-down` cycle (4211 passed / 3 skipped). One `[repark]` PR, no merge.
+## ACTIVE (2026-08-15): F-1 Java-cited doc strings on `readable_metrics` leaves
+
+Branch: `repark/f1-readable-metrics-leaf-docs` off `d3c30181` (#199). Closes the finding #199
+reported and deliberately did not ship (omitted, never xfailed).
+
+- [x] `readable_metrics.rs::readable_metrics_field` passes each leaf's Java doc into
+      `NestedField::with_doc`, from six new `*_DOC` consts transcribed verbatim from
+      `MetricsUtil.READABLE_METRIC_COLS` — Java builds every leaf with the FOUR-arg
+      `optional(nextId.incrementAndGet(), m.name(), m.colType(field), m.doc())`. Module-doc table
+      gains the `doc()` column. Nothing else changes: ids, order, types, values untouched.
+- [x] Re-enable the ported test O-8 removed: `java_schema_shape.rs`'s `READABLE_METRIC_COLS` becomes
+      `(name, is_long, doc)` (mirroring `ReadableMetricColDefinition` fully) and
+      `readable_metrics_metric_cols_carry_their_java_doc_strings` asserts all six docs on every leaf
+      column of both `entries` and `all_entries`. Mutation bait: dropping any single `.with_doc`
+      reds it with the exact failure #199 quoted (`doc for column_size` / left `None` / right
+      `Some("Total size on disk")`).
+- [x] GAP_MATRIX R142 in place (F-1 landed note; anchors untouched, no new row — the drafted row in
+      #199 would have opened a gap that is closed in the same breath). `inspect/map.md` lockstep.
+- [x] Gates: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=0 on retry after one
+      `make docker-down` cycle (4209 passed / 3 skipped; first attempt was the known SQLITE_BUSY
+      REST-catalog flake on `test_register_table`/`test_update_table` — never `crates/iceberg`).
+      One `[repark]` PR, no merge.
 
 ## ACTIVE (2026-08-15): FB-1 Java inspect schema-shape battery (increment 1)
 
@@ -90,12 +112,12 @@ Branch: `repark/fb4-java-battery-2` off `f40d3faa` (#198). Additive tests only
       pre-increment id counter seeded at the host `highestFieldId()` (1000 partitioned /
       145 unpartitioned). Interior field-id ORDER pinned as the fork's DOCUMENTED
       divergence — Java's `idToName()` HashMap order is not portable, so it is not chased.
-- [ ] FINDING F-1 (reported, NOT shipped): the six `readable_metrics` sub-fields carry no
+- [x] FINDING F-1 (reported, NOT shipped here): the six `readable_metrics` sub-fields carry no
       doc string; Java passes `m.doc()` ("Total size on disk", "Total count, including null
       and NaN", "Null value count", "NaN value count", "Lower bound", "Upper bound") into
       `optional(id, name, type, doc)`. The column struct + top-level docs ARE present.
-      Cosmetic (docs are not in the Avro/Arrow read path) — needs a GAP_MATRIX row and a
-      production fix in `readable_metrics.rs::readable_metrics_field` on a separate PR.
+      Cosmetic (docs are not in the Avro/Arrow read path). **Shipped separately 2026-08-15 —
+      see the F-1 section below.**
 - [x] A6: `make check` / `make unit-test` / `make test`. One `[repark]` PR, no merge.
 
 ## ACTIVE (2026-08-15): FB-3 lazy per-namespace `list_tables`

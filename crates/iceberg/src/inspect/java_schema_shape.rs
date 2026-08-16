@@ -109,16 +109,19 @@ const MANIFEST_ENTRY_WRAP_FIELDS: &[(i32, &str, bool)] = &[
     (2, "data_file", true),
 ];
 
-/// Java `MetricsUtil.READABLE_METRIC_COLS` order (`core/.../MetricsUtil.java`).
-/// `true` = the sub-field is a fixed `Types.LongType`; `false` = its `colType` is
-/// `Types.NestedField::type`, i.e. the data COLUMN's own primitive type.
-const READABLE_METRIC_COLS: &[(&str, bool)] = &[
-    ("column_size", true),
-    ("value_count", true),
-    ("null_value_count", true),
-    ("nan_value_count", true),
-    ("lower_bound", false),
-    ("upper_bound", false),
+/// Java `MetricsUtil.READABLE_METRIC_COLS` order (`core/.../MetricsUtil.java`) —
+/// each entry is `(name, is_long, doc)`. `is_long == true` = the sub-field is a
+/// fixed `Types.LongType`; `false` = its `colType` is `Types.NestedField::type`,
+/// i.e. the data COLUMN's own primitive type. `doc` is the definition's `doc()`,
+/// which `readableMetricsSchema` passes into the FOUR-argument
+/// `optional(id, name, type, doc)`.
+const READABLE_METRIC_COLS: &[(&str, bool, &str)] = &[
+    ("column_size", true, "Total size on disk"),
+    ("value_count", true, "Total count, including null and NaN"),
+    ("null_value_count", true, "Null value count"),
+    ("nan_value_count", true, "NaN value count"),
+    ("lower_bound", false, "Lower bound"),
+    ("upper_bound", false, "Upper bound"),
 ];
 
 /// The leaf (primitive) columns of [`TableTestFixture`]'s current schema, in
@@ -751,7 +754,7 @@ fn readable_metrics_column_struct_is_the_six_java_metric_cols() {
             READABLE_METRIC_COLS.len(),
             "column {column_name} must carry the six READABLE_METRIC_COLS"
         );
-        for (index, &(metric_name, is_long)) in READABLE_METRIC_COLS.iter().enumerate() {
+        for (index, &(metric_name, is_long, _)) in READABLE_METRIC_COLS.iter().enumerate() {
             let field = &metrics[index];
             assert_eq!(
                 field.name, metric_name,
@@ -771,6 +774,39 @@ fn readable_metrics_column_struct_is_the_six_java_metric_cols() {
                 &expected,
                 "column {column_name} metric {metric_name} type"
             );
+        }
+    }
+}
+
+#[test]
+fn readable_metrics_metric_cols_carry_their_java_doc_strings() {
+    // RISK: F-1. Java builds every one of the six metric leaves with the FOUR-arg
+    // overload — `optional(nextId.incrementAndGet(), m.name(), m.colType(field),
+    // m.doc())` — so each carries the doc from its ReadableMetricColDefinition.
+    // The fork previously passed docs only to the per-column struct and to the
+    // top-level readable_metrics field, leaving all six leaves `doc: None`; that
+    // is what this test caught when it was first ported (reported as F-1 on #199
+    // and omitted from that PR's shipped set rather than xfailed). Dropping the
+    // 4-arg call anywhere in `readable_metrics_field` reds this.
+    // Cite: MetricsUtil.READABLE_METRIC_COLS (the six `doc` strings);
+    // MetricsUtil.readableMetricsSchema (the 4-arg optional(...) call).
+    let fixture = TableTestFixture::new();
+    for schema in entries_family_schemas(&fixture.table) {
+        let columns = struct_fields(&schema, "readable_metrics");
+        for &(column_name, _) in FIXTURE_LEAF_COLUMNS_BY_FIELD_ID {
+            let metrics = nested_struct_fields(columns, column_name);
+            for (index, &(metric_name, _, doc)) in READABLE_METRIC_COLS.iter().enumerate() {
+                let field = &metrics[index];
+                assert_eq!(
+                    field.name, metric_name,
+                    "column {column_name} metric[{index}] name"
+                );
+                assert_eq!(
+                    field.doc.as_deref(),
+                    Some(doc),
+                    "doc for {metric_name} (column {column_name})"
+                );
+            }
         }
     }
 }
