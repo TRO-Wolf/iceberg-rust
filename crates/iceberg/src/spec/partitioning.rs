@@ -20,9 +20,9 @@
 //!
 //! The five public/crate functions here are the hoist of the analogue that
 //! previously lived (with G1–G4 fidelity gaps) in
-//! `maintenance/partition_stats.rs`. Inspect tables still project
-//! [`TableMetadata::default_partition_type`] until increments B/C/D adopt
-//! this module.
+//! `maintenance/partition_stats.rs`. Inspect tables (`partitions` B,
+//! `position_deletes` D, `files`/`entries` C) project
+//! [`TableMetadata::unified_partition_type`].
 
 use std::collections::{HashMap, HashSet};
 

@@ -29,7 +29,9 @@ use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use iceberg::Result;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::inspect::{MetadataTableType, PartitionsTable, PositionDeletesTable};
+use iceberg::inspect::{
+    EntriesTable, FilesTable, MetadataTableType, PartitionsTable, PositionDeletesTable,
+};
 use iceberg::table::Table;
 
 use crate::physical_plan::metadata_scan::IcebergMetadataScan;
@@ -60,14 +62,14 @@ impl IcebergMetadataTableProvider {
         let schema = match r#type {
             MetadataTableType::Snapshots => metadata_table.snapshots().schema(),
             MetadataTableType::Manifests => metadata_table.manifests().schema(),
-            MetadataTableType::Files => metadata_table.files().schema(),
-            MetadataTableType::DataFiles => metadata_table.data_files().schema(),
-            MetadataTableType::DeleteFiles => metadata_table.delete_files().schema(),
-            MetadataTableType::Entries => metadata_table.entries().schema(),
-            MetadataTableType::AllFiles => metadata_table.all_files().schema(),
-            MetadataTableType::AllDataFiles => metadata_table.all_data_files().schema(),
-            MetadataTableType::AllDeleteFiles => metadata_table.all_delete_files().schema(),
-            MetadataTableType::AllEntries => metadata_table.all_entries().schema(),
+            MetadataTableType::Files => FilesTable::try_all(&table)?.schema(),
+            MetadataTableType::DataFiles => FilesTable::try_data(&table)?.schema(),
+            MetadataTableType::DeleteFiles => FilesTable::try_deletes(&table)?.schema(),
+            MetadataTableType::Entries => EntriesTable::try_new(&table)?.schema(),
+            MetadataTableType::AllFiles => FilesTable::try_all_files(&table)?.schema(),
+            MetadataTableType::AllDataFiles => FilesTable::try_all_data_files(&table)?.schema(),
+            MetadataTableType::AllDeleteFiles => FilesTable::try_all_delete_files(&table)?.schema(),
+            MetadataTableType::AllEntries => EntriesTable::try_all(&table)?.schema(),
             MetadataTableType::History => metadata_table.history().schema(),
             MetadataTableType::Refs => metadata_table.refs().schema(),
             MetadataTableType::MetadataLogEntries => metadata_table.metadata_log_entries().schema(),

@@ -68,7 +68,7 @@ use super::readable_metrics::{
 use crate::Result;
 use crate::arrow::schema_to_arrow_schema;
 use crate::scan::ArrowRecordBatchStream;
-use crate::spec::{ManifestContentType, Schema};
+use crate::spec::{ManifestContentType, Schema, StructType};
 use crate::table::Table;
 
 /// Which files a [`FilesTable`] exposes — the only thing that differs across the three tables.
@@ -102,11 +102,44 @@ pub struct FilesTable<'a> {
     table: &'a Table,
     kind: FilesTableKind,
     scope: MetadataScope,
+    /// Java `Partitioning.partitionType(table)` — stored so [`Self::schema`] stays infallible.
+    unified_partition_type: StructType,
 }
 
 impl<'a> FilesTable<'a> {
+    /// Fallible constructor: resolves the unified partition type up front.
+    ///
+    /// The DataFusion `IcebergMetadataTableProvider::try_new` is the public
+    /// fallible seam (A5). G1/G2 (`DataInvalid`) surface there via the
+    /// `try_*` constructors below.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::spec::TableMetadata::unified_partition_type`].
+    fn try_new(table: &'a Table, kind: FilesTableKind, scope: MetadataScope) -> Result<Self> {
+        let unified_partition_type = table.metadata().unified_partition_type()?;
+        Ok(Self {
+            table,
+            kind,
+            scope,
+            unified_partition_type,
+        })
+    }
+
+    /// Infallible constructor. On a G1/G2 table this falls back to
+    /// [`crate::spec::TableMetadata::default_partition_type`] so
+    /// `inspect().files().schema()` cannot panic; the `try_*` constructors
+    /// are the loud refuse path.
     fn new(table: &'a Table, kind: FilesTableKind, scope: MetadataScope) -> Self {
-        Self { table, kind, scope }
+        match Self::try_new(table, kind, scope) {
+            Ok(this) => this,
+            Err(_) => Self {
+                table,
+                kind,
+                scope,
+                unified_partition_type: table.metadata().default_partition_type().clone(),
+            },
+        }
     }
 
     /// Create a `files` table (all data + delete files in the current snapshot).
@@ -114,14 +147,33 @@ impl<'a> FilesTable<'a> {
         Self::new(table, FilesTableKind::All, MetadataScope::CurrentSnapshot)
     }
 
+    /// Fallible [`Self::all`].
+    pub fn try_all(table: &'a Table) -> Result<Self> {
+        Self::try_new(table, FilesTableKind::All, MetadataScope::CurrentSnapshot)
+    }
+
     /// Create a `data_files` table (only DATA-content files in the current snapshot).
     pub fn data(table: &'a Table) -> Self {
         Self::new(table, FilesTableKind::Data, MetadataScope::CurrentSnapshot)
     }
 
+    /// Fallible [`Self::data`].
+    pub fn try_data(table: &'a Table) -> Result<Self> {
+        Self::try_new(table, FilesTableKind::Data, MetadataScope::CurrentSnapshot)
+    }
+
     /// Create a `delete_files` table (only position/equality delete files in the current snapshot).
     pub fn deletes(table: &'a Table) -> Self {
         Self::new(
+            table,
+            FilesTableKind::Deletes,
+            MetadataScope::CurrentSnapshot,
+        )
+    }
+
+    /// Fallible [`Self::deletes`].
+    pub fn try_deletes(table: &'a Table) -> Result<Self> {
+        Self::try_new(
             table,
             FilesTableKind::Deletes,
             MetadataScope::CurrentSnapshot,
@@ -134,16 +186,31 @@ impl<'a> FilesTable<'a> {
         Self::new(table, FilesTableKind::All, MetadataScope::AllSnapshots)
     }
 
+    /// Fallible [`Self::all_files`].
+    pub fn try_all_files(table: &'a Table) -> Result<Self> {
+        Self::try_new(table, FilesTableKind::All, MetadataScope::AllSnapshots)
+    }
+
     /// Create an `all_data_files` table (only DATA-content files reachable from ANY snapshot, Java
     /// `AllDataFilesTable`).
     pub fn all_data_files(table: &'a Table) -> Self {
         Self::new(table, FilesTableKind::Data, MetadataScope::AllSnapshots)
     }
 
+    /// Fallible [`Self::all_data_files`].
+    pub fn try_all_data_files(table: &'a Table) -> Result<Self> {
+        Self::try_new(table, FilesTableKind::Data, MetadataScope::AllSnapshots)
+    }
+
     /// Create an `all_delete_files` table (only delete-content files reachable from ANY snapshot, Java
     /// `AllDeleteFilesTable`).
     pub fn all_delete_files(table: &'a Table) -> Self {
         Self::new(table, FilesTableKind::Deletes, MetadataScope::AllSnapshots)
+    }
+
+    /// Fallible [`Self::all_delete_files`].
+    pub fn try_all_delete_files(table: &'a Table) -> Result<Self> {
+        Self::try_new(table, FilesTableKind::Deletes, MetadataScope::AllSnapshots)
     }
 
     /// Returns the iceberg schema of the files metadata table.
@@ -154,7 +221,7 @@ impl<'a> FilesTable<'a> {
     /// (so an empty struct is never advertised), then `TypeUtil.join` of `readable_metrics`.
     /// The `files` family exposes the data_file projection FLAT as top-level columns.
     pub fn schema(&self) -> Schema {
-        let partition_type = self.table.metadata().default_partition_type();
+        let partition_type = &self.unified_partition_type;
         let data_file_schema = Schema::builder()
             .with_fields(data_file_fields(partition_type))
             .build()
@@ -191,7 +258,7 @@ impl<'a> FilesTable<'a> {
         // into the top-level columns); `readable_metrics` is built alongside and appended as the last
         // column.
         let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema())?);
-        let partition_type = self.table.metadata().default_partition_type().clone();
+        let partition_type = self.unified_partition_type.clone();
         let data_schema = self.table.metadata().current_schema().clone();
 
         // The leading top-level columns are the data_file projection; the trailing one is readable_metrics.
@@ -245,6 +312,7 @@ mod tests {
     use arrow_array::{Array, StructArray};
     use futures::TryStreamExt;
 
+    use super::FilesTable;
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestContentType,
@@ -1574,6 +1642,188 @@ mod tests {
             lower.value(row),
             upper.value(row),
             "lower and upper bounds must be distinct (pins the lower↔upper swap mutation)"
+        );
+    }
+
+    fn partition_struct_type(schema: &crate::spec::Schema) -> &crate::spec::StructType {
+        let partition = schema
+            .field_by_name("partition")
+            .expect("partition column present");
+        match partition.field_type.as_ref() {
+            crate::spec::Type::Struct(partition_type) => partition_type,
+            other => panic!("partition must be a struct, got {other:?}"),
+        }
+    }
+
+    /// Increment C: files schema projects the TWO-field unified type, not
+    /// `default_partition_type`. Cite: Java `BaseFilesTable.schema` /
+    /// `Partitioning.partitionType`.
+    #[test]
+    fn files_schema_uses_unified_type_under_widening_evolution() {
+        let fixture = TableTestFixture::new_with_widening_spec_evolution();
+        let schema = fixture.table.inspect().files().schema();
+        let partition_type = partition_struct_type(&schema);
+        assert_eq!(partition_type.fields().len(), 2);
+        assert_eq!(partition_type.fields()[0].name, "x");
+        assert_eq!(partition_type.fields()[1].name, "y_bucket_8");
+    }
+
+    /// Fixture 2 discriminator: default spec is `{x}` only; unified is `{x, y}`.
+    #[test]
+    fn files_schema_keeps_dropped_v2_field() {
+        let fixture = TableTestFixture::new_with_dropped_partition_field_v2();
+        let schema = fixture.table.inspect().files().schema();
+        let partition_type = partition_struct_type(&schema);
+        assert_eq!(
+            partition_type.fields().len(),
+            2,
+            "unified type keeps the dropped y field"
+        );
+        assert_eq!(partition_type.fields()[0].id, 1000);
+        assert_eq!(partition_type.fields()[0].name, "x");
+        assert_eq!(partition_type.fields()[1].id, 1001);
+        assert_eq!(partition_type.fields()[1].name, "y");
+    }
+
+    /// Fixture 3 / G3: name from newest spec, type from the non-void field.
+    #[test]
+    fn files_schema_void_repair_name_from_newest_type_from_non_void() {
+        let fixture = TableTestFixture::new_with_void_dropped_field_v1();
+        let schema = fixture.table.inspect().files().schema();
+        let partition_type = partition_struct_type(&schema);
+        assert_eq!(partition_type.fields().len(), 2);
+        assert_eq!(partition_type.fields()[0].id, 1000);
+        assert_eq!(partition_type.fields()[0].name, "y_1000");
+        assert_eq!(
+            partition_type.fields()[0].field_type.as_ref(),
+            &crate::spec::Type::Primitive(crate::spec::PrimitiveType::Int),
+            "void-repair type is int (bucket), not the void field's source long"
+        );
+        assert_eq!(partition_type.fields()[1].id, 1001);
+        assert_eq!(partition_type.fields()[1].name, "y");
+        assert_eq!(
+            partition_type.fields()[1].field_type.as_ref(),
+            &crate::spec::Type::Primitive(crate::spec::PrimitiveType::Long)
+        );
+    }
+
+    /// Fixture 5: current spec is unpartitioned but unified type is `{x}`.
+    #[test]
+    fn files_schema_keeps_partition_when_evolved_to_unpartitioned() {
+        let fixture = TableTestFixture::new_evolved_to_unpartitioned();
+        let schema = fixture.table.inspect().files().schema();
+        assert!(
+            schema.field_by_name("partition").is_some(),
+            "historical spec 0 keeps the partition column"
+        );
+        let partition_type = partition_struct_type(&schema);
+        assert_eq!(partition_type.fields().len(), 1);
+        assert_eq!(partition_type.fields()[0].name, "x");
+    }
+
+    /// Fixture 2 scan: spec-0 file carries both values; spec-1 file null-fills `y`.
+    #[tokio::test]
+    async fn files_scan_null_fills_dropped_v2_field() {
+        use arrow_array::types::Int64Type;
+        let mut fixture = TableTestFixture::new_with_dropped_partition_field_v2();
+        fixture.setup_dropped_partition_field_v2_manifests().await;
+        let batch = scan_single_batch(fixture.table.inspect().files().scan().await.unwrap()).await;
+        assert_eq!(batch.num_rows(), 2);
+
+        let paths = batch
+            .column_by_name("file_path")
+            .unwrap()
+            .as_string::<i32>();
+        let partition = batch.column_by_name("partition").unwrap().as_struct();
+        assert_eq!(partition.num_columns(), 2);
+        let x = partition.column(0).as_primitive::<Int64Type>();
+        let y = partition.column(1).as_primitive::<Int64Type>();
+
+        let mut by_suffix = HashMap::new();
+        for index in 0..paths.len() {
+            let suffix = paths.value(index).rsplit('/').next().unwrap().to_string();
+            by_suffix.insert(suffix, index);
+        }
+        let spec0 = by_suffix["1.parquet"];
+        let spec1 = by_suffix["2.parquet"];
+        assert_eq!(x.value(spec0), 7);
+        assert_eq!(y.value(spec0), 9);
+        assert_eq!(x.value(spec1), 7);
+        assert!(
+            partition.column(1).is_null(spec1),
+            "spec-1 file null-fills dropped y"
+        );
+    }
+
+    /// Fixture 6: same-typed swapped field ids. A positional walk would put
+    /// spec-0's `x==11` into unified column 0 (`y`). Id-matched + unified
+    /// projection puts it under `x`.
+    #[tokio::test]
+    async fn files_scan_same_typed_swapped_specs_match_by_field_id() {
+        use arrow_array::types::Int64Type;
+        let mut fixture = TableTestFixture::new_with_same_typed_swapped_specs();
+        fixture.setup_same_typed_swapped_spec_manifests().await;
+        let batch = scan_single_batch(fixture.table.inspect().files().scan().await.unwrap()).await;
+        assert_eq!(batch.num_rows(), 2);
+
+        let paths = batch
+            .column_by_name("file_path")
+            .unwrap()
+            .as_string::<i32>();
+        let partition = batch.column_by_name("partition").unwrap().as_struct();
+        assert_eq!(partition.num_columns(), 2, "unified type is {{y, x}}");
+        let y = partition.column(0).as_primitive::<Int64Type>();
+        let x = partition.column(1).as_primitive::<Int64Type>();
+
+        let mut by_suffix = HashMap::new();
+        for index in 0..paths.len() {
+            let suffix = paths.value(index).rsplit('/').next().unwrap().to_string();
+            by_suffix.insert(suffix, index);
+        }
+        let spec0 = by_suffix["1.parquet"];
+        let spec1 = by_suffix["2.parquet"];
+        assert!(
+            partition.column(0).is_null(spec0),
+            "spec-0 file has no y@1000"
+        );
+        assert_eq!(x.value(spec0), 11, "spec-0 x value must not land in y");
+        assert_eq!(y.value(spec1), 22);
+        assert!(
+            partition.column(1).is_null(spec1),
+            "spec-1 file has no x@1001"
+        );
+    }
+
+    /// Fixture 5 scan: partition column stays and carries the spec-0 value.
+    #[tokio::test]
+    async fn files_scan_keeps_partition_when_evolved_to_unpartitioned() {
+        use arrow_array::types::Int64Type;
+        let mut fixture = TableTestFixture::new_evolved_to_unpartitioned();
+        fixture.setup_evolved_to_unpartitioned_file().await;
+        let batch = scan_single_batch(fixture.table.inspect().files().scan().await.unwrap()).await;
+        assert_eq!(batch.num_rows(), 1);
+        let partition = batch
+            .column_by_name("partition")
+            .expect("scan must keep partition when unified type is non-empty")
+            .as_struct();
+        assert_eq!(partition.num_columns(), 1);
+        assert_eq!(partition.column(0).as_primitive::<Int64Type>().value(0), 7);
+    }
+
+    /// `try_all` is the G2 refuse path. `new_with_two_identity_specs` is a
+    /// Java-invalid unifier input and is used here ONLY as a refusal pin.
+    #[test]
+    fn files_try_all_refuses_conflicting_field_ids() {
+        let fixture = TableTestFixture::new_with_two_identity_specs();
+        let error = match FilesTable::try_all(&fixture.table) {
+            Ok(_) => panic!("G2: conflicting field ids must refuse try_all"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error.message().starts_with("Conflicting partition fields"),
+            "message was: {}",
+            error.message()
         );
     }
 }

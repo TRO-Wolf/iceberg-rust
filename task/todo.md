@@ -31,6 +31,18 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-16): PT increment C — files/entries project the unified type
+
+Branch: `grok/c16-files-entries-unified` off `16abae8b` (#204). Projected-type
+swap only (A1): `append_partition` stays the PT-0 field-id walk.
+
+- [x] `FilesTable` / `EntriesTable` `try_*` store `unified_partition_type`;
+      schema+scan use it. DataFusion `try_new` is the G1/G2 seam.
+- [x] Fixtures 2/3/6 in `scan/partitioning_fixtures.rs`.
+- [x] Pins: dropped-v2 field kept; void-repair name+type; evolved-to-unpartitioned
+      keeps `partition`; swapped same-typed specs match by field id; G2 refuse.
+- [x] GAP_MATRIX R142 + `inspect/map.md` + `scan/map.md` lockstep.
+
 ## ACTIVE (2026-08-16): PT increment D — `position_deletes` schema adopts the unified type
 
 Branch: `grok/c16-position-deletes-unified` off `d09d4831` (#203). Schema-only (FB-2);
