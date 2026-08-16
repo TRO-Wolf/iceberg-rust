@@ -91,8 +91,8 @@ use crate::arrow::{
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, Manifest, ManifestEntry,
     ManifestFile, ManifestStatus, NestedField, NestedFieldRef, PartitionSpec,
-    PartitionStatisticsFile, PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, Snapshot, Struct,
-    StructType, TableMetadata, Type,
+    PartitionStatisticsFile, PrimitiveLiteral, PrimitiveType, Schema, Snapshot, Struct, StructType,
+    TableMetadata, Type, coerce_partition,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -555,114 +555,17 @@ pub fn partition_stats_schema(
     Schema::builder().with_fields(fields).build()
 }
 
-/// Builds the table's unified partition type — the Rust port of Java
-/// `Partitioning.partitionType(table)` → `buildPartitionProjectionType`.
+/// Deprecated thin alias for [`TableMetadata::unified_partition_type`].
 ///
-/// One struct field per UNIQUE partition field id across all of the table's specs (deduped by id),
-/// keeping only field ids whose source column still exists in the current schema. Specs are visited
-/// spec-id DESCENDING so the newest spec's name/type wins on a shared id; the output fields are sorted
-/// by field id ASCENDING and each made `optional`. A data partition under two specs that share a
-/// partition field id therefore lands in ONE unified field, not two.
-///
-/// This re-derives the unifier locally rather than reusing `inspect::partitions` — that table keys
-/// rows by the file's OWN partition `Struct` against `default_partition_type()` and documents that the
-/// Rust core has no cross-spec unifier (see `inspect/partitions.rs` module doc). It also re-derives
-/// rather than touching `spec/` (READ-ONLY) — it is built entirely from the public `PartitionSpec`
-/// accessors.
+/// The unifier lives in `spec/partitioning.rs` (Java `Partitioning.partitionType`).
+/// Kept so downstream and the interop harness keep compiling.
 ///
 /// # Errors
 ///
-/// Returns an error if a spec's `partition_type(schema)` cannot be resolved.
+/// Propagates [`TableMetadata::unified_partition_type`] (G1 unknown-transform
+/// and G2 conflicting-field `DataInvalid`).
 pub fn unified_partition_type(metadata: &TableMetadata) -> Result<StructType> {
-    let schema = metadata.current_schema();
-
-    // Collect specs sorted by spec id DESCENDING (newest first → most recent field names win).
-    let mut specs: Vec<&PartitionSpec> = metadata
-        .partition_specs_iter()
-        .map(|spec_ref| spec_ref.as_ref())
-        .collect();
-    specs.sort_by_key(|spec| std::cmp::Reverse(spec.spec_id()));
-
-    // fieldId -> (name, type), keeping the first-seen (newest-spec) entry per field id.
-    let mut fields_by_id: HashMap<i32, (String, Type)> = HashMap::new();
-    // Track insertion shape so the output can be field-id ASCENDING (Java's natural-order sort).
-    let mut field_ids: Vec<i32> = Vec::new();
-
-    for spec in &specs {
-        let spec_type = spec.partition_type(schema)?;
-        for (field, struct_field) in spec.fields().iter().zip(spec_type.fields().iter()) {
-            // Java keeps only field ids whose source column is still present in the current schema
-            // (`allActiveFieldIds`: schema.findField(field.sourceId()) != null).
-            if schema.field_by_id(field.source_id).is_none() {
-                continue;
-            }
-            let field_id = field.field_id;
-            if fields_by_id.contains_key(&field_id) {
-                // Newest spec already supplied the name/type for this id; Java additionally swaps in
-                // a non-void field's type over a void one for dropped v1 partitions. The Rust core
-                // does not model void-transform partition types distinctly here, and the conflict
-                // validation Java runs is on identical-id fields that are equivalent-ignoring-names;
-                // keeping the newest-spec entry matches the common (non-v1-void) case.
-                continue;
-            }
-            fields_by_id.insert(
-                field_id,
-                (
-                    struct_field.name.clone(),
-                    struct_field.field_type.as_ref().clone(),
-                ),
-            );
-            field_ids.push(field_id);
-        }
-    }
-
-    field_ids.sort_unstable();
-    let unified_fields = field_ids
-        .into_iter()
-        .map(|field_id| {
-            let (name, field_type) = fields_by_id
-                .get(&field_id)
-                .expect("field id was just inserted into fields_by_id");
-            NestedField::optional(field_id, name.clone(), field_type.clone()).into()
-        })
-        .collect::<Vec<_>>();
-
-    Ok(StructType::new(unified_fields))
-}
-
-/// Coerces a file's per-spec partition tuple into the table's unified partition type — the Rust port
-/// of Java `PartitionUtil.coercePartition` (`StructProjection.createAllowMissing(spec.partitionType,
-/// unifiedType)`).
-///
-/// For each unified field (by id), the value is taken from the position in the file's spec whose
-/// partition field has the matching id; a unified field absent from this spec is null-filled. The
-/// file's partition `Struct` is positional against `spec.partition_type(schema).fields()`, which is in
-/// `spec.fields()` order — so the index of a unified field id within the spec's partition type is the
-/// index into the file's partition tuple.
-fn coerce_partition(
-    unified_partition_type: &StructType,
-    spec_type: &StructType,
-    file_partition: &Struct,
-) -> Struct {
-    let spec_fields = spec_type.fields();
-    let file_values = file_partition.fields();
-
-    unified_partition_type
-        .fields()
-        .iter()
-        .map(|unified_field| {
-            // Find the position of this unified field id within the file's spec.
-            let position = spec_fields
-                .iter()
-                .position(|spec_field| spec_field.id == unified_field.id);
-            match position {
-                // Null-fill when the field is absent from this spec, or (defensively) when the file's
-                // tuple is shorter than its declared spec type.
-                Some(index) if index < file_values.len() => file_values[index].clone(),
-                _ => None,
-            }
-        })
-        .collect()
+    metadata.unified_partition_type()
 }
 
 /// Computes per-partition statistics for a snapshot — the Rust port of Java 1.10.0
@@ -749,16 +652,16 @@ async fn compute_stats_over_manifests(
         // All files in one manifest share the manifest's partition spec id; resolve the spec's
         // partition type ONCE per manifest (the residual/constants-map per-manifest idiom).
         let spec_id = manifest_file.partition_spec_id;
-        let spec_type = resolve_spec_partition_type(metadata, schema, spec_id)?;
+        let spec = resolve_spec(metadata, spec_id)?;
 
         let per_manifest = collect_stats_for_manifest(
             metadata,
             &manifest,
-            spec_id,
-            &spec_type,
+            spec,
+            schema,
             unified_type,
             incremental,
-        );
+        )?;
         merge_partition_map(per_manifest, &mut stats_by_key)?;
     }
     Ok(stats_by_key)
@@ -927,16 +830,17 @@ async fn compute_and_merge_stats_incremental(
 fn collect_stats_for_manifest(
     metadata: &TableMetadata,
     manifest: &Manifest,
-    spec_id: i32,
-    spec_type: &StructType,
+    spec: &PartitionSpec,
+    schema: &Schema,
     unified_type: &StructType,
     incremental: bool,
-) -> HashMap<(i32, Struct), PartitionStats> {
+) -> Result<HashMap<(i32, Struct), PartitionStats>> {
+    let spec_id = spec.spec_id();
     let mut stats_map: HashMap<(i32, Struct), PartitionStats> = HashMap::new();
 
     for entry in manifest.entries() {
         let data_file = entry.data_file();
-        let coerced = coerce_partition(unified_type, spec_type, data_file.partition());
+        let coerced = coerce_partition(unified_type, spec, schema, data_file.partition())?;
 
         // The entry's OWN snapshot (Java table.snapshot(entry.snapshotId())) supplies the
         // last-updated timestamp/id; absent if that snapshot is not in the table's metadata.
@@ -965,7 +869,7 @@ fn collect_stats_for_manifest(
         }
     }
 
-    stats_map
+    Ok(stats_map)
 }
 
 /// Folds one manifest's stats map into the running total — the Rust port of Java `mergePartitionMap`.
@@ -991,20 +895,16 @@ fn merge_partition_map(
     Ok(())
 }
 
-/// Resolves a manifest's spec's partition type, erroring loudly if the spec id is unknown (a
+/// Resolves a manifest's partition spec, erroring loudly if the spec id is unknown (a
 /// corrupt manifest list referencing a spec the metadata does not carry).
-fn resolve_spec_partition_type(
-    metadata: &TableMetadata,
-    schema: &SchemaRef,
-    spec_id: i32,
-) -> Result<StructType> {
+fn resolve_spec(metadata: &TableMetadata, spec_id: i32) -> Result<&PartitionSpec> {
     let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
         Error::new(
             crate::ErrorKind::DataInvalid,
             format!("Cannot find partition spec for manifest: {spec_id}"),
         )
     })?;
-    spec.partition_type(schema)
+    Ok(spec.as_ref())
 }
 
 /// Pulls the `(timestamp_ms, snapshot_id)` for an entry's own snapshot, or `(None, None)` if the
@@ -1993,6 +1893,51 @@ mod tests {
         ])
     }
 
+    fn xyz_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedFieldRef::from(NestedField::required(
+                    1,
+                    "x",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                NestedFieldRef::from(NestedField::required(
+                    2,
+                    "y",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                NestedFieldRef::from(NestedField::required(
+                    3,
+                    "z",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("x/y/z schema")
+    }
+
+    fn identity_unbound(source_id: i32, field_id: i32, name: &str) -> UnboundPartitionField {
+        UnboundPartitionField {
+            source_id,
+            field_id: Some(field_id),
+            name: name.to_string(),
+            transform: Transform::Identity,
+        }
+    }
+
+    fn bind_spec(
+        schema: &Schema,
+        spec_id: i32,
+        fields: Vec<UnboundPartitionField>,
+    ) -> PartitionSpec {
+        PartitionSpec::builder(schema.clone())
+            .with_spec_id(spec_id)
+            .add_unbound_fields(fields)
+            .expect("add unbound fields")
+            .build()
+            .expect("bind spec")
+    }
+
     /// RISK: the on-disk field ids drift from Java's constants → an X2 stats file Java cannot read,
     /// or a reader maps the wrong column. Pins every field id / name / type / nullability for the v2
     /// schema (12 fields, delete fields OPTIONAL, no dv_count).
@@ -2470,14 +2415,35 @@ mod tests {
         assert!(!fields[0].required && !fields[1].required);
     }
 
+    /// Delegation equivalence: the maintenance alias, `TableMetadata::unified_partition_type`,
+    /// and `spec::partition_type` must agree on a Java-legal widening evolution.
+    #[test]
+    fn test_unified_partition_type_delegates_to_spec_partitioning() {
+        let metadata = two_spec_metadata();
+        let via_alias = unified_partition_type(&metadata).expect("alias");
+        let via_method = metadata
+            .unified_partition_type()
+            .expect("TableMetadata method");
+        let specs: Vec<_> = metadata.partition_specs_iter().cloned().collect();
+        let via_fn = crate::spec::partition_type(metadata.current_schema(), &specs)
+            .expect("spec::partition_type");
+        assert_eq!(via_alias, via_method);
+        assert_eq!(via_alias, via_fn);
+    }
+
     /// RISK: coercion DIRECTION 1 — a spec-1 file `(x, y)` projects identically into the unified type
     /// {x, y} (both values carried through, in unified order).
     #[test]
     fn test_coerce_partition_carries_full_tuple_for_the_newer_spec() {
+        let schema = xyz_schema();
+        let spec = bind_spec(&schema, 1, vec![
+            identity_unbound(1, 1000, "x"),
+            identity_unbound(2, 1001, "y"),
+        ]);
         let unified = xy_partition_type();
-        let spec1_type = xy_partition_type();
         let file_partition = Struct::from_iter([Some(Literal::long(7)), Some(Literal::long(9))]);
-        let coerced = coerce_partition(&unified, &spec1_type, &file_partition);
+        let coerced =
+            coerce_partition(&unified, &spec, &schema, &file_partition).expect("coerce full tuple");
         assert_eq!(
             coerced,
             Struct::from_iter([Some(Literal::long(7)), Some(Literal::long(9))])
@@ -2489,10 +2455,12 @@ mod tests {
     /// the null-fill (e.g. carrying the wrong index) would key the partition incorrectly.
     #[test]
     fn test_coerce_partition_null_fills_field_absent_from_the_older_spec() {
+        let schema = xyz_schema();
+        let spec = bind_spec(&schema, 0, vec![identity_unbound(1, 1000, "x")]);
         let unified = xy_partition_type();
-        let spec0_type = x_partition_type();
         let file_partition = Struct::from_iter([Some(Literal::long(7))]);
-        let coerced = coerce_partition(&unified, &spec0_type, &file_partition);
+        let coerced =
+            coerce_partition(&unified, &spec, &schema, &file_partition).expect("coerce null-fill");
         assert_eq!(
             coerced,
             Struct::from_iter([Some(Literal::long(7)), None]),
@@ -2509,23 +2477,16 @@ mod tests {
     /// be `(x=7, y=9)`, which requires pulling spec index 1 for x and index 0 for y.
     #[test]
     fn test_coerce_partition_remaps_by_field_id_not_position() {
-        let unified = xy_partition_type(); // {x @ 1000, y @ 1001} (ascending)
-        // The spec lists y (id 1001) at index 0 and x (id 1000) at index 1 — REVERSED order.
-        let spec_type = StructType::new(vec![
-            Arc::new(NestedField::optional(
-                1001,
-                "y",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                1000,
-                "x",
-                Type::Primitive(PrimitiveType::Long),
-            )),
+        let schema = xyz_schema();
+        // Spec lists y (id 1001) first, then x (id 1000) — REVERSED vs unified ascending.
+        let spec = bind_spec(&schema, 0, vec![
+            identity_unbound(2, 1001, "y"),
+            identity_unbound(1, 1000, "x"),
         ]);
-        // The file's tuple matches the spec order: [y=9, x=7].
+        let unified = xy_partition_type();
         let file_partition = Struct::from_iter([Some(Literal::long(9)), Some(Literal::long(7))]);
-        let coerced = coerce_partition(&unified, &spec_type, &file_partition);
+        let coerced =
+            coerce_partition(&unified, &spec, &schema, &file_partition).expect("coerce remap");
         assert_eq!(
             coerced,
             Struct::from_iter([Some(Literal::long(7)), Some(Literal::long(9))]),
@@ -3581,6 +3542,7 @@ mod tests {
     /// (index-by-unified-position) fails on BOTH, not just one fragile fixture.
     #[test]
     fn test_coerce_partition_three_field_scramble_remaps_by_id() {
+        let schema = xyz_schema();
         let unified = StructType::new(vec![
             Arc::new(NestedField::optional(
                 1000,
@@ -3599,22 +3561,10 @@ mod tests {
             )),
         ]);
         // spec tuple order: z (1002), x (1000), y (1001).
-        let spec_type = StructType::new(vec![
-            Arc::new(NestedField::optional(
-                1002,
-                "z",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                1000,
-                "x",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                1001,
-                "y",
-                Type::Primitive(PrimitiveType::Long),
-            )),
+        let spec = bind_spec(&schema, 0, vec![
+            identity_unbound(3, 1002, "z"),
+            identity_unbound(1, 1000, "x"),
+            identity_unbound(2, 1001, "y"),
         ]);
         // file values in spec order: z=30, x=10, y=20.
         let file_partition = Struct::from_iter([
@@ -3622,7 +3572,8 @@ mod tests {
             Some(Literal::long(10)),
             Some(Literal::long(20)),
         ]);
-        let coerced = coerce_partition(&unified, &spec_type, &file_partition);
+        let coerced =
+            coerce_partition(&unified, &spec, &schema, &file_partition).expect("coerce scramble");
         assert_eq!(
             coerced,
             Struct::from_iter([
