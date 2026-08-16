@@ -21,14 +21,17 @@
 //! STRUCT with ONE sub-field per LEAF (primitive-typed) column of the DATA table's current schema. Each
 //! sub-field is itself a struct of six human-readable per-column metrics:
 //!
-//! | sub-field          | type           | source (Java `READABLE_METRIC_COLS`, `MetricsUtil.java:140-193`) |
-//! |--------------------|----------------|------------------------------------------------------------------|
-//! | `column_size`      | long, opt      | `DataFile.column_sizes[fieldId]`                                 |
-//! | `value_count`      | long, opt      | `DataFile.value_counts[fieldId]`                                 |
-//! | `null_value_count` | long, opt      | `DataFile.null_value_counts[fieldId]`                            |
-//! | `nan_value_count`  | long, opt      | `DataFile.nan_value_counts[fieldId]`                             |
-//! | `lower_bound`      | COLUMN type, opt | `Conversions.fromByteBuffer(field.type(), lower_bounds[fieldId])` |
-//! | `upper_bound`      | COLUMN type, opt | `Conversions.fromByteBuffer(field.type(), upper_bounds[fieldId])` |
+//! | sub-field          | type           | Java `doc()`                          | source (Java `READABLE_METRIC_COLS`, `MetricsUtil.java:140-193`) |
+//! |--------------------|----------------|---------------------------------------|------------------------------------------------------------------|
+//! | `column_size`      | long, opt      | "Total size on disk"                  | `DataFile.column_sizes[fieldId]`                                 |
+//! | `value_count`      | long, opt      | "Total count, including null and NaN" | `DataFile.value_counts[fieldId]`                                 |
+//! | `null_value_count` | long, opt      | "Null value count"                    | `DataFile.null_value_counts[fieldId]`                            |
+//! | `nan_value_count`  | long, opt      | "NaN value count"                     | `DataFile.nan_value_counts[fieldId]`                             |
+//! | `lower_bound`      | COLUMN type, opt | "Lower bound"                       | `Conversions.fromByteBuffer(field.type(), lower_bounds[fieldId])` |
+//! | `upper_bound`      | COLUMN type, opt | "Upper bound"                       | `Conversions.fromByteBuffer(field.type(), upper_bounds[fieldId])` |
+//!
+//! Every sub-field's `doc` is emitted, not just described: Java builds each leaf with the FOUR-argument
+//! `optional(id, name, type, doc)` overload, passing `ReadableMetricColDefinition::doc`.
 //!
 //! The four counts are read from the file's metric maps BY FIELD ID and are null when the file does not
 //! carry that metric. The lower/upper bounds are the file's bound for that column DECODED to the COLUMN's
@@ -122,6 +125,18 @@ const NAN_VALUE_COUNT: &str = "nan_value_count";
 const LOWER_BOUND: &str = "lower_bound";
 const UPPER_BOUND: &str = "upper_bound";
 
+/// The doc string each of the six sub-fields carries, verbatim from the corresponding
+/// `ReadableMetricColDefinition`'s `doc` in Java `MetricsUtil.READABLE_METRIC_COLS`
+/// (`core/src/main/java/org/apache/iceberg/MetricsUtil.java`). `readableMetricsSchema` builds every
+/// leaf with the FOUR-argument overload — `optional(nextId.incrementAndGet(), m.name(),
+/// m.colType(field), m.doc())` — so the docs are part of the emitted schema, not commentary.
+const COLUMN_SIZE_DOC: &str = "Total size on disk";
+const VALUE_COUNT_DOC: &str = "Total count, including null and NaN";
+const NULL_VALUE_COUNT_DOC: &str = "Null value count";
+const NAN_VALUE_COUNT_DOC: &str = "NaN value count";
+const LOWER_BOUND_DOC: &str = "Lower bound";
+const UPPER_BOUND_DOC: &str = "Upper bound";
+
 /// Builds the `readable_metrics` STRUCT field appended to the `files` family / `entries` schema.
 ///
 /// `metadata_highest_field_id` is the host metadata table's highest field id (Java's
@@ -147,36 +162,46 @@ pub(super) fn readable_metrics_field(
         // Java assigns the column-struct id FIRST, then its six sub-field ids.
         let column_struct_id = next();
         let sub_fields = vec![
-            Arc::new(NestedField::optional(
-                next(),
-                COLUMN_SIZE,
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                next(),
-                VALUE_COUNT,
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                next(),
-                NULL_VALUE_COUNT,
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                next(),
-                NAN_VALUE_COUNT,
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                next(),
-                LOWER_BOUND,
-                Type::Primitive(column.primitive_type.clone()),
-            )),
-            Arc::new(NestedField::optional(
-                next(),
-                UPPER_BOUND,
-                Type::Primitive(column.primitive_type.clone()),
-            )),
+            Arc::new(
+                NestedField::optional(next(), COLUMN_SIZE, Type::Primitive(PrimitiveType::Long))
+                    .with_doc(COLUMN_SIZE_DOC),
+            ),
+            Arc::new(
+                NestedField::optional(next(), VALUE_COUNT, Type::Primitive(PrimitiveType::Long))
+                    .with_doc(VALUE_COUNT_DOC),
+            ),
+            Arc::new(
+                NestedField::optional(
+                    next(),
+                    NULL_VALUE_COUNT,
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .with_doc(NULL_VALUE_COUNT_DOC),
+            ),
+            Arc::new(
+                NestedField::optional(
+                    next(),
+                    NAN_VALUE_COUNT,
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .with_doc(NAN_VALUE_COUNT_DOC),
+            ),
+            Arc::new(
+                NestedField::optional(
+                    next(),
+                    LOWER_BOUND,
+                    Type::Primitive(column.primitive_type.clone()),
+                )
+                .with_doc(LOWER_BOUND_DOC),
+            ),
+            Arc::new(
+                NestedField::optional(
+                    next(),
+                    UPPER_BOUND,
+                    Type::Primitive(column.primitive_type.clone()),
+                )
+                .with_doc(UPPER_BOUND_DOC),
+            ),
         ];
         column_fields.push(Arc::new(
             NestedField::optional(
