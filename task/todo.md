@@ -705,5 +705,15 @@ transcribed from Java `PositionDeletesTable.calculateSchema` (fixed metadata-col
 partition child-id reassignment, empty-partition drop; v3 DV columns behind the format
 gate). Scan refused loud (`FeatureUnsupported`). `$`-name resolution and the provider
 `table_names` enumeration extend automatically; the enumeration pin flip is declared.
-Partition type uses `default_partition_type` (cross-spec unification residual unchanged).
+Partition type: cross-spec unified as of conductor-16 increment D (#204).
 Residual: `PositionDeletesBatchScan` port (R142).
+
+## CLOSED (2026-08-16): conductor-16 — partitioning unification (increments A-E)
+
+The `Partitioning.partitionType` / `PartitionUtil.coercePartition` campaign is complete:
+A `spec/partitioning.rs` module (#202), B `partitions` adoption (#203), D
+`position_deletes` schema (#204), C `files`/`entries`/`all_*` projection (#205), E docs
+sweep (this change): new row R165, R138/R140/R145/R93/R95 notes, and the
+`rewrite_position_delete_files` accepted-finer grouping residue recorded on R165.
+Remaining to flip R165 green: a bidirectional interop round-trip (out of this campaign's
+scope per the charter — `make interop` excluded).
