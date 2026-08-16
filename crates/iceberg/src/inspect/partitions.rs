@@ -42,6 +42,10 @@
 //!    shaped partition tuples) the rows are not coerced into a unified type — a known divergence deferred
 //!    until a `Partitioning.partitionType` analogue lands (tracked in GAP_MATRIX + `task/todo.md`). The
 //!    per-file `spec_id` is still reported, so no data is silently misattributed within a single spec.
+//!    What IS ported (PT-0) is the field-id half of `PartitionUtil.coercePartition`: each row's tuple is
+//!    read BY FIELD ID against the spec it was written under (see `data_file::append_partition`), so a
+//!    partition field the default type projects but that spec does not carry reads null instead of
+//!    picking up whatever value happened to sit at the same tuple position.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,7 +57,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Fields};
 use futures::{StreamExt, stream};
 
-use super::data_file::append_partition;
+use super::data_file::{append_partition, partition_field_ids_by_spec};
 use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{
@@ -262,6 +266,10 @@ impl<'a> PartitionsTable<'a> {
         rows: &[Partition],
     ) -> Result<RecordBatch> {
         let unpartitioned = self.is_unpartitioned();
+        // Each rolled-up row's tuple is aligned to the spec it was written under, so the projection
+        // reads it BY FIELD ID (Java `PartitionUtil.coercePartition`) — see
+        // `data_file::append_partition`. The row KEY is still the raw per-file tuple (divergence 2).
+        let partition_field_ids = partition_field_ids_by_spec(self.table.metadata());
         let mut partition = if unpartitioned {
             None
         } else {
@@ -285,7 +293,17 @@ impl<'a> PartitionsTable<'a> {
 
         for row in rows {
             if let Some(partition) = partition.as_mut() {
-                append_partition(partition, partition_type, &row.key)?;
+                let source_field_ids =
+                    partition_field_ids.get(&row.spec_id).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "partition row references partition spec id {}, which is not in the table metadata",
+                                row.spec_id
+                            ),
+                        )
+                    })?;
+                append_partition(partition, partition_type, source_field_ids, &row.key)?;
             }
             if let Some(spec_id) = spec_id.as_mut() {
                 spec_id.append_value(row.spec_id);

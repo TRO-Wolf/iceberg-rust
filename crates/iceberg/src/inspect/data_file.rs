@@ -49,7 +49,7 @@ use arrow_schema::Fields;
 
 use crate::spec::{
     Datum, ListType, Literal, MapType, NestedField, NestedFieldRef, PrimitiveLiteral,
-    PrimitiveType, Schema, StructType, Type, select_not,
+    PrimitiveType, Schema, StructType, TableMetadata, Type, select_not,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -68,6 +68,27 @@ pub(super) fn omit_empty_partition_field(schema: Schema, partition_type: &Struct
     } else {
         schema
     }
+}
+
+/// Every spec's partition-field ids, in that spec's OWN field order, keyed by spec id.
+///
+/// A [`crate::spec::DataFile`]'s partition `Struct` is a bare `Vec<Option<Literal>>` whose values are
+/// positionally aligned with the fields of the spec the file was WRITTEN under
+/// (`DataFile::partition_spec_id`) — not with the partition type the metadata table projects. Java
+/// recovers the same information inside `PartitionUtil.coercePartition`, which builds a
+/// `StructProjection.createAllowMissing(spec.partitionType(), partitionType)` — i.e. a FIELD-ID match
+/// between the file's own spec and the projected type. This map is the fork's equivalent lookup, and it
+/// is what lets [`append_partition`] match by field id instead of by position.
+pub(super) fn partition_field_ids_by_spec(metadata: &TableMetadata) -> HashMap<i32, Vec<i32>> {
+    metadata
+        .partition_specs_iter()
+        .map(|spec| {
+            (
+                spec.spec_id(),
+                spec.fields().iter().map(|field| field.field_id).collect(),
+            )
+        })
+        .collect()
 }
 
 /// The boxed `MapBuilder` shape `StructBuilder::from_fields` produces for a `DataType::Map` child (its
@@ -243,6 +264,9 @@ fn int_list(element_id: i32) -> Type {
 /// exactly the top-level columns the `files` table flattens. One builder, both shapes.
 pub(super) struct DataFileStructBuilder<'a> {
     partition_type: &'a StructType,
+    /// Spec id → that spec's partition-field ids in its own tuple order, from
+    /// [`partition_field_ids_by_spec`]. Used to read each file's partition tuple by FIELD ID.
+    partition_field_ids_by_spec: &'a HashMap<i32, Vec<i32>>,
     /// Child name → builder index. Name-keyed so dropping `partition` (Java empty-struct
     /// `selectNot`) does not shift the remaining columns.
     indices: HashMap<String, usize>,
@@ -253,7 +277,14 @@ impl<'a> DataFileStructBuilder<'a> {
     /// Creates a builder over the given Arrow `data_file` struct fields (the converted [`data_file_fields`],
     /// possibly without `partition`) and the table's DEFAULT partition type (used to dispatch the
     /// partition tuple's per-field types when that column is present).
-    pub(super) fn new(data_file_arrow_fields: &Fields, partition_type: &'a StructType) -> Self {
+    ///
+    /// `partition_field_ids_by_spec` ([`partition_field_ids_by_spec`]) resolves each appended file's OWN
+    /// spec so its partition tuple is read by field id rather than by position.
+    pub(super) fn new(
+        data_file_arrow_fields: &Fields,
+        partition_type: &'a StructType,
+        partition_field_ids_by_spec: &'a HashMap<i32, Vec<i32>>,
+    ) -> Self {
         let indices = data_file_arrow_fields
             .iter()
             .enumerate()
@@ -261,6 +292,7 @@ impl<'a> DataFileStructBuilder<'a> {
             .collect();
         Self {
             partition_type,
+            partition_field_ids_by_spec,
             indices,
             builder: StructBuilder::from_fields(data_file_arrow_fields.clone(), 0),
         }
@@ -303,10 +335,26 @@ impl<'a> DataFileStructBuilder<'a> {
         struct_child::<Int32Builder>(b, i_spec_id)?.append_value(data_file.partition_spec_id);
 
         if let Some(i_partition) = i_partition {
+            // The tuple is aligned to the file's OWN spec (Java `table.specs().get(file.specId())`
+            // inside `PartitionUtil.coercePartition`), so resolve that spec's field ids before reading.
+            let source_field_ids = self
+                .partition_field_ids_by_spec
+                .get(&data_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "data file {} was written under partition spec id {}, which is not in the table metadata",
+                            data_file.file_path(),
+                            data_file.partition_spec_id
+                        ),
+                    )
+                })?;
             let partition_builder = struct_child::<StructBuilder>(b, i_partition)?;
             append_partition(
                 partition_builder,
                 self.partition_type,
+                source_field_ids,
                 data_file.partition(),
             )?;
         }
@@ -481,13 +529,33 @@ fn append_i32_list(builder: &mut DynListBuilder, values: Option<&[i32]>) -> Resu
 }
 
 /// Appends one partition tuple to the partition [`StructBuilder`], dispatching each field on its
-/// primitive type. The partition `Struct`'s values are aligned with `partition_type`'s fields.
+/// primitive type.
+///
+/// `partition` is a bare tuple: its values are positionally aligned with `source_field_ids` — the
+/// partition-field ids of the spec the tuple was written under, in that spec's own field order (see
+/// [`partition_field_ids_by_spec`]). `partition_type` is the type the metadata table PROJECTS, which
+/// under partition evolution is a different spec's shape. Each projected field is therefore matched to
+/// the tuple BY FIELD ID; a projected field the source spec does not carry is null-filled.
+///
+/// This is the field-id half of Java `PartitionUtil.coercePartition`
+/// (`core/src/main/java/org/apache/iceberg/util/PartitionUtil.java`), which wraps the tuple in
+/// `StructProjection.createAllowMissing(spec.partitionType(), partitionType)` — a projection whose
+/// `positionMap` is built by matching field ids, and whose not-found entries read as null. Matching by
+/// POSITION instead silently writes one partition field's value into another field's column whenever
+/// the two specs agree on type but not on field id.
+///
+/// The other half of Java's coercion — projecting into the cross-spec UNIFIED partition type rather
+/// than the table's default one — is still outstanding: `partition_type` here is
+/// `TableMetadata::default_partition_type`, so a partition field that exists only in an older spec has
+/// no column to land in and is dropped rather than surfaced. That is the
+/// `Partitioning.partitionType` unification tracked in GAP_MATRIX R142.
 ///
 /// Shared in-module helper: `files`/`entries` reach it through [`DataFileStructBuilder::append`], and
 /// the `partitions` aggregating table reuses it directly for its `partition` column (Rule of Three).
 pub(super) fn append_partition(
     builder: &mut StructBuilder,
     partition_type: &StructType,
+    source_field_ids: &[i32],
     partition: &crate::spec::Struct,
 ) -> Result<()> {
     for (index, field) in partition_type.fields().iter().enumerate() {
@@ -500,9 +568,10 @@ pub(super) fn append_partition(
                 ),
             )
         })?;
-        let value = partition
-            .fields()
-            .get(index)
+        let value = source_field_ids
+            .iter()
+            .position(|source_field_id| *source_field_id == field.id)
+            .and_then(|source_index| partition.fields().get(source_index))
             .and_then(|value| value.as_ref());
         append_partition_field(builder, index, primitive_type, value)?;
     }
@@ -639,7 +708,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{TimestampMicrosecondType, TimestampNanosecondType};
+    use arrow_array::types::{
+        Int32Type, Int64Type, TimestampMicrosecondType, TimestampNanosecondType,
+    };
     use arrow_array::{Array, StructArray};
     use arrow_schema::{DataType, TimeUnit};
     use futures::TryStreamExt;
@@ -649,8 +720,8 @@ mod tests {
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
-        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, NestedField, PrimitiveType,
-        Schema, Struct, StructType, Type,
+        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, NestedField, PartitionSpec,
+        PrimitiveType, Schema, Struct, StructType, Transform, Type, UnboundPartitionField,
     };
     use crate::{ErrorKind, Result};
 
@@ -686,7 +757,12 @@ mod tests {
             other => panic!("partition column must be a struct, got {other:?}"),
         };
         let mut builder = arrow_array::builder::StructBuilder::from_fields(partition_arrow, 0);
-        append_partition(&mut builder, &partition_type, &Struct::from_iter([value]))?;
+        append_partition(
+            &mut builder,
+            &partition_type,
+            &[1000],
+            &Struct::from_iter([value]),
+        )?;
         Ok(builder.finish())
     }
 
@@ -738,9 +814,118 @@ mod tests {
         fixture
     }
 
-    /// Writes one Added DATA file with `partition` and stitches it into the current snapshot's
-    /// manifest list (inspect-test mold: no real parquet).
+    /// Partition-field id of `identity(x)` (source column `x`, schema field 1) — carried by BOTH specs
+    /// of [`with_reordered_evolved_spec`].
+    const PARTITION_FIELD_ID_X: i32 = 1000;
+    /// Partition-field id of `identity(y)` (source column `y`, schema field 2) — added by spec 1.
+    const PARTITION_FIELD_ID_Y: i32 = 1001;
+
+    /// Spec-EVOLUTION fixture. The template's spec 0 is `identity(x)` @ field id 1000. This adds spec 1
+    /// as the new DEFAULT: `identity(y)` @ 1001 FOLLOWED BY `identity(x)` @ 1000 — monotonic, non-reused
+    /// field ids (a Java-LEGAL evolution, unlike `TableTestFixture::new_with_two_identity_specs`, which
+    /// reuses field id 1000 across two source columns and is a `"Conflicting partition fields"` refusal
+    /// in Java `Partitioning.buildPartitionProjectionType`).
+    ///
+    /// Two properties make it the PT-0 corruption pin:
+    ///  * spec 1's TUPLE order (`y`, `x`) differs from its field-id order, so a spec-0 file's 1-tuple
+    ///    `(x)` lines up positionally with the projected `y` column;
+    ///  * both partition fields are `long`, so a positional read produces no type error — the value is
+    ///    silently written into the wrong column.
+    fn with_reordered_evolved_spec(fixture: TableTestFixture) -> TableTestFixture {
+        let mut metadata = fixture.table.metadata().clone();
+        let current_schema = metadata.current_schema().clone();
+        let evolved_spec = Arc::new(
+            PartitionSpec::builder(current_schema.clone())
+                .with_spec_id(1)
+                .add_unbound_field(
+                    UnboundPartitionField::builder()
+                        .source_id(2)
+                        .name("y".to_string())
+                        .field_id(PARTITION_FIELD_ID_Y)
+                        .transform(Transform::Identity)
+                        .build(),
+                )
+                .expect("identity(y) is a valid partition field")
+                .add_unbound_field(
+                    UnboundPartitionField::builder()
+                        .source_id(1)
+                        .name("x".to_string())
+                        .field_id(PARTITION_FIELD_ID_X)
+                        .transform(Transform::Identity)
+                        .build(),
+                )
+                .expect("identity(x) is a valid partition field")
+                .build()
+                .expect("build the evolved spec"),
+        );
+        metadata.default_partition_type = evolved_spec
+            .partition_type(current_schema.as_ref())
+            .expect("evolved spec resolves against the current schema");
+        metadata.default_spec = evolved_spec.clone();
+        metadata.partition_specs.insert(1, evolved_spec);
+
+        let mut fixture = fixture;
+        fixture.table = fixture.table.clone().with_metadata(Arc::new(metadata));
+        fixture
+    }
+
+    /// Projects one partition tuple through [`append_partition`] against the two-field `long` projection
+    /// `{1001 y, 1000 x}` that [`with_reordered_evolved_spec`]'s default spec produces.
+    fn project_reordered_pair(
+        source_field_ids: &[i32],
+        values: Vec<Option<Literal>>,
+    ) -> StructArray {
+        let partition_type = StructType::new(vec![
+            Arc::new(NestedField::optional(
+                PARTITION_FIELD_ID_Y,
+                "y",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                PARTITION_FIELD_ID_X,
+                "x",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+        ]);
+        let iceberg_schema = Schema::builder()
+            .with_fields(data_file_fields(&partition_type))
+            .build()
+            .expect("data_file_fields schema is statically valid");
+        let arrow_schema =
+            schema_to_arrow_schema(&iceberg_schema).expect("data_file_fields convert to Arrow");
+        let partition_arrow = match arrow_schema
+            .field_with_name("partition")
+            .expect("data_file projection has a partition column")
+            .data_type()
+        {
+            DataType::Struct(fields) => fields.clone(),
+            other => panic!("partition column must be a struct, got {other:?}"),
+        };
+        let mut builder = arrow_array::builder::StructBuilder::from_fields(partition_arrow, 0);
+        append_partition(
+            &mut builder,
+            &partition_type,
+            source_field_ids,
+            &Struct::from_iter(values),
+        )
+        .expect("same-typed long partition fields must project");
+        builder.finish()
+    }
+
+    /// Writes one Added DATA file with `partition` under the table's DEFAULT spec and stitches it into
+    /// the current snapshot's manifest list (inspect-test mold: no real parquet).
     async fn write_one_partitioned_data_file(fixture: &TableTestFixture, partition: Struct) {
+        let default_spec_id = fixture.table.metadata().default_partition_spec_id();
+        write_data_files_under_specs(fixture, &[(default_spec_id, partition)]).await;
+    }
+
+    /// Writes one Added DATA file per `(spec_id, partition)` pair, EACH IN ITS OWN MANIFEST written
+    /// under that spec — the shape partition evolution actually produces — then rewrites the current
+    /// snapshot's manifest list to reference them all (inspect-test mold: no real parquet).
+    ///
+    /// Each `partition` tuple must be ordered by ITS OWN spec's field order, exactly as a writer under
+    /// that spec would have serialized it.
+    async fn write_data_files_under_specs(fixture: &TableTestFixture, files: &[(i32, Struct)]) {
         let metadata = fixture.table.metadata().clone();
         let current_snapshot = metadata
             .current_snapshot()
@@ -748,47 +933,60 @@ mod tests {
         let current_schema = current_snapshot
             .schema(&metadata)
             .expect("current snapshot schema");
-        let current_partition_spec = metadata.default_partition_spec();
-        let output = fixture
-            .table
-            .file_io()
-            .new_output(format!(
-                "{}/metadata/manifest_proj_{}.avro",
-                fixture.table_location,
-                uuid::Uuid::new_v4()
-            ))
-            .expect("create inspect-test manifest output");
-        let mut writer = ManifestWriterBuilder::new(
-            output,
-            Some(current_snapshot.snapshot_id()),
-            None,
-            current_schema.clone(),
-            current_partition_spec.as_ref().clone(),
-        )
-        .build_v2_data();
-        writer
-            .add_entry(
-                ManifestEntry::builder()
-                    .status(ManifestStatus::Added)
-                    .data_file(
-                        DataFileBuilder::default()
-                            .partition_spec_id(0)
-                            .content(DataContentType::Data)
-                            .file_path(format!("{}/proj.parquet", &fixture.table_location))
-                            .file_format(DataFileFormat::Parquet)
-                            .file_size_in_bytes(FILE_SIZE)
-                            .record_count(1)
-                            .partition(partition)
-                            .build()
-                            .expect("build inspect-test data file"),
-                    )
-                    .build(),
+
+        let mut manifests = Vec::with_capacity(files.len());
+        for (index, (spec_id, partition)) in files.iter().enumerate() {
+            let spec = metadata
+                .partition_spec_by_id(*spec_id)
+                .expect("inspect-test data file references a spec in the fixture metadata")
+                .clone();
+            let output = fixture
+                .table
+                .file_io()
+                .new_output(format!(
+                    "{}/metadata/manifest_proj_{}.avro",
+                    fixture.table_location,
+                    uuid::Uuid::new_v4()
+                ))
+                .expect("create inspect-test manifest output");
+            let mut writer = ManifestWriterBuilder::new(
+                output,
+                Some(current_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                spec.as_ref().clone(),
             )
-            .expect("add inspect-test manifest entry");
-        let data_manifest = writer
-            .write_manifest_file()
-            .await
-            .expect("write inspect-test data manifest");
+            .build_v2_data();
+            writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(*spec_id)
+                                .content(DataContentType::Data)
+                                .file_path(format!(
+                                    "{}/proj_{index}.parquet",
+                                    &fixture.table_location
+                                ))
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(FILE_SIZE)
+                                .record_count(1)
+                                .partition(partition.clone())
+                                .build()
+                                .expect("build inspect-test data file"),
+                        )
+                        .build(),
+                )
+                .expect("add inspect-test manifest entry");
+            manifests.push(
+                writer
+                    .write_manifest_file()
+                    .await
+                    .expect("write inspect-test data manifest"),
+            );
+        }
+
         let mut manifest_list = ManifestListWriter::v2(
             fixture
                 .table
@@ -800,7 +998,7 @@ mod tests {
             current_snapshot.sequence_number(),
         );
         manifest_list
-            .add_manifests(vec![data_manifest].into_iter())
+            .add_manifests(manifests.into_iter())
             .expect("add inspect-test manifest to list");
         manifest_list
             .close()
@@ -1048,5 +1246,106 @@ mod tests {
             "expected existing refuse needle, got: {}",
             error.message()
         );
+    }
+    #[test]
+    fn append_partition_null_fills_a_projected_field_absent_from_the_source_spec() {
+        // RISK (PT-0): the tuple `(x=777)` was written under spec 0 (`[1000]`), and the projection is
+        // spec 1's `{1001 y, 1000 x}`. A POSITIONAL read takes tuple index 0 for projected index 0 and
+        // writes 777 — an `x` value — into the `y` column. Both fields are `long`, so nothing errors.
+        let projected =
+            project_reordered_pair(&[PARTITION_FIELD_ID_X], vec![Some(Literal::long(777))]);
+        assert_eq!(projected.len(), 1);
+        let y = projected.column(0).as_primitive::<Int64Type>();
+        let x = projected.column(1).as_primitive::<Int64Type>();
+        assert!(
+            y.is_null(0),
+            "projected field 1001 (`y`) is absent from spec 0, so it must null-fill (Java \
+             `StructProjection.createAllowMissing`), got {}",
+            y.value(0)
+        );
+        assert_eq!(
+            x.value(0),
+            777,
+            "projected field 1000 (`x`) must take the value the source spec holds at ITS position"
+        );
+    }
+
+    #[test]
+    fn append_partition_reorders_a_full_tuple_by_field_id() {
+        // RISK (PT-0): a source spec whose tuple order differs from the projection's. Here the source is
+        // `[1000, 1001]` = `(x=777, y=888)` and the projection is `{1001 y, 1000 x}` — a positional walk
+        // swaps the two values with no error at all.
+        let projected =
+            project_reordered_pair(&[PARTITION_FIELD_ID_X, PARTITION_FIELD_ID_Y], vec![
+                Some(Literal::long(777)),
+                Some(Literal::long(888)),
+            ]);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected.column(0).as_primitive::<Int64Type>().value(0),
+            888,
+            "`y` (field 1001) must come from the source tuple's field-1001 slot"
+        );
+        assert_eq!(
+            projected.column(1).as_primitive::<Int64Type>().value(0),
+            777,
+            "`x` (field 1000) must come from the source tuple's field-1000 slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn files_table_projects_partition_values_by_field_id_under_spec_evolution() {
+        // RISK (PT-0): the end-to-end corruption. Spec 0's live file carries the 1-tuple `(x=777)`;
+        // the projected (default = spec 1) partition type is `{1001 y, 1000 x}`. Reading the tuple
+        // POSITIONALLY surfaces `y = 777` / `x = null` on the `files` table — an `x` value reported
+        // under `y`, silently, because both fields are `long`. Java coerces each file's partition into
+        // the projected type BY FIELD ID (`PartitionUtil.coercePartition` →
+        // `StructProjection.createAllowMissing`), which yields `y = null` / `x = 777`.
+        let fixture = with_reordered_evolved_spec(TableTestFixture::new());
+        write_data_files_under_specs(&fixture, &[
+            // Written under spec 0 = `[identity(x)]`.
+            (0, Struct::from_iter([Some(Literal::long(777))])),
+            // Written under spec 1 = `[identity(y), identity(x)]`, in THAT tuple order.
+            (
+                1,
+                Struct::from_iter([Some(Literal::long(888)), Some(Literal::long(999))]),
+            ),
+        ])
+        .await;
+
+        let batch = scan_files_single_batch(&fixture).await;
+        assert_eq!(batch.num_rows(), 2);
+
+        let spec_ids = batch
+            .column_by_name("spec_id")
+            .expect("files.spec_id")
+            .as_primitive::<Int32Type>();
+        assert_eq!(
+            (spec_ids.value(0), spec_ids.value(1)),
+            (0, 1),
+            "rows follow manifest-list order: the spec-0 file first, then the spec-1 file"
+        );
+
+        let partition = batch
+            .column_by_name("partition")
+            .expect("files.partition")
+            .as_struct();
+        let y = partition.column(0).as_primitive::<Int64Type>();
+        let x = partition.column(1).as_primitive::<Int64Type>();
+
+        assert!(
+            y.is_null(0),
+            "the spec-0 file has no field-1001 (`y`) partition value; positional reading reports {} \
+             there, which is the spec-0 file's `x` value",
+            y.value(0)
+        );
+        assert_eq!(
+            x.value(0),
+            777,
+            "the spec-0 file's field-1000 (`x`) value must land in the `x` column"
+        );
+
+        assert_eq!(y.value(1), 888, "the spec-1 file's `y` value");
+        assert_eq!(x.value(1), 999, "the spec-1 file's `x` value");
     }
 }
