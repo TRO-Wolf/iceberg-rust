@@ -46,6 +46,29 @@ Branch: `repark/fb1-java-schema-shape` off freeze `0c5fd58d` (#195). Additive te
 - [x] A6: `make check` EXIT=0; `make unit-test` EXIT=0; `make test` EXIT=0 on retry
       (first attempt SQLITE_BUSY on REST `test_get_namespace`/`test_update_table`; retry
       4193 passed / 3 skipped). One `[repark]` PR. Report after `gh pr create`.
+## ACTIVE (2026-08-15): FB-4 Java inspect schema-shape battery (increment 2)
+
+Branch: `repark/fb4-java-battery-2` off `f40d3faa` (#198). Additive tests only
+(conductor-13F A4/A5). No GAP_MATRIX cell edit. Covers exactly what #196 deferred.
+
+- [x] `BaseEntriesTable.schema()` shape: `ManifestEntry.wrapFileSchema` rows (0/1/3/4 then
+      `data_file`/2 LAST), `data_file` == `DataFile.getType(partitionType)`, nested
+      `selectNot(102)` on the unpartitioned branch (FW-3 drop, #194), `entries` ==
+      `all_entries`, and `entries.data_file` == the flat `files` projection.
+- [x] `MetricsUtil.readableMetricsSchema` STRUCTURE: one optional struct per PRIMITIVE
+      leaf column with Java's docs, the six `READABLE_METRIC_COLS` in list order (four
+      `long` + typed `lower_bound`/`upper_bound`), the by-name emit sort, and the
+      pre-increment id counter seeded at the host `highestFieldId()` (1000 partitioned /
+      145 unpartitioned). Interior field-id ORDER pinned as the fork's DOCUMENTED
+      divergence — Java's `idToName()` HashMap order is not portable, so it is not chased.
+- [ ] FINDING F-1 (reported, NOT shipped): the six `readable_metrics` sub-fields carry no
+      doc string; Java passes `m.doc()` ("Total size on disk", "Total count, including null
+      and NaN", "Null value count", "NaN value count", "Lower bound", "Upper bound") into
+      `optional(id, name, type, doc)`. The column struct + top-level docs ARE present.
+      Cosmetic (docs are not in the Avro/Arrow read path) — needs a GAP_MATRIX row and a
+      production fix in `readable_metrics.rs::readable_metrics_field` on a separate PR.
+- [x] A6: `make check` / `make unit-test` / `make test`. One `[repark]` PR, no merge.
+
 ## ACTIVE (2026-08-15): FB-3 lazy per-namespace `list_tables`
 
 Branch: `repark/fb3-lazy-list-tables` off freeze `0c5fd58d` (#195). Independent of FB-1 (#196).
