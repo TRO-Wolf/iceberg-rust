@@ -27,9 +27,10 @@
 //! Two deliberate bounds, both tracked in GAP_MATRIX R142:
 //! - **Scan is refused loud** (`FeatureUnsupported`): Java backs this table with a dedicated
 //!   `PositionDeletesBatchScan` over delete manifests; that port is a separate campaign.
-//! - **Partition type** uses `TableMetadata::default_partition_type` — the fork has no
-//!   `Partitioning.partitionType` cross-spec unification yet (same known divergence as
-//!   `partitions.rs`, deferred until that analogue lands).
+//!   Increment D does **not** un-refuse the scan.
+//! - **Partition type** is [`TableMetadata::unified_partition_type`] (Java
+//!   `Partitioning.partitionType`) — increment D. That automatically corrects the
+//!   remapped-child-id set and the empty-partition drop predicate.
 
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type};
@@ -59,12 +60,40 @@ const CONTENT_SIZE_IN_BYTES_COLUMN_ID: i32 = JAVA_INT_MAX - 7;
 /// PositionDeletes table (schema only — see the module doc for the scan bound).
 pub struct PositionDeletesTable<'a> {
     table: &'a Table,
+    /// Java `Partitioning.partitionType(table)` — stored so [`Self::schema`] stays infallible.
+    unified_partition_type: StructType,
 }
 
 impl<'a> PositionDeletesTable<'a> {
+    /// Fallible constructor: resolves the unified partition type up front.
+    ///
+    /// The DataFusion `IcebergMetadataTableProvider::try_new` is the public
+    /// fallible seam (A5).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::spec::TableMetadata::unified_partition_type`].
+    pub fn try_new(table: &'a Table) -> Result<Self> {
+        let unified_partition_type = table.metadata().unified_partition_type()?;
+        Ok(Self {
+            table,
+            unified_partition_type,
+        })
+    }
+
     /// Create a new PositionDeletes table instance.
+    ///
+    /// Signature stays infallible (A5). On a G1/G2 table this falls back to
+    /// [`TableMetadata::default_partition_type`] so `inspect().position_deletes().schema()`
+    /// cannot panic; [`Self::try_new`] is the loud refuse path.
     pub fn new(table: &'a Table) -> Self {
-        Self { table }
+        match Self::try_new(table) {
+            Ok(this) => this,
+            Err(_) => Self {
+                table,
+                unified_partition_type: table.metadata().default_partition_type().clone(),
+            },
+        }
     }
 
     /// Returns the iceberg schema of the `position_deletes` table.
@@ -72,11 +101,11 @@ impl<'a> PositionDeletesTable<'a> {
     /// Transcribed from Java `PositionDeletesTable.calculateSchema`: column list order is
     /// `file_path`, `pos`, `row`, `partition`, `spec_id`, `delete_file_path` (+ `content_offset`,
     /// `content_size_in_bytes` on format v3+); partition child ids are reassigned to the smallest
-    /// positive ids unused by any table schema or metadata column; an EMPTY partition type drops
-    /// the `partition` column entirely (`TypeUtil.selectNot(PARTITION_COLUMN_ID)`).
+    /// positive ids unused by any table schema or metadata column; an EMPTY *unified* partition
+    /// type drops the `partition` column entirely (`TypeUtil.selectNot(PARTITION_COLUMN_ID)`).
     pub fn schema(&self) -> Schema {
         let metadata = self.table.metadata();
-        let partition_type = metadata.default_partition_type();
+        let partition_type = &self.unified_partition_type;
         let table_struct = metadata.current_schema().as_struct().clone();
         let format_version = metadata.format_version() as u8;
 
@@ -320,6 +349,79 @@ mod tests {
         assert!(
             MetadataTableType::all_types().any(|t| t.as_str() == "position_deletes"),
             "all_types must include position_deletes"
+        );
+    }
+
+    /// Increment D: unified type has two children under widening evolution,
+    /// so the remapped `partition` struct has two fields (default spec would
+    /// also be two here; the next test is the discriminating one).
+    #[test]
+    fn widening_schema_partition_has_two_remapped_children() {
+        let fixture = TableTestFixture::new_with_widening_spec_evolution();
+        let schema = fixture.table.inspect().position_deletes().schema();
+        let partition = schema
+            .field_by_id(PARTITION_COLUMN_ID)
+            .expect("widening table keeps partition");
+        let Type::Struct(partition_struct) = partition.field_type.as_ref() else {
+            panic!("partition must be a struct");
+        };
+        assert_eq!(
+            partition_struct.fields().len(),
+            2,
+            "unified type {{x, y_bucket_8}} remaps two children"
+        );
+        assert_eq!(partition_struct.fields()[0].name, "x");
+        assert_eq!(partition_struct.fields()[1].name, "y_bucket_8");
+    }
+
+    /// Discriminator vs default_partition_type: current spec is unpartitioned
+    /// but unified type is `{x}`, so `partition` stays (Java empty-drop fires
+    /// on `Partitioning.partitionType`, not the default spec).
+    #[test]
+    fn evolved_to_unpartitioned_keeps_partition_column() {
+        let fixture = TableTestFixture::new_evolved_to_unpartitioned();
+        let schema = fixture.table.inspect().position_deletes().schema();
+        assert!(
+            schema.field_by_id(PARTITION_COLUMN_ID).is_some(),
+            "historical spec 0 keeps the partition column"
+        );
+        let partition = schema.field_by_id(PARTITION_COLUMN_ID).unwrap();
+        let Type::Struct(partition_struct) = partition.field_type.as_ref() else {
+            panic!("partition must be a struct");
+        };
+        assert_eq!(partition_struct.fields().len(), 1);
+        assert_eq!(partition_struct.fields()[0].name, "x");
+    }
+
+    /// Increment D does not un-refuse the scan (FB-2 bound).
+    #[test]
+    fn scan_still_refused_after_unified_schema() {
+        let fixture = TableTestFixture::new_with_widening_spec_evolution();
+        let err = fixture
+            .table
+            .inspect()
+            .position_deletes()
+            .scan()
+            .err()
+            .expect("scan stays refused");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+    }
+
+    /// `try_new` is the G2 refuse path. `new_with_two_identity_specs` is a
+    /// Java-invalid unifier input (field id 1000 reused for two sources) and
+    /// is used here ONLY as a refusal pin, never as a successful unifier input.
+    #[test]
+    fn try_new_refuses_conflicting_field_ids() {
+        let fixture = TableTestFixture::new_with_two_identity_specs();
+        let error = match PositionDeletesTable::try_new(&fixture.table) {
+            Ok(_) => panic!("G2: conflicting field ids must refuse try_new"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().starts_with("Conflicting partition fields"),
+            "message was: {}",
+            error.message()
         );
     }
 }

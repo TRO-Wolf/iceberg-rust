@@ -31,6 +31,18 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-16): PT increment D — `position_deletes` schema adopts the unified type
+
+Branch: `grok/c16-position-deletes-unified` off `d09d4831` (#203). Schema-only (FB-2);
+do **not** un-refuse the scan.
+
+- [x] `PositionDeletesTable::try_new` stores `unified_partition_type`; schema uses it
+      for remapped children + empty-partition drop. `scan()` stays `FeatureUnsupported`.
+- [x] DataFusion `IcebergMetadataTableProvider::try_new` uses `try_new` for this table.
+- [x] Pins: widening two-child remap; evolved-to-unpartitioned keeps `partition`;
+      scan still refused; `try_new` G2 refuse on `new_with_two_identity_specs`.
+- [x] GAP_MATRIX R142 + `inspect/map.md` lockstep.
+
 ## ACTIVE (2026-08-16): PT increment B — `partitions` adopts the unified type
 
 Branch: `grok/c16-partitions-unified` off the #202 squash-merge. Java `PartitionsTable` +
