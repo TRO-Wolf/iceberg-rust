@@ -29,7 +29,7 @@ use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use iceberg::Result;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::inspect::MetadataTableType;
+use iceberg::inspect::{MetadataTableType, PartitionsTable};
 use iceberg::table::Table;
 
 use crate::physical_plan::metadata_scan::IcebergMetadataScan;
@@ -71,7 +71,7 @@ impl IcebergMetadataTableProvider {
             MetadataTableType::History => metadata_table.history().schema(),
             MetadataTableType::Refs => metadata_table.refs().schema(),
             MetadataTableType::MetadataLogEntries => metadata_table.metadata_log_entries().schema(),
-            MetadataTableType::Partitions => metadata_table.partitions().schema(),
+            MetadataTableType::Partitions => PartitionsTable::try_new(&table)?.schema(),
             MetadataTableType::AllManifests => metadata_table.all_manifests().schema(),
             MetadataTableType::PositionDeletes => metadata_table.position_deletes().schema(),
         };

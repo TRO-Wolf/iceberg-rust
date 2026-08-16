@@ -26,26 +26,22 @@
 //! References:
 //! - <https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/PartitionsTable.java>
 //!
-//! ## Scoping decisions (Java divergences, tested + documented)
+//! ## Parity (Java `PartitionsTable`)
 //!
 //! 1. **Unpartitioned columns.** Java `PartitionsTable.schema()` uses `TypeUtil.select` to keep
 //!    everything EXCEPT field id 1 (`partition`) AND field id 4 (`spec_id`) when the table is
 //!    unpartitioned (the unpartitioned scan also omits those cells from each `StaticDataTask.Row`).
 //!    This port matches that drop. The files/entries families drop only `partition` (field 102).
+//!    "Unpartitioned" is Java `Partitioning.partitionType(table).fields().isEmpty()` — the unified
+//!    type — so a table whose *current* spec is empty but which has historical partitioned specs
+//!    keeps both columns (Java `testPartitionTypeWithSpecEvolutionInV1Tables` ends in that state).
 //!
-//! 2. **Multi-spec partition evolution.** Java unifies all of a table's partition specs into ONE partition
-//!    type via `Partitioning.partitionType(table)` and coerces each file's partition into it
-//!    (`PartitionUtil.coercePartition`). The Rust core has NO cross-spec partition-type unifier (only
-//!    `TableMetadata::default_partition_type`), so this table keys rows by the file's OWN partition `Struct`
-//!    and uses the DEFAULT partition type for the `partition` column's schema. This is correct for the
-//!    single-spec (no partition-evolution) case. Under partition EVOLUTION (multiple specs with differently
-//!    shaped partition tuples) the rows are not coerced into a unified type — a known divergence deferred
-//!    until a `Partitioning.partitionType` analogue lands (tracked in GAP_MATRIX + `task/todo.md`). The
-//!    per-file `spec_id` is still reported, so no data is silently misattributed within a single spec.
-//!    What IS ported (PT-0) is the field-id half of `PartitionUtil.coercePartition`: each row's tuple is
-//!    read BY FIELD ID against the spec it was written under (see `data_file::append_partition`), so a
-//!    partition field the default type projects but that spec does not carry reads null instead of
-//!    picking up whatever value happened to sit at the same tuple position.
+//! 2. **Multi-spec partition evolution.** The `partition` column type is
+//!    [`TableMetadata::unified_partition_type`] (Java `Partitioning.partitionType`). Each file's
+//!    tuple is coerced into that type via [`crate::spec::coerce_partition`] (Java
+//!    `PartitionUtil.coercePartition`) before it is used as the rollup key, so two files in the
+//!    same logical partition written under different specs land in one row. `append_partition`
+//!    then projects the already-coerced tuple by field id (PT-0).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -57,12 +53,12 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Fields};
 use futures::{StreamExt, stream};
 
-use super::data_file::{append_partition, partition_field_ids_by_spec};
+use super::data_file::append_partition;
 use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{
     DataContentType, Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Struct,
-    StructType, Type, select,
+    StructType, Type, coerce_partition, select,
 };
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
@@ -70,27 +66,52 @@ use crate::{Error, ErrorKind, Result};
 /// The `partitions` metadata table (Java `PartitionsTable`).
 pub struct PartitionsTable<'a> {
     table: &'a Table,
+    /// Java `Partitioning.partitionType(table)` — stored so [`Self::schema`] stays infallible.
+    unified_partition_type: StructType,
 }
 
 impl<'a> PartitionsTable<'a> {
-    /// Create a new `partitions` table instance.
-    pub fn new(table: &'a Table) -> Self {
-        Self { table }
+    /// Fallible constructor: resolves the unified partition type up front.
+    ///
+    /// The DataFusion `IcebergMetadataTableProvider::try_new` is the public
+    /// fallible seam (A5). G1/G2 (`DataInvalid`) surface there via this constructor.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`TableMetadata::unified_partition_type`](crate::spec::TableMetadata::unified_partition_type).
+    pub fn try_new(table: &'a Table) -> Result<Self> {
+        let unified_partition_type = table.metadata().unified_partition_type()?;
+        Ok(Self {
+            table,
+            unified_partition_type,
+        })
     }
 
-    /// Whether the table is unpartitioned (its default partition type has no fields).
+    /// Create a new `partitions` table instance.
+    ///
+    /// Signature stays infallible (A5). On a G1/G2 table this falls back to
+    /// [`TableMetadata::default_partition_type`] so `inspect().partitions().schema()`
+    /// cannot panic; [`Self::try_new`] and `scan()` are the loud refuse paths.
+    pub fn new(table: &'a Table) -> Self {
+        match Self::try_new(table) {
+            Ok(this) => this,
+            Err(_) => Self {
+                table,
+                unified_partition_type: table.metadata().default_partition_type().clone(),
+            },
+        }
+    }
+
+    /// Whether the unified partition type has no fields (Java
+    /// `Partitioning.partitionType(table).fields().isEmpty()`).
     fn is_unpartitioned(&self) -> bool {
-        self.table
-            .metadata()
-            .default_partition_type()
-            .fields()
-            .is_empty()
+        self.unified_partition_type.fields().is_empty()
     }
 
     /// Returns the iceberg schema of the `partitions` metadata table.
     ///
     /// The 11 fields are in Java `PartitionsTable` COLUMN order with the EXACT (non-sequential) Java field
-    /// ids: `partition`/1 (struct = the table's default partition type, REQUIRED), `spec_id`/4 int,
+    /// ids: `partition`/1 (struct = the table's unified partition type, REQUIRED), `spec_id`/4 int,
     /// `record_count`/2 long, `file_count`/3 int, `total_data_file_size_in_bytes`/11 long,
     /// `position_delete_record_count`/5 long, `position_delete_file_count`/6 int,
     /// `equality_delete_record_count`/7 long, `equality_delete_file_count`/8 int, `last_updated_at`/9
@@ -99,7 +120,7 @@ impl<'a> PartitionsTable<'a> {
     /// For an UNPARTITIONED table Java `TypeUtil.select`s only the count/timestamp columns —
     /// field ids 2, 3, 11, 5, 6, 7, 8, 9, 10 — dropping `partition`/1 and `spec_id`/4.
     pub fn schema(&self) -> Schema {
-        let partition_type = self.table.metadata().default_partition_type().clone();
+        let partition_type = self.unified_partition_type.clone();
 
         let fields = vec![
             Arc::new(NestedField::required(
@@ -184,9 +205,11 @@ impl<'a> PartitionsTable<'a> {
     /// current snapshot) yields one empty batch.
     pub async fn scan(&self) -> Result<ArrowRecordBatchStream> {
         let metadata = self.table.metadata();
-        let partition_type = metadata.default_partition_type().clone();
+        let partition_type = self.unified_partition_type.clone();
+        let current_schema = metadata.current_schema();
 
-        // Aggregate the live entries by partition value.
+        // Aggregate the live entries by coerced partition value (Java
+        // `PartitionUtil.coercePartition` into `Partitioning.partitionType`).
         let mut partitions: HashMap<Struct, Partition> = HashMap::new();
         if let Some(snapshot) = metadata.current_snapshot() {
             let manifest_list = snapshot
@@ -205,7 +228,24 @@ impl<'a> PartitionsTable<'a> {
                         continue;
                     }
                     let data_file = entry.data_file();
-                    let key = data_file.partition().clone();
+                    let spec = metadata
+                        .partition_spec_by_id(data_file.partition_spec_id)
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "data file {} was written under partition spec id {}, which is not in the table metadata",
+                                    data_file.file_path(),
+                                    data_file.partition_spec_id
+                                ),
+                            )
+                        })?;
+                    let key = coerce_partition(
+                        &partition_type,
+                        spec,
+                        current_schema,
+                        data_file.partition(),
+                    )?;
                     let partition = partitions
                         .entry(key.clone())
                         .or_insert_with(|| Partition::new(key));
@@ -266,10 +306,14 @@ impl<'a> PartitionsTable<'a> {
         rows: &[Partition],
     ) -> Result<RecordBatch> {
         let unpartitioned = self.is_unpartitioned();
-        // Each rolled-up row's tuple is aligned to the spec it was written under, so the projection
-        // reads it BY FIELD ID (Java `PartitionUtil.coercePartition`) — see
-        // `data_file::append_partition`. The row KEY is still the raw per-file tuple (divergence 2).
-        let partition_field_ids = partition_field_ids_by_spec(self.table.metadata());
+        // Row keys are already coerced into the unified type, so `append_partition`'s
+        // field-id walk is an identity map (PT-0 still runs; the source ids are the
+        // unified field ids in unified order).
+        let unified_field_ids: Vec<i32> = partition_type
+            .fields()
+            .iter()
+            .map(|field| field.id)
+            .collect();
         let mut partition = if unpartitioned {
             None
         } else {
@@ -293,17 +337,7 @@ impl<'a> PartitionsTable<'a> {
 
         for row in rows {
             if let Some(partition) = partition.as_mut() {
-                let source_field_ids =
-                    partition_field_ids.get(&row.spec_id).ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "partition row references partition spec id {}, which is not in the table metadata",
-                                row.spec_id
-                            ),
-                        )
-                    })?;
-                append_partition(partition, partition_type, source_field_ids, &row.key)?;
+                append_partition(partition, partition_type, &unified_field_ids, &row.key)?;
             }
             if let Some(spec_id) = spec_id.as_mut() {
                 spec_id.append_value(row.spec_id);
@@ -448,12 +482,15 @@ mod tests {
     use arrow_array::types::{Int32Type, Int64Type, TimestampMicrosecondType};
     use futures::TryStreamExt;
 
+    use crate::ErrorKind;
     use crate::arrow::UTC_TIME_ZONE;
+    use crate::inspect::PartitionsTable;
     use crate::scan::ArrowRecordBatchStream;
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
-        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Snapshot, Struct,
+        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, PrimitiveType, Snapshot, Struct,
+        Type,
     };
     use crate::table::Table;
 
@@ -1344,6 +1381,128 @@ mod tests {
         assert_eq!(
             compare_partition_values(&one_string("banana"), &one_string("banana")),
             Ordering::Equal
+        );
+    }
+
+    /// Java `Partitioning.partitionType` / `PartitionsTable.schema` after
+    /// `testPartitionTypeWithSpecEvolutionInV1Tables`-shaped widening: the
+    /// `partition` column is the TWO-field unified type, not the default spec's
+    /// type alone.
+    #[test]
+    fn test_partitions_schema_uses_unified_type_under_widening_evolution() {
+        let fixture = TableTestFixture::new_with_widening_spec_evolution();
+        let schema = fixture.table.inspect().partitions().schema();
+        let partition = schema
+            .field_by_name("partition")
+            .expect("partition column present");
+        let Type::Struct(partition_type) = partition.field_type.as_ref() else {
+            panic!("partition column must be a struct");
+        };
+        assert_eq!(
+            partition_type.fields().len(),
+            2,
+            "unified type is {{x, y_bucket_8}}, not the default spec alone"
+        );
+        assert_eq!(partition_type.fields()[0].id, 1000);
+        assert_eq!(partition_type.fields()[0].name, "x");
+        assert_eq!(
+            partition_type.fields()[0].field_type.as_ref(),
+            &Type::Primitive(PrimitiveType::Long)
+        );
+        assert_eq!(partition_type.fields()[1].id, 1001);
+        assert_eq!(partition_type.fields()[1].name, "y_bucket_8");
+        assert_eq!(
+            partition_type.fields()[1].field_type.as_ref(),
+            &Type::Primitive(PrimitiveType::Int)
+        );
+        assert!(schema.field_by_name("spec_id").is_some());
+    }
+
+    /// Java `PartitionUtil.coercePartition`: a spec-0 file's 1-tuple null-fills
+    /// the extra unified field; a spec-1 file carries both values. Two files
+    /// that coerce to different tuples stay two rows.
+    #[tokio::test]
+    async fn test_partitions_scan_coerces_widening_evolution() {
+        let mut fixture = TableTestFixture::new_with_widening_spec_evolution();
+        fixture.setup_widening_spec_manifests().await;
+
+        let batch =
+            scan_single_batch(fixture.table.inspect().partitions().scan().await.unwrap()).await;
+        assert_eq!(batch.num_rows(), 2);
+
+        let partition = batch.column_by_name("partition").unwrap().as_struct();
+        assert_eq!(
+            partition.num_columns(),
+            2,
+            "unified partition has two fields"
+        );
+        let x = partition.column(0).as_primitive::<Int64Type>();
+        let bucket = partition.column(1).as_primitive::<Int32Type>();
+        // Sorted by coerced tuple: {7, null} before {7, 3} (null-first).
+        assert_eq!(x.value(0), 7);
+        assert!(
+            partition.column(1).is_null(0),
+            "spec-0 file null-fills bucket"
+        );
+        assert_eq!(x.value(1), 7);
+        assert_eq!(bucket.value(1), 3);
+        assert!(!partition.column(1).is_null(1));
+    }
+
+    /// Java `PartitionsTable` keeps `partition`/`spec_id` when the unified type
+    /// is non-empty even if the *current* spec is unpartitioned
+    /// (`testPartitionTypeWithSpecEvolutionInV1Tables` end state).
+    #[test]
+    fn test_partitions_schema_keeps_columns_when_evolved_to_unpartitioned() {
+        let fixture = TableTestFixture::new_evolved_to_unpartitioned();
+        let schema = fixture.table.inspect().partitions().schema();
+        assert!(
+            schema.field_by_name("partition").is_some(),
+            "historical spec 0 keeps the partition column"
+        );
+        assert!(
+            schema.field_by_name("spec_id").is_some(),
+            "historical spec 0 keeps spec_id"
+        );
+        let partition = schema.field_by_name("partition").unwrap();
+        let Type::Struct(partition_type) = partition.field_type.as_ref() else {
+            panic!("partition column must be a struct");
+        };
+        assert_eq!(partition_type.fields().len(), 1);
+        assert_eq!(partition_type.fields()[0].id, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_partitions_scan_keeps_partition_when_evolved_to_unpartitioned() {
+        let mut fixture = TableTestFixture::new_evolved_to_unpartitioned();
+        fixture.setup_evolved_to_unpartitioned_file().await;
+
+        let batch =
+            scan_single_batch(fixture.table.inspect().partitions().scan().await.unwrap()).await;
+        assert_eq!(batch.num_rows(), 1);
+        assert!(
+            batch.column_by_name("partition").is_some(),
+            "scan must keep partition when unified type is non-empty"
+        );
+        assert!(batch.column_by_name("spec_id").is_some());
+        assert_eq!(partition_x_values(&batch), vec![7]);
+    }
+
+    /// `try_new` is the G2 refuse path. `new_with_two_identity_specs` is a
+    /// Java-invalid unifier input (field id 1000 reused for two sources) and
+    /// is used here ONLY as a refusal pin, never as a successful unifier input.
+    #[test]
+    fn test_partitions_try_new_refuses_conflicting_field_ids() {
+        let fixture = TableTestFixture::new_with_two_identity_specs();
+        let error = match PartitionsTable::try_new(&fixture.table) {
+            Ok(_) => panic!("G2: conflicting field ids must refuse try_new"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().starts_with("Conflicting partition fields"),
+            "message was: {}",
+            error.message()
         );
     }
 }

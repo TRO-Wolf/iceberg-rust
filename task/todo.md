@@ -31,6 +31,20 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-16): PT increment B — `partitions` adopts the unified type
+
+Branch: `grok/c16-partitions-unified` off the #202 squash-merge. Java `PartitionsTable` +
+`PartitionUtil.coercePartition` rollup.
+
+- [x] `PartitionsTable::try_new` stores `unified_partition_type`; `schema()` stays
+      infallible; `new()` falls back on G1/G2 so the inspect API cannot panic.
+      `IcebergMetadataTableProvider::try_new` is the fallible seam.
+- [x] `is_unpartitioned` / schema / scan use the unified type; rollup keyed on
+      `coerce_partition`. Module-doc scoping note replaced with a parity statement.
+- [x] Fixtures 1 + 5 in `scan/partitioning_fixtures.rs` (A8). `new_with_two_identity_specs`
+      used only as a `try_new` G2 refusal pin.
+- [x] GAP_MATRIX R142 + `inspect/map.md` + `scan/map.md` lockstep.
+
 ## ACTIVE (2026-08-16): PT increment A — hoist `Partitioning` into `spec/partitioning.rs`
 
 Branch: `grok/c16-partitioning-analogue` off `250ea37f` (#201). First landable increment of

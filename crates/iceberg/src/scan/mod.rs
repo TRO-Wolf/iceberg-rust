@@ -28,6 +28,8 @@ pub use batch::*;
 pub use incremental::*;
 mod metrics_collector;
 mod partition_work;
+#[cfg(test)]
+pub mod partitioning_fixtures;
 mod task;
 mod task_group;
 
