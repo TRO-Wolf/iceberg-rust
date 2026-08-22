@@ -191,7 +191,8 @@ taxonomy's table rows don't spell out:
 
 > **In this repo, the Critic is a mandatory *independent* agent on Opus** (`OO` =
 > Opus–Opus; [binding-manifest.md](../binding-manifest.md) *Sub-agent / tier policy*;
-> [CLAUDE.md](../../../CLAUDE.md) `<subagent_policy>`). The single-agent role-shift below is
+> [AGENTS.md](../../../AGENTS.md) `<subagent_policy>` for the neutral rule,
+> [CLAUDE.md](../../../CLAUDE.md) for the Claude-tier mapping). The single-agent role-shift below is
 > the fallback for trivial work that never reaches a PR — do **not** use it in place of
 > the independent Critic for anything that ships.
 

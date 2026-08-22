@@ -50,7 +50,7 @@
 # COW-DELETE leg green, so the >0 failures can only come from the null-tuple assertions.
 # Each leg: corrupt → re-run Java verify → assert >0 failures → restore → re-run → assert GREEN.
 # If the corruption cannot be applied (file absent), the script exits non-zero (HARD-FAIL per
-# CLAUDE.md — a sabotage that cannot be applied must FAIL, not skip).
+# AGENTS.md — a sabotage that cannot be applied must FAIL, not skip).
 #
 # TEST-ONLY ORACLE (dev tool); not in the offline gate; nothing binary committed; temp dir
 # gitignored.  Without ICEBERG_INTEROP_PART_DML_GEN_DIR the Rust GEN test is a clean no-op.

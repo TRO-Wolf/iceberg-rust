@@ -48,7 +48,7 @@ exceptions = [
 # without a sanctioned dependency sync.
 unmaintained = "workspace"
 # Known advisories in the pinned 0.9.1-era lockfile, recorded 2026-07-10 (audit remediation
-# Tier 3). Dependency bumps are out of policy for routine work (see CLAUDE.md); each entry
+# Tier 3). Dependency bumps are out of policy for routine work (see AGENTS.md); each entry
 # below is a deliberate, dated acceptance — remove it when the next sanctioned dependency
 # sync clears the affected crate. New advisories NOT in this list fail the gate.
 ignore = [

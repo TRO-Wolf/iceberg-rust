@@ -25,7 +25,7 @@ Per-model-tier operating manuals: the portable engineering contract (reasoning
 and planning, naming, Rust/Python rules, debugging protocol, verification
 gates, the `map.md` convention itself) — plus the lessons-compaction procedure
 the manuals' §2 points to. Read the manual matching the model you are running
-as, **after** root [CLAUDE.md](../CLAUDE.md). CLAUDE.md wins on any conflict
+as, **after** root [AGENTS.md](../AGENTS.md). AGENTS.md wins on any conflict
 (it is repo-specific; these are portable defaults).
 
 This directory also hosts [sepmo/](sepmo/) — the **SEPMO control plane** (the lifecycle/governance
@@ -50,10 +50,10 @@ The four manuals are variants of the same contract; **the rules are identical** 
 | I want to... | go to |
 |---|---|
 | Read my manual | the file matching my model tier (Mythos-class → `Fable.md`) |
-| Find the `map.md` convention spec | any of the four (Navigation section) — but the repo's authoritative rule is in [CLAUDE.md](../CLAUDE.md) `<map_md_navigation>` |
+| Find the `map.md` convention spec | any of the four (Navigation section) — but the repo's authoritative rule is in [AGENTS.md](../AGENTS.md) `<map_md_navigation>` |
 | Find the testing-discipline contract (mandatory before any code change) | [docs/testing.md](../docs/testing.md) (referenced from each manual's verification gate) |
-| Resolve a manual-vs-repo conflict | [CLAUDE.md](../CLAUDE.md) (it wins) |
-| Know the sub-agent / parallelism policy | [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single agent for small stuff; a PR-shipping Actor–Critic cycle has a mandatory independent Critic, and a spawned Actor + Critic **default to Opus** (`OO` = Opus–Opus). (Each manual's Workflow Orchestration section points here; `Fable.md`'s Frontier Addendum adds: never spawn Fable-tier sub-agents above Opus unless the user names the tier.) |
+| Resolve a manual-vs-repo conflict | [AGENTS.md](../AGENTS.md) (it wins) |
+| Know the sub-agent / parallelism policy | [AGENTS.md](../AGENTS.md) `<subagent_policy>` — the neutral rule: single agent for small stuff; a PR-shipping Actor–Critic cycle has a mandatory independent Critic; both roles default to the frontier tier. The **Claude-tier mapping** (`OO` = Opus–Opus, `model: "opus"`) is tool mechanics and lives in the Claude adapter, [CLAUDE.md](../CLAUDE.md). (Each manual's Workflow Orchestration section points here; `Fable.md`'s Frontier Addendum adds: never spawn Fable-tier sub-agents above Opus unless the user names the tier.) |
 | Find the plan / lessons workflow | [task/todo.md](../task/todo.md) + [task/lessons.md](../task/lessons.md) (each manual's Workflow Storage section) |
 | Compact the lessons file / decide what to archive | [compaction.md](compaction.md) — its own scoped change, interactive-approval-only |
 | Find an old archived lesson | [task/lessons-archive/map.md](../task/lessons-archive/map.md) (archives are read on demand, never by default — see [compaction.md](compaction.md)) |
@@ -61,8 +61,8 @@ The four manuals are variants of the same contract; **the rules are identical** 
 
 ## Pointers
 
-- **Up:** repo root [CLAUDE.md](../CLAUDE.md).
-- **Related:** [docs/testing.md](../docs/testing.md) (the verification gate); [task/](../task/) (plan + lessons + lessons-archive). CLAUDE.md's read-order section sequences these into a session.
+- **Up:** repo root [AGENTS.md](../AGENTS.md).
+- **Related:** [docs/testing.md](../docs/testing.md) (the verification gate); [task/](../task/) (plan + lessons + lessons-archive); [.agents/skills/map.md](../.agents/skills/map.md) (a **separate** tree — the agent-facing review procedures, symlinked into `.claude/skills`; these tier manuals are not). AGENTS.md's `<read_order>` sequences these into a session.
 
 ## Debug
 
@@ -70,17 +70,17 @@ The four manuals are variants of the same contract; **the rules are identical** 
 
 | Symptom | Likely cause |
 |---|---|
-| Following a manual rule that contradicts the repo | CLAUDE.md overrides the manual — re-check CLAUDE.md. |
+| Following a manual rule that contradicts the repo | AGENTS.md overrides the manual — re-check AGENTS.md. |
 | Unsure which manual applies | Match the running model tier (Mythos-class → `Fable.md`); if unknown, default to `Opus.md` (fullest). |
 | Session-start lessons read is consuming excessive context | A compaction trigger has likely fired — check [compaction.md](compaction.md) triggers; propose a pass (do not run one mid-increment). |
 | A needed lesson seems to be missing from `task/lessons.md` | It may have been promoted or archived — check the compaction header at the top of [task/lessons.md](../task/lessons.md), then [task/lessons-archive/map.md](../task/lessons-archive/map.md). |
-| A manual link doesn't resolve | The bundle expects to live at the repo root (`CLAUDE.md`, `skills/`, `docs/`, `task/` as siblings). Confirm the layout. |
+| A manual link doesn't resolve | The bundle expects to live at the repo root (`AGENTS.md`, `skills/`, `docs/`, `task/` as siblings). Confirm the layout. |
 
 ### First checks
 
-- Did you read root `CLAUDE.md` first? It sets precedence and the `map.md` rule.
+- Did you read root `AGENTS.md` first? It sets precedence and the `map.md` rule.
 
 ### Escalate to
 
-- Conflicts / precedence → [CLAUDE.md](../CLAUDE.md).
+- Conflicts / precedence → [AGENTS.md](../AGENTS.md).
 - Unresolved → open an issue.

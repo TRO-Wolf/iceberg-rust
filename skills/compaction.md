@@ -57,7 +57,7 @@ works." Tests for promotability:
 - It names a *class* of mistake, not one instance ("strict `<` on wall-clock millis is flaky" —
   class; "Increment 9's third test was flaky" — instance).
 - It has *recurred*, or its first occurrence was expensive enough that one occurrence suffices.
-- It contradicts or refines a rule already in a manual / `CLAUDE.md` / a `map.md` — in which case
+- It contradicts or refines a rule already in a manual / `AGENTS.md` / a `map.md` — in which case
   promotion is mandatory, because two sources now disagree and the precedence chain only works if
   the canonical home is correct.
 
@@ -69,9 +69,9 @@ the manuals, which are read even more often than the lessons file.
 | The lesson is about... | Promote into... |
 |---|---|
 | A repo-wide engineering rule (testing discipline, error handling, style) | The relevant section of the tier manuals ([skills/](.)) — all variants, since the rules are identical across tiers |
-| Repo intent, precedence, prohibitions, build/test behavior | [CLAUDE.md](../CLAUDE.md) (it wins all conflicts, so it must stay correct) |
+| Repo intent, precedence, prohibitions, build/test behavior | [AGENTS.md](../AGENTS.md) (it wins all conflicts, so it must stay correct) |
 | A failure mode, first-check, or escalation specific to one directory | That directory's `map.md` **`## Debug`** section — this is the highest-value target; most REVIEWER lessons are really debug knowledge with a home address |
-| A library API correction (§7) | The directory `map.md` of the code that uses it, or `CLAUDE.md` if repo-wide |
+| A library API correction (§7) | The directory `map.md` of the code that uses it, or `AGENTS.md` if repo-wide |
 | Testing-specific discipline | [docs/testing.md](../docs/testing.md) |
 | A capability-status fact ("X actually works / doesn't") | [docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md), date-stamped per its provenance rule |
 
@@ -87,7 +87,7 @@ Run a compaction pass when **any** of these holds; do not run one mid-increment.
    procedure was written.)
 2. **Phase boundary:** a Roadmap phase completes. Phase-scoped narratives are spent by
    definition; this is the natural archive line and pairs with the GAP_MATRIX re-audit that
-   `CLAUDE.md` already requires at phase end.
+   `AGENTS.md` already requires at phase end.
 3. **Staleness:** the oldest KEEP-by-recency entry is more than **30 days** old and the file has
    grown since the last pass.
 4. **On request:** the user asks for one.
@@ -183,7 +183,7 @@ treated with the same care as a destructive operation, even though nothing is de
 
 - **Summarize instead of archive.** "Condensed 30 entries into 5 themes" destroys the specific
   reproduction details that made the lessons useful. Promotion distills; archiving preserves.
-- **Promote eagerly to shrink the file.** The manuals and `CLAUDE.md` are read more often than
+- **Promote eagerly to shrink the file.** The manuals and `AGENTS.md` are read more often than
   the lessons file — moving noise upstream makes the problem worse everywhere.
 - **Compact mid-increment.** In-flight context is exactly what the recency window protects.
 - **Skip the conservation check because the diff "looks right".** The check exists because a
@@ -289,7 +289,7 @@ Treated with the same care as lessons compaction (it edits the plan every future
 5. **Build the active file:** intro + the active-sprint section(s) + the Carried-forward section +
    the Archived-narratives pointer section. Target: **well under ~500 lines.**
 6. **Create/update `task/todo-archive/map.md`** in the same change.
-7. **`typos` clean** and the chained-gate commit (CLAUDE.md Working conventions).
+7. **`typos` clean** and the chained-gate commit (AGENTS.md Working conventions).
 
 ## Done gate for a todo-archival pass
 

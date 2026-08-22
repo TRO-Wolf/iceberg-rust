@@ -61,7 +61,7 @@ Resolved for this repo by `../binding-manifest.md` row *Engineering contract*
 **Condition:** the same capability status or fact appears in two or more
 locations.
 
-**Canonical rule:** `../../../CLAUDE.md` *Working conventions* — "One home per fact
+**Canonical rule:** `../../../AGENTS.md` *Working conventions* — "One home per fact
 (de-triplication rule)." The capability status SSOT is named there; the Monitor
 does not restate which file it is.
 
@@ -72,7 +72,7 @@ does not restate which file it is.
 **Condition:** a `map.md` is observed (or knowingly left) out of sync with the
 directory it documents after a change to that directory.
 
-**Canonical rule:** `../../../CLAUDE.md` `<map_md_navigation>` — the code-is-truth
+**Canonical rule:** `../../../AGENTS.md` `<map_md_navigation>` — the code-is-truth
 rule and the same-change update requirement. Read the rule there.
 
 ---

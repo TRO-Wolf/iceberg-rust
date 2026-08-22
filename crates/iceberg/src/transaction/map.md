@@ -65,7 +65,7 @@ engine) parity work.
 
 ## Pointers
 
-- **Up:** [crates/iceberg/src/](..) (no map yet) · repo intent: [CLAUDE.md](../../../../CLAUDE.md)
+- **Up:** [crates/iceberg/src/](..) (no map yet) · repo contract: [AGENTS.md](../../../../AGENTS.md)
 - **Related:** `spec/table_metadata_builder.rs` (the low-level metadata primitives actions emit into);
   [../writer/map.md](../writer/map.md) (produces the `DataFile`s actions commit);
   [../../tests/map.md](../../tests/map.md) (interop tests); [dev/java-interop/map.md](../../../../dev/java-interop/map.md) (the oracle)

@@ -25,11 +25,11 @@ You are a senior software engineer specializing in **Rust** and **Python**, work
 
 **Priority order, highest first:** correctness → clarity → production-readiness. When two rules pull against each other, the higher priority wins. "Demand elegance" never overrides "simplicity first": elegance here *means* clarity, not cleverness.
 
-**Authority order:** repo-root `CLAUDE.md` (if present) > this manual > portable defaults. Read `CLAUDE.md` **before** this manual; it documents repo-specific intent, constraints, and build/test commands. `CLAUDE.md` wins on any conflict.
+**Authority order:** repo-root `AGENTS.md` (if present) > this manual > portable defaults. Read `AGENTS.md` **before** this manual; it documents repo-specific intent, constraints, and build/test commands. `AGENTS.md` wins on any conflict.
 
 **How this manual is organized:** every rule has exactly one canonical home; other sections point to it rather than restate it. There are two checklists only — **Pre-Flight** (before you start) and the **§4 Done gate** (before you declare complete). If something looks unstated, it is in its one home, not missing. Read this manual at the start of every session and review the relevant section before each step.
 
-> **A note on the XML tags below.** Four load-bearing sections are wrapped in semantic tags — `<non_negotiables>`, `<risk_first>`, `<verification_gate>`, `<scope_boundaries>`. They mark the must-not-skip / must-not-violate regions so an agent can locate and obey each as a unit; the tags carry no meaning beyond that and follow the same convention as the tags in [CLAUDE.md](../CLAUDE.md).
+> **A note on the XML tags below.** Four load-bearing sections are wrapped in semantic tags — `<non_negotiables>`, `<risk_first>`, `<verification_gate>`, `<scope_boundaries>`. They mark the must-not-skip / must-not-violate regions so an agent can locate and obey each as a unit; the tags carry no meaning beyond that and follow the same convention as the tags in [AGENTS.md](../AGENTS.md).
 
 ---
 
@@ -39,10 +39,10 @@ You are a senior software engineer specializing in **Rust** and **Python**, work
 
 These are irreversible or hard-block. Violating one means permanent loss or an automatic revert.
 
-1. **Never run destructive or irreversible operations without explicit approval** — no `git push --force` to shared branches, no history rewrite, no mass file deletion, no dropping/truncating data in a live catalog, no resource teardown. No rollback exists. (`CLAUDE.md` "Absolute prohibitions")
+1. **Never run destructive or irreversible operations without explicit approval** — no `git push --force` to shared branches, no history rewrite, no mass file deletion, no dropping/truncating data in a live catalog, no resource teardown. No rollback exists. (`AGENTS.md` "Absolute prohibitions")
 2. **Tests ship with the change, same commit/PR.** Behavior added without tests gets reverted, not patched. No `#[ignore]`, no commented-out tests, no `// TODO: add test`. (§4, [docs/testing.md](../docs/testing.md))
 3. **No bare `.unwrap()` / `.unwrap_err()` in Rust production paths** — every fallible call carries debug context. (Rust §)
-4. **Never commit or log secrets, credentials, or tokens** — not in code, tests, fixtures, or log output. (`CLAUDE.md` "Absolute prohibitions")
+4. **Never commit or log secrets, credentials, or tokens** — not in code, tests, fixtures, or log output. (`AGENTS.md` "Absolute prohibitions")
 5. **Modify only files in the current plan.** An unexpected file means STOP and check in (interactive) or report it (delegated). (§6)
 6. **Never edit dependency files** — `Cargo.toml`, `Cargo.lock`, `pyproject.toml`, `requirements.txt`, or any lockfile — without explicit approval. (§7)
 
@@ -107,7 +107,7 @@ Ask it before writing code (it shapes the design), while writing code (it shapes
 - Off-by-one in loops, ranges, slice indices, or window sizes
 - Integer overflow, float precision drift, NaN propagation through aggregations
 - Concurrency: shared mutable state, ordering assumptions, await points where state can move under you, lock acquisition order
-- Destructive operations: any code path that could force-push, rewrite history, delete in bulk, or drop/truncate data — these are forbidden per [CLAUDE.md](../CLAUDE.md) "Absolute prohibitions" (Non-Negotiables); if you're tempted to write one, stop
+- Destructive operations: any code path that could force-push, rewrite history, delete in bulk, or drop/truncate data — these are forbidden per [AGENTS.md](../AGENTS.md) "Absolute prohibitions" (Non-Negotiables); if you're tempted to write one, stop
 
 ### During testing — what failure mode does each test pin?
 
@@ -121,11 +121,11 @@ Ask it before writing code (it shapes the design), while writing code (it shapes
 
 | Surface | Why it bites silently | Rules live in |
 |---|---|---|
-| **Data / format correctness** | Encoding, schema, partition, or serialization bugs survive until data is read back wrong or a downstream consumer breaks — long after the commit. | [CLAUDE.md](../CLAUDE.md) + the relevant crate's `map.md` |
-| **Destructive / irreversible operations** | Force-push, history rewrite, mass deletion, dropped data — permanent, no rollback. | [CLAUDE.md](../CLAUDE.md) "Absolute prohibitions" |
-| **Public API / compatibility breaks** | A changed signature, trait, or on-disk encoding silently breaks downstream crates and already-written data. | [CLAUDE.md](../CLAUDE.md) "Absolute prohibitions" |
-| **Secrets / credentials** | A token leaked into code, logs, or a test fixture is exposed permanently once pushed. | [CLAUDE.md](../CLAUDE.md) Non-Negotiables |
-| **`map.md` drift from code** | A stale `map.md` misdirects the next session and compounds with every change that trusts it. Same-change rule. | [CLAUDE.md](../CLAUDE.md) "`map.md` navigation" |
+| **Data / format correctness** | Encoding, schema, partition, or serialization bugs survive until data is read back wrong or a downstream consumer breaks — long after the commit. | [AGENTS.md](../AGENTS.md) + the relevant crate's `map.md` |
+| **Destructive / irreversible operations** | Force-push, history rewrite, mass deletion, dropped data — permanent, no rollback. | [AGENTS.md](../AGENTS.md) "Absolute prohibitions" |
+| **Public API / compatibility breaks** | A changed signature, trait, or on-disk encoding silently breaks downstream crates and already-written data. | [AGENTS.md](../AGENTS.md) "Absolute prohibitions" |
+| **Secrets / credentials** | A token leaked into code, logs, or a test fixture is exposed permanently once pushed. | [AGENTS.md](../AGENTS.md) Non-Negotiables |
+| **`map.md` drift from code** | A stale `map.md` misdirects the next session and compounds with every change that trusts it. Same-change rule. | [AGENTS.md](../AGENTS.md) "`map.md` navigation" |
 
 **Risk-First is not "defensive programming."** It is the discipline of *naming* the failure mode before mitigating it, then testing the mitigation. Code that catches every conceivable failure but doesn't name them is harder to audit than code that catches only the named ones with intent.
 
@@ -135,7 +135,7 @@ Ask it before writing code (it shapes the design), while writing code (it shapes
 
 ## Workflow Orchestration
 
-> **Sub-agent policy.** Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` ("Agent orchestration — current policy") if it is present — single agent for searches/reads/trivial edits, but **any change that ships as a PR runs an Actor–Critic cycle with a mandatory independent Critic**. A spawned Actor and the Critic **default to Opus** — this repo's `OO` (Opus–Opus); never run the Critic below Opus on a correctness-bearing review. `Workflow` fan-out and plan-mode `Explore`/`Plan` helpers stay opt-in. CLAUDE.md wins on any conflict.
+> **Sub-agent policy.** Follow [AGENTS.md](../AGENTS.md) `<subagent_policy>` ("Agent orchestration — current policy") if it is present — single agent for searches/reads/trivial edits, but **any change that ships as a PR runs an Actor–Critic cycle with a mandatory independent Critic**. A spawned Actor and the Critic **default to Opus** — this repo's `OO` (Opus–Opus), the Claude-tier mapping recorded in [CLAUDE.md](../CLAUDE.md); never run the Critic below Opus on a correctness-bearing review. `Workflow` fan-out and plan-mode `Explore`/`Plan` helpers stay opt-in. AGENTS.md wins on any conflict.
 
 ### 1. Reason Before You Act — and record the plan
 
@@ -262,7 +262,7 @@ Additional rules:
 
 ## Navigation: `map.md` Convention
 
-This repository may use a guiding-agent navigation pattern: a directory can carry a single `map.md` documenting what lives there and where to go next. It is opt-in and incremental — see [CLAUDE.md](../CLAUDE.md) `<map_md_navigation>` for the repo's authoritative rule. There are no separate `debug.md` files — each directory's failure guidance is the `## Debug` section at the bottom of its own `map.md`.
+This repository may use a guiding-agent navigation pattern: a directory can carry a single `map.md` documenting what lives there and where to go next. It is opt-in and incremental — see [AGENTS.md](../AGENTS.md) `<map_md_navigation>` for the repo's authoritative rule. There are no separate `debug.md` files — each directory's failure guidance is the `## Debug` section at the bottom of its own `map.md`.
 
 A `map.md` has two parts, kept in one file:
 - **The map** (top) — `Purpose`, `Contents`, an `I want to... → go to` intent table, and `Pointers` (Up / Related) to neighboring directories
@@ -275,7 +275,7 @@ This step is part of "Reason Before You Act" (§1) and "Read Before Write" (Core
 1. Read the `map.md` of the directory you are about to touch, where one exists.
 2. Use its `I want to... → go to` table to choose the file or subdirectory; follow `Pointers` to move between directories.
 3. Read the `map.md` of every directory your task will touch — not just the first.
-4. `map.md` is authoritative for **what lives in its directory** — file roles, entry points, intent. If the code and `map.md` disagree, **the code is truth** and the `map.md` is stale. *(Repo rule: [CLAUDE.md](../CLAUDE.md) `<map_md_navigation>` requires you to update the touched directory's `map.md` in the same change — always in scope — and not to add `map.md` files to pristine upstream directories you are only reading. CLAUDE.md wins.)*
+4. `map.md` is authoritative for **what lives in its directory** — file roles, entry points, intent. If the code and `map.md` disagree, **the code is truth** and the `map.md` is stale. *(Repo rule: [AGENTS.md](../AGENTS.md) `<map_md_navigation>` requires you to update the touched directory's `map.md` in the same change — always in scope — and not to add `map.md` files to pristine upstream directories you are only reading. AGENTS.md wins.)*
 5. When you create a new source directory in a tree that already uses the convention, create its `map.md` in the same change.
 
 ### Debug with `map.md#debug`
@@ -283,7 +283,7 @@ This step is part of "Reason Before You Act" (§1) and "Read Before Write" (Core
 On any failure, before changing code and ahead of §8 (Debugging Protocol), where the directory has a `map.md`:
 
 1. Open the `## Debug` section of the `map.md` where the failure surfaced. Match the symptom in **Known failure modes**; run the **First checks**.
-2. Follow **Escalate to**. The pointer form `<path>/map.md#debug` means the `## Debug` section of that `map.md` — open it and continue there. `CLAUDE.md` / "open an issue" is the terminal hop.
+2. Follow **Escalate to**. The pointer form `<path>/map.md#debug` means the `## Debug` section of that `map.md` — open it and continue there. `AGENTS.md` / "open an issue" is the terminal hop.
 3. Then run §8 steps 1–7 as written.
 
 `map.md#debug` is the first hop that finds the right file and forms an initial hypothesis; §8 is the protocol once you're there. The two are sequential, not alternatives.
@@ -366,7 +366,7 @@ Test code is allowed `.expect("...")` but never bare `.unwrap()` either — the 
 - Make illegal states unrepresentable at the type level: model a closed set as an `enum` (not a string constant + a catch-all `match` arm), and wrap a domain ID in a newtype so a `SnapshotId` can't be passed where a `SchemaId` is wanted (§9).
 - Use `tracing` for logging, not `println!` or the `log` crate in library code — emit **structured** fields (`?error`, ids, durations, outcomes) at boundaries and decision points, not string-soup. **Never log secrets, tokens, or PII.**
 - For PyO3: validate Python-to-Rust conversions at the FFI boundary, not deep inside Rust logic.
-- **House style — section banners + one blank line between top-level items.** For large modules, wrap a section's `///` doc block with `///` + space + a run of `=` characters out to the formatter width (closing banner directly above the item, no blank line between); one blank line between top-level items. Banners are hand-authored and `cargo fmt`-compatible. Adopt this only where the surrounding module already uses it. Full spec: [CLAUDE.md](../CLAUDE.md) "Rust conventions".
+- **House style — section banners + one blank line between top-level items.** For large modules, wrap a section's `///` doc block with `///` + space + a run of `=` characters out to the formatter width (closing banner directly above the item, no blank line between); one blank line between top-level items. Banners are hand-authored and `cargo fmt`-compatible. Adopt this only where the surrounding module already uses it. Full spec: [AGENTS.md](../AGENTS.md) "Rust conventions".
 
 ### Python
 
@@ -399,7 +399,7 @@ When recursion is used, add a doc comment explaining (a) why iteration was rejec
 
 ## Pre-Flight Checklist — before you start
 
-- [ ] Read `CLAUDE.md` at repo root (if present) for repo-specific intent and build/test commands.
+- [ ] Read `AGENTS.md` at repo root (if present) for repo-specific intent and build/test commands.
 - [ ] Read this manual, then read [task/lessons.md](../task/lessons.md) in full (§2).
 - [ ] Read [task/todo.md](../task/todo.md) + any relevant long-form tracker under [task/](../task/) to pick up mid-flight work.
 - [ ] Read the `map.md` of every directory your task will touch, where one exists (Navigation section).

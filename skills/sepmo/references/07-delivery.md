@@ -82,7 +82,7 @@ flag), and any dispute that is neither `WITHDRAWN` nor terminated per R6 blocks 
 ### 4 — Interop evidence for capability PRs
 
 For any PR that advances a parity capability, a byte-level interop round-trip is required (see
-`../../../CLAUDE.md` *Parity mandate* for the definition and rationale). Delivery applies that
+`../../../AGENTS.md` *Parity mandate* for the definition and rationale). Delivery applies that
 rule; it does not restate it.
 
 This criterion is not proportionality-scaled: every capability PR carries it, regardless of
@@ -98,9 +98,9 @@ When a PR's acceptance advances a capability row to done:
 
 1. Edit `../../../docs/parity/GAP_MATRIX.md` — the capability cell — and **nothing else**. Status
    lives only in the GAP_MATRIX (binding-manifest row *Status SSOT*); the
-   de-triplication rule in `../../../CLAUDE.md` *Working conventions* forbids any other location.
+   de-triplication rule in `../../../AGENTS.md` *Working conventions* forbids any other location.
 2. The flip requires both unit tests and an interop test — rule and rationale in
-   `../../../CLAUDE.md` *Parity mandate*; read it there.
+   `../../../AGENTS.md` *Parity mandate*; read it there.
 3. Record in `DELIVERY_VERDICT` that the flip was performed (`gap_matrix_flip: done`), not what
    the new cell value is — the matrix is the sole location for that content.
 
@@ -135,7 +135,7 @@ DELIVERY_VERDICT:
     provided: true | false | n/a    # n/a when required: false
     evidence_ref: >
       # Pointer to the interop test(s) or artifact proving the round-trip; omit when n/a
-      # rule home: ../../../CLAUDE.md *Parity mandate*
+      # rule home: ../../../AGENTS.md *Parity mandate*
   gap_matrix_flip: done | not_applicable
     # done: the capability row was flipped in the GAP_MATRIX cell, and nowhere else
     # not_applicable: this PR does not flip a capability row
