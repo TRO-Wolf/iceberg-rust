@@ -797,7 +797,8 @@ impl RewritePositionDeleteFiles {
 
     /// Stages S1 - S3: walk the current snapshot's manifests ONCE, collect the live PARQUET
     /// position-delete entries that pass the user `filter`, and group them by `(spec_id, partition)`.
-    /// Puffin deletion vectors (`format == Puffin`) and equality/data entries are EXCLUDED.
+    /// Equality/data entries are EXCLUDED, and so is EVERY non-Parquet position delete — Puffin
+    /// deletion vectors and V2 ORC/Avro alike (the format skip below, a fork divergence).
     ///
     /// The filter is applied PER ENTRY here (S2), not per group, because Java applies it at the
     /// `PositionDeletes` scan — strictly before `groupByPartition`. The selection is identical either
@@ -821,12 +822,30 @@ impl RewritePositionDeleteFiles {
                     continue;
                 }
                 let data_file = entry.data_file();
-                // Only PARQUET position deletes. Skip data, equality deletes, and Puffin DVs.
+                // Only PARQUET position deletes. Skip data and equality deletes here; the FORMAT
+                // skip below drops every non-Parquet position delete.
                 if data_file.content_type() != DataContentType::PositionDeletes {
                     continue;
                 }
+                // THE FORMAT SKIP — a FORK DIVERGENCE, not a port. The predicate is
+                // `file_format() != Parquet`, so it drops TWO classes of live position delete:
+                //
+                //   1. Puffin DELETION VECTORS (V3) — file-scoped, never bin-packed by this action;
+                //      compacting them is a different operation with a different output format.
+                //   2. V2 ORC and AVRO position-delete files — a legal V2 encoding this action
+                //      simply cannot read, because `compact_group` reads pairs through the parquet
+                //      reader and writes through `ParquetWriterBuilder`.
+                //
+                // JAVA'S PLANNER DOES NOT DO THIS. `BinPackRewritePositionDeletePlanner` is
+                // FORMAT-BLIND — `javap -v` over its class file yields zero case-insensitive
+                // matches for `FileFormat` or `PUFFIN`, and its `filterFiles` is size-only
+                // (`outsideDesiredFileSizeRange`). Java's DV avoidance is an all-or-nothing early
+                // exit in the SPARK action, one level above the planner ported here. So a table
+                // whose position deletes are ORC or Avro is compacted by Java and silently left
+                // alone by this action.
+                //
+                // Documented divergence, `docs/parity/GAP_MATRIX.md` row R136.
                 if data_file.file_format() != DataFileFormat::Parquet {
-                    // A Puffin DELETION VECTOR — file-scoped, never bin-packed by this action.
                     continue;
                 }
                 // S2 — the user filter, at collection (Java's scan-level `filter`).

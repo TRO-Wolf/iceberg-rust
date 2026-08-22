@@ -369,7 +369,26 @@ async fn test_rewrite_pos_deletes_gen() {
     // Build a SEPARATE compacted table so Java can read BOTH the PRE and POST tables.
     let compacted = create_table(&catalog, "rust_table_compacted", &compacted_location).await;
     let compacted = build_pre_world(&catalog, compacted).await;
+    // `.min_input_files(2)` — the ONE knob this suite needs after the size-based admission gate
+    // landed. This oracle's subject is READ IDENTITY across a compaction, not admission, so the
+    // fixture is deliberately NOT grown (growing it would re-open the Java oracle recording, and
+    // `RewritePosDeleteOracle.expectedLiveIds()` is a golden).
+    //
+    // WHY 2. Each partition carries exactly TWO ~1.4 KB position-delete files. Both are far below
+    // the resolved `min_file_size_bytes` (50331648), so both are candidates; both fit one bin under
+    // the 100 GiB group default. At the gate, of the three clauses only
+    // `enough_input_files = size > 1 && size >= min_input_files` can fire — `enough_content` needs
+    // the bin's ~2.8 KB to exceed the 67108864 target and `too_much_content` needs it to exceed the
+    // 120795955 max, and neither can. So the bin is admitted iff `2 >= min_input_files`: the
+    // admitting set is exactly `{1, 2}` (0 is rejected outright by the `min_input_files > 0`
+    // precondition), and at Java's default of 5 the bin is DECLINED — the regression this knob
+    // repairs. 2 is the MINIMUM ADMITTING RELAXATION of the gate: it is the largest floor that
+    // still admits, so it weakens the shipped default by the smallest amount that restores the
+    // pre-gate behaviour. `min_input_files(1)` would also green this suite, but it would additionally
+    // switch off the `size >= min_input_files` conjunct for every bin, which this oracle has no
+    // business doing.
     let result = RewritePositionDeleteFiles::new(compacted.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .expect("run RewritePositionDeleteFiles");
