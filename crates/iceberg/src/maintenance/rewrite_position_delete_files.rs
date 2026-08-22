@@ -179,6 +179,12 @@ use crate::{Catalog, Error, ErrorKind, Result};
 /// `BinPackRewritePositionDeletePlanner` groups by partition + spec).
 type GroupKey = (i32, Struct);
 
+/// One ADMITTED BIN as [`plan_bins`] emits it: the `(spec_id, partition)` key it was grouped under,
+/// and the member entries the packer put in this bin. Kept as one value so `compact_group` takes the
+/// bin as a UNIT — the two halves are never meaningful apart, and the seq stamp is defined over
+/// exactly this entry set (C-010).
+type AdmittedBin = (GroupKey, Vec<LiveDeleteEntry>);
+
 // ONE HOME for the four Java planner constants, imported above from the sibling template rather
 // than duplicated here: `MIN_FILE_SIZE_DEFAULT_RATIO` (0.75), `MAX_FILE_SIZE_DEFAULT_RATIO` (1.8),
 // `MIN_INPUT_FILES_DEFAULT` (5) and `MAX_FILE_GROUP_SIZE_BYTES_DEFAULT` (107374182400 = 100 GiB).
@@ -197,6 +203,45 @@ const DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT_I64: i64 = {
     assert!(default <= i64::MAX as u64);
     default as i64
 };
+
+/// Java's `SizeBasedFileRewritePlanner.writeMaxFileSize()` band ratio — the `ldc2_w // double 0.5d`
+/// the bytecode multiplies the `(max_file_size - target)` band by before adding it back to the
+/// target (offsets 0-21: `getfield targetFileSize; l2d; getfield maxFileSize; getfield
+/// targetFileSize; lsub; l2d; ldc2_w 0.5d; dmul; dadd; d2l`). PARITY-CITED, not fork-authored.
+const WRITE_MAX_FILE_SIZE_RATIO: f64 = 0.5;
+
+/// FORK-AUTHORED — **no Java analogue** (see the module rustdoc's named non-port: Java applies
+/// `inputSplitSize` on the READ side and never chunks a writer feed). The maximum number of
+/// `(file_path, pos)` pairs handed to the rolling writer in ONE `write` call.
+///
+/// WHY 256: [`RollingFileWriter::should_roll`](crate::writer::file_writer::rolling_writer) is
+/// evaluated once per `write`, so the feed granularity IS the roll granularity. A single
+/// whole-bin batch (what this action used to write) can never roll; 256 pairs bounds the batch so
+/// the check runs many times per bin while keeping the per-batch Arrow allocation trivial. It is a
+/// COUNT cap layered on top of the BYTE cap below — whichever binds first wins.
+const CHUNK_PAIRS: usize = 256;
+
+/// FORK-AUTHORED — **no Java analogue** (as [`CHUNK_PAIRS`]). The absolute ceiling on one chunk's
+/// MEASURED serialized size, `sum(file_path.len() + 8)` over the chunk.
+///
+/// WHY 16384: [`RollingFileWriter::should_roll`] is a PRE-check, so a rolled file has already
+/// exceeded the bound by at most one chunk's contribution. That overshoot must fit inside the
+/// candidate-filter headroom `max_file_size_bytes - write_max_file_size` (26843546 at the delete
+/// defaults) or a run-1 output would be re-admitted by `too_much_content` forever. 16 KiB sits
+/// three orders of magnitude below that headroom, which is the margin the convergence argument
+/// wants; it is not a Java number and must never be cited as one.
+const CHUNK_MAX_SERIALIZED_BYTES: u64 = 16384;
+
+/// FORK-AUTHORED — **no Java analogue** (as [`CHUNK_PAIRS`]). The divisor that reserves HALF the
+/// candidate-filter headroom for the Parquet FOOTER.
+///
+/// WHY 2: `should_roll` reads `current_written_size()` = `bytes_written() + in_progress_size()`
+/// (`parquet_writer.rs`), which EXCLUDES the footer — and this action inflates the footer by
+/// writing FULL untruncated `file_path` bounds (`MetricsConfig::for_position_delete`). The final
+/// `file_size_in_bytes` is therefore the roll-time size PLUS a footer, so the headroom must cover
+/// chunk AND footer. Reserving half for each gives `write_max + 2 * chunk_budget <= max_file_size`,
+/// which is why the runtime pin's overshoot ceiling is `2 * chunk_budget`.
+const CHUNK_HEADROOM_FOOTER_SHARE: u64 = 2;
 
 /// Java's `d2l` on the ratio products in `SizeBasedFileRewritePlanner.sizeThresholds` — the JVM's
 /// `(long) doubleValue`, which SATURATES at `Long.MAX_VALUE` (and at `Long.MIN_VALUE` / `0` for NaN).
@@ -316,6 +361,13 @@ struct ResolvedConfig {
     max_file_size_bytes: u64,
     min_input_files: usize,
     max_file_group_size_bytes: u64,
+    /// Java `SizeBasedFileRewritePlanner.writeMaxFileSize()` — the bound the ROLLING WRITER rolls
+    /// at, which is NOT the resolved target. Derived, never user-settable (Java has no option for
+    /// it either).
+    write_max_file_size: u64,
+    /// FORK-AUTHORED (see [`CHUNK_MAX_SERIALIZED_BYTES`]) — the per-chunk MEASURED-serialized-byte
+    /// cap for the writer feed. Derived from the candidate-filter headroom; never user-settable.
+    chunk_budget: u64,
 }
 
 /// The `RewritePositionDeleteFiles` maintenance action. Build it with [`Self::new`], optionally restrict
@@ -482,13 +534,13 @@ impl RewritePositionDeleteFiles {
         // not required for CAS correctness under the retry/refresh loop.
         let mut table = self.table.clone();
         let mut result = RewritePositionDeleteFilesResult::default();
-        for (key, bin) in bins {
+        for bin in bins {
             table = self
                 .compact_group(
                     catalog,
                     &table,
-                    &key,
                     &bin,
+                    &config,
                     starting_snapshot_id,
                     &mut result,
                 )
@@ -545,6 +597,13 @@ impl RewritePositionDeleteFiles {
     ///   Checking the overrides at read time is therefore the only placement under which each knob
     ///   reports its own rejection AND the narrowing cast is total, and it leaves the relative order
     ///   of Java's own (1) → (3) → (4) untouched.
+    ///
+    /// # Derived (not options, on either engine)
+    ///
+    /// Two more fields are computed AFTER the preconditions, because both need `target < max`:
+    /// [`ResolvedConfig::write_max_file_size`] (Java's `writeMaxFileSize()`, the ROLLING WRITER's
+    /// bound) and [`ResolvedConfig::chunk_budget`] (fork-authored, the writer feed's per-chunk byte
+    /// cap). Neither is user-settable and neither rejects a config.
     fn resolve_config(&self) -> Result<ResolvedConfig> {
         // (7) at READ time, one leg per knob, in builder-declaration order.
         if let Some(target) = self.target_file_size_bytes
@@ -641,12 +700,54 @@ impl RewritePositionDeleteFiles {
             ));
         }
 
+        // ---- Derived, AFTER every precondition (both derivations below need `target < max`) ----
+
+        // Java `writeMaxFileSize()`:
+        //   `target + (max_file_size - target) * 0.5`
+        // with the subtraction a LONG `lsub` performed BEFORE the `l2d` — hence the `u64`
+        // subtraction here, then the widening, then the same `d2l` clamp `sizeThresholds` uses. The
+        // subtraction cannot underflow: precondition (4) has just proven `target < max`.
+        //
+        // This is the bound the ROLLING WRITER rolls at, deliberately NOT the resolved target. It is
+        // what makes the fixed point STRUCTURAL rather than argued: wherever the doubles are exact,
+        // `write_max < max_file_size`, so a run-1 output is never re-admitted by `too_much_content`.
+        // (NOT universal — at `target = 2^62 + 513, max = target + 1` the `l2d` rounds the target up
+        // and `d2l` returns a value ABOVE max. Java behaves identically, so that bounds the claim
+        // rather than naming a divergence, and the `saturating_sub` below keeps the headroom sane.)
+        //
+        // SIBLING DIVERGENCE, recorded not hidden: `RewriteDataFiles` rolls at its resolved TARGET
+        // (its own named deviation), so until that template follows, the two ports roll at different
+        // bounds.
+        let write_max_file_size =
+            d2l(target as f64 + (max_file_size_bytes - target) as f64 * WRITE_MAX_FILE_SIZE_RATIO);
+
+        // The candidate-filter HEADROOM: how far a run-1 output may exceed `write_max` and still
+        // land inside `[min, max]`, where `outsideDesiredFileSizeRange` declines it forever.
+        let headroom = max_file_size_bytes.saturating_sub(write_max_file_size);
+        let chunk_budget = CHUNK_MAX_SERIALIZED_BYTES.min(headroom / CHUNK_HEADROOM_FOOTER_SHARE);
+
+        // INTENT DOCUMENTATION WITH A TRIPWIRE — and nothing more. This assert is TRIVIALLY TRUE by
+        // construction (`chunk_budget = min(_, headroom / 2) <= headroom`), so it does NOT establish
+        // the runtime clearance and must not be described as doing so: `chunk_serialized_bytes` is a
+        // per-chunk RUNTIME quantity this function cannot see, and the footer is not visible here at
+        // all. The RUNTIME clearance is established by a MEASURED-OUTPUT pin
+        // (`test_no_split_output_exceeds_max_file_size`), never by this line. What the assert buys is
+        // a loud red if a future editor changes `CHUNK_HEADROOM_FOOTER_SHARE` or rewrites the
+        // derivation in a way that stops respecting the headroom.
+        assert!(
+            chunk_budget <= headroom,
+            "the write-feed chunk budget ({chunk_budget}) must fit inside the candidate-filter \
+             headroom ({headroom} = max {max_file_size_bytes} - write_max {write_max_file_size})"
+        );
+
         Ok(ResolvedConfig {
             target_file_size_bytes: target,
             min_file_size_bytes,
             max_file_size_bytes,
             min_input_files: self.min_input_files,
             max_file_group_size_bytes: self.max_file_group_size_bytes,
+            write_max_file_size,
+            chunk_budget,
         })
     }
 
@@ -721,10 +822,17 @@ impl RewritePositionDeleteFiles {
     }
 
     /// Compact ONE ADMITTED BIN of a `(spec, partition)` group: read every member file's
-    /// `(file_path, pos)` pairs, concat + sort, write FEWER position-delete files, and commit ONE
-    /// `RewriteFiles` that replaces the rewritten files with the new one, stamped with the bin MAX
-    /// rewritten data-seq and validated from the starting snapshot. Accumulates the four `Result`
-    /// counts.
+    /// `(file_path, pos)` pairs, concat + sort, write the compacted position-delete file(s), and
+    /// commit ONE `RewriteFiles` that replaces the rewritten files with ALL of them, each stamped
+    /// with the bin MAX rewritten data-seq and validated from the starting snapshot. Accumulates the
+    /// four `Result` counts.
+    ///
+    /// The bin may produce MORE THAN ONE output file: the rolling writer rolls at
+    /// [`ResolvedConfig::write_max_file_size`], so a bin larger than that bound splits. Every output
+    /// of THIS bin carries THIS bin's own max — Java's
+    /// `RewritePositionDeletesGroup.maxRewrittenDataSequenceNumber` ranges the max over that GROUP's
+    /// task list, and one Java group IS one bin, so ranging over the whole partition (or reusing a
+    /// previous bin's max) is a stamping error, not a rounding one.
     ///
     /// Returns the committed [`Table`] so the caller can advance the base for the next group
     /// (mirrors [`crate::maintenance::rewrite_data_files::RewriteDataFiles`]).
@@ -732,11 +840,13 @@ impl RewritePositionDeleteFiles {
         &self,
         catalog: &dyn Catalog,
         table: &Table,
-        key: &GroupKey,
-        entries: &[LiveDeleteEntry],
+        bin: &AdmittedBin,
+        config: &ResolvedConfig,
         starting_snapshot_id: i64,
         result: &mut RewritePositionDeleteFilesResult,
     ) -> Result<Table> {
+        let (key, entries) = bin;
+
         // (2) Read + concat the (file_path, pos) pairs across the group.
         let mut pairs: Vec<(String, i64)> = Vec::new();
         for entry in entries {
@@ -752,15 +862,34 @@ impl RewritePositionDeleteFiles {
 
         // Spec-recommended position-delete ordering: sort by (file_path, pos). Java does NOT dedup within
         // a group (the reader bitmap dedups); we keep duplicates and only sort.
+        //
+        // GLOBAL SORT, BEFORE ANY SPLIT — load-bearing, and the one line an editor can silently
+        // break. `write_compacted_file` chunks THIS already-sorted `Vec` in order, so the bin's N
+        // outputs carry DISJOINT ASCENDING `(file_path, pos)` ranges whose union is exactly this
+        // multiset. Sorting per chunk instead, or chunking before this call, still writes every pair
+        // — so the masked row set survives — but destroys the global ordering the spec recommends
+        // and the delete-file range pruning depends on. Do not move this below the split.
         pairs.sort();
 
-        // (3) Write FEWER position-delete files (one per group) under the group spec + partition key.
-        let new_file = self.write_compacted_file(table, key, &pairs).await?;
+        // (3) Write the compacted position-delete file(s) under the group spec + partition key. The
+        // rolling writer rolls at `write_max_file_size`, so this is ONE file for a bin below that
+        // bound and N files for a bin above it.
+        let new_files = self
+            .write_compacted_file(table, key, &pairs, config)
+            .await?;
 
-        // (4) STALLER — the group MAX rewritten data sequence number. A position delete applies to data
-        // with `data_seq < delete_seq`; stamping the MAX of the rewritten group preserves exactly which
-        // data generation the compacted delete masks. A higher (inherited) seq resurrects deleted rows;
-        // a lower seq over-applies.
+        // (4) STALLER — THIS BIN's MAX rewritten data sequence number, ranged over `entries`, which
+        // IS the bin (Java `RewritePositionDeletesGroup.<init>` maxes over that group's task list,
+        // and one group is one bin). Ranging over the whole partition, or carrying a previous bin's
+        // value, is a stamping error. Stamping the MAX of the rewritten bin preserves exactly which
+        // data generation the compacted delete masks.
+        //
+        // DIRECTION OF DANGER, against the fork's OWN rule — `delete_file_index.rs`'s
+        // `applicable_pos_deletes` keeps a delete whose `delete_seq >= data_seq`. So an OVER-HIGH
+        // (e.g. inherited) stamp reaches data it never masked and OVER-APPLIES; an UNDER-LOW stamp
+        // stops applying and RESURRECTS deleted rows. Carrying a previous bin's max is the UNDER
+        // direction whenever that bin's max is the lower one, which is why C-010's ranging pin
+        // asserts the two bins' maxima DIFFER before it asserts either stamp.
         let max_seq = entries
             .iter()
             .map(|e| e.sequence_number)
@@ -772,27 +901,41 @@ impl RewritePositionDeleteFiles {
                 )
             })?;
 
-        // Accumulate the byte counts (Java `rewrittenBytesCount` / `addedBytesCount`).
+        // Accumulate the byte counts (Java `rewrittenBytesCount` / `addedBytesCount`). The added
+        // side is a CHECKED sum across the N split outputs — the guard the single-output form
+        // carried, retained at the new arity rather than replaced by a plain `sum()`.
         let rewritten_bytes: u64 = entries.iter().map(|e| e.data_file.file_size_in_bytes).sum();
         let rewritten_count = entries.len();
-        let added_bytes = new_file.file_size_in_bytes;
+        let added_count = new_files.len();
+        let mut added_bytes: u64 = 0;
+        for file in &new_files {
+            added_bytes = added_bytes
+                .checked_add(file.file_size_in_bytes)
+                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "added bytes count overflow"))?;
+        }
         let rewritten_files: Vec<DataFile> = entries.iter().map(|e| e.data_file.clone()).collect();
 
-        // (5) Commit ONE RewriteFiles per group: REPLACE the rewritten pos-deletes with the new one,
-        // stamped with the group MAX rewritten data-seq via `add_delete_file_with_sequence_number` (NOT
-        // the default-inherit add), validating from the starting snapshot (Java
-        // `newRewrite().validateFromSnapshot(J).deleteFile(rewritten).addFile(added, J).commit()`).
+        // (5) Commit ONE RewriteFiles per BIN: REPLACE the rewritten pos-deletes with ALL of this
+        // bin's outputs, EACH stamped with THIS bin's max rewritten data-seq via
+        // `add_delete_file_with_sequence_number` (NOT the default-inherit add), validating from the
+        // starting snapshot (Java `newRewrite().validateFromSnapshot(J).deleteFile(rewritten)
+        // .addFile(added, J).commit()`).
+        //
+        // `add_delete_file_with_sequence_number` PUSHES onto the action's added list, so N chained
+        // calls stamp N files with the one seq — no new transaction API is needed for the fan-out.
         let transaction = Transaction::new(table);
-        let action = transaction
+        let mut action = transaction
             .rewrite_files(Vec::new(), Vec::new())
-            .delete_delete_files(rewritten_files)
-            .add_delete_file_with_sequence_number(new_file, max_seq)
-            .validate_from_snapshot(starting_snapshot_id);
+            .delete_delete_files(rewritten_files);
+        for file in new_files {
+            action = action.add_delete_file_with_sequence_number(file, max_seq);
+        }
+        let action = action.validate_from_snapshot(starting_snapshot_id);
         let transaction = action.apply(transaction)?;
         let committed = transaction.commit(catalog).await?;
 
         result.rewritten_delete_files_count += rewritten_count;
-        result.added_delete_files_count += 1;
+        result.added_delete_files_count += added_count;
         result.rewritten_bytes_count = result
             .rewritten_bytes_count
             .checked_add(rewritten_bytes)
@@ -841,14 +984,55 @@ impl RewritePositionDeleteFiles {
         Ok(())
     }
 
-    /// Write the sorted `(file_path, pos)` pairs into ONE compacted position-delete file under the
-    /// group's spec + partition key, returning the resulting [`DataFile`].
+    /// Write the GLOBALLY SORTED `(file_path, pos)` pairs into the bin's compacted position-delete
+    /// file(s) under the group's spec + partition key, returning every resulting [`DataFile`].
+    ///
+    /// # One writer, many chunks
+    ///
+    /// `pairs` is fed to ONE [`RollingFileWriter`](crate::writer::file_writer::rolling_writer) in
+    /// bounded chunks — at most [`CHUNK_PAIRS`] pairs AND at most `config.chunk_budget` MEASURED
+    /// serialized bytes, with a floor of ONE pair so an absurdly tight budget still terminates. The
+    /// chunking exists because `should_roll` is evaluated once per `write`: the single whole-bin
+    /// batch this action used to write could never roll, whatever bound it was given.
+    ///
+    /// The writer's bound is `config.write_max_file_size` (Java `writeMaxFileSize()`), passed
+    /// EXPLICITLY — `RollingFileWriterBuilder::new_with_default_file_size` hard-wires the 512 MiB
+    /// **data** default, which is eight times the delete target and unrelated to this action.
+    ///
+    /// # The split preserves the global order
+    ///
+    /// The chunks are contiguous slices of the already-sorted `pairs`, taken front to back, so
+    /// output *k*'s `(file_path, pos)` range is entirely below output *k+1*'s and the union of the
+    /// outputs is exactly the input multiset — the masked row set is unchanged by the split.
+    ///
+    /// # Stated assumption (measured by the pins, not assumed away)
+    ///
+    /// `chunk_budget` counts RAW INPUT bytes (`file_path.len() + 8` per pair) while `should_roll`
+    /// measures OUTPUT parquet bytes. The overshoot bound therefore rests on "one chunk's parquet
+    /// contribution <= its raw bytes", which holds for a sorted dictionary/RLE-encoded path column
+    /// plus an int64 `pos` column. It is MEASURED by `test_no_split_output_exceeds_max_file_size`
+    /// rather than argued here.
+    ///
+    /// # RESIDUE (RES-8), both halves
+    ///
+    /// **Correctness half:** on an absurdly tight `[write_max, max]` band the one-pair floor, or a
+    /// footer larger than its reserved half, can still overshoot — the same best-effort class of
+    /// bound Java carries.
+    ///
+    /// **Throughput half:** `chunk_budget` resolves to `0` for any config with
+    /// `max_file_size_bytes - target_file_size_bytes <= 2`, and to `1` at `3` — in every such band
+    /// it is below one pair's serialized size, so the one-pair floor governs and the feed degrades
+    /// to ONE Arrow batch (and one `should_roll` evaluation) PER PAIR. Correct, and arbitrarily
+    /// slow. Both bands are legal under `resolve_config`'s preconditions, so this is reachable
+    /// configuration rather than a theoretical edge; it is named rather than defended against,
+    /// because clamping the budget upward would trade a throughput cliff for a correctness one.
     async fn write_compacted_file(
         &self,
         table: &Table,
         key: &GroupKey,
         pairs: &[(String, i64)],
-    ) -> Result<DataFile> {
+        config: &ResolvedConfig,
+    ) -> Result<Vec<DataFile>> {
         let metadata = table.metadata();
         let schema = metadata.current_schema().clone();
         let (spec_id, partition) = key;
@@ -863,7 +1047,7 @@ impl RewritePositionDeleteFiles {
             .as_ref()
             .clone();
 
-        let config = PositionDeleteWriterConfig::new()?;
+        let writer_config = PositionDeleteWriterConfig::new()?;
         let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
         let file_name_gen = DefaultFileNameGenerator::new(
             "compacted-pos-del".to_string(),
@@ -872,11 +1056,17 @@ impl RewritePositionDeleteFiles {
         );
         // Position-delete files keep `file_path`/`pos` bounds FULL (Java `MetricsConfig.forPositionDelete`)
         // so delete-file path pruning stays precise — the default `truncate(16)` would widen the path range.
-        let parquet_builder =
-            ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
-                .with_metrics_config(MetricsConfig::for_position_delete());
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        let parquet_builder = ParquetWriterBuilder::new(
+            position_delete_writer_properties(),
+            writer_config.schema().clone(),
+        )
+        .with_metrics_config(MetricsConfig::for_position_delete());
+        // Java `writeMaxFileSize()`, NOT the resolved target — see `ResolvedConfig`. The builder
+        // takes a `usize`, so a `write_max` above `usize::MAX` (only reachable on a 32-bit target)
+        // saturates to "never roll", which is exactly what the default constructor would have done.
+        let rolling = RollingFileWriterBuilder::new(
             parquet_builder,
+            usize::try_from(config.write_max_file_size).unwrap_or(usize::MAX),
             table.file_io().clone(),
             location_gen,
             file_name_gen,
@@ -887,32 +1077,86 @@ impl RewritePositionDeleteFiles {
         // including empty/unpartitioned and all-Void null tuples — so we never fabricate spec_id 0
         // via `build(None)` without `with_partition_spec` (C2-L-001 / C1-L-001 class).
         let partition_key = PartitionKey::new(spec, schema.clone(), partition.clone())?;
-        let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        let mut writer = PositionDeleteFileWriterBuilder::new(rolling, writer_config.clone())
             .build(Some(partition_key))
             .await?;
 
-        let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
-        let positions: Vec<i64> = pairs.iter().map(|(_, pos)| *pos).collect();
-        let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
-            Arc::new(StringArray::from(paths)) as ArrayRef,
-            Arc::new(Int64Array::from(positions)) as ArrayRef,
-        ])
-        .map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                "Failed to build compacted position-delete record batch",
-            )
-            .with_source(e)
-        })?;
-        writer.write(batch).await?;
-        let files = writer.close().await?;
-        files.into_iter().next().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Unexpected,
-                "Position-delete writer produced no file for a non-empty input",
-            )
-        })
+        // THE BOUNDED CHUNK FEED. `pairs` is already globally sorted (see `compact_group`); each
+        // chunk is the NEXT contiguous slice, so the split preserves that order.
+        let mut start = 0usize;
+        while start < pairs.len() {
+            let end = chunk_end(pairs, start, config.chunk_budget);
+            let chunk = &pairs[start..end];
+            let paths: Vec<&str> = chunk.iter().map(|(path, _)| path.as_str()).collect();
+            let positions: Vec<i64> = chunk.iter().map(|(_, pos)| *pos).collect();
+            let batch = RecordBatch::try_new(writer_config.arrow_schema().clone(), vec![
+                Arc::new(StringArray::from(paths)) as ArrayRef,
+                Arc::new(Int64Array::from(positions)) as ArrayRef,
+            ])
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to build compacted position-delete record batch",
+                )
+                .with_source(e)
+            })?;
+            writer.write(batch).await?;
+            start = end;
+        }
+
+        require_non_empty(writer.close().await?)
     }
+}
+
+/// One `(file_path, pos)` pair's MEASURED serialized size: the UTF-8 length of the path plus 8 for
+/// the `int64` position. This is the RAW INPUT measure `chunk_budget` is denominated in — see
+/// [`RewritePositionDeleteFiles::write_compacted_file`]'s stated assumption.
+fn pair_serialized_bytes(pair: &(String, i64)) -> u64 {
+    u64::try_from(pair.0.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(8)
+}
+
+/// The exclusive end of the chunk starting at `start`: at most [`CHUNK_PAIRS`] pairs, at most
+/// `chunk_budget` [`pair_serialized_bytes`], and ALWAYS at least one pair.
+///
+/// The one-pair floor is what keeps the feed loop total — `chunk_budget` can legitimately resolve to
+/// `0` (a `[write_max, max]` band narrower than two bytes), and a chunk of zero pairs would spin
+/// forever. It is also the residue RES-8 names: a single pair whose path is longer than the whole
+/// budget overshoots the bound by construction, on any config where such a band is configured.
+fn chunk_end(pairs: &[(String, i64)], start: usize, chunk_budget: u64) -> usize {
+    let limit = pairs.len().min(start.saturating_add(CHUNK_PAIRS));
+    let mut end = start;
+    let mut bytes: u64 = 0;
+    while end < limit {
+        let next = bytes.saturating_add(pair_serialized_bytes(&pairs[end]));
+        // `end > start` IS the one-pair floor: the first pair of a chunk is taken unconditionally.
+        if end > start && next > chunk_budget {
+            break;
+        }
+        bytes = next;
+        end += 1;
+    }
+    end
+}
+
+/// The FAIL-CLOSED guard on the writer's output, extracted so it survives — and stays pinnable — at
+/// the `Vec<DataFile>` arity.
+///
+/// A bin reaching here has NON-EMPTY pairs, so it must produce at least one file. "No file" is a
+/// NORMAL return from the parquet writer, not an error: `ParquetWriter::close` returns `Ok(vec![])`
+/// and DELETES the output whenever `current_row_num == 0`. Without this check `execute` would go on
+/// to commit a `Replace` snapshot that removes live position-delete files and adds none — silent
+/// UNDER-masking — and nothing downstream would reject it, because `RewriteFilesAction::validate`
+/// early-returns when `deleted_data_files` is empty, which is always true for this action.
+fn require_non_empty(files: Vec<DataFile>) -> Result<Vec<DataFile>> {
+    if files.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            "Position-delete writer produced no file for a non-empty input",
+        ));
+    }
+    Ok(files)
 }
 
 /// Stage S2's evaluator: the user `filter`, bound ONCE to the table schema, plus the projected +
@@ -1012,8 +1256,8 @@ fn build_partition_evaluator(
 fn plan_bins(
     groups: HashMap<GroupKey, Vec<LiveDeleteEntry>>,
     config: &ResolvedConfig,
-) -> Vec<(GroupKey, Vec<LiveDeleteEntry>)> {
-    let mut admitted: Vec<(GroupKey, Vec<LiveDeleteEntry>)> = Vec::new();
+) -> Vec<AdmittedBin> {
+    let mut admitted: Vec<AdmittedBin> = Vec::new();
 
     for (key, entries) in groups {
         // S4 — the candidate filter.

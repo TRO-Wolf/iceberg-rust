@@ -422,10 +422,16 @@ async fn test_crown_jewel_read_identity_data_file_masked_by_two_pos_deletes() {
 // =================================================================================================
 
 /// SEQ STAMPING (the silent-corruption staller). Data X is at seq 1; two pos-deletes mask it at seqs 2
-/// and 3. The compacted file MUST carry the group MAX rewritten data seq (3) — NOT the inherited
+/// and 3. The compacted file MUST carry the BIN MAX rewritten data seq (3) — NOT the inherited
 /// (higher) rewrite-snapshot seq, NOT the min (2). If it carried the inherited seq it would still apply
 /// here (4 > 1) so the read would look fine — this test therefore asserts the EXACT stamped seq is 3,
 /// pinning the precise stamp.
+///
+/// C-010 element 1 — the ONE-OUTPUT bin, which fixes the stamp's BASE VALUE. The two other elements
+/// fix the other two dimensions: `test_every_split_output_carries_bin_max_rewritten_seq` the FAN-OUT
+/// (every output of a split bin, not just the first) and
+/// `test_each_bin_output_carries_its_own_bin_max_not_the_partition_max` the RANGING (this bin's
+/// entries, not the partition's).
 ///
 /// MUTATION COVERAGE: change `add_delete_file_with_sequence_number(.., max_seq)` to
 /// `add_delete_file(..)` (inherit) and the live compacted pos-delete seq becomes the rewrite snapshot's
@@ -436,7 +442,7 @@ async fn test_crown_jewel_read_identity_data_file_masked_by_two_pos_deletes() {
 /// also acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that
 /// knob must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
 #[tokio::test]
-async fn test_compacted_file_carries_group_max_rewritten_seq() {
+async fn test_compacted_file_carries_bin_max_rewritten_seq() {
     let (catalog, _temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
 
@@ -464,7 +470,7 @@ async fn test_compacted_file_carries_group_max_rewritten_seq() {
     assert_eq!(
         seqs.iter().copied().max(),
         Some(3),
-        "fixture: the group MAX rewritten pos-delete seq is 3"
+        "fixture: this bin's MAX rewritten pos-delete seq is 3"
     );
 
     let before = scan_y_values(&table).await;
@@ -490,7 +496,7 @@ async fn test_compacted_file_carries_group_max_rewritten_seq() {
     assert_eq!(
         pos_entries[0].1,
         Some(3),
-        "the compacted pos-delete MUST carry the group MAX rewritten data seq (3), \
+        "the compacted pos-delete MUST carry the BIN MAX rewritten data seq (3), \
          not the inherited rewrite seq and not the min"
     );
 
@@ -2441,6 +2447,8 @@ async fn test_group_input_size_saturates_not_wraps() {
         // Above the bin size, so `enough_input_files` cannot be the admitter under EITHER arithmetic.
         min_input_files: 10,
         max_file_group_size_bytes: 1_000_000,
+        write_max_file_size: 550,
+        chunk_budget: 225,
     };
 
     assert!(
@@ -2483,6 +2491,10 @@ fn white_box_gate_config() -> ResolvedConfig {
         max_file_size_bytes: 1_000,
         min_input_files: 10,
         max_file_group_size_bytes: 1_000_000,
+        // Java `writeMaxFileSize()` = 100 + (1000 - 100) * 0.5. Neither gate leaf reads it.
+        write_max_file_size: 550,
+        // min(16384, (1000 - 550) / 2). Neither gate leaf reads it either.
+        chunk_budget: 225,
     }
 }
 
@@ -2535,5 +2547,1318 @@ async fn test_gate_enough_content_size_guard_declines_lone_over_target_file_whit
     assert!(
         !group_qualifies(&bin, &config),
         "a LONE file above the target is declined by enough_content's `size > 1` conjunct"
+    );
+}
+
+// =================================================================================================
+// G3 — THE WRITER. C-009 (the roll bound), C-025 (the bounded chunk feed), C-026 (the fixed point),
+// C-044 (global sort before split), C-046 (the fail-closed guard at the new arity), C-010 (the
+// `Vec<DataFile>` fan-out and the BIN-max stamp).
+//
+// FIXTURE DISCIPLINE (C-036, N-C2, N-C3). Recipes 3 and 9 derive their target `T` from the fixture's
+// MEASURED size, which makes every `S`- or `B`-relative window an ALGEBRAIC IDENTITY that can never
+// red. Those windows are RECORDED in prose as true by construction and are NOT asserted; the
+// falsifiable content of both recipes lives on the MEASURED OUTPUTS instead.
+//
+// DISCLOSURE — C-036's NINE-RECIPE ENUMERATION IS INCOMPLETE, and by its own rule ("a pin needing a
+// tenth recipe is a finding") that is a finding, filed here rather than left silent. This group
+// needed THREE size-class fixtures the nine do not describe, named below at their definition sites:
+//
+//   * RECIPE 10 — the SMALL-EXPLICIT-BAND SPLIT (`split_fixture_run`). Two sub-min files in one bin
+//     at `min = 0.55C / target = 0.60C / max = 0.75C`, `min_input_files(2)`. An ENGINEERING CHOICE,
+//     not a clause requirement: it is the cheap counterpart to recipe 3, carrying four split pins at
+//     ~0.24 MB instead of ~4.7 MB. Recipe 3 keeps the two assertions that genuinely need the wide
+//     DEFAULT band (outputs inside `[min, max]`, and the fixed point).
+//   * RECIPE 11 — FIVE BINS OF ONE, each splitting to a sub-min tail (C-026 counterexample 2).
+//   * RECIPE 12 — TWO BINS OF ONE, each splitting to a sub-min tail (C-026 counterexample 3).
+//
+// Recipes 11 and 12 are MANDATED BY C-026's own pin form — it names both counterexamples and
+// requires them pinned — while C-036 describes no fixture that can build either. That half is a
+// ledger-completeness defect this build surfaced, not a scope escape. The ledger edit is outside
+// this unit's two-file fence and is carried as a hand-off.
+// =================================================================================================
+
+/// Every live PARQUET position-delete file in the current snapshot.
+async fn live_pos_delete_files(table: &Table) -> Vec<DataFile> {
+    live_delete_files(table)
+        .await
+        .into_iter()
+        .filter(|f| f.content_type() == DataContentType::PositionDeletes)
+        .collect()
+}
+
+/// Read one position-delete file's `(file_path, pos)` pairs back off disk, by RESERVED FIELD ID —
+/// the same way the action reads them. This is what turns "two files exist" into "these exact pairs
+/// are in these exact files", which is what C-044's ordering pin needs.
+async fn read_pos_delete_pairs(table: &Table, delete_file: &DataFile) -> Vec<(String, i64)> {
+    let loader = BasicDeleteFileLoader::new(table.file_io().clone());
+    let mut stream = loader
+        .parquet_to_batch_stream(delete_file.file_path(), delete_file.file_size_in_bytes)
+        .await
+        .expect("open the compacted position-delete file");
+    let mut pairs = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.expect("read a compacted position-delete batch");
+        let (path_col, pos_col) =
+            locate_reserved_columns(&batch, delete_file.file_path()).expect("reserved columns");
+        for row in 0..batch.num_rows() {
+            pairs.push((path_col.value(row).to_string(), pos_col.value(row)));
+        }
+    }
+    pairs
+}
+
+/// The live position-delete files with their pairs, in WRITE order — sorted by each file's FIRST
+/// pair, not by manifest order, which does not track the order the rolling writer produced them in.
+/// Every "first output" / "output k vs k+1" assertion below is made through this, so none of them
+/// silently depends on a manifest ordering nobody pinned.
+async fn outputs_in_write_order(table: &Table) -> Vec<(DataFile, Vec<(String, i64)>)> {
+    let mut outputs = Vec::new();
+    for file in live_pos_delete_files(table).await {
+        let pairs = read_pos_delete_pairs(table, &file).await;
+        outputs.push((file, pairs));
+    }
+    outputs.sort_by(|a, b| a.1.first().cmp(&b.1.first()));
+    outputs
+}
+
+/// Write ONE position-delete file holding `path_count` pairs, each naming a DISTINCT data-file path.
+///
+/// This is C-036's dictionary-defeating size dial: `write_sized_pos_delete` grows the `pos` column
+/// against ONE repeated path, which dictionary-encodes to a single value, so it cannot reach the
+/// multi-megabyte size class recipe 3 needs. Growing the PATH COUNT is what recipe 3 mandates —
+/// never growing the knobs, which is what would make the window tautological.
+async fn write_wide_path_pos_delete(table: &Table, path_count: i64) -> DataFile {
+    let base = format!("{}/data", table.metadata().location());
+    let paths: Vec<String> = (0..path_count)
+        .map(|i| format!("{base}/wide-{i:012}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.parquet"))
+        .collect();
+    let pairs: Vec<(&str, i64)> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, path)| (path.as_str(), i as i64))
+        .collect();
+    write_position_delete_file(table, Some(0), &pairs).await
+}
+
+/// C-036 RECIPE 3 — the LONE OVERSIZED file, WIDE BAND.
+///
+/// ONE position-delete file whose MEASURED size `S` clears `240 * CHUNK_MAX_SERIALIZED_BYTES`
+/// (3_932_160), built by growing the DISTINCT PATH COUNT. Only `.target_file_size_bytes(T)` is set,
+/// with `T = S * 10 / 24`; min / max are DEFAULTED, giving `min = 0.75T`, `max = 1.8T`,
+/// `write_max = 1.4T` and — since `(max - write_max) / 2 = 0.2T` is far above the cap —
+/// `chunk_budget = 16384`.
+///
+/// RECORDED as TRUE BY CONSTRUCTION and deliberately NOT asserted, because `T := S * 10 / 24` makes
+/// each an identity in `S` that no drift could ever red (N-C3):
+/// - `S > resolved max` (i.e. `S > 1.8T = 0.75S`), which is why `too_much_content` admits the lone
+///   file at all; and
+/// - `2.15T <= S <= 2.8T`, the two-output window expressed on the INPUT.
+///
+/// Returns the catalog, the temp dir (kept alive), the committed table, `S` and `T`.
+async fn recipe_3_lone_oversized_fixture() -> (impl Catalog, TempDir, Table, u64, u64) {
+    let (catalog, temp, table, _x_path) = gate_table().await;
+    // 34_000 distinct ~105-byte paths measure ~4.74 MB here — ~20% above the 3_932_160 floor, which
+    // the test asserts rather than assumes. The path count is the only dial; the knobs never move.
+    let pd = write_wide_path_pos_delete(&table, 34_000).await;
+    let s = pd.file_size_in_bytes;
+    let t = s * 10 / 24;
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+    (catalog, temp, table, s, t)
+}
+
+/// Recipe 3's shared PRE-ASSERTIONS, run before `execute` in both of its tests: the fixture really is
+/// in the size class the recipe claims, and the chunk budget really is the ruled constant. A size
+/// drift therefore fails HERE, loudly, instead of reddening the fixed point for an unrelated reason.
+fn assert_recipe_3_preconditions(s: u64, config: &ResolvedConfig) {
+    assert!(
+        s >= 240 * CHUNK_MAX_SERIALIZED_BYTES,
+        "recipe 3 precondition: the measured fixture size S = {s} must clear \
+         240 * CHUNK_MAX_SERIALIZED_BYTES = {} — grow the DISTINCT PATH COUNT, never the knobs",
+        240 * CHUNK_MAX_SERIALIZED_BYTES
+    );
+    assert_eq!(
+        config.chunk_budget, CHUNK_MAX_SERIALIZED_BYTES,
+        "recipe 3 precondition: the band is wide, so the 16 KiB CAP binds, not the headroom half"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-009 — the roll bound is Java's `writeMaxFileSize()`, NOT the resolved target.
+// ------------------------------------------------------------------------------------------------
+
+/// C-009 pin 1 (C-036 recipe 6 — no fixture). The VALUE, white-box through the `resolve_config`
+/// seam: at the delete defaults `write_max_file_size` is EXACTLY Java's 93952409, and in particular
+/// is NOT the resolved target 67108864.
+///
+/// `writeMaxFileSize()` = `target + (max - target) * 0.5` with the subtraction a LONG `lsub` BEFORE
+/// the `l2d` — `67108864 + (120795955 - 67108864) * 0.5 = 93952409.5`, `d2l` → 93952409.
+///
+/// MUTATION COVERAGE: any drift in the ratio, in the subtraction order, or a revert to "roll at the
+/// target" moves this literal. The `assert_ne!` is the specific guard against the reversion R-1
+/// exists to prevent, which an `assert!(write_max > 0)` style check would not catch.
+#[tokio::test]
+async fn test_config_write_max_file_size_default_is_java_write_max() {
+    let (_temp, table) = config_table(&[]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect("the delete defaults are a legal config");
+
+    assert_eq!(
+        config.write_max_file_size, 93_952_409,
+        "Java writeMaxFileSize() at the delete defaults: 67108864 + (120795955 - 67108864) * 0.5"
+    );
+    assert_ne!(
+        config.write_max_file_size, config.target_file_size_bytes,
+        "the roll bound is write-max, NOT the resolved target — that reversion is what R-1 forbids"
+    );
+
+    // THE SUBTRACTION ORDER, which nothing else in this suite discriminates. Java's bytecode is
+    // `getfield maxFileSize; getfield targetFileSize; lsub; l2d` — a LONG subtraction BEFORE the
+    // widening — so the Rust mirror must subtract in `u64` and only then convert. At the delete
+    // defaults both orders agree (the values sit far below 2^53), so the property needs a config
+    // where the two roundings diverge. This is one: the `u64` subtraction yields 48764580662105708
+    // exactly, whose `l2d` differs from `l2d(max) - l2d(target)` by enough to move the result by 32.
+    //
+    // MUTATION COVERAGE: rewrite the derivation as
+    // `d2l(target as f64 + ((max_file_size_bytes as f64) - (target as f64)) * RATIO)` and this
+    // reads 198299551875299584.
+    let (_temp, table) = config_table(&[]).await;
+    let ordered = RewritePositionDeleteFiles::new(table)
+        .target_file_size_bytes(173_917_261_544_246_756)
+        .max_file_size_bytes(222_681_842_206_352_464)
+        .resolve_config()
+        .expect("min defaults to 0.75 * target < target < max <= i64::MAX, so this resolves");
+    assert_eq!(
+        ordered.write_max_file_size, 198_299_551_875_299_616,
+        "the (max - target) subtraction happens in the INTEGER domain, BEFORE the widening — \
+         subtracting after it gives 198299551875299584"
+    );
+}
+
+/// C-009 pin 2 (A-001 — `write_max_file_size` gets its OWN clamp pair, never a borrowed one).
+/// Java's `d2l` saturates at `Long.MAX_VALUE`; Rust's `as u64` saturates at `u64::MAX`, so the
+/// `.min(i64::MAX as u64)` inside [`d2l`] IS the parity act on this call site too.
+///
+/// The fixture is the only shape in which the two disagree: `target = 2^63 - 512` (whose `l2d`
+/// rounds UP to `2^63`) with an EXPLICIT `max = i64::MAX`. Then
+/// `write_max = d2l(2^63 + (i64::MAX - target) * 0.5) = d2l(2^63 + 255.5)`, whose `f64` value is
+/// `2^63` exactly (the spacing there is 2048) — 9223372036854775808 unclamped, i64::MAX clamped.
+/// Both branches resolve Ok, so the equality assertion is the discriminator, not the Ok/Err.
+///
+/// MUTATION COVERAGE: drop the `.min(i64::MAX as u64)` from `d2l` and this reads
+/// 9223372036854775808.
+#[tokio::test]
+async fn test_config_write_max_file_size_clamps_to_java_long_max() {
+    let (_temp, table) = config_table(&[]).await;
+    let target: u64 = 9_223_372_036_854_775_296; // 2^63 - 512
+    let config = RewritePositionDeleteFiles::new(table)
+        .target_file_size_bytes(target)
+        .max_file_size_bytes(i64::MAX as u64)
+        .resolve_config()
+        .expect("target < max and target > default min, so this config resolves");
+
+    assert!(
+        (target as f64) > (i64::MAX as f64) - 2048.0,
+        "fixture: the target's `l2d` must round UP to 2^63, or the two branches agree and the \
+         assertion below is vacuous"
+    );
+    assert_eq!(
+        config.write_max_file_size,
+        i64::MAX as u64,
+        "Java's d2l SATURATES at Long.MAX_VALUE; unclamped this would be 9223372036854775808"
+    );
+}
+
+/// C-009 pin 3 (C-036 RECIPE 9) — the CALL-SITE DISCRIMINATOR, and the only pin that can tell the
+/// two candidate bounds apart.
+///
+/// The bound reaches [`RollingFileWriterBuilder::new`] as an opaque `usize`, so no white-box config
+/// assertion can distinguish "passed `write_max`" from "passed the resolved target"; and rolling at
+/// the smaller target only ever produces MORE outputs, so a bare "more than one file" assertion
+/// cannot discriminate either. Only an OUTPUT COUNT inside the window where the two bounds DISAGREE
+/// does — and per N-C3 that window is asserted on the MEASURED OUTPUT, never implied by an identity
+/// in the fixture size.
+///
+/// RECIPE 9: FIVE sub-min position-delete files in one partition whose MEASURED total `B` clears
+/// `30 * CHUNK_MAX_SERIALIZED_BYTES` (491_520), with `T = B * 10 / 12` and min / max DEFAULTED —
+/// `min = 0.625B`, `max = 1.5B`, `write_max = 1.1667B`.
+///
+/// RECORDED as TRUE BY CONSTRUCTION and deliberately NOT asserted (STRUCK per N-C3): `target < B <=
+/// write_max`, an identity in `B` once `T := B * 10 / 12` is substituted.
+///
+/// NAMED MUTANT, APPLIED: `RollingFileWriterBuilder::new(builder,
+/// usize::try_from(config.write_max_file_size)...)` → `...config.target_file_size_bytes...`. The
+/// asserted `target + 2 * chunk_budget < O` IS that mutant's roll condition, so the pin proves its
+/// own non-vacuity at runtime: under the mutant the single output would have rolled into two.
+#[tokio::test]
+async fn test_roll_bound_is_write_max_not_target() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    // Five files, each ~118 KB, over DISJOINT position ranges of the same data file.
+    let mut deletes = Vec::new();
+    for k in 0..5i64 {
+        deletes.push(write_sized_pos_delete(&table, &x_path, 1 + k * 20_000, 12_000).await);
+    }
+    let sizes: Vec<u64> = deletes.iter().map(|f| f.file_size_in_bytes).collect();
+    let b: u64 = sizes.iter().sum();
+    let t = b * 10 / 12;
+    let table = add_deletes(&catalog, &table, deletes).await;
+
+    let action = || RewritePositionDeleteFiles::new(table.clone()).target_file_size_bytes(t);
+    let config = action().resolve_config().expect("legal knobs");
+
+    // PRECONDITIONS, all over MEASURED quantities.
+    assert!(
+        b >= 30 * CHUNK_MAX_SERIALIZED_BYTES,
+        "recipe 9 precondition: the measured total B = {b} must clear \
+         30 * CHUNK_MAX_SERIALIZED_BYTES = {}, or the named mutant can survive a re-encode drift",
+        30 * CHUNK_MAX_SERIALIZED_BYTES
+    );
+    for size in &sizes {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "recipe 9 precondition: every input must be SUB-MIN so all five are candidates \
+             (measured {size}, resolved min {})",
+            config.min_file_size_bytes
+        );
+    }
+    assert!(
+        5 >= config.min_input_files,
+        "recipe 9 precondition: five files must clear the DEFAULT count floor of \
+         {} — this is what admits the one bin",
+        config.min_input_files
+    );
+    assert_eq!(
+        config.chunk_budget, CHUNK_MAX_SERIALIZED_BYTES,
+        "recipe 9 precondition: the band is wide, so the 16 KiB cap binds"
+    );
+
+    let before = scan_y_values(&table).await;
+    let result = action().execute(&catalog).await.expect("run 1");
+
+    assert_eq!(
+        result.rewritten_delete_files_count, 5,
+        "all five are one bin and all five are rewritten"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 1,
+        "ONE output: the bin is below write_max, so the rolling writer never rolls. Rolling at the \
+         resolved target instead would have produced TWO — that is the named mutant"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    let outputs = live_pos_delete_files(&reloaded).await;
+    assert_eq!(outputs.len(), 1);
+    let o = outputs[0].file_size_in_bytes;
+
+    // NON-VACUITY, ON THE MEASURED OUTPUT. The left inequality is the mutant's roll condition; the
+    // right is the reason the real bound does NOT roll.
+    assert!(
+        config.target_file_size_bytes + 2 * config.chunk_budget < o,
+        "the single output ({o}) must exceed target + 2 * chunk_budget ({}) — this is exactly the \
+         condition under which rolling at the TARGET would have split it, so without it the \
+         `added == 1` assertion above would be vacuous",
+        config.target_file_size_bytes + 2 * config.chunk_budget
+    );
+    assert!(
+        o <= config.write_max_file_size,
+        "the single output ({o}) must not exceed write_max ({}) — otherwise the real bound rolled \
+         too and the pin is measuring something else",
+        config.write_max_file_size
+    );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+/// Write a position-delete file masking `count` positions of `target_path` STRIDED by `stride` from
+/// `first_pos`. Two strided files offset by one INTERLEAVE, which is what makes the global sort
+/// observable: with consecutive, disjoint ranges the concatenated input is ALREADY sorted and
+/// C-044's ordering pin is vacuous — a mutation proof caught exactly that.
+async fn write_strided_pos_delete(
+    table: &Table,
+    target_path: &str,
+    first_pos: i64,
+    count: i64,
+    stride: i64,
+) -> DataFile {
+    let pairs: Vec<(&str, i64)> = (0..count)
+        .map(|index| (target_path, first_pos + index * stride))
+        .collect();
+    write_position_delete_file(table, Some(0), &pairs).await
+}
+
+/// Everything the SMALL-EXPLICIT-BAND split fixture's tests read off one run.
+struct SplitFixture {
+    table: Table,
+    input_sizes: Vec<u64>,
+    /// The two inputs' pairs READ BACK OFF DISK and concatenated in MANIFEST ORDER — the exact
+    /// sequence `compact_group` builds before it sorts. This is measured, never reconstructed from
+    /// the fixture's own construction, because the ordering pin's non-vacuity depends on this
+    /// sequence being UNSORTED and a reconstructed value could not witness that.
+    input_concat: Vec<(String, i64)>,
+    /// `input_concat` sorted — the multiset the split outputs must reproduce exactly.
+    input_pairs: Vec<(String, i64)>,
+    before: HashSet<i64>,
+    config: ResolvedConfig,
+    result: RewritePositionDeleteFilesResult,
+}
+
+/// **C-036 RECIPE 10 (NEW — not one of the ledger's nine; see the section banner's disclosure).**
+///
+/// The SMALL-EXPLICIT-BAND SPLIT fixture, built and run once: TWO ~118 KB position-delete files over
+/// DISJOINT position ranges of one data file, committed in TWO separate snapshots so their data
+/// sequence numbers are 2 and 3 (bin max = 3). The knobs are set as fractions of the MEASURED
+/// combined size `C` — `min = 0.55C`, `target = 0.60C`, `max = 0.75C`, so `write_max = 0.675C` —
+/// which puts the ONE bin comfortably above the roll bound and makes it split.
+///
+/// This is the cheap counterpart to recipe 3: it exercises the SPLIT (fan-out, ordering, counts,
+/// stamping) without paying for a multi-megabyte fixture. Recipe 3 stays the home of the two
+/// assertions that genuinely need the wide default band — the run-1 outputs landing inside
+/// `[min, max]`, and the fixed point.
+async fn split_fixture_run() -> (impl Catalog, TempDir, SplitFixture) {
+    let (catalog, temp, table, x_path) = gate_table().await;
+
+    // ODD positions and EVEN positions over the SAME range: whichever order the manifest walk
+    // reads them in, the concatenated pair list is NOT sorted, so only the GLOBAL sort in
+    // `compact_group` can produce ascending outputs (C-044).
+    let pd1 = write_strided_pos_delete(&table, &x_path, 1, 12_000, 2).await;
+    let table = add_deletes(&catalog, &table, vec![pd1]).await; // seq 2
+    let pd2 = write_strided_pos_delete(&table, &x_path, 2, 12_000, 2).await;
+    let table = add_deletes(&catalog, &table, vec![pd2]).await; // seq 3
+
+    let input_sizes: Vec<u64> = live_pos_delete_files(&table)
+        .await
+        .iter()
+        .map(|f| f.file_size_in_bytes)
+        .collect();
+    let c: u64 = input_sizes.iter().sum();
+    // READ the inputs back in MANIFEST ORDER — the same order `collect_position_delete_groups`
+    // walks them — so the fixture can witness what the writer is actually fed.
+    let mut input_concat: Vec<(String, i64)> = Vec::new();
+    for file in live_pos_delete_files(&table).await {
+        input_concat.extend(read_pos_delete_pairs(&table, &file).await);
+    }
+    let mut input_pairs = input_concat.clone();
+    input_pairs.sort();
+
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_input_files(2)
+            .min_file_size_bytes(c * 55 / 100)
+            .target_file_size_bytes(c * 60 / 100)
+            .max_file_size_bytes(c * 75 / 100)
+    };
+    let config = action().resolve_config().expect("legal knobs");
+
+    // PRECONDITIONS, over MEASURED sizes.
+    assert_eq!(input_sizes.len(), 2, "fixture: exactly two inputs");
+    for size in &input_sizes {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "fixture: both inputs must be SUB-MIN so both are candidates \
+             (measured {size}, resolved min {})",
+            config.min_file_size_bytes
+        );
+    }
+    assert!(
+        2 >= config.min_input_files,
+        "fixture: a bin of two must clear the count floor"
+    );
+    assert!(
+        c > config.write_max_file_size,
+        "fixture: the bin ({c}) must exceed the roll bound ({}) or nothing splits and every \
+         split assertion below is vacuous",
+        config.write_max_file_size
+    );
+
+    let before = scan_y_values(&table).await;
+    let result = action().execute(&catalog).await.expect("the split run");
+
+    (catalog, temp, SplitFixture {
+        table,
+        input_sizes,
+        input_concat,
+        input_pairs,
+        before,
+        config,
+        result,
+    })
+}
+
+/// C-009 pin 4. With an explicit SMALL band the bin exceeds `write_max` and the rolling writer
+/// really rolls, so ONE bin produces MORE THAN ONE file — which the pre-G3 action could not do at
+/// any configuration, because it wrote a single whole-bin batch to a writer bounded by the 512 MiB
+/// DATA default.
+///
+/// MUTATION COVERAGE: revert `RollingFileWriterBuilder::new(.., write_max, ..)` to
+/// `new_with_default_file_size` and the whole bin lands in ONE file. Revert the chunked feed to a
+/// single `writer.write(batch)` and it also lands in one file, because `should_roll` is evaluated
+/// once per `write`.
+#[tokio::test]
+async fn test_output_splits_into_multiple_files_at_a_small_explicit_config() {
+    let (catalog, _temp, fixture) = split_fixture_run().await;
+
+    assert_eq!(
+        fixture.result.rewritten_delete_files_count, 2,
+        "both inputs form ONE bin and both are rewritten"
+    );
+    assert!(
+        fixture.result.added_delete_files_count >= 2,
+        "ONE bin, MORE THAN ONE output file — got {}",
+        fixture.result.added_delete_files_count
+    );
+
+    let reloaded = catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let outputs = live_pos_delete_files(&reloaded).await;
+    assert_eq!(outputs.len(), fixture.result.added_delete_files_count);
+    assert!(
+        outputs
+            .iter()
+            .any(|f| f.file_size_in_bytes > fixture.config.target_file_size_bytes),
+        "at least one output must be larger than the resolved TARGET — so this fixture would ALSO \
+         red under the pin-3 mutant (roll at the target), not merely under a revert to the 512 MiB \
+         data default"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-025 — the BOUNDED CHUNK FEED. Three FORK-AUTHORED literals with no Java analogue (R-11 / R-14):
+// CHUNK_PAIRS = 256, CHUNK_MAX_SERIALIZED_BYTES = 16384, and the /2 footer reservation.
+//
+// R-16 is the shape of this section: the CONFIG-TIME assert inside `resolve_config` is trivially
+// true by construction and is kept only as intent documentation with a tripwire; the RUNTIME
+// clearance is established by `test_no_split_output_exceeds_max_file_size`'s MEASURED OUTPUTS.
+// ------------------------------------------------------------------------------------------------
+
+/// C-025 pin 1 (C-036 recipe 6 — no fixture). `chunk_budget` is
+/// `min(CHUNK_MAX_SERIALIZED_BYTES, (max - write_max) / 2)`, and BOTH limbs are exercised:
+///
+/// - at the DELETE DEFAULTS the headroom is 26843546, so half of it (13421773) is far above the cap
+///   and the CAP binds: `chunk_budget == 16384`;
+/// - on a NARROW band the headroom half binds instead: `min 100 / target 200 / max 1000` gives
+///   `write_max = 600`, headroom 400, and `chunk_budget == 200`.
+///
+/// MUTATION COVERAGE: drop the `min(CHUNK_MAX_SERIALIZED_BYTES, ..)` cap and the defaults case reads
+/// 13421773. Drop the `/ CHUNK_HEADROOM_FOOTER_SHARE` footer reservation and the narrow case reads
+/// 400. Neither mutant is caught by the other case, which is why both are here.
+#[tokio::test]
+async fn test_feed_chunk_budget_is_the_ruled_constant() {
+    let (_temp, table) = config_table(&[]).await;
+
+    let defaults = RewritePositionDeleteFiles::new(table.clone())
+        .resolve_config()
+        .expect("the delete defaults are a legal config");
+    assert_eq!(
+        defaults.max_file_size_bytes - defaults.write_max_file_size,
+        26_843_546,
+        "the candidate-filter headroom at the delete defaults (120795955 - 93952409)"
+    );
+    assert_eq!(
+        defaults.chunk_budget, 16_384,
+        "the wide default band lets the fork-authored CAP bind; half the headroom would be 13421773"
+    );
+
+    let narrow = RewritePositionDeleteFiles::new(table)
+        .min_file_size_bytes(100)
+        .target_file_size_bytes(200)
+        .max_file_size_bytes(1_000)
+        .resolve_config()
+        .expect("legal knobs");
+    assert_eq!(narrow.write_max_file_size, 600, "200 + (1000 - 200) * 0.5");
+    assert_eq!(
+        narrow.chunk_budget,
+        (narrow.max_file_size_bytes - narrow.write_max_file_size) / 2,
+        "on a narrow band the HEADROOM HALF binds, not the 16 KiB cap"
+    );
+    assert_eq!(
+        narrow.chunk_budget, 200,
+        "(1000 - 600) / 2 — the footer keeps the other half"
+    );
+
+    // RES-8's THROUGHPUT half, pinned rather than left as prose: a band of `max - target <= 2`
+    // resolves `chunk_budget` to ZERO, which is below ANY pair's serialized size, so the one-pair
+    // floor governs and the feed degrades to one Arrow batch per pair. Legal config, named residue —
+    // see `write_compacted_file`'s RES-8 section.
+    let (_degenerate_temp, degenerate_table) = config_table(&[]).await;
+    let degenerate = RewritePositionDeleteFiles::new(degenerate_table)
+        .min_file_size_bytes(100)
+        .target_file_size_bytes(200)
+        .max_file_size_bytes(202)
+        .resolve_config()
+        .expect("legal knobs: min < target < max");
+    assert_eq!(
+        degenerate.write_max_file_size, 201,
+        "200 + (202 - 200) * 0.5"
+    );
+    assert_eq!(
+        degenerate.chunk_budget, 0,
+        "a two-byte band leaves a one-byte headroom, whose half is ZERO"
+    );
+}
+
+/// C-025 pin 2 — the CHUNKING RULE itself, white-box on [`chunk_end`], because neither the pair cap
+/// nor the one-pair floor is observable end to end (raising `CHUNK_PAIRS` only changes how often
+/// `should_roll` runs, and a zero-pair chunk HANGS rather than failing an assertion).
+///
+/// MUTATION COVERAGE, one per element:
+/// - raise or lower `CHUNK_PAIRS` ⇒ the "count cap binds" case reds;
+/// - drop the `next > chunk_budget` break ⇒ the "byte cap binds" case reds;
+/// - drop the `end > start` one-pair floor ⇒ the floor case returns `start` (0 pairs), which is
+///   caught HERE as a failed assertion instead of spinning the feed loop forever;
+/// - change `pair_serialized_bytes` from `len + 8` ⇒ the byte-cap boundary moves.
+#[test]
+fn test_chunk_end_takes_at_least_one_pair_and_respects_both_caps() {
+    let pairs: Vec<(String, i64)> = (0..1_000i64).map(|pos| ("aaaa".to_string(), pos)).collect();
+    assert_eq!(
+        pair_serialized_bytes(&pairs[0]),
+        12,
+        "one pair measures `file_path.len() + 8` — 4 UTF-8 bytes plus the int64 pos"
+    );
+
+    assert_eq!(
+        chunk_end(&pairs, 0, u64::MAX),
+        CHUNK_PAIRS,
+        "with an unbounded byte budget the PAIR CAP binds"
+    );
+    assert_eq!(
+        chunk_end(&pairs, 0, 60),
+        5,
+        "with a 60-byte budget the BYTE CAP binds: 5 pairs measure exactly 60, a 6th would be 72"
+    );
+    assert_eq!(
+        chunk_end(&pairs, 0, 0),
+        1,
+        "the ONE-PAIR FLOOR: a zero budget still takes one pair, or the feed loop never terminates"
+    );
+    assert_eq!(
+        chunk_end(&pairs, 998, u64::MAX),
+        1_000,
+        "a tail shorter than the pair cap ends at the input length, never past it"
+    );
+}
+
+/// C-025 pin 3 (C-036 RECIPE 3) — THE RUNTIME CLEARANCE PIN, which is where R-16 puts the weight
+/// that the config-time assert must NOT be credited with carrying.
+///
+/// It measures, on real outputs, the two things the config assert cannot see:
+/// 1. that a chunk's PARQUET contribution really does fit inside the raw-byte budget it was
+///    denominated in (the stated assumption on `write_compacted_file`), and
+/// 2. that the Parquet FOOTER — which `current_written_size()` EXCLUDES, and which this action
+///    inflates by writing FULL untruncated `file_path` bounds — fits inside its reserved half.
+///
+/// Together those are what keep every run-1 output inside `[min, max]`, where the candidate filter
+/// declines it forever. That containment is C-026's convergence argument, MEASURED here rather than
+/// asserted.
+#[tokio::test]
+async fn test_no_split_output_exceeds_max_file_size() {
+    let (catalog, _temp, table, s, t) = recipe_3_lone_oversized_fixture().await;
+    let action = || RewritePositionDeleteFiles::new(table.clone()).target_file_size_bytes(t);
+    let config = action().resolve_config().expect("legal knobs");
+    assert_recipe_3_preconditions(s, &config);
+
+    let before = scan_y_values(&table).await;
+    let result = action().execute(&catalog).await.expect("run 1");
+    assert_eq!(
+        result.rewritten_delete_files_count, 1,
+        "the LONE oversized file is admitted by too_much_content, which carries no `size > 1` guard"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 2,
+        "and it is rewritten into EXACTLY TWO outputs — one roll at write_max = 1.4T, then a tail"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    let outputs = outputs_in_write_order(&reloaded).await;
+    assert_eq!(outputs.len(), 2);
+
+    for (file, _) in &outputs {
+        assert!(
+            file.file_size_in_bytes >= config.min_file_size_bytes
+                && file.file_size_in_bytes <= config.max_file_size_bytes,
+            "every run-1 output must land INSIDE [min, max] ({} .. {}) — an output outside it is a \
+             candidate again, and the fixed point is gone (measured {})",
+            config.min_file_size_bytes,
+            config.max_file_size_bytes,
+            file.file_size_in_bytes
+        );
+    }
+
+    let first = outputs[0].0.file_size_in_bytes;
+    assert!(
+        first > config.write_max_file_size,
+        "the FIRST output must EXCEED the roll bound — `should_roll` is a PRE-check, so a rolled \
+         file has already passed it (measured {first}, write_max {})",
+        config.write_max_file_size
+    );
+    let overshoot = first - config.write_max_file_size;
+    assert!(
+        overshoot <= 2 * config.chunk_budget,
+        "the overshoot ({overshoot}) must fit inside one chunk PLUS its reserved footer half \
+         (2 * chunk_budget = {}) — this is the raw-vs-output assumption and the footer allowance, \
+         both MEASURED",
+        2 * config.chunk_budget
+    );
+
+    let o: u64 = outputs.iter().map(|(f, _)| f.file_size_in_bytes).sum();
+    assert!(
+        o >= 215 * t / 100 + 2 * config.chunk_budget && o <= 28 * t / 10,
+        "the measured TOTAL output O = {o} must sit inside the two-output window \
+         [2.15T + 2 * chunk_budget, 2.8T] = [{}, {}]. Above 2.8T the SECOND output itself reaches \
+         write_max and rolls, leaving a sub-min THIRD that reds the `[min, max]` assertion above",
+        215 * t / 100 + 2 * config.chunk_budget,
+        28 * t / 10
+    );
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "read identity across the split"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-026 — THE FIXED POINT, and the three counterexamples that BOUND it.
+//
+// This closes the non-convergence G2 deliberately opened: at G2's state a lone file above
+// `max_file_size_bytes` was admitted, rewritten to about the same size, and RE-ADMITTED on every
+// subsequent run — unbounded churn. The convergence does NOT come from the roll bound directly. It
+// comes from the CANDIDATE FILTER: a run-1 output that lands inside [min, max] fails
+// `outsideDesiredFileSizeRange`, is therefore never a candidate, and no bin forms.
+//
+// The claim is CONDITIONAL, not universal, and the two counterexamples below are PARITY-CORRECT —
+// Java behaves identically — so they are pinned as EXPECTED behaviour. They are not defects and no
+// later change should "fix" them.
+// ------------------------------------------------------------------------------------------------
+
+/// C-026 — ACCEPTANCE 3, in its ruled fixed-point form (R-3): the no-op is the three-way
+/// CONJUNCTION `rewritten == 0 && added == 0 && current_snapshot_id() unchanged`.
+///
+/// The MANDATORY pre-assertions on run 1's state come FIRST, so a size drift fails loudly on a
+/// precondition instead of reddening the fixed point for an unrelated reason. Per C-029, a red on
+/// the three conjuncts THEMSELVES is a DESIGN failure to escalate — never an assert to weaken.
+///
+/// MUTATION COVERAGE: revert the roll bound to the resolved target and output 1 is ~T, still inside
+/// [0.75T, 1.8T], so this test alone would still pass — which is exactly why C-009 pin 3 exists.
+/// What this test kills is the far more dangerous class: any change that lets a run-1 output land
+/// OUTSIDE [min, max] (drop the chunk cap, drop the footer reservation, roll at `max` instead of
+/// `write_max`) re-admits it forever and reds the conjuncts.
+#[tokio::test]
+async fn test_second_run_is_a_no_op_after_split() {
+    let (catalog, _temp, table, s, t) = recipe_3_lone_oversized_fixture().await;
+    let action = |t_: Table| RewritePositionDeleteFiles::new(t_).target_file_size_bytes(t);
+    let config = action(table.clone()).resolve_config().expect("legal knobs");
+    assert_recipe_3_preconditions(s, &config);
+
+    let before = scan_y_values(&table).await;
+    let run1 = action(table.clone())
+        .execute(&catalog)
+        .await
+        .expect("run 1");
+
+    // PRE-ASSERTIONS ON RUN 1's STATE — every one on a MEASURED quantity.
+    assert_eq!(
+        run1.rewritten_delete_files_count, 1,
+        "run 1 must admit EXACTLY ONE bin (the lone oversized file), or a counterexample below is \
+         firing on this fixture instead of the fixed point"
+    );
+    assert_eq!(
+        run1.added_delete_files_count, 2,
+        "run 1 produced EXACTLY 2 outputs"
+    );
+
+    let after_run1 = catalog.load_table(table.identifier()).await.unwrap();
+    let outputs = outputs_in_write_order(&after_run1).await;
+    assert_eq!(outputs.len(), 2);
+    for (file, _) in &outputs {
+        assert!(
+            file.file_size_in_bytes >= config.min_file_size_bytes
+                && file.file_size_in_bytes <= config.max_file_size_bytes,
+            "THE CONVERGENCE CONDITION: every run-1 output must be inside [min, max] ({} .. {}), \
+             where outsideDesiredFileSizeRange declines it forever (measured {})",
+            config.min_file_size_bytes,
+            config.max_file_size_bytes,
+            file.file_size_in_bytes
+        );
+    }
+    let overshoot = outputs[0].0.file_size_in_bytes - config.write_max_file_size;
+    assert!(
+        outputs[0].0.file_size_in_bytes > config.write_max_file_size
+            && overshoot <= 2 * config.chunk_budget,
+        "run 1's first output overshoots the roll bound by {overshoot}, which must fit in \
+         2 * chunk_budget = {}",
+        2 * config.chunk_budget
+    );
+    let o: u64 = outputs.iter().map(|(f, _)| f.file_size_in_bytes).sum();
+    assert!(
+        o >= 215 * t / 100 + 2 * config.chunk_budget && o <= 28 * t / 10,
+        "run 1's measured total O = {o} must sit inside [2.15T + 2 * chunk_budget, 2.8T] = [{}, {}]",
+        215 * t / 100 + 2 * config.chunk_budget,
+        28 * t / 10
+    );
+
+    // THE FIXED POINT, all three conjuncts.
+    let snapshot_before_run2 = after_run1.metadata().current_snapshot_id();
+    let run2 = action(after_run1.clone())
+        .execute(&catalog)
+        .await
+        .expect("run 2");
+    assert_eq!(
+        run2.rewritten_delete_files_count, 0,
+        "run 2 rewrites NOTHING — neither run-1 output is a candidate any more"
+    );
+    assert_eq!(run2.added_delete_files_count, 0, "run 2 adds NOTHING");
+    let after_run2 = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        after_run2.metadata().current_snapshot_id(),
+        snapshot_before_run2,
+        "run 2 commits NO snapshot — zero counts alone would not rule out an empty Replace"
+    );
+    assert_eq!(
+        scan_y_values(&after_run2).await,
+        before,
+        "read identity across both runs"
+    );
+}
+
+/// C-026 COUNTEREXAMPLE 2, PINNED AS EXPECTED BEHAVIOUR — **not** a defect, and **not** to be
+/// "fixed": Java behaves identically.
+///
+/// **C-036 RECIPE 11 (NEW — not one of the ledger's nine; see the section banner's disclosure).**
+/// C-026 requires this counterexample pinned but C-036 describes no fixture that can build it.
+///
+/// `B >= min_input_files` bins in one partition each leave a SUB-MIN TAIL. Those tails co-bin on the
+/// next run and are admitted by `enough_input_files` — the COUNT clause — so the second run is not a
+/// no-op even though every non-tail output converged.
+///
+/// The fixture ISOLATES the count clause: five ~118 KB files, knobs at `min = 0.80C`,
+/// `target = 0.85C`, `max = 0.95C` (so `write_max = 0.90C`) and `max_file_group_size_bytes = 1.05C`,
+/// which forces FIVE bins of one. Each bin is admitted by `too_much_content` (its file exceeds max)
+/// and splits into a ~0.9C output that lands IN RANGE plus a ~0.11C tail that does not. On run 2 the
+/// five tails sum to well UNDER the target, so `enough_content` is false and `too_much_content` is
+/// false — the admission is `enough_input_files` and nothing else, which the assertions below pin.
+#[tokio::test]
+async fn test_multi_bin_tails_are_readmitted_on_second_run() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let mut deletes = Vec::new();
+    for k in 0..5i64 {
+        deletes.push(write_sized_pos_delete(&table, &x_path, 1 + k * 20_000, 12_000).await);
+    }
+    let c = deletes[0].file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, deletes).await;
+
+    let action = |t: Table| {
+        RewritePositionDeleteFiles::new(t)
+            .min_file_size_bytes(c * 80 / 100)
+            .target_file_size_bytes(c * 85 / 100)
+            .max_file_size_bytes(c * 95 / 100)
+            .max_file_group_size_bytes(c * 105 / 100)
+    };
+    let config = action(table.clone()).resolve_config().expect("legal knobs");
+
+    let before = scan_y_values(&table).await;
+    let run1 = action(table.clone())
+        .execute(&catalog)
+        .await
+        .expect("run 1");
+    assert_eq!(run1.rewritten_delete_files_count, 5);
+    assert_eq!(
+        run1.added_delete_files_count, 10,
+        "FIVE bins of one, each splitting into an in-range output plus a sub-min tail"
+    );
+
+    let after_run1 = catalog.load_table(table.identifier()).await.unwrap();
+    let sizes: Vec<u64> = live_pos_delete_files(&after_run1)
+        .await
+        .iter()
+        .map(|f| f.file_size_in_bytes)
+        .collect();
+    let tails: Vec<u64> = sizes
+        .iter()
+        .copied()
+        .filter(|s| *s < config.min_file_size_bytes)
+        .collect();
+    assert_eq!(
+        tails.len(),
+        5,
+        "exactly five SUB-MIN tails, one per bin (measured {sizes:?})"
+    );
+    assert_eq!(
+        sizes.len() - tails.len(),
+        5,
+        "and five outputs INSIDE [min, max], which are no longer candidates"
+    );
+
+    // THE ISOLATION: on run 2 the five tails form ONE bin, and ONLY the count clause admits it.
+    let tail_sum: u64 = tails.iter().sum();
+    assert!(
+        tail_sum <= config.max_file_group_size_bytes,
+        "the five tails ({tail_sum}) must co-bin under the group-size cap"
+    );
+    assert!(
+        tail_sum <= config.target_file_size_bytes,
+        "enough_content must be FALSE ({tail_sum} <= target {}) — otherwise this fixture does not \
+         isolate the count clause and duplicates counterexample 3",
+        config.target_file_size_bytes
+    );
+    assert!(
+        tail_sum <= config.max_file_size_bytes,
+        "too_much_content must be FALSE ({tail_sum} <= max {})",
+        config.max_file_size_bytes
+    );
+    assert!(
+        tails.len() >= config.min_input_files,
+        "enough_input_files is the ONLY admitter: {} tails >= min_input_files {}",
+        tails.len(),
+        config.min_input_files
+    );
+
+    let run2 = action(after_run1).execute(&catalog).await.expect("run 2");
+    assert_eq!(
+        run2.rewritten_delete_files_count, 5,
+        "PARITY-CORRECT, not a defect: the five sub-min tails ARE re-admitted, by the count clause"
+    );
+    assert_eq!(run2.added_delete_files_count, 1);
+
+    let after_run2 = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&after_run2).await,
+        before,
+        "read identity across both runs"
+    );
+}
+
+/// **C-036 RECIPE 12 (NEW — not one of the ledger's nine; see the section banner's disclosure).**
+/// As with recipe 11, C-026 requires this counterexample pinned and C-036 describes no fixture for it.
+///
+/// C-026 COUNTEREXAMPLE 3, DISTINCT from counterexample 2 and likewise PINNED AS EXPECTED BEHAVIOUR:
+/// as few as **TWO** bins whose sub-min tails SUM ABOVE THE TARGET are re-admitted, by
+/// `enough_content`, which needs only `size > 1`. Two is far below the default count floor of five,
+/// which is what makes this a separate bound on the fixed-point claim rather than a weaker case of
+/// counterexample 2.
+///
+/// The fixture ISOLATES the content clause: two ~118 KB files, knobs at `min = 0.55C`,
+/// `target = 0.60C`, `max = 0.75C` (so `write_max = 0.675C`) and `max_file_group_size_bytes = 1.05C`,
+/// forcing TWO bins of one. Each splits into an in-range ~0.675C output plus a ~0.32C sub-min tail.
+/// On run 2 the two tails sum ABOVE the target but BELOW the max, and two is below the DEFAULT count
+/// floor, so `enough_content` is the sole admitter.
+#[tokio::test]
+async fn test_two_bin_tails_over_target_are_readmitted() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let mut deletes = Vec::new();
+    for k in 0..2i64 {
+        deletes.push(write_sized_pos_delete(&table, &x_path, 1 + k * 20_000, 12_000).await);
+    }
+    let c = deletes[0].file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, deletes).await;
+
+    let action = |t: Table| {
+        RewritePositionDeleteFiles::new(t)
+            .min_file_size_bytes(c * 55 / 100)
+            .target_file_size_bytes(c * 60 / 100)
+            .max_file_size_bytes(c * 75 / 100)
+            .max_file_group_size_bytes(c * 105 / 100)
+    };
+    let config = action(table.clone()).resolve_config().expect("legal knobs");
+
+    let before = scan_y_values(&table).await;
+    let run1 = action(table.clone())
+        .execute(&catalog)
+        .await
+        .expect("run 1");
+    assert_eq!(run1.rewritten_delete_files_count, 2);
+    assert_eq!(
+        run1.added_delete_files_count, 4,
+        "TWO bins of one, each splitting in two"
+    );
+
+    let after_run1 = catalog.load_table(table.identifier()).await.unwrap();
+    let sizes: Vec<u64> = live_pos_delete_files(&after_run1)
+        .await
+        .iter()
+        .map(|f| f.file_size_in_bytes)
+        .collect();
+    let tails: Vec<u64> = sizes
+        .iter()
+        .copied()
+        .filter(|s| *s < config.min_file_size_bytes)
+        .collect();
+    assert_eq!(
+        tails.len(),
+        2,
+        "exactly two SUB-MIN tails (measured {sizes:?})"
+    );
+
+    let tail_sum: u64 = tails.iter().sum();
+    assert!(
+        tails.len() < config.min_input_files,
+        "enough_input_files must be FALSE: {} tails < the DEFAULT floor {}",
+        tails.len(),
+        config.min_input_files
+    );
+    assert!(
+        tail_sum > config.target_file_size_bytes,
+        "enough_content is the ONLY admitter: the two tails sum to {tail_sum} > target {}",
+        config.target_file_size_bytes
+    );
+    assert!(
+        tail_sum <= config.max_file_size_bytes,
+        "too_much_content must be FALSE ({tail_sum} <= max {})",
+        config.max_file_size_bytes
+    );
+
+    let run2 = action(after_run1).execute(&catalog).await.expect("run 2");
+    assert_eq!(
+        run2.rewritten_delete_files_count, 2,
+        "PARITY-CORRECT, not a defect: TWO bins are enough — the content clause carries no count floor"
+    );
+    assert_eq!(run2.added_delete_files_count, 1);
+
+    let after_run2 = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&after_run2).await,
+        before,
+        "read identity across both runs"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-010 — `write_compacted_file` returns `Vec<DataFile>`, and EVERY output of a bin is stamped with
+// THAT BIN's own max rewritten data-seq.
+//
+// The stamp is a function of exactly two variables: which ENTRIES the max ranges over, and which
+// OUTPUTS receive it. `test_compacted_file_carries_bin_max_rewritten_seq` (above) fixes the base
+// value on a one-output bin; the two pins below fix the other two dimensions.
+//
+// DIRECTION OF DANGER, against the fork's OWN rule (`delete_file_index.rs`'s applicable_pos_deletes
+// keeps `delete_seq >= data_seq`): an OVER-HIGH stamp OVER-APPLIES; an UNDER-LOW stamp stops
+// applying and RESURRECTS rows. Stamping bin 2 from bin 1's entries is the UNDER-stamp path whenever
+// bin 1's max is the lower one — the resurrection direction, and the reason the ranging dimension
+// gets its own pin rather than being folded into the fan-out one.
+// ------------------------------------------------------------------------------------------------
+
+/// C-010 element 2 — the FAN-OUT dimension. A bin that SPLITS must stamp EVERY output with the bin
+/// max, not just the first one the old `.next()` shape happened to return.
+///
+/// MUTATION COVERAGE: stamp only `new_files[0]` and let the rest inherit (i.e. `add_delete_file`)
+/// and the second output carries the rewrite snapshot's seq (4) instead of 3 — an OVER-HIGH stamp,
+/// which over-applies. Asserting only `pos_entries[0]` would miss it, which is why this iterates.
+#[tokio::test]
+async fn test_every_split_output_carries_bin_max_rewritten_seq() {
+    let (catalog, _temp, fixture) = split_fixture_run().await;
+    assert!(
+        fixture.result.added_delete_files_count >= 2,
+        "fixture: the bin must SPLIT, or this pin tests the same thing as the one-output pin"
+    );
+
+    let reloaded = catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let stamped: Vec<Option<i64>> = live_delete_entries_with_seq(&reloaded)
+        .await
+        .into_iter()
+        .filter(|(f, _)| f.content_type() == DataContentType::PositionDeletes)
+        .map(|(_, seq)| seq)
+        .collect();
+    assert_eq!(stamped.len(), fixture.result.added_delete_files_count);
+    for seq in &stamped {
+        assert_eq!(
+            *seq,
+            Some(3),
+            "EVERY output of the bin carries the bin max (3) — the inputs are at seqs 2 and 3, and \
+             the rewrite snapshot's own seq is 4 (measured {stamped:?})"
+        );
+    }
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        fixture.before,
+        "read identity"
+    );
+}
+
+/// C-010 element 3 — the RANGING dimension, and the pin that kills the two most dangerous mutants.
+///
+/// ONE partition, FOUR position-delete files committed in FOUR separate snapshots so their data
+/// sequence numbers are 2, 3, 5 and 6 (a dummy data-file append sits at seq 4). The group-size cap
+/// is `2 * max(S_i)`, with `< 3 * min(S_i)` asserted, so the sequential first-fit packer puts
+/// exactly TWO files in each bin — whatever the manifest order turns out to be.
+///
+/// The expected stamp per bin is DERIVED from what each output actually contains (each input masks a
+/// disjoint 1000-block of positions, so an output's positions name its bin's members), never assumed
+/// from an unpinned manifest ordering. The test then asserts the two bins' expected maxima DIFFER,
+/// which is what makes both mutants lethal:
+///
+/// MUTATIONS, APPLIED:
+/// - range the max over the PARTITION's whole entry list ⇒ both outputs carry 6 ⇒ the lower bin reds;
+/// - compute bin 2's max from bin 1's entries ⇒ the second output carries the first bin's value ⇒
+///   reds (and that is the UNDER-stamp, row-resurrection direction).
+#[tokio::test]
+async fn test_each_bin_output_carries_its_own_bin_max_not_the_partition_max() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    // Four pos-deletes over DISJOINT 1000-blocks, with distinct sizes, each in its own snapshot.
+    let mut table = table;
+    let mut by_block: HashMap<i64, i64> = HashMap::new(); // pos/1000 block -> data seq
+    for (index, count) in [2i64, 3, 4, 5].into_iter().enumerate() {
+        let block = 1 + index as i64;
+        let pd = write_sized_pos_delete(&table, &x_path, block * 1_000, count).await;
+        table = add_deletes(&catalog, &table, vec![pd]).await;
+        if index == 1 {
+            // A dummy data-file append between the bins, so the seqs are 2, 3, 5, 6 and the two
+            // bins' maxima cannot coincide by accident.
+            let w = write_data_file(&table, "w.parquet", 0, &[(0, 60, 600)]).await;
+            table = append_files(&catalog, &table, vec![w]).await;
+        }
+        let seq = live_delete_entries_with_seq(&table)
+            .await
+            .into_iter()
+            .filter(|(f, _)| f.content_type() == DataContentType::PositionDeletes)
+            .filter_map(|(_, seq)| seq)
+            .max()
+            .expect("the just-committed pos-delete carries a seq");
+        by_block.insert(block, seq);
+    }
+    let mut seqs: Vec<i64> = by_block.values().copied().collect();
+    seqs.sort();
+    assert_eq!(seqs, vec![2, 3, 5, 6], "fixture: the four input seqs");
+
+    let sizes: Vec<u64> = live_pos_delete_files(&table)
+        .await
+        .iter()
+        .map(|f| f.file_size_in_bytes)
+        .collect();
+    assert_eq!(sizes.len(), 4);
+    let group_size = 2 * sizes.iter().copied().max().expect("four sizes");
+    assert!(
+        group_size < 3 * sizes.iter().copied().min().expect("four sizes"),
+        "fixture: TWO files must always fit a bin and THREE must never — this makes the bin \
+         MEMBERSHIP independent of the manifest order (measured {sizes:?})"
+    );
+
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_input_files(2)
+            .min_file_size_bytes(100_000)
+            .target_file_size_bytes(200_000)
+            .max_file_size_bytes(400_000)
+            .max_file_group_size_bytes(group_size)
+    };
+    let config = action().resolve_config().expect("legal knobs");
+    for size in &sizes {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "fixture: all four are sub-min candidates"
+        );
+    }
+
+    let before = scan_y_values(&table).await;
+    let result = action().execute(&catalog).await.expect("execute");
+    assert_eq!(result.rewritten_delete_files_count, 4);
+    assert_eq!(result.added_delete_files_count, 2, "two bins ⇒ two outputs");
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    let mut observed: Vec<(i64, i64)> = Vec::new(); // (expected bin max, stamped seq)
+    for (file, seq) in live_delete_entries_with_seq(&reloaded).await {
+        if file.content_type() != DataContentType::PositionDeletes {
+            continue;
+        }
+        let pairs = read_pos_delete_pairs(&reloaded, &file).await;
+        let mut blocks: Vec<i64> = pairs.iter().map(|(_, pos)| pos / 1_000).collect();
+        blocks.sort();
+        blocks.dedup();
+        let expected = blocks
+            .iter()
+            .map(|block| by_block[block])
+            .max()
+            .expect("an output covers at least one input block");
+        observed.push((
+            expected,
+            seq.expect("the compacted file carries an explicit seq"),
+        ));
+    }
+    assert_eq!(observed.len(), 2);
+    assert_ne!(
+        observed[0].0, observed[1].0,
+        "NON-VACUITY: the two bins' expected maxima must DIFFER, or neither mutant is lethal \
+         (observed {observed:?})"
+    );
+    for (expected, stamped) in &observed {
+        assert_eq!(
+            stamped, expected,
+            "each bin's output carries ITS OWN bin max — not the partition's, and not the other \
+             bin's (observed {observed:?})"
+        );
+    }
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+/// C-010's counting half: `added_delete_files_count` is the REAL number of files added across the
+/// split, and `added_bytes_count` is the CHECKED sum of their sizes — not the hard-coded `+= 1` and
+/// single `file_size_in_bytes` the one-output shape carried.
+///
+/// MUTATION COVERAGE: restore `added_delete_files_count += 1` and the count reds against the live
+/// pos-delete count; sum only the first output's bytes and the byte assertion reds.
+#[tokio::test]
+async fn test_result_counts_added_files_and_bytes_across_split_outputs() {
+    let (catalog, _temp, fixture) = split_fixture_run().await;
+
+    let reloaded = catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let outputs = live_pos_delete_files(&reloaded).await;
+    assert!(outputs.len() >= 2, "fixture: the bin must SPLIT");
+
+    assert_eq!(
+        fixture.result.added_delete_files_count,
+        outputs.len(),
+        "the added COUNT is the real number of files the split produced"
+    );
+    assert_eq!(
+        fixture.result.added_bytes_count,
+        outputs.iter().map(|f| f.file_size_in_bytes).sum::<u64>(),
+        "the added BYTES are the sum across EVERY output, not just the first"
+    );
+    assert_eq!(
+        fixture.result.rewritten_bytes_count,
+        fixture.input_sizes.iter().sum::<u64>(),
+        "and the rewritten side is unchanged by the fan-out"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-044 — the GLOBAL SORT happens BEFORE any split, and the split preserves it.
+// ------------------------------------------------------------------------------------------------
+
+/// C-044. A bin's pairs are sorted by `(file_path, pos)` ONCE, globally, and the feed then chunks
+/// that already-sorted `Vec` in order — so output *k*'s range lies entirely below output *k+1*'s and
+/// the union of the outputs is EXACTLY the input multiset.
+///
+/// Java does not dedup within a group either (the reader bitmap dedups), so the multiset equality is
+/// the right relation, not set equality.
+///
+/// MUTATION COVERAGE: move `pairs.sort()` below the chunking, or sort per chunk instead of globally,
+/// and the ranges interleave — output *k*'s max exceeds output *k+1*'s min. The multiset equality
+/// and the read-identity assertion both survive that mutation, which is precisely why the ORDERING
+/// assertion has to be here: the masked row set alone cannot see it.
+#[tokio::test]
+async fn test_split_outputs_have_disjoint_ascending_ranges() {
+    let (catalog, _temp, fixture) = split_fixture_run().await;
+    assert!(
+        fixture.result.added_delete_files_count >= 2,
+        "fixture: the bin must SPLIT, or there are no ranges to be disjoint"
+    );
+
+    // NON-VACUITY, ON THE MEASURED INPUT SEQUENCE — not on the fixture's own construction.
+    //
+    // Everything below can only distinguish a GLOBAL sort from no sort at all if what the writer is
+    // FED is not already ascending. `input_concat` is the two inputs read back off disk and
+    // concatenated in MANIFEST ORDER, i.e. exactly the sequence `compact_group` builds before it
+    // sorts; asserting that THAT is unsorted is the property, and a fixture edit that makes the two
+    // inputs consecutive-and-disjoint again reds HERE.
+    //
+    // This replaces an earlier guard that asserted `input_pairs.len() == 24_000` while
+    // `input_pairs` was built four lines above as `(1..=24_000).map(..)` — an unconditional
+    // identity in the fixture's own construction that could never red. An independent Critic proved
+    // it: reverting only the two stride arguments and touching no assertion left the suite green
+    // under the sort mutation. Same over-claim class R-16 corrected on the config-time assert.
+    //
+    // The witness form is deliberate: ONE descending adjacent pair is logically equivalent to "not
+    // already ascending", and it fails in one line. Comparing the whole `Vec` against its own sorted
+    // clone would emit a ~3.9 MB panic message for the same information. Not asserted, because it
+    // would be the SAME unkillable class this round deleted from `assert_recipe_3_preconditions`:
+    // `input_pairs` IS `sort(clone(input_concat))` by construction (see `split_fixture_run`), so
+    // re-deriving it here and comparing could never red. The multiset relation that CAN red is the
+    // union-vs-`input_pairs` assertion at the end of this test, against the real split OUTPUTS.
+    assert!(
+        fixture
+            .input_concat
+            .windows(2)
+            .any(|pair| pair[0] > pair[1]),
+        "fixture: the concatenated input MUST NOT already be ascending, or a global sort and no \
+         sort are indistinguishable and every ordering assertion below is vacuous"
+    );
+
+    let reloaded = catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let outputs = outputs_in_write_order(&reloaded).await;
+    assert_eq!(outputs.len(), fixture.result.added_delete_files_count);
+
+    for (file, pairs) in &outputs {
+        assert!(!pairs.is_empty(), "no output is empty");
+        let mut sorted = pairs.clone();
+        sorted.sort();
+        assert_eq!(
+            *pairs,
+            sorted,
+            "each output's pairs are ASCENDING in (file_path, pos) — file {}",
+            file.file_path()
+        );
+    }
+    for window in outputs.windows(2) {
+        let left_max = window[0].1.last().expect("non-empty");
+        let right_min = window[1].1.first().expect("non-empty");
+        assert!(
+            left_max <= right_min,
+            "output ranges must be DISJOINT and ASCENDING: {left_max:?} then {right_min:?}"
+        );
+    }
+
+    let mut union: Vec<(String, i64)> = outputs.iter().flat_map(|(_, p)| p.clone()).collect();
+    union.sort();
+    assert_eq!(
+        union, fixture.input_pairs,
+        "the union of the split outputs is EXACTLY the input multiset — no pair lost, none invented"
+    );
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        fixture.before,
+        "read identity across the split"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-046 — the FAIL-CLOSED guard SURVIVES the `Vec<DataFile>` change at the new arity.
+// ------------------------------------------------------------------------------------------------
+
+/// C-046. A bin whose `pairs` are NON-EMPTY must produce at least one file. "No file" is a NORMAL
+/// return from the parquet writer, not an error — `ParquetWriter::close` returns `Ok(vec![])` and
+/// DELETES the output whenever `current_row_num == 0` — so nothing below this guard would object.
+///
+/// With the guard removed, `execute` goes on to commit a `Replace` snapshot that REMOVES live
+/// position-delete files and adds none: silent UNDER-masking, the row-RESURRECTION direction. Nothing
+/// downstream rejects it either, because `RewriteFilesAction::validate` early-returns when
+/// `deleted_data_files` is empty, which is always true for this action.
+///
+/// WHITE-BOX on the extracted [`require_non_empty`], because the state is unreachable end to end:
+/// the guard's whole point is that it fires where no fixture can put the writer.
+///
+/// MUTATION COVERAGE: delete the guard (return `Ok(files)` unconditionally) and the empty case
+/// returns `Ok(vec![])`.
+#[tokio::test]
+async fn test_bin_with_pairs_but_no_output_file_is_a_hard_error() {
+    let error = require_non_empty(Vec::new()).expect_err("an empty file list is a hard error");
+    assert_eq!(error.kind(), ErrorKind::Unexpected);
+    assert!(
+        error
+            .message()
+            .contains("Position-delete writer produced no file for a non-empty input"),
+        "the guard keeps its exact message: {error}"
+    );
+
+    let (_catalog, _temp, table, x_path) = gate_table().await;
+    let file = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let passed = require_non_empty(vec![file.clone()]).expect("a non-empty list passes through");
+    assert_eq!(passed.len(), 1);
+    assert_eq!(
+        passed[0].file_path(),
+        file.file_path(),
+        "and is returned UNCHANGED"
     );
 }
