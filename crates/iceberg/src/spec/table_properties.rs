@@ -204,6 +204,25 @@ impl TableProperties {
     pub const PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES: &str = "write.target-file-size-bytes";
     /// Default target file size
     pub const PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT: usize = 512 * 1024 * 1024; // 512 MB
+
+    /// Target size for newly written / compacted POSITION-DELETE files (Java
+    /// `TableProperties.DELETE_TARGET_FILE_SIZE_BYTES`). This is the DELETE-specific key: Java's
+    /// `BinPackRewritePositionDeletePlanner.defaultTargetFileSize()` reads THIS property and never
+    /// [`Self::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES`], so the two targets move independently.
+    pub const PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES: &str =
+        "write.delete.target-file-size-bytes";
+    /// Default delete-file target size: 64 MiB (Java
+    /// `BinPackRewritePositionDeletePlanner.defaultTargetFileSize` = `PropertyUtil.propertyAsLong(..,
+    /// "write.delete.target-file-size-bytes", 67108864L)`, bytecode-verified vs
+    /// `iceberg-core-1.10.0.jar`).
+    ///
+    /// **Typed `u64` DELIBERATELY**, unlike the `usize` sibling
+    /// [`Self::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT`] directly above — do NOT "align" the two.
+    /// Java's field is a `long`, and every consumer of this constant (the `RewritePositionDeleteFiles`
+    /// size-based admission gate) compares it against `u64` byte counts taken off `DataFile`s. The
+    /// `usize` sibling is `usize` only because `RollingFileWriter`'s `target_file_size` field is
+    /// `usize`; that is a writer-side accident, not the parity type.
+    pub const PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT: u64 = 67108864;
     /// Whether to use `FanoutWriter` for partitioned tables (handles unsorted data).
     /// If false, uses `ClusteredWriter` (requires sorted data, more memory efficient).
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &str = "write.datafusion.fanout.enabled";
@@ -272,6 +291,31 @@ mod tests {
         assert_eq!(
             TableProperties::PROPERTY_DEFAULT_NAME_MAPPING,
             crate::spec::DEFAULT_SCHEMA_NAME_MAPPING
+        );
+    }
+
+    #[test]
+    fn test_delete_target_property_key_matches_java() {
+        // C-032: the DELETE-specific target key and its 64 MiB default are Java's
+        // `BinPackRewritePositionDeletePlanner.defaultTargetFileSize()` operands, bytecode-verified
+        // vs `iceberg-core-1.10.0.jar`. Pinned as literals so neither can drift silently.
+        assert_eq!(
+            TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES,
+            "write.delete.target-file-size-bytes"
+        );
+        assert_eq!(
+            TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT,
+            67108864
+        );
+        // ... and it is a DIFFERENT key from the data-file target, whose default is 512 MiB. A port
+        // that resolved the delete target from `write.target-file-size-bytes` would collapse these.
+        assert_ne!(
+            TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES,
+            TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES
+        );
+        assert_ne!(
+            TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT,
+            TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT as u64
         );
     }
 

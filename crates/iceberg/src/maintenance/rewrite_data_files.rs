@@ -160,17 +160,17 @@ use crate::transaction::{ApplyTransactionAction, Transaction};
 
 /// Java `SizeBasedFileRewritePlanner.MIN_FILE_SIZE_DEFAULT_RATIO` — the default
 /// `min_file_size_bytes` is 75% of the target file size.
-const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
+pub(super) const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
 
 /// Java `SizeBasedFileRewritePlanner.MAX_FILE_SIZE_DEFAULT_RATIO` — the default
 /// `max_file_size_bytes` is 180% of the target file size.
-const MAX_FILE_SIZE_DEFAULT_RATIO: f64 = 1.80;
+pub(super) const MAX_FILE_SIZE_DEFAULT_RATIO: f64 = 1.80;
 
 /// Java `SizeBasedFileRewritePlanner.MIN_INPUT_FILES_DEFAULT`.
-const MIN_INPUT_FILES_DEFAULT: usize = 5;
+pub(super) const MIN_INPUT_FILES_DEFAULT: usize = 5;
 
 /// Java `SizeBasedFileRewritePlanner.MAX_FILE_GROUP_SIZE_BYTES_DEFAULT` = 100 GiB.
-const MAX_FILE_GROUP_SIZE_BYTES_DEFAULT: u64 = 100 * 1024 * 1024 * 1024;
+pub(super) const MAX_FILE_GROUP_SIZE_BYTES_DEFAULT: u64 = 100 * 1024 * 1024 * 1024;
 
 /// Java `BinPackRewriteFilePlanner.DELETE_FILE_THRESHOLD_DEFAULT = Integer.MAX_VALUE` — the
 /// delete-count candidate clause is disabled by default. Modeled here as `usize::MAX`.
@@ -718,7 +718,11 @@ fn plan_file_groups(
         }
 
         // 4. Bin-pack the partition's candidates into groups of total size <= max_file_group_size.
-        let bins = pack_bins(candidates, config.max_file_group_size_bytes);
+        let bins = pack_bins(
+            candidates,
+            |task| task.file_size_in_bytes,
+            config.max_file_group_size_bytes,
+        );
 
         // 5. Group filter (Java `filterFileGroups`).
         for bin in bins {
@@ -769,7 +773,7 @@ fn group_qualifies(group: &[FileScanTask], config: &ResolvedConfig) -> bool {
 /// Forward greedy first-fit bin-packing — the materialized form of Java
 /// `BinPacking.ListPacker(maxGroupSize, lookback=1, largestBinFirst=false, maxGroupCount).pack`
 /// (`BinPacking.PackingIterator.next`). With `lookback = 1` there is a single open bin at a time:
-/// each task is placed in the open bin if it still fits (`bin_weight + length <= target_weight`),
+/// each item is placed in the open bin if it still fits (`bin_weight + weight <= target_weight`),
 /// else the open bin is closed and a fresh one opened. (This is the SAME algorithm the fork's
 /// merge-append `bin_packing::pack` implements, but that module is `pub(crate)`-private to
 /// `transaction/merge_append.rs`; opening it would be a `transaction/` change, which is out of this
@@ -778,22 +782,33 @@ fn group_qualifies(group: &[FileScanTask], config: &ResolvedConfig) -> bool {
 /// `maxGroupCount` (Java `MAX_FILE_GROUP_INPUT_FILES`, default `Long.MAX_VALUE`) is not exposed by
 /// this action, so there is no per-bin item cap. Sizes come from the manifest (trusted within the
 /// table), but the running sum is saturated defensively.
-fn pack_bins(tasks: Vec<FileScanTask>, target_weight: u64) -> Vec<Vec<FileScanTask>> {
-    let mut bins: Vec<Vec<FileScanTask>> = Vec::new();
-    let mut open_bin: Vec<FileScanTask> = Vec::new();
+///
+/// GENERIC over the item type and a `weight` closure so the sibling
+/// [`rewrite_position_delete_files`](super::rewrite_position_delete_files) planner packs its live
+/// position-delete entries through the SAME packer rather than reimplementing it: Java's
+/// `BinPackRewritePositionDeletePlanner` inherits `SizeBasedFileRewritePlanner`'s packer unchanged,
+/// so one home here is the parity-faithful shape. `weight` is evaluated exactly once per item, at
+/// the point the non-generic form read `task.file_size_in_bytes`, so the packing is unchanged.
+pub(super) fn pack_bins<T>(
+    items: Vec<T>,
+    weight: impl Fn(&T) -> u64,
+    target_weight: u64,
+) -> Vec<Vec<T>> {
+    let mut bins: Vec<Vec<T>> = Vec::new();
+    let mut open_bin: Vec<T> = Vec::new();
     let mut open_weight: u64 = 0;
 
-    for task in tasks {
-        let weight = task.file_size_in_bytes;
-        if !open_bin.is_empty() && open_weight.saturating_add(weight) <= target_weight {
-            open_weight = open_weight.saturating_add(weight);
-            open_bin.push(task);
+    for item in items {
+        let w = weight(&item);
+        if !open_bin.is_empty() && open_weight.saturating_add(w) <= target_weight {
+            open_weight = open_weight.saturating_add(w);
+            open_bin.push(item);
         } else {
             if !open_bin.is_empty() {
                 bins.push(std::mem::take(&mut open_bin));
             }
-            open_weight = weight;
-            open_bin.push(task);
+            open_weight = w;
+            open_bin.push(item);
         }
     }
     if !open_bin.is_empty() {
@@ -2602,14 +2617,20 @@ mod tests {
             .enumerate()
             .map(|(index, &size)| synthetic_task(&format!("f{index}"), size, 0, 0, &spec, &schema))
             .collect();
-        assert_eq!(sizes_of(&pack_bins(tasks, 6)), vec![vec![3, 3], vec![3, 3]]);
+        assert_eq!(
+            sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
+            vec![vec![3, 3], vec![3, 3]]
+        );
 
         let tasks: Vec<FileScanTask> = [4u64, 3, 3]
             .iter()
             .enumerate()
             .map(|(index, &size)| synthetic_task(&format!("g{index}"), size, 0, 0, &spec, &schema))
             .collect();
-        assert_eq!(sizes_of(&pack_bins(tasks, 6)), vec![vec![4], vec![3, 3]]);
+        assert_eq!(
+            sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
+            vec![vec![4], vec![3, 3]]
+        );
 
         // A single item over target gets its own bin (Java: a too-big item opens + closes a bin).
         let tasks: Vec<FileScanTask> = [7u64, 2, 2]
@@ -2617,7 +2638,10 @@ mod tests {
             .enumerate()
             .map(|(index, &size)| synthetic_task(&format!("h{index}"), size, 0, 0, &spec, &schema))
             .collect();
-        assert_eq!(sizes_of(&pack_bins(tasks, 6)), vec![vec![7], vec![2, 2]]);
+        assert_eq!(
+            sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
+            vec![vec![7], vec![2, 2]]
+        );
     }
 
     /// The candidate predicate (Java `outsideDesiredFileSizeRange || tooManyDeletes`): undersized OR
